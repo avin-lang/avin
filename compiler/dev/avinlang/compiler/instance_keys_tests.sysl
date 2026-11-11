@@ -1,0 +1,232 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.slices.sort
+
+// Instance keys: every instance lowering makes has a key over what its text is made from, and an edit
+// changes exactly the keys of the instances whose text it can change. Each test builds a program of
+// three modules, edits it, builds it again and compares every instance's key, the library's
+// included; and wherever an instance's emitted text changed, its key must have changed too.
+
+private const Geo: string = "module geo\n\ndata Shape\n    Circle(r: int)\n    Square(side: int)\n\nclass Box(val w: int, val h: int)\n    area() -> int = w * h\n\ntrait Named\n    name() -> string\n\nclass Cat(val n: string): Named\n    override name() -> string = \"cat \" + n\n\nval limit = 10\n\nscale(x: int, by: int = 2) -> int = x * by\n\narea(s: Shape) -> int = s match\n    Circle(r) -> 3 * r * r\n    Square(a) -> a * a\n"
+
+private const Extra: string = "module extra\n\nhelper(n: int) -> int = n + 100\n"
+
+private const Main: string = "import geo.{Shape, Circle, Square, Box, Named, Cat, area, scale, limit}\nimport extra.helper\n\ndata Pair(a: int, b: int)\n\ntwice[T](x: T) -> (T, T) = (x, x)\n\ndescribe(n: Named) -> string = n.name()\n\nmeasure() = 7\n\nuseMeasure() = measure()\n\nshown(x: Any) -> string = x match\n    n: Named -> n.name()\n    _ -> \"other\"\n\nboxArea(b: Box) -> int = b.w * b.h\n\ntotal(xs: Vector[int]) -> int\n    var sum = 0\n    for x in xs\n        sum = sum + x\n    sum\n\nmain()\n    println(area(Circle(2)) + area(Square(3)))\n    println(twice(1))\n    println(twice(\"a\"))\n    println(twice(Pair(1, 2)))\n    val k = 3\n    val add = (x: int) -> x + k\n    println(add(4))\n    println(describe(Cat(\"tom\")))\n    println(shown(Cat(\"x\")))\n    println(boxArea(Box(2, 3)))\n    println(scale(5))\n    println(limit)\n    println(useMeasure())\n    println(Pair(1, 2) == Pair(1, 2))\n    println(Pair(3, 4))\n    println(total([1, 2, 3]))\n    println(helper(1))\n"
+
+/** The program's three files, under directory `dir`. */
+private program_of(dir: string, main: string, geo: string, extra: string) -> Buf[ProgramFile]
+    var files: Buf[ProgramFile] = buf()
+    files.push(ProgramFile(source_of(dir + "geo/geo.avin", geo), Some("geo"), false, buf(), ""))
+    files.push(ProgramFile(source_of(dir + "extra/extra.avin", extra), Some("extra"), false, buf(), ""))
+    files.push(ProgramFile(source_of(dir + "main.avin", main), None, false, buf(), ""))
+    files
+
+/** `text` with its one `old` replaced by `new`. */
+private edited(text: string, old: string, new: string) -> string
+    assert(text.contains(old), "the edit's text is not in the program: " + old)
+    text.replace_all(old, new)
+
+/** A program as built: each function's key and emitted text, by its symbol. */
+private struct Built
+    keys: Map[string, string]
+    texts: Map[string, string]
+    symbols: Buf[string]
+
+private built(files: Buf[ProgramFile]) -> Built
+    val program = lower_files(repository_toolchain(), files) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    assert_eq(program.keys.len(), program.functions.len())
+    var symbols: Buf[string] = buf()
+    var keys: Map[string, string] = map()
+    for i in 0..<program.functions.len()
+        symbols.push(program.functions[i].symbol)
+        keys.put(program.functions[i].symbol, program.keys[i])
+    val texts = definition_texts(emit_llvm(program))
+    Built(keys, texts, symbols)
+
+/** Each function `ir` defines, its definition's whole text by its symbol, unquoted. */
+private definition_texts(ir: string) -> Map[string, string]
+    var out: Map[string, string] = map()
+    var name = ""
+    var text = ""
+    for line in ir.split("\n")
+        if line.starts_with("define ")
+            name = ""
+            if line.index_of(" @\"") is Some(at)
+                val end = line.index_of_from("\"", at + 3).unwrap()
+                name = line[at + 3..<end]
+            text = ""
+        if name != ""
+            text = text + line + "\n"
+            if line == "}"
+                out.put(name, text)
+                name = ""
+    out
+
+/** The symbols whose key differs between two builds, sorted; one only `after` has is written with a
+ * `+` before it, one only `before` has with a `-`, and one whose emitted text changed too with a `*`
+ * after it. Asserts that every function whose emitted text changed has a changed key, and that no two
+ * functions of either build share a key. */
+private changed(before: Built, after: Built) -> string
+    distinct_keys(before)
+    distinct_keys(after)
+    var out: Buf[string] = buf()
+    var text_compared = 0usize
+    for s in before.symbols
+        val old = before.keys.get(s).unwrap()
+        after.keys.get(s) match
+            Some(new) ->
+                var text_changed = false
+                if before.texts.get(s) is Some(a)
+                    if after.texts.get(s) is Some(b)
+                        text_compared += 1
+                        if a != b
+                            assert(old != new, "text changed but not its key: " + s)
+                            text_changed = true
+                if old != new then out.push(if text_changed then s + "*" else s)
+            None -> out.push("-" + s)
+    for s in after.symbols
+        if before.keys.get(s) is None then out.push("+" + s)
+    assert(text_compared > 300, s"only $text_compared functions' texts compared")
+    val sorted = out.view()
+    sort(sorted)
+    var joined = ""
+    for s in sorted
+        joined = joined + s + "\n"
+    joined
+
+private distinct_keys(b: Built)
+    var seen: Map[string, string] = map()
+    for s in b.symbols
+        val key = b.keys.get(s).unwrap()
+        assert_eq(key.bytes.len, 32)
+        if seen.get(key) is Some(other) then panic(s"$s and $other share a key")
+        seen.put(key, s)
+
+/** The changes an edit of the program makes: `main`, `geo` and `extra` as edited. */
+private edit(main: string, geo: string, extra: string) -> string = changed(built(program_of("", Main, Geo, Extra)), built(program_of("", main, geo, extra)))
+
+/** `names`, sorted, one to a line, as `changed` writes them. */
+private expected(names: []const string) -> string
+    var all: Buf[string] = buf()
+    for n in names
+        all.push(n)
+    val sorted = all.view()
+    sort(sorted)
+    var joined = ""
+    for s in sorted
+        joined = joined + s + "\n"
+    joined
+
+@test("two builds of one program give every instance the same key, the library's included")
+keys_stable_across_builds()
+    assert_eq(edit(Main, Geo, Extra), "")
+
+@test("a program built from another directory gives every instance the same key")
+keys_stable_across_directories()
+    val here = built(program_of("", Main, Geo, Extra))
+    val there = built(program_of("/elsewhere/deeper/copy/", Main, Geo, Extra))
+    assert_eq(changed(here, there), "")
+
+@test("an edited body changes its own key, and that of a caller it was copied into")
+body_edit()
+    // `boxArea` reads the fields of the box `main` made, so scalar replacement copies it into `main`.
+    assert_eq(edit(edited(Main, "b.w * b.h", "b.h * b.w"), Geo, Extra), expected(["<program>.boxArea*", "<program>.main*"]))
+    // `total` is copied into nothing.
+    assert_eq(edit(edited(Main, "sum = sum + x", "sum = x + sum"), Geo, Extra), expected(["<program>.total*"]))
+
+@test("a comment inside a function changes its key alone, since its trap sites move")
+comment_inside_function()
+    assert_eq(edit(edited(Main, "    var sum = 0\n", "    var sum = 0\n    // running total\n"), Geo, Extra), expected(["<program>.total*"]))
+
+@test("an edited signature changes the function, its default's, and its callers'")
+signature_edit()
+    val geo = edited(Geo, "scale(x: int, by: int = 2) -> int", "scale(x: long, by: long = 2) -> long")
+    // `main` now shows a `long`, whose record's rendering is a new instance.
+    assert_eq(edit(Main, geo, Extra), expected(["+avin.record.display.long", "<program>.main*", "geo.scale*", "geo.scale/by*"]))
+
+@test("a changed constant default argument changes the function computing it and the calls it is copied into")
+default_edit()
+    assert_eq(edit(Main, edited(Geo, "by: int = 2", "by: int = 3"), Extra), expected(["<program>.main*", "geo.scale/by*"]))
+
+@test("a computed default argument changes the function computing it alone")
+computed_default_edit()
+    val geo = edited(Geo, "by: int = 2", "by: int = limit + 1")
+    val before = built(program_of("", Main, geo, Extra))
+    val after = built(program_of("", Main, edited(geo, "limit + 1", "limit + 2"), Extra))
+    assert_eq(changed(before, after), expected(["geo.scale/by*"]))
+
+@test("a new overload renames the overloaded function and changes its callers")
+new_overload()
+    val geo = edited(Geo, "val limit = 10\n", "val limit = 10\n\nscale(x: string) -> string = x + x\n")
+    assert_eq(edit(Main, geo, Extra), expected(["+geo.scale(int, int)", "+geo.scale(string)", "+geo.scale/by(int, int)", "-geo.scale", "-geo.scale/by", "<program>.main*"]))
+
+@test("a new class implementing a trait changes the calls through the trait that see it")
+new_implementing_class()
+    val geo = edited(Geo, "val limit = 10\n", "class Dog(val n: string): Named\n    override name() -> string = \"dog \" + n\n\nval limit = 10\n")
+    val main = edited(Main, "boxArea(b: Box)", "useDog() -> string = describe(Dog(\"rex\"))\n\nboxArea(b: Box)").replace_all("Named, Cat,", "Named, Cat, Dog,")
+    // `describe` and `shown` call `name` through `Named`, now on two classes; `main` holds a copy of
+    // `describe`.
+    assert_eq(edit(main, geo, Extra), expected(["+<program>.useDog", "+avin.record.display.class geo.Dog[]", "+geo.Dog", "+geo.Dog.name", "<program>.describe*", "<program>.main*", "<program>.shown*"]))
+
+@test("a new impl of a trait for a data type changes what reads the type's table")
+new_impl()
+    val main = edited(Main, "twice[T]", "impl Named for Pair\n    name() -> string = \"pair\"\n\ntwice[T]")
+    // The calls through `Named` see a new type. The instances at `Pair`, and at a tuple of it, read
+    // its supertypes and table, which choose what a call on a bound runs, though none of these makes
+    // one: a key that changes where the text did not costs a rebuild, never a stale one.
+    assert_eq(edit(main, Geo, Extra), expected(["+<program>.Pair.name", "<program>.describe*", "<program>.main*", "<program>.shown*", "<program>.twice[<program>.Pair[]]", "avin.(A0, A1).display[<program>.Pair[], <program>.Pair[]]", "avin.(A0, A1).toString[<program>.Pair[], <program>.Pair[]]", "avin.equals.<program>.Pair[]", "avin.record.display.(<program>.Pair[], <program>.Pair[])", "avin.record.display.<program>.Pair[]"]))
+
+@test("a field added to a class changes every instance that makes the class or reads its fields")
+class_field_edit()
+    val geo = edited(Geo, "    area() -> int = w * h\n", "    var hits = 0\n    area() -> int = w * h\n")
+    // The readers of `w` and `h` find them where they were, but read the layout all the same.
+    assert_eq(edit(Main, geo, Extra), expected(["<program>.boxArea", "<program>.main*", "geo.Box*", "geo.Box.area"]))
+
+@test("a renamed field of a data type changes what shows or describes it, and nothing that reaches fields by place")
+data_field_edit()
+    assert_eq(edit(edited(Main, "data Pair(a: int, b: int)", "data Pair(a: int, bb: int)"), Geo, Extra), expected(["<program>.Pair.display*", "<program>.__shape_Pair", "<program>.__shape_Pair_0*", "<program>.__shape_Pair_0_0", "<program>.__shape_Pair_0_1*"]))
+
+@test("a changed constant changes its initializer and every instance that reads it")
+constant_edit()
+    assert_eq(edit(Main, edited(Geo, "val limit = 10", "val limit = 11"), Extra), expected(["<program>.main*", "geo.limit*"]))
+
+@test("a callee's inferred result changes the callers whose types it decides")
+inferred_type_edit()
+    assert_eq(edit(edited(Main, "measure() = 7", "measure() = \"seven\""), Geo, Extra), expected(["<program>.main*", "<program>.measure*", "<program>.useMeasure*"]))
+
+@test("an edited lambda changes itself and its closure entry, not the function it is declared in")
+closure_edit()
+    assert_eq(edit(edited(Main, "(x: int) -> x + k", "(x: int) -> x * k"), Geo, Extra), expected(["<program>.main.lambda#1*", "<program>.main.lambda#1#closure"]))
+
+@test("a lambda capturing another local changes the function it is declared in")
+closure_capture_edit()
+    val main = edited(Main, "    val add = (x: int) -> x + k\n", "    var m = 2\n    val add = (x: int) -> x + k\n")
+    val before = built(program_of("", main, Geo, Extra))
+    val after = built(program_of("", edited(main, "x + k\n", "x + k + m\n"), Geo, Extra))
+    assert_eq(changed(before, after), expected(["<program>.main*", "<program>.main.lambda#1*", "<program>.main.lambda#1#closure*"]))
+
+@test("an edited generic function changes every one of its instances")
+generic_edit()
+    val main = edited(Main, "twice[T](x: T) -> (T, T) = (x, x)", "twice[T](x: T) -> (T, T)\n    val y = x\n    (x, y)")
+    assert_eq(edit(main, Geo, Extra), expected(["<program>.twice[<program>.Pair[]]*", "<program>.twice[int]*", "<program>.twice[string]*"]))
+
+@test("comments and blank lines between declarations change no key")
+comment_between_declarations()
+    val main = edited(Main, "data Pair", "// pairs of numbers\n\n\ndata Pair")
+    val geo = edited(Geo, "data Shape", "\n// shapes\n\ndata Shape")
+    assert_eq(edit(main, geo, Extra), "")
+
+@test("a function moved to another line changes no key")
+moved_function()
+    val main = edited(Main, "boxArea(b: Box) -> int = b.w * b.h\n\n", "") + "\nboxArea(b: Box) -> int = b.w * b.h\n"
+    assert_eq(edit(main, Geo, Extra), "")
+
+@test("an edit in a module an instance does not read changes no key of that instance")
+other_module_edit()
+    assert_eq(edit(Main, Geo, edited(Extra, "n + 100", "n + 200")), expected(["extra.helper*"]))

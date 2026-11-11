@@ -100,7 +100,11 @@ private struct Analysis
 /** The program's functions with objects that never leave a function kept as their fields. An
  * object made with a descriptor `finalized` marks is never replaced: the collector must see it die,
  * since its finalizer gives back what it holds. */
-scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor], finalized: Buf[bool]) -> Buf[MirFunction]
+//
+// What it read of other functions is all its rewriting of a function depends on beyond the function's
+// own code: `facts` gets that, for each function in order (see `ScalarFacts`), so the function's
+// instance key can name it.
+scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor], finalized: Buf[bool], facts: *Buf[ScalarFacts]) -> Buf[MirFunction]
     val n = functions.len()
     val cyclic = cyclic_functions(functions)
     var inlinable: Buf[bool] = buf()
@@ -108,10 +112,49 @@ scalar_replace(functions: Buf[MirFunction], descriptors: Buf[Descriptor], finali
         inlinable.push(!cyclic[i] && size_of(functions[i]) <= MaxInlineSize)
     val summary = summarize(functions, inlinable)
     var out: Buf[MirFunction] = buf()
+    var inlined_into: Buf[Buf[usize]] = buf()
     for i in 0..<n
-        val inlined = inline_for_objects(functions[i], functions, summary)
-        out.push(replace_objects(inlined, descriptors, finalized, summary))
-    remove_fences(out)
+        var inlined: Buf[usize] = buf()
+        val grown = inline_for_objects(functions[i], functions, summary, &inlined)
+        out.push(replace_objects(grown, descriptors, finalized, summary))
+        inlined_into.push(inlined)
+    val exits = fence_exits(out)
+    for i in 0..<n
+        facts.push(ScalarFacts(read_summaries(functions, out, i, inlined_into[i], summary, exits), inlined_into[i]))
+    remove_fences(out, exits)
+
+/** What a function's rewriting read of the others, as text: for each function whose call it held
+ * before or after inlining, or that it inlined, that function's summary; and where it has fences,
+ * whether each function it calls may return with a store not yet fenced. */
+private read_summaries(before: Buf[MirFunction], after: Buf[MirFunction], i: usize, inlined: Buf[usize], s: Summary, exits: Buf[bool]) -> string
+    var read: Buf[usize] = buf()
+    for g in inlined
+        add_once(&read, g)
+    add_callees(&read, before[i])
+    add_callees(&read, after[i])
+    var fences = false
+    for block in after[i].blocks
+        for inst in block.insts
+            if inst is Publish then fences = true
+    var out = ""
+    for g in read
+        var row = ""
+        for ok in s.param_ok[g]
+            row = row + (if ok then "1" else "0")
+        out = out + s"${before[g].symbol} ${s.inlinable[g]} ${s.fresh[g]} ${s.passes[g]} $row"
+        if fences then out = out + s" ${exits[g]}"
+        out = out + "\n"
+    out
+
+private add_callees(read: *Buf[usize], f: MirFunction)
+    for block in f.blocks
+        for inst in block.insts
+            if inst is Call(_, Direct(g), _) then add_once(read, g)
+
+private add_once(read: *Buf[usize], g: usize)
+    for x in *read
+        if x == g then return
+    read.push(g)
 
 /** The number of instructions of `f`, a terminator counting as one. */
 private size_of(f: MirFunction) -> usize
@@ -422,7 +465,7 @@ private escape_operands(flags: *Buf[u32], value_group: Buf[Option[usize]], field
 
 /** `f` with the calls that make or are handed objects it could keep as fields inlined, round by
  * round, while it grows by no more than `MaxGrowth` instructions. */
-private inline_for_objects(f: MirFunction, functions: Buf[MirFunction], s: Summary) -> MirFunction
+private inline_for_objects(f: MirFunction, functions: Buf[MirFunction], s: Summary, inlined: *Buf[usize]) -> MirFunction
     var current = f
     var grown = 0usize
     for _ in 0..<MaxRounds
@@ -439,7 +482,9 @@ private inline_for_objects(f: MirFunction, functions: Buf[MirFunction], s: Summa
                                 if worthy(a, a.value_group[d]) then wanted = true
                             for arg in args
                                 if worthy(a, grouped(a.value_group, arg)) then wanted = true
-                        if wanted then grown += size_of(functions[g])
+                        if wanted
+                            grown += size_of(functions[g])
+                            add_once(inlined, g)
                 if wanted then any = true
                 marks.push(wanted)
         if !any then break
@@ -918,28 +963,9 @@ private dirty_entries(f: MirFunction, exits: Buf[bool]) -> Buf[bool]
     entry
 
 /** The functions with every fence dropped that no store another thread could see precedes since the
- * last fence. Whether a function may return with such a store not yet fenced is found for the whole
- * program at once. */
-private remove_fences(functions: Buf[MirFunction]) -> Buf[MirFunction]
-    val n = functions.len()
-    var exits: Buf[bool] = buf()
-    for _ in 0..<n do exits.push(false)
-    var changed = true
-    while changed
-        changed = false
-        for i in 0..<n
-            if exits[i] then continue
-            val f = functions[i]
-            val entry = dirty_entries(f, exits)
-            for b in 0..<f.blocks.len()
-                if !(f.blocks[b].term is Return(_)) then continue
-                var state = entry[b]
-                for inst in f.blocks[b].insts
-                    state = dirty_after(inst, state, exits)
-                if state
-                    exits[i] = true
-                    changed = true
-                    break
+ * last fence, given for each function whether it may return with such a store not yet fenced
+ * (`fence_exits`). */
+private remove_fences(functions: Buf[MirFunction], exits: Buf[bool]) -> Buf[MirFunction]
     var out: Buf[MirFunction] = buf()
     for f in functions
         var fences = false
@@ -960,3 +986,27 @@ private remove_fences(functions: Buf[MirFunction]) -> Buf[MirFunction]
             blocks.push(MirBlock(insts, f.blocks[b].term))
         out.push(MirFunction(f.symbol, f.signature, f.value_types, f.slots, blocks))
     out
+
+/** For each function, whether it may return with a store another thread could see not yet fenced,
+ * found for the whole program at once. */
+private fence_exits(functions: Buf[MirFunction]) -> Buf[bool]
+    val n = functions.len()
+    var exits: Buf[bool] = buf()
+    for _ in 0..<n do exits.push(false)
+    var changed = true
+    while changed
+        changed = false
+        for i in 0..<n
+            if exits[i] then continue
+            val f = functions[i]
+            val entry = dirty_entries(f, exits)
+            for b in 0..<f.blocks.len()
+                if !(f.blocks[b].term is Return(_)) then continue
+                var state = entry[b]
+                for inst in f.blocks[b].insts
+                    state = dirty_after(inst, state, exits)
+                if state
+                    exits[i] = true
+                    changed = true
+                    break
+    exits

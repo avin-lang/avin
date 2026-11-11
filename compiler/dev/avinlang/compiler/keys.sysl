@@ -1,0 +1,912 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.env.current_exe
+import sysl.fs.metadata
+import sysl.path.file_name
+import sysl.slices.sort
+import sysl.text.{StrBuilder, str_builder}
+
+// Instance keys: for each instance lowering made, a hash over everything its finished text is made
+// from, so a later build may reuse the text while the key is the same. The key is a hash over:
+//
+// - the compiler, by its version and its executable's path and time, and whether the program is
+//   built for its tests;
+// - the instance: its function's symbol and its type arguments, or for a function lowering makes, its
+//   kind and type;
+// - the function's **body fingerprint**: its typed tree printed in a canonical form, every callee,
+//   field, conversion and inferred type in it, every type spelled by qualified names and every place
+//   counted from the declaration its trap sites are named by; and what every function of its family
+//   (the top-level function or method and the local functions and lambdas in it) captures, which
+//   decides the locals each keeps in a box;
+// - the **interfaces** that tree reads: each callee's signature, the layout of every type it makes,
+//   reads a field of or takes apart by variant, the supertypes and table of every type it tests against, each
+//   module-level value it reads, with the initializer of one made at compile time, and for each type
+//   argument the type's supertypes and method table;
+// - the **world facts** the whole-program steps used on it: the slots lowering gave the methods with
+//   type parameters of their own it calls through a table, what devirtualization decided at each of
+//   its calls through a table, and what scalar replacement read of the functions it calls or inlined,
+//   with the key of each function it inlined.
+//
+// Nothing in a key is a number the checker or lowering gave in the order it found things, and no
+// place is counted from the start of a file, so a key changes only where the instance's text can.
+
+/** One instance lowering made, as `Instance` in lowering. */
+struct KeyedInstance
+    function: usize
+    type_args: Buf[&Type]
+    entry: bool
+    generated: u8
+
+/** What scalar replacement read of the other functions while rewriting one: `text` names each
+ * function it read the summary of, with that summary, and `inlined` the functions it inlined. */
+struct ScalarFacts
+    text: string
+    inlined: Buf[usize]
+
+/** What lowering gives the keys beyond the typed program, by instance index: the instances, the
+ * numbering of local functions, the facts lowering, devirtualization and scalar replacement decided
+ * from the whole program, which module-level values are made at compile time, and the decisions every
+ * instance shares (`world`). */
+struct KeyInputs
+    instances: Buf[KeyedInstance]
+    ordinals: Buf[usize]
+    lowering: Buf[string]
+    devirt: Buf[string]
+    scalar: Buf[ScalarFacts]
+    constant_globals: Buf[bool]
+    world: string
+
+/** What `instance_keys` found: each instance's key, how many functions' bodies were fingerprinted
+ * (a generic function's once for all its instances), and how many different keys there are. */
+struct KeyCounts
+    keys: Buf[string]
+    bodies: usize
+    distinct: usize
+
+private struct Keys
+    program: TProgram
+    inputs: KeyInputs
+    prefix: string
+    /** Each top-level function's local functions, in the order the checker declared them. */
+    members: Map[usize, Buf[usize]]
+    /** The top-level functions and methods of each declaration's span, by `span_key`. */
+    spans: Map[string, Buf[usize]]
+    /** The top-level functions and methods of each unit. */
+    tops: Map[usize, Buf[usize]]
+    /** The body fingerprint hash of each function, and the functions being fingerprinted, so a
+     * module-level value read while making its own initializer stops there. */
+    bodies: Map[usize, string]
+    busy: Map[usize, bool]
+    /** The interfaces already printed, by what they are of. */
+    interfaces: Map[string, string]
+    /** Each instance's finished key, made when first asked for. */
+    finished: Buf[string]
+    builtins: string
+    c_digest: string
+
+/** A fingerprint being printed: its text, where its places are counted from, and the interfaces it
+ * reads, each once. */
+private struct KeyPrinter
+    out: StrBuilder
+    base: usize
+    end: usize
+    unit: usize
+    absolute: bool
+    read: Map[string, bool]
+    reads: Buf[string]
+    family: Map[usize, usize]
+
+/** The key of every instance of `mir`, lowered from `program`. */
+instance_keys(program: TProgram, mir: MirProgram) -> KeyCounts
+    var members: Map[usize, Buf[usize]] = map()
+    var spans: Map[string, Buf[usize]] = map()
+    var tops: Map[usize, Buf[usize]] = map()
+    for id in 0..<program.symbols.len()
+        program.symbols[id].root match
+            Some(root) ->
+                var row = members.get(root).unwrap_or(buf())
+                row.push(id)
+                members.put(root, row)
+            None ->
+                val key = span_key(program.symbols[id].unit, program.symbols[id].decl.span)
+                var row = spans.get(key).unwrap_or(buf())
+                row.push(id)
+                spans.put(key, row)
+                val unit = program.symbols[id].unit
+                var in_unit = tops.get(unit).unwrap_or(buf())
+                in_unit.push(id)
+                tops.put(unit, in_unit)
+    var stamp = str_builder()
+    stamp.push("avin " + Version + "\n")
+    if current_exe() is Some(exe)
+        stamp.push(exe + "\n")
+        if metadata(exe) is Ok(m) then stamp.push(m.modified.us.to_string() + "\n")
+    stamp.push((if program.testing then "tests\n" else "program\n") + mir.key_inputs.world + "\n")
+    var finished: Buf[string] = buf()
+    for _ in mir.key_inputs.instances do finished.push("")
+    var k = Keys(program, mir.key_inputs, content_key(stamp.finish()), members, spans, tops, map(),map(), map(), finished, "", "")
+    k.builtins = builtins_text(&k)
+    k.c_digest = c_text(program)
+    var keys: Buf[string] = buf()
+    var seen: Map[string, bool] = map()
+    for i in 0..<k.inputs.instances.len()
+        val key = finished_key(&k, i)
+        keys.push(key)
+        seen.put(key, true)
+    KeyCounts(keys, k.bodies.len(), seen.len())
+
+private span_key(unit: usize, span: Span) -> string = s"$unit:${span.start}:${span.end}"
+
+/** An instance's key: its own part, then what the whole-program steps decided for it, with the key of
+ * every function scalar replacement copied into it, which never calls back into it. */
+private finished_key(k: *Keys, i: usize) -> string
+    if k.finished[i] != "" then return k.finished[i]
+    var text = str_builder()
+    text.push(k.prefix + "\n")
+    text.push(own_part(k, i))
+    text.push("lowering\n" + k.inputs.lowering[i])
+    text.push("devirtualized\n" + k.inputs.devirt[i])
+    val scalar = k.inputs.scalar[i]
+    text.push("scalar\n" + scalar.text)
+    for g in scalar.inlined
+        text.push("inlined " + finished_key(k, g) + "\n")
+    val key = content_key(text.finish())
+    k.finished[i] = key
+    key
+
+/** What an instance is and the fingerprint of what it is made from. */
+private own_part(k: *Keys, i: usize) -> string
+    val inst = k.inputs.instances[i]
+    var out = str_builder()
+    if inst.generated == Written
+        out.push("instance " + symbol_spelling(k.program, k.inputs.ordinals, inst.function, inst.type_args) + (if inst.entry then " entry\n" else "\n"))
+        out.push("body " + body_hash(k, inst.function) + "\n")
+        for t in inst.type_args
+            argument_text(k, &out, t)
+        return out.finish()
+    out.push(s"generated ${inst.generated} [")
+    var p = printer(0, true)
+    for t in inst.type_args
+        type_text(k, &p, t)
+        p.out.push(", ")
+    out.push(p.out.finish() + "]\n")
+    if inst.generated == OptionAdapter || inst.generated == CCallbackBody
+        out.push(callee_interface(k, inst.function) + "\n")
+        if inst.generated == CCallbackBody then out.push(k.c_digest)
+    // Equality and hashing field by field read the type's layout; a record's entries and the
+    // functions on values of unknown type call the type's methods by name, through its table.
+    val structural = inst.generated == StructuralEquals || inst.generated == StructuralHash
+    for t in inst.type_args
+        if structural then generated_type_text(k, &out, t) else argument_text(k, &out, t)
+    out.finish()
+
+private printer(base: usize, absolute: bool) -> KeyPrinter = KeyPrinter(str_builder(), base, base, 0, absolute, map(), buf(), map())
+
+// Type arguments.
+
+/** What an instance reads of a type argument: its supertypes and its method table, which choose the
+ * method a call on a bound runs and whether it goes through the table, and the same of its own type
+ * arguments. A built-in type's tables are the impls for built-in types. */
+private argument_text(k: *Keys, out: *StrBuilder, t: &Type)
+    val solved = resolved(k, t)
+    *solved match
+        Data(id, _, args) ->
+            out.push(header_of(k, "data", id) + "\n")
+            for a in args
+                argument_text(k, out, a)
+        Class(id, _, args) ->
+            out.push(header_of(k, "class", id) + "\n")
+            for a in args
+                argument_text(k, out, a)
+        Tuple(items) ->
+            out.push(k.builtins)
+            for a in items
+                argument_text(k, out, a)
+        Function(params, result, _) ->
+            for a in params
+                argument_text(k, out, a)
+            argument_text(k, out, result)
+        Union(members) ->
+            for a in members
+                argument_text(k, out, a)
+        _ -> out.push(k.builtins)
+
+/** What a function lowering makes for type `t` reads of it: its layout, supertypes and method table,
+ * and the supertypes and method table of each of its fields' and parts' types, whose equality,
+ * hash and rendering it calls. */
+private generated_type_text(k: *Keys, out: *StrBuilder, t: &Type)
+    val solved = resolved(k, t)
+    *solved match
+        Data(id, _, args) ->
+            out.push(layout_of(k, "data", id) + "\n")
+            argument_text(k, out, solved)
+            for v in k.program.data[id].variants
+                for f in variant_fields_at(k, id, v.fields, args)
+                    argument_text(k, out, f)
+        Class(id, _, _) ->
+            out.push(layout_of(k, "class", id) + "\n")
+            argument_text(k, out, solved)
+            for f in k.program.classes[id].fields
+                if f.ty is Some(ft) then argument_text(k, out, ft)
+        _ -> argument_text(k, out, solved)
+
+private variant_fields_at(k: *Keys, id: usize, fields: Buf[&Type], args: Buf[&Type]) -> Buf[&Type] = substitute_all(fields, data_owner(id), args)
+
+/** `t` with the checker's solved unknowns replaced by their solutions. */
+private resolved(k: *Keys, t: &Type) -> &Type = solve(k.program.vars, t)
+
+// Families.
+
+/** The hash of the body fingerprint of function `id`: its own typed tree and what it reads, with what
+ * it shares with the rest of its family, the top-level function or method it is declared in and that
+ * function's local functions and lambdas. They are lowered from one table of locals, and a local a
+ * closure captures is kept in a box by every function that reaches it, so each one's fingerprint
+ * holds what every function of the family captures; nothing else of a sibling's body. */
+private body_hash(k: *Keys, id: usize) -> string
+    if k.bodies.get(id) is Some(h) then return h
+    if k.busy.get(id) is Some(_) then return "cycle " + symbol_spelling(k.program, k.inputs.ordinals, id, buf())
+    k.busy.put(id, true)
+    val root = k.program.symbols[id].root.unwrap_or(id)
+    var p = place_printer(k, root)
+    var family: Buf[usize] = buf()
+    family.push(root)
+    if k.members.get(root) is Some(locals)
+        for m in locals
+            family.push(m)
+    for i in 0..<family.len()
+        p.family.put(family[i], i)
+    captures_text(k, &p, root, family)
+    member_text(k, &p, id)
+    val reads = p.reads.view()
+    sort(reads)
+    for r in reads
+        p.out.push(r)
+        p.out.push("\n")
+    val h = content_key(p.out.finish())
+    _ = k.busy.remove(id)
+    k.bodies.put(id, h)
+    h
+
+/** What a family's functions capture: the top-level function's parameters, and for each function
+ * whether it is a lambda, made into a value or evaluated at each read, and the locals, with their
+ * types and whether they are variables, and the parameters it captures. */
+private captures_text(k: *Keys, p: *KeyPrinter, root: usize, family: Buf[usize])
+    p.out.push("family (")
+    for t in k.program.symbols[root].params
+        type_text(k, p, t)
+        p.out.push(", ")
+    p.out.push(")\n")
+    val locals = k.program.functions[root].locals
+    for i in 0..<family.len()
+        val s = k.program.symbols[family[i]]
+        p.out.push(s" member $i ${s.lambda} ${s.delayed} ${s.value} captures")
+        for x in s.captured_locals
+            p.out.push(s" $x ")
+            if x < locals.len()
+                p.out.push(s"${locals[x].mutable} ")
+                type_text(k, p, locals[x].ty)
+        p.out.push(" ;")
+        for x in s.captured_params
+            p.out.push(" " + x.to_string())
+        p.out.push("\n")
+
+/** A printer for the family of `root`, its places counted as its trap sites are named: from the
+ * start of the declaration they are inside, named by the first of that declaration's functions by
+ * symbol; or, for a declaration several types' methods share, a derived impl's template, from the
+ * start of its file. */
+private place_printer(k: *Keys, root: usize) -> KeyPrinter
+    val decl = k.program.symbols[root].decl.span
+    val unit = k.program.symbols[root].unit
+    val sharing = k.spans.get(span_key(unit, decl)).unwrap_or(buf())
+    var best = symbol_spelling(k.program, k.inputs.ordinals, root, buf())
+    for id in sharing
+        val name = symbol_spelling(k.program, k.inputs.ordinals, id, buf())
+        if name < best then best = name
+    var shared = false
+    for id in sharing
+        val a = k.program.symbols[id].name
+        val b = k.program.symbols[root].name
+        if a != b && last_member(a) == last_member(b) then shared = true
+    var p = printer(decl.start, shared)
+    p.end = decl.end
+    p.unit = unit
+    if shared
+        val src = k.program.sources[unit].name
+        p.out.push("in " + file_name(src).unwrap_or(src) + "\n")
+        return p
+    p.out.push("in " + best + "\n")
+    p
+
+/** What follows the last dot of a name. */
+private last_member(name: string) -> string
+    var at = name.bytes.len
+    while at > 0 && name.bytes[at - 1] != u8('.')
+        at -= 1
+    name[at..]
+
+/** One function of a family: its own signature and what it captures, its locals and its body. */
+private member_text(k: *Keys, p: *KeyPrinter, id: usize)
+    val s = k.program.symbols[id]
+    p.out.push(s"function ${p.family.get(id).unwrap_or(0)} ${s.name} ${s.lambda} ${s.delayed} ${s.value} ${s.static_member} ${s.constructor} ${s.public} ${s.overload} (")
+    for t in s.params
+        type_text(k, p, t)
+        p.out.push(", ")
+    p.out.push(") -> ")
+    if s.result is Some(r) then type_text(k, p, r)
+    p.out.push(s"\n intrinsic ${s.intrinsic.unwrap_or("")} type params ${s.type_params.len()}\n")
+    annotations_text(p, s.decl.annotations)
+    if s.receiver is Some(r)
+        p.out.push(" receiver ")
+        type_text(k, p, r)
+        p.out.push("\n")
+    if s.owner_class is Some(c) then p.out.push(" owner " + header_of(k, "class", c) + "\n")
+    p.out.push(" params")
+    for x in s.param_locals
+        p.out.push(" " + x.to_string())
+    p.out.push(" captures")
+    for x in s.captured_locals
+        p.out.push(" " + x.to_string())
+    p.out.push(" ;")
+    for x in s.captured_params
+        p.out.push(" " + x.to_string())
+    p.out.push(" defaults")
+    for d in s.defaults
+        p.out.push(" ")
+        if d is Some(f) then callee(k, p, f) else p.out.push("-")
+    p.out.push("\n")
+    val f = k.program.functions[id]
+    // The locals it keeps itself, which are the slots of its frame, and those it captures; a
+    // sibling's own locals are not its business.
+    p.out.push(" locals")
+    for x in 0..<f.locals.len()
+        val local = f.locals[x]
+        var mine = local.owner == id
+        for c in s.captured_locals
+            if c == x then mine = true
+        if !mine then continue
+        p.out.push(s" $x ${local.mutable} ${p.family.get(local.owner).unwrap_or(9999)} ")
+        type_text(k, p, local.ty)
+        p.out.push(";")
+    p.out.push("\n")
+    if f.body is Some(body)
+        expr(k, p, body)
+    p.out.push("\n")
+
+private annotations_text(p: *KeyPrinter, annotations: Buf[Annotation])
+    for a in annotations
+        p.out.push(" @" + a.name + "(")
+        for arg in a.args
+            p.out.push(arg.name.unwrap_or("") + "=" + show_expr(arg.value) + ",")
+        p.out.push(")\n")
+
+// The canonical typed tree.
+
+/** A node's place: counted from the declaration's start where it is inside the declaration, and
+ * otherwise named as a trap site there would be. A default argument's expression is copied into its
+ * callers with its place in the file that declares it, which lowering takes as a place in the
+ * caller's own file. */
+private place(k: *Keys, p: *KeyPrinter, span: Span)
+    // An empty span is code the compiler wrote, whose trap sites are named by the instance itself.
+    if span.start == span.end
+        p.out.push("@made")
+    elif p.absolute && p.base <= span.start && span.end <= p.end
+        p.out.push(s"@${span.start}:${span.end}")
+    elif p.base <= span.start && span.end <= p.end
+        p.out.push(s"@+${span.start - p.base}:${span.end - p.base}")
+    else
+        p.out.push("@" + trap_place(k, p.unit, span.start) + s":${span.end - span.start}")
+
+/** The place part of the name lowering gives a trap site at offset `at` of a function of `unit`: the
+ * innermost top-level function or method declared around it, as `trap_name` in lowering finds it, and
+ * the offset from its start; or the file and offset. */
+private trap_place(k: *Keys, unit: usize, at: usize) -> string
+    val tops = k.tops.get(unit).unwrap_or(buf())
+    var best: Option[usize] = None
+    var best_name = ""
+    for id in tops
+        val span = k.program.symbols[id].decl.span
+        if !(span.start <= at && at <= span.end) then continue
+        val name = symbol_spelling(k.program, k.inputs.ordinals, id, buf())
+        val better = best match
+            Some(b) ->
+                val other = k.program.symbols[b].decl.span
+                val width = span.end - span.start
+                val other_width = other.end - other.start
+                width < other_width || (width == other_width && name < best_name)
+            None -> true
+        if better
+            best = Some(id)
+            best_name = name
+    val src = k.program.sources[unit].name
+    val file = file_name(src).unwrap_or(src)
+    val b = best match
+        Some(b) -> b
+        None -> return s"$file+$at"
+    val mine = k.program.symbols[b]
+    for id in tops
+        val other = k.program.symbols[id]
+        if id != b && other.decl.span.start == mine.decl.span.start && other.decl.span.end == mine.decl.span.end && other.name != mine.name && last_member(other.name) == last_member(mine.name) then return s"$file+$at"
+    s"$best_name+${at - mine.decl.span.start}"
+
+private exprs(k: *Keys, p: *KeyPrinter, items: Buf[&TExpr])
+    p.out.push("[")
+    for e in items
+        expr(k, p, e)
+        p.out.push(",")
+    p.out.push("]")
+
+private types(k: *Keys, p: *KeyPrinter, items: Buf[&Type])
+    p.out.push("[")
+    for t in items
+        type_text(k, p, t)
+        p.out.push(",")
+    p.out.push("]")
+
+private optional(k: *Keys, p: *KeyPrinter, e: Option[&TExpr])
+    if e is Some(x) then expr(k, p, x) else p.out.push("-")
+
+private expr(k: *Keys, p: *KeyPrinter, e: &TExpr)
+    p.out.push("(")
+    // A constant names no trap site, so its place is nothing to its text; and a constant default
+    // argument is copied into each call with its place in the file declaring it.
+    val constant = e.kind is IntConst(_) || e.kind is BoolConst(_) || e.kind is CharConst(_) || e.kind is RealConst(_) || e.kind is StrConst(_) || e.kind is UnitConst
+    if !constant then place(k, p, e.span)
+    p.out.push(" ")
+    type_text(k, p, e.ty)
+    p.out.push(" ")
+    e.kind match
+        IntConst(digits) -> p.out.push("int " + digits)
+        BoolConst(value) -> p.out.push(if value then "true" else "false")
+        CharConst(code) -> p.out.push("char " + code.to_string())
+        RealConst(value) -> p.out.push("real " + value.bits().to_string())
+        StrConst(value) -> p.out.push("str " + content_key(value))
+        UnitConst -> p.out.push("unit")
+        CConst(name) ->
+            p.out.push("c " + name)
+            read(p, "c digest", k.c_digest)
+        Param(index) -> p.out.push("param " + index.to_string())
+        TypeReceiver -> p.out.push("type")
+        Local(index) -> p.out.push("local " + index.to_string())
+        Call(function, args, type_args) ->
+            p.out.push("call ")
+            callee(k, p, function)
+            types(k, p, type_args)
+            exprs(k, p, args)
+        Dispatch(function, slot, args, type_args) ->
+            p.out.push(s"dispatch $slot ")
+            callee(k, p, function)
+            types(k, p, type_args)
+            exprs(k, p, args)
+        BoundCall(function, slot, args, type_args) ->
+            p.out.push("bound " + (if slot is Some(x) then x.to_string() else "-") + " ")
+            callee(k, p, function)
+            types(k, p, type_args)
+            exprs(k, p, args)
+        Construct(variant, args) ->
+            p.out.push("construct " + variant.to_string())
+            layout_read(k, p, e.ty)
+            exprs(k, p, args)
+        Collection(elements, built) ->
+            p.out.push("collection ")
+            exprs(k, p, elements)
+            expr(k, p, built)
+        FunctionValue(function, type_args) ->
+            p.out.push("closure ")
+            callee(k, p, function)
+            types(k, p, type_args)
+        CallValue(callee_value, args) ->
+            p.out.push("apply ")
+            expr(k, p, callee_value)
+            exprs(k, p, args)
+        Field(value, index) ->
+            p.out.push("field " + index.to_string())
+            layout_read(k, p, value.ty)
+            expr(k, p, value)
+        New ->
+            p.out.push("new")
+            layout_read(k, p, e.ty)
+        StoreField(object, index, value, yields) ->
+            p.out.push(s"store field $index $yields")
+            layout_read(k, p, object.ty)
+            expr(k, p, object)
+            expr(k, p, value)
+        Global(index) ->
+            p.out.push("global ")
+            global(k, p, index, true)
+        LazyGlobal(index, initialize, name) ->
+            p.out.push("lazy global " + name + " ")
+            global(k, p, index, true)
+            expr(k, p, initialize)
+        LazyField(object, index, initialize, name) ->
+            p.out.push(s"lazy field $index $name")
+            layout_read(k, p, object.ty)
+            expr(k, p, object)
+            expr(k, p, initialize)
+        StoreGlobal(index, value, yields) ->
+            p.out.push(s"store global $yields ")
+            global(k, p, index, yields)
+            expr(k, p, value)
+        Block(items) ->
+            p.out.push("block ")
+            exprs(k, p, items)
+        Let(local, value) ->
+            p.out.push("let " + local.to_string())
+            expr(k, p, value)
+        LetPattern(pattern, value) ->
+            p.out.push("let ")
+            pattern_text(k, p, pattern)
+            expr(k, p, value)
+        Store(local, value, yields) ->
+            p.out.push(s"store $local $yields")
+            expr(k, p, value)
+        MultiStore(locals, value) ->
+            p.out.push("stores")
+            for x in locals
+                p.out.push(" " + (if x is Some(v) then v.to_string() else "-"))
+            expr(k, p, value)
+        Step(local, increment, postfix, op_span) ->
+            p.out.push(s"step $local $increment $postfix")
+            place(k, p, op_span)
+        Negate(operand) ->
+            p.out.push("negate")
+            expr(k, p, operand)
+        Not(operand) ->
+            p.out.push("not")
+            expr(k, p, operand)
+        Complement(operand) ->
+            p.out.push("complement")
+            expr(k, p, operand)
+        Convert(operand, wrap) ->
+            p.out.push(s"convert $wrap")
+            expr(k, p, operand)
+        Arith(op, left, right, op_span) ->
+            p.out.push("arith " + binary_spelling(op))
+            place(k, p, op_span)
+            expr(k, p, left)
+            expr(k, p, right)
+        Box(value) ->
+            p.out.push("box")
+            expr(k, p, value)
+        NoneAs(value) ->
+            p.out.push("none as")
+            expr(k, p, value)
+        Logic(and, left, right) ->
+            p.out.push(s"logic $and")
+            expr(k, p, left)
+            expr(k, p, right)
+        Compare(operands, ops) ->
+            p.out.push("compare")
+            for op in ops
+                p.out.push(" " + compare_spelling(op))
+            exprs(k, p, operands)
+        If(condition, yes, no) ->
+            p.out.push("if")
+            expr(k, p, condition)
+            expr(k, p, yes)
+            optional(k, p, no)
+        While(label, condition, body, otherwise) ->
+            p.out.push("while " + label.to_string())
+            expr(k, p, condition)
+            expr(k, p, body)
+            optional(k, p, otherwise)
+        Break(label, value) ->
+            p.out.push("break " + label.to_string())
+            optional(k, p, value)
+        Continue(label) -> p.out.push("continue " + label.to_string())
+        Return(value) ->
+            p.out.push("return")
+            optional(k, p, value)
+        Match(subject, arms) ->
+            p.out.push("match")
+            expr(k, p, subject)
+            for arm in arms
+                p.out.push(" arm ")
+                pattern_text(k, p, arm.pattern)
+                optional(k, p, arm.guard)
+                expr(k, p, arm.body)
+        Is(value, pattern, negated) ->
+            p.out.push(s"is $negated")
+            expr(k, p, value)
+            pattern_text(k, p, pattern)
+        Clauses(subjects, clauses) ->
+            p.out.push("clauses")
+            exprs(k, p, subjects)
+            for clause in clauses
+                p.out.push(" clause")
+                for pattern in clause.patterns
+                    pattern_text(k, p, pattern)
+                for guarded in clause.bodies
+                    p.out.push(" body")
+                    optional(k, p, guarded.guard)
+                    expr(k, p, guarded.body)
+    p.out.push(")")
+
+private optional_local(p: *KeyPrinter, local: Option[usize])
+    p.out.push(" " + (if local is Some(x) then x.to_string() else "-"))
+
+private bound_text(k: *Keys, p: *KeyPrinter, b: Option[TBound])
+    b match
+        Some(x) ->
+            p.out.push(s" ${x.inclusive}")
+            expr(k, p, x.value)
+        None -> p.out.push(" -")
+
+private pattern_text(k: *Keys, p: *KeyPrinter, pattern: &TPattern)
+    p.out.push("<")
+    place(k, p, pattern.span)
+    p.out.push(" ")
+    type_text(k, p, pattern.ty)
+    p.out.push(" ")
+    pattern.kind match
+        PWildcard -> p.out.push("_")
+        PBind(local) -> p.out.push("bind " + local.to_string())
+        PLiteral(value) ->
+            p.out.push("literal")
+            expr(k, p, value)
+        PBounds(local, lower, upper) ->
+            p.out.push("bounds")
+            optional_local(p, local)
+            bound_text(k, p, lower)
+            bound_text(k, p, upper)
+        PSuccessor(local, amount) ->
+            p.out.push("successor")
+            optional_local(p, local)
+            expr(k, p, amount)
+        PAlternatives(options) ->
+            p.out.push("alternatives")
+            for o in options
+                pattern_text(k, p, o)
+        PNamed(local, inner) ->
+            p.out.push("named " + local.to_string())
+            pattern_text(k, p, inner)
+        PVariant(variant, fields) ->
+            p.out.push("variant " + variant.to_string())
+            layout_read(k, p, pattern.ty)
+            for f in fields
+                pattern_text(k, p, f)
+        PType(target, local, tested) ->
+            p.out.push(s"type $tested")
+            optional_local(p, local)
+            type_text(k, p, target)
+            record_read(k, p, target)
+        PSequence(local, test, elements, items, rest) ->
+            p.out.push(s"sequence $local $rest")
+            expr(k, p, test)
+            exprs(k, p, elements)
+            for item in items
+                pattern_text(k, p, item)
+        PView(local, view, inner) ->
+            p.out.push("view " + local.to_string())
+            expr(k, p, view)
+            pattern_text(k, p, inner)
+        PUnion(parts) ->
+            p.out.push("union")
+            for part in parts
+                pattern_text(k, p, part)
+    p.out.push(">")
+
+// Types, spelled by qualified names.
+
+private type_text(k: *Keys, p: *KeyPrinter, t: &Type)
+    *t match
+        Var(id) -> k.program.vars[id] match
+            Some(bound) -> type_text(k, p, bound)
+            None -> p.out.push("_")
+        Tuple(items) ->
+            p.out.push("(")
+            for x in items
+                type_text(k, p, x)
+                p.out.push(", ")
+            p.out.push(")")
+        Function(params, result, sendable) ->
+            p.out.push(if sendable then "@sendable (" else "(")
+            for x in params
+                type_text(k, p, x)
+                p.out.push(", ")
+            p.out.push(") -> ")
+            type_text(k, p, result)
+        ByName(inner) ->
+            p.out.push("-> ")
+            type_text(k, p, inner)
+        Data(id, _, args) ->
+            p.out.push(module_prefix(k.program.data[id].module_name) + "." + k.program.data[id].name)
+            types(k, p, args)
+        Class(id, _, args) ->
+            val c = k.program.classes[id]
+            p.out.push((if c.decl.object then "object " else "class ") + module_prefix(c.module_name) + "." + c.name)
+            types(k, p, args)
+        TypeVar(_, index, name) -> p.out.push(s"$name#$index")
+        // A union is one type whatever order its members were written in.
+        Union(members) ->
+            var keys: Buf[string] = buf()
+            for m in members
+                var inner = printer(p.base, p.absolute)
+                type_text(k, &inner, m)
+                keys.push(inner.out.finish())
+            val sorted = keys.view()
+            sort(sorted)
+            p.out.push("union(")
+            for x in sorted
+                p.out.push(x + " | ")
+            p.out.push(")")
+        _ -> p.out.push(type_name(t))
+
+// Interfaces.
+
+/** Notes that the fingerprint reads `text`, the interface `what`, once. */
+private read(p: *KeyPrinter, what: string, text: string)
+    if p.read.get(what) is Some(_) then return
+    p.read.put(what, true)
+    p.reads.push(text)
+
+/** A callee by its symbol, reading its signature. */
+private callee(k: *Keys, p: *KeyPrinter, id: usize)
+    p.out.push(symbol_spelling(k.program, k.inputs.ordinals, id, buf()))
+    read(p, "callee " + id.to_string(), callee_interface(k, id))
+
+/** What a call reads of the function it calls: how it is called, by name, with what it takes and
+ * gives, as its machine signature and its annotations decide. */
+private callee_interface(k: *Keys, id: usize) -> string
+    val what = "callee " + id.to_string()
+    if k.interfaces.get(what) is Some(t) then return t
+    val s = k.program.symbols[id]
+    var p = printer(0, true)
+    p.out.push(s"callee ${symbol_spelling(k.program, k.inputs.ordinals, id, buf())} ${s.static_member} ${s.lambda} ${s.delayed} ${s.constructor} intrinsic ${s.intrinsic.unwrap_or("")} type params ${s.type_params.len()} captures ${s.captured_locals.len()} ${s.captured_params.len()} (")
+    for t in s.params
+        type_text(k, &p, t)
+        p.out.push(", ")
+    p.out.push(") -> ")
+    if s.result is Some(r) then type_text(k, &p, r)
+    if s.receiver is Some(r)
+        p.out.push(" receiver ")
+        type_text(k, &p, r)
+    if s.owner_class is Some(c)
+        val owner = k.program.classes[c]
+        p.out.push(s" of ${module_prefix(owner.module_name)}.${owner.name} ${owner.decl.modifier} ${owner.decl.object}")
+    annotations_text(&p, s.decl.annotations)
+    for a in s.decl.annotations
+        if a.name == "c" then p.out.push(k.c_digest)
+    val text = p.out.finish()
+    k.interfaces.put(what, text)
+    text
+
+/** A module-level value by its qualified name, reading its type and whether it is made at compile
+ * time, and, where the code reads it (`reads_value`) and it is, the fingerprint of its initializer:
+ * every read of it is the constant. Storing into one made at compile time does nothing. */
+private global(k: *Keys, p: *KeyPrinter, index: usize, reads_value: bool)
+    val g = k.program.globals[index]
+    val name = module_prefix(g.module_name) + "." + g.name
+    p.out.push(name)
+    val what = "global " + index.to_string()
+    if p.read.get(what + (if reads_value then " read" else "")) is Some(_) then return
+    var q = printer(0, true)
+    q.out.push(s"global $name ${g.mutable} ${g.lazy} ")
+    if k.program.symbols[g.init].result is Some(r) then type_text(k, &q, r)
+    if k.inputs.constant_globals[index]
+        q.out.push(" constant")
+        if reads_value then q.out.push(" " + body_hash(k, g.init))
+    read(p, what + (if reads_value then " read" else ""), q.out.finish())
+
+/** Notes that the code reads the layout of type `t`'s declaration, where `t` has one. */
+private layout_read(k: *Keys, p: *KeyPrinter, t: &Type)
+    *resolved(k, t) match
+        Data(id, _, _) -> read(p, "layout data " + id.to_string(), layout_of(k, "data", id))
+        Class(id, _, _) -> read(p, "layout class " + id.to_string(), layout_of(k, "class", id))
+        _ -> ()
+
+/** Notes that the code tests against type `t`, reading its kind and supertypes. */
+private record_read(k: *Keys, p: *KeyPrinter, t: &Type)
+    *resolved(k, t) match
+        Data(id, _, args) ->
+            read(p, "header data " + id.to_string(), header_of(k, "data", id))
+            for a in args
+                record_read(k, p, a)
+        Class(id, _, args) ->
+            read(p, "header class " + id.to_string(), header_of(k, "class", id))
+            for a in args
+                record_read(k, p, a)
+        Tuple(items) ->
+            for a in items
+                record_read(k, p, a)
+        _ -> ()
+
+/** The layout of a data type or a class: its variants or fields, each field's type, in the order
+ * lowering lays them out. A field is reached by its place, never its name. */
+private layout_of(k: *Keys, kind: string, id: usize) -> string
+    val what = s"layout $kind $id"
+    if k.interfaces.get(what) is Some(t) then return t
+    var p = printer(0, true)
+    if kind == "data"
+        val d = k.program.data[id]
+        p.out.push(s"layout data ${module_prefix(d.module_name)}.${d.name} ${d.decl.type_params.len()}\n")
+        annotations_text(&p, d.decl.annotations)
+        for v in d.variants
+            p.out.push(" variant " + v.name)
+            for t in v.fields
+                p.out.push(" ")
+                type_text(k, &p, t)
+            p.out.push("\n")
+    else
+        val c = k.program.classes[id]
+        p.out.push(s"layout class ${module_prefix(c.module_name)}.${c.name} ${c.decl.modifier} ${c.decl.object} ${c.decl.type_params.len()} inherited ${c.inherited}\n")
+        annotations_text(&p, c.decl.annotations)
+        for f in c.fields
+            p.out.push(s" field ${f.mutable} ${f.lazy} ${f.param} ")
+            if f.ty is Some(t) then type_text(k, &p, t)
+            p.out.push("\n")
+        for m in c.mixed
+            p.out.push(s" mixed ${m.state} ")
+            type_text(k, &p, m.trait_type)
+            p.out.push("\n")
+        if c.superclass is Some(s)
+            p.out.push(" extends ")
+            type_text(k, &p, s)
+    val text = p.out.finish()
+    k.interfaces.put(what, text)
+    text
+
+/** A type's kind, its supertypes and its method table, every method by its symbol. */
+private header_of(k: *Keys, kind: string, id: usize) -> string
+    val what = s"header $kind $id"
+    if k.interfaces.get(what) is Some(t) then return t
+    var p = printer(0, true)
+    if kind == "data"
+        val d = k.program.data[id]
+        p.out.push(s"type data ${module_prefix(d.module_name)}.${d.name} ${d.variants.len()}")
+        types(k, &p, d.traits)
+        types(k, &p, d.functions)
+        table_text(k, &p, d.table)
+        if d.call is Some(f) then p.out.push(" call " + symbol_spelling(k.program, k.inputs.ordinals, f, buf()))
+    else
+        val c = k.program.classes[id]
+        p.out.push(s"type class ${module_prefix(c.module_name)}.${c.name} ${c.decl.modifier} ${c.decl.object}")
+        if c.superclass is Some(s) then type_text(k, &p, s)
+        types(k, &p, c.traits)
+        types(k, &p, c.functions)
+        table_text(k, &p, c.table)
+        if c.call is Some(f) then p.out.push(" call " + symbol_spelling(k.program, k.inputs.ordinals, f, buf()))
+    val text = p.out.finish()
+    k.interfaces.put(what, text)
+    text
+
+private table_text(k: *Keys, p: *KeyPrinter, table: Buf[Option[usize]])
+    p.out.push(" table")
+    for entry in table
+        p.out.push(" " + (if entry is Some(m) then symbol_spelling(k.program, k.inputs.ordinals, m, buf()) else "-"))
+
+/** Every impl for a built-in type: the trait, the type and the table, in one text every key reading a
+ * built-in type argument shares. */
+private builtins_text(k: *Keys) -> string
+    var lines: Buf[string] = buf()
+    for b in k.program.builtins
+        var p = printer(0, true)
+        p.out.push("builtin ")
+        type_text(k, &p, b.ty)
+        p.out.push(" ")
+        type_text(k, &p, b.trait_type)
+        table_text(k, &p, b.table)
+        lines.push(p.out.finish())
+    val sorted = lines.view()
+    sort(sorted)
+    var all = str_builder()
+    for line in sorted
+        all.push(line + "\n")
+    "builtins " + content_key(all.finish()) + "\n"
+
+/** What the C unit measured, which a C binding's call converts at: every measure and value, by its
+ * key, in order. */
+private c_text(program: TProgram) -> string
+    var lines: Buf[string] = buf()
+    for (key, m) in program.c_measures
+        lines.push(s"measure $key ${m.bits} ${m.signed}")
+    for (key, v) in program.c_values
+        lines.push(s"value $key ${v.integer} ${v.negative} ${v.real.bits()} ${v.text.unwrap_or("")}")
+    val sorted = lines.view()
+    sort(sorted)
+    var all = str_builder()
+    for line in sorted
+        all.push(line + "\n")
+    "c " + content_key(all.finish()) + "\n"

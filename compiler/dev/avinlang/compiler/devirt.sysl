@@ -53,7 +53,11 @@ private meet(a: usize, b: usize) -> usize
 
 /** The program's functions with their calls through method tables made direct or guarded where they
  * can be. `sites` is ordered by function. */
-devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: Buf[DispatchSite]) -> Buf[MirFunction]
+//
+// What it decided at each call through a table is all its rewriting of a function depends on beyond
+// the function's own code: `facts` gets that, for each function in order, one line per call, so the
+// function's instance key can name it.
+devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: Buf[DispatchSite], facts: *Buf[string]) -> Buf[MirFunction]
     val n = functions.len()
     // What each function returns, from what the functions it calls return, until nothing changes.
     var returns: Buf[usize] = buf()
@@ -74,20 +78,24 @@ devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: B
         while s < sites.len() && sites[s].function == i
             own.push(sites[s])
             s += 1
-        out.push(rewrite(functions[i], value_states(functions[i], returns), own, descriptors, callees))
+        var decided = ""
+        out.push(rewrite(functions[i], value_states(functions[i], returns), own, descriptors, callees, &decided))
+        facts.push(decided)
     out
 
 /** The number of instructions of each function, and its signature. */
 private callees_of(functions: Buf[MirFunction]) -> Callees
     var sizes: Buf[usize] = buf()
     var signatures: Buf[MirSignature] = buf()
+    var symbols: Buf[string] = buf()
     for f in functions
         var n = 0usize
         for block in f.blocks
             n += block.insts.len() + 1
         sizes.push(n)
         signatures.push(f.signature)
-    Callees(sizes, signatures)
+        symbols.push(f.symbol)
+    Callees(sizes, signatures, symbols)
 
 /** What is known of each value of `f`, given what each function returns. */
 private value_states(f: MirFunction, returns: Buf[usize]) -> Buf[usize]
@@ -158,6 +166,7 @@ private enum Target
 private struct Callees
     sizes: Buf[usize]
     signatures: Buf[MirSignature]
+    symbols: Buf[string]
 
 private machine_key(t: MirType) -> string = t match
     MInt(bits) -> s"i$bits"
@@ -205,6 +214,17 @@ private target_of(object: Operand, position: usize, code: usize, wanted: MirSign
         return Guarded(site.guards)
     Unchanged
 
+/** What was decided at a call through table position `position`, one line naming the methods and
+ * descriptors by their symbols. */
+private decision_text(position: usize, target: Target, descriptors: Buf[Descriptor], callees: Callees) -> string = target match
+    Unchanged -> s"$position table\n"
+    DirectTo(g) -> s"$position direct ${callees.symbols[g]}\n"
+    Guarded(guards) ->
+        var out = s"$position guarded"
+        for guard in guards
+            out = out + s" ${descriptors[guard.descriptor].name}=${callees.symbols[guard.function]}"
+        out + "\n"
+
 /** The index of the call in `insts`, after `from`, of the code value `code`. */
 private call_of(insts: Buf[Inst], from: usize, code: usize) -> Option[usize]
     for j in from + 1..<insts.len()
@@ -212,7 +232,7 @@ private call_of(insts: Buf[Inst], from: usize, code: usize) -> Option[usize]
             if c == code then return Some(j)
     None
 
-private rewrite(f: MirFunction, states: Buf[usize], sites: Buf[DispatchSite], descriptors: Buf[Descriptor], callees: Callees) -> MirFunction
+private rewrite(f: MirFunction, states: Buf[usize], sites: Buf[DispatchSite], descriptors: Buf[Descriptor], callees: Callees, decided: *string) -> MirFunction
     var values: Buf[MirType] = buf()
     for t in f.value_types do values.push(t)
     var slots: Buf[MirType] = buf()
@@ -243,7 +263,9 @@ private rewrite(f: MirFunction, states: Buf[usize], sites: Buf[DispatchSite], de
                     val wanted = block.insts[j] match
                         Call(_, Indirect(_, s), _) -> s
                         _ -> panic("a call through a method table that is not an indirect call")
-                    target_of(object, position, code, wanted, states, sites, descriptors, callees) match
+                    val target = target_of(object, position, code, wanted, states, sites, descriptors, callees)
+                    *decided = *decided + decision_text(position, target, descriptors, callees)
+                    target match
                         DirectTo(g) ->
                             direct_codes.push(code)
                             direct_functions.push(g)

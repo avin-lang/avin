@@ -223,6 +223,12 @@ private struct Lowering
     /** The top-level functions and methods declared in each unit, by the unit's index, found when
      * the first trap site in that unit is named. */
     unit_functions: Map[usize, Buf[usize]]
+    /** Whether an instance's body is being lowered, rather than the method tables being filled. */
+    in_body: bool
+    /** For each instance, by its index, what lowering decided for its code from the whole program
+     * rather than from the instance itself, one line each: the slot of each method with type
+     * parameters of its own it calls through a table. Its key reads them. */
+    instance_facts: Buf[string]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -333,7 +339,7 @@ lower_program(program: TProgram) -> MirProgram
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
     val local = local_values(program)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, local_ordinals(program), map(), "", map())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, local_ordinals(program), map(), "", map(), false, buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -408,7 +414,9 @@ lower_program(program: TProgram) -> MirProgram
     var k = 0usize
     while true
         while k < l.instances.len()
+            l.in_body = true
             functions.push(lower_function(&l, k))
+            l.in_body = false
             k += 1
         // A call through a position no call used before fills it in every table made so far.
         if fill_used_slots(&l) then continue
@@ -419,15 +427,28 @@ lower_program(program: TProgram) -> MirProgram
         val shown = l.runtime_rendering && add_rendering_entries(&l)
         if !compared && !shown then break
     add_variant_ancestors(&l)
-    functions = devirtualize(functions, l.descriptors, dispatch_sites(&l))
+    var devirt_facts: Buf[string] = buf()
+    functions = devirtualize(functions, l.descriptors, dispatch_sites(&l), &devirt_facts)
     // An object whose kind has a finalizer, a Sysl or C handle, must stay an object, however
     // little it is used: its finalizer is what gives its reference back.
     var finalized: Buf[bool] = buf()
     for _ in 0..<l.descriptors.len() do finalized.push(false)
     for h in l.handles do finalized[h.descriptor] = true
     for h in l.c_handles do finalized[h.descriptor] = true
-    functions = scalar_replace(functions, l.descriptors, finalized)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings))
+    var scalar_facts: Buf[ScalarFacts] = buf()
+    functions = scalar_replace(functions, l.descriptors, finalized, &scalar_facts)
+    while l.instance_facts.len() < l.instances.len()
+        l.instance_facts.push("")
+    var keyed: Buf[KeyedInstance] = buf()
+    for inst in l.instances
+        keyed.push(KeyedInstance(inst.function, inst.type_args, inst.entry, inst.generated))
+    var constant_globals: Buf[bool] = buf()
+    for g in 0..<program.globals.len()
+        constant_globals.push(l.constant_values[g] is Some(_))
+    val plan = l.options
+    val world = s"options ${plan.pointers} ${plan.nothing} ${plan.nothing_as_pointer} ${plan.nothing_as_object}"
+    val inputs = KeyInputs(keyed, l.local_ordinals, l.instance_facts, devirt_facts, scalar_facts, constant_globals, world)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf())
 
 /** Each string's name: the first 16 hexadecimal digits of the SHA-256 of its bytes. Two different
  * strings of one program that share them, which no program has been seen to hold, are told apart
@@ -845,13 +866,24 @@ private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf
     var key = s"$position $name ${type_key(receiver)}"
     for t in type_args
         key = key + "|" + type_key(t)
-    if l.generic_index.get(key) is Some(index) then return l.generic_base + index
+    if l.generic_index.get(key) is Some(index)
+        note_fact(l, s"slot $position $name ${l.generic_base + index}")
+        return l.generic_base + index
     val index = l.generic_slots.len()
     l.generic_slots.push(GenericSlot(position, name, type_args, receiver))
     l.generic_index.put(key, index)
     for h in l.generic_holders
         fill_generic_slot(l, h.descriptor, h.ty, index)
+    note_fact(l, s"slot $position $name ${l.generic_base + index}")
     l.generic_base + index
+
+/** Records, for the key of the instance being lowered, a decision its code depends on that lowering
+ * took from the whole program. Filling the tables decides nothing for any instance's code. */
+private note_fact(l: *Lowering, fact: string)
+    if !l.in_body then return
+    while l.instance_facts.len() <= l.function_index
+        l.instance_facts.push("")
+    l.instance_facts[l.function_index] = l.instance_facts[l.function_index] + fact + "\n"
 
 // Fills generic slot `s` of a descriptor of type `t` with `t`'s implementation of the method, at the
 // slot's own type arguments after those of the type that declares the implementation. A type holding
@@ -2114,15 +2146,17 @@ private signature_of(l: *Lowering, f: TFunction) -> MirSignature
  * an instance's by its type arguments, spelled by `stable_type_key`. Nothing in it is a number the
  * checker or lowering gave in the order it found things, so a function keeps its symbol whatever is
  * added to or taken from the rest of the program. Quoted in LLVM, so any text is valid. */
-private function_symbol(l: *Lowering, id: usize, type_args: Buf[&Type]) -> string
-    val program = l.program
+private function_symbol(l: *Lowering, id: usize, type_args: Buf[&Type]) -> string = symbol_spelling(l.program, l.local_ordinals, id, type_args)
+
+/** `function_symbol` for a program whose local functions are numbered by `ordinals`. */
+symbol_spelling(program: TProgram, ordinals: Buf[usize], id: usize, type_args: Buf[&Type]) -> string
     val symbol = program.symbols[id]
     val prefix = module_prefix(symbol.module_name)
     var arguments = ""
     if type_args.len() > 0
         arguments = "[" + stable_key_list(program, type_args) + "]"
     symbol.root match
-        Some(root) -> s"$prefix.${declared_name(program, root)}${program.symbols[root].overload}$arguments.${symbol.name}#${l.local_ordinals[id]}"
+        Some(root) -> s"$prefix.${declared_name(program, root)}${program.symbols[root].overload}$arguments.${symbol.name}#${ordinals[id]}"
         None -> prefix + "." + declared_name(program, id) + symbol.overload + arguments
 
 /** A function's name as its symbol spells it: an object's constructor and methods after `object `,
@@ -2134,7 +2168,7 @@ private declared_name(program: TProgram, id: usize) -> string
     symbol.name
 
 /** The module path a symbol is spelled under: `<program>` for a file with no module header. */
-private module_prefix(module_name: string) -> string = if module_name == "" then "<program>" else module_name
+module_prefix(module_name: string) -> string = if module_name == "" then "<program>" else module_name
 
 /** **A type spelled by qualified names**, for the symbols of the emitted text: a data type by its
  * module and name, a class or trait the same after `class `, an object after `object `, then the
@@ -5799,11 +5833,11 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
 // compares such values.
 
 /** The kinds of `Instance.generated`: a function of the program, or one lowering makes. */
-private const Written: u8 = 0
+const Written: u8 = 0
 /** `==` on two values of a tuple or data type, field by field. */
-private const StructuralEquals: u8 = 1
+const StructuralEquals: u8 = 1
 /** The hash of a tuple or data value, from its fields'. */
-private const StructuralHash: u8 = 2
+const StructuralHash: u8 = 2
 /** A type record's `equals` entry: two objects of the type, compared as that type. */
 private const RecordEquals: u8 = 3
 /** A type record's `hash` entry. */
@@ -5813,10 +5847,10 @@ private const AnyEquals: u8 = 5
 /** The hash of a value of unknown type, through its record. */
 private const AnyHash: u8 = 6
 /** A method table's entry for an option kept as a pointer: see `table_entry`. */
-private const OptionAdapter: u8 = 7
+const OptionAdapter: u8 = 7
 /** The function a C trampoline runs, converting what C calls an Avin function with: see
  * `c_callback_body`. */
-private const CCallbackBody: u8 = 12
+const CCallbackBody: u8 = 12
 /** A type record's `display` entry: an object of the type rendered by its `Display`, or by name. */
 private const RecordDisplay: u8 = 8
 /** A type record's `debug` entry: the same through `Debug`. */
