@@ -1321,7 +1321,9 @@ Settled by the user on 2026-11-04:
   follows, it and the definitions before it after the same generator pair each element with its
   value through the source's `map`, so it is evaluated for every element before that guard tests
   any, and over a set or map the pair has to be hashable. A definition may not rebind a name its
-  generator or an earlier definition after it binds; a later generator may.
+  generator or an earlier definition after it binds; a later generator may. Settled on the user's
+  delegation 2026-11-11 as no longer open: built and pinned at `-O0` and `-O2` by
+  `tests/run/for_yield_definitions.avin` and `tests/run/spec_collections_comprehensions.avin`.
 - Settled by the user 2026-11-04: Comprehensions over the mutable collections ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   a mutable `Set` and `Map` have `withFilter`, a lazy view as the immutable ones have, and a
   mutable `Map` a `map` over its entries as pairs, so the first source's kind decides the result as
@@ -6866,8 +6868,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   beside its declarations, and the IntelliJ plugin's resolution following an export to the
   declaration (go-to-definition, find usages, renaming through an export).
 
-- Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
-  over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
+- What a comprehension over a `Map` yields when its values are not pairs (it needs `Iterable`'s own
+  transformations).
 
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
   - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a
