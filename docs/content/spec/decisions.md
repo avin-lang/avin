@@ -5892,21 +5892,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `if` in brackets to break inside it (adds tokens, which the formatter never does); leaving any
   line holding an `if` long (also loses the safe break in the last branch).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `time-parse`): **`BadShape` names what was expected**:
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **`BadShape` names what was expected**:
   `BadShape(text, at, expected)`, its message `cannot read "2026/03/08": expected '-' at byte 4`, and
   `Trailing`'s `expected the end at byte 10`, in place of the chapter's earlier `not the expected
   shape at byte 4`. *Why*: a reader fixing the text needs to know what would have been accepted
   there, and the parser knows it at the point it stops. *Alternatives*: `BadShape(text, at)` with one
   fixed message (says where but not what); a separate `expected` method computing it again from the
   text (a second parser).
-- Proposed (built on branch `time-parse`): **a parse reads the whole shape first, then checks the
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **a parse reads the whole shape first, then checks the
   fields in the order they are written**, so `2026-02-30T24:00` is refused for its day and
   `2026-02-30T24:00 ` for its trailing space; a zone name is looked up last. The fields an
   `OutOfRange` names are `year`, `month`, `day`, `date` (past `Date.Min`/`Date.Max` inside their
@@ -5915,14 +5908,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   several faults gets, and a shape error never hides behind a range error further left.
   *Alternatives*: failing at the first fault left to right (a range error could then mask a
   shape error after it, and the answer would depend on how far the reader had got).
-- Proposed (built on branch `time-parse`): **a year of four digits has no sign, and a signed year has
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **a year of four digits has no sign, and a signed year has
   four digits or more**, even inside `0` to `9999` (`+2026`, `-0000` read); an unsigned fifth digit
   is a shape error at byte 4. A seventh digit of fraction is `OutOfRange(text, "fraction")` even
   when it is `0`. `t`, `z`, a comma as the decimal sign, `−` (U+2212) and a bare `±hh` offset are
   refused. *Why*: the display never writes them, and each accepted alternative is one more form
   every other reader of the text would have to accept. *Alternatives*: ISO 8601's lowercase and
   comma variants (wider, and nothing here writes them).
-- Proposed (built on branch `time-parse`): **`parseZoned` with a zone name checks the offset against
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **`parseZoned` with a zone name checks the offset against
   the zone**: the reading minus the offset is the instant, and the zone's clocks must show that
   offset then, or the text is `OutOfRange(text, "offset")`; so both readings of an autumn overlap
   read and a reading in a spring gap is refused. Any `ZoneError` from looking the name up
@@ -5934,7 +5927,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   overlaps, and drops the offset the text gave); trusting the offset and ignoring the zone's (keeps
   a `Zoned` whose offset its zone contradicts). Review with the user whether a mismatch deserves a
   variant of its own rather than `OutOfRange`'s `offset`.
-- Proposed (built on branch `time-parse`): **`parsePeriod(text)`**, named as the chapter's other
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **`parsePeriod(text)`**, named as the chapter's other
   readers are, reads `P`, then a number of years `Y`, of months `M` and of days `D` in that order, at
   least one, each with its own `-` where negative, so every `toIsoString()` reads back equal. Forms
   `toIsoString()` does not write but whose numbers are plain also read (`P12M` as `P1Y`, `P0Y`,
@@ -5944,6 +5937,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   companion (unlike the chapter's other readers); accepting only the canonical form (refuses
   `P12M`, which means one exact period); ISO's weeks (`P2W`, fourteen days, which `toIsoString`
   never writes).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
