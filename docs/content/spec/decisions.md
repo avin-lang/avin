@@ -5699,14 +5699,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   too (refuses a later argument that widens them); a second checking pass over the whole call
   (the same answers here, with each argument checked twice).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- **An array's descriptor carries a per-element reference map** (branch `array-refmaps`; the
+- Settled on the user's delegation 2026-11-11 (built on branch `array-refmaps`): **An array's descriptor carries a per-element reference map** (the
   runtime half of the union tag-and-payload layout, under Settled → unions → Representation). An
   array of elements `k` words wide names one of three tracers: every element one reference
   (`avin_rt_trace_array`, as before), no reference word (the ordinary tracer with no offsets, as
@@ -5725,7 +5718,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   but code per instance and a new symbol per shape); keeping union elements boxed in arrays (no
   runtime change, an allocation per element).
 
-- Proposed (branch `json-stream`): **`avin.io.Reader`**, a trait of one method, `read(max) ->
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **`avin.io.Reader`**, a trait of one method, `read(max) ->
   Result[Array[byte], IoError]`, an empty array at the end, which `fs.File`, `net.TcpStream` and
   `net.UnixStream` implement with the `read` each already had. *Why*: the streaming JSON reader
   reads "a byte stream", and the three byte sources had the same method with no common type, so a
@@ -5734,7 +5727,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   other byte readers gain nothing); a `ByteSource` trait private to the json package (each source
   wrapped by hand). Standard input and a command's output are not readers yet; making them so is
   later work when a program needs it.
-- Proposed (branch `json-stream`): **the streaming JSON reader's interface**, `JsonReader` with the
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **the streaming JSON reader's interface**, `JsonReader` with the
   pull events of `JsonEvent` (`next`, `peek`, `depth`) beside the calls the derivation chapter's
   decoder makes (`beginArray`, `nextElement`, `beginObject`, `nextKey`, `readString`, `takeNull`,
   `skipValue`, `error`), completed with `readBool`, `readLong`, `readInt`, `readReal`, `readValue`,
@@ -5746,24 +5739,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   values in a row (JSON lines), later if a program needs it, as `parse` takes one value too.
   Review with the user: the variant names (`StartObject` … `EndOfText`), chosen to stay apart from
   `Json`'s own variants in the same module.
-- Proposed (branch `json-stream`): **a stream gives `parse`'s faults at `parse`'s places**, and a
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **a stream gives `parse`'s faults at `parse`'s places**, and a
   failure to read is a `JsonError` (`the text could not be read: <the IoError's message>`) at the
   place reading stopped, rather than a separate error type. Bytes that are not UTF-8 are found as
   they are read, so a grammar fault earlier in the text is reported first, where `parse` of bytes,
   which checks the whole text first, reports the UTF-8 fault. *Why*: one error type for the decoder
   to carry, and a stream cannot look ahead to the end. *Alternatives*: `Either[IoError, JsonError]`
   per call (every decoder's signature grows); trapping on a read failure.
-- Proposed (branch `json-stream`): **`JsonError`'s `line`, `column` and `offset` are `long`s**
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **`JsonError`'s `line`, `column` and `offset` are `long`s**
   (they were `int`s). *Why*: a stream larger than memory runs past two gibibytes, and a minified one
   is on a single line, so an `int` column or offset would trap on overflow. *Alternatives*: `int`s
   that saturate (a wrong place, silently); a `long` offset only (a column of a long line still
   overflows).
-- Proposed (branch `json-stream`): **a parent after `:` may be named through its module**,
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **a parent after `:` may be named through its module**,
   `class Body: shapes.Base("b"), io.Reader`, resolved as a type written `m.T` is. *Why*: it was
   refused with "expected a superclass" though the same name is a type everywhere else; found when
   `fs.File` was made an `io.Reader`. *Alternatives*: none weighed; the bare name through an import
   stays the common form.
-- Proposed (branch `json-stream`): **one `JsonReader`, the streaming one, which the derived
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **one `JsonReader`, the streaming one, which the derived
   decoders read through**. The in-memory reader of the derivation item is gone and so are the
   token methods it added to `parse`'s private reader; `json.decode[A](text)` reads through
   `JsonReader.fromString`. Where the two readers named a call differently the streaming names stay:
@@ -5778,7 +5771,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (two grammars to keep in step, and a decoder call through a trait for every token); keeping both
   names of each call (two words for one thing in the chapter's table); a second constructor
   `JsonReader(text)` (the language gives a class one constructor).
-- Proposed (branch `json-stream`): **where the two readers worded an error differently, the settled
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **where the two readers worded an error differently, the settled
   derivation wording stays**: `expected a boolean` (not `expected true or false`), `found a boolean`
   for `true` and `false` alike (not `found false`), and `the number N is not a whole number within an
   int's range` / `a long's range` (not `does not fit an int` / `within a long`), `readInt` naming the
@@ -5791,15 +5784,16 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `[0]`), since no element has begun. *Why*: the derivation's messages were settled and name kinds throughout (`a number`, `a
   string`), and a stream cannot answer "what character is next" without reading a token.
   *Alternatives*: the stream's wordings throughout; the derivation's character-level messages, which
-  would make the stream peek bytes outside its tokenizer.
-- Proposed (branch `json-stream`): **`json.decode[A](source: Reader, maxDepth = 512)`**, an overload
+  would make the stream peek bytes outside its tokenizer. Review with the user: the `[0]` path a
+  fault at the next element used to carry.
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **`json.decode[A](source: Reader, maxDepth = 512)`**, an overload
   of `decode` reading a value of a derived type as its text arrives, from a file, a connection or any
   `Reader`, refusing anything but white space after it. *Why*: the streaming reader exists so that a
   document need not be held whole, and a program decoding its own type should not have to build the
   reader and call `finish` itself. *Alternatives*: `JsonReader.fromReader` and `A.decode(r)` by hand;
   a `decode` taking a `JsonReader` (which leaves the end of the text unchecked or checks it where a
   caller wanted to read on).
-- Proposed (branch `json-stream`): **`net.ByteStream` is an `io.Reader`** (`trait ByteStream:
+- Settled on the user's delegation 2026-11-11 (built on branch `json-stream`): **`net.ByteStream` is an `io.Reader`** (`trait ByteStream:
   Sendable, Reader`, its `read` the trait's), so `TcpStream`, `UnixStream` and `TlsStream` are all
   readers and JSON reads from a TLS connection as from a plain one. *Why*: both sides arrived at
   once, the stream item making `TcpStream` and `UnixStream` readers by name and the TLS item giving
@@ -5807,7 +5801,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   included, with one line. *Alternatives*: naming `io.Reader` beside `ByteStream` on each class (TLS
   left out unless named a third time).
 
-- Proposed (branch `time-period`): **`a.monthsUntil(b)` counts a month whole when `b`'s day of the
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`a.monthsUntil(b)` counts a month whole when `b`'s day of the
   month has reached `a`'s** (the month difference, less one where `b`'s day is smaller, or plus one
   going backward where it is larger), and `a.until(b)` is those months and the days from `a +
   months(n)` to `b`. *Why*: it is the chapter's "as a person counts them" (2026-01-31 to 2026-02-28
@@ -5818,7 +5812,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with `a + months(n) <= b` (answers 1 for 2026-01-31 to 2026-02-28, against the chapter); counting
   backward periods from `b` so the reverse is the negation (breaks `a + a.until(b) == b` for
   `a > b`).
-- Proposed (branch `time-period`): **`p.toIsoString()` writes a period in ISO 8601's form**,
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`p.toIsoString()` writes a period in ISO 8601's form**,
   `P1Y2M3D`, the months split into years as the display splits them, `P0D` for the empty period,
   and a negative part with its own sign (`P-1Y-2M`, `P1M-3D`). *Why*: the display `1y 2mo 3d` is
   for people; exchange formats want ISO's, and a period's parts may differ in sign, which a single
@@ -5826,26 +5820,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   signs only otherwise (two rules for one value); no ISO text until step 5's parsing (a writer
   without a reader for a while). Review with the user whether the step 5 parser should read it
   (`parsePeriod`), which the chapter does not list.
-- Proposed (branch `time-period`): **`toYearsPart()` and `toMonthsPart()` carry the months' sign**
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`toYearsPart()` and `toMonthsPart()` carry the months' sign**
   (`months(-14)` is -1 year and -2 months), as `Duration`'s parts do, and the display and ISO text
   write each part with that sign (`-1y -2mo`). **`p.isZero()`** asks for the empty period, as
   `Duration.isZero()` does. *Alternatives*: floor division (-2 years and 10 months, which reads as
   something else); no `isZero` (`p == Period.Zero` says the same, less directly).
-- Proposed (branch `time-period`): **calendar steps count in a `long`**: `Date ± Period`,
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **calendar steps count in a `long`**: `Date ± Period`,
   `plusYears(n)` (`12 * n` months) and `plusWeeks(n)` (`7 * n` days) never overflow on the way, so
   an answer past the dates traps naming the date (`the date +5881580-08-11 is outside Date.Min to
   Date.Max`), or the count of days where only a day step overflows, as step 2's traps do; the
   makers `years(n)` and `Period * n`, whose answers are periods, trap as an integer overflow.
   `plusYears`, `plusMonths`, `plusWeeks` and `plusDays` take an `int`, as the makers do.
-- Proposed (branch `time-period`): **`Zoned ± Period` and `Zoned`'s `plus…` wait for step 3**,
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`Zoned ± Period` and `Zoned`'s `plus…` wait for step 3**,
   whose `Resolution` decides a period landing in a gap or an overlap.
-- Proposed (branch `time-period`): **the formatter breaks a long one-line `if` only after its last
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **the formatter breaks a long one-line `if` only after its last
   `then`, `elif` or `else`**, keeping its tests, its earlier branches and any operators before it
   on one line. *Why*: a line after an `if`'s test is its block, so a break there changes the
   program (the formatter refused `library/avin/time/period.avin`); a break in an earlier branch
   would put the next `elif` or `else` inside a continuation line. *Alternatives*: wrapping the
   `if` in brackets to break inside it (adds tokens, which the formatter never does); leaving any
   line holding an `if` long (also loses the safe break in the last branch).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
