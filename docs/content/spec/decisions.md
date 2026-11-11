@@ -5652,6 +5652,51 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   second refusing anything but white space after the value. *Alternatives*: only the traits'
   methods, leaving every program to make a writer and a reader.
 
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`startOfYear()`, `startOfMonth()` and `startOfWeek()` on a
+  `DateTime` answer midnight** of that day, while `endOfMonth()` keeps the time of day, as the
+  chapter says. *Why*: a start is the first moment of its span, as `startOfDay` is; keeping the
+  time would make `r.startOfMonth()` mean "the same time on the 1st", which `r.withDay(1)` already
+  says. *Alternatives*: keep the time of day for all four (symmetric with `endOfMonth`, but two
+  spellings of `withDay(1)`); make `endOfMonth` the last microsecond of the month too (a start/end
+  pair, but the chapter decided "at the same time of day"). Review with the user whether
+  `endOfMonth` on a reading should rather be its month's last microsecond.
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **a calendar answer outside `Date.Min` to `Date.Max` traps
+  with a message naming the date** (`the date +5881580-07-31 is outside Date.Min to Date.Max`), or,
+  where the answer is a count of days with no year to write (a weekday search, `startOfWeek`,
+  `DateTime ± Duration`), `the date N days from 1970-01-01 is outside Date.Min to Date.Max`; the
+  maker `date(y, m, d)` traps the same way, and a year far beyond the dates (`withYear(long.MaxValue)`)
+  is checked before any arithmetic, so it never overflows on the way. `daysUntil` and `DateTime -
+  DateTime`, whose answers are an `int` and a `Duration`, trap as an integer overflow does. *Why*:
+  the chapter says leaving a type's range traps "as an integer overflow does"; a message naming the
+  date says more than `integer overflow` where there is a date to name. *Alternatives*: a bare
+  integer overflow trap everywhere (shorter code, a less useful message); clamping to the bounds
+  (silently wrong).
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`withYear` takes a `long`**, the type `year()` answers, so
+  `d.withYear(d.year() + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
+  `int` like the makers (a conversion at every use of `year()`), or changing `year()` to `int`
+  (every year of a `Date` fits, but a change to step 1's fields).
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
+  builds `Resolution` and the zone's handling of a skipped or repeated reading they rely on; step 2
+  gives `Zoned` only `isoWeek()` and `isoWeekYear()`, which need no resolution.
+- Settled on the user's delegation 2026-11-11 (built on branch `generic-variant-inference`): **A
+  shared variant name takes the type its siblings decide**: a bare or called variant name several data types share, passed for
+  a generic function's type argument, is decided by what the call's other arguments decide of that
+  type argument: `assertEq(p.segments(0), MoveTo(10.0, 20.0))` takes `T = Segment` from the first
+  argument, so `MoveTo` is `Segment`'s. It is checked after the arguments that are not such names,
+  wherever it is written, so `same(MoveTo(1.0, 2.0), segment)` resolves too, and named arguments go
+  the same way. The elements of a collection literal and the two branches of an `if` agree the same
+  way: `[Close, segment]`, `if c then Close else segment`. Only the data type is taken from the
+  others; its type arguments are left for the variant's own fields to decide, so a later argument
+  may still widen them, as any argument's may. Where every argument for the type argument is such a
+  name, or the others decide a type that is none of the name's owners, the use is refused with the
+  usual message. Why: the name's type is fixed by the call before it is chosen, exactly as with a
+  parameter of the data type itself, and checking the shared names last makes the result
+  independent of argument order, which a reader expects of `assertEq(a, b)` and `assertEq(b, a)`.
+  Alternatives: left to right only, so `same(MoveTo(…), segment)` is refused (order-dependent, and
+  the expected value usually comes second); taking the decided type with its type arguments fixed
+  too (refuses a later argument that widens them); a second checking pass over the whole call
+  (the same answers here, with each argument checked twice).
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
@@ -5710,6 +5755,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   expression evaluated on every new handle (a new word, and a check on bindings that keep nothing);
   answering `None` for a refused attach (loses the reason); keeping the trap and the library's
   pre-checks (what cairo had to write).
+- **An array's descriptor carries a per-element reference map** (branch `array-refmaps`; the
+  runtime half of the union tag-and-payload layout, under Settled → unions → Representation). An
+  array of elements `k` words wide names one of three tracers: every element one reference
+  (`avin_rt_trace_array`, as before), no reference word (the ordinary tracer with no offsets, as
+  before), or a mapped element (`avin_rt_trace_array_map`), whose descriptor lists the byte offset
+  within an element of each reference word, in the same trailing offset list an object's
+  descriptor uses for its fields; the tracer reads exactly those words of every element and never a
+  scalar word, so a union's bits word holding something that looks like a heap address keeps
+  nothing alive. The compiler builds every array descriptor through `array_descriptor(…, words)`,
+  which picks the fast path whenever the map fits one; a one-word element is never mapped. Handing
+  a value over to another thread reads the same words through the same scanners (`scan_object`).
+  The two fast paths compile to the same machine code as before. *Why*: the offset list already
+  exists, is what the emitter writes for objects, and costs nothing for the arrays every program has
+  today; elements of a union are at most three words, so a short list per element is cheap.
+  *Alternatives*: a bit mask word per descriptor (one word, but a second format beside the offset
+  list, and a bit scan per element); a tracer per element shape generated by the compiler (fastest,
+  but code per instance and a new symbol per shape); keeping union elements boxed in arrays (no
+  runtime change, an allocation per element).
 
 ## Open
 

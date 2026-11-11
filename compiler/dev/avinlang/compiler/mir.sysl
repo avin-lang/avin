@@ -1,7 +1,7 @@
 module dev.avinlang.compiler
 
 import sh.sysl.parsing.Span
-import sysl.buf.Buf
+import sysl.buf.{Buf, buf}
 
 // The mid-level representation: functions of basic blocks over numbered values, with explicit
 // control flow and machine-level types. `unit` has no representation here: a unit value is never
@@ -239,9 +239,8 @@ struct MirFunction
  * variant's tag, its size in bytes with the descriptor word, and the byte offsets of the fields
  * that hold references. A variant with no field data has one shared constant object instead of
  * allocating. A class's descriptor also carries its method table: the function in each slot, or
- * `None` for an abstract method's. An array's descriptor gives the size of one element instead,
- * lists no offsets, and with `elements` set holds references in every element, which the runtime's
- * array tracer marks. */
+ * `None` for an abstract method's. An array's descriptor gives the size of one element instead, and
+ * `tracing` says which of an element's words hold references (see `array_descriptor`). */
 struct Descriptor
     name: string
     tag: usize
@@ -251,11 +250,38 @@ struct Descriptor
     methods: Buf[Option[usize]]
     /** The type record of the objects' type, by its index in `MirProgram.records`. */
     record: usize
-    elements: bool
+    tracing: Tracing
     /** The function a call of the object as a function value runs, taking the object and then the
      * call's arguments: a closure's code, or the `apply` of a class or data type that is a function;
      * `None` for an object that is no function. */
     call: Option[usize]
+
+/** How the runtime finds the references in the objects a descriptor lays out: which tracer its kind
+ * names. */
+enum Tracing
+    /** The fields at the offsets in `refs`, counted from the start of the object: every object that
+     * is no array, and an array whose elements hold no reference, with no offsets. */
+    Fields
+    /** Every element of an array, each one reference; `refs` is empty. */
+    EachElement
+    /** In every element of an array, the words at the offsets in `refs`, counted from the start of
+     * the element: an element of several words, some references and some not. */
+    ElementMap
+
+/** The descriptor of an array whose elements are `size` bytes, `words` long, and hold a reference in
+ * word `j` where `words[j]` is set. The two common shapes take the runtime's fast paths: one word that
+ * is a reference marks every element, and no reference word marks nothing. Any other map, a mix of
+ * the two or several reference words, lists the byte offset of each reference word within an
+ * element, which the runtime's mapped-array tracer reads in every element and no other word. */
+array_descriptor(name: string, size: usize, words: []bool, methods: Buf[Option[usize]], record: usize, call: Option[usize]) -> Descriptor
+    var offsets: Buf[usize] = buf()
+    var j = 0usize
+    for w in words
+        if w then offsets.push(j * 8)
+        j = j + 1
+    if offsets.len() == 0 then return Descriptor(name, 0, size, buf(), false, methods, record, Fields, call)
+    if j == 1 then return Descriptor(name, 0, size, buf(), false, methods, record, EachElement, call)
+    Descriptor(name, 0, size, offsets, false, methods, record, ElementMap, call)
 
 /** What a type pattern reads to learn an object's type, written as constant data: one record per
  * type, which every descriptor of an object of that type names, and the records of the types it
@@ -266,7 +292,8 @@ struct Descriptor
  * A record also holds the type's equality entries, which `==` and the hash on an `Any` or a
  * trait-typed value call once both values are known to have the type: `equals` takes two objects of
  * it and `hash` one, by the functions' indices in `MirProgram.functions`. They are `None` for a type
- * no object has as its own, a trait's, and in a program that never compares such values.
+ * no object has as its own, such as a trait or a type only tested against or listed as an ancestor,
+ * and in a program that never compares such values.
  *
  * Its rendering entries, `display` and `debug`, are what showing an `Any` or a trait-typed value
  * calls: each takes an object of the type, a writer and a format spec, and renders the object by the
@@ -276,7 +303,15 @@ struct Descriptor
  * `apart` marks the type of an object whose handles keep their owners when a value reaching it is
  * handed over: a reference to an actor, a future, a channel, a mutex. Handing a value over walks the
  * objects it reaches and stops at one of these, so a message that holds an actor's reference never
- * hands over what the actor holds. */
+ * hands over what the actor holds.
+ *
+ * A tuple type's record lists its parts' records, `parts`, and no other tuple among its ancestors: a
+ * tuple is one of another tuple type of as many parts when each of its parts' types is that type's
+ * part, or a tuple type that is one of it in turn, or a class or data type with that part among its
+ * first `part_view` ancestors, which the runtime tests part by part. Those are the superclasses and
+ * traits the type conforms to by its declarations, under which a part keeps its representation;
+ * the ancestors a record gains for type patterns' sake follow them. Every other record's `parts`
+ * is empty, and `part_view` is zero for a type other than a class or data type. */
 struct TypeRecord
     name: string
     ancestors: Buf[usize]
@@ -285,6 +320,8 @@ struct TypeRecord
     display: Option[usize]
     debug: Option[usize]
     apart: bool
+    parts: Buf[usize]
+    part_view: usize
 
 /** A closure that captures nothing, made once as constant data: its descriptor, whose `call` is
  * `function`, its entry. */

@@ -1,0 +1,175 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.parse_int
+import sysl.time.micros
+
+// The build log: one `phase=<name> ms=<n> <key>=<n>...` line per phase of a build, written only
+// when `AVIN_BUILD_LOG` names where.
+
+private const Hello: string = "main() = 7\n"
+
+private phases() -> []const string = ["load", "check", "cunit", "lower", "shims", "emit", "split", "units", "link"]
+
+// The repository's toolchain building into a cache of its own under `dir`.
+private cold_toolchain(dir: string) -> Toolchain
+    val real = repository_toolchain()
+    Toolchain(real.root, dir + "/cache", real.clang, real.sysl, real.pkg_config)
+
+// The log's lines, as each is written.
+private log_lines(file: string) -> Buf[string]
+    var lines: Buf[string] = buf()
+    for line in read_text(file).unwrap().split("\n")
+        if line != "" then lines.push(line)
+    lines
+
+// The line of phase `name`.
+private line_of(lines: Buf[string], name: string) -> string
+    for line in lines
+        if line.split(" ")[0] == "phase=" + name then return line
+    panic("no line for phase " + name)
+
+// The number `key` has on `line`.
+private count(line: string, key: string) -> int
+    for word in line.split(" ")
+        if word.starts_with(key + "=") then return parse_int(word[key.bytes.len + 1..]).unwrap()
+    panic(s"no `$key` on `$line`")
+
+// Compiles and links Hello at `optimization` into `dir`, in `units` codegen units, with the log
+// going to `file`, and returns the lines it wrote.
+private logged_build(tc: Toolchain, dir: string, file: string, optimization: string, units: int) -> Buf[string] = logged_build_of(tc, dir, file, optimization, units, Hello)
+
+// `logged_build` of the program `text`.
+private logged_build_of(tc: Toolchain, dir: string, file: string, optimization: string, units: int, text: string) -> Buf[string]
+    open_build_log(Some(file)).unwrap()
+    defer close_build_log()
+    val compiled = compile_program(tc, single_file(source_of("hello.avin", text)), false, buf(), buf())
+    assert_eq(compiled.diagnostics, "")
+    link(tc, compiled.llvm.unwrap(), compiled.archive, dir + "/hello", optimization, compiled.c_link, units).unwrap()
+    log_lines(file)
+
+@test("every line of a build's log is one phase with its time and counts, the phases in pipeline order")
+log_lines_have_stable_form()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val lines = logged_build(cold_toolchain(dir), dir, dir + "/build.log", "-O2", 4)
+    val names = phases()
+    assert_eq(lines.len(), names.len)
+    for i in 0..<names.len
+        val words = lines[i].split(" ")
+        assert_eq(words[0], "phase=" + names[i])
+        assert(words[1].starts_with("ms="))
+        assert(count(lines[i], "ms") >= 0)
+        for w in words[2..]
+            val pair = w.split("=")
+            assert_eq(pair.len, 2)
+            assert(parse_int(pair[1]).is_ok())
+
+@test("a program's log counts its modules, functions and bytes exactly")
+log_counts_of_a_small_program()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val lines = logged_build(cold_toolchain(dir), dir, dir + "/build.log", "-O2", 4)
+    assert_eq(count(line_of(lines, "load"), "modules"), 42)
+    assert_eq(count(line_of(lines, "check"), "modules"), 42)
+    assert_eq(count(line_of(lines, "lower"), "functions"), 19)
+    assert_eq(count(line_of(lines, "lower"), "tests"), 0)
+    assert_eq(count(line_of(lines, "shims"), "bindings"), 0)
+    assert_eq(count(line_of(lines, "shims"), "handles"), 0)
+    assert(count(line_of(lines, "emit"), "bytes") > 10000)
+    assert_eq(count(line_of(lines, "units"), "units"), 2)
+
+@test("a function the program calls adds exactly one to the log's function count, and bytes to the text")
+log_counts_follow_the_program()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = cold_toolchain(dir)
+    val base = logged_build(tc, dir, dir + "/one.log", "-O0", 2)
+    val more = logged_build_of(tc, dir, dir + "/two.log", "-O0", 2, "seven() = 7\nmain() = seven()\n")
+    assert_eq(count(line_of(more, "lower"), "functions"), count(line_of(base, "lower"), "functions") + 1)
+    assert(count(line_of(more, "emit"), "bytes") > count(line_of(base, "emit"), "bytes"))
+    assert_eq(count(line_of(more, "load"), "modules"), count(line_of(base, "load"), "modules"))
+
+@test("a second build of the same program reuses every codegen unit the first compiled")
+log_counts_units_reused()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = cold_toolchain(dir)
+    val first = line_of(logged_build(tc, dir, dir + "/one.log", "-O2", 4), "units")
+    val n = count(first, "units")
+    assert(n >= 2)
+    assert_eq(count(first, "compiled"), n)
+    assert_eq(count(first, "reused"), 0)
+    val second = line_of(logged_build(tc, dir, dir + "/two.log", "-O2", 4), "units")
+    assert_eq(count(second, "units"), n)
+    assert_eq(count(second, "compiled"), 0)
+    assert_eq(count(second, "reused"), n)
+
+@test("a build at -O0 logs the same phases, its units compiled then reused")
+log_at_o0()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = cold_toolchain(dir)
+    val first = logged_build(tc, dir, dir + "/one.log", "-O0", 4)
+    assert_eq(first.len(), phases().len)
+    val units = line_of(first, "units")
+    assert_eq(count(units, "compiled"), count(units, "units"))
+    val second = line_of(logged_build(tc, dir, dir + "/two.log", "-O0", 4), "units")
+    assert_eq(count(second, "compiled"), 0)
+    assert_eq(count(second, "reused"), count(second, "units"))
+
+@test("a build in one unit logs one unit compiled and none reused")
+log_one_unit()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val units = line_of(logged_build(cold_toolchain(dir), dir, dir + "/build.log", "-O2", 1), "units")
+    assert_eq(units, "phase=units ms=" + count(units, "ms").to_string() + " units=1 compiled=1 reused=0")
+
+@test("with no log named, a build writes nothing and takes no clock reading")
+log_is_off_by_default()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    assert(open_build_log(None).is_ok())
+    assert(!build_log_on())
+    assert(phase_start() == micros(0))
+    assert(open_build_log(Some("")).is_ok())
+    assert(!build_log_on())
+    assert(phase_start() == micros(0))
+    val tc = cold_toolchain(dir)
+    val compiled = compile_program(tc, single_file(source_of("hello.avin", Hello)), false, buf(), buf())
+    assert_eq(compiled.diagnostics, "")
+    link(tc, compiled.llvm.unwrap(), compiled.archive, dir + "/hello", "-O0", compiled.c_link, 2).unwrap()
+    assert(exists(dir + "/hello"))
+
+@test("a log that cannot be written is an error naming the variable and the file, and leaves logging off")
+log_that_cannot_be_written()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/no/such/dir/build.log"
+    val opened = open_build_log(Some(file))
+    assert(opened is Err(_))
+    val message = opened.unwrap_err()
+    assert(message.starts_with("avin: AVIN_BUILD_LOG: cannot write `" + file + "`"))
+    assert(!build_log_on())
+    write_text(dir + "/file", "x").unwrap()
+    assert(open_build_log(Some(dir + "/file/inside.log")) is Err(_))
+    assert(open_build_log(Some(dir)) is Err(_))
+    assert(!build_log_on())
+
+@test("opening the log empties the file, so it holds one build")
+log_holds_one_build()
+    val dir = make_temp_dir("avin-log").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/build.log"
+    write_text(file, "phase=old ms=1\n").unwrap()
+    open_build_log(Some(file)).unwrap()
+    defer close_build_log()
+    assert_eq(read_text(file).unwrap(), "")
+    _ = phase_done("probe", phase_start(), "n=3")
+    val lines = log_lines(file)
+    assert_eq(lines.len(), 1)
+    assert(lines[0].starts_with("phase=probe ms="))
+    assert(lines[0].ends_with(" n=3"))

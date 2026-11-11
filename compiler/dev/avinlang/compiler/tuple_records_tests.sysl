@@ -1,0 +1,91 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// A tuple's record names its parts' records rather than listing, as its ancestors, every tuple type
+// its parts may be seen as, and only a record some object has gets equality and rendering entries.
+// So a tuple of parts with many traits costs a handful of functions and records, not one per
+// combination of its parts' traits.
+
+/** The module a program compiles to. */
+private tuple_ir(text: string) -> string
+    val program = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    emit_llvm(program)
+
+/** How many lines of `ir` start with `prefix`. */
+private lines_starting(ir: string, prefix: string) -> usize
+    var n = 0usize
+    for line in ir.split("\n")
+        if line.starts_with(prefix) then n += 1
+    n
+
+private functions_of(ir: string) -> usize = lines_starting(ir, "define ")
+
+private records_of(ir: string) -> usize = lines_starting(ir, "@avin.type.")
+
+private const Hello: string = "main()\n    println(\"hello\")\n"
+
+private const Six: string = "(Some(1), Some(2), Some(3), Some(4), Some(5), Some(6))"
+
+/** The functions and records of `text` beyond those of a program that prints a string. */
+private beyond_hello(text: string) -> (usize, usize, string)
+    val hello = tuple_ir(Hello)
+    val ir = tuple_ir(text)
+    (functions_of(ir) - functions_of(hello), records_of(ir) - records_of(hello), ir)
+
+@test("a sextuple of options shown once costs a few functions, not one per view of its parts")
+sextuple_shown()
+    val (functions, records, _) = beyond_hello("main()\n    println(" + Six + ")\n")
+    assert(functions <= 40, s"$functions functions beyond hello")
+    assert(records <= 20, s"$records records beyond hello")
+
+@test("a triple of options shown once costs a few functions")
+triple_shown()
+    val (functions, records, _) = beyond_hello("main()\n    println((Some(1), Some(2), Some(3)))\n")
+    assert(functions <= 30, s"$functions functions beyond hello")
+    assert(records <= 15, s"$records records beyond hello")
+
+@test("a sextuple of options held as Any, compared, hashed, shown and debugged gets one set of entries")
+sextuple_as_any()
+    val text = "main()\n    val a: Any = " + Six + "\n    val b: Any = " + Six + "\n    println(a == b)\n    println(a.hash() == b.hash())\n    println(a)\n    println(debug(a))\n"
+    val (functions, records, ir) = beyond_hello(text)
+    // Comparing and showing values of unknown type gives every record an object has its entries,
+    // the library's too: about 470 functions here.
+    assert(functions <= 600, s"$functions functions beyond hello")
+    assert(records <= 40, s"$records records beyond hello")
+    // The sextuple's own record has its entries; no record of a tuple of traits exists.
+    assert(ir.contains("; type (Option[int], Option[int], Option[int], Option[int], Option[int], Option[int])"), ir)
+    assert(!ir.contains("; type (Display"), ir)
+    assert(!ir.contains("; type (Debug"), ir)
+
+@test("a type pattern on a sextuple of traits makes one record for it and none for the views between")
+sextuple_tested()
+    val text = "kind(x: Any) -> string = x match\n    _: (Display, Display, Display, Display, Display, Display) -> \"shown\"\n    _ -> \"other\"\n\nmain()\n    println(kind(" + Six + "))\n"
+    val (functions, records, ir) = beyond_hello(text)
+    assert(functions <= 60, s"$functions functions beyond hello")
+    assert(records <= 25, s"$records records beyond hello")
+    assert(lines_starting(ir, "; type (Display, Display, Display, Display, Display, Display)") == 1, ir)
+    assert(!ir.contains("; type (Option[int], Display"), ir)
+    assert(!ir.contains("; type (Display, Option[int]"), ir)
+
+@test("a record that only names a type tested against or a tuple's part has no entries")
+tested_records_have_no_entries()
+    val text = "main()\n    val a: Any = (Some(1), 2)\n    println(a == a)\n    println(a)\n    println(a match\n        _: (Display, int) -> \"yes\"\n        _ -> \"no\")\n"
+    val ir = tuple_ir(text)
+    var named = ""
+    var checked = 0
+    for line in ir.split("\n")
+        if line.starts_with("; type ") then named = line
+        elif line.starts_with("@avin.type.")
+            val entries = line.contains("ptr @\"")
+            if named == "; type (Display, int)" || named == "; type Display"
+                assert(!entries, line)
+                checked += 1
+            if named == "; type (Option[int], int)"
+                assert(entries, line)
+                checked += 1
+    assert(checked == 3, ir)

@@ -208,6 +208,9 @@ private struct Lowering
     memo: ConformanceMemo
     /** The receivers of the calls `slot_calls` records, by position and method name. */
     slot_receivers: Map[string, Buf[KnownType]]
+    /** Whether some object has the record as its own type's, by the record's index: only such a
+     * record's equality and rendering entries can be called. */
+    object_records: Buf[bool]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -317,11 +320,12 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
-    l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false))
+    l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
     l.record_types.push(Unit)
+    l.object_records.push(true)
     // A module-level value made at compile time has no storage: every read of it is the constant.
     for _ in program.globals
         l.constant_state.push(0)
@@ -449,7 +453,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
     val identity = type_key(t)
     if l.layout_index.get(identity) is Some(index) then return l.layouts[index]
     var variants: Buf[VariantLayout] = buf()
-    val record = record_of(l, t)
+    val record = object_record(l, t)
     *t match
         Data(id, _, args) ->
             val d = l.program.data[id]
@@ -464,7 +468,7 @@ private layout(l: *Lowering, t: &Type) -> DataLayout
                 val element = mir_type(args[0])
                 val methods = method_table(l, t)
                 val shape = VariantLayout(l.descriptors.len(), buf())
-                l.descriptors.push(Descriptor(key, 0, element_size(element), buf(), false, methods, record, element is Some(MRef), call_entry(l, t)))
+                l.descriptors.push(array_descriptor(key, element_size(element), [element is Some(MRef)], methods, record, call_entry(l, t)))
                 variants.push(shape)
             else
                 var fields: Buf[&Type] = buf()
@@ -542,7 +546,7 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
                 size += field_size(m)
             None -> fields.push(None)
     val shape = VariantLayout(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record, false, call))
+    l.descriptors.push(Descriptor(name, tag, size, refs, shared && size == 0, methods, record, Fields, call))
     shape
 
 /** The bytes an array element of machine type `t` takes: what storing one writes, a power of two up
@@ -1127,24 +1131,41 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     var refs: Buf[usize] = buf()
     if t is MRef then refs.push(0)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0, false, None))
+    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0, Fields, None))
     l.boxes.put(key, d)
     d
 
 // A type's record lists its ancestors: for a class or trait, its superclasses and the traits it and
-// they conform to, for a data type the traits its impls make it conform to, with their type arguments as it sees them; for a tuple, each tuple type its parts
-// may be seen as, one part's ancestor at a time. Every other type is its own and nothing else.
+// they conform to, for a data type the traits its impls make it conform to, with their type
+// arguments as it sees them. A tuple's record lists its parts' records instead, and the runtime
+// tests a tuple against another tuple type part by part, so the tuple types its parts may be seen
+// as, a product of every part's ancestors, have no records unless the program names them. Every
+// other type is its own and nothing else.
 private record_of(l: *Lowering, t: &Type) -> usize
     val key = type_key(t)
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
-    l.records.push(TypeRecord(type_name(t), buf(), None, None, None, None, false))
+    l.records.push(TypeRecord(type_name(t), buf(), None, None, None, None, false, buf(), 0))
     l.record_types.push(t)
+    l.object_records.push(false)
     l.record_index.put(key, index)
     var ancestors: Buf[usize] = buf()
     for up in supertypes(l, t)
         ancestors.push(record_of(l, up))
-    l.records[index] = TypeRecord(type_name(t), ancestors, None, None, None, None, keeps_owners(l, t))
+    var parts: Buf[usize] = buf()
+    if *t is Tuple(items)
+        for item in items
+            parts.push(record_of(l, item))
+    // A class or data part is seen through what its declarations make it, as a reference both ways.
+    val part_view = if *t is Class(_, _, _) || *t is Data(_, _, _) then ancestors.len() else 0
+    l.records[index] = TypeRecord(type_name(t), ancestors, None, None, None, None, keeps_owners(l, t), parts, part_view)
+    index
+
+/** The record of `t` as the type of some object: one whose equality and rendering entries a value
+ * of unknown type may call. */
+private object_record(l: *Lowering, t: &Type) -> usize
+    val index = record_of(l, t)
+    l.object_records[index] = true
     index
 
 /** Whether `t` is a class the standard library marks `@keeps_owners`: its objects are shared
@@ -1206,34 +1227,13 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
         TypeVar(_, _, _) -> true
         _ -> false
 
-/** The types `t` conforms to besides itself and `Any`, each once. */
+/** The classes and traits `t` conforms to besides itself and `Any`, each once. A tuple's other
+ * tuple types are tested through its parts' records, so they are not among them. */
 private supertypes(l: *Lowering, t: &Type) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     *t match
         Class(_, _, _) -> class_ancestors(l, t, &out)
         Data(_, _, _) -> class_ancestors(l, t, &out)
-        Tuple(items) ->
-            // Each part's own type and its ancestors; every combination but the tuple itself.
-            var choices: Buf[Buf[&Type]] = buf()
-            for item in items
-                var options: Buf[&Type] = buf()
-                options.push(item)
-                if *item is Class(_, _, _) || *item is Data(_, _, _) then class_ancestors(l, item, &options)
-                choices.push(options)
-            var combos: Buf[Buf[&Type]] = buf()
-            combos.push(buf())
-            for options in choices
-                var next: Buf[Buf[&Type]] = buf()
-                for combo in combos
-                    for option in options
-                        var longer: Buf[&Type] = buf()
-                        for x in combo do longer.push(x)
-                        longer.push(option)
-                        next.push(longer)
-                combos = next
-            for combo in combos
-                val up: &Type = Tuple(combo)
-                if !same_type(up, t) then out.push(up)
         _ -> ()
     out
 
@@ -1276,10 +1276,10 @@ private class_ancestors(l: *Lowering, t: &Type, out: *Buf[&Type])
 // bytes, with no references, and the type record of `string` and its method table, so a string is a
 // value of `Any` and of each trait it implements as it is, with no box.
 private string_descriptor(l: *Lowering) -> usize
-    val record = record_of(l, Str)
+    val record = object_record(l, Str)
     val methods = method_table(l, Str)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("string", 0, 8, buf(), false, methods, record, false, None))
+    l.descriptors.push(Descriptor("string", 0, 8, buf(), false, methods, record, Fields, None))
     if holds_generic_methods(l, Str) then hold_generic_slots(l, d, Str)
     d
 
@@ -1291,10 +1291,10 @@ private value_box(l: *Lowering, t: &Type) -> usize
     val size = machine(l, t) match
         Some(m) -> field_size(m)
         None -> 0
-    val record = record_of(l, t)
+    val record = object_record(l, t)
     val methods = method_table(l, t)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, methods, record, false, None))
+    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, methods, record, Fields, None))
     l.boxes.put(key, d)
     // A built-in type's impls may add methods with type parameters of their own, which a call
     // through a trait reaches at a slot of their own type arguments, as an object's does.
@@ -1320,24 +1320,33 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
 private const DescriptorRecord: usize = 56
 
 // Whether the object `object` has type `t` at run time. A string's descriptor names no record; a
-// type nothing else can be is tested by its record alone, and an open class, a trait, or a tuple
-// with such a part also by the record's ancestors.
+// type nothing else can be is tested by its record alone, an open class or a trait also by the
+// record's ancestors, and a tuple with such a part also part by part, by the parts' records.
 private type_test(l: *Lowering, object: Operand, t: &Type) -> Operand
+    val record = record_at(l, object)
+    val index = record_of(l, t)
+    val target = RecordAddress(index)
+    if exact(l, t) then return compare(l, CmpEq, record, target)
+    note_tested(l, index)
+    val found = runtime_call(l, "avin_rt_conforms", [MPtr, MPtr], MInt(32), [record, target])
+    compare(l, CmpNe, found, ConstInt(32, "0"))
+
+/** The address of the type record of the object `object`, read from its descriptor. */
+private record_at(l: *Lowering, object: Operand) -> Operand
     val descriptor = fresh(l, MPtr)
     l.insts.push(DescriptorOf(descriptor, object))
     val address = fresh(l, MPtr)
     l.insts.push(Offset(address, Value(descriptor), DescriptorRecord))
     val record = fresh(l, MPtr)
     l.insts.push(Load(record, Value(address)))
-    val index = record_of(l, t)
-    val target = RecordAddress(index)
-    if exact(l, t) then return compare(l, CmpEq, Value(record), target)
-    var seen = false
+    Value(record)
+
+/** Records that a type pattern tests against the type whose record is `index`, so that the records
+ * of the types that may be seen as it gain it as an ancestor. */
+private note_tested(l: *Lowering, index: usize)
     for r in l.tested
-        if r == index then seen = true
-    if !seen then l.tested.push(index)
-    val found = runtime_call(l, "avin_rt_conforms", [MPtr, MPtr], MInt(32), [Value(record), target])
-    compare(l, CmpNe, found, ConstInt(32, "0"))
+        if r == index then return
+    l.tested.push(index)
 
 /** Whether only a value of exactly type `t` has type `t`: true of every type but an open or
  * abstract class, a trait, an instance of a type with a parameter that is not invariant, a function
@@ -1378,7 +1387,7 @@ private add_variant_ancestors(l: *Lowering)
             if seen_as(l, known, to)
                 ancestors.push(target)
                 grew = true
-        if grew then l.records[r] = TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug, l.records[r].apart)
+        if grew then l.records[r] = TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug, l.records[r].apart, l.records[r].parts, l.records[r].part_view)
 
 /** Whether a value of type `from` is one of `to`, as `always_is` or a view through `view_as` shows.
  * A class or data value is seen as another class or trait only through the instance of it that it
@@ -1507,9 +1516,9 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entr
                     fields.push(FieldSlot(size, m))
                     size += field_size(m)
         None -> ()
-    val record = record_of(l, closure_type(l, function, type_args))
+    val record = object_record(l, closure_type(l, function, type_args))
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), record, false, Some(entry)))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), record, Fields, Some(entry)))
     l.shapes.put(key, shape)
     shape
 
@@ -5739,21 +5748,22 @@ private own_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
         _ -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
 
 /** Gives every type record that some object has as its own type equality entries; whether it made
- * any. A trait's record and an abstract class's belong to no object. Record 0, of captured
- * variables' boxes, and a function type's record, of closures, compare by identity. */
+ * any. A trait's record and an abstract class's belong to no object, nor does a record only tested
+ * against or listed among another's ancestors or parts. Record 0, of captured variables' boxes, and
+ * a function type's record, of closures, compare by identity. */
 private add_equality_entries(l: *Lowering) -> bool
     var added = false
     var r = 0usize
     while r < l.records.len()
         val record = l.records[r]
         val t: &Type = if r == 0 then Function(buf(), Unit, false) else l.record_types[r]
-        var owned = record.equals is None
+        var owned = record.equals is None && l.object_records[r]
         if *t is Class(k, _, _)
             if l.program.classes[k].decl.modifier == "trait" || l.program.classes[k].decl.modifier == "abstract" then owned = false
         if owned
             val equals = generated(l, RecordEquals, t)
             val hash = generated(l, RecordHash, t)
-            l.records[r] = TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash), l.records[r].display, l.records[r].debug, l.records[r].apart)
+            l.records[r] = TypeRecord(record.name, l.records[r].ancestors, Some(equals), Some(hash), l.records[r].display, l.records[r].debug, l.records[r].apart, l.records[r].parts, l.records[r].part_view)
             added = true
         r += 1
     added
@@ -5770,7 +5780,7 @@ private add_rendering_entries(l: *Lowering) -> bool
     while r < l.records.len()
         val record = l.records[r]
         val t: &Type = if r == 0 then Function(buf(), Unit, false) else l.record_types[r]
-        var owned = true
+        var owned = l.object_records[r]
         if *t is Class(k, _, _)
             if l.program.classes[k].decl.modifier == "trait" || l.program.classes[k].decl.modifier == "abstract" then owned = false
         if owned
@@ -5779,7 +5789,7 @@ private add_rendering_entries(l: *Lowering) -> bool
             if displays && display is None then display = Some(generated(l, RecordDisplay, t))
             if debugs && debug is None then debug = Some(generated(l, RecordDebug, t))
             if !same_entry(display, record.display) || !same_entry(debug, record.debug)
-                l.records[r] = TypeRecord(record.name, record.ancestors, record.equals, record.hash, display, debug, record.apart)
+                l.records[r] = TypeRecord(record.name, l.records[r].ancestors, l.records[r].equals, l.records[r].hash, display, debug, record.apart, l.records[r].parts, l.records[r].part_view)
                 added = true
         r += 1
     added

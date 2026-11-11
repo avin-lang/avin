@@ -1,0 +1,90 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// An array descriptor's tracing: the word map of an element decides which of the runtime's three
+// array tracers its kind names, and the offsets a mapped array lists.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private mapped(words: []bool) -> Descriptor = array_descriptor("Array[probe]", 24, words, buf(), 0, None)
+
+private offsets_of(d: Descriptor) -> string
+    var s = ""
+    for o in d.refs
+        s = s + o.to_string() + " "
+    s.trim()
+
+private descriptor_named(program: MirProgram, name: string) -> Descriptor
+    for d in program.descriptors
+        if d.name == name then return d
+    panic("no descriptor " + name)
+
+@test("an element of one word takes a fast path: a reference marks every element, a scalar nothing")
+one_word_maps()
+    val r = mapped([true])
+    assert(r.tracing is EachElement)
+    assert_eq(r.refs.len(), 0)
+    val s = mapped([false])
+    assert(s.tracing is Fields)
+    assert_eq(s.refs.len(), 0)
+
+@test("an element of two words lists the offset of each reference word, and none takes the scalar path")
+two_word_maps()
+    assert(mapped([false, false]).tracing is Fields)
+    assert_eq(mapped([false, false]).refs.len(), 0)
+    assert(mapped([true, false]).tracing is ElementMap)
+    assert_eq(offsets_of(mapped([true, false])), "0")
+    assert(mapped([false, true]).tracing is ElementMap)
+    assert_eq(offsets_of(mapped([false, true])), "8")
+    assert(mapped([true, true]).tracing is ElementMap)
+    assert_eq(offsets_of(mapped([true, true])), "0 8")
+
+@test("an element of three words maps every pattern of reference and scalar words")
+three_word_maps()
+    assert(mapped([false, false, false]).tracing is Fields)
+    assert_eq(mapped([false, false, false]).refs.len(), 0)
+    assert_eq(offsets_of(mapped([true, false, false])), "0")
+    assert_eq(offsets_of(mapped([false, true, false])), "8")
+    assert_eq(offsets_of(mapped([false, false, true])), "16")
+    assert_eq(offsets_of(mapped([true, true, false])), "0 8")
+    assert_eq(offsets_of(mapped([true, false, true])), "0 16")
+    assert_eq(offsets_of(mapped([false, true, true])), "8 16")
+    assert_eq(offsets_of(mapped([true, true, true])), "0 8 16")
+    for d in [mapped([true, false, false]), mapped([false, true, false]), mapped([true, true, true])]
+        assert(d.tracing is ElementMap)
+        assert_eq(d.size, 24)
+        assert_eq(d.tag, 0)
+        assert(!d.constant)
+
+private const Arrays: string = "main()\n    val a: Array[string] = [\"x\"]\n    val b: Array[int] = [1]\n    val c: Array[real] = [1.0]\n    println(a)\n    println(b)\n    println(c)\n"
+
+@test("the arrays a program makes today take the fast paths: references every element, scalars none")
+lowered_arrays_take_fast_paths()
+    val p = lowered(Arrays)
+    val a = descriptor_named(p, "Array[string]")
+    assert(a.tracing is EachElement)
+    assert_eq(a.refs.len(), 0)
+    assert_eq(a.size, 8)
+    for name in ["Array[int]", "Array[real]"]
+        val d = descriptor_named(p, name)
+        assert(d.tracing is Fields)
+        assert_eq(d.refs.len(), 0)
+
+@test("a descriptor with an element map is emitted with the mapped-array tracer and its offsets")
+emits_element_map()
+    var p = lowered(Arrays)
+    val shape = descriptor_named(p, "Array[string]")
+    val i = p.descriptors.len()
+    p.descriptors.push(array_descriptor("Array[mapped]", 24, [false, true, false], buf(), shape.record, None))
+    val ir = emit_llvm(p)
+    assert(ir.contains("declare void @avin_rt_trace_array_map(ptr, ptr)\n"))
+    assert(ir.contains(s"; Array[mapped]\n@avin.methods.$i = "))
+    assert(ir.contains("{ ptr @avin_rt_trace_array_map, ptr null, ptr null, ptr null }, i64 0, i64 24, i64 1, ptr @avin.type."))
+    assert(ir.contains("[1 x i64] [i64 8] }"))
+    // The fast paths keep their own tracers.
+    assert(ir.contains("{ ptr @avin_rt_trace_array, ptr null, ptr null, ptr null }, i64 0, i64 8, i64 0"))

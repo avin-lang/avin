@@ -62,7 +62,7 @@ handle_claim(ctx: *Context, h: *u8) -> bool
     was == InTransit || was == ctx.owner
 
 /** Gives every handle that the value at `root` reaches and `from` owns to `to`: what the value holds,
- * through every object and array of references, each visited once. The walk stops at an object whose
+ * through every object and array, each visited once, reading the words a collection reads. The walk stops at an object whose
  * type keeps its handles' owners, its record marked `apart` — a reference to an actor, a future, a
  * channel, a mutex — so a value holding one never hands over what that shared object reaches. A
  * value handed to code that runs on another thread is handed over by the thread that gives it,
@@ -73,10 +73,10 @@ hand_over(ctx: *Context, root: *u8, from: long, to: long)
     val f = u64(from)
     val t = u64(to)
     var seen: Set[usize] = set()
-    var work: Buf[*u8] = buf()
-    work.push(root)
+    var work: Buf[usize] = buf()
+    work.push(usize(root))
     while work.len() > 0
-        val p = work.pop().unwrap()
+        val p: *u8 = ptr_cast(work.pop().unwrap())
         if !seen.add(usize(p)) then continue
         val d = descriptor_of(p)
         if d.record != null
@@ -86,12 +86,14 @@ hand_over(ctx: *Context, root: *u8, from: long, to: long)
             val word: *Atomic[u64] = ptr_cast(usize(p) + HandleOwnerOffset)
             _ = word.cas(f, t)
             continue
-        if d.kind.trace == &trace_array
-            val elements: **u8 = ptr_cast(array_elements(p))
-            for i in 0..<array_length(p)
-                if elements[i] != null then work.push(elements[i])
-            continue
-        val offsets: *usize = ptr_cast(usize(d) + sizeof(Descriptor))
-        for i in 0..<d.refs
-            val field: **u8 = ptr_cast(usize(p) + offsets[i])
-            if field[0] != null then work.push(field[0])
+        var follow = Follower(&work)
+        scan_object(p, &follow)
+
+// The marker of a hand-over: each reference it reads, unless null, is a value still to visit, kept
+// by its address, as `seen` keeps those visited.
+private struct Follower
+    work: *Buf[usize]
+
+impl Marker for Follower
+    mark(*self, p: *u8)
+        if p != null then self.work.push(usize(p))

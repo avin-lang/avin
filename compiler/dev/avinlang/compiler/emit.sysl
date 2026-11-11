@@ -20,6 +20,7 @@ emit_llvm(program: MirProgram) -> string
     // Every descriptor begins with the collector's kind, whose tracer is the runtime's.
     out.push("declare void @avin_rt_trace(ptr, ptr)\n")
     out.push("declare void @avin_rt_trace_array(ptr, ptr)\n")
+    out.push("declare void @avin_rt_trace_array_map(ptr, ptr)\n")
     // A Sysl handle's kind names its finalizer, which the program's shims define.
     for h in program.handles
         out.push(s"declare void @${h.finalizer}(ptr, ptr)\n")
@@ -41,21 +42,20 @@ emit_llvm(program: MirProgram) -> string
     for i in 0..<program.descriptors.len()
         emit_descriptor(&out, program, i)
     // A type record is the number of the type's ancestors, its equality and rendering entries,
-    // whether handing a value over stops at its objects, and its ancestors' records' addresses.
+    // whether handing a value over stops at its objects, the number of its parts, how many of its
+    // first ancestors it is seen as when it is a tuple's part, and its ancestors' records' addresses
+    // followed by its parts'.
     for i in 0..<program.records.len()
         val r = program.records[i]
         val n = r.ancestors.len()
+        val m = r.parts.len()
         val apart = if r.apart then 1 else 0
-        out.push(s"; type ${r.name}\n@avin.type.$i = private constant { i64, ptr, ptr, ptr, ptr, i64, [$n x ptr] } { i64 $n, ")
+        out.push(s"; type ${r.name}\n@avin.type.$i = private constant { i64, ptr, ptr, ptr, ptr, i64, i64, i64, [$n x ptr], [$m x ptr] } { i64 $n, ")
         out.push(entry_address(program, r.equals) + ", " + entry_address(program, r.hash) + ", ")
-        out.push(entry_address(program, r.display) + ", " + entry_address(program, r.debug) + s", i64 $apart, [$n x ptr] ")
-        if n == 0 then out.push("zeroinitializer")
-        else
-            out.push("[")
-            for j in 0..<n
-                if j > 0 then out.push(", ")
-                out.push(s"ptr @avin.type.${r.ancestors[j]}")
-            out.push("]")
+        out.push(entry_address(program, r.display) + ", " + entry_address(program, r.debug) + s", i64 $apart, i64 $m, i64 ${r.part_view}, [$n x ptr] ")
+        record_addresses(&out, r.ancestors)
+        out.push(s", [$m x ptr] ")
+        record_addresses(&out, r.parts)
         out.push(" }, align 8\n")
     // A closure that captures nothing is constant: only a header naming its descriptor, whose `call`
     // is its entry.
@@ -232,6 +232,17 @@ const TestReady: string = "avin: test: ready"
 
 /** The line a test's process writes to standard error once the test itself has returned. */
 const TestReturned: string = "avin: test: returned"
+
+/** The addresses of the records `records`, as the elements of a constant array. */
+private record_addresses(out: *StrBuilder, records: Buf[usize])
+    if records.len() == 0
+        out.push("zeroinitializer")
+        return
+    out.push("[")
+    for j in 0..<records.len()
+        if j > 0 then out.push(", ")
+        out.push(s"ptr @avin.type.${records[j]}")
+    out.push("]")
 
 /** A type record's equality entry as an LLVM constant: the function's address, or null. */
 private entry_address(program: MirProgram, entry: Option[usize]) -> string = entry match
@@ -826,7 +837,10 @@ private emit_descriptor(out: *StrBuilder, program: MirProgram, i: usize)
     val n = d.refs.len()
     val header = s"{ $KindType, i64, i64, i64, ptr, [$n x i64] }"
     var body = str_builder()
-    var kind = if d.elements then ArrayKindValue else KindValue
+    var kind = d.tracing match
+        Fields -> KindValue
+        EachElement -> ArrayKindValue
+        ElementMap -> MappedArrayKindValue
     for h in program.handles
         if h.descriptor == i then kind = s"$KindType { ptr @avin_rt_trace, ptr @${h.finalizer}, ptr null, ptr null }"
     for h in program.c_handles
@@ -932,6 +946,9 @@ private const KindType: string = "{ ptr, ptr, ptr, ptr }"
 private const KindValue: string = "{ ptr, ptr, ptr, ptr } { ptr @avin_rt_trace, ptr null, ptr null, ptr null }"
 /** The kind of an array whose elements are references: the runtime's array tracer marks each one. */
 private const ArrayKindValue: string = "{ ptr, ptr, ptr, ptr } { ptr @avin_rt_trace_array, ptr null, ptr null, ptr null }"
+/** The kind of an array with an element map: the runtime's mapped-array tracer marks, in every
+ * element, the words at the descriptor's offsets. */
+private const MappedArrayKindValue: string = "{ ptr, ptr, ptr, ptr } { ptr @avin_rt_trace_array_map, ptr null, ptr null, ptr null }"
 
 /** How far before an object its descriptor is: the collector's `KIND_BACK`, two words. A constant
  * object outside the heap is laid out with those two words ahead of it, its descriptor and a word
