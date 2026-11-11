@@ -142,7 +142,6 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 return Err("a variadic function cannot be bound: the types of the arguments `...` takes cannot be checked")
             var length_of = ""
             if *at < tokens.len() && tokens[*at] == "length"
-                if inner then return Err("a callback's parameter marked `length(...)` carries the length of memory C lends the callback, which crosses as a `ByteView`, and views lent to a callback are not implemented")
                 if *at + 3 >= tokens.len() || tokens[*at + 1] != "(" || !is_c_word(tokens[*at + 2]) || tokens[*at + 3] != ")"
                     return Err("`length` names the array parameter whose length the parameter carries, in parentheses, as in `length(data) size_t n`")
                 length_of = tokens[*at + 2]
@@ -221,6 +220,8 @@ private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared) -
     if *at >= tokens.len() || tokens[*at] != "(" then return Err(shape)
     *at = *at + 1
     val params = c_param_list(tokens, at, true)?
+    // A byte pointer with `length(p)` beside it is memory C lends the function, crossing as a view.
+    c_check_lengths(params)?
     if result.ty is CText(_) then return Err("a callback answers C a scalar or an enum mirror; a string it answered would have to outlive the call, which nothing frees")
     Ok(CPrototype(name, result.ty, result.text, params))
 
@@ -648,22 +649,38 @@ c_as_position(d: &ClassDecl, text: string) -> Option[usize]
     None
 
 /** What a field accessor's `@c(field: …)` says: the C lvalue it reads or writes, a member path of the
- * struct `self` points at, and the `bound:` of each index, in order. */
+ * struct `self` points at, the `bound:` of each index, in order, and for a field that is a byte
+ * pointer lent as a view, `view`, `writable` and the C expression its `length:` is. */
 struct CField
     expr: string
     bounds: Buf[string]
+    view: bool
+    writable: bool
+    length: string
 
 /** The field accessor a method's `@c` makes, when it says `field:`. */
 c_field_of(f: &Function) -> Option[CField]
     for a in f.annotations
         if a.name != "c" then continue
+        var expr: Option[string] = None
+        var view = false
+        var writable = false
+        var length = ""
         for arg in a.args
-            if arg.name is Some(n) && n == "field"
-                if arg.value.kind is StringLit(text)
-                    var bounds: Buf[string] = buf()
-                    for b in c_binding_names(f, "bound")
-                        bounds.push(b)
-                    return Some(CField(text, bounds))
+            arg.name match
+                Some(n) ->
+                    if arg.value.kind is StringLit(text)
+                        if n == "field" && expr is None then expr = Some(text)
+                        elif n == "length" then length = text
+                None ->
+                    if arg.value.kind is Name(word)
+                        if word == "view" then view = true
+                        elif word == "writable" then writable = true
+        if expr is Some(text)
+            var bounds: Buf[string] = buf()
+            for b in c_binding_names(f, "bound")
+                bounds.push(b)
+            return Some(CField(text, bounds, view, writable, length))
     None
 
 /** The name of a field accessor's glue in the C unit, by the index of its symbol: `get` reads the
@@ -794,11 +811,12 @@ c_out_count(p: CPrototype) -> usize
     n
 
 /** The indices of the parameters of a callback's prototype `f` the Avin function takes, in order:
- * all but its `userdata`. */
+ * all but its `userdata` and the parameters marked `length(p)`, whose value is the length of the
+ * view `p` crosses as. */
 c_callback_positions(f: CPrototype) -> Buf[usize]
     var out: Buf[usize] = buf()
     for i in 0..<f.params.len()
-        if !f.params[i].userdata then out.push(i)
+        if !f.params[i].userdata && f.params[i].length_of == "" then out.push(i)
     out
 
 /** The index of the parameter of `p` taking the function whose closure the `userdata` parameter `k`

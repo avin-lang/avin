@@ -1,0 +1,134 @@
+module tests
+
+// What decoding refuses, and how it says so: each error names the path from the document's top to
+// the value at fault, the reason, and the line and column where the fault is.
+import json
+import json.JsonError
+import json.JsonEncoder
+import json.JsonDecoder
+import json.JsonKey
+import json.JsonTag
+import json.JsonOmit
+import json.PathStep
+
+data Street(street: string, city: string) derives JsonEncoder, JsonDecoder
+
+data Resident(@JsonKey("full_name") name: string, age: int, home: Option[Street]) derives JsonEncoder, JsonDecoder
+
+@JsonTag("kind")
+data Figure derives JsonEncoder, JsonDecoder
+    @JsonKey("circle") Disc(radius: real)
+    Square(side: real)
+
+data Numbers(i: int, n: long, x: real, b: bool) derives JsonEncoder, JsonDecoder
+
+data Nest(items: Vector[Vector[Figure]], byName: HashMap[string, int], byId: TreeMap[int, string]) derives JsonEncoder, JsonDecoder
+
+data OmitNoDefault(a: int, @JsonOmit b: int) derives JsonEncoder, JsonDecoder
+
+// The error decoding `text` as an `A`, displayed.
+failure[A: JsonDecoder + Display](text: string) -> string = json.decode[A](text) match
+    Ok(a) -> s"decoded $a"
+    Err(e) -> s"$e"
+
+@test("a field absent from the input with no default and no whenMissing is an error naming it, at the object's end")
+missing()
+    assertEq(failure[Street]("{\"street\":\"s\"}"), "missing field \"city\" at line 1, column 14")
+    assertEq(failure[Street]("{}"), "missing field \"street\" at line 1, column 2")
+    assertEq(failure[Resident]("{\"full_name\":\"A\",\"age\":1,\"home\":{\"city\":\"c\"}}"), "home: missing field \"street\" at line 1, column 44")
+    assertEq(failure[Resident]("{\"name\":\"A\",\"age\":1}"), "missing field \"full_name\" at line 1, column 20")
+
+@test("a value of the wrong kind names the field's path, what was expected and what was found")
+wrongKind()
+    assertEq(failure[Street]("{\"street\":1,\"city\":\"c\"}"), "street: expected a string, found a number at line 1, column 11")
+    assertEq(failure[Resident]("{\"full_name\":\"Ada\",\"age\":36,\"home\":{\"street\":1}}"), "home.street: expected a string, found a number at line 1, column 46")
+    assertEq(failure[Street]("{\"street\":null,\"city\":\"c\"}"), "street: expected a string, found null at line 1, column 11")
+    assertEq(failure[Numbers]("{\"i\":\"1\",\"n\":1,\"x\":1,\"b\":true}"), "i: expected a number, found a string at line 1, column 6")
+    assertEq(failure[Numbers]("{\"i\":1,\"n\":[],\"x\":1,\"b\":true}"), "n: expected a number, found an array at line 1, column 12")
+    assertEq(failure[Numbers]("{\"i\":1,\"n\":1,\"x\":{},\"b\":true}"), "x: expected a number, found an object at line 1, column 18")
+    assertEq(failure[Numbers]("{\"i\":1,\"n\":1,\"x\":1,\"b\":0}"), "b: expected a boolean, found a number at line 1, column 24")
+    assertEq(failure[Resident]("{\"full_name\":\"A\",\"age\":1,\"home\":[]}"), "home: expected an object, found an array at line 1, column 33")
+
+@test("at the top a value of the wrong kind has an empty path")
+wrongKindAtTop()
+    assertEq(failure[int]("\"x\""), "expected a number, found a string at line 1, column 1")
+    assertEq(failure[Street]("[]"), "expected an object, found an array at line 1, column 1")
+    assertEq(failure[Vector[int]]("{}"), "expected an array, found an object at line 1, column 1")
+    assertEq(failure[bool]("tru"), "expected a boolean, found 't' at line 1, column 1")
+    assertEq(failure[string]("  "), "expected a string, found the end of the text at line 1, column 3")
+    assertEq(failure[int]("1 2"), "unexpected '2' after the value at line 1, column 3")
+
+@test("an element's index is in the path, nested arrays and maps included")
+indexPaths()
+    assertEq(failure[Vector[Street]]("[{\"street\":\"a\",\"city\":\"b\"},{\"street\":true}]"), "[1].street: expected a string, found a boolean at line 1, column 38")
+    assertEq(failure[Nest]("{\"items\":[[],[{\"kind\":\"Square\",\"side\":1},{\"kind\":\"circle\",\"radius\":\"r\"}]],\"byName\":{},\"byId\":{}}"), "items[1][1].radius: expected a number, found a string at line 1, column 68")
+    assertEq(failure[Nest]("{\"items\":[],\"byName\":{\"a\":1,\"b\":\"x\"},\"byId\":{}}"), "byName.b: expected a number, found a string at line 1, column 33")
+    assertEq(failure[Nest]("{\"items\":[],\"byName\":{},\"byId\":{\"1\":\"a\",\"x\":\"b\"}}"), "byId.x: the key \"x\" is not a key of this map's type at line 1, column 41")
+
+@test("the path is kept as steps, outermost first, and written with dots and brackets")
+pathSteps()
+    val e = json.decode[Vector[Resident]]("[{\"full_name\":\"A\",\"age\":1,\"home\":{\"street\":2}}]").err().get()
+    assertEq(e.path, [PathStep.Index(0), PathStep.Key("home"), PathStep.Key("street")])
+    assertEq(e.pathText(), "[0].home.street")
+    assertEq((e.line, e.column, e.offset), (1, 44, 43))
+    assertEq(JsonError("m", 1, 1, 0).pathText(), "")
+    assertEq(JsonError("m", 2, 3, 9).inField("b").atIndex(4).inField("a").pathText(), "a[4].b")
+    assertEq(s"${JsonError("m", 2, 3, 9).inField("k")}", "k: m at line 2, column 3")
+
+@test("a sum type's discriminator comes first, is a string, and names a variant")
+discriminator()
+    assertEq(failure[Figure]("{\"kind\":\"hexagon\"}"), "kind: unknown variant \"hexagon\" at line 1, column 9")
+    assertEq(failure[Figure]("{\"kind\":\"Disc\",\"radius\":1}"), "kind: unknown variant \"Disc\" at line 1, column 9")
+    assertEq(failure[Figure]("{\"radius\":1.0,\"kind\":\"circle\"}"), "expected \"kind\" first, naming the variant at line 1, column 2")
+    assertEq(failure[Figure]("{\"type\":\"circle\",\"radius\":1.0}"), "expected \"kind\" first, naming the variant at line 1, column 2")
+    assertEq(failure[Figure]("{}"), "expected \"kind\" first, naming the variant at line 1, column 2")
+    assertEq(failure[Figure]("{\"kind\":1}"), "kind: expected a string, found a number at line 1, column 9")
+    assertEq(failure[Figure]("{\"kind\":\"circle\"}"), "missing field \"radius\" at line 1, column 17")
+    assertEq(failure[Figure]("{\"kind\":\"Square\",\"kind\":\"Square\",\"side\":1}"), "decoded Square(1)")
+
+@test("a field written twice is an error at its second key")
+duplicate()
+    assertEq(failure[Street]("{\"street\":\"a\",\"street\":\"b\",\"city\":\"c\"}"), "duplicate field \"street\" at line 1, column 15")
+    assertEq(failure[Resident]("{\"full_name\":\"A\",\"age\":1,\"home\":null,\"home\":null}"), "duplicate field \"home\" at line 1, column 38")
+
+@test("a number that is not a whole number within an int or a long is refused; a whole real is taken")
+numberRanges()
+    assertEq(failure[int]("2147483648"), "the number 2147483648 is not a whole number within an int's range at line 1, column 1")
+    assertEq(failure[int]("-2147483649"), "the number -2147483649 is not a whole number within an int's range at line 1, column 1")
+    assertEq(failure[int]("1.5"), "the number 1.5 is not a whole number within an int's range at line 1, column 1")
+    assertEq(failure[long]("9223372036854775808"), "the number 9223372036854776000.0 is not a whole number within a long's range at line 1, column 1")
+    assertEq(failure[long]("0.1"), "the number 0.1 is not a whole number within a long's range at line 1, column 1")
+    assertEq(json.decode[int]("3.0"), Ok(3))
+    assertEq(json.decode[int]("1e3"), Ok(1000))
+    assertEq(json.decode[int]("-0.0"), Ok(0))
+    assertEq(json.decode[long]("-9223372036854775808"), Ok(long(-9223372036854775807) - 1))
+    assertEq(failure[real]("1e400"), "the number 1e400 is too large for a real at line 1, column 1")
+
+@test("text that is not JSON is refused wherever it is, in a value the decoder skips too")
+syntax()
+    assertEq(failure[Street]("{\"street\":\"s\",}"), "unexpected '}' after ',' in an object at line 1, column 15")
+    assertEq(failure[Street]("{\"street\":\"s\""), "unexpected end of text in an object, where ',' or '}' was expected at line 1, column 14")
+    assertEq(failure[Street]("{\"street\" \"s\"}"), "unexpected '\"' after an object's key, where ':' was expected at line 1, column 11")
+    assertEq(failure[Street]("{street:1}"), "unexpected 's' where an object's key was expected at line 1, column 2")
+    assertEq(failure[Street]("{\"x\":[1,,2],\"street\":\"s\",\"city\":\"c\"}"), "unexpected ',' where a value was expected at line 1, column 9")
+    assertEq(failure[Vector[int]]("[1,]"), "unexpected ']' after ',' in an array at line 1, column 4")
+    assertEq(failure[Vector[int]]("[1 2]"), "unexpected '2' in an array, where ',' or ']' was expected at line 1, column 4")
+    assertEq(failure[Vector[int]]("["), "[0]: expected a number, found the end of the text at line 1, column 2")
+    assertEq(failure[string]("\"a\\qb\""), "unexpected 'q' after '\\' in a string, where an escape was expected at line 1, column 4")
+
+@test("the line and column count lines, and characters rather than bytes")
+lines()
+    assertEq(failure[Street]("{\n  \"street\": \"é日\",\n  \"city\": 7\n}"), "city: expected a string, found a number at line 3, column 11")
+    assertEq(failure[Street]("{\"street\":\"日本\", \"city\":false}"), "city: expected a string, found a boolean at line 1, column 24")
+
+@test("an omitted field with no default is not refused while compiling, and fails when a value is decoded")
+omitNoDefault()
+    assertEq(json.encode(OmitNoDefault(1, 2)), "{\"a\":1}")
+    assertEq(failure[OmitNoDefault]("{\"a\":1,\"b\":2}"), "missing field \"b\" at line 1, column 13")
+
+@test("a NaN or an infinity is written null, which does not read back as a real")
+nonFiniteReals()
+    val inf = real.PositiveInfinity
+    assertEq(json.encode([inf, -inf, inf - inf, 1.0]), "[null,null,null,1.0]")
+    assertEq(failure[real]("null"), "expected a number, found null at line 1, column 1")
+    assertEq(json.decode[Option[real]]("null"), Ok(None))

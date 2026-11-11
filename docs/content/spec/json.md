@@ -143,6 +143,56 @@ exitCode(event: Json) -> Option[int] = event.get("result")?.get("exit")?.asInt()
 
 ## A program's own types
 
-Encoding and decoding a program's own types, `derives JsonEncoder` and `derives JsonDecoder` with a
-`JsonWriter` and a `JsonReader` that stream, is designed in [derivation](/spec/derivation/#a-json-library);
-it belongs to this package and reads and writes the grammar this chapter gives.
+A type that says `derives JsonEncoder, JsonDecoder` is written and read as JSON with no tree in
+between: its encoder writes through a `JsonWriter` and its decoder reads a token at a time through a
+`JsonReader`, each written for the type's own fields by the templates in
+[derivation](/spec/derivation/#a-json-library).
+
+```avin
+import json
+import json.{JsonEncoder, JsonDecoder, JsonKey, JsonTag}
+
+data Address(street: string, city: string) derives JsonEncoder, JsonDecoder
+
+data Person(@JsonKey("full_name") name: string, age: int, home: Option[Address]) derives JsonEncoder, JsonDecoder
+
+@JsonTag("kind")
+data Shape derives JsonEncoder, JsonDecoder
+    Circle(radius: real)
+    Empty
+
+main()
+    println(json.encode(Person("Ada", 36, None)))     // {"full_name":"Ada","age":36,"home":null}
+    println(json.encode[Shape](Circle(1.5)))         // {"kind":"Circle","radius":1.5}
+    println(json.decode[Person]("{\"full_name\": \"Ada\", \"age\": 36, \"home\": {\"street\": 1}}").err().get())
+    // home.street: expected a string, found a number at line 1, column 52
+```
+
+| A value of | Is written as |
+| --- | --- |
+| A data type or a class deriving them | An object of its fields by name (a class's constructor parameters), in order; a type of several variants writes its variant's name first under `"type"`, or its `@JsonTag`'s key |
+| `bool`, `int`, `long`, `real`, `string` | `true`/`false`, a number, a string; a NaN or an infinity as `null` |
+| `Option[A]` | `null` for `None`, and the value otherwise |
+| `Vector[A]`, `List[A]` | An array |
+| `HashMap[K, A]`, `TreeMap[K, A]` | An object, in the map's order; `K` is a `JsonMapKey`: a `string`, or an `int` or a `long` written as its digits |
+| `Json` | Itself |
+
+- **`json.encode(value)`** is the compact text; **`json.decode[A](text, maxDepth)`** the value, with
+  nothing but white space around it, or a `JsonError`.
+- **Decoding** reads fields in any order and skips a key no field has, whatever its value. A field
+  absent from the input takes its default, or `None` for an `Option`; any other is the error
+  *missing field*. A field written twice is an error, as is a variant name the type does not have
+  and a discriminator that is not the object's first key.
+- **A number** is read as an `int` or a `long` where it is a whole number in range, written plainly
+  or as `3.0` or `1e3`; any other is an error naming the number. A `real` takes any number, and no
+  `null`, so a NaN written out does not read back.
+- **An error's `path`** is the steps from the document's top to the value at fault, written
+  `items[2].name` by `pathText()` and before the message by its `Display`; an error of `parse` has
+  none. Arrays and objects nest no deeper than `maxDepth`, 512 unless given, counting those of a
+  value the decoder skips.
+- `@JsonKey(name)` renames a field or a variant, `@JsonTag(key)` names a type's discriminator key,
+  and `@JsonOmit` leaves a field unwritten and unread, so a decoded value takes its default.
+- A type deriving them where a field's type lacks them is an error at the `derives` entry naming the
+  field. A union has an encoder where its members do, and no decoder; an open class has an encoder
+  and no decoder, since a value of its type could be of any subclass; a field typed as the `Map`
+  trait has neither, its `HashMap` or `TreeMap` type both.

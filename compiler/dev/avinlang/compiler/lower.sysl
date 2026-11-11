@@ -729,9 +729,12 @@ private unheld_positions(l: *Lowering, known: KnownType) -> Buf[bool]
         Class(k, _, _) -> class_owner(k)
         Data(d, _, _) -> data_owner(d)
         _ -> return out
+    // An impl with bounds of its own may be of the type or of a class it extends: a bounded impl for
+    // an abstract `Vector[T]` places its trait in the table of every subclass's instance as well.
     var conditional = false
     for x in l.program.conditional
         if x.owner == owner then conditional = true
+        elif x.owner >= class_owner(0) && x.owner < class_owner(l.program.classes.len()) && ancestor_type(l.program.classes, l.program.data, t, x.owner - class_owner(0)) is Some(_) then conditional = true
     if !conditional then return out
     val f = lowering_conformances(l)
     for k in 0..<l.program.classes.len()
@@ -1441,6 +1444,8 @@ private option_object(l: *Lowering, t: &Type, pointer: Operand) -> Operand
 // null for `None`.
 private option_pointer(l: *Lowering, t: &Type, object: Operand) -> Operand
     val shape = layout(l, concrete(l, t))
+    // A `Some` with no slot holds a `Nothing`, so the object is `None`.
+    if shape.variants[some_variant(l)].fields[0] is None then return NullAddress
     val slot = machine_slot(l, MRef)
     val absent = new_block(l)
     val present = new_block(l)
@@ -3174,13 +3179,31 @@ private c_array_copy_out(l: *Lowering, symbol: usize, array: &Type, element: &Ty
 // empty view where the length is zero and a stop where it is not; a negative length, or one longer
 // than an `int`, stops the program.
 private c_view_answer(l: *Lowering, call: CCall, t: &Type, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+    val owner = trap_name(l, call.classes[0])
+    val name = l.program.classes[m.class_index].name
+    val lender = CViewLender(call.objects[0], s"the `$name` of `$owner` was closed when `$owner` was used again", s"the `$name` of `$owner` belongs to another thread")
+    c_view_lent(l, lender, t, m, pointer, length, who, at, None)
+
+/** Who lends a view and what its traps say: the handle lending it, which keeps it as the view it lent
+ * last, or none for memory C lends a callback for the call; and the reasons a closed view and a use by
+ * another thread stop the program with. */
+private struct CViewLender
+    lender: Option[Operand]
+    closed: string
+    foreign: string
+
+// The view `lender` lends of `pointer`, as `c_view_answer` says; the view itself, or null for `None`,
+// is also stored in `raw` where there is one, so what lent it can close it.
+private c_view_lent(l: *Lowering, lender: CViewLender, t: &Type, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span, raw: Option[Place]) -> Operand
     val absent = compare(l, CmpEq, pointer, NullAddress)
     if !m.optional
         val counted = compare(l, CmpNe, length, ConstInt(64, "0"))
         val both = fresh(l, MBool)
         l.insts.push(Select(both, absent, counted, ConstBool(false)))
         trap_if(l, Value(both), s"$who null", at)
-        return c_view_made(l, call, m, pointer, length, who, at)
+        val made = c_view_made(l, lender, m, pointer, length, who, at)
+        if raw is Some(_) then store(l, raw, Some(made))
+        return made
     val slot = machine_slot(l, MRef)
     val none = new_block(l)
     val present = new_block(l)
@@ -3188,18 +3211,17 @@ private c_view_answer(l: *Lowering, call: CCall, t: &Type, m: CMemoryForm, point
     finish_into(l, Branch(absent, none, present), none)
     store(l, slot, Some(NullAddress))
     finish_into(l, Jump(join), present)
-    store(l, slot, Some(c_view_made(l, call, m, pointer, length, who, at)))
+    store(l, slot, Some(c_view_made(l, lender, m, pointer, length, who, at)))
     finish_into(l, Jump(join), join)
     val value = load(l, slot).unwrap()
+    if raw is Some(_) then store(l, raw, Some(value))
     if pointer_option(l, t) then value else option_object(l, t, value)
 
-// A new view of the memory at `pointer`, of class `m.class_index`, owned by the code running and lent
-// by the call's receiver, which keeps it as the view it lent last, to close it at its next use.
-private c_view_made(l: *Lowering, call: CCall, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+// A new view of the memory at `pointer`, of class `m.class_index`, owned by the code running and, where
+// a handle lends it, kept by that handle as the view it lent last, to close it at its next use.
+private c_view_made(l: *Lowering, lent: CViewLender, m: CMemoryForm, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
     trap_if(l, compare(l, CmpLt, length, ConstInt(64, "0")), s"$who a negative length", at)
     trap_if(l, compare(l, CmpGt, length, ConstInt(64, "2147483647")), s"$who more bytes than a view holds", at)
-    val lender = call.objects[0].unwrap()
-    val owner = trap_name(l, call.classes[0])
     val name = l.program.classes[m.class_index].name
     val t: &Type = Class(m.class_index, name, buf())
     val object = fresh(l, MRef)
@@ -3210,12 +3232,23 @@ private c_view_made(l: *Lowering, call: CCall, m: CMemoryForm, pointer: Operand,
     l.insts.push(Load(mine, OwnerWord))
     l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryOwner, MInt(64))), Value(mine)))
     l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryLength, MInt(64))), length))
-    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryClosedReason, MRef)), string_constant(l, s"the `$name` of `$owner` was closed when `$owner` was used again")))
-    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryForeignReason, MRef)), string_constant(l, s"the `$name` of `$owner` belongs to another thread")))
-    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryLender, MRef)), lender))
-    l.insts.push(Publish)
-    l.insts.push(Store(field_address(l, lender, FieldSlot(CHandleLent, MRef)), v))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryClosedReason, MRef)), string_constant(l, lent.closed)))
+    l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryForeignReason, MRef)), string_constant(l, lent.foreign)))
+    lent.lender match
+        Some(lender) ->
+            l.insts.push(Store(field_address(l, v, FieldSlot(CMemoryLender, MRef)), lender))
+            l.insts.push(Publish)
+            l.insts.push(Store(field_address(l, lender, FieldSlot(CHandleLent, MRef)), v))
+        None -> l.insts.push(Publish)
     v
+
+// Closes the view `view`, unless it is null: what lent it has ended, and C may free the memory.
+private c_close_view(l: *Lowering, view: Operand)
+    val open = new_block(l)
+    val join = new_block(l)
+    finish_into(l, Branch(compare(l, CmpEq, view, NullAddress), join, open), open)
+    l.insts.push(Store(field_address(l, view, FieldSlot(CMemoryClosed, MInt(64))), ConstInt(64, "1")))
+    finish_into(l, Jump(join), join)
 
 // Closes the view the handle `object` lent last, if it is open: the handle is being used, and the
 // use may free or replace the memory the view reads.
@@ -3471,6 +3504,21 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
         return
     val get = c_field_glue(n, "get")
     val who = s"the field `${field.expr}` of `${trap_name(l, k)}` holds"
+    // A field lent as a view: the memory it points at, its length the glue's, lent by the handle.
+    if c_memory_form(result_type, l.program.data, l.program.classes) is Some(m)
+        val answer = fresh(l, MPtr)
+        l.insts.push(Call(Some(answer), CFunction(get, c_field_params(indices.len()), Some(CAddress)), c_field_args(pointer, indices)))
+        val length = fresh(l, MInt(64))
+        l.insts.push(Call(Some(length), CFunction(c_field_glue(n, "length"), c_field_params(indices.len()), Some(CSigned(64))), c_field_args(pointer, indices)))
+        var objects: Buf[Option[Operand]] = buf()
+        objects.push(Some(object))
+        var classes: Buf[usize] = buf()
+        classes.push(k)
+        val call = CCall(who, buf(), objects, classes, buf(), 1, false, buf())
+        val value = c_view_answer(l, call, result_type, m, Value(answer), Value(length), who, at)
+        l.library = outer
+        finish(l, Return(Some(value)))
+        return
     val form = c_text_form(result_type, l.program.data, l.program.classes)
     if !(form is NoText)
         val answer = fresh(l, MPtr)
@@ -3726,6 +3774,7 @@ private c_trampoline(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type) 
 // pointer, an enum mirror as the integer it is, and a scalar at the width the C unit measured.
 private c_callback_scalar(l: *Lowering, c: CType, t: &Type) -> CScalar
     if c_handle_form(t, l.program.data, l.program.classes) is Some(_) then return CAddress
+    if c_memory_form(t, l.program.data, l.program.classes) is Some(_) then return CAddress
     if !(c_text_form(t, l.program.data, l.program.classes) is NoText) then return CAddress
     if c_mirror_of(t, l.program.data) is Some(_) then return c_scalar_of(c, Int(64), l.program.c_measures)
     c_scalar_of(c, t, l.program.c_measures)
@@ -3747,14 +3796,26 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
     var params: Buf[MirType] = buf()
     params.push(MPtr)
     val record = fresh(l, MPtr)
+    // Every parameter C passes but the `userdata` is one of the function's, in C's order: each the
+    // Avin function takes, and each length of a view, which only makes the view.
     var scalars: Buf[CScalar] = buf()
     var values: Buf[usize] = buf()
-    for j in 0..<positions.len()
-        val s = c_callback_scalar(l, plan.f.params[positions[j]].ty, ps[j])
+    for i in 0..<plan.f.params.len()
+        val q = plan.f.params[i]
+        if q.userdata
+            scalars.push(CAddress)
+            values.push(0)
+            continue
+        var s = CAddress
+        if q.length_of != "" then s = c_scalar_of(q.ty, Int(64), l.program.c_measures)
+        else
+            for j in 0..<positions.len()
+                if positions[j] == i then s = c_callback_scalar(l, q.ty, ps[j])
         scalars.push(s)
         params.push(c_machine(s))
         values.push(fresh(l, c_machine(s)))
     val who = s"the function given to `${plan.name}` was called by C with"
+    var lent: Buf[Option[Place]] = buf()
     val closure = runtime_call(l, "avin_rt_c_callback_object", [MPtr], MRef, [Value(record)])
     var operands: Buf[Operand] = buf()
     operands.push(closure)
@@ -3763,11 +3824,20 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
     for j in 0..<positions.len()
         val q = plan.f.params[positions[j]]
         val t = ps[j]
-        val x = Value(values[j])
-        val s = scalars[j]
+        val x = Value(values[positions[j]])
+        val s = scalars[positions[j]]
         val form = c_text_form(t, l.program.data, l.program.classes)
         var v: Option[Operand] = None
-        if c_handle_form(t, l.program.data, l.program.classes) is Some(h) then v = Some(c_lent_handle(l, x, t, h, who, at))
+        if c_memory_form(t, l.program.data, l.program.classes) is Some(m)
+            // Memory C lends for the call, a view closed when the function returns.
+            val li = c_length_param(plan.f, q.name).unwrap()
+            val length = c_answer(l, Value(values[li]), scalars[li], Int(64), at)
+            val name = l.program.classes[m.class_index].name
+            val lender = CViewLender(None, s"the `$name` lent to the function given to `${plan.name}` was closed when it returned", s"the `$name` lent to the function given to `${plan.name}` belongs to another thread")
+            val raw = machine_slot(l, MRef)
+            lent.push(raw)
+            v = Some(c_view_lent(l, lender, t, m, x, length, s"C lent the function given to `${plan.name}`", at, raw))
+        elif c_handle_form(t, l.program.data, l.program.classes) is Some(h) then v = Some(c_lent_handle(l, x, t, h, who, at))
         elif !(form is NoText) then v = c_text_answer(l, x, t, form, None, who, at)
         elif c_mirror_of(t, l.program.data) is Some(d) then v = Some(c_mirror_answer(l, x, d, s, who, at))
         else v = Some(c_answer(l, x, s, t, at))
@@ -3781,6 +3851,9 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
         Some(m) -> Some(fresh(l, m))
         None -> None
     push_call(l, dest, Indirect(Value(code), MirSignature(types, answer)), operands)
+    // The memory was lent for the call, so each view is closed once the function returns.
+    for raw in lent
+        c_close_view(l, load(l, raw).unwrap())
     var result: Option[CScalar] = None
     var answered: Option[Operand] = None
     if !(plan.f.result is CVoidType)
@@ -3794,16 +3867,10 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
             answered = Some(c_argument(l, Value(dest.unwrap()), r, s, s"${c_integer_name(plan.f.result, s)}, what the function given to `${plan.name}` answered", at))
     finish(l, Return(answered))
     // The trampoline takes every parameter C passes, the `userdata` among them.
-    var all: Buf[CScalar] = buf()
     var userdata = 0usize
-    var at_value = 0usize
     for i in 0..<plan.f.params.len()
-        if plan.f.params[i].userdata
-            userdata = i
-            all.push(CAddress)
-        else
-            all.push(scalars[at_value])
-            at_value += 1
+        if plan.f.params[i].userdata then userdata = i
+    val all = scalars
     l.trampolines[plan.trampoline] = MirTrampoline(k, all, userdata, result)
     MirFunction(s"avin.c.callback.${plan.trampoline}", MirSignature(params, result match
         Some(s) -> Some(c_machine(s))
@@ -4771,9 +4838,13 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         if v is None && machine(l, value.ty) is Some(_) then return None
         box_value(l, concrete(l, value.ty), v)
     NoneAs(value) ->
-        // The value is always `None`; kept as a pointer, the other option's `None` is null.
+        // The value is always `None`, so it is the other option's own `None`: null where that option
+        // is kept as a pointer, and its one constant object where it is an object, so that as an `Any`
+        // it has the option's type.
         val v = lower_expr(l, value)
-        if pointer_option(l, e.ty) && !pointer_option(l, value.ty) then Some(NullAddress) else v
+        if v is None && machine(l, value.ty) is Some(_) then return None
+        if pointer_option(l, e.ty) then Some(NullAddress)
+        else Some(ConstObject(layout(l, concrete(l, e.ty)).variants[none_variant(l)].descriptor))
     Logic(and, left, right) -> logic(l, and, left, right, tail)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no, tail)

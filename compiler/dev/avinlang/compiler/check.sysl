@@ -7891,16 +7891,23 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
     var expr = ""
     var given: Buf[string] = buf()
     var bound_count = 0usize
+    var view = false
+    var writable = false
+    var has_length = false
     for arg in a.args
         val n = arg.name match
             Some(n) -> n
             None ->
                 if arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "a field accessor names its field with `field:` and has no prototype: the field's type is the header's")
-                elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of a field accessor, which takes `field:` and `bound:`; a handle it reads is always lent, and takes a reference of its own")
-                else c.note(unit, arg.value.span, "a field accessor takes `field:` and `bound:`")
+                elif arg.value.kind is Name(word) && (word == "view" || word == "writable")
+                    if contains_name(given, word) then c.note(unit, arg.value.span, s"`$word` is said once")
+                    given.push(word)
+                    if word == "view" then view = true else writable = true
+                elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of a field accessor, which takes `field:`, `bound:`, `length:`, `view` and `writable`; a handle it reads is always lent, and takes a reference of its own")
+                else c.note(unit, arg.value.span, "a field accessor takes `field:`, `bound:`, `length:`, `view` and `writable`")
                 continue
-        if n != "field" && n != "bound"
-            c.note(unit, arg.value.span, s"`$n:` is not a word of a field accessor, which takes `field:` and `bound:`")
+        if n != "field" && n != "bound" && n != "length"
+            c.note(unit, arg.value.span, s"`$n:` is not a word of a field accessor, which takes `field:`, `bound:`, `length:`, `view` and `writable`")
             continue
         if contains_name(given, n)
             c.note(unit, arg.value.span, s"`$n:` is given once" + (if n == "bound" then "; it takes a list, one bound for each index, as in `bound: [\"self->rows\", \"self->columns\"]`" else ""))
@@ -7911,6 +7918,13 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
                 StringLit(t) ->
                     if t.trim() == "" then c.note(unit, arg.value.span, "`field:` names the field, a C lvalue in the struct `self` points at, as in `field: \"width\"`") else expr = t
                 _ -> c.note(unit, arg.value.span, "`field:` takes the field as a string, a C lvalue in the struct `self` points at, as in `field: \"width\"`")
+            continue
+        if n == "length"
+            has_length = true
+            arg.value.kind match
+                StringLit(t) ->
+                    if t.trim() == "" then c.note(unit, arg.value.span, "`length:` is the C expression in `self` the length of the view is, and is empty")
+                _ -> c.note(unit, arg.value.span, "`length:` takes the length of the view as a string, a C expression in `self`, as in `length: \"self->size\"`")
             continue
         var well_formed = true
         arg.value.kind match
@@ -7966,8 +7980,25 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
         c.note(unit, a.span, s"`bound:` bounds an index, and the field accessor `${f.name}` takes none")
     elif bound_count != indices
         c.note(unit, a.span, s"the field accessor `${f.name}` takes ${index_count(indices)} and `bound:` gives ${count(bound_count, "bound")}: one for each, in order")
+    if writer && view
+        c.note(unit, a.span, s"the field accessor `${f.name}` answers `unit`, so it writes its field, and `view` lends the memory a field points at, which only a reader answers")
+        return
+    if writable && !view then c.note(unit, a.span, "`writable` marks a field accessor that lends a `MutByteView`, with `view`")
+    if has_length && !view then c.note(unit, a.span, "`length:` is the length of the memory a field accessor marked `view` lends, and this one lends none")
+    if view && !has_length then c.note(unit, a.span, s"C keeps no length with the memory the field of `${f.name}` points at, so the accessor says it with `length:`, a C expression in `self`, as in `length: \"self->size\"`")
     if writer || *r is ErrorType then return
     val at = if f.result is Some(t) then t.span else f.name_span
+    if view
+        val problem = c_view_problem(c, r, "", writable)
+        if problem != "" then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}` and lends the memory its field points at: $problem")
+        // A view is valid until its lender is used again, so only a handle of one thread lends one.
+        val k = receiver_class.unwrap()
+        if c_class_shared(c.classes[k].decl) then c.note(unit, a.span, s"`${c.classes[k].name}` is `shared`, so another thread may use it while a view it lent is read; a view is lent only by a handle that belongs to one thread at a time")
+        return
+    if c_memory_form(r, c.data, c.classes) is Some(m)
+        val problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, made by `ByteBlock(length)`, never read from a field" else "a field accessor lends the memory its field points at when it says `view`, its length given with `length:`"
+        c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`: $problem")
+        return
     if c_handle_form(r, c.data, c.classes) is Some(h)
         val d = c.classes[h.class_index].decl
         val name = c.classes[h.class_index].name
@@ -8188,13 +8219,29 @@ private c_callback_problem(c: *Checker, q: CParam, t: &Type) -> string
         _ -> return s"the parameter takes a function, an Avin function of a matching type, as in `(int, int) -> int`"
     val positions = c_callback_positions(f)
     if positions.len() != ps.len()
-        return s"C calls it with ${count(positions.len(), "parameter")} besides its `userdata`, and the function takes ${ps.len()}; they correspond by position"
+        var lengths = false
+        for q in f.params
+            if q.length_of != "" then lengths = true
+        val besides = if lengths then "its `userdata` and the lengths of its views" else "its `userdata`"
+        return s"C calls it with ${count(positions.len(), "parameter")} besides $besides, and the function takes ${ps.len()}; they correspond by position"
     for j in 0..<ps.len()
         val cq = f.params[positions[j]]
         val a = ps[j]
         if *a is ErrorType then continue
         var problem = ""
-        if *a is Function(_, _, _) then problem = "a function is not a callback's parameter: a function crosses to C only as a binding's own parameter"
+        val lent = c_length_param(f, cq.name) is Some(_)
+        if lent
+            // Memory C lends the function, its length beside it, is a view closed when it returns; the
+            // prototype's reading has found it a pointer.
+            val writable = !(" " + cq.text + " ").contains(" const ")
+            if c_memory_form(a, c.data, c.classes) is Some(m)
+                if m.kind is MemBlock then problem = "a `ByteBlock` is memory Avin gives C; memory C lends a callback is a `ByteView`, or a `MutByteView` where it is not `const`"
+                elif writable && m.kind is MemView then problem = "C lends this memory to be written, as it is not `const`, so it crosses as a `MutByteView`"
+                elif !writable && m.kind is MemMutView then problem = "C lends this memory `const`, so it crosses as a `ByteView`"
+            else problem = "memory C lends a callback, its length beside it, crosses as a view: a `ByteView` where it is `const` and a `MutByteView` where it is not, perhaps in an `Option` for null"
+        elif c_memory_form(a, c.data, c.classes) is Some(m)
+            problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, and C never gives one back" else s"memory C lends a callback is a view, its length given by a parameter of C's function marked `length(${cq.name})`"
+        elif *a is Function(_, _, _) then problem = "a function is not a callback's parameter: a function crosses to C only as a binding's own parameter"
         elif !(c_text_form(a, c.data, c.classes) is NoText) then problem = c_crossing_problem(cq.ty, a, c_text_form(a, c.data, c.classes), true)
         elif c_array_form(a, c.data, c.classes) is Some(_) then problem = "an array is not a callback's parameter: memory C lends a callback is a view"
         elif c_status_error(a, c.data) is Some(_) then problem = "a status is a binding's result, not a callback's parameter"
@@ -8213,6 +8260,7 @@ private c_callback_problem(c: *Checker, q: CParam, t: &Type) -> string
     var problem = ""
     if c_text_form(r, c.data, c.classes) is TextString(_) then problem = "a string a callback answered would have to outlive the call, which nothing frees, so a callback answers a scalar or an enum mirror"
     elif c_handle_form(r, c.data, c.classes) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no handle"
+    elif c_memory_form(r, c.data, c.classes) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no view or block: memory goes back to C only as a binding's `ByteBlock` parameter"
     elif c_status_error(r, c.data) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no status"
     elif c_mirror_of(r, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, f.result_text)
     else problem = c_crossing_problem(f.result, r, NoText, false)
