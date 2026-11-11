@@ -24,7 +24,15 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
 │   ├── Deque[A]             mutable, growable at both ends
 │   └── Queue[+A]            immutable first-in, first-out, two lists
+├── LazyList[+T]             immutable, elements computed on demand and remembered
 ├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
+├── Set[A]                   mutable hash set (avin.collections.mutable)
+├── LinkedSet[A]             mutable hash set, in insertion order (avin.collections.mutable)
+├── TreeSet[A]               mutable sorted set, by Ord (avin.collections.mutable)
+├── BitSet                   mutable set of non-negative ints, as bits (avin.collections.mutable)
+├── Map[K, V]                mutable hash map (avin.collections.mutable)
+├── LinkedMap[K, V]          mutable hash map, in insertion order (avin.collections.mutable)
+├── TreeMap[K, V]            mutable sorted map, by Ord (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
 │   ├── SeqSet[A]            in insertion order
