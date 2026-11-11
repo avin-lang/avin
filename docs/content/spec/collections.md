@@ -22,19 +22,25 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
-│   └── Deque[A]             mutable, growable at both ends
+│   ├── Deque[A]             mutable, growable at both ends
+│   └── Queue[+A]            immutable first-in, first-out, two lists
+├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
+│   ├── SeqSet[A]            in insertion order
+│   │   └── OrderedSet[A]    by hash, with the order of first insertion
 │   └── SortedSet[A]         in order, with the ordered operations
 │       └── TreeSet[A]       sorted by Ord
 └── Map[K, +V]               immutable maps, (K) -> V
     ├── HashMap[K, +V]       by hash; what {k: v} and Map(...) build
+    ├── SeqMap[K, +V]        in insertion order
+    │   └── OrderedMap[K, +V]  by hash, with the order of first insertion
     └── SortedMap[K, +V]     in key order, with the ordered operations
         └── TreeMap[K, +V]   sorted by Ord
 ```
 
-`Set`, `SortedSet`, `Map` and `SortedMap` are traits; the hash-based and tree collections are the
-data types that conform to them.
+`Set`, `SeqSet`, `SortedSet`, `Map`, `SeqMap` and `SortedMap` are traits; the hash-based, insertion-ordered
+and tree collections are the data types that conform to them.
 
 `[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
 [types](/spec/types/).
@@ -397,6 +403,20 @@ trait, and the tree collection's own versions answer a tree collection where its
 hash-based kinds are hash tries, branching on one bit of the spread hash at a time, so an update
 copies a path proportional to the logarithm of the size.
 
+`OrderedMap` and `OrderedSet`, the `SeqMap` and `SeqSet` data types, find keys by hash as the hash-based
+kinds do and iterate in the order their keys were first added: `OrderedMap(("b", 1), ("a", 2))` visits
+`b` then `a`, whatever the hashes. Updating a key already present replaces its value and keeps its
+place; a key removed and added again goes to the end. `keys()`, `values()`, `keySet()`, the
+iterators, `display` and `toString` all follow that order, and `reverseIterator()` visits it backwards.
+They are persistent like the others: the entries sit in a vector in insertion order, a removed entry
+leaving a gap that is dropped, with the keys renumbered, once the gaps outnumber the entries, so a
+lookup, an update or a removal takes time in the logarithm of the size (a compaction costs the size,
+paid for by the removals that caused it) and the slots never exceed about twice the entries. Equality
+ignores the order: an `OrderedMap` equals a `HashMap` or `TreeMap` of the same entries, an
+`OrderedSet` equals a `HashSet` of the same elements, and equal ones hash alike. Updates through
+`SeqMap` and `SeqSet` answer a `SeqMap` or `SeqSet`; `map`, `collect` and `flatMap` answer hash-based
+collections. A literal `{k: v}` or `{a, b}` where one of them is expected builds it in the order written.
+
 A map's values are covariant, so a method that puts a value in takes any supertype of `V`, as
 [lower bounds](/spec/generics/#lower-bounds) allow: `updated[W >: V](key, value: W) -> Map[K, W]`,
 `++[W >: V]`, `updatedWith[W >: V]` and `getOrElse[W >: V]`. A `Map[string, Cat]` updated with a
@@ -451,6 +471,19 @@ set's `union`, `intersect` and `diff` — answer a new mutable one; a mutable ma
 Iteration visits a map's entries as `(key, value)` pairs in an order the program cannot rely on. For
 the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the
 mutable ones it is the table's order.
+
+`avin.collections.mutable` also holds `LinkedMap[K, V]` and `LinkedSet[A]`, which have everything
+`Map` and `Set` have and iterate in insertion order, oldest first, in `keys()`, `values()`, the
+display and every method that builds a collection (which answers a linked one). Binding a key that
+is present replaces its value and leaves it in place; `putLast(k, v)` and `moveToEnd(k)` make it the
+newest, and a key that was removed and bound again is new. `headOption()` and `lastOption()` answer
+the oldest and newest entry, and `removeFirst()` and `removeLast()` remove and answer one, trapping
+when the map is empty, so a least-recently-used cache is a `moveToEnd` on each hit and a
+`removeFirst()` when it is full. A set has the same, with `addLast`, `moveToEnd`, `removeFirst()` and
+`removeLast()` answering elements. Removing entries while iterating is safe and an entry removed
+before the iterator reaches it is not visited; binding new keys while iterating never traps, but
+whether the iterator visits them is not defined. Two linked maps, or sets, are equal when they hold
+the same entries, whatever order they were bound in.
 
 Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
 compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
@@ -927,6 +960,57 @@ terms of the elements front first: `remove(i, n)`, `trimStart(n)`, `trimEnd(n)`,
 val pending: Deque[string] = ["build", "test"]
 pending.prepend("fetch")
 while pending.nonEmpty() do run(pending.removeHead())
+```
+
+## Priority queues
+
+`avin.collections.mutable.PriorityQueue[T]` is a mutable binary heap: elements go in in any order
+and `dequeue()` takes out the greatest. `PriorityQueue[int]()` orders by the element type's `Ord`;
+`PriorityQueue.withOrdering(compare)` takes a comparison, positive where its first argument is to
+come out before its second. A queue giving the least first is made with `Reverse` elements or with
+`reverseOrder`, and `compareBy` and `thenBy` build the comparison from keys.
+
+```text
+val q = PriorityQueue[int]()
+q.enqueue(3, 9, 1)
+q += 5
+q.head()           // 9, left in the queue
+q.dequeue()        // 9
+q.dequeueAll()     // [5, 3, 1], and q is empty
+
+val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
+```
+
+`enqueue(xs*)`, `addOne(x)`, `addAll(xs)`, `+=` and `++=` add, each in O(log n) per element;
+`dequeue()` and `head()` trap on an empty queue, `dequeueOption()` and `headOption()` answer `None`;
+`size()`, `isEmpty()` and `nonEmpty()` take constant time, and `clear()` empties the queue.
+`copy()` makes an independent queue with the same comparison, and `PriorityQueue.newBuilder` a
+builder. A queue is `Iterable`: `iterator()` and `toVector()` give the elements in heap order, the
+greatest first and the rest in no promised order, and an iterator is a snapshot, unaffected by
+changes made while it runs. `toSortedVector()` gives the elements in the order `dequeue` would,
+leaving the queue as it is. Elements the comparison finds equal come out in no promised order; the
+queue is not stable.
+
+## Queue
+
+`Queue[+T]` is an immutable first-in, first-out sequence. `Queue(1, 2, 3)` has 1 at its front and
+`Queue.empty[int]()` is empty. `q.enqueue(x)` makes a queue with `x` after the others and
+`q.enqueueAll(xs)` one with every element of `xs`; `q.dequeue()` answers the front element and the
+queue of the rest as a pair, trapping on an empty queue, `q.dequeueOption()` answers `None` instead,
+and `q.front()` and `q.frontOption()` read the front. Each leaves `q` as it was, so any earlier
+version stays usable. The elements are held in two lists, the front in order and the back reversed;
+when the front runs out the back is turned around into it. `enqueue`, `dequeue`, `front` and `isEmpty`
+take amortized constant time, and `q(i)` takes time proportional to `i`.
+
+A queue is a `Seq`, front first, so it has every sequence method, compares and hashes as any sequence
+does (equal to a `Vector` or `List` of the same elements, however its two lists are split),
+displays as `[1, 2, 3]` and is built by `Queue.newBuilder`. It is covariant: `enqueue` and
+`enqueueAll` take `W >: T`, so enqueueing a `Cat` to a `Queue[Dog]` makes a `Queue[Animal]`. `map`,
+`filter`, `filterNot` and `flatMap` answer queues.
+
+```text
+val jobs = Queue("build", "test")
+val (next, rest) = jobs.enqueue("deploy").dequeue()
 ```
 
 ## Sorting
