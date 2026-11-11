@@ -22,24 +22,31 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
-│   └── Deque[A]             mutable, growable at both ends
+│   ├── Deque[A]             mutable, growable at both ends
+│   └── Queue[+A]            immutable first-in, first-out, two lists
+├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
+│   ├── SeqSet[A]            in insertion order
+│   │   └── OrderedSet[A]    by hash, with the order of first insertion
 │   └── SortedSet[A]         in order, with the ordered operations
-│       └── TreeSet[A]       sorted by Ord
+│       ├── TreeSet[A]       sorted by Ord
+│       └── BitSet           SortedSet[int] of non-negative ints, as bits
 └── Map[K, +V]               immutable maps, (K) -> V
     ├── HashMap[K, +V]       by hash; what {k: v} and Map(...) build
+    ├── SeqMap[K, +V]        in insertion order
+    │   └── OrderedMap[K, +V]  by hash, with the order of first insertion
     └── SortedMap[K, +V]     in key order, with the ordered operations
         └── TreeMap[K, +V]   sorted by Ord
 ```
 
-`Set`, `SortedSet`, `Map` and `SortedMap` are traits; the hash-based and tree collections are the
-data types that conform to them.
+`Set`, `SeqSet`, `SortedSet`, `Map`, `SeqMap` and `SortedMap` are traits; the hash-based, insertion-ordered
+and tree collections are the data types that conform to them.
 
 `[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
 [types](/spec/types/).
 
-The mutable `Set` and `Map` variants live in `avin.collections.mutable`. `Buffer` is the one
+The mutable `Set`, `Map` and `BitSet` variants live in `avin.collections.mutable`. `Buffer` is the one
 growable mutable sequence; code that adds and removes at both ends uses a `Deque`.
 
 **Iterator is Iterable.** Asking an iterator for its iterator returns the same iterator, at its
@@ -397,6 +404,20 @@ trait, and the tree collection's own versions answer a tree collection where its
 hash-based kinds are hash tries, branching on one bit of the spread hash at a time, so an update
 copies a path proportional to the logarithm of the size.
 
+`OrderedMap` and `OrderedSet`, the `SeqMap` and `SeqSet` data types, find keys by hash as the hash-based
+kinds do and iterate in the order their keys were first added: `OrderedMap(("b", 1), ("a", 2))` visits
+`b` then `a`, whatever the hashes. Updating a key already present replaces its value and keeps its
+place; a key removed and added again goes to the end. `keys()`, `values()`, `keySet()`, the
+iterators, `display` and `toString` all follow that order, and `reverseIterator()` visits it backwards.
+They are persistent like the others: the entries sit in a vector in insertion order, a removed entry
+leaving a gap that is dropped, with the keys renumbered, once the gaps outnumber the entries, so a
+lookup, an update or a removal takes time in the logarithm of the size (a compaction costs the size,
+paid for by the removals that caused it) and the slots never exceed about twice the entries. Equality
+ignores the order: an `OrderedMap` equals a `HashMap` or `TreeMap` of the same entries, an
+`OrderedSet` equals a `HashSet` of the same elements, and equal ones hash alike. Updates through
+`SeqMap` and `SeqSet` answer a `SeqMap` or `SeqSet`; `map`, `collect` and `flatMap` answer hash-based
+collections. A literal `{k: v}` or `{a, b}` where one of them is expected builds it in the order written.
+
 A map's values are covariant, so a method that puts a value in takes any supertype of `V`, as
 [lower bounds](/spec/generics/#lower-bounds) allow: `updated[W >: V](key, value: W) -> Map[K, W]`,
 `++[W >: V]`, `updatedWith[W >: V]` and `getOrElse[W >: V]`. A `Map[string, Cat]` updated with a
@@ -451,6 +472,19 @@ set's `union`, `intersect` and `diff` — answer a new mutable one; a mutable ma
 Iteration visits a map's entries as `(key, value)` pairs in an order the program cannot rely on. For
 the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the
 mutable ones it is the table's order.
+
+`avin.collections.mutable` also holds `LinkedMap[K, V]` and `LinkedSet[A]`, which have everything
+`Map` and `Set` have and iterate in insertion order, oldest first, in `keys()`, `values()`, the
+display and every method that builds a collection (which answers a linked one). Binding a key that
+is present replaces its value and leaves it in place; `putLast(k, v)` and `moveToEnd(k)` make it the
+newest, and a key that was removed and bound again is new. `headOption()` and `lastOption()` answer
+the oldest and newest entry, and `removeFirst()` and `removeLast()` remove and answer one, trapping
+when the map is empty, so a least-recently-used cache is a `moveToEnd` on each hit and a
+`removeFirst()` when it is full. A set has the same, with `addLast`, `moveToEnd`, `removeFirst()` and
+`removeLast()` answering elements. Removing entries while iterating is safe and an entry removed
+before the iterator reaches it is not visited; binding new keys while iterating never traps, but
+whether the iterator visits them is not defined. Two linked maps, or sets, are equal when they hold
+the same entries, whatever order they were bound in.
 
 Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
 compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
@@ -511,6 +545,75 @@ println(small.rangeTo(3))           // {1, 3}
 their hash-based counterparts' companions do, and a set or map literal builds one where one is expected.
 `SortedMap` and `SortedSet` have the same companions, making tree collections typed as the sorted
 traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tree collection.
+
+**Mutable sorted maps and sets.** `avin.collections.mutable.TreeMap[K: Ord, V]` and `TreeSet[A: Ord]`
+are the in-place counterparts, with the whole mutable `Map` and `Set` API (`m(k) = v`, `get`,
+`remove`, `getOrElseUpdate`, `updateWith`, `+=`, `-=`, `++=`, `--=`, `filterInPlace`, `copy()`, and
+for a set `add`, `union`, `intersect`, `diff`, `subsetOf`) and the ordered operations of the table
+above: `headOption()`, `lastOption()`, `head()`, `last()`, `firstKey()`, `lastKey()`, `minAfter`,
+`maxBefore`, `reverseIterator()` and the four `range` forms. The slices are new mutable collections,
+not views. Two operations are their own: `removeFirst()` and `removeLast()` unbind the least or the
+greatest key and answer its entry (a set's element), trapping when empty, and `removeFirstOption()` and
+`removeLastOption()` answer an `Option` instead. A mutable tree collection holds an immutable `TreeMap`
+or `TreeSet` and replaces it at each update, so the cost of every operation is the logarithmic one of
+the persistent tree, `toTreeMap()` and `toTreeSet()` hand out the current tree in constant time as a
+snapshot later updates do not reach, and an iterator, or a `for` loop, goes on over the entries as they
+were when it began: updating the collection inside the loop is legal and the loop does not see the
+change. Equality and hash follow the contents, and equal an immutable tree collection's of the same
+entries. The two collections of one name are told apart by their modules, the immutable one being
+`avin.TreeMap` and the mutable one `avin.collections.mutable.TreeMap`; where both are used, one is
+imported under another name, as for `Map` and `Set`.
+
+```text
+import avin.collections.mutable.{TreeMap as MutableTreeMap}
+
+val queue = MutableTreeMap[int, string]()
+queue(30) = "c"
+queue(10) = "a"
+queue(20) = "b"
+println(queue.removeFirst())        // (10, a)
+println(queue.minAfter(21))         // Some((30, c))
+for (k, v) in queue
+    queue.remove(k)                 // the loop still visits both entries
+println(queue.isEmpty())            // true
+```
+
+### Bit sets
+
+`BitSet` is an immutable `SortedSet[int]` that holds its elements as bits: element `e` is bit `e % 64`
+of word `e / 64`. Membership takes constant time, `union`, `intersect`, `diff`, `symmetricDiff` and
+`subsetOf` work a word, 64 elements, at a time, and it takes a word for each 64 of its greatest
+element, so it suits a dense run of small numbers rather than a few large ones. It has every
+operation of a `SortedSet`, and an update answers a `BitSet` that copies the words it changes and
+leaves the old set as it was. It is equal to any set of the same elements, a `TreeSet` or a `HashSet`
+included, and hashes as they do. `BitSet(3, 1, 2)`, `BitSet.empty()` and `BitSet.newBuilder()` make
+one.
+
+A negative number is not an element of any `BitSet`. `contains` of one answers `false` and `excl` of
+one leaves the set as it was, but anything that would put one in traps: `incl`, `++`, `BitSet(…)`
+and the builder. `minAfter`, `maxBefore` and the four slices take any `int`, so `rangeFrom(-5)` is
+the whole set.
+
+`toBitMask()` answers the words as a `Vector[long]`, the lowest element in bit 0 of the first, with no
+empty word at the end (so the empty set's is `[]`), and `BitSet.fromBitMask(words)` is its inverse,
+accepting empty words at the end.
+
+```text
+val s = BitSet(1, 3, 64)
+println(s.toBitMask())                  // [10, 1]
+println(BitSet.fromBitMask([10, 1]))    // {1, 3, 64}
+println(s.rangeFrom(2))                 // {3, 64}
+```
+
+`avin.collections.mutable.BitSet` is the same set changed in place. `add(x)` and `remove(x)` answer
+whether the set changed, `+=`, `-=`, `++=` and `--=` need no `var`, `addAll(xs)` and `filterInPlace(p)`
+are as the mutable `Set`'s, and the in-place algebra `unionInPlace(other)`, `intersectInPlace(other)`,
+`diffInPlace(other)` and `symmetricDiffInPlace(other)` takes another mutable bit set. `union`,
+`intersect`, `diff` and `symmetricDiff` answer new mutable bit sets, `toSet()` an immutable `BitSet`
+and `BitSet.fromBitMask(words)` builds one from words. A negative element is refused as above, `add`
+trapping and `contains` and `remove` answering `false`. Iteration is over the elements the set had when
+it began, in ascending order. Like the other mutable collections it compares and hashes by its
+contents, and an equal immutable set hashes alike.
 
 ## Indexing and callable sequences
 
@@ -859,6 +962,57 @@ terms of the elements front first: `remove(i, n)`, `trimStart(n)`, `trimEnd(n)`,
 val pending: Deque[string] = ["build", "test"]
 pending.prepend("fetch")
 while pending.nonEmpty() do run(pending.removeHead())
+```
+
+## Priority queues
+
+`avin.collections.mutable.PriorityQueue[T]` is a mutable binary heap: elements go in in any order
+and `dequeue()` takes out the greatest. `PriorityQueue[int]()` orders by the element type's `Ord`;
+`PriorityQueue.withOrdering(compare)` takes a comparison, positive where its first argument is to
+come out before its second. A queue giving the least first is made with `Reverse` elements or with
+`reverseOrder`, and `compareBy` and `thenBy` build the comparison from keys.
+
+```text
+val q = PriorityQueue[int]()
+q.enqueue(3, 9, 1)
+q += 5
+q.head()           // 9, left in the queue
+q.dequeue()        // 9
+q.dequeueAll()     // [5, 3, 1], and q is empty
+
+val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
+```
+
+`enqueue(xs*)`, `addOne(x)`, `addAll(xs)`, `+=` and `++=` add, each in O(log n) per element;
+`dequeue()` and `head()` trap on an empty queue, `dequeueOption()` and `headOption()` answer `None`;
+`size()`, `isEmpty()` and `nonEmpty()` take constant time, and `clear()` empties the queue.
+`copy()` makes an independent queue with the same comparison, and `PriorityQueue.newBuilder` a
+builder. A queue is `Iterable`: `iterator()` and `toVector()` give the elements in heap order, the
+greatest first and the rest in no promised order, and an iterator is a snapshot, unaffected by
+changes made while it runs. `toSortedVector()` gives the elements in the order `dequeue` would,
+leaving the queue as it is. Elements the comparison finds equal come out in no promised order; the
+queue is not stable.
+
+## Queue
+
+`Queue[+T]` is an immutable first-in, first-out sequence. `Queue(1, 2, 3)` has 1 at its front and
+`Queue.empty[int]()` is empty. `q.enqueue(x)` makes a queue with `x` after the others and
+`q.enqueueAll(xs)` one with every element of `xs`; `q.dequeue()` answers the front element and the
+queue of the rest as a pair, trapping on an empty queue, `q.dequeueOption()` answers `None` instead,
+and `q.front()` and `q.frontOption()` read the front. Each leaves `q` as it was, so any earlier
+version stays usable. The elements are held in two lists, the front in order and the back reversed;
+when the front runs out the back is turned around into it. `enqueue`, `dequeue`, `front` and `isEmpty`
+take amortized constant time, and `q(i)` takes time proportional to `i`.
+
+A queue is a `Seq`, front first, so it has every sequence method, compares and hashes as any sequence
+does (equal to a `Vector` or `List` of the same elements, however its two lists are split),
+displays as `[1, 2, 3]` and is built by `Queue.newBuilder`. It is covariant: `enqueue` and
+`enqueueAll` take `W >: T`, so enqueueing a `Cat` to a `Queue[Dog]` makes a `Queue[Animal]`. `map`,
+`filter`, `filterNot` and `flatMap` answer queues.
+
+```text
+val jobs = Queue("build", "test")
+val (next, rest) = jobs.enqueue("deploy").dequeue()
 ```
 
 ## Sorting

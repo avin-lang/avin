@@ -1125,7 +1125,8 @@ Settled by the user on 2026-11-04:
   `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
   compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
   a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
-  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. A type parameter bounded by `Integer` has the limits too, `T.MaxValue` and
+  `T.MinValue`, each instance's own ([generics](/spec/generics/)).
 - Settled by the user 2026-11-04: Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
   at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
@@ -6466,6 +6467,170 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     words call each other in constant stack as functions yielding tuples do. *Alternatives*: never
     inlining such functions (a call where there was none at `-O0`); no tail calls of several words
     (deep mutual recursion through `val (a, b) = f(x)` would overflow the stack).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **`PriorityQueue` gives the greatest element first** (branch `stdlib-priority-queue`),
+  [collections](/spec/collections/#priority-queues). `PriorityQueue[T]()` orders by `T`'s `Ord`, and
+  `PriorityQueue.withOrdering(compare)` by a comparison; the element `compare` finds greatest comes
+  out first. Why: it matches `max`, which every `Ord` type already answers, and `dequeue` then takes
+  the same element `max()` would; a least-first queue is one `Reverse` or `reverseOrder` away either
+  way. Alternative: least first (the order of a sorted sequence read from the front, the usual choice
+  for shortest-path searches); it makes `PriorityQueue[int]()` the odd one out against `max`.
+  Review with the user: it is the default every caller will meet.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **A queue's `iterator()` and `toVector()` are in heap order, and `toSortedVector()` is the sorted
+  form** (branch `stdlib-priority-queue`). Heap order starts with the greatest element and is
+  otherwise unspecified; the iterator is a snapshot taken when it is made, so enqueuing or dequeuing
+  while iterating neither traps nor changes what it gives. Why: heap order costs nothing, a sorted
+  iteration costs O(n log n) and a copy, and `Iterable` conformance wants the cheap one; a snapshot
+  makes mutation during iteration defined. Alternatives: iterating in dequeue order; an iterator
+  over the live heap (cheaper, but what it gives after a change is arbitrary).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **Equal elements come out in no promised order** (branch `stdlib-priority-queue`): a binary heap
+  is not stable. Alternative: a sequence number breaking ties first-in-first-out, at the cost of a
+  word per element and a wider comparison; a caller wanting it orders by `thenBy` on its own counter.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordered-map`): **Insertion-ordered maps and sets: names, update order, equality** (branch `stdlib-ordered-map`).
+  The concrete types are `OrderedMap[K, +V]` and `OrderedSet[A]`, conforming to the traits `SeqMap[K, +V]`
+  and `SeqSet[A]`. *Why:* the concrete names say what the collection does, as `HashMap` says how it
+  finds and `TreeMap` how it sorts, and no implementation (a vector of keys) leaks into them; the
+  trait names follow the sequence-like "in the order added" meaning of `Seq`. *Alternatives:*
+  `VectorMap`/`VectorSet` (names the layout, not the behaviour), `InsertionOrderedMap`,
+  `LinkedHashMap`-style names, and `OrderedMap` as the trait with the concrete type named for its
+  layout. *Update order:* updating a key already present keeps its place and replaces its value;
+  removing and re-adding moves it to the end. *Why:* an update is not a new arrival, so a map used as
+  a record keeps its field order. *Alternative:* an update moves the key to the end. *Equality:* two
+  maps are equal when they hold the same keys bound to equal values, and two sets when they hold the
+  same elements, whatever the order, and equal ones hash alike, so an `OrderedMap` equals a
+  `HashMap` of the same entries as every kind of `Map` does. *Why:* the existing rule makes map
+  equality independent of the kind, and an order-sensitive `==` on one kind would break transitivity
+  through the traits. *Alternative:* an order-sensitive `==` between two ordered maps (reached by
+  comparing `iterator()`s). *Layout:* a hash trie from key to slot and a vector of slots, removal
+  leaving a gap, compacted when gaps exceed both eight and the entries. `map`, `collect` and
+  `flatMap` through the trait answer hash-based collections, as for `TreeMap` through `Map`. A
+  `{k: v}` or `{a, b}` literal builds one where `SeqMap`, `OrderedMap`, `SeqSet` or `OrderedSet` is
+  expected. Review with the user: the names.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordered-map`): **A call through a method table or a bound reaches only methods of types that conform** (branch
+  `stdlib-ordered-map`; a fix, recorded because it changes what the polymorphic-recursion check
+  reports). The type arguments of a method's own type parameters flowed into every method of the same
+  name and arity of any type, so a generic method that called a sequence's `updated` with a type built
+  from its own parameter was reported as recursing into itself. They now flow only into methods of
+  types that have the called method's class or trait among their ancestors. *Alternative:* keep the
+  name-only approximation and rename the method (rejected: `updated` is the name every map has).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-linked-map`): **`avin.collections.mutable.LinkedMap[K, V]` and
+  `LinkedSet[A]`, the insertion-ordered mutable map and set.** The choices:
+  1. *Re-binding a present key keeps its place*; `putLast(k, v)` and `moveToEnd(k)` (and a set's
+     `addLast` and `moveToEnd`) make it the newest, and a key removed and bound again is new. Why:
+     `m(k) = v` is a plain update everywhere else, and an insertion-ordered map whose update reorders
+     it would make `m(k) += 1` shuffle the iteration; an LRU cache that wants the move says so
+     with `moveToEnd`. Alternatives: every put moves to the end (access order for caches, but
+     surprising for a plain map); a constructor flag selecting access order (one type with two
+     behaviours).
+  2. *Equality and hash ignore order*: two linked maps (or sets) are equal when they hold the same
+     entries, as two mutable maps are; a `LinkedMap` is not comparable with a `Map` of the other
+     kind (they are different classes). Why: `==` on maps is about contents, and the order is
+     observable through iteration anyway. Alternative: order-sensitive equality, which makes
+     `{a: 1, b: 2}` differ from `{b: 2, a: 1}`, unlike every other map.
+  3. *The oldest and newest ends*: `headOption()` and `lastOption()` answer the ends in constant
+     time (overriding `Iterable`'s, so `head()` and `last()` trap when empty), and `removeFirst()`
+     and `removeLast()` answer the removed `(key, value)` (a set's, the element) and trap when empty.
+     Why: `removeFirst` is the eviction step of an LRU cache. Alternatives: `removeFirst` answering
+     an `Option` (an empty map is then silently ignored by a cache that expected an entry);
+     `pollFirst`-style names.
+  4. *Mutation during iteration*: replacing values and removing entries are defined (a removed
+     entry the iterator has not reached is skipped); binding new keys never traps but whether the
+     iterator visits them is not defined. Why: the entries sit in a buffer, a removal leaves a gap
+     the iterator skips, and the buffer is squeezed only by an insertion, which hands the map a new
+     buffer and leaves an iterator in progress stepping through the old one. Alternative: trapping on
+     a structural change (a version counter), which the other mutable maps do not do either.
+  5. *Representation*: a `Map[K, int]` from each key to its position, and a `Buffer` of entries in
+     insertion order with gaps for removed ones, squeezed when gaps are half of at least 32
+     positions; every operation is amortized constant time. Alternative: open addressing with
+     order links threaded through the table, one structure instead of two but a second copy of the
+     table's removal logic; it can replace this without changing the API.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-queue`): **`Queue[+T]` (immutable, two lists), built by the stdlib-queue branch.**
+  - *Choice:* `Queue` is an abstract covariant class with a private two-list implementation, so its
+    constructor cannot be called with a state that breaks the invariant (the front is empty only
+    when the back is). It has `Queue(xs*)`, `Queue.empty[T]()` and `Queue.newBuilder`, but no
+    `tabulate` or `fill`, no `++`, and no literal form. `dequeue()` answers `(T, Queue[T])`;
+    `front()` is the name of the head read; `apply(i)` is O(i) and `map`/`filter` answer queues.
+  - *Why:* the abstract class keeps the invariant that gives constant-time `front()` and amortized
+    constant `dequeue`; a pair return keeps the type immutable; `Seq` conformance gives equality,
+    hashing and the sequence methods for free, so a queue equals a vector of its elements.
+  - *Alternatives weighed:* a `data` type with public `Cons`-like variants (exposes the lists and the
+    invariant); a banker's queue with lazy rebalancing (worst-case bounds, but heavier and no
+    better for the usual single-threaded use); `dequeue` answering `Option` only (loses the trap
+    that every other `removeHead` has); `head`/`tail` names only (they remain, from `Seq`, with `tail`
+    answering a `Vector`).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` (immutable and mutable): representation and negatives** (branch `stdlib-bitset`).
+  Proposed: the immutable `BitSet` is a class over a `Vector[long]` of words, kept without empty words
+  at the end, so an update copies one path and `toBitMask()` is the words; the mutable one is over a
+  `Buffer[long]`. A negative element is not in any bit set: `contains` and `excl`/`remove` treat it as
+  absent (`false`, set unchanged), and everything that would add one traps (`incl`, `++`, `apply`,
+  the builder, `add`, `+=`, `++=`, `addAll`); the ordered queries and slices take any `int`. Why: a
+  query about a number that cannot be present has the honest answer "no", which keeps generic
+  code over `Set[int]` from trapping on `s(x)`, while storing a number the set cannot hold must not
+  silently succeed. Alternatives weighed: trapping in `contains`/`remove` too (strict, but breaks
+  `Set[int]` code that probes with arbitrary ints); ignoring negatives in `incl` (silently drops an
+  element, so `s.incl(x).contains(x)` can be false); offsetting by a minimum (a different set type).
+  Review with the user if bit sets of negatives (a signed range) are wanted.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` method names beyond the `Set` ones** (branch `stdlib-bitset`). Proposed: the immutable
+  set adds `symmetricDiff` and `toBitMask`, with `BitSet.fromBitMask`; the mutable one adds
+  `unionInPlace`, `intersectInPlace`, `diffInPlace`, `symmetricDiffInPlace` (taking a mutable bit
+  set), the non-mutating `union`, `intersect`, `diff` and `symmetricDiff` over mutable bit sets,
+  `copy()` and `toSet()` (the immutable one), beside the mutable `Set`'s `add`, `remove`, `addAll`,
+  `+=`, `-=`, `++=`, `--=` and `filterInPlace`. Why: the `…InPlace` suffix names the in-place form of a
+  method the set already has (as `filterInPlace` and `sortInPlace` do) and spells out what the symbol
+  forms `|=` and `&=` would, which are free method names but carry no word for a reader. Alternatives:
+  `|=`, `&=`, `-=` as the in-place algebra (`-=` is taken by removing an element); `unionWith` and so on
+  (suggests a combining function); `addAll(other)` for the union (already means adding elements of
+  any `Iterable`). `symmetricDiff` is `xor` in some libraries; the longer name reads without
+  knowing bit-twiddling. The mutable bit set's `union`/`intersect`/`diff` take a mutable bit set only
+  rather than any `Set[int]`, the mutable `Set` not being a `Set` trait member either.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **A mutable `BitSet` iterates over a snapshot, and its ordered queries copy it** (branch
+  `stdlib-bitset`). Proposed: `iterator()`, `headOption()`, `lastOption()`, `minAfter` and
+  `maxBefore` of a mutable bit set read an immutable copy of its words, so changing the set during a
+  `for` is safe and visits the elements it had when the loop began. Why: it makes the iterator the
+  same code as the immutable one, and a mutable hash set's iterator has no defined behaviour under
+  change at all, so a stable one is the safer promise. Cost: one pass over the words per call, so a
+  loop calling `minAfter` repeatedly on a large sparse set is quadratic in the words. Alternative: a
+  live iterator that reads the words as it goes (no copy, but sees its own changes); revisit if
+  `minAfter` is used as a scan.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree map or set holds an immutable one and
+  replaces it; iterating it while updating it is legal and sees the collection as it was.**
+  `avin.collections.mutable.TreeMap` and `TreeSet` keep a private immutable `TreeMap` or `TreeSet`
+  and assign a new one at each update. Why: the persistent tree is already balanced and tested, its
+  `SortedTree` is private to module `avin` (so a second module could not share it without widening
+  it), every ordered query comes for free, and `toTreeMap()`/`toTreeSet()` become O(1) snapshots.
+  Consequence: an iterator made before an update visits the entries as they were, so a loop that
+  removes or adds entries cannot skip, repeat or fault, unlike the hash-based mutable collections,
+  whose iteration while updating is unspecified. Alternatives weighed: a mutable balanced tree with
+  in-place rotations (faster constants, no allocation per update, but a second tree implementation,
+  and iterators would need invalidation rules); a skip list (same objection). Updates allocate
+  O(log n) nodes, which a mutable tree would not; revisit if a profile shows it. Review with the user:
+  the snapshot-iteration guarantee is a promise a later in-place tree would have to keep.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **Two types are named `TreeMap` (and `TreeSet`), one in
+  `avin` and one in `avin.collections.mutable`.** As `Map` and `Set` already are. Inside the mutable
+  module the bare name is the mutable one and the immutable one is imported under an alias; a program
+  importing the mutable one unaliased while also using the prelude's gets the mutable one for the bare
+  name, and reaches the immutable one through an aliased import (both forms are tested). Alternatives:
+  distinct names (`MutableTreeMap`) which would break the parallel with `Map`/`Set`.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **`removeFirst()`/`removeLast()` trap on an empty
+  collection; `removeFirstOption()`/`removeLastOption()` answer `None`.** The immutable sorted
+  collections pair `head()` (trapping) with `headOption()`; the removal operations follow the same
+  split, the plain name being the trapping form. Alternatives: answering an `Option` from the plain
+  name (as `remove(key)` does), or a `pollFirst` name.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **The `range*` forms of a mutable tree collection answer a
+  new mutable collection, not a view.** As `filter` and `copy()` do on the hash-based mutable
+  collections; a write to the slice does not reach the original. Sharing the tree makes the slice O(log
+  n) to make. Alternative: live views, which would need the mutable tree to be in place.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree set's `union`, `intersect`, `diff` and
+  `subsetOf` take a mutable tree set**, as the mutable hash set's take a mutable hash set; the
+  `keySet()` of a mutable tree map is an immutable `TreeSet` snapshot, as a mutable `Map`'s is an
+  immutable `Set`.
 
 **Deferred**
 
