@@ -5633,6 +5633,17 @@ private declare_defaults(c: *Checker, id: usize)
         var own: Buf[&Type] = buf()
         for k in 0..<f.decl.type_params.len()
             own.push(TypeVar(did, k, f.decl.type_params[k].name))
+        // The default's own copies of the function's type parameters have the function's bounds, so
+        // that `T.MaxValue` or `T(0)` reads in a default as in the body.
+        if !shared
+            for k in 0..<f.decl.type_params.len()
+                val tp = f.decl.type_params[k]
+                if c.bounds.get(bound_key(id, k, tp)) is Some(bounds)
+                    var copied: Buf[&Type] = buf()
+                    for b in bounds
+                        copied.push(substitute(b, id, own))
+                    c.bounds.put(bound_key(did, k, tp), copied)
+                if c.lowers.get(bound_key(id, k, tp)) is Some(lower) then c.lowers.put(bound_key(did, k, tp), substitute(lower, id, own))
         var params: Buf[&Type] = buf()
         var names: Buf[string] = buf()
         var decls: Buf[Param] = buf()
@@ -11300,9 +11311,18 @@ private limit_constant(c: *Checker, at: Span, target: &Expr, name: string) -> Op
     if !is_capitalized(name) then return None
     val ty = static_receiver(c, target, name)?
     val t = zonk(c, ty)
-    if !(*t is Int(_) || *t is Byte || *t is Char || *t is Real) then return None
     val least = name == "MinValue"
     val greatest = name == "MaxValue"
+    // A type parameter bounded by `Integer` has the limits every integer width has, each instance's
+    // own: the constant is folded at the width the instance is made at.
+    if is_integer_param(c, t)
+        if greatest || least then return Some(TExpr(at, t, IntLimit(greatest)))
+        c.note(unit_of(c), at, s"`${type_name(t)}` has no member `$name`")
+        return Some(TExpr(at, ErrorType, UnitConst))
+    if *t is TypeVar(_, _, _) && (greatest || least)
+        c.note(unit_of(c), at, s"`${type_name(t)}` has no member `$name`: a type parameter has the integer limits where it is bounded by `Integer`, as in `[${type_name(t)}: Integer]`")
+        return Some(TExpr(at, ErrorType, UnitConst))
+    if !(*t is Int(_) || *t is Byte || *t is Char || *t is Real) then return None
     *t match
         Int(bits) ->
             if greatest then return Some(TExpr(at, t, IntConst(max_digits(bits))))
