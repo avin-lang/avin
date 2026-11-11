@@ -1159,10 +1159,15 @@ Avin over these, and casing, replacing and the white-space test are Sysl binding
 whose objects are not laid out from fields: an array is its length, a 64-bit word, then its
 elements, each at its element type's store width (a power of two up to a word for integers, a byte
 for `bool`, a word for a real or a reference, none for `unit`), with no gaps. Each instance's
-descriptor gives one element's size where a class's gives the object's, lists no reference
-offsets, and carries the class's method table and type record as any class's does; when the
-elements are references its kind's tracer is the runtime's `avin_rt_trace_array`, which marks every
-element, and otherwise the ordinary tracer, which marks none. The checker recognizes the class by
+descriptor gives one element's size where a class's gives the object's, and carries the class's
+method table and type record as any class's does. Which of an element's words are references is
+the descriptor's tracing (`array_descriptor` in `mir.sysl` builds it from the element's word map):
+when each element is one reference its kind's tracer is the runtime's `avin_rt_trace_array`, which
+marks every element; when no word is, the ordinary tracer, which marks none, with no offsets; and an
+element of several words that mixes the two (a union's tag, bits and reference) lists the byte
+offset of each reference word within an element, which `avin_rt_trace_array_map` reads in every
+element and no other word. Handing a value over reads the same words through the same scanners
+(`scan_object` in `runtime/avin/rt/array.sysl`). The checker recognizes the class by
 its module and name (`is_array_class`); it is the one class whose methods may be intrinsics, and its
 constructor cannot be called. `length`, `apply`, `update` and `slice` are intrinsics lowered at each
 call: the length word, then for an element an unsigned compare of the index against it (so a

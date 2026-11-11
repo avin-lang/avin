@@ -1,0 +1,269 @@
+module avin.rt
+@tests
+
+import sh.sysl.gc
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+
+// An array descriptor with an element map of up to three words, laid out as the compiler emits one:
+// the descriptor, then the byte offset within an element of each word that holds a reference.
+private struct Mapped
+    d: Descriptor
+    offsets: [3]usize
+
+@assert(offsetof(Mapped, offsets) == sizeof(Descriptor), "an element map follows its descriptor")
+
+// The descriptor of an array of `words`-word elements whose word `j` holds a reference where bit `j`
+// of `bits` is set.
+private mapped(words: usize, bits: usize) -> Mapped
+    var m = Mapped(Descriptor(gc.Kind(&trace_array_map, null, null, null), 0, words * 8, 0, null), [0, 0, 0])
+    for j in 0..<words
+        if ((bits >> j) & 1) != 0
+            m.offsets[m.d.refs] = j * 8
+            m.d.refs = m.d.refs + 1
+    m
+
+private var current: Mapped = Mapped(Descriptor(gc.Kind(&trace_array_map, null, null, null), 0, 24, 1, null), [8, 0, 0])
+private var middle: Mapped = Mapped(Descriptor(gc.Kind(&trace_array_map, null, null, null), 0, 24, 1, null), [8, 0, 0])
+private var references: Descriptor = Descriptor(gc.Kind(&trace_array, null, null, null), 0, 8, 0, null)
+private var scalars: Descriptor = descriptor(0, 8, 0)
+private var cell: Descriptor = descriptor(0, 16, 0)
+private var arraying: Context = new_context()
+
+private struct ArrayRoots
+    frame: Frame
+    slots: [3]*u8
+
+private var held: ArrayRoots = ArrayRoots(Frame(null, 3), [null, null, null])
+
+// What a tracer reads, counted: every word it reads as a reference, in order.
+private struct Counter
+    words: usize
+    read: Buf[usize]
+
+impl Marker for Counter
+    mark(*self, p: *u8)
+        self.words = self.words + 1
+        self.read.push(usize(p))
+
+private counted(p: *u8) -> Counter
+    var c = Counter(0, buf())
+    scan_object(p, &c)
+    c
+
+private live_now() -> usize
+    collect_now()
+    gc.live(&space)
+
+private begin()
+    attach(&arraying)
+    leave_safe(&arraying)
+    held.frame.prev = null
+    arraying.top = &held.frame
+
+private end()
+    stress = false
+    for i in 0..<3 do held.slots[i] = null
+    arraying.top = null
+    detach(&arraying)
+
+private words_of(p: *u8) -> *usize = ptr_cast(array_elements(p))
+
+// A new cell holding `value` in its first word, kept only by whatever the caller stores it in.
+private made_cell(value: usize) -> *u8
+    val c = allocate(&arraying, &cell)
+    val w: *usize = ptr_cast(c)
+    w[0] = value
+    c
+
+private cell_value(c: usize) -> usize
+    val w: *usize = ptr_cast(c)
+    w[0]
+
+@test("every element map of one, two and three words keeps exactly its reference words alive and reads no other")
+every_element_map()
+    begin()
+    val n = 5usize
+    for words in 1usize ..< 4
+        for bits in 0..<(1usize << words)
+            current = mapped(words, bits)
+            val base = live_now()
+            val a = new_array(&arraying, &current.d, n)
+            held.slots[0] = a
+            val w = words_of(a)
+            var expected: Buf[usize] = buf()
+            var decoys: Buf[usize] = buf()
+            for i in 0..<n
+                for j in 0..<words
+                    val k = i * words + j
+                    if ((bits >> j) & 1) != 0
+                        val c = made_cell(k)
+                        w[k] = usize(c)
+                        expected.push(usize(c))
+                    else
+                        // A scalar word holding the address of a live object nothing else keeps.
+                        val decoy = made_cell(1000 + k)
+                        w[k] = usize(decoy)
+                        decoys.push(usize(decoy))
+            val c = counted(a)
+            assert_eq(c.words, expected.len())
+            assert_eq(c.read.len(), expected.len())
+            for r in 0..<expected.len()
+                assert_eq(c.read[r], expected[r])
+            assert_eq(live_now(), base + 1 + expected.len())
+            var d = 0usize
+            for i in 0..<n
+                for j in 0..<words
+                    val k = i * words + j
+                    if ((bits >> j) & 1) != 0 then assert_eq(cell_value(w[k]), k)
+                    else
+                        assert_eq(w[k], decoys[d])
+                        d = d + 1
+            held.slots[0] = null
+            assert_eq(live_now(), base)
+    end()
+
+@test("an array of three-word elements with the reference in the middle survives collection at every allocation")
+middle_reference_under_stress()
+    begin()
+    val base = live_now()
+    val n = 64usize
+    stress = true
+    val a = new_array(&arraying, &middle.d, n)
+    held.slots[0] = a
+    val w = words_of(a)
+    var planted: Buf[usize] = buf()
+    for i in 0..<n
+        // Heap addresses in the scalar words: an object's start, and a word inside it.
+        val decoy = made_cell(9999)
+        w[i * 3] = usize(decoy)
+        w[i * 3 + 2] = usize(decoy) + 8
+        planted.push(usize(decoy))
+        w[i * 3 + 1] = usize(made_cell(i))
+    // Garbage allocated under stress collects at every step, reusing what the decoys held.
+    for _ in 0..<200
+        _ = made_cell(0xdeadbeef)
+    stress = false
+    assert_eq(live_now(), base + 1 + n)
+    for i in 0..<n
+        assert_eq(cell_value(w[i * 3 + 1]), i)
+        assert_eq(w[i * 3], planted[i])
+        assert_eq(w[i * 3 + 2], planted[i] + 8)
+    assert_eq(counted(a).words, n)
+    end()
+
+// An array of `n` three-word elements, the reference in the middle, each holding a cell of its index.
+private filled_middle(n: usize) -> *u8
+    val a = new_array(&arraying, &middle.d, n)
+    held.slots[0] = a
+    val w = words_of(a)
+    for i in 0..<n
+        w[i * 3] = 7777 + i
+        w[i * 3 + 1] = usize(made_cell(i))
+        w[i * 3 + 2] = usize(a)
+    a
+
+@test("a slice of an array with an element map copies whole elements and keeps only what it holds")
+slicing_mapped_arrays()
+    begin()
+    val base = live_now()
+    stress = true
+    val n = 10usize
+    val a = filled_middle(n)
+    val s = array_slice(&arraying, a, 2, 7)
+    held.slots[1] = s
+    stress = false
+    assert_eq(array_length(s), 5usize)
+    val from = words_of(a)
+    val to = words_of(s)
+    for i in 0..<15usize
+        assert_eq(to[i], from[6 + i])
+    held.slots[0] = null
+    // The slice keeps its five cells; a scalar word naming the dropped source keeps nothing.
+    assert_eq(live_now(), base + 1 + 5)
+    for i in 0..<5usize
+        assert_eq(cell_value(to[i * 3 + 1]), i + 2)
+        assert_eq(to[i * 3], 7777 + i + 2)
+    val empty = array_slice(&arraying, s, 3, 3)
+    held.slots[0] = empty
+    assert_eq(array_length(empty), 0usize)
+    assert_eq(counted(empty).words, 0usize)
+    end()
+
+@test("an array with an element map grown into a larger one and cleared keeps exactly the references it holds")
+growing_and_clearing_mapped_arrays()
+    begin()
+    val base = live_now()
+    stress = true
+    val n = 8usize
+    val a = filled_middle(n)
+    val grown = new_array(&arraying, &middle.d, 2 * n)
+    held.slots[1] = grown
+    val from = words_of(a)
+    val to = words_of(grown)
+    for i in 0..<n * 3 do to[i] = from[i]
+    held.slots[0] = null
+    _ = made_cell(0)
+    stress = false
+    assert_eq(live_now(), base + 1 + n)
+    assert_eq(counted(grown).words, 2 * n)
+    for i in 0..<n
+        assert_eq(cell_value(to[i * 3 + 1]), i)
+    for i in n * 3 ..< 2 * n * 3
+        assert_eq(to[i], 0usize)
+    array_clear(&arraying, grown, 0, 3)
+    assert_eq(live_now(), base + 1 + n - 3)
+    for i in 0..<9usize
+        assert_eq(to[i], 0usize)
+    assert_eq(cell_value(to[3 * 3 + 1]), 3usize)
+    end()
+
+@test("an empty array with an element map reads no word and survives collection")
+empty_mapped_array()
+    begin()
+    val base = live_now()
+    stress = true
+    val a = new_array(&arraying, &middle.d, 0)
+    held.slots[0] = a
+    _ = made_cell(0)
+    stress = false
+    assert_eq(array_length(a), 0usize)
+    assert_eq(counted(a).words, 0usize)
+    assert_eq(live_now(), base + 1)
+    end()
+
+@test("the two fast paths read what they always read: every element of an array of references, nothing of an array of scalars")
+fast_paths_unchanged()
+    begin()
+    val base = live_now()
+    val n = 10000usize
+    val r = new_array(&arraying, &references, n)
+    held.slots[0] = r
+    val rw = words_of(r)
+    for i in 0..<n
+        if i % 100 == 0 then rw[i] = usize(made_cell(i))
+    val s = new_array(&arraying, &scalars, n)
+    held.slots[1] = s
+    val sw = words_of(s)
+    for i in 0..<n do sw[i] = rw[i - i % 100]
+    // A reference array reads one word per element, as its tracer always has; a scalar array none.
+    val c = counted(r)
+    assert_eq(c.words, n)
+    for i in 0..<n
+        assert_eq(c.read[i], rw[i])
+    assert_eq(counted(s).words, 0usize)
+    // The same elements under a one-word element map read the same words.
+    current = mapped(1, 1)
+    val m = new_array(&arraying, &current.d, n)
+    held.slots[2] = m
+    val mw = words_of(m)
+    for i in 0..<n do mw[i] = rw[i]
+    val mc = counted(m)
+    assert_eq(mc.words, n)
+    for i in 0..<n
+        assert_eq(mc.read[i], c.read[i])
+    held.slots[2] = null
+    assert_eq(live_now(), base + 2 + n / 100)
+    held.slots[0] = null
+    assert_eq(live_now(), base + 1)
+    end()
