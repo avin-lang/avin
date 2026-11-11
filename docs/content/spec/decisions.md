@@ -797,7 +797,8 @@ Settled by the user on 2026-11-04:
   characters has a list broken one item per line, a call's or a literal's items two columns in and
   a parameter list's four, the closing bracket on its own line; a list the source wrote one item
   per line stays so; a binding's value with no list to break is broken before its loosest operators
-  as continuation lines. No trailing commas are added. The formatter keeps every token and
+  as continuation lines, though only after the last `then`, `elif` or `else` of a one-line `if`
+  (a line after an `if`'s test is its block, so a test and an earlier branch stay whole). No trailing commas are added. The formatter keeps every token and
   refuses a file that does not parse; its result parses to the same syntax tree.
 
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
