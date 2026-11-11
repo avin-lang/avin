@@ -3,7 +3,7 @@ module avin.rt
 
 import sysl.raw.ptr_cast
 import sysl.sync.*
-import sysl.time.{millis, sleep}
+import sysl.time.{micros, millis, sleep}
 
 // Cancellation of lightweight threads started as compiled code starts them, through `thread_start`
 // with a Sysl function as the runner and the test's own state as the closure. A function handed over
@@ -94,6 +94,68 @@ cancel_bit_is_its_own()
     assert_eq(requested.load() & Cancel, 0u32)
     assert_eq(requested.load() & Poll, Poll)
     _ = requested.and(~Poll)
+
+// A queue a thread waits on with a deadline, which nothing ever wakes.
+private var unwoken: WaitQueue = new_wait_queue()
+
+private wait_long(c: *Context, run: *u8) -> unit
+    val s: *Stopping = ptr_cast(run)
+    _ = s.began.add(1)
+    val w = waiter_of(c)
+    unwoken.guard.lock()
+    enqueue(&unwoken, w)
+    if wait_on_as(c, &unwoken, w, deadline_after(3600000), may_cancel(c, 0)) then _ = s.ended.add(1)
+
+// Whether the cancellation of `p`'s wait is armed: its worker has put it in a cancellable wait.
+private armed(p: *Lwt) -> bool
+    p.cancel_guard.lock()
+    val a = p.cancel_waiter != null
+    p.cancel_guard.unlock()
+    a
+
+// Starts `count` threads running `body`, each parking in a timed cancellable wait, and cancels each
+// from the calling thread the moment its worker has armed the wait's cancellation, while the worker is
+// held up before the timer is set where `pause`. Once they have all been joined, no timer of theirs
+// may be left: a cancellation that made a thread ready before its timer was set let the thread end
+// first, and the timer set after it named a waiter whose wait had answered.
+private cancel_on_arming(body: *u8, count: usize, pause: bool)
+    stopping_state.began.store(0)
+    stopping_state.ended.store(0)
+    val me = thread_attach()
+    cancel_joints.frame.prev = me.top
+    me.top = &cancel_joints.frame
+    val before = timers_pending()
+    park_arm_pause = pause
+    for i in 0..<count
+        cancel_joints.slots[i] = thread_start(me, ptr_cast(&stopping_state), LeastStack, body)
+        val j: *Joint = ptr_cast(cancel_joints.slots[i])
+        while !armed(j.lwt) do sleep(micros(1))
+        thread_cancel(me, cancel_joints.slots[i])
+    for i in 0..<count
+        thread_join(me, cancel_joints.slots[i])
+        cancel_joints.slots[i] = null
+    // Long enough for any worker still held up to have set the timer it was about to set.
+    sleep(millis(10))
+    park_arm_pause = false
+    me.top = cancel_joints.frame.prev
+    thread_detach(me)
+    assert_eq(stopping_state.ended.load(), 0u32)
+    assert_eq(timers_pending(), before)
+    assert(timers_ordered())
+    assert_eq(cancels_outstanding(), 0u64)
+
+@test("a sleep cancelled while its worker arms it leaves no timer behind")
+cancel_racing_sleep_timer()
+    cancel_on_arming(ptr_cast(&sleep_long), 4, true)
+
+@test("a timed wait on a queue cancelled while its worker arms it leaves no timer behind")
+cancel_racing_queue_timer()
+    cancel_on_arming(ptr_cast(&wait_long), 4, true)
+
+@test("timed waits cancelled the moment they are armed, many at once, leave no timer behind")
+cancel_racing_many_timers()
+    for round in 0..<20
+        cancel_on_arming(if round % 2 == 0 then ptr_cast(&sleep_long) else ptr_cast(&wait_long), 16, false)
 
 @test("a thread that is not lightweight has no cancellation and may not be stopped")
 os_threads_are_not_cancellable()
