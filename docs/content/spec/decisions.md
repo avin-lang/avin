@@ -6721,7 +6721,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `partition` of a pair function answers the own kind only where the type is known. Why: a
   tuple of two collections is not a subtype of a tuple of two supertypes in an override's
   result, and a set's partition over the trait cannot change `Iterable`'s result type.
-  Proposed amendment (built on branch `partition-override`): with an override's result free to
+  Amended on the user's delegation 2026-11-11 (built on branch `partition-override`): with an override's result free to
   narrow, `Map`, `SortedMap` and `SeqMap` declare `partition(p: (K, V) -> bool)` answering maps
   of their own trait (`Map` carries a default built on `removed`, so a user class implementing
   `Map` needs no change), and each concrete map overrides it with its own kind, so a call through
@@ -6794,7 +6794,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
     `Any` are equal and hash alike. (The review flag this entry carried, a stored union with a string
     member allocating its cell, is closed by the next entry.)
-- Proposed (built on branch `union-words-storage`): **A union with a scalar member is stored as its
+- Settled on the user's delegation 2026-11-11 (built on branch `union-words-storage`): **A union with a scalar member is stored as its
   words** (the storage half of the entry above).
   - **Every storage place holds the words**: a field of a data value, a class or a tuple, an array
     element (so a `Vector`, a `Buffer` and a map), a closure's capture, a captured `var`'s box and a
