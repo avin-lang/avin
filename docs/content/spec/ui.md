@@ -21,7 +21,7 @@ dependencies {
 }
 ```
 
-It names `syslui-sdl` 0.2.23 in its own `sysl-dependencies`, which brings syslui 0.1.18 and SDL3,
+It names `syslui-sdl` 0.2.25 in its own `sysl-dependencies`, which brings syslui 0.2.0 and SDL3,
 so a program using it names no Sysl package itself, and is linked with SDL3.
 
 ```text
