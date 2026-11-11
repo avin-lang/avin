@@ -5210,15 +5210,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
   (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
   after the interface is gone).
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
+- Settled on the user's delegation 2026-11-10 (built on branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
   that rounds: `f32`, `f16`, `bf16` and `real`.** A binding's own `real` parameter, a mirror's `real`
   field going into Sysl, and a callback's `real` answer are rounded into the Sysl type to the nearest
   value it holds, a tie to the even one, as an IEEE conversion rounds: a value past its largest
@@ -5242,6 +5234,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `real`, losing precision silently).
   **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
   rather than round to it.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
