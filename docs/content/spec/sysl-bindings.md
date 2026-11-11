@@ -21,7 +21,9 @@ readText(path: string) -> Result[string, IoError] =
 A binding is a top-level function declaration with no body. `@sysl` takes one string: the Sysl
 function's module path and name. Bindings are usually private, with a public function giving the
 Avin-shaped API: camelCase names, Avin error types, Avin collections. A binding is otherwise an
-ordinary function: it is called, overloaded, given defaults and passed as a value like any other.
+ordinary function: it is called, overloaded, given defaults and passed as a value like any other. A
+binding that passes its arguments [by name](#arguments-passed-by-name) may leave a parameter with a
+Sysl default to Sysl.
 
 ```text
 @sysl("sysl.text.to_upper")
@@ -83,6 +85,37 @@ error: the Sysl binding `digitCount` does not match `avintest.digits.digit_count
 
 A new release of a Sysl package, a different commit, or a change to the sources of one named by
 directory builds the shims again; nothing else about it does.
+
+## Arguments passed by name
+
+A binding passes its arguments by position: its first parameter is the Sysl function's first, and
+so on. A binding marked **`named`** passes each argument by its parameter's name instead, spelled as
+Sysl spells it: each uppercase letter becomes an underscore and its lowercase, as a
+[mirror's](#mirrors) fields are, so `onFrame` is `on_frame`. It lists only the parameters it passes,
+in any order, and **every parameter it leaves out takes the Sysl function's own default**, which
+Sysl evaluates at each call, exactly as for a Sysl caller that leaves the argument out. A binding
+never repeats a Sysl default, so it never goes stale when the Sysl function's defaults change.
+
+```text
+@sysl("sh.sysl.ui_sdl.app", named)
+private appOf(title: string, tree: () -> View, ground: () -> long, width: int, height: int, onFrame: real -> unit) -> App
+```
+
+`app` declares `on_event`, `font` and `size` between `height` and `on_frame`, with defaults; the
+binding passes `on_frame` past them and leaves all three to Sysl. `named` is written after the Sysl
+function's name, with `blocking` where the call may also wait (`@sysl("f", blocking, named)`), or
+alone on a handle's method bound by its own name (`@sysl(named)`), whose receiver is never named.
+Every parameter of a `named` binding has a name, since its argument is passed by it.
+
+A default an Avin caller sees is the binding's own: a binding's parameter may have an Avin default
+like any function's, and the Avin caller that leaves it out passes that value, so Sysl's default for
+it is not used. Leaving a parameter that has no Sysl default out, or naming one the Sysl function
+does not have, is reported at the binding with Sysl's own message:
+
+```text
+error: the Sysl binding `framedNoTitle` does not match `avintest.digits.framed`: function 'digits.avintest.digits.framed' was given no value for 'title', and that parameter declares no default
+error: the Sysl binding `joinedWrongName` does not match `avintest.digits.joined`: function 'digits.avintest.digits.joined' declares no parameter named 'd' — it takes 'a', 'b' and 'c'
+```
 
 ## Boundary types
 

@@ -5177,17 +5177,14 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   branch `binding-f32`, which rests on the Proposed `f32` entry): **The frame loop runs the waiting
   work in syslui-sdl's `on_frame`**, at the start of every frame and before the loop decides whether to build
   the tree again, so work posted before a frame runs in that frame and what it writes is built in it;
-  `run` runs what is left once more as it returns. The package passes `app` its `on_event` (answering
-  `false` for every event, as syslui-sdl's default does, through a private handle on
-  `sh.sysl.sdl3.Event`), an empty `font` and `size` 15, syslui-sdl's defaults, to reach `on_frame`
-  behind them, since a binding passes its arguments by place. Why: `on_frame` is the hook syslui-sdl
-  runs first in a frame for exactly this; a real crosses into its `size: f32` (see the `f32` entry).
-  Alternatives weighed: a wrapper of `ground`, which `lwt-ui` used while no real could cross into an
-  `f32` (run after the tree, so its work was built a frame late); `tree` (called only when something
-  was written, so it would never notice a post); `on_event` (called only when there are events);
-  naming arguments at the Sysl call so the defaults in between need not be repeated (a larger change
-  to every binding's shim, for one call). If syslui-sdl's defaults for `font` or `size` change, the
-  package's copies must follow.
+  `run` runs what is left once more as it returns. The package's binding of `app` is `named` (branch
+  `binding-defaults`, see the Proposed `named` entry), so it passes `on_frame` and leaves `on_event`,
+  `font` and `size`, which come before it, to syslui-sdl's own defaults; until then it copied those
+  defaults into Avin, since a binding passed its arguments by place. Why: `on_frame` is the hook syslui-sdl
+  runs first in a frame for exactly this. Alternatives weighed: a wrapper of `ground`, which `lwt-ui`
+  used while no real could cross into an `f32` (run after the tree, so its work was built a frame
+  late); `tree` (called only when something was written, so it would never notice a post);
+  `on_event` (called only when there are events).
 - Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **`handlePosted` runs only what was waiting when it was called.**
   Work that sends or posts waits for the next call. Why: work that posts itself again, a common
   animation shape, would otherwise hold a frame for ever. Alternatives weighed: draining until the
@@ -5234,6 +5231,27 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `real`, losing precision silently).
   **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
   rather than round to it.
+- Settled on the user's delegation 2026-11-10 (built on branch `binding-defaults`): **A binding marked `named` (`@sysl("f", named)`) passes
+  every argument by its parameter's name, so a parameter it leaves out takes the Sysl function's own
+  default.** The Avin name is spelled as Sysl spells it, each uppercase letter an underscore and its
+  lowercase, as a mirror's fields are (`onFrame` is `on_frame`); the binding lists the parameters it
+  passes in any order; the receiver of a handle's method is never named; every parameter of a
+  `named` binding has a name. A binding without `named` passes by position, as before. Sysl checks
+  the names and reports a missing parameter without a default, or a name it does not declare, with
+  its own message at the binding. Why: a binding that had to reach a parameter behind defaulted ones
+  copied the Sysl defaults into Avin (the ui package copied syslui-sdl's `font` and `size` and reached
+  a private handle for `on_event`'s default), and those copies go stale silently; with names, Sysl
+  supplies and evaluates its own defaults at each call, a non-literal one included. One word on the
+  annotation, decided per binding, changes no existing binding's shim and needs no knowledge of the
+  Sysl signature in the Avin compiler. Alternatives weighed: caller-side omission, where an argument
+  an Avin caller leaves out of a binding's call is left out of the Sysl call too (most general, but a
+  binding would need a shim for each set of omitted arguments its callers use, and Avin's own
+  defaults on a binding would mean two things); a per-parameter mark such as `@named` or a
+  `= sysl` default on a positional list (the binding still lists every parameter up to the last one
+  it passes, and a mixed call needs the names anyway); naming every binding's arguments always (would
+  make every existing binding's parameter names part of its contract with Sysl); copying the
+  defaults (the stale copies this replaces). Review with the user: the surface word `named`, and
+  whether a caller-side form should come later.
 
 **Deferred**
 
