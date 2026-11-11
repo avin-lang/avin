@@ -7852,7 +7852,9 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 elif !c_names_struct(cp.text, wanted) then problem = s"`${c.classes[k].name}` is a copy of `$wanted`, so it is passed by value, as `$wanted`"
             elif c_value_option(t, c.data, c.classes) then problem = "an opaque value is passed by value, which is never null, so it is not in an `Option`"
             elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, ctext)
-            else problem = c_crossing_problem(ctype, t, c_text_form(t, c.data, c.classes), false)
+            else
+                val form = c_text_form(t, c.data, c.classes)
+                problem = c_crossing_problem(c_text_position(ctype, ctext, form), t, form, false)
             if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C" + (if inout then ", `inout`" else "") + s": $problem")
         val r = result.unwrap_or(Unit)
         val at = if f.result is Some(t) then t.span else f.name_span
@@ -7916,7 +7918,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     val problem = c_mirror_problem(c.data[d].decl, c.data[d].name, p.result_text)
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 else
-                    val problem = c_crossing_problem(p.result, answered, form, true)
+                    val problem = c_crossing_problem(c_text_position(p.result, p.result_text, form), answered, form, true)
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 // Each out value crosses as a result does, from the type its pointer points at.
                 var array_found = false
@@ -7968,13 +7970,15 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                             if made is None then made = Some(h.class_index)
                     elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, q.pointee_text)
                     elif c_status_error(t, c.data) is Some(_) then problem = outs_word
-                    else problem = c_crossing_problem(q.pointee, t, c_text_form(t, c.data, c.classes), true)
+                    else
+                        val form = c_text_form(t, c.data, c.classes)
+                        problem = c_crossing_problem(c_text_position(q.pointee, q.pointee_text, form), t, form, true)
                     if problem != "" then c.note(unit, at, s"out value $j of the C binding `${f.name}`, `${q.name}`, is `${type_name(t)}` in Avin and `${q.pointee_text}` in C: $problem")
                 if array_word == "view" && array_name is Some(arr) && !array_found then c.note(unit, a.span, s"`view:` names the `out` parameter C answers the memory it lends through, and `$arr` is no `out` parameter of the prototype")
                 for arr in arrays_named
                     if !contains_name(found_arrays, arr) then c.note(unit, a.span, s"`$array_word:` names the `out` parameter C answers an array through, and `$arr` is no `out` parameter of the prototype")
                 // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
-                val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
+                val text = p.result is CText(_) || (c_text_position(p.result, p.result_text, form) is CTypedef(_) && !(form is NoText))
                 if free is Some(_) && !text
                     c.note(unit, at, s"`free:` names the C function that frees a string the binding answers, and `${f.name}` answers no string: its result is `${p.result_text}` in C")
         check_c_ownership(c, unit, f, a, params, receiver_class, made, borrowed, keeps, consumes)
@@ -8072,8 +8076,10 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
             Byte -> true
             Bool -> true
             Real -> true
-            _ -> c_mirror_of(t, c.data) is Some(_)
-        if !scalar then c.note(unit, decl.ty.span, s"the field accessor `${f.name}` writes `${type_name(t)}`, and a field is written as an integer type, `byte`, `bool`, `real` or an enum mirror; a string or handle field is only read")
+            _ -> c_mirror_of(t, c.data) is Some(_) || c_struct_of(t, c.data) is Some(_)
+        if !scalar then c.note(unit, decl.ty.span, s"the field accessor `${f.name}` writes `${type_name(t)}`, and a field is written as an integer type, `byte`, `bool`, `real`, an enum mirror or a struct mirror; a string or handle field is only read")
+        elif c_struct_of(t, c.data) is Some(d) && c_struct_holds_string(d, c.data, c.classes)
+            c.note(unit, decl.ty.span, s"the field accessor `${f.name}` writes `${type_name(t)}`, which holds a string: a string stored into a struct would leave C holding memory no one gives back, so a field holding one is only read")
     if indices > 0 && bound_count == 0
         c.note(unit, a.span, s"the field accessor `${f.name}` takes ${index_count(indices)} and no `bound:`: name the C expression in `self` that bounds each, which the index is checked against before C reads anything")
     elif bound_count > 0 && indices == 0
@@ -8108,14 +8114,14 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
             c.note(unit, at, s"`$name` names what it keeps with `kept:`, so only a binding keeping one makes it, and the field accessor `${f.name}` keeps nothing")
         return
     if !(c_text_form(r, c.data, c.classes) is NoText) then return
-    if c_mirror_of(r, c.data) is Some(_) then return
+    if c_mirror_of(r, c.data) is Some(_) || c_struct_of(r, c.data) is Some(_) then return
     val scalar = *r match
         Int(_) -> true
         Byte -> true
         Bool -> true
         Real -> true
         _ -> false
-    if !scalar then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`, and a field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a string or a handle")
+    if !scalar then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`, and a field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a struct mirror, a string or a handle")
 
 private index_count(n: usize) -> string = if n == 1 then "1 index" else s"$n indices"
 
@@ -8345,7 +8351,9 @@ private c_callback_problem(c: *Checker, q: CParam, t: &Type) -> string
         elif c_memory_form(a, c.data, c.classes) is Some(m)
             problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, and C never gives one back" else s"memory C lends a callback is a view, its length given by a parameter of C's function marked `length(${cq.name})`"
         elif *a is Function(_, _, _) then problem = "a function is not a callback's parameter: a function crosses to C only as a binding's own parameter"
-        elif !(c_text_form(a, c.data, c.classes) is NoText) then problem = c_crossing_problem(cq.ty, a, c_text_form(a, c.data, c.classes), true)
+        elif !(c_text_form(a, c.data, c.classes) is NoText)
+            val form = c_text_form(a, c.data, c.classes)
+            problem = c_crossing_problem(c_text_position(cq.ty, cq.text, form), a, form, true)
         elif c_array_form(a, c.data, c.classes) is Some(_) then problem = "an array is not a callback's parameter: memory C lends a callback is a view"
         elif c_status_error(a, c.data) is Some(_) then problem = "a status is a binding's result, not a callback's parameter"
         elif c_handle_form(a, c.data, c.classes) is Some(h)

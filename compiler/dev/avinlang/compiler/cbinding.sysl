@@ -975,6 +975,19 @@ c_struct_of(t: &Type, data: Buf[DataSymbol]) -> Option[usize] = *t match
     Data(d, _, args) -> if args.len() == 0 && c_struct_type(data[d].decl) is Some(_) then Some(d) else None
     _ -> None
 
+/** Whether the struct mirror `d` holds a string, in a field of its own or of a mirror it holds. */
+c_struct_holds_string(d: usize, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> bool = holds_string_within(d, data, classes, data.len())
+
+// The search of `c_struct_holds_string`, `depth` mirrors deep at most, so that a mirror holding
+// itself, which its own check refuses, ends it.
+private holds_string_within(d: usize, data: Buf[DataSymbol], classes: Buf[ClassSymbol], depth: usize) -> bool
+    if depth == 0 || data[d].variants.len() != 1 then return false
+    for ft in data[d].variants[0].fields
+        if c_struct_of(ft, data) is Some(e)
+            if holds_string_within(e, data, classes, depth - 1) then return true
+        elif c_text_form(ft, data, classes) is TextString(_) then return true
+    false
+
 /** The index of the struct mirror `t` holds as an `Option`'s value, or is: the mirror, and whether it
  * is in an `Option`, whose `None` is null. */
 c_struct_form(t: &Type, data: Buf[DataSymbol]) -> Option[CHandleForm]
@@ -1324,9 +1337,31 @@ c_array_problem(q: CParam, form: CArrayForm, data: Buf[DataSymbol]) -> string
     if q.ty is CText(_) && !(*form.element is Byte) then return "a pointer to `char` takes an `Array[byte]`"
     ""
 
+/** The C type `c`, written `text`, at a position a string crosses, `form` saying how: one pointer to a
+ * typedef, `const FT_String *`, is a string where the typedef is `char`, which only the headers say,
+ * so it is taken as a typedef of the whole pointer, whose kind the C unit checks. Any other type is
+ * itself. */
+c_text_position(c: CType, text: string, form: CTextForm) -> CType
+    if form is NoText || !(c is CPointerType) then return c
+    if c_typedef_pointee(text) is Some(_) then CTypedef(text.trim()) else c
+
+/** The typedef the C type written `text` points at, where it is one pointer to a typedef,
+ * `const FT_String *` or `FT_String *const`. */
+c_typedef_pointee(text: string) -> Option[string]
+    val star = text.index_of("*")?
+    if text[star + 1..].contains("*") then return None
+    val after = text[star + 1..].trim()
+    if !(after == "" || after == "const" || after == "volatile" || after == "restrict") then return None
+    parse_c_type(text[..<star].trim()) match
+        Ok(r) -> r.ty match
+            CTypedef(name) -> Some(name)
+            _ -> None
+        Err(_) -> None
+
 /** What the Avin type at a C position must be, as a diagnostic says it, or "" where `avin` may cross
- * as `c`; `form` is how `avin` carries a string, if it does. A result whose Avin type is `unit`
- * discards whatever C answers, except a struct, which is passed by value. */
+ * as `c`; `form` is how `avin` carries a string, if it does, and a string's position is read through
+ * `c_text_position`. A result whose Avin type is `unit` discards whatever C answers, except a struct,
+ * which is passed by value. */
 c_crossing_problem(c: CType, avin: &Type, form: CTextForm, result: bool) -> string
     if result && *avin is Unit
         return if c is CRecordType(_) then "a struct C answers by value is answered as its mirror, a data type declared `@c(struct: …)`, or as an opaque value, a class declared `@c(value: …)`" else ""
