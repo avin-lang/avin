@@ -466,6 +466,28 @@ them lazily instead. `m.filterKeys(p)` keeps the entries whose key passes, `m.tr
 binds each key to a value made from both, and `m.updatedWith(k, f)` calls `f` with `m.get(k)` and
 binds `k` to the `Some` it answers or leaves it unbound for `None`, so it adds, replaces or removes.
 
+`m.withDefault(f)` and `m.withDefaultValue(v)` see a map of any kind with a default for the keys it
+does not hold: `apply` of an absent key answers `f(key)` (or `v`) where the map's own `apply` traps,
+and the default is never stored. Everything else sees only the real entries: `get` answers `None`,
+`contains` `false`, `getOrElse` its own default, and `size`, iteration, `keys()` and `keySet()` are
+those of the wrapped map. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` answer a map
+with the same default, and `transform` and `mapValues` the wrapped map's own, with none. The wrapper
+is equal to the map it wraps, and to every map of the same entries whatever its default, and hashes
+and displays as it does. A default of a supertype of the values makes a map of that type. A
+counter reads `val counts = HashMap.empty[string, int]().withDefaultValue(0)` and then
+`counts.updated(w, counts(w) + 1)`.
+
+A hash, tree or ordered map's `partition((k, v) -> bool)` answers two maps of its own kind, the
+entries that pass and those that do not, each keeping the order of the whole and `p` called once per
+entry; likewise `partition(p)` of a hash, tree, ordered or bit set answers two sets of its own kind.
+Held as a `Map` or `Set`, or given a function of one pair, `partition` is `Iterable`'s and answers
+vectors. `s.subsets()` visits every subset of a set and `s.subsets(k)` those of `k` elements, as
+iterators that make each subset only when it is asked for: each is a set of the receiver's kind,
+visited by size, the empty set first and the set itself last, and those of one size in the
+lexicographic order of their elements' positions in iteration order. A set of `n` elements has `2^n`
+subsets and `C(n, k)` of size `k`; `subsets(k)` of a `k` below 0 or above `n` is empty, and the empty
+set's `subsets()` is itself alone.
+
 `avin.collections.mutable` holds `Map[K, V]` and `Set[A]`, invariant, updated in place:
 `m(k) = v` binds a key, `m(k) += 1` updates its value, and `remove` answers the value removed as an
 `Option`. They are open-addressed tables, probed linearly, kept at most two thirds full. A program
