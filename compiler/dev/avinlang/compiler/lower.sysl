@@ -3616,6 +3616,21 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
     val field_type = CTypedef(c_field_type_name(n))
     if writer
         val t = concrete(l, symbol.params[last])
+        // A struct mirror is written whole: laid out as C's struct in memory of its own, which the
+        // glue assigns to the field, then freed. A mirror holding a string is never written.
+        if c_struct_of(t, l.program.data) is Some(d)
+            val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
+            var copies: Buf[Operand] = buf()
+            c_struct_write(l, symbol, d, Value(l.param_values[last].unwrap()), memory, 0, &copies, at)
+            var params = c_field_params(indices.len())
+            params.push(CAddress)
+            var args = c_field_args(pointer, indices)
+            args.push(memory)
+            l.insts.push(Call(None, CFunction(c_field_glue(n, "set"), params, None), args))
+            c_free_struct_memory(l, memory)
+            l.library = outer
+            finish(l, Return(None))
+            return
         // An enum mirror is written as its enumerator's value, which the field's type holds.
         val mirror = c_mirror_of(t, l.program.data)
         val s = c_scalar_of(field_type, if mirror is Some(_) then Int(64) else t, l.program.c_measures)
@@ -3644,6 +3659,20 @@ private c_field_body(l: *Lowering, symbol: FunctionSymbol, n: usize, field: CFie
         classes.push(k)
         val call = CCall(who, buf(), objects, classes, buf(), 1, false, buf())
         val value = c_view_answer(l, call, result_type, m, Value(answer), Value(length), who, at)
+        l.library = outer
+        finish(l, Return(Some(value)))
+        return
+    // A struct mirror is read whole: the glue copies the field into memory of its own, read into a
+    // new value of the mirror, then freed.
+    if c_struct_of(result_type, l.program.data) is Some(d)
+        val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
+        var params = c_field_params(indices.len())
+        params.push(CAddress)
+        var args = c_field_args(pointer, indices)
+        args.push(memory)
+        l.insts.push(Call(None, CFunction(get, params, None), args))
+        val value = c_struct_read(l, d, memory, s"read from the field `${field.expr}` of `${trap_name(l, k)}`", at)
+        c_free_struct_memory(l, memory)
         l.library = outer
         finish(l, Return(Some(value)))
         return

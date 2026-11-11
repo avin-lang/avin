@@ -30,7 +30,7 @@ int fx_object_check(fx_object *o, int want);
 fx_object *fx_object_lend(fx_object *o);
 
 /* A library owning the faces made in it, which frees every face still in it when its last reference
- * goes, as FreeType's `FT_Done_FreeType` does; a face given back after that is freed twice. */
+ * goes, as a FreeType library does; a face given back after that is freed twice. */
 typedef struct fx_library_rec *fx_library;
 struct fx_face_rec {
     fx_library library;
