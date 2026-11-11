@@ -5231,15 +5231,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `real`, losing precision silently).
   **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
   rather than round to it.
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `binding-defaults`): **A binding marked `named` (`@sysl("f", named)`) passes
+- Settled on the user's delegation 2026-11-10 (built on branch `binding-defaults`): **A binding marked `named` (`@sysl("f", named)`) passes
   every argument by its parameter's name, so a parameter it leaves out takes the Sysl function's own
   default.** The Avin name is spelled as Sysl spells it, each uppercase letter an underscore and its
   lowercase, as a mirror's fields are (`onFrame` is `on_frame`); the binding lists the parameters it
@@ -5260,6 +5252,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   make every existing binding's parameter names part of its contract with Sysl); copying the
   defaults (the stale copies this replaces). Review with the user: the surface word `named`, and
   whether a caller-side form should come later.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
