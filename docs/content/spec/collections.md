@@ -471,6 +471,19 @@ Iteration visits a map's entries as `(key, value)` pairs in an order the program
 the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the
 mutable ones it is the table's order.
 
+`avin.collections.mutable` also holds `LinkedMap[K, V]` and `LinkedSet[A]`, which have everything
+`Map` and `Set` have and iterate in insertion order, oldest first, in `keys()`, `values()`, the
+display and every method that builds a collection (which answers a linked one). Binding a key that
+is present replaces its value and leaves it in place; `putLast(k, v)` and `moveToEnd(k)` make it the
+newest, and a key that was removed and bound again is new. `headOption()` and `lastOption()` answer
+the oldest and newest entry, and `removeFirst()` and `removeLast()` remove and answer one, trapping
+when the map is empty, so a least-recently-used cache is a `moveToEnd` on each hit and a
+`removeFirst()` when it is full. A set has the same, with `addLast`, `moveToEnd`, `removeFirst()` and
+`removeLast()` answering elements. Removing entries while iterating is safe and an entry removed
+before the iterator reaches it is not visited; binding new keys while iterating never traps, but
+whether the iterator visits them is not defined. Two linked maps, or sets, are equal when they hold
+the same entries, whatever order they were bound in.
+
 Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
 compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
 `{a: 1, b: 2}` and `{1, 2, 3}`, each part in its own `Display`, and its `Debug` uses the parts'
