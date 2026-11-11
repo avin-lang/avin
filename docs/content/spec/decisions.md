@@ -6330,6 +6330,47 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `stdlib-iterator`): **The eager methods added to every `Iterable` answer
+  vectors.** `scanLeft` is a `Vector[B]`, `tapEach` and `concat` a `Vector[T]` (`Vector[W]` for
+  `concat[W >: T]`), `span` and `partitionMap` pairs of vectors, and `flatten()` of a collection of
+  collections a `Vector[T]`; `grouped` and `sliding` answer the `Iterator[Vector[T]]` a sequence's
+  do, by delegating to the iterator's forms. WHY: one predictable kind, the one `partition`, `span`
+  and `scanLeft` on a sequence already answer, with no higher-kinded types to name the receiver's
+  own. Alternatives: `Iterable[B]` as the `Iterable` transformations answer (hides that it is a
+  vector), or each collection keeping a same-kind form (a long tail of overrides). Review with the
+  user: whether `tapEach` on a list should answer a list.
+- Proposed (built on branch `stdlib-iterator`): **An iterator's new lazy forms are added by
+  `impl[T] Iterator[T]`, not declared in the trait.** So `padTo(total, element: T)` and
+  `zipAll(other, thisElement: T, thatElement)` take the element type in a parameter of the
+  covariant `Iterator`, and the forms are found before the eager ones every `Iterable` has. An
+  iterator whose static type is only `Iterable` gets the eager forms, as with `map`. Alternatives:
+  trait members with lower-bounded parameters (`padTo[W >: A]`), which a program's own iterator
+  could override, at the cost of a widened result everywhere.
+- Proposed (built on branch `stdlib-iterator`): **`it ++ other` takes `other` as an ordinary
+  `Iterable` and asks for its `iterator()` only once `it` is used up**; `concat` on an iterator is
+  the same lazy join. WHY: a strict argument reads like every other call, and the iterator taken late
+  is what keeps a mutable `other` read as it is when reached. Alternative: a by-name `other`, which
+  would delay even evaluating the expression.
+- Proposed (built on branch `stdlib-iterator`): **`Iterator.from` is two overloads over
+  `T: Integer`, `from(start)` and `from(start, step)`,** not one with `step = 1`, since the default
+  would have to be `T(1)` of the caller's type. An element is computed when it is read, so
+  `from(int.MaxValue)` gives `int.MaxValue` and overflow traps only when the element past it is read.
+  Alternatives: a default parameter written `T(1)`; `int` and `long` overloads only.
+- Proposed (built on branch `stdlib-iterator`): **The companion iterators compute when read.**
+  `fill` and `continually` evaluate their by-name element at each `next()`, `tabulate` calls `f` at
+  each `next()`, `iterate` calls `f` before each element after the first, and `unfold` calls `f`
+  when `hasNext()` is asked and holds the element it gave. WHY: an iterator does no work for an
+  element that is not read. Alternative: `fill` and `tabulate` building a vector and iterating it,
+  as the sequence companions do (eager, and `fill`'s element evaluated before any is read).
+- Proposed (built on branch `stdlib-iterator`): **`grouped` and `sliding` on an iterator give the
+  windows a sequence's give**, reading the next window when `hasNext()` is asked, holding no element
+  beyond the current window, and trapping on a size or step below 1 at the call, with the messages a
+  sequence's use. `BufferedIterator[A]` is a public class with `peek()` (trapping with "peek on an
+  exhausted iterator") and `peekOption()`; `buffered()` on one wraps it again. `flatten()` is also
+  on an iterator of collections, lazily, beside the eager one on every collection of collections.
+  Alternatives: windows read at `next()` only (no lookahead, but `hasNext()` could not answer for a
+  step that skips past the end); `buffered()` answering a buffered iterator itself.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

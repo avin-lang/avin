@@ -14,6 +14,7 @@ have.
 ```text
 Iterable[+A]                 iterator(), and the operation families below
 ├── Iterator[+A]             single-pass; iterator() returns itself
+│   └── BufferedIterator[A]  also peek() at the next element
 ├── Seq[+A]                  ordered, (Int) -> A
 │   ├── List[+A]             immutable linked list
 │   ├── Vector[+A]           immutable, persistent tree; the default sequence
@@ -130,6 +131,13 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 | `toMap()`, on pairs | `Map[K, V]`, a later key's value replacing | O(n) |
 | `zipWithIndex()` | `Vector[(T, int)]`, positions from 0 | O(n) |
 | `collectFirst(pf)` | `Option[B]` | O(n) |
+| `scanLeft(initial, f)` | `Vector[B]`: `initial`, then each partial result of `foldLeft(initial, f)`; one more than there are elements | O(n) |
+| `tapEach(f)` | `Vector[T]`, the elements, `f` called with each in order before it is answered | O(n) |
+| `partitionMap(f)` (`f: (T) -> Either[A, B]`) | `(Vector[A], Vector[B])`: the values of the `Left`s and of the `Right`s, each in order | O(n) |
+| `span(p)` | `(Vector[T], Vector[T])`: the elements before the first that fails `p`, and the rest; `p` not called after that | O(n) |
+| `grouped(size)`, `sliding(size, step = 1)` | `Iterator[Vector[T]]`, an iterator's own `grouped` and `sliding` of the elements; a size or step below 1 traps | O(n) |
+| `concat(other)` | `Vector[W]`, the elements then `other`'s, `W` a supertype of both element types | O(n) |
+| `flatten()`, on a collection of collections | `Vector[T]`, their elements in order | O(n) |
 | `view()` | `Iterator[T]`, lazy; see below | O(1) |
 
 Each group of `groupBy` and `groupMap` keeps its elements' order; `groupMapReduce` combines a key's
@@ -151,6 +159,47 @@ the collection made of the one before is used up, `zip` ends with the shorter si
 `zipWithIndex` here is an `Iterator[(T, int)]` rather than a vector. The new iterator shares its
 source, which must not then be read on its own. `withFilter(p)` is its `filter(p)`, already lazy, so a
 comprehension over an iterator is an iterator, read element by element.
+
+An iterator's own forms of more of the methods are lazy too, found before the ones every `Iterable`
+has, which build vectors:
+
+| Method on `Iterator[T]` | Result, an iterator |
+|---|---|
+| `it ++ other`, `it.concat(other)` | the elements, then `other`'s, whose `iterator()` is asked for only once these are used up; `Iterator[W]`, `W` a supertype of both |
+| `scanLeft(initial, f)` | `initial`, then each partial fold, `f` called as each result is read |
+| `grouped(size)`, `sliding(size, step = 1)` | `Iterator[Vector[T]]`, windows as a [sequence's](#methods-every-seq-has) are, each read from the source when it is asked for and no element held beyond it; a size or step below 1 traps at the call |
+| `distinct()`, `distinctBy(key)` | the elements with each one equal to, or whose key equals, an earlier one's left out; `key` once per element read |
+| `zipAll(other, thisElement, thatElement)` | pairs as many as the longer side has, the side that has run out filled |
+| `padTo(total, element)` | the elements, then copies of `element` up to `total` of them |
+| `tapEach(f)` | the elements, `f` called with each as it is read |
+| `buffered()` | a `BufferedIterator[T]` of the elements |
+| `flatten()`, on an iterator of collections | their elements, each collection read when it is reached |
+
+A `BufferedIterator` is an iterator that can look ahead: `peek()` is the element `next()` would give,
+read from the source if it has not been and held until `next()` gives it, and traps when none is left;
+`peekOption()` is `Some` of it or `None`. Since each lazy form reads only as far as it is asked, an
+endless source works with all of them: `Iterator.from(1).sliding(2).take(3)` reads four elements.
+
+**`object Iterator` makes iterators from a value or a function.** Each is lazy, computing an element
+when it is read; an endless one is used through `take`, `takeWhile` and the other methods that stop.
+
+| Function | Elements |
+|---|---|
+| `Iterator.empty[T]()` | none |
+| `Iterator.single(x)` | `x` |
+| `Iterator.iterate(start, f)` | `start`, `f(start)`, `f(f(start))`, …, endless, each call of `f` made when its result is read |
+| `Iterator.unfold(state, f)` (`f: (S) -> Option[(T, S)]`) | while `f(state)` is `Some((x, next))`, `x`, with `next` the state after it; the first `None` ends it, and `f` is called when another element is asked for |
+| `Iterator.continually(element)` | the by-name `element`, evaluated once for each element read, endless |
+| `Iterator.from(start)`, `Iterator.from(start, step)` | `start`, `start + step`, …, endless, of any integer type, `step` 1 when left out; an overflowing addition traps only when the element past the type's limit is read |
+| `Iterator.fill(count, element)` | `count` values of the by-name `element`, evaluated as each is read |
+| `Iterator.tabulate(count, f)` | `f(0)`, …, `f(count - 1)`, each computed when it is read |
+
+`fill` and `tabulate` with a `count` that is not positive give no elements.
+
+```text
+Iterator.unfold((0, 1), p -> Some((p.0, (p.1, p.0 + p.1)))).take(6).toVector()   // [0, 1, 1, 2, 3, 5]
+Iterator.from(1).map(x -> x * x).takeWhile(x -> x < 50).toVector()              // [1, 4, 9, 16, 25, 36, 49]
+```
 
 **An iterator counts by being used up.** `size()` and `length()` on an `Iterator` answer the number of
 elements remaining as an `int`, found by reading them all: `hasNext()` is false afterwards and a second
