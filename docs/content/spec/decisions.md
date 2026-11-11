@@ -5521,15 +5521,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   rule by run-time type says; one seen inside a vector as an `Option[Dog]` and then boxed is an
   `Option[Dog]` too. A view inside an object-form value still leaves the `Option[Nothing]` object
   there, as any view leaves a value as it was made.
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `https`): **TLS's API** ([system library](/spec/system-library/#tls)).
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **TLS's API** ([system library](/spec/system-library/#tls)).
   A module of its own, `avin.net.tls`: `TlsStream.connect(host, port, settings)`, and
   `TlsStream.client(tcp, host, settings)` / `TlsStream.server(tcp, settings)` over a `TcpStream`
   the caller made; `TlsClient` (the authorities it adds) and `TlsServer(certificate, key)` (PEM
@@ -5546,7 +5538,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   shared between threads; a context is made per connection instead, which reads the machine's
   store each time, a few milliseconds); a `trust(pem)` that checks the PEM at once (it would need
   a context; a PEM that is not one is `Credentials` at the connection instead).
-- Proposed (built on branch `https`): **the trust model**. A client trusts the machine's store,
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **the trust model**. A client trusts the machine's store,
   through OpenSSL's default paths, plus what `TlsClient.trust(pem)` adds; it always checks the
   host name (a name or an address), sends it for SNI, and speaks TLS 1.2 at the least, none of
   which can be turned off, as the Sysl package `openssl` decides. *Why*: trust that only grows
@@ -5556,7 +5548,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   of Homebrew's OpenSSL, not the Keychain, so a root added only to the Keychain is not trusted;
   the `sysl` session would queue reading the Keychain in the `openssl` package on request.
   Review with the user whether Keychain roots are wanted.
-- Proposed (built on branch `https`): **TLS errors**. `TlsError` is `Transport(IoError)`,
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **TLS errors**. `TlsError` is `Transport(IoError)`,
   `Certificate(text)`, `Handshake(text)` and `Credentials(text)`; an `HttpError` gains
   `Tls(TlsError)`, a `Transport` failure staying `Io` as for `http`. After the handshake a TLS
   failure in a read or write is `IoError.Other("TLS: …")`, so a `TlsStream` is a `ByteStream`.
@@ -5567,7 +5559,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   into those kinds there alone. *Alternatives*: one `Tls(text)` error (a program could not tell
   a refused certificate from a broken connection); typed errors for every read and write (every
   `ByteStream` user would need a second error type).
-- Proposed (built on branch `https`): **a connection's end and timeouts over TLS**. The end of the
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **a connection's end and timeouts over TLS**. The end of the
   stream is the peer's `close_notify` or the TCP connection closing, both read as the end, since
   many servers close without a `close_notify` and HTTP frames its bodies; a body read to the
   connection's end can therefore be cut short undetected, as over TCP. Every wait, the handshake's
@@ -5577,7 +5569,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   *Alternatives*: an error for an end without `close_notify` (it would refuse ordinary servers);
   a handshake timeout of its own (one more limit to set). Review with the user whether a body read
   to the connection's end should require `close_notify`.
-- Proposed (built on branch `https`): **the standard library's Sysl packages**. The library names
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **the standard library's Sysl packages**. The library names
   the Sysl packages its own bindings reach in `library/library.hocon`, a manifest whose
   `sysl-dependencies` block is read as a package's is. One joins a program's shims only where a
   binding or handle the program compiles names a Sysl item inside it, the package's name being a
@@ -5589,7 +5581,8 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   package's tests). *Alternatives*: always adding the library's packages (every program with a
   binding would fetch and link OpenSSL); the runtime depending on `openssl` (every program would
   link it); a table from module to package in the compiler (a second place to keep in step).
-- **Views lent by a field and to a callback, as built** (branch `c-view-fields`, stage 13 item (A)):
+- Settled on the user's delegation 2026-11-11 (built on branch `c-view-fields`): **Views lent by a
+  field and to a callback**:
   - **A field accessor lending a view says `view`, `length:` and perhaps `writable`, as a binding
     does**, and nothing else; `length:` is a C expression in `self` and the indices, evaluated after
     the field is read, whether or not it is null. *Why*: the words a binding lending its result
@@ -5622,7 +5615,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     closed when it returned`` and `` … belongs to another thread``; a field's view is a handle's view
     and says `` the `ByteView` of `Face` was closed when `Face` was used again``.
 
-JSON derivation (branch `json-derive`, stage 11 item (f)):
+Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **JSON derivation**.
 
 - **One `JsonError` for parsing and decoding**, the path its last field with a default:
   `JsonError(message, line, column, offset, path: List[PathStep] = [])`, `inField`/`atIndex`
@@ -5658,6 +5651,13 @@ JSON derivation (branch `json-derive`, stage 11 item (f)):
 - **Entry points** `json.encode(value) -> string` and `json.decode[A](text, maxDepth = 512)`, the
   second refusing anything but white space after the value. *Alternatives*: only the traits'
   methods, leaving every program to make a writer and a reader.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
