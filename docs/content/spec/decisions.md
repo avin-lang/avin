@@ -6559,14 +6559,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     that every other `removeHead` has); `head`/`tail` names only (they remain, from `Seq`, with `tail`
     answering a `Vector`).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- **`BitSet` (immutable and mutable): representation and negatives** (branch `stdlib-bitset`).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` (immutable and mutable): representation and negatives** (branch `stdlib-bitset`).
   Proposed: the immutable `BitSet` is a class over a `Vector[long]` of words, kept without empty words
   at the end, so an update copies one path and `toBitMask()` is the words; the mutable one is over a
   `Buffer[long]`. A negative element is not in any bit set: `contains` and `excl`/`remove` treat it as
@@ -6579,7 +6572,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   element, so `s.incl(x).contains(x)` can be false); offsetting by a minimum (a different set type).
   Review with the user if bit sets of negatives (a signed range) are wanted.
 
-- **`BitSet` method names beyond the `Set` ones** (branch `stdlib-bitset`). Proposed: the immutable
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` method names beyond the `Set` ones** (branch `stdlib-bitset`). Proposed: the immutable
   set adds `symmetricDiff` and `toBitMask`, with `BitSet.fromBitMask`; the mutable one adds
   `unionInPlace`, `intersectInPlace`, `diffInPlace`, `symmetricDiffInPlace` (taking a mutable bit
   set), the non-mutating `union`, `intersect`, `diff` and `symmetricDiff` over mutable bit sets,
@@ -6593,7 +6586,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   knowing bit-twiddling. The mutable bit set's `union`/`intersect`/`diff` take a mutable bit set only
   rather than any `Set[int]`, the mutable `Set` not being a `Set` trait member either.
 
-- **A mutable `BitSet` iterates over a snapshot, and its ordered queries copy it** (branch
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **A mutable `BitSet` iterates over a snapshot, and its ordered queries copy it** (branch
   `stdlib-bitset`). Proposed: `iterator()`, `headOption()`, `lastOption()`, `minAfter` and
   `maxBefore` of a mutable bit set read an immutable copy of its words, so changing the set during a
   `for` is safe and visits the elements it had when the loop began. Why: it makes the iterator the
@@ -6602,7 +6595,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   loop calling `minAfter` repeatedly on a large sparse set is quadratic in the words. Alternative: a
   live iterator that reads the words as it goes (no copy, but sees its own changes); revisit if
   `minAfter` is used as a scan.
-- Proposed (branch `stdlib-mutable-tree`): **A mutable tree map or set holds an immutable one and
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree map or set holds an immutable one and
   replaces it; iterating it while updating it is legal and sees the collection as it was.**
   `avin.collections.mutable.TreeMap` and `TreeSet` keep a private immutable `TreeMap` or `TreeSet`
   and assign a new one at each update. Why: the persistent tree is already balanced and tested, its
@@ -6616,28 +6609,35 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   O(log n) nodes, which a mutable tree would not; revisit if a profile shows it. Review with the user:
   the snapshot-iteration guarantee is a promise a later in-place tree would have to keep.
 
-- Proposed (branch `stdlib-mutable-tree`): **Two types are named `TreeMap` (and `TreeSet`), one in
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **Two types are named `TreeMap` (and `TreeSet`), one in
   `avin` and one in `avin.collections.mutable`.** As `Map` and `Set` already are. Inside the mutable
   module the bare name is the mutable one and the immutable one is imported under an alias; a program
   importing the mutable one unaliased while also using the prelude's gets the mutable one for the bare
   name, and reaches the immutable one through an aliased import (both forms are tested). Alternatives:
   distinct names (`MutableTreeMap`) which would break the parallel with `Map`/`Set`.
 
-- Proposed (branch `stdlib-mutable-tree`): **`removeFirst()`/`removeLast()` trap on an empty
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **`removeFirst()`/`removeLast()` trap on an empty
   collection; `removeFirstOption()`/`removeLastOption()` answer `None`.** The immutable sorted
   collections pair `head()` (trapping) with `headOption()`; the removal operations follow the same
   split, the plain name being the trapping form. Alternatives: answering an `Option` from the plain
   name (as `remove(key)` does), or a `pollFirst` name.
 
-- Proposed (branch `stdlib-mutable-tree`): **The `range*` forms of a mutable tree collection answer a
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **The `range*` forms of a mutable tree collection answer a
   new mutable collection, not a view.** As `filter` and `copy()` do on the hash-based mutable
   collections; a write to the slice does not reach the original. Sharing the tree makes the slice O(log
   n) to make. Alternative: live views, which would need the mutable tree to be in place.
 
-- Proposed (branch `stdlib-mutable-tree`): **A mutable tree set's `union`, `intersect`, `diff` and
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree set's `union`, `intersect`, `diff` and
   `subsetOf` take a mutable tree set**, as the mutable hash set's take a mutable hash set; the
   `keySet()` of a mutable tree map is an immutable `TreeSet` snapshot, as a mutable `Map`'s is an
   immutable `Set`.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
