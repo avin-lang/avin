@@ -82,6 +82,40 @@ union fxf_cell {
         double y;
     } point;
 };
+/* Structs read and written whole through fields: a box, as FreeType's `FT_BBox` is; a size's
+ * metrics, holding another struct and an enum, reached through a pointer, as `FT_Size_Metrics` is
+ * through `face->size`, here `record->scaled`; and a struct holding a string, which is only read. */
+typedef struct fxf_box {
+    long x_min;
+    long y_min;
+    long x_max;
+    long y_max;
+} fxf_box;
+struct fxf_metrics {
+    unsigned short x_ppem;
+    long ascender;
+    struct fxf_point origin;
+    enum fxf_shade shade;
+};
+struct fxf_size {
+    struct fxf_metrics metrics;
+};
+struct fxf_labelled {
+    const char *label;
+    int id;
+};
+/* Typedefs of `char`, as FreeType's `FT_String` is, one through another and one `const`, and of the
+ * byte types, which are no text. */
+typedef char fxf_string;
+typedef fxf_string fxf_string2;
+typedef const char fxf_cstring;
+typedef unsigned char fxf_ubyte;
+typedef signed char fxf_sbyte;
+/* A struct whose name is bytes, which no mirror reads as a string. */
+struct fxf_raw_named {
+    const fxf_ubyte *name;
+    int id;
+};
 typedef struct fxf_record fxf_record;
 struct fxf_record {
     int magic;
@@ -120,6 +154,15 @@ struct fxf_record {
     fxf_record *next;
     fxf_base base;
     fxf_derived derived;
+    fxf_box box;
+    struct fxf_size *scaled;
+    struct fxf_labelled labelled;
+    struct fxf_point corners[3];
+    const struct fxf_point anchor;
+    const fxf_string *family_name;
+    fxf_string2 *style_name;
+    fxf_ubyte *raw;
+    const fxf_sbyte *signed_raw;
 };
 /* A record with every field set to a fixed sample: see avin_fields.c. */
 fxf_record *fxf_record_new(void);
@@ -139,5 +182,23 @@ void fxf_record_copy_values(const fxf_record *r, int *into);
 void fxf_record_set_count(fxf_record *r, int count);
 /* The values a writer stored, read back by C. */
 long long fxf_record_sum(const fxf_record *r);
+/* The record's box, size metrics and corners as text, read by C, in a buffer of the record's own. */
+const char *fxf_record_shapes(fxf_record *r);
+/* Stores a shade no variant holds into the size's metrics. */
+void fxf_record_bad_metrics(fxf_record *r);
+/* Strings through typedefs of `char`: the family and style names, the length of a string passed as
+ * one, `const` or not, and the family name written back through an `out` pointer. */
+const fxf_string *fxf_family(const fxf_record *r);
+fxf_string2 *fxf_style(const fxf_record *r);
+long fxf_string_length(const fxf_string *s);
+long fxf_string2_length(fxf_string2 const *s);
+long fxf_cstring_length(fxf_cstring *s);
+long fxf_mutable_length(fxf_string *s);
+void fxf_family_out(const fxf_record *r, const fxf_string **name);
+/* Bytes, no text: the record's raw bytes, and the length of a run of signed ones. */
+const fxf_ubyte *fxf_raw(const fxf_record *r);
+long fxf_sbyte_length(const fxf_sbyte *s);
+/* Calls `f` with the family name, as a `const fxf_string *`, and answers what it answered. */
+int fxf_with_family(const fxf_record *r, int (*f)(const fxf_string *name, void *userdata), void *userdata);
 
 #endif

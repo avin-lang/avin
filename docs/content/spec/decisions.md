@@ -3253,9 +3253,10 @@ their words are reserved.
   - **A kept handle whose class declares `retain` is held by a C reference**, taken through that
     `retain` when the call succeeds and given back through its `release` after the holder's own
     `release`. *Why*: the collector finalizes the unreachable in address order, so a `Face` and the
-    `Library` it keeps, dead in one collection, may be finalized library first; `FT_Done_FreeType`
+    `Library` it keeps, dead in one collection, may be finalized library first; freeing the library
     frees every face still in it, and the face's `FT_Done_Face` then frees one twice. With the
-    reference, `FT_Done_FreeType` only drops a count. MLT's `Consumer` keeping its `Playlist`
+    reference, the library's `release`, `FT_Done_Library`, only drops a count (`FT_Done_FreeType`
+    also frees the memory manager whatever the count, so it is no `release`). MLT's `Consumer` keeping its `Playlist`
     (`keeps: "source"`) gains the same order. *Alternatives*: ordered finalization in the collector
     (kept before keeper), which Avin cannot change and which the collector's address-order sweep
     does not offer; holding the Avin object and taking the order on trust, a use after free whenever
@@ -5944,6 +5945,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   macros.
 
 ## Proposed
+
+- Proposed (built on branch `c-binding-gaps-2`): **A field accessor reads and writes a struct
+  mirror whole**: the C unit checks the field is the struct the mirror mirrors (any member path,
+  through pointers and array elements); the reader's glue copies the field into memory Avin
+  allocates, read into a new value as a filled `out` mirror is, the memory then freed; the writer
+  lays the value out as C's struct and the glue assigns it. A mirror holding a string, directly or
+  in a mirror it holds, is refused as a writer's value, and an `Option` of a mirror is refused
+  either way. *Why*: FreeType's `face->bbox` and `face->size->metrics` are structs read whole, and
+  one accessor per member (the package's workaround, eight accessors and a tuple) loses the type;
+  the mirror's layout is already checked and measured, so the copy is the struct passed by value's
+  own conversion. Writing a string would leave C holding a copy no one frees, the rule for string
+  fields; a field is never null. *Alternatives*: read only, no writer (writing is the scalar rule
+  extended and costs one glue function); a writer that leaks or keeps the string copies (C would
+  own Avin's allocation); answering a handle on the struct inside the owner (lifetime tied to the
+  owner, and every member a call).
+- Proposed (built on branch `c-binding-gaps-2`): **One pointer to a typedef of `char` is a
+  string**: where a string crosses (parameter, result, `out` value, callback parameter), a C type
+  written as one pointer to a typedef (`const FT_String *`, `FT_String const *`, `T *const`) is
+  checked by the C unit as a typedef of the whole pointer: `char *` or `const char *` as a result,
+  `const char *` as a parameter, so a typedef chain and a `typedef const char T` both work. A
+  pointer to a typedef of `unsigned char` or `signed char` is refused by a check of its own whose
+  message says those are bytes rather than text, for results, parameters, fields and struct
+  mirrors' fields. *Why*: only the headers know what `FT_String` is, and the existing typedef rule
+  already defers the string check to the C unit; fields already resolved typedefs, since their
+  type comes from the header. *Alternatives*: rewriting the prototype's spelling to `char` (loses
+  the header check's typedef names); a new C type kind in the parser for a pointer to a typedef
+  (every handle `cairo_t *` is one, so each position would have to tell the two apart).
+- Proposed (built on branch `c-binding-gaps-2`): **The c-bindings chapter's FreeType library is
+  released with `FT_Done_Library`**, not `FT_Done_FreeType`: the latter frees the library's memory
+  manager whatever the reference count, so a face kept past the library's handle would allocate
+  through freed memory. The chapter's prose and both examples say so. *Why*: a `release` must give
+  back exactly one reference when the class declares `retain`. *Alternatives*: none that keeps
+  `keeps:` sound; the manager's small record is not given back, as the freetype package notes.
 
 ## Open
 
