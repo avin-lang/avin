@@ -1,0 +1,72 @@
+// expect: exit 0
+// A thread parked in TCP `connect` is woken by its scope's cancellation and stops, with nothing after
+// the `connect` run and no result. The connection that never completes is to 127.0.0.2: on this
+// platform the loopback interface carries only 127.0.0.1, so a connection to any other address of
+// 127/8 is sent there and dropped, with no refusal, and the connect waits until the platform gives up,
+// over a minute later. One thread, many at once, one in a scope nested inside a cancelled thread, and
+// one cancelled again and again on the same thread of the program's are all stopped at once; the
+// socket each was connecting is closed, and connecting to a listener afterwards still works.
+import avin.fs
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Atomic, scope, sleep}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+// Starts `n` threads in a scope, each connecting to an address that never answers, cancels the scope
+// once they are all parked, and answers how many have no result and how many ran past `connect`.
+cancelConnects(n: int) -> (int, int)
+    val started = Atomic(0)
+    val after = Atomic(0)
+    val ts = scope(s ->
+        val ts = (0..<n).toVector().map(_ -> s.spawn(() ->
+            started.add(1)
+            val c = TcpStream.connect("127.0.0.2", 9)
+            after.add(1)
+            c.isOk()))
+        while started.load() < n do sleep(time.millis(1))
+        sleep(time.millis(30))
+        s.cancel()
+        ts)
+    (ts.count(t -> t.result().isEmpty()), after.load())
+
+main()
+    val start = time.monotonic()
+    println(cancelConnects(1))
+    println(cancelConnects(16))
+    // A cancelled thread parked in a scope of its own, whose thread is parked in `connect`.
+    val inner = Atomic(0)
+    val after = Atomic(0)
+    val outer = scope(s ->
+        val t = s.spawn(() ->
+            scope(s2 ->
+                val t2 = s2.spawn(() ->
+                    inner.store(1)
+                    TcpStream.connect("127.0.0.2", 9)
+                    after.add(1))
+                t2.join())
+            after.add(1))
+        while inner.load() == 0 do sleep(time.millis(1))
+        sleep(time.millis(30))
+        s.cancel()
+        t)
+    println(outer.result())
+    println(after.load())
+    // Over and over: each cancelled connect closes its socket and leaves nothing behind.
+    val descriptors = ok(fs.listDir("/dev/fd")).length()
+    var stopped = 0
+    for _ in 0..<20
+        val (none, _) = cancelConnects(2)
+        stopped += none
+    println(stopped)
+    println(ok(fs.listDir("/dev/fd")).length() == descriptors)
+    // Connecting still works.
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+    val s = ok(l.accept())
+    ok(c.writeText("connected after\n"))
+    println(ok(s.readLine()))
+    println(time.monotonic() - start < time.seconds(20))

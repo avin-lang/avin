@@ -5285,6 +5285,24 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `Option[Executor] = None` (breaks the positional `spawn(b, Stop, ex)`); a public
   `Executor.isShared()` (more surface for one library's need). Review with the user: whether an
   explicit executor should still bound an actor once every turn could be a thread.
+- Proposed (branch `train-2`): **A scope's cancellation does not reach actors**
+  ([cancellation](/spec/threads/#cancellation), [scheduling](/spec/actors/#scheduling)). An actor
+  started by a scope's thread is a top-level actor and runs on when that thread is cancelled; an
+  actor's turn, a lightweight thread started as a plain thread is, is never cancelled by a scope,
+  though the scopes it runs cancel their own threads. The waits a turn makes need nothing of their
+  own: a turn waits only in the library's waits (a future's `await`, so an `ask`; a sleep, a
+  channel, a condition, a socket), every one already a cancellation point for a thread that can be
+  cancelled. An asker cancelled in an `ask`'s `await` leaves its question in the actor's mailbox,
+  handled in its place among the messages told, and the reply completes a promise nobody awaits,
+  which also takes the ask's timer out. *Why*: cancellation reaches down through scopes and only
+  scopes, and an actor is owned by its parent actor or by nobody, never by the thread that happened
+  to start it, so tying its life to that thread's scope would make where an actor is spawned decide
+  when it ends; cancelling a turn would stop an actor halfway through a message, leaving its fields
+  half changed with no lock to guard them, and break one turn at a time. *Alternatives weighed*:
+  stopping the actors a cancelled thread started (structured actors, which the actor tree already
+  provides through parent actors); taking a cancelled asker's question back out of the mailbox
+  (needs a mailbox that removes from its middle, and the actor may already be handling it); making
+  a turn cancellable by the scope that told it a message (a message has no owning scope).
 
 ## Open
 

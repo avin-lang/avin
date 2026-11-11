@@ -91,6 +91,13 @@ goes on running after the call. What a program can rely on:
   only its own threads. A scope opened while its thread holds a lock is not cancelled with that
   thread, since nothing stops the thread there: its threads finish, and the thread stops once it has
   let the lock go.
+- **Actors are not a scope's threads.** An actor started by a scope's thread is a top-level actor,
+  and its turns are threads of their own, so cancelling the scope does not reach it: it runs on and
+  ends as any actor ends, having handled what the cancelled thread told it, in the order told. A
+  thread parked in an actor's `ask` is parked in a future's `await`, so it stops at once; the
+  question stays in the actor's mailbox and is handled in its place, and its reply, going to an ask
+  nobody awaits, is dropped, the ask's timer with it. An actor's turn is never cancelled by a scope,
+  but the scopes a turn runs are cancelled as any thread's are.
 - `s.isCancelled()` answers whether the scope has been cancelled, by `cancel` or by a cancellation of
   the thread running it. `cancel`, like `spawn`, is called by the thread that runs the scope's body
   while the scope is open, and traps otherwise; cancelling twice is cancelling once.

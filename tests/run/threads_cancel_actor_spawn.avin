@@ -1,0 +1,100 @@
+// expect: exit 0
+// An actor started by a scope's thread is a top-level actor, and the scope's cancellation does not
+// reach it: it is no thread of the scope's, so it runs on after the thread that started it is
+// cancelled, handles every message that thread told it, in the order told, and ends only as any actor
+// ends. A thread cancelled while it computes, telling an actor a number on each turn of its loop,
+// stops between two tells, so the actor has a gap-free prefix of the numbers. A thread cancelled while
+// parked waiting for an actor's end stops, and the actor goes on. A thread cancelled while parked in
+// an hour's sleep stops at once, and its far timer does not hold the program.
+import avin.actors.{ActorRef, Ending, spawn}
+import avin.threads.{Atomic, Channel, Promise, scope, sleep}
+import avin.time
+
+data Msg
+    Note(n: int)
+    Report(reply: Promise[string])
+    Quit
+
+// Checks the numbers come 0, 1, 2, … with no gap, and reports how many came and whether in order.
+actor Counter() receives Msg
+    var next = 0
+    var disorders = 0
+    receive
+        Note(n) ->
+            if n != next then disorders += 1
+            next = n + 1
+        Report(reply) -> reply.complete(s"$next notes, $disorders out of order")
+        Quit -> stop()
+
+report(c: ActorRef[Msg]) -> string
+    val p = Promise[string]()
+    c.tell(Report(p))
+    p.future.await()
+
+main()
+    val start = time.monotonic()
+    // Threads that start an actor, tell it some notes and park, each on a different wait, then are
+    // cancelled.
+    val refs = Channel[ActorRef[Msg]](8)
+    val after = Atomic(0)
+    val ts = scope(s ->
+        val never = Promise[unit]()
+        val idle = Channel[int]()
+        val ts = [
+            s.spawn(() ->
+                val c = spawn(Counter())
+                for n in 0..<50 do c.tell(Note(n))
+                refs.send(c)
+                never.future.await()
+                after.add(1)),
+            s.spawn(() ->
+                val c = spawn(Counter())
+                for n in 0..<7 do c.tell(Note(n))
+                refs.send(c)
+                idle.receive()
+                after.add(1)),
+            s.spawn(() ->
+                val c = spawn(Counter())
+                c.tell(Note(0))
+                refs.send(c)
+                sleep(time.hours(1))
+                after.add(1)),
+            s.spawn(() ->
+                val c = spawn(Counter())
+                refs.send(c)
+                val ended: Ending = c.ended().await()
+                after.add(1))]
+        var got: Vector[ActorRef[Msg]] = Vector()
+        for _ in 0..<4 do got = got :+ refs.receive().get()
+        sleep(time.millis(30))
+        s.cancel()
+        (ts, got))
+    val (threads, actors) = ts
+    println(threads.count(t -> t.result().isEmpty()))
+    println(after.load())
+    // Each actor runs on, with every note its cancelled starter told it.
+    var reports: Vector[string] = Vector()
+    for c in actors do reports = reports :+ report(c)
+    for r in reports.sorted() do println(r)
+    for c in actors do println(c.ended().isCompleted())
+    for c in actors do c.tell(Quit)
+    for c in actors do c.ended().await()
+    println("all ended")
+    // A thread cancelled mid-loop, at a safepoint between two tells.
+    val counter = spawn(Counter())
+    val told = Atomic(0)
+    val t = scope(s ->
+        val t = s.spawn(() ->
+            var n = 0
+            loop
+                counter.tell(Note(n))
+                n += 1
+                told.store(n))
+        while told.load() < 1000 do sleep(time.millis(1))
+        s.cancel()
+        t)
+    println(t.result().isEmpty())
+    val r = report(counter)
+    println(r == s"${told.load()} notes, 0 out of order" || r == s"${told.load() + 1} notes, 0 out of order")
+    println(r.endsWith(", 0 out of order"))
+    println(time.monotonic() - start < time.seconds(10))

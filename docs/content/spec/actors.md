@@ -392,6 +392,11 @@ instead, which bounds how many of them work at once:
   another worker in its place while it does. On an executor of its own, a task that waits in `await`
   or `threads.blocking(body)` leaves its place to another worker of that executor, and one that
   waits otherwise keeps it.
+- **Cancellation.** No scope's [cancellation](/spec/threads/#cancellation) reaches an actor: one
+  started by a scope's thread runs on once that thread is cancelled, and a turn is not a scope's
+  thread, so it is never cancelled, though a scope it runs may cancel its own threads. An asker
+  cancelled while it awaits an `ask` leaves its question in the mailbox, handled in its turn, the
+  reply going nowhere.
 - **Memory model.** A `tell` happens before the handling of the message it sent, and a reply's
   `tell` happens before the `await` or `pipeToSelf` that delivers it, joining the edges of
   [the memory model](/spec/threads/#the-memory-model).
