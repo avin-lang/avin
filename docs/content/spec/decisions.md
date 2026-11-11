@@ -5266,6 +5266,25 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   cancelled is otherwise unusable by anyone, and closing it is the scope's thread's job. *Alternatives
   weighed*: leaving them with the ended thread's owner (every later use traps); handing them back on
   the cancelled thread as it stops (it runs no code of its own then).
+- **Actors' turns on lightweight threads** (branch `lwt-actors`, [scheduling](/spec/actors/#scheduling)).
+  An actor on the shared executor, the default, runs each turn as a lightweight thread of its own,
+  started with a thread's default stack (8 MiB reserved, committed as touched, reused from the
+  scheduler's spares) and handing nothing over, the turn making the actor the owner of its code; a
+  turn that waits parks, and one that computes is time-sliced. An actor given an executor of its own
+  keeps running its turns as tasks on that executor's workers, so `Executor.fixed(n)` still bounds
+  how many work at once and the 16-message fairness among its actors stays exact. To tell the two
+  apart, `Executor.shared()` now gives back the same executor every time, compared with `===`.
+  *Why*: a turn as its own thread is what makes a sleeping or awaiting turn free its worker; the
+  shared pool counts a worker that sleeps or receives from a channel as working, so its few workers
+  could all be held by waiting turns. An explicit executor is a request for a bound, and keeping it
+  keeps every program that asked for one behaving as it did. *Alternatives*: one long-lived
+  lightweight thread per actor, parked on an empty mailbox (a committed stack page or more for every
+  idle actor, and a parked thread for each of a hundred thousand actors); every turn a thread of its
+  own whatever the executor (drops the bound `Executor.fixed(n)` asks for, and the
+  `actors_fairness`/`actors_waiting` behaviour on one worker); `spawn`'s executor as an
+  `Option[Executor] = None` (breaks the positional `spawn(b, Stop, ex)`); a public
+  `Executor.isShared()` (more surface for one library's need). Review with the user: whether an
+  explicit executor should still bound an actor once every turn could be a thread.
 
 ## Open
 

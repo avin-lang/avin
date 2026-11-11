@@ -492,7 +492,8 @@ most `n` tasks working at once, `n` at least one, and starts its workers as work
 pool does; a worker waiting in `await` or `blocking` leaves its place to another there too.
 `ex.future(body)` runs `body` on it, and **a future runs its `map`, `flatMap` and `onComplete` on the
 executor it was made on**, so a chain begun on an executor stays there. `Executor.shared()` is the
-pool `Future(body)` uses; `Future.successful`, `Future.all`, `Future.first`, `Future.traverse` and a
+pool `Future(body)` uses, the same executor every time it is asked (`Executor.shared() ===
+Executor.shared()`); `Future.successful`, `Future.all`, `Future.first`, `Future.traverse` and a
 promise's future belong to it.
 
 An executor is sendable, so a body on one thread may give work to an executor another made.
@@ -558,8 +559,9 @@ safepoint. A program with one thread never stops anything.
 
 ## Actors
 
-[Actors](/spec/actors/) are scheduled by the runtime onto a pool of these threads. An actor handles
-one message at a time, so its own state needs no lock; its mailbox is a runtime queue on the shared
+[Actors](/spec/actors/) handle their messages in turns, each turn a lightweight thread of its own
+([scheduling](/spec/actors/#scheduling)), so a turn that waits parks as any thread does. An actor
+handles one message at a time, so its own state needs no lock; its mailbox is a runtime queue on the shared
 heap, and a message is a reference to a heap value. A message holds only values no other actor can
 change, or hands over the ownership of what it carries, and the compiler checks every message type
 for it ([what may be sent](/spec/actors/#what-may-be-sent)).

@@ -1,12 +1,13 @@
 module avin.actors
 
 // Actors: many small owners of state, each reached only by the messages sent to it, run a message at
-// a time on the workers of an executor. `spawn(behaviour)` starts one and gives back at once its
-// `ActorRef`; `tell` puts a message in its mailbox and returns, never waiting. An actor with
-// messages is one task on its executor: a worker handles at most `throughput` of them before putting
-// the actor at the back of the queue, so a busy actor never holds a worker from the others, and the
-// actor never runs on two threads at once. Before each turn the worker makes the actor the owner of
-// the code it runs, so the Sysl handles the actor owns are its own on whichever worker it is.
+// a time. `spawn(behaviour)` starts one and gives back at once its `ActorRef`; `tell` puts a message
+// in its mailbox and returns, never waiting. An actor with messages has one turn queued: a
+// lightweight thread of its own, or a task on the executor it was given, which handles at most
+// `throughput` of them before queueing the next turn at the back, so a busy actor never holds a worker
+// from the others, and the actor never runs two turns at once. A turn that waits parks its thread
+// and frees its worker. Each turn makes the actor the owner of the code it runs, so the Sysl handles
+// the actor owns are its own on whichever worker it is.
 //
 // An actor runs until it stops. An actor started by code another actor runs is that actor's child,
 // and an ending actor stops its children and waits for their ends before it ends itself, so a tree
@@ -49,6 +50,15 @@ private holdsHandles[T](value: T) -> bool
 @intrinsic("trap")
 private fail(reason: string) -> Nothing
 
+// Starts a lightweight thread running `run` on a stack of `stack` bytes, handing nothing over, and
+// gives back the object it is joined by, which a turn never needs.
+@intrinsic("thread_start")
+private startThread(run: () -> unit, stack: long) -> Any
+
+// The stack of a turn's lightweight thread: a thread's default, reserved and committed as it is
+// touched, so a turn recurses as deeply as any thread.
+private val turnStack: long = 8388608
+
 // Runs `run` as the code of the actor shown as `name`, and answers whether it trapped: the runtime
 // reports a trap naming the actor, drops what `run` was doing, and stores the trap's reason as the
 // element of `outcome`, an array of one string. A trap that leaves state other threads share in
@@ -70,8 +80,8 @@ data Supervision
     Stop
     Restart(limit: int, within: Duration)
 
-// The most messages of one actor a worker handles before the actor goes to the back of its
-// executor's queue.
+// The most messages of one actor a turn handles before the actor's next turn goes to the back of the
+// queue.
 private val throughput = 16
 
 // The last number given to an actor; each actor's is one more, never reused.
@@ -200,6 +210,8 @@ private trait Core: Sendable
 private class Actor[M: Sendable](private val behaviour: Behaviour[M], private val executor: Executor, val parent: Option[Core], private val supervision: Supervision): Core
     val number: long = numbers.add(1)
     val owner: long = newOwner()
+    // Whether each turn is a lightweight thread of its own, as on the shared executor.
+    private val ownThreads = executor === Executor.shared()
     val end = Promise[Ending]()
     private val mailbox = Mailbox[M]()
     // Set until `start`, which queues the first turn, so nothing queues one before it.
@@ -298,7 +310,14 @@ private class Actor[M: Sendable](private val behaviour: Behaviour[M], private va
     private wake()
         if scheduled.compareAndSet(false, true) then schedule()
 
-    private schedule() = executor.execute(() -> turn())
+    // Queues the next turn: a lightweight thread of its own where the actor runs on the shared
+    // executor, so a turn that waits parks only itself; a task on the executor's workers where it was
+    // given one of its own, which bounds how many of its tasks work at once.
+    private schedule()
+        if ownThreads
+            startThread(() -> turn(), turnStack)
+            ()
+        else executor.execute(() -> turn())
 
     // One turn on a worker, as the actor's owner: a failure a child escalated, then the start where
     // it has not run and at most `throughput` messages, stopping early where the actor is asked to
