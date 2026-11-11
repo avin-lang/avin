@@ -32,11 +32,14 @@ import sysl.buf.{Buf, buf}
 // Views between two options whose arguments are both pointers need nothing: every such option is the
 // same pointer.
 //
-// An `Option[Nothing]`, always `None`, is an object, as an option of a value type is. Where one is
-// written as another option (passed, returned, stored, a branch or an element agreeing with other
-// options, a side of `==`), the checker converts it to that option's `None` (`NoneAs`), null for one
-// kept as a pointer, so that is no view. Seen as another option inside another value, as a
-// `Vector[Option[Nothing]]` as a `Vector[Option[Dog]]`, it is a view like any other.
+// An `Option[Nothing]` is always `None`, which is null as a pointer and one constant object as an
+// object, so it may take either form. Where one is written as another option (passed, returned,
+// stored, a branch or an element agreeing with other options, a side of `==`), the checker converts
+// it to that option's `None` (`NoneAs`), so that is no view. Seen as another option inside another
+// value, as a `Vector[Option[Nothing]]` as a `Vector[Option[Dog]]`, it is a view, and it takes the
+// form of the options it is seen as there: a pointer, null, unless one of them is kept as an object
+// (an `Option[int]`, an `Option[Option[Dog]]`). Seen as both, or as an option of a type parameter,
+// it can be neither, and no option in the program is a pointer.
 
 /** Whether the program keeps its pointer-shaped options as pointers, and which data type is
  * `Option`. */
@@ -45,6 +48,12 @@ struct OptionPlan
     pointers: bool
     /** Where they are not, what decided it. */
     reason: string
+    /** Whether `Option[Nothing]` is kept as a pointer, null, rather than as an object. */
+    nothing: bool
+    /** Whether an `Option[Nothing]` inside another value is seen as an option kept as a pointer. */
+    nothing_as_pointer: bool
+    /** Whether one is seen as an option kept as an object. */
+    nothing_as_object: bool
 
     /** Keeps every option an object, for `why`. */
     objects(*self, why: string)
@@ -59,7 +68,7 @@ option_plan(program: TProgram) -> OptionPlan
     var option: Option[usize] = None
     for i in 0..<program.data.len()
         if program.data[i].module_name == "avin" && program.data[i].name == "Option" then option = Some(i)
-    var plan = OptionPlan(option, option is Some(_), "")
+    var plan = OptionPlan(option, option is Some(_), "", true, false, false)
     if !plan.pointers then return plan
     if nests_self(program, option.unwrap()) then plan.objects("a trait `Option` conforms to takes `Self` inside another type")
     for v in program.views
@@ -71,6 +80,10 @@ option_plan(program: TProgram) -> OptionPlan
         if !plan.pointers then break
         walk_test(program, &plan, erase_unions(t.from), erase_unions(t.to))
         if !plan.pointers then plan.reason = s"${plan.reason}: a type pattern ${type_name(t.to)} on ${type_name(t.from)}"
+    // `Option[Nothing]`'s one value, `None`, is null and is the object alike, so it takes the form of
+    // the options it is seen as inside other values; only seen as both it cannot be either.
+    if plan.nothing_as_pointer && plan.nothing_as_object then plan.objects("an `Option[Nothing]` inside another value is seen both as an option kept as a pointer and as one kept as an object")
+    plan.nothing = !plan.nothing_as_object
     plan
 
 /** Whether `t` is an instance of `Option` kept as a pointer. */
@@ -87,8 +100,10 @@ option_argument(plan: OptionPlan, t: &Type) -> Option[&Type] = *t match
     _ -> None
 
 // A type whose every value is a non-null reference to an object with a descriptor. A value type is
-// none, and neither is an option, whose `None` would be null too.
+// none, and neither is an option, whose `None` would be null too. `Nothing` has no value, so an
+// `Option[Nothing]` is null exactly where the plan keeps it so.
 private pointer_shaped(plan: OptionPlan, t: &Type) -> bool = *t match
+    Nothing -> plan.nothing
     AnyType -> true
     Str -> true
     Tuple(_) -> true
@@ -111,7 +126,11 @@ private walk_view(program: TProgram, plan: *OptionPlan, x: &Type, to: &Type, top
     if option_argument(*plan, x) is Some(a)
         option_argument(*plan, to) match
             Some(b) ->
-                if pointer_shaped(*plan, a) != pointer_shaped(*plan, b) || unknown(a) || unknown(b) then plan.objects("options of differing forms are viewed as one another")
+                // An `Option[Nothing]` seen as another option takes that option's form.
+                if (*a is Nothing) != (*b is Nothing) && !unknown(a) && !unknown(b)
+                    if pointer_shaped(*plan, if *a is Nothing then b else a) then plan.nothing_as_pointer = true
+                    else plan.nothing_as_object = true
+                elif pointer_shaped(*plan, a) != pointer_shaped(*plan, b) || unknown(a) || unknown(b) then plan.objects("options of differing forms are viewed as one another")
                 else walk_view(program, plan, a, b, false, depth + 1)
                 return
             // Written as an `Any`, the option is boxed, which makes the object it stands for.

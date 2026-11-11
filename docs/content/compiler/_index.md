@@ -588,8 +588,10 @@ reference to an object with a descriptor is kept as one pointer: `Some(x)` is `x
 is null, so making either allocates nothing and a match compares with null. `T` is then a class, a
 trait, an object, an `Array` or another class instance, `Any`, a string, a tuple, a function, or a
 `data` type other than `Option`. Every other option stays an object: one of a built-in value type
-(`int`, `real`, `bool`, `char`, `byte`, `unit`), of `Nothing`, and of an option, since
-`Option[Option[C]]` cannot spend null on both of its `None`s. The choice is lowering's (construction,
+(`int`, `real`, `bool`, `char`, `byte`, `unit`) and one of an option, since `Option[Option[C]]`
+cannot spend null on both of its `None`s. `Option[Nothing]` has only `None`, which either form
+holds, so it takes the form of the options it is seen as inside other values (below): a pointer,
+null, unless one of them is an object. The choice is lowering's (construction,
 variant patterns, structural `==` and hash, which compute exactly what the object form computes),
 and the program cannot tell:
 
@@ -629,6 +631,14 @@ every option of the program an object where one of them could:
 - a trait `Option` conforms to declaring a method that takes or returns `Self` inside another type.
 
 Two options whose arguments are both pointer-shaped share the one form, so their views need nothing.
+An `Option[Nothing]` written as another option converts to that option's `None` where it is written
+(`NoneAs`: null, or the constant `None` object), so that is no view. Inside another value it cannot
+be converted: a `Vector[Option[Nothing]]` seen as a `Vector[Option[Dog]]`, a
+`Result[Option[Nothing], E]` as a `Result[Option[Dog], E]`, a function yielding one as one yielding
+an `Option[Dog]`, and the same through options, tuples, data fields and map values. `option_plan`
+notes what each such view sees it as; seen only as options kept as pointers, `Option[Nothing]` is a
+pointer, seen only as objects (`Option[int]`, `Option[Option[Dog]]`), an object, and seen as both, or
+as an option of a type parameter, it can be neither, and every option of the program is an object.
 
 `Any` is a reference to an object. The checker inserts a **box** node wherever a value converts to
 `Any`; lowering makes it nothing for a value already kept as a reference to an object with a

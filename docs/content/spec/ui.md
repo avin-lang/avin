@@ -127,6 +127,21 @@ A control that holds a value reads and writes a **signal**: a handle on one inst
 with `read()` and `set(v)`. The four classes are `IntSignal`, `RealSignal`, `BoolSignal` and
 `StringSignal`, one for each instance a control takes.
 
+A control writes the application's own signal, the one the program made and holds, never a copy:
+a tap's write is read by the program at once, the next build of the tree shows it, and every other
+control over the same signal shows it too. A signal outlives the views made over it, so a tree
+built afresh each frame hands its controls the same signals each time:
+
+```text
+val done = boolSignal(false)
+val tree = () -> column([switch(done), checkbox(done, "Done"), text(s"done=${done.read()}")])
+// a tap on the switch: done.read() is true at once, and the next tree() shows the checkbox checked
+```
+
+Work [handed to the main thread](#threads) and a control may both write one signal in a frame: the
+work runs at the frame's start and the control's write comes after it, each is one write, and the
+later is the value the build shows.
+
 Every `set` is one write, whatever it writes, and `invalidate()` is one more; `writes()` answers how
 many there have been. The frame loop builds the tree again on the frame after the count has moved,
 so a program keeping its state in Avin variables changes them and calls `invalidate()`.

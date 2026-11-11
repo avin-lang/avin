@@ -5497,6 +5497,30 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   a dependency is the one way this design fails, and it fails silently; the clean build is an oracle
   that needs no list of what each edit should touch. Alternatives: count-only tests (prove reuse,
   not correctness); trusting the key (no defence against a missed dependency).
+- Settled on the user's delegation 2026-11-11 (built on branch `option-nested`): **`Option[Nothing]` takes the form of the options it is seen
+  as inside other values.** Its one value, `None`, is null as a pointer and the constant `None`
+  object as an object, so the program-wide plan keeps it a pointer when every view of it inside
+  another value (a `Vector[Option[Nothing]]` as a `Vector[Option[Dog]]`, a `Result`, a function's
+  result, an option, a tuple, a data field, a map value) sees it as an option kept as a pointer, and
+  an object when every such view sees it as one kept as an object (`Option[int]`,
+  `Option[Option[Dog]]`); a bare `Option[Nothing]` written as an option of the other form is
+  converted where it is written, as before. *Why*: options of classes and strings stay pointers in
+  the common program that builds a collection of `None`s, at no cost in any other. *Left as full
+  objects (correct, slower)*: a program that sees it inside other values both ways, since one
+  vector of it could flow to both and no single form serves; and one that sees it as an option of a
+  type parameter (`Vector[Option[Nothing]]` as `Vector[Option[T]]` in generic code), since the view
+  is recorded once for every instance. *Alternatives*: (a) `None` null in every option, objects
+  included, removing the conflict but adding a null test to every match, method call and table
+  entry on an object option; (b) copying the containing value at the view, which a view by
+  definition does not do and which breaks identity of mutable containers; (c) keeping
+  `Option[Nothing]` always an object, the old rule, which stores every option of the program as an
+  object as soon as one nested view to a pointer option exists. With it, an `Option[Nothing]`
+  written as another option is always that option's own `None` (the null, or that option's constant
+  object, where an object option used to receive the `Option[Nothing]` object itself), so as an
+  `Any` it has the option's type and equals that type's other `None`s, as the equality chapter's
+  rule by run-time type says; one seen inside a vector as an `Option[Dog]` and then boxed is an
+  `Option[Dog]` too. A view inside an object-form value still leaves the `Option[Nothing]` object
+  there, as any view leaves a value as it was made.
 
 **Deferred**
 
