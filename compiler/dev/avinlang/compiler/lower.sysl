@@ -515,8 +515,8 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     while l.instance_facts.len() < l.instances.len()
         l.instance_facts.push("")
     var keyed: Buf[KeyedInstance] = buf()
-    for inst in l.instances
-        keyed.push(KeyedInstance(inst.function, inst.type_args, inst.entry, inst.generated, inst.words))
+    for k in 0..<l.instances.len()
+        keyed.push(keyed_instance(&l, k))
     while l.own_keys.len() < l.instances.len()
         l.own_keys.push(own_key(&l.keyer, keyed[l.own_keys.len()]))
         l.stored.push("")
@@ -4854,8 +4854,8 @@ private c_free_records(l: *Lowering, slots: Buf[Option[Place]])
         l.insts.push(Call(None, Runtime("avin_rt_c_callback_free", mir_signature(single(MPtr), None)), args))
 
 /** What the function a trampoline runs converts for: the binding's name, the unit and span that
- * place it, the prototype of the function C calls, the Avin function's type, and the trampoline's
- * index. */
+ * place it, the prototype of the function C calls, the Avin function's type, the trampoline's
+ * index, and the binding's function and type arguments. */
 private struct CCallbackPlan
     name: string
     unit: usize
@@ -4863,6 +4863,8 @@ private struct CCallbackPlan
     f: CPrototype
     ty: &Type
     trampoline: usize
+    binding: usize
+    binding_args: Buf[&Type]
 
 // The trampoline C calls the function the binding `symbol` passes for its parameter `q` through, of
 // Avin type `t`, and the function it runs, made to be lowered with the program's others. The
@@ -4877,7 +4879,7 @@ private c_trampoline(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type) 
     l.place_counts.put(owner, place)
     l.instances.push(Instance(0, buf(), false, CCallbackBody, false))
     l.trampolines.push(MirTrampoline(s"$owner#$place", k, buf(), 0, None))
-    l.c_callbacks.put(k, CCallbackPlan(symbol.name, symbol.unit, symbol.decl.name_span, q.callback[0], t, index))
+    l.c_callbacks.put(k, CCallbackPlan(symbol.name, symbol.unit, symbol.decl.name_span, q.callback[0], t, index, binding.function, binding.type_args))
     index
 
 // How a value of the Avin type `t` crosses a callback's C type `c`: a handle or a string as a
@@ -7422,8 +7424,7 @@ private any_hash(l: *Lowering, a: Operand)
 /** Instance `k`'s code: read back from the instance cache where its own key has an entry there,
  * lowered otherwise, and kept for the cache where an entry can hold it. */
 private lower_instance(l: *Lowering, k: usize) -> MirFunction
-    val inst = l.instances[k]
-    l.own_keys.push(own_key(&l.keyer, KeyedInstance(inst.function, inst.type_args, inst.entry, inst.generated, inst.words)))
+    l.own_keys.push(own_key(&l.keyer, keyed_instance(l, k)))
     l.stored.push("")
     l.reused.push(false)
     if !l.caching || !recordable_instance(l, k) then return lower_function(l, k)
@@ -7440,13 +7441,32 @@ private lower_instance(l: *Lowering, k: usize) -> MirFunction
     l.unrecordable = false
     val f = lower_function(l, k)
     l.recording = false
-    if l.unrecordable then return f
+    if l.unrecordable || calls_c_glue(f) then return f
     var head = entry_writer()
     head.num(l.request_count)
     val requests = l.requests.finish()
     var body = entry_writer()
     if write_function(l, &body, f) then l.stored[k] = head.finish() + requests + body.finish()
     f
+
+/** Instance `k` as its keys see it. A C callback's body is known by the binding that passes it and
+ * the trampoline's name, the binding's symbol and its place among the binding's callbacks
+ * (`<program>.repeat callback#1`), since the body converts what the binding's signature says. */
+private keyed_instance(l: *Lowering, k: usize) -> KeyedInstance
+    val inst = l.instances[k]
+    if inst.generated == CCallbackBody
+        if l.c_callbacks.get(k) is Some(plan)
+            return KeyedInstance(plan.binding, plan.binding_args, false, CCallbackBody, false, l.trampolines[plan.trampoline].name)
+    KeyedInstance(inst.function, inst.type_args, inst.entry, inst.generated, inst.words, "")
+
+/** Whether `f` calls the C unit's glue, whose names number the bindings, handle classes and structs
+ * by the checker's indices: an entry holding such code could name another binding after an edit
+ * elsewhere, so such a function is lowered every build. */
+private calls_c_glue(f: MirFunction) -> bool
+    for block in f.blocks
+        for inst in block.insts
+            if inst is Call(_, CFunction(_, _, _), _) then return true
+    false
 
 /** Whether an entry may hold instance `k`: a function of the program with a body, not its closure
  * entry. Bindings, closure entries and the functions lowering makes are small, and lowered every

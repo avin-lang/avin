@@ -3,6 +3,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.{Source, source_of}
 import sysl.buf.{Buf, buf}
+import sysl.env.get
 import sysl.fs.{create, current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, set_permissions, write_text}
 import sysl.process.{Exited, FromPath, Signalled, Stdio, ToFile, Var, capture, run}
 import sysl.text.from_utf8_unchecked
@@ -169,9 +170,39 @@ private case_at(path: string) -> Case
     Case(single_file(src), expectation_text(src), buf(), buf(), "")
 
 // Compiles a case as the command line would, or answers why its package could not be loaded.
-private compile_case(tc: Toolchain, program: Case) -> Compilation =
-    if program.refused != "" then Compilation(program.refused, None, None, buf(), buf())
-    else compile_program(tc, program.files, false, program.sysl, program.c)
+//
+// With `AVIN_INCREMENTAL=verify` in the tests' own environment, the corpus is built warm as well as
+// cold: each case is built with an empty instance cache in `scratch`, then edited (`warm_edit`) and
+// built again from that cache in `verify` mode, which also builds it clean and fails the case where
+// the two texts differ. The warm build is the one that runs. Unset, or anything else, the case is
+// built once with no cache, as every gate builds it; so is a case given no `scratch`, which a
+// program that must not compile is.
+private compile_case(tc: Toolchain, program: Case, scratch: string) -> Compilation
+    if program.refused != "" then return Compilation(program.refused, None, None, buf(), buf())
+    if scratch == "" || get("AVIN_INCREMENTAL").unwrap_or("") != "verify" then return compile_program(tc, program.files, false, program.sysl, program.c)
+    val cache = scratch + "/instances"
+    _ = remove_dir_all(cache)
+    open_incremental(cache, IncrementalOn)
+    defer close_incremental()
+    val cold = compile_program(tc, program.files, false, program.sysl, program.c)
+    if cold.diagnostics != "" then return cold
+    open_incremental(cache, IncrementalVerify)
+    compile_program(tc, warm_edit(program.files), false, program.sysl, program.c)
+
+/** `files` with the edit the warm corpus run makes before its second build: a function nothing calls
+ * added at the end of the first of the program's own files that is not literate. It changes the
+ * file, so the executable's build key, but no line of what the program does or reports. */
+warm_edit(files: Buf[ProgramFile]) -> Buf[ProgramFile]
+    var out: Buf[ProgramFile] = buf()
+    var edited = false
+    for f in files
+        if !edited && !f.dependency && !is_literate(f.src.name)
+            val text = from_utf8_unchecked(f.src.bytes)
+            val ending = if text.ends_with("\n") then "" else "\n"
+            out.push(ProgramFile(source_of(f.src.name, text + ending + "\ncorpusWarmEdit() -> int = 1\n"), f.module_name, f.dependency, f.fences, f.package))
+            edited = true
+        else out.push(f)
+    out
 
 // The lines a file's expectations are read from: its text, or a literate file's program, where its
 // expectation comments stand at the margin of the program rather than four columns in.
@@ -230,7 +261,7 @@ private run_all(tc: Toolchain, all: Buf[string]) -> Tally
 
 /** Runs one program at both optimization levels; a failure description, or "" when it passed. */
 private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, scratch: string) -> string
-    val compiled = compile_case(tc, program)
+    val compiled = compile_case(tc, program, scratch)
     if compiled.diagnostics != "" then return path + ": did not compile:\n" + compiled.diagnostics
     val llvm = compiled.llvm.unwrap_or("")
     val stdout = sidecar(sidecar_base(path), ".out")
@@ -418,7 +449,7 @@ example_packages_build()
     assert(all.len() > 0)
     var failures = ""
     for path in all
-        val compiled = compile_case(tc, case_at(path))
+        val compiled = compile_case(tc, case_at(path), scratch)
         if compiled.diagnostics != ""
             failures = failures + path + ": did not compile:\n" + compiled.diagnostics
             continue
@@ -591,7 +622,7 @@ private reject_all(tc: Toolchain, all: Buf[string]) -> Tally
             continue
         var failures = ""
         if want.errors.len() == 0 then failures = failures + s"$path: names no expected error\n"
-        val compiled = compile_case(tc, program)
+        val compiled = compile_case(tc, program, "")
         if compiled.diagnostics == "" then failures = failures + s"$path: compiled\n"
         // A binding's diagnostic is in the program's terms, never naming the shim's own functions.
         if compiled.diagnostics.contains("avin.shims.") || compiled.diagnostics.contains("'mirror_") then failures = failures + s"$path: a diagnostic names the shim's internals:\n${compiled.diagnostics}\n"
