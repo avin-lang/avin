@@ -125,11 +125,48 @@ object Time
 // A wall reading: a date and a time of day, with no zone.
 data DateTime(date: Date, time: Time) derives Ord
 
+// A wall reading: a date and a time of day, with no zone.
+object DateTime
+    // The least and greatest readings: the first microsecond of `Date.Min` and the last of `Date.Max`.
+    val Min: DateTime = DateTime(Date.Min, Time.Midnight)
+    val Max: DateTime = DateTime(Date.Max, Time(MicrosPerDay - 1))
+
 // The date `year`-`month`-`day`; numbers that name no date trap.
-date(year: int, month: int, day: int) -> Date
-    if !(1 <= month <= 12) || !(1 <= day <= daysInMonth(long(year), month))
-        fail(s"there is no such date: ${yearText(long(year))}-${padded(long(month), 2)}-${padded(long(day), 2)}")
-    Date(int(epochDayOf(long(year), month, day)))
+date(year: int, month: int, day: int) -> Date = dateIn(long(year), month, day)
+
+// The date `year`-`month`-`day`, trapping where the numbers name no date or one outside `Date.Min`
+// to `Date.Max`.
+private dateIn(year: long, month: int, day: int) -> Date
+    val text = s"${yearText(year)}-${padded(long(month), 2)}-${padded(long(day), 2)}"
+    if !(1 <= month <= 12) || !(1 <= day <= monthLength(year, month)) then fail(s"there is no such date: $text")
+    if !(MinYear <= year <= MaxYear) then fail(s"the date $text is outside Date.Min to Date.Max")
+    val count = epochDayOf(year, month, day)
+    if !(long(int.MinValue) <= count <= long(int.MaxValue)) then fail(s"the date $text is outside Date.Min to Date.Max")
+    Date(int(count))
+
+// The years of `Date.Min` and `Date.Max`.
+private val MinYear: long = civilOf(long(int.MinValue)).0
+private val MaxYear: long = civilOf(long(int.MaxValue)).0
+
+// The date `day` days from 1970-01-01, trapping outside `Date.Min` to `Date.Max`.
+private dateOfDay(day: long) -> Date
+    if !(long(int.MinValue) <= day <= long(int.MaxValue)) then fail(s"the date $day days from 1970-01-01 is outside Date.Min to Date.Max")
+    Date(int(day))
+
+// The Thursday of the ISO 8601 week holding `day`, a day counted from 1970-01-01 (a Thursday): the
+// week's year and number are that Thursday's.
+private isoThursday(day: long) -> long = day - floorMod(day + 3, 7) + 3
+
+// `day` where the month has it, else the month's last day.
+private clampedDay(year: long, month: int, day: int) -> int
+    val length = monthLength(year, month)
+    if day < length then day else length
+
+// The reading `days` days and `micros` microseconds (less than a day) after `dt`.
+private movedReading(dt: DateTime, days: long, micros: long) -> DateTime
+    val inDay = dt.time.microsOfDay + micros
+    val carry: long = if inDay >= MicrosPerDay then 1 else 0
+    DateTime(dateOfDay(long(dt.date.epochDay) + days + carry), Time(inDay - carry * MicrosPerDay))
 
 // `value` where it is within `lo` to `hi`, and a trap naming the field and its range where it is not.
 private checked(field: string, value: long, lo: long, hi: long) -> long
@@ -167,6 +204,35 @@ impl Date
     monthName() -> string = MonthNames(month() - 1)
     atTime(t: Time) -> DateTime = DateTime(self, t)
 
+    // The ISO 8601 week, `1` to `53`, and the year it belongs to: weeks start on Monday, and week 1
+    // is the one holding its year's first Thursday, so 2027-01-01 is in week 53 of 2026.
+    isoWeek() -> int
+        val thursday = isoThursday(long(epochDay))
+        int((thursday - epochDayOf(civilOf(thursday).0, 1, 1)) / 7) + 1
+    isoWeekYear() -> long = civilOf(isoThursday(long(epochDay))).0
+
+    // The date with one field replaced. `withYear` and `withMonth` clamp the day to the new month's
+    // length, so 2024-02-29 `withYear(2025)` is 2025-02-28; a month outside 1 to 12, a day the month
+    // does not have, and a date outside `Date.Min` to `Date.Max` trap.
+    withYear(year: long) -> Date = dateIn(year, month(), clampedDay(year, month(), day()))
+    withMonth(month: int) -> Date = dateIn(year(), month, clampedDay(year(), month, day()))
+    withDay(day: int) -> Date = dateIn(year(), month(), day)
+
+    // The first day of the date's year, month and week (the Monday), and the last day of its month.
+    startOfYear() -> Date = dateIn(year(), 1, 1)
+    startOfMonth() -> Date = dateIn(year(), month(), 1)
+    startOfWeek() -> Date = dateOfDay(long(epochDay) - floorMod(long(epochDay) + 3, 7))
+    endOfMonth() -> Date = dateIn(year(), month(), daysInMonth())
+
+    // The first date on or after this one falling on `w`, and the last on or before it; a date on `w`
+    // is its own answer.
+    onOrAfter(w: Weekday) -> Date = dateOfDay(long(epochDay) + floorMod(long(w.isoNumber()) - long(weekday().isoNumber()), 7))
+    onOrBefore(w: Weekday) -> Date = dateOfDay(long(epochDay) - floorMod(long(weekday().isoNumber()) - long(w.isoNumber()), 7))
+
+    // The whole days from this date to `other`, negative where `other` is earlier; a count beyond an
+    // `int` traps.
+    daysUntil(other: Date) -> int = other.epochDay - epochDay
+
     // The date written by `pattern`; an element of a time of day or a zone traps.
     format(pattern: string) -> string = formatReading(pattern, Some(self), None, None)
 
@@ -176,6 +242,12 @@ impl Time
     second() -> int = int(microsOfDay % MicrosPerMinute / MicrosPerSecond)
     microsecond() -> int = int(microsOfDay % MicrosPerSecond)
     atDate(d: Date) -> DateTime = DateTime(d, self)
+
+    // The time of day with one field replaced; a value outside the field's range traps.
+    withHour(hour: int) -> Time = time(hour, minute(), second(), microsecond())
+    withMinute(minute: int) -> Time = time(hour(), minute, second(), microsecond())
+    withSecond(second: int) -> Time = time(hour(), minute(), second, microsecond())
+    withMicrosecond(micros: int) -> Time = time(hour(), minute(), second(), micros)
 
     // The time of day written by `pattern`; an element of a date or a zone traps.
     format(pattern: string) -> string = formatReading(pattern, None, Some(self), None)
@@ -194,6 +266,48 @@ impl DateTime
     minute() -> int = time.minute()
     second() -> int = time.second()
     microsecond() -> int = time.microsecond()
+    isoWeek() -> int = date.isoWeek()
+    isoWeekYear() -> long = date.isoWeekYear()
+
+    // The reading with one field replaced, as `Date` and `Time` replace them.
+    withYear(year: long) -> DateTime = DateTime(date.withYear(year), time)
+    withMonth(month: int) -> DateTime = DateTime(date.withMonth(month), time)
+    withDay(day: int) -> DateTime = DateTime(date.withDay(day), time)
+    withHour(hour: int) -> DateTime = DateTime(date, time.withHour(hour))
+    withMinute(minute: int) -> DateTime = DateTime(date, time.withMinute(minute))
+    withSecond(second: int) -> DateTime = DateTime(date, time.withSecond(second))
+    withMicrosecond(micros: int) -> DateTime = DateTime(date, time.withMicrosecond(micros))
+
+    // The start of the reading's year, month and week (the Monday), at midnight; the last day of its
+    // month at the same time of day.
+    startOfYear() -> DateTime = DateTime(date.startOfYear(), Time.Midnight)
+    startOfMonth() -> DateTime = DateTime(date.startOfMonth(), Time.Midnight)
+    startOfWeek() -> DateTime = DateTime(date.startOfWeek(), Time.Midnight)
+    endOfMonth() -> DateTime = DateTime(date.endOfMonth(), time)
+
+    // The reading with its time of day truncated to the day, hour, minute or second.
+    startOfDay() -> DateTime = DateTime(date, Time.Midnight)
+    startOfHour() -> DateTime = DateTime(date, Time(time.microsOfDay - time.microsOfDay % MicrosPerHour))
+    startOfMinute() -> DateTime = DateTime(date, Time(time.microsOfDay - time.microsOfDay % MicrosPerMinute))
+    startOfSecond() -> DateTime = DateTime(date, Time(time.microsOfDay - time.microsOfDay % MicrosPerSecond))
+
+    // The reading `d` later along its own wall clock, `dt + d`, or earlier, `dt - d`, with no zone to
+    // skip or repeat an hour; an answer outside `DateTime.Min` to `DateTime.Max` traps. The duration
+    // is split into whole days and the rest before it is added, so no step overflows on the way.
+    +(d: Duration) -> DateTime = movedReading(self, floorDiv(d.micros, MicrosPerDay), floorMod(d.micros, MicrosPerDay))
+    -(d: Duration) -> DateTime
+        val days = floorDiv(d.micros, MicrosPerDay)
+        val rest = floorMod(d.micros, MicrosPerDay)
+        if rest == 0 then movedReading(self, -days, 0) else movedReading(self, -days - 1, MicrosPerDay - rest)
+
+    // The duration from `earlier` to this reading along the wall clock, negative where `earlier` is
+    // the later one; one beyond a `Duration` traps.
+    -(earlier: DateTime) -> Duration
+        val days = long(date.epochDay) - long(earlier.date.epochDay)
+        val rest = time.microsOfDay - earlier.time.microsOfDay
+        if days > 0 && rest < 0 then Duration((days - 1) * MicrosPerDay + (rest + MicrosPerDay))
+        elif days < 0 && rest > 0 then Duration((days + 1) * MicrosPerDay + (rest - MicrosPerDay))
+        else Duration(days * MicrosPerDay + rest)
 
     // The reading written by `pattern`; an element of a zone traps.
     format(pattern: string) -> string = formatReading(pattern, Some(date), Some(time), None)
@@ -420,6 +534,8 @@ impl Zoned
     minute() -> int = dateTime.minute()
     second() -> int = dateTime.second()
     microsecond() -> int = dateTime.microsecond()
+    isoWeek() -> int = dateTime.isoWeek()
+    isoWeekYear() -> long = dateTime.isoWeekYear()
     epochSeconds() -> long = toInstant().epochSeconds()
     epochMillis() -> long = toInstant().epochMillis()
     epochMicros() -> long = toInstant().epochMicros

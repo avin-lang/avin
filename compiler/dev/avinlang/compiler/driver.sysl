@@ -205,6 +205,7 @@ compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf
         Ok(l) -> l
         Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
     var archive: Option[string] = None
+    var began = phase_start()
     if lowered.program.bindings.len() > 0 || lowered.program.handles.len() > 0
         var targets: Buf[string] = buf()
         for b in lowered.program.bindings
@@ -217,7 +218,10 @@ compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf
         ensure_shims(tc, lowered.program.bindings, lowered.program.handles, lowered.units, reached) match
             Ok(a) -> archive = Some(a)
             Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
-    Compilation("", Some(emit_llvm(lowered.program)), archive, lowered.tests, lowered.c_link)
+    began = phase_done("shims", began, s"bindings=${lowered.program.bindings.len()} handles=${lowered.program.handles.len()}")
+    val ll = emit_llvm(lowered.program)
+    _ = phase_done("emit", began, s"bytes=${ll.len}")
+    Compilation("", Some(ll), archive, lowered.tests, lowered.c_link)
 
 /** Compiles a program of one file as far as MIR, or renders its diagnostics. */
 lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_files(tc, single_file(src))
@@ -474,14 +478,18 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Bu
         val f = program.symbols[t.symbol]
         val src = program.sources[f.unit]
         tests.push(TestEntry(t.name, src.name, src.locate(f.decl.name_span.start).line, t.module_name, t.should_trap, t.ignore, t.timeout, hook_name(program, t.setup), hook_name(program, t.teardown), hook_name(program, t.setup_all), hook_name(program, t.teardown_all)))
+    var began = phase_start()
     val c_unit = ensure_c_unit_of(tc, c_parts(program, files, loaded.library), c, program.sources)?
+    began = phase_done("cunit", began)
     program.c_measures = c_unit.measures
     program.c_values = c_unit.values
     var c_link: Buf[string] = buf()
     if c_unit.object is Some(o) then c_link.push(o)
     for flag in c_unit.link
         c_link.push(flag)
-    Ok(Lowered(lower_program(program), front.units, tests, c_link))
+    val mir = lower_program(program)
+    _ = phase_done("lower", began, s"functions=${mir.functions.len()} strings=${mir.strings.len()} descriptors=${mir.descriptors.len()} tests=${tests.len()}")
+    Ok(Lowered(mir, front.units, tests, c_link))
 
 /** A program through checking and no further: the diagnostics of a program that is wrong, which are
  * everything `avin check` reports without building the shims of its Sysl bindings or its C unit, or ""
@@ -503,8 +511,11 @@ private struct FrontEnd
 // A program loaded, checked, and with the tests of its dependencies and of the core library taken
 // out, since they are theirs.
 private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[FrontEnd, string]
+    var began = phase_start()
     val loaded = load_units(tc.library_dir(), files, false, src -> src).map_err(message -> s"avin: $message\n")?
     val units = loaded.units
+    val modules = units.len()
+    began = phase_done("load", began, s"modules=$modules")
     val root_module = loaded.root_module
     // A file with syntax errors is not checked: its tree is a recovery, and checking it would
     // report the recovery rather than the program. A file in the wrong module is not checked either,
@@ -515,6 +526,7 @@ private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Re
             if u.report.has_errors() then diagnostics = diagnostics + u.report.render(u.src)
         return Err(diagnostics)
     val checked = check_program(units, root_module, testing)
+    _ = phase_done("check", began, s"modules=$modules")
     if checked.has_errors() then return Err(checked.render())
     checked.program match
         Some(checked_program) ->
@@ -616,13 +628,18 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     defer _ = remove_file(pending)
     var args: Buf[string] = buf()
     val n = if units > 0 then units else codegen_units(llvm.len)
+    var began = phase_start()
     val parts = if n >= 2 then split_module(llvm, n, optimization != "-O0") else None
     parts match
         Some(texts) ->
+            began = phase_done("split", began, s"units=${texts.len()}")
             val compiled = compile_units(tc.clang, texts, dir, optimization, if keep_units then tc.unit_cache() else "")?
             for o in compiled.objects
                 args.push(o)
+            began = phase_done("units", began, s"units=${compiled.objects.len()} compiled=${compiled.compiled} reused=${int(compiled.objects.len()) - compiled.compiled}")
         None ->
+            began = phase_done("split", began, "units=1")
+            _ = phase_done("units", began, "units=1 compiled=1 reused=0")
             val ir = dir + "/program.ll"
             write_text(ir, llvm).map_err(e -> e.to_string())?
             for a in ["-x", "ir", optimization, "-Wno-override-module", ir, "-x", "none"]
@@ -634,8 +651,10 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
         args.push(flag)
     for a in ["-lm", "-o", pending]
         args.push(a)
+    began = phase_start()
     val result = capture(tc.clang, args.view(), stderr = true, timeout = 120000).map_err(e -> missing_tool(tc.clang, e.to_string()))?
     if !result.status.ok()
         return Err("clang failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
     publish_file(pending, output).map_err(e -> e.to_string())?
+    _ = phase_done("link", began)
     Ok(())

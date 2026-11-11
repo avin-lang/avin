@@ -140,10 +140,11 @@ past the month's end, trap. On a `Zoned` the wall reading changes and the zone r
 [a period does](#zoned-arithmetic).
 
 **Starting points.** `startOfYear()`, `startOfMonth()` and `startOfWeek()` (the Monday) on `Date`,
-`DateTime` and `Zoned`; `endOfMonth()` on the same, the month's last day at the same time of day;
-`startOfDay()`, `startOfHour()`, `startOfMinute()` and `startOfSecond()` on `DateTime` and `Zoned`
-truncate the time of day. On a `Date` the date-only ones answer a `Date`; a `Date` has no
-`startOfHour`. `d.onOrAfter(w)` is the first date on or after `d` falling on weekday `w`, and
+`DateTime` and `Zoned`, at midnight; `endOfMonth()` on the same, the month's last day at the same
+time of day; `startOfDay()`, `startOfHour()`, `startOfMinute()` and `startOfSecond()` on `DateTime`
+and `Zoned` truncate the time of day. On a `Date` the date-only ones answer a `Date`; a `Date` has no
+`startOfHour`. A start or end that falls outside `Date.Min` to `Date.Max` traps naming the date
+(`Date.Max`, 11 July, has no `endOfMonth()`). `d.onOrAfter(w)` is the first date on or after `d` falling on weekday `w`, and
 `d.onOrBefore(w)` the last on or before it: `date(2026, 8, 28).onOrAfter(Monday)` is 2026-08-31, and
 a Friday's `onOrAfter(Friday)` is itself.
 
@@ -193,7 +194,8 @@ last day of the month" on a last day: `date(2026, 1, 31) + months(1)` is 2026-02
 `+ Period(0, n)`; a negative `n` steps back.
 
 **Between dates.** `a.daysUntil(b)` is the whole days from `a` to `b` as an `int`, negative where `b`
-is earlier; `a.monthsUntil(b)` the whole months, counted as a person counts them (2026-01-31 to
+is earlier, trapping as an integer overflow does where the count leaves `int` (only between dates
+more than about 5,880,000 years apart); `a.monthsUntil(b)` the whole months, counted as a person counts them (2026-01-31 to
 2026-02-28 is `0` months, to 2026-03-01 is `1`); `a.until(b)` the `Period` of those whole months and
 the days left over, so `a + a.until(b) == b` for `a <= b`.
 

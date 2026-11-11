@@ -456,8 +456,11 @@ println(heavy(Normal))
 A bare use of a shared name is the variant of the type expected where it is written: a parameter's
 type, an annotated binding's, a function's result, a field's, a collection's element, the other
 operand of a comparison (`w == Normal`), and in a pattern the type of the value matched, so a nested
-pattern decides each name by its field's type. A `match` is checked for coverage over the matched
-type's own variants. Where nothing expected decides it, the use is an error that names the types and
+pattern decides each name by its field's type. Where the parameter's type is a type argument of a
+generic function, what the call's other arguments decide of it decides the name, on whichever side
+of them it is written: with `same[T](a: T, b: T)`, both `same(w, Normal)` and `same(Normal, w)` take
+`Weight`'s. The elements of a collection literal (`[Normal, w]`) and the branches of an `if` agree
+the same way. A `match` is checked for coverage over the matched type's own variants. Where nothing expected decides it, the use is an error that names the types and
 the qualified forms:
 
 ```text
