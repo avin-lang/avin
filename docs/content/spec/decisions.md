@@ -5173,15 +5173,18 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   lock (every build would lock, and a write from another thread would race the build); an actor for
   the interface (the frame loop owns the thread, so a mailbox would still need this queue); a queue
   for each inbox (loses one thread's order between two inboxes).
-- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **The frame loop runs the waiting work where it asks for the frame's
-  colour**, through a wrapper of `ground`, and `run` runs what is left once more as it returns. Why:
-  syslui-sdl's `on_frame`, the natural place, follows `size: f32` in `app`'s parameters, and a
-  binding cannot pass an `f32` (no Avin type crosses as one), so `app` cannot be given an `on_frame`;
-  the colour is asked for once a frame on the main thread. The cost is one frame: work run there is
-  built on the next frame rather than the one it ran in. Alternatives weighed: `tree` (called only
-  when something was written, so it would never notice a post); `on_event` (called only when there
-  are events). **Review with the user:** a `real` parameter crossing into a Sysl `f32`, converted,
-  would let the package pass `on_frame` and remove the frame's delay.
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`; moved to `on_frame` on
+  branch `binding-f32`, which rests on the Proposed `f32` entry): **The frame loop runs the waiting
+  work in syslui-sdl's `on_frame`**, at the start of every frame and before the loop decides whether to build
+  the tree again, so work posted before a frame runs in that frame and what it writes is built in it;
+  `run` runs what is left once more as it returns. The package's binding of `app` is `named` (branch
+  `binding-defaults`, see the Proposed `named` entry), so it passes `on_frame` and leaves `on_event`,
+  `font` and `size`, which come before it, to syslui-sdl's own defaults; until then it copied those
+  defaults into Avin, since a binding passed its arguments by place. Why: `on_frame` is the hook syslui-sdl
+  runs first in a frame for exactly this. Alternatives weighed: a wrapper of `ground`, which `lwt-ui`
+  used while no real could cross into an `f32` (run after the tree, so its work was built a frame
+  late); `tree` (called only when something was written, so it would never notice a post);
+  `on_event` (called only when there are events).
 - Settled on the user's delegation 2026-11-10 (built on branch `lwt-ui`): **`handlePosted` runs only what was waiting when it was called.**
   Work that sends or posts waits for the next call. Why: work that posts itself again, a common
   animation shape, would otherwise hold a frame for ever. Alternatives weighed: draining until the
@@ -5204,6 +5207,51 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
   (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
   after the interface is gone).
+- Settled on the user's delegation 2026-11-10 (built on branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
+  that rounds: `f32`, `f16`, `bf16` and `real`.** A binding's own `real` parameter, a mirror's `real`
+  field going into Sysl, and a callback's `real` answer are rounded into the Sysl type to the nearest
+  value it holds, a tie to the even one, as an IEEE conversion rounds: a value past its largest
+  becomes an infinity of its sign, one below half its smallest subnormal a zero of its sign, a NaN
+  stays a NaN, and nothing stops the program. A `real` result, a mirror's field coming out, a
+  callback's parameter, and a real an `Option`, a `Result`, a tuple or a collection result holds are
+  widened exactly. A real inside a parameter's `Option`, tuple or collection is passed as `real`
+  only, as an integer there is passed as its declared type. A binding's own real is passed as it is
+  first and rounded only where Sysl refuses a `real` there (the shim is built again), so a Sysl
+  function overloaded at `real` and `f32` (`sysl.math.ulp`) is called at `real`, unrounded, and a
+  generic one takes the real itself. A real is not made from an `f128` (its arithmetic is not
+  `sysl.math.Float`; Sysl widens a parameter into one itself), nor from any non-floating type. Why: Avin has one floating type, and a
+  graphics or audio library's `f32` (syslui-sdl's `size`, a canvas's coordinates) is what a binding
+  meets; rounding is what every conversion between floating widths does and the only one that keeps
+  every `f32` value exact on the way back. It mirrors how an integer crosses into any Sysl integer.
+  Alternatives weighed: an `f32` type in Avin (a second floating type in every arithmetic rule, for
+  the boundary's sake); trapping where the value does not fit (a rounding is not an error, and an
+  infinity is a legal `f32`); converting a real held inside a parameter's option or collection too
+  (integers are not converted there either, and the copy would be written element by element);
+  rounding every real parameter at once (an overload at `f32` would then be chosen over the one at
+  `real`, losing precision silently).
+  **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
+  rather than round to it.
+- Settled on the user's delegation 2026-11-10 (built on branch `binding-defaults`): **A binding marked `named` (`@sysl("f", named)`) passes
+  every argument by its parameter's name, so a parameter it leaves out takes the Sysl function's own
+  default.** The Avin name is spelled as Sysl spells it, each uppercase letter an underscore and its
+  lowercase, as a mirror's fields are (`onFrame` is `on_frame`); the binding lists the parameters it
+  passes in any order; the receiver of a handle's method is never named; every parameter of a
+  `named` binding has a name. A binding without `named` passes by position, as before. Sysl checks
+  the names and reports a missing parameter without a default, or a name it does not declare, with
+  its own message at the binding. Why: a binding that had to reach a parameter behind defaulted ones
+  copied the Sysl defaults into Avin (the ui package copied syslui-sdl's `font` and `size` and reached
+  a private handle for `on_event`'s default), and those copies go stale silently; with names, Sysl
+  supplies and evaluates its own defaults at each call, a non-literal one included. One word on the
+  annotation, decided per binding, changes no existing binding's shim and needs no knowledge of the
+  Sysl signature in the Avin compiler. Alternatives weighed: caller-side omission, where an argument
+  an Avin caller leaves out of a binding's call is left out of the Sysl call too (most general, but a
+  binding would need a shim for each set of omitted arguments its callers use, and Avin's own
+  defaults on a binding would mean two things); a per-parameter mark such as `@named` or a
+  `= sysl` default on a positional list (the binding still lists every parameter up to the last one
+  it passes, and a mixed call needs the names anyway); naming every binding's arguments always (would
+  make every existing binding's parameter names part of its contract with Sysl); copying the
+  defaults (the stale copies this replaces). Review with the user: the surface word `named`, and
+  whether a caller-side form should come later.
 
 **Deferred**
 

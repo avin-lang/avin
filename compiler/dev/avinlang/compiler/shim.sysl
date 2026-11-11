@@ -164,7 +164,7 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
                 held[handle_index(&w, e)] = true
                 listed[handle_index(&w, e)] = true
                 holds = true
-    put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.raw.str_cast\n")
+    put(&w, "module avin.shims\n\nimport avin.rt.{Context, stop_in_binding, text_bytes, text_length, text_of}\nimport sysl.math.Float\nimport sysl.raw.str_cast\n")
     if holds then put(&w, "import avin.rt.handle_claim\n")
     if converts then put(&w, "import avin.rt.{Frame, allocate, array_elements, array_length, descriptor_of, new_array}\nimport sysl.raw.ptr_cast\nimport sysl.slices.copy\n")
     elif handles.len() > 0 then put(&w, "import sysl.raw.ptr_cast\n")
@@ -199,6 +199,7 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
         else put(&w, s"import $path as instance_$m\n")
     put(&w, "\n// An Avin string's bytes, copied into a Sysl string.\nprivate text_in(p: *u8) -> string = str_cast(text_bytes(p)[0..<text_length(p)])\n")
     put(&w, IntegerHelper)
+    put(&w, RealHelper)
     // A call that waits converts its integer parameters with the thread safe for the collector, and
     // one that does not fit makes the thread running again before the program stops.
     if blocks then put(&w, IntegerWaiting)
@@ -326,6 +327,9 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
             if b.params[k].form is Callback(_, _, _, _, _) then callback_functions(&w, b, i, k)
             if (receiver is None || k > 0) && converted_parameter(&w, b.params[k], i, k)
                 val n = if receiver is Some(_) then k else k + 1
+                if *b.params[k].ty is Real
+                    put(&w, s"\n// `${b.name}`'s parameter $n, rounded into the floating-point type the Sysl parameter is.\nprivate param_${i}_$k[T: Float](ctx: *Context, x: real) -> T = real_in(x)\n")
+                    continue
                 val check = if b.blocking then "integer_in_waiting" else "integer_in"
                 put(&w, s"\n// `${b.name}`'s parameter $n, converted into the integer the Sysl parameter is.\nprivate param_${i}_$k[T: Integer](ctx: *Context, x: ${sysl_side(b.params[k].ty)}) -> T = $check(ctx, x)\n")
         for h in handles
@@ -342,17 +346,26 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
     var unconverted: Buf[string] = buf()
     for c in w.outs
         var from = ""
-        var n = 0usize
+        var n: Buf[string] = buf()
         val spelled = spellings(&w, c, true, &n)
         for i in 0..<spelled.len()
             if i > 0 then from = from + (if i + 1 == spelled.len() then " or " else ", ")
             from = from + "`" + spelled[i] + "`"
-        // An integer is spelled in the shim by its type parameter, and here as any integer `I`.
-        var s = n
+        // A number is spelled in the shim by its type parameter, and here as any integer `I` or any
+        // floating-point type `F`.
+        var s = n.len()
+        var integers = false
+        var floats = false
         while s > 0
             s -= 1
-            from = from.replace_all(s"S$s", "I")
-        if n > 0 then from = from + " of any integer type `I`"
+            if n[s] == "Float"
+                from = from.replace_all(s"S$s", "F")
+                floats = true
+            else
+                from = from.replace_all(s"S$s", "I")
+                integers = true
+        if integers then from = from + " of any integer type `I`"
+        if floats then from = from + (if integers then " and" else "") + " of any floating-point type `F`"
         // A mirror is spelled in the shim by the name it is imported as, and here by the Sysl type's.
         var m = w.mirrors.len()
         while m > 0
@@ -463,24 +476,26 @@ private callback_functions(w: *ShimWriter, b: &MirBinding, i: usize, k: usize)
     var types = ""
     var declared = ""
     var passed = ""
-    // An integer is any Sysl integer, and a collection, an option, a result, a tuple or a value a
-    // handle is made of is spelled as Sysl spells it; any other scalar has its one Sysl type.
+    // An integer is any Sysl integer and a real any Sysl floating-point type, and a collection, an
+    // option, a result, a tuple or a value a handle is made of is spelled as Sysl spells it; any other
+    // scalar has its one Sysl type.
     for j in 0..<params.len()
         val p = params[j]
         passed = passed + s", q$j"
-        if p.form is Plain && !(*p.ty is Int(_))
+        if p.form is Plain && !numeric(p.ty)
             declared = declared + s", q$j: ${sysl_side(p.ty)}"
             continue
         if types != "" then types = types + ", "
-        types = types + (if p.form is Plain then s"S$j: Integer" else s"S$j")
+        types = types + (if p.form is Plain then s"S$j: ${number_bound(p.ty)}" else s"S$j")
         declared = declared + s", q$j: S$j"
     // An integer answer is converted, with a check, into whatever integer the closure's type answers,
-    // which Sysl infers where the closure is passed: a Sysl `u32` takes an Avin `long`. A closure
+    // which Sysl infers where the closure is passed: a Sysl `u32` takes an Avin `long`. A real answer
+    // is rounded into whatever floating-point type it answers, an `f32` as well as a `real`. A closure
     // whose answer is a generic Sysl function's type parameter answers the Avin type itself.
-    val integral = result.form is Plain && *result.ty is Int(_) && !is_fixed(w, s"call_${i}_$k")
+    val integral = result.form is Plain && numeric(result.ty) && !is_fixed(w, s"call_${i}_$k")
     if integral
         if types != "" then types = types + ", "
-        types = types + "R: Integer"
+        types = types + s"R: ${number_bound(result.ty)}"
     val generic = if types == "" then "" else s"[$types]"
     val unit = *result.ty is Unit
     val answer = if unit then "" elif integral then " -> R" else " -> " + callback_answer(w, result)
@@ -516,6 +531,7 @@ private callback_functions(w: *ShimWriter, b: &MirBinding, i: usize, k: usize)
     if result.form is Handle(_)
         val m = handle_index(w, result)
         put(w, s"    cell_$m(held_$m(ctx, r)).r\n")
+    elif integral && *result.ty is Real then put(w, "    real_in(r)\n")
     elif integral then put(w, "    integer_to(ctx, r, integer_name[R]())\n")
     else put(w, "    " + into_expr(w, result, "r", "ep", base) + "\n")
 
@@ -610,10 +626,11 @@ private call_arms(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[stri
 // argument `args[k]` is given to at the call.
 private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[string], wrappers: Buf[string], method: bool, fills: Buf[usize], indent: string)
     // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds an
-    // integer with any Sysl integer, so it takes the Sysl function's own type, and the overloads of
-    // its conversion choose by it.
-    var n = 0usize
-    val spelled = spellings(w, b.result, true, &n)
+    // integer with any Sysl integer or a real with any floating-point type, so it takes the Sysl
+    // function's own type, and the overloads of its conversion choose by it.
+    var numbers: Buf[string] = buf()
+    val spelled = spellings(w, b.result, true, &numbers)
+    val n = numbers.len()
     var target = callee
     var given: Buf[string] = buf()
     // A call that may wait is made with the thread safe for the collector, which may run, and free
@@ -645,19 +662,25 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
     else
         for k in 0..<args.len()
             given.push(wrapped(wrappers[k], args[k]))
+    // A `named` binding names every argument, so a parameter it leaves out takes its Sysl default.
     var call = target + "("
     for k in 0..<given.len()
         if k > 0 then call = call + ", "
+        if k < b.names.len() then call = call + b.names[k] + " = "
         call = call + given[k]
     call = call + ")"
     // A handle's method may answer a view of the handle's Sysl value, which Sysl lets no local hold
     // across a call that may free the value, as the conversion's allocation may: the conversion
     // takes the answer where the call gives it.
     val direct = method && !(b.result.form is Plain) && !b.blocking
-    // An integer result takes any Sysl integer, converted with a check as a mirror's field is.
+    // An integer result takes any Sysl integer, converted with a check as a mirror's field is, and a
+    // real result any Sysl floating-point type, widened exactly.
     val integral = *b.result.ty is Int(_)
+    val floating = b.result.form is Plain && *b.result.ty is Real
     if b.blocking
-        if integral
+        if floating
+            put(w, indent + s"val raw = $call\n" + indent + "leave_safe(ctx)\n" + indent + "val r: real = real_to(raw)\n")
+        elif integral
             val side = sysl_side(b.result.ty)
             put(w, indent + s"val raw = $call\n" + indent + "leave_safe(ctx)\n" + indent + s"val r: $side = integer_to(ctx, raw, \"$side\")\n")
         // The bytes are copied before the thread leaves the safe region, touching only Sysl memory.
@@ -665,6 +688,7 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
             put(w, indent + s"owned.extend($call)\n" + indent + "leave_safe(ctx)\n" + indent + "val r = owned.view()\n")
         elif spelled.len() == 1 && n == 0 then put(w, indent + s"val r: ${spelled[0]} = $call\n" + indent + "leave_safe(ctx)\n")
         else put(w, indent + s"val r = $call\n" + indent + "leave_safe(ctx)\n")
+    elif floating then put(w, indent + s"val r: real = real_to($call)\n")
     elif integral
         val side = sysl_side(b.result.ty)
         put(w, indent + s"val r: $side = integer_to(ctx, $call, \"$side\")\n")
@@ -703,11 +727,16 @@ private wrapped(wrapper: string, arg: string) -> string
     if wrapper.starts_with("param_") then return s"$wrapper(ctx, $arg)"
     s"$wrapper($arg)"
 
-// Whether binding `i`'s parameter `k`, `p`, is an integer converted into the Sysl parameter's
-// integer type: every integer but a byte, unless the Sysl parameter is a type parameter of a generic
-// function, which says no integer to convert into.
-private converted_parameter(w: *ShimWriter, p: &Crossing, i: usize, k: usize) -> bool =
-    p.form is Plain && *p.ty is Int(_) && !is_fixed(w, s"param_${i}_$k")
+// Whether binding `i`'s parameter `k`, `p`, is a number converted into the Sysl parameter's type:
+// every integer but a byte, into the parameter's integer type, unless the Sysl parameter is a type
+// parameter of a generic function, which says no type to convert into; and a real, into its
+// floating-point type, where Sysl refused the real itself (`round_<i>_<k>`). A real is passed as it
+// is first, so a Sysl function overloaded for `real` and `f32` is called at `real`, and a generic
+// one takes the real itself.
+private converted_parameter(w: *ShimWriter, p: &Crossing, i: usize, k: usize) -> bool
+    if !(p.form is Plain) then return false
+    if *p.ty is Real then return is_fixed(w, s"round_${i}_$k")
+    *p.ty is Int(_) && !is_fixed(w, s"param_${i}_$k")
 
 // The conversions of arrays of bytes, and the frame that keeps an object a conversion has made while
 // it makes the objects of the object's fields.
@@ -752,6 +781,23 @@ private const IntegerHelper: string =
     "\n// The integer type `T` as its width and sign spell it, `u32` or `i8`.\n" +
     "private integer_name[T: Integer]() -> string = (if T.wrap(-1) < T.wrap(0) then \"i\" else \"u\") + s\"${sizeof(T) * 8usize}\"\n"
 
+// The conversion of a real crossing the boundary in either direction: a real goes into whatever
+// floating-point type its Sysl place is, rounded to the nearest value that type holds, and comes out
+// of any, widened exactly. Neither ever stops the program: a value past the type's largest rounds to
+// an infinity, and one below its smallest to a subnormal or a zero of its sign.
+private const RealHelper: string =
+    "\n// `x` rounded to the floating-point type its place asks for, to the nearest value it holds.\n" +
+    "private real_in[T: Float](x: real) -> T = T(x)\n" +
+    "\n// `x`, of whatever floating-point type it is, widened exactly into a `real`.\n" +
+    "private real_to[S: Float](x: S) -> real = real(x)\n"
+
+// Whether a boundary type is a number converted where it crosses: an integer, into and out of any
+// Sysl integer, or a real, into and out of any Sysl floating-point type.
+private numeric(t: &Type) -> bool = *t is Int(_) || *t is Real
+
+// The trait bounding the Sysl type a number of type `t` crosses as.
+private number_bound(t: &Type) -> string = if *t is Real then "Float" else "Integer"
+
 // The conversion of an integer parameter of a call that waits, made while the thread is safe for the
 // collector: a value that does not fit makes the thread running again before stopping the program.
 private const IntegerWaiting: string =
@@ -763,14 +809,14 @@ private const IntegerWaiting: string =
     "        stop_in_binding(ctx, \"value out of range for \" + integer_name[T]())\n" +
     "    y\n"
 
-// The type parameters of a conversion generic in the Sysl types of the `n` integers it holds, each
-// any Sysl integer, or nothing where it holds none.
-private integer_parameters(n: usize) -> string
-    if n == 0 then return ""
+// The type parameters of a conversion generic in the Sysl types of the numbers it holds, each bounded
+// as `bounds` says, any Sysl integer or any Sysl floating-point type, or nothing where it holds none.
+private number_parameters(bounds: Buf[string]) -> string
+    if bounds.len() == 0 then return ""
     var out = "["
-    for i in 0..<n
+    for i in 0..<bounds.len()
         if i > 0 then out = out + ", "
-        out = out + s"S$i: Integer"
+        out = out + s"S$i: ${bounds[i]}"
     out + "]"
 
 // Whether a binding passes or returns an array of bytes, which no data type's conversion holds.
@@ -937,19 +983,20 @@ private comma_list(parts: Buf[string]) -> string
 // Every Sysl type a value of `c`'s type is converted from. A collection comes out of Sysl as a slice
 // or a `Buf`, so a conversion that holds one is one overload for each way of spelling its type.
 private sysl_types(w: *ShimWriter, c: &Crossing) -> Buf[string]
-    var n = 0usize
+    var n: Buf[string] = buf()
     spellings(w, c, false, &n)
 
 // Every Sysl type a value of `c`'s type is converted from, as `sysl_types` says, but where `generic`
-// is set, an integer an option, a result or a collection holds is any Sysl integer: it is spelled
-// with a type parameter, `S` and its number, counting from `n[0]`, which is left past the last.
-private spellings(w: *ShimWriter, c: &Crossing, generic: bool, n: *usize) -> Buf[string]
+// is set, an integer an option, a result or a collection holds is any Sysl integer, and a real any
+// Sysl floating-point type: each is spelled with a type parameter, `S` and its number, whose bound,
+// `Integer` or `Float`, is pushed onto `n`, so the number is its place there.
+private spellings(w: *ShimWriter, c: &Crossing, generic: bool, n: *Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
     c.form match
         Plain ->
-            if generic && *c.ty is Int(_)
-                out.push(s"S${n[0]}")
-                n[0] += 1
+            if generic && numeric(c.ty)
+                out.push(s"S${n.len()}")
+                n.push(number_bound(c.ty))
             else out.push(sysl_type(w, c))
         OptionForm(_) ->
             for t in spellings(w, payload(c, "Some"), generic, n)
@@ -1040,10 +1087,12 @@ private into_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base:
 
 // The Sysl value `value` of `c`'s type converted out of Sysl, with its layouts from `base` among the
 // ones `ds` points at. An integer, a mirror's field or held in an option, a result or a collection,
-// takes any Sysl integer, converted.
+// takes any Sysl integer, converted, and a real any Sysl floating-point type, widened.
 private out_expr(w: *ShimWriter, c: &Crossing, value: string, ds: string, base: usize) -> string = c.form match
     Plain ->
-        if *c.ty is Int(_) then s"integer_to(ctx, $value, \"${sysl_side(c.ty)}\")" else out_of_sysl(c.ty, value)
+        if *c.ty is Int(_) then s"integer_to(ctx, $value, \"${sysl_side(c.ty)}\")"
+        elif *c.ty is Real then s"real_to($value)"
+        else out_of_sysl(c.ty, value)
     Bytes -> s"bytes_of(ctx, $value, $ds[$base])"
     _ ->
         val at = if base == 0 then ds else s"ptr_cast(usize($ds) + ${base * 8}usize)"
@@ -1107,6 +1156,7 @@ private in_function(w: *ShimWriter, k: usize)
                         if !has_mirror(types, m) then types.push(m)
                         args.push("")
                     elif mirrored && *f.crossing.ty is Int(_) then args.push(s"integer_to(ctx, q$i[0], \"the Sysl field `${f.name}`\")")
+                    elif mirrored && *f.crossing.ty is Real then args.push(s"real_in(q$i[0])")
                     else args.push(into_expr(w, f.crossing, s"q$i[0]", "ds", f.base))
                 None -> args.push("()")
         construction_arms(w, c, v, args, handles, types, 0, buf(), if lastly then "" else "return ", indent)
@@ -1168,10 +1218,10 @@ private out_function(w: *ShimWriter, k: usize)
     // A mirror is its one Sysl type, whatever its fields hold.
     if holds_handle(c) && !(c.form is Mirror(_, _, _, _, _)) then out_overload(w, k, c, "", "")
     else
-        // A conversion that holds an integer is generic in the Sysl integer type of each.
-        var n = 0usize
+        // A conversion that holds a number is generic in the Sysl type of each.
+        var n: Buf[string] = buf()
         val spelled = spellings(w, c, true, &n)
-        val parameters = integer_parameters(n)
+        val parameters = number_parameters(n)
         for spelling in spelled
             out_overload(w, k, c, spelling, parameters)
     mirror_lines(w, c, start)
@@ -1264,9 +1314,9 @@ private out_elements(w: *ShimWriter, k: usize, c: &Crossing, element: &Crossing,
     val own = if vector then 4usize else 1usize
     val side = crossing_c_side(element)
     put(w, s"\n// ${type_name(c.ty)} out of Sysl.\n")
-    var n = 0usize
+    var n: Buf[string] = buf()
     var elements = spellings(w, element, true, &n)
-    var parameters = integer_parameters(n)
+    var parameters = number_parameters(n)
     // Elements that hold a handle are taken as whatever Sysl type they are, a value or a counted
     // reference, which a type with a destructor can only be.
     if holds_handle(element)
@@ -1360,7 +1410,9 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     // its answer is converted into unsaid, so that callback answers the Avin type itself, and an
     // integer passed to a parameter of such a type leaves its Sysl type unsaid, so it is passed as
     // the Avin type itself; and a closure whose parameters' types Sysl cannot infer has each written as
-    // the Avin type's. The archive is kept under the first source's key, which decides the others.
+    // the Avin type's. A real Sysl refuses as it is, as an `f32` parameter does, is rounded into the
+    // parameter's floating-point type instead. The archive is kept under the first source's key,
+    // which decides the others.
     // Sysl reports what it could not infer a part at a time, a closure's parameters before its answer,
     // so the shims are built again while each build finds more to write out.
     var fixed: Buf[string] = buf()
@@ -1397,6 +1449,7 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
     val marker = "cannot infer the type argument '"
     var stalled = false
     var untyped = false
+    var unrounded = false
     for text in output.split("\n")
         // The place of an error that left another type argument unsaid names its binding.
         if stalled && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
@@ -1415,8 +1468,21 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
                 Some(i) -> out = add_name(out, s"lambda_$i")
                 None -> ()
             continue
+        // A real passed as it is to a parameter of another type, an `f32` most often, is rounded
+        // into the parameter's floating-point type instead: each of that binding's own reals is.
+        if unrounded && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
+            unrounded = false
+            owner_of(shim, line_of(text.trim()["--> ".bytes.len..])) match
+                Some(i) ->
+                    for k in 0..<bindings[i].params.len()
+                        val p = bindings[i].params[k]
+                        if p.form is Plain && *p.ty is Real then out = add_name(out, s"round_${i}_$k")
+                None -> ()
+            continue
         if text.starts_with("error: ")
             stalled = false
+            unrounded = refuses_real(text)
+            if unrounded then continue
             untyped = text.contains("has no type here — nothing says what this closure takes")
             if untyped then continue
         val parts = text.split(marker)
@@ -1430,6 +1496,19 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
         if rest.len < 2 then continue
         out = add_name(out, rest[0])
     out
+
+/** Whether Sysl's diagnostic `message` refuses a real given as it is to a parameter of one other
+ * type, `'x' of 'f' is f32, but real was given`; a real inside an option or a collection is not
+ * rounded, so a type spelled with brackets or parentheses is not one. */
+refuses_real(message: string) -> bool
+    val ending = ", but real was given"
+    val text = message.trim()
+    if !text.ends_with(ending) then return false
+    val head = text[0..<text.bytes.len - ending.bytes.len]
+    val parts = head.split("' is ")
+    if parts.len < 2 then return false
+    val wanted = parts[parts.len - 1]
+    !wanted.contains("[") && !wanted.contains("(")
 
 // `names` with `name` added, unless it is there already.
 private add_name(names: Buf[string], name: string) -> Buf[string]
@@ -1593,6 +1672,17 @@ private unconverted_message(shim: ShimSource, bindings: Buf[MirBinding], message
             if trimmed.starts_with("'avin.shims.param_")
                 return s"parameter ${parameter_number(trimmed["'avin.shims.param_".bytes.len..], bindings)} is an integer, which goes into Sysl only as an integer, but the Sysl parameter is $given"
             return s"an integer is made from a Sysl integer, but the value is $given"
+    // A real goes into and comes out of any Sysl floating-point type, and only one.
+    val floating = " to implement 'Float', but "
+    if trimmed.starts_with("'avin.shims.") && trimmed.contains(floating) && trimmed.ends_with(refusal)
+        val parts = trimmed.split(floating)
+        if parts.len == 2
+            val given = parts[1][0..<parts[1].bytes.len - refusal.bytes.len]
+            if trimmed.starts_with("'avin.shims.call_") || trimmed.starts_with("'avin.shims.run_")
+                return s"the function answers a real, which goes into Sysl only as a floating-point number, but the closure Sysl takes answers $given"
+            if trimmed.starts_with("'avin.shims.param_")
+                return s"parameter ${parameter_number(trimmed["'avin.shims.param_".bytes.len..], bindings)} is a real, which goes into Sysl only as a floating-point number, but the Sysl parameter is $given"
+            return s"a real is made from a Sysl floating-point number, but the value is $given"
     val prefix = "no 'avin.shims.out_"
     if !message.starts_with(prefix) then return message
     var k = 0usize
@@ -1635,11 +1725,14 @@ private nested_integer_message(message: string) -> string
     val passed = halves[1]
     // A plain integer is converted, so only an integer inside another type reaches here.
     if !expected.contains("[") && !expected.contains("(") then return message
-    if any_integer(expected) != any_integer(passed) then return message
-    message + ": an integer inside an `Option`, a `Result`, a tuple or a collection is passed as the type it is declared, and only a binding's own integer parameter is converted into the Sysl parameter's integer"
+    if any_integer(expected, false) == any_integer(passed, false) then return message + ": an integer inside an `Option`, a `Result`, a tuple or a collection is passed as the type it is declared, and only a binding's own integer parameter is converted into the Sysl parameter's integer"
+    // So is a real inside another type, which only a binding's own real parameter is rounded from.
+    if any_integer(expected, true) == any_integer(passed, true) then return message + ": a real inside an `Option`, a `Result`, a tuple or a collection is passed as the type it is declared, and only a binding's own real parameter is rounded into the Sysl parameter's floating-point type"
+    message
 
-// `text` with each Sysl integer type it names spelled `I`.
-private any_integer(text: string) -> string
+// `text` with each Sysl integer type it names spelled `I`, and where `floats` is set, each
+// floating-point type a real converts into spelled `F`.
+private any_integer(text: string, floats: bool) -> string
     var out = str_builder()
     var at = 0usize
     while at < text.bytes.len
@@ -1654,7 +1747,11 @@ private any_integer(text: string) -> string
         var integer = false
         for t in ["isize", "usize", "long", "int", "i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8"]
             if word == t then integer = true
-        out.push(if integer then "I" else word)
+        var floating = false
+        if floats
+            for t in ["real", "f64", "f32", "f16", "bf16"]
+                if word == t then floating = true
+        out.push(if integer then "I" elif floating then "F" else word)
         at = end
     out.finish()
 

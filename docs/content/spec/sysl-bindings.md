@@ -21,7 +21,9 @@ readText(path: string) -> Result[string, IoError] =
 A binding is a top-level function declaration with no body. `@sysl` takes one string: the Sysl
 function's module path and name. Bindings are usually private, with a public function giving the
 Avin-shaped API: camelCase names, Avin error types, Avin collections. A binding is otherwise an
-ordinary function: it is called, overloaded, given defaults and passed as a value like any other.
+ordinary function: it is called, overloaded, given defaults and passed as a value like any other. A
+binding that passes its arguments [by name](#arguments-passed-by-name) may leave a parameter with a
+Sysl default to Sysl.
 
 ```text
 @sysl("sysl.text.to_upper")
@@ -84,13 +86,44 @@ error: the Sysl binding `digitCount` does not match `avintest.digits.digit_count
 A new release of a Sysl package, a different commit, or a change to the sources of one named by
 directory builds the shims again; nothing else about it does.
 
+## Arguments passed by name
+
+A binding passes its arguments by position: its first parameter is the Sysl function's first, and
+so on. A binding marked **`named`** passes each argument by its parameter's name instead, spelled as
+Sysl spells it: each uppercase letter becomes an underscore and its lowercase, as a
+[mirror's](#mirrors) fields are, so `onFrame` is `on_frame`. It lists only the parameters it passes,
+in any order, and **every parameter it leaves out takes the Sysl function's own default**, which
+Sysl evaluates at each call, exactly as for a Sysl caller that leaves the argument out. A binding
+never repeats a Sysl default, so it never goes stale when the Sysl function's defaults change.
+
+```text
+@sysl("sh.sysl.ui_sdl.app", named)
+private appOf(title: string, tree: () -> View, ground: () -> long, width: int, height: int, onFrame: real -> unit) -> App
+```
+
+`app` declares `on_event`, `font` and `size` between `height` and `on_frame`, with defaults; the
+binding passes `on_frame` past them and leaves all three to Sysl. `named` is written after the Sysl
+function's name, with `blocking` where the call may also wait (`@sysl("f", blocking, named)`), or
+alone on a handle's method bound by its own name (`@sysl(named)`), whose receiver is never named.
+Every parameter of a `named` binding has a name, since its argument is passed by it.
+
+A default an Avin caller sees is the binding's own: a binding's parameter may have an Avin default
+like any function's, and the Avin caller that leaves it out passes that value, so Sysl's default for
+it is not used. Leaving a parameter that has no Sysl default out, or naming one the Sysl function
+does not have, is reported at the binding with Sysl's own message:
+
+```text
+error: the Sysl binding `framedNoTitle` does not match `avintest.digits.framed`: function 'digits.avintest.digits.framed' was given no value for 'title', and that parameter declares no default
+error: the Sysl binding `joinedWrongName` does not match `avintest.digits.joined`: function 'digits.avintest.digits.joined' declares no parameter named 'd' — it takes 'a', 'b' and 'c'
+```
+
 ## Boundary types
 
 Data crosses the boundary in a fixed set of shapes:
 
 | Avin type | Crossing |
 | --- | --- |
-| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results); an integer parameter goes into [any](#integer-parameters), and so does a callback's integer answer [too](#callbacks) |
+| `i8`, `i16`, `int`, `long`, `byte`, `real`, `char`, `bool`, `unit` | By value; Sysl's `u8` is `byte`. An integer result, and an integer a result holds, takes [any Sysl integer](#integer-results); an integer parameter goes into [any](#integer-parameters), and so does a callback's integer answer [too](#callbacks). A `real` goes into and comes out of [any Sysl floating-point type](#real-numbers), `f32` among them |
 | `string` | Copied into a Sysl `string` in each direction |
 | `Array[byte]` | Copied into a Sysl `[]u8` and, as a binding's own parameter, [copied back](#filled-arrays) after the call; out of a Sysl `[]u8` or `[]const u8` |
 | `Array[T]`, `Vector[T]` of any other boundary type | **Copied**, element by element: into a Sysl slice, and out of a Sysl `[]T` or `Buf[T]` into a new array or vector. An array of numbers, booleans or characters as a binding's own parameter is [copied back](#filled-arrays); any other array goes in as a `[]const T` |
@@ -181,6 +214,40 @@ error: the Sysl binding `countOrZero` does not match `avintest.digits.count_or_z
 
 A value narrower than 32 bits crosses widened as the C convention widens it, a signed integer
 sign-extended and a byte or a bool zero-extended: as a parameter, and as a callback's answer.
+
+### Real numbers
+
+A `real` goes into whatever floating-point type its Sysl place is — `f32`, the half-precision `f16`
+and `bf16`, or `real` itself — and comes out of any of them. syslui-sdl's `app` takes its text size
+as an `f32`, and a binding gives it a `real`:
+
+```text
+@sysl("sh.sysl.ui_sdl.app")
+appOf(title: string, tree: () -> View, ground: () -> long, width: int, height: int, onEvent: Event -> bool, font: string, size: real, onFrame: real -> unit) -> App
+```
+
+Going in — a binding's own parameter, a mirror's field, a callback's answer — the value is rounded to
+the nearest the Sysl type holds, a tie to the one whose last bit is zero. Nothing stops the program:
+a value past the type's largest becomes an infinity of its sign, one smaller than half its smallest
+subnormal a zero of its sign, and a NaN stays a NaN. `0.1` reaches an `f32` as
+`0.10000000149011612`, and `16777217.0` as `16777216`.
+
+Coming out — a result, a mirror's field, a callback's parameter, and a real an `Option`, a `Result`, a
+tuple or a collection holds — the value is widened exactly, so an `f32` that went out comes back
+as the same number. A Sysl `Option[f32]` is bound as an `Option[real]`, and a `Buf[f32]` as a
+`Vector[real]`.
+
+As with integers, a real a parameter holds — in an `Option`, a `Result`, a tuple or a collection — is
+passed as `real` and not rounded, and a Sysl parameter whose type is a type parameter of a generic
+function takes the `real` itself. A binding's own real is passed as it is wherever Sysl takes a
+`real`, and rounded only where it does not, so a Sysl function overloaded at `real` and at `f32` is
+called at `real`, with the value unrounded. A real goes into a floating-point type only, and is
+made from one of the four only — not from Sysl's quadruple-precision `f128`, which Sysl itself
+widens a parameter into:
+
+```text
+error: the Sysl binding `countReal` does not match `avintest.digits.digit_count`: parameter 1 is a real, which goes into Sysl only as a floating-point number, but the Sysl parameter is long
+```
 
 ### Collections are copies
 
@@ -313,7 +380,9 @@ readText(file: string) -> Result[string, IoError]
 - **A field is a boundary type.** An integer field takes any Sysl integer, converted with a check in
   each direction as an [integer result](#integer-results) is: Avin has no unsigned integers, so
   Sysl's `usize` offset above is a `long`, and a value the other side's type cannot hold stops the
-  program where the binding was called. A collection field is copied as a binding's collection is.
+  program where the binding was called. A real field takes any Sysl floating-point type, rounded
+  going in and widened coming out as a [real](#real-numbers) is. A collection field is copied as a
+  binding's collection is.
 - **A field may be a [handle](#handles)**, by itself — not in an `Option`, a collection or a tuple.
   Into Sysl it is passed as a handle parameter is, with the same checks: a closed handle, or one
   another thread owns, stops the program where the binding was called. Out of Sysl each such field
@@ -736,6 +805,10 @@ runEvery(ms: long, @threaded tick: () -> bool)
   ```text
   error: the Sysl binding `integerForText` does not match `avintest.callbacks.text_op`: the function answers an integer, which goes into Sysl only as an integer, but the closure Sysl takes answers string
   ```
+
+- **A callback's real answer is rounded into whatever floating-point type the closure answers**,
+  and a real parameter Sysl calls it with is widened out of whatever floating-point type it is, as
+  a binding's [real](#real-numbers) is: a closure `&Fn(f32) -> f32` takes an Avin `real -> real`.
 
 - **Sysl keeps the function alive for as long as it holds the closure.** The closure holds a root of
   the collector, made when the binding is called, so a callback Sysl stores and calls later runs
