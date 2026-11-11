@@ -6474,6 +6474,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `stdlib-mutable-tree`): **A mutable tree map or set holds an immutable one and
+  replaces it; iterating it while updating it is legal and sees the collection as it was.**
+  `avin.collections.mutable.TreeMap` and `TreeSet` keep a private immutable `TreeMap` or `TreeSet`
+  and assign a new one at each update. Why: the persistent tree is already balanced and tested, its
+  `SortedTree` is private to module `avin` (so a second module could not share it without widening
+  it), every ordered query comes for free, and `toTreeMap()`/`toTreeSet()` become O(1) snapshots.
+  Consequence: an iterator made before an update visits the entries as they were, so a loop that
+  removes or adds entries cannot skip, repeat or fault, unlike the hash-based mutable collections,
+  whose iteration while updating is unspecified. Alternatives weighed: a mutable balanced tree with
+  in-place rotations (faster constants, no allocation per update, but a second tree implementation,
+  and iterators would need invalidation rules); a skip list (same objection). Updates allocate
+  O(log n) nodes, which a mutable tree would not; revisit if a profile shows it. Review with the user:
+  the snapshot-iteration guarantee is a promise a later in-place tree would have to keep.
+
+- Proposed (branch `stdlib-mutable-tree`): **Two types are named `TreeMap` (and `TreeSet`), one in
+  `avin` and one in `avin.collections.mutable`.** As `Map` and `Set` already are. Inside the mutable
+  module the bare name is the mutable one and the immutable one is imported under an alias; a program
+  importing the mutable one unaliased while also using the prelude's gets the mutable one for the bare
+  name, and reaches the immutable one through an aliased import (both forms are tested). Alternatives:
+  distinct names (`MutableTreeMap`) which would break the parallel with `Map`/`Set`.
+
+- Proposed (branch `stdlib-mutable-tree`): **`removeFirst()`/`removeLast()` trap on an empty
+  collection; `removeFirstOption()`/`removeLastOption()` answer `None`.** The immutable sorted
+  collections pair `head()` (trapping) with `headOption()`; the removal operations follow the same
+  split, the plain name being the trapping form. Alternatives: answering an `Option` from the plain
+  name (as `remove(key)` does), or a `pollFirst` name.
+
+- Proposed (branch `stdlib-mutable-tree`): **The `range*` forms of a mutable tree collection answer a
+  new mutable collection, not a view.** As `filter` and `copy()` do on the hash-based mutable
+  collections; a write to the slice does not reach the original. Sharing the tree makes the slice O(log
+  n) to make. Alternative: live views, which would need the mutable tree to be in place.
+
+- Proposed (branch `stdlib-mutable-tree`): **A mutable tree set's `union`, `intersect`, `diff` and
+  `subsetOf` take a mutable tree set**, as the mutable hash set's take a mutable hash set; the
+  `keySet()` of a mutable tree map is an immutable `TreeSet` snapshot, as a mutable `Map`'s is an
+  immutable `Set`.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
