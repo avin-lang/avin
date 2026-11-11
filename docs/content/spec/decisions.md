@@ -5622,6 +5622,43 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
     closed when it returned`` and `` … belongs to another thread``; a field's view is a handle's view
     and says `` the `ByteView` of `Face` was closed when `Face` was used again``.
 
+JSON derivation (branch `json-derive`, stage 11 item (f)):
+
+- **One `JsonError` for parsing and decoding**, the path its last field with a default:
+  `JsonError(message, line, column, offset, path: List[PathStep] = [])`, `inField`/`atIndex`
+  putting a step in front, `pathText()` writing `items[2].name`, and `Display` putting that text
+  and a colon before the message where the path is not empty. *Why*: a program handles one error
+  type from the package, and every existing `JsonError(message, line, column, offset)` keeps
+  compiling. *Alternatives*: the derivation chapter's `JsonError(path, message, line, column)`,
+  which drops the offset and breaks every existing construction; a separate `DecodeError`.
+- **`JsonReader` reads text in memory**, `JsonReader(text, maxDepth = 512)`, with `beginObject`,
+  `nextKey`, `beginArray`, `nextElement`, `takeNull`, `readString`, `readBool`, `readInt`,
+  `readLong`, `readReal`, `readJson`, `skipValue`, `end` and `error(message)`, the last naming the
+  start of the last token read. *Why*: the derivations need exactly these, and the tokenizer is the
+  parser's own, so its messages are `parse`'s. *Alternatives*: reading a byte stream now, which is
+  the streaming reader's item; these methods are the seam it plugs into. A `JsonWriter(out:
+  Writer)` writes compact text only, `writeNull()` for `null`.
+- **Numbers**: an `int` or a `long` reads any whole number in range, `3.0` and `1e3` included, as
+  `Json.asInt`/`asLong` do; a fraction or a number out of range is an error naming it. A NaN or an
+  infinity is written `null` (as `render` writes it) and `null` does not read as a `real`.
+  *Alternatives*: integer literals only; `null` reading back as NaN, which would make every `real`
+  field silently nullable.
+- **`Option[Option[A]]`**: `Some(None)` and `None` both write `null` and read back as `None`. *Why*:
+  JSON has one null. *Alternatives*: refusing to derive for nested options.
+- **Maps** are `HashMap[K, A]` and `TreeMap[K, A]` with `K: JsonMapKey`, a trait the package
+  implements for `string`, `int` and `long` (the digits, read back only from what `toLongOption`
+  reads); a key written twice keeps its last value. *Why*: an impl of a trait is for a data type or
+  a class, not for the `Map` trait, and must take its type's parameters in order, so `Map[string, A]`
+  cannot be named. *Alternatives*: string keys only. **Review with the user**: a field typed as the
+  `Map` trait (what a map literal is typed as) cannot derive the JSON traits; covering it needs the
+  language to let a library trait be implemented for a trait type.
+- **Unknown keys are skipped** and a field written twice is an error (as the chapter says); a second
+  discriminator key after the first is an unknown key. A missing field's error is at the object's
+  closing brace, with the object's path. The nesting limit counts a skipped value's containers too.
+- **Entry points** `json.encode(value) -> string` and `json.decode[A](text, maxDepth = 512)`, the
+  second refusing anything but white space after the value. *Alternatives*: only the traits'
+  methods, leaving every program to make a writer and a reader.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

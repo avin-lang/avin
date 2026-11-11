@@ -2,13 +2,45 @@ module json
 
 // Why JSON text could not be read, and where: the line and column of the character at fault, both
 // counted from 1 and the column in characters, and its byte offset in the text, counted from 0. A
-// line ends at a line feed.
-data JsonError(message: string, line: int, column: int, offset: int)
+// line ends at a line feed. An error decoding a program's own type also carries the path from the
+// document's top to the value at fault, outermost first: `home.street` is `[Key("home"),
+// Key("street")]`. An error of `parse` has an empty path.
+data JsonError(message: string, line: int, column: int, offset: int, path: List[PathStep] = [])
 
-// An error displays as its message and its place: `expected ':' after an object's key at line 3,
-// column 9`.
+// One step of a path into a document: a member's key, or an element's index.
+data PathStep
+    Key(name: string)
+    Index(at: int)
+
+impl JsonError
+    // The error with `name`'s member in front of its path, as the decoder of the object holding the
+    // value at fault adds it.
+    inField(name: string) -> JsonError = JsonError(message, line, column, offset, Key(name) :: path)
+
+    // The error with the element `i` in front of its path.
+    atIndex(i: int) -> JsonError = JsonError(message, line, column, offset, Index(i) :: path)
+
+    // The path written out: keys joined by `.`, an index in brackets, so `items[2].name`; empty where
+    // the error is at the document's top.
+    pathText() -> string
+        val out = StringWriter()
+        var first = true
+        for step in path
+            step match
+                Key(name) ->
+                    if !first then out.writeChar('.')
+                    out.write(name)
+                Index(i) -> out.write(s"[$i]")
+            first = false
+        out.text()
+
+// An error displays as its path, where it has one, its message and its place: `expected ':' after an
+// object's key at line 3, column 9`; `home.street: expected a string, found a number at line 1,
+// column 51`.
 impl Display for JsonError
-    display(out: Writer, spec: FormatSpec) = out.writeField(s"$message at line $line, column $column", spec)
+    display(out: Writer, spec: FormatSpec)
+        val place = if path.isEmpty() then "" else s"${pathText()}: "
+        out.writeField(s"$place$message at line $line, column $column", spec)
 
 // How deeply arrays and objects may nest in the text `parse` reads unless it is told otherwise.
 val defaultMaxDepth: int = 512
@@ -281,6 +313,149 @@ private class Reader(text: string, maxDepth: int)
         val end = at
         at = start
         Err(fault(s"the number ${text.slice(start, end)} is too large for a real"))
+
+    // Reading a token at a time, for a `JsonReader`. Each of these skips the white space before its
+    // token and notes where the token starts, the place an error about it names. `depth` counts the
+    // arrays and objects begun and not yet ended, and `opened` is true right after a `{` or `[`,
+    // where the container may end at once and no comma comes before its first entry.
+    private var depth = 0
+    private var opened = false
+    private var tokenAt = 0
+
+    private startToken()
+        skipSpace()
+        tokenAt = at
+
+    // The error `message` at the start of the last token read.
+    errorHere(message: string) -> JsonError = errorAt(text, tokenAt, message)
+
+    // What stands at `at`, as a value: its kind, or the character that begins no value.
+    private found() -> string
+        if at >= n then return "the end of the text"
+        peek() match
+            '{' -> "an object"
+            '[' -> "an array"
+            '"' -> "a string"
+            '-' | '0'..'9' -> "a number"
+            _ ->
+                if startsWithWord("true") || startsWithWord("false") then return "a boolean"
+                if startsWithWord("null") then return "null"
+                val c = text.charAt(at)
+                if int(c) < 0x20 || int(c) == 0x7f then s"control character U+${hex4(int(c))}" else s"'$c'"
+
+    private expected(what: string) -> JsonError = fault(s"expected $what, found ${found()}")
+
+    private startsWithWord(word: string) -> bool
+        if !text.startsWith(word, at) then return false
+        val after = at + word.byteLength()
+        after >= n || !isWordChar(char(int(text.byteAt(after))))
+
+    private enter() -> Result[unit, JsonError]
+        depth += 1
+        nested(depth)?
+        at += 1
+        opened = true
+        Ok(())
+
+    beginObjectToken() -> Result[unit, JsonError]
+        startToken()
+        if at >= n || peek() != '{' then return Err(expected("an object"))
+        enter()
+
+    beginArrayToken() -> Result[unit, JsonError]
+        startToken()
+        if at >= n || peek() != '[' then return Err(expected("an array"))
+        enter()
+
+    // The next key of the object being read, with its colon read too, or None at the object's end.
+    keyToken() -> Result[Option[string], JsonError]
+        startToken()
+        if opened
+            opened = false
+            if at < n && peek() == '}'
+                at += 1
+                depth -= 1
+                return Ok(None)
+        else
+            if at >= n then return Err(fault("unexpected end of text in an object, where ',' or '}' was expected"))
+            peek() match
+                ',' ->
+                    at += 1
+                    startToken()
+                    if at < n && peek() == '}' then return Err(fault("unexpected '}' after ',' in an object"))
+                '}' ->
+                    at += 1
+                    depth -= 1
+                    return Ok(None)
+                _ -> return Err(fault(s"${unexpected()} in an object, where ',' or '}' was expected"))
+        if at >= n || peek() != '"' then return Err(fault(s"${unexpected()} where an object's key was expected"))
+        val key = readString()?
+        skipSpace()
+        if at >= n || peek() != ':' then return Err(fault(s"${unexpected()} after an object's key, where ':' was expected"))
+        at += 1
+        Ok(Some(key))
+
+    // Whether another element of the array being read follows, its comma read; false at the array's end.
+    elementToken() -> Result[bool, JsonError]
+        startToken()
+        if opened
+            opened = false
+            if at < n && peek() == ']'
+                at += 1
+                depth -= 1
+                return Ok(false)
+            return Ok(true)
+        if at >= n then return Err(fault("unexpected end of text in an array, where ',' or ']' was expected"))
+        peek() match
+            ',' ->
+                at += 1
+                startToken()
+                if at < n && peek() == ']' then return Err(fault("unexpected ']' after ',' in an array"))
+                Ok(true)
+            ']' ->
+                at += 1
+                depth -= 1
+                Ok(false)
+            _ -> Err(fault(s"${unexpected()} in an array, where ',' or ']' was expected"))
+
+    // Whether the next value is `null`, read if it is.
+    nullToken() -> bool
+        startToken()
+        if !startsWithWord("null") then return false
+        at += 4
+        true
+
+    stringToken() -> Result[string, JsonError]
+        startToken()
+        if at >= n || peek() != '"' then return Err(expected("a string"))
+        readString()
+
+    boolToken() -> Result[bool, JsonError]
+        startToken()
+        if startsWithWord("true")
+            at += 4
+            return Ok(true)
+        if startsWithWord("false")
+            at += 5
+            return Ok(false)
+        Err(expected("a boolean"))
+
+    // A number, as a `Long` or a `Real` as `parse` reads one.
+    numberToken() -> Result[Json, JsonError]
+        startToken()
+        if at >= n || !(peek() == '-' || '0' <= peek() <= '9') then return Err(expected("a number"))
+        readNumber()
+
+    // A whole value of any kind, nested no deeper than the limit counting the containers it is in.
+    valueToken() -> Result[Json, JsonError]
+        startToken()
+        readValue(depth)
+
+    // Nothing but white space after the value.
+    endToken() -> Result[unit, JsonError]
+        skipSpace()
+        if at < n then return Err(fault(s"${unexpected()} after the value"))
+        Ok(())
 
 // `code` as four hexadecimal digits, upper case.
 private hex4(code: int) -> string
