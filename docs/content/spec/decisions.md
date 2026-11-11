@@ -6098,14 +6098,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with the user whether `avin new` should write the running version (it ties a new package to the
   Avin that made it, which may be later than the package needs).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
   part (identity, body fingerprint, interfaces read) and the world facts the whole-program steps
   decided for it, both made on every build after lowering** ([the instance
   key](/compiler/#incremental-builds)). The facts are recorded where they are decided, as each step
@@ -6119,14 +6112,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   passes on the second. Alternatives: the callee's key for every summarized callee, as the pipeline
   first wrote it (every leaf edit would reach every transitive caller); the admitted descriptors
   rather than the decision (a class added past the guard limit would change keys for no change).
-- Proposed (branch `instance-keys`): **The body fingerprint is per function, with its family's
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **The body fingerprint is per function, with its family's
   captures, not per family.** A local function or lambda and its top-level function share one table
   of locals; each fingerprint holds its own tree, the locals it owns or captures, and what every
   function of the family captures (with each captured local's type and mutability), which decides
   what is kept in a box. WHY: a lambda's body edit then changes the lambda and its closure entry and
   not the function around it, unless its captures change. Alternatives: one fingerprint for the
   whole family (every edit in it changes every member; simpler, and what the first build did).
-- Proposed (branch `instance-keys`): **Places in the fingerprint follow trap-site naming**: a node
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **Places in the fingerprint follow trap-site naming**: a node
   inside its declaration counts from the declaration's start; a node outside it (a constant default
   argument copied into a call keeps its place in its own file) is named as `trap_name` would name
   a trap there; a derived impl's shared template counts from the start of its file; the compiler's
@@ -6136,7 +6129,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a function changes its key whether or not a trap site follows it. Alternatives: only the places of
   nodes that can trap (needs lowering's knowledge of which do, duplicated); no places at all
   (unsound: an edit moving a trap site changes the text).
-- Proposed (branch `instance-keys`): **What a key reads of types is conservative where the text
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **What a key reads of types is conservative where the text
   rarely depends on it**: every type argument's supertypes and method table (they choose the method
   a call on a bound runs), and a class's or data type's whole layout for any read of a field (its
   field types in order, never the names). So a new impl for a type changes the instances at that
@@ -6146,10 +6139,17 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   recorded during lowering, as the other facts are. Alternatives: record during lowering exactly
   which table entries and fields each instance used (precise, more state threaded through
   lowering).
-- Proposed (branch `instance-keys`): **The key names the compiler by its version and its
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **The key names the compiler by its version and its
   executable's path and modification time, not the level.** WHY: lowering does not depend on the
   level, and the pipeline keeps one instance directory per level. Alternatives: the level in the key
   as well (redundant with the directory), the executable's hash (reads 8 MB per build).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
