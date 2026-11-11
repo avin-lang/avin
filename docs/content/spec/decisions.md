@@ -6719,7 +6719,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `partition` of a pair function answers the own kind only where the type is known. Why: a
   tuple of two collections is not a subtype of a tuple of two supertypes in an override's
   result, and a set's partition over the trait cannot change `Iterable`'s result type.
-  Alternatives weighed: trait methods answering `(Map, Map)` (the concrete type then cannot
+  Proposed amendment (built on branch `partition-override`): with an override's result free to
+  narrow, `Map`, `SortedMap` and `SeqMap` declare `partition(p: (K, V) -> bool)` answering maps
+  of their own trait (`Map` carries a default built on `removed`, so a user class implementing
+  `Map` needs no change), and each concrete map overrides it with its own kind, so a call through
+  `Map` answers maps of the receiver's kind. Sets keep `Iterable`'s `(Vector, Vector)` through
+  `Set`, since a set is not a vector and `Set` cannot narrow it; the own-kind set `partition`
+  stays on the concrete types. Alternatives weighed: a `Set.partition` answering `(Set, Set)`
+  (conflicts with `Iterable`'s result, which is not a supertype of it). Alternatives weighed
+  originally: trait methods answering `(Map, Map)` (the concrete type then could not
   narrow the result); two `filter` calls (calls `p` twice, which a predicate with an effect
   shows). `subsets()` and `subsets(k)` are iterators on `Set` that read the elements into a
   vector and generate combinations by size, so the order is by size then by position and nothing
