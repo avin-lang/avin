@@ -5226,15 +5226,20 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   stays a NaN, and nothing stops the program. A `real` result, a mirror's field coming out, a
   callback's parameter, and a real an `Option`, a `Result`, a tuple or a collection result holds are
   widened exactly. A real inside a parameter's `Option`, tuple or collection is passed as `real`
-  only, as an integer there is passed as its declared type. `f128` is refused (its arithmetic is not
-  `sysl.math.Float`), and so is every non-floating type. Why: Avin has one floating type, and a
+  only, as an integer there is passed as its declared type. A binding's own real is passed as it is
+  first and rounded only where Sysl refuses a `real` there (the shim is built again), so a Sysl
+  function overloaded at `real` and `f32` (`sysl.math.ulp`) is called at `real`, unrounded, and a
+  generic one takes the real itself. A real is not made from an `f128` (its arithmetic is not
+  `sysl.math.Float`; Sysl widens a parameter into one itself), nor from any non-floating type. Why: Avin has one floating type, and a
   graphics or audio library's `f32` (syslui-sdl's `size`, a canvas's coordinates) is what a binding
   meets; rounding is what every conversion between floating widths does and the only one that keeps
   every `f32` value exact on the way back. It mirrors how an integer crosses into any Sysl integer.
   Alternatives weighed: an `f32` type in Avin (a second floating type in every arithmetic rule, for
   the boundary's sake); trapping where the value does not fit (a rounding is not an error, and an
   infinity is a legal `f32`); converting a real held inside a parameter's option or collection too
-  (integers are not converted there either, and the copy would be written element by element).
+  (integers are not converted there either, and the copy would be written element by element);
+  rounding every real parameter at once (an overload at `f32` would then be chosen over the one at
+  `real`, losing precision silently).
   **Review with the user** whether a `real` into an `f32` should trap on overflow to infinity
   rather than round to it.
 

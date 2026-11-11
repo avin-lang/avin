@@ -206,8 +206,11 @@ as the same number. A Sysl `Option[f32]` is bound as an `Option[real]`, and a `B
 
 As with integers, a real a parameter holds — in an `Option`, a `Result`, a tuple or a collection — is
 passed as `real` and not rounded, and a Sysl parameter whose type is a type parameter of a generic
-function takes the `real` itself. A real goes into a floating-point type only, and Sysl's
-quadruple-precision `f128` is not one it converts into:
+function takes the `real` itself. A binding's own real is passed as it is wherever Sysl takes a
+`real`, and rounded only where it does not, so a Sysl function overloaded at `real` and at `f32` is
+called at `real`, with the value unrounded. A real goes into a floating-point type only, and is
+made from one of the four only — not from Sysl's quadruple-precision `f128`, which Sysl itself
+widens a parameter into:
 
 ```text
 error: the Sysl binding `countReal` does not match `avintest.digits.digit_count`: parameter 1 is a real, which goes into Sysl only as a floating-point number, but the Sysl parameter is long

@@ -726,11 +726,15 @@ private wrapped(wrapper: string, arg: string) -> string
     s"$wrapper($arg)"
 
 // Whether binding `i`'s parameter `k`, `p`, is a number converted into the Sysl parameter's type:
-// every integer but a byte, into the parameter's integer type, and a real, into its floating-point
-// type, unless the Sysl parameter is a type parameter of a generic function, which says no type to
-// convert into.
-private converted_parameter(w: *ShimWriter, p: &Crossing, i: usize, k: usize) -> bool =
-    p.form is Plain && numeric(p.ty) && !is_fixed(w, s"param_${i}_$k")
+// every integer but a byte, into the parameter's integer type, unless the Sysl parameter is a type
+// parameter of a generic function, which says no type to convert into; and a real, into its
+// floating-point type, where Sysl refused the real itself (`round_<i>_<k>`). A real is passed as it
+// is first, so a Sysl function overloaded for `real` and `f32` is called at `real`, and a generic
+// one takes the real itself.
+private converted_parameter(w: *ShimWriter, p: &Crossing, i: usize, k: usize) -> bool
+    if !(p.form is Plain) then return false
+    if *p.ty is Real then return is_fixed(w, s"round_${i}_$k")
+    *p.ty is Int(_) && !is_fixed(w, s"param_${i}_$k")
 
 // The conversions of arrays of bytes, and the frame that keeps an object a conversion has made while
 // it makes the objects of the object's fields.
@@ -1404,7 +1408,9 @@ ensure_shims(tc: Toolchain, bindings: Buf[MirBinding], handles: Buf[MirHandle], 
     // its answer is converted into unsaid, so that callback answers the Avin type itself, and an
     // integer passed to a parameter of such a type leaves its Sysl type unsaid, so it is passed as
     // the Avin type itself; and a closure whose parameters' types Sysl cannot infer has each written as
-    // the Avin type's. The archive is kept under the first source's key, which decides the others.
+    // the Avin type's. A real Sysl refuses as it is, as an `f32` parameter does, is rounded into the
+    // parameter's floating-point type instead. The archive is kept under the first source's key,
+    // which decides the others.
     // Sysl reports what it could not infer a part at a time, a closure's parameters before its answer,
     // so the shims are built again while each build finds more to write out.
     var fixed: Buf[string] = buf()
@@ -1441,6 +1447,7 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
     val marker = "cannot infer the type argument '"
     var stalled = false
     var untyped = false
+    var unrounded = false
     for text in output.split("\n")
         // The place of an error that left another type argument unsaid names its binding.
         if stalled && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
@@ -1459,8 +1466,21 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
                 Some(i) -> out = add_name(out, s"lambda_$i")
                 None -> ()
             continue
+        // A real passed as it is to a parameter of another type, an `f32` most often, is rounded
+        // into the parameter's floating-point type instead: each of that binding's own reals is.
+        if unrounded && text.trim().starts_with("--> ") && text.contains("/avin/shims/shims.sysl:")
+            unrounded = false
+            owner_of(shim, line_of(text.trim()["--> ".bytes.len..])) match
+                Some(i) ->
+                    for k in 0..<bindings[i].params.len()
+                        val p = bindings[i].params[k]
+                        if p.form is Plain && *p.ty is Real then out = add_name(out, s"round_${i}_$k")
+                None -> ()
+            continue
         if text.starts_with("error: ")
             stalled = false
+            unrounded = refuses_real(text)
+            if unrounded then continue
             untyped = text.contains("has no type here — nothing says what this closure takes")
             if untyped then continue
         val parts = text.split(marker)
@@ -1474,6 +1494,19 @@ private unsaid_answers(output: string, shim: ShimSource, bindings: Buf[MirBindin
         if rest.len < 2 then continue
         out = add_name(out, rest[0])
     out
+
+/** Whether Sysl's diagnostic `message` refuses a real given as it is to a parameter of one other
+ * type, `'x' of 'f' is f32, but real was given`; a real inside an option or a collection is not
+ * rounded, so a type spelled with brackets or parentheses is not one. */
+refuses_real(message: string) -> bool
+    val ending = ", but real was given"
+    val text = message.trim()
+    if !text.ends_with(ending) then return false
+    val head = text[0..<text.bytes.len - ending.bytes.len]
+    val parts = head.split("' is ")
+    if parts.len < 2 then return false
+    val wanted = parts[parts.len - 1]
+    !wanted.contains("[") && !wanted.contains("(")
 
 // `names` with `name` added, unless it is there already.
 private add_name(names: Buf[string], name: string) -> Buf[string]
