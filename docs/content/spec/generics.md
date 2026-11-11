@@ -89,7 +89,9 @@ class SortedPair[T: Ordered](first: T, second: T)
   operator and both text forms. A value of such a `T` converts to the other integer types and to
   `real`, `byte` and `char` as an integer does (`long(x)`), and a call of `T` converts to it
   (`T(n)`, trapping when `n` does not fit, as integers do; `T.wrap(n)` keeps the low bits); each instance converts
-  at its width.
+  at its width. The bitwise operators `&`, `|`, `^`, `<<` and `>>` also work on such a `T`, both
+  operands of type `T` (`x >> T(1)`), as the machine's operators at each instance's width; a `T`
+  with any other bound has them only as methods of those names.
 
 ```text
 digits[T: Integer](x: T) -> int

@@ -66,6 +66,27 @@ has every integer operation and conversion ([Bounds](generics.md#bounds)). A val
 `long` renders through it, at no cost for widths up to 64 bits; a wider one renders in chunks of
 eighteen digits.
 
+**Integer methods.** Every integer type has these methods, from one impl for the whole family, each
+working at the width it is called at (an `i8` stays an `i8`) and trapping, as arithmetic does, when
+a result does not fit:
+
+| Method | Result |
+| --- | --- |
+| `abs()` | The magnitude; traps for `MinValue`, whose magnitude does not fit |
+| `sign()` | `-1`, `0` or `1`, as an `int` at every width |
+| `pow(n)` | The number to the power `n`, an `int`; `x.pow(0)` is `1`, `0.pow(0)` included. Traps when the result does not fit and when `n` is negative |
+| `gcd(o)` | The greatest common divisor, never negative; `0.gcd(0)` is `0`. Traps only when it is `MinValue`'s magnitude, as in `MinValue.gcd(0)` |
+| `lcm(o)` | The least positive common multiple, `0` when either is `0`; traps when it does not fit |
+| `floorDiv(o)`, `floorMod(o)` | The quotient rounded towards negative infinity, and the remainder that takes the divisor's sign, so `a == a.floorDiv(d) * d + a.floorMod(d)`. They trap where `/` and `%` do: a zero divisor, and `MinValue.floorDiv(-1)` |
+| `bitCount()` | The number of one bits of the two's-complement form at the width: `(-1).bitCount()` is `32` for an `int` |
+| `leadingZeros()`, `trailingZeros()` | The zero bits above the highest one and below the lowest one, an `int`; the width for zero. `leadingZeros()` is `0` for a negative number |
+| `isPowerOfTwo()` | Whether the number is `1`, `2`, `4`, and so on; never for zero or a negative number |
+| `toRadix(r)` | The digits in radix `r` from 2 to 36, lower case, with a `-` for a negative number and no prefix, as `f"%x"` and `f"%b"` write them; any other radix traps |
+
+The bitwise operators `&`, `|`, `^` and the shifts also work on a type parameter bounded by
+`Integer`, as the machine's operators at each width, with both operands of one type: `x >> T(1)`.
+The methods above are not members of `Integer`, so generic code cannot call them on a `T`.
+
 ## byte
 
 `byte` is an octet with a value from 0 to 255. It is the element of binary data — file contents,
