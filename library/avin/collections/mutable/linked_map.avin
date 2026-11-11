@@ -1,0 +1,400 @@
+module avin.collections.mutable
+
+import avin.{Map as ImmutableMap, Set as ImmutableSet}
+
+// A mutable map that remembers the order its keys were first bound in: iteration, `keys()`, `values()`
+// and the display visit the entries oldest first. Binding a key that is already bound replaces its
+// value and leaves it where it was; `putLast` and `moveToEnd` make it the newest. A key that is removed
+// and bound again is new. `removeFirst()` and `removeLast()` take the oldest and the newest entry, so
+// the map serves as a least-recently-used cache. The entries sit in a buffer in insertion order, a
+// removed one leaving a gap that the buffer drops when it is the last and the next insertion squeezes
+// out once the gaps are half the buffer, and a `Map` finds each key's position, so every operation is
+// amortized constant time. A map is the function `(K) -> V` from its keys to their values.
+//
+// Removing entries during an iteration is safe: an entry removed before the iterator reaches it is not
+// visited. Binding new keys during an iteration never traps, but whether the iterator visits them is
+// not defined.
+class LinkedMap[K: Eq + Hash, V]: Iterable[(K, V)], (K) -> V
+    private val index = Map[K, int]()
+    private var slots = Buffer[Option[LinkedEntry[K, V]]]()
+    // Every position before `start` is a gap.
+    private var start = 0
+
+    // The number of entries.
+    override size() -> int = index.size()
+
+    // The number of entries, which the map holds: the same as `size()`.
+    override knownSize() -> int = index.size()
+
+    isEmpty() -> bool = index.isEmpty()
+
+    nonEmpty() -> bool = index.nonEmpty()
+
+    // The value bound to `key`, or `None` when there is none.
+    get(key: K) -> Option[V]
+        index.get(key) match
+            Some(i) -> Some(entryAt(i).value)
+            None -> None
+
+    // The value bound to `key`, which traps when there is none.
+    apply(key: K) -> V
+        index.get(key) match
+            Some(i) -> entryAt(i).value
+            None -> fail("key not found in the map")
+
+    // The value bound to `key`, or `default`, which is evaluated only when there is none.
+    getOrElse(key: K, default: -> V) -> V
+        index.get(key) match
+            Some(i) -> entryAt(i).value
+            None -> default
+
+    contains(key: K) -> bool = index.contains(key)
+
+    // Binds `key` to `value`, replacing the value it had without moving it; a new key becomes the
+    // newest entry. `m(key) = value` calls it.
+    update(key: K, value: V)
+        index.get(key) match
+            Some(i) -> entryAt(i).value = value
+            None -> append(key, value)
+
+    // Binds `key` to `value` and makes it the newest entry, whether or not it was bound.
+    putLast(key: K, value: V)
+        remove(key)
+        append(key, value)
+
+    // Makes `key` the newest entry, answering whether it was bound.
+    moveToEnd(key: K) -> bool
+        remove(key) match
+            Some(v) ->
+                append(key, v)
+                true
+            None -> false
+
+    // The value bound to `key`; when there is none, `default` is evaluated, bound to `key` and
+    // returned.
+    getOrElseUpdate(key: K, default: -> V) -> V
+        index.get(key) match
+            Some(i) -> entryAt(i).value
+            None ->
+                val value = default
+                update(key, value)
+                value
+
+    // Unbinds `key`, answering the value it had, or `None` when it had none.
+    remove(key: K) -> Option[V]
+        index.remove(key) match
+            Some(i) -> Some(vacate(i))
+            None -> None
+
+    // The oldest entry, or `None` when the map is empty.
+    override headOption() -> Option[(K, V)]
+        skipGaps()
+        if start >= slots.length() then None else Some(pairAt(start))
+
+    // The newest entry, or `None` when the map is empty; `head()` and `last()` trap on an empty map.
+    override lastOption() -> Option[(K, V)]
+        if index.isEmpty() then None else Some(pairAt(slots.length() - 1))
+
+    // Unbinds the oldest entry and answers it; traps when the map is empty.
+    removeFirst() -> (K, V)
+        skipGaps()
+        if start >= slots.length() then fail("removeFirst on an empty map")
+        removeAt(start)
+
+    // Unbinds the newest entry and answers it; traps when the map is empty.
+    removeLast() -> (K, V)
+        if index.isEmpty() then fail("removeLast on an empty map")
+        removeAt(slots.length() - 1)
+
+    // Removes every entry.
+    clear()
+        index.clear()
+        slots.clear()
+        start = 0
+
+    // Binds every key of `entries` to its value, in order.
+    addAll(entries: Iterable[(K, V)])
+        for (k, v) in entries do update(k, v)
+
+    // The keys, oldest first.
+    keysIterator() -> Iterator[K] = LinkedKeys(slots)
+
+    // The values, in the order of the keys.
+    valuesIterator() -> Iterator[V] = LinkedValues(slots)
+
+    // The keys oldest first, as a vector snapshot.
+    keys() -> Vector[K] = keysIterator().toVector()
+
+    // The values as a vector snapshot: the value at each index belongs to the key at the same index
+    // of `keys()`.
+    values() -> Vector[V] = valuesIterator().toVector()
+
+    // An immutable set of the keys, a snapshot.
+    keySet() -> ImmutableSet[K]
+        var result = ImmutableSet[K]()
+        for k in keysIterator() do result = result.incl(k)
+        result
+
+    // Calls `f` with each key and its value, oldest first.
+    foreach(f: (K, V) -> unit)
+        for (k, v) in iterator() do f(k, v)
+
+    // Binds `key` to `value`: `m += (key, value)`, which needs no `var`.
+    +=(entry: (K, V))
+        update(entry.0, entry.1)
+
+    // Unbinds `key` if it is bound: `m -= key`.
+    -=(key: K)
+        remove(key)
+        ()
+
+    // Binds every key of `entries` to its value, in order: `m ++= entries`.
+    ++=(entries: Iterable[(K, V)]) = addAll(entries)
+
+    // Unbinds every key of `ks` that is bound: `m --= ks`.
+    --=(ks: Iterable[K])
+        for k in ks do remove(k)
+
+    // Replaces the value of `key` by what `f` makes of the value it has now, or of `None` when it has
+    // none: `Some(v)` binds `key` to `v` and `None` leaves it unbound. Answers the new binding.
+    updateWith(key: K, f: (Option[V]) -> Option[V]) -> Option[V]
+        val updated = f(get(key))
+        updated match
+            Some(v) -> update(key, v)
+            None -> remove(key)
+        updated
+
+    // Unbinds every entry whose key and value do not satisfy `p`.
+    filterInPlace(p: (K, V) -> bool)
+        val doomed = Buffer[K]()
+        foreach((k, v) -> if !p(k, v) then doomed.addOne(k))
+        for k in doomed do remove(k)
+
+    // A new map of the entries whose key satisfies `p`, in this map's order.
+    filterKeys(p: (K) -> bool) -> LinkedMap[K, V] = filter((k, v) -> p(k))
+
+    // A new map of the same keys, each bound to `f` of its value.
+    mapValues[W](f: (V) -> W) -> LinkedMap[K, W]
+        val result = LinkedMap[K, W]()
+        foreach((k, v) -> result(k) = f(v))
+        result
+
+    // A new map of the same keys, each bound to `f` of the key and its value.
+    transform[W](f: (K, V) -> W) -> LinkedMap[K, W]
+        val result = LinkedMap[K, W]()
+        foreach((k, v) -> result(k) = f(k, v))
+        result
+
+    // A new map of the pairs `f` makes of each entry; where two make the same key, the later is
+    // kept in the place of the earlier.
+    map[L, W](f: (K, V) -> (L, W)) -> LinkedMap[L, W]
+        val result = LinkedMap[L, W]()
+        foreach((k, v) -> result += f(k, v))
+        result
+
+    // A new map of the pairs `f` makes of each entry, given as a pair, as a `for` with `yield` gives it.
+    map[L, W](f: ((K, V)) -> (L, W)) -> LinkedMap[L, W]
+        val result = LinkedMap[L, W]()
+        for entry in iterator() do result += f(entry)
+        result
+
+    // A new map of the pairs in the collections `f` makes of each entry.
+    flatMap[L, W](f: ((K, V)) -> Iterable[(L, W)]) -> LinkedMap[L, W]
+        val result = LinkedMap[L, W]()
+        for entry in iterator() do result ++= f(entry)
+        result
+
+    // The entries that satisfy `p`, tested only as `map`, `flatMap` or `foreach` reaches each one.
+    withFilter(p: ((K, V)) -> bool) -> FilteredLinkedMap[K, V] = FilteredLinkedMap(self, p)
+
+    // A new map of the entries whose key and value satisfy `p`, in this map's order.
+    filter(p: (K, V) -> bool) -> LinkedMap[K, V]
+        val result = LinkedMap[K, V]()
+        foreach((k, v) -> if p(k, v) then result(k) = v)
+        result
+
+    // A new map of the same entries in the same order.
+    copy() -> LinkedMap[K, V]
+        val result = LinkedMap[K, V]()
+        foreach((k, v) -> result(k) = v)
+        result
+
+    // An immutable map of the same entries.
+    toMap() -> ImmutableMap[K, V]
+        var result = ImmutableMap[K, V]()
+        foreach((k, v) -> result = result.updated(k, v))
+        result
+
+    // The entries as `(key, value)` pairs, oldest first.
+    override iterator() -> Iterator[(K, V)] = LinkedEntries(slots)
+
+    private entryAt(i: int) -> LinkedEntry[K, V]
+        slots(i) match
+            Some(e) -> e
+            None -> fail("the map's index names a gap")
+
+    private pairAt(i: int) -> (K, V)
+        val e = entryAt(i)
+        (e.key, e.value)
+
+    // Adds an entry for a key that is not bound, making room first when gaps are half the buffer.
+    private append(key: K, value: V)
+        if slots.length() >= 32 && slots.length() >= 2 * index.size() then squeeze()
+        index(key) = slots.length()
+        slots.addOne(Some(LinkedEntry(key, value)))
+
+    // Unbinds the live entry at position `i`, whose key is still in `index`.
+    private removeAt(i: int) -> (K, V)
+        val e = entryAt(i)
+        index.remove(e.key)
+        vacate(i)
+        (e.key, e.value)
+
+    // Turns position `i` into a gap, answering the value it held, and drops the gaps that end the buffer.
+    private vacate(i: int) -> V
+        val e = entryAt(i)
+        slots(i) = None
+        while slots.length() > 0 && slots(slots.length() - 1) is None
+            slots.remove(slots.length() - 1)
+        if start > slots.length() then start = slots.length()
+        e.value
+
+    private skipGaps()
+        while start < slots.length() && slots(start) is None do start += 1
+
+    // Moves the live entries to the front of a new buffer, leaving the old one to any iterator still
+    // stepping through it.
+    private squeeze()
+        val old = slots
+        slots = Buffer[Option[LinkedEntry[K, V]]]()
+        slots.sizeHint(index.size() * 2)
+        start = 0
+        for slot in old
+            slot match
+                Some(e) ->
+                    index(e.key) = slots.length()
+                    slots.addOne(slot)
+                None -> ()
+
+// One entry of a linked map; its value is replaced in place.
+private class LinkedEntry[K, V](val key: K, var value: V)
+
+// A linked map seen through a test of its entries, which a guard of a `for` with `yield` makes: each
+// entry is tested just before the call after it would use it. What it makes is a new linked map.
+class FilteredLinkedMap[K: Eq + Hash, V](private val source: LinkedMap[K, V], private val p: ((K, V)) -> bool)
+    // A new map of the pairs `f` makes of each entry that passes the test.
+    map[L, W](f: ((K, V)) -> (L, W)) -> LinkedMap[L, W]
+        val result = LinkedMap[L, W]()
+        for entry in source
+            if p(entry) then result += f(entry)
+        result
+
+    // A new map of the pairs in the collections `f` makes of each entry that passes the test.
+    flatMap[L, W](f: ((K, V)) -> Iterable[(L, W)]) -> LinkedMap[L, W]
+        val result = LinkedMap[L, W]()
+        for entry in source
+            if p(entry) then result ++= f(entry)
+        result
+
+    // The entries that pass this test and then `q`.
+    withFilter(q: ((K, V)) -> bool) -> FilteredLinkedMap[K, V] = FilteredLinkedMap(source, e -> p(e) && q(e))
+
+    // Calls `f` with each entry that passes the test.
+    foreach(f: ((K, V)) -> unit)
+        for entry in source
+            if p(entry) then f(entry)
+
+// Two linked maps are equal when they hold the same keys bound to equal values at the moment they are
+// compared, whatever order the keys were bound in; `===` tells two maps apart.
+impl[K, V: Eq] Eq for LinkedMap[K, V]
+    equals(other: LinkedMap[K, V]) -> bool
+        if size() != other.size() then return false
+        for (k, v) in self
+            other.get(k) match
+                Some(w) -> if w != v then return false
+                None -> return false
+        true
+
+// A sum over the entries, so that the hash does not depend on the order.
+impl[K, V: Hash] Hash for LinkedMap[K, V]
+    hash() -> long
+        var h: long = 0
+        for (k, v) in self do h = h +% spreadHash(k.hash() *% 31 +% v.hash())
+        h
+
+// Displays as `{a: 1, b: 2}`, oldest entry first.
+impl[K: Display, V: Display] Display for LinkedMap[K, V]
+    display(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.display(w, FormatSpec())
+            w.write(": ")
+            entry.1.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+// The diagnostic form is `{"a": 1}`, oldest entry first.
+impl[K: Debug, V: Debug] Debug for LinkedMap[K, V]
+    debug(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.debug(w, FormatSpec())
+            w.write(": ")
+            entry.1.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+// Steps through the live entries of a linked map's buffer, skipping gaps as it reaches them.
+private class LinkedEntries[K, V](slots: Buffer[Option[LinkedEntry[K, V]]]): Iterator[(K, V)]
+    private var at = 0
+
+    override hasNext() -> bool
+        while at < slots.length() && slots(at) is None do at += 1
+        at < slots.length()
+
+    override next() -> (K, V)
+        if !hasNext() then fail("next on an exhausted iterator")
+        slots(at) match
+            Some(e) ->
+                at += 1
+                (e.key, e.value)
+            None -> fail("the map's index names a gap")
+
+private class LinkedKeys[K, V](slots: Buffer[Option[LinkedEntry[K, V]]]): Iterator[K]
+    private val entries = LinkedEntries(slots)
+
+    override hasNext() -> bool = entries.hasNext()
+
+    override next() -> K = entries.next().0
+
+private class LinkedValues[K, V](slots: Buffer[Option[LinkedEntry[K, V]]]): Iterator[V]
+    private val entries = LinkedEntries(slots)
+
+    override hasNext() -> bool = entries.hasNext()
+
+    override next() -> V = entries.next().1
+
+object LinkedMap
+    // A new, empty linked map.
+    empty[K: Eq + Hash, V]() -> LinkedMap[K, V] = LinkedMap[K, V]()
+
+    // A builder of a linked map: the pairs it is given in order, a later pair's value replacing an
+    // earlier one's for the same key.
+    newBuilder[K, V]() -> Builder[(K, V), LinkedMap[K, V]] = LinkedMapBuilder[K, V]()
+
+// Builds a linked map by storing each pair in it.
+class LinkedMapBuilder[K: Eq + Hash, V]: Builder[(K, V), LinkedMap[K, V]]
+    private var map = LinkedMap[K, V]()
+    private var spent = false
+
+    override addOne(element: (K, V))
+        if spent then fail("add to a builder whose result was taken")
+        map(element.0) = element.1
+
+    override result() -> LinkedMap[K, V]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        map
+
+    // Starts a new map, leaving one already handed over as it is.
+    override clear()
+        map = LinkedMap[K, V]()
+        spent = false
+
+    override knownSize() -> int = map.size()

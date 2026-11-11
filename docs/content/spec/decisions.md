@@ -6330,6 +6330,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed 2026-11-11 (branch `stdlib-linked-map`): **`avin.collections.mutable.LinkedMap[K, V]` and
+  `LinkedSet[A]`, the insertion-ordered mutable map and set.** The choices:
+  1. *Re-binding a present key keeps its place*; `putLast(k, v)` and `moveToEnd(k)` (and a set's
+     `addLast` and `moveToEnd`) make it the newest, and a key removed and bound again is new. Why:
+     `m(k) = v` is a plain update everywhere else, and an insertion-ordered map whose update reorders
+     it would make `m(k) += 1` shuffle the iteration; an LRU cache that wants the move says so
+     with `moveToEnd`. Alternatives: every put moves to the end (access order for caches, but
+     surprising for a plain map); a constructor flag selecting access order (one type with two
+     behaviours).
+  2. *Equality and hash ignore order*: two linked maps (or sets) are equal when they hold the same
+     entries, as two mutable maps are; a `LinkedMap` is not comparable with a `Map` of the other
+     kind (they are different classes). Why: `==` on maps is about contents, and the order is
+     observable through iteration anyway. Alternative: order-sensitive equality, which makes
+     `{a: 1, b: 2}` differ from `{b: 2, a: 1}`, unlike every other map.
+  3. *The oldest and newest ends*: `headOption()` and `lastOption()` answer the ends in constant
+     time (overriding `Iterable`'s, so `head()` and `last()` trap when empty), and `removeFirst()`
+     and `removeLast()` answer the removed `(key, value)` (a set's, the element) and trap when empty.
+     Why: `removeFirst` is the eviction step of an LRU cache. Alternatives: `removeFirst` answering
+     an `Option` (an empty map is then silently ignored by a cache that expected an entry);
+     `pollFirst`-style names.
+  4. *Mutation during iteration*: replacing values and removing entries are defined (a removed
+     entry the iterator has not reached is skipped); binding new keys never traps but whether the
+     iterator visits them is not defined. Why: the entries sit in a buffer, a removal leaves a gap
+     the iterator skips, and the buffer is squeezed only by an insertion, which hands the map a new
+     buffer and leaves an iterator in progress stepping through the old one. Alternative: trapping on
+     a structural change (a version counter), which the other mutable maps do not do either.
+  5. *Representation*: a `Map[K, int]` from each key to its position, and a `Buffer` of entries in
+     insertion order with gaps for removed ones, squeezed when gaps are half of at least 32
+     positions; every operation is amortized constant time. Alternative: open addressing with
+     order links threaded through the table, one structure instead of two but a second copy of the
+     table's removal logic; it can replace this without changing the API.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
