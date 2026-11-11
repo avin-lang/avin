@@ -58,6 +58,9 @@ private meet(a: usize, b: usize) -> usize
 // the function's own code: `facts` gets that, for each function in order, one line per call, so the
 // function's instance key can name it.
 devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: Buf[DispatchSite], facts: *Buf[string]) -> Buf[MirFunction]
+    var summaries: Buf[DevirtSummary] = buf()
+    for f in functions
+        summaries.push(devirt_summary(f))
     val n = functions.len()
     // What each function returns, from what the functions it calls return, until nothing changes.
     var returns: Buf[usize] = buf()
@@ -66,7 +69,7 @@ devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: B
     while changed
         changed = false
         for i in 0..<n
-            val r = return_state(functions[i], value_states(functions[i], returns))
+            val r = atoms_state(summaries[i].returns, returns)
             if r != returns[i]
                 returns[i] = r
                 changed = true
@@ -78,10 +81,138 @@ devirtualize(functions: Buf[MirFunction], descriptors: Buf[Descriptor], sites: B
         while s < sites.len() && sites[s].function == i
             own.push(sites[s])
             s += 1
+        // A function that calls through no table is left as it is.
+        if summaries[i].receivers.len() == 0
+            out.push(functions[i])
+            facts.push("")
+            continue
         var decided = ""
-        out.push(rewrite(functions[i], value_states(functions[i], returns), own, descriptors, callees, &decided))
+        out.push(rewrite(functions[i], receiver_states(functions[i], summaries[i], returns), own, descriptors, callees, &decided))
         facts.push(decided)
     out
+
+// What is known of a value's object, as the function alone shows it: the meet of a set of atoms, each
+// an object of one descriptor, what one function returns, or unknown. An empty set is not yet
+// determined. A parameter is unknown; an allocation is its descriptor's object; a call's result is
+// what its callee returns; a slot is followed only while its address is used for nothing but loading
+// and storing it (an address passed on lets another function store to it), and a value loaded from it
+// is whatever was stored there; anything else is unknown. Given what every function returns, the
+// meet of a value's set is what is known of it; so a function's summary is found once, and the whole
+// program's fixed point is found over the summaries.
+
+/** The atom of what is unknown. */
+private const UnknownAtom: usize = 1
+
+/** The atom of an object of descriptor `d`. */
+private descriptor_atom(d: usize) -> usize = 2 + 2 * d
+
+/** The atom of what function `g` returns. */
+private returned_atom(g: usize) -> usize = 3 + 2 * g
+
+/** A function's summary: the atoms of what it returns, and of the object of each of its calls through
+ * a method table, in the order of its `MethodSlot` instructions. */
+private struct DevirtSummary
+    returns: Buf[usize]
+    receivers: Buf[Buf[usize]]
+
+/** The meet of `atoms`, given what each function returns. */
+private atoms_state(atoms: Buf[usize], returns: Buf[usize]) -> usize
+    var state = Undetermined
+    for a in atoms
+        val s = if a == UnknownAtom then Unknown elif a % 2 == 0 then (a - 2) / 2 + Known else returns[(a - 3) / 2]
+        state = meet(state, s)
+        if state == Unknown then return Unknown
+    state
+
+/** Adds the atoms of `more` to `set`, keeping each once and only the unknown atom once it is there;
+ * answers whether `set` grew. */
+private join_atoms(set: *Buf[usize], more: Buf[usize]) -> bool
+    if set.len() == 1 && (*set)[0] == UnknownAtom then return false
+    var grew = false
+    for a in more
+        if a == UnknownAtom
+            set.clear()
+            set.push(UnknownAtom)
+            return true
+        var seen = false
+        for x in *set
+            if x == a then seen = true
+        if !seen
+            set.push(a)
+            grew = true
+    grew
+
+/** The set holding the one atom `a`. */
+private atom_set(a: usize) -> Buf[usize]
+    var set: Buf[usize] = buf()
+    set.push(a)
+    set
+
+private operand_atoms(atoms: Buf[Buf[usize]], o: Operand) -> Buf[usize] = o match
+    Value(id) -> atoms[id]
+    ConstObject(d) -> atom_set(descriptor_atom(d))
+    ConstData(_, d) -> atom_set(descriptor_atom(d))
+    _ -> atom_set(UnknownAtom)
+
+/** `f`'s summary: each value's atoms, found until nothing changes. */
+private devirt_summary(f: MirFunction) -> DevirtSummary
+    var atoms: Buf[Buf[usize]] = buf()
+    for _ in 0..<f.value_types.len() do atoms.push(buf())
+    for i in 0..<f.signature.params.len()
+        atoms[i] = atom_set(UnknownAtom)
+    var slots: Buf[Buf[usize]] = buf()
+    for _ in 0..<f.slots.len() do slots.push(buf())
+    for block in f.blocks
+        for inst in block.insts
+            val operands = inst_operands(inst)
+            for k in 0..<operands.len()
+                if operands[k] is SlotAddress(x)
+                    if !(k == 0 && (inst is Load(_, _) || inst is Store(_, _))) then slots[x] = atom_set(UnknownAtom)
+        block.term match
+            Return(Some(SlotAddress(x))) -> slots[x] = atom_set(UnknownAtom)
+            Branch(SlotAddress(x), _, _) -> slots[x] = atom_set(UnknownAtom)
+            _ -> ()
+    var changed = true
+    while changed
+        changed = false
+        for block in f.blocks
+            for inst in block.insts
+                if inst is Store(SlotAddress(x), v)
+                    var set = slots[x]
+                    if join_atoms(&set, operand_atoms(atoms, v))
+                        slots[x] = set
+                        changed = true
+                    continue
+                val dest = inst_dest(inst) match
+                    Some(d) -> d
+                    None -> continue
+                val more: Buf[usize] = inst match
+                    Alloc(_, d) -> atom_set(descriptor_atom(d))
+                    Call(_, Direct(g), _) -> atom_set(returned_atom(g))
+                    Load(_, SlotAddress(x)) -> slots[x]
+                    _ -> atom_set(UnknownAtom)
+                var set = atoms[dest]
+                if join_atoms(&set, more)
+                    atoms[dest] = set
+                    changed = true
+    var returned: Buf[usize] = buf()
+    var receivers: Buf[Buf[usize]] = buf()
+    for block in f.blocks
+        for inst in block.insts
+            if inst is MethodSlot(_, object, _) then receivers.push(operand_atoms(atoms, object))
+        if block.term is Return(Some(v)) then _ = join_atoms(&returned, operand_atoms(atoms, v))
+    DevirtSummary(returned, receivers)
+
+/** The states `rewrite` reads of `f`: each object of a call through a table, from its atoms. */
+private receiver_states(f: MirFunction, s: DevirtSummary, returns: Buf[usize]) -> Buf[usize]
+    var states: Buf[usize] = buf()
+    for _ in 0..<f.value_types.len() do states.push(Undetermined)
+    var k = 0usize
+    for block in f.blocks
+        for inst in block.insts
+            if inst is MethodSlot(_, Value(id), _) then states[id] = atoms_state(s.receivers[k], returns)
+            if inst is MethodSlot(_, _, _) then k += 1
+    states
 
 /** The number of instructions of each function, and its signature. */
 private callees_of(functions: Buf[MirFunction]) -> Callees
@@ -97,63 +228,11 @@ private callees_of(functions: Buf[MirFunction]) -> Callees
         symbols.push(f.symbol)
     Callees(sizes, signatures, symbols)
 
-/** What is known of each value of `f`, given what each function returns. */
-private value_states(f: MirFunction, returns: Buf[usize]) -> Buf[usize]
-    var states: Buf[usize] = buf()
-    for _ in 0..<f.value_types.len() do states.push(Undetermined)
-    for i in 0..<f.signature.params.len()
-        states[i] = Unknown
-    // A slot is followed only while its address is used for nothing but loading and storing it: an
-    // address passed on lets another function store to it.
-    var slots: Buf[usize] = buf()
-    for _ in 0..<f.slots.len() do slots.push(Undetermined)
-    for block in f.blocks
-        for inst in block.insts
-            val operands = inst_operands(inst)
-            for k in 0..<operands.len()
-                if operands[k] is SlotAddress(x)
-                    if !(k == 0 && (inst is Load(_, _) || inst is Store(_, _))) then slots[x] = Unknown
-        block.term match
-            Return(Some(SlotAddress(x))) -> slots[x] = Unknown
-            Branch(SlotAddress(x), _, _) -> slots[x] = Unknown
-            _ -> ()
-    var changed = true
-    while changed
-        changed = false
-        for block in f.blocks
-            for inst in block.insts
-                if inst is Store(SlotAddress(x), v)
-                    val m = meet(slots[x], operand_state(states, v))
-                    if m != slots[x]
-                        slots[x] = m
-                        changed = true
-                    continue
-                val dest = inst_dest(inst) match
-                    Some(d) -> d
-                    None -> continue
-                val value = inst match
-                    Alloc(_, d) -> d + Known
-                    Call(_, Direct(g), _) -> returns[g]
-                    Load(_, SlotAddress(x)) -> slots[x]
-                    _ -> Unknown
-                val m = meet(states[dest], value)
-                if m != states[dest]
-                    states[dest] = m
-                    changed = true
-    states
-
 private operand_state(states: Buf[usize], o: Operand) -> usize = o match
     Value(id) -> states[id]
     ConstObject(d) -> d + Known
     ConstData(_, d) -> d + Known
     _ -> Unknown
-
-/** What `f` returns, from what is known of its values. */
-private return_state(f: MirFunction, states: Buf[usize]) -> usize
-    var r = Undetermined
-    for block in f.blocks
-        if block.term is Return(Some(v)) then r = meet(r, operand_state(states, v))
-    r
 
 /** How a call through a method table is made: unchanged, directly, or guarded by its receiver's
  * descriptor. */

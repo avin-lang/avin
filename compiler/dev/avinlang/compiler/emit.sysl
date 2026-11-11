@@ -15,7 +15,26 @@ import sysl.text.{StrBuilder, str_builder}
  * thread's context from it, runs the
  * program's entry function and returns its result as the exit status, or zero for an entry function
  * that returns nothing. */
-emit_llvm(program: MirProgram) -> string
+emit_llvm(program: MirProgram) -> string = emit_llvm_cached(program, map(), false).text
+
+/** A program's LLVM text, and with the instance cache, each function's text entry: its key, "" for
+ * none, and what the entry holds, by the function's index; and how many functions' text the cache
+ * gave. */
+struct Emitted
+    text: string
+    keys: Buf[string]
+    payloads: Buf[string]
+    reused: usize
+
+/** `emit_llvm` with the instance cache's text entries `texts`: with `caching`, a function whose
+ * finished key and emission facts have an entry there is taken from it rather than emitted, and every
+ * function gets an entry. A function's text is made from its code, which its finished key covers, and
+ * from what the whole program decides for it here: whether each call may close a cycle of the call
+ * graph or collect, each callee's signature, and the shims' extensions; `emission_facts` lists them. */
+emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool) -> Emitted
+    var keys: Buf[string] = buf()
+    var payloads: Buf[string] = buf()
+    var reused = 0usize
     var out = str_builder()
     out.push("; Avin program\n\n")
     // Every descriptor begins with the collector's kind, whose tracer is the runtime's.
@@ -110,8 +129,40 @@ emit_llvm(program: MirProgram) -> string
     var intrinsics: Buf[string] = buf()
     val graph = call_graph(program)
     val collects = collecting_functions(program, graph)
+    val shims: Map[string, string] = if caching then shim_texts(program) else map()
     for i in 0..<program.functions.len()
-        emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
+        if !caching || i >= program.keys.len()
+            emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
+            continue
+        val key = content_key(program.keys[i] + "\n" + emission_facts(program, graph, collects, shims, i))
+        if texts.get(key) is Some(payload)
+            var r = entry_reader(payload)
+            val n = r.num()
+            var needed: Buf[string] = buf()
+            for _ in 0..<n
+                needed.push(r.text())
+            val text = r.text()
+            if !r.failed && r.at == payload.bytes.len
+                out.push(text)
+                for d in needed
+                    need(&intrinsics, d)
+                keys.push(key)
+                payloads.push(payload)
+                reused += 1
+                continue
+        var own: Buf[string] = buf()
+        var piece = str_builder()
+        emit_function(&piece, &own, program, graph, plan_roots(program, graph, collects, i), i)
+        val text = piece.finish()
+        out.push(text)
+        var w = entry_writer()
+        w.num(own.len())
+        for d in own
+            need(&intrinsics, d)
+            w.text(d)
+        w.text(text)
+        keys.push(key)
+        payloads.push(w.finish())
     val outside = called_from_outside(program)
     for g in outside.functions
         emit_c_wrapper(&out, program, g)
@@ -133,7 +184,7 @@ emit_llvm(program: MirProgram) -> string
     if roots > 0 then out.push("declare void @avin_rt_globals(ptr)\n")
     if program.testing
         emit_test_main(&out, program, roots)
-        return out.finish()
+        return Emitted(out.finish(), keys, payloads, reused)
     val entry = program.functions[program.entry.unwrap()]
     out.push("\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n")
     out.push("  %ctx = call ptr @avin_rt_start(i32 %argc, ptr %argv)\n")
@@ -160,7 +211,38 @@ emit_llvm(program: MirProgram) -> string
             out.push("  %status = add i32 0, 0\n")
     out.push("  %exit = call i32 @avin_rt_finish(ptr %ctx, i32 %status)\n  ret i32 %exit\n")
     out.push("}\n")
+    Emitted(out.finish(), keys, payloads, reused)
+
+/** What the whole program decides for the text of function `index` beyond its code: for each call,
+ * the callee's symbol and signature, whether it may collect and whether the call may close a cycle of
+ * the call graph; for a call into the runtime or a shim, how its arguments are extended. */
+private emission_facts(program: MirProgram, graph: CallGraph, collects: Buf[bool], shims: Map[string, string], index: usize) -> string
+    var out = str_builder()
+    for block in program.functions[index].blocks
+        for inst in block.insts
+            inst match
+                Call(_, Direct(g), _) ->
+                    val callee = program.functions[g]
+                    out.push(s"d ${callee.symbol} ${convention(callee.signature)}${result_type(callee.signature)}(")
+                    for p in callee.signature.params
+                        out.push(llvm_type(p) + ",")
+                    out.push(s") ${collects[g]} ${graph.component[g] == graph.component[index]}\n")
+                Call(_, Indirect(_, _), _) -> out.push(s"i ${graph.reentered[graph.component[index]]}\n")
+                Call(_, Runtime(symbol, _), _) ->
+                    if shims.get(symbol) is Some(extensions) then out.push("r " + symbol + extensions + "\n")
+                _ -> ()
     out.finish()
+
+/** Each shim's extensions of its arguments, as `emission_facts` lists them. */
+private shim_texts(program: MirProgram) -> Map[string, string]
+    var out: Map[string, string] = map()
+    for b in program.bindings
+        if out.get(b.shim) is Some(_) then continue
+        var text = ""
+        for e in shim_extensions(program, b.shim)
+            text = text + " " + e
+        out.put(b.shim, text)
+    out
 
 // A program built for its tests runs one of them in each process: the one its first argument numbers,
 // counting from 0 in the order the checker found them. The module-level values are initialized

@@ -49,7 +49,8 @@ struct ScalarFacts
 /** What lowering gives the keys beyond the typed program, by instance index: the instances, the
  * numbering of local functions, the facts lowering, devirtualization and scalar replacement decided
  * from the whole program, which module-level values are made at compile time, and the decisions every
- * instance shares (`world`). */
+ * instance shares (`world`). `own` is each instance's own key, which lowering makes as it finds the
+ * instance (see `own_key`), and `bodies` how many bodies those keys fingerprinted. */
 struct KeyInputs
     instances: Buf[KeyedInstance]
     ordinals: Buf[usize]
@@ -58,6 +59,8 @@ struct KeyInputs
     scalar: Buf[ScalarFacts]
     constant_globals: Buf[bool]
     world: string
+    own: Buf[string]
+    bodies: usize
 
 /** What `instance_keys` found: each instance's key, how many functions' bodies were fingerprinted
  * (a generic function's once for all its instances), and how many different keys there are. */
@@ -66,7 +69,9 @@ struct KeyCounts
     bodies: usize
     distinct: usize
 
-private struct Keys
+/** The keys of one program's instances being made: what every key shares, and the fingerprints and
+ * interfaces already printed. */
+struct Keys
     program: TProgram
     inputs: KeyInputs
     prefix: string
@@ -99,8 +104,24 @@ private struct KeyPrinter
     reads: Buf[string]
     family: Map[usize, usize]
 
-/** The key of every instance of `mir`, lowered from `program`. */
+/** The key of every instance of `mir`, lowered from `program`: each instance's own key, which
+ * lowering made, then what the whole-program steps decided for it. */
 instance_keys(program: TProgram, mir: MirProgram) -> KeyCounts
+    var finished: Buf[string] = buf()
+    for _ in mir.key_inputs.instances do finished.push("")
+    var k = Keys(program, mir.key_inputs, "", map(), map(), map(), map(), map(), map(), finished, "", "")
+    var keys: Buf[string] = buf()
+    var seen: Map[string, bool] = map()
+    for i in 0..<k.inputs.instances.len()
+        val key = finished_key(&k, i)
+        keys.push(key)
+        seen.put(key, true)
+    KeyCounts(keys, mir.key_inputs.bodies, seen.len())
+
+/** The maker of a program's own keys, before lowering: `ordinals` numbers its local functions,
+ * `constant_globals` says which module-level values are made at compile time, and `world` is the
+ * decisions every instance shares. */
+key_maker(program: TProgram, ordinals: Buf[usize], constant_globals: Buf[bool], world: string) -> Keys
     var members: Map[usize, Buf[usize]] = map()
     var spans: Map[string, Buf[usize]] = map()
     var tops: Map[usize, Buf[usize]] = map()
@@ -121,32 +142,41 @@ instance_keys(program: TProgram, mir: MirProgram) -> KeyCounts
                 tops.put(unit, in_unit)
     var stamp = str_builder()
     stamp.push("avin " + Version + "\n")
-    if current_exe() is Some(exe)
+    if stamp_standing_in != "" then stamp.push(stamp_standing_in + "\n")
+    elif current_exe() is Some(exe)
         stamp.push(exe + "\n")
         if metadata(exe) is Ok(m) then stamp.push(m.modified.us.to_string() + "\n")
-    stamp.push((if program.testing then "tests\n" else "program\n") + mir.key_inputs.world + "\n")
-    var finished: Buf[string] = buf()
-    for _ in mir.key_inputs.instances do finished.push("")
-    var k = Keys(program, mir.key_inputs, content_key(stamp.finish()), members, spans, tops, map(),map(), map(), finished, "", "")
+    stamp.push((if program.testing then "tests\n" else "program\n") + world + "\n")
+    val inputs = KeyInputs(buf(), ordinals, buf(), buf(), buf(), constant_globals, world, buf(), 0)
+    var k = Keys(program, inputs, content_key(stamp.finish()), members, spans, tops, map(),map(), map(), buf(), "", "")
     k.builtins = builtins_text(&k)
     k.c_digest = c_text(program)
-    var keys: Buf[string] = buf()
-    var seen: Map[string, bool] = map()
-    for i in 0..<k.inputs.instances.len()
-        val key = finished_key(&k, i)
-        keys.push(key)
-        seen.put(key, true)
-    KeyCounts(keys, k.bodies.len(), seen.len())
+    k
+
+// What stands for the compiler's executable and its time in every key, "" for the executable itself.
+private var stamp_standing_in: string = ""
+
+/** Makes every key name `stamp` in place of the compiler's executable and its time, as a compiler
+ * built at another time would, or with "" its own again: for the compiler's tests. */
+stand_in_compiler(stamp: string)
+    stamp_standing_in = stamp
+
+/** An instance's own key: what it is and the fingerprint of what it is made from, before the
+ * whole-program steps decide anything for it. Lowering an instance whose own key is the same gives the
+ * same code, so a build may take that code from the instance cache instead. */
+own_key(k: *Keys, inst: KeyedInstance) -> string = content_key(k.prefix + "\n" + own_part(k, inst))
+
+/** How many functions' bodies `k` has fingerprinted. */
+bodies_fingerprinted(k: Keys) -> usize = k.bodies.len()
 
 private span_key(unit: usize, span: Span) -> string = s"$unit:${span.start}:${span.end}"
 
-/** An instance's key: its own part, then what the whole-program steps decided for it, with the key of
+/** An instance's key: its own key, then what the whole-program steps decided for it, with the key of
  * every function scalar replacement copied into it, which never calls back into it. */
 private finished_key(k: *Keys, i: usize) -> string
     if k.finished[i] != "" then return k.finished[i]
     var text = str_builder()
-    text.push(k.prefix + "\n")
-    text.push(own_part(k, i))
+    text.push(k.inputs.own[i] + "\n")
     text.push("lowering\n" + k.inputs.lowering[i])
     text.push("devirtualized\n" + k.inputs.devirt[i])
     val scalar = k.inputs.scalar[i]
@@ -158,8 +188,7 @@ private finished_key(k: *Keys, i: usize) -> string
     key
 
 /** What an instance is and the fingerprint of what it is made from. */
-private own_part(k: *Keys, i: usize) -> string
-    val inst = k.inputs.instances[i]
+private own_part(k: *Keys, inst: KeyedInstance) -> string
     var out = str_builder()
     if inst.generated == Written
         out.push("instance " + symbol_spelling(k.program, k.inputs.ordinals, inst.function, inst.type_args) + (if inst.entry then " entry\n" else "\n"))
