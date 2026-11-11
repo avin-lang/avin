@@ -227,3 +227,133 @@ void bf_holder_free(bf_holder *h) {
 
 long bf_holder_sum(bf_holder *h) { return bf_surface_sum(h->s); }
 void bf_holder_paint(bf_holder *h, unsigned char value) { bf_surface_paint(h->s, value); }
+
+static atomic_int faces_alive;
+static const unsigned char face_name[] = "face";
+
+bf_face *bf_face_new(void) {
+    bf_face *f = calloc(1, sizeof *f);
+    if (!f) die("out of memory");
+    f->refs = 1;
+    f->glyph = calloc(1, sizeof *f->glyph);
+    if (!f->glyph) die("out of memory");
+    f->name = face_name;
+    f->name_length = 4;
+    f->plane_length = 3;
+    for (int p = 0; p < 2; p++) f->planes[p] = made(3, p * 10);
+    atomic_fetch_add(&faces_alive, 1);
+    return f;
+}
+
+static bf_face *live_face(bf_face *f) {
+    if (!f || f->dead) die("a face used after it was freed");
+    return f;
+}
+
+bf_face *bf_face_ref(bf_face *f) {
+    live_face(f)->refs++;
+    return f;
+}
+
+void bf_face_unref(bf_face *f) {
+    if (--live_face(f)->refs > 0) return;
+    free(f->glyph->bitmap.buffer);
+    free(f->glyph);
+    for (int p = 0; p < 2; p++) free(f->planes[p]);
+    f->glyph = 0;
+    f->dead = 1;
+    atomic_fetch_sub(&faces_alive, 1);
+}
+
+int bf_faces_alive(void) { return atomic_load(&faces_alive); }
+
+void bf_face_load(bf_face *f, int rows, int width, int pitch, int fill) {
+    bf_bitmap *b = &live_face(f)->glyph->bitmap;
+    /* The old pixels are overwritten before they are freed, so a view still reading them sees it. */
+    if (b->buffer) memset(b->buffer, 0xDD, (size_t)(b->rows * (b->pitch < 0 ? -b->pitch : b->pitch)));
+    free(b->buffer);
+    int stride = pitch < 0 ? -pitch : pitch;
+    b->rows = rows;
+    b->width = width;
+    b->pitch = pitch;
+    b->buffer = 0;
+    f->loads++;
+    if (rows == 0 || width == 0) return;
+    b->buffer = malloc((size_t)(rows * stride));
+    if (!b->buffer) die("out of memory");
+    memset(b->buffer, 0, (size_t)(rows * stride));
+    for (int r = 0; r < rows; r++) {
+        /* Bottom row first where the pitch is negative. */
+        int at = pitch < 0 ? (rows - 1 - r) * stride : r * stride;
+        for (int c = 0; c < width; c++) b->buffer[at + c] = (unsigned char)((r * 16 + c + fill) & 255);
+    }
+}
+
+long bf_face_sum(bf_face *f) {
+    bf_bitmap *b = &live_face(f)->glyph->bitmap;
+    long sum = 0;
+    int stride = b->pitch < 0 ? -b->pitch : b->pitch;
+    for (int i = 0; b->buffer && i < b->rows * stride; i++) sum += b->buffer[i];
+    return sum;
+}
+
+int bf_stream_write(int total, int chunk, int (*write)(void *closure, const unsigned char *data, unsigned int length), void *closure) {
+    for (int at = 0; at < total; at += chunk) {
+        int n = total - at < chunk ? total - at : chunk;
+        unsigned char *piece = malloc((size_t)n + 1);
+        if (!piece) die("out of memory");
+        for (int i = 0; i < n; i++) piece[i] = (unsigned char)((at + i) & 255);
+        int answer = write(closure, piece, (unsigned int)n);
+        memset(piece, 0xDD, (size_t)n);
+        free(piece);
+        if (answer != 0) return answer;
+    }
+    return 0;
+}
+
+long bf_stream_read(int total, int chunk, int (*read)(void *closure, unsigned char *data, unsigned int length), void *closure) {
+    long sum = 0;
+    for (int at = 0; at < total; at += chunk) {
+        int n = total - at < chunk ? total - at : chunk;
+        unsigned char *piece = malloc((size_t)n + 1);
+        if (!piece) die("out of memory");
+        memset(piece, 0xEE, (size_t)n);
+        int answer = read(closure, piece, (unsigned int)n);
+        for (int i = 0; i < n; i++) sum += piece[i];
+        free(piece);
+        if (answer != 0) return -answer;
+    }
+    return sum;
+}
+
+int bf_stream_null(unsigned int length, int (*write)(void *closure, const unsigned char *data, unsigned int length), void *closure) {
+    return write(closure, 0, length);
+}
+
+void bf_stream_sized(size_t n, void (*seen)(void *closure, size_t length, const uint8_t *data), void *closure) {
+    uint8_t *piece = malloc(n + 1);
+    if (!piece) die("out of memory");
+    for (size_t i = 0; i < n; i++) piece[i] = (uint8_t)(i & 255);
+    seen(closure, n, piece);
+    free(piece);
+}
+
+void bf_stream_signed(int n, void (*seen)(void *closure, const unsigned char *data, int length), void *closure) {
+    static const unsigned char four[4] = {1, 2, 3, 4};
+    seen(closure, four, n);
+}
+
+long bf_stream_pair(int a, int b, long (*seen)(void *closure, const unsigned char *first, unsigned int n, unsigned char *second, unsigned int m), void *closure) {
+    unsigned char *x = made(a, 0);
+    unsigned char *y = made(b, 100);
+    long answer = seen(closure, x, (unsigned int)a, y, (unsigned int)b);
+    for (int i = 0; i < b; i++) answer += y[i];
+    free(x);
+    free(y);
+    return answer;
+}
+
+void bf_stream_ints(int n, void (*seen)(void *closure, const int *data, int length), void *closure) {
+    int values[4] = {1, 2, 3, 4};
+    seen(closure, values, n);
+}

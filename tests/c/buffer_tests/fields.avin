@@ -1,0 +1,267 @@
+// Views a field accessor lends: the memory a field of a C struct points at, its length a C expression
+// in `self` (another field, the magnitude of a negative pitch times the rows, a constant), read in place
+// and bounds-checked; null as `None`, as an empty view or a stop; indexed by a bounded field; written
+// through a `writable` one; and closed by the handle's next use — a bound method, another field
+// accessor, the next view, `close()` — wherever the view was kept.
+import avin.c.{ByteView, MutByteView}
+
+@c(type: "bf_face *", release: "bf_face_unref", retain: "bf_face_ref")
+class Face
+    // A glyph's bitmap, as FreeType's is: `|pitch| * rows` bytes, null for a glyph with no pixels.
+    @c(field: "glyph->bitmap.buffer", view,
+       length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows")
+    bitmap() -> Option[ByteView]
+
+    @c(field: "glyph->bitmap.buffer", view, length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows")
+    bitmapAlways() -> ByteView
+
+    @c(field: "glyph->bitmap.buffer", view, writable, length: "self->glyph->bitmap.pitch * self->glyph->bitmap.rows")
+    pixels() -> MutByteView
+
+    @c(field: "glyph->bitmap.buffer", view, length: "4")
+    bitmapCounted() -> ByteView
+
+    // A `const` field, its length another field.
+    @c(field: "name", view, length: "self->name_length")
+    name() -> ByteView
+
+    @c(field: "name", view, length: "self->name_length - 5")
+    nameNegative() -> ByteView
+
+    @c(field: "name", view, length: "2147483648LL")
+    nameTooLong() -> ByteView
+
+    @c(field: "name", view, length: "2147483647")
+    nameWidest() -> ByteView
+
+    // One of an array of pointers, by a bounded index.
+    @c(field: "planes[i]", bound: "2", view, length: "self->plane_length")
+    plane(i: int) -> ByteView
+
+    @c(field: "glyph->bitmap.rows")
+    rows() -> int
+
+    @c(field: "loads")
+    loads() -> int
+
+    @c("void bf_face_load(bf_face *self, int rows, int width, int pitch, int fill)")
+    load(rows: int, width: int, pitch: int, fill: int)
+
+    @c("long bf_face_sum(bf_face *self)")
+    sum() -> long
+
+@c("bf_face *bf_face_new(void)")
+newFace() -> Face
+
+@c("int bf_faces_alive(void)")
+facesAlive() -> int
+
+// Allocates until the collector has run several times.
+faceChurn()
+    var n = 0
+    for i in 0..<200000
+        val v = [i, i + 1]
+        n += v(1) - v(0)
+
+// The byte a loaded glyph holds at row `r` and column `c`.
+pixel(r: int, c: int, fill: int) -> byte = byte((r * 16 + c + fill) & 255)
+
+@test("a field's view reads the bitmap a glyph slot holds in place, its length the pitch times the rows")
+fieldViewReads()
+    val f = newFace()
+    f.load(3, 4, 4, 0)
+    val v = f.bitmap().get()
+    assertEq(v.length(), 12)
+    for r in 0..<3
+        for c in 0..<4
+            assertEq(v(r * 4 + c), pixel(r, c, 0))
+    assertEq(f.bitmapAlways().length(), 12)
+
+@test("a negative pitch is a bitmap stored bottom row first: the length takes its magnitude, and the view begins with the bottom row")
+fieldViewNegativePitch()
+    val f = newFace()
+    f.load(3, 2, -2, 1)
+    val v = f.bitmap().get()
+    assertEq(v.length(), 6)
+    assertEq(v(0), pixel(2, 0, 1))
+    assertEq(v(1), pixel(2, 1, 1))
+    assertEq(v(4), pixel(0, 0, 1))
+    assertEq(v(5), pixel(0, 1, 1))
+
+@test("a pitch wider than the row lends the padding too, which the view reads as C left it")
+fieldViewPadding()
+    val f = newFace()
+    f.load(2, 3, 5, 0)
+    val v = f.bitmap().get()
+    assertEq(v.length(), 10)
+    assertEq(v(2), pixel(0, 2, 0))
+    assertEq(v(3), byte(0))
+    assertEq(v(4), byte(0))
+    assertEq(v(5), pixel(1, 0, 0))
+
+@test("a glyph with no pixels has a null buffer: `None`, or an empty view where the length is zero")
+fieldViewEmptyGlyph()
+    val f = newFace()
+    assert(f.bitmap() is None)
+    assertEq(f.bitmapAlways().length(), 0)
+    f.load(0, 5, 5, 0)
+    assert(f.bitmap() is None)
+    f.load(1, 1, 1, 9)
+    val one = f.bitmap().get()
+    assertEq(one.length(), 1)
+    assertEq(one(0), byte(9))
+
+@test(should_trap: "the field `glyph->bitmap.buffer` of `Face` holds null")
+fieldViewNullCounted()
+    newFace().bitmapCounted()
+
+@test("a view's length is another field, and a field `const` in C is read through a `ByteView`")
+fieldViewLengthFromField()
+    val f = newFace()
+    val n = f.name()
+    assertEq(n.length(), 4)
+    assertEq(n(0), byte(int('f')))
+    assertEq(n(3), byte(int('e')))
+    assertEq(n.copy().length(), 4)
+
+@test(should_trap: "the field `name` of `Face` holds a negative length")
+fieldViewNegativeLength()
+    newFace().nameNegative()
+
+@test(should_trap: "the field `name` of `Face` holds more bytes than a view holds")
+fieldViewTooLong()
+    newFace().nameTooLong()
+
+@test("a length of the greatest `int` is lent, and only the bytes read are touched")
+fieldViewWidest()
+    val v = newFace().nameWidest()
+    assertEq(v.length(), 2147483647)
+    assertEq(v(0), byte(int('f')))
+
+@test("an indexed field lends the memory of the pointer it names, at the first and the last index")
+fieldViewIndexed()
+    val f = newFace()
+    val first = f.plane(0)
+    assertEq(first.length(), 3)
+    assertEq(first(2), byte(2))
+    val last = f.plane(1)
+    assertEq(last(0), byte(10))
+
+@test(should_trap: "index `i` of `Face.plane` out of range")
+fieldViewIndexAtBound()
+    newFace().plane(2)
+
+@test(should_trap: "index `i` of `Face.plane` out of range")
+fieldViewIndexNegative()
+    newFace().plane(-1)
+
+@test(should_trap: "index out of range")
+fieldViewReadPastLength()
+    val f = newFace()
+    f.load(2, 2, 2, 0)
+    f.bitmap().get()(4)
+
+@test(should_trap: "the `ByteView` of `Face` was closed when `Face` was used again")
+fieldViewClosedByLoad()
+    val f = newFace()
+    f.load(2, 2, 2, 0)
+    val v = f.bitmap().get()
+    f.load(2, 2, 2, 7)
+    v(0)
+
+@test(should_trap: "the `ByteView` of `Face` was closed when `Face` was used again")
+fieldViewClosedByField()
+    val f = newFace()
+    f.load(2, 2, 2, 0)
+    val v = f.bitmap().get()
+    assertEq(f.rows(), 2)
+    v(0)
+
+@test(should_trap: "the `ByteView` of `Face` was closed when `Face` was used again")
+fieldViewClosedByNextView()
+    val f = newFace()
+    val a = f.plane(0)
+    val b = f.plane(1)
+    assertEq(b(0), byte(10))
+    a(0)
+
+@test(should_trap: "the `ByteView` of `Face` was closed when `Face` was used again")
+fieldViewClosedByClose()
+    val f = newFace()
+    f.load(1, 1, 1, 0)
+    val v = f.bitmap().get()
+    f.close()
+    v.length()
+
+@test(should_trap: "the `ByteView` of `Face` was closed when `Face` was used again")
+fieldViewClosedInClosure()
+    val f = newFace()
+    f.load(1, 2, 2, 0)
+    val v = f.bitmap().get()
+    val read = () -> v(1)
+    assertEq(read(), pixel(0, 1, 0))
+    f.load(1, 2, 2, 0)
+    read()
+
+@test(should_trap: "the `MutByteView` of `Face` was closed when `Face` was used again")
+fieldViewWriteAfterUse()
+    val f = newFace()
+    f.load(1, 2, 2, 0)
+    val px = f.pixels()
+    px.update(0, byte(1))
+    f.sum()
+    px.update(1, byte(1))
+
+@test("a view lent again after a load reads the new pixels, and a copy taken before keeps the old")
+fieldViewAfterLoad()
+    val f = newFace()
+    f.load(1, 3, 3, 0)
+    val before = f.bitmap().get().copy()
+    f.load(1, 3, 3, 100)
+    val after = f.bitmap().get()
+    assertEq(before(0), byte(0))
+    assertEq(after(0), byte(100))
+    assertEq(f.loads(), 2)
+
+@test("a `writable` field's view writes the bytes C reads, and is read as a `ByteView` too")
+fieldViewWrites()
+    val f = newFace()
+    f.load(2, 2, 2, 0)
+    val px = f.pixels()
+    px.fill(0, 4, byte(0))
+    px.update(3, byte(200))
+    val read: ByteView = px
+    assertEq(read(3), byte(200))
+    assertEq(f.sum(), long(200))
+
+@test("a field's view keeps its face alive while the program holds nothing else of it")
+fieldViewKeepsFace()
+    val alive = facesAlive()
+    val v = makeView()
+    faceChurn()
+    faceChurn()
+    assertEq(facesAlive(), alive + 1)
+    assertEq(v(1), pixel(0, 1, 3))
+
+makeView() -> ByteView
+    val f = newFace()
+    f.load(2, 2, 2, 3)
+    f.bitmap().get()
+
+firstPixel(fill: int) -> byte
+    val f = newFace()
+    f.load(1, 1, 1, fill)
+    f.bitmap().get()(0)
+
+@test("views of a thousand faces are read, and the faces collected with them once nothing holds them")
+fieldViewMany()
+    val alive = facesAlive()
+    var total = 0
+    for i in 0..<1000
+        total += int(firstPixel(i))
+    assertEq(total, 124716)
+    var tries = 0
+    while facesAlive() > alive && tries < 50
+        faceChurn()
+        tries += 1
+    assertEq(facesAlive(), alive)
