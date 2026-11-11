@@ -163,7 +163,8 @@ carrying the months' sign (`months(14)` is 1 year and 2 months, `months(-14)` -1
 `p.isZero()` asks for the empty period. A period has no order: whether a month is longer than 30 days
 depends on the month. `p.toIsoString()` writes ISO 8601's form, `P1Y2M3D`: the years, the months
 left over and the days, each where it is not zero, `P0D` for the empty period, and a negative part
-with its own sign (`P-1Y-2M`, `P1M-3D`), since the parts may differ in sign.
+with its own sign (`P-1Y-2M`, `P1M-3D`), since the parts may differ in sign; `parsePeriod` reads it
+back ([Parsing](#parsing)).
 
 **A duration is exact timeline and may be added to an `Instant`, a `DateTime` or a `Zoned`; a
 period is a calendar step and may be added only to a `Date`, a `DateTime` or a `Zoned`.** A `Date`
@@ -341,18 +342,29 @@ other type as its display.
 | `parseDateTime(text) -> Result[DateTime, TimeParseError]` | a date and a time joined by `T` or one space |
 | `parseTimestamp(text) -> Result[Instant, TimeParseError]` | a date-time and an offset: `Z`, `±hh:mm` or `±hhmm` |
 | `parseZoned(text) -> Result[Zoned, TimeParseError]` | a timestamp and, optionally, a zone name in brackets |
+| `parsePeriod(text) -> Result[Period, TimeParseError]` | `P`, then years `Y`, months `M` and days `D` in that order, at least one, each with its own `-` where negative: what `toIsoString()` writes |
 
-**Every display of `Instant`, `Date`, `Time`, `DateTime` and `Zoned` reads back** to an equal value.
-A fraction means what it says: `.5` is half a second. **A parse checks the calendar, not only the
-shape**: `2026-02-30` has the right shape and is refused, as are `24:00`, a second of `60`, a
-seventh digit of fraction, an offset beyond ±23:59, and a timestamp with no offset (defaulting one
-would invent it). Digits are ASCII only; any other character, a digit of another script included, is
-a shape error.
+**Every display of `Instant`, `Date`, `Time`, `DateTime` and `Zoned` reads back** to an equal value,
+and so does every period's `toIsoString()`. A year of four digits has no sign; one written with a sign
+has four digits or more (`+10000`, `-0001`, `+2026`). A fraction means what it says: `.5` is half a
+second. **A parse checks the calendar, not only the shape**: `2026-02-30` has the right shape and is
+refused, as are `24:00`, a second of `60`, a seventh digit of fraction (even a `0`), an offset beyond
+±23:59, and a timestamp with no offset (defaulting one would invent it). The whole text is read for
+its shape first, and then its fields are checked in the order they are written, so
+`2026-02-30T24:00` is refused for its day. Without a zone name `parseZoned`'s zone is the offset's
+fixed zone (`utc` for `Z` or any zero offset); with one, the offset must be the one that zone's clocks
+show at that instant, so both readings of an autumn overlap are read and a reading in a spring gap is
+refused for its offset. A period's years are twelve months each, and `P12M` reads as `P1Y` does.
+Digits are ASCII only; any other character, a digit of another script included, is a shape error.
 
-`TimeParseError` is `BadShape(text, at)`, `OutOfRange(text, field)`, `Trailing(text, at)` and
-`UnknownZone(text, name)`, `at` a byte offset into `text`; its message quotes the text:
-`cannot read "2026-02-30": day is out of range`, `cannot read "2026/03/08": not the expected shape at
-byte 4`.
+`TimeParseError` is `BadShape(text, at, expected)`, `OutOfRange(text, field)`, `Trailing(text, at)`
+and `UnknownZone(text, name)`, `at` a byte offset into `text`. `field` is `year`, `month`, `day`,
+`date` (a date past `Date.Min` or `Date.Max` in their own years), `hour`, `minute`, `second`,
+`fraction`, `offset`, `instant` (a timestamp past `Instant.Min` or `Instant.Max`), `months` or
+`days`. Its message quotes the text and says what was expected and where: `cannot read
+"2026-02-30": day is out of range`, `cannot read "2026/03/08": expected '-' at byte 4`, `cannot read
+"2026-03-08T": expected the end at byte 10`, `cannot read "…[Nowhere/Atall]": no zone is named
+'Nowhere/Atall'`. A parse never traps.
 
 ### Patterns
 
