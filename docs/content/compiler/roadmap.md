@@ -279,7 +279,12 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    instance count of the triple and the sextuple bounded (the emitted text compared with a limit);
    `is`, `match` and equality on tuples seen as tuples of traits, `(Display, int)` made directly and
    shown, a tuple in `Any` shown, compared and hashed, nested tuples, at `-O0` and `-O2`. The
-   largest win, separable, and first.
+   largest win, separable, and first. **Done:** a tuple's record holds its parts' records and the
+   runtime tests a tuple target part by part; only a record some object has gets equality and
+   rendering entries. The sextuple of options shown once went from 47,181 functions and 273 MB to
+   309 and 1.1 MB (hello is 304); marshal from 71,663 functions and 237 MB to 40,478 and 126 MB,
+   its `emit-llvm` from 165 s to 49 s and its `-O2` build from 195 s to 55 s (load averages 107
+   and about 45, so the times are rough).
 2. **Lowering's constant factors**, led by a fresh profile after item 1: symbols read in place
    rather than copied, and the conformance and type-equality hot spots memoized where the profile
    says. Its tests are the existing suite; the report gives marshal's before and after.
