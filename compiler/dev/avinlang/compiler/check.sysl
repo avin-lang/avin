@@ -10631,11 +10631,12 @@ private is_option_data(c: *Checker, d: usize) -> bool = core_data(c, "Option") m
 
 // A built-in value or a tuple expected as a trait it conforms to converts to it where it is written:
 // it is put in a box, as for `Any`, whose method table holds the type's implementations. A data value
-// and an object already are values of every trait they conform to.
+// and an object already are values of every trait they conform to, and so is a union of references,
+// laid out as an `Any` holding one; a union with a scalar member converts by its tag.
 private to_trait(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
     if !is_trait_type(c, want) then return typed
     val t = zonk(c, typed.ty)
-    if !(is_builtin(t) || *t is Tuple(_)) then return typed
+    if !(is_builtin(t) || *t is Tuple(_) || *t is Union(_) && !is_reference(t)) then return typed
     if !conforms_to_bound(c, t, want) then return typed
     TExpr(typed.span, want, Box(typed))
 
@@ -10947,6 +10948,13 @@ private union_rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usiz
 struct UnionLookup
     owners: Buf[&Type]
     methods: Buf[usize]
+
+/** The union value `value` as `owner`, the class or trait a member is found on: a union of
+ * references is that type already, laid out as an `Any` holding its member; one with a scalar member
+ * converts to it, which lowering does by the union's tag. */
+private union_as_owner(c: *Checker, value: &TExpr, owner: &Type) -> &TExpr
+    if is_reference(zonk(c, value.ty)) then TExpr(value.span, owner, value.kind)
+    else TExpr(value.span, owner, Box(value))
 
 /** The class or trait the members of a union agree on, as the branches of an `if` yielding each
  * would: what a member call on the union is looked up on first. */
@@ -11337,7 +11345,7 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         if found.owners.len() > 1
             c.note(unit, e.span, union_clash(ty, name, found.owners))
             return TExpr(e.span, ErrorType, UnitConst)
-        if found.owners.len() == 1 then return member_of(c, e, TExpr(value.span, found.owners[0], value.kind), name, expected)
+        if found.owners.len() == 1 then return member_of(c, e, union_as_owner(c, value, found.owners[0]), name, expected)
     // A field of a data type with one variant comes before a method of the same name.
     if !(*ty is Class(_, _, _)) && !one_variant_field(c, ty, name)
         val ms = methods_of(c, ty, name)
@@ -15739,9 +15747,10 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
     var object = named_value match
         Some(v) -> v
         None -> check_expr(c, target, None)
-    // A union's member is called through the members' join or a trait the union conforms to, the
-    // union seen as that type with no conversion, as an `Any` holding its member; a name more than
-    // one of those has is not chosen between.
+    // A union's member is called through the members' join or a trait the union conforms to: a
+    // union of references seen as that type with no conversion, as an `Any` holding its member, and
+    // one with a scalar member converted to it; a name more than one of those has is not chosen
+    // between.
     if *zonk(c, object.ty) is Union(_)
         val found = union_lookup(c, zonk(c, object.ty), name)
         if found.owners.len() > 1
@@ -15749,7 +15758,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-        if found.owners.len() == 1 then object = TExpr(object.span, found.owners[0], object.kind)
+        if found.owners.len() == 1 then object = union_as_owner(c, object, found.owners[0])
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
         if ms.len() > 0
@@ -16950,6 +16959,8 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
                             t = to_trait(c, t, zonk(c, p))
+                            // A value given for a union parameter is injected where it is written.
+                            if *zonk(c, p) is Union(_) then t = inject(c, t, zonk(c, p))
                             if converts_none(c, t.ty, p) then t = TExpr(t.span, p, NoneAs(t))
                             val agrees = *t.ty is Nothing || same_type(t.ty, p) || constrain(c, p, t.ty, open, true)
                             if !agrees

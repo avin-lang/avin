@@ -480,6 +480,8 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
         val shown = l.runtime_rendering && add_rendering_entries(&l)
         if !compared && !shown then break
     add_variant_ancestors(&l)
+    // A union with a scalar member crosses every call as its words.
+    functions = union_words(functions, &l.descriptors)
     var devirt_facts: Buf[string] = buf()
     functions = devirtualize(functions, l.descriptors, dispatch_sites(&l), &devirt_facts)
     // An object whose kind has a finalizer, a Sysl or C handle, must stay an object, however
@@ -1602,6 +1604,7 @@ private value_box_made(l: *Lowering, t: &Type) -> usize
 private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Operand]
     if *t is Unit then return Some(ConstObject(value_box(l, t)))
     val v = value?
+    if is_scalar_union(t) then return Some(cell_as_any(l, t, v))
     val m = machine(l, t)?
     if pointer_option(l, t) then return Some(option_object(l, t, v))
     if m is MRef then return Some(v)
@@ -1610,6 +1613,246 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
     l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, m)), v))
     l.insts.push(Publish)
     Some(Value(object))
+
+// A union with a scalar member is a tag and a payload. In the code lowering writes, such a value is a
+// reference to its cell, an object of the union's words: the tag (`cell_tag`), the bits of a scalar
+// member (`cell_bits`) and, where a member is a reference, the reference (`cell_reference`). Tag 0
+// says the union holds a reference, whose header names its type; tag `i + 1` says it holds scalar
+// member `i` of `union_scalars`, the order of the normal form. A cell is never changed once made, so
+// a value is shared by reference to it; every cell of a function is made there (an injection, or the
+// words a parameter or a call's result arrives as, see `union_words`) and only its fields are read
+// after, so scalar replacement keeps a cell that stays in its function as its fields, and a union in
+// a local, a parameter or a result allocates nothing. A cell stored in an object, an array, a closure
+// or a module-level value stays an object, traced through its reference word.
+
+private cell_tag() -> FieldSlot = FieldSlot(0, MInt(32))
+
+private cell_bits() -> FieldSlot = FieldSlot(8, MInt(64))
+
+private cell_reference() -> FieldSlot = FieldSlot(16, MRef)
+
+/** The descriptor of a union's cell, with a reference word where `refs`. */
+private cell_descriptor(l: *Lowering, refs: bool) -> usize
+    if begin_request(l, "U") then l.requests.flag(refs)
+    l.depth -= 1
+    val key = if refs then "union cell" else "union cell of scalars"
+    if l.boxes.get(key) is Some(d) then return d
+    val d = union_cell_descriptor(&l.descriptors, refs)
+    l.boxes.put(key, d)
+    d
+
+/** The tag of member `m` of the union `t`: its place among the scalar members, from 1, or 0 for a
+ * member kept as a reference. */
+private member_tag(t: &Type, m: &Type) -> Option[u32]
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        if same_type(scalars[i], m) then return Some(u32(i + 1))
+    None
+
+private tag_constant(tag: u32) -> Operand = ConstInt(32, tag.to_string())
+
+/** A new cell of the union `t` holding `tag` and, where given, `bits` and `reference`. */
+private make_cell(l: *Lowering, t: &Type, tag: Operand, bits: Option[Operand], reference: Option[Operand]) -> Operand
+    val refs = union_holds_reference(t)
+    val cell = fresh(l, MRef)
+    l.insts.push(Alloc(cell, cell_descriptor(l, refs)))
+    l.insts.push(Store(field_address(l, Value(cell), cell_tag()), tag))
+    if bits is Some(b) then l.insts.push(Store(field_address(l, Value(cell), cell_bits()), b))
+    if refs
+        if reference is Some(r) then l.insts.push(Store(field_address(l, Value(cell), cell_reference()), r))
+    l.insts.push(Publish)
+    Value(cell)
+
+/** The 64 bits a value of the scalar type `m` is kept as in a union's cell. */
+private scalar_bits(l: *Lowering, m: &Type, value: Option[Operand]) -> Operand
+    val v = value match
+        Some(v) -> v
+        None -> return ConstInt(64, "0")
+    *m match
+        Int(bits) -> resize(l, v, bits, 64, true)
+        Byte -> resize(l, v, 8, 64, false)
+        Char -> resize(l, v, 32, 64, false)
+        Bool -> select(l, MInt(64), v, ConstInt(64, "1"), ConstInt(64, "0"))
+        Real -> convert_op(l, Bitcast, MInt(64), v)
+        _ -> ConstInt(64, "0")
+
+/** The value of the scalar type `m` that the bits `bits` of a union's cell keep. */
+private scalar_of_bits(l: *Lowering, m: &Type, bits: Operand) -> Option[Operand] = *m match
+    Int(width) -> Some(resize(l, bits, 64, width, true))
+    Byte -> Some(resize(l, bits, 64, 8, false))
+    Char -> Some(resize(l, bits, 64, 32, false))
+    Bool -> Some(compare(l, CmpNe, bits, ConstInt(64, "0")))
+    Real -> Some(convert_op(l, Bitcast, MReal, bits))
+    _ -> None
+
+/** `value`, of type `from`, as a value of the union `to`, which has a scalar member: a scalar member
+ * is its tag and its bits, a member kept as a reference or a value converting to one tag 0 and the
+ * value as an `Any`, and a smaller union its member's place in `to`. */
+private inject_cell(l: *Lowering, from: &Type, to: &Type, value: Option[Operand]) -> Option[Operand]
+    if same_type(from, to) then return value
+    if is_scalar_union(from) then return Some(recell(l, from, to, value?))
+    if member_tag(to, from) is Some(tag) then return Some(make_cell(l, to, tag_constant(tag), Some(scalar_bits(l, from, value)), None))
+    val object = box_value(l, from, value)?
+    Some(make_cell(l, to, tag_constant(0), None, Some(object)))
+
+/** The blocks taking a union's cell apart by its tag: one for each scalar member, in the order of
+ * `union_scalars`, and one for a reference where a member is one, each to end by jumping to `join`.
+ * The current block ends with the tests. */
+private struct CellArms
+    scalars: Buf[usize]
+    reference: Option[usize]
+    join: usize
+
+private cell_arms(l: *Lowering, t: &Type, cell: Operand) -> CellArms
+    val scalars = union_scalars(t)
+    val refs = union_holds_reference(t)
+    val tag = load_field(l, cell, cell_tag())
+    var arms: Buf[usize] = buf()
+    for _ in scalars do arms.push(new_block(l))
+    val reference: Option[usize] = if refs then Some(new_block(l)) else None
+    val join = new_block(l)
+    for i in 0..<scalars.len()
+        // The last test is left out where nothing else can be.
+        if i + 1 == scalars.len() && !refs
+            finish(l, Jump(arms[i]))
+        else
+            val next = new_block(l)
+            finish_into(l, Branch(compare(l, CmpEq, tag, tag_constant(u32(i + 1))), arms[i], next), next)
+    if reference is Some(r) then finish(l, Jump(r))
+    CellArms(arms, reference, join)
+
+/** The union `from`'s cell `cell` as a value of `to`, a wider union with a scalar member: each member
+ * moved to its place there. */
+private recell(l: *Lowering, from: &Type, to: &Type, cell: Operand) -> Operand
+    val slot = machine_slot(l, MRef)
+    val arms = cell_arms(l, from, cell)
+    val scalars = union_scalars(from)
+    for i in 0..<scalars.len()
+        l.current = arms.scalars[i]
+        val v = scalar_of_bits(l, scalars[i], load_field(l, cell, cell_bits()))
+        store(l, slot, inject_cell(l, scalars[i], to, v))
+        finish(l, Jump(arms.join))
+    if arms.reference is Some(r)
+        l.current = r
+        val object = load_field(l, cell, cell_reference())
+        store(l, slot, Some(make_cell(l, to, tag_constant(0), None, Some(object))))
+        finish(l, Jump(arms.join))
+    l.current = arms.join
+    load(l, slot).unwrap()
+
+/** The union `t`'s cell `cell` as an `Any`: a scalar member boxed, a reference as it is. */
+private cell_as_any(l: *Lowering, t: &Type, cell: Operand) -> Operand
+    val slot = machine_slot(l, MRef)
+    val arms = cell_arms(l, t, cell)
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        l.current = arms.scalars[i]
+        val v = scalar_of_bits(l, scalars[i], load_field(l, cell, cell_bits()))
+        store(l, slot, box_value(l, scalars[i], v))
+        finish(l, Jump(arms.join))
+    if arms.reference is Some(r)
+        l.current = r
+        store(l, slot, Some(load_field(l, cell, cell_reference())))
+        finish(l, Jump(arms.join))
+    l.current = arms.join
+    load(l, slot).unwrap()
+
+/** The object `object`, an `Any` known to hold a member of the union `t`, as a cell of `t`: a scalar
+ * member is found by its type and taken out of its box, and anything else is kept as the reference. */
+private any_as_cell(l: *Lowering, t: &Type, object: Operand) -> Operand
+    val slot = machine_slot(l, MRef)
+    val join = new_block(l)
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        val yes = new_block(l)
+        val next = new_block(l)
+        finish_into(l, Branch(type_test(l, object, scalars[i]), yes, next), yes)
+        val v = unbox(l, scalars[i], object)
+        store(l, slot, Some(make_cell(l, t, tag_constant(u32(i + 1)), Some(scalar_bits(l, scalars[i], v)), None)))
+        finish_into(l, Jump(join), next)
+    store(l, slot, Some(make_cell(l, t, tag_constant(0), None, Some(object))))
+    finish_into(l, Jump(join), join)
+    load(l, slot).unwrap()
+
+/** The value of member `m` of the union `t` its cell `cell` holds, where a test has shown it holds
+ * one: a scalar member's bits read as it, a smaller union with a scalar member as a cell of its own,
+ * and anything else out of the reference. */
+private cell_member(l: *Lowering, t: &Type, m: &Type, cell: Operand) -> Option[Operand]
+    if same_type(t, m) then return Some(cell)
+    if is_scalar_union(m) then return Some(narrow_cell(l, t, m, cell))
+    if member_tag(t, m) is Some(_) then return scalar_of_bits(l, m, load_field(l, cell, cell_bits()))
+    // A type a scalar member is also seen as, such as `Any` or a trait it implements, holds the
+    // value boxed.
+    for s in union_scalars(t)
+        if always_is(l, s, m) then return Some(cell_as_any(l, t, cell))
+    unbox(l, m, load_field(l, cell, cell_reference()))
+
+/** The union `t`'s cell `cell`, known to hold a member of the smaller union `m`, as a cell of `m`. */
+private narrow_cell(l: *Lowering, t: &Type, m: &Type, cell: Operand) -> Operand
+    val slot = machine_slot(l, MRef)
+    val arms = cell_arms(l, t, cell)
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        l.current = arms.scalars[i]
+        if member_tag(m, scalars[i]) is Some(tag)
+            store(l, slot, Some(make_cell(l, m, tag_constant(tag), Some(load_field(l, cell, cell_bits())), None)))
+        else
+            val v = scalar_of_bits(l, scalars[i], load_field(l, cell, cell_bits()))
+            store(l, slot, inject_cell(l, scalars[i], m, v))
+        finish(l, Jump(arms.join))
+    if arms.reference is Some(r)
+        l.current = r
+        store(l, slot, Some(make_cell(l, m, tag_constant(0), None, Some(load_field(l, cell, cell_reference())))))
+        finish(l, Jump(arms.join))
+    l.current = arms.join
+    load(l, slot).unwrap()
+
+/** `value`, of type `from`, which a type pattern has found holds a member of the union `to`, as a
+ * value of `to`: a cell where `to` has a scalar member, and otherwise an `Any`. */
+private as_union(l: *Lowering, from: &Type, to: &Type, value: Option[Operand]) -> Option[Operand]
+    if !is_scalar_union(to)
+        if *from is AnyType then return value
+        if is_scalar_union(from) then return cell_member(l, from, to, value?)
+        return box_value(l, from, value)
+    if same_type(from, to) then return value
+    if *from is AnyType then return Some(any_as_cell(l, to, value?))
+    if is_scalar_union(from)
+        // A value of a smaller union becomes one of `to` as any member does; from a wider one, the
+        // member it holds is moved to its place in `to`.
+        var smaller = true
+        for m in members_of(from)
+            var found = false
+            for n in members_of(to)
+                if same_type(m, n) then found = true
+            if !found then smaller = false
+        if smaller then return inject_cell(l, from, to, value)
+        return Some(narrow_cell(l, from, to, value?))
+    inject_cell(l, from, to, value)
+
+// Continues where the union `t`'s cell `cell` holds a value of type `to` (no union), which is one of
+// its members, a type one of them is, or a class or trait a reference it holds may have; otherwise
+// goes to `fail`.
+private cell_test(l: *Lowering, t: &Type, to: &Type, cell: Operand, fail: usize)
+    val matched = new_block(l)
+    val tag = load_field(l, cell, cell_tag())
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        if same_type(scalars[i], to) || always_is(l, scalars[i], to)
+            val next = new_block(l)
+            finish_into(l, Branch(compare(l, CmpEq, tag, tag_constant(u32(i + 1))), matched, next), next)
+    // A reference is never of a scalar type: a scalar is always kept in the bits.
+    if union_holds_reference(t) && !is_scalar_member(to)
+        val reference = new_block(l)
+        finish_into(l, Branch(compare(l, CmpEq, tag, tag_constant(0)), reference, fail), reference)
+        var every = true
+        for m in members_of(t)
+            if !is_scalar_member(m) && !always_is(l, m, to) then every = false
+        if !every
+            val object = load_field(l, cell, cell_reference())
+            continue_if(l, type_test(l, object, to), fail)
+        finish(l, Jump(matched))
+    else finish(l, Jump(fail))
+    l.current = matched
 
 /** Where a descriptor's type record is: after the collector's kind and three words. */
 private const DescriptorRecord: usize = 56
@@ -1734,6 +1977,8 @@ private seen_as(l: *Lowering, from: KnownType, target: KnownType) -> bool
  * option kept as a pointer is the `Some`'s value or null. */
 private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand]
     if pointer_option(l, t) then return Some(option_pointer(l, t, object))
+    val c = concrete(l, t)
+    if is_scalar_union(c) then return Some(any_as_cell(l, c, object))
     machine(l, t) match
         Some(MRef) -> Some(object)
         Some(m) -> Some(load_field(l, object, FieldSlot(0, m)))
@@ -1824,6 +2069,7 @@ private machine_name(t: MirType) -> string = t match
     MReal -> "real"
     MPtr -> "address"
     MRef -> "reference"
+    MCell(refs) -> if refs then "union" else "scalar union"
 
 // A closure is the value of each local and top-level parameter the function captures; a boxed local
 // is captured as its box, so it stays shared. Its descriptor's `call` is `entry`, the function's code.
@@ -1869,8 +2115,8 @@ private closure_type(l: *Lowering, function: usize, type_args: Buf[&Type]) -> &T
     val owner = l.program.symbols[symbol.root.unwrap_or(function)].type_owner
     var params: Buf[&Type] = buf()
     for p in symbol.params
-        params.push(erase_unions(substitute(solve(l.program.vars, p), owner, type_args)))
-    Function(params, erase_unions(substitute(solve(l.program.vars, symbol.result.unwrap_or(Unit)), owner, type_args)), false)
+        params.push(erase_reference_unions(substitute(solve(l.program.vars, p), owner, type_args)))
+    Function(params, erase_reference_unions(substitute(solve(l.program.vars, symbol.result.unwrap_or(Unit)), owner, type_args)), false)
 
 // The type arguments of the copy of `symbol` a call or a function value in the instance being
 // lowered reaches. A local function without type parameters of its own shares those of the code it
@@ -1890,7 +2136,7 @@ private instance_args(l: *Lowering, symbol: FunctionSymbol, type_args: Buf[&Type
             prefix.push(l.subst[i])
         return prefix
     // A union type argument is kept, so a type pattern naming the parameter tests its members; the
-    // copy lays the union out as an `Any`, as every type made concrete in it is.
+    // copy lays a union of references out as an `Any`, as every type made concrete in it is.
     var out: Buf[&Type] = buf()
     for t in type_args
         out.push(written_concrete(l, t))
@@ -1969,8 +2215,17 @@ private note_calls_values(l: *Lowering)
 // slot in the object's class, it takes the parameters `function` takes and yields its result, as
 // machine types, so the call is spelled from `function`'s signature.
 private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    // A union with a scalar member has no method table: a member call on one, seen as a trait every
+    // member has, goes to the member's own implementation by its tag where it renders the value, and
+    // otherwise through the table of the value as an `Any`.
+    var held: Option[&Type] = None
+    var receiver_expr = args[0]
+    if args[0].kind is Box(inner)
+        if is_scalar_union(concrete(l, inner.ty)) then receiver_expr = inner
+    if is_scalar_union(concrete(l, receiver_expr.ty)) then held = Some(concrete(l, receiver_expr.ty))
     var operands: Buf[Operand] = buf()
-    for a in args
+    for i in 0..<args.len()
+        val a = if i == 0 then receiver_expr else args[i]
         val op = lower_expr(l, a)
         // An argument that never finishes ends the code here: the call is never made.
         if *a.ty is Nothing then return None
@@ -1985,6 +2240,9 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
                 None -> return None
     // Only the object an option kept as a pointer stands for has a method table.
     if pointer_option(l, args[0].ty) then operands[0] = option_object(l, args[0].ty, operands[0])
+    if held is Some(u)
+        if union_rendering(l, function, u, operands) is Some(shown) then return shown
+        operands[0] = cell_as_any(l, u, operands[0])
     if rendering_call(l, function, concrete(l, args[0].ty), operands) is Some(shown) then return shown
     val symbol = l.program.symbols[function]
     var concrete_args: Buf[&Type] = buf()
@@ -1992,14 +2250,15 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         concrete_args.push(concrete(l, t))
     var params: Buf[MirType] = buf()
     for p in symbol.params
-        if machine(l, substitute(p, symbol.type_owner, concrete_args)) is Some(t) then params.push(t)
-    val result = machine(l, substitute(symbol.result.unwrap_or(Unit), symbol.type_owner, concrete_args))
+        if signature_machine(l, substitute(p, symbol.type_owner, concrete_args)) is Some(t) then params.push(t)
+    val result = signature_machine(l, substitute(symbol.result.unwrap_or(Unit), symbol.type_owner, concrete_args))
     // A method with type parameters of its own has a slot for each list of its own type arguments.
     var position = slot
     // A receiver whose type still names a type parameter, as `Self` does in a trait's default body
-    // compiled once for every type, may be an object of any type.
+    // compiled once for every type, may be an object of any type, and so may a union's value as an
+    // `Any`.
     val seen = concrete(l, args[0].ty)
-    val receiver: &Type = if names_type_parameter(seen) then AnyType else seen
+    val receiver: &Type = if names_type_parameter(seen) || held is Some(_) then AnyType else seen
     val own = symbol.decl.type_params.len()
     if own > 0
         var own_args: Buf[&Type] = buf()
@@ -2012,12 +2271,66 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     l.insts.push(MethodSlot(code, operands[0], position))
     if !(*receiver is AnyType) then note_dispatch(l, code, position, receiver)
     val dest = result match
-        Some(t) -> Some(fresh(l, t))
+        Some(t) -> Some(fresh(l, value_machine(t)))
         None -> None
     push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
+
+/** The machine type a parameter or result of type `t` has in a signature: a union with a scalar
+ * member is its cell, `MCell`, which `union_words` turns into the union's words; any other type is its
+ * machine type. */
+private signature_machine(l: *Lowering, t: &Type) -> Option[MirType]
+    val c = concrete(l, t)
+    if is_scalar_union(c) then return Some(MCell(union_holds_reference(c)))
+    mir_type(c)
+
+/** The machine type of a value of signature type `t`: a union's cell is a reference to it. */
+private value_machine(t: MirType) -> MirType = if t is MCell(_) then MRef else t
+
+// `display`, `debug` or `toString` called on the union `t`'s cell, `operands[0]`, by its tag: each
+// scalar member rendered by its own implementation, a reference through the rendering entries of
+// its record. `None` for any other method.
+private union_rendering(l: *Lowering, function: usize, t: &Type, operands: Buf[Operand]) -> Option[Option[Operand]]
+    val core = l.program.core
+    if core.is(function, "toString")
+        return Some(Some(call_instance(l, library_instance(l, "displayString", AnyType), one(cell_as_any(l, t, operands[0])), machine(l, Str)).unwrap()))
+    var name = "display"
+    if core.is(function, "debug") then name = "debug"
+    elif !core.is(function, "display") then return None
+    val m = core.method_named(name).unwrap()
+    val cell = operands[0]
+    val arms = cell_arms(l, t, cell)
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        l.current = arms.scalars[i]
+        val s = scalars[i]
+        val v = scalar_of_bits(l, s, load_field(l, cell, cell_bits()))
+        own_rendering(l, s, m) match
+            Some(index) ->
+                var args: Buf[Operand] = buf()
+                if v is Some(x) then args.push(x)
+                for k in 1..<operands.len()
+                    args.push(operands[k])
+                _ = call_instance(l, index, args, None)
+            None ->
+                var args: Buf[Operand] = buf()
+                args.push(string_constant(l, type_name(s)))
+                for k in 1..<operands.len()
+                    args.push(operands[k])
+                _ = call_instance(l, library_function(l, "renderTypeName"), args, None)
+        finish(l, Jump(arms.join))
+    if arms.reference is Some(r)
+        l.current = r
+        var args: Buf[Operand] = buf()
+        args.push(load_field(l, cell, cell_reference()))
+        for k in 1..<operands.len()
+            args.push(operands[k])
+        _ = call_instance(l, generated(l, if name == "display" then AnyDisplay else AnyDebug, AnyType), args, None)
+        finish(l, Jump(arms.join))
+    l.current = arms.join
+    Some(None)
 
 // Whether an object whose type is `up` as an instance of the class or trait `head` can never be a
 // value of the static type `receiver`: some type argument the parameter does not take the other way
@@ -2264,6 +2577,8 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
         Some(s) -> s
         None -> return direct_call(l, e, function, args, type_args)
     val receiver = concrete(l, args[0].ty)
+    // A union with a scalar member has no table; `dispatch` calls its member's method.
+    if is_scalar_union(receiver) then return dispatch(l, function, position, args, type_args)
     // A static member is called on a type, so the type's own table names it even where an object of
     // the type could be of a subclass.
     val on_type = args[0].kind is TypeReceiver
@@ -2340,14 +2655,14 @@ private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Op
     *concrete(l, callee.ty) match
         Function(ps, r, _) ->
             for p in ps
-                if machine(l, p) is Some(t) then params.push(t)
-            result = machine(l, r)
-        ByName(r) -> result = machine(l, r)
+                if signature_machine(l, p) is Some(t) then params.push(t)
+            result = signature_machine(l, r)
+        ByName(r) -> result = signature_machine(l, r)
         _ -> panic("a call of a value that is not a function")
     val code = fresh(l, MPtr)
     l.insts.push(CallEntry(code, target))
     val dest = result match
-        Some(t) -> Some(fresh(l, t))
+        Some(t) -> Some(fresh(l, value_machine(t)))
         None -> None
     push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
     dest match
@@ -2375,9 +2690,10 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
     l.insts.push(Publish)
     store(l, l.local_slots[x], Some(Value(box)))
 
-/** A type of the code being lowered, with the instance's type arguments substituted. A union is laid
- * out as an `Any` holding its member, so lowering sees every union as `Any`. */
-private concrete(l: *Lowering, t: &Type) -> &Type = erase_unions(substitute(solve(l.program.vars, t), l.subst_owner, l.subst))
+/** A type of the code being lowered, with the instance's type arguments substituted. A union of
+ * references is laid out as an `Any` holding its member, so lowering sees it as `Any`; a union with
+ * a scalar member is kept, since it has a layout of its own (see `union_cell`). */
+private concrete(l: *Lowering, t: &Type) -> &Type = erase_reference_unions(substitute(solve(l.program.vars, t), l.subst_owner, l.subst))
 
 /** `t` in the instance being lowered, with its unions kept: what a type pattern naming a union tests. */
 private written_concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
@@ -2397,13 +2713,14 @@ private signature_of(l: *Lowering, f: TFunction) -> MirSignature
     val symbol = program.symbols[f.symbol]
     var params: Buf[MirType] = buf()
     for i in 0..<symbol.params.len()
-        if param_machine(l, symbol, i) is Some(t) then params.push(t)
+        if param_machine(l, symbol, i) is Some(_)
+            params.push(signature_machine(l, symbol.params[i]).unwrap())
     for x in symbol.captured_locals
         if machine(l, f.locals[x].ty) is Some(_) then params.push(MPtr)
     if symbol.root is Some(root)
         for x in symbol.captured_params
-            if machine(l, program.symbols[root].params[x]) is Some(t) then params.push(t)
-    mir_signature(params, machine(l, symbol.result.unwrap_or(Unit)))
+            if signature_machine(l, program.symbols[root].params[x]) is Some(t) then params.push(t)
+    mir_signature(params, signature_machine(l, symbol.result.unwrap_or(Unit)))
 
 /** The symbol a function has in the object file: its module path and name. A file with no module
  * header is in `<program>`, which no module path can spell; a local function is named within its
@@ -2651,9 +2968,9 @@ private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
     val closure = Value(fresh(l, MRef))
     var args: Buf[Operand] = buf()
     for p in l.program.symbols[inst.function].params
-        if machine(l, p) is Some(t)
+        if signature_machine(l, p) is Some(t)
             params.push(t)
-            args.push(Value(fresh(l, t)))
+            args.push(Value(fresh(l, value_machine(t))))
     l.returns_value = direct.result is Some(_)
     l.current = new_block(l)
     val symbol = l.program.symbols[inst.function]
@@ -2670,7 +2987,7 @@ private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
         args.push(load_field(l, closure, shape.fields[i]))
         i += 1
     val dest = direct.result match
-        Some(t) -> Some(fresh(l, t))
+        Some(t) -> Some(fresh(l, value_machine(t)))
         None -> None
     l.insts.push(Call(dest, Direct(instance(l, inst.function, inst.type_args)), args))
     finish(l, Return(dest match
@@ -5594,7 +5911,11 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     Box(value) ->
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None
-        box_value(l, concrete(l, value.ty), v)
+        val to = concrete(l, e.ty)
+        // A value injected into a union with a scalar member becomes its cell; into anything else
+        // it is seen as an `Any`.
+        if is_scalar_union(to) then inject_cell(l, concrete(l, value.ty), to, v)
+        else box_value(l, concrete(l, value.ty), v)
     NoneAs(value) ->
         // The value is always `None`, so it is the other option's own `None`: null where that option
         // is kept as a pointer, and its one constant object where it is an object, so that as an `Any`
@@ -5895,12 +6216,30 @@ private compare_link(l: *Lowering, op: CompareOp, x: &Type, y: &Type, a: Operand
                     val element = if is_core_seq(l, t) then et else es
                     val equal = call_instance(l, library_instance(l, "seqEquals", element), two(a, b), Some(MBool)).unwrap()
                     return if op is Equal then equal else binary(l, MBool, OpXor, equal, ConstBool(true))
+        // A union with a scalar member compared with a value of another type compares as an `Any`.
+        var left = a
+        var right = b
+        var ls = s
+        var rt = t
+        if !same_type(s, t)
+            if is_scalar_union(s)
+                left = cell_as_any(l, s, a)
+                ls = AnyType
+            if is_scalar_union(t)
+                right = cell_as_any(l, t, b)
+                rt = AnyType
         // A value whose type is decided at run time compares through its record, whichever side
         // holds it.
-        val common = if decided_at_run_time(l, t) then t else s
-        val same = equals_values(l, common, a, b)
+        val common = if decided_at_run_time(l, rt) then rt else ls
+        val same = equals_values(l, common, left, right)
         return if op is Equal then same else binary(l, MBool, OpXor, same, ConstBool(true))
-    if op is Same || op is NotSame || is_machine_scalar(s) then return compare_values(l, op, s, a, b)
+    if op is Same || op is NotSame
+        // A union with a scalar member is compared by identity as an `Any` holding its value is: a
+        // scalar's new box is never the object on the other side.
+        val left = if is_scalar_union(s) then cell_as_any(l, s, a) else a
+        val right = if is_scalar_union(t) then cell_as_any(l, t, b) else b
+        return compare_values(l, op, s, left, right)
+    if is_machine_scalar(s) then return compare_values(l, op, s, a, b)
     val name = compare_operator_method(op).unwrap().method
     operator_call(l, s, name, [a, b], Some(MBool)).unwrap_or(ConstBool(false))
 
@@ -6041,8 +6380,11 @@ private member_test(l: *Lowering, from: &Type, to: &Type, value: Option[Operand]
         finish(l, Jump(fail))
         l.current = matched
         return
-    val target = erase_unions(to)
+    val target = erase_reference_unions(to)
     if always_is(l, from, target) then return
+    if is_scalar_union(from)
+        if value is Some(cell) then cell_test(l, from, target, cell, fail)
+        return
     if *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _) || *from is Function(_, _, _)
         if value is Some(v)
             val object = if pointer_option(l, from) then option_object(l, from, v) else v
@@ -6050,8 +6392,9 @@ private member_test(l: *Lowering, from: &Type, to: &Type, value: Option[Operand]
     else continue_if(l, ConstBool(false), fail)
 
 // A pattern on a union value: each part is tried in turn, on the member its type names, taken out
-// of the `Any` the union is laid out as. Where the instance being lowered made the union one of its
-// members, the value is that member already.
+// of the `Any` a union of references is laid out as, or out of the cell of one with a scalar member.
+// Where the instance being lowered made the union one of its members, the value is that member
+// already.
 private test_union(l: *Lowering, p: &TPattern, parts: Buf[&TPattern], value: Option[Operand], fail: usize)
     val from = concrete(l, p.ty)
     val matched = new_block(l)
@@ -6063,6 +6406,8 @@ private test_union(l: *Lowering, p: &TPattern, parts: Buf[&TPattern], value: Opt
         member_test(l, from, member, value, next)
         if *from is AnyType && !(*to is AnyType)
             if value is Some(x) then v = unbox(l, to, x)
+        elif is_scalar_union(from)
+            if value is Some(x) then v = cell_member(l, from, to, x)
         test_pattern(l, part, v, next)
         finish(l, Jump(matched))
         l.current = next
@@ -6105,11 +6450,10 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             l.current = matched
         PType(target, local, tested) ->
             val from = concrete(l, p.ty)
-            // A union matches where one of its members does, and binds the value as the union, laid
-            // out as an `Any`.
+            // A union matches where one of its members does, and binds the value as the union.
             if *written_concrete(l, target) is Union(_)
                 if tested then member_test(l, from, written_concrete(l, target), value, fail)
-                if local is Some(x) then bind_local(l, x, if *from is AnyType then value else box_value(l, from, value))
+                if local is Some(x) then bind_local(l, x, as_union(l, from, concrete(l, target), value))
                 return
             val to = concrete(l, target)
             var bound = value
@@ -6118,6 +6462,11 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             val pointer = pointer_option(l, from)
             if always_is(l, from, to)
                 if (*to is AnyType && !(*from is AnyType)) || (pointer && !pointer_option(l, to)) then bound = box_value(l, from, value)
+            elif is_scalar_union(from)
+                // A union with a scalar member: its tag says which member it holds.
+                if value is Some(v)
+                    cell_test(l, from, to, v, fail)
+                    bound = cell_member(l, from, to, v)
             elif *from is AnyType || *from is Class(_, _, _) || *from is Tuple(_) || *from is Data(_, _, _) || *from is Function(_, _, _)
                 // An object whose type is a subtype of its static type: its descriptor's record says.
                 if value is Some(v)
@@ -6393,6 +6742,7 @@ private equals_values(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
     Str -> compare_values(l, Equal, t, a, b)
     Function(_, _, _) -> compare(l, CmpEq, a, b)
     ByName(_) -> compare(l, CmpEq, a, b)
+    Union(_) -> if is_scalar_union(t) then union_equals(l, t, a, b) else call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
     _ ->
         if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqEquals", e), two(a, b), Some(MBool)).unwrap()
         elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
@@ -6421,6 +6771,7 @@ private hash_value(l: *Lowering, t: &Type, a: Operand) -> Operand = *t match
     Str -> runtime_call(l, "avin_rt_string_hash", [MRef], MInt(64), [a])
     Function(_, _, _) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     ByName(_) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
+    Union(_) -> if is_scalar_union(t) then union_hash(l, t, a) else call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
     _ ->
         if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqHash", e), one(a), Some(MInt(64))).unwrap()
         elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
@@ -6436,6 +6787,54 @@ private own_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
         Data(_, _, _) -> call_instance(l, generated(l, StructuralHash, t), one(a), Some(MInt(64))).unwrap()
         Tuple(_) -> call_instance(l, generated(l, StructuralHash, t), one(a), Some(MInt(64))).unwrap()
         _ -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
+
+/** `a == b` for two values of the union `t`, which has a scalar member: equal where they hold the same
+ * member and its values are equal, as two `Any`s holding them would be. */
+private union_equals(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
+    val slot = machine_slot(l, MBool)
+    store(l, slot, Some(ConstBool(false)))
+    val same_tag = new_block(l)
+    val done = new_block(l)
+    val ta = load_field(l, a, cell_tag())
+    val tb = load_field(l, b, cell_tag())
+    finish_into(l, Branch(compare(l, CmpEq, ta, tb), same_tag, done), same_tag)
+    val arms = cell_arms(l, t, a)
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        l.current = arms.scalars[i]
+        val x = scalar_of_bits(l, scalars[i], load_field(l, a, cell_bits()))
+        val y = scalar_of_bits(l, scalars[i], load_field(l, b, cell_bits()))
+        val equal = if x is Some(p) && y is Some(q) then equals_values(l, scalars[i], p, q) else ConstBool(true)
+        store(l, slot, Some(equal))
+        finish(l, Jump(arms.join))
+    if arms.reference is Some(r)
+        l.current = r
+        val x = load_field(l, a, cell_reference())
+        val y = load_field(l, b, cell_reference())
+        store(l, slot, Some(call_instance(l, generated(l, AnyEquals, AnyType), two(x, y), Some(MBool)).unwrap()))
+        finish(l, Jump(arms.join))
+    l.current = arms.join
+    finish_into(l, Jump(done), done)
+    load(l, slot).unwrap()
+
+/** The hash of a value of the union `t`, which has a scalar member: its member's hash, as an `Any`
+ * holding the member has. */
+private union_hash(l: *Lowering, t: &Type, a: Operand) -> Operand
+    val slot = machine_slot(l, MInt(64))
+    val arms = cell_arms(l, t, a)
+    val scalars = union_scalars(t)
+    for i in 0..<scalars.len()
+        l.current = arms.scalars[i]
+        val x = scalar_of_bits(l, scalars[i], load_field(l, a, cell_bits()))
+        store(l, slot, Some(if x is Some(v) then hash_value(l, scalars[i], v) else ConstInt(64, "0")))
+        finish(l, Jump(arms.join))
+    if arms.reference is Some(r)
+        l.current = r
+        val x = load_field(l, a, cell_reference())
+        store(l, slot, Some(call_instance(l, generated(l, AnyHash, AnyType), one(x), Some(MInt(64))).unwrap()))
+        finish(l, Jump(arms.join))
+    l.current = arms.join
+    load(l, slot).unwrap()
 
 /** Gives every type record that some object has as its own type equality entries; whether it made
  * any. A trait's record and an abstract class's belong to no object, nor does a record only tested
@@ -6636,11 +7035,11 @@ private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
     var params: Buf[MirType] = buf()
     var given: Buf[Option[Operand]] = buf()
     for p in 0..<symbol.params.len()
-        val m = if boxed && shape.selfs[p] then Some(MRef) else param_machine(l, symbol, p)
+        val m = if boxed && shape.selfs[p] then Some(MRef) elif param_machine(l, symbol, p) is Some(_) then signature_machine(l, symbol.params[p]) else None
         given.push(m match
             Some(m) ->
                 params.push(m)
-                Some(Value(fresh(l, m)))
+                Some(Value(fresh(l, value_machine(m))))
             None -> None)
     var operands: Buf[Operand] = buf()
     for p in 0..<given.len()
@@ -6650,7 +7049,7 @@ private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
             if unbox(l, shape.option, given[p].unwrap()) is Some(v) then operands.push(v)
         elif given[p] is Some(v) then operands.push(option_pointer(l, shape.option, v))
     val dest = signature.result match
-        Some(m) -> Some(fresh(l, m))
+        Some(m) -> Some(fresh(l, value_machine(m)))
         None -> None
     push_call(l, dest, Direct(instance(l, inst.function, inst.type_args)), operands)
     var result = dest match
@@ -6974,6 +7373,9 @@ private replay_requests(l: *Lowering, r: *EntryReader, apply: bool) -> Option[un
         elif tag == "X"
             val t = read_machine(r)?
             if apply then _ = box_descriptor(l, t)
+        elif tag == "U"
+            val refs = r.flag()
+            if apply then _ = cell_descriptor(l, refs)
         elif tag == "R"
             val t = read_type(r, l.type_names)?
             if apply then _ = record_of(l, t)
