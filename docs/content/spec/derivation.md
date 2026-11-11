@@ -277,14 +277,15 @@ that never encodes a `Person` compiles none of the encoder.
 ## A JSON library
 
 The core of a `json` library written with templates. `JsonWriter` writes text and places the
-commas; `JsonReader` reads tokens from a byte stream, one at a time.
+commas; `JsonReader` is the json package's [streaming reader](/spec/json/#reading-a-stream), which
+reads events from text in hand or from any `Reader`, one at a time.
 
 ```text
 data PathStep
     Key(name: string)
     Index(at: int)
 
-data JsonError(message: string, line: int, column: int, offset: int, path: List[PathStep] = [])
+data JsonError(message: string, line: long, column: long, offset: long, path: List[PathStep] = [])
 
 impl JsonError
     inField(name: string) -> JsonError = JsonError(message, line, column, offset, Key(name) :: path)

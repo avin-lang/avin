@@ -1,0 +1,74 @@
+// expect: exit 0
+// A program's own types decoded as their text arrives: from a file, from TCP connections a peer
+// writes a few bytes at a time while eight lightweight threads decode, from a Unix connection, and
+// from a connection closed in the middle of a document, whose error carries the path of the value
+// being read and the place the text stopped.
+import json
+import json.{JsonDecoder, JsonEncoder}
+import avin.fs
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.threads.spawn
+
+data Entry(name: string, size: long, tags: Vector[string]) derives JsonEncoder, JsonDecoder
+
+data Listing(owner: string, entries: Vector[Entry]) derives JsonEncoder, JsonDecoder
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+listing(t: int) -> Listing =
+    Listing(s"owner $t é😀", (0..<50).map(i -> Entry(s"f$i", long(i) * 1000000000, [s"t$t", "日"])).toVector())
+
+total(l: Listing) -> long = l.entries.foldLeft(long(0), (a, e) -> a + e.size)
+
+// Writes `text` in pieces of `size` bytes, each its own write.
+sendInPieces(out: TcpStream, text: string, size: int)
+    val bytes = text.bytes().toArray()
+    var at = 0
+    while at < bytes.length()
+        val end = if bytes.length() - at > size then at + size else bytes.length()
+        ok(out.write(bytes.slice(at, end)))
+        at = end
+
+main()
+    val dir = ok(fs.createTempDir("json-stream-decode"))
+    ok(fs.writeText(s"$dir/listing.json", json.encode(listing(1))))
+    val fromFile = json.decode[Listing](ok(fs.open(s"$dir/listing.json"))).ok().get()
+    println(fromFile == listing(1))
+    println(fromFile.owner)
+
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    val port = l.port()
+    val writers = (0..<8).map(t -> spawn(() ->
+        val c = ok(TcpStream.connect("127.0.0.1", port))
+        sendInPieces(c, json.encode(listing(t)), 1 + t * 5)
+        c.close()
+        t)).toVector()
+    val readers = (0..<8).map(t ->
+        val conn = ok(l.accept())
+        spawn(() -> json.decode[Listing](conn).map(total))).toVector()
+    for w in writers do w.join()
+    println(readers.map(r -> r.join().ok().get()).foldLeft(long(0), (a, b) -> a + b))
+    l.close()
+
+    val ul = ok(UnixListener.bind(s"$dir/s.sock"))
+    val served = spawn(() -> json.decode[Listing](ok(ul.accept())).map(x -> x.owner))
+    val uc = ok(UnixStream.connect(s"$dir/s.sock"))
+    ok(uc.write(json.encode(listing(3)).bytes().toArray()))
+    uc.close()
+    println(served.join())
+    ul.close()
+
+    val cut = ok(TcpListener.bind("127.0.0.1", 0))
+    val cutPort = cut.port()
+    val cutReader = spawn(() -> json.decode[Listing](ok(cut.accept())))
+    val half = ok(TcpStream.connect("127.0.0.1", cutPort))
+    ok(half.write("{\"owner\": \"o\", \"entries\": [{\"name\": \"a\", \"size\": 1, \"tags\": []}, {\"name\": \"unfin".bytes().toArray()))
+    half.close()
+    val e = cutReader.join().err().get()
+    println(e)
+    println(e.pathText())
+    cut.close()
+    ok(fs.removeDirAll(dir))

@@ -656,6 +656,8 @@ class Square(label: string, side: int): Rect(label, side, side)
 
 - **Only an `open` or `abstract` class can be extended**; extending a final class is an error. A
   generic superclass is written with its type arguments, `class IntBox(x: int): Box[int](x)`.
+  A superclass or trait from another module is named as an import makes it visible, bare or
+  through its module: `class Body: shapes.Base("b"), io.Reader`.
 - **Construction runs from the top down.** A subclass's constructor first evaluates the arguments
   written after the superclass and runs the superclass's constructor body on the new object, then
   stores its own parameters and runs its own body. Those arguments run before the object is ready:

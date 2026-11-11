@@ -156,10 +156,14 @@ some number of the other. `months(n)` and `years(n)` take an `int`, and are meth
 (`3.months()`). `years(n)` is `12 * n` months, which is exact, so `years(1) ==
 months(12)`; `months(1) != Period(0, 30)`. `Period.Zero` is the empty period.
 
-Periods add, subtract and negate, and `p * n` scales both parts by an `int`. `p.months` and
-`p.days` are the fields; `p.toYearsPart()` and `p.toMonthsPart()` split the months
-(`months(14)` is 1 year and 2 months). A period has no order: whether a month is longer than 30 days
-depends on the month.
+Periods add, subtract and negate part by part, never carrying days into months, and `p * n` scales
+both parts by an `int`; a part leaving `int` traps as an integer overflow does. `p.months` and
+`p.days` are the fields; `p.toYearsPart()` and `p.toMonthsPart()` split the months, each part
+carrying the months' sign (`months(14)` is 1 year and 2 months, `months(-14)` -1 and -2), and
+`p.isZero()` asks for the empty period. A period has no order: whether a month is longer than 30 days
+depends on the month. `p.toIsoString()` writes ISO 8601's form, `P1Y2M3D`: the years, the months
+left over and the days, each where it is not zero, `P0D` for the empty period, and a negative part
+with its own sign (`P-1Y-2M`, `P1M-3D`), since the parts may differ in sign.
 
 **A duration is exact timeline and may be added to an `Instant`, a `DateTime` or a `Zoned`; a
 period is a calendar step and may be added only to a `Date`, a `DateTime` or a `Zoned`.** A `Date`
@@ -197,7 +201,11 @@ last day of the month" on a last day: `date(2026, 1, 31) + months(1)` is 2026-02
 is earlier, trapping as an integer overflow does where the count leaves `int` (only between dates
 more than about 5,880,000 years apart); `a.monthsUntil(b)` the whole months, counted as a person counts them (2026-01-31 to
 2026-02-28 is `0` months, to 2026-03-01 is `1`); `a.until(b)` the `Period` of those whole months and
-the days left over, so `a + a.until(b) == b` for `a <= b`.
+the days left over, so `a + a.until(b) == b` for `a <= b`. Where `b` is earlier both parts are
+negative or zero and the same holds: `date(2026, 3, 1).until(date(2026, 1, 31))` is `-1mo -1d`.
+`b.monthsUntil(a)` is always `-a.monthsUntil(b)`, but clamping makes two other round trips fail for
+some pairs: `date(2026, 1, 30).until(date(2026, 3, 1))` is `1mo 1d` (by way of 2026-02-28), so
+`b - a.until(b)` is 2026-01-31, not `a`, and `b.until(a)` is `-1mo -2d`, not `-1mo -1d`.
 
 ### Zoned arithmetic
 
