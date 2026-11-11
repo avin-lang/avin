@@ -98,8 +98,11 @@ struct CLibrary
 const SyslManifestName: string = "sysl.hocon"
 
 /** The manifest of the package at `dir`, or the first thing wrong with it, rendered with its place. */
-read_manifest(dir: string) -> Result[Manifest, string]
-    val file = dir + "/" + ManifestName
+read_manifest(dir: string) -> Result[Manifest, string] = read_manifest_named(dir, ManifestName)
+
+/** The manifest in the file `name` of `dir`, read and checked as `read_manifest` reads a package's. */
+read_manifest_named(dir: string, name: string) -> Result[Manifest, string]
+    val file = dir + "/" + name
     val text = read_text(file).map_err(e -> s"avin: $file: ${e.to_string()}")?
     val src = source_of(file, text)
     val doc = parse_hocon(src).map_err(d -> d.render(src))?
@@ -1433,6 +1436,47 @@ sysl_packages(res: Resolution) -> Result[Buf[SyslPackage], string]
                         continue
             return Err(error(d.span, s"the Sysl dependency `${d.label}` is ${origin_text(origin)} here and ${origin_text(out[i].origin)} in `${named_by[i]}`: one name is one Sysl package, so make them agree").render(p.manifest.src))
     Ok(out)
+
+/** The file of the standard library's directory naming the Sysl packages the library's own bindings
+ * reach beyond Sysl's standard library and the runtime, in a manifest's `sysl-dependencies` block. */
+const LibraryManifestName: string = "library.hocon"
+
+/** The Sysl packages a program's bindings reach: `sysl`, those its manifests name, with each Sysl
+ * package the standard library at `library` names that one of the Sysl names in `targets` (the
+ * bindings' and handles' targets) is inside, a name having the package's name as one of the
+ * segments before its last. A program naming the same package keeps its own, unless both are
+ * releases of one repository, where the higher is taken. */
+with_library_sysl(library: string, sysl: Buf[SyslPackage], targets: []const string) -> Result[Buf[SyslPackage], string]
+    if !exists(library + "/" + LibraryManifestName) then return Ok(sysl)
+    val m = read_manifest_named(library, LibraryManifestName)?
+    var out = sysl
+    for d in m.sysl_dependencies
+        if !reaches_package(targets, d.label) then continue
+        val origin = d.origin match
+            Local(dir) ->
+                val full = if is_absolute(dir) then dir else library + "/" + dir
+                Local(canonicalize(full).unwrap_or(full))
+            o -> o
+        var found: Option[usize] = None
+        for i in 0..<out.len()
+            if out[i].label == d.label then found = Some(i)
+        found match
+            None -> out.push(SyslPackage(d.label, origin))
+            Some(i) ->
+                if out[i].origin is Git(c, v)
+                    if origin is Git(c2, v2)
+                        if c == c2 && version_after(v2, v) then out[i].origin = origin
+    Ok(out)
+
+/** Whether one of the Sysl names `targets` is inside the package `label`: has it as a segment before
+ * its last. */
+reaches_package(targets: []const string, label: string) -> bool
+    for t in targets
+        val segments = t.split(".")
+        if segments.len < 2 then continue
+        for k in 0..<segments.len - 1
+            if segments[k] == label then return true
+    false
 
 private same_origin(a: Origin, b: Origin) -> bool = origin_text(a) == origin_text(b)
 

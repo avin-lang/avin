@@ -5455,6 +5455,67 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (built on branch `https`): **TLS's API** ([system library](/spec/system-library/#tls)).
+  A module of its own, `avin.net.tls`: `TlsStream.connect(host, port, settings)`, and
+  `TlsStream.client(tcp, host, settings)` / `TlsStream.server(tcp, settings)` over a `TcpStream`
+  the caller made; `TlsClient` (the authorities it adds) and `TlsServer(certificate, key)` (PEM
+  text, checked by `TlsServer.of`) as immutable sendable values. In `avin.net.http` an `https` URL
+  just works (port 443 by default), `Request.withTls(client)` choosing the settings, kept across
+  redirects; `http.serve(…, tls = Some(server))` serves HTTPS. A trait `ByteStream`, which
+  `TcpStream`, `UnixStream` and `TlsStream` implement, lets the HTTP code run over either, and
+  `ReadAhead` became public so the TLS module shares the line reading. *Why*: the URL decides
+  TLS, as a reader expects; settings are values, so a request, a thread and an actor carry them
+  freely; the stream over a caller's `TcpStream` keeps that connection's timeout and cancellation
+  without a second set. *Alternatives*: `TlsStream` in `avin.net` itself (every TCP program would
+  then build OpenSSL, since a module's bindings come with it); a `TlsClient` holding one OpenSSL
+  context for many connections (a context's reference count is not atomic, so it could not be
+  shared between threads; a context is made per connection instead, which reads the machine's
+  store each time, a few milliseconds); a `trust(pem)` that checks the PEM at once (it would need
+  a context; a PEM that is not one is `Credentials` at the connection instead).
+- Proposed (built on branch `https`): **the trust model**. A client trusts the machine's store,
+  through OpenSSL's default paths, plus what `TlsClient.trust(pem)` adds; it always checks the
+  host name (a name or an address), sends it for SNI, and speaks TLS 1.2 at the least, none of
+  which can be turned off, as the Sysl package `openssl` decides. *Why*: trust that only grows
+  cannot be misused to accept a bad certificate; a private, corporate or test authority is one
+  case. *Alternatives*: a switch to skip verification (refused: it is how bad certificates get
+  accepted); a bundled set of roots (it goes stale). **Gap**: on macOS the store is the `cert.pem`
+  of Homebrew's OpenSSL, not the Keychain, so a root added only to the Keychain is not trusted;
+  the `sysl` session would queue reading the Keychain in the `openssl` package on request.
+  Review with the user whether Keychain roots are wanted.
+- Proposed (built on branch `https`): **TLS errors**. `TlsError` is `Transport(IoError)`,
+  `Certificate(text)`, `Handshake(text)` and `Credentials(text)`; an `HttpError` gains
+  `Tls(TlsError)`, a `Transport` failure staying `Io` as for `http`. After the handshake a TLS
+  failure in a read or write is `IoError.Other("TLS: …")`, so a `TlsStream` is a `ByteStream`.
+  `openssl` 0.2.2 reports a refused certificate as one error, so `Certificate` covers an
+  untrusted, self-signed or expired certificate and one for another host alike; the mapping is
+  the one function `handshakeError` in `library/avin/net/tls/tls.avin`, and `openssl` 0.2.3's
+  `Error.refusal()` (`HostMismatch`, `Expired`, `Untrusted`, `Other`) lets it split `Certificate`
+  into those kinds there alone. *Alternatives*: one `Tls(text)` error (a program could not tell
+  a refused certificate from a broken connection); typed errors for every read and write (every
+  `ByteStream` user would need a second error type).
+- Proposed (built on branch `https`): **a connection's end and timeouts over TLS**. The end of the
+  stream is the peer's `close_notify` or the TCP connection closing, both read as the end, since
+  many servers close without a `close_notify` and HTTP frames its bodies; a body read to the
+  connection's end can therefore be cut short undetected, as over TCP. Every wait, the handshake's
+  included, is a wait of the TCP connection beneath, under its `setTimeout` limit and cancellable
+  by a scope; `http` sets the request's timeout before the handshake, and `http.serve` bounds the
+  handshake by `readTimeout`. A handler that traps on a TLS connection has it closed unanswered.
+  *Alternatives*: an error for an end without `close_notify` (it would refuse ordinary servers);
+  a handshake timeout of its own (one more limit to set). Review with the user whether a body read
+  to the connection's end should require `close_notify`.
+- Proposed (built on branch `https`): **the standard library's Sysl packages**. The library names
+  the Sysl packages its own bindings reach in `library/library.hocon`, a manifest whose
+  `sysl-dependencies` block is read as a package's is. One joins a program's shims only where a
+  binding or handle the program compiles names a Sysl item inside it, the package's name being a
+  segment of the item's name before its last (`sh.sysl.openssl.client`); a program naming the same
+  package keeps its own, unless both are releases of one repository and the library's is later.
+  So only programs that reach `avin.net.tls` (`avin.net.http` among them) need OpenSSL installed,
+  and the Homebrew formula depends on `openssl@3`. *Why*: a dependency written as a package's,
+  without making the library a package (an `avin.hocon` there would make `library/tests` a
+  package's tests). *Alternatives*: always adding the library's packages (every program with a
+  binding would fetch and link OpenSSL); the runtime depending on `openssl` (every program would
+  link it); a table from module to package in the compiler (a second place to keep in step).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
