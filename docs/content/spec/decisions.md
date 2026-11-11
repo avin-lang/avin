@@ -5379,22 +5379,51 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   client is served late instead of not at all, and the server spends nothing on it meanwhile.
   *Alternatives*: accept and close at once, or answer `503` (a burst turns into failures the client
   must retry).
-- Proposed (branch `lwt-server`): **`stop()` wakes the acceptor parked in `accept` with a
-  connection of its own** to the listener (to `127.0.0.1` or `::1` where it listens on every
-  address), which the acceptor, seeing the server stopping, closes before closing the listener.
-  *Why*: a listener belongs to the thread parked on it, so no other thread may close it, and until
-  `scope` can cancel a wait (stage 14, item 6) a connection is the one thing that ends a parked
-  `accept`. **How cancellation hooks in**: the acceptor and the connections run inside a `scope` the
-  server holds; `stop()` cancels the acceptor's wait instead of connecting, and cancels the waits
-  of connections idle between requests, so a shutdown no longer waits for their idle limit; a
-  connection in a request is not cancelled, so it still finishes. The API does not change.
-  *Alternatives*: an `accept` with a timeout polled for the stop (a delay of up to the poll, and
-  wake-ups for nothing); a listener closable from another thread (against the ownership rule).
-- Proposed (branch `lwt-server`): **a connection idle between requests ends at its idle limit
-  during a shutdown, and a request that arrives on one meanwhile is answered `503`**. *Why*: the
-  idle wait cannot be ended from outside until cancellation; `idleTimeout` is short (5 seconds by
-  default), so `join` is bounded. *Alternatives*: serving requests on connections already open (a
-  chatty client keeps the server up for ever).
+- Proposed (branch `lwt-server`, reworked on `train-2`): **`stop()` cancels the acceptor's parked
+  `accept`**, which waits on a thread of a scope the acceptor runs; the acceptor's own thread then
+  closes the listener. No connection is made to wake it. (`lwt-server` first woke it with a
+  connection of its own to the listener, the one thing that could end a parked `accept` before
+  `scope` could cancel a wait.) *Why*: a listener belongs to the thread parked on it, so no other
+  thread may close it, and cancellation ends a wait where it is parked without a connection the
+  server would accept and drop, a descriptor per stop, or a host to reach itself on (`127.0.0.1`
+  for `0.0.0.0`). The API of `stop`, `join` and `shutdown` does not change. *Alternatives*: the
+  waking connection (kept until cancellation landed); an `accept` with a timeout polled for the
+  stop (a delay of up to the poll, and wake-ups for nothing); a listener closable from another
+  thread (against the ownership rule).
+- Proposed (branch `train-2`): **a shutdown closes a connection idle between requests at once,
+  unanswered, and a request read once the server is stopping is answered `503`**. The HTTP server
+  waits for each request, its first included, through `TcpServer.idle`, so stopping cancels that
+  wait; a request being read or answered finishes, its response saying `Connection: close`.
+  (`lwt-server` let an idle connection run to its idle limit, answering `503` to a request arriving
+  meanwhile, since nothing could end the wait from outside.) *Why*: an idle connection has nothing
+  in flight, so closing it loses nothing, and `join` no longer waits up to `idleTimeout`, or for
+  ever where it is zero. *Alternatives*: idle connections ending at their limit (a slow shutdown);
+  serving requests on connections already open (a chatty client keeps the server up for ever).
+- Proposed (branch `train-2`): **a shutdown reaches a connection's actor through `TcpServer.idle`,
+  a scope the actor's turn runs around each idle wait**, not a scope around the turn. `idle(wait)`
+  registers the wait with the server, runs `wait` on a thread of a scope opened by the calling
+  thread, and parks that thread on a promise that the wait completes `false` once it answers and
+  `stop()` completes `true` for every registered wait; on `true` the scope cancels the wait. Its
+  result is `Some` of the wait's answer, or `None` where the server stopped first, and `None` at
+  once, `wait` not run, where it was already stopping. The acceptor's `accept` goes through the
+  same path, so what follows an accept (counting the connection, starting its actor) runs on a
+  thread nothing cancels. *Why*: a scope's cancellation does not reach actors, and an actor's turn
+  is never cancelled (settled for `train-2` above), so the server cannot cancel a turn; it can only
+  cancel a scope the turn runs, and `cancel` must be called by the thread running that scope's body,
+  which is why the turn parks on the promise and cancels itself. Only the wait is cancelled, so
+  code answering a request, and a trap in it (which fails the connection's actor alone), stay on the
+  turn. A promise per wait and a registry keyed by number wake only the waits that exist, not every
+  connection on every request. *Costs*: a scope and a lightweight thread per idle wait, and a
+  `Vector` copy of each read the HTTP server makes there, since a wait's result must be sendable;
+  a trap in `wait` stops the program, as a trap in any thread does. **Review with the user**: it
+  adds `idle` to `TcpServer`'s public API, the one way a protocol on it tells the server which
+  waits a shutdown may end. *Alternatives*: the connection's whole `serve` on a scope's thread with
+  the turn watching it (a trap in `serve` would stop the program instead of failing the actor, and
+  a request in flight would be cancelled with it); a server-wide condition notified when any wait
+  ends (wakes every idle connection per request); shutting down the read side of idle sockets from
+  the stopping thread (not cancellation, and a socket belongs to the thread that uses it); a
+  per-connection server handle carrying an idle flag (the same cancellation, plus a race between
+  the flag and the wait's answer).
 - Proposed (branch `lwt-server`): **HTTP limits and refusals.** Timeouts bound each wait, as a
   connection's do: `readTimeout` while a request is read (`408` once one runs out mid-request, and a
   quiet close where a connection sent nothing), `writeTimeout` while a response is written, and

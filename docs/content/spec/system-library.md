@@ -951,7 +951,8 @@ main()
 | `s.port() -> int` | The port it listens on, the one the platform chose for port 0. |
 | `s.connections() -> int` | How many connections it holds now. |
 | `s.isStopping() -> bool` | Whether it has been asked to stop, for code serving a connection to finish early. |
-| `s.stop()` | Stops accepting and returns at once; stopping again does nothing. |
+| `s.idle[T: Sendable](@sendable wait: () -> T) -> Option[T]` | Runs `wait`, a connection's wait for its next piece of work, on a thread of its own; `Some` of its result, or `None` where the server stops first, which cancels `wait`. |
+| `s.stop()` | Stops accepting and returns at once, cancelling the parked `accept` and every wait in `idle`; stopping again does nothing. |
 | `s.join()` | Waits until it has stopped and every connection it held has ended. |
 | `s.shutdown()` | `stop()`, then `join()`. |
 
@@ -966,10 +967,26 @@ main()
 - **At most `maxConnections` are held at once.** The next connection waits unaccepted, in the
   listener's backlog, until one ends; a limit less than one traps. Each connection's timeout is
   `timeout` when `serve` begins, none for zero, and `serve` may change it.
-- **A graceful shutdown.** `stop()` stops accepting at once: the listener is closed, so a new
-  connection is refused, and the connections held go on until `serve` returns; `join()` waits for
-  them. Code serving a connection calls `stop()`, since `shutdown()` there would wait for itself.
-  The server may be shared between threads, and any of them may stop it and wait for it.
+- **A graceful shutdown.** `stop()` stops accepting at once: the acceptor's parked `accept` is
+  [cancelled](/spec/threads/#cancellation), no connection being made to wake it, and the listener
+  is closed, so a new connection is refused. The connections held go on until `serve` returns;
+  `join()` waits for them. Code serving a connection calls `stop()`, since `shutdown()` there would
+  wait for itself. The server may be shared between threads, and any of them may stop it and wait
+  for it.
+- **A connection idle between pieces of work ends at once.** `serve` waits for the next one
+  through `server.idle(() -> s.readLine())`: `wait` runs on a thread of a scope the calling thread
+  runs, and stopping the server cancels that scope, so `wait` ends wherever it waits, however long
+  its timeout, and `idle` answers `None`; once the server is stopping, `idle` answers `None` without
+  running `wait`. The connection `wait` reads is handed back when `idle` returns, as a scope hands
+  back the handles of its threads. Code outside `idle`, a request being answered, is never
+  cancelled, so it finishes. A trap in `wait` stops the program, as a trap in any thread does,
+  rather than failing the connection's actor alone.
+
+```text
+serveLines(s: TcpStream, server: TcpServer)
+    while server.idle(() -> s.readLine()) is Some(Ok(Some(line)))
+        s.writeText(handle(line) + "\n")
+```
 
 ### HTTP server
 
@@ -992,7 +1009,11 @@ readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5),
 16384, maxBodyBytes = 1048576) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
 `writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
-takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps.
+takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The
+wait for a connection's next request, its first among them, is made through `idle`, so a shutdown
+closes a connection waiting there at once, unanswered; a request already being read or answered
+finishes, its response saying `Connection: close`, and a request read once the server is stopping
+is answered `503`.
 
 A `ServerRequest` has its `method`, its `target` as the request line gave it, its `version`
 (`HTTP/1.1` or `HTTP/1.0`), its `headers` in order with `header(name)` looking one up without regard

@@ -1,13 +1,15 @@
 // expect: exit 0
 // stderr: actor numbers vary
+// stderr: places hidden in server.avin
 // The HTTP server's limits and life: a body over its limit answered `413` by its length and while
 // chunked, a request line over the header limit `414` and headers over it `431`, each at the limit
 // served; a client too slow `408`; a connection kept alive closed once idle for its limit; the
 // connection limit holding the next connection unanswered until one ends; a hundred clients at
 // once on few carriers; handlers that trap, a status out of range and a header with a line break,
 // each answered `500` with the server living on; and a graceful shutdown with a request in flight,
-// which is answered and closed, while a request on an idle connection is answered `503`, a new
-// connection is refused, and `shutdown` waits for them all.
+// which is answered and closed, while an idle connection is closed at once, a request read once
+// stopping is answered `503`, a new connection is refused, and `shutdown` waits for them all; and
+// a shutdown closing idle and silent connections at once on a server with no limits.
 import avin.io.{ConnectionRefused, IoError}
 import avin.net.{TcpServer, TcpStream}
 import avin.net.http
@@ -139,8 +141,10 @@ main()
     sameConnection.close()
     fragile.shutdown()
 
-    // A graceful shutdown: the request in flight is answered with `Connection: close`; a request on a
-    // connection that was idle is answered `503`; a new connection is refused; `shutdown` waits.
+    // A graceful shutdown: the request in flight is answered with `Connection: close`; a connection
+    // idle between requests is closed at once, unanswered; a request read once the server is stopping
+    // (its body sent after `100 Continue`) is answered `503`; a new connection is refused; `shutdown`
+    // waits.
     val entered = Channel[string](8)
     val release = Promise[unit]()
     val graceful = ok(http.serve("127.0.0.1", 0, r ->
@@ -152,6 +156,9 @@ main()
     val idler = open(graceful)
     ok(idler.writeText(get("/early")))
     println(response(idler))
+    val halfway = open(graceful)
+    ok(halfway.writeText("POST /late HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n"))
+    println(s"asked to go on: ${ok(halfway.readLine())} ${ok(halfway.readLine())}")
     val busy = open(graceful)
     ok(busy.writeText(get("/wait")))
     println(s"entered: ${entered.receive()}")
@@ -160,9 +167,11 @@ main()
         graceful.shutdown()
         done.store(true))
     while !graceful.isStopping() do sleep(millis(1))
-    ok(idler.writeText(get("/late")))
-    println(s"on the idle connection: ${shown(ok(idler.readAll()))}")
+    println(s"the idle connection closed unanswered: ${shown(ok(idler.readAll()))}|")
     idler.close()
+    ok(halfway.writeText("body"))
+    println(s"a request read once stopping: ${shown(ok(halfway.readAll()))}")
+    halfway.close()
     var refused = false
     for _ in 0..<500
         TcpStream.connect("127.0.0.1", gport) match
@@ -180,15 +189,24 @@ main()
     println(s"shutdown returned: ${done.load()}, held: ${graceful.connections()}")
 
     // A connection that sends nothing is closed unanswered once its first wait outlasts
-    // `readTimeout`; a shutdown waits for a connection idle between requests to reach its own limit.
-    val patient = ok(http.serve("127.0.0.1", 0, echoLength, readTimeout = millis(100), idleTimeout = millis(1000)))
+    // `readTimeout`.
+    val patient = ok(http.serve("127.0.0.1", 0, echoLength, readTimeout = millis(100)))
     val mute = open(patient)
     println(s"nothing sent, closed unanswered: ${shown(ok(mute.readAll()))}|")
     mute.close()
-    val lingering = open(patient)
+    patient.shutdown()
+
+    // A shutdown closes at once, without waiting for any limit, a connection idle between requests
+    // and one that has sent nothing yet, on a server whose waits have no limit at all.
+    val lasting = ok(http.serve("127.0.0.1", 0, echoLength, readTimeout = Duration.Zero, idleTimeout = Duration.Zero))
+    val lingering = open(lasting)
     ok(lingering.writeText(get("/kept")))
     println(response(lingering))
+    val silent = open(lasting)
+    while lasting.connections() < 2 do sleep(millis(1))
     val start = monotonic()
-    patient.shutdown()
-    println(s"shutdown waited for the idle limit: ${monotonic() - start >= millis(500)}, then closed: ${shown(ok(lingering.readAll()))}|")
+    lasting.shutdown()
+    println(s"shutdown at once: ${monotonic() - start < time.seconds(10)}, held: ${lasting.connections()}")
+    println(s"both closed: ${shown(ok(lingering.readAll()))}|${shown(ok(silent.readAll()))}|")
     lingering.close()
+    silent.close()

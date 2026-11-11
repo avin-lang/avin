@@ -21,7 +21,9 @@ import sysl.text.from_utf8_unchecked
 // `// args: ARG ...` line gives the program arguments, separated by spaces, an argument in double
 // quotes holding spaces or nothing at all. A `// stderr: actor numbers vary` line compares standard
 // error with every number after a `#` shown as `n` (`Racer#n`), for a program whose actors race and
-// whose reports therefore name whichever actor lost.
+// whose reports therefore name whichever actor lost. A `// stderr: places hidden in FILE` line compares
+// it with the line and column dropped from every place in `FILE` (`at server.avin`), for a program
+// that traps inside a library file whose lines move as that file is edited.
 //
 // A test for a known bug keeps its correct expectations and carries a `// ignore: REASON` line, which
 // is required: the program is then neither compiled nor run, and the summary counts it apart and
@@ -59,9 +61,10 @@ private struct Expectation
     ignored: bool
     reason: string
     numbers_vary: bool
+    places_hidden: Buf[string]
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false)
+    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false, buf())
     for line in text.split("\n")
         if line == "// ignore" || line.starts_with("// ignore:")
             e.ignored = true
@@ -69,6 +72,7 @@ private expectation(text: string) -> Expectation
         elif line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
         elif line == "// expect: trap" then e.trap = true
         elif line == "// stderr: actor numbers vary" then e.numbers_vary = true
+        elif line.starts_with("// stderr: places hidden in ") then e.places_hidden.push(line["// stderr: places hidden in ".bytes.len..].trim())
         elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
         elif line.starts_with("// env: ")
             val setting = line["// env: ".bytes.len..]
@@ -258,7 +262,8 @@ private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, 
             _ -> false
         if !ended then failures = failures + s"$path $level: ended ${run.status.to_string()}\n"
         if run.text != stdout then failures = failures + s"$path $level: standard output was:\n${run.text}\n"
-        val err = if want.numbers_vary then without_actor_numbers(run.err.unwrap_or("")) else run.err.unwrap_or("")
+        var err = if want.numbers_vary then without_actor_numbers(run.err.unwrap_or("")) else run.err.unwrap_or("")
+        for name in want.places_hidden do err = without_places_in(err, name)
         if err != stderr then failures = failures + s"$path $level: standard error was:\n$err\n"
     failures
 
@@ -274,6 +279,30 @@ without_actor_numbers(text: string) -> string
             i += 1
             while i < text.bytes.len && u8('0') <= text.bytes[i] <= u8('9') do i += 1
         else i += 1
+    from_utf8_unchecked(out.view())
+
+/** `text` with the line and column dropped from every place in the file `name`, so
+ * `x at server.avin:225:46` reads `x at server.avin`: the standard error of a program that traps
+ * inside a library file, whose lines move whenever that file is edited. */
+without_places_in(text: string, name: string) -> string
+    val marker = " at " + name + ":"
+    val m = marker.bytes.len
+    val n = text.bytes.len
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+    while i < n
+        var found = i + m < n && u8('0') <= text.bytes[i + m] <= u8('9')
+        var k: usize = 0
+        while found && k < m
+            if text.bytes[i + k] != marker.bytes[k] then found = false
+            k += 1
+        if found
+            for j in 0..<m - 1 do out.push(marker.bytes[j])
+            i += m
+            while i < n && (u8('0') <= text.bytes[i] <= u8('9') || text.bytes[i] == u8(':')) do i += 1
+        else
+            out.push(text.bytes[i])
+            i += 1
     from_utf8_unchecked(out.view())
 
 // The corpus is run in four parts, each its own test, so the parts run side by side and no one
@@ -491,6 +520,23 @@ corpus_actor_numbers_vary()
     assert(without_actor_numbers("# #x end#") == "# #x end#")
     assert(without_actor_numbers("") == "")
     assert(without_actor_numbers("é#9é") == "é#né")
+
+@test("a stderr line hides the line and column of every place in the files it names, and nothing else")
+corpus_places_hidden()
+    val want = expectation("// stderr: places hidden in server.avin\n// stderr: places hidden in http.avin\nmain() = 0\n")
+    assert(want.places_hidden.len() == 2)
+    assert(want.places_hidden[0] == "server.avin")
+    assert(want.places_hidden[1] == "http.avin")
+    assert(expectation("main() = 0\n").places_hidden.len() == 0)
+    assert(without_places_in("avin: trap in C#n: x at server.avin:225:46\n", "server.avin") == "avin: trap in C#n: x at server.avin\n")
+    assert(without_places_in("a at server.avin:1:2\nb at server.avin:30:4\n", "server.avin") == "a at server.avin\nb at server.avin\n")
+    assert(without_places_in("x at main.avin:3:4\n", "server.avin") == "x at main.avin:3:4\n")
+    assert(without_places_in("x at http/server.avin:3:4\n", "server.avin") == "x at http/server.avin:3:4\n")
+    assert(without_places_in("x at server.avin:\n", "server.avin") == "x at server.avin:\n")
+    assert(without_places_in("x at server.avin:7", "server.avin") == "x at server.avin")
+    assert(without_places_in("x at server.avin", "server.avin") == "x at server.avin")
+    assert(without_places_in("", "server.avin") == "")
+    assert(without_places_in("é at server.avin:1:1 é", "server.avin") == "é at server.avin é")
 
 @test("a program's standard input is its .in sidecar, and empty when it has none")
 corpus_input_sidecars()

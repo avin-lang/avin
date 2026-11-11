@@ -1,0 +1,119 @@
+// expect: exit 0
+// Stopping a `TcpServer` cancels the waits that only wait for more work. Its acceptor's parked
+// `accept` ends with no connection made: nothing is served, logged or counted, on this machine's
+// address and on every address, stopped at once after starting and after the acceptor has parked.
+// `idle` answers its wait's result while the server runs, `None` at once where the server is already
+// stopping (the wait not run), and `None` where the server stops during the wait, which ends at once
+// however long it would have lasted; the connection it read is the caller's again afterwards. A
+// shutdown closes connections idle in `idle` at once, with no limit on their waits, while one whose
+// code is busy outside `idle` finishes its work first. A hundred starts and stops leave the
+// process's descriptors as they were.
+import avin.fs
+import avin.io.{IoError}
+import avin.net.{TcpServer, TcpStream}
+import avin.threads.{Atomic, Channel, Promise, sleep, spawn}
+import avin.time.{Duration, millis, monotonic, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message())
+
+connect(server: TcpServer) -> TcpStream = ok(TcpStream.connect("127.0.0.1", server.port()))
+
+shown(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+descriptors() -> int = ok(fs.listDir("/dev/fd")).length()
+
+// Each line read in `idle` echoed back, until the server stops or the client finishes.
+echo(s: TcpStream, server: TcpServer)
+    loop
+        server.idle(() -> s.readLine()) match
+            Some(Ok(Some(line))) -> ok(s.writeText(s"echo $line\n"))
+            _ -> return
+
+main()
+    // A parked `accept` cancelled: right after starting, and once the acceptor has waited a while.
+    for host in ["127.0.0.1", "0.0.0.0"]
+        for pause in Vector[long](0, 20)
+            val served = Atomic(0)
+            val server = ok(TcpServer.start(host, 0, (_, _) -> served.update(n -> n + 1)))
+            if pause > 0 then sleep(millis(pause))
+            val start = monotonic()
+            server.shutdown()
+            println(s"$host after ${pause}ms: served ${served.load()}, held ${server.connections()}, stopping ${server.isStopping()}, at once ${monotonic() - start < seconds(10)}")
+
+    // `idle` while running, once stopping, and stopped during its wait.
+    val handle = ok(TcpServer.start("127.0.0.1", 0, (_, _) -> ()))
+    println(s"while running: ${handle.idle(() -> 41 + 1)}")
+    val ran = Atomic(false)
+    val blocker = spawn(() ->
+        handle.idle(() ->
+            sleep(seconds(3600))
+            ran.store(true)
+            "never"))
+    sleep(millis(20))
+    val before = monotonic()
+    handle.stop()
+    println(s"stopped during the wait: ${blocker.join()}, at once ${monotonic() - before < seconds(10)}, its rest run: ${ran.load()}")
+    val late = handle.idle(() ->
+        ran.store(true)
+        "ran")
+    println(s"once stopping: $late, wait run: ${ran.load()}")
+    handle.join()
+
+    // The connection read in `idle` is the caller's again afterwards, and Unicode passes whole.
+    val echoes = ok(TcpServer.start("127.0.0.1", 0, echo))
+    val e = connect(echoes)
+    ok(e.writeText("héllo ✓ 𝄞\n"))
+    println(ok(e.readLine()))
+    ok(e.writeText("again\n"))
+    println(ok(e.readLine()))
+
+    // A shutdown with an idle connection, one that never sent anything, and one busy outside `idle`:
+    // the idle ones are closed at once, the busy one finishes and is answered.
+    val entered = Channel[string](4)
+    val release = Promise[unit]()
+    val mixed = ok(TcpServer.start("127.0.0.1", 0, (s, server) ->
+        loop
+            server.idle(() -> s.readLine()) match
+                Some(Ok(Some("work"))) ->
+                    entered.send("work")
+                    release.future.await()
+                    ok(s.writeText("worked\n"))
+                Some(Ok(Some(line))) -> ok(s.writeText(s"echo $line\n"))
+                _ -> return))
+    val idler = connect(mixed)
+    ok(idler.writeText("ping\n"))
+    println(ok(idler.readLine()))
+    val silent = connect(mixed)
+    val busy = connect(mixed)
+    ok(busy.writeText("work\n"))
+    println(s"entered: ${entered.receive()}")
+    while mixed.connections() < 3 do sleep(millis(1))
+    val done = Atomic(false)
+    val stopper = spawn(() ->
+        mixed.shutdown()
+        done.store(true))
+    println(s"idle closed: ${shown(ok(idler.readAll()))}|${shown(ok(silent.readAll()))}|")
+    println(s"shutdown waits for the busy one: ${!done.load()}")
+    release.complete(())
+    println(s"busy: ${ok(busy.readLine())}")
+    stopper.join()
+    println(s"shut down: ${done.load()}, held ${mixed.connections()}")
+    idler.close()
+    silent.close()
+    busy.close()
+    e.close()
+    echoes.shutdown()
+
+    // Starting and stopping a hundred times leaves the descriptors as they were, a connection
+    // served in idle and closed by each shutdown.
+    val open = descriptors()
+    for _ in 0..<100
+        val server = ok(TcpServer.start("127.0.0.1", 0, echo))
+        val c = connect(server)
+        ok(c.writeText("x\n"))
+        ok(c.readLine())
+        server.shutdown()
+        c.close()
+    println(s"descriptors as they were: ${descriptors() == open}")
