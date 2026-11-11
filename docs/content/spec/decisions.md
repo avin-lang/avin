@@ -5455,6 +5455,33 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- Proposed (branch `time-calendar`): **`startOfYear()`, `startOfMonth()` and `startOfWeek()` on a
+  `DateTime` answer midnight** of that day, while `endOfMonth()` keeps the time of day, as the
+  chapter says. *Why*: a start is the first moment of its span, as `startOfDay` is; keeping the
+  time would make `r.startOfMonth()` mean "the same time on the 1st", which `r.withDay(1)` already
+  says. *Alternatives*: keep the time of day for all four (symmetric with `endOfMonth`, but two
+  spellings of `withDay(1)`); make `endOfMonth` the last microsecond of the month too (a start/end
+  pair, but the chapter decided "at the same time of day"). Review with the user whether
+  `endOfMonth` on a reading should rather be its month's last microsecond.
+- Proposed (branch `time-calendar`): **a calendar answer outside `Date.Min` to `Date.Max` traps
+  with a message naming the date** (`the date +5881580-07-31 is outside Date.Min to Date.Max`), or,
+  where the answer is a count of days with no year to write (a weekday search, `startOfWeek`,
+  `DateTime ± Duration`), `the date N days from 1970-01-01 is outside Date.Min to Date.Max`; the
+  maker `date(y, m, d)` traps the same way, and a year far beyond the dates (`withYear(long.MaxValue)`)
+  is checked before any arithmetic, so it never overflows on the way. `daysUntil` and `DateTime -
+  DateTime`, whose answers are an `int` and a `Duration`, trap as an integer overflow does. *Why*:
+  the chapter says leaving a type's range traps "as an integer overflow does"; a message naming the
+  date says more than `integer overflow` where there is a date to name. *Alternatives*: a bare
+  integer overflow trap everywhere (shorter code, a less useful message); clamping to the bounds
+  (silently wrong).
+- Proposed (branch `time-calendar`): **`withYear` takes a `long`**, the type `year()` answers, so
+  `d.withYear(d.year() + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
+  `int` like the makers (a conversion at every use of `year()`), or changing `year()` to `int`
+  (every year of a `Date` fits, but a change to step 1's fields).
+- Proposed (branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
+  builds `Resolution` and the zone's handling of a skipped or repeated reading they rely on; step 2
+  gives `Zoned` only `isoWeek()` and `isoWeekYear()`, which need no resolution.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
