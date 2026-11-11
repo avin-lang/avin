@@ -6187,6 +6187,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (`on`, `verify`, `off`) for `avin build` and `avin emit-llvm`, in
   `.avin/build/incremental/<kind><level>/`. WHY: item 7 of the plan makes `build`, `run`, `test` and
   the language server use it by default once the corpus has run warm. Alternatives: on by default now.
+  Superseded by the Proposed default for every command that builds (branch `incremental-default`).
 - Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The store is a file per module named by a hash of
   its module and keys, with a length and CRC-32 header, a manifest written last, and no lock**; a
   file is kept only if the build read it whole, and files neither named nor used in the last hour are
@@ -6565,6 +6566,56 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   macros.
 
 ## Proposed
+
+- Proposed (built on branch `incremental-default`): **The instance cache is on by default** for
+  every command that builds: `avin build`, `run`, `test` and `emit-llvm`. `AVIN_INCREMENTAL=off`
+  turns it off, `verify` stays, and `on`, unset or empty are the default; any other value is an
+  error for the commands that build, while `avin check` (even with `--bindings`) neither reads the
+  variable nor keeps a cache. The language server only checks, so it has no build to cache. WHY: the
+  whole corpus built warm under `verify` matched its clean builds, the commands' tests hold every
+  command to a clean build after an edit, and the cache needs no care (another compiler's entries
+  are misses and trimmed after an hour; damage is a miss). Alternatives: on for `run` and `test`
+  only, `build` staying clean for release builds (a release build has the same oracle and gains as
+  much); an `--incremental` flag rather than a variable (a flag every command would carry for a
+  setting nobody changes per build). Review with the user: the disk it takes, about the size of the
+  program's text per kind and level (185 MB for marshal at `-O2`).
+- Proposed (built on branch `incremental-default`): **A program of one file names its cache
+  directories after itself**, `.avin/build/incremental/<stem>-<kind><level>`, while a directory
+  or package keeps `<kind><level>`. WHY: every file of a directory shares that directory's
+  `.avin/build`, as their executables already do (named by stem); with one directory per kind and
+  level, two programs built in turn would overwrite each other's manifest and an hour later trim each
+  other's entries. The suffix is one of four fixed words, so no stem makes two programs' names meet.
+  Alternatives: a subdirectory per file (`incremental/<stem>/program-O2`, which a file named
+  `tests-O0.avin` would make collide with a directory program's); one shared directory (correct,
+  since entries are content-addressed, but each program would lose its reuse in turn).
+- Proposed (built on branch `incremental-default`): **A manifest names only module files of its own
+  directory**: a name that is not hexadecimal digits and `.mod` is passed over as damaged and never
+  read. WHY: a damaged manifest could otherwise send the reader to `../` paths outside the cache;
+  nothing a build writes has another form. Alternatives: trusting the manifest (only the checksum
+  would stand between a stray path and its contents being read as entries).
+- Proposed (built on branch `incremental-default`): **Code that calls the C unit's glue is never
+  taken from the cache's lowered entries, and the glue it calls is part of its text's key**; a C
+  callback's body is keyed by its binding and its trampoline's name. The warm corpus run found three
+  stale texts: the glue (`avin_c_call_<n>`, `avin_c_field_get_<n>`, `avin_c_retain_<n>` and the
+  rest) is named by the checker's indices, which a declaration added earlier renumbers, and no key
+  held those numbers; and every callback body had one key, so one binding's callback took
+  another's text. WHY: the functions that call glue directly are the bindings' own bodies, fields
+  and handles, which are small and already mostly lowered every build, and covering the names in
+  the text key also covers the copies inlining makes of them. Alternatives: name the glue by what it
+  glues, as the stable names do for everything else (the right end state, but it changes the C unit
+  and every place lowering calls into it); a digest of every C declaration's number in every key
+  (a declaration added anywhere would re-lower a C program whole). Review with the user: stable C
+  glue names would let these functions be reused too.
+- Proposed (built on branch `incremental-default`): **The warm corpus run is chosen by
+  `AVIN_INCREMENTAL=verify` in the environment of `sysl test compiler`**: each corpus program is
+  built cold with an empty cache, edited by adding a function nothing calls at the end of its first
+  non-literate file, and built again from the cache in `verify` mode, which also builds it clean; the
+  warm build is the one run. Unset, the gate builds each program once with no cache. WHY: the warm run
+  builds every program three times, so it belongs before a release or after a change to the cache,
+  not in every gate; the edit changes the source and the executable's key but no line any program
+  prints or traps at, so the corpus's expectations still hold. Alternatives: the warm run in every
+  gate (triples the corpus's compile time); an edit inside a function (moves trap lines the `.err`
+  files record, or changes what a program does).
 
 ## Open
 
