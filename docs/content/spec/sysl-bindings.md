@@ -414,6 +414,50 @@ Sysl's words:
 error: the Sysl mirror `IoError` does not match `sysl.fs.IoError`: match on 'IoError' is not exhaustive; missing PermissionDenied, …
 ```
 
+### Methods of a mirror
+
+A method without a body in an `impl` of a mirror is **bound** to a Sysl method of the value the
+mirror is: the one of the same words in snake_case (`dayOfWeek` is `day_of_week`), or the one its
+own `@sysl("name")` names. `@sysl(blocking)` and `@sysl("name", blocking)` mark a Sysl method that
+may wait, and `named` passes the arguments by name, as on a [handle's method](#handles). A method
+with a body is an ordinary method, may call the bound ones, and takes no `@sysl`:
+
+```text
+@sysl("sh.sysl.openssl.Refusal")
+data TlsRefusal
+    HostMismatch
+    Expired
+    NotYetValid
+    Untrusted
+    Other(code: long)
+
+@sysl("sh.sysl.openssl.Error")
+data TlsFailure(reason: int, code: long, message: string, verify: long)
+
+impl TlsFailure
+    refusal() -> Option[TlsRefusal]
+    refused() -> bool = refusal() is Some(_)
+```
+
+- **The receiver is converted at each call.** The mirror goes into Sysl as a binding's parameter of
+  its type does, into a counted box of its own, and the Sysl method is called on that box, so a
+  Sysl method taking `self`, `&self` or `*self` is bound alike. What a `*self` method writes goes
+  into the box and is gone with it: a mirror is a value, and the call leaves it as it was.
+- **Its parameters and result cross as a binding's do**: a result may be another mirror or the
+  mirror itself, an `Option` or `Result` of one, a handle, or any other boundary type, and an
+  integer is converted with a check as a binding's integer is.
+- **Bound methods may be overloaded** by their parameter types, each naming its own Sysl method.
+- Only a mirror's methods may go without a body, and only in an `impl` of no trait: a method
+  without a body on any other data type, or one implementing a trait's, is refused as needing a
+  body. A data type's body holds its variants, so a mirror's bound methods are always in an `impl`.
+
+Sysl checks each bound method when it checks the shim, and reports a mismatch at the method, in its
+own words:
+
+```text
+error: the Sysl binding `Verdict.missing` does not match `avintest.digits.Verdict`: type 'digits.avintest.digits.Verdict' has no method 'missing'
+```
+
 ## Handles
 
 A Sysl value that Avin should hold without seeing inside — a checksum in progress, a mapped file, a

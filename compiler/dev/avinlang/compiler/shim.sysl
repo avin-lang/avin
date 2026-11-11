@@ -227,8 +227,11 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
         var args: Buf[string] = buf()
         var lists: Buf[string] = buf()
         var handles: Buf[PassedHandle] = buf()
-        // A handle's method takes the handle first, and reads the Sysl value it holds.
-        val receiver = if b.reach is TopLevel then None else Some(handle_index(&w, b.params[0]))
+        // A handle's method takes the handle first, and reads the Sysl value it holds. A mirror's
+        // method takes the mirror first, converted into the Sysl value its method is called on.
+        val by_value = b.reach is ValueMethod(_)
+        val receiver = if b.reach is TopLevel || by_value then None else Some(handle_index(&w, b.params[0]))
+        var value_receiver = ""
         for k in 0..<b.params.len()
             val p = b.params[k]
             if receiver is Some(_) && k == 0
@@ -239,6 +242,9 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
                 lists.push("")
                 continue
             put(&w, s", a$k: ${crossing_c_side(p)}")
+            if by_value && k == 0
+                value_receiver = into_expr(&w, p, "a0", "ep0", 0)
+                continue
             // A collection of handles is converted into the shares of their Sysl values, which are
             // made the slice the Sysl parameter asks for at the call. An integer is converted, with a
             // check, into whatever integer the Sysl parameter is, which Sysl infers at the call.
@@ -272,7 +278,10 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
             put(&w, s"]\n    val ep$k: **u8 = ptr_cast(&es$k)")
         receiver match
             Some(m) -> put(&w, s"\n    val s = cell_$m(a0)")
-            None -> ()
+            // A mirror's value is put in a box of its own, which every receiver a Sysl method takes
+            // reads: `self` copies it, `&self` shares the box, and `*self` writes into the box,
+            // never into the mirror, which is a value.
+            None -> if by_value then put(&w, s"\n    val s: &${sysl_type(&w, b.params[0])} = $value_receiver")
         // Each function passed is rooted for as long as Sysl keeps the closure made of it.
         for k in 0..<b.params.len()
             if b.params[k].form is Callback(_, _, _, _, threaded)
@@ -297,6 +306,7 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
             continue
         var callee = b.reach match
             Method(name) -> s"s.r.$name"
+            ValueMethod(name) -> s"s.$name"
             _ -> s"bound_$i"
         // A result that holds a collection may be spelled with a slice or a `Buf`, and one that holds
         // an integer with any Sysl integer, so it takes the Sysl function's own type, and the
@@ -322,7 +332,7 @@ shim_source_fixing(bindings: Buf[MirBinding], handles: Buf[MirHandle], fixed: Bu
                         if t == m then seen = true
                     if !seen then types.push(m)
         put(&w, "\n")
-        call_arms(&w, b, callee, args, lists, handles, types, 0, buf(), receiver is Some(_), fills, "    ")
+        call_arms(&w, b, callee, args, lists, handles, types, 0, buf(), receiver is Some(_) || by_value, fills, "    ")
         for k in 0..<b.params.len()
             if b.params[k].form is Callback(_, _, _, _, _) then callback_functions(&w, b, i, k)
             if (receiver is None || k > 0) && converted_parameter(&w, b.params[k], i, k)
@@ -657,6 +667,9 @@ private call_lines(w: *ShimWriter, b: &MirBinding, callee: string, args: Buf[str
                 if b.result.form is Bytes then put(w, indent + "var owned: Buf[u8] = buf()\n")
                 put(w, indent + "val h = s.r\n")
                 target = s"h.$name"
+            // A mirror's value is the shim's own local, converted before the call.
+            ValueMethod(_) ->
+                if b.result.form is Bytes then put(w, indent + "var owned: Buf[u8] = buf()\n")
             _ -> ()
         put(w, indent + "enter_safe(ctx)\n")
     else
