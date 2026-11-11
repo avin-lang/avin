@@ -7891,16 +7891,23 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
     var expr = ""
     var given: Buf[string] = buf()
     var bound_count = 0usize
+    var view = false
+    var writable = false
+    var has_length = false
     for arg in a.args
         val n = arg.name match
             Some(n) -> n
             None ->
                 if arg.value.kind is StringLit(_) then c.note(unit, arg.value.span, "a field accessor names its field with `field:` and has no prototype: the field's type is the header's")
-                elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of a field accessor, which takes `field:` and `bound:`; a handle it reads is always lent, and takes a reference of its own")
-                else c.note(unit, arg.value.span, "a field accessor takes `field:` and `bound:`")
+                elif arg.value.kind is Name(word) && (word == "view" || word == "writable")
+                    if contains_name(given, word) then c.note(unit, arg.value.span, s"`$word` is said once")
+                    given.push(word)
+                    if word == "view" then view = true else writable = true
+                elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of a field accessor, which takes `field:`, `bound:`, `length:`, `view` and `writable`; a handle it reads is always lent, and takes a reference of its own")
+                else c.note(unit, arg.value.span, "a field accessor takes `field:`, `bound:`, `length:`, `view` and `writable`")
                 continue
-        if n != "field" && n != "bound"
-            c.note(unit, arg.value.span, s"`$n:` is not a word of a field accessor, which takes `field:` and `bound:`")
+        if n != "field" && n != "bound" && n != "length"
+            c.note(unit, arg.value.span, s"`$n:` is not a word of a field accessor, which takes `field:`, `bound:`, `length:`, `view` and `writable`")
             continue
         if contains_name(given, n)
             c.note(unit, arg.value.span, s"`$n:` is given once" + (if n == "bound" then "; it takes a list, one bound for each index, as in `bound: [\"self->rows\", \"self->columns\"]`" else ""))
@@ -7911,6 +7918,13 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
                 StringLit(t) ->
                     if t.trim() == "" then c.note(unit, arg.value.span, "`field:` names the field, a C lvalue in the struct `self` points at, as in `field: \"width\"`") else expr = t
                 _ -> c.note(unit, arg.value.span, "`field:` takes the field as a string, a C lvalue in the struct `self` points at, as in `field: \"width\"`")
+            continue
+        if n == "length"
+            has_length = true
+            arg.value.kind match
+                StringLit(t) ->
+                    if t.trim() == "" then c.note(unit, arg.value.span, "`length:` is the C expression in `self` the length of the view is, and is empty")
+                _ -> c.note(unit, arg.value.span, "`length:` takes the length of the view as a string, a C expression in `self`, as in `length: \"self->size\"`")
             continue
         var well_formed = true
         arg.value.kind match
@@ -7966,8 +7980,25 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
         c.note(unit, a.span, s"`bound:` bounds an index, and the field accessor `${f.name}` takes none")
     elif bound_count != indices
         c.note(unit, a.span, s"the field accessor `${f.name}` takes ${index_count(indices)} and `bound:` gives ${count(bound_count, "bound")}: one for each, in order")
+    if writer && view
+        c.note(unit, a.span, s"the field accessor `${f.name}` answers `unit`, so it writes its field, and `view` lends the memory a field points at, which only a reader answers")
+        return
+    if writable && !view then c.note(unit, a.span, "`writable` marks a field accessor that lends a `MutByteView`, with `view`")
+    if has_length && !view then c.note(unit, a.span, "`length:` is the length of the memory a field accessor marked `view` lends, and this one lends none")
+    if view && !has_length then c.note(unit, a.span, s"C keeps no length with the memory the field of `${f.name}` points at, so the accessor says it with `length:`, a C expression in `self`, as in `length: \"self->size\"`")
     if writer || *r is ErrorType then return
     val at = if f.result is Some(t) then t.span else f.name_span
+    if view
+        val problem = c_view_problem(c, r, "", writable)
+        if problem != "" then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}` and lends the memory its field points at: $problem")
+        // A view is valid until its lender is used again, so only a handle of one thread lends one.
+        val k = receiver_class.unwrap()
+        if c_class_shared(c.classes[k].decl) then c.note(unit, a.span, s"`${c.classes[k].name}` is `shared`, so another thread may use it while a view it lent is read; a view is lent only by a handle that belongs to one thread at a time")
+        return
+    if c_memory_form(r, c.data, c.classes) is Some(m)
+        val problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, made by `ByteBlock(length)`, never read from a field" else "a field accessor lends the memory its field points at when it says `view`, its length given with `length:`"
+        c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`: $problem")
+        return
     if c_handle_form(r, c.data, c.classes) is Some(h)
         val d = c.classes[h.class_index].decl
         val name = c.classes[h.class_index].name
@@ -8188,13 +8219,29 @@ private c_callback_problem(c: *Checker, q: CParam, t: &Type) -> string
         _ -> return s"the parameter takes a function, an Avin function of a matching type, as in `(int, int) -> int`"
     val positions = c_callback_positions(f)
     if positions.len() != ps.len()
-        return s"C calls it with ${count(positions.len(), "parameter")} besides its `userdata`, and the function takes ${ps.len()}; they correspond by position"
+        var lengths = false
+        for q in f.params
+            if q.length_of != "" then lengths = true
+        val besides = if lengths then "its `userdata` and the lengths of its views" else "its `userdata`"
+        return s"C calls it with ${count(positions.len(), "parameter")} besides $besides, and the function takes ${ps.len()}; they correspond by position"
     for j in 0..<ps.len()
         val cq = f.params[positions[j]]
         val a = ps[j]
         if *a is ErrorType then continue
         var problem = ""
-        if *a is Function(_, _, _) then problem = "a function is not a callback's parameter: a function crosses to C only as a binding's own parameter"
+        val lent = c_length_param(f, cq.name) is Some(_)
+        if lent
+            // Memory C lends the function, its length beside it, is a view closed when it returns; the
+            // prototype's reading has found it a pointer.
+            val writable = !(" " + cq.text + " ").contains(" const ")
+            if c_memory_form(a, c.data, c.classes) is Some(m)
+                if m.kind is MemBlock then problem = "a `ByteBlock` is memory Avin gives C; memory C lends a callback is a `ByteView`, or a `MutByteView` where it is not `const`"
+                elif writable && m.kind is MemView then problem = "C lends this memory to be written, as it is not `const`, so it crosses as a `MutByteView`"
+                elif !writable && m.kind is MemMutView then problem = "C lends this memory `const`, so it crosses as a `ByteView`"
+            else problem = "memory C lends a callback, its length beside it, crosses as a view: a `ByteView` where it is `const` and a `MutByteView` where it is not, perhaps in an `Option` for null"
+        elif c_memory_form(a, c.data, c.classes) is Some(m)
+            problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, and C never gives one back" else s"memory C lends a callback is a view, its length given by a parameter of C's function marked `length(${cq.name})`"
+        elif *a is Function(_, _, _) then problem = "a function is not a callback's parameter: a function crosses to C only as a binding's own parameter"
         elif !(c_text_form(a, c.data, c.classes) is NoText) then problem = c_crossing_problem(cq.ty, a, c_text_form(a, c.data, c.classes), true)
         elif c_array_form(a, c.data, c.classes) is Some(_) then problem = "an array is not a callback's parameter: memory C lends a callback is a view"
         elif c_status_error(a, c.data) is Some(_) then problem = "a status is a binding's result, not a callback's parameter"
@@ -8213,6 +8260,7 @@ private c_callback_problem(c: *Checker, q: CParam, t: &Type) -> string
     var problem = ""
     if c_text_form(r, c.data, c.classes) is TextString(_) then problem = "a string a callback answered would have to outlive the call, which nothing frees, so a callback answers a scalar or an enum mirror"
     elif c_handle_form(r, c.data, c.classes) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no handle"
+    elif c_memory_form(r, c.data, c.classes) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no view or block: memory goes back to C only as a binding's `ByteBlock` parameter"
     elif c_status_error(r, c.data) is Some(_) then problem = "a callback answers a scalar or an enum mirror, and no status"
     elif c_mirror_of(r, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, f.result_text)
     else problem = c_crossing_problem(f.result, r, NoText, false)
@@ -12337,7 +12385,7 @@ private literal_parts(c: *Checker, exprs: Buf[&Expr], want: &Type, what: string)
     for x in exprs
         checked.push(None)
     var agreed: Option[&Type] = None
-    for k in agreement_order(exprs)
+    for k in agreement_order(c, exprs)
         val x = exprs[k]
         val t = check_expr(c, x, agreement_hint(c, x, agreed))
         checked[k] = Some(t)
@@ -12401,16 +12449,22 @@ private expected_of_branches(c: *Checker, expected: Option[&Type], used: bool, a
 // those that give a type of their own, then the values built around number literals (`Some(1)`,
 // `[1, 2]`), then the expressions of literals alone (`2`, `-(4 * 5)`), and each empty collection
 // literal last, so that what those before agree on settles the numbers and element types of those
-// after. Within a rank they keep the order they are written in.
-private agreement_order(exprs: Buf[&Expr]) -> Buf[usize]
+// after. A variant name several data types share goes with the literals alone, so that the type the
+// others agree on decides it. Within a rank they keep the order they are written in.
+private agreement_order(c: *Checker, exprs: Buf[&Expr]) -> Buf[usize]
     var order: Buf[usize] = buf()
     for rank in 0..<4
         for i in 0..<exprs.len()
-            if agreement_rank(exprs[i]) == rank then order.push(i)
+            if shared_agreement_rank(c, exprs[i]) == rank then order.push(i)
     order
 
 private agreement_rank(e: &Expr) -> i32 =
     if empty_literal(e) then 3 elif literal_expression(e) then 2 elif holds_literal(e) then 1 else 0
+
+/** `agreement_rank`, with a variant name several data types share ranked with the literals alone. */
+private shared_agreement_rank(c: *Checker, e: &Expr) -> i32
+    val rank = agreement_rank(e)
+    if rank < 2 && shared_variant_owners(c, e).len() > 0 then 2 else rank
 
 // The type `e` is checked against among siblings that agree on `agreed`, where `agreed` says something
 // of a type: that type, where `e` is an empty collection literal; its shape with its numbers and other
@@ -12419,6 +12473,8 @@ private agreement_rank(e: &Expr) -> i32 =
 // is expected.
 private agreement_hint(c: *Checker, e: &Expr, agreed: Option[&Type]) -> Option[&Type]
     if empty_literal(e) then return shaped_hint(c, e, useful_hint(c, agreed))
+    if agreed is Some(t)
+        if shared_variant_expected(c, t, shared_variant_owners(c, e)) is Some(decided) then return Some(decided)
     if !holds_literal(e) && !literal_expression(e) then return None
     val so_far = useful_hint(c, agreed)?
     shaped_hint(c, e, Some(literal_hint(c, so_far)))
@@ -12610,7 +12666,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
         for item in items
             checked.push(None)
         var agreed: Option[&Type] = None
-        for k in agreement_order(items)
+        for k in agreement_order(c, items)
             val item = items[k]
             var t = check_expr(c, item, agreement_hint(c, item, agreed))
             // An element that is an `Option[Nothing]` converts to the other elements' option, and the
@@ -13830,7 +13886,7 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
     val agreeing = used && !settled_outside
     var y: &TExpr = TExpr(e.span, ErrorType, UnitConst)
     var n: &TExpr = TExpr(e.span, ErrorType, UnitConst)
-    if agreeing && agreement_rank(yes) > agreement_rank(other)
+    if agreeing && shared_agreement_rank(c, yes) > shared_agreement_rank(c, other)
         n = tested_branch(c, other, tested.no, wanted, used)
         y = tested_branch(c, yes, tested.yes, hint_or(agreement_hint(c, yes, Some(n.ty)), wanted), used)
     else
@@ -15200,6 +15256,37 @@ private lambda_ready(c: *Checker, value: &Expr, param: Option[&Type]) -> bool
 /** Whether an argument takes its type from its parameter, and so is checked after the others: a
  * lambda, or a `match` with nothing before it. */
 private takes_parameter_type(value: &Expr) -> bool = value.kind is Lambda(_, _) || value.kind is MatchFunction(_)
+
+/** The data types an argument written as a bare variant name, `Close` or `MoveTo(1.0, 2.0)`, may be
+ * a value of, where data types share that name and so its type decides which variant it is; empty
+ * for any other argument. Such an argument is checked after the others, so that what they decide of
+ * a type argument decides the name. */
+private shared_variant_owners(c: *Checker, value: &Expr) -> Buf[usize]
+    var owners: Buf[usize] = buf()
+    var name = ""
+    if value.kind is Name(n) then name = n
+    if value.kind is Call(f, _)
+        if f.kind is Name(n) then name = n
+    if name.len == 0 || lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return owners
+    val vs = variants_named(c, name)
+    if vs.len() < 2 then return owners
+    for v in vs
+        owners.push(v.data)
+    owners
+
+/** The expected type that decides a shared variant name passed for a parameter of type `p`, where
+ * the arguments checked before it have decided `p` to be one of `owners`: that data type, with its
+ * type arguments left for the variant's own fields to decide, so a later argument may still widen
+ * them. */
+private shared_variant_expected(c: *Checker, p: &Type, owners: Buf[usize]) -> Option[&Type]
+    if owners.len() == 0 then return None
+    if *zonk(c, p) is Data(id, name, args)
+        if contains_index(owners, id)
+            var open: Buf[&Type] = buf()
+            for _ in args
+                open.push(fresh_var(c))
+            return Some(Data(id, name, open))
+    None
 
 // Whether an integer literal, possibly negated, can be a value of type `t`, as `integer_literal`
 // would make it.
@@ -16711,7 +16798,8 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                     continue
             // Values built around literals take what the plain arguments decide; expressions of
             // literals alone take that too, or what the built values decide.
-            val rank = if takes_parameter_type(value) then 3 elif literal_expression(value) then 2 elif holds_literal(value) then 1 else 0
+            // A shared variant name goes with the literals, after what decides its type.
+            val rank = if takes_parameter_type(value) then 3 elif literal_expression(value) || shared_variant_owners(c, value).len() > 0 then 2 elif holds_literal(value) then 1 else 0
             if rank != pass then continue
             early[i] = Some(call_argument(c, args[i], param, open))
         // Then the lambdas whose results belong to this tier, each once its parameter types are known.
@@ -17174,6 +17262,10 @@ private call_argument(c: *Checker, arg: Argument, param: Option[&Type], open: *B
         val literals = (!is_literal(arg.value) && holds_literal(arg.value)) || tier == 1 || tier == 2
         val known = loosen_for(c, p, open, true, literals)
         if !(*known is Var(_)) then wanted = Some(known)
+        // A shared variant name takes its type from what the other arguments decided of the type
+        // argument, even where a later one may still widen it: `same(segment, MoveTo(1.0, 2.0))`.
+        if wanted is None
+            if shared_variant_expected(c, p, shared_variant_owners(c, arg.value)) is Some(t) then wanted = Some(t)
     // A lambda or a `match` function passed for a type argument bounded by `Sendable` is a `@sendable`
     // function, checked as one where it is made.
     var sendable = false

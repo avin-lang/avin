@@ -128,7 +128,8 @@ struct CUnitHandle
 /** A field accessor as the C unit compiles its glue: the method's name, the index of its symbol, which
  * names its glue, the field, the names of its indices and the bound of each, whether it writes the
  * field, the kind of C type the field must be for the Avin type it reads or writes, or for a handle
- * read the handle's class, that Avin type, and the unit and span that place the accessor. */
+ * read the handle's class, that Avin type, the unit and span that place the accessor, and for a field
+ * lent as a view, whether it is lent `writable` and the C expression its length is ("" for no view). */
 struct CUnitField
     name: string
     symbol: usize
@@ -141,6 +142,8 @@ struct CUnitField
     avin: &Type
     unit: usize
     span: Span
+    writable: bool
+    length: string
 
 /** The handle a class's `kept:` names: the name `release:` gives its pointer, the kept class's index
  * and its C type. */
@@ -407,11 +410,13 @@ private c_unit_fields(program: TProgram, k: usize) -> Buf[CUnitField]
         val avin = if writer then s.params[last] else result
         var kind: Option[CKind] = None
         var handle: Option[usize] = None
-        if c_handle_form(avin, program.data, program.classes) is Some(h) then handle = Some(h.class_index)
+        val lent = field.view && !writer && field.length != ""
+        if lent then ()
+        elif c_handle_form(avin, program.data, program.classes) is Some(h) then handle = Some(h.class_index)
         elif !(c_text_form(avin, program.data, program.classes) is NoText) then kind = Some(KindText)
         else kind = c_field_kind(avin)
-        if kind is None && handle is None then continue
-        out.push(CUnitField(s.name, n, field.expr, indices, field.bounds, writer, kind, handle, avin, s.unit, s.decl.name_span))
+        if kind is None && handle is None && !lent then continue
+        out.push(CUnitField(s.name, n, field.expr, indices, field.bounds, writer, kind, handle, avin, s.unit, s.decl.name_span, field.writable, if lent then field.length else ""))
     out
 
 /** The C unit of a program whose C bindings are `bindings` and whose packages name `libraries`. Each
@@ -598,6 +603,9 @@ enum CUnitLine
     /** The check that the type parameter `position` of `bindings[binding]` points at is the element
      * type of the Avin array passed there, as it is, by kind, size and sign. */
     ElementLine(binding: usize, position: usize)
+    /** The check that the pointer `name`, which the function `bindings[binding]` passes for its
+     * parameter `param` is called with, points at bytes one byte wide, lent as a view. */
+    CallbackBytesLine(binding: usize, param: usize, name: string)
     /** The check that `free`, which `bindings[binding]`'s `free:` names, frees a string. */
     FreeLine(binding: usize, free: string)
     /** A line of the glue of `handles[handle]` compiling what its `@c` says under `part`: `type`,
@@ -803,6 +811,29 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
                 if !contains_text(measured, key)
                     measured.push(key)
                     measured_types.push(c_spelling(c))
+            // Memory C lends the function is a pointer to bytes one byte wide, and its length an
+            // integer, measured as any is.
+            for r in f.params
+                if r.length_of == "" then continue
+                for q in f.params
+                    if q.name != r.length_of then continue
+                    out.push(s"_Static_assert(${element_test(Byte, "__typeof__(*(" + q.text + ")0)")}, \"avin: the bytes ${q.name} lends ${b.name}'s function\");\n")
+                    lines.push(CallbackBytesLine(i, k, q.name))
+                val c = r.ty
+                val kind = c_kind_needed(c, Int(64), NoText, true) match
+                    Some(kind) -> kind
+                    None -> continue
+                if c is CTypedef(name)
+                    val tag = kind_tag(kind) + " " + name
+                    if !contains_text(kinds, tag)
+                        kinds.push(tag)
+                        out.push(s"_Static_assert(${kind_test(kind, name)}, \"avin: the C type $name\");\n")
+                        lines.push(KindLine(i, k + 1, name, kind))
+                if !c_kind_measured(kind) then continue
+                val key = c_measure_key(c, kind)
+                if !contains_text(measured, key)
+                    measured.push(key)
+                    measured_types.push(c_spelling(c))
     // The measurements: the marker, the count, then two bytes for each measured type.
     out.push("__attribute__((used)) const unsigned char avin_c_unit_measurements[] = {\n")
     lines.push(Plain)
@@ -937,10 +968,20 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
                 indices = indices + s", long long $name"
             // The type is the field's at any index: an unevaluated operand reads no memory.
             glue(out, lines, s"typedef __typeof__((($t)0)->${c_replace_names(f.expr, f.indices, "0")}) $ft;", FieldLine(i, j, "field"))
-            val test = f.handle match
+            // A field lent as a view points at bytes one byte wide.
+            val test = if f.length != "" then element_test(Byte, s"__typeof__(*($ft)0)") else f.handle match
                 Some(k) -> s"__builtin_types_compatible_p($ft, avin_c_type_$k)"
                 None -> kind_test(f.kind.unwrap(), ft)
             glue(out, lines, s"_Static_assert($test, \"avin: the field ${f.name}\");", FieldLine(i, j, "kind"))
+            if f.length != ""
+                // The view's length, a C expression in `self` and the indices.
+                val length = c_field_glue(f.symbol, "length")
+                glue(out, lines, s"long long $length(void *avin_p$indices) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    return (long long)(${f.length});", FieldLine(i, j, "length"))
+                glue(out, lines, "}", Plain)
+                // Memory lent `writable` is assigned through, which a `const` pointer refuses.
+                if f.writable then glue(out, lines, s"void ${c_field_glue(f.symbol, "writable")}($ft avin_w) { *avin_w = *avin_w; }", FieldLine(i, j, "writable"))
             for b in 0..<f.bounds.len()
                 val part = "bound" + b.to_string()
                 val bound = c_field_glue(f.symbol, part)
@@ -953,6 +994,12 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
                 glue(out, lines, s"void $set(void *avin_p$indices, $ft avin_value) {", Plain)
                 glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
                 glue(out, lines, s"    self->${f.expr} = avin_value;", FieldLine(i, j, "write"))
+                glue(out, lines, "}", Plain)
+            elif f.length != ""
+                val get = c_field_glue(f.symbol, "get")
+                glue(out, lines, s"void *$get(void *avin_p$indices) {", Plain)
+                glue(out, lines, s"    $t self = ($t)avin_p;", Plain)
+                glue(out, lines, s"    return (void *)self->${f.expr};", FieldLine(i, j, "field"))
                 glue(out, lines, "}", Plain)
             else
                 val get = c_field_glue(f.symbol, "get")
@@ -1410,7 +1457,11 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 val f = h.fields[j]
                 val verb = if f.writer then "write" else "read"
                 var m = s"the field `${f.expr}` of the C handle `${h.name}`, which `${f.name}` ${verb}s, does not compile against its headers: clang says '${d.message}'"
-                if part == "kind"
+                if part == "kind" && f.length != ""
+                    m = s"the field `${f.expr}` of the C handle `${h.name}` is not a pointer to an integer type one byte wide in the headers, so `${f.name}` cannot lend the memory it points at as `${type_name(f.avin)}`"
+                elif part == "length" then m = s"the field accessor `${f.name}` gives the length of the memory `${f.expr}` points at as `${f.length}`, which does not compile against the headers of the C handle `${h.name}`: clang says '${d.message}'"
+                elif part == "writable" then m = s"the field `${f.expr}` of the C handle `${h.name}` points at `const` memory in the headers, so `${f.name}` cannot lend it `writable`"
+                elif part == "kind"
                     var what = ""
                     f.handle match
                         Some(k) ->
@@ -1477,6 +1528,10 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 elif block then troubles[i].kinds.push(s"parameter $position of `${bindings[i].name}`, `${q.text}`, is not a pointer to an integer type one byte wide in the headers, so a `ByteBlock` cannot be passed to it")
                 else
                     troubles[i].kinds.push(s"the C type `${q.pointee_text}` parameter $position points at is not ${element_text(element)} in the headers, so it cannot hold the elements of an `Array[${type_name(element)}]` as they are")
+            CallbackBytesLine(i, k, name) ->
+                placed_any = true
+                val q = bindings[i].prototype.params[k]
+                troubles[i].kinds.push(s"the function `${bindings[i].name}` passes for `${q.name}` is lent the memory `$name` points at as a view, and `$name` is not a pointer to an integer type one byte wide in the headers")
             FreeLine(i, name) ->
                 placed_any = true
                 if troubles[i].frees.len() > 0 then continue

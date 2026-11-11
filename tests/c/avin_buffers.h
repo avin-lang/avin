@@ -7,6 +7,7 @@
 #ifndef AVIN_BUFFERS_H
 #define AVIN_BUFFERS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* A frame of `size` bytes, the byte at `i` being `(fill + i) & 255`; one reference. */
@@ -79,5 +80,57 @@ bf_holder *bf_holder_new(bf_surface *s);
 void bf_holder_free(bf_holder *h);
 long bf_holder_sum(bf_holder *h);
 void bf_holder_paint(bf_holder *h, unsigned char value);
+
+/* A face shaped as a FreeType face is: its glyph slot holds a bitmap of `rows` rows `pitch` bytes apart,
+ * negative for one stored bottom row first, whose buffer the next load frees and replaces, null for a
+ * glyph with no pixels. The byte at row `r` and column `c` of a loaded glyph is `(r * 16 + c + fill) &
+ * 255`, row 0 being the top. Its fields are published, so field accessors read them; one reference. */
+typedef struct {
+    int rows;
+    int width;
+    int pitch;
+    unsigned char *buffer;
+} bf_bitmap;
+typedef struct {
+    bf_bitmap bitmap;
+} bf_glyph_slot_rec;
+typedef struct bf_face {
+    int refs;
+    int dead;
+    int loads;
+    bf_glyph_slot_rec *glyph;
+    const unsigned char *name;
+    int name_length;
+    int *ints;
+    unsigned char *planes[2];
+    int plane_length;
+} bf_face;
+bf_face *bf_face_new(void);
+bf_face *bf_face_ref(bf_face *f);
+void bf_face_unref(bf_face *f);
+int bf_faces_alive(void);
+/* Frees the glyph's buffer and loads one of `rows` rows of `width` bytes, `pitch` apart (its magnitude
+ * at least `width`), null where `rows` or `width` is zero. */
+void bf_face_load(bf_face *f, int rows, int width, int pitch, int fill);
+/* The sum of the loaded glyph's pixels, read by C. */
+long bf_face_sum(bf_face *f);
+
+/* Calls `write` with `total` bytes, the byte at `i` being `i & 255`, `chunk` at a time (the last perhaps
+ * shorter), stopping at an answer other than zero, which it answers; zero once all are written. Each
+ * chunk is freed after its call, so a view kept past it would read freed memory. */
+int bf_stream_write(int total, int chunk, int (*write)(void *closure, const unsigned char *data, unsigned int length), void *closure);
+/* Calls `read` for `total` bytes, `chunk` at a time, each into fresh memory set to 0xEE, freed after its
+ * call, and answers the sum of the bytes read, or minus the first answer other than zero. */
+long bf_stream_read(int total, int chunk, int (*read)(void *closure, unsigned char *data, unsigned int length), void *closure);
+/* Calls `write` once with null and `length`. */
+int bf_stream_null(unsigned int length, int (*write)(void *closure, const unsigned char *data, unsigned int length), void *closure);
+/* Calls `seen` once with `n` bytes, `i & 255`, the length first and its type `size_t`. */
+void bf_stream_sized(size_t n, void (*seen)(void *closure, size_t length, const uint8_t *data), void *closure);
+/* Calls `seen` with a signed length `n` over 4 bytes, whatever `n` is. */
+void bf_stream_signed(int n, void (*seen)(void *closure, const unsigned char *data, int length), void *closure);
+/* Calls `seen` with two lent pieces of `a` and `b` bytes. */
+long bf_stream_pair(int a, int b, long (*seen)(void *closure, const unsigned char *first, unsigned int n, unsigned char *second, unsigned int m), void *closure);
+/* Calls `seen` with the bytes as `int`s, which no view lends. */
+void bf_stream_ints(int n, void (*seen)(void *closure, const int *data, int length), void *closure);
 
 #endif

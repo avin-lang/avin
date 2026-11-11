@@ -5522,15 +5522,138 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   rule by run-time type says; one seen inside a vector as an `Option[Dog]` and then boxed is an
   `Option[Dog]` too. A view inside an object-form value still leaves the `Option[Nothing]` object
   there, as any view leaves a value as it was made.
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **TLS's API** ([system library](/spec/system-library/#tls)).
+  A module of its own, `avin.net.tls`: `TlsStream.connect(host, port, settings)`, and
+  `TlsStream.client(tcp, host, settings)` / `TlsStream.server(tcp, settings)` over a `TcpStream`
+  the caller made; `TlsClient` (the authorities it adds) and `TlsServer(certificate, key)` (PEM
+  text, checked by `TlsServer.of`) as immutable sendable values. In `avin.net.http` an `https` URL
+  just works (port 443 by default), `Request.withTls(client)` choosing the settings, kept across
+  redirects; `http.serve(…, tls = Some(server))` serves HTTPS. A trait `ByteStream`, which
+  `TcpStream`, `UnixStream` and `TlsStream` implement, lets the HTTP code run over either, and
+  `ReadAhead` became public so the TLS module shares the line reading. *Why*: the URL decides
+  TLS, as a reader expects; settings are values, so a request, a thread and an actor carry them
+  freely; the stream over a caller's `TcpStream` keeps that connection's timeout and cancellation
+  without a second set. *Alternatives*: `TlsStream` in `avin.net` itself (every TCP program would
+  then build OpenSSL, since a module's bindings come with it); a `TlsClient` holding one OpenSSL
+  context for many connections (a context's reference count is not atomic, so it could not be
+  shared between threads; a context is made per connection instead, which reads the machine's
+  store each time, a few milliseconds); a `trust(pem)` that checks the PEM at once (it would need
+  a context; a PEM that is not one is `Credentials` at the connection instead).
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **the trust model**. A client trusts the machine's store,
+  through OpenSSL's default paths, plus what `TlsClient.trust(pem)` adds; it always checks the
+  host name (a name or an address), sends it for SNI, and speaks TLS 1.2 at the least, none of
+  which can be turned off, as the Sysl package `openssl` decides. *Why*: trust that only grows
+  cannot be misused to accept a bad certificate; a private, corporate or test authority is one
+  case. *Alternatives*: a switch to skip verification (refused: it is how bad certificates get
+  accepted); a bundled set of roots (it goes stale). **Gap**: on macOS the store is the `cert.pem`
+  of Homebrew's OpenSSL, not the Keychain, so a root added only to the Keychain is not trusted;
+  the `sysl` session would queue reading the Keychain in the `openssl` package on request.
+  Review with the user whether Keychain roots are wanted.
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **TLS errors**. `TlsError` is `Transport(IoError)`,
+  `Certificate(text)`, `Handshake(text)` and `Credentials(text)`; an `HttpError` gains
+  `Tls(TlsError)`, a `Transport` failure staying `Io` as for `http`. After the handshake a TLS
+  failure in a read or write is `IoError.Other("TLS: …")`, so a `TlsStream` is a `ByteStream`.
+  `openssl` 0.2.2 reports a refused certificate as one error, so `Certificate` covers an
+  untrusted, self-signed or expired certificate and one for another host alike; the mapping is
+  the one function `handshakeError` in `library/avin/net/tls/tls.avin`, and `openssl` 0.2.3's
+  `Error.refusal()` (`HostMismatch`, `Expired`, `Untrusted`, `Other`) lets it split `Certificate`
+  into those kinds there alone. *Alternatives*: one `Tls(text)` error (a program could not tell
+  a refused certificate from a broken connection); typed errors for every read and write (every
+  `ByteStream` user would need a second error type).
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **a connection's end and timeouts over TLS**. The end of the
+  stream is the peer's `close_notify` or the TCP connection closing, both read as the end, since
+  many servers close without a `close_notify` and HTTP frames its bodies; a body read to the
+  connection's end can therefore be cut short undetected, as over TCP. Every wait, the handshake's
+  included, is a wait of the TCP connection beneath, under its `setTimeout` limit and cancellable
+  by a scope; `http` sets the request's timeout before the handshake, and `http.serve` bounds the
+  handshake by `readTimeout`. A handler that traps on a TLS connection has it closed unanswered.
+  *Alternatives*: an error for an end without `close_notify` (it would refuse ordinary servers);
+  a handshake timeout of its own (one more limit to set). Review with the user whether a body read
+  to the connection's end should require `close_notify`.
+- Settled on the user's delegation 2026-11-11 (built on branch `https`): **the standard library's Sysl packages**. The library names
+  the Sysl packages its own bindings reach in `library/library.hocon`, a manifest whose
+  `sysl-dependencies` block is read as a package's is. One joins a program's shims only where a
+  binding or handle the program compiles names a Sysl item inside it, the package's name being a
+  segment of the item's name before its last (`sh.sysl.openssl.client`); a program naming the same
+  package keeps its own, unless both are releases of one repository and the library's is later.
+  So only programs that reach `avin.net.tls` (`avin.net.http` among them) need OpenSSL installed,
+  and the Homebrew formula depends on `openssl@3`. *Why*: a dependency written as a package's,
+  without making the library a package (an `avin.hocon` there would make `library/tests` a
+  package's tests). *Alternatives*: always adding the library's packages (every program with a
+  binding would fetch and link OpenSSL); the runtime depending on `openssl` (every program would
+  link it); a table from module to package in the compiler (a second place to keep in step).
+- Settled on the user's delegation 2026-11-11 (built on branch `c-view-fields`): **Views lent by a
+  field and to a callback**:
+  - **A field accessor lending a view says `view`, `length:` and perhaps `writable`, as a binding
+    does**, and nothing else; `length:` is a C expression in `self` and the indices, evaluated after
+    the field is read, whether or not it is null. *Why*: the words a binding lending its result
+    already uses, so a reader learns one form. *Alternatives*: a separate `buffer:` word for fields;
+    evaluating the length only for a non-null pointer, which would let a `length:` that dereferences
+    the struct run only sometimes.
+  - **The C unit, not the checker, refuses a `writable` view of a `const` field**, by glue that
+    assigns through the pointer, since the field's type is the header's and the checker never sees
+    it. *Why*: a binding's prototype says `const` in Avin's source, a field's does not. *Alternative*:
+    making the accessor spell the field's C type, which repeats the header.
+  - **A view lent a callback may be an `Option`**, null with any length `None`, and otherwise null
+    follows a binding's rule: an empty view for a length of zero, a stop for any other
+    (`` C lent the function given to `f` null``); a negative length and one past the greatest `int`
+    stop the program at the binding's call. *Why*: one rule for every view. *Alternative*: refusing an
+    `Option` in a callback, which would make a C library that passes null for an empty chunk stop
+    the program.
+  - **A view lent a callback has no lender and belongs to the code the callback runs in**: another
+    thread's use stops the program, a thread the callback starts among them, since the view is not
+    handed over with a body that captures it as a handle's view is with its lender. *Why*: C frees
+    the memory when the callback returns, so it must not be read anywhere the closing cannot order
+    before the free. *Alternative*: handing it over like a block, which lets another thread read
+    while the callback returns and C frees. Review with the user only if a library needs a thread to
+    read a chunk in place.
+  - **A callback view's length is converted through `long`** before the view's own checks, so an
+    unsigned 64-bit length past a `long`'s range stops the program as that conversion does, and any
+    smaller one past the greatest `int` as `more bytes than a view holds`. *Why*: the conversions a
+    callback's integer arguments already use. *Alternative*: a dedicated 64-bit unsigned comparison,
+    which only changes the message.
+  - **The trap texts** name the binding: `` the `ByteView` lent to the function given to `f` was
+    closed when it returned`` and `` … belongs to another thread``; a field's view is a handle's view
+    and says `` the `ByteView` of `Face` was closed when `Face` was used again``.
 
-**Deferred**
+Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **JSON derivation**.
 
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
+- **One `JsonError` for parsing and decoding**, the path its last field with a default:
+  `JsonError(message, line, column, offset, path: List[PathStep] = [])`, `inField`/`atIndex`
+  putting a step in front, `pathText()` writing `items[2].name`, and `Display` putting that text
+  and a colon before the message where the path is not empty. *Why*: a program handles one error
+  type from the package, and every existing `JsonError(message, line, column, offset)` keeps
+  compiling. *Alternatives*: the derivation chapter's `JsonError(path, message, line, column)`,
+  which drops the offset and breaks every existing construction; a separate `DecodeError`.
+- **`JsonReader` reads text in memory**, `JsonReader(text, maxDepth = 512)`, with `beginObject`,
+  `nextKey`, `beginArray`, `nextElement`, `takeNull`, `readString`, `readBool`, `readInt`,
+  `readLong`, `readReal`, `readJson`, `skipValue`, `end` and `error(message)`, the last naming the
+  start of the last token read. *Why*: the derivations need exactly these, and the tokenizer is the
+  parser's own, so its messages are `parse`'s. *Alternatives*: reading a byte stream now, which is
+  the streaming reader's item; these methods are the seam it plugs into. A `JsonWriter(out:
+  Writer)` writes compact text only, `writeNull()` for `null`.
+- **Numbers**: an `int` or a `long` reads any whole number in range, `3.0` and `1e3` included, as
+  `Json.asInt`/`asLong` do; a fraction or a number out of range is an error naming it. A NaN or an
+  infinity is written `null` (as `render` writes it) and `null` does not read as a `real`.
+  *Alternatives*: integer literals only; `null` reading back as NaN, which would make every `real`
+  field silently nullable.
+- **`Option[Option[A]]`**: `Some(None)` and `None` both write `null` and read back as `None`. *Why*:
+  JSON has one null. *Alternatives*: refusing to derive for nested options.
+- **Maps** are `HashMap[K, A]` and `TreeMap[K, A]` with `K: JsonMapKey`, a trait the package
+  implements for `string`, `int` and `long` (the digits, read back only from what `toLongOption`
+  reads); a key written twice keeps its last value. *Why*: an impl of a trait is for a data type or
+  a class, not for the `Map` trait, and must take its type's parameters in order, so `Map[string, A]`
+  cannot be named. *Alternatives*: string keys only. **Review with the user**: a field typed as the
+  `Map` trait (what a map literal is typed as) cannot derive the JSON traits; covering it needs the
+  language to let a library trait be implemented for a trait type.
+- **Unknown keys are skipped** and a field written twice is an error (as the chapter says); a second
+  discriminator key after the first is an unknown key. A missing field's error is at the object's
+  closing brace, with the object's path. The nesting limit counts a skipped value's containers too.
+- **Entry points** `json.encode(value) -> string` and `json.decode[A](text, maxDepth = 512)`, the
+  second refusing anything but white space after the value. *Alternatives*: only the traits'
+  methods, leaving every program to make a writer and a reader.
 
-## Proposed
-
-- Proposed (branch `time-calendar`): **`startOfYear()`, `startOfMonth()` and `startOfWeek()` on a
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`startOfYear()`, `startOfMonth()` and `startOfWeek()` on a
   `DateTime` answer midnight** of that day, while `endOfMonth()` keeps the time of day, as the
   chapter says. *Why*: a start is the first moment of its span, as `startOfDay` is; keeping the
   time would make `r.startOfMonth()` mean "the same time on the 1st", which `r.withDay(1)` already
@@ -5538,7 +5661,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   spellings of `withDay(1)`); make `endOfMonth` the last microsecond of the month too (a start/end
   pair, but the chapter decided "at the same time of day"). Review with the user whether
   `endOfMonth` on a reading should rather be its month's last microsecond.
-- Proposed (branch `time-calendar`): **a calendar answer outside `Date.Min` to `Date.Max` traps
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **a calendar answer outside `Date.Min` to `Date.Max` traps
   with a message naming the date** (`the date +5881580-07-31 is outside Date.Min to Date.Max`), or,
   where the answer is a count of days with no year to write (a weekday search, `startOfWeek`,
   `DateTime ± Duration`), `the date N days from 1970-01-01 is outside Date.Min to Date.Max`; the
@@ -5549,13 +5672,39 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   date says more than `integer overflow` where there is a date to name. *Alternatives*: a bare
   integer overflow trap everywhere (shorter code, a less useful message); clamping to the bounds
   (silently wrong).
-- Proposed (branch `time-calendar`): **`withYear` takes a `long`**, the type `year()` answers, so
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`withYear` takes a `long`**, the type `year()` answers, so
   `d.withYear(d.year() + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
   `int` like the makers (a conversion at every use of `year()`), or changing `year()` to `int`
   (every year of a `Date` fits, but a change to step 1's fields).
-- Proposed (branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
+- Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
   builds `Resolution` and the zone's handling of a skipped or repeated reading they rely on; step 2
   gives `Zoned` only `isoWeek()` and `isoWeekYear()`, which need no resolution.
+- Settled on the user's delegation 2026-11-11 (built on branch `generic-variant-inference`): **A
+  shared variant name takes the type its siblings decide**: a bare or called variant name several data types share, passed for
+  a generic function's type argument, is decided by what the call's other arguments decide of that
+  type argument: `assertEq(p.segments(0), MoveTo(10.0, 20.0))` takes `T = Segment` from the first
+  argument, so `MoveTo` is `Segment`'s. It is checked after the arguments that are not such names,
+  wherever it is written, so `same(MoveTo(1.0, 2.0), segment)` resolves too, and named arguments go
+  the same way. The elements of a collection literal and the two branches of an `if` agree the same
+  way: `[Close, segment]`, `if c then Close else segment`. Only the data type is taken from the
+  others; its type arguments are left for the variant's own fields to decide, so a later argument
+  may still widen them, as any argument's may. Where every argument for the type argument is such a
+  name, or the others decide a type that is none of the name's owners, the use is refused with the
+  usual message. Why: the name's type is fixed by the call before it is chosen, exactly as with a
+  parameter of the data type itself, and checking the shared names last makes the result
+  independent of argument order, which a reader expects of `assertEq(a, b)` and `assertEq(b, a)`.
+  Alternatives: left to right only, so `same(MoveTo(…), segment)` is refused (order-dependent, and
+  the expected value usually comes second); taking the decided type with its type arguments fixed
+  too (refuses a later argument that widens them); a second checking pass over the whole call
+  (the same answers here, with each argument checked twice).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
+
 - Proposed (branch `time-period`): **`a.monthsUntil(b)` counts a month whole when `b`'s day of the
   month has reached `a`'s** (the month difference, less one where `b`'s day is smaller, or plus one
   going backward where it is larger), and `a.until(b)` is those months and the days from `a +
@@ -5588,6 +5737,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `plusYears`, `plusMonths`, `plusWeeks` and `plusDays` take an `int`, as the makers do.
 - Proposed (branch `time-period`): **`Zoned ± Period` and `Zoned`'s `plus…` wait for step 3**,
   whose `Resolution` decides a period landing in a gap or an overlap.
+- Proposed (branch `time-period`): **the formatter breaks a long one-line `if` only after its last
+  `then`, `elif` or `else`**, keeping its tests, its earlier branches and any operators before it
+  on one line. *Why*: a line after an `if`'s test is its block, so a break there changes the
+  program (the formatter refused `library/avin/time/period.avin`); a break in an earlier branch
+  would put the next `elif` or `else` inside a continuation line. *Alternatives*: wrapping the
+  `if` in brackets to break inside it (adds tokens, which the formatter never does); leaving any
+  line holding an `if` long (also loses the safe break in the last branch).
 
 ## Open
 

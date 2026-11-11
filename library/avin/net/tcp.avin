@@ -127,9 +127,10 @@ private closedError() -> IoError = io.Other("the connection is closed")
 private val ChunkSize = 8192
 
 // The bytes a connection has read beyond what its caller has asked for, and the reading that works
-// through them before asking the connection for more. A TCP connection and a Unix one share it; each
-// passes the way it receives bytes from its own socket.
-private class ReadAhead(private var ahead: Array[byte], private var at: int)
+// through them before asking the connection for more. A TCP connection, a Unix one and a TLS one
+// share it; each passes the way it receives bytes from its own socket. `ahead` is what has already
+// arrived, read from `at`; a new connection's is `ReadAhead(Array.empty[byte](), 0)`.
+class ReadAhead(private var ahead: Array[byte], private var at: int)
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     read(max: int, fill: (int) -> Result[Array[byte], IoError]) -> Result[Array[byte], IoError]
@@ -188,10 +189,10 @@ private utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), 
 // A read or write waits at most `limitMs` milliseconds at a time for the connection, zero for no
 // limit.
 class TcpStream(private val conn: Socket, private val buffered: ReadAhead, private var closed: bool,
-                private var limitMs: int): Sendable
+                private var limitMs: int): Sendable, ByteStream
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
-    read(max: int) -> Result[Array[byte], IoError]
+    override read(max: int) -> Result[Array[byte], IoError]
         mine()
         if closed then return Err(closedError())
         buffered.read(max, received)
@@ -199,44 +200,44 @@ class TcpStream(private val conn: Socket, private val buffered: ReadAhead, priva
     // The next line, without its terminator, or `None` once the other end has finished sending and
     // every line has been read. A line ends at `\n`, a `\r` just before it being part of the
     // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
-    readLine() -> Result[Option[string], IoError]
+    override readLine() -> Result[Option[string], IoError]
         mine()
         if closed then return Err(closedError())
         buffered.readLine(received)
 
     // Everything the other end sends until it finishes, after what earlier reads left.
-    readAll() -> Result[Array[byte], IoError]
+    override readAll() -> Result[Array[byte], IoError]
         mine()
         if closed then return Err(closedError())
         buffered.readAll(received)
 
     // Sends all of `bytes`.
-    write(bytes: Array[byte]) -> Result[unit, IoError]
+    override write(bytes: Array[byte]) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
         afterWait(sendAll(conn, bytes, limitMs)).mapErr(ioError)
 
     // Sends `text` as UTF-8.
-    writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
+    override writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
 
     // A read or a write that waits longer than `d` for the other end fails with `TimedOut` from now
     // on; a duration of zero or less takes the limit away. The limit is kept in whole milliseconds, a
     // part of one counting as one, and each wait has the whole of it: a write that has to wait for
     // room several times fails only where one of those waits runs out.
-    setTimeout(d: Duration) -> Result[unit, IoError]
+    override setTimeout(d: Duration) -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
         limitMs = millisOf(d)
         Ok(())
 
     // Tells the other end nothing more will be sent; reading goes on.
-    shutdownOutput() -> Result[unit, IoError]
+    override shutdownOutput() -> Result[unit, IoError]
         mine()
         if closed then return Err(closedError())
         conn.shutdown(Write).mapErr(ioError)
 
     // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
-    close()
+    override close()
         mine()
         if !closed
             closed = true

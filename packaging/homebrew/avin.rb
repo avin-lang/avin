@@ -20,6 +20,10 @@ class Avin < Formula
   # LLVM's archiver with it.
   depends_on "sysl-lang/tap/sysl"
 
+  # TLS -- `avin.net.tls` and `https` in `avin.net.http` -- binds the Sysl package `openssl`, which
+  # links the machine's OpenSSL, found by pkg-config, and trusts its certificate store.
+  depends_on "openssl@3"
+
   # A collection out of Sysl is converted by two generic shim overloads, for a slice and a `Buf`,
   # that a program can reach at the same type argument, which needs Sysl 0.9.0; a handle passed to a
   # `&T` parameter is shared rather than copied, and a socket closes when its last copy goes, from
