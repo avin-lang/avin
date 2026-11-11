@@ -180,8 +180,9 @@ form. Devirtualization's whole-program part runs over summaries: each function's
 what it returns and for the object of each of its calls through a table, the set of what it may be
 (an object of one descriptor, what one function returns, or unknown), found once from the function
 alone, and the fixed point of what each function returns is found over the summaries; only a function
-that calls through a table is rewritten. Running the passes again only where an instance's world
-facts changed is not done yet (see [decisions](/spec/decisions/#proposed)).
+that calls through a table is rewritten. The passes run over every instance rather than only where
+an instance's world facts changed, which needs a key over the cone of the call graph a function's
+passes read (see [decisions](/spec/decisions/#proposed)).
 
 **Stable names.** The emitted text names everything by what it is, never by the order the checker
 or lowering found it in, so one new function, string or type renames nothing else. Each table's

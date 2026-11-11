@@ -343,7 +343,23 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    `.avin/build/incremental/<kind><level>/`, the worklist replaying requests, the passes rerun only
    where facts changed; `AVIN_INCREMENTAL=verify`. Tests: the edit matrix's counts; the oracle
    (incremental text equals a clean build's) for every edit; two builds of one program at once both
-   correct; a truncated entry treated as a miss; trimming sparing the other level.
+   correct; a truncated entry treated as a miss; trimming sparing the other level. **Done:** with
+   `AVIN_INCREMENTAL=on` (or `verify`), `avin build` and `avin emit-llvm` keep, per module, a lowered
+   entry under each instance's own key (the requests lowering it made, replayed through the
+   worklist, and its code by stable names) and a text entry under its finished key and the emission
+   facts, in CRC-checked module files named by their keys, a manifest written last and no lock, as
+   the [pipeline](/compiler/#incremental-builds) defines; the passes still run over every instance.
+   The tests hold an edit matrix (a body, a default argument, a signature, a constant, a class field,
+   a renamed data field, an overload, an implementing class, an impl for a data type, a generic
+   function, a callee's inferred result, a lambda's body and captures, lines added above and inside
+   a function, a moved function, a call removed) to lowering exactly the instances with new own keys
+   and to a clean build's text, and cover truncated, damaged and missing files, another compiler's
+   entries, trimming, two builds at once, `-O0` and `-O2`, and a corpus sample built warm. On marshal
+   at `-O2` (load average 30 to 70), a one-line leaf edit rebuilds in 21.1 s against 27.0 s without
+   the cache (cold 26.7 s against 26.9 s): emission 5.8 s to 1.5 s and the keys 0.8 s to 0.13 s, but
+   lowering only 11.0 s to 9.1 s with 24,246 of 41,583 instances' code from the cache, since the
+   passes still run everywhere and checking (7 s) is untouched; `verify` passes on the edit and back.
+   The cache is 22 module files, 185 MB.
 7. **The commands.** `avin build`, `run` and `test` and the language server's builds through it, the
    corpus run with the cache warm as well as cold (each corpus program edited by a script and checked
    against a clean build).
