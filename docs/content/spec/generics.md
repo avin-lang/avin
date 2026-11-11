@@ -91,7 +91,9 @@ class SortedPair[T: Ordered](first: T, second: T)
   (`T(n)`, trapping when `n` does not fit, as integers do; `T.wrap(n)` keeps the low bits); each instance converts
   at its width. The bitwise operators `&`, `|`, `^`, `<<` and `>>` also work on such a `T`, both
   operands of type `T` (`x >> T(1)`), as the machine's operators at each instance's width; a `T`
-  with any other bound has them only as methods of those names.
+  with any other bound has them only as methods of those names. So do the wrapping operators `+%`,
+  `-%`, `*%` and the saturating `+|`, `-|`, `*|` (and their compound forms), which a `T` with any other
+  bound lacks.
 
 ```text
 digits[T: Integer](x: T) -> int
