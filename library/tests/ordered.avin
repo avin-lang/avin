@@ -1,0 +1,400 @@
+// OrderedMap and OrderedSet (the SeqMap and SeqSet traits): iteration in insertion order, an update
+// keeping its key's place, a removed key coming back at the end, compaction after many removals,
+// equality that ignores order, covariant values, and the trait-typed forms.
+
+open class Animal(val name: string)
+class Cat(n: string): Animal(n)
+class Dog(n: string): Animal(n)
+
+// A key whose hash is the same for every value, so every key collides with every other.
+data Clash(n: int)
+
+impl Eq for Clash
+    equals(other: Clash) -> bool = n == other.n
+
+impl Hash for Clash
+    hash() -> long = 7
+
+@test("an empty ordered map has no entries and nothing to remove")
+emptyOrderedMap()
+    val m = OrderedMap.empty[string, int]()
+    assert(m.isEmpty())
+    assert(!m.nonEmpty())
+    assertEq(m.size(), 0)
+    assertEq(m.get("a"), None)
+    assertEq(m.removed("a"), m)
+    assertEq(m.keys().length(), 0)
+    assertEq(m.values().length(), 0)
+    assert(!m.iterator().hasNext())
+    assert(!m.reverseIterator().hasNext())
+    assertEq(m.headOption(), None)
+    assertEq(m.lastOption(), None)
+    assertEq(s"$m", "{}")
+
+@test("one entry")
+oneEntry()
+    val m = OrderedMap(("a", 1))
+    assertEq(m.size(), 1)
+    assertEq(m.head(), ("a", 1))
+    assertEq(m.last(), ("a", 1))
+    assertEq(m("a"), 1)
+    assertEq(m.removed("a").size(), 0)
+    assertEq(m.removed("b"), m)
+    assertEq(m.keys(), ["a"])
+
+@test("entries iterate in the order their keys were added, not hash order")
+insertionOrder()
+    var m = OrderedMap.empty[int, string]()
+    val keys = [50, 3, 17, 99, 1, 42, 8, 1000, -5, 0]
+    for k in keys do m = m.updated(k, s"v$k")
+    assertEq(m.keys(), keys)
+    assertEq(m.values(), keys.map(k -> s"v$k"))
+    assertEq(m.size(), keys.length())
+    for k in keys do assertEq(m.get(k), Some(s"v$k"))
+    assertEq(m.keySet().toVector(), keys)
+
+@test("updating a key keeps its place and replaces its value")
+updateKeepsPlace()
+    val m = OrderedMap(("b", 1), ("a", 2), ("c", 3)).updated("a", 20)
+    assertEq(m.keys(), ["b", "a", "c"])
+    assertEq(m.values(), [1, 20, 3])
+    assertEq(m.size(), 3)
+    val n = m.updated("b", 10).updated("c", 30)
+    assertEq(n.keys(), ["b", "a", "c"])
+    assertEq(n.values(), [10, 20, 30])
+    assertEq(m.values(), [1, 20, 3])
+
+@test("a removed key leaves the others in order and comes back at the end")
+removeAndReinsert()
+    val m = OrderedMap(("a", 1), ("b", 2), ("c", 3), ("d", 4))
+    val r = m.removed("b")
+    assertEq(r.keys(), ["a", "c", "d"])
+    assertEq(r.size(), 3)
+    assertEq(r.get("b"), None)
+    assertEq(r.updated("b", 20).keys(), ["a", "c", "d", "b"])
+    assertEq(r.removed("a").removed("d").keys(), ["c"])
+    assertEq(m.keys(), ["a", "b", "c", "d"])
+    assertEq(m.removed("a").updated("a", 0).keys(), ["b", "c", "d", "a"])
+
+@test("removing everything leaves an empty map that fills again in order")
+removeAll()
+    var m = OrderedMap.empty[int, int]()
+    for i in 0..<40 do m = m.updated(i, i)
+    for i in 0..<40 do m = m.removed(i)
+    assert(m.isEmpty())
+    assertEq(m.keys().length(), 0)
+    m = m.updated(7, 1).updated(3, 2)
+    assertEq(m.keys(), [7, 3])
+
+@test("the reverse iterator visits the last added first, skipping removed keys")
+reverseIteration()
+    val m = OrderedMap((1, "a"), (2, "b"), (3, "c"), (4, "d")).removed(3)
+    assertEq(m.reverseIterator().toVector(), [(4, "d"), (2, "b"), (1, "a")])
+    assertEq(m.iterator().toVector(), [(1, "a"), (2, "b"), (4, "d")])
+    val s = OrderedSet(5, 6, 7, 8).excl(8)
+    assertEq(s.reverseIterator().toVector(), [7, 6, 5])
+
+// A model: the entries as a vector of pairs in order, changed by linear search.
+modelUpdated(model: Vector[(int, int)], k: int, v: int) -> Vector[(int, int)]
+    var found = false
+    val out = model.map(e ->
+        if e.0 == k
+            found = true
+            (k, v)
+        else e)
+    if found then out else out :+ (k, v)
+
+modelRemoved(model: Vector[(int, int)], k: int) -> Vector[(int, int)] = model.filter(e -> e.0 != k)
+
+@test("a long run of updates and removals agrees with a model at every step, through compaction")
+againstModel()
+    var m = OrderedMap.empty[int, int]()
+    var model: Vector[(int, int)] = []
+    var seed = 12345
+    for step in 0..<1500
+        seed = (seed * 1103 + 12345) % 1000003
+        val k = (seed / 7) % 60
+        // Bursts of removals, so that gaps outnumber entries and the map compacts.
+        if (step / 100) % 3 == 2 || seed % 3 == 0
+            m = m.removed(k)
+            model = modelRemoved(model, k)
+        else
+            m = m.updated(k, step)
+            model = modelUpdated(model, k, step)
+        assertEq(m.size(), model.length())
+        assertEq(m.iterator().toVector(), model)
+        assertEq(m.reverseIterator().toVector(), model.reverse())
+        for e in model do assertEq(m.get(e.0), Some(e.1))
+
+@test("the same run through a set agrees with a model")
+setAgainstModel()
+    var s = OrderedSet.empty[int]()
+    var model: Vector[int] = []
+    var seed = 777
+    for step in 0..<1500
+        seed = (seed * 1103 + 12345) % 1000003
+        val x = (seed / 7) % 50
+        if (step / 90) % 3 == 2 || seed % 3 == 0
+            s = s.excl(x)
+            model = model.filter(y -> y != x)
+        else
+            s = s.incl(x)
+            if !model.contains(x) then model = model :+ x
+        assertEq(s.size(), model.length())
+        assertEq(s.iterator().toVector(), model)
+        assertEq(s.reverseIterator().toVector(), model.reverse())
+        for y in model do assert(s.contains(y))
+
+@test("many removals leave a map that still looks up and iterates correctly")
+compactionLarge()
+    var m = OrderedMap.empty[int, int]()
+    for i in 0..<500 do m = m.updated(i, i * 2)
+    for i in 0..<500
+        if i % 5 != 0 then m = m.removed(i)
+    assertEq(m.size(), 100)
+    assertEq(m.keys(), Vector.tabulate(100, i -> i * 5))
+    for i in 0..<500 do assertEq(m.get(i), if i % 5 == 0 then Some(i * 2) else None)
+    m = m.updated(1, 1)
+    assertEq(m.keys().last(), 1)
+    assertEq(m.size(), 101)
+
+@test("removals compact the slots, so a map that churns stays within twice its size")
+compactionBound()
+    var m = OrderedMap.empty[int, int]()
+    for round in 0..<50
+        for i in 0..<20 do m = m.updated(round * 100 + i, i)
+        for i in 0..<20 do m = m.removed(round * 100 + i)
+        m = m.updated(-round, 0)
+        assert(m.slots.length() <= 2 * m.size() + 9)
+    assertEq(m.size(), 50)
+    var s = OrderedSet.empty[int]()
+    for round in 0..<50
+        for i in 0..<20 do s = s.incl(round * 100 + i)
+        for i in 0..<20 do s = s.excl(round * 100 + i)
+        s = s.incl(-round)
+        assert(s.slots.length() <= 2 * s.size() + 9)
+    assertEq(s.size(), 50)
+
+@test("an older map is unchanged by later updates and removals")
+persistence()
+    val a = OrderedMap(("a", 1), ("b", 2))
+    val b = a.updated("c", 3)
+    val c = b.removed("a")
+    val d = c.updated("a", 9)
+    assertEq(a.keys(), ["a", "b"])
+    assertEq(b.keys(), ["a", "b", "c"])
+    assertEq(c.keys(), ["b", "c"])
+    assertEq(d.keys(), ["b", "c", "a"])
+    assertEq(d.values(), [2, 3, 9])
+
+@test("keys that collide in the hash keep their own order")
+collidingKeys()
+    var m = OrderedMap.empty[Clash, int]()
+    for i in [5, 2, 9, 1, 7] do m = m.updated(Clash(i), i)
+    assertEq(m.keys().map(c -> c.n), [5, 2, 9, 1, 7])
+    val r = m.removed(Clash(9))
+    assertEq(r.keys().map(c -> c.n), [5, 2, 1, 7])
+    assertEq(r.get(Clash(7)), Some(7))
+    assertEq(r.get(Clash(9)), None)
+    val s = OrderedSet(Clash(3), Clash(1), Clash(2), Clash(1))
+    assertEq(s.toVector().map(c -> c.n), [3, 1, 2])
+
+@test("string and tuple keys")
+structuredKeys()
+    val m = OrderedMap(("pear", 1), ("apple", 2), ("fig", 3))
+    assertEq(m.keys(), ["pear", "apple", "fig"])
+    val t = OrderedMap(((2, "b"), 1), ((1, "a"), 2)).updated((2, "b"), 5)
+    assertEq(t.keys(), [(2, "b"), (1, "a")])
+    assertEq(t.values(), [5, 2])
+
+@test("the map operations keep insertion order")
+mapOperations()
+    val m = OrderedMap(("c", 3), ("a", 1), ("b", 2))
+    assertEq((m ++ [("d", 4), ("a", 10)]).iterator().toVector(), [("c", 3), ("a", 10), ("b", 2), ("d", 4)])
+    assertEq((m -- ["a", "zz"]).keys(), ["c", "b"])
+    assertEq(m.filterKeys(k -> k != "a").keys(), ["c", "b"])
+    assertEq(m.filter((k, v) -> v >= 2).keys(), ["c", "b"])
+    assertEq(m.transform((k, v) -> k + v.toString()).values(), ["c3", "a1", "b2"])
+    assertEq(m.mapValues(v -> v * 10).iterator().toVector(), [("c", 30), ("a", 10), ("b", 20)])
+    assertEq(m.updatedWith("a", o -> o.map(v -> v + 100)).values(), [3, 101, 2])
+    assertEq(m.updatedWith("z", o -> Some(0)).keys(), ["c", "a", "b", "z"])
+    assertEq(m.updatedWith("a", o -> None).keys(), ["c", "b"])
+    assertEq(m.updatedWith("z", o -> None), m)
+    assertEq(m.getOrElse("q", 7), 7)
+    assert(m.contains("a"))
+    assert(!m.contains("q"))
+    assertEq(m.keysIterator().toVector(), ["c", "a", "b"])
+    assertEq(m.valuesIterator().toVector(), [3, 1, 2])
+    var seen = ""
+    m.foreach((k, v) -> seen = seen + k + v.toString())
+    assertEq(seen, "c3a1b2")
+
+@test("map applied to a missing key traps", should_trap: "key not found in the map")
+missingKeyTraps()
+    OrderedMap(("a", 1))("b")
+
+@test("equality ignores order and kind, and equal maps hash alike")
+mapEquality()
+    val o = OrderedMap(("a", 1), ("b", 2), ("c", 3))
+    val p = OrderedMap(("c", 3), ("a", 1), ("b", 2))
+    assertEq(o, p)
+    assertEq(o.hash(), p.hash())
+    val h: Map[string, int] = HashMap(("b", 2), ("c", 3), ("a", 1))
+    val om: Map[string, int] = o
+    assert(om == h)
+    assert(h == om)
+    val t: Map[string, int] = TreeMap(("a", 1), ("b", 2), ("c", 3))
+    assert(om == t)
+    assert(!(o == OrderedMap(("a", 1), ("b", 2))))
+    assert(!(o == OrderedMap(("a", 1), ("b", 2), ("c", 4))))
+    assert(!(o == OrderedMap(("a", 1), ("b", 2), ("d", 3))))
+    assertEq(o.removed("a").updated("a", 1) == o, true)
+    assertEq(OrderedMap.empty[int, int](), OrderedMap.empty[int, int]())
+
+@test("values are covariant")
+covariantValues()
+    val cats: OrderedMap[string, Cat] = OrderedMap(("tom", Cat("Tom")))
+    val pets = cats.updated("rex", Dog("Rex"))
+    val animals: SeqMap[string, Animal] = pets
+    assertEq(animals.values().map(a -> a.name), ["Tom", "Rex"])
+    val viaPlus: SeqMap[string, Animal] = cats ++ [("fido", Dog("Fido"))]
+    assertEq(viaPlus.keys(), ["tom", "fido"])
+    val asMap: Map[string, Animal] = cats
+    assertEq(asMap.size(), 1)
+
+@test("updates through the traits keep the kind and the order")
+throughTraits()
+    val s: SeqMap[string, int] = OrderedMap(("z", 1), ("y", 2))
+    val u: SeqMap[string, int] = s.updated("a", 3).removed("z")
+    assertEq(u.keys(), ["y", "a"])
+    assertEq(u.keySet().toVector(), ["y", "a"])
+    assertEq(u.reverseIterator().toVector(), [("a", 3), ("y", 2)])
+    val m: Map[string, int] = s
+    assertEq(m.updated("q", 0).keys(), ["z", "y", "q"])
+    assertEq(m.removed("z").keys(), ["y"])
+    val set: SeqSet[int] = OrderedSet(9, 8)
+    assertEq(set.incl(7).excl(9).toVector(), [8, 7])
+    val plain: Set[int] = set
+    assertEq(plain.incl(1).toVector(), [9, 8, 1])
+
+@test("the companions and builders build ordered collections")
+companions()
+    assertEq(SeqMap.empty[int, int]().size(), 0)
+    assertEq(SeqMap((2, "b"), (1, "a")).keys(), [2, 1])
+    val b = OrderedMap.newBuilder[int, string]()
+    b.addOne((3, "c"))
+    b.addOne((1, "a"))
+    b.addOne((3, "z"))
+    assertEq(b.result().iterator().toVector(), [(3, "z"), (1, "a")])
+    val sb = SeqMap.newBuilder[int, int]()
+    sb.addOne((9, 1))
+    assertEq(sb.result().keys(), [9])
+    assertEq(SeqSet.empty[int]().size(), 0)
+    assertEq(SeqSet(3, 1, 3, 2).toVector(), [3, 1, 2])
+    val sb2 = OrderedSet.newBuilder[int]()
+    sb2.addOne(5)
+    sb2.addOne(4)
+    sb2.addOne(5)
+    assertEq(sb2.result().toVector(), [5, 4])
+    val lit: OrderedMap[string, int] = {"x": 1, "y": 2}
+    assertEq(lit.keys(), ["x", "y"])
+    val seq: SeqMap[int, int] = {3: 1, 1: 2, 2: 3}
+    assertEq(seq.keys(), [3, 1, 2])
+    val setLit: OrderedSet[int] = {30, 10, 20, 10}
+    assertEq(setLit.toVector(), [30, 10, 20])
+    val seqLit: SeqSet[int] = {3, 2, 1}
+    assertEq(seqLit.toVector(), [3, 2, 1])
+    val e: OrderedMap[int, int] = {}
+    assert(e.isEmpty())
+
+@test("a builder refuses use after its result was taken", should_trap: "add to a builder whose result was taken")
+spentBuilder()
+    val b = OrderedMap.newBuilder[int, int]()
+    b.addOne((1, 1))
+    b.result()
+    b.addOne((2, 2))
+
+@test("an empty ordered set and a one element set")
+emptyAndOneSet()
+    val e = OrderedSet.empty[int]()
+    assert(e.isEmpty())
+    assertEq(e.excl(1), e)
+    assert(!e.contains(1))
+    assertEq(s"$e", "{}")
+    val one = OrderedSet(4)
+    assertEq(one.head(), 4)
+    assertEq(one.last(), 4)
+    assertEq(one.excl(4).size(), 0)
+    assertEq(one.incl(4), one)
+
+@test("a set iterates in insertion order and ignores a repeated element")
+setOrder()
+    val s = OrderedSet(30, 10, 20, 10, 30, 5)
+    assertEq(s.toVector(), [30, 10, 20, 5])
+    assertEq(s.size(), 4)
+    assertEq(s.excl(10).toVector(), [30, 20, 5])
+    assertEq(s.excl(10).incl(10).toVector(), [30, 20, 5, 10])
+    assertEq(s.incl(30).toVector(), [30, 10, 20, 5])
+    assertEq(s.excl(99), s)
+    assert(s(20))
+    assert(!s(21))
+    assertEq(s.contains(5), true)
+
+@test("the set operations keep insertion order")
+setOperations()
+    val s = OrderedSet(5, 1, 4, 2)
+    assertEq((s ++ [9, 1, 7]).toVector(), [5, 1, 4, 2, 9, 7])
+    assertEq((s -- [1, 100]).toVector(), [5, 4, 2])
+    assertEq(s.union(OrderedSet(0, 5, 6)).toVector(), [5, 1, 4, 2, 0, 6])
+    assertEq(s.intersect(OrderedSet(2, 4, 8)).toVector(), [4, 2])
+    assertEq(s.diff(OrderedSet(1, 2)).toVector(), [5, 4])
+    assertEq(s.filter(x -> x % 2 == 0).toVector(), [4, 2])
+    assert(OrderedSet(1, 2).subsetOf(s))
+    assert(!OrderedSet(1, 3).subsetOf(s))
+    var total = 0
+    s.foreach(x -> total = total + x)
+    assertEq(total, 12)
+
+@test("set equality ignores order and kind, and equal sets hash alike")
+setEquality()
+    val a = OrderedSet(1, 2, 3)
+    val b = OrderedSet(3, 1, 2)
+    assertEq(a, b)
+    assertEq(a.hash(), b.hash())
+    val h: Set[int] = HashSet(2, 3, 1)
+    val sa: Set[int] = a
+    assert(sa == h)
+    assert(h == sa)
+    assert(sa == TreeSet(1, 2, 3))
+    assert(!(a == OrderedSet(1, 2)))
+    assert(!(a == OrderedSet(1, 2, 4)))
+    assertEq(a.excl(1).incl(1), b)
+
+@test("an ordered map and set display and debug in insertion order")
+displaying()
+    val m = OrderedMap(("b", 1), ("a", 2))
+    assertEq(s"$m", "{b: 1, a: 2}")
+    assertEq(f"$m%?", "{\"b\": 1, \"a\": 2}")
+    val s = OrderedSet("z", "y")
+    assertEq(s"$s", "{z, y}")
+    assertEq(f"$s%?", "{\"z\", \"y\"}")
+
+@test("the key set of an ordered map is an ordered set in the same order, with gaps dropped")
+keySetOrder()
+    val m = OrderedMap((3, "c"), (1, "a"), (2, "b"), (4, "d")).removed(1)
+    val ks = m.keySet()
+    assertEq(ks.toVector(), [3, 2, 4])
+    assertEq(ks.size(), 3)
+    assert(ks.contains(2))
+    assert(!ks.contains(1))
+    assertEq(ks.incl(1).toVector(), [3, 2, 4, 1])
+
+@test("collections of ordered maps and sets nest and are used as keys")
+nesting()
+    val outer = OrderedMap(("x", OrderedSet(2, 1)), ("y", OrderedSet(3)))
+    assertEq(outer("x").toVector(), [2, 1])
+    val byset = HashMap((OrderedSet(1, 2), "a"))
+    assertEq(byset.get(OrderedSet(2, 1)), Some("a"))
+    val grouped = OrderedMap.empty[string, OrderedSet[int]]()
+    val g = grouped.updated("k", OrderedSet(1)).updated("k", grouped.getOrElse("k", OrderedSet.empty[int]()).incl(5))
+    assertEq(g("k").toVector(), [5])
