@@ -6143,15 +6143,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   executable's path and modification time, not the level.** WHY: lowering does not depend on the
   level, and the pipeline keeps one instance directory per level. Alternatives: the level in the key
   as well (redundant with the directory), the executable's hash (reads 8 MB per build).
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `instance-cache`): **A lowered entry is the instance's requests and its
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **A lowered entry is the instance's requests and its
   code by name, replayed; not a record of lowering's state** ([the instance
   cache](/compiler/#incremental-builds)). Every request lowering an instance makes of the whole
   program goes through one function of lowering (seventeen of them: a layout, a record, an object's
@@ -6166,21 +6158,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives: the difference in lowering's state before and after each instance (state is keyed by
   the checker's indices, which an edit moves); a module's whole lowered program (a change anywhere
   in the module loses all of it).
-- Proposed (built on branch `instance-cache`): **Only the program's functions with bodies get lowered
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **Only the program's functions with bodies get lowered
   entries.** Closure entries, bindings and the functions lowering makes (equality, hashing, rendering,
   adapters, C callbacks) are lowered every build; every function gets a text entry. WHY: they are
   small and many of them depend on the whole set of types; on marshal they are about 17,000 of
   41,583 instances and a fraction of lowering's time. Alternatives: entries for every kind
   (each kind's requests would need recording; generated functions read tables the worklist is still
   filling).
-- Proposed (built on branch `instance-cache`): **A text entry is keyed by the finished key and the
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **A text entry is keyed by the finished key and the
   facts emission reads of the whole program**: for each call, the callee's symbol and signature,
   whether it may collect and whether the call may close a cycle of the call graph, and a shim's
   extensions. WHY: these decide the frame, the polls and the calling convention of a function's text
   and are not in its finished key, which covers its code. Alternatives: emission facts in the
   finished key itself (the keys would depend on emission's call graph); a hash of the finished code
   (costs an encoding of every function each build).
-- Proposed (built on branch `instance-cache`): **The passes still run over every instance on every
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The passes still run over every instance on every
   build**; devirtualization's fixed point runs over per-function summaries (the set of objects a
   receiver or a result may be) and rewrites only functions that call through a table, and the
   dispatch sites are found once per position and class or trait. Both give byte-identical text.
@@ -6190,11 +6182,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   dispatch targets as edges); that is a design of its own. Review with the user: it is what stands
   between the cache and a lowering phase proportional to an edit. Alternatives: build the cone keys
   now.
-- Proposed (built on branch `instance-cache`): **The cache is opt-in in this step**: `AVIN_INCREMENTAL`
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The cache is opt-in in this step**: `AVIN_INCREMENTAL`
   (`on`, `verify`, `off`) for `avin build` and `avin emit-llvm`, in
   `.avin/build/incremental/<kind><level>/`. WHY: item 7 of the plan makes `build`, `run`, `test` and
   the language server use it by default once the corpus has run warm. Alternatives: on by default now.
-- Proposed (built on branch `instance-cache`): **The store is a file per module named by a hash of
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The store is a file per module named by a hash of
   its module and keys, with a length and CRC-32 header, a manifest written last, and no lock**; a
   file is kept only if the build read it whole, and files neither named nor used in the last hour are
   trimmed, with no size limit. WHY: a name from the keys costs nothing to compute (a content hash
@@ -6202,11 +6194,18 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   builds write the same bytes for the same keys. Alternatives: an entry per file (41,000 files per
   build); a SHA-256 per file; a size limit as the unit cache has (the unit cache's hour rule already
   keeps it to what recent builds used).
-- Proposed (built on branch `instance-cache`): **`verify` compares the whole text and names the first
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **`verify` compares the whole text and names the first
   function that differs**, in the clean build's order, or the first line where no function does.
   WHY: the function's symbol says which key missed a dependency; its key adds nothing a reader can
   act on. Alternatives: compare instance by instance before emission (needs the clean build's
   instances matched to the cached build's).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
