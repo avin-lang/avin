@@ -116,6 +116,79 @@ derived_address_keeps_its_object()
     assert_eq(plan.cells, 1usize)
     assert_eq(plan.value_cells[0], Some(0usize))
 
+/** The frame of a function added to a lowered program, taking one array and holding no reference
+ * of its own but the elements it loads: `blocks` over the values typed `value_types`, value 0 the
+ * array. */
+private plan_of_added(value_types: Buf[MirType], slots: Buf[MirType], blocks: Buf[MirBlock]) -> RootPlan
+    var program = lowered(CellText + "main()\n    println(use(Cell(1)).toString())\n")
+    var params: Buf[MirType] = buf()
+    params.push(MRef)
+    program.functions.push(MirFunction("<program>.added", MirSignature(params, None), value_types, slots, blocks))
+    val graph = call_graph(program)
+    plan_roots(program, graph, collecting_functions(program, graph), program.functions.len() - 1)
+
+/** The call answering the address of the elements of the array value 0 into value 1. */
+private elements_call() -> Inst
+    var types: Buf[MirType] = buf()
+    types.push(MRef)
+    var args: Buf[Operand] = buf()
+    args.push(Value(0))
+    Call(Some(1usize), Runtime("avin_rt_c_array_elements", MirSignature(types, Some(MPtr))), args)
+
+private block(insts: Buf[Inst], term: Terminator) -> MirBlock = MirBlock(insts, term)
+
+private types_of(ts: []const MirType) -> Buf[MirType]
+    var out: Buf[MirType] = buf()
+    for t in ts do out.push(t)
+    out
+
+@test("an array stays rooted while the address of its elements is in use across a loop's poll, as a struct array's conversion for C uses it")
+elements_address_keeps_its_array_across_a_poll()
+    // v0 the array, v1 its elements, v2 the index, v3 the test, v4 an element's address, v5 the
+    // element, v6 the next index; slot 0 the index.
+    var blocks: Buf[MirBlock] = buf()
+    var entry: Buf[Inst] = buf()
+    entry.push(elements_call())
+    entry.push(Store(SlotAddress(0), ConstInt(64, "0")))
+    blocks.push(block(entry, Jump(1)))
+    var head: Buf[Inst] = buf()
+    head.push(Load(2, SlotAddress(0)))
+    head.push(Compare(3, CmpLt, Value(2), ConstInt(64, "4")))
+    blocks.push(block(head, Branch(Value(3), 2, 3)))
+    var body: Buf[Inst] = buf()
+    body.push(Index(4, Value(1), Value(2)))
+    body.push(Load(5, Value(4)))
+    body.push(Binary(6, OpAdd, Value(2), ConstInt(64, "1")))
+    body.push(Store(SlotAddress(0), Value(6)))
+    blocks.push(block(body, Jump(1)))
+    blocks.push(block(buf(), Return(None)))
+    val plan = plan_of_added(types_of([MRef, MPtr, MInt(64), MBool, MPtr, MRef, MInt(64)]), types_of([MInt(64)]), blocks)
+    assert_eq(plan.cells, 1usize)
+    assert_eq(plan.value_cells[0], Some(0usize))
+    assert(plan.value_cells[5] is None)
+
+@test("an array stays rooted while the address of its elements is in use across an allocation")
+elements_address_keeps_its_array_across_an_allocation()
+    var insts: Buf[Inst] = buf()
+    insts.push(elements_call())
+    insts.push(Alloc(2, 0))
+    insts.push(Load(3, Value(1)))
+    var blocks: Buf[MirBlock] = buf()
+    blocks.push(block(insts, Return(None)))
+    val plan = plan_of_added(types_of([MRef, MPtr, MRef, MRef]), buf(), blocks)
+    assert_eq(plan.value_cells[0], Some(0usize))
+
+@test("the address of an array's elements no longer in use keeps nothing rooted past it")
+elements_address_used_up_keeps_nothing()
+    var insts: Buf[Inst] = buf()
+    insts.push(elements_call())
+    insts.push(Load(2, Value(1)))
+    insts.push(Alloc(3, 0))
+    var blocks: Buf[MirBlock] = buf()
+    blocks.push(block(insts, Return(None)))
+    val plan = plan_of_added(types_of([MRef, MPtr, MRef, MRef]), buf(), blocks)
+    assert(plan.value_cells[0] is None)
+
 @test("a frame slot starts null only when the collector can read it before the function writes it")
 slots_start_null_only_when_read_first()
     val held = CellText + "keep(c: Cell) -> int\n    val d = Cell(c.n + 1)\n    use(d) + c.n\n\nmain()\n    println(keep(Cell(1)).toString())\n"
