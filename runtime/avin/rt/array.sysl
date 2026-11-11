@@ -5,9 +5,21 @@ import sysl.raw.ptr_cast
 
 // Avin's arrays. An array is a reference to an object holding its length and then its elements,
 // each its element type's width, with no gaps; its descriptor is in the header the collector keeps
-// before it. An array descriptor's `size` is one element's size, and it lists no reference offsets:
-// an array whose elements are references has `avin_rt_trace_array` as its kind's tracer, which marks
-// every element, and any other array has the ordinary tracer, which marks none.
+// before it. An array descriptor's `size` is one element's size, and its kind's tracer says which of
+// an element's words are references, in one of three ways:
+//
+// - `avin_rt_trace_array`: every element is one reference, and the tracer marks each. The
+//   descriptor lists no offsets.
+// - `avin_rt_trace`, the ordinary tracer: no element holds a reference. The descriptor lists no
+//   offsets, so the tracer marks nothing.
+// - `avin_rt_trace_array_map`: an element is `size` bytes, some of its words references and the
+//   rest scalars, and the descriptor's offsets are the element's map: the byte offset, within each
+//   element, of every word that holds a reference. The tracer marks those words of every element
+//   and never reads the others, so a scalar word whose bits look like a heap address keeps nothing
+//   alive.
+//
+// The first two are the fast paths, and the compiler uses them whenever they fit; the map is for an
+// element of several words that mixes the two, such as a union's tag, bits and reference.
 
 /** The header of an array object. `length` elements follow it. */
 struct ArrayHeader
@@ -62,6 +74,61 @@ array_clear(ctx: *Context, p: *u8, from: int, until: int)
 // being filled, or a constant object outside the heap; the collector ignores both.
 @export("avin_rt_trace_array")
 trace_array(p: *u8, h: *gc.Heap)
+    var m = HeapMarker(h)
+    scan_references(p, &m)
+
+// The tracer of an array whose elements hold references at the offsets its descriptor maps. A word
+// the map names may be null, or a constant object outside the heap, as a field may.
+@export("avin_rt_trace_array_map")
+trace_array_map(p: *u8, h: *gc.Heap)
+    var m = HeapMarker(h)
+    scan_mapped(p, &m)
+
+/** What reading an object's reference words does with each one: a collection marks it, and handing
+ * a value over follows it. Every tracer reads its object's words through one, so whatever reads them
+ * reads exactly the words a collection does. */
+trait Marker
+    mark(*self, p: *u8)
+
+/** The marker of a collection: each word read marks its object in `heap`. */
+struct HeapMarker
+    heap: *gc.Heap
+
+impl Marker for HeapMarker
+    mark(*self, p: *u8) = gc.mark(self.heap, p)
+
+/** Reads every word of the object at `p` that holds a reference, as its descriptor's tracer reads
+ * them, giving each to `m`: every element of an array of references, the mapped words of every
+ * element of an array with an element map, and otherwise the fields at the descriptor's offsets. */
+scan_object[M: Marker](p: *u8, m: *M)
+    val tracer = descriptor_of(p).kind.trace
+    if tracer == &trace_array then scan_references(p, m)
+    else if tracer == &trace_array_map then scan_mapped(p, m)
+    else scan_fields(p, m)
+
+/** Reads every element of the array of references at `p`. */
+scan_references[M: Marker](p: *u8, m: *M)
     val elements: **u8 = ptr_cast(array_elements(p))
     for i in 0..<array_length(p)
-        gc.mark(h, elements[i])
+        m.mark(elements[i])
+
+/** Reads, in every element of the array at `p`, the words its descriptor's element map names. */
+scan_mapped[M: Marker](p: *u8, m: *M)
+    val d = descriptor_of(p)
+    val offsets: *usize = ptr_cast(usize(d) + sizeof(Descriptor))
+    val size = d.size
+    val refs = d.refs
+    var element = usize(array_elements(p))
+    for _ in 0..<array_length(p)
+        for j in 0..<refs
+            val word: **u8 = ptr_cast(element + offsets[j])
+            m.mark(word[0])
+        element = element + size
+
+/** Reads the fields of the object at `p` at its descriptor's offsets, counted from its start. */
+scan_fields[M: Marker](p: *u8, m: *M)
+    val d = descriptor_of(p)
+    val offsets: *usize = ptr_cast(usize(d) + sizeof(Descriptor))
+    for i in 0..<d.refs
+        val field: **u8 = ptr_cast(usize(p) + offsets[i])
+        m.mark(field[0])
