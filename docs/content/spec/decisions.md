@@ -797,7 +797,8 @@ Settled by the user on 2026-11-04:
   characters has a list broken one item per line, a call's or a literal's items two columns in and
   a parameter list's four, the closing bracket on its own line; a list the source wrote one item
   per line stays so; a binding's value with no list to break is broken before its loosest operators
-  as continuation lines. No trailing commas are added. The formatter keeps every token and
+  as continuation lines, though only after the last `then`, `elif` or `else` of a one-line `if`
+  (a line after an `if`'s test is its block, so a test and an earlier branch stay whole). No trailing commas are added. The formatter keeps every token and
   refuses a file that does not parse; its result parses to the same syntax tree.
 
 - **`compareAndSet` on a value without identity** — a data value, tuple, string, `Option` or `Any` —
@@ -5805,6 +5806,46 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the three a common `ByteStream`; declaring it on the trait covers every connection, the TLS one
   included, with one line. *Alternatives*: naming `io.Reader` beside `ByteStream` on each class (TLS
   left out unless named a third time).
+
+- Proposed (branch `time-period`): **`a.monthsUntil(b)` counts a month whole when `b`'s day of the
+  month has reached `a`'s** (the month difference, less one where `b`'s day is smaller, or plus one
+  going backward where it is larger), and `a.until(b)` is those months and the days from `a +
+  months(n)` to `b`. *Why*: it is the chapter's "as a person counts them" (2026-01-31 to 2026-02-28
+  is 0, to 2026-03-01 is 1), it makes `b.monthsUntil(a) == -a.monthsUntil(b)` always, and with
+  months-first addition `a + a.until(b) == b` holds in both directions (a sweep of 21,228 pairs
+  tests it). `b - a.until(b) == a` and `b.until(a) == -a.until(b)` fail for some pairs near month
+  ends (2026-01-30 and 2026-03-01), and the chapter now says so. *Alternatives*: the largest `n`
+  with `a + months(n) <= b` (answers 1 for 2026-01-31 to 2026-02-28, against the chapter); counting
+  backward periods from `b` so the reverse is the negation (breaks `a + a.until(b) == b` for
+  `a > b`).
+- Proposed (branch `time-period`): **`p.toIsoString()` writes a period in ISO 8601's form**,
+  `P1Y2M3D`, the months split into years as the display splits them, `P0D` for the empty period,
+  and a negative part with its own sign (`P-1Y-2M`, `P1M-3D`). *Why*: the display `1y 2mo 3d` is
+  for people; exchange formats want ISO's, and a period's parts may differ in sign, which a single
+  leading `-` cannot write. *Alternatives*: a leading `-` when every part is negative and per-part
+  signs only otherwise (two rules for one value); no ISO text until step 5's parsing (a writer
+  without a reader for a while). Review with the user whether the step 5 parser should read it
+  (`parsePeriod`), which the chapter does not list.
+- Proposed (branch `time-period`): **`toYearsPart()` and `toMonthsPart()` carry the months' sign**
+  (`months(-14)` is -1 year and -2 months), as `Duration`'s parts do, and the display and ISO text
+  write each part with that sign (`-1y -2mo`). **`p.isZero()`** asks for the empty period, as
+  `Duration.isZero()` does. *Alternatives*: floor division (-2 years and 10 months, which reads as
+  something else); no `isZero` (`p == Period.Zero` says the same, less directly).
+- Proposed (branch `time-period`): **calendar steps count in a `long`**: `Date ± Period`,
+  `plusYears(n)` (`12 * n` months) and `plusWeeks(n)` (`7 * n` days) never overflow on the way, so
+  an answer past the dates traps naming the date (`the date +5881580-08-11 is outside Date.Min to
+  Date.Max`), or the count of days where only a day step overflows, as step 2's traps do; the
+  makers `years(n)` and `Period * n`, whose answers are periods, trap as an integer overflow.
+  `plusYears`, `plusMonths`, `plusWeeks` and `plusDays` take an `int`, as the makers do.
+- Proposed (branch `time-period`): **`Zoned ± Period` and `Zoned`'s `plus…` wait for step 3**,
+  whose `Resolution` decides a period landing in a gap or an overlap.
+- Proposed (branch `time-period`): **the formatter breaks a long one-line `if` only after its last
+  `then`, `elif` or `else`**, keeping its tests, its earlier branches and any operators before it
+  on one line. *Why*: a line after an `if`'s test is its block, so a break there changes the
+  program (the formatter refused `library/avin/time/period.avin`); a break in an earlier branch
+  would put the next `elif` or `else` inside a continuation line. *Alternatives*: wrapping the
+  `if` in brackets to break inside it (adds tokens, which the formatter never does); leaving any
+  line holding an `if` long (also loses the safe break in the last branch).
 
 ## Open
 
