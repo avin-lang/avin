@@ -1025,6 +1025,19 @@ built-in type implements every method of the trait, defaults included.
   misses a bound is an error naming the bound. [Generics](generics.md) has the rules.
 - A method added to a built-in type (`impl string`, `impl int`) is called on a value of that type,
   `"hi".shout()`, `7.squared()`.
+- **An impl without `for` may add methods to tuples and to functions**, naming a tuple or a function
+  type built from its parameters: `impl[A, B] (A, B)` adds to every pair, `impl[A] (A, A)` to the
+  pairs whose parts are of one type, `impl[A, B] (A) -> B` to every function of one parameter. The
+  tuple and function types are the core library's, so such an impl elsewhere is an extension. The
+  receiver matches as for any type built from parameters, and a call on a tuple or a function of
+  another shape says what it would need to be ("`swap` is for a pair; this is `(int, int, int)`").
+  A function type is a trait, so its methods reach a value of a type naming that function type, a
+  sequence or a map among them, and the type's own method of the same name and parameter types is
+  found first; a `@sendable` function type adds only to `@sendable` functions. Neither form has
+  static members, and a tuple's operators stay the language's. An impl of a trait is never for a
+  function type, and one for tuples is the core library's alone. The impl has at least one type
+  parameter, since `impl (`… with none begins a function named `impl`; a part may still be written
+  out, as `impl[A] (A, int)` adds to the pairs whose second part is an `int`.
 - **An impl without `for` whose type is a trait adds methods to the trait** (`impl[T] Seq[T]`,
   `impl[T: Display] Seq[T]`). Every value whose type conforms to the trait has
   them: a class or `data` type implementing it, the trait's own type, a type parameter it bounds.

@@ -6370,6 +6370,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   on an iterator of collections, lazily, beside the eager one on every collection of collections.
   Alternatives: windows read at `next()` only (no lookahead, but `hasNext()` could not answer for a
   step that skips past the end); `buffered()` answering a buffered iterator itself.
+- Proposed (branch `stdlib-predef`): **an impl without `for` adds methods to tuple and function
+  types** built from its parameters (`impl[A, B] (A, B)`, `impl[A, B] (A) -> B`), as the impl chapter
+  already allowed for any type built from parameters and for traits, which function types are. The
+  checker refused both ("an impl adds to a data type, a class, an object or a built-in type"; "an
+  impl for every tuple of an arity implements a trait"); that was a bug against the design and is
+  fixed. The choices the chapter did not settle: **a function type's methods reach the types that
+  are subtypes of it** (a data type or class naming it, sequences, sets, maps, partial functions), as
+  a trait's added methods reach its implementers, and **the type's own method of the same parameter
+  types is found first**, as for a trait; a tuple pattern stays exact, as other non-trait patterns
+  do. **A `@sendable` function type in the pattern matches only `@sendable` functions.** Such an impl
+  outside the core library is an extension, since the tuple and function types are the core
+  library's. Rationale: these follow the existing rules for traits and for patterns, with no new
+  rule. Alternatives weighed: matching only receivers whose static type is a function type (a
+  `Vector` would then lack `andThen`, though it is passed wherever an `(int) -> T` is); treating a
+  `@sendable` pattern as plain (its methods would reach functions that may not run on another
+  thread, against what the impl names).
+- Proposed (branch `stdlib-predef`): **an impl naming a tuple or function type has at least one type
+  parameter.** `impl (int, int)` with none begins a function named `impl`, since `impl` is a
+  keyword only before a type and `impl(…)` declares a function; `impl() -> int` followed by a body
+  reads either way, so no rule on the tokens can tell them apart. A part may be written out
+  (`impl[A] (A, int)`). Alternatives weighed: allowing `impl[]` (an empty list says nothing and the
+  parser refuses it for every impl); making `impl` a full keyword (breaks a function of that name).
+  Review with the user: whether an impl for one concrete tuple or function type is wanted enough to
+  reserve `impl (`.
+- Proposed (branch `stdlib-predef`): **`require(condition, message)` takes the message by name**, so
+  it is built only when the requirement fails, while `assert(condition, message)` takes a plain
+  string. Rationale: `require` sits at the top of ordinary functions, called on every call, and its
+  message usually interpolates the arguments; building it every time would cost the common path.
+  Alternatives weighed: a plain string, as `assert` (cost on every call); changing `assert` to by-name
+  as well (out of this item's scope; it would be a separate change to a settled API). `todo(message)`
+  takes a plain string, since it always traps. **`ensuring` is not provided**: it needs an impl for
+  every type (`impl[T] T`), which only the integer family has; a postcondition is written with
+  `require`/`assert` on the result.
 
 ## Open
 

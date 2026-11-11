@@ -235,7 +235,10 @@ returns `unit`.
 
 `(A, B, …)` is a tuple type of any arity, written and matched with parentheses: `(1, "one")`,
 `(n, name) -> …`. Elements are read with `t.0`, `t.1`. Tuples are values with no identity and derive
-`Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do.
+`Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do. A pair has `swap()`, the pair
+with its parts the other way round: `(1, "one").swap()` is `("one", 1)`. A program adds methods to
+tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from its parameters,
+`impl[A, B] (A, B)` or `impl[A] (A, A)`; only the core library implements a trait for tuples.
 
 Where a value fills the rest of a line, a tuple needs no parentheses: after `=` in a function, clause
 or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
@@ -334,6 +337,28 @@ collections are functions this way: a `Seq[T]` is an `(int) -> T`, a `Set[A]` an
 `Map[K, V]` a `(K) -> V` (see [collections](/spec/collections/#collections-as-functions)).
 
 There is no arity limit.
+
+**Functions compose.** The core library adds to every function of one parameter `f.andThen(g)`, the
+function that runs `f` and then `g` on its result, and `f.compose(g)`, which runs `g` first; and to
+every function of two parameters `f.tupled()`, the function taking its two arguments as one pair. A
+function type is a trait, so they reach every value that is a function of that shape: a lambda, a
+reference to a function, a method value, and a value of a type naming a function type, a sequence or
+a map among them. A type's own method of the same name and parameter types is found first.
+`identity`, in the prelude, is the function that gives back its argument, for passing where a
+function is asked for and nothing should change.
+
+```text
+val inc = (x: int) -> x + 1
+inc.andThen(x -> x * 2)(3)              // 8
+inc.compose((x: int) -> x * 2)(3)       // 7
+((a: int, b: int) -> a + b).tupled()((2, 3))   // 5
+[1, 2, 3].andThen(n -> n * 10)(0)       // 10: a sequence is a function of its index
+[[1], [2, 3]].flatMap(identity)         // [1, 2, 3]
+```
+
+A program may add methods to function types the same way, with an
+[impl](/spec/declarations/#impl) naming one: `impl[A] (A) -> A`, `impl[A, B, C] (A, B) -> C`. A
+`@sendable (A) -> B` there adds only to `@sendable` functions.
 
 **`@sendable` before a function type**, `@sendable (A) -> B`, makes the type of a function that may
 run on any thread: it captures only sendable values and no `var`, and the code it runs reaches no
