@@ -5993,14 +5993,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   back exactly one reference when the class declares `retain`. *Alternatives*: none that keeps
   `keeps:` sound; the manager's small record is not given back, as the freetype package notes.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed 2026-11-11 (built on branch `openssl-024`): **a mirror's methods may be bound to Sysl**
+- Settled on the user's delegation 2026-11-11 (built on branch `openssl-024`): **a mirror's methods may be bound to Sysl**
   ([methods of a mirror](/spec/sysl-bindings/#methods-of-a-mirror)). A method without a body in an
   `impl` of a `@sysl` data type that names no trait is bound to the Sysl method of its name's words
   in snake_case, or the one its own `@sysl("name")` names, with `blocking` and `named` as on a
@@ -6023,6 +6016,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   variant names cannot share the module, and the two would be the same five cases. Review with
   the user whether a public library type mirroring a package's enum is wanted: a variant `openssl`
   adds must be added to `TlsRefusal`, which Sysl reports as not matching until it is.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
