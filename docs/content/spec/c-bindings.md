@@ -677,7 +677,9 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   parameter marked `length(data)`, which is not an Avin parameter, converted to that parameter's C
   type as any `int` argument is: an array too long for it stops the program at the call. The length
   may come before the array or after it, and a call may take several arrays, each with its own. A
-  binding taking an array whose length nothing carries is refused, since C could read past its end.
+  binding taking an array whose length nothing carries is refused, since C could read past its end;
+  one C fills with as many elements as another call says is [an `out` array](#arrays-and-out-parameters)
+  the binding allocates.
   An `Option` of an array passes null and a length of zero for `None`.
 
   ```avin
@@ -720,6 +722,25 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   array, an empty array where the length is zero, and stops the program otherwise, as a negative
   length does; where a status fails, the array is freed unread ([proposed](/spec/decisions/#proposed)).
   `bytes:` is the same for an `Array[byte]`.
+
+- **An array C fills is allocated by the binding** ([proposed](/spec/decisions/#proposed)): an `out`
+  pointer to the elements themselves, `out double *dashes`, named with `array:` and given a
+  `length:`, a C expression over the parameters evaluated in the glue *before* the call, since C
+  writes as many elements as some other call says and no parameter tells it how many. The glue
+  allocates that many, C fills them, and the array is copied into a new `Array` and freed. Cairo's dash
+  pattern is as long as `cairo_get_dash_count` says:
+
+  ```avin
+  @c("void cairo_get_dash(cairo_t *self, out double *dashes, out double *offset)",
+     array: "dashes", length: "cairo_get_dash_count(self)")
+  dash() -> (Array[real], real)
+  ```
+
+  A length of zero is an empty array, C still called. A negative length, or one longer than an array
+  holds, calls nothing and stops the program (`` `cairo_get_dash` answered through `dashes` a negative
+  length``). The array is never null, so never in an `Option`, and the binding frees it, so it takes
+  no `free:`; its elements are those of an array C allocates, and an out value's name is not yet
+  written when the length is evaluated, so a `length:` naming one is refused by clang in the glue.
 
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without

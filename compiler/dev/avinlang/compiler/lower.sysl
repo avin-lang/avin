@@ -2340,7 +2340,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     for t in symbol.params
         avin_types.push(concrete(l, t))
     val callee = if c_binding_glued(symbol.decl, p, avin_types, concrete(l, parts.result), l.program.data, l.program.classes) then c_call_glue(n) else p.symbol
-    val array_out = c_array_out_of(symbol.decl)
+    val array_outs = c_array_outs_of(symbol.decl)
     var in_at = 0usize
     var out_at = 0usize
     for k in 0..<p.params.len()
@@ -2390,8 +2390,8 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
                 optionals.push(false)
                 in_at += 1
             var slot = c_out_slot(l, symbol, q, t, given, given_type, &copies, at)
-            if array_out is Some(a)
-                if a.name != "" && a.name == q.name then slot.array = true
+            for j in 0..<array_outs.len()
+                if array_outs[j].name != "" && array_outs[j].name == q.name then slot.array = Some(j)
             outs.push(slot)
             scalars.push(CAddress)
             slot.memory match
@@ -2476,15 +2476,17 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         if c_handle_form(o.t, l.program.data, l.program.classes) is Some(_) then answers_handle = true
     val calls = CCall(s"`${p.symbol}` answered", args, objects, classes, optionals, skipped, answers_handle, record_slots)
     val answered = concrete(l, parts.result)
-    // The glue writes the length of the array C answers through the address passed last.
-    var length_slot: Option[usize] = None
-    if array_out is Some(_)
+    // The glue writes the length of each array C answers through the addresses passed last, in the
+    // order the binding names them.
+    var length_slots: Buf[usize] = buf()
+    for _ in array_outs
         val place = machine_slot(l, MInt(64))
         store(l, place, Some(ConstInt(64, "0")))
-        length_slot = Some(slot_of(place))
+        length_slots.push(slot_of(place))
         scalars.push(CAddress)
         passed.push(SlotAddress(slot_of(place)))
-    val outs_read = COutsRead(n, length_slot)
+    val length_slot: Option[usize] = if length_slots.len() > 0 then Some(length_slots[0]) else None
+    val outs_read = COutsRead(n, length_slots)
     // A status: `Ok` of the out values, read only when it is zero, and `Err` of the code otherwise.
     if c_status_error(answered, l.program.data) is Some(e)
         val mirror = c_mirror_of(e, l.program.data)
@@ -2732,8 +2734,8 @@ private struct COutSlot
     limit: Option[Operand]
     /** For a struct mirror, the C memory C fills, passed in place of a slot. */
     memory: Option[Operand]
-    /** Whether it is the pointer to the array C answers that `array:` names. */
-    array: bool
+    /** Where it is the pointer to an array C answers that `array:` names, which of them it is. */
+    array: Option[usize]
 
 // The slot of the `out` or `inout` parameter `q`, whose value is of Avin type `t`, holding the
 // argument `given`, of Avin type `given_type`, converted to the C type `q` points at, or zero or null.
@@ -2744,7 +2746,7 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
     if c_struct_of(t, l.program.data) is Some(d)
         val memory = c_struct_memory(l, ConstInt(64, c_struct_size(l, d).to_string()))
         if given is Some(x) then c_struct_write(l, symbol, d, x, memory, 0, copies, at)
-        return COutSlot(q, t, 0, CAddress, None, Some(memory), false)
+        return COutSlot(q, t, 0, CAddress, None, Some(memory), None)
     val pointer = c_handle_form(t, l.program.data, l.program.classes) is Some(_) || !(c_text_form(t, l.program.data, l.program.classes) is NoText) || c_array_form(t, l.program.data, l.program.classes) is Some(_) || c_memory_form(t, l.program.data, l.program.classes) is Some(_)
     if pointer
         val place = machine_slot(l, MPtr)
@@ -2756,7 +2758,7 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
                 copies.push(copy)
                 start = copy
         store(l, place, Some(start))
-        return COutSlot(q, t, slot_of(place), CAddress, None, None, false)
+        return COutSlot(q, t, slot_of(place), CAddress, None, None, None)
     val mirror = c_mirror_of(t, l.program.data)
     val s = c_scalar_of(q.pointee, if mirror is Some(_) then Int(64) else t, l.program.c_measures)
     val m = if s is CBinary32 then MInt(32) else c_machine(s)
@@ -2773,7 +2775,7 @@ private c_out_slot(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type, gi
             start = c_argument(l, x, given_type, s, c_integer_name(q.pointee, s), at)
             if s is CBinary32 then start = convert_op(l, RealToBinary32, MInt(32), start)
     store(l, place, Some(start))
-    COutSlot(q, t, slot_of(place), s, None, None, false)
+    COutSlot(q, t, slot_of(place), s, None, None, None)
 
 // The position among a binding's declared parameters of the `inout` parameter `q`, for a trap's
 // name of it.
@@ -2804,12 +2806,12 @@ private c_read_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf
         if o.memory is Some(memory)
             values.push(Some(c_struct_read(l, c_struct_of(o.t, l.program.data).unwrap(), memory, who, at)))
             continue
-        if o.array
+        if o.array is Some(j)
             val pointer = load(l, Some(Place(SlotAddress(o.slot), MPtr))).unwrap()
-            val length = load(l, Some(Place(SlotAddress(reading.length_slot.unwrap()), MInt(64)))).unwrap()
+            val length = load(l, Some(Place(SlotAddress(reading.length_slots[j]), MInt(64)))).unwrap()
             c_memory_form(o.t, l.program.data, l.program.classes) match
                 Some(m) -> values.push(Some(c_view_answer(l, call, o.t, m, pointer, length, who, at)))
-                None -> values.push(Some(c_array_answer(l, reading.symbol, o.t, pointer, length, who, at)))
+                None -> values.push(Some(c_array_answer(l, reading.symbol, j, o.t, pointer, length, who, at)))
             continue
         val place = Some(Place(SlotAddress(o.slot), if o.scalar is CAddress then MPtr elif o.scalar is CBinary32 then MInt(32) else c_machine(o.scalar)))
         val x = load(l, place).unwrap()
@@ -2840,10 +2842,10 @@ private c_read_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf
     COutValues(values, made, made_optional)
 
 /** What reading a binding's out values needs beyond their slots: the binding's symbol, which names
- * its glue, and the slot the glue writes the length of the array C answers into. */
+ * its glue, and the slots the glue writes the length of each array C answers into. */
 private struct COutsRead
     symbol: usize
-    length_slot: Option[usize]
+    length_slots: Buf[usize]
 
 /** C memory a call's struct mirrors were converted into, freed once the call has returned: for one
  * passed in, its mirror, whose strings were copied into it and are freed with it. What C fills or
@@ -3104,28 +3106,32 @@ private c_free_struct_memory(l: *Lowering, memory: Operand)
 private c_free_array_outs(l: *Lowering, outs: Buf[COutSlot], symbol: usize)
     for o in outs
         // Memory C lends is C's, and nothing frees it.
-        if !o.array || c_memory_form(o.t, l.program.data, l.program.classes) is Some(_) then continue
+        val j = o.array match
+            Some(j) -> j
+            None -> continue
+        if c_memory_form(o.t, l.program.data, l.program.classes) is Some(_) then continue
         val pointer = load(l, Some(Place(SlotAddress(o.slot), MPtr))).unwrap()
         var params: Buf[CScalar] = buf()
         params.push(CAddress)
         var args: Buf[Operand] = buf()
         args.push(pointer)
-        l.insts.push(Call(None, CFunction(c_array_free_glue(symbol), params, None), args))
+        l.insts.push(Call(None, CFunction(c_array_free_glue(symbol, j), params, None), args))
 
 // The array C answered at `pointer`, `length` elements long, as the Avin type `t`, an `Array` or an
 // `Option` of one: copied into a new array, each element as its type is, a struct mirror's read as
-// an out value is, and then freed through the binding's glue. Null is `None` for an `Option`, and
-// otherwise an empty array where the length is zero and a stop where it is not; a negative length,
-// or one longer than an array holds, stops the program.
-private c_array_answer(l: *Lowering, symbol: usize, t: &Type, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+// an out value is, and then freed through the binding's glue, the `j`th array's. Null is `None` for
+// an `Option`, and otherwise an empty array where the length is zero and a stop where it is not; a
+// negative length, or one longer than an array holds, stops the program, before null does.
+private c_array_answer(l: *Lowering, symbol: usize, j: usize, t: &Type, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
     val form = c_array_form(t, l.program.data, l.program.classes).unwrap()
     val absent = compare(l, CmpEq, pointer, NullAddress)
     if !form.optional
+        c_array_length_traps(l, length, who, at)
         val counted = compare(l, CmpNe, length, ConstInt(64, "0"))
         val both = fresh(l, MBool)
         l.insts.push(Select(both, absent, counted, ConstBool(false)))
         trap_if(l, Value(both), s"$who null", at)
-        return c_array_copy_out(l, symbol, t, form.element, pointer, length, who, at)
+        return c_array_copy_out(l, symbol, j, t, form.element, pointer, length, who, at)
     val slot = machine_slot(l, MRef)
     val none = new_block(l)
     val present = new_block(l)
@@ -3134,14 +3140,18 @@ private c_array_answer(l: *Lowering, symbol: usize, t: &Type, pointer: Operand, 
     store(l, slot, Some(NullAddress))
     finish_into(l, Jump(join), present)
     val inner = option_argument(l.options, t).unwrap()
-    store(l, slot, Some(c_array_copy_out(l, symbol, inner, form.element, pointer, length, who, at)))
+    store(l, slot, Some(c_array_copy_out(l, symbol, j, inner, form.element, pointer, length, who, at)))
     finish_into(l, Jump(join), join)
     val value = load(l, slot).unwrap()
     if pointer_option(l, t) then value else option_object(l, t, value)
 
-private c_array_copy_out(l: *Lowering, symbol: usize, array: &Type, element: &Type, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+// Stops the program where the length of an array C answers is negative or longer than an array holds.
+private c_array_length_traps(l: *Lowering, length: Operand, who: string, at: Span)
     trap_if(l, compare(l, CmpLt, length, ConstInt(64, "0")), s"$who a negative length", at)
     trap_if(l, compare(l, CmpGt, length, ConstInt(64, "2147483647")), s"$who more elements than an array holds", at)
+
+private c_array_copy_out(l: *Lowering, symbol: usize, j: usize, array: &Type, element: &Type, pointer: Operand, length: Operand, who: string, at: Span) -> Operand
+    c_array_length_traps(l, length, who, at)
     val descriptor = layout(l, array).variants[0].descriptor
     val made = runtime_call(l, "avin_rt_new_array", [MPtr, MInt(64)], MRef, [DescriptorAddress(descriptor), length])
     val each = c_loop_start(l, length)
@@ -3162,7 +3172,7 @@ private c_array_copy_out(l: *Lowering, symbol: usize, array: &Type, element: &Ty
     params.push(CAddress)
     var args: Buf[Operand] = buf()
     args.push(pointer)
-    l.insts.push(Call(None, CFunction(c_array_free_glue(symbol), params, None), args))
+    l.insts.push(Call(None, CFunction(c_array_free_glue(symbol, j), params, None), args))
     made
 
 // The memory C lent at `pointer`, `length` bytes long, as the Avin type `t`, a view of the form `m`:

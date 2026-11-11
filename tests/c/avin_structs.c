@@ -225,6 +225,59 @@ void as_bad_answer(int which, as_point **points, int *count) {
     else { *points = malloc(sizeof(as_point)); *count = -1; }
 }
 
+static int dash_n = 0;
+static int dash_calls = 0;
+
+void as_dash_set(int n) { dash_n = n; }
+int as_dash_count(void) { return dash_n; }
+int as_dash_calls(void) { return dash_calls; }
+
+void as_dash_get(double *dashes, double *offset) {
+    dash_calls += 1;
+    for (int i = 0; i < dash_n; i++) dashes[i] = 0.5 + i;
+    *offset = dash_n * 2.0;
+}
+
+int as_glyphs_fill(int n, as_glyph *glyphs) {
+    if (n == 2) return 4;
+    for (int i = 0; i < n; i++) { glyphs[i].index = (unsigned long)i + 1; glyphs[i].x = i * 0.5; glyphs[i].y = -i; }
+    return 0;
+}
+
+int as_spread(int n, int32_t *ints, uint8_t *bytes) {
+    for (int i = 0; i < n; i++) ints[i] = i == 0 ? INT32_MIN : i == 1 ? INT32_MAX : i * -3;
+    for (int i = 0; i < 2 * n; i++) bytes[i] = (uint8_t)(255 - i);
+    return n * 3;
+}
+
+static int clusters_allocated = 0;
+static int clusters_freed = 0;
+static int shape_nulls = 0;
+
+int as_shape(const char *text, int n, as_glyph **glyphs, int *num_glyphs, as_cluster **clusters, int *num_clusters, as_cluster_flags *flags) {
+    int m = n < 0 ? 1 : n;
+    *glyphs = n == 0 ? NULL : glyphs_of(m);
+    *num_glyphs = m;
+    if (clusters == NULL && num_clusters == NULL && flags == NULL) shape_nulls += 1;
+    if (clusters != NULL) {
+        int k = (m + 1) / 2;
+        if (k == 0) *clusters = NULL;
+        else {
+            *clusters = malloc(sizeof(as_cluster) * (size_t)k);
+            for (int i = 0; i < k; i++) { (*clusters)[i].num_bytes = (int32_t)strlen(text) + i; (*clusters)[i].num_glyphs = i == k - 1 && m % 2 ? 1 : 2; }
+            clusters_allocated += 1;
+        }
+        if (num_clusters != NULL) *num_clusters = k;
+    }
+    if (flags != NULL) *flags = text[0] == 'r' ? AS_CLUSTER_BACKWARD : AS_CLUSTER_FORWARD;
+    return n < 0 ? 7 : 0;
+}
+
+void as_clusters_free(as_cluster *clusters) { clusters_freed += 1; free(clusters); }
+int as_clusters_allocated(void) { return clusters_allocated; }
+int as_clusters_freed(void) { return clusters_freed; }
+int as_shape_nulls(void) { return shape_nulls; }
+
 as_event as_event_int(int32_t i) { as_event e; e.p = NULL; e.i = i; return e; }
 as_event as_event_float(float f) { as_event e; e.p = NULL; e.f = f; return e; }
 int32_t as_event_to_int(as_event self) { return self.i; }

@@ -46,16 +46,17 @@ struct CUnitBinding
      * first, whether a struct crosses there by value. */
     glued: bool
     by_value: Buf[bool]
-    /** The array C answers through an `out` pointer, copied after the call, or the memory it lends as
-     * a view, when it answers one. */
-    array_out: Option[CUnitArrayOut]
+    /** The arrays C answers through `out` pointers, each copied after the call, or the memory it lends
+     * as a view, when it answers one, in the order the binding names them. */
+    array_outs: Buf[CUnitArrayOut]
     /** The prototype's indices of the parameters a `ByteBlock` is passed to. */
     blocks: Buf[usize]
 
 /** An array a binding's `array:` or `bytes:` names, or the memory its `view:` or bare `view` lends:
  * the prototype's index of the `out` parameter it is answered through, or the number of parameters
  * for the C result; the C type of its elements; the Avin type of an element; the C expression its
- * length is; how an array is freed; and whether it is a view, which nothing frees. */
+ * length is; how an array is freed; whether it is a view, which nothing frees; and whether it is an
+ * array C fills, `out T *`, which the glue allocates at its length evaluated before the call. */
 struct CUnitArrayOut
     param: usize
     element_text: string
@@ -63,6 +64,7 @@ struct CUnitArrayOut
     length: string
     free: Option[string]
     view: bool
+    filled: bool
 
 /** A struct mirror as the C unit checks and measures it: its name and data type's index, which names
  * its typedefs, the C struct it mirrors, its fields, and the unit, span and package that place it. */
@@ -286,16 +288,18 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             val q = p.params[i]
             by_value.push(q.mode is CIn && c_by_value(q.ty, params[i], program.data, program.classes))
             if c_is_avin_param(q) then glue_params.push(params[i])
-        var array_out: Option[CUnitArrayOut] = None
-        if c_array_out_of(s.decl) is Some(a)
+        var array_outs: Buf[CUnitArrayOut] = buf()
+        for a in c_array_outs_of(s.decl)
             // A view's bytes are checked through the pointer C lends them by: the C result's type for
             // a bare `view`, which the out parameters' indices do not reach.
             if a.view && a.name == ""
-                array_out = Some(CUnitArrayOut(p.params.len(), s"__typeof__(*(${p.result_text})0)", Byte, a.length, None, true))
+                array_outs.push(CUnitArrayOut(p.params.len(), s"__typeof__(*(${p.result_text})0)", Byte, a.length, None, true, false))
             elif c_array_out_index(p, a) is Some(k)
-                if a.view then array_out = Some(CUnitArrayOut(k, s"__typeof__(**(${p.params[k].pointee_text} *)0)", Byte, a.length, None, true))
+                if a.view then array_outs.push(CUnitArrayOut(k, s"__typeof__(**(${p.params[k].pointee_text} *)0)", Byte, a.length, None, true, false))
                 elif c_array_form(params[k], program.data, program.classes) is Some(form)
-                    array_out = Some(CUnitArrayOut(k, c_array_out_element(p.params[k]), form.element, a.length, a.free, false))
+                    // An array C fills is the glue's, given back with `free`.
+                    val filled = c_array_out_filled(p.params[k])
+                    array_outs.push(CUnitArrayOut(k, c_array_out_element(p.params[k]), form.element, a.length, if filled then Some("free") else a.free, false, filled))
         // The parameters a `ByteBlock` is passed to, a pointer to its bytes.
         var blocks: Buf[usize] = buf()
         for k in 0..<p.params.len()
@@ -317,7 +321,7 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             if c_handle_form(t, program.data, program.classes) is Some(h)
                 val used = package_of(program.classes[h.class_index].unit, files, library)
                 if used != package && !contains_text(uses, used) then uses.push(used)
-        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_out, blocks))
+        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_outs, blocks))
     out
 
 /** The struct mirrors of a checked program, in the order of its data types. */
@@ -689,7 +693,7 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
     // The glue gives back handles and frees arrays, often with `free`.
     var frees = handles.len() > 0
     for b in bindings
-        if b.array_out is Some(_) then frees = true
+        if b.array_outs.len() > 0 then frees = true
     if frees
         out.push("#include <stdlib.h>\n")
         lines.push(Plain)
@@ -1030,8 +1034,11 @@ private binding_glue(out: *StrBuilder, lines: *Buf[CUnitLine], b: CUnitBinding, 
             param = s"${q.text} *avin_s$k"
             arg = s"*avin_s$k"
         elif !(q.mode is CIn)
-            param = s"${q.text} avin_o$k"
-            arg = s"avin_o$k"
+            // An array C fills is passed the memory the glue allocates, through the slot it is
+            // answered in.
+            val filled = filled_array_at(b, k) is Some(_)
+            param = if filled then s"${q.text} *avin_o$k" else s"${q.text} avin_o$k"
+            arg = if filled then s"*avin_o$k" else s"avin_o$k"
             if q.name != "" then locals = locals + s" __typeof__(*avin_o$k) ${q.name} = *avin_o$k;"
         else
             val name = if q.name == "" then s"avin_a$k" else q.name
@@ -1039,34 +1046,67 @@ private binding_glue(out: *StrBuilder, lines: *Buf[CUnitLine], b: CUnitBinding, 
             arg = name
         params = params + (if params == "" then "" else ", ") + param
         args = args + (if args == "" then "" else ", ") + arg
-    if b.array_out is Some(_) then params = params + (if params == "" then "" else ", ") + "long long *avin_length"
+    for j in 0..<b.array_outs.len()
+        params = params + (if params == "" then "" else ", ") + s"long long *${c_array_length_param(j)}"
     if params == "" then params = "void"
     val returns = !answered_by_value && !(p.result is CVoidType)
     val result = if returns then p.result_text else "void"
     glue(out, lines, s"$result ${c_call_glue(b.symbol)}($params) {", BindingGlueLine(i, "call"))
+    // Each array C fills is allocated before the call, at its length over the parameters; a length
+    // no array holds calls nothing, and answers zero, the length stopping the program once read.
+    var filled_any = false
+    var range = ""
+    for j in 0..<b.array_outs.len()
+        val a = b.array_outs[j]
+        if !a.filled then continue
+        filled_any = true
+        glue(out, lines, s"    long long avin_n$j = (long long)(${a.length});", BindingGlueLine(i, c_array_glue_part("length", j)))
+        glue(out, lines, s"    *${c_array_length_param(j)} = avin_n$j;", BindingGlueLine(i, "call"))
+        range = range + (if range == "" then "" else " || ") + s"avin_n$j < 0 || avin_n$j > 2147483647"
+    val nothing = if answered_by_value then "{ __builtin_memset(avin_r, 0, sizeof *avin_r); return; }" elif returns then s"{ ${p.result_text} avin_z; __builtin_memset(&avin_z, 0, sizeof avin_z); return avin_z; }" else "return;"
+    if filled_any
+        glue(out, lines, s"    if ($range) $nothing", BindingGlueLine(i, "call"))
+        for j in 0..<b.array_outs.len()
+            val a = b.array_outs[j]
+            if !a.filled then continue
+            val k = a.param
+            glue(out, lines, s"    *avin_o$k = malloc(sizeof **avin_o$k * (size_t)(avin_n$j > 0 ? avin_n$j : 1));", BindingGlueLine(i, "call"))
+            glue(out, lines, s"    if (!*avin_o$k) $nothing", BindingGlueLine(i, "call"))
     val call = s"${p.symbol}($args)"
     if answered_by_value then glue(out, lines, s"    *avin_r = $call;", BindingGlueLine(i, "call"))
     elif returns then glue(out, lines, s"    ${p.result_text} avin_v = $call;", BindingGlueLine(i, "call"))
     else glue(out, lines, s"    $call;", BindingGlueLine(i, "call"))
-    if b.array_out is Some(a)
-        glue(out, lines, s"   $locals", BindingGlueLine(i, "call"))
-        glue(out, lines, s"    *avin_length = (long long)(${a.length});", BindingGlueLine(i, "length"))
+    // The length of each array C allocates, or lends, over the parameters and the out values.
+    var after = false
+    for j in 0..<b.array_outs.len()
+        val a = b.array_outs[j]
+        if a.filled then continue
+        if !after then glue(out, lines, s"   $locals", BindingGlueLine(i, "call"))
+        after = true
+        glue(out, lines, s"    *${c_array_length_param(j)} = (long long)(${a.length});", BindingGlueLine(i, c_array_glue_part("length", j)))
     if returns then glue(out, lines, "    return avin_v;", BindingGlueLine(i, "call"))
     glue(out, lines, "}", BindingGlueLine(i, "call"))
-    if b.array_out is Some(a)
+    for j in 0..<b.array_outs.len()
+        val a = b.array_outs[j]
         if a.view
             glue(out, lines, s"_Static_assert(${element_test(a.element, a.element_text)}, \"avin: the bytes ${b.name} lends\");", BindingGlueLine(i, "bytes"))
-            return
+            continue
         val name = p.params[a.param].name
         if c_array_element_size(a.element) > 0
-            glue(out, lines, s"_Static_assert(${element_test(a.element, a.element_text)}, \"avin: the elements of the array ${b.name} answers\");", BindingGlueLine(i, "element"))
-        glue(out, lines, s"void ${c_array_free_glue(b.symbol)}(${a.element_text} *$name) {", BindingGlueLine(i, "free"))
+            glue(out, lines, s"_Static_assert(${element_test(a.element, a.element_text)}, \"avin: the elements of the array ${b.name} answers\");", BindingGlueLine(i, c_array_glue_part("element", j)))
+        glue(out, lines, s"void ${c_array_free_glue(b.symbol, j)}(${a.element_text} *$name) {", BindingGlueLine(i, c_array_glue_part("free", j)))
         a.free match
             Some(f) ->
                 val freed = if is_c_identifier(f.trim()) then s"${f.trim()}((void *)$name)" else f
-                glue(out, lines, s"    if ($name) { $freed; }", BindingGlueLine(i, "free"))
+                glue(out, lines, s"    if ($name) { $freed; }", BindingGlueLine(i, c_array_glue_part("free", j)))
             None -> ()
-        glue(out, lines, "}", BindingGlueLine(i, "free"))
+        glue(out, lines, "}", BindingGlueLine(i, c_array_glue_part("free", j)))
+
+/** The array a binding names that C fills through its prototype's parameter `k`, if one does. */
+private filled_array_at(b: CUnitBinding, k: usize) -> Option[CUnitArrayOut]
+    for a in b.array_outs
+        if a.filled && a.param == k then return Some(a)
+    None
 
 // The checks of each struct mirror against its struct and of each opaque value's C type. A mirror's
 // struct is a struct, and each field's C type the kind its Avin type asks for, or the struct another
@@ -1593,16 +1633,25 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 if contains_text(troubles[i].glue_parts, part) then continue
                 troubles[i].glue_parts.push(part)
                 val b = bindings[i]
-                val a = b.array_out
+                // A part of the `j`th array's glue is named by its word followed by `j`, but for the first.
+                var word = part
+                var j = 0usize
+                val pb = part.bytes
+                var cut = pb.len
+                while cut > 0 && u8('0') <= pb[cut - 1] <= u8('9') do cut -= 1
+                if cut < pb.len
+                    word = part[..<cut]
+                    for at in cut..<pb.len do j = j * 10 + usize(pb[at] - u8('0'))
+                val a: Option[CUnitArrayOut] = if j < b.array_outs.len() then Some(b.array_outs[j]) else None
                 val array = a match
                     Some(x) -> if x.param < b.prototype.params.len() then b.prototype.params[x.param].name else ""
                     None -> ""
                 val lent = if array == "" then "the memory its result points at" else s"the memory `$array` points at"
-                if part == "bytes" then troubles[i].kinds.push(s"the C binding `${b.name}` lends $lent as a view, and its bytes are not of an integer type one byte wide in the headers")
-                elif part == "length" && a.unwrap().view then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of $lent as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
-                elif part == "length" then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of the array `$array` as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
-                elif part == "free" then troubles[i].glue.push(s"the C binding `${b.name}` frees the array `$array` with `${a.unwrap().free.unwrap_or("")}`, which does not compile against its headers: clang says '${d.message}'")
-                elif part == "element" then troubles[i].kinds.push(s"the C type `${a.unwrap().element_text}` the array `$array` points at is not ${element_text(a.unwrap().element)} in the headers, so it cannot hold the elements of an `Array[${type_name(a.unwrap().element)}]` as they are")
+                if word == "bytes" then troubles[i].kinds.push(s"the C binding `${b.name}` lends $lent as a view, and its bytes are not of an integer type one byte wide in the headers")
+                elif word == "length" && a.unwrap().view then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of $lent as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
+                elif word == "length" then troubles[i].glue.push(s"the C binding `${b.name}` gives the length of the array `$array` as `${a.unwrap().length}`, which does not compile against its headers: clang says '${d.message}'")
+                elif word == "free" then troubles[i].glue.push(s"the C binding `${b.name}` frees the array `$array` with `${a.unwrap().free.unwrap_or("")}`, which does not compile against its headers: clang says '${d.message}'")
+                elif word == "element" then troubles[i].kinds.push(s"the C type `${a.unwrap().element_text}` the array `$array` points at is not ${element_text(a.unwrap().element)} in the headers, so it cannot hold the elements of an `Array[${type_name(a.unwrap().element)}]` as they are")
                 else troubles[i].glue.push(s"the C binding `${b.name}` cannot be called through its glue: clang says '${d.message}'")
             StructLine(i, j, part) ->
                 placed_any = true

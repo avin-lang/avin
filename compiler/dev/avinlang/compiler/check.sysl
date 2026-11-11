@@ -7765,7 +7765,11 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     None -> s"`${cp.name}` is an array, its length carried by the parameter marked `length(${cp.name})`, so it crosses as an `Array` or an `Option` of one"
             elif array is Some(_) && inout then problem = "an array is passed in, a pointer to its elements, and never `inout`"
             elif array is Some(_) && cp.name == "" then problem = "C could read past the end of an array whose length nothing carries: name the pointer, and mark the integer parameter that carries its length `length(name)`"
-            elif array is Some(_) then problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
+            elif array is Some(_)
+                problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
+                // A pointer C may write through may be an array C fills, as many elements as another
+                // call says.
+                if !(" " + cp.text + " ").contains(" const ") then problem = problem + s", or, for an array C fills with as many elements as the binding can work out before the call, write it `out ${cp.text}${cp.name}` and name it with `array: \"${cp.name}\"`, its length a C expression given with `length:`"
             elif c_handle_form(t, c.data, c.classes) is Some(h)
                 problem = if inout then "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say" else c_handle_problem(c, h.class_index, cp.text, false)
             elif c_struct_form(t, c.data) is Some(m) then problem = c_struct_problem(c, m, cp)
@@ -7845,6 +7849,8 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                             else problem = c_view_problem(c, t, q.pointee_text, writable)
                         else
                             problem = c_array_out_problem(c, q, t)
+                            if problem == "" && c_array_out_filled(q) && free_text is Some(_)
+                                problem = s"the binding makes the array C fills through `${q.name}`, and frees it once copied; `free:` frees an array C allocates, answered through `out T **${q.name}`"
                             if problem == "" && array_word == "bytes"
                                 val bytes = c_array_form(t, c.data, c.classes) match
                                     Some(form) -> *form.element is Byte
@@ -8066,13 +8072,15 @@ private c_view_problem(c: *Checker, t: &Type, text: string, writable: bool) -> s
 private c_array_out_problem(c: *Checker, q: CParam, t: &Type) -> string
     if q.mode is CInOut then return s"C answers the array `${q.name}`, so it is `out`, not `inout`"
     val element_text = c_array_out_element(q)
-    if element_text == "" then return s"C answers an array through a pointer to a pointer to its elements, as in `out cairo_glyph_t **${q.name}`"
+    val filled = c_array_out_filled(q)
     val form = c_array_form(t, c.data, c.classes) match
         Some(f) -> f
-        None -> return "the array C answers is copied into an `Array`, or an `Option` of one for null"
+        None -> return if filled then "the array C fills is copied into an `Array`" else "the array C answers is copied into an `Array`, or an `Option` of one for null"
+    if filled && form.optional then return s"the binding makes the array C fills through `${q.name}`, which is never null, so it is not in an `Option`"
     if c_struct_of(form.element, c.data) is Some(d)
         val wanted = c_struct_text(c.data[d].decl)
-        if wanted != "" && !c_names_struct(element_text, wanted) then return s"`${c.data[d].name}` mirrors `$wanted`, so an array of it is answered as `out $wanted **${q.name}`"
+        val stars = if filled then "*" else "**"
+        if wanted != "" && !c_names_struct(element_text, wanted) then return s"`${c.data[d].name}` mirrors `$wanted`, so an array of it is answered as `out $wanted $stars${q.name}`"
         return ""
     if c_array_element_size(form.element) == 0 then return "an array C answers is copied into an `Array[byte]`, `Array[int]`, `Array[long]`, `Array[real]` or an `Array` of a struct mirror"
     ""

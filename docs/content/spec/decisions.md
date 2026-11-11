@@ -5659,6 +5659,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **An array C fills, its length known before the call** (built on branch `c-binding-gaps`): an
+  `out T *` parameter (one star, against `out T **` for an array C allocates) named with `array:`, its
+  `length:` a C expression over the parameters evaluated in the glue before the call; the glue
+  `malloc`s that many elements (at least one), C fills them, and they are copied into an `Array` and
+  freed with `free`. A negative length or one past the greatest `int` calls nothing (the glue answers
+  a zeroed result) and the length stops the program when it is read; length checks now come before the
+  null check for every array C answers. It is never in an `Option` and takes no `free:`. *Why*:
+  Cairo's `cairo_get_dash` writes `cairo_get_dash_count` doubles, a length no parameter carries; the
+  words `array:`/`length:` are the ones an array C answers already uses, the number of stars says who
+  allocates, and the answer is the same `Array` in the result. *Alternatives*: an Avin `Array` passed
+  in, checked by the glue to be at least `length:` long (the library would make and size it, and a
+  precondition the binding cannot see becomes the program's); a `capacity:` word on an in-array; the
+  array allocated in the collected heap (a moving or concurrent collection, and a `blocking` call,
+  would need it pinned).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -131,6 +131,10 @@ void fxf_record_clear_text(fxf_record *r);
 void fxf_record_bad_text(fxf_record *r);
 /* Sets the unsigned 64-bit field to its greatest, past every signed integer's. */
 void fxf_record_u64_max(fxf_record *r);
+/* Copies the record's `count` values into memory the caller allocates, as Cairo's `cairo_get_dash`
+ * does; `fxf_record_set_count` changes how many there are, no more than five. */
+void fxf_record_copy_values(const fxf_record *r, int *into);
+void fxf_record_set_count(fxf_record *r, int count);
 /* The values a writer stored, read back by C. */
 long long fxf_record_sum(const fxf_record *r);
 
