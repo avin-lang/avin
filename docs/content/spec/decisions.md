@@ -5252,15 +5252,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   make every existing binding's parameter names part of its contract with Sysl); copying the
   defaults (the stale copies this replaces). Review with the user: the surface word `named`, and
   whether a caller-side form should come later.
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `lwt-scope`): **Cancellation by a scope stops a thread and drops its frames**
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-scope`): **Cancellation by a scope stops a thread and drops its frames**
   ([cancellation](/spec/threads/#cancellation)). `s.cancel()` cancels the scope's threads, and those
   it starts afterwards (which run nothing); a cancelled thread stops at its next cancellation point
   with its frames dropped and ends with no result: `Thread.result() -> Option[T]` (new) answers
@@ -5278,7 +5270,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   to look is never cancelled, and parked threads still need waking); a trap at the next wait (stops
   the program). Review with the user: `join` trapping on a cancelled thread rather than answering an
   `Option`, which keeps every existing `join` unchanged.
-- Proposed (branch `lwt-scope`): **A thread is not stopped inside a region others may wait on**: a
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-scope`): **A thread is not stopped inside a region others may wait on**: a
   lock held, a `lazy val` being initialized, an Avin function Sysl called (the regions a trap already
   treats as in doubt), and the library's running of what waits for a future it completed. It
   finishes the region and stops at its next cancellation point after. A wait on a condition is a
@@ -5290,7 +5282,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   anywhere and releasing the locks a thread holds (leaves the state they guard half changed); making
   the release of the last lock itself a cancellation point (cuts library code short after its
   release, as a future's completion is).
-- Proposed (branch `lwt-scope`): **Cancellation reaches down through scopes, and only scopes.** A
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-scope`): **Cancellation reaches down through scopes, and only scopes.** A
   cancelled thread stops first at the innermost scope it runs, which cancels its own threads and
   waits for them, and the cancellation then goes on outward; a scope opened while its thread holds a
   lock sets no such stop, so its threads are not cancelled with the thread. Threads started with the
@@ -5299,7 +5291,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   have no owner to be cancelled by. *Alternatives weighed*: cancelling the thread alone and leaving
   its inner scope's threads running (breaks the scope's promise); a `Thread.cancel()` on any thread
   (unstructured cancellation, which nothing here needs).
-- Proposed (branch `lwt-scope`): **A failure does not cancel a scope by itself.** A trap stops the
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-scope`): **A failure does not cancel a scope by itself.** A trap stops the
   program as before, so there is no failing thread to propagate; a thread reports a failure as a
   `Result`, and the scope's body cancels and returns it. `Scope` gains `cancel()` and
   `isCancelled()` only, both used by the thread running the body while the scope is open. *Why*: the
@@ -5308,13 +5300,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   threads return `Result[T, E]` and whose first `Err` cancels the rest (a second entry point for what
   a channel and a `cancel` express); a sendable canceller a thread could call (the body can already
   cancel on a message). Review with the user: whether a `Result`-aware scope is wanted for brevity.
-- Proposed (branch `lwt-scope`): **The scope hands back the Sysl handles a cancelled thread's body
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-scope`): **The scope hands back the Sysl handles a cancelled thread's body
   reached**, once it has waited for the thread, as a body that returns hands them back itself; they
   are then in transit, for the next code to use. *Why*: a connection given to a thread that was
   cancelled is otherwise unusable by anyone, and closing it is the scope's thread's job. *Alternatives
   weighed*: leaving them with the ended thread's owner (every later use traps); handing them back on
   the cancelled thread as it stops (it runs no code of its own then).
-- **Actors' turns on lightweight threads** (branch `lwt-actors`, [scheduling](/spec/actors/#scheduling)).
+- Settled on the user's delegation 2026-11-10: **Actors' turns on lightweight threads** (branch `lwt-actors`, [scheduling](/spec/actors/#scheduling)).
   An actor on the shared executor, the default, runs each turn as a lightweight thread of its own,
   started with a thread's default stack (8 MiB reserved, committed as touched, reused from the
   scheduler's spares) and handing nothing over, the turn making the actor the owner of its code; a
@@ -5333,7 +5325,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `Option[Executor] = None` (breaks the positional `spawn(b, Stop, ex)`); a public
   `Executor.isShared()` (more surface for one library's need). Review with the user: whether an
   explicit executor should still bound an actor once every turn could be a thread.
-- Proposed (branch `train-2`): **A scope's cancellation does not reach actors**
+- Settled on the user's delegation 2026-11-10 (built on branch `train-2`): **A scope's cancellation does not reach actors**
   ([cancellation](/spec/threads/#cancellation), [scheduling](/spec/actors/#scheduling)). An actor
   started by a scope's thread is a top-level actor and runs on when that thread is cancelled; an
   actor's turn, a lightweight thread started as a plain thread is, is never cancelled by a scope,
@@ -5351,7 +5343,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   provides through parent actors); taking a cancelled asker's question back out of the mailbox
   (needs a mailbox that removes from its middle, and the actor may already be handling it); making
   a turn cancellable by the scope that told it a message (a message has no owning scope).
-- Proposed (branch `lwt-server`): **the server library is in the standard library, as `TcpServer` in
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **the server library is in the standard library, as `TcpServer` in
   `avin.net` and `http.serve` in `avin.net.http`**, not a package and not a module of its own. *Why*:
   the TCP connection and the HTTP client it builds on are there already, the server shares the
   client's `Response` and token rules, and it is the first user of the runtime's poller and, later,
@@ -5359,7 +5351,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `dev.avinlang.http` (versioned apart, but it would duplicate the client's types or depend on the
   standard library's privates); a module `avin.net.server` (one more import for the one type).
   Review with the user if a larger web framework is wanted later: that belongs in a package on top.
-- Proposed (branch `lwt-server`): **each connection is served in an actor's first turn, supervised
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **each connection is served in an actor's first turn, supervised
   with `Stop`**, rather than on a plain lightweight thread. *Why*: a trap in a thread stops the
   program, and an actor is the only place a trap is contained; a connection's handler is the place
   a server most needs a bug to cost one connection. The actor's first turn runs the whole
@@ -5367,19 +5359,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   runs `failed` (which writes the `500`) and closes it, since a `stopping` block is given only after
   the body has run. *Alternatives*: a lightweight thread per connection (a handler's trap stops the
   server); an actor per request (a mailbox and a turn per request, for no gain).
-- Proposed (branch `lwt-server`): **the connections' actors run on an executor of the server's own,
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **the connections' actors run on an executor of the server's own,
   `Executor.fixed(maxConnections)`**. *Why*: a connection's turn parks on its socket for as long as
   the connection lives, and on the shared pool, about one worker per processor, those parked turns
   would keep every other connection waiting for a worker; the workers are lightweight threads, so a
   worker per connection costs a parked stack each. Once actors' turns run on lightweight threads of
   their own (stage 14, item 5), the executor may go. *Alternatives*: the shared pool with each wait
   in `blocking` (a trap inside `blocking` leaves the worker counted as waiting for good).
-- Proposed (branch `lwt-server`): **at the connection limit, the next connection waits unaccepted**
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **at the connection limit, the next connection waits unaccepted**
   in the listener's backlog until one ends, rather than being accepted and refused. *Why*: the
   client is served late instead of not at all, and the server spends nothing on it meanwhile.
   *Alternatives*: accept and close at once, or answer `503` (a burst turns into failures the client
   must retry).
-- Proposed (branch `lwt-server`, reworked on `train-2`): **`stop()` cancels the acceptor's parked
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`, reworked on `train-2`): **`stop()` cancels the acceptor's parked
   `accept`**, which waits on a thread of a scope the acceptor runs; the acceptor's own thread then
   closes the listener. No connection is made to wake it. (`lwt-server` first woke it with a
   connection of its own to the listener, the one thing that could end a parked `accept` before
@@ -5390,7 +5382,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   waking connection (kept until cancellation landed); an `accept` with a timeout polled for the
   stop (a delay of up to the poll, and wake-ups for nothing); a listener closable from another
   thread (against the ownership rule).
-- Proposed (branch `train-2`): **a shutdown closes a connection idle between requests at once,
+- Settled on the user's delegation 2026-11-10 (built on branch `train-2`): **a shutdown closes a connection idle between requests at once,
   unanswered, and a request read once the server is stopping is answered `503`**. The HTTP server
   waits for each request, its first included, through `TcpServer.idle`, so stopping cancels that
   wait; a request being read or answered finishes, its response saying `Connection: close`.
@@ -5399,7 +5391,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   in flight, so closing it loses nothing, and `join` no longer waits up to `idleTimeout`, or for
   ever where it is zero. *Alternatives*: idle connections ending at their limit (a slow shutdown);
   serving requests on connections already open (a chatty client keeps the server up for ever).
-- Proposed (branch `train-2`): **a shutdown reaches a connection's actor through `TcpServer.idle`,
+- Settled on the user's delegation 2026-11-10 (built on branch `train-2`): **a shutdown reaches a connection's actor through `TcpServer.idle`,
   a scope the actor's turn runs around each idle wait**, not a scope around the turn. `idle(wait)`
   registers the wait with the server, runs `wait` on a thread of a scope opened by the calling
   thread, and parks that thread on a promise that the wait completes `false` once it answers and
@@ -5424,7 +5416,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   the stopping thread (not cancellation, and a socket belongs to the thread that uses it); a
   per-connection server handle carrying an idle flag (the same cancellation, plus a race between
   the flag and the wait's answer).
-- Proposed (branch `lwt-server`): **HTTP limits and refusals.** Timeouts bound each wait, as a
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **HTTP limits and refusals.** Timeouts bound each wait, as a
   connection's do: `readTimeout` while a request is read (`408` once one runs out mid-request, and a
   quiet close where a connection sent nothing), `writeTimeout` while a response is written, and
   `idleTimeout` between requests; `maxHeaderBytes` (16 KiB) bounds the request line (`414`) and the
@@ -5438,7 +5430,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   deadline for the whole request (stops a slow upload still making progress; review with the user
   if wanted beside the per-wait limit); decoding `gzip` request bodies (a dependency for a rare
   case).
-- Proposed (branch `lwt-server`): **a `Response` is the client's class, given makers**
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **a `Response` is the client's class, given makers**
   (`Response.text`, `bytes`, `empty`, `withHeader`) and `http.reasonPhrase`; a handler is a plain
   `@sendable (ServerRequest) -> Response`; routes are a vector given to `Router(routes)`, made by
   `Route(method, pattern, handler)` or `Route.get` and its siblings, and `router.handle` is the
@@ -5449,12 +5441,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   *Alternatives*: a builder `Router().get(…)` (a chain on one line, or a `var` reassigned); a
   response writer handed to the handler (streaming, but a handler that forgets to finish it).
   Review with the user whether a line that starts with `.` should continue the expression above.
-- Proposed (branch `lwt-server`): **routing**: segments matched one for one with the request's
+- Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **routing**: segments matched one for one with the request's
   decoded segments, `:name` binding a non-empty one, the first matching route winning; a `GET`
   route answers `HEAD`; `404` for a path no route matches and `405` with `Allow` for one matched for
   other methods. *Why*: the smallest router that covers a service's paths, with escaped and raw
   Unicode routing alike and an escaped `/` staying inside its segment. *Alternatives*: wildcards
   for the rest of a path and patterns in a segment (later, if programs need them).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
