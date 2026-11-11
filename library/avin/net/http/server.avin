@@ -10,7 +10,8 @@ module avin.net.http
 // is answered `500` and closed.
 
 import avin.io.{IoError, TimedOut}
-import avin.net.{TcpServer, TcpStream, Url}
+import avin.net.{ByteStream, TcpServer, TcpStream, Url}
+import avin.net.tls.{TlsServer, TlsStream}
 import avin.time.{Duration, millis, seconds}
 
 // A request as a server read it: its method, its target as the request line gave it, its headers in
@@ -152,15 +153,31 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // closed; zero takes a limit away. A request line may be at most `maxHeaderBytes` long, and the
 // request line and headers together as long; a body may be at most `maxBodyBytes`. A
 // `maxHeaderBytes` less than one, or a `maxBodyBytes` or `maxConnections` less than zero or one,
-// traps.
+// traps. With `tls`, the server speaks HTTPS: each connection begins with a TLS handshake presenting
+// its certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
+// whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
+// answer, since the answer would have to go through the connection's TLS, which ended with the
+// handler.
 serve(host: string, port: int, handler: @sendable (ServerRequest) -> Response, maxConnections: int = 1024,
       readTimeout: Duration = seconds(30), writeTimeout: Duration = seconds(30), idleTimeout: Duration = seconds(5),
-      maxHeaderBytes: int = 16384, maxBodyBytes: int = 1048576) -> Result[TcpServer, IoError]
+      maxHeaderBytes: int = 16384, maxBodyBytes: int = 1048576, tls: Option[TlsServer] = None) -> Result[TcpServer, IoError]
     if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
     if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
     val s = Settings(readTimeout, writeTimeout, idleTimeout, maxHeaderBytes, maxBodyBytes)
-    TcpServer.start(host, port, (stream, server) -> converse(stream, server, handler, s), maxConnections,
-        failed = stream -> refuse(stream, 500, s))
+    tls match
+        None -> TcpServer.start(host, port, (stream, server) -> converse(stream, server, handler, s), maxConnections,
+            failed = stream -> refuse(stream, 500, s))
+        Some(identity) -> TcpServer.start(host, port, (stream, server) -> secured(stream, server, handler, s, identity), maxConnections,
+            failed = stream -> stream.close())
+
+// A connection served over TLS: the handshake, then its requests as `converse` serves them.
+private secured(tcp: TcpStream, server: TcpServer, handler: @sendable (ServerRequest) -> Response, s: Settings, identity: TlsServer)
+    if tcp.setTimeout(s.readTimeout).isErr() then return
+    TlsStream.server(tcp, identity) match
+        Ok(stream) ->
+            converse(stream, server, handler, s)
+            stream.close()
+        Err(_) -> ()
 
 // The limits a server was started with.
 private data Settings(readTimeout: Duration, writeTimeout: Duration, idleTimeout: Duration, maxHeaderBytes: int, maxBodyBytes: int)
@@ -172,7 +189,7 @@ private data Refusal
 
 // One connection's requests, read and answered in turn until it is not kept alive, its peer ends it,
 // or it waits for a request longer than its limit.
-private converse(stream: TcpStream, server: TcpServer, handler: @sendable (ServerRequest) -> Response, s: Settings)
+private converse(stream: ByteStream, server: TcpServer, handler: @sendable (ServerRequest) -> Response, s: Settings)
     val input = Incoming(stream)
     var limit = s.readTimeout
     while input.awaits(limit, server)
@@ -205,7 +222,7 @@ private connectionWords(headers: Vector[(string, string)]) -> Vector[string] =
 
 // Answers `status` and closes the connection gently: the server's side is shut, then what the client
 // still sends is read and dropped for a moment, so the answer is not lost to a reset.
-private refuse(stream: TcpStream, status: int, s: Settings)
+private refuse(stream: ByteStream, status: int, s: Settings)
     if written(stream, false, Response.text(status, s"${reasonPhrase(status)}\n"), false, "HTTP/1.1", s.writeTimeout)
         if stream.shutdownOutput().isErr() then return
         if stream.setTimeout(millis(500)).isErr() then return
@@ -221,7 +238,7 @@ private refuse(stream: TcpStream, status: int, s: Settings)
 // The server writes `Content-Length` and `Connection` itself, in place of any the handler gave, and
 // no body for `HEAD` or for `204` and `304`. A status outside 200 to 599, or a header the response
 // cannot carry, traps.
-private written(stream: TcpStream, headOnly: bool, response: Response, keep: bool, version: string, limit: Duration) -> bool
+private written(stream: ByteStream, headOnly: bool, response: Response, keep: bool, version: string, limit: Duration) -> bool
     if !(200 <= response.status <= 599) then fail(s"a response of status ${response.status}: a handler answers 200 to 599")
     if response.reason.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the reason `${response.reason}` holds a line break")
     val out = StringWriter()
@@ -242,7 +259,7 @@ private written(stream: TcpStream, headOnly: bool, response: Response, keep: boo
     stream.setTimeout(limit).isOk() && stream.write(all.toArray()).isOk()
 
 // The bytes of a connection, read ahead in pieces and handed out as lines and counted runs.
-private class Incoming(private val stream: TcpStream)
+private class Incoming(private val stream: ByteStream)
     private var ahead: Array[byte] = Array.empty[byte]()
     private var at = 0
 
@@ -301,7 +318,7 @@ private class Incoming(private val stream: TcpStream)
             Err(_) -> Err(Quietly)
 
 // One request: its request line, its headers and its body.
-private readRequest(input: Incoming, stream: TcpStream, s: Settings) -> Result[ServerRequest, Refusal]
+private readRequest(input: Incoming, stream: ByteStream, s: Settings) -> Result[ServerRequest, Refusal]
     var room = s.maxHeaderBytes
     var first = input.line(s.readTimeout, room, 414)?
     // Empty lines before a request line are passed over, counted against the limit.
@@ -346,7 +363,7 @@ private isDigit(b: byte) -> bool = int('0') <= int(b) <= int('9')
 
 // The body the headers announce: chunked, of a `Content-Length`, or none. An `Expect: 100-continue`
 // is answered `100 Continue` once the body is known to fit, and any other expectation `417`.
-private readBody(input: Incoming, stream: TcpStream, headers: Vector[(string, string)], version: string, s: Settings) -> Result[Array[byte], Refusal]
+private readBody(input: Incoming, stream: ByteStream, headers: Vector[(string, string)], version: string, s: Settings) -> Result[Array[byte], Refusal]
     val expect = headerIn(headers, "Expect")
     if expect is Some(e) && !e.equalsIgnoreCase("100-continue") then return Err(Answer(417))
     val continues = expect.isDefined() && version == "HTTP/1.1"
@@ -373,7 +390,7 @@ private readBody(input: Incoming, stream: TcpStream, headers: Vector[(string, st
             input.bytes(int(n), s.readTimeout)
 
 // Tells the client to go on and send the body it waits to send.
-private sayContinue(stream: TcpStream, s: Settings) -> Result[unit, Refusal]
+private sayContinue(stream: ByteStream, s: Settings) -> Result[unit, Refusal]
     if stream.setTimeout(s.writeTimeout).isErr() then return Err(Quietly)
     stream.write(utf8("HTTP/1.1 100 Continue\r\n\r\n")).mapErr(_ -> Quietly)
 
