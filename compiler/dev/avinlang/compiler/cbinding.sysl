@@ -53,6 +53,10 @@ struct CParam
     /** For a parameter taking a function, the function pointer's own prototype, named by the
      * parameter, one entry; empty for any other parameter. */
     callback: Buf[CPrototype]
+    /** Whether the parameter is a pointer marked `null`, which the binding passes null, as C allows:
+     * an `out` pointer whose value is not wanted, or an optional pointer the binding leaves out. It
+     * is no Avin parameter and no part of the result. */
+    nulled: bool
 
 /** How a prototype's parameter crosses: passed in, or `out`, a pointer C writes a value through that
  * is part of the binding's result, or `inout`, one C is also passed a value through. */
@@ -148,6 +152,14 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 *at = *at + 4
                 if *at < tokens.len() && tokens[*at] == "out"
                     return Err(s"a length is filled in from the array `$length_of`, so `length($length_of)` marks a parameter passed in, or an `inout` pointer C writes the length it used through, not an `out` one")
+            var nulled = false
+            if *at < tokens.len() && tokens[*at] == "null"
+                if inner then return Err("a callback's parameter is what C calls it with, so it is never `null`")
+                if length_of != "" then return Err("a length is filled in from its array, so it is not passed `null`")
+                nulled = true
+                *at = *at + 1
+                if *at < tokens.len() && (tokens[*at] == "out" || tokens[*at] == "inout" || tokens[*at] == "userdata")
+                    return Err(s"`null` marks a pointer the binding passes null, which is neither read nor written, so it is not `${tokens[*at]}` too")
             var mode = CIn
             if *at < tokens.len() && (tokens[*at] == "out" || tokens[*at] == "inout")
                 if inner then return Err(s"a callback's parameter is what C calls it with, so it is never `${tokens[*at]}`")
@@ -159,6 +171,8 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 userdata = true
                 *at = *at + 1
             val p = c_declaration(tokens, at)?
+            if nulled && (*at < tokens.len() && tokens[*at] == "(" || !p.text.ends_with("*"))
+                return Err(s"`null` marks a pointer the binding passes null, as in `null int *num_clusters`, and `${p.text}` is not one")
             if *at < tokens.len() && tokens[*at] == "("
                 if inner then return Err("a callback's parameter taking a function cannot cross a C binding: a function crosses only as a binding's own parameter")
                 if userdata || length_of != "" || !(mode is CIn) then return Err("a parameter taking a function is passed in, with no `userdata`, `out`, `inout` or `length` of its own")
@@ -170,7 +184,7 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 if shown == "" then shown = "void"
                 var own: Buf[CPrototype] = buf()
                 own.push(f)
-                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own))
+                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own, false))
                 if *at < tokens.len() && tokens[*at] == ","
                     *at = *at + 1
                     continue
@@ -194,7 +208,7 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 if parse_c_type(inner_text) is Ok(t)
                     pointee = t.ty
                     pointee_text = inner_text
-            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text, length_of, userdata, buf()))
+            params.push(CParam(p.ty, p.text, p.name.unwrap_or(""), mode, pointee, pointee_text, length_of, userdata, buf(), nulled))
             if *at < tokens.len() && tokens[*at] == ","
                 *at = *at + 1
                 continue
@@ -285,6 +299,7 @@ private c_check_lengths(params: Buf[CParam]) -> Result[unit, string]
             if name == "self" then return Err("`self` is the receiver, a handle, and no array")
             if a.length_of != "" then return Err(s"`$name` carries a length itself, so it is no array")
             if !(a.mode is CIn) then return Err(s"`$name` is an `out` or `inout` pointer, so it is no array; an array is a pointer passed in")
+            if a.nulled then return Err(s"`$name` is passed `null`, so it is no array")
             if !(a.ty is CPointerType || a.ty is CText(_)) then return Err(s"`$name` is `${a.text}`, and an array is passed as a pointer to its elements, as in `uint8_t *$name`")
         if !found then return Err(s"`length($name)` names no parameter of the prototype")
     Ok(())
@@ -801,7 +816,7 @@ c_avin_positions(p: CPrototype) -> Buf[usize]
 
 /** Whether a prototype's parameter is one an Avin binding takes: not `out`, carrying no length, and
  * not a `userdata`. */
-c_is_avin_param(q: CParam) -> bool = !(q.mode is COut) && q.length_of == "" && !q.userdata
+c_is_avin_param(q: CParam) -> bool = !(q.mode is COut) && q.length_of == "" && !q.userdata && !q.nulled
 
 /** The number of `out` and `inout` parameters of a prototype. */
 c_out_count(p: CPrototype) -> usize
@@ -1085,7 +1100,14 @@ c_array_out_of(f: &Function) -> Option[CArrayOut]
                             if name is None then name = Some("")
                         elif word == "writable" then writable = true
                     continue
-            val text = if arg.value.kind is StringLit(t) then t else continue
+            // A list names several arrays, the first of which this answers.
+            var text = ""
+            arg.value.kind match
+                StringLit(t) -> text = t
+                ListLit(items) ->
+                    if items.len() == 0 then continue
+                    if items[0].kind is StringLit(t) then text = t else continue
+                _ -> continue
             if n == "array" then name = Some(text)
             elif n == "bytes"
                 name = Some(text)
@@ -1100,7 +1122,34 @@ c_array_out_of(f: &Function) -> Option[CArrayOut]
 /** Every array a binding's `@c` says C answers, or the memory it lends, in the order it names them. */
 c_array_outs_of(f: &Function) -> Buf[CArrayOut]
     var out: Buf[CArrayOut] = buf()
-    if c_array_out_of(f) is Some(a) then out.push(a)
+    val first = c_array_out_of(f) match
+        Some(a) -> a
+        None -> return out
+    // Several arrays are named by a list, each with its length and perhaps its `free:` in a list of
+    // their own, in the same order; an empty `free:` frees nothing.
+    var names: Buf[string] = buf()
+    var lengths: Buf[string] = buf()
+    var frees: Buf[string] = buf()
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            val n = arg.name match
+                Some(n) -> n
+                None -> continue
+            if arg.value.kind is ListLit(items)
+                var texts: Buf[string] = buf()
+                for item in items
+                    if item.kind is StringLit(t) then texts.push(t)
+                if n == "array" || n == "bytes" then names = texts
+                elif n == "length" then lengths = texts
+                elif n == "free" then frees = texts
+    if names.len() == 0
+        out.push(first)
+        return out
+    for j in 0..<names.len()
+        val length = if j < lengths.len() then lengths[j] else ""
+        val free: Option[string] = if j < frees.len() && frees[j] != "" then Some(frees[j]) else None
+        out.push(CArrayOut(names[j], length, free, false, false, first.bytes))
     out
 
 /** The index among the prototype's parameters of the `out` pointer `array:` names, if it names one. */

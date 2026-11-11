@@ -250,6 +250,14 @@ int as_spread(int n, int32_t *ints, uint8_t *bytes) {
     return n * 3;
 }
 
+int as_mixed(int n, int32_t *filled, double **made, int *count) {
+    for (int i = 0; i < n; i++) filled[i] = i * i;
+    *made = malloc(sizeof(double) * (size_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) (*made)[i] = i / 2.0;
+    *count = n;
+    return n;
+}
+
 static int clusters_allocated = 0;
 static int clusters_freed = 0;
 static int shape_nulls = 0;

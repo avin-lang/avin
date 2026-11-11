@@ -144,6 +144,8 @@ int as_dash_calls(void);
 void as_dash_get(double *dashes, double *offset);
 int as_glyphs_fill(int n, as_glyph *glyphs);
 int as_spread(int n, int32_t *ints, uint8_t *bytes);
+/* An array C fills and one it allocates in one call: `n` integers each, and `n` halves. */
+int as_mixed(int n, int32_t *filled, double **made, int *count);
 
 /* Several arrays C allocates in one call, each with its own count, freed by its own function, the
  * clusters and flags optional, as Cairo's `cairo_scaled_font_text_to_glyphs` answers them: `n`

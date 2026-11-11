@@ -5673,6 +5673,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   precondition the binding cannot see becomes the program's); a `capacity:` word on an in-array; the
   array allocated in the collected heap (a moving or concurrent collection, and a `blocking` call,
   would need it pinned).
+- **Several arrays in one call** (built on branch `c-binding-gaps`): `array:`/`bytes:` take a list,
+  `length:` and `free:` then lists of the same length in the same order, `""` in `free:` freeing
+  nothing; the glue writes each length through its own pointer and has a free function per array
+  (`avin_c_array_free_<symbol>_<j>`). *Why*: the existing words, with the list shape `keeps:` already
+  has; one array keeps its single-string form. *Alternatives*: repeating `array:`/`length:`/`free:`
+  groups in order (order-dependent pairing nobody can see); marking the count in the prototype
+  (`length(glyphs) out int *num_glyphs`), which would drop the count from the result and reuse a
+  marker that means something else for `inout`; a `free:` keyed by name (no map literal in an
+  annotation).
+- **`null` in a prototype passes null** (built on branch `c-binding-gaps`): a word before a pointer
+  parameter's type; the parameter is no Avin parameter and no out value, and a function whose caller
+  chooses (Cairo's clusters, wanted or not) is bound twice, once with `out` and once with `null`.
+  *Why*: what is passed is fixed per binding, so the result's type stays fixed; the prototype is where
+  the other per-parameter words (`out`, `inout`, `userdata`, `length`) already live. *Alternatives*:
+  an Avin `bool` or `Option` parameter choosing at run time (the result's shape would depend on a
+  value); a `skip:` list on the annotation (a second place saying what one parameter is).
+  **Review with the user**: whether `null` should also let an Avin `Option` parameter decide.
 
 ## Open
 

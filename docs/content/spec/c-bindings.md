@@ -742,6 +742,36 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   no `free:`; its elements are those of an array C allocates, and an out value's name is not yet
   written when the length is evaluated, so a `length:` naming one is refused by clang in the glue.
 
+- **Several arrays in one call are named as a list** ([proposed](/spec/decisions/#proposed)):
+  `array:` (or `bytes:`) a list of the out parameters, `length:` a list of their lengths in the same
+  order, and `free:`, where it is given, a list of how each is freed, `""` for an array C fills or one
+  nothing frees. Each array is copied and freed by its own entry, and where a status fails every array
+  C answered is freed unread. The result keeps the prototype's order whatever order the lists name the
+  arrays in. A list names each array once, each an `out` parameter, and a list of lengths or of frees
+  comes only with a list of arrays.
+
+- **A pointer marked `null` is passed null** ([proposed](/spec/decisions/#proposed)): the word is
+  written before the parameter's type, as `out` is, for a pointer C allows to be null — an out value
+  the binding does not want, or an optional pointer it leaves out. It is no Avin parameter and no part
+  of the result, and the header check holds it to the header's type like any other. A function whose
+  caller chooses is bound twice. Cairo's `cairo_scaled_font_text_to_glyphs` answers glyphs and
+  clusters, each allocated by Cairo with its own count and its own free function, and takes null for
+  the clusters, their count and their flags where they are not wanted:
+
+  ```avin
+  @c("cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, out cairo_text_cluster_t **clusters, out int *num_clusters, out cairo_text_cluster_flags_t *cluster_flags)",
+     array: ["glyphs", "clusters"], length: ["num_glyphs", "num_clusters"],
+     free: ["cairo_glyph_free", "cairo_text_cluster_free"])
+  private textToGlyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int, Array[TextCluster], int, ClusterFlags), Status]
+
+  @c("cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, null cairo_text_cluster_t **clusters, null int *num_clusters, null cairo_text_cluster_flags_t *cluster_flags)",
+     array: "glyphs", length: "num_glyphs", free: "cairo_glyph_free")
+  private glyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int), Status]
+  ```
+
+  `null` is never `out`, `inout` or `userdata` besides, never an array a length is filled in from, and
+  never a callback's parameter.
+
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without
   it, one value alone is not a tuple, and a status bound as `Result[T, int]` holds the rest in its
