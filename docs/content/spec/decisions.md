@@ -5497,15 +5497,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   a dependency is the one way this design fails, and it fails silently; the clean build is an oracle
   that needs no list of what each edit should touch. Alternatives: count-only tests (prove reuse,
   not correctness); trusting the key (no defence against a missed dependency).
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `option-nested`): **`Option[Nothing]` takes the form of the options it is seen
+- Settled on the user's delegation 2026-11-11 (built on branch `option-nested`): **`Option[Nothing]` takes the form of the options it is seen
   as inside other values.** Its one value, `None`, is null as a pointer and the constant `None`
   object as an object, so the program-wide plan keeps it a pointer when every view of it inside
   another value (a `Vector[Option[Nothing]]` as a `Vector[Option[Dog]]`, a `Result`, a function's
@@ -5529,6 +5521,13 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   rule by run-time type says; one seen inside a vector as an `Option[Dog]` and then boxed is an
   `Option[Dog]` too. A view inside an object-form value still leaves the `Option[Nothing]` object
   there, as any view leaves a value as it was made.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
