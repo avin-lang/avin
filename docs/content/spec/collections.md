@@ -546,6 +546,38 @@ their hash-based counterparts' companions do, and a set or map literal builds on
 `SortedMap` and `SortedSet` have the same companions, making tree collections typed as the sorted
 traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tree collection.
 
+**Mutable sorted maps and sets.** `avin.collections.mutable.TreeMap[K: Ord, V]` and `TreeSet[A: Ord]`
+are the in-place counterparts, with the whole mutable `Map` and `Set` API (`m(k) = v`, `get`,
+`remove`, `getOrElseUpdate`, `updateWith`, `+=`, `-=`, `++=`, `--=`, `filterInPlace`, `copy()`, and
+for a set `add`, `union`, `intersect`, `diff`, `subsetOf`) and the ordered operations of the table
+above: `headOption()`, `lastOption()`, `head()`, `last()`, `firstKey()`, `lastKey()`, `minAfter`,
+`maxBefore`, `reverseIterator()` and the four `range` forms. The slices are new mutable collections,
+not views. Two operations are their own: `removeFirst()` and `removeLast()` unbind the least or the
+greatest key and answer its entry (a set's element), trapping when empty, and `removeFirstOption()` and
+`removeLastOption()` answer an `Option` instead. A mutable tree collection holds an immutable `TreeMap`
+or `TreeSet` and replaces it at each update, so the cost of every operation is the logarithmic one of
+the persistent tree, `toTreeMap()` and `toTreeSet()` hand out the current tree in constant time as a
+snapshot later updates do not reach, and an iterator, or a `for` loop, goes on over the entries as they
+were when it began: updating the collection inside the loop is legal and the loop does not see the
+change. Equality and hash follow the contents, and equal an immutable tree collection's of the same
+entries. The two collections of one name are told apart by their modules, the immutable one being
+`avin.TreeMap` and the mutable one `avin.collections.mutable.TreeMap`; where both are used, one is
+imported under another name, as for `Map` and `Set`.
+
+```text
+import avin.collections.mutable.{TreeMap as MutableTreeMap}
+
+val queue = MutableTreeMap[int, string]()
+queue(30) = "c"
+queue(10) = "a"
+queue(20) = "b"
+println(queue.removeFirst())        // (10, a)
+println(queue.minAfter(21))         // Some((30, c))
+for (k, v) in queue
+    queue.remove(k)                 // the loop still visits both entries
+println(queue.isEmpty())            // true
+```
+
 ### Bit sets
 
 `BitSet` is an immutable `SortedSet[int]` that holds its elements as bits: element `e` is bit `e % 64`
