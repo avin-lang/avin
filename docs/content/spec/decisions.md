@@ -6633,14 +6633,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `keySet()` of a mutable tree map is an immutable `TreeSet` snapshot, as a mutable `Map`'s is an
   immutable `Set`.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `tuple-result-override`): **an override's or an implementation's result may be
+- Settled on the user's delegation 2026-11-11 (built on branch `tuple-result-override`): **an override's or an implementation's result may be
   any type seen as the declared result with no conversion**
   ([declarations](/spec/declarations/)), the covariant position [generics](/spec/generics/#variance)
   already names: `-> (Dog, Dog)` overrides `-> (Animal, Animal)`, `-> (HashMap[K, V], HashMap[K, V])`
@@ -6654,7 +6647,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
   a differently named method, as own-kind `partition` met); also boxing a scalar result, which
   would make an override's call site convert behind a virtual call.
-- Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
   private `lazy val`**, and the expression that computes the cell is dropped once it has run. The
   cell is `Option[(T, LazyList[T])]`; the class holds a function that reads the real expression out
   of a captured variable and empties it, so an evaluated cell keeps nothing the expression captured.
@@ -6664,14 +6657,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   would hold every source cell it skipped). ALTERNATIVES: an invariant node class with `var`s (the
   list could then not be covariant); a `var` of type `Any` cast back on each read (no type checking
   of the cell); keeping the expression (simpler, a space leak).
-- Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
   strictly and the tail by name, and the tail is evaluated when the list's second cell is first
   read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
   cell is then exactly the head, and a function building a list recursively runs one step per cell
   read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
   at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
   next step).
-- Proposed (built on branch `stdlib-lazy-list`): **There is no lazy cons operator; `x +: xs`
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **There is no lazy cons operator; `x +: xs`
   prepends to a list already made.** A symbol method whose name ends in `:` takes its receiver on
   the right, and a receiver is evaluated where it is written, so the tail of `x op: tail` cannot be
   delayed; a left-grouping name would need a method on every element type, which only the core
@@ -6680,32 +6673,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   by-name receiver for `:`-ending methods, or `::` building a lazy list where one is expected) would
   give `head #:: tail`; and `head :: tail` patterns on a lazy list need the pattern rules to reach
   beyond `List`: both are language changes, left to the user.
-- Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
   a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
   never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from
   it; sequence patterns over it would call `length()` too. As an `Iterable` it keeps the forcing
   methods every collection has, its own lazy forms found first. ALTERNATIVES: a `Seq` overriding the
   methods that would not return (most of them), or a `Seq` whose `length()` simply does not return
   on an endless list.
-- Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
   evaluated prefix and `…`, evaluating nothing**: `[0, 1, 4]`, `[0, 1, …]`, `[…]`, with a field
   width padding the whole. WHY: displaying an endless list must return, and a display that
   evaluated cells would run a program's functions while printing. ALTERNATIVES: forcing every cell
   (does not return on an endless list); a fixed prefix forced (side effects while printing);
   `<not computed>` text (longer, and not a form the other collections use). No `Eq`, `Hash` or
   `Ord`, which could not answer for two equal endless lists.
-- Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
   the thread that made it; the cells' `lazy val` evaluation would be safe between threads, but the
   expressions not yet evaluated are functions that may capture anything. ALTERNATIVES: sendable when
   every expression is a `@sendable` function (every lazy method would need a sendable form).
-- Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
   **`flatMap` takes `(T) -> Iterable[U]`**, reading each collection through its iterator as cells are
   read; **`++` takes its right operand by name**, evaluated only when the cell after the left's last
   is read (the iterator's `++` takes a strict `Iterable`, since an iterator is read once anyway);
   `toLazyList()` on every `Iterable` converts, since `from` is the integer counter's name as on
   `Iterator`. Also added beyond the item: `filterNot`, `zipWithIndex`, `fill`, `tabulate`, `lift`,
   `force()` and `isEvaluated()`.
-- **Map defaults, own-kind `partition` and `Set.subsets`** (branch `stdlib-map-extras`).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-map-extras`): **Map defaults, own-kind `partition` and `Set.subsets`** (branch `stdlib-map-extras`).
   Proposed: `withDefault(f)` and `withDefaultValue(v)` on every map answer a `DefaultMap`, a
   wrapper whose `apply` of an absent key answers the default and whose every other read (`get`,
   `contains`, `getOrElse`, `size`, iteration, `keySet`) sees only the real entries; the default is
@@ -6734,7 +6727,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and the set last, the same order for every kind, and no `2^n` counter to overflow for a set of
   more than 62 elements. Alternatives weighed: bitmask order (overflows past 62 elements, and
   puts the subsets in an order a reader cannot predict from the sizes).
-- **Companion `from`, `Vector.iterate`, `unfold` and the sorted conversions** (branch
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-from`): **Companion `from`, `Vector.iterate`, `unfold` and the sorted conversions** (branch
   `stdlib-from`). Proposed: `from(xs: Iterable[T])` on every immutable collection companion and
   on the mutable ones (`Buffer`, `Map`, `Set`, `TreeMap`, `TreeSet`, `LinkedMap`, `LinkedSet`,
   `BitSet`, `PriorityQueue`), a map's taking `Iterable[(K, V)]`; for a duplicate key the later
@@ -6749,7 +6742,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
   `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
   counting iterator and keeps its name.
-- Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
   where they live** (the second part of Settled → unions → Representation, built on the multi-word
   values above).
   - **Three words**: a 32-bit tag, 64 bits for a scalar member and, where a member is a reference, the
@@ -6787,7 +6780,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
     `Any` are equal and hash alike. Review with the user: storing a union with a string member now
     allocates its cell where an `Any` did not, until fields and collections take the words.
-- Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
   A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
   part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a
   function, or a union of references) is seen as an `Any` part, so a `(string, string)` and a
@@ -6806,6 +6799,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (rebuilding the tuple at the pattern's layout where a scalar part would need a box, an allocation
   hidden in a `match`). Review with the user: a union-of-references part tests the object, while a
   class part tests the type the tuple was made with.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
