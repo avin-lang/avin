@@ -1,0 +1,405 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// Values of more than one machine word: one value, parameter, slot or field per word, a call's later
+// words read by `CallWord` and a return's given by `ReturnWord`. The frame plan roots exactly the
+// words of reference type; a scalar word is never in it. A call that takes apart the tuple it is
+// given is made to a copy of the callee answering with the tuple's parts as such words.
+
+private words_lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private function_index(program: MirProgram, symbol: string) -> usize
+    for i in 0..<program.functions.len()
+        if program.functions[i].symbol == symbol then return i
+    panic("no function " + symbol)
+
+private has_function(program: MirProgram, symbol: string) -> bool
+    for f in program.functions
+        if f.symbol == symbol then return true
+    false
+
+private plan_at(program: MirProgram, index: usize) -> RootPlan
+    val graph = call_graph(program)
+    plan_roots(program, graph, collecting_functions(program, graph), index)
+
+/** The LLVM text of the function named `symbol` in `program`. */
+private text_of(program: MirProgram, symbol: string) -> string
+    val all = emit_llvm(program)
+    val head = "@\"" + symbol + "\"("
+    var out = ""
+    var inside = false
+    for line in all.split("\n")
+        if line.starts_with("define ") && line.contains(head) then inside = true
+        if inside
+            out = out + line + "\n"
+            if line == "}" then return out
+    out
+
+private count_insts(f: MirFunction, keep: (Inst) -> bool) -> int
+    var n = 0
+    for block in f.blocks
+        for inst in block.insts
+            if keep(inst) then n = n + 1
+    n
+
+private calls_to(f: MirFunction, g: usize) -> int = count_insts(f, inst -> inst match
+    Call(_, Direct(h), _) -> h == g
+    _ -> false)
+
+private types(ts: []const MirType) -> Buf[MirType]
+    var out: Buf[MirType] = buf()
+    for t in ts do out.push(t)
+    out
+
+private one_block(insts: Buf[Inst], term: Terminator) -> Buf[MirBlock]
+    var blocks: Buf[MirBlock] = buf()
+    blocks.push(MirBlock(insts, term))
+    blocks
+
+/** A program to add hand-made functions to: one data type, whose descriptor 0 they allocate by. */
+private base_program() -> MirProgram = words_lowered("data Cell(n: int)\n\nmain()\n    println(Cell(1).n.toString())\n")
+
+private add_function(program: *MirProgram, symbol: string, signature: MirSignature, value_types: Buf[MirType], slots: Buf[MirType], blocks: Buf[MirBlock]) -> usize
+    program.functions.push(MirFunction(symbol, signature, value_types, slots, blocks))
+    program.functions.len() - 1
+
+// A recursive function is never copied into its callers, so its calls stay calls.
+const Countdown: string = "count(n: int) -> (string, int)\n    if n == 0 then return (\"a\", 0)\n    val (s, k) = count(n - 1)\n    (s + \"b\", k + 1)\n\n"
+
+@test("a call whose tuple is taken apart calls the copy answering with the tuple's parts as words")
+destructured_call_takes_words()
+    val program = words_lowered(Countdown + "main()\n    val (s, k) = count(3)\n    println(s)\n    println(k.toString())\n")
+    val words = function_index(program, "<program>.count#words")
+    val f = program.functions[words]
+    assert(f.signature.result is Some(MRef))
+    assert_eq(f.signature.rest.len(), 1usize)
+    assert(f.signature.rest[0] is MInt(32))
+    // The copy reads the parts out of the tuple it makes, which is then kept as them: no tuple.
+    // One for each of its two returns.
+    assert_eq(count_insts(f, inst -> inst is ReturnWord(1, _)), 2)
+    assert_eq(count_insts(f, inst -> inst is Alloc(_, _)), 0)
+    // It takes its own recursive call's tuple apart too.
+    assert_eq(calls_to(f, words), 1)
+    val main = program.functions[function_index(program, "<program>.main")]
+    assert_eq(calls_to(main, words), 1)
+    assert_eq(count_insts(main, inst -> inst is CallWord(_, _, 1)), 1)
+    // The function itself, compiled as every function of the program is, is called by neither.
+    assert_eq(calls_to(main, function_index(program, "<program>.count")), 0)
+    assert_eq(calls_to(f, function_index(program, "<program>.count")), 0)
+
+@test("a caller that keeps the tuple calls the function itself, which still makes it")
+kept_tuple_calls_the_function()
+    val program = words_lowered(Countdown + "main()\n    val t = count(3)\n    val (s, k) = count(2)\n    println(t.0 + s)\n    println((t.1 + k).toString())\n")
+    val plain = function_index(program, "<program>.count")
+    val words = function_index(program, "<program>.count#words")
+    val main = program.functions[function_index(program, "<program>.main")]
+    assert_eq(calls_to(main, plain), 1)
+    assert_eq(calls_to(main, words), 1)
+    assert(program.functions[plain].signature.rest.len() == 0)
+    assert(program.functions[plain].signature.result is Some(MRef))
+
+@test("a tuple with one part that has a runtime value is no value of several words")
+one_word_tuple_is_no_words()
+    val text = "solo(n: int) -> (unit, int)\n    if n == 0 then return ((), 0)\n    val (_, k) = solo(n - 1)\n    ((), k + 1)\n\nmain()\n    val (_, k) = solo(3)\n    println(k.toString())\n"
+    val program = words_lowered(text)
+    assert(!has_function(program, "<program>.solo#words"))
+
+@test("a part with no runtime value is no word; the others keep their order and types")
+unit_part_is_no_word()
+    val text = "trio(n: int) -> (bool, unit, real, string)\n    if n == 0 then return (true, (), 0.5, \"x\")\n    val (b, u, r, s) = trio(n - 1)\n    (!b, u, r * 2.0, s)\n\nmain()\n    val (b, _, r, s) = trio(2)\n    println(s\"$b $r $s\")\n"
+    val program = words_lowered(text)
+    val f = program.functions[function_index(program, "<program>.trio#words")]
+    assert(f.signature.result is Some(MBool))
+    assert_eq(f.signature.rest.len(), 2usize)
+    assert(f.signature.rest[0] is MReal)
+    assert(f.signature.rest[1] is MRef)
+
+@test("a small function answering with words is copied into the caller taking its tuple apart, each later word through a slot of its own")
+small_words_function_is_inlined()
+    val text = "divmod(a: int, b: int) -> (int, int) = (a / b, a % b)\n\nmain() -> int\n    val (q, r) = divmod(17, 5)\n    q + r\n"
+    val program = words_lowered(text)
+    val main = program.functions[function_index(program, "<program>.main")]
+    if has_function(program, "<program>.divmod#words")
+        assert_eq(calls_to(main, function_index(program, "<program>.divmod#words")), 0)
+    assert_eq(count_insts(main, inst -> inst is CallWord(_, _, _)), 0)
+    assert_eq(count_insts(main, inst -> inst is ReturnWord(_, _)), 0)
+    assert_eq(count_insts(main, inst -> inst is Alloc(_, _)), 0)
+
+@test("a call in tail position of a copy answering with words passes the callee's words straight on")
+tail_call_passes_words_on()
+    val text = "ping(n: int) -> (string, int)\n    if n == 0 then return (\"p\", 0)\n    pong(n - 1)\n\npong(n: int) -> (string, int)\n    if n == 0 then (\"q\", 1) else ping(n - 1)\n\nmain()\n    val (s, k) = ping(5)\n    println(s + k.toString())\n"
+    val program = words_lowered(text)
+    val ping = program.functions[function_index(program, "<program>.ping#words")]
+    val pong = function_index(program, "<program>.pong#words")
+    assert_eq(calls_to(ping, pong), 1)
+    // The callee's later word is returned as it was read: the `ReturnWord` names the `CallWord`'s value.
+    var passed = false
+    for block in ping.blocks
+        for inst in block.insts
+            if inst is CallWord(d, _, 1)
+                for other in block.insts
+                    if other is ReturnWord(1, Value(v))
+                        if v == d then passed = true
+    assert(passed)
+    // So the two call each other in constant stack, as functions yielding the tuple do.
+    assert(text_of(program, "<program>.ping#words").contains("musttail call tailcc { ptr, i32 } @\"<program>.pong#words\""))
+    assert(text_of(program, "<program>.pong#words").contains("musttail call tailcc { ptr, i32 } @\"<program>.ping#words\""))
+    assert_eq(calls_to(ping, function_index(program, "<program>.pong")), 0)
+    assert_eq(calls_to(program.functions[pong], function_index(program, "<program>.ping")), 0)
+
+@test("the reference word of a call's result is rooted across an allocation before it is stored, the scalar word never")
+call_word_rooted_across_box()
+    // `n` is a `var` a closure changes, so binding it allocates its box while `s` is still the call's
+    // word.
+    val text = "make(k: int) -> (int, string)\n    if k == 0 then return (0, \"s\")\n    val (n, s) = make(k - 1)\n    (n + 1, s + \"x\")\n\nkeep(k: int) -> int\n    var (n, s) = make(k)\n    val bump = () -> n += 1\n    bump()\n    n + s.byteLength()\n\nmain()\n    println(keep(3).toString())\n"
+    val program = words_lowered(text)
+    val index = function_index(program, "<program>.keep")
+    val f = program.functions[index]
+    val plan = plan_at(program, index)
+    var word: Option[usize] = None
+    var first: Option[usize] = None
+    for block in f.blocks
+        for inst in block.insts
+            if inst is CallWord(d, call, 1)
+                word = Some(d)
+                first = Some(call)
+    val w = word.unwrap()
+    assert(f.value_types[w] is MRef)
+    assert(plan.value_cells[w] is Some(_))
+    assert(f.value_types[first.unwrap()] is MInt(32))
+    assert(plan.value_cells[first.unwrap()] is None)
+    val text_of_keep = text_of(program, "<program>.keep")
+    assert(text_of_keep.contains(s"%v$w = extractvalue { i32, ptr } %r${first.unwrap()}, 1"))
+    assert(text_of_keep.contains(s"store ptr %v$w, ptr %root"))
+    assert(!text_of_keep.contains(s"%v${first.unwrap()}, ptr %root"))
+    assert(text_of(program, "<program>.make#words").contains("ret { i32, ptr }"))
+
+@test("a value of three words as parameters: only the reference word held across an allocation is rooted")
+three_word_parameters()
+    var program = base_program()
+    // v0 tag, v1 bits, v2 pointer; v3 the new object; v4 and v5 read after it.
+    var insts: Buf[Inst] = buf()
+    insts.push(Alloc(3, 0))
+    insts.push(Binary(4, OpAdd, Value(0), Value(1)))
+    insts.push(Load(5, Value(2)))
+    val index = add_function(&program, "<program>.three", mir_signature(types([MInt(64), MInt(64), MRef]), None), types([MInt(64), MInt(64), MRef, MRef, MInt(64), MInt(32)]), buf(), one_block(insts, Return(None)))
+    val plan = plan_at(program, index)
+    assert_eq(plan.cells, 1usize)
+    assert(plan.value_cells[2] is Some(_))
+    assert(plan.value_cells[0] is None)
+    assert(plan.value_cells[1] is None)
+    val text = text_of(program, "<program>.three")
+    assert(text.contains("store ptr %v2, ptr %root0"))
+
+@test("a value of three words merged at a join through three slots: only the reference slot is in the frame")
+three_word_merge_through_slots()
+    var program = base_program()
+    // v0 the condition; v1..v2 and v3..v4 the scalar and reference words of two values; slots 0..2
+    // the merged value's tag, bits and pointer.
+    var blocks: Buf[MirBlock] = buf()
+    blocks.push(MirBlock(buf(), Branch(Value(0), 1, 2)))
+    var yes: Buf[Inst] = buf()
+    yes.push(Store(SlotAddress(0), ConstInt(64, "1")))
+    yes.push(Store(SlotAddress(1), Value(1)))
+    yes.push(Store(SlotAddress(2), Value(2)))
+    blocks.push(MirBlock(yes, Jump(3)))
+    var no: Buf[Inst] = buf()
+    no.push(Store(SlotAddress(0), ConstInt(64, "2")))
+    no.push(Store(SlotAddress(1), Value(3)))
+    no.push(Store(SlotAddress(2), Value(4)))
+    blocks.push(MirBlock(no, Jump(3)))
+    var join: Buf[Inst] = buf()
+    join.push(Alloc(5, 0))
+    join.push(Load(6, SlotAddress(0)))
+    join.push(Load(7, SlotAddress(1)))
+    join.push(Load(8, SlotAddress(2)))
+    join.push(Load(9, Value(8)))
+    blocks.push(MirBlock(join, Return(None)))
+    val index = add_function(&program, "<program>.merge", mir_signature(types([MBool, MInt(64), MRef, MInt(64), MRef]), None), types([MBool, MInt(64), MRef, MInt(64), MRef, MRef, MInt(64), MInt(64), MRef, MInt(32)]), types([MInt(64), MInt(64), MRef]), blocks)
+    val plan = plan_at(program, index)
+    assert_eq(plan.cells, 1usize)
+    assert(plan.slot_cells[2] is Some(_))
+    assert(plan.slot_cells[0] is None)
+    assert(plan.slot_cells[1] is None)
+    // The two references stored to the slot are not themselves held across anything.
+    assert(plan.value_cells[2] is None)
+    assert(plan.value_cells[4] is None)
+
+@test("a reference returned as a later word is live until the return, so it is rooted across an allocation before it")
+return_word_keeps_reference_live()
+    var program = base_program()
+    var insts: Buf[Inst] = buf()
+    insts.push(Alloc(1, 0))
+    insts.push(ReturnWord(1, Value(0)))
+    val index = add_function(&program, "<program>.give", MirSignature(types([MRef]), Some(MInt(64)), types([MRef])), types([MRef, MRef]), buf(), one_block(insts, Return(Some(ConstInt(64, "7")))))
+    val plan = plan_at(program, index)
+    assert(plan.value_cells[0] is Some(_))
+    val text = text_of(program, "<program>.give")
+    assert(text.contains("define internal tailcc { i64, ptr } @\"<program>.give\"(ptr %ctx, ptr %v0)"))
+    assert(text.contains("%ret0.0 = insertvalue { i64, ptr } undef, i64 7, 0"))
+    assert(text.contains("%ret0.1 = insertvalue { i64, ptr } %ret0.0, ptr %v0, 1"))
+    assert(text.contains("ret { i64, ptr } %ret0.1"))
+
+/** A function answering with three words, tag, bits and pointer: 3, 4 and a new object. */
+private add_triple(program: *MirProgram) -> usize
+    var insts: Buf[Inst] = buf()
+    insts.push(Alloc(0, 0))
+    insts.push(ReturnWord(1, ConstInt(64, "4")))
+    insts.push(ReturnWord(2, Value(0)))
+    add_function(program, "<program>.triple", MirSignature(buf(), Some(MInt(64)), types([MInt(64), MRef])), types([MRef]), buf(), one_block(insts, Return(Some(ConstInt(64, "3")))))
+
+@test("a call's later reference word is defined by its CallWord and rooted from there, across an allocation")
+call_word_reference_rooted()
+    var program = base_program()
+    val triple = add_triple(&program)
+    var insts: Buf[Inst] = buf()
+    insts.push(Call(Some(0), Direct(triple), buf()))
+    insts.push(CallWord(1, 0, 1))
+    insts.push(CallWord(2, 0, 2))
+    insts.push(Alloc(3, 0))
+    insts.push(Load(4, Value(2)))
+    insts.push(Binary(5, OpAdd, Value(0), Value(1)))
+    val index = add_function(&program, "<program>.use", mir_signature(buf(), None), types([MInt(64), MInt(64), MRef, MRef, MInt(32), MInt(64)]), buf(), one_block(insts, Return(None)))
+    val plan = plan_at(program, index)
+    assert_eq(plan.cells, 1usize)
+    assert(plan.value_cells[2] is Some(_))
+    assert(plan.value_cells[0] is None)
+    assert(plan.value_cells[1] is None)
+    val text = text_of(program, "<program>.use")
+    assert(text.contains("%r0 = call tailcc { i64, i64, ptr } @\"<program>.triple\"(ptr %ctx)"))
+    assert(text.contains("%v0 = extractvalue { i64, i64, ptr } %r0, 0"))
+    assert(text.contains("%v1 = extractvalue { i64, i64, ptr } %r0, 1"))
+    assert(text.contains("%v2 = extractvalue { i64, i64, ptr } %r0, 2"))
+    assert(text.contains("store ptr %v2, ptr %root0"))
+    // A call of several words is never made as a tail call.
+    assert(!text.contains("musttail"))
+
+@test("a reference word no longer used before an allocation is not rooted")
+call_word_dead_reference_not_rooted()
+    var program = base_program()
+    val triple = add_triple(&program)
+    var insts: Buf[Inst] = buf()
+    insts.push(Call(Some(0), Direct(triple), buf()))
+    insts.push(CallWord(1, 0, 1))
+    insts.push(CallWord(2, 0, 2))
+    insts.push(Load(3, Value(2)))
+    insts.push(Alloc(4, 0))
+    val index = add_function(&program, "<program>.drop", mir_signature(buf(), None), types([MInt(64), MInt(64), MRef, MInt(32), MRef]), buf(), one_block(insts, Return(None)))
+    val plan = plan_at(program, index)
+    assert_eq(plan.cells, 0usize)
+
+@test("a call whose every word is returned at its own place is a tail call, its whole result returned")
+words_passed_through_as_tail_call()
+    var program = base_program()
+    val triple = add_triple(&program)
+    var insts: Buf[Inst] = buf()
+    insts.push(Call(Some(0), Direct(triple), buf()))
+    insts.push(CallWord(1, 0, 1))
+    insts.push(CallWord(2, 0, 2))
+    insts.push(ReturnWord(1, Value(1)))
+    insts.push(ReturnWord(2, Value(2)))
+    add_function(&program, "<program>.pass", MirSignature(buf(), Some(MInt(64)), types([MInt(64), MRef])), types([MInt(64), MInt(64), MRef]), buf(), one_block(insts, Return(Some(Value(0)))))
+    val text = text_of(program, "<program>.pass")
+    assert(text.contains("%r0 = musttail call tailcc { i64, i64, ptr } @\"<program>.triple\"(ptr %ctx)\n  ret { i64, i64, ptr } %r0\n"))
+    assert(!text.contains("extractvalue"))
+    assert(!text.contains("insertvalue"))
+
+@test("a call whose words are returned at other places, or with another word, is an ordinary call and a return put together word by word")
+words_moved_are_no_tail_call()
+    var program = base_program()
+    val triple = add_triple(&program)
+    // The two later words swapped: the bits word where the tag was is not what the call returned.
+    var insts: Buf[Inst] = buf()
+    insts.push(Call(Some(0), Direct(triple), buf()))
+    insts.push(CallWord(1, 0, 1))
+    insts.push(CallWord(2, 0, 2))
+    insts.push(ReturnWord(1, Value(0)))
+    insts.push(ReturnWord(2, Value(2)))
+    add_function(&program, "<program>.moved", MirSignature(buf(), Some(MInt(64)), types([MInt(64), MRef])), types([MInt(64), MInt(64), MRef]), buf(), one_block(insts, Return(Some(Value(1)))))
+    val text = text_of(program, "<program>.moved")
+    assert(!text.contains("musttail"))
+    assert(text.contains("%ret0.0 = insertvalue { i64, i64, ptr } undef, i64 %v1, 0"))
+    assert(text.contains("%ret0.1 = insertvalue { i64, i64, ptr } %ret0.0, i64 %v0, 1"))
+    assert(text.contains("%ret0.2 = insertvalue { i64, i64, ptr } %ret0.1, ptr %v2, 2"))
+    assert(text.contains("ret { i64, i64, ptr } %ret0.2"))
+    // A constant in place of a word the call gave.
+    var other: Buf[Inst] = buf()
+    other.push(Call(Some(0), Direct(triple), buf()))
+    other.push(CallWord(1, 0, 1))
+    other.push(CallWord(2, 0, 2))
+    other.push(ReturnWord(1, ConstInt(64, "9")))
+    other.push(ReturnWord(2, Value(2)))
+    add_function(&program, "<program>.other", MirSignature(buf(), Some(MInt(64)), types([MInt(64), MRef])), types([MInt(64), MInt(64), MRef]), buf(), one_block(other, Return(Some(Value(0)))))
+    assert(!text_of(program, "<program>.other").contains("musttail"))
+
+@test("a value of several words passed to a function and stored to an object's fields: every word a parameter and a field of its own")
+words_as_parameters_and_fields()
+    var program = base_program()
+    // `store3(object, tag, bits, pointer)` keeps the three words at offsets 0, 8 and 16 of the object.
+    var insts: Buf[Inst] = buf()
+    insts.push(Offset(4, Value(0), 8))
+    insts.push(Offset(5, Value(0), 16))
+    insts.push(Store(Value(0), Value(1)))
+    insts.push(Store(Value(4), Value(2)))
+    insts.push(Store(Value(5), Value(3)))
+    val store3 = add_function(&program, "<program>.store3", mir_signature(types([MRef, MInt(64), MInt(64), MRef]), None), types([MRef, MInt(64), MInt(64), MRef, MPtr, MPtr]), buf(), one_block(insts, Return(None)))
+    val triple = add_triple(&program)
+    var calls: Buf[Inst] = buf()
+    calls.push(Call(Some(0), Direct(triple), buf()))
+    calls.push(CallWord(1, 0, 1))
+    calls.push(CallWord(2, 0, 2))
+    calls.push(Alloc(3, 0))
+    var args: Buf[Operand] = buf()
+    args.push(Value(3))
+    args.push(Value(0))
+    args.push(Value(1))
+    args.push(Value(2))
+    calls.push(Call(None, Direct(store3), args))
+    val index = add_function(&program, "<program>.keep3", mir_signature(buf(), None), types([MInt(64), MInt(64), MRef, MRef]), buf(), one_block(calls, Return(None)))
+    // The pointer word is held across the allocation; passed on, it is the callee's to keep.
+    val plan = plan_at(program, index)
+    assert_eq(plan.cells, 1usize)
+    assert(plan.value_cells[2] is Some(_))
+    val text = text_of(program, "<program>.keep3")
+    assert(text.contains("@\"<program>.store3\"(ptr %ctx, ptr %v3, i64 %v0, i64 %v1, ptr %v2)"))
+    assert_eq(plan_at(program, store3).cells, 0usize)
+
+@test("inlining a call of several words stores each later word to a slot and loads it where the CallWord was")
+inlining_a_words_call()
+    var program = base_program()
+    // `triple(p)` answers with 3, 4 and `p`.
+    var body: Buf[Inst] = buf()
+    body.push(ReturnWord(1, ConstInt(64, "4")))
+    body.push(ReturnWord(2, Value(0)))
+    val triple = add_function(&program, "<program>.triple", MirSignature(types([MRef]), Some(MInt(64)), types([MInt(64), MRef])), types([MRef]), buf(), one_block(body, Return(Some(ConstInt(64, "3")))))
+    // v0 the caller's parameter; v1..v3 the call's words.
+    var insts: Buf[Inst] = buf()
+    var args: Buf[Operand] = buf()
+    args.push(Value(0))
+    insts.push(Call(Some(1), Direct(triple), args))
+    insts.push(CallWord(2, 1, 1))
+    insts.push(CallWord(3, 1, 2))
+    insts.push(Load(4, Value(3)))
+    insts.push(Binary(5, OpAdd, Value(1), Value(2)))
+    val caller = add_function(&program, "<program>.caller", mir_signature(types([MRef]), None), types([MRef, MInt(64), MInt(64), MRef, MInt(32), MInt(64)]), buf(), one_block(insts, Return(None)))
+    var facts: Buf[ScalarFacts] = buf()
+    var finalized: Buf[bool] = buf()
+    for _ in program.descriptors do finalized.push(false)
+    val out = scalar_replace(program.functions, program.descriptors, finalized, &facts)
+    val f = out[caller]
+    assert_eq(calls_to(f, triple), 0)
+    assert_eq(count_insts(f, inst -> inst is CallWord(_, _, _)), 0)
+    assert_eq(count_insts(f, inst -> inst is ReturnWord(_, _)), 0)
+    // Each word's value is still defined, by a load of its slot.
+    assert_eq(count_insts(f, inst -> inst match
+        Load(d, SlotAddress(_)) -> d >= 1 && d <= 3
+        _ -> false), 3)
+    // And the return stored the words to them: 3, 4 and the parameter.
+    assert_eq(count_insts(f, inst -> inst match
+        Store(SlotAddress(_), v) -> v is Value(0) || v is ConstInt(_, _)
+        _ -> false), 3)

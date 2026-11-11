@@ -654,8 +654,27 @@ three steps:
 So `for x in xs` over a `Vector`, a `List`, an `ArraySeq` or a `Range` value keeps its iterator in
 slots, `val (q, r) = divmod(a, b)` makes no tuple once `divmod` is inlined, and a derived method's
 visitor costs nothing. A tuple returned by a function too large to inline, or a recursive one, is
-still an object: results are not returned as several machine values. A `for` over an `Iterable`
-whose `iterator()` call stays guarded keeps its iterator on the heap.
+made only for a caller that keeps it: a caller taking it apart gets its parts as words (below). A
+`for` over an `Iterable` whose `iterator()` call stays guarded keeps its iterator on the heap.
+
+**Values of several machine words.** A value of more than one machine word is one MIR value per
+word, each of its own machine type: that many parameters, slots of a local, fields of an object or
+a closure, and slots where branches meet. A result is the one place needing more: a signature's
+`rest` lists the types of the words after the first, a call defines the first word as its value and
+each later one with `CallWord`, and a return gives the first as its value and each later one with a
+`ReturnWord` in its block, after anything that may collect. LLVM returns the words as one structure,
+in registers. Since every word is an ordinary value, the frame plan roots exactly the words of
+reference type that are live across a collection point and never a scalar word. A call in tail
+position whose every word the block returns at its own place is made as a tail call, its whole
+result returned; inlining stores each later word of a return to a slot of its own, which the
+`CallWord`s load; devirtualization makes such a call direct but never guards it.
+
+Lowering uses them for tuples taken apart from calls: `val (a, b) = f(x)`, where `f` is one of the
+program's functions with a body (no constructor, trait method or binding) and the tuple has at least
+two parts with runtime values, calls `f#words`, a copy of `f` answering with the tuple's parts. Each
+of its returns reads the parts out of the tuple, which scalar replacement then keeps as its parts, and
+a call in its tail position of a function yielding a tuple of the same words calls that function's
+copy and hands its words on. A caller that keeps the tuple calls `f`, which still makes it.
 
 A method with type parameters of its own, a trait's or an overridable class method, holds a
 position in the checker's tables like any other, but no one function fills it: each list of its own

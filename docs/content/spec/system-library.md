@@ -738,6 +738,7 @@ main()
 | `log2(x)` | The logarithm to base 2, exact at every power of two. |
 | `fma(x, y, z)` | `x * y + z` rounded once. The language never fuses `x * y + z` by itself, so `fma` is how a program asks for it. |
 | `copySign(x, s)` | The magnitude of `x` with the sign of `s`, a negative zero's sign included. |
+| `signBit(x)` | Whether the sign bit of `x` is set: `true` for a negative value, a negative zero and a negated NaN. |
 | `ulp(x)` | The gap from `abs(x)` to the next `real` above: `real.MinPositiveValue` at zero and through the subnormals, infinity at an infinity, NaN at NaN, and at the greatest finite value the gap below it. |
 | `nextUp(x)`, `nextDown(x)` | The next `real` above, or below: `nextUp(0.0)` is `real.MinPositiveValue`, the greatest finite value goes to infinity, and an infinity going outward and NaN stay as they are. |
 

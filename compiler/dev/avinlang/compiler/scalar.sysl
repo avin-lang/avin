@@ -478,6 +478,11 @@ private inline_for_objects(f: MirFunction, functions: Buf[MirFunction], s: Summa
                 if grown < MaxGrowth
                     if inst is Call(dest, Direct(g), args)
                         if s.inlinable[g]
+                            // A result of several words is read out of what the callee holds, often
+                            // an object it makes only for that, as a tuple whose parts it answers
+                            // with: inlined, such an object is made and read in one function, and
+                            // kept as its fields.
+                            if functions[g].signature.rest.len() > 0 then wanted = true
                             if dest is Some(d)
                                 if worthy(a, a.value_group[d]) then wanted = true
                             for arg in args
@@ -557,6 +562,8 @@ private map_inst(r: Remap, inst: Inst) -> Inst
         DescriptorOf(dest, object) -> DescriptorOf(v + dest, map_operand(r, object))
         MethodSlot(dest, object, slot) -> MethodSlot(v + dest, map_operand(r, object), slot)
         CallEntry(dest, object) -> CallEntry(v + dest, map_operand(r, object))
+        CallWord(dest, call, word) -> CallWord(v + dest, v + call, word)
+        ReturnWord(word, value) -> ReturnWord(word, map_operand(r, value))
 
 private map_term(r: Remap, term: Terminator) -> Terminator = term match
     Return(Some(o)) -> Return(Some(map_operand(r, o)))
@@ -564,10 +571,22 @@ private map_term(r: Remap, term: Terminator) -> Terminator = term match
     Branch(condition, yes, no) -> Branch(map_operand(r, condition), r.blocks + yes, r.blocks + no)
     _ -> term
 
+/** An inlined call whose result has several words: its first word's value, and the slot each later
+ * word is kept in. */
+private struct InlinedWords
+    call: usize
+    slots: Buf[usize]
+
+private words_slot(inlined: Buf[InlinedWords], call: usize, word: usize) -> Option[usize]
+    for w in inlined
+        if w.call == call then return Some(w.slots[word - 1])
+    None
+
 // Each inlined call ends the block it is in: the block jumps to the callee's entry, the callee's
 // blocks follow, each return stores the result to a slot of its own and jumps to a new block that
 // loads it and goes on with the rest of the original block. A block keeps its number, so every jump
-// to it still lands at its start.
+// to it still lands at its start. A result of several words has a slot for each word: each return
+// stores its `ReturnWord`s to theirs, and each `CallWord` of the call loads its word.
 private inline_marked(f: MirFunction, marks: Buf[bool], functions: Buf[MirFunction]) -> MirFunction
     var values: Buf[MirType] = buf()
     for t in f.value_types do values.push(t)
@@ -580,10 +599,17 @@ private inline_marked(f: MirFunction, marks: Buf[bool], functions: Buf[MirFuncti
         val block = f.blocks[b]
         var current = b
         var insts: Buf[Inst] = buf()
+        // For each call inlined in this block whose result has several words, its first word and
+        // the slot each later word is stored to, which the call's `CallWord`s load instead.
+        var inlined_words: Buf[InlinedWords] = buf()
         for inst in block.insts
             val wanted = marks[k]
             k += 1
             if !wanted
+                if inst is CallWord(d, call, word)
+                    if words_slot(inlined_words, call, word) is Some(x)
+                        insts.push(Load(d, SlotAddress(x)))
+                        continue
                 insts.push(inst)
                 continue
             val (dest, callee, args) = inst match
@@ -597,12 +623,21 @@ private inline_marked(f: MirFunction, marks: Buf[bool], functions: Buf[MirFuncti
                     slots.push(values[d])
                     Some(slots.len() - 1)
                 None -> None
+            var word_slots: Buf[usize] = buf()
+            if dest is Some(d)
+                for t in g.signature.rest
+                    slots.push(t)
+                    word_slots.push(slots.len() - 1)
+                if word_slots.len() > 0 then inlined_words.push(InlinedWords(d, word_slots))
             val r = Remap(values.len(), slots.len(), blocks.len(), g.signature.params.len(), args, buf())
             for t in g.value_types do values.push(t)
             for t in g.slots do slots.push(t)
             for gb in g.blocks
                 var body: Buf[Inst] = buf()
-                for i in gb.insts do body.push(map_inst(r, i))
+                for i in gb.insts
+                    if i is ReturnWord(word, value)
+                        if word_slots.len() > 0 then body.push(Store(SlotAddress(word_slots[word - 1]), map_operand(r, value)))
+                    else body.push(map_inst(r, i))
                 val term = gb.term match
                     Return(value) ->
                         if result is Some(x) && value is Some(o) then body.push(Store(SlotAddress(x), map_operand(r, o)))

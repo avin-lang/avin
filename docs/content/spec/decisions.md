@@ -6423,6 +6423,49 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Display`) and make every call a resolution by specificity for no gain, `writeDisplayed` already
   writing any `Display` value. Revisit if a user wants `out.write(42)`. Review with the user: the
   length-change trap in (3), and leaving out `write(x: Display)` in (8).
+- Settled on the user's delegation 2026-11-11 (built on branch `neg-nan-sign`): **Unary minus on a
+  `real` flips the sign bit of every value, NaN included** (the machine's negation, not `-0.0 - x`,
+  which leaves a NaN's sign as it was), and **`math.signBit(x: real) -> bool`** answers whether the
+  sign bit is set, so the sign of a NaN or a zero can be observed. WHY: negation is the sign flip
+  for every value in IEEE 754, and without `signBit` a program could tell a NaN's sign by no means
+  (`hash` makes every NaN one value and both print as `NaN`). Alternatives: reading the sign through
+  `copySign(1.0, x)` only (works, but reads as a trick).
+- Settled on the user's delegation 2026-11-11 (built on branch `union-mir-words`): **Values of more than one machine word in the intermediate
+  code** (the first part of the union tag-and-payload layout, under Settled → unions →
+  Representation).
+  - **Each word is a value of its own** (scalar replacement): as parameters a multi-word value is one
+    parameter per word, in a local one slot per word, in an object or a closure one field per word,
+    and a merge at a join is one slot per word. Only a result needs new forms: a signature's `rest`
+    lists the types of the words after the first; a call defines the first word as its value and each
+    later one with `CallWord`, a return gives the first as its value and each later one with
+    `ReturnWord`; LLVM returns the words as one structure, in registers. *Why*: every word is an
+    ordinary typed value, so the frame plan roots exactly the words of reference type, wherever each
+    is live across a collection point, and never a scalar word, with no change to how roots are
+    found. *Alternatives*: an LLVM structure value carried whole (the root plan would have to look
+    inside it); returning the later words through slots of the caller passed by address (a slot whose
+    address is passed is no root the plan follows); returning them through the thread's context (a
+    store and a load per word, and a window where a reference is in no frame).
+  - **Proven on tuples taken apart from calls**: `val (a, b) = f(x)`, where `f` is one of the
+    program's functions with a body (not a constructor, a trait's method or a binding) and the tuple
+    has at least two parts with runtime values, calls a copy of `f`, `f#words`, that answers with the
+    tuple's parts, one word each; every return reads the parts out of the tuple, which is then made
+    and read in one function and kept as its parts, and a call in tail position of a function yielding
+    a tuple of the same words passes its words straight on. So a recursive or large function answering
+    with a tuple no longer allocates it for a caller that takes it apart; a caller that keeps the tuple
+    calls `f` itself, which still makes it. *Why*: a real path the existing programs run, with
+    references beside scalars in every combination, and with no change to any type's representation
+    or to what a program sees. *Alternatives*: a compiler-internal pair type no program could reach
+    (exercised only by tests); every function yielding a tuple answering with words and callers that
+    keep it making it again (a made-again tuple's type record could differ from the one the function
+    made, which a type pattern on an `Any` would see).
+  - **A small function answering with words is inlined where it is called**, each later word through a
+    slot of its own, so `val (q, r) = divmod(a, b)` still makes no call and no tuple. Guarded calls
+    through a method table meet in one value, so devirtualization leaves a call of several words
+    through the table rather than guarding it. A call in tail position whose every word the block
+    returns at its own place is a tail call, its whole result returned, so functions answering with
+    words call each other in constant stack as functions yielding tuples do. *Alternatives*: never
+    inlining such functions (a call where there was none at `-O0`); no tail calls of several words
+    (deep mutual recursion through `val (a, b) = f(x)` would overflow the stack).
 
 **Deferred**
 

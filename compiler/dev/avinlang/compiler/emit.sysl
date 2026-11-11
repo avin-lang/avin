@@ -427,9 +427,53 @@ private llvm_type(t: MirType) -> string = t match
     MPtr -> "ptr"
     MRef -> "ptr"
 
-private result_type(s: MirSignature) -> string = s.result match
-    Some(t) -> llvm_type(t)
-    None -> "void"
+// A result of several words is returned as one LLVM structure of them, which travels in registers.
+private result_type(s: MirSignature) -> string
+    val first = s.result match
+        Some(t) -> llvm_type(t)
+        None -> return "void"
+    if s.rest.len() == 0 then return first
+    var out = "{ " + first
+    for t in s.rest
+        out = out + ", " + llvm_type(t)
+    out + " }"
+
+// A call whose result has several words names the whole structure `%r<dest>` and its first word
+// `%v<dest>`, as every value is named; each later word is taken out of it by its `CallWord`.
+private call_dest(out: *StrBuilder, s: MirSignature, dest: Option[usize])
+    if dest is Some(d) then out.push(if s.rest.len() > 0 then s"%r$d = " else s"%v$d = ")
+
+private first_word(out: *StrBuilder, s: MirSignature, dest: Option[usize])
+    if s.rest.len() == 0 then return
+    if dest is Some(d) then out.push(s"  %v$d = extractvalue ${result_type(s)} %r$d, 0\n")
+
+/** The type of the whole result of the call in `f` whose first word is value `call`. */
+private call_result_type(program: MirProgram, f: MirFunction, call: usize) -> string
+    for block in f.blocks
+        for inst in block.insts
+            inst match
+                Call(Some(d), Direct(g), _) -> if d == call then return result_type(program.functions[g].signature)
+                Call(Some(d), Indirect(_, s), _) -> if d == call then return result_type(s)
+                _ -> ()
+    panic(s"no call of several words defines value $call of ${f.symbol}")
+
+/** The return of a block of a function whose result has several words: the first word is the
+ * return's value, and each later one its block's `ReturnWord`. */
+private return_words(out: *StrBuilder, program: MirProgram, f: MirFunction, b: usize, first: Operand)
+    val t = result_type(f.signature)
+    var words: Buf[Option[Operand]] = buf()
+    words.push(Some(first))
+    for _ in f.signature.rest do words.push(None)
+    for inst in f.blocks[b].insts
+        if inst is ReturnWord(k, value) then words[k] = Some(value)
+    var whole = "undef"
+    for k in 0..<words.len()
+        val word = words[k] match
+            Some(w) -> w
+            None -> panic(s"block $b of ${f.symbol} returns no word $k")
+        out.push(s"  %ret$b.$k = insertvalue $t $whole, " + typed_operand(program, f, word) + s", $k\n")
+        whole = s"%ret$b.$k"
+    out.push(s"  ret $t $whole\n")
 
 // The runtime is called with the C convention, so a bool is passed as a byte.
 private c_type(t: MirType) -> string = t match
@@ -528,13 +572,18 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
         val block = f.blocks[b]
         var polled = polled_on_entry[b]
-        val tail = tail_call_at(program, f, block)
+        val tail_at = tail_call_at(program, f, block)
+        val tail = tail_at is Some(_)
         for i in 0..<block.insts.len()
             val inst = block.insts[i]
+            // After a tail call come only the words it hands on, which its result, returned whole,
+            // carries.
+            if tail_at is Some(c)
+                if i > c then continue
             if !polled && closes_cycle(graph, index, inst)
                 polls = emit_poll(out, intrinsics, polls)
                 polled = true
-            val last = tail && i + 1 == block.insts.len()
+            val last = tail_at == Some(i)
             // A tail call gives the caller's frame back before it is made, exactly as a return does,
             // since the callee's frame takes its place. Its arguments are then roots of no frame until
             // the callee links its own, which is the first thing it does: nothing between the two
@@ -548,7 +597,15 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
         if block.term is Return(_) && !tail
             if roots > 0 then out.push("  store ptr %caller, ptr %ctx\n")
         block.term match
-            Return(Some(value)) -> out.push("  ret " + typed_operand(program, f, value) + "\n")
+            Return(Some(value)) ->
+                if f.signature.rest.len() == 0 then out.push("  ret " + typed_operand(program, f, value) + "\n")
+                elif tail
+                    // The tail call's whole result, `%r` of its first word.
+                    val first = value match
+                        Value(v) -> v
+                        _ -> panic("a tail call's result is a value")
+                    out.push(s"  ret ${result_type(f.signature)} %r$first\n")
+                else return_words(out, program, f, b, value)
             Return(None) -> out.push("  ret void\n")
             Jump(target) -> out.push(s"  br label %b$target\n")
             Branch(condition, yes, no) -> out.push("  br i1 " + operand(program, f, condition) + s", label %b$yes, label %b$no\n")
@@ -572,13 +629,22 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
 // of function values in tail position run in constant stack at every optimization level. A call stays
 // an ordinary one when an argument may be the address of the caller's own stack: one of its slots, or
 // a pointer it made rather than received, which the callee would read after the frame is gone.
-private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> bool
+//
+// A result of several words is returned the same way when the block returns every word as the call
+// gave it: after the call come only its `CallWord`s and the `ReturnWord`s giving each word back at its
+// own place, which the tail call's result, returned whole, stands for. The index of the call is the
+// answer, `None` where the block makes no tail call.
+private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> Option[usize]
     val n = block.insts.len()
-    if n == 0 then return false
+    if n == 0 then return None
+    // The call is the last instruction but for the words it hands on.
+    var c = n - 1
+    while c > 0 && (block.insts[c] is CallWord(_, _, _) || block.insts[c] is ReturnWord(_, _))
+        c -= 1
     var dest: Option[usize] = None
     var callee = f.signature
     var args: Buf[Operand] = buf()
-    block.insts[n - 1] match
+    block.insts[c] match
         Call(d, Direct(g), a) ->
             dest = d
             callee = program.functions[g].signature
@@ -587,20 +653,47 @@ private tail_call_at(program: MirProgram, f: MirFunction, block: MirBlock) -> bo
             dest = d
             callee = signature
             args = a
-        _ -> return false
+        _ -> return None
     val result = callee.result
-    if !same_result(result, f.signature.result) then return false
-    if convention(f.signature) == "" || convention(callee) == "" then return false
+    if !same_result(result, f.signature.result) then return None
+    if !same_words(callee.rest, f.signature.rest) then return None
+    if convention(f.signature) == "" || convention(callee) == "" then return None
     val returned = block.term match
         Return(Some(Value(v))) -> dest == Some(v)
         Return(None) -> result is None
         _ -> false
-    if !returned then return false
+    if !returned then return None
+    if !hands_words_on(block, c, callee.rest.len()) then return None
     for a in args
         a match
-            SlotAddress(_) -> return false
-            Value(id) -> if f.value_types[id] is MPtr && id >= f.signature.params.len() then return false
+            SlotAddress(_) -> return None
+            Value(id) -> if f.value_types[id] is MPtr && id >= f.signature.params.len() then return None
             _ -> ()
+    Some(c)
+
+private same_words(a: Buf[MirType], b: Buf[MirType]) -> bool
+    if a.len() != b.len() then return false
+    for k in 0..<a.len()
+        if llvm_type(a[k]) != llvm_type(b[k]) then return false
+    true
+
+// Whether the instructions after the call at `c` are exactly its `CallWord`s and `ReturnWord`s
+// returning each of its `rest` later words at its own place.
+private hands_words_on(block: MirBlock, c: usize, rest: usize) -> bool
+    if block.insts.len() - c - 1 != 2 * rest then return false
+    val call = block.insts[c] match
+        Call(Some(d), _, _) -> d
+        _ -> return rest == 0
+    for i in (c + 1)..<block.insts.len()
+        block.insts[i] match
+            CallWord(_, from, _) -> if from != call then return false
+            ReturnWord(k, Value(v)) ->
+                var given = false
+                for j in (c + 1)..<block.insts.len()
+                    if block.insts[j] is CallWord(d, from, w)
+                        if d == v && from == call && w == k then given = true
+                if !given then return false
+            _ -> return false
     true
 
 private same_result(a: Option[MirType], b: Option[MirType]) -> bool = a match
@@ -631,6 +724,9 @@ private convention(s: MirSignature) -> string
             _ -> integers += 1
     if s.result is Some(MInt(bits))
         if bits > 64 then return ""
+    for t in s.rest
+        if t is MInt(bits)
+            if bits > 64 then return ""
     if integers > 6 || reals > 8 then "" else "tailcc "
 
 /** The functions of the program that code outside it calls, each through its wrapper with the C
@@ -885,6 +981,9 @@ inst_operands(inst: Inst) -> Buf[Operand]
         DescriptorOf(_, object) -> out.push(object)
         MethodSlot(_, object, _) -> out.push(object)
         CallEntry(_, object) -> out.push(object)
+        // The word is read out of the call's result, not out of its first word's value.
+        CallWord(_, _, _) -> ()
+        ReturnWord(_, value) -> out.push(value)
     out
 
 // The strongly connected components of a graph of `n` vertices, numbered from 0, by Tarjan's
@@ -1041,7 +1140,7 @@ private emit_invoker(out: *StrBuilder, name: string, machine: Buf[MirType], answ
     params.push(MRef)
     for t in machine
         params.push(t)
-    val cc = convention(MirSignature(params, answer))
+    val cc = convention(mir_signature(params, answer))
     val result = answer match
         Some(t) -> ext.trim() + " " + c_type(t)
         None -> "void"
@@ -1195,6 +1294,8 @@ inst_dest(inst: Inst) -> Option[usize] = inst match
     DescriptorOf(dest, _) -> Some(dest)
     MethodSlot(dest, _, _) -> Some(dest)
     CallEntry(dest, _) -> Some(dest)
+    CallWord(dest, _, _) -> Some(dest)
+    ReturnWord(_, _) -> None
 
 private need(intrinsics: *Buf[string], declaration: string)
     if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
@@ -1449,18 +1550,24 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
         Call(dest, Direct(index), args) ->
             val callee = program.functions[index]
             out.push("  ")
-            if dest is Some(d) then out.push(s"%v$d = ")
+            call_dest(out, callee.signature, dest)
             out.push(call_head(tail, callee.signature) + result_type(callee.signature) + " @\"" + callee.symbol + "\"(ptr %ctx")
             for a in args
                 out.push(", " + typed_operand(program, f, a))
             out.push(")\n")
+            if !tail then first_word(out, callee.signature, dest)
         Call(dest, Indirect(target, signature), args) ->
             out.push("  ")
-            if dest is Some(d) then out.push(s"%v$d = ")
+            call_dest(out, signature, dest)
             out.push(call_head(tail, signature) + result_type(signature) + " " + operand(program, f, target) + "(ptr %ctx")
             for a in args
                 out.push(", " + typed_operand(program, f, a))
             out.push(")\n")
+            if !tail then first_word(out, signature, dest)
+        CallWord(dest, call, word) ->
+            out.push(s"  %v$dest = extractvalue ${call_result_type(program, f, call)} %r$call, $word\n")
+        // The block's return gathers the later words of its result.
+        ReturnWord(_, _) -> ()
         Call(dest, Runtime(symbol, signature), args) ->
             var parts: Buf[string] = buf()
             parts.push("ptr %ctx")
