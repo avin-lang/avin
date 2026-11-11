@@ -6207,6 +6207,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **`Queue[+T]` (immutable, two lists), built by the stdlib-queue branch.**
+  - *Choice:* `Queue` is an abstract covariant class with a private two-list implementation, so its
+    constructor cannot be called with a state that breaks the invariant (the front is empty only
+    when the back is). It has `Queue(xs*)`, `Queue.empty[T]()` and `Queue.newBuilder`, but no
+    `tabulate` or `fill`, no `++`, and no literal form. `dequeue()` answers `(T, Queue[T])`;
+    `front()` is the name of the head read; `apply(i)` is O(i) and `map`/`filter` answer queues.
+  - *Why:* the abstract class keeps the invariant that gives constant-time `front()` and amortized
+    constant `dequeue`; a pair return keeps the type immutable; `Seq` conformance gives equality,
+    hashing and the sequence methods for free, so a queue equals a vector of its elements.
+  - *Alternatives weighed:* a `data` type with public `Cons`-like variants (exposes the lists and the
+    invariant); a banker's queue with lazy rebalancing (worst-case bounds, but heavier and no
+    better for the usual single-threaded use); `dequeue` answering `Option` only (loses the trap
+    that every other `removeHead` has); `head`/`tail` names only (they remain, from `Seq`, with `tail`
+    answering a `Vector`).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -21,7 +21,8 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
-│   └── Deque[A]             mutable, growable at both ends
+│   ├── Deque[A]             mutable, growable at both ends
+│   └── Queue[+A]            immutable first-in, first-out, two lists
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
 │   └── SortedSet[A]         in order, with the ordered operations
@@ -754,6 +755,28 @@ and is built by `Deque.newBuilder` and by a sequence literal where one is expect
 val pending: Deque[string] = ["build", "test"]
 pending.prepend("fetch")
 while pending.nonEmpty() do run(pending.removeHead())
+```
+
+## Queue
+
+`Queue[+T]` is an immutable first-in, first-out sequence. `Queue(1, 2, 3)` has 1 at its front and
+`Queue.empty[int]()` is empty. `q.enqueue(x)` makes a queue with `x` after the others and
+`q.enqueueAll(xs)` one with every element of `xs`; `q.dequeue()` answers the front element and the
+queue of the rest as a pair, trapping on an empty queue, `q.dequeueOption()` answers `None` instead,
+and `q.front()` and `q.frontOption()` read the front. Each leaves `q` as it was, so any earlier
+version stays usable. The elements are held in two lists, the front in order and the back reversed;
+when the front runs out the back is turned around into it. `enqueue`, `dequeue`, `front` and `isEmpty`
+take amortized constant time, and `q(i)` takes time proportional to `i`.
+
+A queue is a `Seq`, front first, so it has every sequence method, compares and hashes as any sequence
+does (equal to a `Vector` or `List` of the same elements, however its two lists are split),
+displays as `[1, 2, 3]` and is built by `Queue.newBuilder`. It is covariant: `enqueue` and
+`enqueueAll` take `W >: T`, so enqueueing a `Cat` to a `Queue[Dog]` makes a `Queue[Animal]`. `map`,
+`filter`, `filterNot` and `flatMap` answer queues.
+
+```text
+val jobs = Queue("build", "test")
+val (next, rest) = jobs.enqueue("deploy").dequeue()
 ```
 
 ## Sorting
