@@ -200,8 +200,23 @@ compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_p
 /** Compiles a program as `compile_files` does, its bindings reaching the Sysl packages `sysl` as well
  * as Sysl's standard library and its C bindings the C libraries `c`; with `testing`, into a program
  * that runs one of its tests in each process rather than `main`, which it then need not have. */
+//
+// With the instance cache open (`open_incremental`), the build reads and writes it; in its `verify`
+// mode the program is then built again without it, and the two texts must be the same.
 compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary]) -> Compilation
-    val lowered = lower_units(tc, files, testing, c) match
+    val mode = incremental_now()
+    if mode != IncrementalVerify then return compile_with(tc, files, testing, sysl, c, mode == IncrementalOn)
+    val cached = compile_with(tc, files, testing, sysl, c, true)
+    if cached.diagnostics != "" then return cached
+    val clean = compile_with(tc, files, testing, sysl, c, false)
+    if clean.diagnostics != "" then return clean
+    val differs = first_difference(cached.llvm.unwrap_or(""), clean.llvm.unwrap_or(""))
+    if differs != "" then return Compilation(differs, None, None, buf(), buf())
+    cached
+
+/** `compile_program` reading and writing the instance cache, with `caching`, or neither. */
+private compile_with(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary], caching: bool) -> Compilation
+    val lowered = lower_units(tc, files, testing, c, caching) match
         Ok(l) -> l
         Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
     var archive: Option[string] = None
@@ -219,15 +234,47 @@ compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf
             Ok(a) -> archive = Some(a)
             Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
     began = phase_done("shims", began, s"bindings=${lowered.program.bindings.len()} handles=${lowered.program.handles.len()}")
-    val ll = emit_llvm(lowered.program)
-    _ = phase_done("emit", began, s"bytes=${ll.len}")
+    val emitted = emit_llvm_cached(lowered.program, lowered.store.texts, caching)
+    val ll = emitted.text
+    began = phase_done("emit", began, s"bytes=${ll.len} reused=${emitted.reused}")
+    if caching
+        val written = store_entries(lowered, emitted)
+        _ = phase_done("store", began, s"written=${written.written} kept=${written.kept} trimmed=${written.trimmed}")
     Compilation("", Some(ll), archive, lowered.tests, lowered.c_link)
+
+/** Writes the instance cache's entries of a build: each function's lowered entry and its text entry,
+ * in the file of its module. */
+private store_entries(lowered: Lowered, emitted: Emitted) -> StoreWritten
+    var store = lowered.store
+    val mir = lowered.program
+    for i in 0..<mir.functions.len()
+        if mir.stored[i] != "" then keep_entry(&store, lowered.modules[i], CacheEntry(LoweredEntry, mir.key_inputs.own[i], mir.stored[i]))
+    for i in 0..<emitted.keys.len()
+        keep_entry(&store, lowered.modules[i], CacheEntry(TextEntry, emitted.keys[i], emitted.payloads[i]))
+    write_instance_store(store)
+
+/** What a build with the instance cache made of a program: its MIR, with each function's keys and
+ * whether its code came from the cache, its LLVM text, and how many functions' text the cache gave. */
+struct CachedLowering
+    program: MirProgram
+    llvm: string
+    texts_reused: usize
+
+/** A program lowered and emitted as a build with the instance cache in `dir` makes it, reading and
+ * writing the cache, for the compiler's tests. */
+cached_lowering(tc: Toolchain, files: Buf[ProgramFile], dir: string) -> Result[CachedLowering, string]
+    open_incremental(dir, IncrementalOn)
+    defer close_incremental()
+    val lowered = lower_units(tc, files, false, buf(), true)?
+    val emitted = emit_llvm_cached(lowered.program, lowered.store.texts, true)
+    _ = store_entries(lowered, emitted)
+    Ok(CachedLowering(lowered.program, emitted.text, emitted.reused))
 
 /** Compiles a program of one file as far as MIR, or renders its diagnostics. */
 lower_source(tc: Toolchain, src: Source) -> Result[MirProgram, string] = lower_files(tc, single_file(src))
 
 /** Compiles a program as far as MIR against the toolchain's library, or renders its diagnostics. */
-lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files, false, buf()) match
+lower_files(tc: Toolchain, files: Buf[ProgramFile]) -> Result[MirProgram, string] = lower_units(tc, files, false, buf(), false) match
     Ok(lowered) -> Ok(lowered.program)
     Err(diagnostics) -> Err(diagnostics)
 
@@ -237,6 +284,10 @@ private struct Lowered
     units: Buf[SourceUnit]
     tests: Buf[TestEntry]
     c_link: Buf[string]
+    /** The instance cache as the build read it, and the module each function's entries are kept in,
+     * by the function's index. */
+    store: InstanceStore
+    modules: Buf[string]
 
 /** A file of the standard library, found before it is read: its path and the module its directory
  * names. */
@@ -469,7 +520,7 @@ private modules_under(modules: Map[string, bool], prefix: string) -> string
 // The library's modules a compilation reads are the prelude and those imported, and every module in
 // it is the core library's, `avin` or under it; the program's own modules may not be. A program's
 // C unit is built between checking and lowering, which converts at the widths it measured.
-private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary]) -> Result[Lowered, string]
+private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary], caching: bool) -> Result[Lowered, string]
     val front = check_units(tc, files, testing)?
     var program = front.program
     val loaded = front.loaded
@@ -487,12 +538,20 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Bu
     if c_unit.object is Some(o) then c_link.push(o)
     for flag in c_unit.link
         c_link.push(flag)
-    var mir = lower_program(program)
-    began = phase_done("lower", began, s"functions=${mir.functions.len()} strings=${mir.strings.len()} descriptors=${mir.descriptors.len()} tests=${tests.len()}")
+    val store = if caching then read_instance_store(incremental_directory()) else instance_store_at("")
+    if caching then began = phase_done("cache", began, s"files=${store.files} damaged=${store.damaged} lowered=${store.lowered.len()} texts=${store.texts.len()}")
+    var mir = lower_program_cached(program, store.lowered, caching)
+    var reused = 0usize
+    for r in mir.reused
+        if r then reused += 1
+    began = phase_done("lower", began, s"functions=${mir.functions.len()} strings=${mir.strings.len()} descriptors=${mir.descriptors.len()} tests=${tests.len()} reused=$reused")
     val counted = instance_keys(program, mir)
     mir.keys = counted.keys
     _ = phase_done("keys", began, s"instances=${counted.keys.len()} bodies=${counted.bodies} distinct=${counted.distinct}")
-    Ok(Lowered(mir, front.units, tests, c_link))
+    var modules: Buf[string] = buf()
+    for inst in mir.key_inputs.instances
+        modules.push(if inst.generated == Written then module_prefix(program.symbols[inst.function].module_name) else "<generated>")
+    Ok(Lowered(mir, front.units, tests, c_link, store, modules))
 
 /** A program through checking and no further: the diagnostics of a program that is wrong, which are
  * everything `avin check` reports without building the shims of its Sysl bindings or its C unit, or ""

@@ -1,0 +1,659 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{current_dir, entries, exists, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, set_modified, write_text}
+import sysl.process.{Exited, Stdio, Var, capture, spawn}
+import sysl.slices.sort
+import sysl.text.parse_int
+import sysl.time.{micros, now}
+
+// The instance cache: a build keeps what lowering and emission made of each instance under its key,
+// and the next build takes an unchanged instance's code and text from it. Each test builds a program,
+// changes it or the cache, builds again with the cache, and holds the second build to two things:
+// it lowered exactly the instances whose own keys are new, and its text is a clean build's.
+
+private const Geo: string = "module geo\n\ndata Shape\n    Circle(r: int)\n    Square(side: int)\n\nclass Box(val w: int, val h: int)\n    area() -> int = w * h\n\ntrait Named\n    name() -> string\n\nclass Cat(val n: string): Named\n    override name() -> string = \"cat \" + n\n\nval limit = 10\n\nscale(x: int, by: int = 2) -> int = x * by\n\narea(s: Shape) -> int = s match\n    Circle(r) -> 3 * r * r\n    Square(a) -> a * a\n"
+
+private const Extra: string = "module extra\n\nhelper(n: int) -> int = n + 100\n\nhalf(n: int) -> int = 100 / n\n\nthird(n: int) = n / 3\n"
+
+private const Main: string = "import geo.{Shape, Circle, Square, Box, Named, Cat, area, scale, limit}\nimport extra.{helper, half, third}\n\ndata Pair(a: int, b: int)\n\ntwice[T](x: T) -> (T, T) = (x, x)\n\ndescribe(n: Named) -> string = n.name()\n\nshown(x: Any) -> string = x match\n    n: Named -> n.name()\n    _ -> \"other\"\n\ntotal(xs: Vector[int]) -> int\n    var sum = 0\n    for x in xs\n        sum = sum + x\n    sum\n\nmain()\n    println(area(Circle(2)) + area(Square(3)))\n    println(twice(1))\n    println(twice(\"a\"))\n    println(twice(Pair(1, 2)))\n    val k = 3\n    val add = (x: int) -> x + k\n    println(add(4))\n    println(describe(Cat(\"tom\")))\n    println(shown(Cat(\"x\")))\n    println(Box(2, 3).area())\n    println(scale(5))\n    println(limit)\n    println(Pair(1, 2) == Pair(1, 2))\n    println(total([1, 2, 3]))\n    println(helper(1))\n    println(half(4))\n    println(third(9))\n    println(1.5 * 2.0)\n"
+
+/** The program's three files, under directory `dir`. */
+private program_of(dir: string, main: string, geo: string, extra: string) -> Buf[ProgramFile]
+    var files: Buf[ProgramFile] = buf()
+    files.push(ProgramFile(source_of(dir + "/geo/geo.avin", geo), Some("geo"), false, buf(), ""))
+    files.push(ProgramFile(source_of(dir + "/extra/extra.avin", extra), Some("extra"), false, buf(), ""))
+    files.push(ProgramFile(source_of(dir + "/main.avin", main), None, false, buf(), ""))
+    files
+
+/** `text` with its one `old` replaced by `new`. */
+private edited(text: string, old: string, new: string) -> string
+    assert(text.contains(old), "the edit's text is not in the program: " + old)
+    text.replace_all(old, new)
+
+/** A build of `files` with the instance cache in `cache`. */
+private cached(files: Buf[ProgramFile], cache: string) -> CachedLowering = cached_lowering(repository_toolchain(), files, cache) match
+    Ok(c) -> c
+    Err(d) -> panic(d)
+
+/** A build of `files` with no instance cache: the oracle. */
+private clean(files: Buf[ProgramFile]) -> string
+    val compiled = compile_files(repository_toolchain(), files)
+    assert_eq(compiled.diagnostics, "")
+    compiled.llvm.unwrap()
+
+/** The symbols of the functions a build lowered that an entry could have held, and the own keys of
+ * those it made an entry for or read one from. */
+private struct Lowered
+    fresh: Buf[string]
+    reused: Buf[string]
+    keys: Map[string, bool]
+
+private lowered_of(c: CachedLowering) -> Lowered
+    val p = c.program
+    var fresh: Buf[string] = buf()
+    var reused: Buf[string] = buf()
+    var keys: Map[string, bool] = map()
+    for i in 0..<p.functions.len()
+        if p.stored[i] == "" then continue
+        keys.put(p.key_inputs.own[i], true)
+        if p.reused[i] then reused.push(p.functions[i].symbol) else fresh.push(p.functions[i].symbol)
+    Lowered(fresh, reused, keys)
+
+/** Builds the program, then the edited one with the same cache, and holds the second build to its
+ * two rules: an instance is lowered exactly where no earlier build made an entry for its own key, and
+ * the text is a clean build's. Answers the symbols the second build lowered. */
+private edit_lowers(main: string, geo: string, extra: string) -> Buf[string]
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val cache = dir + "/cache"
+    val first = cached(program_of(dir, Main, Geo, Extra), cache)
+    assert_eq(first.llvm, clean(program_of(dir, Main, Geo, Extra)))
+    val before = lowered_of(first)
+    assert_eq(before.reused.len(), 0)
+    val files = program_of(dir, main, geo, extra)
+    val second = cached(files, cache)
+    val p = second.program
+    for i in 0..<p.functions.len()
+        val had = before.keys.get(p.key_inputs.own[i]) is Some(_)
+        if p.stored[i] != "" then assert_eq(p.reused[i], had, p.functions[i].symbol)
+        else assert(!p.reused[i], p.functions[i].symbol)
+    assert_eq(second.llvm, clean(files))
+    lowered_of(second).fresh
+
+private holds(symbols: Buf[string], name: string) -> bool
+    for s in symbols
+        if s == name then return true
+    false
+
+@test("a second build of an unchanged program lowers nothing an entry holds and emits nothing again")
+unchanged_program_reuses_everything()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val first = cached(files, dir + "/cache")
+    val made = lowered_of(first)
+    assert(made.fresh.len() > 10)
+    assert_eq(first.texts_reused, 0)
+    val second = cached(files, dir + "/cache")
+    val again = lowered_of(second)
+    assert_eq(again.fresh.len(), 0)
+    assert_eq(again.reused.len(), made.fresh.len())
+    assert_eq(second.texts_reused, second.program.functions.len())
+    assert_eq(second.llvm, first.llvm)
+    assert_eq(second.llvm, clean(files))
+
+@test("a body edited in one module lowers that function alone")
+body_edit_lowers_its_function()
+    val fresh = edit_lowers(Main, Geo, edited(Extra, "n + 100", "n + 101"))
+    assert_eq(fresh.len(), 1)
+    assert(holds(fresh, "extra.helper"))
+
+@test("a default argument changed lowers what reads it and none of the other module's functions")
+default_argument_edit_lowers_callers()
+    val fresh = edit_lowers(Main, edited(Geo, "by: int = 2", "by: int = 3"), Extra)
+    assert(fresh.len() >= 1)
+    assert(!holds(fresh, "extra.helper"))
+
+@test("a signature changed lowers the function and its callers")
+signature_edit_lowers_callers()
+    val fresh = edit_lowers(edited(Main, "println(helper(1))", "println(helper(long(1)))"), Geo, edited(Extra, "helper(n: int) -> int = n + 100", "helper(n: long) -> long = n + 100"))
+    assert(holds(fresh, "extra.helper"))
+    assert(holds(fresh, "<program>.main"))
+    assert(!holds(fresh, "extra.half"))
+
+@test("a field added to a class lowers every function that lays it out or reads it")
+field_edit_lowers_users()
+    val fresh = edit_lowers(Main, edited(Geo, "class Box(val w: int, val h: int)", "class Box(val w: int, val h: int, val d: int = 1)"), Extra)
+    assert(holds(fresh, "geo.Box.area"))
+    assert(!holds(fresh, "extra.helper"))
+
+@test("a class added that implements a trait keeps every other function's code and gives a clean build's text")
+implementing_class_added()
+    val fresh = edit_lowers(Main, Geo + "\nclass Dog(val n: string): Named\n    override name() -> string = \"dog \" + n\n", Extra)
+    assert(!holds(fresh, "extra.helper"))
+
+@test("a generic function's body edited lowers every instance of it")
+generic_edit_lowers_every_instance()
+    val fresh = edit_lowers(edited(Main, "twice[T](x: T) -> (T, T) = (x, x)", "twice[T](x: T) -> (T, T) = (x, x) match\n    p -> p"), Geo, Extra)
+    var instances = 0
+    for s in fresh
+        if s.starts_with("<program>.twice[") then instances += 1
+    assert_eq(instances, 3)
+
+@test("a lambda's captures changed lowers its function and the function it is in")
+lambda_captures_edit()
+    val fresh = edit_lowers(edited(Main, "val add = (x: int) -> x + k", "val add = (x: int) -> x + k + limit"), Geo, Extra)
+    assert(holds(fresh, "<program>.main"))
+    assert(!holds(fresh, "extra.helper"))
+
+@test("lines added above every function lower nothing, and the trap sites below them report their new lines")
+lines_added_above_lower_nothing()
+    val moved = "module extra\n\n// A helper.\n\n\n" + Extra["module extra\n\n".bytes.len..]
+    val fresh = edit_lowers(Main, Geo, moved)
+    assert_eq(fresh.len(), 0)
+
+@test("a comment inside a function lowers that function")
+comment_inside_lowers_it()
+    val fresh = edit_lowers(Main, Geo, edited(Extra, "half(n: int) -> int = 100 / n", "half(n: int) -> int =\n    // the half\n    100 / n"))
+    assert(holds(fresh, "extra.half"))
+    assert(!holds(fresh, "extra.helper"))
+
+@test("a module-level constant changed lowers what reads it and none of the other module's functions")
+constant_edit_lowers_readers()
+    val fresh = edit_lowers(Main, edited(Geo, "val limit = 10", "val limit = 11"), Extra)
+    assert(holds(fresh, "<program>.main"))
+    assert(!holds(fresh, "extra.helper"))
+    assert(!holds(fresh, "geo.area"))
+
+@test("an overload added renames the overloaded function and lowers it and its callers, nothing else of its module")
+overload_added_lowers_the_renamed_and_callers()
+    val fresh = edit_lowers(Main, Geo, Extra + "\nhelper(s: string) -> string = s + \"!\"\n")
+    assert(holds(fresh, "extra.helper(int)"))
+    assert(holds(fresh, "<program>.main"))
+    assert(!holds(fresh, "extra.half"))
+    assert(!holds(fresh, "geo.area"))
+
+@test("an impl of a trait added for a data type gives a clean build's text and keeps the other module's code")
+data_impl_added()
+    val fresh = edit_lowers(Main, Geo + "\nimpl Named for Shape\n    name() -> string = \"shape\"\n", Extra)
+    assert(!holds(fresh, "extra.helper"))
+    assert(!holds(fresh, "extra.half"))
+
+@test("a data type's field renamed lowers what lays it out and none of the other modules' functions")
+data_field_renamed()
+    val fresh = edit_lowers(edited(Main, "data Pair(a: int, b: int)", "data Pair(first: int, b: int)"), Geo, Extra)
+    assert(fresh.len() >= 1)
+    assert(!holds(fresh, "extra.helper"))
+    assert(!holds(fresh, "geo.area"))
+
+@test("a callee's inferred result changed lowers the callee and its caller")
+inferred_result_edit_lowers_callers()
+    val fresh = edit_lowers(Main, Geo, edited(Extra, "third(n: int) = n / 3", "third(n: int) = long(n) / long(3)"))
+    assert(holds(fresh, "extra.third"))
+    assert(holds(fresh, "<program>.main"))
+    assert(!holds(fresh, "extra.helper"))
+
+@test("a lambda's body edited lowers the lambda and none of the other modules' functions")
+lambda_body_edit()
+    val fresh = edit_lowers(edited(Main, "val add = (x: int) -> x + k", "val add = (x: int) -> x * k"), Geo, Extra)
+    assert(fresh.len() >= 1)
+    assert(!holds(fresh, "extra.helper"))
+    assert(!holds(fresh, "geo.area"))
+
+@test("a function moved below another lowers nothing")
+function_moved_lowers_nothing()
+    val moved = edited(Extra, "helper(n: int) -> int = n + 100\n\nhalf(n: int) -> int = 100 / n\n", "half(n: int) -> int = 100 / n\n\nhelper(n: int) -> int = n + 100\n")
+    val fresh = edit_lowers(Main, Geo, moved)
+    assert_eq(fresh.len(), 0)
+
+@test("a function no longer called is gone from the text and a string added is in it")
+instance_dropped_and_string_added()
+    val fresh = edit_lowers(edited(Main, "    println(helper(1))\n", "    println(\"new\")\n"), Geo, Extra)
+    assert(holds(fresh, "<program>.main"))
+
+// --- the cache's files -----------------------------------------------------------------------------
+
+/** The module files of the cache in `dir`, by full path. */
+private module_files(dir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for name in entries(dir).unwrap()
+        if name.ends_with(".mod") then out.push(dir + "/" + name)
+    val sorted = out.view()
+    sort(sorted)
+    var files: Buf[string] = buf()
+    for f in sorted
+        files.push(f)
+    files
+
+@test("a truncated module file is passed over, its instances lowered again, and replaced")
+truncated_file_is_a_miss()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val cache = dir + "/cache"
+    val first = cached(files, cache)
+    val made = lowered_of(first).fresh.len()
+    val store = read_instance_store(cache)
+    assert_eq(store.damaged, 0)
+    for f in module_files(cache)
+        val text = read_text(f).unwrap()
+        write_text(f, text[0..<text.bytes.len - 7]).unwrap()
+    val damaged = read_instance_store(cache)
+    assert_eq(damaged.damaged, damaged.files)
+    assert_eq(damaged.lowered.len(), 0)
+    val second = cached(files, cache)
+    assert_eq(lowered_of(second).fresh.len(), made)
+    assert_eq(second.texts_reused, 0)
+    assert_eq(second.llvm, clean(files))
+    // The build wrote whole files again, which the next one reads.
+    val third = cached(files, cache)
+    assert_eq(lowered_of(third).fresh.len(), 0)
+    assert_eq(third.llvm, clean(files))
+
+@test("a module file with one byte changed fails its checksum and is never trusted")
+damaged_file_is_never_trusted()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val cache = dir + "/cache"
+    _ = cached(files, cache)
+    // Make every `ret` of the text entries a `rex`: the lengths still match, the checksum does not.
+    for f in module_files(cache)
+        write_text(f, read_text(f).unwrap().replace_all("  ret ", "  rex ")).unwrap()
+    val store = read_instance_store(cache)
+    assert(store.damaged > 0)
+    for (_, payload) in store.texts
+        assert(!payload.contains("  rex "))
+    val second = cached(files, cache)
+    assert(!second.llvm.contains("  rex "))
+    assert_eq(second.llvm, clean(files))
+
+@test("a missing manifest or module file is an empty cache, not an error")
+missing_files_are_misses()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val cache = dir + "/cache"
+    val empty = read_instance_store(cache)
+    assert_eq(empty.files, 0)
+    assert_eq(empty.lowered.len(), 0)
+    _ = cached(files, cache)
+    for f in module_files(cache)
+        remove_file(f).unwrap()
+    val gone = read_instance_store(cache)
+    assert_eq(gone.damaged, gone.files)
+    val second = cached(files, cache)
+    assert_eq(lowered_of(second).reused.len(), 0)
+    assert_eq(second.llvm, clean(files))
+
+@test("another compiler's entries are never used: its keys name another stamp")
+compiler_change_invalidates()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    defer stand_in_compiler("")
+    val files = program_of(dir, Main, Geo, Extra)
+    val cache = dir + "/cache"
+    stand_in_compiler("a compiler of yesterday")
+    val first = cached(files, cache)
+    val made = lowered_of(first).fresh.len()
+    stand_in_compiler("a compiler of today")
+    val second = cached(files, cache)
+    assert_eq(lowered_of(second).reused.len(), 0)
+    assert_eq(lowered_of(second).fresh.len(), made)
+    assert_eq(second.texts_reused, 0)
+    assert_eq(second.llvm, clean(files))
+    val third = cached(files, cache)
+    assert_eq(lowered_of(third).fresh.len(), 0)
+
+@test("a module file no manifest names is trimmed once an hour old, and the other level's directory is never touched")
+trimming_spares_fresh_files_and_the_other_level()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val o0 = instance_cache_dir(dir + "/.avin/build", false, "-O0")
+    val o2 = instance_cache_dir(dir + "/.avin/build", false, "-O2")
+    assert(o0 != o2)
+    _ = cached(files, o0)
+    _ = cached(files, o2)
+    val other = module_files(o0)
+    val old = now() - micros(InstanceCacheFresh + 60000000)
+    for f in other
+        set_modified(f, old).unwrap()
+    // A stale file in the level being built, one fresh, and a write left behind.
+    make_dir_all(o2).unwrap()
+    write_text(o2 + "/0123456789abcdef0123456789abcdef.mod", "stale").unwrap()
+    set_modified(o2 + "/0123456789abcdef0123456789abcdef.mod", old).unwrap()
+    write_text(o2 + "/fedcba9876543210fedcba9876543210.mod", "fresh").unwrap()
+    write_text(o2 + "/manifest.pending-1-1", "left").unwrap()
+    set_modified(o2 + "/manifest.pending-1-1", old).unwrap()
+    _ = cached(program_of(dir, edited(Main, "println(limit)", "println(limit + 1)"), Geo, Extra), o2)
+    assert(!exists(o2 + "/0123456789abcdef0123456789abcdef.mod"))
+    assert(exists(o2 + "/fedcba9876543210fedcba9876543210.mod"))
+    assert(!exists(o2 + "/manifest.pending-1-1"))
+    for f in other
+        assert(exists(f), f)
+    assert_eq(read_instance_store(o0).damaged, 0)
+
+@test("verify names the function whose cached text differs from a clean build's")
+verify_names_a_stale_text()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val cache = dir + "/cache"
+    _ = cached(files, cache)
+    // Rewrite the cache with helper's text changed, as a key that missed a dependency would leave it.
+    val store = read_instance_store(cache)
+    var tampered = instance_store_at(cache)
+    var changed = 0
+    for (key, payload) in store.texts
+        var text = payload
+        if payload.contains(" @\"extra.helper\"(ptr %ctx, i32 %v0) {")
+            text = payload.replace_all("i32 100", "i32 999")
+            changed += 1
+        keep_entry(&tampered, "all", CacheEntry(TextEntry, key, text))
+    for (key, payload) in store.lowered
+        keep_entry(&tampered, "all", CacheEntry(LoweredEntry, key, payload))
+    assert_eq(changed, 1)
+    for f in module_files(cache)
+        remove_file(f).unwrap()
+    _ = write_instance_store(tampered)
+    open_incremental(cache, IncrementalVerify)
+    defer close_incremental()
+    val compiled = compile_program(repository_toolchain(), files, false, buf(), buf())
+    assert(compiled.diagnostics.contains("AVIN_INCREMENTAL=verify: the function `extra.helper`"), compiled.diagnostics)
+    close_incremental()
+    open_incremental(cache, IncrementalOn)
+    val trusting = compile_program(repository_toolchain(), files, false, buf(), buf())
+    assert(trusting.llvm.unwrap().contains("i32 999"))
+
+@test("verify passes where the cache is right, at every edit")
+verify_passes_a_right_cache()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val cache = dir + "/cache"
+    open_incremental(cache, IncrementalVerify)
+    defer close_incremental()
+    for extra in [Extra, edited(Extra, "n + 100", "n + 7"), Extra]
+        val compiled = compile_program(repository_toolchain(), program_of(dir, Main, Geo, extra), false, buf(), buf())
+        assert_eq(compiled.diagnostics, "")
+    assert(read_instance_store(cache).texts.len() > 0)
+
+/** The phases of a build log, in order, and each one's counts. */
+private logged_phases(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for line in read_text(file).unwrap().split("\n")
+        if line != "" then out.push(line)
+    out
+
+private phase_names(lines: Buf[string]) -> string
+    var out = ""
+    for line in lines
+        out = out + line.split(" ")[0][6..] + " "
+    out
+
+private count_in(lines: Buf[string], phase: string, key: string) -> int
+    for line in lines
+        if line.split(" ")[0] != "phase=" + phase then continue
+        for word in line.split(" ")
+            if word.starts_with(key + "=") then return parse_int(word[key.bytes.len + 1..]).unwrap()
+    panic(s"no `$key` on the `$phase` line")
+
+@test("the build log counts what the cache gave: entries read, instances and texts reused, files written")
+build_log_counts_the_cache()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val log = dir + "/build.log"
+    defer close_build_log()
+    open_build_log(Some(log)).unwrap()
+    _ = compile_program(repository_toolchain(), files, false, buf(), buf())
+    val off = logged_phases(log)
+    assert_eq(phase_names(off), "load check cunit lower keys shims emit ")
+    assert_eq(count_in(off, "lower", "reused"), 0)
+    assert_eq(count_in(off, "emit", "reused"), 0)
+    open_incremental(dir + "/cache", IncrementalOn)
+    defer close_incremental()
+    open_build_log(Some(log)).unwrap()
+    _ = compile_program(repository_toolchain(), files, false, buf(), buf())
+    val cold = logged_phases(log)
+    assert_eq(phase_names(cold), "load check cunit cache lower keys shims emit store ")
+    assert_eq(count_in(cold, "cache", "files"), 0)
+    assert_eq(count_in(cold, "cache", "lowered"), 0)
+    assert_eq(count_in(cold, "lower", "reused"), 0)
+    assert_eq(count_in(cold, "emit", "reused"), 0)
+    assert(count_in(cold, "store", "written") >= 3)
+    assert_eq(count_in(cold, "store", "kept"), 0)
+    open_build_log(Some(log)).unwrap()
+    _ = compile_program(repository_toolchain(), files, false, buf(), buf())
+    val warm = logged_phases(log)
+    val modules = count_in(cold, "store", "written")
+    assert_eq(count_in(warm, "cache", "files"), modules)
+    assert_eq(count_in(warm, "cache", "damaged"), 0)
+    assert_eq(count_in(warm, "lower", "reused"), count_in(warm, "cache", "lowered"))
+    assert_eq(count_in(warm, "emit", "reused"), count_in(warm, "lower", "functions"))
+    assert_eq(count_in(warm, "cache", "texts"), count_in(warm, "lower", "functions"))
+    assert_eq(count_in(warm, "store", "written"), 0)
+    assert_eq(count_in(warm, "store", "kept"), modules)
+    assert_eq(count_in(warm, "store", "trimmed"), 0)
+
+@test("AVIN_INCREMENTAL is on, verify, off or unset; anything else is an error naming it")
+incremental_modes()
+    assert_eq(incremental_mode_of(None).unwrap(), IncrementalOff)
+    assert_eq(incremental_mode_of(Some("")).unwrap(), IncrementalOff)
+    assert_eq(incremental_mode_of(Some("off")).unwrap(), IncrementalOff)
+    assert_eq(incremental_mode_of(Some("on")).unwrap(), IncrementalOn)
+    assert_eq(incremental_mode_of(Some("verify")).unwrap(), IncrementalVerify)
+    assert(incremental_mode_of(Some("yes")).unwrap_err().contains("AVIN_INCREMENTAL is `yes`"))
+    assert(incremental_mode_of(Some("On")) is Err(_))
+    assert_eq(incremental_now(), IncrementalOff)
+    open_incremental("/nowhere", IncrementalOn)
+    assert_eq(incremental_now(), IncrementalOn)
+    assert_eq(incremental_directory(), "/nowhere")
+    close_incremental()
+    assert_eq(incremental_now(), IncrementalOff)
+    assert_eq(incremental_directory(), "")
+
+@test("each kind and level has its own directory beside the executables")
+directories_by_kind_and_level()
+    assert_eq(instance_cache_dir("p/.avin/build", false, "-O2"), "p/.avin/build/incremental/program-O2")
+    assert_eq(instance_cache_dir("p/.avin/build", true, "-O0"), "p/.avin/build/incremental/tests-O0")
+
+// --- the entries' text -----------------------------------------------------------------------------
+
+/** The typed program of `files`. */
+private checked_program(files: Buf[ProgramFile]) -> TProgram
+    val loaded = load_units(repository_toolchain().library_dir(), files, false, src -> src) match
+        Ok(l) -> l
+        Err(m) -> panic(m)
+    val result = check_program(loaded.units, loaded.root_module, false)
+    if result.has_errors() then panic(result.render())
+    result.program.unwrap()
+
+@test("an entry's numbers, words, flags and text read back as written, text of any bytes")
+entry_text_round_trips()
+    var w = entry_writer()
+    w.num(0)
+    w.num(18446744073709551615)
+    w.word("abc")
+    w.flag(true)
+    w.flag(false)
+    w.opt(None)
+    w.opt(Some(7))
+    w.text("")
+    w.text("two words\nand a line: 5:x ")
+    w.text("é 字 🎉")
+    val written = w.finish()
+    var r = entry_reader(written)
+    assert_eq(r.num(), 0)
+    assert_eq(r.num(), 18446744073709551615)
+    assert_eq(r.word(), "abc")
+    assert(r.flag())
+    assert(!r.flag())
+    assert(r.opt() is None)
+    assert_eq(r.opt().unwrap(), 7)
+    assert_eq(r.text(), "")
+    assert_eq(r.text(), "two words\nand a line: 5:x ")
+    assert_eq(r.text(), "é 字 🎉")
+    assert(!r.failed)
+    assert(r.at_end())
+
+@test("a short or malformed entry fails rather than reading garbage")
+entry_text_failures()
+    var short = entry_reader("12:abc ")
+    assert_eq(short.text(), "")
+    assert(short.failed)
+    var letters = entry_reader("x ")
+    _ = letters.num()
+    assert(letters.failed)
+    var unended = entry_reader("12")
+    _ = unended.num()
+    assert(unended.failed)
+    var empty = entry_reader("")
+    _ = empty.word()
+    assert(empty.failed)
+    assert(empty.at_end())
+
+@test("every kind of type an entry names reads back as the same type")
+types_round_trip()
+    val checked = checked_program(program_of("/p", Main, Geo, Extra))
+    val names = type_names(checked)
+    var samples: Buf[&Type] = buf()
+    samples.push(Unit)
+    samples.push(Bool)
+    samples.push(Char)
+    samples.push(Real)
+    samples.push(Str)
+    samples.push(Byte)
+    samples.push(Int(7))
+    samples.push(Nothing)
+    samples.push(AnyType)
+    var parts: Buf[&Type] = buf()
+    parts.push(Int(32))
+    parts.push(Str)
+    samples.push(Tuple(parts))
+    samples.push(Function(parts, Bool, true))
+    samples.push(ByName(Real))
+    samples.push(Union(parts))
+    for id in 0..<checked.data.len()
+        var args: Buf[&Type] = buf()
+        for _ in checked.data[id].decl.type_params
+            args.push(Int(64))
+        samples.push(Data(id, checked.data[id].name, args))
+    for id in 0..<checked.classes.len()
+        var args: Buf[&Type] = buf()
+        for _ in checked.classes[id].decl.type_params
+            args.push(Str)
+        samples.push(Class(id, checked.classes[id].name, args))
+    for t in samples
+        var w = entry_writer()
+        assert(write_type(&w, checked, t), type_name(t))
+        val text = w.finish()
+        var r = entry_reader(text)
+        val back = read_type(&r, names).unwrap()
+        assert(same_type(back, t), type_name(t))
+        assert_eq(stable_type_key(checked, back), stable_type_key(checked, t))
+        assert(r.at_end())
+    var w = entry_writer()
+    assert(!write_type(&w, checked, TypeVar(0, 0, "T")))
+    assert(!write_type(&w, checked, ErrorType))
+
+@test("a type naming a declaration the program no longer has does not read back")
+type_of_a_removed_declaration()
+    val checked = checked_program(program_of("/p", Main, Geo, Extra))
+    var r = entry_reader("D 12:geo\nNoSuchType 4:Gone 0 ")
+    assert(read_type(&r, type_names(checked)) is None)
+    var c = entry_reader("C 8:geo\nNope 4:Nope 0 ")
+    assert(read_type(&c, type_names(checked)) is None)
+
+// --- corpus programs and builds at once ------------------------------------------------------------
+
+@test("a sample of the corpus builds warm to a clean build's text, reusing what it lowered cold")
+corpus_sample_warm_equals_clean()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    var names: Buf[string] = buf()
+    for name in entries("tests/run").unwrap()
+        if name.ends_with(".avin") then names.push(name)
+    val sorted = names.view()
+    sort(sorted)
+    var checked = 0
+    var i = 0usize
+    while i < sorted.len
+        val name = sorted[i]
+        i += 47
+        val files = single_file(source_of(name, read_text("tests/run/" + name).unwrap()))
+        val compiled = compile_files(repository_toolchain(), files)
+        if compiled.diagnostics != "" then continue
+        val cache = dir + "/" + name
+        val cold = cached(files, cache)
+        val warm = cached(files, cache)
+        assert_eq(cold.llvm, compiled.llvm.unwrap(), name)
+        assert_eq(warm.llvm, compiled.llvm.unwrap(), name)
+        assert_eq(lowered_of(warm).fresh.len(), 0, name)
+        assert_eq(lowered_of(warm).reused.len(), lowered_of(cold).fresh.len(), name)
+        assert_eq(warm.texts_reused, warm.program.functions.len(), name)
+        checked += 1
+    assert(checked * 2 >= sorted.len / 47, s"only $checked of the sample compiled")
+
+@test("two builds of one program at once both succeed, and leave a cache a third build verifies")
+two_builds_at_once()
+    val dir = make_temp_dir("avin-ic-twice").unwrap()
+    defer _ = remove_dir_all(dir)
+    val bin = dir + "/avin"
+    val built = capture(repository_toolchain().sysl, ["build", "compiler", "-o", bin], stderr = true, timeout = 900000).unwrap()
+    assert(built.status.ok(), built.err.unwrap_or(""))
+    val program = dir + "/prog"
+    make_dir_all(program + "/geo").unwrap()
+    make_dir_all(program + "/extra").unwrap()
+    write_text(program + "/geo/geo.avin", Geo).unwrap()
+    write_text(program + "/extra/extra.avin", Extra).unwrap()
+    write_text(program + "/main.avin", Main).unwrap()
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env.push(Var("AVIN_INCREMENTAL", "on"))
+    for round in 0..<2
+        val a = spawn(bin, ["build", program, "-O0", "-o", dir + "/a"], env = env.view(), stdout = Stdio.ToPath(dir + "/a.out"), stderr = Stdio.ToPath(dir + "/a.err")).unwrap()
+        val b = spawn(bin, ["build", program, "-O0", "-o", dir + "/b"], env = env.view(), stdout = Stdio.ToPath(dir + "/b.out"), stderr = Stdio.ToPath(dir + "/b.err")).unwrap()
+        val ea = a.wait().unwrap()
+        val eb = b.wait().unwrap()
+        assert(ea is Exited(0), s"round $round: " + read_text(dir + "/a.err").unwrap_or(""))
+        assert(eb is Exited(0), s"round $round: " + read_text(dir + "/b.err").unwrap_or(""))
+        val ra = capture(dir + "/a", [], timeout = 60000).unwrap()
+        val rb = capture(dir + "/b", [], timeout = 60000).unwrap()
+        assert_eq(ra.text, rb.text)
+        assert(ra.text.starts_with("21\n"), ra.text)
+    var verify: Buf[Var] = buf()
+    verify.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    verify.push(Var("AVIN_INCREMENTAL", "verify"))
+    val checked = spawn(bin, ["build", program, "-O0", "-o", dir + "/c"], env = verify.view(), stdout = Stdio.ToPath(dir + "/c.out"), stderr = Stdio.ToPath(dir + "/c.err")).unwrap()
+    assert(checked.wait().unwrap() is Exited(0), read_text(dir + "/c.err").unwrap_or(""))
+    val cache = instance_cache_dir(program + "/.avin/build", false, "-O0")
+    for name in entries(cache).unwrap()
+        assert(!name.contains(".pending-"), name)
+    assert_eq(read_instance_store(cache).damaged, 0)
+
+@test("a program built at -O0 and at -O2 with the cache runs the same, each level from its own entries")
+both_levels()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val tc = repository_toolchain()
+    var outputs: Buf[string] = buf()
+    for level in ["-O0", "-O2"]
+        val cache = instance_cache_dir(dir + "/.avin/build", false, level)
+        open_incremental(cache, IncrementalOn)
+        for round in 0..<2
+            val compiled = compile_program(tc, files, false, buf(), buf())
+            assert_eq(compiled.diagnostics, "")
+            val exe = dir + s"/run$level$round"
+            link(tc, compiled.llvm.unwrap(), compiled.archive, exe, level, compiled.c_link).unwrap()
+            outputs.push(capture(exe, [], timeout = 60000).unwrap().text)
+        close_incremental()
+        assert(read_instance_store(cache).texts.len() > 0)
+    for o in outputs
+        assert_eq(o, outputs[0])
+    assert(outputs[0].contains("cat tom"))

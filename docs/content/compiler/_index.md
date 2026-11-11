@@ -106,8 +106,30 @@ lowering makes it, and the front end stays a whole-program pass that runs on eve
 | Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/` |
 | Executable | the linked program | the build key of [running and testing](#running-and-testing) | `.avin/build/` (exists) |
 
-Instances are stored a file per source module, holding the instances of that module's functions,
-so a module whose functions' instances are all reused is a module not compiled again.
+Instances are stored a file per source module, holding the instances of that module's functions
+(the functions lowering makes are the module `<generated>`'s), so a module whose functions'
+instances are all reused is a module file read and not written again.
+
+An instance's entries are two. Its **lowered entry**, under its own key (the key's first part,
+below, which is known when the worklist reaches the instance), holds the requests lowering it made
+of the whole program, in order, then its code. A request is everything lowering an instance asks of
+or tells the program: a layout, a record, a box, a string, a trap site, another instance, a method
+table slot, a closure, a constant object, a call through a table, a type tested, a call of a function
+value. Each is made through one function of lowering, which records it while the instance is lowered
+for the cache, every type in it spelled by qualified names; only the outermost request is recorded,
+since replaying it makes the ones inside it again. In the code, every number that counts the
+program's functions, descriptors, records, strings, constants, closures, trap sites, module-level
+values or table slots is replaced by the name of what it counts. A later build that reaches an
+instance whose own key has an entry replays the requests, so the instances and tables grow exactly as
+lowering the instance would grow them, and reads the code back by those names; an entry naming a type
+or function the program no longer has is read without being made and lowered fresh instead. A trap
+site inside the instance's declaration is kept counted from the declaration's start, so a function
+that moved keeps its entry and its sites report their new lines. Only the program's own functions
+with bodies get lowered entries: closure entries, bindings and the functions lowering makes are small
+and lowered every build. Its **text entry**, under its finished key and the facts emission reads of
+the whole program for it (for each call, the callee's symbol and signature, whether it may collect
+and whether the call may close a cycle of the call graph; a shim's extensions), holds its LLVM text
+and the declarations the text needs.
 
 **The instance key.** An instance's text is reused only while everything it was made from is the
 same. The key is a hash over:
@@ -141,7 +163,10 @@ same. The key is a hash over:
 
 A function lowering makes for a type reads that type's supertypes and table, and, for equality and
 hashing field by field, its layout and its fields' types' supertypes and tables. The keys are made
-on every build, after lowering, and the build log's `keys` line counts them. The compiler's tests
+on every build in two parts: an instance's **own key** (the compiler, the shared decisions, its
+identity, its body fingerprint and the interfaces it reads) as the worklist reaches it, and its
+**finished key** (its own key and its world facts) after the whole-program passes; the build log's
+`keys` line counts them. The compiler's tests
 build a program of three modules, edit it in each way the design names and compare every key, the
 library's included: the keys that change are exactly those listed, and every function whose emitted
 text changed has a changed key.
@@ -150,9 +175,14 @@ text changed has a changed key.
 build, by the same worklist as today: a reused instance contributes the requests it recorded
 instead of being lowered, so the set grows and shrinks exactly as a clean build's would. An
 instance no longer requested is not emitted; a new one is lowered fresh. **Devirtualization and
-scalar replacement** stay whole-program passes over summaries, which are small; an instance whose
-world facts changed (a new class implementing a trait it calls through, a callee it inlined edited)
-has its passes run again from its lowered form, and only it.
+scalar replacement** stay whole-program passes, run on every build over every instance's lowered
+form. Devirtualization's whole-program part runs over summaries: each function's summary is, for
+what it returns and for the object of each of its calls through a table, the set of what it may be
+(an object of one descriptor, what one function returns, or unknown), found once from the function
+alone, and the fixed point of what each function returns is found over the summaries; only a function
+that calls through a table is rewritten. The passes run over every instance rather than only where
+an instance's world facts changed, which needs a key over the cone of the call graph a function's
+passes read (see [decisions](/spec/decisions/#proposed)).
 
 **Stable names.** The emitted text names everything by what it is, never by the order the checker
 or lowering found it in, so one new function, string or type renames nothing else. Each table's
@@ -182,12 +212,22 @@ unit alone. The tables are made from the instance set on every build.
 them, since the passes and the copies made for inlining differ. A build at one level never trims the
 other's.
 
-**Two builds at once.** Every entry is content-addressed: written under a temporary name and
-published by rename, so two builds writing one key write the same bytes, and a reader that finds an
-entry missing, short or failing its checksum treats it as a miss. Each module file of a build is
-looked up by the hash of its contents; the manifest naming the module files of the last build is
-written last. No lock is taken. A build trims entries that neither its manifest names nor were used
-in the last hour, as the unit cache spares what is fresh.
+**Two builds at once.** Every entry is content-addressed, so two builds writing one key write the
+same bytes. A module file is named by a hash of its module and the keys it holds, starts with its
+format, the length and the CRC-32 of what follows, and is written under a temporary name and
+published by rename; a reader that finds one missing, short or failing its checksum passes over it,
+its entries misses, and the build writes it again. A file the build read whole is touched rather
+than written. The manifest naming the module files of the build is written last, the same way. No
+lock is taken: whichever manifest is published last names files the other build left in place. A
+build trims the module files that its manifest does not name and that no build used in the last
+hour, and any temporary file left that long, as the unit cache spares what is fresh; there is no
+size limit.
+
+**Turning it on.** `AVIN_INCREMENTAL=on` makes `avin build` and `avin emit-llvm` read and write the
+instance cache, kept in `.avin/build/incremental/<kind><level>/` of the program's root directory
+(`program-O2`, `tests-O0`); `verify` does that and then builds the program again without the cache,
+and stops with the first function whose text differs from the clean build's; `off`, or unset, uses
+no cache. Any other value is an error.
 
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
@@ -200,10 +240,12 @@ clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its
 | `load` | `modules`: the modules read, the library's included |
 | `check` | `modules`: the modules checked |
 | `cunit` | none: the C unit of the program's C bindings |
-| `lower` | `functions`, `strings`, `descriptors`, `tests` |
+| `cache` | with the instance cache only: `files`, `damaged`, `lowered`, `texts`: the module files the manifest names, those passed over, and the lowered and text entries read |
+| `lower` | `functions`, `strings`, `descriptors`, `tests`, `reused`: the last, the instances whose code came from the cache |
 | `keys` | `instances`, `bodies`, `distinct`: the instance keys made, one per function lowered; the bodies fingerprinted, a generic function's once for all its instances; and how many keys differ |
 | `shims` | `bindings`, `handles`: the Sysl shims built |
-| `emit` | `bytes`: the size of the LLVM text |
+| `emit` | `bytes`, `reused`: the size of the LLVM text, and the functions whose text came from the cache |
+| `store` | with the instance cache only: `written`, `kept`, `trimmed`: module files written, those left as they were, and those trimmed |
 | `split` | `units`: the codegen units the module was cut into |
 | `units` | `units`, `compiled`, `reused`: units clang compiled, and units taken from its cache |
 | `link` | none |
@@ -220,8 +262,13 @@ added that implements a trait passes again the instances that call through it an
 else; a field added lowers every user of the type; an instance no longer requested is gone from
 the output. **The oracle is a clean build**: for every edit, the incremental build's LLVM text is
 the same as a build with no cache, so a key that misses a dependency fails a test rather than
-shipping a stale instance. `AVIN_INCREMENTAL=verify` lowers everything and compares it with what the
-cache would have given, naming the first instance whose key failed to change.
+shipping a stale instance. `AVIN_INCREMENTAL=verify` builds with the cache and again without it and
+compares the two texts, naming the first function where they differ. The compiler's tests hold each
+edit of the matrix to lowering exactly the instances whose own keys no earlier build made an entry
+for, and to a clean build's text; a cache whose files are truncated, damaged or missing, or were made
+by another compiler, gives a clean build's text and is written again; two builds of one program at
+once both succeed and leave a cache a third build verifies; and a sample of the corpus builds warm to
+a clean build's text with every instance taken from the cache.
 
 ## Sysl bindings and the shim cache
 

@@ -1,0 +1,663 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.checksum.crc32
+import sysl.container.{Map, map}
+import sysl.fs.{entries, make_dir_all, metadata, pending_name, publish_file, read_text, remove_file, set_modified, write_text}
+import sysl.slices.sort
+import sysl.text.{StrBuilder, parse_ulong, str_builder}
+import sysl.time.now
+
+// **The instance cache.** A build keeps what lowering and emission made of each instance, under the
+// instance's key, so the next build of the program takes an unchanged instance's code from the cache
+// instead of making it again:
+//
+// - a **lowered** entry, under the instance's own key (see `own_key`): the requests lowering the
+//   instance made of the whole program (the layouts, records, strings, trap sites, instances and
+//   method table slots it asked for, each by what it is), then its code, every function, descriptor,
+//   record, string, constant, closure, trap site and global it names spelled by its stable name. A
+//   build that finds one replays the requests, which grow the program's instances and tables exactly
+//   as lowering the instance would, and reads the code back, naming this build's numbers;
+// - a **text** entry, under the instance's finished key and the facts of the whole program its text
+//   was emitted with: the instance's LLVM text, and the declarations it needs.
+//
+// The entries live in `.avin/build/incremental/<kind><level>/` beside the program's executables: a
+// file per source module, `<name>.mod`, holding the entries of that module's instances (the functions
+// lowering makes are the module `<generated>`'s), named by a hash of the keys it holds, and a
+// `manifest` naming the module files of the last build. A module file is written under a temporary
+// name and published by renaming it, and starts with the length and CRC-32 of what follows, so a
+// reader never sees one half written and treats a short or damaged one as missing. The manifest is
+// written last, the same way, and no lock is taken: two builds of one program write the same bytes
+// for the same keys, and whichever manifest is published last names files the other build left in
+// place. A build trims the files that its manifest does not name and that no build used in the last
+// hour, in its own directory alone, so a build at one level never trims the other's.
+
+/** The variable that turns the instance cache on: `on`, `verify` or `off`. */
+const IncrementalVariable: string = "AVIN_INCREMENTAL"
+
+/** No instance cache: every instance is lowered and emitted. */
+const IncrementalOff: u8 = 0
+/** The instance cache read and written. */
+const IncrementalOn: u8 = 1
+/** The instance cache read and written, and the program built again without it: the two texts must
+ * be the same, or the build stops naming the first function where they differ. */
+const IncrementalVerify: u8 = 2
+
+/** The first line of every module file, which names its format. */
+private const ModuleFormat: string = "avin instances 1"
+
+/** How long a module file no manifest names is kept after its last use: an hour, in microseconds. */
+const InstanceCacheFresh: long = 3600000000
+
+// The cache's mode and directory for the builds of this process: off until `open_incremental`.
+private var incremental_mode: u8 = 0
+private var incremental_dir: string = ""
+
+/** The mode `AVIN_INCREMENTAL` names: unset, empty or `off` for none, `on`, or `verify`. */
+incremental_mode_of(value: Option[string]) -> Result[u8, string]
+    val v = value.unwrap_or("")
+    if v == "" || v == "off" then return Ok(IncrementalOff)
+    if v == "on" then return Ok(IncrementalOn)
+    if v == "verify" then return Ok(IncrementalVerify)
+    Err(s"avin: $IncrementalVariable is `$v`; it is `on`, `verify` or `off`")
+
+/** Turns the instance cache on for the builds that follow, kept in `dir`, in `mode`. */
+open_incremental(dir: string, mode: u8)
+    incremental_mode = mode
+    incremental_dir = dir
+
+/** Turns the instance cache off. */
+close_incremental()
+    incremental_mode = IncrementalOff
+    incremental_dir = ""
+
+/** The instance cache's mode for the builds of this process. */
+incremental_now() -> u8 = if incremental_dir == "" then IncrementalOff else incremental_mode
+
+/** The directory of the instance cache open now, or "" for none. */
+incremental_directory() -> string = if incremental_mode == IncrementalOff then "" else incremental_dir
+
+/** The instance cache of a program whose executables are kept in `cache` (see `build_cache`), built
+ * for its tests or not, at `optimization` (`-O0` or `-O2`): each kind and level has its own. */
+instance_cache_dir(cache: string, testing: bool, optimization: string) -> string =
+    cache + "/incremental/" + (if testing then "tests" else "program") + optimization
+
+/** What `verify` reports where the text a build made with the instance cache differs from a clean
+ * build's: the first function, in the clean build's order, whose definition differs or is missing,
+ * or else the first line that differs; "" where the two are the same. */
+first_difference(cached: string, clean: string) -> string
+    if cached == clean then return ""
+    val mine = definitions(cached)
+    val theirs = definitions(clean)
+    for name in theirs.order
+        val want = theirs.texts.get(name).unwrap_or("")
+        val got = mine.texts.get(name)
+        val same = got match
+            Some(t) -> t == want
+            None -> false
+        if !same then return s"avin: $IncrementalVariable=verify: the function `$name` the instance cache gave differs from a clean build's\n"
+    val a = cached.split("\n")
+    val b = clean.split("\n")
+    var i = 0usize
+    while i < a.len && i < b.len && a[i] == b[i]
+        i += 1
+    val line = if i < b.len then b[i] else if i < a.len then a[i] else ""
+    s"avin: $IncrementalVariable=verify: the program the instance cache gave differs from a clean build's at line ${i + 1}: $line\n"
+
+/** The functions an LLVM text defines: each one's whole definition by its symbol, and the symbols in
+ * order. */
+private struct Definitions
+    texts: Map[string, string]
+    order: Buf[string]
+
+private definitions(ir: string) -> Definitions
+    var texts: Map[string, string] = map()
+    var order: Buf[string] = buf()
+    var name = ""
+    var text = str_builder()
+    for line in ir.split("\n")
+        if line.starts_with("define ")
+            name = ""
+            if line.index_of(" @\"") is Some(at)
+                val rest = line[at + 3..]
+                if rest.index_of("\"") is Some(end) then name = rest[0..<end]
+            text = str_builder()
+        if name != "" then text.push(line + "\n")
+        if line == "}" && name != ""
+            texts.put(name, text.finish())
+            order.push(name)
+            name = ""
+    Definitions(texts, order)
+
+// --- entries ---------------------------------------------------------------------------------------
+
+/** An entry's kind: what lowering made of an instance, or its emitted text. */
+const LoweredEntry: u8 = 0
+const TextEntry: u8 = 1
+
+/** One entry of the cache: its kind, its key and what it holds. */
+struct CacheEntry
+    kind: u8
+    key: string
+    payload: string
+
+/** The instance cache as a build reads and writes it: the entries of the last build, by kind and key,
+ * and the entries this build used or made, by module, which it writes when it is done. */
+struct InstanceStore
+    dir: string
+    lowered: Map[string, string]
+    texts: Map[string, string]
+    keep: Map[string, Map[string, CacheEntry]]
+    /** The module files read, and those passed over as short, damaged or missing; and the names of
+     * those read whole, which a build may leave as they are. */
+    files: usize
+    damaged: usize
+    whole: Map[string, bool]
+
+/** An empty store over `dir`. */
+instance_store_at(dir: string) -> InstanceStore = InstanceStore(dir, map(), map(), map(), 0, 0, map())
+
+/** The entries of the last build kept in `dir`: none where there is no manifest. A module file the
+ * manifest names that is missing, short or damaged is passed over, its entries misses. */
+read_instance_store(dir: string) -> InstanceStore
+    var store = instance_store_at(dir)
+    val manifest = read_text(dir + "/manifest") match
+        Ok(text) -> text
+        Err(_) -> return store
+    for name in manifest.split("\n")
+        if name == "" then continue
+        store.files += 1
+        if read_module_file(&store, dir + "/" + name) then store.whole.put(name, true) else store.damaged += 1
+    store
+
+// Reads one module file into `store`, or answers false, adding nothing, for one that is not whole.
+private read_module_file(store: *InstanceStore, file: string) -> bool
+    val text = read_text(file) match
+        Ok(t) -> t
+        Err(_) -> return false
+    val bytes = text.bytes
+    var at = 0usize
+    val first = line_at(text, &at)
+    if first != ModuleFormat then return false
+    val header = line_at(text, &at).split(" ")
+    if header.len != 2 then return false
+    val sum = parse_ulong(header[0]) match
+        Ok(n) -> n
+        Err(_) -> return false
+    val length = parse_ulong(header[1]) match
+        Ok(n) -> n
+        Err(_) -> return false
+    if length != ulong(bytes.len - at) then return false
+    val body = text[at..]
+    if ulong(crc32(body.bytes)) != sum then return false
+    var r = entry_reader(body)
+    var lowered: Buf[CacheEntry] = buf()
+    while !r.at_end()
+        val kind = r.num()
+        val key = r.word()
+        val payload = r.text()
+        if r.failed then return false
+        lowered.push(CacheEntry(u8(kind), key, payload))
+    for e in lowered
+        if e.kind == LoweredEntry then store.lowered.put(e.key, e.payload) else store.texts.put(e.key, e.payload)
+    true
+
+/** The line of `text` at `*at`, without its line break, moving `*at` past it. */
+private line_at(text: string, at: *usize) -> string
+    val start = *at
+    var i = start
+    while i < text.bytes.len && text.bytes[i] != u8('\n')
+        i += 1
+    *at = if i < text.bytes.len then i + 1 else i
+    text[start..<i]
+
+/** Keeps `entry` among module `module`'s entries for this build to write. */
+keep_entry(store: *InstanceStore, unit: string, entry: CacheEntry)
+    var row = store.keep.get(unit).unwrap_or(map())
+    row.put(entry.key, entry)
+    store.keep.put(unit, row)
+
+/** What writing the store did: the module files written and those already there. */
+struct StoreWritten
+    written: usize
+    kept: usize
+    trimmed: usize
+
+/** Writes the entries this build kept: a module file for each module, unless the build read one with
+ * the same keys whole, which is touched instead, then the manifest naming them, then trims what is
+ * neither named nor fresh. A failure is not the build's: the worst a cache that could not be written
+ * costs is the next build's time. */
+write_instance_store(store: InstanceStore) -> StoreWritten
+    var result = StoreWritten(0, 0, 0)
+    if make_dir_all(store.dir).is_err() then return result
+    var modules: Buf[string] = buf()
+    for (m, _) in store.keep
+        modules.push(m)
+    val ordered = modules.view()
+    sort(ordered)
+    var names: Buf[string] = buf()
+    for m in ordered
+        val row = store.keep.get(m).unwrap()
+        var keys: Buf[string] = buf()
+        for (k, _) in row
+            keys.push(k)
+        val sorted = keys.view()
+        sort(sorted)
+        var listed = str_builder()
+        listed.push(ModuleFormat + "\n" + m + "\n")
+        for k in sorted
+            listed.push(k + "\n")
+        val name = content_key(listed.finish()) + ".mod"
+        names.push(name)
+        val file = store.dir + "/" + name
+        // A file this build read whole is left in place; any other with the name is written again,
+        // since it may be one a reader passed over.
+        if store.whole.get(name) is Some(_) && set_modified(file, now()).is_ok()
+            result.kept += 1
+            continue
+        var w = entry_writer()
+        for k in sorted
+            val e = row.get(k).unwrap()
+            w.num(usize(e.kind))
+            w.word(e.key)
+            w.text(e.payload)
+        val body = w.finish()
+        val text = s"$ModuleFormat\n${crc32(body.bytes)} ${body.bytes.len}\n" + body
+        if publish(file, text) then result.written += 1
+    var manifest = str_builder()
+    for n in names
+        manifest.push(n + "\n")
+    _ = publish(store.dir + "/manifest", manifest.finish())
+    result.trimmed = trim_instance_store(store.dir, names)
+    result
+
+// Writes `text` to `file` under a temporary name and renames it into place.
+private publish(file: string, text: string) -> bool
+    val pending = pending_name(file)
+    if write_text(pending, text).is_err()
+        _ = remove_file(pending)
+        return false
+    if publish_file(pending, file).is_err()
+        _ = remove_file(pending)
+        return false
+    true
+
+/** Removes from `dir` the module files `named` does not hold and every file a write left behind,
+ * each only once no build has used it for `InstanceCacheFresh`; answers how many went. */
+trim_instance_store(dir: string, named: Buf[string]) -> usize
+    val found = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return 0
+    var keep: Map[string, bool] = map()
+    for n in named
+        keep.put(n, true)
+    val fresh = now().us - InstanceCacheFresh
+    var removed = 0usize
+    for name in found
+        if name == "manifest" || keep.get(name) is Some(_) then continue
+        if !name.ends_with(".mod") && !name.contains(".pending-") then continue
+        val file = dir + "/" + name
+        val old = metadata(file) match
+            Ok(meta) -> meta.modified.us < fresh
+            Err(_) -> false
+        if old && remove_file(file).is_ok() then removed += 1
+    removed
+
+// --- the entries' text -----------------------------------------------------------------------------
+
+/** A writer of an entry's text: numbers and words, each followed by a space, and text as its length
+ * in bytes, a colon and its bytes. A word never holds a space or a line break. */
+struct EntryWriter
+    out: StrBuilder
+
+    num(*self, n: usize)
+        self.out.push(n.to_string())
+        self.out.push_char(' ')
+
+    word(*self, w: string)
+        self.out.push(w)
+        self.out.push_char(' ')
+
+    flag(*self, b: bool) = self.out.push(if b then "1 " else "0 ")
+
+    /** A number that may be absent, written `-`. */
+    opt(*self, n: Option[usize])
+        n match
+            Some(x) -> self.num(x)
+            None -> self.out.push("- ")
+
+    text(*self, t: string)
+        self.out.push(t.bytes.len.to_string())
+        self.out.push_char(':')
+        self.out.push(t)
+        self.out.push_char(' ')
+
+    finish(*self) -> string = self.out.finish()
+
+entry_writer() -> EntryWriter = EntryWriter(str_builder())
+
+/** A reader of what an `EntryWriter` wrote. Reading past the end or a malformed item sets `failed`
+ * and answers an empty value, so a caller checks once, at the end. */
+struct EntryReader
+    src: string
+    at: usize
+    failed: bool
+
+    at_end(self) -> bool = self.failed || self.at >= self.src.bytes.len
+
+    num(*self) -> usize
+        val b = self.src.bytes
+        var n = 0usize
+        var digits = 0usize
+        while self.at < b.len && u8('0') <= b[self.at] && b[self.at] <= u8('9')
+            n = n * 10 + usize(b[self.at] - u8('0'))
+            self.at += 1
+            digits += 1
+        if digits == 0 || self.at >= b.len || b[self.at] != u8(' ')
+            self.failed = true
+            return 0
+        self.at += 1
+        n
+
+    flag(*self) -> bool = self.num() == 1
+
+    opt(*self) -> Option[usize]
+        val b = self.src.bytes
+        if self.at + 1 < b.len && b[self.at] == u8('-') && b[self.at + 1] == u8(' ')
+            self.at += 2
+            return None
+        Some(self.num())
+
+    word(*self) -> string
+        val b = self.src.bytes
+        val start = self.at
+        while self.at < b.len && b[self.at] != u8(' ')
+            self.at += 1
+        if self.at >= b.len
+            self.failed = true
+            return ""
+        val w = self.src[start..<self.at]
+        self.at += 1
+        w
+
+    text(*self) -> string
+        val b = self.src.bytes
+        var n = 0usize
+        var digits = 0usize
+        while self.at < b.len && u8('0') <= b[self.at] && b[self.at] <= u8('9')
+            n = n * 10 + usize(b[self.at] - u8('0'))
+            self.at += 1
+            digits += 1
+        if digits == 0 || self.at >= b.len || b[self.at] != u8(':') || self.at + 1 + n >= b.len || b[self.at + 1 + n] != u8(' ')
+            self.failed = true
+            return ""
+        val t = self.src[self.at + 1..<self.at + 1 + n]
+        self.at += n + 2
+        t
+
+entry_reader(src: string) -> EntryReader = EntryReader(src, 0, false)
+
+// --- types -----------------------------------------------------------------------------------------
+
+/** The program's data types and classes by qualified name, which a type is read back by. */
+struct TypeNames
+    data: Map[string, usize]
+    classes: Map[string, usize]
+
+type_names(program: TProgram) -> TypeNames
+    var data: Map[string, usize] = map()
+    for id in 0..<program.data.len()
+        data.put(program.data[id].module_name + "\n" + program.data[id].name, id)
+    var classes: Map[string, usize] = map()
+    for id in 0..<program.classes.len()
+        val k = program.classes[id]
+        classes.put(k.module_name + "\n" + k.name + (if k.decl.object then "\nobject" else ""), id)
+    TypeNames(data, classes)
+
+/** Writes `t` by qualified names, or answers false for a type no entry may hold: one naming a type
+ * parameter, an unsolved type or an error. */
+write_type(w: *EntryWriter, program: TProgram, t: &Type) -> bool = *t match
+    Nothing ->
+        w.word("N")
+        true
+    AnyType ->
+        w.word("A")
+        true
+    Unit ->
+        w.word("U")
+        true
+    Bool ->
+        w.word("Bo")
+        true
+    Char ->
+        w.word("Ch")
+        true
+    Real ->
+        w.word("Re")
+        true
+    Str ->
+        w.word("St")
+        true
+    Byte ->
+        w.word("By")
+        true
+    Int(bits) ->
+        w.word("I")
+        w.num(usize(bits))
+        true
+    Tuple(items) ->
+        w.word("T")
+        write_types(w, program, items)
+    Function(params, result, sendable) ->
+        w.word("F")
+        w.flag(sendable)
+        write_types(w, program, params) && write_type(w, program, result)
+    ByName(inner) ->
+        w.word("B")
+        write_type(w, program, inner)
+    Data(id, name, args) ->
+        w.word("D")
+        w.text(program.data[id].module_name + "\n" + program.data[id].name)
+        w.text(name)
+        write_types(w, program, args)
+    Class(id, name, args) ->
+        val k = program.classes[id]
+        w.word("C")
+        w.text(k.module_name + "\n" + k.name + (if k.decl.object then "\nobject" else ""))
+        w.text(name)
+        write_types(w, program, args)
+    Union(members) ->
+        w.word("Un")
+        write_types(w, program, members)
+    Var(_) ->
+        val solved = solve(program.vars, t)
+        if *solved is Var(_) then false else write_type(w, program, solved)
+    _ -> false
+
+/** Writes a list of types, its length first. */
+write_types(w: *EntryWriter, program: TProgram, items: Buf[&Type]) -> bool
+    w.num(items.len())
+    for t in items
+        if !write_type(w, program, t) then return false
+    true
+
+/** Reads back a type `write_type` wrote, or `None` for one naming a type this program lacks. */
+read_type(r: *EntryReader, names: TypeNames) -> Option[&Type]
+    val tag = r.word()
+    if r.failed then return None
+    if tag == "N" then return Some(Nothing)
+    if tag == "A" then return Some(AnyType)
+    if tag == "U" then return Some(Unit)
+    if tag == "Bo" then return Some(Bool)
+    if tag == "Ch" then return Some(Char)
+    if tag == "Re" then return Some(Real)
+    if tag == "St" then return Some(Str)
+    if tag == "By" then return Some(Byte)
+    if tag == "I" then return Some(Int(u32(r.num())))
+    if tag == "T" then return Some(Tuple(read_types(r, names)?))
+    if tag == "F"
+        val sendable = r.flag()
+        val params = read_types(r, names)?
+        return Some(Function(params, read_type(r, names)?, sendable))
+    if tag == "B" then return Some(ByName(read_type(r, names)?))
+    if tag == "D"
+        val id = names.data.get(r.text())?
+        val name = r.text()
+        return Some(Data(id, name, read_types(r, names)?))
+    if tag == "C"
+        val id = names.classes.get(r.text())?
+        val name = r.text()
+        return Some(Class(id, name, read_types(r, names)?))
+    if tag == "Un" then return Some(Union(read_types(r, names)?))
+    None
+
+/** Reads back a list of types `write_types` wrote. */
+read_types(r: *EntryReader, names: TypeNames) -> Option[Buf[&Type]]
+    val n = r.num()
+    if r.failed then return None
+    var out: Buf[&Type] = buf()
+    for _ in 0..<n
+        out.push(read_type(r, names)?)
+    Some(out)
+
+// --- the parts of code that name nothing ----------------------------------------------------------
+
+write_machine(w: *EntryWriter, t: MirType)
+    t match
+        MInt(bits) ->
+            w.word("I")
+            w.num(usize(bits))
+        MBool -> w.word("Bo")
+        MReal -> w.word("Re")
+        MPtr -> w.word("P")
+        MRef -> w.word("O")
+
+read_machine(r: *EntryReader) -> Option[MirType]
+    val tag = r.word()
+    if tag == "I" then return Some(MInt(u32(r.num())))
+    if tag == "Bo" then return Some(MBool)
+    if tag == "Re" then return Some(MReal)
+    if tag == "P" then return Some(MPtr)
+    if tag == "O" then return Some(MRef)
+    None
+
+write_machines(w: *EntryWriter, items: Buf[MirType])
+    w.num(items.len())
+    for t in items
+        write_machine(w, t)
+
+read_machines(r: *EntryReader) -> Option[Buf[MirType]]
+    val n = r.num()
+    if r.failed then return None
+    var out: Buf[MirType] = buf()
+    for _ in 0..<n
+        out.push(read_machine(r)?)
+    Some(out)
+
+write_signature(w: *EntryWriter, s: MirSignature)
+    write_machines(w, s.params)
+    s.result match
+        Some(t) ->
+            w.word("+")
+            write_machine(w, t)
+        None -> w.word("-")
+
+read_signature(r: *EntryReader) -> Option[MirSignature]
+    val params = read_machines(r)?
+    val has = r.word()
+    if has == "-" then return Some(MirSignature(params, None))
+    if has != "+" then return None
+    Some(MirSignature(params, Some(read_machine(r)?)))
+
+write_scalar(w: *EntryWriter, c: CScalar)
+    c match
+        CSigned(bits) ->
+            w.word("s")
+            w.num(usize(bits))
+        CUnsigned(bits) ->
+            w.word("u")
+            w.num(usize(bits))
+        CBoolean -> w.word("b")
+        CBinary64 -> w.word("d")
+        CBinary32 -> w.word("f")
+        CAddress -> w.word("a")
+
+read_scalar(r: *EntryReader) -> Option[CScalar]
+    val tag = r.word()
+    if tag == "s" then return Some(CSigned(u32(r.num())))
+    if tag == "u" then return Some(CUnsigned(u32(r.num())))
+    if tag == "b" then return Some(CBoolean)
+    if tag == "d" then return Some(CBinary64)
+    if tag == "f" then return Some(CBinary32)
+    if tag == "a" then return Some(CAddress)
+    None
+
+op_number(op: MirOp) -> usize = op match
+    OpAdd -> 0
+    OpSub -> 1
+    OpMul -> 2
+    OpDiv -> 3
+    OpRem -> 4
+    OpAnd -> 5
+    OpOr -> 6
+    OpXor -> 7
+    OpShl -> 8
+    OpAShr -> 9
+    OpLShr -> 10
+    OpAddSat -> 11
+    OpSubSat -> 12
+    OpMulSat -> 13
+    OpFAdd -> 14
+    OpFSub -> 15
+    OpFMul -> 16
+    OpFDiv -> 17
+    OpFRem -> 18
+
+op_of(n: usize) -> Option[MirOp]
+    val all = [OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr, OpXor, OpShl, OpAShr, OpLShr, OpAddSat, OpSubSat, OpMulSat, OpFAdd, OpFSub, OpFMul, OpFDiv, OpFRem]
+    if n < all.len then Some(all[n]) else None
+
+cmp_number(op: MirCmp) -> usize = op match
+    CmpEq -> 0
+    CmpNe -> 1
+    CmpLt -> 2
+    CmpLe -> 3
+    CmpGt -> 4
+    CmpGe -> 5
+    CmpUge -> 6
+    CmpUlt -> 7
+    CmpUle -> 8
+    CmpUgt -> 9
+    FEq -> 10
+    FNe -> 11
+    FLt -> 12
+    FLe -> 13
+    FGt -> 14
+    FGe -> 15
+
+cmp_of(n: usize) -> Option[MirCmp]
+    val all = [CmpEq, CmpNe, CmpLt, CmpLe, CmpGt, CmpGe, CmpUge, CmpUlt, CmpUle, CmpUgt, FEq, FNe, FLt, FLe, FGt, FGe]
+    if n < all.len then Some(all[n]) else None
+
+checked_number(op: MirChecked) -> usize = op match
+    CheckedAdd -> 0
+    CheckedSub -> 1
+    CheckedMul -> 2
+
+checked_of(n: usize) -> Option[MirChecked]
+    val all = [CheckedAdd, CheckedSub, CheckedMul]
+    if n < all.len then Some(all[n]) else None
+
+conv_number(c: MirConv) -> usize = c match
+    SignExtend -> 0
+    ZeroExtend -> 1
+    Truncate -> 2
+    SignedToReal -> 3
+    UnsignedToReal -> 4
+    RealToInt -> 5
+    Binary32ToReal -> 6
+    RealToBinary32 -> 7
+
+conv_of(n: usize) -> Option[MirConv]
+    val all = [SignExtend, ZeroExtend, Truncate, SignedToReal, UnsignedToReal, RealToInt, Binary32ToReal, RealToBinary32]
+    if n < all.len then Some(all[n]) else None

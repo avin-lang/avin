@@ -229,6 +229,41 @@ private struct Lowering
      * rather than from the instance itself, one line each: the slot of each method with type
      * parameters of its own it calls through a table. Its key reads them. */
     instance_facts: Buf[string]
+    /** The maker of each instance's own key, and the own key of each instance, by its index, made as
+     * the instance is reached. */
+    keyer: Keys
+    own_keys: Buf[string]
+    /** The instance cache's lowered entries, by own key, which `caching` says to use and to make. */
+    cached: Map[string, string]
+    caching: bool
+    /** For each instance, by its index, its lowered entry, "" where it has none, and whether the
+     * entry came from the cache rather than from lowering it. */
+    stored: Buf[string]
+    reused: Buf[bool]
+    /** While an instance is lowered for the cache: the requests it made so far and how many, how
+     * deep inside a request lowering is (only the outermost is recorded, since replaying it makes the
+     * rest), and whether it did something no entry can hold. */
+    recording: bool
+    depth: usize
+    requests: EntryWriter
+    request_count: usize
+    unrecordable: bool
+    /** What reads an entry back: the program's types by qualified name, its functions by their
+     * symbols (made when first needed) and the module-level values by name; and the descriptors,
+     * records, constants and trap sites by name, each map covering the first so many. */
+    type_names: TypeNames
+    function_ids: Map[string, usize]
+    shared_spellings: Map[string, bool]
+    global_ids: Map[string, usize]
+    descriptor_names: Map[string, usize]
+    descriptors_named: usize
+    record_names: Map[string, usize]
+    records_named: usize
+    constant_names: Map[string, usize]
+    constants_named: usize
+    trap_names: Map[string, usize]
+    traps_named: usize
+    global_list: Buf[string]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -324,7 +359,12 @@ private pair_key(a: usize, b: usize) -> usize = a * 4294967296 + b
 // Every function that is not generic is compiled once; each generic function is compiled for each
 // list of type arguments a compiled call gives it, as those calls are found. An abstract method has
 // no code, and an abstract class's constructor is never called: its subclasses run its initializer.
-lower_program(program: TProgram) -> MirProgram
+lower_program(program: TProgram) -> MirProgram = lower_program_cached(program, map(), false)
+
+/** `lower_program` with the instance cache's lowered entries `cached`: with `caching`, an instance
+ * whose own key has an entry there is read back rather than lowered, and every instance lowered that
+ * an entry can hold gets one, in the program's `key_inputs`. */
+lower_program_cached(program: TProgram, cached: Map[string, string], caching: bool) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in program.globals
         global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
@@ -339,7 +379,12 @@ lower_program(program: TProgram) -> MirProgram
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
     val local = local_values(program)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, local_ordinals(program), map(), "", map(), false, buf())
+    val plan = option_plan(program)
+    val world = s"options ${plan.pointers} ${plan.nothing} ${plan.nothing_as_pointer} ${plan.nothing_as_object}"
+    val ordinals = local_ordinals(program)
+    var constant_globals: Buf[bool] = buf()
+    val keyer = key_maker(program, ordinals, constant_globals, world)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program))
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -351,6 +396,8 @@ lower_program(program: TProgram) -> MirProgram
         l.constant_values.push(None)
     for g in 0..<program.globals.len()
         if global_constant(&l, g) is Some(_) then l.global_types[g] = None
+    for g in 0..<program.globals.len()
+        constant_globals.push(l.constant_values[g] is Some(_))
     // The core library's functions are compiled only as the program reaches them, so a program
     // carries none of the library it does not use, and builds no shim for a binding it never calls.
     // A data type's implementation of a trait is compiled as it is called, directly or through a
@@ -415,7 +462,7 @@ lower_program(program: TProgram) -> MirProgram
     while true
         while k < l.instances.len()
             l.in_body = true
-            functions.push(lower_function(&l, k))
+            functions.push(lower_instance(&l, k))
             l.in_body = false
             k += 1
         // A call through a position no call used before fills it in every table made so far.
@@ -442,13 +489,13 @@ lower_program(program: TProgram) -> MirProgram
     var keyed: Buf[KeyedInstance] = buf()
     for inst in l.instances
         keyed.push(KeyedInstance(inst.function, inst.type_args, inst.entry, inst.generated))
-    var constant_globals: Buf[bool] = buf()
-    for g in 0..<program.globals.len()
-        constant_globals.push(l.constant_values[g] is Some(_))
-    val plan = l.options
-    val world = s"options ${plan.pointers} ${plan.nothing} ${plan.nothing_as_pointer} ${plan.nothing_as_object}"
-    val inputs = KeyInputs(keyed, l.local_ordinals, l.instance_facts, devirt_facts, scalar_facts, constant_globals, world)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf())
+    while l.own_keys.len() < l.instances.len()
+        l.own_keys.push(own_key(&l.keyer, keyed[l.own_keys.len()]))
+        l.stored.push("")
+        l.reused.push(false)
+    val inputs = KeyInputs(keyed, l.local_ordinals, l.instance_facts, devirt_facts, scalar_facts, constant_globals, world, l.own_keys, bodies_fingerprinted(l.keyer))
+    var mir = MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf(), l.stored, l.reused)
+    mir
 
 /** Each string's name: the first 16 hexadecimal digits of the SHA-256 of its bytes. Two different
  * strings of one program that share them, which no program has been seen to hold, are told apart
@@ -510,6 +557,12 @@ private field_size(t: MirType) -> usize = t match
  * tuple is laid out as a data type with one variant whose fields are its parts, and a class as one
  * whose fields are the class's: its parameters, then the fields its body declares. */
 private layout(l: *Lowering, t: &Type) -> DataLayout
+    if begin_request(l, "L") then record_type(l, t)
+    val made = layout_made(l, t)
+    l.depth -= 1
+    made
+
+private layout_made(l: *Lowering, t: &Type) -> DataLayout
     // The descriptors are named by the type's qualified spelling, a variant's after its type's.
     val key = stable_type_key(l.program, t)
     val identity = type_key(t)
@@ -724,6 +777,14 @@ private slot_used(l: *Lowering, position: usize, name: string, t: KnownType) -> 
 /** Records a call through `position` of a method table, of the method `name`, on a receiver of static
  * type `receiver`, `Any` where any object may be the receiver. */
 private use_slot(l: *Lowering, position: usize, name: string, receiver: &Type)
+    if begin_request(l, "S")
+        l.requests.num(position)
+        l.requests.text(name)
+        record_type(l, receiver)
+    use_slot_made(l, position, name, receiver)
+    l.depth -= 1
+
+private use_slot_made(l: *Lowering, position: usize, name: string, receiver: &Type)
     while l.slot_calls.len() <= position
         l.slot_calls.push(buf())
     // The receivers already recorded for this method at this position are the ones kept by
@@ -863,9 +924,24 @@ private hold_generic_slots(l: *Lowering, descriptor: usize, t: &Type)
  * named `name`, with its own type arguments `type_args`: made when first asked for, and filled in
  * every descriptor holding such a method there. */
 private generic_slot(l: *Lowering, position: usize, name: string, type_args: Buf[&Type], receiver: &Type) -> usize
+    if begin_request(l, "G")
+        l.requests.num(position)
+        l.requests.text(name)
+        record_types(l, type_args)
+        record_type(l, receiver)
+    val made = generic_slot_made(l, position, name, type_args, receiver)
+    l.depth -= 1
+    made
+
+/** The key a generic slot is found by. */
+private generic_slot_key(position: usize, name: string, type_args: Buf[&Type], receiver: &Type) -> string
     var key = s"$position $name ${type_key(receiver)}"
     for t in type_args
         key = key + "|" + type_key(t)
+    key
+
+private generic_slot_made(l: *Lowering, position: usize, name: string, type_args: Buf[&Type], receiver: &Type) -> usize
+    val key = generic_slot_key(position, name, type_args, receiver)
     if l.generic_index.get(key) is Some(index)
         note_fact(l, s"slot $position $name ${l.generic_base + index}")
         return l.generic_base + index
@@ -1080,6 +1156,21 @@ private core_class(l: *Lowering, name: string) -> Option[usize]
 /** A new constant object; with `shared`, the one already made with the same descriptor and fields,
  * if there is one. */
 private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
+    if begin_request(l, "B")
+        var w = entry_writer()
+        w.text(l.descriptors[descriptor].name)
+        w.num(size)
+        w.flag(shared)
+        w.num(fields.len())
+        for f in fields
+            w.num(f.offset)
+            write_machine(&w, f.ty)
+            if !write_operand(l, &w, f.value) then l.unrecordable = true
+        l.requests.out.push(w.finish())
+    l.depth -= 1
+    constant_object_made(l, descriptor, size, fields, shared)
+
+private constant_object_made(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
     var key = s"$descriptor:$size"
     for f in fields
         key = key + s";${f.offset}=" + constant_key(f.value)
@@ -1187,6 +1278,15 @@ private entry_instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     instance_of(l, function, type_args, true)
 
 private instance_of(l: *Lowering, function: usize, type_args: Buf[&Type], entry: bool) -> usize
+    if begin_request(l, "I")
+        record_function(l, function)
+        record_types(l, type_args)
+        l.requests.flag(entry)
+    val made = instance_made(l, function, type_args, entry)
+    l.depth -= 1
+    made
+
+private instance_made(l: *Lowering, function: usize, type_args: Buf[&Type], entry: bool) -> usize
     val key = instance_key(function, type_args, entry)
     if l.instance_index.get(key) is Some(index) then return index
     val index = l.instances.len()
@@ -1207,6 +1307,14 @@ private library_instance(l: *Lowering, index: usize) -> bool
 
 /** The function lowering makes of kind `kind` for type `t`, made when first asked for. */
 private generated(l: *Lowering, kind: u8, t: &Type) -> usize
+    if begin_request(l, "Q")
+        l.requests.num(usize(kind))
+        record_type(l, t)
+    val made = generated_made(l, kind, t)
+    l.depth -= 1
+    made
+
+private generated_made(l: *Lowering, kind: u8, t: &Type) -> usize
     val key = s"generated $kind|${type_key(t)}"
     if l.instance_index.get(key) is Some(index) then return index
     val index = l.instances.len()
@@ -1252,6 +1360,12 @@ private local_values(program: TProgram) ->Map[usize, Buf[usize]]
 
 /** The descriptor of a box holding one value of machine type `t`. */
 private box_descriptor(l: *Lowering, t: MirType) -> usize
+    if begin_request(l, "X") then write_machine(&l.requests, t)
+    val made = box_descriptor_made(l, t)
+    l.depth -= 1
+    made
+
+private box_descriptor_made(l: *Lowering, t: MirType) -> usize
     val key = machine_name(t)
     if l.boxes.get(key) is Some(d) then return d
     var refs: Buf[usize] = buf()
@@ -1268,6 +1382,12 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
 // as, a product of every part's ancestors, have no records unless the program names them. Every
 // other type is its own and nothing else.
 private record_of(l: *Lowering, t: &Type) -> usize
+    if begin_request(l, "R") then record_type(l, t)
+    val made = record_made(l, t)
+    l.depth -= 1
+    made
+
+private record_made(l: *Lowering, t: &Type) -> usize
     val key = type_key(t)
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
@@ -1291,8 +1411,10 @@ private record_of(l: *Lowering, t: &Type) -> usize
 /** The record of `t` as the type of some object: one whose equality and rendering entries a value
  * of unknown type may call. */
 private object_record(l: *Lowering, t: &Type) -> usize
+    if begin_request(l, "O") then record_type(l, t)
     val index = record_of(l, t)
     l.object_records[index] = true
+    l.depth -= 1
     index
 
 /** Whether `t` is a class the standard library marks `@keeps_owners`: its objects are shared
@@ -1413,6 +1535,12 @@ private string_descriptor(l: *Lowering) -> usize
 /** The descriptor of a box holding a value of the built-in type `t` as an `Any`; unit's is one
  * constant object. */
 private value_box(l: *Lowering, t: &Type) -> usize
+    if begin_request(l, "V") then record_type(l, t)
+    val made = value_box_made(l, t)
+    l.depth -= 1
+    made
+
+private value_box_made(l: *Lowering, t: &Type) -> usize
     val key = "value box " + type_key(t)
     if l.boxes.get(key) is Some(d) then return d
     val size = machine(l, t) match
@@ -1471,6 +1599,8 @@ private record_at(l: *Lowering, object: Operand) -> Operand
 /** Records that a type pattern tests against the type whose record is `index`, so that the records
  * of the types that may be seen as it gain it as an ancestor. */
 private note_tested(l: *Lowering, index: usize)
+    if begin_request(l, "T") then record_type(l, l.record_types[index])
+    l.depth -= 1
     for r in l.tested
         if r == index then return
     l.tested.push(index)
@@ -1658,6 +1788,14 @@ private machine_name(t: MirType) -> string = t match
 // A closure is the value of each local and top-level parameter the function captures; a boxed local
 // is captured as its box, so it stays shared. Its descriptor's `call` is `entry`, the function's code.
 private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entry: usize) -> ClosureShape
+    if begin_request(l, "C")
+        record_function(l, function)
+        record_types(l, type_args)
+    val made = closure_shape_made(l, function, type_args, entry)
+    l.depth -= 1
+    made
+
+private closure_shape_made(l: *Lowering, function: usize, type_args: Buf[&Type], entry: usize) -> ClosureShape
     val key = instance_key(function, type_args, false)
     if l.shapes.get(key) is Some(shape) then return shape
     val symbol = l.program.symbols[function]
@@ -1739,13 +1877,7 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     val concrete_args = instance_args(l, symbol, type_args)
     val entry = entry_instance(l, function, concrete_args)
     val shape = closure_shape(l, function, concrete_args, entry)
-    if shape.fields.len() == 0
-        val key = instance_key(function, concrete_args, false)
-        if l.closure_index.get(key) is Some(index) then return ConstClosure(index)
-        val index = l.closures.len()
-        l.closures.push(ClosureConstant(shape.descriptor, entry))
-        l.closure_index.put(key, index)
-        return ConstClosure(index)
+    if shape.fields.len() == 0 then return ConstClosure(constant_closure(l, function, concrete_args, shape.descriptor, entry))
     var values: Buf[Operand] = buf()
     for x in symbol.captured_locals
         if machine(l, l.locals[x].ty) is Some(_)
@@ -1759,6 +1891,39 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
         l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
     l.insts.push(Publish)
     Value(object)
+
+/** The constant closure of `function`'s copy at `type_args`, which captures nothing, laid out by
+ * `descriptor` and entered at instance `entry`: made when first asked for. */
+private constant_closure(l: *Lowering, function: usize, type_args: Buf[&Type], descriptor: usize, entry: usize) -> usize
+    if begin_request(l, "K")
+        record_function(l, function)
+        record_types(l, type_args)
+    l.depth -= 1
+    val key = instance_key(function, type_args, false)
+    if l.closure_index.get(key) is Some(index) then return index
+    val index = l.closures.len()
+    l.closures.push(ClosureConstant(descriptor, entry))
+    l.closure_index.put(key, index)
+    index
+
+/** Records a call through a method table, at the value `code` of the instance being lowered, for
+ * devirtualization to decide on. */
+private note_dispatch(l: *Lowering, code: usize, position: usize, receiver: &Type)
+    if begin_request(l, "P")
+        l.requests.num(code)
+        l.requests.num(position)
+        record_type(l, receiver)
+    l.depth -= 1
+    l.dispatches.push(DispatchCall(l.function_index, code, position, receiver))
+
+/** Records that the program calls a function value, which puts the `apply` of every class and data
+ * type that is a function in its tables. */
+private note_calls_values(l: *Lowering)
+    _ = begin_request(l, "F")
+    l.depth -= 1
+    if !l.calls_values
+        l.calls_values = true
+        l.new_slots = true
 
 // Calls a method through the method table of the receiver, `args[0]`: whichever override fills the
 // slot in the object's class, it takes the parameters `function` takes and yields its result, as
@@ -1805,7 +1970,7 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
         use_slot(l, position, symbol.decl.name, receiver)
     val code = fresh(l, MPtr)
     l.insts.push(MethodSlot(code, operands[0], position))
-    if !(*receiver is AnyType) then l.dispatches.push(DispatchCall(l.function_index, code, position, receiver))
+    if !(*receiver is AnyType) then note_dispatch(l, code, position, receiver)
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
@@ -1848,11 +2013,19 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
     val f = lowering_conformances(l)
     var out: Buf[DispatchSite] = buf()
     var types: Buf[KnownType] = buf()
-    for descriptor in l.descriptors
-        val t = l.record_types[descriptor.record]
-        types.push(known_type(l, t))
+    // The descriptors holding a method at each position, in order: a call's answer reads only those.
+    var holding: Buf[Buf[usize]] = buf()
+    for d in 0..<l.descriptors.len()
+        val descriptor = l.descriptors[d]
+        types.push(known_type(l, l.record_types[descriptor.record]))
+        for p in 0..<descriptor.methods.len()
+            if descriptor.methods[p] is None then continue
+            while holding.len() <= p
+                holding.push(buf())
+            holding[p].push(d)
     var answered: Map[usize, usize] = map()
     var answers: Buf[DispatchAnswer] = buf()
+    var held_groups: Map[usize, Buf[HeldMethod]] = map()
     for call in l.dispatches
         val head = *call.receiver match
             Class(k, _, _) -> k
@@ -1869,23 +2042,33 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
         var single: Option[usize] = None
         var many = false
         var guards: Buf[DispatchGuard] = buf()
-        for d in 0..<l.descriptors.len()
-            val descriptor = l.descriptors[d]
-            if call.position >= descriptor.methods.len() then continue
-            val g = descriptor.methods[call.position] match
-                Some(g) -> g
-                None -> continue
-            val t = types[d].ty
-            val placed = *t is Class(_, _, _) || *t is Data(_, _, _)
-            if placed
-                val up = held_ancestor(l, types[d], head) match
-                    Some(up) -> up
-                    None -> continue
+        // The descriptors holding a method at the position whose type conforms to the receiver's class
+        // or trait are the same for every receiver of that class or trait.
+        val group_key = pair_key(call.position, head)
+        val group = held_groups.get(group_key) match
+            Some(found) -> found
+            None ->
+                var made: Buf[HeldMethod] = buf()
+                val holders: Buf[usize] = if call.position < holding.len() then holding[call.position] else buf()
+                for d in holders
+                    val g = l.descriptors[d].methods[call.position].unwrap()
+                    val t = types[d].ty
+                    if *t is Class(_, _, _) || *t is Data(_, _, _)
+                        if l.memo.ancestor(f, types[d], head) is Some(up) then made.push(HeldMethod(d, g, Some(up)))
+                    else made.push(HeldMethod(d, g, None))
+                held_groups.put(group_key, made)
+                made
+        for held in group
+            val g = held.function
+            if held.up is Some(up)
                 if never_reaches(f, head, up, call.receiver) then continue
             single match
                 Some(s) -> if s != g then many = true
                 None -> single = Some(g)
-            if placed && always_is_known(l, types[d], receiver) then guards.push(DispatchGuard(d, g))
+            if held.up is Some(_) && l.memo.always_is(f, types[held.descriptor], receiver) then guards.push(DispatchGuard(held.descriptor, g))
+            // A call reaching more than one method through more guards than a guarded call tests
+            // stays a call through the table, whatever else the descriptors hold.
+            if many && guards.len() > MaxGuards then break
         val reached = if many then None else single
         if key is Some(k)
             if answered.get(k) is None
@@ -1893,6 +2076,13 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
                 answers.push(DispatchAnswer(call.receiver, reached, guards))
         out.push(DispatchSite(call.function, call.code, reached, guards))
     out
+
+/** A descriptor holding `function` at a position, with its type as an instance of a call's class or
+ * trait, `up`, or `None` for a boxed value's, which cannot be placed. */
+private struct HeldMethod
+    descriptor: usize
+    function: usize
+    up: Option[&Type]
 
 /** What `dispatch_sites` found of the calls at one position on a receiver of type `receiver`. */
 private struct DispatchAnswer
@@ -2053,9 +2243,7 @@ private conformance_member(l: *Lowering, receiver: &Type, function: usize, table
 // Calls a function value, a closure or an object of a class or data type that is a function: its
 // descriptor's `call` takes the object before the arguments.
 private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Operand]
-    if !l.calls_values
-        l.calls_values = true
-        l.new_slots = true
+    note_calls_values(l)
     val target = lower_expr(l, callee)?
     var operands: Buf[Operand] = buf()
     operands.push(target)
@@ -2407,6 +2595,8 @@ private returning(l: *Lowering, value: Option[Operand]) -> Terminator
 // parameter the shim reads through the core library, a vector, with the functions it reads it by:
 // each parameter's layouts after the parameters, then the result's.
 private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
+    // A binding's crossing is the program's, not one request of the instance's.
+    l.unrecordable = true
     var args: Buf[Operand] = buf()
     var params: Buf[MirType] = buf()
     var crossings: Buf[&Crossing] = buf()
@@ -4096,6 +4286,7 @@ private struct CCallbackPlan
 // Avin type `t`, and the function it runs, made to be lowered with the program's others. The
 // trampoline's parameters are filled in when that function is.
 private c_trampoline(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type) -> usize
+    l.unrecordable = true
     val index = l.trampolines.len()
     val k = l.instances.len()
     val binding = l.instances[l.function_index]
@@ -4989,6 +5180,25 @@ private load(l: *Lowering, place: Option[Place]) -> Option[Operand] = place matc
  * asked for, so every instance of a generic function shares its sites. A site names its file
  * without the directories it was compiled from, so a report reads the same wherever it was built. */
 private trap_site(l: *Lowering, reason: string, at: Span) -> usize
+    if begin_request(l, "A")
+        l.requests.text(reason)
+        // A place inside the declaration the instance belongs to is kept counted from its start, so
+        // the site is made again where the declaration is now; any other is kept as it is.
+        val base = instance_declaration(l, l.function_index)
+        val inside = base.start <= at.start && at.end <= base.end
+        l.requests.flag(inside)
+        l.requests.num(if inside then at.start - base.start else at.start)
+        l.requests.num(if inside then at.end - base.start else at.end)
+    val made = trap_site_made(l, reason, at)
+    l.depth -= 1
+    made
+
+/** The span of the declaration of the top-level function or method instance `k` belongs to. */
+private instance_declaration(l: *Lowering, k: usize) -> Span
+    val function = l.instances[k].function
+    l.program.symbols[l.program.symbols[function].root.unwrap_or(function)].decl.span
+
+private trap_site_made(l: *Lowering, reason: string, at: Span) -> usize
     // An empty span is code the compiler wrote rather than the source, placed nowhere in it: its
     // site is the function being lowered's own.
     val made = if at.start == at.end then lowering_scope(l) else ""
@@ -5513,6 +5723,8 @@ private string_constant(l: *Lowering, text: string) -> Operand = ConstStr(intern
 
 /** The index of the constant string `text`, made when first asked for. */
 private intern(l: *Lowering, text: string) -> usize
+    if begin_request(l, "N") then l.requests.text(text)
+    l.depth -= 1
     if l.string_index.get(text) is Some(index) then return index
     l.string_index.put(text, l.strings.len())
     l.strings.push(text)
@@ -6477,3 +6689,669 @@ private any_hash(l: *Lowering, a: Operand)
     val dest = fresh(l, MInt(64))
     push_call(l, Some(dest), Indirect(code, MirSignature(single(MRef), Some(MInt(64)))), one(a))
     finish(l, Return(Some(Value(dest))))
+
+// --- the instance cache ----------------------------------------------------------------------------
+//
+// Lowering an instance asks the program for what its code names (layouts, records, strings, trap
+// sites, other instances, method table slots, closures) and tells it what the whole program needs to
+// know (calls through tables, type tests, calls of function values). Each such request is made through
+// one function, which records it, with what it names spelled by qualified names, while the instance is
+// lowered for the cache; a request made inside another is not recorded, since replaying the outer one
+// makes it again. An entry is the requests in order, then the instance's code, every number in it that
+// counts the program's functions, descriptors, records, strings, constants, closures, trap sites,
+// module-level values or method table slots replaced by the name of what it counts. Replaying the
+// requests in a later build grows the program exactly as lowering the instance would, so reading the
+// code back finds every name it holds.
+
+/** Instance `k`'s code: read back from the instance cache where its own key has an entry there,
+ * lowered otherwise, and kept for the cache where an entry can hold it. */
+private lower_instance(l: *Lowering, k: usize) -> MirFunction
+    val inst = l.instances[k]
+    l.own_keys.push(own_key(&l.keyer, KeyedInstance(inst.function, inst.type_args, inst.entry, inst.generated)))
+    l.stored.push("")
+    l.reused.push(false)
+    if !l.caching || !recordable_instance(l, k) then return lower_function(l, k)
+    val own = l.own_keys[k]
+    if l.cached.get(own) is Some(entry)
+        if replayed(l, k, entry) is Some(f)
+            l.stored[k] = entry
+            l.reused[k] = true
+            return f
+    l.recording = true
+    l.depth = 0
+    l.requests = entry_writer()
+    l.request_count = 0
+    l.unrecordable = false
+    val f = lower_function(l, k)
+    l.recording = false
+    if l.unrecordable then return f
+    var head = entry_writer()
+    head.num(l.request_count)
+    val requests = l.requests.finish()
+    var body = entry_writer()
+    if write_function(l, &body, f) then l.stored[k] = head.finish() + requests + body.finish()
+    f
+
+/** Whether an entry may hold instance `k`: a function of the program with a body, not its closure
+ * entry. Bindings, closure entries and the functions lowering makes are small, and lowered every
+ * build. */
+private recordable_instance(l: *Lowering, k: usize) -> bool
+    val inst = l.instances[k]
+    inst.generated == Written && !inst.entry && l.program.functions[inst.function].body is Some(_)
+
+/** Starts a request: true, with its tag written, where it is the outermost one of an instance being
+ * recorded. Every call is matched by `l.depth -= 1` when the request is done. */
+private begin_request(l: *Lowering, tag: string) -> bool
+    val outermost = l.recording && l.depth == 0
+    l.depth += 1
+    if outermost
+        l.requests.word(tag)
+        l.request_count += 1
+    outermost
+
+private record_type(l: *Lowering, t: &Type)
+    var w = entry_writer()
+    if !write_type(&w, l.program, t) then l.unrecordable = true
+    l.requests.out.push(w.finish())
+
+private record_types(l: *Lowering, items: Buf[&Type])
+    var w = entry_writer()
+    if !write_types(&w, l.program, items) then l.unrecordable = true
+    l.requests.out.push(w.finish())
+
+private record_function(l: *Lowering, id: usize) = l.requests.text(symbol_spelling(l.program, l.local_ordinals, id, buf()))
+
+/** The function a symbol spells, where exactly one does. */
+private function_named(l: *Lowering, spelling: string) -> Option[usize]
+    if l.function_ids.len() == 0
+        for id in 0..<l.program.symbols.len()
+            val s = symbol_spelling(l.program, l.local_ordinals, id, buf())
+            if l.function_ids.get(s) is Some(_) then l.shared_spellings.put(s, true) else l.function_ids.put(s, id)
+    if l.shared_spellings.get(spelling) is Some(_) then return None
+    l.function_ids.get(spelling)
+
+// Sets up the context lowering instance `k`'s body begins in, which some requests read: its type
+// arguments, unit, locals and which of them are boxed.
+private enter_instance(l: *Lowering, k: usize)
+    val inst = l.instances[k]
+    l.function_index = k
+    val f = l.program.functions[inst.function]
+    val symbol = l.program.symbols[f.symbol]
+    l.subst = inst.type_args
+    l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
+    l.unit = symbol.unit
+    l.library = library_instance(l, k)
+    l.here = symbol.decl.name_span
+    l.locals = f.locals
+    l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
+
+/** Instance `k`'s code read back from its entry, after its requests are replayed; `None`, with
+ * what replaying decided for the instance undone, where the entry does not read back in this
+ * program. Its requests are first read without being made, so an entry naming a type or function
+ * the program no longer has changes nothing. */
+private replayed(l: *Lowering, k: usize, entry: string) -> Option[MirFunction]
+    var dry = entry_reader(entry)
+    if replay_requests(l, &dry, false) is None then return None
+    enter_instance(l, k)
+    val mark = l.dispatches.len()
+    var r = entry_reader(entry)
+    if replay_requests(l, &r, true) is Some(_)
+        if read_function(l, &r) is Some(f)
+            if !r.failed && r.at == entry.bytes.len then return Some(f)
+    l.dispatches.truncate(mark)
+    if l.instance_facts.len() > k then l.instance_facts[k] = ""
+    None
+
+/** Reads the requests of an entry, making each when `apply` is set; `None` where one does not read
+ * back. */
+private replay_requests(l: *Lowering, r: *EntryReader, apply: bool) -> Option[unit]
+    val n = r.num()
+    for _ in 0..<n
+        val tag = r.word()
+        if r.failed then return None
+        if tag == "L"
+            val t = read_type(r, l.type_names)?
+            if apply then _ = layout(l, t)
+        elif tag == "S"
+            val position = r.num()
+            val name = r.text()
+            val t = read_type(r, l.type_names)?
+            if apply then use_slot(l, position, name, t)
+        elif tag == "G"
+            val position = r.num()
+            val name = r.text()
+            val args = read_types(r, l.type_names)?
+            val t = read_type(r, l.type_names)?
+            if apply then _ = generic_slot(l, position, name, args, t)
+        elif tag == "I"
+            val function = function_named(l, r.text())?
+            val args = read_types(r, l.type_names)?
+            val entry = r.flag()
+            if apply then _ = instance_of(l, function, args, entry)
+        elif tag == "Q"
+            val kind = u8(r.num())
+            val t = read_type(r, l.type_names)?
+            if apply then _ = generated(l, kind, t)
+        elif tag == "X"
+            val t = read_machine(r)?
+            if apply then _ = box_descriptor(l, t)
+        elif tag == "R"
+            val t = read_type(r, l.type_names)?
+            if apply then _ = record_of(l, t)
+        elif tag == "O"
+            val t = read_type(r, l.type_names)?
+            if apply then _ = object_record(l, t)
+        elif tag == "T"
+            val t = read_type(r, l.type_names)?
+            if apply then note_tested(l, record_of(l, t))
+        elif tag == "V"
+            val t = read_type(r, l.type_names)?
+            if apply then _ = value_box(l, t)
+        elif tag == "C" || tag == "K"
+            val function = function_named(l, r.text())?
+            val args = read_types(r, l.type_names)?
+            if apply
+                val entry = instance_of(l, function, args, true)
+                val shape = closure_shape(l, function, args, entry)
+                if tag == "K" then _ = constant_closure(l, function, args, shape.descriptor, entry)
+        elif tag == "P"
+            val code = r.num()
+            val position = r.num()
+            val t = read_type(r, l.type_names)?
+            if apply then note_dispatch(l, code, position, t)
+        elif tag == "F"
+            if apply then note_calls_values(l)
+        elif tag == "A"
+            val reason = r.text()
+            val inside = r.flag()
+            val start = r.num()
+            val end = r.num()
+            if apply
+                val base = if inside then instance_declaration(l, l.function_index).start else 0
+                _ = trap_site(l, reason, Span(base + start, base + end))
+        elif tag == "N"
+            val text = r.text()
+            if apply then _ = intern(l, text)
+        elif tag == "B"
+            val name = r.text()
+            val size = r.num()
+            val shared = r.flag()
+            val count = r.num()
+            var fields: Buf[ConstantField] = buf()
+            for _ in 0..<count
+                val offset = r.num()
+                val t = read_machine(r)?
+                val value = read_operand(l, r, apply)?
+                fields.push(ConstantField(offset, t, value))
+            if apply then _ = constant_object(l, descriptor_named(l, name)?, size, fields, shared)
+        else return None
+        if r.failed then return None
+    if r.failed then None else Some(())
+
+// The names of what code counts, each map extended to cover what was made since it was last read.
+
+private descriptor_named(l: *Lowering, name: string) -> Option[usize]
+    while l.descriptors_named < l.descriptors.len()
+        l.descriptor_names.put(l.descriptors[l.descriptors_named].name, l.descriptors_named)
+        l.descriptors_named += 1
+    l.descriptor_names.get(name)
+
+private record_named(l: *Lowering, name: string) -> Option[usize]
+    while l.records_named < l.records.len()
+        l.record_names.put(l.records[l.records_named].name, l.records_named)
+        l.records_named += 1
+    l.record_names.get(name)
+
+private constant_named(l: *Lowering, name: string) -> Option[usize]
+    while l.constants_named < l.constants.len()
+        l.constant_names.put(l.constants[l.constants_named].name, l.constants_named)
+        l.constants_named += 1
+    l.constant_names.get(name)
+
+private trap_named(l: *Lowering, name: string) -> Option[usize]
+    while l.traps_named < l.traps.len()
+        l.trap_names.put(l.traps[l.traps_named].name, l.traps_named)
+        l.traps_named += 1
+    l.trap_names.get(name)
+
+private global_named(l: *Lowering, name: string) -> Option[usize]
+    if l.global_ids.len() == 0
+        for i in 0..<l.global_list.len()
+            l.global_ids.put(l.global_list[i], i)
+    l.global_ids.get(name)
+
+// An instance named by what it is: a function of the program by its symbol's spelling, whether it is
+// the closure entry and its type arguments; an option's table adapter by its method and type
+// arguments; a function lowering makes by its kind and type. A C callback's body names a trampoline,
+// which no entry holds.
+
+private write_instance(l: *Lowering, w: *EntryWriter, g: usize) -> bool
+    val inst = l.instances[g]
+    if inst.generated == CCallbackBody then return false
+    if inst.generated == Written || inst.generated == OptionAdapter
+        w.word(if inst.generated == Written then "W" else "J")
+        w.text(symbol_spelling(l.program, l.local_ordinals, inst.function, buf()))
+        w.flag(inst.entry)
+        return write_types(w, l.program, inst.type_args)
+    w.word("G")
+    w.num(usize(inst.generated))
+    write_types(w, l.program, inst.type_args)
+
+private read_instance(l: *Lowering, r: *EntryReader) -> Option[usize]
+    val tag = r.word()
+    if tag == "W" || tag == "J"
+        val function = function_named(l, r.text())?
+        val entry = r.flag()
+        val args = read_types(r, l.type_names)?
+        val key = instance_key(function, args, entry)
+        return l.instance_index.get(if tag == "W" then key else "adapter " + key)
+    if tag == "G"
+        val kind = r.num()
+        val args = read_types(r, l.type_names)?
+        if args.len() != 1 then return None
+        return l.instance_index.get(s"generated $kind|${type_key(args[0])}")
+    None
+
+private write_operand(l: *Lowering, w: *EntryWriter, o: Operand) -> bool
+    o match
+        Value(id) ->
+            w.word("v")
+            w.num(id)
+        ConstInt(bits, digits) ->
+            w.word("i")
+            w.num(usize(bits))
+            w.text(digits)
+        ConstBool(value) ->
+            w.word("b")
+            w.flag(value)
+        ConstReal(value) ->
+            w.word("r")
+            w.num(usize(value.bits()))
+        ConstStr(index) ->
+            w.word("s")
+            w.text(l.strings[index])
+        SlotAddress(slot) ->
+            w.word("a")
+            w.num(slot)
+        ConstObject(d) ->
+            w.word("o")
+            w.text(l.descriptors[d].name)
+        ConstData(index, d) ->
+            w.word("d")
+            w.text(l.constants[index].name)
+            w.text(l.descriptors[d].name)
+        ConstClosure(index) ->
+            w.word("k")
+            return write_instance(l, w, l.closures[index].function)
+        FunctionAddress(g) ->
+            w.word("f")
+            return write_instance(l, w, g)
+        GlobalAddress(index) ->
+            w.word("g")
+            w.text(l.global_list[index])
+        RecordAddress(index) ->
+            w.word("rc")
+            w.text(l.records[index].name)
+        DescriptorAddress(d) ->
+            w.word("da")
+            w.text(l.descriptors[d].name)
+        NullAddress -> w.word("n")
+        TrapSiteAddress(site) ->
+            w.word("ts")
+            w.text(l.traps[site].name)
+        CallerSite -> w.word("cs")
+        OwnerWord -> w.word("ow")
+        ClosureRunner -> w.word("cr")
+        TrampolineAddress(_) -> return false
+    true
+
+/** An operand read back; with `resolve` unset, one whose names are not looked up, `NullAddress`
+ * standing for it. */
+private read_operand(l: *Lowering, r: *EntryReader, resolve: bool) -> Option[Operand]
+    val tag = r.word()
+    if r.failed then return None
+    if tag == "v" then return Some(Value(r.num()))
+    if tag == "i"
+        val bits = u32(r.num())
+        return Some(ConstInt(bits, r.text()))
+    if tag == "b" then return Some(ConstBool(r.flag()))
+    if tag == "r" then return Some(ConstReal(real.from_bits(u64(r.num()))))
+    if tag == "a" then return Some(SlotAddress(r.num()))
+    if tag == "n" then return Some(NullAddress)
+    if tag == "cs" then return Some(CallerSite)
+    if tag == "ow" then return Some(OwnerWord)
+    if tag == "cr" then return Some(ClosureRunner)
+    if tag == "k" || tag == "f"
+        if !resolve
+            skip_instance(l, r)?
+            return Some(NullAddress)
+        val g = read_instance(l, r)?
+        if tag == "f" then return Some(FunctionAddress(g))
+        val inst = l.instances[g]
+        return Some(ConstClosure(l.closure_index.get(instance_key(inst.function, inst.type_args, false))?))
+    val name = r.text()
+    if tag == "d"
+        val descriptor = r.text()
+        if !resolve then return Some(NullAddress)
+        return Some(ConstData(constant_named(l, name)?, descriptor_named(l, descriptor)?))
+    if !resolve then return Some(NullAddress)
+    if tag == "s" then return Some(ConstStr(l.string_index.get(name)?))
+    if tag == "o" then return Some(ConstObject(descriptor_named(l, name)?))
+    if tag == "g" then return Some(GlobalAddress(global_named(l, name)?))
+    if tag == "rc" then return Some(RecordAddress(record_named(l, name)?))
+    if tag == "da" then return Some(DescriptorAddress(descriptor_named(l, name)?))
+    if tag == "ts" then return Some(TrapSiteAddress(trap_named(l, name)?))
+    None
+
+/** Reads past an instance `write_instance` wrote, without looking it up. */
+private skip_instance(l: *Lowering, r: *EntryReader) -> Option[unit]
+    val tag = r.word()
+    if tag == "W" || tag == "J"
+        _ = r.text()
+        _ = r.flag()
+    elif tag == "G" then _ = r.num()
+    else return None
+    _ = read_types(r, l.type_names)?
+    if r.failed then None else Some(())
+
+private write_operands(l: *Lowering, w: *EntryWriter, items: Buf[Operand]) -> bool
+    w.num(items.len())
+    for o in items
+        if !write_operand(l, w, o) then return false
+    true
+
+private read_operands(l: *Lowering, r: *EntryReader) -> Option[Buf[Operand]]
+    val n = r.num()
+    if r.failed then return None
+    var out: Buf[Operand] = buf()
+    for _ in 0..<n
+        out.push(read_operand(l, r, true)?)
+    Some(out)
+
+/** A method table slot: a position the checker gave, or a slot of a method with type parameters of
+ * its own, by the call it was made for. */
+private write_slot(l: *Lowering, w: *EntryWriter, slot: usize) -> bool
+    if slot < l.generic_base
+        w.word("p")
+        w.num(slot)
+        return true
+    val s = l.generic_slots[slot - l.generic_base]
+    w.word("g")
+    w.num(s.position)
+    w.text(s.name)
+    write_types(w, l.program, s.type_args) && write_type(w, l.program, s.receiver)
+
+private read_slot(l: *Lowering, r: *EntryReader) -> Option[usize]
+    val tag = r.word()
+    if tag == "p" then return Some(r.num())
+    if tag != "g" then return None
+    val position = r.num()
+    val name = r.text()
+    val args = read_types(r, l.type_names)?
+    val receiver = read_type(r, l.type_names)?
+    Some(l.generic_base + l.generic_index.get(generic_slot_key(position, name, args, receiver))?)
+
+private write_inst(l: *Lowering, w: *EntryWriter, inst: Inst) -> bool
+    inst match
+        Call(dest, callee, args) ->
+            w.word("c")
+            w.opt(dest)
+            val named = callee match
+                Direct(g) ->
+                    w.word("d")
+                    write_instance(l, w, g)
+                Runtime(symbol, signature) ->
+                    w.word("r")
+                    w.text(symbol)
+                    write_signature(w, signature)
+                    true
+                Indirect(target, signature) ->
+                    w.word("i")
+                    write_signature(w, signature)
+                    write_operand(l, w, target)
+                CFunction(symbol, params, result) ->
+                    w.word("f")
+                    w.text(symbol)
+                    w.num(params.len())
+                    for p in params
+                        write_scalar(w, p)
+                    result match
+                        Some(c) ->
+                            w.word("+")
+                            write_scalar(w, c)
+                        None -> w.word("-")
+                    true
+            return named && write_operands(l, w, args)
+        Binary(dest, op, left, right) ->
+            w.word("bi")
+            w.num(dest)
+            w.num(op_number(op))
+            return write_operand(l, w, left) && write_operand(l, w, right)
+        Checked(dest, overflow, op, left, right) ->
+            w.word("ck")
+            w.num(dest)
+            w.num(overflow)
+            w.num(checked_number(op))
+            return write_operand(l, w, left) && write_operand(l, w, right)
+        Compare(dest, op, left, right) ->
+            w.word("cm")
+            w.num(dest)
+            w.num(cmp_number(op))
+            return write_operand(l, w, left) && write_operand(l, w, right)
+        Select(dest, condition, yes, no) ->
+            w.word("se")
+            w.num(dest)
+            return write_operand(l, w, condition) && write_operand(l, w, yes) && write_operand(l, w, no)
+        Convert(dest, conv, value) ->
+            w.word("cv")
+            w.num(dest)
+            w.num(conv_number(conv))
+            return write_operand(l, w, value)
+        Load(dest, address) ->
+            w.word("ld")
+            w.num(dest)
+            return write_operand(l, w, address)
+        Store(address, value) ->
+            w.word("st")
+            return write_operand(l, w, address) && write_operand(l, w, value)
+        Alloc(dest, d) ->
+            w.word("al")
+            w.num(dest)
+            w.text(l.descriptors[d].name)
+        Publish -> w.word("pu")
+        AtomicLoad(dest, address) ->
+            w.word("aL")
+            w.num(dest)
+            return write_operand(l, w, address)
+        AtomicStore(address, value) ->
+            w.word("aS")
+            return write_operand(l, w, address) && write_operand(l, w, value)
+        AtomicSwap(dest, address, value) ->
+            w.word("aW")
+            w.num(dest)
+            return write_operand(l, w, address) && write_operand(l, w, value)
+        AtomicCompareSet(dest, address, expected, desired) ->
+            w.word("aC")
+            w.num(dest)
+            return write_operand(l, w, address) && write_operand(l, w, expected) && write_operand(l, w, desired)
+        Offset(dest, base, bytes) ->
+            w.word("of")
+            w.num(dest)
+            w.num(bytes)
+            return write_operand(l, w, base)
+        Index(dest, base, index) ->
+            w.word("ix")
+            w.num(dest)
+            return write_operand(l, w, base) && write_operand(l, w, index)
+        DescriptorOf(dest, object) ->
+            w.word("do")
+            w.num(dest)
+            return write_operand(l, w, object)
+        MethodSlot(dest, object, slot) ->
+            w.word("ms")
+            w.num(dest)
+            return write_slot(l, w, slot) && write_operand(l, w, object)
+        CallEntry(dest, object) ->
+            w.word("ce")
+            w.num(dest)
+            return write_operand(l, w, object)
+    true
+
+private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
+    val tag = r.word()
+    if r.failed then return None
+    if tag == "c"
+        val dest = r.opt()
+        val kind = r.word()
+        var callee: Option[Callee] = None
+        if kind == "d" then callee = Some(Direct(read_instance(l, r)?))
+        elif kind == "r"
+            val symbol = r.text()
+            callee = Some(Runtime(symbol, read_signature(r)?))
+        elif kind == "i"
+            val signature = read_signature(r)?
+            callee = Some(Indirect(read_operand(l, r, true)?, signature))
+        elif kind == "f"
+            val symbol = r.text()
+            val n = r.num()
+            var params: Buf[CScalar] = buf()
+            for _ in 0..<n
+                params.push(read_scalar(r)?)
+            val has = r.word()
+            val result = if has == "+" then Some(read_scalar(r)?) else None
+            callee = Some(CFunction(symbol, params, result))
+        return Some(Call(dest, callee?, read_operands(l, r)?))
+    if tag == "pu" then return Some(Publish)
+    val dest = r.num()
+    if tag == "bi"
+        val op = op_of(r.num())?
+        val left = read_operand(l, r, true)?
+        return Some(Binary(dest, op, left, read_operand(l, r, true)?))
+    if tag == "ck"
+        val overflow = r.num()
+        val op = checked_of(r.num())?
+        val left = read_operand(l, r, true)?
+        return Some(Checked(dest, overflow, op, left, read_operand(l, r, true)?))
+    if tag == "cm"
+        val op = cmp_of(r.num())?
+        val left = read_operand(l, r, true)?
+        return Some(Compare(dest, op, left, read_operand(l, r, true)?))
+    if tag == "se"
+        val condition = read_operand(l, r, true)?
+        val yes = read_operand(l, r, true)?
+        return Some(Select(dest, condition, yes, read_operand(l, r, true)?))
+    if tag == "cv"
+        val conv = conv_of(r.num())?
+        return Some(Convert(dest, conv, read_operand(l, r, true)?))
+    if tag == "ld" then return Some(Load(dest, read_operand(l, r, true)?))
+    if tag == "al" then return Some(Alloc(dest, descriptor_named(l, r.text())?))
+    if tag == "aL" then return Some(AtomicLoad(dest, read_operand(l, r, true)?))
+    if tag == "aW"
+        val address = read_operand(l, r, true)?
+        return Some(AtomicSwap(dest, address, read_operand(l, r, true)?))
+    if tag == "aC"
+        val address = read_operand(l, r, true)?
+        val expected = read_operand(l, r, true)?
+        return Some(AtomicCompareSet(dest, address, expected, read_operand(l, r, true)?))
+    if tag == "of"
+        val bytes = r.num()
+        return Some(Offset(dest, read_operand(l, r, true)?, bytes))
+    if tag == "ix"
+        val base = read_operand(l, r, true)?
+        return Some(Index(dest, base, read_operand(l, r, true)?))
+    if tag == "do" then return Some(DescriptorOf(dest, read_operand(l, r, true)?))
+    if tag == "ms"
+        val slot = read_slot(l, r)?
+        return Some(MethodSlot(dest, read_operand(l, r, true)?, slot))
+    if tag == "ce" then return Some(CallEntry(dest, read_operand(l, r, true)?))
+    None
+
+// `st` and `aS` define nothing, so they are read before the destination every other instruction
+// starts with.
+private read_store(l: *Lowering, r: *EntryReader, atomic: bool) -> Option[Inst]
+    val address = read_operand(l, r, true)?
+    val value = read_operand(l, r, true)?
+    Some(if atomic then AtomicStore(address, value) else Store(address, value))
+
+private write_term(l: *Lowering, w: *EntryWriter, t: Terminator) -> bool
+    t match
+        Return(value) ->
+            value match
+                Some(v) ->
+                    w.word("R")
+                    return write_operand(l, w, v)
+                None -> w.word("RN")
+        Jump(target) ->
+            w.word("J")
+            w.num(target)
+        Branch(condition, yes, no) ->
+            w.word("B")
+            w.num(yes)
+            w.num(no)
+            return write_operand(l, w, condition)
+        Trap(site) ->
+            w.word("T")
+            w.text(l.traps[site].name)
+        CallerTrap(site) ->
+            w.word("CT")
+            w.text(l.traps[site].name)
+        Unreachable -> w.word("U")
+    true
+
+private read_term(l: *Lowering, r: *EntryReader) -> Option[Terminator]
+    val tag = r.word()
+    if tag == "R" then return Some(Return(Some(read_operand(l, r, true)?)))
+    if tag == "RN" then return Some(Return(None))
+    if tag == "J" then return Some(Jump(r.num()))
+    if tag == "B"
+        val yes = r.num()
+        val no = r.num()
+        return Some(Branch(read_operand(l, r, true)?, yes, no))
+    if tag == "T" then return Some(Trap(trap_named(l, r.text())?))
+    if tag == "CT" then return Some(CallerTrap(trap_named(l, r.text())?))
+    if tag == "U" then return Some(Unreachable)
+    None
+
+/** Writes a function's code, every number that counts the program's things by the thing's name; false
+ * where it names something no entry can hold. */
+private write_function(l: *Lowering, w: *EntryWriter, f: MirFunction) -> bool
+    w.text(f.symbol)
+    write_signature(w, f.signature)
+    write_machines(w, f.value_types)
+    write_machines(w, f.slots)
+    w.num(f.blocks.len())
+    for block in f.blocks
+        w.num(block.insts.len())
+        for inst in block.insts
+            if !write_inst(l, w, inst) then return false
+        if !write_term(l, w, block.term) then return false
+    true
+
+private read_function(l: *Lowering, r: *EntryReader) -> Option[MirFunction]
+    val symbol = r.text()
+    val signature = read_signature(r)?
+    val values = read_machines(r)?
+    val slots = read_machines(r)?
+    val n = r.num()
+    if r.failed then return None
+    var blocks: Buf[MirBlock] = buf()
+    for _ in 0..<n
+        val count = r.num()
+        if r.failed then return None
+        var insts: Buf[Inst] = buf()
+        for _ in 0..<count
+            if peek_word(r, "st") then insts.push(read_store(l, r, false)?)
+            elif peek_word(r, "aS") then insts.push(read_store(l, r, true)?)
+            else insts.push(read_inst(l, r)?)
+        blocks.push(MirBlock(insts, read_term(l, r)?))
+    Some(MirFunction(symbol, signature, values, slots, blocks))
+
+/** Whether the next word is `w`, which is then read past. */
+private peek_word(r: *EntryReader, w: string) -> bool
+    val b = r.src.bytes
+    val n = w.bytes.len
+    if r.at + n >= b.len || b[r.at + n] != u8(' ') then return false
+    for i in 0..<n
+        if b[r.at + i] != w.bytes[i] then return false
+    r.at += n + 1
+    true
