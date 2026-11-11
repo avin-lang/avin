@@ -488,6 +488,13 @@ val none = Array.empty[string]()
 distinct objects (an `Array`'s `fill` shares one value). A length that is not positive gives an empty
 collection.
 
+An array changes in place with `reverseInPlace()`, `mapInPlace(f)` (`f` of each element, in index
+order, of the element type), `fillInPlace(x)` (every element the one value `x`, as `Array.fill`
+shares it) and `copyTo(dest, at, from = 0, count = length() - from)`, which copies `count` elements
+from index `from` into `dest` from index `at`. A range outside either array traps at the call. `dest`
+may be the array itself with the ranges overlapping, in either direction: the elements land as they
+were before the call.
+
 `Array[int]()` is an error. `xs.length()` is the length, which never changes; `xs.slice(from, until)`
 and `xs.copy()` make new arrays; `xs.lift(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`
 work as they do on a variable, evaluating `xs` and `i` once. Because a call with untyped arguments
@@ -634,6 +641,17 @@ places the elements it held when the call began, once. `b(i)` and `b(i) = v` rea
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
 
+A buffer changes in place beyond adding and removing one element: `remove(i, n)` takes out `n`
+elements from `i` on, `trimStart(n)` and `trimEnd(n)` the first or last `n`, `filterInPlace(p)` keeps
+the elements that satisfy `p`, `mapInPlace(f)` replaces each with `f` of it (`f` returns the element
+type), `patchInPlace(from, other, replaced)` replaces the `replaced` elements from `from` with those
+of `other` (read before any change, so `b.patchInPlace(i, b, n)` is well defined), and
+`reverseInPlace()` reverses. A buffer of `Eq` elements has `subtractOne(x)`, which takes out the first
+element equal to `x` and answers whether there was one. A range or count outside the buffer traps at
+the call (`n = 0` is always fine at `0 ..< length()` and at `length()`). A predicate or function given
+to `filterInPlace` or `mapInPlace` must not change the buffer: the call traps once it returns to a
+buffer whose length changed.
+
 ## Vector
 
 `Vector[+T]` is the default sequence: immutable, covariant and persistent. A changed vector shares
@@ -749,6 +767,11 @@ once. Its elements live in an array as a ring that wraps
 around from the array's end to its start, doubling as a buffer's does when full. A deque compares and
 hashes by its elements in order, displays as `[1, 2, 3]`, has `mkString` where its elements display,
 and is built by `Deque.newBuilder` and by a sequence literal where one is expected.
+
+A deque has the same in-place operations as a buffer, with the same traps and the same meaning in
+terms of the elements front first: `remove(i, n)`, `trimStart(n)`, `trimEnd(n)`, `filterInPlace(p)`,
+`mapInPlace(f)`, `patchInPlace(from, other, replaced)`, `reverseInPlace()` and, for `Eq` elements,
+`subtractOne(x)`. They work wherever the ring's elements wrap around the array's end.
 
 ```text
 val pending: Deque[string] = ["build", "test"]

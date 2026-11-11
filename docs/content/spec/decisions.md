@@ -6207,6 +6207,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `stdlib-inplace`): **in-place operations on `Buffer`, `Deque` and `Array`, and
+  `StringWriter` length and clear.** Choices the spec did not settle:
+  (1) **`remove(i, n)` is an overload of `remove(i)`**, and its count parameter is named `n`, so it
+  never shadows the buffer's own `count`. A range not within the collection traps (`n` greater than
+  `length() - i` included, tested without overflow); `n = 0` at `length()` is allowed.
+  (2) **`subtractOne(x)` answers a `bool`** (whether one was taken out) rather than the collection,
+  and is declared in an `impl[T: Eq]` block, so it exists only where elements compare; it takes the
+  first match, from the front. Alternatives: returning `self` for chaining (hides a miss), and a
+  `-=` operator (a bool-valued compound assignment reads badly).
+  (3) **`filterInPlace` and `mapInPlace` trap when the predicate or function changed the length**,
+  instead of leaving the outcome unspecified or silently working on a snapshot: the check is one
+  comparison per element and turns a corrupted result into a trap at the caller's line. Alternatives:
+  iterate a snapshot (hides the bug and costs a copy), or leave it undefined.
+  (4) **`mapInPlace` takes `(T) -> T`**, since the element type cannot change in place.
+  (5) **`patchInPlace(from, other, replaced)` reads `other` first** and traps for a `from` or
+  `replaced` outside the collection, where a clamping rule would hide a wrong index.
+  (6) **`fillInPlace` is a separate name from the companion's `Array.fill`**, as `fill` there makes a
+  new array; it shares the one value as `fill` does.
+  (7) **`Array.copyTo(dest, at, from = 0, count = length() - from)`** gives `count` a default that is
+  a function of `from`, which the declaration rules allow; it is overlap-safe in both directions
+  (the copy runs backwards when `dest` is the same array and `at > from`). All ranges are checked
+  before the first element moves.
+  (8) **`StringWriter.length()` is an `int` count of bytes**, as every offset into a string is, and
+  `clear()` drops the stored text so a text already taken is unaffected. A **`write(x: Display)`
+  overload on `Writer` is not added**: it would sit beside `write(text: string)` (a `string` is
+  `Display`) and make every call a resolution by specificity for no gain, `writeDisplayed` already
+  writing any `Display` value. Revisit if a user wants `out.write(42)`.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
