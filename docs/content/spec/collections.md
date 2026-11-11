@@ -616,6 +616,74 @@ trap on the empty list, and `headOption()` and `lift(i)` return an `Option`. Lis
 their contents, and order element by element when their elements are ordered, a list ordering
 before every longer list it begins.
 
+## LazyList
+
+`LazyList[+T]` is an immutable list whose elements are computed when they are first needed and then
+kept. It is a chain of cells, each empty or an element with the lazy list of the rest; a cell is
+evaluated the first time something reads it, **at most once**, and every later read, through the
+same list, a list made from it or another iterator over it, gives the cell kept. So a lazy list may
+be endless, and may be defined by reference to itself:
+
+```text
+lazy val fibs: LazyList[long] = LazyList.cons(0, LazyList.cons(1, fibs.zip(fibs.tail()).map(p -> p.0 + p.1)))
+
+sieve(xs: LazyList[int]) -> LazyList[int]
+    val p = xs.head()
+    LazyList.cons(p, sieve(xs.tail().filter(n -> n % p != 0)))
+
+fibs(90)                                 // 2880067194370816120
+sieve(LazyList.from(2)).take(5)          // the first five primes, once read
+```
+
+**Making one.** `LazyList.empty[T]()` is the empty list. `LazyList.cons(head, tail)` takes `tail`
+[by name](/spec/by-name/): it is evaluated when the list's second cell is first read, once, and not at
+all if that cell never is; `head` is an ordinary argument. `x +: xs` puts `x` in front of a list
+already made. The companion's makers have `Iterator`'s names and argument orders, and evaluate
+nothing when called: `from(start)` and `from(start, step)` over any integer type (an addition that
+overflows traps only when the cell past the greatest value is read), `iterate(start, f)`,
+`unfold(state, f)`, `continually(element)` (by name, evaluated once per cell), `fill(count, element)`
+and `tabulate(count, f)`. `xs.toLazyList()` on every `Iterable` reads one iterator of it as the cells
+are first read; made from an iterator, the list takes the iterator over.
+
+**Lazy methods** evaluate nothing when called; each makes a list whose cells read the source's cells
+as they are themselves read: `map`, `filter`, `filterNot`, `take`, `drop`, `takeWhile`, `dropWhile`,
+`zip` (with another lazy list), `zipWithIndex`, `flatMap` (`f` yielding any `Iterable`, read through
+its iterator) and `++`, whose right operand is by name and evaluated only when the cell after the
+left's last is first read. `take(n)` never reads the cell after its `n`th; `takeWhile` reads the
+element that ends it and nothing after.
+
+**Forcing methods** evaluate the cells they need: `head()`, `tail()` and `headOption()` the first
+cell, `isEmpty()` and `nonEmpty()` the first cell, `apply(i)` and `lift(i)` the cells up to `i` (none
+for a negative index), and `length()`, `force()` and every method an `Iterable` has (`toVector()`,
+`foldLeft`, `foreach`, `mkString`, `sum` and the rest) all of them; on an endless list such a method
+does not return. `head()`, `tail()` and an index out of range trap. `isEvaluated()` says whether the
+first cell has been evaluated, evaluating nothing, and `knownSize()` is 0 only for a list already seen
+to be empty.
+
+**Depth.** Every method that reads many cells reads them in a loop, and so does `filter`,
+`dropWhile`, `drop` or `flatMap` skipping any number of elements to reach the next, so a list of
+millions of cells is walked, counted and converted without deepening the stack. Only a pipeline adds
+depth: one frame per stage when a cell of its last stage is first read.
+
+**Memory.** Once a cell is evaluated, the expression that computed it is dropped along with
+everything it captured, so a list holds its evaluated elements and the expressions of the cells not
+yet evaluated. A list whose head nothing holds is collected cell by cell as a `for` loop or an
+iterator walks it; a method called on a list holds that list for the length of the call.
+
+**Threads.** A lazy list is not [sendable](/spec/threads/): the cells not yet evaluated are functions
+that may hold anything, so a thread's body may not reach one, and each list belongs to the thread
+that made it. A cell is evaluated as a [`lazy val`](/spec/declarations/#initialization) is
+initialized, and a cell whose evaluation reads that same cell (an empty list joined to itself,
+`lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read, as a `lazy val`
+initializer reading itself does.
+
+**Display.** A lazy list's `Display` and `Debug` show the elements evaluated so far, in brackets,
+and evaluate nothing: `[0, 1, 4, 9]` when every cell has been evaluated, `[0, 1, …]` when the cell
+after 1 has not, `[…]` when nothing has.
+
+`LazyList` is an `Iterable` and not a `Seq`, and `::` and list patterns are `List`'s: a lazy list is
+taken apart with `headOption()` and `tail()`, or with `head()` after `isEmpty()`.
+
 ## Sequence patterns
 
 A sequence is taken apart with the same brackets that build it. `[]` matches an empty sequence, and
