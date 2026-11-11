@@ -6090,7 +6090,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   edited belongs to. *Why*: `cairo` needed 0.0.18 and could only say so in its README, and a
   package that needs a feature should fail with the upgrade named rather than with an unknown key
   or a type error. The key's spelling follows `sysl.hocon`, which names the Sysl a package needs
-  as `sysl = "0.9.20"` in its `package` block. A minimum, because Avin's versions only add: a
+  as `sysl = "0.10.0"` in its `package` block. A minimum, because Avin's versions only add: a
   later Avin that breaks a package is a bug or a deliberate break in a release, which a range
   written in advance cannot foresee, and an upper bound would refuse every upgrade until each
   package re-releases. Checked when each manifest is read, so every path that reads one is held to
