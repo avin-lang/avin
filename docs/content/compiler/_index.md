@@ -153,7 +153,28 @@ looked up by the hash of its contents; the manifest naming the module files of t
 written last. No lock is taken. A build trims entries that neither its manifest names nor were used
 in the last hour, as the unit cache spares what is fresh.
 
-**Testing it.** A build reports what it did when `AVIN_BUILD_LOG` names a file: each phase's time,
+**The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
+error channel. The file is emptied when the build starts, so it holds that build alone; a file that
+cannot be written is an error before any work is done. Unset or empty, nothing is written and no
+clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its counts as
+`key=<n>` words, in this order:
+
+| Phase | Counts |
+|---|---|
+| `load` | `modules`: the modules read, the library's included |
+| `check` | `modules`: the modules checked |
+| `cunit` | none: the C unit of the program's C bindings |
+| `lower` | `functions`, `strings`, `descriptors`, `tests` |
+| `shims` | `bindings`, `handles`: the Sysl shims built |
+| `emit` | `bytes`: the size of the LLVM text |
+| `split` | `units`: the codegen units the module was cut into |
+| `units` | `units`, `compiled`, `reused`: units clang compiled, and units taken from its cache |
+| `link` | none |
+
+A run that finds its executable already built writes the one line `phase=cached ms=0 built=0`.
+The keys and phase names are stable; later phases add lines and keys, never rename them.
+
+**Testing it.** A build reports what it did through that log: each phase's time,
 and the counts of instances reused, lowered and passed again, modules reused and units compiled.
 The compiler's tests build a program of several modules in a temporary directory and edit it, each
 edit with the counts it must give: a body edited in one module lowers only that module's instances
