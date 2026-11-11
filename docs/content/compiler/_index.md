@@ -112,19 +112,39 @@ so a module whose functions' instances are all reused is a module not compiled a
 **The instance key.** An instance's text is reused only while everything it was made from is the
 same. The key is a hash over:
 
-- the compiler (its version and its executable's stamp), the level and whether the build is for
-  tests;
-- the instance's identity: the function's qualified name and parameter types, and its type
-  arguments, every type spelled by qualified names (never by the checker's indices, which an edit
-  elsewhere moves);
+- the compiler (its version and its executable's path and time) and whether the build is for tests;
+  lowering is the same at both levels, so the level is the instance directory's, not the key's;
+- the decisions every instance shares: whether the program keeps its pointer-shaped options as
+  pointers, which lowering decides for the whole program;
+- the instance's identity: its symbol, the function's qualified name, overload and type arguments,
+  every type spelled by qualified names (never by the checker's indices, which an edit elsewhere
+  moves); a function lowering makes is known by its kind and type;
 - the function's **body fingerprint**: its typed tree printed in a canonical form, which carries
   every callee, field and conversion the checker resolved and every type it inferred, so an edit to
-  another function's signature that changes what this body means changes its fingerprint;
-- the **interfaces it reads**: the layout of every type it allocates or reads a field of, and the
-  record of every type it tests against;
-- the **world facts** the whole-program passes used on it: for each call through a method table,
-  the descriptors and methods its static receiver type admits (what devirtualization decided from),
-  and for each callee scalar replacement inlined or summarized, that callee's key.
+  another function's signature that changes what this body means changes its fingerprint. Each node's
+  place is counted from the start of the declaration its trap sites are named by, so lines added
+  above it change nothing and a comment inside it changes it; a constant's place, which names no
+  trap, is left out. A local function or lambda shares its top-level function's table of locals, so
+  each fingerprint also holds what every function of that family captures (which decides the locals
+  kept in a box), and nothing else of a sibling's body;
+- the **interfaces it reads**: each callee's signature and annotations; the layout of every type it
+  makes, reads a field of or takes apart by variant, its fields' types in order (never their names,
+  since a field is reached by its place); the supertypes and method table of every type it tests
+  against and of every type argument, which choose what a call on a bound runs; and each module-level
+  value it reads, with, for one made at compile time, the fingerprint of its initializer;
+- the **world facts** the whole-program steps used on it: the slots lowering gave the methods with
+  type parameters of their own it calls through a table; what devirtualization decided at each of
+  its calls through a table (left, made direct to a method, or guarded by descriptors and their
+  methods); and what scalar replacement read of the others (each callee's summary, and where the
+  function has fences, whether each callee may return with a store not yet fenced), with the key of
+  every function it inlined.
+
+A function lowering makes for a type reads that type's supertypes and table, and, for equality and
+hashing field by field, its layout and its fields' types' supertypes and tables. The keys are made
+on every build, after lowering, and the build log's `keys` line counts them. The compiler's tests
+build a program of three modules, edit it in each way the design names and compare every key, the
+library's included: the keys that change are exactly those listed, and every function whose emitted
+text changed has a changed key.
 
 **Closed-world monomorphization stays correct** because the set of instances is computed on every
 build, by the same worklist as today: a reused instance contributes the requests it recorded
@@ -181,6 +201,7 @@ clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its
 | `check` | `modules`: the modules checked |
 | `cunit` | none: the C unit of the program's C bindings |
 | `lower` | `functions`, `strings`, `descriptors`, `tests` |
+| `keys` | `instances`, `bodies`, `distinct`: the instance keys made, one per function lowered; the bodies fingerprinted, a generic function's once for all its instances; and how many keys differ |
 | `shims` | `bindings`, `handles`: the Sysl shims built |
 | `emit` | `bytes`: the size of the LLVM text |
 | `split` | `units`: the codegen units the module was cut into |

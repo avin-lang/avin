@@ -325,7 +325,20 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 5. **Instance keys.** The canonical typed-tree fingerprint, the interfaces read and the world facts,
    computed and logged but not yet used. Test: an edit matrix (a body, a signature, a field, a new
    implementing class, a new impl, a changed default argument, an inferred type changed by a callee's
-   result, a moved line) changes exactly the keys it must.
+   result, a moved line) changes exactly the keys it must. **Done:** every instance gets a key after
+   lowering, as the [pipeline](/compiler/#incremental-builds) defines it, logged as `phase=keys` with
+   `instances`, `bodies` and `distinct`. Devirtualization and scalar replacement report what they
+   decided and read for each function, and lowering the slots it gave methods with type parameters of
+   their own (still numbered past the largest table in the order found, so a larger table anywhere
+   changes the keys of the calls through them, as it changes their text). The matrix builds a program
+   of three modules and edits a body, a signature, a constant and a computed default argument, adds an
+   overload, an implementing class, an impl for a data type and a class field, renames a data field,
+   changes a callee's inferred result, a lambda, a lambda's captures and a generic function, and adds
+   comments between declarations and inside one and moves a function; each changes exactly the keys
+   listed, the library's included, and every function whose emitted text changed has a changed key.
+   Keys are the same across two builds and from another directory. On marshal at `-O2`, 41,583
+   instances from 6,596 bodies, all keys different: the keys take 0.59 to 0.63 s against lowering's
+   6.9 to 7.9 s (load average about 12).
 6. **The instance cache.** Store and reuse each instance's text, requests and summary in
    `.avin/build/incremental/<kind><level>/`, the worklist replaying requests, the passes rerun only
    where facts changed; `AVIN_INCREMENTAL=verify`. Tests: the edit matrix's counts; the oracle

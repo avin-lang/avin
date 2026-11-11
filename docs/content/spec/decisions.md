@@ -6105,6 +6105,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
+  part (identity, body fingerprint, interfaces read) and the world facts the whole-program steps
+  decided for it, both made on every build after lowering** ([the instance
+  key](/compiler/#incremental-builds)). The facts are recorded where they are decided, as each step
+  runs: the slots of methods with type parameters of their own, each devirtualization decision at a
+  call through a table (not the whole set of descriptors a receiver type admits), and each summary
+  scalar replacement read, with the finished key of every function it inlined (never one that may
+  recur, so the inlined keys form no cycle). WHY: a decision is exactly what a step's rewriting of
+  a function depends on, so a new implementing class changes the keys of only the calls whose
+  decision it changes, and a callee's body edit reaches a caller only through a changed summary or
+  an inlining; and the cache (item 6) can reuse a lowered form on the first part and rerun only the
+  passes on the second. Alternatives: the callee's key for every summarized callee, as the pipeline
+  first wrote it (every leaf edit would reach every transitive caller); the admitted descriptors
+  rather than the decision (a class added past the guard limit would change keys for no change).
+- Proposed (branch `instance-keys`): **The body fingerprint is per function, with its family's
+  captures, not per family.** A local function or lambda and its top-level function share one table
+  of locals; each fingerprint holds its own tree, the locals it owns or captures, and what every
+  function of the family captures (with each captured local's type and mutability), which decides
+  what is kept in a box. WHY: a lambda's body edit then changes the lambda and its closure entry and
+  not the function around it, unless its captures change. Alternatives: one fingerprint for the
+  whole family (every edit in it changes every member; simpler, and what the first build did).
+- Proposed (branch `instance-keys`): **Places in the fingerprint follow trap-site naming**: a node
+  inside its declaration counts from the declaration's start; a node outside it (a constant default
+  argument copied into a call keeps its place in its own file) is named as `trap_name` would name
+  a trap there; a derived impl's shared template counts from the start of its file; the compiler's
+  own code (an empty span) is named by the instance. A constant's place is left out: no trap is
+  named by it. WHY: a trap site's name is the only place a function's text holds, so this is the
+  least that keeps the key sound; lines added between declarations change no key. A comment inside
+  a function changes its key whether or not a trap site follows it. Alternatives: only the places of
+  nodes that can trap (needs lowering's knowledge of which do, duplicated); no places at all
+  (unsound: an edit moving a trap site changes the text).
+- Proposed (branch `instance-keys`): **What a key reads of types is conservative where the text
+  rarely depends on it**: every type argument's supertypes and method table (they choose the method
+  a call on a bound runs), and a class's or data type's whole layout for any read of a field (its
+  field types in order, never the names). So a new impl for a type changes the instances at that
+  type that never call through a bound, and a field appended to a class changes the readers of its
+  earlier fields; both cost a rebuild, never a stale instance. Review with the user if the cache's
+  hit rate after edits like these matters: narrowing needs the bound calls and the fields read
+  recorded during lowering, as the other facts are. Alternatives: record during lowering exactly
+  which table entries and fields each instance used (precise, more state threaded through
+  lowering).
+- Proposed (branch `instance-keys`): **The key names the compiler by its version and its
+  executable's path and modification time, not the level.** WHY: lowering does not depend on the
+  level, and the pipeline keeps one instance directory per level. Alternatives: the level in the key
+  as well (redundant with the directory), the executable's hash (reads 8 MB per build).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
