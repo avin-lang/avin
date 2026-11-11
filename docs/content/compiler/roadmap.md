@@ -288,7 +288,20 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    and about 45, so the times are rough).
 2. **Lowering's constant factors**, led by a fresh profile after item 1: symbols read in place
    rather than copied, and the conformance and type-equality hot spots memoized where the profile
-   says. Its tests are the existing suite; the report gives marshal's before and after.
+   says. Its tests are the existing suite; the report gives marshal's before and after. **Done:**
+   the fresh profile named loops whose work grew with the square of the program rather than
+   copying alone. Scalar replacement's test that no two objects of a group are in use at once
+   (`overlapping`) copied a vector of booleans per block per pass and repeated whole passes; it now
+   keeps 64 bits to a word and revisits only a block whose entry changed. Finding a function's
+   boxed locals read, and copied, every symbol of the program for every instance; an index of each
+   function's local functions, built once, replaced it. Recording a slot call searched every call
+   at its position; variant ancestors asked whether each record holds each tested class once per
+   tested type rather than once per class; and the dispatch sites asked the same questions again
+   for every call at one position on one receiver type. marshal's lowering went from 24.3 s to
+   7.6 s, by the build log, at load averages of about 10 before and 20 after, with the emitted
+   text byte for byte the same. What remains of lowering is spread out: conformance questions
+   asked for the first time, devirtualization, method tables and scalar replacement, none above a
+   tenth.
 3. **Build log.** `AVIN_BUILD_LOG=<file>`: each phase's time and the counts of instances, units
    compiled and units reused, with a test of its form on a small program. Every later item asserts
    through it. Built: `AVIN_BUILD_LOG` is a file or `-`, one `phase=<name> ms=<n> key=<n>` line per

@@ -764,70 +764,111 @@ private overlapping(f: MirFunction, a: Analysis, valid: Buf[bool]) -> Buf[bool]
         else slot_bit.push(None)
     val k = bit_group.len()
     if k == 0 then return stale
+    // The bits of each group, listed together: those of group `g` are
+    // `group_member[group_start[g]..<group_start[g + 1]]`.
+    var group_start: Buf[usize] = buf()
+    for _ in 0..<(groups + 1) do group_start.push(0)
+    for j in 0..<k do group_start[bit_group[j] + 1] = group_start[bit_group[j] + 1] + 1
+    for g in 0..<groups do group_start[g + 1] = group_start[g + 1] + group_start[g]
+    var group_member: Buf[usize] = buf()
+    var next: Buf[usize] = buf()
+    for g in 0..<groups do next.push(group_start[g])
+    for _ in 0..<k do group_member.push(0)
+    for j in 0..<k
+        group_member[next[bit_group[j]]] = j
+        next[bit_group[j]] = next[bit_group[j]] + 1
+    // Each block's entry state, `words` 64-bit words of bits, one block after another. The
+    // states only fall, so a block is visited again only when its entry has changed, and the
+    // fixed point is the one any order of visits reaches.
     val n = f.blocks.len()
-    var entry: Buf[bool] = buf()
+    val words = (k + 63) / 64
+    var entry: Buf[u64] = buf()
     for b in 0..<n
-        for _ in 0..<k do entry.push(b != 0)
-    var changed = true
-    while changed
-        changed = false
-        for b in 0..<n
-            var state: Buf[bool] = buf()
-            for j in 0..<k do state.push(entry[b * k + j])
-            for inst in f.blocks[b].insts
-                currency(inst, &state, value_bit, slot_bit, bit_group, &stale, false)
-            for t in successors(f.blocks[b].term)
-                for j in 0..<k
-                    if entry[t * k + j] && !state[j]
-                        entry[t * k + j] = false
-                        changed = true
+        for w in 0..<words
+            if b == 0 then entry.push(0u64)
+            else if w < k / 64 then entry.push(~0u64)
+            else entry.push((1u64 << u64(k % 64)) - 1u64)
+    var work: Buf[usize] = buf()
+    var queued: Buf[bool] = buf()
     for b in 0..<n
-        var state: Buf[bool] = buf()
-        for j in 0..<k do state.push(entry[b * k + j])
+        work.push(b)
+        queued.push(true)
+    var state: Buf[u64] = buf()
+    for _ in 0..<words do state.push(0u64)
+    var head: usize = 0
+    while head < work.len()
+        val b = work[head]
+        head = head + 1
+        queued[b] = false
+        for w in 0..<words do state[w] = entry[b * words + w]
         for inst in f.blocks[b].insts
-            currency(inst, &state, value_bit, slot_bit, bit_group, &stale, true)
+            currency(inst, &state, value_bit, slot_bit, bit_group, group_start, group_member, &stale, false)
+        for t in successors(f.blocks[b].term)
+            var lowered = false
+            for w in 0..<words
+                val before = entry[t * words + w]
+                val after = before & state[w]
+                if after != before
+                    entry[t * words + w] = after
+                    lowered = true
+            if lowered && !queued[t]
+                work.push(t)
+                queued[t] = true
+    for b in 0..<n
+        for w in 0..<words do state[w] = entry[b * words + w]
+        for inst in f.blocks[b].insts
+            currency(inst, &state, value_bit, slot_bit, bit_group, group_start, group_member, &stale, true)
     stale
+
+private current_bit(bits: *Buf[u64], j: usize) -> bool = ((*bits)[j / 64] & (1u64 << u64(j % 64))) != 0u64
+
+private set_current(bits: *Buf[u64], j: usize, on: bool)
+    val i = j / 64
+    if on then (*bits)[i] = (*bits)[i] | (1u64 << u64(j % 64))
+    else (*bits)[i] = (*bits)[i] & ~(1u64 << u64(j % 64))
 
 /** Moves the currency of references past `inst`; with `check`, marks the group of any reference used
  * while it may not be current. */
-private currency(inst: Inst, state: *Buf[bool], value_bit: Buf[Option[usize]], slot_bit: Buf[Option[usize]], bit_group: Buf[usize], stale: *Buf[bool], check: bool)
+private currency(inst: Inst, state: *Buf[u64], value_bit: Buf[Option[usize]], slot_bit: Buf[Option[usize]], bit_group: Buf[usize], group_start: Buf[usize], group_member: Buf[usize], stale: *Buf[bool], check: bool)
     inst match
         Alloc(d, _) ->
             if value_bit[d] is Some(j)
-                for i in 0..<bit_group.len()
-                    if bit_group[i] == bit_group[j] then (*state)[i] = false
-                (*state)[j] = true
+                val g = bit_group[j]
+                for m in group_start[g]..<group_start[g + 1]
+                    set_current(state, group_member[m], false)
+                set_current(state, j, true)
             return
         Store(SlotAddress(x), value) ->
             if slot_bit[x] is Some(j)
                 require_current(value, state, value_bit, bit_group, stale, check)
-                (*state)[j] = true
+                set_current(state, j, true)
                 return
         Load(d, SlotAddress(x)) ->
             if slot_bit[x] is Some(j)
-                if check && !(*state)[j] then (*stale)[bit_group[j]] = true
-                if value_bit[d] is Some(i) then (*state)[i] = true
+                if check && !current_bit(state, j) then (*stale)[bit_group[j]] = true
+                if value_bit[d] is Some(i) then set_current(state, i, true)
                 return
         Select(d, _, yes, no) ->
             if value_bit[d] is Some(i)
                 require_current(yes, state, value_bit, bit_group, stale, check)
                 require_current(no, state, value_bit, bit_group, stale, check)
-                (*state)[i] = true
+                set_current(state, i, true)
                 return
         Offset(d, base, _) ->
             if value_bit[d] is Some(i)
                 require_current(base, state, value_bit, bit_group, stale, check)
-                (*state)[i] = true
+                set_current(state, i, true)
                 return
         _ -> ()
+    if !check then return
     for o in inst_operands(inst)
         require_current(o, state, value_bit, bit_group, stale, check)
 
-private require_current(o: Operand, state: *Buf[bool], value_bit: Buf[Option[usize]], bit_group: Buf[usize], stale: *Buf[bool], check: bool)
+private require_current(o: Operand, state: *Buf[u64], value_bit: Buf[Option[usize]], bit_group: Buf[usize], stale: *Buf[bool], check: bool)
     if !check then return
     if o is Value(v)
         if value_bit[v] is Some(j)
-            if !(*state)[j] then (*stale)[bit_group[j]] = true
+            if !current_bit(state, j) then (*stale)[bit_group[j]] = true
 
 // ---- Fences
 

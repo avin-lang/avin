@@ -211,6 +211,8 @@ private struct Lowering
     /** Whether some object has the record as its own type's, by the record's index: only such a
      * record's equality and rendering entries can be called. */
     object_records: Buf[bool]
+    /** The local functions made into values, by the symbol of the top-level function they are in. */
+    local_values: Map[usize, Buf[usize]]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -320,7 +322,8 @@ lower_program(program: TProgram) -> MirProgram
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf())
+    val local = local_values(program)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local)
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -664,14 +667,15 @@ private slot_used(l: *Lowering, position: usize, name: string, t: KnownType) -> 
 private use_slot(l: *Lowering, position: usize, name: string, receiver: &Type)
     while l.slot_calls.len() <= position
         l.slot_calls.push(buf())
-    var known: Buf[SlotCall] = buf()
-    for k in l.slot_calls[position]
-        if k.name == name && same_type(k.receiver, receiver) then return
-        known.push(k)
-    known.push(SlotCall(name, receiver))
-    l.slot_calls[position] = known
+    // The receivers already recorded for this method at this position are the ones kept by
+    // `slot_receivers`, in the order they were recorded.
     val key = s"$position $name"
     var receivers: Buf[KnownType] = l.slot_receivers.get(key).unwrap_or(buf())
+    for k in receivers
+        if same_type(k.ty, receiver) then return
+    var known = l.slot_calls[position]
+    known.push(SlotCall(name, receiver))
+    l.slot_calls[position] = known
     receivers.push(known_type(l, receiver))
     l.slot_receivers.put(key, receivers)
     l.new_slots = true
@@ -1118,11 +1122,25 @@ private boxed_locals(l: *Lowering, root: usize, locals: Buf[TLocal]) -> Buf[bool
     var boxed: Buf[bool] = buf()
     for _ in locals
         boxed.push(false)
-    for symbol in l.program.symbols
-        if symbol.root != Some(root) || !symbol.value then continue
-        for x in symbol.captured_locals
+    val inner = l.local_values.get(root) match
+        Some(inner) -> inner
+        None -> return boxed
+    for s in inner
+        for x in l.program.symbols[s].captured_locals
             if locals[x].mutable && machine(l, locals[x].ty) is Some(_) then boxed[x] = true
     boxed
+
+/** Each top-level function's local functions that are made into values, found in one pass over the
+ * symbols. */
+private local_values(program: TProgram) ->Map[usize, Buf[usize]]
+    var found: Map[usize, Buf[usize]] = map()
+    for s in 0..<program.symbols.len()
+        if !program.symbols[s].value then continue
+        if program.symbols[s].root is Some(root)
+            var row: Buf[usize] = found.get(root).unwrap_or(buf())
+            row.push(s)
+            found.put(root, row)
+    found
 
 /** The descriptor of a box holding one value of machine type `t`. */
 private box_descriptor(l: *Lowering, t: MirType) -> usize
@@ -1372,31 +1390,66 @@ private all_invariant(params: Buf[TypeParam]) -> bool
 // so a record does not list them all: once every function is lowered, each record gains those among
 // the types that type patterns test against.
 private add_variant_ancestors(l: *Lowering)
+    var targets: Buf[KnownType] = buf()
+    // The classes and traits the targets are instances of, each once, and each target's among them.
+    var heads: Buf[usize] = buf()
+    var target_head: Buf[Option[usize]] = buf()
+    for target in l.tested
+        val t = l.record_types[target]
+        targets.push(known_type(l, t))
+        *t match
+            Class(k, _, _) ->
+                var at: Option[usize] = None
+                for h in 0..<heads.len()
+                    if heads[h] == k then at = Some(h)
+                if at is None
+                    at = Some(heads.len())
+                    heads.push(k)
+                target_head.push(at)
+            _ -> target_head.push(None)
+    // Which records the record at hand already lists, marked while it is being extended.
+    var listed: Buf[bool] = buf()
+    for _ in 0..<l.records.len() do listed.push(false)
     for r in 1..<l.records.len()
         val from = l.record_types[r]
         val known = known_type(l, from)
+        val placed = *from is Class(_, _, _) || *from is Data(_, _, _)
+        // Whether `from` holds an instance of each head, asked once a head is met: 0 not yet asked,
+        // 1 it does, 2 it does not.
+        var holds: Buf[u8] = buf()
+        for _ in heads do holds.push(0u8)
         var ancestors = l.records[r].ancestors
+        for a in ancestors do listed[a] = true
         var grew = false
-        for target in l.tested
-            if target == r then continue
-            var listed = false
-            for a in ancestors
-                if a == target then listed = true
-            if listed then continue
-            val to = l.record_types[target]
-            if seen_as(l, known, to)
+        for i in 0..<l.tested.len()
+            val target = l.tested[i]
+            if target == r || listed[target] then continue
+            // A class or data value is seen as another class or trait only through the instance of
+            // it that it holds, so where `held_ancestor` remembers none, the answer is no without
+            // asking the rest.
+            if placed && target_head[i] is Some(h)
+                var itself = false
+                if *from is Class(k, _, _) && k == heads[h] then itself = same_type(from, targets[i].ty)
+                if !itself
+                    if holds[h] == 0u8
+                        holds[h] = if held_ancestor(l, known, heads[h]) is Some(_) then 1u8 else 2u8
+                    if holds[h] == 2u8 then continue
+            if seen_as(l, known, targets[i])
                 ancestors.push(target)
+                listed[target] = true
                 grew = true
+        for a in ancestors do listed[a] = false
         if grew then l.records[r] = TypeRecord(l.records[r].name, ancestors, l.records[r].equals, l.records[r].hash, l.records[r].display, l.records[r].debug, l.records[r].apart, l.records[r].parts, l.records[r].part_view)
 
-/** Whether a value of type `from` is one of `to`, as `always_is` or a view through `view_as` shows.
- * A class or data value is seen as another class or trait only through the instance of it that it
- * holds, so where `held_ancestor` remembers none, the answer is no without asking the rest. */
-private seen_as(l: *Lowering, from: KnownType, to: &Type) -> bool
-    if *to is Class(k, _, _)
-        if (*from.ty is Class(_, _, _) || *from.ty is Data(_, _, _)) && !same_type(from.ty, to)
-            if held_ancestor(l, from, k) is None then return false
-    always_is(l, from.ty, to) || same_type(view_as(lowering_conformances(l), from.ty, to), to)
+/** Whether a value of type `from` is one of `to`, as `always_is` or a view through `view_as` shows. */
+private seen_as(l: *Lowering, from: KnownType, target: KnownType) -> bool
+    val to = target.ty
+    if always_is_known(l, from, target) then return true
+    // For a reference that is not boxed to be seen as a trait, `always_is` has already looked
+    // through `view_as`, and its no stands.
+    val boxed = (is_builtin(from.ty) || *from.ty is Tuple(_)) && *to is Class(_, _, _)
+    if is_reference(from.ty) && !boxed then return false
+    same_type(view_as(lowering_conformances(l), from.ty, to), to)
 
 /** The value of type `t` an object that has that type holds: a built-in value is in its box, and an
  * option kept as a pointer is the `Some`'s value or null. */
@@ -1689,11 +1742,21 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
     for descriptor in l.descriptors
         val t = l.record_types[descriptor.record]
         types.push(known_type(l, t))
+    var answered: Map[usize, usize] = map()
+    var answers: Buf[DispatchAnswer] = buf()
     for call in l.dispatches
         val head = *call.receiver match
             Class(k, _, _) -> k
             _ -> continue
         val receiver = known_type(l, call.receiver)
+        // Calls at one position on one receiver type reach the same methods.
+        var key: Option[usize] = None
+        if receiver.id is Some(id) then key = Some(pair_key(call.position, id))
+        if key is Some(k)
+            if answered.get(k) is Some(a)
+                if same_type(answers[a].receiver, call.receiver)
+                    out.push(DispatchSite(call.function, call.code, answers[a].single, answers[a].guards))
+                    continue
         var single: Option[usize] = None
         var many = false
         var guards: Buf[DispatchGuard] = buf()
@@ -1714,8 +1777,19 @@ private dispatch_sites(l: *Lowering) -> Buf[DispatchSite]
                 Some(s) -> if s != g then many = true
                 None -> single = Some(g)
             if placed && always_is_known(l, types[d], receiver) then guards.push(DispatchGuard(d, g))
-        out.push(DispatchSite(call.function, call.code, if many then None else single, guards))
+        val reached = if many then None else single
+        if key is Some(k)
+            if answered.get(k) is None
+                answered.put(k, answers.len())
+                answers.push(DispatchAnswer(call.receiver, reached, guards))
+        out.push(DispatchSite(call.function, call.code, reached, guards))
     out
+
+/** What `dispatch_sites` found of the calls at one position on a receiver of type `receiver`. */
+private struct DispatchAnswer
+    receiver: &Type
+    single: Option[usize]
+    guards: Buf[DispatchGuard]
 
 // A direct call of `function`, the receiver first for a method. A static member's receiver is a
 // type, which is not passed.
