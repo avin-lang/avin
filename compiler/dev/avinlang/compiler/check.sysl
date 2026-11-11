@@ -7413,24 +7413,40 @@ is_blocking_binding(f: &Function) -> bool
             if is_blocking_word(arg) then return true
     false
 
-private is_blocking_word(arg: AnnotationArg) -> bool
+private is_blocking_word(arg: AnnotationArg) -> bool = is_binding_word(arg, "blocking")
+
+/** Whether a binding's `@sysl` says its arguments are passed by name, with the word `named` after
+ * the function's name: its shim names each argument by its parameter's name in Sysl's spelling, so
+ * the binding lists only the parameters it passes, and Sysl gives the others their defaults. */
+is_named_binding(f: &Function) -> bool
+    for a in f.annotations
+        if a.name != "sysl" then continue
+        for arg in a.args
+            if is_binding_word(arg, "named") then return true
+    false
+
+private is_binding_word(arg: AnnotationArg, word: string) -> bool
     if arg.name is Some(_) then return false
     arg.value.kind match
-        Name(word) -> word == "blocking"
+        Name(w) -> w == word
         _ -> false
 
 // The arguments of a function's `@sysl` after the Sysl function's name, or after none on a handle's
-// method bound by its own name: `blocking`, once and alone, and nothing else.
+// method bound by its own name: `blocking` and `named`, each once and alone, and nothing else.
 private check_binding_flags(c: *Checker, unit: usize, a: Annotation, first: usize)
     var blocking = false
+    var named = false
     for i in first..<a.args.len()
         val arg = a.args[i]
         if is_blocking_word(arg)
             if blocking then c.note(unit, arg.value.span, "`@sysl` takes `blocking` once")
             blocking = true
-        elif arg.name is Some(k) && k == "blocking"
-            c.note(unit, arg.value.span, "`blocking` is written alone, after the Sysl function's name: `@sysl(\"sysl.net.accept\", blocking)`")
-        else c.note(unit, arg.value.span, "`@sysl` takes the Sysl function's module and name, and after it only `blocking`, for a call that may wait: `@sysl(\"sysl.net.accept\", blocking)`")
+        elif is_binding_word(arg, "named")
+            if named then c.note(unit, arg.value.span, "`@sysl` takes `named` once")
+            named = true
+        elif arg.name is Some(k) && (k == "blocking" || k == "named")
+            c.note(unit, arg.value.span, s"`$k` is written alone, after the Sysl function's name: `@sysl(\"sysl.net.accept\", $k)`")
+        else c.note(unit, arg.value.span, "`@sysl` takes the Sysl function's module and name, and after it only `blocking`, for a call that may wait, and `named`, for arguments passed by name: `@sysl(\"sysl.net.accept\", blocking)`")
 
 // A binding is a top-level function without a body whose `@sysl("module.path.name")` names a Sysl
 // function, followed by `blocking` where the call may wait. Its parameters and result are boundary
@@ -7449,6 +7465,9 @@ private check_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Type]
             None -> c.note(unit, a.span, "`@sysl` takes one string, the module and name of the Sysl function, as in `@sysl(\"sysl.text.to_upper\")`")
         if intrinsic then c.note(unit, a.span, "a function is an intrinsic or a Sysl binding, not both")
         if f.body is Some(_) || f.clauses.len() > 0 then c.note(unit, a.span, "a Sysl binding has no body: the Sysl function it names is its body")
+        if is_named_binding(f)
+            for p in f.params
+                if param_name(p) == "_" then c.note(unit, p.span, "a `named` binding passes each argument by its parameter's name, so every parameter has one")
         check_crossings_once_bounded(c, unit, f, params, 0, result, c.generic)
 
 // Each type parameter of a generic Sysl handle is a type argument of the Sysl type, so it is bounded
@@ -8407,7 +8426,7 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                         if a.args[0].value.kind is StringLit(p) then name = Some(p)
                     // `@sysl(blocking)` binds a method that may wait to the Sysl method of its own
                     // name's words.
-                    val own_name = name is None && a.args.len() >= 1 && (is_blocking_word(a.args[0]) || a.args[0].name is Some(_))
+                    val own_name = name is None && a.args.len() >= 1 && (is_blocking_word(a.args[0]) || is_binding_word(a.args[0], "named") || a.args[0].name is Some(_))
                     if name is Some(_) then check_binding_flags(c, unit, a, 1)
                     elif own_name then check_binding_flags(c, unit, a, 0)
                     name match
