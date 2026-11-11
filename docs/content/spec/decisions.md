@@ -5938,14 +5938,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `P12M`, which means one exact period); ISO's weeks (`P2W`, fourteen days, which `toIsoString`
   never writes).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `tls-refusal`): **why a certificate was refused**. `TlsError.Certificate`
+- Settled on the user's delegation 2026-11-11 (built on branch `tls-refusal`): **why a certificate was refused**. `TlsError.Certificate`
   gains a second field, `why: TlsRefusal`, and `TlsError.refusal() -> Option[TlsRefusal]` answers it
   (`None` for the other errors). `TlsRefusal` is `HostMismatch`, `Expired`, `NotYetValid`,
   `Untrusted` and `Other(code: long)`, and its `message()` and the error's say the reason in words.
@@ -5965,6 +5958,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   adding a separate query (the reason would have to be stored somewhere anyway). **Breaking**:
   `Certificate(_)` patterns become `Certificate(_, _)`. Review with the user whether the
   `Certificate` arity change is wanted over a variant per kind.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
