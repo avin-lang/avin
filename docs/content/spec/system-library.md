@@ -501,6 +501,22 @@ the program blocks for the answer.
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
 
+### `Reader`
+
+A `Reader` is bytes read from somewhere a piece at a time, so one function can read a file, a
+connection, or a source the program writes itself, holding no more of the input than it asks for:
+
+```text
+trait Reader
+    read(max: int) -> Result[Array[byte], IoError]
+```
+
+`read(max)` gives up to `max` bytes, `max` being at least one, waiting for at least one where the
+source is still going, and an empty array once it has ended. `fs.File` is a reader by its own
+`read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
+naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
+[json package](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
+
 ### `Source`
 
 A `Source` is text to be read from somewhere, so one function can read a file, a string
@@ -933,7 +949,9 @@ avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 **`ByteStream` is what the three connections share**: a trait with `read`, `readLine`, `readAll`,
 `write`, `writeText`, `setTimeout`, `shutdownOutput` and `close`, which `TcpStream`, `UnixStream` and
 `TlsStream` implement, so code that speaks a protocol, as the HTTP client and server do, takes a
-`ByteStream` and runs over any of them. It is [sendable](/spec/actors/#what-may-be-sent). `ReadAhead`,
+`ByteStream` and runs over any of them. It is [sendable](/spec/actors/#what-may-be-sent), and it is
+an [`io.Reader`](#reader) by its `read`, so whatever reads a `Reader` reads any connection, a TLS one
+included. `ReadAhead`,
 the bytes a connection has read beyond what its caller asked for and the line reading over them, is
 public for a connection of one's own.
 

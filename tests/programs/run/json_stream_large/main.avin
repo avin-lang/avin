@@ -1,0 +1,66 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// A document of more than 100 MB read as a stream from a source that makes it as it is asked for,
+// so the text is never in memory whole: every record is checked as its events come, and the
+// program's resident memory, sampled as it reads, stays within a few mebibytes of where it began.
+import json
+import json.JsonEvent
+import json.JsonReader
+import avin.io.IoError
+import avin.io.Reader
+import avin.process
+
+// An array of `count` records, written a record at a time as the reader asks for bytes.
+class Records(private val count: int): Reader
+    private var next = 0
+    private var pending: Array[byte] = "[".bytes().toArray()
+    private var at = 0
+    var made: long = 0
+
+    override read(max: int) -> Result[Array[byte], IoError]
+        if at == pending.length()
+            if next > count then return Ok(Array.empty[byte]())
+            val text = if next == count then "]" else
+                val comma = if next == 0 then "" else ",\n"
+                s"$comma{\"id\": $next, \"name\": \"record \\u00e9 $next 😀\", \"ok\": ${next % 2 == 0}, \"none\": null, \"v\": [${next}.5, -1e3, \"${"x".repeat(next % 50)}\"]}"
+            pending = text.bytes().toArray()
+            at = 0
+            next += 1
+        val end = if pending.length() - at > max then at + max else pending.length()
+        val piece = pending.slice(at, end)
+        made += long(piece.length())
+        at = end
+        Ok(piece)
+
+resident() -> long = process.residentBytes(process.pid()).ok().get()
+
+main()
+    val count = 800000
+    val source = Records(count)
+    val r = JsonReader.fromReader(source)
+    val before = resident()
+    var peak = before
+    var records = 0
+    var idSum: long = 0
+    var strings = 0
+    r.beginArray().ok().get()
+    while r.nextElement().ok().get()
+        r.beginObject().ok().get()
+        loop
+            r.nextKey().ok().get() match
+                None -> break
+                Some("id") -> idSum += r.readLong().ok().get()
+                Some("name") ->
+                    if r.readString().ok().get() == s"record é $records 😀" then strings += 1
+                Some(_) -> r.skipValue().ok().get()
+        records += 1
+        if records % 50000 == 0
+            val now = resident()
+            if now > peak then peak = now
+    r.finish().ok().get()
+    println(s"records: $records, names read back: $strings")
+    println(s"id sum: $idSum")
+    println(s"more than 100 MB: ${source.made > long(100) * 1000 * 1000}")
+    val grown = peak - before
+    println(s"resident memory grew by less than 32 MiB: ${grown < long(32) * 1024 * 1024}")
+    if grown >= long(32) * 1024 * 1024 then println(s"grew by $grown bytes")
