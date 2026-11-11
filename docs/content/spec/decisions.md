@@ -6639,6 +6639,22 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **Companion `from`, `Vector.iterate`, `unfold` and the sorted conversions** (branch
+  `stdlib-from`). Proposed: `from(xs: Iterable[T])` on every immutable collection companion and
+  on the mutable ones (`Buffer`, `Map`, `Set`, `TreeMap`, `TreeSet`, `LinkedMap`, `LinkedSet`,
+  `BitSet`, `PriorityQueue`), a map's taking `Iterable[(K, V)]`; for a duplicate key the later
+  pair's value wins (an ordered map keeping the key's first place), the rule `apply` and the
+  builders already follow. `Vector.iterate(start, length, f)` takes the length as its second
+  parameter and calls `f` `length - 1` times; `Vector.unfold` and `List.unfold` are the eager forms
+  of `Iterator.unfold`. `toSortedSet()` and `toSortedMap()` are `impl` blocks on `Iterable` bounded
+  by `Ord`, like `toSet()` and `toMap()`. Why: one spelling that works for every source and target,
+  where the collection-specific conversions need a method per pair. Alternatives weighed: a
+  `to(factory)` conversion (needs higher-kinded types); a universal `into(builder)` (not added:
+  `builder.addAll(xs)` already reads as well, and `from` covers the target-first reading);
+  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
+  `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
+  counting iterator and keeps its name.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
