@@ -6322,15 +6322,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   common use then needs `long(round(x))`); `trunc` returning `long` (loses negative zero and the
   large values). Review with the user: the `round` and `trunc` result types differ, which is
   unusual to read.
-
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `stdlib-iterator`): **The eager methods added to every `Iterable` answer
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **The eager methods added to every `Iterable` answer
   vectors.** `scanLeft` is a `Vector[B]`, `tapEach` and `concat` a `Vector[T]` (`Vector[W]` for
   `concat[W >: T]`), `span` and `partitionMap` pairs of vectors, and `flatten()` of a collection of
   collections a `Vector[T]`; `grouped` and `sliding` answer the `Iterator[Vector[T]]` a sequence's
@@ -6339,30 +6331,30 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   own. Alternatives: `Iterable[B]` as the `Iterable` transformations answer (hides that it is a
   vector), or each collection keeping a same-kind form (a long tail of overrides). Review with the
   user: whether `tapEach` on a list should answer a list.
-- Proposed (built on branch `stdlib-iterator`): **An iterator's new lazy forms are added by
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **An iterator's new lazy forms are added by
   `impl[T] Iterator[T]`, not declared in the trait.** So `padTo(total, element: T)` and
   `zipAll(other, thisElement: T, thatElement)` take the element type in a parameter of the
   covariant `Iterator`, and the forms are found before the eager ones every `Iterable` has. An
   iterator whose static type is only `Iterable` gets the eager forms, as with `map`. Alternatives:
   trait members with lower-bounded parameters (`padTo[W >: A]`), which a program's own iterator
   could override, at the cost of a widened result everywhere.
-- Proposed (built on branch `stdlib-iterator`): **`it ++ other` takes `other` as an ordinary
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **`it ++ other` takes `other` as an ordinary
   `Iterable` and asks for its `iterator()` only once `it` is used up**; `concat` on an iterator is
   the same lazy join. WHY: a strict argument reads like every other call, and the iterator taken late
   is what keeps a mutable `other` read as it is when reached. Alternative: a by-name `other`, which
   would delay even evaluating the expression.
-- Proposed (built on branch `stdlib-iterator`): **`Iterator.from` is two overloads over
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **`Iterator.from` is two overloads over
   `T: Integer`, `from(start)` and `from(start, step)`,** not one with `step = 1`, since the default
   would have to be `T(1)` of the caller's type. An element is computed when it is read, so
   `from(int.MaxValue)` gives `int.MaxValue` and overflow traps only when the element past it is read.
   Alternatives: a default parameter written `T(1)`; `int` and `long` overloads only.
-- Proposed (built on branch `stdlib-iterator`): **The companion iterators compute when read.**
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **The companion iterators compute when read.**
   `fill` and `continually` evaluate their by-name element at each `next()`, `tabulate` calls `f` at
   each `next()`, `iterate` calls `f` before each element after the first, and `unfold` calls `f`
   when `hasNext()` is asked and holds the element it gave. WHY: an iterator does no work for an
   element that is not read. Alternative: `fill` and `tabulate` building a vector and iterating it,
   as the sequence companions do (eager, and `fill`'s element evaluated before any is read).
-- Proposed (built on branch `stdlib-iterator`): **`grouped` and `sliding` on an iterator give the
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **`grouped` and `sliding` on an iterator give the
   windows a sequence's give**, reading the next window when `hasNext()` is asked, holding no element
   beyond the current window, and trapping on a size or step below 1 at the call, with the messages a
   sequence's use. `BufferedIterator[A]` is a public class with `peek()` (trapping with "peek on an
@@ -6370,7 +6362,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   on an iterator of collections, lazily, beside the eager one on every collection of collections.
   Alternatives: windows read at `next()` only (no lookahead, but `hasNext()` could not answer for a
   step that skips past the end); `buffered()` answering a buffered iterator itself.
-- Proposed (branch `stdlib-predef`): **an impl without `for` adds methods to tuple and function
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-predef`): **an impl without `for` adds methods to tuple and function
   types** built from its parameters (`impl[A, B] (A, B)`, `impl[A, B] (A) -> B`), as the impl chapter
   already allowed for any type built from parameters and for traits, which function types are. The
   checker refused both ("an impl adds to a data type, a class, an object or a built-in type"; "an
@@ -6386,7 +6378,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Vector` would then lack `andThen`, though it is passed wherever an `(int) -> T` is); treating a
   `@sendable` pattern as plain (its methods would reach functions that may not run on another
   thread, against what the impl names).
-- Proposed (branch `stdlib-predef`): **an impl naming a tuple or function type has at least one type
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-predef`): **an impl naming a tuple or function type has at least one type
   parameter.** `impl (int, int)` with none begins a function named `impl`, since `impl` is a
   keyword only before a type and `impl(…)` declares a function; `impl() -> int` followed by a body
   reads either way, so no rule on the tokens can tell them apart. A part may be written out
@@ -6394,7 +6386,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parser refuses it for every impl); making `impl` a full keyword (breaks a function of that name).
   Review with the user: whether an impl for one concrete tuple or function type is wanted enough to
   reserve `impl (`.
-- Proposed (branch `stdlib-predef`): **`require(condition, message)` takes the message by name**, so
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-predef`): **`require(condition, message)` takes the message by name**, so
   it is built only when the requirement fails, while `assert(condition, message)` takes a plain
   string. Rationale: `require` sits at the top of ordinary functions, called on every call, and its
   message usually interpolates the arguments; building it every time would cost the common path.
@@ -6403,6 +6395,41 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   takes a plain string, since it always traps. **`ensuring` is not provided**: it needs an impl for
   every type (`impl[T] T`), which only the integer family has; a postcondition is written with
   `require`/`assert` on the result.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-inplace`): **in-place operations on `Buffer`, `Deque` and `Array`, and
+  `StringWriter` length and clear.** Choices the spec did not settle:
+  (1) **`remove(i, n)` is an overload of `remove(i)`**, and its count parameter is named `n`, so it
+  never shadows the buffer's own `count`. A range not within the collection traps (`n` greater than
+  `length() - i` included, tested without overflow); `n = 0` at `length()` is allowed.
+  (2) **`subtractOne(x)` answers a `bool`** (whether one was taken out) rather than the collection,
+  and is declared in an `impl[T: Eq]` block, so it exists only where elements compare; it takes the
+  first match, from the front. Alternatives: returning `self` for chaining (hides a miss), and a
+  `-=` operator (a bool-valued compound assignment reads badly).
+  (3) **`filterInPlace` and `mapInPlace` trap when the predicate or function changed the length**,
+  instead of leaving the outcome unspecified or silently working on a snapshot: the check is one
+  comparison per element and turns a corrupted result into a trap at the caller's line. Alternatives:
+  iterate a snapshot (hides the bug and costs a copy), or leave it undefined.
+  (4) **`mapInPlace` takes `(T) -> T`**, since the element type cannot change in place.
+  (5) **`patchInPlace(from, other, replaced)` reads `other` first** and traps for a `from` or
+  `replaced` outside the collection, where a clamping rule would hide a wrong index.
+  (6) **`fillInPlace` is a separate name from the companion's `Array.fill`**, as `fill` there makes a
+  new array; it shares the one value as `fill` does.
+  (7) **`Array.copyTo(dest, at, from = 0, count = length() - from)`** gives `count` a default that is
+  a function of `from`, which the declaration rules allow; it is overlap-safe in both directions
+  (the copy runs backwards when `dest` is the same array and `at > from`). All ranges are checked
+  before the first element moves.
+  (8) **`StringWriter.length()` is an `int` count of bytes**, as every offset into a string is, and
+  `clear()` drops the stored text so a text already taken is unaffected. A **`write(x: Display)`
+  overload on `Writer` is not added**: it would sit beside `write(text: string)` (a `string` is
+  `Display`) and make every call a resolution by specificity for no gain, `writeDisplayed` already
+  writing any `Display` value. Revisit if a user wants `out.write(42)`. Review with the user: the
+  length-change trap in (3), and leaving out `write(x: Display)` in (8).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
