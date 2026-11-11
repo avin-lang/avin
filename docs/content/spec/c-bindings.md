@@ -497,7 +497,8 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
 - **The field is a member path of the struct `self` points at**, `"width"`, `"origin.x"`,
   `"glyph->bitmap.rows"`, read as `self->` followed by it. The handle's type must point at a struct
   the headers define; one they only declare is refused when the C unit compiles the accessor.
-- **A field is read as an integer type, `byte`, `bool`, `real`, a string or a handle.** The C unit
+- **A field is read as an integer type, `byte`, `bool`, `real`, a string or a handle**, or the memory
+  a byte pointer points at is lent as a [view](#buffers) with `view` and `length:`. The C unit
   checks the field is the kind its Avin type needs (an integer or enumeration, one byte wide for
   `byte`, a `bool` or an integer for `bool`, a floating-point type for `real`, `char *` or
   `const char *` for a string, and the class's own C type for a handle) and measures its width and
@@ -790,6 +791,19 @@ The buffer is null for a glyph with no pixels (a space), answered as `None`. Rea
 pitch` with a negative pitch is caught by the view's bounds check rather than read from before the
 buffer.
 
+Such an accessor takes `view`, `length:` and `writable` beside `field:` and `bound:`, and nothing
+else: `length:` is a C expression in `self` and the indices, evaluated after the field is read, and
+an index is checked against its bound before either. The C unit checks the field points at an integer
+type one byte wide, and that a `writable` one is not `const` ([proposed](/spec/decisions/#proposed)):
+
+```text
+error: the field `name` of the C handle `Face` points at `const` memory in the headers, so `Face.name` cannot lend it `writable`
+```
+
+A field view is lent and closed by the rules of every view below: its handle's next use closes it,
+another field accessor among them, and a `shared` handle lends none. A writer lends nothing, and an
+accessor answering a view without saying `view`, or a `ByteBlock` at all, is refused.
+
 ### Writing into C's memory
 
 **A `ByteView` is read-only. A binding marked `writable` answers an `avin.c.MutByteView`**, which is
@@ -919,6 +933,21 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
       surface.writePngStream(collect).mapErr(CairoError.from)?
       Ok(out.toArray())
   ```
+
+  The length may come before its pointer and be of any integer type; a function may be lent several
+  views; and null crosses by the [rules of views](#the-rules-of-views-and-blocks), `None` for an
+  `Option[ByteView]`, an empty view for a length of zero, and otherwise a stop where the binding was
+  called (`` C lent the function given to `writePngStream` null``). A view lent a callback has no
+  lender: it belongs to the code the callback runs in, so a thread the callback starts cannot read it
+  (`` the `ByteView` lent to the function given to `writePngStream` belongs to another thread``),
+  and a view kept past the call stops the program at its use
+  ([proposed](/spec/decisions/#proposed)):
+
+  ```text
+  avin: trap: the `ByteView` lent to the function given to `writePngStream` was closed when it returned at main.avin:14:13
+  ```
+
+  A callback answers no view, and the C unit checks each lent pointer points at bytes one byte wide.
 - **The compiler makes one trampoline per parameter taking a function**, a function with C's
   convention whose address is passed for the pointer ([proposed](/spec/decisions/#proposed)): two
   bindings of one C type may cross it as different Avin types. It finds the closure through the `userdata`, which points at the

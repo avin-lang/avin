@@ -1,0 +1,252 @@
+// Views lent to a callback: a byte pointer with `length(p)` beside it in the function pointer's
+// prototype crosses as a `ByteView` where it is `const` and a `MutByteView` where it is not, its length
+// filled from C's, before or after the pointer, at any integer width; null as `None`, an empty view or a
+// stop; two at once; and every view closed when the callback returns, wherever it was kept.
+import avin.c.{ByteView, MutByteView}
+import avin.threads.spawn
+
+@c("int bf_stream_write(int total, int chunk, int (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+writeStream(total: int, chunk: int, write: (ByteView) -> int) -> int
+
+@c("long bf_stream_read(int total, int chunk, int (*read)(userdata void *closure, unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+readStream(total: int, chunk: int, read: (MutByteView) -> int) -> long
+
+@c("int bf_stream_null(unsigned int length, int (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+nullStream(length: int, write: (ByteView) -> int) -> int
+
+@c("int bf_stream_null(unsigned int length, int (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+maybeNullStream(length: int, write: (Option[ByteView]) -> int) -> int
+
+@c("int bf_stream_write(int total, int chunk, int (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+maybeWriteStream(total: int, chunk: int, write: (Option[ByteView]) -> int) -> int
+
+@c("void bf_stream_sized(size_t n, void (*seen)(userdata void *closure, length(data) size_t length, const uint8_t *data), userdata void *closure)")
+sizedStream(n: long, seen: (ByteView) -> unit)
+
+@c("void bf_stream_signed(int n, void (*seen)(userdata void *closure, const unsigned char *data, length(data) int length), userdata void *closure)")
+signedStream(n: int, seen: (ByteView) -> unit)
+
+@c("long bf_stream_pair(int a, int b, long (*seen)(userdata void *closure, const unsigned char *first, length(first) unsigned int n, unsigned char *second, length(second) unsigned int m), userdata void *closure)")
+pairStream(a: int, b: int, seen: (ByteView, MutByteView) -> long) -> long
+
+// Allocates until the collector has run several times.
+streamChurn()
+    var n = 0
+    for i in 0..<200000
+        val v = [i, i + 1]
+        n += v(1) - v(0)
+
+@test("a callback reads each chunk C lends it in place, the length C's own")
+streamWriteReads()
+    val out = Buffer[byte]()
+    var calls = 0
+    val answer = writeStream(1000, 64, chunk ->
+        calls += 1
+        out.appendAll(chunk.copy())
+        0)
+    assertEq(answer, 0)
+    assertEq(calls, 16)
+    assertEq(out.length(), 1000)
+    for i in 0..<1000
+        assertEq(out(i), byte(i & 255))
+
+@test("a chunk of one byte, and a last chunk shorter than the rest")
+streamWriteShortChunks()
+    var lengths = Buffer[int]()
+    writeStream(5, 2, chunk ->
+        lengths.append(chunk.length())
+        0)
+    assertEq(lengths.length(), 3)
+    assertEq(lengths(2), 1)
+    var ones = 0
+    writeStream(3, 1, chunk ->
+        ones += chunk.length()
+        0)
+    assertEq(ones, 3)
+
+@test("C lending nothing calls nothing, and an answer other than zero stops C's loop")
+streamWriteStops()
+    var calls = 0
+    assertEq(writeStream(0, 8, chunk ->
+        calls += 1
+        0), 0)
+    assertEq(calls, 0)
+    assertEq(writeStream(100, 10, chunk ->
+        calls += 1
+        if calls == 3 then 7 else 0), 7)
+    assertEq(calls, 3)
+
+@test("a `MutByteView` lent a callback is written in place, and C reads what was written")
+streamReadWrites()
+    var at = 0
+    val sum = readStream(10, 4, chunk ->
+        assertEq(chunk(0), byte(0xEE))
+        for i in 0..<chunk.length()
+            chunk(i) = byte(at & 255)
+            at += 1
+        0)
+    assertEq(sum, long(45))
+    val filled = readStream(8, 8, chunk ->
+        chunk.fill(0, chunk.length(), byte(1))
+        chunk.write(6, [byte(2), byte(3)])
+        0)
+    assertEq(filled, long(11))
+    assertEq(readStream(4, 4, chunk -> 5), long(-5))
+
+@test("null with a length of zero is an empty view, and `None` where the callback takes an `Option`")
+streamNullEmpty()
+    var seen = -1
+    nullStream(0, v ->
+        seen = v.length()
+        0)
+    assertEq(seen, 0)
+    var none = false
+    maybeNullStream(0, v ->
+        none = v is None
+        0)
+    assert(none)
+    maybeNullStream(4, v ->
+        none = v is None
+        0)
+    assert(none)
+    var length = 0
+    maybeWriteStream(3, 3, v ->
+        length = v.get().length()
+        0)
+    assertEq(length, 3)
+
+@test(should_trap: "C lent the function given to `nullStream` null")
+streamNullCounted()
+    nullStream(4, v -> 0)
+
+@test("a length before its pointer, of type `size_t`, and one of zero bytes")
+streamSizedFirst()
+    var total = 0
+    sizedStream(300, v ->
+        for i in 0..<v.length()
+            total += int(v(i))
+        assertEq(v(299), byte(43)))
+    assertEq(total, 33586)
+    var empty = -1
+    sizedStream(0, v -> empty = v.length())
+    assertEq(empty, 0)
+
+@test(should_trap: "C lent the function given to `signedStream` a negative length")
+streamNegativeLength()
+    signedStream(-1, v -> ())
+
+@test(should_trap: "index out of range")
+streamReadPastLength()
+    signedStream(4, v -> v(4))
+
+@test("two views lent at once, one read-only and one writable, each its own length")
+streamPair()
+    val answer = pairStream(3, 2, (a, b) ->
+        assertEq(a.length(), 3)
+        assertEq(b.length(), 2)
+        b(0) = a(2)
+        b(1) = byte(0)
+        long(int(a(0)) + int(a(1)))
+        )
+    assertEq(answer, long(1 + 2))
+
+@test(should_trap: "the `ByteView` lent to the function given to `writeStream` was closed when it returned")
+streamViewKept()
+    var kept: Option[ByteView] = None
+    writeStream(4, 4, v ->
+        kept = Some(v)
+        0)
+    kept.get()(0)
+
+@test(should_trap: "the `ByteView` lent to the function given to `writeStream` was closed when it returned")
+streamViewKeptInVector()
+    val kept = Buffer[ByteView]()
+    writeStream(8, 4, v ->
+        kept.append(v)
+        0)
+    assertEq(kept.length(), 2)
+    kept(0).length()
+
+@test(should_trap: "the `ByteView` lent to the function given to `writeStream` was closed when it returned")
+streamViewKeptInClosure()
+    var read: () -> byte = () -> byte(0)
+    writeStream(4, 4, v ->
+        read = () -> v(1)
+        assertEq(read(), byte(1))
+        0)
+    read()
+
+@test(should_trap: "the `MutByteView` lent to the function given to `readStream` was closed when it returned")
+streamMutViewKept()
+    var kept: Option[MutByteView] = None
+    readStream(4, 4, v ->
+        kept = Some(v)
+        0)
+    kept.get()(0) = byte(1)
+
+@test(should_trap: "the `MutByteView` lent to the function given to `pairStream` was closed when it returned")
+streamPairKept()
+    var kept: Option[MutByteView] = None
+    pairStream(1, 1, (a, b) ->
+        kept = Some(b)
+        long(0))
+    kept.get().length()
+
+@test("a copy taken in the callback outlives it; the view each call is lent is a new one")
+streamCopyKept()
+    val copies = Buffer[Array[byte]]()
+    writeStream(6, 3, v ->
+        copies.append(v.copy())
+        0)
+    assertEq(copies.length(), 2)
+    assertEq(copies(1)(0), byte(3))
+
+@test("a callback allocating between reads, so collections run while it holds its view")
+streamCollects()
+    var total = 0
+    writeStream(4096, 512, v ->
+        streamChurn()
+        for i in 0..<v.length()
+            total += int(v(i))
+        0)
+    assertEq(total, 16 * 32640)
+
+// A method value and a top-level function as the callback.
+class Counter
+    var bytes = 0
+    take(v: ByteView) -> int
+        bytes += v.length()
+        0
+
+countAll(v: ByteView) -> int = v.length() - v.length()
+
+@test("a method value and a top-level function take views as a lambda does")
+streamMethodValues()
+    val c = Counter()
+    writeStream(70, 7, c.take)
+    assertEq(c.bytes, 70)
+    assertEq(writeStream(70, 7, countAll), 0)
+
+@test(should_trap: "the `ByteView` lent to the function given to `writeStream` belongs to another thread")
+streamOtherThread()
+    writeStream(4, 4, v -> spawn(() -> int(v(0))).join())
+
+@test("a lightweight thread's callback reads its view across its own switches")
+streamInThread()
+    val total = spawn(() ->
+        var sum = 0
+        writeStream(16, 16, v ->
+            for i in 0..<v.length()
+                val junk = [i, i]
+                sum += int(v(i)) + junk(0) - junk(1)
+            0)
+        sum).join()
+    assertEq(total, 120)
+
+@test("a callback called a hundred thousand times, each view closed as its call ends")
+streamManyCalls()
+    var calls = 0
+    writeStream(100000, 1, v ->
+        calls += int(v(0)) - int(v(0)) + 1
+        0)
+    assertEq(calls, 100000)

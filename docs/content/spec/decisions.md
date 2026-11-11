@@ -5455,6 +5455,39 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 
 ## Proposed
 
+- **Views lent by a field and to a callback, as built** (branch `c-view-fields`, stage 13 item (A)):
+  - **A field accessor lending a view says `view`, `length:` and perhaps `writable`, as a binding
+    does**, and nothing else; `length:` is a C expression in `self` and the indices, evaluated after
+    the field is read, whether or not it is null. *Why*: the words a binding lending its result
+    already uses, so a reader learns one form. *Alternatives*: a separate `buffer:` word for fields;
+    evaluating the length only for a non-null pointer, which would let a `length:` that dereferences
+    the struct run only sometimes.
+  - **The C unit, not the checker, refuses a `writable` view of a `const` field**, by glue that
+    assigns through the pointer, since the field's type is the header's and the checker never sees
+    it. *Why*: a binding's prototype says `const` in Avin's source, a field's does not. *Alternative*:
+    making the accessor spell the field's C type, which repeats the header.
+  - **A view lent a callback may be an `Option`**, null with any length `None`, and otherwise null
+    follows a binding's rule: an empty view for a length of zero, a stop for any other
+    (`` C lent the function given to `f` null``); a negative length and one past the greatest `int`
+    stop the program at the binding's call. *Why*: one rule for every view. *Alternative*: refusing an
+    `Option` in a callback, which would make a C library that passes null for an empty chunk stop
+    the program.
+  - **A view lent a callback has no lender and belongs to the code the callback runs in**: another
+    thread's use stops the program, a thread the callback starts among them, since the view is not
+    handed over with a body that captures it as a handle's view is with its lender. *Why*: C frees
+    the memory when the callback returns, so it must not be read anywhere the closing cannot order
+    before the free. *Alternative*: handing it over like a block, which lets another thread read
+    while the callback returns and C frees. Review with the user only if a library needs a thread to
+    read a chunk in place.
+  - **A callback view's length is converted through `long`** before the view's own checks, so an
+    unsigned 64-bit length past a `long`'s range stops the program as that conversion does, and any
+    smaller one past the greatest `int` as `more bytes than a view holds`. *Why*: the conversions a
+    callback's integer arguments already use. *Alternative*: a dedicated 64-bit unsigned comparison,
+    which only changes the message.
+  - **The trap texts** name the binding: `` the `ByteView` lent to the function given to `f` was
+    closed when it returned`` and `` … belongs to another thread``; a field's view is a handle's view
+    and says `` the `ByteView` of `Face` was closed when `Face` was used again``.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
