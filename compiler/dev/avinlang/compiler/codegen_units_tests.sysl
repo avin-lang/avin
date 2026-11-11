@@ -55,10 +55,16 @@ units_define_each_function_once()
                 // Every unit carries the declarations it needs, and comments stay behind.
                 assert(!u.contains("; a program"))
 
-@test("a module of one function, or one asked to make one unit, is not cut")
+@test("a module of one function and no global, or one asked to make one unit, is not cut; one with a global is its function and its tables")
 one_function_is_not_cut()
+    val bare = "declare i32 @puts(ptr)\n\ndefine i32 @main(i32 %argc, ptr %argv) {\nb0:\n  %r = call i32 @puts(ptr null)\n  ret i32 0\n}\n"
+    assert(split_module(bare, 8, true) is None)
     val one = "declare i32 @puts(ptr)\n@s = private constant [3 x i8] c\"hi\\00\"\n\ndefine i32 @main(i32 %argc, ptr %argv) {\nb0:\n  %r = call i32 @puts(ptr @s)\n  ret i32 0\n}\n"
-    assert(split_module(one, 8, true) is None)
+    val units = split_module(one, 8, false).unwrap()
+    assert_eq(units.len(), 2usize)
+    assert(units[0].contains("define i32 @main("), units[0])
+    assert(units[1].contains("@\"avin.cgu:s\" = hidden constant [3 x i8]"), units[1])
+    assert(!units[1].contains("define "), units[1])
     assert(split_module(Sample, 1, true) is None)
     assert(split_module(Sample, 0, false) is None)
     assert(split_module("", 8, false) is None)
@@ -69,23 +75,60 @@ unsplittable_modules_stay_whole()
     assert(split_module("$c = comdat any\n" + Sample, 8, false) is None)
     assert(split_module(Sample + "@f = ifunc void (), ptr @r\n", 8, false) is None)
 
-@test("an alias lives in the unit that defines its global, and a unit naming it from elsewhere declares it hidden")
-alias_stays_with_its_global()
+@test("every global and alias lives in the last unit, which defines no function, and a unit naming one declares it hidden")
+tables_have_a_unit_of_their_own()
     for n in [2, 3, 4, 8]
-        val units = split_module(Sample, n, false).unwrap()
-        var homes = 0
-        for u in units
-            val has_alias = u.contains("@text = private alias") || u.contains("@\"avin.cgu:text\" = hidden alias")
-            val has_global = u.contains("@text.const = private constant") || u.contains("@\"avin.cgu:text.const\" = hidden constant")
-            assert_eq(has_alias, has_global)
-            if has_alias then homes += 1
-            if u.contains("@\"avin.cgu:text\" = external") then assert(u.contains("@\"avin.cgu:text\" = external hidden global i8\n"))
-        assert_eq(homes, 1)
-        // A global nothing names is kept, once.
-        var unused = 0
-        for u in units
-            unused += occurrences(u, "@unused = private constant")
-        assert_eq(unused, 1)
+        for copies in [false, true]
+            val units = split_module(Sample, n, copies).unwrap()
+            val tables = units[units.len() - 1]
+            assert(tables.contains("@\"avin.cgu:text\" = hidden alias"), tables)
+            assert(tables.contains("@text.const = private constant") || tables.contains("@\"avin.cgu:text.const\" = hidden constant"), tables)
+            assert(tables.contains("@\"avin.cgu:count\" = hidden global i64 0"), tables)
+            // A global nothing names is kept there too, local.
+            assert(tables.contains("@unused = private constant"), tables)
+            for line in tables.split("\n")
+                assert(!line.starts_with("define "), line)
+            for i in 0..<units.len() - 1
+                val u = units[i]
+                assert(!u.contains(" = private ") && !u.contains(" = hidden alias") && !u.contains(" = hidden global"), u)
+                assert_eq(occurrences(u, "@unused"), 0)
+                if u.contains("@\"avin.cgu:text\" = external") then assert(u.contains("@\"avin.cgu:text\" = external hidden global i8\n"))
+
+@test("the tables' unit copies no function, and an alias is declared, never copied, at -O2")
+tables_copy_nothing()
+    val units = split_module(Sample, 4, true).unwrap()
+    val tables = units[units.len() - 1]
+    assert(!tables.contains("available_externally"), tables)
+    for u in units
+        assert(!u.contains("hidden alias") || u == tables, u)
+
+@test("a trap site is never copied into the units that reach it, at -O2")
+trap_sites_are_not_copied()
+    val trap = "@\"avin.trap:<program>.f+3:abc\" = private constant { i64, i64 } { i64 7, i64 5 }, align 8\n"
+    val text = trap + Sample + "\ndefine internal void @\"<program>.f\"(ptr %ctx) {\nb0:\n  call void @rt(ptr @\"avin.trap:<program>.f+3:abc\")\n  call void @\"<program>.sayTwice\"()\n  ret void\n}\n\ndeclare void @rt(ptr)\n"
+    val units = split_module(text, 4, true).unwrap()
+    var defined = 0
+    for u in units
+        assert(!u.contains("available_externally hidden constant { i64, i64 }"), u)
+        if u.contains("@\"avin.cgu:avin.trap:<program>.f+3:abc\" = hidden constant") then defined += 1
+    assert_eq(defined, 1)
+
+@test("a unit holds its pieces by name, so the order of the module's functions does not change its text")
+unit_text_ignores_module_order()
+    val s = "@s.const = private constant [3 x i8] c\"hi\\00\"\n@t.const = private constant [3 x i8] c\"ho\\00\"\n"
+    val a = "define internal void @a() {\nb0:\n  call void @c()\n  call void @b()\n  ret void\n}\n"
+    val b = "define internal void @b() {\nb0:\n  call i32 @puts(ptr @t.const)\n  ret void\n}\n"
+    val c = "define internal void @c() {\nb0:\n  call i32 @puts(ptr @s.const)\n  call void @b()\n  ret void\n}\n"
+    val main = "define i32 @main() {\nb0:\n  call void @a()\n  call void @c()\n  ret i32 0\n}\ndeclare i32 @puts(ptr)\n"
+    val first = s + a + b + c + main
+    val second = "declare i32 @puts(ptr)\n" + c + main + b + "@t.const = private constant [3 x i8] c\"ho\\00\"\n" + a + "@s.const = private constant [3 x i8] c\"hi\\00\"\n"
+    for n in [2, 3, 8]
+        for copies in [false, true]
+            val x = split_module(first, n, copies).unwrap()
+            val y = split_module(second, n, copies).unwrap()
+            assert_eq(x.len(), y.len())
+            for i in 0..<x.len()
+                assert_eq(x[i], y[i])
 
 @test("a local named across units is promoted to a hidden name no other symbol can spell; one named only at home stays local")
 promotion_renames_only_what_crosses()

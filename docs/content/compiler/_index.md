@@ -134,13 +134,29 @@ scalar replacement** stay whole-program passes over summaries, which are small; 
 world facts changed (a new class implementing a trait it calls through, a callee it inlined edited)
 has its passes run again from its lowered form, and only it.
 
-**Stable names.** Today's emitted text numbers strings, descriptors, records, closures and trap
-sites in the order lowering finds them, so one new instance can renumber everything after it.
-Incremental builds name each by what it is: a string by its content's hash, a descriptor or record
-by its type's qualified spelling, a closure or trap site by its function and its place within it.
-The module-level tables (descriptors, records, the string descriptor, method tables) are made from
-the instance set on every build, into a codegen unit of their own, so a change to a table recompiles
-that unit and no other.
+**Stable names.** The emitted text names everything by what it is, never by the order the checker
+or lowering found it in, so one new function, string or type renames nothing else. Each table's
+symbol is `@"avin.<kind>:<name>"`:
+
+| Kind | Named by |
+| --- | --- |
+| a function | its module, name, overload and type arguments; a local function or lambda by its top-level function and its number among that function's local functions of its name (`<program>.pick.lambda#2`) |
+| a type in a name | its qualified spelling: `avin.Option[int]`, `class geo.Box[]`, `object geo.Box[]`, `(int, string)` |
+| `str` | the first 16 hexadecimal digits of the SHA-256 of its bytes |
+| `desc`, `methods`, `obj` | the type it lays out, a variant after its type's (`avin.Option[int].Some`); `box of <type>`, `cell of <machine type>`, `closure of <function>`, `string` |
+| `type` | the type the record describes |
+| `fn` | the function of the constant closure |
+| `data` | a shared constant object by a hash of what it holds; any other by its module-level value and its place among that value's objects |
+| `trap` | the innermost top-level function or method declared around it, the byte offset from that declaration's start, and 12 hexadecimal digits of a hash of its reason |
+| `global` | the module-level value's qualified name; one holding a reference is an alias of its slot of the roots frame |
+| `c.trampoline` | the binding passing it and its place among that binding's |
+
+Emission stops with the name where two things of one kind would share one, a defect of the naming
+the assembler would otherwise report as a redefinition. The module-level tables, every global and
+alias, are the last codegen unit, and the functions are spread over the others; a unit holds its
+pieces in the order of their names, and a trap site, which holds its line, is never copied into the
+units that reach it. So a function or string added to a program recompiles its unit and the tables'
+unit alone. The tables are made from the instance set on every build.
 
 **The `-O0`/`-O2` split.** Each level has its own instance directory; nothing is shared between
 them, since the passes and the copies made for inlining differ. A build at one level never trims the

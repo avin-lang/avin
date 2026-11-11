@@ -6017,6 +6017,61 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the user whether a public library type mirroring a package's enum is wanted: a variant `openssl`
   adds must be added to `TlsRefusal`, which Sysl reports as not matching until it is.
 
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **Each emitted table is named `@"avin.<kind>:<name>"`, the name
+  spelled by qualified names in full, with no hash suffix**: a type as `avin.Option[int]`,
+  `class geo.Box[]`, `object geo.Box[]`, `(int, string)`; a descriptor by its type, a variant after
+  its type's (`avin.Option[int].Some`); a record by its type; a constant closure by its function; a
+  module-level value by its qualified name (`object ` before an object's). WHY: readable in the
+  emitted text and in a profile, injective by construction (two types of one module never share a
+  name but an object and its companion, which the prefixes tell apart), and short enough: marshal's
+  longest symbol is 319 bytes, 275 of its 111,642 symbols are over 200, and every one is local to
+  the program, so no linker or object format limit is near. The emitted text grew 11% (126 MB to
+  140 MB for marshal). Alternatives: a hash of the spelling (shorter, unreadable, and a collision
+  is silent until the assembler reports it); the spelling cut at a length with a hash of the rest
+  (not needed at these lengths). Emission stops with the name where two of one kind would share
+  one, rather than the assembler reporting a redefinition.
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A string constant is named by the first 16 hexadecimal digits
+  of the SHA-256 of its bytes**, a later string sharing them by its index after a dot. WHY: the same
+  string has the same name in every program and every build; 64 bits make a shared prefix within one
+  program improbable past any program's size. Alternatives: the whole digest (32 more bytes on each of
+  thousands of strings); the text itself (unbounded, and escaping in a symbol).
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A trap site is named by the innermost top-level function or
+  method declared around it, the byte offset from that declaration's start, and 12 hexadecimal
+  digits of the SHA-256 of its reason**; a site in code the compiler wrote (an empty span) by the
+  instance being lowered; one in a declaration the checker copies (a derived `Display` and its
+  siblings, one method name on several types sharing a declaration) or outside every function by its
+  file and offset. Trap sites are never copied into the units that reach them at `-O2`. WHY: lines
+  added above a function move its sites' lines, which only the tables' unit holds, and leave every
+  function's text as it was; a copy of a site, which no code reads, would carry its line into the
+  units that reach it. Alternatives: the instance and its sites in order (a site is shared by every
+  instance of a generic function, so its name would depend on which instance was lowered first);
+  file and line (moves with every line added above). Review with the user: a site in a library
+  template is named by file and offset, which an edit to that library file moves.
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A local function or lambda is numbered among its top-level
+  function's local functions of its name, from 1 in declaration order** (`<program>.pick.lambda#2`).
+  WHY: two blocks may each declare a local function of one name, and the number counts only within
+  the function, which an edit elsewhere never changes. Alternatives: the checker's symbol index
+  (moves with every symbol declared before it); the byte offset within the function (moves with an
+  edit above the lambda inside the function, which changes the function's text anyway, and is longer).
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A shared constant object is named by a hash of what it holds,
+  an unshared one (a vector literal's) by its module-level value and its place among that value's
+  objects; a C trampoline by its binding and place.** WHY: equal shared objects are one object
+  already, so their content is their identity; an unshared object's identity is its value's.
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A module-level value that holds a reference keeps its slot in the
+  roots frame, and its name is a private alias of that slot**; code names the alias. WHY: the slot's
+  position moves when a value is added before it, and the alias keeps that position in the tables'
+  unit alone; the runtime's view of the frame is unchanged. Alternatives: a global per value and a
+  frame of addresses (a runtime change for the same effect).
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **The module-level tables are the last codegen unit of `n`, the
+  functions spread over the other `n - 1`, and a unit holds its pieces in the order of their names.**
+  WHY: a new string, type or trap site then changes the tables' unit and its user's alone, and a
+  unit whose own pieces are unchanged is the same text whatever order lowering found them in.
+  Alternatives: tables in the first unit that names them (a new early user moves them, changing two
+  units); one unit per kind of table (more units for no fewer recompilations). Left as it was: a
+  function called from one function alone still lives in its caller's unit, so a second caller in
+  another unit moves it; and a small function copied into its callers' units at `-O2` makes an edit
+  to it recompile those units too.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;

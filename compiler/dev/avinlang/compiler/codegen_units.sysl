@@ -23,10 +23,13 @@ import sysl.time.now
 // Everything a program defines is local to its module (`internal`, `private`), so nothing places
 // itself the way an exported symbol would. **Every function is placed by a hash of its name**, which
 // keeps a unit's contents stable when one function is edited: the edited function's unit changes and
-// the others keep their text, so their objects are taken from the cache (below). A global follows
-// its users: it lives in the first unit found to name it, and an alias lives with the global it
-// points into, since an alias cannot point at a declaration. A global nothing names lives in the
-// first unit.
+// the others keep their text, so their objects are taken from the cache (below). **The module-level
+// tables -- every global and alias: strings, descriptors and method tables, type records, constant
+// objects, trap sites, module-level values -- are a unit of their own, the last**, and the functions
+// are spread over the others. Every table is named by what it is (see `emit.sysl`), so a string or
+// type added for one function changes that function's unit and the tables' unit and no other. A
+// unit holds its pieces in the order of their names, not the module's, which follows the order
+// lowering found things in.
 //
 // **A local named from a unit other than its own is promoted**: renamed `avin.cgu:<name>`, a name no
 // Avin, Sysl or C symbol can spell, so it can meet nothing else at the link, and given hidden
@@ -67,6 +70,9 @@ const CopyCost: usize = 32
 /** A constant whose initializer is at most this long is copied into the units that read it at
  * `-O2`. */
 const CopyInitLimit: usize = 2048
+
+/** How a trap site's symbol begins, as `emit.sysl` names it. */
+const TrapPrefix: string = "\"avin.trap:"
 
 /** What a promoted local's name is given in front. */
 const Promoted: string = "avin.cgu:"
@@ -118,7 +124,7 @@ private enum Piece
     PieceDeclare
     /** A global variable or constant. */
     PieceGlobal
-    /** An alias, which lives in the unit of the global it points into. */
+    /** An alias, which lives in the tables' unit with the global it points into. */
     PieceAlias
 
 private struct Entity
@@ -353,6 +359,8 @@ split_module(text: string, n: int, copies: bool) -> Option[Buf[string]]
         Some(found) -> found
         None -> return None
     val count = m.items.len()
+    // The functions are spread over all units but the last, which holds the module-level tables.
+    val tables = usize(n) - 1
     val units = usize(n)
     // `member[p * count + e]`: unit p defines item e. `imported`: p carries an `available_externally`
     // copy of e. `needed`: p names e and e is defined elsewhere, so p declares it.
@@ -363,68 +371,68 @@ split_module(text: string, n: int, copies: bool) -> Option[Buf[string]]
         member.push(false)
         imported.push(false)
         needed.push(false)
-    var home: Buf[int] = buf()
     var promoted: Buf[bool] = buf()
     for _ in 0..<count
-        home.push(-1)
         promoted.push(false)
     // (unit, item) pairs still to be read for what they name.
     var work: Buf[(usize, usize)] = buf()
     var sole = sole_callers(&m)
     for i in 0..<count
-        if m.items[i].piece == PieceDefine
-            val p = function_unit(&m, &sole, i, units)
-            home[i] = int(p)
-            member[p * count + i] = true
-            work.push((p, i))
+        val piece = m.items[i].piece
+        if piece != PieceDefine && piece != PieceGlobal && piece != PieceAlias then continue
+        val p = if piece == PieceDefine then function_unit(&m, &sole, i, tables) else tables
+        member[p * count + i] = true
+        work.push((p, i))
+    // Every piece with a home has it now; what each unit names from another is declared there, or
+    // copied at `-O2` where it is small, and is promoted. An alias is never copied: it points into
+    // the tables, which a copy cannot, and the tables' unit copies nothing, having no code to inline
+    // into.
     var next: usize = 0
-    var swept = false
-    loop
-        while next < work.len()
-            val (p, e) = work[next]
-            next += 1
-            for k in m.ref_start[e]..<m.ref_start[e + 1]
-                val r = m.refs[k]
-                if member[p * count + r] || imported[p * count + r] || needed[p * count + r] then continue
-                val it = m.items[r]
-                if it.piece == PieceDeclare || it.piece == PieceLine
-                    needed[p * count + r] = true
-                elif it.piece == PieceAlias
-                    val q = alias_home(&m, r, p, count, &home, &member, &work)
-                    if q != p
-                        needed[p * count + r] = true
-                        promoted[r] = true
-                elif home[r] < 0
-                    home[r] = int(p)
-                    member[p * count + r] = true
-                    work.push((p, r))
-                elif copies && (if it.piece == PieceDefine then it.cost <= CopyCost else copyable_constant(&m, r))
-                    imported[p * count + r] = true
-                    promoted[r] = true
-                    work.push((p, r))
-                else
-                    needed[p * count + r] = true
-                    if it.local then promoted[r] = true
-        if swept then break
-        // What nothing named, a global no function reads, is kept all the same, with its alias's
-        // global for an alias, and in the first unit otherwise.
-        for i in 0..<count
-            val e = m.items[i]
-            if home[i] >= 0 then continue
-            if e.piece == PieceAlias
-                _ = alias_home(&m, i, 0, count, &home, &member, &work)
-            elif e.piece == PieceGlobal
-                home[i] = 0
-                member[i] = true
-                work.push((0, i))
-        swept = true
+    while next < work.len()
+        val (p, e) = work[next]
+        next += 1
+        for k in m.ref_start[e]..<m.ref_start[e + 1]
+            val r = m.refs[k]
+            if member[p * count + r] || imported[p * count + r] || needed[p * count + r] then continue
+            val it = m.items[r]
+            if it.piece == PieceDeclare || it.piece == PieceLine
+                needed[p * count + r] = true
+            elif copies && p != tables && it.piece != PieceAlias && (if it.piece == PieceDefine then it.cost <= CopyCost else copyable_constant(&m, r))
+                imported[p * count + r] = true
+                promoted[r] = true
+                work.push((p, r))
+            else
+                needed[p * count + r] = true
+                if it.local then promoted[r] = true
+    var order = render_order(&m)
     var out: Buf[string] = buf()
     for p in 0..<units
         var defines = false
         for i in 0..<count
             if member[p * count + i] then defines = true
-        if defines then out.push(render(&m, p, count, &member, &imported, &needed, &promoted))
+        if defines then out.push(render(&m, &order, p, count, &member, &imported, &needed, &promoted))
     if out.len() < 2 then None else Some(out)
+
+/** The order a unit's text holds the module's pieces in: the lines every unit carries, as the module
+ * has them, then everything named, by its name. The module lists functions and constants in the order
+ * lowering found them, which an edit elsewhere can change; by name, a unit whose own pieces are the
+ * same is the same text, and its object is taken from the cache. */
+private render_order(m: *Module) -> Buf[usize]
+    var order: Buf[usize] = buf()
+    var named: Buf[NamedItem] = buf()
+    for i in 0..<m.items.len()
+        if m.items[i].piece == PieceLine then order.push(i)
+        else named.push(NamedItem(m.items[i].name, i))
+    sort_by(named.view(), named_before)
+    for item in named
+        order.push(item.index)
+    order
+
+private struct NamedItem
+    name: string
+    index: usize
+
+private named_before(a: NamedItem, b: NamedItem) -> bool = a.name < b.name
 
 /** For each item, the one function that names it where exactly one does and no global does, and
  * `count` otherwise. */
@@ -459,27 +467,14 @@ private function_unit(m: *Module, sole: *Buf[usize], i: usize, units: usize) -> 
         steps += 1
     usize(name_hash(m.items[at].name) % u64(units))
 
-/** The unit alias `a` lives in, which is its global's: the global is placed in `p` first where it
- * has no unit yet. An alias that names no global of the module stays in `p`. */
-private alias_home(m: *Module, a: usize, p: usize, count: usize, home: *Buf[int], member: *Buf[bool], work: *Buf[(usize, usize)]) -> usize
-    if home[a] >= 0 then return usize(home[a])
-    var target = a
-    for k in m.ref_start[a]..<m.ref_start[a + 1]
-        if target == a then target = m.refs[k]
-    if target != a && home[target] < 0
-        home[target] = int(p)
-        member[p * count + target] = true
-        work.push((p, target))
-    val q = if target == a then p else usize(home[target])
-    home[a] = int(q)
-    member[q * count + a] = true
-    work.push((q, a))
-    q
-
 /** Whether global `i` is a constant whose value a unit that reads it may be given a copy of. */
 private copyable_constant(m: *Module, i: usize) -> bool
     val e = m.items[i]
     if e.piece != PieceGlobal || e.end - e.start > CopyInitLimit then return false
+    // A trap site is only ever handed to the runtime, never read, so a copy would fold nothing; and
+    // it holds its line, which lines added above it move, so a copy would change the units that
+    // reach it with no change to their code.
+    if e.name.starts_with(TrapPrefix) then return false
     val line = m.text[e.start..<e.end]
     global_kind(line) == "constant" && !line.contains(" section ") && !line.contains(" comdat")
 
@@ -491,10 +486,10 @@ private name_hash(name: string) -> u64
     h ^ (h >> 29)
 
 /** One unit's text: every module-level line, its own definitions, its copies, and a declaration of
- * everything it names from elsewhere, in the order the whole text had them. */
-private render(m: *Module, p: usize, count: usize, member: *Buf[bool], imported: *Buf[bool], needed: *Buf[bool], promoted: *Buf[bool]) -> string
+ * everything it names from elsewhere, in `order`. */
+private render(m: *Module, order: *Buf[usize], p: usize, count: usize, member: *Buf[bool], imported: *Buf[bool], needed: *Buf[bool], promoted: *Buf[bool]) -> string
     var out = str_builder()
-    for i in 0..<count
+    for i in *order
         val e = m.items[i]
         if e.piece == PieceLine
             out.push(m.text[e.start..<e.end])

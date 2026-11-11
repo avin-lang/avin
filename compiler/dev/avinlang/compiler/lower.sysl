@@ -213,6 +213,16 @@ private struct Lowering
     object_records: Buf[bool]
     /** The local functions made into values, by the symbol of the top-level function they are in. */
     local_values: Map[usize, Buf[usize]]
+    /** For each local function, its number among its top-level function's local functions of its
+     * name, from 1 in the order they are declared; 0 for a top-level function. */
+    local_ordinals: Buf[usize]
+    /** How many objects and trampolines each owner has made so far, which name the next by place. */
+    place_counts: Map[string, usize]
+    /** The qualified name of the module-level value whose objects are being made at compile time. */
+    constant_owner: string
+    /** The top-level functions and methods declared in each unit, by the unit's index, found when
+     * the first trap site in that unit is named. */
+    unit_functions: Map[usize, Buf[usize]]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -323,7 +333,7 @@ lower_program(program: TProgram) -> MirProgram
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
     val local = local_values(program)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, local_ordinals(program), map(), "", map())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -417,7 +427,34 @@ lower_program(program: TProgram) -> MirProgram
     for h in l.handles do finalized[h.descriptor] = true
     for h in l.c_handles do finalized[h.descriptor] = true
     functions = scalar_replace(functions, l.descriptors, finalized)
-    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines)
+    MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings))
+
+/** Each string's name: the first 16 hexadecimal digits of the SHA-256 of its bytes. Two different
+ * strings of one program that share them, which no program has been seen to hold, are told apart
+ * by the later one's index after a dot. */
+string_names(strings: Buf[string]) -> Buf[string]
+    var names: Buf[string] = buf()
+    var taken: Map[string, usize] = map()
+    for i in 0..<strings.len()
+        var name = content_key(strings[i])[0..<16]
+        if taken.get(name) is Some(_) then name = s"$name.$i"
+        taken.put(name, i)
+        names.push(name)
+    names
+
+/** Each symbol's `local_ordinals` entry: a local function's number among those of its name in its
+ * top-level function, which the checker declares in the order they are written. */
+private local_ordinals(program: TProgram) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    var counts: Map[string, usize] = map()
+    for s in program.symbols
+        var n = 0usize
+        if s.root is Some(root)
+            val key = s"$root ${s.name}"
+            n = counts.get(key).unwrap_or(0) + 1
+            counts.put(key, n)
+        out.push(n)
+    out
 
 /** Whether a function belongs to the core library's module, `avin`, or one under it. */
 private in_core_library(program: TProgram, id: usize) -> bool
@@ -452,7 +489,8 @@ private field_size(t: MirType) -> usize = t match
  * tuple is laid out as a data type with one variant whose fields are its parts, and a class as one
  * whose fields are the class's: its parameters, then the fields its body declares. */
 private layout(l: *Lowering, t: &Type) -> DataLayout
-    val key = type_name(t)
+    // The descriptors are named by the type's qualified spelling, a variant's after its type's.
+    val key = stable_type_key(l.program, t)
     val identity = type_key(t)
     if l.layout_index.get(identity) is Some(index) then return l.layouts[index]
     var variants: Buf[VariantLayout] = buf()
@@ -901,12 +939,32 @@ private global_constant(l: *Lowering, g: usize) -> Option[Operand]
     if !global.mutable && !global.lazy && global.object is None
         if l.program.functions[global.init].body is Some(body)
             val outer = l.in_global
+            val owner = l.constant_owner
             l.in_global = true
+            l.constant_owner = global_name(l.program, g)
             if constant_of(l, body) is Some(k) then made = k.value
             l.in_global = outer
+            l.constant_owner = owner
     l.constant_state[g] = 2
     l.constant_values[g] = made
     made
+
+/** The module-level value `g`'s qualified name, which its symbol and the objects made for it are
+ * named by: an object's after `object `, since an object may share its name with a data type. */
+private global_name(program: TProgram, g: usize) -> string
+    val global = program.globals[g]
+    val name = module_prefix(global.module_name) + "." + global.name
+    if global.object is Some(_) then "object " + name else name
+
+/** The name of each module-level value's storage, by its index among `global_types`: each value's
+ * qualified name, then each `lazy val`'s state word as its value's name followed by `#state`. */
+private global_names(program: TProgram) -> Buf[string]
+    var names: Buf[string] = buf()
+    for g in 0..<program.globals.len()
+        names.push(global_name(program, g))
+    for g in 0..<program.globals.len()
+        if program.globals[g].lazy then names.push(global_name(program, g) + "#state")
+    names
 
 private constant_of(l: *Lowering, e: &TExpr) -> Option[Constant] = e.kind match
     IntConst(digits) ->
@@ -994,10 +1052,19 @@ private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Bu
     for f in fields
         key = key + s";${f.offset}=" + constant_key(f.value)
     // A real's text need not tell two reals apart, so an object holding one is never shared.
+    var name = ""
     if shared && !key.contains("?")
         if l.constant_index.get(key) is Some(index) then return ConstData(index, descriptor)
         l.constant_index.put(key, l.constants.len())
-    l.constants.push(ConstantObject(descriptor, size, fields))
+        var content = l.descriptors[descriptor].name + s"\n$size"
+        for f in fields
+            content = content + s"\n${f.offset}=" + stable_constant_key(l, f.value)
+        name = "=" + content_key(content)
+    else
+        val place = l.place_counts.get(l.constant_owner).unwrap_or(0) + 1
+        l.place_counts.put(l.constant_owner, place)
+        name = s"${l.constant_owner}#$place"
+    l.constants.push(ConstantObject(name, descriptor, size, fields))
     ConstData(l.constants.len() - 1, descriptor)
 
 /** A constant operand as text that tells it from every other. */
@@ -1010,6 +1077,15 @@ private constant_key(o: Operand) -> string = o match
     ConstClosure(index) -> s"c$index"
     NullAddress -> "n"
     _ -> "?"
+
+/** `constant_key` with each object spelled by its name, which no edit elsewhere in the program
+ * moves, rather than by its index, which one does. */
+private stable_constant_key(l: *Lowering, o: Operand) -> string = o match
+    ConstStr(index) -> s"s${l.strings[index].bytes.len}:${l.strings[index]}"
+    ConstObject(descriptor) -> "o" + l.descriptors[descriptor].name
+    ConstData(index, _) -> "d" + l.constants[index].name
+    ConstClosure(index) -> "c" + l.descriptors[l.closures[index].descriptor].name
+    _ -> constant_key(o)
 
 /** A field of an object made at compile time is its value; `None` for any other object. */
 private constant_field(l: *Lowering, object: Operand, field: FieldSlot) -> Option[Operand]
@@ -1149,7 +1225,7 @@ private box_descriptor(l: *Lowering, t: MirType) -> usize
     var refs: Buf[usize] = buf()
     if t is MRef then refs.push(0)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + key, 0, field_size(t), refs, false, buf(), 0, Fields, None))
+    l.descriptors.push(Descriptor("cell of " + key, 0, field_size(t), refs, false, buf(), 0, Fields, None))
     l.boxes.put(key, d)
     d
 
@@ -1163,7 +1239,8 @@ private record_of(l: *Lowering, t: &Type) -> usize
     val key = type_key(t)
     if l.record_index.get(key) is Some(r) then return r
     val index = l.records.len()
-    l.records.push(TypeRecord(type_name(t), buf(), None, None, None, None, false, buf(), 0))
+    val name = stable_type_key(l.program, t)
+    l.records.push(TypeRecord(name, buf(), None, None, None, None, false, buf(), 0))
     l.record_types.push(t)
     l.object_records.push(false)
     l.record_index.put(key, index)
@@ -1176,7 +1253,7 @@ private record_of(l: *Lowering, t: &Type) -> usize
             parts.push(record_of(l, item))
     // A class or data part is seen through what its declarations make it, as a reference both ways.
     val part_view = if *t is Class(_, _, _) || *t is Data(_, _, _) then ancestors.len() else 0
-    l.records[index] = TypeRecord(type_name(t), ancestors, None, None, None, None, keeps_owners(l, t), parts, part_view)
+    l.records[index] = TypeRecord(name, ancestors, None, None, None, None, keeps_owners(l, t), parts, part_view)
     index
 
 /** The record of `t` as the type of some object: one whose equality and rendering entries a value
@@ -1312,7 +1389,7 @@ private value_box(l: *Lowering, t: &Type) -> usize
     val record = object_record(l, t)
     val methods = method_table(l, t)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + type_name(t), 0, size, buf(), size == 0, methods, record, Fields, None))
+    l.descriptors.push(Descriptor("box of " + stable_type_key(l.program, t), 0, size, buf(), size == 0, methods, record, Fields, None))
     l.boxes.put(key, d)
     // A built-in type's impls may add methods with type parameters of their own, which a call
     // through a trait reaches at a slot of their own type arguments, as an object's does.
@@ -1571,7 +1648,7 @@ private closure_shape(l: *Lowering, function: usize, type_args: Buf[&Type], entr
         None -> ()
     val record = object_record(l, closure_type(l, function, type_args))
     val shape = ClosureShape(l.descriptors.len(), fields)
-    l.descriptors.push(Descriptor("closure of " + function_symbol(l.program, function, type_args), 0, size, refs, false, buf(), record, Fields, Some(entry)))
+    l.descriptors.push(Descriptor("closure of " + function_symbol(l, function, type_args), 0, size, refs, false, buf(), record, Fields, Some(entry)))
     l.shapes.put(key, shape)
     shape
 
@@ -2031,26 +2108,72 @@ private signature_of(l: *Lowering, f: TFunction) -> MirSignature
 
 /** The symbol a function has in the object file: its module path and name. A file with no module
  * header is in `<program>`, which no module path can spell; a local function is named within its
- * top-level function and numbered, since two blocks may each declare one with the same name. An
- * overloaded function's name is followed by its parameter types, which tell it from the others.
- * Quoted in LLVM, so any text is valid. */
-function_symbol(program: TProgram, id: usize, type_args: Buf[&Type]) -> string
+ * top-level function and numbered among that function's local functions of its name, counting from
+ * 1 in the order they are declared, since two blocks may each declare one with the same name. An
+ * overloaded function's name is followed by its parameter types, which tell it from the others, and
+ * an instance's by its type arguments, spelled by `stable_type_key`. Nothing in it is a number the
+ * checker or lowering gave in the order it found things, so a function keeps its symbol whatever is
+ * added to or taken from the rest of the program. Quoted in LLVM, so any text is valid. */
+private function_symbol(l: *Lowering, id: usize, type_args: Buf[&Type]) -> string
+    val program = l.program
     val symbol = program.symbols[id]
-    val prefix = if symbol.module_name == "" then "<program>" else symbol.module_name
+    val prefix = module_prefix(symbol.module_name)
     var arguments = ""
     if type_args.len() > 0
-        arguments = "["
-        for i in 0..<type_args.len()
-            if i > 0 then arguments = arguments + ", "
-            arguments = arguments + type_key(type_args[i])
-        arguments = arguments + "]"
-    // An object's constructor and methods are kept apart from its companion class's.
-    var name = symbol.name
-    if symbol.owner_class is Some(k)
-        if program.classes[k].decl.object then name = "object " + name
+        arguments = "[" + stable_key_list(program, type_args) + "]"
     symbol.root match
-        Some(root) -> s"$prefix.${program.symbols[root].name}${program.symbols[root].overload}$arguments.$name#$id"
-        None -> prefix + "." + name + symbol.overload + arguments
+        Some(root) -> s"$prefix.${declared_name(program, root)}${program.symbols[root].overload}$arguments.${symbol.name}#${l.local_ordinals[id]}"
+        None -> prefix + "." + declared_name(program, id) + symbol.overload + arguments
+
+/** A function's name as its symbol spells it: an object's constructor and methods after `object `,
+ * kept apart from its companion class's, and so are the local functions inside them. */
+private declared_name(program: TProgram, id: usize) -> string
+    val symbol = program.symbols[id]
+    if symbol.owner_class is Some(k)
+        if program.classes[k].decl.object then return "object " + symbol.name
+    symbol.name
+
+/** The module path a symbol is spelled under: `<program>` for a file with no module header. */
+private module_prefix(module_name: string) -> string = if module_name == "" then "<program>" else module_name
+
+/** **A type spelled by qualified names**, for the symbols of the emitted text: a data type by its
+ * module and name, a class or trait the same after `class `, an object after `object `, then the
+ * type arguments. It tells apart any two types `type_key` tells apart, since two types of one module
+ * never share a name but an object and its companion, and it never depends on the numbers the checker
+ * gave the program's types in the order it found them, which an edit elsewhere moves. */
+stable_type_key(program: TProgram, t: &Type) -> string = *t match
+    Tuple(items) -> "(" + stable_key_list(program, items) + ")"
+    Function(params, result, sendable) -> (if sendable then "@sendable (" else "(") + stable_key_list(program, params) + ") -> " + stable_type_key(program, result)
+    ByName(inner) -> "-> " + stable_type_key(program, inner)
+    Data(id, _, args) ->
+        val d = program.data[id]
+        s"${module_prefix(d.module_name)}.${d.name}[" + stable_key_list(program, args) + "]"
+    Class(id, _, args) ->
+        val k = program.classes[id]
+        val kind = if k.decl.object then "object " else "class "
+        s"$kind${module_prefix(k.module_name)}.${k.name}[" + stable_key_list(program, args) + "]"
+    // The members' keys in sorted order, so a union is one key whatever order it was written in.
+    Union(members) ->
+        var keys: Buf[string] = buf()
+        for m in members
+            val k = stable_type_key(program, m)
+            var at = keys.len()
+            while at > 0 && k < keys[at - 1]
+                at -= 1
+            keys.insert(at, k)
+        var out = "union("
+        for i in 0..<keys.len()
+            if i > 0 then out = out + " | "
+            out = out + keys[i]
+        out + ")"
+    _ -> type_name(t)
+
+private stable_key_list(program: TProgram, items: Buf[&Type]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + ", "
+        out = out + stable_type_key(program, items[i])
+    out
 
 private lower_function(l: *Lowering, k: usize) -> MirFunction
     val inst = l.instances[k]
@@ -2111,12 +2234,12 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             if is_class_constructor(l.program, f.symbol) then l.insts.push(Publish)
             finish(l, returning(l, result))
         None ->
-            if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || mirror_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l.program, f.symbol, inst.type_args)))
+            if binding_target(symbol.decl) is Some(_) || handle_of(l, symbol) is Some(_) || mirror_of(l, symbol) is Some(_) then binding_body(l, symbol, shim_symbol(function_symbol(l, f.symbol, inst.type_args)))
             elif c_close_class(l, symbol) is Some(k) then c_close_body(l, symbol, k)
             elif c_field_of(symbol.decl) is Some(field) then c_field_body(l, symbol, f.symbol, field)
             elif c_prototype_of(symbol.decl) is Some(p) then c_binding_body(l, symbol, f.symbol, p)
             else intrinsic_body(l, symbol)
-    MirFunction(function_symbol(l.program, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
+    MirFunction(function_symbol(l, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
 
 // A function that calls itself in tail position, at its own type arguments, is compiled as a loop:
 // its parameters are kept in slots, and such a call stores its arguments there and jumps back to the
@@ -2232,7 +2355,7 @@ private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
     finish(l, Return(dest match
         Some(d) -> Some(Value(d))
         None -> None))
-    val name = function_symbol(l.program, inst.function, inst.type_args) + "#closure"
+    val name = function_symbol(l, inst.function, inst.type_args) + "#closure"
     MirFunction(name, MirSignature(params, direct.result), l.values, l.slots, l.blocks)
 
 // The terminator that returns a body's value. A function that yields a value but whose body has
@@ -3941,8 +4064,12 @@ private struct CCallbackPlan
 private c_trampoline(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type) -> usize
     val index = l.trampolines.len()
     val k = l.instances.len()
+    val binding = l.instances[l.function_index]
+    val owner = function_symbol(l, binding.function, binding.type_args) + " callback"
+    val place = l.place_counts.get(owner).unwrap_or(0) + 1
+    l.place_counts.put(owner, place)
     l.instances.push(Instance(0, buf(), false, CCallbackBody))
-    l.trampolines.push(MirTrampoline(k, buf(), 0, None))
+    l.trampolines.push(MirTrampoline(s"$owner#$place", k, buf(), 0, None))
     l.c_callbacks.put(k, CCallbackPlan(symbol.name, symbol.unit, symbol.decl.name_span, q.callback[0], t, index))
     index
 
@@ -4047,8 +4174,9 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
     for i in 0..<plan.f.params.len()
         if plan.f.params[i].userdata then userdata = i
     val all = scalars
-    l.trampolines[plan.trampoline] = MirTrampoline(k, all, userdata, result)
-    MirFunction(s"avin.c.callback.${plan.trampoline}", MirSignature(params, result match
+    val trampoline_name = l.trampolines[plan.trampoline].name
+    l.trampolines[plan.trampoline] = MirTrampoline(trampoline_name, k, all, userdata, result)
+    MirFunction(s"avin.c.callback.$trampoline_name", MirSignature(params, result match
         Some(s) -> Some(c_machine(s))
         None -> None), l.values, l.slots, l.blocks)
 
@@ -4827,14 +4955,77 @@ private load(l: *Lowering, place: Option[Place]) -> Option[Operand] = place matc
  * asked for, so every instance of a generic function shares its sites. A site names its file
  * without the directories it was compiled from, so a report reads the same wherever it was built. */
 private trap_site(l: *Lowering, reason: string, at: Span) -> usize
-    val key = s"${l.unit}:${at.start}:$reason"
+    // An empty span is code the compiler wrote rather than the source, placed nowhere in it: its
+    // site is the function being lowered's own.
+    val made = if at.start == at.end then lowering_scope(l) else ""
+    val key = if made == "" then s"${l.unit}:${at.start}:$reason" else s"${l.unit}:made $made:$reason"
     if l.trap_index.get(key) is Some(index) then return index
     val src = l.program.sources[l.unit]
     val position = src.locate(at.start)
     val file = file_name(src.name).unwrap_or(src.name)
-    l.traps.push(TrapSite(intern(l, reason), intern(l, file), position.line, position.col))
+    val name = if made == "" then trap_name(l, reason, at, file) else s"$made+made:" + content_key(reason)[0..<12]
+    l.traps.push(TrapSite(name, intern(l, reason), intern(l, file), position.line, position.col))
     l.trap_index.put(key, l.traps.len() - 1)
     l.traps.len() - 1
+
+/** What follows the last dot of a function's name: a method's own name. */
+private member_part(name: string) -> string
+    var at = name.bytes.len
+    while at > 0 && name.bytes[at - 1] != u8('.')
+        at -= 1
+    name[at..]
+
+/** The instance being lowered, spelled as stably as its symbol: a written function by
+ * `function_symbol`, a generated one by its type arguments. */
+private lowering_scope(l: *Lowering) -> string
+    if l.function_index >= l.instances.len() then return "<program>"
+    val inst = l.instances[l.function_index]
+    if inst.generated == Written then function_symbol(l, inst.function, inst.type_args)
+    else "generated " + stable_key_list(l.program, inst.type_args)
+
+/** **A trap site's name**: the innermost top-level function or method declared around it, by its
+ * symbol, then the site's byte offset from that declaration's start and a hash of its reason. Lines
+ * added above the function, in its file or anywhere else, leave the name as it was, as does renaming
+ * the file; only an edit to the function itself moves it. A site outside every function's
+ * declaration is named by its file and offset. */
+private trap_name(l: *Lowering, reason: string, at: Span, file: string) -> string
+    if l.unit_functions.get(l.unit) is None
+        var found: Buf[usize] = buf()
+        for id in 0..<l.program.symbols.len()
+            val s = l.program.symbols[id]
+            if s.unit == l.unit && s.root is None then found.push(id)
+        l.unit_functions.put(l.unit, found)
+    var best: Option[usize] = None
+    var best_name = ""
+    for id in l.unit_functions.get(l.unit).unwrap()
+        val span = l.program.symbols[id].decl.span
+        if !(span.start <= at.start && at.start <= span.end) then continue
+        val name = function_symbol(l, id, buf())
+        val better = best match
+            Some(b) ->
+                val other = l.program.symbols[b].decl.span
+                val width = span.end - span.start
+                val other_width = other.end - other.start
+                width < other_width || (width == other_width && name < best_name)
+            None -> true
+        if better
+            best = Some(id)
+            best_name = name
+    // A declaration several functions share is a template the checker copies, a derived `Display`
+    // into every type that asks for one: no copy is the site's own, and which copies exist depends on
+    // the program, so such a site is named by its file and offset, as one outside every function is.
+    // The copies are told by their names: one method's name on different types. A function and the
+    // functions computing its defaults share its declaration too, but its name.
+    var shared = false
+    if best is Some(b)
+        val mine = l.program.symbols[b]
+        for id in l.unit_functions.get(l.unit).unwrap()
+            val other = l.program.symbols[id]
+            if id != b && other.decl.span.start == mine.decl.span.start && other.decl.span.end == mine.decl.span.end && other.name != mine.name && member_part(other.name) == member_part(mine.name) then shared = true
+    val place = best match
+        Some(id) -> if shared then s"$file+${at.start}" else s"$best_name+${at.start - l.program.symbols[id].decl.span.start}"
+        None -> s"$file+${at.start}"
+    place + ":" + content_key(reason)[0..<12]
 
 /** A terminator that stops the program for `reason` at `at`. In the core library the place
  * reported is where the program entered the library instead: the program's author wrote that call,
@@ -5977,7 +6168,7 @@ private record_rendering(l: *Lowering, t: &Type, name: string) -> MirFunction
                 args.push(operands[i])
             call_instance(l, library_function(l, "renderTypeName"), args, None)
     finish(l, Return(None))
-    MirFunction(s"avin.record.$name.${type_key(t)}", MirSignature(params, None), l.values, l.slots, l.blocks)
+    MirFunction(s"avin.record.$name.${stable_type_key(l.program, t)}",MirSignature(params, None), l.values, l.slots, l.blocks)
 
 /** The instance of type `t`'s own implementation of the rendering method `m`, where `t` conforms to
  * the trait declaring it. */
@@ -6008,7 +6199,7 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     if inst.generated == OptionAdapter then return lower_adapter(l, inst)
     if inst.generated == CCallbackBody then return c_callback_body(l, l.function_index)
     val t = inst.type_args[0]
-    val key = type_key(t)
+    val key = stable_type_key(l.program, t)
     val kind = inst.generated
     if kind == StructuralEquals
         val m = mir_type(t).unwrap()
@@ -6089,7 +6280,7 @@ private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
     var returned = signature.result
     if boxed && shape.result then returned = Some(MRef)
     finish(l, Return(result))
-    MirFunction("avin.adapter." + function_symbol(l.program, inst.function, inst.type_args), MirSignature(params, returned), l.values, l.slots, l.blocks)
+    MirFunction("avin.adapter." + function_symbol(l, inst.function, inst.type_args), MirSignature(params, returned), l.values, l.slots, l.blocks)
 
 private pair(m: MirType) -> Buf[MirType]
     var out: Buf[MirType] = buf()
