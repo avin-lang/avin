@@ -6017,14 +6017,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the user whether a public library type mirroring a package's enum is wanted: a variant `openssl`
   adds must be added to `TlsRefusal`, which Sysl reports as not matching until it is.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (branch `stable-names`): **Each emitted table is named `@"avin.<kind>:<name>"`, the name
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **Each emitted table is named `@"avin.<kind>:<name>"`, the name
   spelled by qualified names in full, with no hash suffix**: a type as `avin.Option[int]`,
   `class geo.Box[]`, `object geo.Box[]`, `(int, string)`; a descriptor by its type, a variant after
   its type's (`avin.Option[int].Some`); a record by its type; a constant closure by its function; a
@@ -6037,12 +6030,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   is silent until the assembler reports it); the spelling cut at a length with a hash of the rest
   (not needed at these lengths). Emission stops with the name where two of one kind would share
   one, rather than the assembler reporting a redefinition.
-- Proposed (branch `stable-names`): **A string constant is named by the first 16 hexadecimal digits
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A string constant is named by the first 16 hexadecimal digits
   of the SHA-256 of its bytes**, a later string sharing them by its index after a dot. WHY: the same
   string has the same name in every program and every build; 64 bits make a shared prefix within one
   program improbable past any program's size. Alternatives: the whole digest (32 more bytes on each of
   thousands of strings); the text itself (unbounded, and escaping in a symbol).
-- Proposed (branch `stable-names`): **A trap site is named by the innermost top-level function or
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A trap site is named by the innermost top-level function or
   method declared around it, the byte offset from that declaration's start, and 12 hexadecimal
   digits of the SHA-256 of its reason**; a site in code the compiler wrote (an empty span) by the
   instance being lowered; one in a declaration the checker copies (a derived `Display` and its
@@ -6054,22 +6047,22 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   instance of a generic function, so its name would depend on which instance was lowered first);
   file and line (moves with every line added above). Review with the user: a site in a library
   template is named by file and offset, which an edit to that library file moves.
-- Proposed (branch `stable-names`): **A local function or lambda is numbered among its top-level
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A local function or lambda is numbered among its top-level
   function's local functions of its name, from 1 in declaration order** (`<program>.pick.lambda#2`).
   WHY: two blocks may each declare a local function of one name, and the number counts only within
   the function, which an edit elsewhere never changes. Alternatives: the checker's symbol index
   (moves with every symbol declared before it); the byte offset within the function (moves with an
   edit above the lambda inside the function, which changes the function's text anyway, and is longer).
-- Proposed (branch `stable-names`): **A shared constant object is named by a hash of what it holds,
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A shared constant object is named by a hash of what it holds,
   an unshared one (a vector literal's) by its module-level value and its place among that value's
   objects; a C trampoline by its binding and place.** WHY: equal shared objects are one object
   already, so their content is their identity; an unshared object's identity is its value's.
-- Proposed (branch `stable-names`): **A module-level value that holds a reference keeps its slot in the
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A module-level value that holds a reference keeps its slot in the
   roots frame, and its name is a private alias of that slot**; code names the alias. WHY: the slot's
   position moves when a value is added before it, and the alias keeps that position in the tables'
   unit alone; the runtime's view of the frame is unchanged. Alternatives: a global per value and a
   frame of addresses (a runtime change for the same effect).
-- Proposed (branch `stable-names`): **The module-level tables are the last codegen unit of `n`, the
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **The module-level tables are the last codegen unit of `n`, the
   functions spread over the other `n - 1`, and a unit holds its pieces in the order of their names.**
   WHY: a new string, type or trap site then changes the tables' unit and its user's alone, and a
   unit whose own pieces are unchanged is the same text whatever order lowering found them in.
@@ -6078,6 +6071,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   function called from one function alone still lives in its caller's unit, so a second caller in
   another unit moves it; and a small function copied into its callers' units at `-O2` makes an edit
   to it recompile those units too.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
