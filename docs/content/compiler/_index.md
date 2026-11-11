@@ -89,6 +89,82 @@ which is passed to the runtime with the site (`avin_rt_caller_trap_message`, or
 form of both values; as for every check in the core library, the place reported is where the program
 called it.
 
+## Incremental builds
+
+A rebuild after an edit does again only the work the edit can change. The design follows where a
+build's time goes ([measurements](/compiler/roadmap/#incremental-builds-build-plan)): on a program of
+some size, lowering (monomorphization, devirtualization and scalar replacement) is most of an edit's
+rebuild, emission and one codegen unit's clang come next, and checking the whole program is a few
+seconds. So the unit of reuse is **the instance**, a function at one list of type arguments as
+lowering makes it, and the front end stays a whole-program pass that runs on every build.
+
+**What is kept.** Three caches, from the bottom up:
+
+| Cache | Holds | Key | Where |
+| --- | --- | --- | --- |
+| Unit objects | each codegen unit's object | the unit's text, clang's version, the level | the toolchain's cache (exists) |
+| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/` |
+| Executable | the linked program | the build key of [running and testing](#running-and-testing) | `.avin/build/` (exists) |
+
+Instances are stored a file per source module, holding the instances of that module's functions,
+so a module whose functions' instances are all reused is a module not compiled again.
+
+**The instance key.** An instance's text is reused only while everything it was made from is the
+same. The key is a hash over:
+
+- the compiler (its version and its executable's stamp), the level and whether the build is for
+  tests;
+- the instance's identity: the function's qualified name and parameter types, and its type
+  arguments, every type spelled by qualified names (never by the checker's indices, which an edit
+  elsewhere moves);
+- the function's **body fingerprint**: its typed tree printed in a canonical form, which carries
+  every callee, field and conversion the checker resolved and every type it inferred, so an edit to
+  another function's signature that changes what this body means changes its fingerprint;
+- the **interfaces it reads**: the layout of every type it allocates or reads a field of, and the
+  record of every type it tests against;
+- the **world facts** the whole-program passes used on it: for each call through a method table,
+  the descriptors and methods its static receiver type admits (what devirtualization decided from),
+  and for each callee scalar replacement inlined or summarized, that callee's key.
+
+**Closed-world monomorphization stays correct** because the set of instances is computed on every
+build, by the same worklist as today: a reused instance contributes the requests it recorded
+instead of being lowered, so the set grows and shrinks exactly as a clean build's would. An
+instance no longer requested is not emitted; a new one is lowered fresh. **Devirtualization and
+scalar replacement** stay whole-program passes over summaries, which are small; an instance whose
+world facts changed (a new class implementing a trait it calls through, a callee it inlined edited)
+has its passes run again from its lowered form, and only it.
+
+**Stable names.** Today's emitted text numbers strings, descriptors, records, closures and trap
+sites in the order lowering finds them, so one new instance can renumber everything after it.
+Incremental builds name each by what it is: a string by its content's hash, a descriptor or record
+by its type's qualified spelling, a closure or trap site by its function and its place within it.
+The module-level tables (descriptors, records, the string descriptor, method tables) are made from
+the instance set on every build, into a codegen unit of their own, so a change to a table recompiles
+that unit and no other.
+
+**The `-O0`/`-O2` split.** Each level has its own instance directory; nothing is shared between
+them, since the passes and the copies made for inlining differ. A build at one level never trims the
+other's.
+
+**Two builds at once.** Every entry is content-addressed: written under a temporary name and
+published by rename, so two builds writing one key write the same bytes, and a reader that finds an
+entry missing, short or failing its checksum treats it as a miss. Each module file of a build is
+looked up by the hash of its contents; the manifest naming the module files of the last build is
+written last. No lock is taken. A build trims entries that neither its manifest names nor were used
+in the last hour, as the unit cache spares what is fresh.
+
+**Testing it.** A build reports what it did when `AVIN_BUILD_LOG` names a file: each phase's time,
+and the counts of instances reused, lowered and passed again, modules reused and units compiled.
+The compiler's tests build a program of several modules in a temporary directory and edit it, each
+edit with the counts it must give: a body edited in one module lowers only that module's instances
+and recompiles only the units holding them; a signature edited lowers its callers too; a class
+added that implements a trait passes again the instances that call through it and lowers nothing
+else; a field added lowers every user of the type; an instance no longer requested is gone from
+the output. **The oracle is a clean build**: for every edit, the incremental build's LLVM text is
+the same as a build with no cache, so a key that misses a dependency fails a test rather than
+shipping a stale instance. `AVIN_INCREMENTAL=verify` lowers everything and compares it with what the
+cache would have given, naming the first instance whose key failed to change.
+
 ## Sysl bindings and the shim cache
 
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
