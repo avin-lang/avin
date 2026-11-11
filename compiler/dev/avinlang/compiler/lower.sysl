@@ -66,6 +66,9 @@ private struct Instance
      * the type `type_args[0]`, which no source declares: its structural `==` or hash, its type
      * record's equality entries, or the comparison and hash of values of unknown type. */
     generated: u8
+    /** Whether this copy of a function answering with a tuple answers with the tuple's parts instead,
+     * one machine word each, for a call that takes the tuple apart (see `words_call`). */
+    words: bool
 
 /** The layout of a closure of one function: its descriptor, and where each captured value is kept,
  * the captured locals first, then the captured top-level parameters. The entry's address is at
@@ -229,6 +232,9 @@ private struct Lowering
      * rather than from the instance itself, one line each: the slot of each method with type
      * parameters of its own it calls through a table. Its key reads them. */
     instance_facts: Buf[string]
+    /** Where the instance being lowered answers with the parts of a tuple, one word each, the
+     * tuple's fields its words are read from; empty for any other instance. */
+    result_words: Buf[FieldSlot]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -339,7 +345,7 @@ lower_program(program: TProgram) -> MirProgram
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
     val local = local_values(program)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, local_ordinals(program), map(), "", map(), false, buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), option_plan(program), map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, local_ordinals(program), map(), "", map(), false, buf(), buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -665,7 +671,7 @@ private table_entry(l: *Lowering, t: &Type, m: usize, type_args: Buf[&Type], pos
         Some(d) -> is_self_type(l.program.symbols[d].result.unwrap_or(Unit))
         None -> false
     val index = l.instances.len()
-    l.instances.push(Instance(m, type_args, false, OptionAdapter))
+    l.instances.push(Instance(m, type_args, false, OptionAdapter, false))
     l.instance_index.put(key, index)
     l.adapters.put(index, TableAdapter(t, selfs, result))
     index
@@ -1138,6 +1144,18 @@ private tuple_parts(l: *Lowering, e: &TExpr) -> Option[Buf[Option[Operand]]]
             if *a.ty is Nothing || (v is None && machine(l, a.ty) is Some(_)) then return None
             parts.push(v)
         return Some(parts)
+    // A call of a function yielding the tuple answers with its parts instead.
+    if e.kind is Call(function, args, type_args)
+        val words = words_result(l, e, function)
+        if words.len() > 0
+            val values = words_call(l, e, function, args, type_args, words)?
+            var k = 0usize
+            for field in layout(l, concrete(l, e.ty)).variants[0].fields
+                if field is Some(_)
+                    parts.push(Some(values[k]))
+                    k += 1
+                else parts.push(None)
+            return Some(parts)
     val object = lower_expr(l, e)?
     for field in layout(l, concrete(l, e.ty)).variants[0].fields
         parts.push(field match
@@ -1190,7 +1208,17 @@ private instance_of(l: *Lowering, function: usize, type_args: Buf[&Type], entry:
     val key = instance_key(function, type_args, entry)
     if l.instance_index.get(key) is Some(index) then return index
     val index = l.instances.len()
-    l.instances.push(Instance(function, type_args, entry, Written))
+    l.instances.push(Instance(function, type_args, entry, Written, false))
+    l.instance_index.put(key, index)
+    index
+
+/** The copy of `function` for `type_args` that answers with the parts of the tuple it yields, made
+ * when first asked for. */
+private words_instance(l: *Lowering, function: usize, type_args: Buf[&Type]) -> usize
+    val key = "words " + instance_key(function, type_args, false)
+    if l.instance_index.get(key) is Some(index) then return index
+    val index = l.instances.len()
+    l.instances.push(Instance(function, type_args, false, Written, true))
     l.instance_index.put(key, index)
     index
 
@@ -1212,7 +1240,7 @@ private generated(l: *Lowering, kind: u8, t: &Type) -> usize
     val index = l.instances.len()
     var args: Buf[&Type] = buf()
     args.push(t)
-    l.instances.push(Instance(0, args, false, kind))
+    l.instances.push(Instance(0, args, false, kind, false))
     l.instance_index.put(key, index)
     if kind == AnyEquals || kind == AnyHash then l.runtime_equality = true
     if kind == AnyDisplay || kind == AnyDebug then l.runtime_rendering = true
@@ -1809,7 +1837,7 @@ private dispatch(l: *Lowering, function: usize, slot: usize, args: Buf[&TExpr], 
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    push_call(l, dest, Indirect(Value(code), MirSignature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -1907,12 +1935,22 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     // A trait's default body is compiled once for every conforming type, its `Self` an object: an
     // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
     val default_body = is_trait_method(l, callee)
+    val operands = call_operands(l, callee, args, default_body)?
+    if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
+        val object = call_resolved(l, e, function, callee, args, operands, type_args)?
+        return Some(option_pointer(l, e.ty, object))
+    call_resolved(l, e, function, callee, args, operands, type_args)
+
+// The arguments of a direct call of `callee`, lowered, those with no runtime value and a static
+// member's type receiver left out; `None` where one never finishes, which ends the code there, since
+// the call is never made. In a trait's default body an option kept as a pointer goes in where `Self`
+// is taken as the object it stands for.
+private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], default_body: bool) -> Option[Buf[Operand]]
     var operands: Buf[Operand] = buf()
     for i in 0..<args.len()
         val a = args[i]
         if a.kind is TypeReceiver then continue
         val op = lower_expr(l, a)
-        // An argument that never finishes ends the code here: the call is never made.
         if *a.ty is Nothing then return None
         if machine(l, a.ty) is Some(_)
             op match
@@ -1921,10 +1959,44 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
                     if default_body && self_typed && pointer_option(l, a.ty) then operands.push(option_object(l, a.ty, v))
                     else operands.push(v)
                 None -> return None
-    if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
-        val object = call_resolved(l, e, function, callee, args, operands, type_args)?
-        return Some(option_pointer(l, e.ty, object))
-    call_resolved(l, e, function, callee, args, operands, type_args)
+    Some(operands)
+
+// A local function also receives what it captures, from where the caller keeps it.
+private push_captures(l: *Lowering, callee: FunctionSymbol, operands: *Buf[Operand])
+    for x in callee.captured_locals
+        if l.local_slots[x] is Some(p) then operands.push(p.address)
+    for x in callee.captured_params
+        if param_operand(l, x) is Some(v) then operands.push(v)
+
+/** The fields of the tuple a direct call `e` of `function` yields, read out as the words of the
+ * result of its words instance, where the call can be made to that instead: `function` is one of the
+ * program's with a body, neither a constructor nor a trait's method, and the tuple has at least two
+ * parts with runtime values. Empty where it cannot. */
+private words_result(l: *Lowering, e: &TExpr, function: usize) -> Buf[FieldSlot]
+    val callee = l.program.symbols[function]
+    if callee.intrinsic is Some(_) || callee.constructor || is_trait_method(l, callee) then return buf()
+    if l.program.functions[function].body is None || is_class_constructor(l.program, function) then return buf()
+    tuple_words(l, concrete(l, e.ty))
+
+/** A direct call `e` of `function`, whose tuple the caller takes apart, made to the instance that
+ * answers with the tuple's parts (`words_instance`), so no tuple is made between the two: the parts'
+ * values, read as the words `words` of the call's result. `None` where an argument never finishes. */
+private words_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type], words: Buf[FieldSlot]) -> Option[Buf[Operand]]
+    val callee = l.program.symbols[function]
+    var operands = call_operands(l, callee, args, false)?
+    push_captures(l, callee, &operands)
+    val concrete_args = instance_args(l, callee, type_args)
+    val index = words_instance(l, function, concrete_args)
+    note_fact(l, "words " + function_symbol(l, function, concrete_args))
+    val first = fresh(l, words[0].ty)
+    push_call(l, Some(first), Direct(index), operands)
+    var out: Buf[Operand] = buf()
+    out.push(Value(first))
+    for k in 1..<words.len()
+        val dest = fresh(l, words[k].ty)
+        l.insts.push(CallWord(dest, first, k))
+        out.push(Value(dest))
+    Some(out)
 
 /** Whether a function is a method a trait declares, compiled once for every conforming type. */
 private is_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool = symbol.owner_class match
@@ -1959,7 +2031,7 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
             var values: Buf[Operand] = buf()
             values.push(TrapSiteAddress(site))
             values.push(operands[0])
-            l.insts.push(Call(None, Runtime(entry, MirSignature(types, None)), values))
+            l.insts.push(Call(None, Runtime(entry, mir_signature(types, None)), values))
             leave(l, Unreachable)
             return None
         if name.starts_with("array_")
@@ -1971,11 +2043,7 @@ private call_resolved(l: *Lowering, e: &TExpr, function: usize, callee: Function
         if name == "holds_handles"
             var seen: Buf[string] = buf()
             return Some(ConstBool(holds_handles(l, concrete(l, args[0].ty), &seen)))
-    // A local function also receives what it captures, from where the caller keeps it.
-    for x in callee.captured_locals
-        if l.local_slots[x] is Some(p) then operands.push(p.address)
-    for x in callee.captured_params
-        if param_operand(l, x) is Some(v) then operands.push(v)
+    push_captures(l, callee, &operands)
     val index = instance(l, function, instance_args(l, callee, type_args))
     val dest = machine(l, e.ty) match
         Some(t) -> Some(fresh(l, t))
@@ -2082,7 +2150,7 @@ private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Op
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    push_call(l, dest, Indirect(Value(code), MirSignature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -2136,7 +2204,7 @@ private signature_of(l: *Lowering, f: TFunction) -> MirSignature
     if symbol.root is Some(root)
         for x in symbol.captured_params
             if machine(l, program.symbols[root].params[x]) is Some(t) then params.push(t)
-    MirSignature(params, machine(l, symbol.result.unwrap_or(Unit)))
+    mir_signature(params, machine(l, symbol.result.unwrap_or(Unit)))
 
 /** The symbol a function has in the object file: its module path and name. A file with no module
  * header is in `<program>`, which no module path can spell; a local function is named within its
@@ -2215,6 +2283,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.tail_head = None
     l.tail_calls = false
     l.param_slots = buf()
+    l.result_words = buf()
     if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
@@ -2232,7 +2301,14 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.locals = f.locals
     l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
     if inst.entry then return lower_entry(l, inst)
-    val signature = signature_of(l, f)
+    var signature = signature_of(l, f)
+    var name = function_symbol(l, f.symbol, inst.type_args)
+    if inst.words
+        // The same body, yielding the same tuple, whose parts every return reads out (`returning`).
+        l.result_words = tuple_words(l, concrete(l, symbol.result.unwrap_or(Unit)))
+        signature = words_signature(signature.params, l.result_words)
+        name = name + "#words"
+        note_fact(l, "answers with its tuple's parts")
     l.returns_value = signature.result is Some(_)
     l.current = new_block(l)
     // The function's own locals get slots; a local function's parameters are among them.
@@ -2273,7 +2349,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
             elif c_field_of(symbol.decl) is Some(field) then c_field_body(l, symbol, f.symbol, field)
             elif c_prototype_of(symbol.decl) is Some(p) then c_binding_body(l, symbol, f.symbol, p)
             else intrinsic_body(l, symbol)
-    MirFunction(function_symbol(l, f.symbol, inst.type_args), signature, l.values, l.slots, l.blocks)
+    MirFunction(name, signature, l.values, l.slots, l.blocks)
 
 // A function that calls itself in tail position, at its own type arguments, is compiled as a loop:
 // its parameters are kept in slots, and such a call stores its arguments there and jumps back to the
@@ -2330,6 +2406,19 @@ private returned_call(l: *Lowering, tail: bool, value: Option[Operand]) -> Optio
         _ -> false
     if !made then return value
     leave(l, returning(l, value))
+    None
+
+// A call in tail position of an instance answering with its tuple's parts, of a function yielding a
+// tuple of the same words: its words instance is called and its words returned as they come, so
+// neither function makes the tuple. Any other call returns its value, which `returning` takes apart.
+private passed_words(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
+    val words = words_result(l, e, function)
+    var same = words.len() == l.result_words.len()
+    for k in 0..<words.len()
+        if same && machine_name(words[k].ty) != machine_name(l.result_words[k].ty) then same = false
+    if !same then return returned_call(l, true, direct_call(l, e, function, args, type_args))
+    val values = words_call(l, e, function, args, type_args, words)?
+    leave(l, return_words(l, values))
     None
 
 // A call in tail position of the instance being lowered: its arguments are evaluated, every one
@@ -2390,15 +2479,50 @@ private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
         Some(d) -> Some(Value(d))
         None -> None))
     val name = function_symbol(l, inst.function, inst.type_args) + "#closure"
-    MirFunction(name, MirSignature(params, direct.result), l.values, l.slots, l.blocks)
+    MirFunction(name, mir_signature(params, direct.result), l.values, l.slots, l.blocks)
 
 // The terminator that returns a body's value. A function that yields a value but whose body has
 // none at this point is in code that cannot be reached.
 private returning(l: *Lowering, value: Option[Operand]) -> Terminator
     if !l.returns_value then return Return(None)
-    value match
-        Some(v) -> Return(Some(v))
-        None -> Unreachable
+    val v = value match
+        Some(v) -> v
+        None -> return Unreachable
+    if l.result_words.len() == 0 then return Return(Some(v))
+    // An instance answering with its tuple's parts reads each out of the tuple, which is then made
+    // only to be read here, and so is kept as its parts.
+    var words: Buf[Operand] = buf()
+    for field in l.result_words
+        words.push(constant_field(l, v, field) match
+            Some(known) -> known
+            None -> load_field(l, v, field))
+    return_words(l, words)
+
+/** Returns a result of several words: the first as the return's value, each later one by its
+ * `ReturnWord`, which come last in the block. */
+private return_words(l: *Lowering, words: Buf[Operand]) -> Terminator
+    for k in 1..<words.len()
+        l.insts.push(ReturnWord(k, words[k]))
+    Return(Some(words[0]))
+
+/** The fields of a tuple type that hold its runtime parts, where there are at least two: what a
+ * function yielding the tuple answers with as words instead (see `words_call`); empty for any other
+ * type. */
+private tuple_words(l: *Lowering, t: &Type) -> Buf[FieldSlot]
+    var out: Buf[FieldSlot] = buf()
+    if !(*t is Tuple(_)) then return out
+    for field in layout(l, t).variants[0].fields
+        if field is Some(f) then out.push(f)
+    if out.len() < 2 then return buf()
+    out
+
+/** The signature of a function taking `params` and answering with one word of each type of
+ * `words`. */
+private words_signature(params: Buf[MirType], words: Buf[FieldSlot]) -> MirSignature
+    var rest: Buf[MirType] = buf()
+    for k in 1..<words.len()
+        rest.push(words[k].ty)
+    MirSignature(params, Some(words[0].ty), rest)
 
 // A Sysl binding is a function like any other in the object file; its body passes its parameters to
 // the binding's shim, with the context first, and returns what the shim returns. The shim is
@@ -2494,7 +2618,7 @@ private binding_body(l: *Lowering, symbol: FunctionSymbol, shim: string)
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    l.insts.push(Call(dest, Runtime(shim, MirSignature(params, result)), args))
+    l.insts.push(Call(dest, Runtime(shim, mir_signature(params, result)), args))
     finish(l, Return(dest match
         Some(d) -> Some(Value(d))
         None -> None))
@@ -2948,7 +3072,7 @@ private c_block_in(l: *Lowering, x: Operand, at: Span) -> CArrayIn
     var args: Buf[Operand] = buf()
     args.push(x)
     args.push(TrapSiteAddress(trap_site(l, "", at)))
-    l.insts.push(Call(None, Runtime("avin_rt_c_memory_check", MirSignature(types, None)), args))
+    l.insts.push(Call(None, Runtime("avin_rt_c_memory_check", mir_signature(types, None)), args))
     val pointer = load_field(l, x, FieldSlot(0, MPtr))
     val limit = load_field(l, x, FieldSlot(CMemoryLength, MInt(64)))
     val length = resize(l, limit, 64, 32, true)
@@ -2968,9 +3092,9 @@ private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, obje
     if !blocking
         l.insts.push(call)
         return
-    l.insts.push(Call(None, Runtime("avin_rt_enter_safe", MirSignature(buf(), None)), buf()))
+    l.insts.push(Call(None, Runtime("avin_rt_enter_safe", mir_signature(buf(), None)), buf()))
     l.insts.push(call)
-    l.insts.push(Call(None, Runtime("avin_rt_leave_safe", MirSignature(buf(), None)), buf()))
+    l.insts.push(Call(None, Runtime("avin_rt_leave_safe", mir_signature(buf(), None)), buf()))
     for x in arrays.of
         if x is Some(a)
             if a.converted is Some(_) || a.block then continue
@@ -2984,7 +3108,7 @@ private c_call(l: *Lowering, call: Inst, blocking: bool, arrays: CArraysIn, obje
             operands.push(a.pointer)
             operands.push(ConstInt(64, a.size.to_string()))
             operands.push(ConstInt(32, if a.write then "1" else "0"))
-            l.insts.push(Call(None, Runtime("avin_rt_c_array_back", MirSignature(types, None)), operands))
+            l.insts.push(Call(None, Runtime("avin_rt_c_array_back", mir_signature(types, None)), operands))
     for o in objects
         if o is Some(object)
             val keep = machine_slot(l, MRef)
@@ -3250,7 +3374,7 @@ private c_struct_free_strings(l: *Lowering, d: usize, base: Operand, offset: usi
         types_in.push(MPtr)
         var args: Buf[Operand] = buf()
         args.push(Value(p))
-        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", MirSignature(types_in, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", mir_signature(types_in, None)), args))
 
 // Whether the struct mirror `d` holds a string, in a field of its own or of a mirror it holds.
 private c_struct_has_strings(l: *Lowering, d: usize) -> bool
@@ -3381,7 +3505,7 @@ private c_free_struct_memory(l: *Lowering, memory: Operand)
     types.push(MPtr)
     var args: Buf[Operand] = buf()
     args.push(memory)
-    l.insts.push(Call(None, Runtime("avin_rt_c_struct_free", MirSignature(types, None)), args))
+    l.insts.push(Call(None, Runtime("avin_rt_c_struct_free", mir_signature(types, None)), args))
 
 // Frees, unread, the array C answered through the `out` pointer `array:` names, as a failed status
 // leaves it.
@@ -4034,7 +4158,7 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     val join = new_block(l)
     finish_into(l, Branch(compare(l, CmpEq, Value(known), ConstInt(64, "0")), make, join), make)
     val fresh_record = fresh(l, MInt(64))
-    l.insts.push(Call(Some(fresh_record), Runtime("avin_rt_c_attach_new", MirSignature(buf(), Some(MInt(64)))), buf()))
+    l.insts.push(Call(Some(fresh_record), Runtime("avin_rt_c_attach_new", mir_signature(buf(), Some(MInt(64)))), buf()))
     val made = Value(fresh_record)
     var params: Buf[CScalar] = buf()
     params.push(CAddress)
@@ -4051,7 +4175,7 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     undo.push(MInt(64))
     var undone: Buf[Operand] = buf()
     undone.push(made)
-    l.insts.push(Call(None, Runtime("avin_rt_c_attach_failed", MirSignature(undo, None)), undone))
+    l.insts.push(Call(None, Runtime("avin_rt_c_attach_failed", mir_signature(undo, None)), undone))
     fail match
         Some(f) ->
             l.insts.push(Store(SlotAddress(f.code), Value(answer)))
@@ -4070,7 +4194,7 @@ private c_attach(l: *Lowering, holder: Operand, k: usize, binding: string, at: S
     var values: Buf[Operand] = buf()
     values.push(load(l, record).unwrap())
     values.push(Value(list))
-    l.insts.push(Call(None, Runtime("avin_rt_c_attach_set", MirSignature(types, None)), values))
+    l.insts.push(Call(None, Runtime("avin_rt_c_attach_set", mir_signature(types, None)), values))
 
 // Frees the record of each function the call passed C that no handle keeps, once the call has
 // returned: C calls it no more.
@@ -4079,7 +4203,7 @@ private c_free_records(l: *Lowering, slots: Buf[Option[Place]])
         if slot is None then continue
         var args: Buf[Operand] = buf()
         args.push(load(l, slot).unwrap())
-        l.insts.push(Call(None, Runtime("avin_rt_c_callback_free", MirSignature(single(MPtr), None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_c_callback_free", mir_signature(single(MPtr), None)), args))
 
 /** What the function a trampoline runs converts for: the binding's name, the unit and span that
  * place it, the prototype of the function C calls, the Avin function's type, and the trampoline's
@@ -4102,7 +4226,7 @@ private c_trampoline(l: *Lowering, symbol: FunctionSymbol, q: CParam, t: &Type) 
     val owner = function_symbol(l, binding.function, binding.type_args) + " callback"
     val place = l.place_counts.get(owner).unwrap_or(0) + 1
     l.place_counts.put(owner, place)
-    l.instances.push(Instance(0, buf(), false, CCallbackBody))
+    l.instances.push(Instance(0, buf(), false, CCallbackBody, false))
     l.trampolines.push(MirTrampoline(s"$owner#$place", k, buf(), 0, None))
     l.c_callbacks.put(k, CCallbackPlan(symbol.name, symbol.unit, symbol.decl.name_span, q.callback[0], t, index))
     index
@@ -4187,7 +4311,7 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
     val dest = answer match
         Some(m) -> Some(fresh(l, m))
         None -> None
-    push_call(l, dest, Indirect(Value(code), MirSignature(types, answer)), operands)
+    push_call(l, dest, Indirect(Value(code), mir_signature(types, answer)), operands)
     // The memory was lent for the call, so each view is closed once the function returns.
     for raw in lent
         c_close_view(l, load(l, raw).unwrap())
@@ -4210,7 +4334,7 @@ private c_callback_body(l: *Lowering, k: usize) -> MirFunction
     val all = scalars
     val trampoline_name = l.trampolines[plan.trampoline].name
     l.trampolines[plan.trampoline] = MirTrampoline(trampoline_name, k, all, userdata, result)
-    MirFunction(s"avin.c.callback.$trampoline_name", MirSignature(params, result match
+    MirFunction(s"avin.c.callback.$trampoline_name", mir_signature(params, result match
         Some(s) -> Some(c_machine(s))
         None -> None), l.values, l.slots, l.blocks)
 
@@ -4320,7 +4444,7 @@ private c_release_copies(l: *Lowering, copies: Buf[Operand])
         types.push(MPtr)
         var args: Buf[Operand] = buf()
         args.push(c)
-        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", MirSignature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_c_string_free", mir_signature(types, None)), args))
 
 // Calls the C function `free` on the string C answered at `answer`.
 private c_free_answer(l: *Lowering, free: string, answer: Operand)
@@ -4705,7 +4829,7 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
         val dest = result match
             Some(t) -> Some(fresh(l, t))
             None -> None
-        l.insts.push(Call(dest, Runtime("avin_rt_" + name, MirSignature(types, result)), args))
+        l.insts.push(Call(dest, Runtime("avin_rt_" + name, mir_signature(types, result)), args))
         finish(l, Return(dest match
             Some(id) -> Some(Value(id))
             None -> None))
@@ -4732,7 +4856,7 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    l.insts.push(Call(dest, Runtime(found.0, MirSignature(params, result)), args))
+    l.insts.push(Call(dest, Runtime(found.0, mir_signature(params, result)), args))
     // An entry point that never returns, such as ending the process, leaves nothing to return.
     if *found.2 is Nothing
         finish(l, Unreachable)
@@ -4810,7 +4934,7 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
         types.push(MRef)
         types.push(MInt(32))
         types.push(MInt(32))
-        l.insts.push(Call(None, Runtime("avin_rt_array_clear", MirSignature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_array_clear", mir_signature(types, None)), args))
         return None
     if name == "array_slice"
         trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)
@@ -4947,7 +5071,7 @@ private lazy_read(l: *Lowering, at: Span, name: string, p: LazyPlace, initialize
         types.push(MPtr)
         var args: Buf[Operand] = buf()
         args.push(lazy_state_address(l, p))
-        l.insts.push(Call(None, Runtime("avin_rt_lazy_end", MirSignature(types, None)), args))
+        l.insts.push(Call(None, Runtime("avin_rt_lazy_end", mir_signature(types, None)), args))
         finish_into(l, Jump(done), done)
     load(l, lazy_value_place(l, p))
 
@@ -5154,6 +5278,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     TypeReceiver -> panic("a static member's receiver is a type, which has no value to lower")
     Call(function, args, type_args) ->
         if tail && l.tail_head is Some(_) && same_instance(l, function, type_args) then return tail_call(l, function, args)
+        if tail && l.tail_calls && l.result_words.len() > 0 then return passed_words(l, e, function, args, type_args)
         returned_call(l, tail, direct_call(l, e, function, args, type_args))
     Dispatch(function, slot, args, type_args) -> returned_call(l, tail, dispatch(l, function, slot, args, type_args))
     BoundCall(function, slot, args, type_args) -> returned_call(l, tail, bound_call(l, e, function, slot, args, type_args))
@@ -5564,7 +5689,7 @@ private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: Mi
     var operands: Buf[Operand] = buf()
     for a in args do operands.push(a)
     val dest = fresh(l, result)
-    l.insts.push(Call(Some(dest), Runtime(symbol, MirSignature(types, Some(result))), operands))
+    l.insts.push(Call(Some(dest), Runtime(symbol, mir_signature(types, Some(result))), operands))
     Value(dest)
 
 // A chain evaluates each operand when its link is reached, and the first false link decides.
@@ -6008,7 +6133,7 @@ private dispatch_operands(l: *Lowering, position: usize, name: string, operands:
     val dest = result match
         Some(t) -> Some(fresh(l, t))
         None -> None
-    push_call(l, dest, Indirect(Value(code), MirSignature(params, result)), operands)
+    push_call(l, dest, Indirect(Value(code), mir_signature(params, result)), operands)
     dest match
         Some(id) -> Some(Value(id))
         None -> None
@@ -6175,9 +6300,9 @@ private any_rendering(l: *Lowering, name: string, entry: usize) -> MirFunction
     for m in params
         operands.push(Value(fresh(l, m)))
     val code = record_entry(l, object_record(l, operands[0]), entry)
-    push_call(l, None, Indirect(code, MirSignature(params, None)), operands)
+    push_call(l, None, Indirect(code, mir_signature(params, None)), operands)
     finish(l, Return(None))
-    MirFunction(s"avin.any.$name", MirSignature(params, None), l.values, l.slots, l.blocks)
+    MirFunction(s"avin.any.$name", mir_signature(params, None), l.values, l.slots, l.blocks)
 
 // A record's `display` or `debug` entry for type `t`: the object rendered by the type's own
 // implementation of the trait that declares `name`, or, where the type has none, as the type's name.
@@ -6202,7 +6327,7 @@ private record_rendering(l: *Lowering, t: &Type, name: string) -> MirFunction
                 args.push(operands[i])
             call_instance(l, library_function(l, "renderTypeName"), args, None)
     finish(l, Return(None))
-    MirFunction(s"avin.record.$name.${stable_type_key(l.program, t)}",MirSignature(params, None), l.values, l.slots, l.blocks)
+    MirFunction(s"avin.record.$name.${stable_type_key(l.program, t)}",mir_signature(params, None), l.values, l.slots, l.blocks)
 
 /** The instance of type `t`'s own implementation of the rendering method `m`, where `t` conforms to
  * the trait declaring it. */
@@ -6240,12 +6365,12 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
         val a = Value(fresh(l, m))
         val b = Value(fresh(l, m))
         structural_equals(l, t, a, b)
-        return MirFunction("avin.equals." + key, MirSignature(pair(m), Some(MBool)), l.values, l.slots, l.blocks)
+        return MirFunction("avin.equals." + key, mir_signature(pair(m), Some(MBool)), l.values, l.slots, l.blocks)
     if kind == StructuralHash
         val m = mir_type(t).unwrap()
         val a = Value(fresh(l, m))
         structural_hash(l, t, a)
-        return MirFunction("avin.hash." + key, MirSignature(single(m), Some(MInt(64))), l.values, l.slots, l.blocks)
+        return MirFunction("avin.hash." + key, mir_signature(single(m), Some(MInt(64))), l.values, l.slots, l.blocks)
     if kind == RecordEquals
         val a = Value(fresh(l, MRef))
         val b = Value(fresh(l, MRef))
@@ -6253,13 +6378,13 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
         val y = unbox(l, t, b).unwrap_or(ConstBool(false))
         val same = if *t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) then own_equals(l, t, x, y) else equals_values(l, t, x, y)
         finish(l, Return(Some(same)))
-        return MirFunction("avin.record.equals." + key, MirSignature(pair(MRef), Some(MBool)), l.values, l.slots, l.blocks)
+        return MirFunction("avin.record.equals." + key, mir_signature(pair(MRef), Some(MBool)), l.values, l.slots, l.blocks)
     if kind == RecordHash
         val a = Value(fresh(l, MRef))
         val x = unbox(l, t, a).unwrap_or(ConstBool(false))
         val h = if *t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) then own_hash(l, t, x) else hash_value(l, t, x)
         finish(l, Return(Some(h)))
-        return MirFunction("avin.record.hash." + key, MirSignature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
+        return MirFunction("avin.record.hash." + key, mir_signature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
     if kind == RecordDisplay then return record_rendering(l, t, "display")
     if kind == RecordDebug then return record_rendering(l, t, "debug")
     if kind == AnyDisplay then return any_rendering(l, "display", RecordDisplayEntry)
@@ -6268,10 +6393,10 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
         val a = Value(fresh(l, MRef))
         val b = Value(fresh(l, MRef))
         any_equals(l, a, b)
-        return MirFunction("avin.any.equals", MirSignature(pair(MRef), Some(MBool)), l.values, l.slots, l.blocks)
+        return MirFunction("avin.any.equals", mir_signature(pair(MRef), Some(MBool)), l.values, l.slots, l.blocks)
     val a = Value(fresh(l, MRef))
     any_hash(l, a)
-    MirFunction("avin.any.hash", MirSignature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
+    MirFunction("avin.any.hash", mir_signature(single(MRef), Some(MInt(64))), l.values, l.slots, l.blocks)
 
 // A method table's entry for an option kept as a pointer: each parameter its trait's method takes as
 // `Self` arrives as the object the option stands for and is passed on as the pointer, and a `Self`
@@ -6314,7 +6439,7 @@ private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
     var returned = signature.result
     if boxed && shape.result then returned = Some(MRef)
     finish(l, Return(result))
-    MirFunction("avin.adapter." + function_symbol(l, inst.function, inst.type_args), MirSignature(params, returned), l.values, l.slots, l.blocks)
+    MirFunction("avin.adapter." + function_symbol(l, inst.function, inst.type_args), mir_signature(params, returned), l.values, l.slots, l.blocks)
 
 private pair(m: MirType) -> Buf[MirType]
     var out: Buf[MirType] = buf()
@@ -6463,7 +6588,7 @@ private any_equals(l: *Lowering, a: Operand, b: Operand)
     l.current = others
     val code = record_entry(l, record, RecordEqualsEntry)
     val dest = fresh(l, MBool)
-    push_call(l, Some(dest), Indirect(code, MirSignature(pair(MRef), Some(MBool))), two(a, b))
+    push_call(l, Some(dest), Indirect(code, mir_signature(pair(MRef), Some(MBool))), two(a, b))
     finish(l, Return(Some(Value(dest))))
 
 private any_hash(l: *Lowering, a: Operand)
@@ -6475,5 +6600,5 @@ private any_hash(l: *Lowering, a: Operand)
     l.current = others
     val code = record_entry(l, record, RecordHashEntry)
     val dest = fresh(l, MInt(64))
-    push_call(l, Some(dest), Indirect(code, MirSignature(single(MRef), Some(MInt(64)))), one(a))
+    push_call(l, Some(dest), Indirect(code, mir_signature(single(MRef), Some(MInt(64)))), one(a))
     finish(l, Return(Some(Value(dest))))
