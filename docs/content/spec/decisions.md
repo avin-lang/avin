@@ -5555,6 +5555,38 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
 - Proposed (branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
   builds `Resolution` and the zone's handling of a skipped or repeated reading they rely on; step 2
   gives `Zoned` only `isoWeek()` and `isoWeekYear()`, which need no resolution.
+- Proposed (branch `time-period`): **`a.monthsUntil(b)` counts a month whole when `b`'s day of the
+  month has reached `a`'s** (the month difference, less one where `b`'s day is smaller, or plus one
+  going backward where it is larger), and `a.until(b)` is those months and the days from `a +
+  months(n)` to `b`. *Why*: it is the chapter's "as a person counts them" (2026-01-31 to 2026-02-28
+  is 0, to 2026-03-01 is 1), it makes `b.monthsUntil(a) == -a.monthsUntil(b)` always, and with
+  months-first addition `a + a.until(b) == b` holds in both directions (a sweep of 21,228 pairs
+  tests it). `b - a.until(b) == a` and `b.until(a) == -a.until(b)` fail for some pairs near month
+  ends (2026-01-30 and 2026-03-01), and the chapter now says so. *Alternatives*: the largest `n`
+  with `a + months(n) <= b` (answers 1 for 2026-01-31 to 2026-02-28, against the chapter); counting
+  backward periods from `b` so the reverse is the negation (breaks `a + a.until(b) == b` for
+  `a > b`).
+- Proposed (branch `time-period`): **`p.toIsoString()` writes a period in ISO 8601's form**,
+  `P1Y2M3D`, the months split into years as the display splits them, `P0D` for the empty period,
+  and a negative part with its own sign (`P-1Y-2M`, `P1M-3D`). *Why*: the display `1y 2mo 3d` is
+  for people; exchange formats want ISO's, and a period's parts may differ in sign, which a single
+  leading `-` cannot write. *Alternatives*: a leading `-` when every part is negative and per-part
+  signs only otherwise (two rules for one value); no ISO text until step 5's parsing (a writer
+  without a reader for a while). Review with the user whether the step 5 parser should read it
+  (`parsePeriod`), which the chapter does not list.
+- Proposed (branch `time-period`): **`toYearsPart()` and `toMonthsPart()` carry the months' sign**
+  (`months(-14)` is -1 year and -2 months), as `Duration`'s parts do, and the display and ISO text
+  write each part with that sign (`-1y -2mo`). **`p.isZero()`** asks for the empty period, as
+  `Duration.isZero()` does. *Alternatives*: floor division (-2 years and 10 months, which reads as
+  something else); no `isZero` (`p == Period.Zero` says the same, less directly).
+- Proposed (branch `time-period`): **calendar steps count in a `long`**: `Date ± Period`,
+  `plusYears(n)` (`12 * n` months) and `plusWeeks(n)` (`7 * n` days) never overflow on the way, so
+  an answer past the dates traps naming the date (`the date +5881580-08-11 is outside Date.Min to
+  Date.Max`), or the count of days where only a day step overflows, as step 2's traps do; the
+  makers `years(n)` and `Period * n`, whose answers are periods, trap as an integer overflow.
+  `plusYears`, `plusMonths`, `plusWeeks` and `plusDays` take an `int`, as the makers do.
+- Proposed (branch `time-period`): **`Zoned ± Period` and `Zoned`'s `plus…` wait for step 3**,
+  whose `Resolution` decides a period landing in a gap or an overlap.
 
 ## Open
 
