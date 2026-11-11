@@ -135,6 +135,32 @@ void as_reals_free(double *values);
 void as_names_make(int n, as_named **names, int *count);
 void as_bad_answer(int which, as_point **points, int *count);
 
+/* Arrays C fills, the caller allocating as many elements as another call says: a dash pattern whose
+ * length `as_dash_count` answers, as Cairo's is; glyphs filled with a status, failing for 2; and two
+ * arrays filled in one call, `n` integers and `2n` bytes. `as_dash_calls` counts the calls made. */
+void as_dash_set(int n);
+int as_dash_count(void);
+int as_dash_calls(void);
+void as_dash_get(double *dashes, double *offset);
+int as_glyphs_fill(int n, as_glyph *glyphs);
+int as_spread(int n, int32_t *ints, uint8_t *bytes);
+/* An array C fills and one it allocates in one call: `n` integers each, and `n` halves. */
+int as_mixed(int n, int32_t *filled, double **made, int *count);
+
+/* Several arrays C allocates in one call, each with its own count, freed by its own function, the
+ * clusters and flags optional, as Cairo's `cairo_scaled_font_text_to_glyphs` answers them: `n`
+ * glyphs and `(n + 1) / 2` clusters, failing with status 7 for a negative `n` once both are
+ * allocated. `as_shape_nulls` counts the calls passed null for all three of clusters, their count
+ * and the flags. */
+typedef struct { int32_t num_bytes; int32_t num_glyphs; } as_cluster;
+typedef enum { AS_CLUSTER_FORWARD = 0, AS_CLUSTER_BACKWARD = 1 } as_cluster_flags;
+
+int as_shape(const char *text, int n, as_glyph **glyphs, int *num_glyphs, as_cluster **clusters, int *num_clusters, as_cluster_flags *flags);
+void as_clusters_free(as_cluster *clusters);
+int as_clusters_allocated(void);
+int as_clusters_freed(void);
+int as_shape_nulls(void);
+
 /* Opaque values: a union and a struct with a bit-field, which no mirror holds. */
 typedef union { int32_t i; float f; void *p; } as_event;
 typedef struct { int32_t kind; unsigned bits : 4; unsigned more : 12; } as_flags;

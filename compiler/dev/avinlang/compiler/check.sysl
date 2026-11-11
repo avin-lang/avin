@@ -7595,6 +7595,14 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         var result_view = false
         var writable = false
         var length_text: Option[string] = None
+        // `array:` or `bytes:` naming several arrays, as a list, with a `length:` and perhaps a
+        // `free:` for each, in the same order; `free:` an empty string for one nothing frees.
+        var array_list: Buf[string] = buf()
+        var length_list: Buf[string] = buf()
+        var free_list: Buf[string] = buf()
+        var listed = false
+        var length_listed = false
+        var free_listed = false
         var named_ok = true
         var borrowed = false
         var blocking = false
@@ -7648,7 +7656,26 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 given.push(n)
                 val names_out = n != "length"
                 if names_out && array_name is Some(_)
-                    c.note(unit, arg.value.span, s"`$n:` and `$array_word:` both name what C answers; a binding answers one array or view")
+                    c.note(unit, arg.value.span, s"`$n:` and `$array_word:` both name what C answers; a binding answers one view, or names its arrays in one list")
+                    continue
+                if arg.value.kind is ListLit(items)
+                    // Several arrays, each with its length, in one list each.
+                    var texts: Buf[string] = buf()
+                    var well_formed = items.len() > 0
+                    for item in items
+                        if item.kind is StringLit(t) && t != "" then texts.push(t) else well_formed = false
+                    if n == "view" || !well_formed
+                        c.note(unit, arg.value.span, if n == "view" then "`view:` names the one `out` parameter C lends memory through, as a string, as in `view: \"buffer\"`" else s"`$n:` names its arrays as a list of strings, none empty, as in `$n: [\"glyphs\", \"clusters\"]`")
+                        continue
+                    if names_out
+                        array_list = texts
+                        listed = true
+                        array_name = Some(texts[0])
+                        array_word = n
+                    else
+                        length_list = texts
+                        length_listed = true
+                        length_text = Some(texts[0])
                     continue
                 if arg.value.kind is StringLit(t)
                     if t == "" then c.note(unit, arg.value.span, s"`$n:` " + (if names_out then "names the `out` parameter C answers " + (if n == "view" then "the memory it lends" else "an array") + " through" else "is the C expression the length is") + ", and is empty")
@@ -7661,12 +7688,20 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
             if n != "free"
                 c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `array:`, `bytes:`, `view:`, `length:`, `borrowed`, `blocking`, `view` and `writable`")
                 continue
-            if free is Some(_) || free_text is Some(_)
+            if free is Some(_) || free_text is Some(_) || free_listed
                 c.note(unit, arg.value.span, "`free:` is given once")
                 continue
             if arg.value.kind is StringLit(name)
                 free_text = Some(name)
                 free_span = arg.value.span
+            elif arg.value.kind is ListLit(items)
+                var well_formed = items.len() > 0
+                for item in items
+                    if item.kind is StringLit(t) then free_list.push(t) else well_formed = false
+                if well_formed
+                    free_listed = true
+                    free_span = arg.value.span
+                else c.note(unit, arg.value.span, "`free:` frees each array `array:` names as a list of strings, in the same order, as in `free: [\"cairo_glyph_free\", \"cairo_text_cluster_free\"]`")
             else c.note(unit, arg.value.span, "`free:` names the C function that frees the string as a string, as in `free: \"free\"`")
         // `free:` frees the array `array:` names where there is one, with a C function or a C
         // expression in the array's name, and otherwise the string the binding answers, with a C
@@ -7678,7 +7713,32 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 if !is_c_identifier(name) && !c_uses_name(name, arr) then c.note(unit, free_span, s"`free:` names the C function that frees the array `$arr`, or is a C expression in `$arr`, and `$name` is neither")
             elif is_c_identifier(name) then free = Some(name)
             else c.note(unit, free_span, s"`free:` names a C function, and `$name` is not a C identifier")
-        val lends = result_view || (array_name is Some(_) && array_word == "view")
+        // Several arrays: a `length:` for each, and a `free:` for each where it is given, in one list
+        // each, in the same order, and no array named twice. Each array's name and how it is freed.
+        var arrays_named: Buf[string] = buf()
+        var arrays_freed: Buf[string] = buf()
+        if listed
+            arrays_named = array_list
+            for k in 0..<array_list.len()
+                for m in 0..<k
+                    if array_list[m] == array_list[k] then c.note(unit, a.span, s"`$array_word:` names `${array_list[k]}` twice")
+            if length_text is Some(_) && (!length_listed || length_list.len() != array_list.len())
+                c.note(unit, a.span, s"`$array_word:` names ${count(array_list.len(), "array")}, so `length:` gives the length of each, as a list in the same order, as in `length: [\"num_glyphs\", \"num_clusters\"]`")
+            if free_text is Some(_) || free_listed && free_list.len() != array_list.len()
+                c.note(unit, free_span, s"`$array_word:` names ${count(array_list.len(), "array")}, so `free:` says how each is freed, as a list in the same order, `\"\"` for one nothing frees")
+            elif free_listed
+                arrays_freed = free_list
+                for k in 0..<free_list.len()
+                    val name = free_list[k]
+                    val arr = array_list[k]
+                    if name != "" && !is_c_identifier(name) && !c_uses_name(name, arr) then c.note(unit, free_span, s"`free:` names the C function that frees the array `$arr`, or is a C expression in `$arr`, and `$name` is neither")
+        else
+            if length_listed then c.note(unit, a.span, "`length:` is a list only where `array:` names a list of arrays, one length for each")
+            if free_listed then c.note(unit, free_span, "`free:` is a list only where `array:` names a list of arrays, one for each")
+            if array_name is Some(arr) && array_word != "view"
+                arrays_named.push(arr)
+                if free_text is Some(name) then arrays_freed.push(name)
+        val lends =result_view || (array_name is Some(_) && array_word == "view")
         if result_view && array_name is Some(_) then c.note(unit, a.span, s"`view` lends the memory C answers as its result, and `$array_word:` names an out parameter too; a binding answers one array or view")
         if length_text is Some(_) && array_name is None && !result_view then c.note(unit, a.span, "`length:` is the length of the array C answers through the `out` parameter `array:` names, or of the memory a `view` lends, and the binding names none")
         if array_name is Some(arr) && length_text is None then c.note(unit, a.span, s"C answers `$arr` with no length of its own, so the binding says it with `length:`, a C expression over the call's parameters and out values, as in `length: \"num_glyphs\"`")
@@ -7764,7 +7824,11 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     None -> s"`${cp.name}` is an array, its length carried by the parameter marked `length(${cp.name})`, so it crosses as an `Array` or an `Option` of one"
             elif array is Some(_) && inout then problem = "an array is passed in, a pointer to its elements, and never `inout`"
             elif array is Some(_) && cp.name == "" then problem = "C could read past the end of an array whose length nothing carries: name the pointer, and mark the integer parameter that carries its length `length(name)`"
-            elif array is Some(_) then problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
+            elif array is Some(_)
+                problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
+                // A pointer C may write through may be an array C fills, as many elements as another
+                // call says.
+                if !(" " + cp.text + " ").contains(" const ") then problem = problem + s", or, for an array C fills with as many elements as the binding can work out before the call, write it `out ${cp.text}${cp.name}` and name it with `array: \"${cp.name}\"`, its length a C expression given with `length:`"
             elif c_handle_form(t, c.data, c.classes) is Some(h)
                 problem = if inout then "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say" else c_handle_problem(c, h.class_index, cp.text, false)
             elif c_struct_form(t, c.data) is Some(m) then problem = c_struct_problem(c, m, cp)
@@ -7806,6 +7870,20 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 elif c_struct_result_problem(c, answered, p.result_text) is Some(problem)
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
+                elif c_attach_result(answered, split.outs.len(), c.data, c.classes) is Some(e)
+                    // A handle in a `Result`: its error is what the class's `attach:` answered, when
+                    // it could not tie what the call keeps to the C object.
+                    val h = c_handle_form(c_status_ok(answered), c.data, c.classes).unwrap()
+                    made = Some(h.class_index)
+                    val name = c.classes[h.class_index].name
+                    var problem = c_handle_problem(c, h.class_index, p.result_text, true)
+                    if problem == "" && c_class_text(c.classes[h.class_index].decl, "attach") is None
+                        problem = s"`$name` has no `attach:`, so nothing fails once C has answered it: a handle is answered itself, or in an `Option` for null"
+                    elif problem == "" && keeps.len() == 0
+                        problem = s"the error is what `attach:` of `$name` answers when what the call keeps cannot be kept, and `${f.name}` keeps nothing"
+                    elif problem == "" && !(*e is Int(_)) && c_mirror_of(e, c.data) is None && !(*e is ErrorType)
+                        problem = s"the error is what `attach:` of `$name` answered, an integer or an enum mirror"
+                    if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 elif c_status_error(answered, c.data) is Some(e)
                     // A status is an integer, of C's keywords, an enumeration or a typedef of one, or
                     // the enum a mirror mirrors.
@@ -7828,6 +7906,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     if problem != "" then c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(answered)}` in Avin and `${p.result_text}` in C: $problem")
                 // Each out value crosses as a result does, from the type its pointer points at.
                 var array_found = false
+                var found_arrays: Buf[string] = buf()
                 var j = 0usize
                 for q in p.params
                     if q.mode is CIn then continue
@@ -7836,19 +7915,25 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     if *t is ErrorType then continue
                     var problem = ""
                     val outs_word = "an out value is a scalar, a string, a handle, an enum mirror or a struct mirror"
-                    if array_name is Some(arr) && q.name == arr
+                    var which: Option[usize] = None
+                    for k in 0..<arrays_named.len()
+                        if arrays_named[k] == q.name then which = Some(k)
+                    if array_word == "view" && array_name is Some(arr) && q.name == arr
                         array_found = true
-                        if array_word == "view"
-                            if q.mode is CInOut then problem = s"C lends the memory `${q.name}` points at, so it is `out`, not `inout`"
-                            elif !q.pointee_text.ends_with("*") then problem = s"C lends memory through a pointer to a pointer to its bytes, as in `out uint8_t **${q.name}`"
-                            else problem = c_view_problem(c, t, q.pointee_text, writable)
-                        else
-                            problem = c_array_out_problem(c, q, t)
-                            if problem == "" && array_word == "bytes"
-                                val bytes = c_array_form(t, c.data, c.classes) match
-                                    Some(form) -> *form.element is Byte
-                                    None -> false
-                                if !bytes then problem = "`bytes:` copies the bytes C answers into an `Array[byte]`, or an `Option` of one for null; `array:` copies an array of any other element"
+                        if q.mode is CInOut then problem = s"C lends the memory `${q.name}` points at, so it is `out`, not `inout`"
+                        elif !q.pointee_text.ends_with("*") then problem = s"C lends memory through a pointer to a pointer to its bytes, as in `out uint8_t **${q.name}`"
+                        else problem = c_view_problem(c, t, q.pointee_text, writable)
+                    elif which is Some(k)
+                        found_arrays.push(q.name)
+                        problem = c_array_out_problem(c, q, t)
+                        val freed = k < arrays_freed.len() && arrays_freed[k] != ""
+                        if problem == "" && c_array_out_filled(q) && freed
+                            problem = s"the binding makes the array C fills through `${q.name}`, and frees it once copied; `free:` frees an array C allocates, answered through `out T **${q.name}`"
+                        if problem == "" && array_word == "bytes"
+                            val bytes = c_array_form(t, c.data, c.classes) match
+                                Some(form) -> *form.element is Byte
+                                None -> false
+                            if !bytes then problem = "`bytes:` copies the bytes C answers into an `Array[byte]`, or an `Option` of one for null; `array:` copies an array of any other element"
                     elif c_memory_form(t, c.data, c.classes) is Some(m)
                         problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, made by `ByteBlock(length)`, never answered by C" else s"a view C lends through `${q.name}` is named with `view:`, its length given with `length:`, as in `view: \"${q.name}\", length: \"size\"`"
                     elif q.length_of != ""
@@ -7871,7 +7956,9 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     elif c_status_error(t, c.data) is Some(_) then problem = outs_word
                     else problem = c_crossing_problem(q.pointee, t, c_text_form(t, c.data, c.classes), true)
                     if problem != "" then c.note(unit, at, s"out value $j of the C binding `${f.name}`, `${q.name}`, is `${type_name(t)}` in Avin and `${q.pointee_text}` in C: $problem")
-                if array_name is Some(arr) && !array_found then c.note(unit, a.span, s"`$array_word:` names the `out` parameter C answers " + (if array_word == "view" then "the memory it lends" else "an array") + s" through, and `$arr` is no `out` parameter of the prototype")
+                if array_word == "view" && array_name is Some(arr) && !array_found then c.note(unit, a.span, s"`view:` names the `out` parameter C answers the memory it lends through, and `$arr` is no `out` parameter of the prototype")
+                for arr in arrays_named
+                    if !contains_name(found_arrays, arr) then c.note(unit, a.span, s"`$array_word:` names the `out` parameter C answers an array through, and `$arr` is no `out` parameter of the prototype")
                 // Only a string C answers is freed, and one bound as `unit` is freed and discarded.
                 val text = p.result is CText(_) || (p.result is CTypedef(_) && !(form is NoText))
                 if free is Some(_) && !text
@@ -7971,8 +8058,8 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
             Byte -> true
             Bool -> true
             Real -> true
-            _ -> false
-        if !scalar then c.note(unit, decl.ty.span, s"the field accessor `${f.name}` writes `${type_name(t)}`, and a field is written as an integer type, `byte`, `bool` or `real`; a string or handle field is only read")
+            _ -> c_mirror_of(t, c.data) is Some(_)
+        if !scalar then c.note(unit, decl.ty.span, s"the field accessor `${f.name}` writes `${type_name(t)}`, and a field is written as an integer type, `byte`, `bool`, `real` or an enum mirror; a string or handle field is only read")
     if indices > 0 && bound_count == 0
         c.note(unit, a.span, s"the field accessor `${f.name}` takes ${index_count(indices)} and no `bound:`: name the C expression in `self` that bounds each, which the index is checked against before C reads anything")
     elif bound_count > 0 && indices == 0
@@ -8007,13 +8094,14 @@ private check_c_field(c: *Checker, unit: usize, f: &Function, a: Annotation, par
             c.note(unit, at, s"`$name` names what it keeps with `kept:`, so only a binding keeping one makes it, and the field accessor `${f.name}` keeps nothing")
         return
     if !(c_text_form(r, c.data, c.classes) is NoText) then return
+    if c_mirror_of(r, c.data) is Some(_) then return
     val scalar = *r match
         Int(_) -> true
         Byte -> true
         Bool -> true
         Real -> true
         _ -> false
-    if !scalar then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`, and a field is read as an integer type, `byte`, `bool`, `real`, a string or a handle")
+    if !scalar then c.note(unit, at, s"the field accessor `${f.name}` answers `${type_name(r)}`, and a field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a string or a handle")
 
 private index_count(n: usize) -> string = if n == 1 then "1 index" else s"$n indices"
 
@@ -8065,13 +8153,15 @@ private c_view_problem(c: *Checker, t: &Type, text: string, writable: bool) -> s
 private c_array_out_problem(c: *Checker, q: CParam, t: &Type) -> string
     if q.mode is CInOut then return s"C answers the array `${q.name}`, so it is `out`, not `inout`"
     val element_text = c_array_out_element(q)
-    if element_text == "" then return s"C answers an array through a pointer to a pointer to its elements, as in `out cairo_glyph_t **${q.name}`"
+    val filled = c_array_out_filled(q)
     val form = c_array_form(t, c.data, c.classes) match
         Some(f) -> f
-        None -> return "the array C answers is copied into an `Array`, or an `Option` of one for null"
+        None -> return if filled then "the array C fills is copied into an `Array`" else "the array C answers is copied into an `Array`, or an `Option` of one for null"
+    if filled && form.optional then return s"the binding makes the array C fills through `${q.name}`, which is never null, so it is not in an `Option`"
     if c_struct_of(form.element, c.data) is Some(d)
         val wanted = c_struct_text(c.data[d].decl)
-        if wanted != "" && !c_names_struct(element_text, wanted) then return s"`${c.data[d].name}` mirrors `$wanted`, so an array of it is answered as `out $wanted **${q.name}`"
+        val stars = if filled then "*" else "**"
+        if wanted != "" && !c_names_struct(element_text, wanted) then return s"`${c.data[d].name}` mirrors `$wanted`, so an array of it is answered as `out $wanted $stars${q.name}`"
         return ""
     if c_array_element_size(form.element) == 0 then return "an array C answers is copied into an `Array[byte]`, `Array[int]`, `Array[long]`, `Array[real]` or an `Array` of a struct mirror"
     ""

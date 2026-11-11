@@ -251,6 +251,13 @@ void fxf_record_bad_text(fxf_record *r) {
 
 void fxf_record_u64_max(fxf_record *r) { r->u64 = UINT64_MAX; }
 
+void fxf_record_copy_values(const fxf_record *r, int *into) {
+    check_record(r, "a freed record's values copied");
+    for (int i = 0; i < r->count; i++) into[i] = r->values[i];
+}
+
+void fxf_record_set_count(fxf_record *r, int count) { r->count = count; }
+
 long long fxf_record_sum(const fxf_record *r) {
     check_record(r, "a freed record summed");
     long long sum = (long long)r->tiny + r->small + r->i16 + r->u16 + r->i32 + r->u32 + r->letter + r->truth;

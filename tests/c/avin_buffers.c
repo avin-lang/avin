@@ -144,6 +144,7 @@ struct bf_surface {
     void *user;
     void (*destroy)(void *);
     int dead;
+    int status;
 };
 
 bf_surface *bf_surface_new(unsigned char *data, int n) {
@@ -189,6 +190,17 @@ int bf_surface_set_user_data(bf_surface *s, const bf_user_data_key_t *key, void 
     s->user = data;
     s->destroy = destroy;
     return 0;
+}
+
+bf_surface *bf_surface_new_checked(unsigned char *data, int n, int stride) {
+    bf_surface *s = bf_surface_new(data, n);
+    if (stride <= 0) s->status = stride == 0 ? BF_INVALID_STRIDE : -stride;
+    return s;
+}
+
+bf_status bf_surface_set_user_data_checked(bf_surface *s, const bf_user_data_key_t *key, void *data, void (*destroy)(void *)) {
+    if (live_surface(s)->status) return (bf_status)s->status;
+    return (bf_status)bf_surface_set_user_data(s, key, data, destroy);
 }
 
 int bf_surface_refuse_user_data(bf_surface *s, const bf_user_data_key_t *key, void *data, void (*destroy)(void *)) {

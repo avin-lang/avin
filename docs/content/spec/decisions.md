@@ -5699,6 +5699,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   too (refuses a later argument that widens them); a second checking pass over the whole call
   (the same answers here, with each argument checked twice).
 
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps`): **An array C fills, its length known before the call**: an
+  `out T *` parameter (one star, against `out T **` for an array C allocates) named with `array:`, its
+  `length:` a C expression over the parameters evaluated in the glue before the call; the glue
+  `malloc`s that many elements (at least one), C fills them, and they are copied into an `Array` and
+  freed with `free`. A negative length or one past the greatest `int` calls nothing (the glue answers
+  a zeroed result) and the length stops the program when it is read; length checks now come before the
+  null check for every array C answers. It is never in an `Option` and takes no `free:`. *Why*:
+  Cairo's `cairo_get_dash` writes `cairo_get_dash_count` doubles, a length no parameter carries; the
+  words `array:`/`length:` are the ones an array C answers already uses, the number of stars says who
+  allocates, and the answer is the same `Array` in the result. *Alternatives*: an Avin `Array` passed
+  in, checked by the glue to be at least `length:` long (the library would make and size it, and a
+  precondition the binding cannot see becomes the program's); a `capacity:` word on an in-array; the
+  array allocated in the collected heap (a moving or concurrent collection, and a `blocking` call,
+  would need it pinned).
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps`): **Several arrays in one call**: `array:`/`bytes:` take a list,
+  `length:` and `free:` then lists of the same length in the same order, `""` in `free:` freeing
+  nothing; the glue writes each length through its own pointer and has a free function per array
+  (`avin_c_array_free_<symbol>_<j>`). *Why*: the existing words, with the list shape `keeps:` already
+  has; one array keeps its single-string form. *Alternatives*: repeating `array:`/`length:`/`free:`
+  groups in order (order-dependent pairing nobody can see); marking the count in the prototype
+  (`length(glyphs) out int *num_glyphs`), which would drop the count from the result and reuse a
+  marker that means something else for `inout`; a `free:` keyed by name (no map literal in an
+  annotation).
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps`): **`null` in a prototype passes null**: a word before a pointer
+  parameter's type; the parameter is no Avin parameter and no out value, and a function whose caller
+  chooses (Cairo's clusters, wanted or not) is bound twice, once with `out` and once with `null`.
+  *Why*: what is passed is fixed per binding, so the result's type stays fixed; the prototype is where
+  the other per-parameter words (`out`, `inout`, `userdata`, `length`) already live. *Alternatives*:
+  an Avin `bool` or `Option` parameter choosing at run time (the result's shape would depend on a
+  value); a `skip:` list on the annotation (a second place saying what one parameter is).
+  **Review with the user**: whether `null` should also let an Avin `Option` parameter decide.
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps`): **A field accessor reads and writes an enum mirror**: the C
+  unit checks the field is of an integer type (any, not only the mirrored enum) and measures it; a read
+  value no variant holds stops the program as an enum result does (`` the field `f` of `H` held a
+  value no variant of `M` holds``), a write stores the enumerator's value, and an `Option` of a
+  mirror is refused. *Why*: a struct mirror's field already crosses this way, and Cairo's path header
+  is a union member; accepting any integer type lets an `int` field holding an enum's values be
+  mirrored. *Alternatives*: requiring the field to be exactly the mirrored enum (the field's type is
+  the header's, which the checker never sees, so the C unit would compare type names); reading it as
+  an `int` and converting in Avin (the workaround cairo used).
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps`): **`attach:` failing
+  answers `Err` where the binding answers `Result[H, E]`**: a binding whose C result is a handle of a class with `attach:`, which keeps
+  something and answers no out values, may answer `Result[H, E]`, `E` an integer type or an enum
+  mirror; when `attach:` answers non-zero, the record is undone, the handle given back (its kept list
+  cleared) and `Err` of the answer returned, converted as a status code is. Without the `Result` the
+  trap stays. *Why*: Cairo's `cairo_surface_set_user_data` on a surface in error answers the surface's
+  own status, so the `attach:` answer is exactly the error the program wants, and no new word is
+  needed; the `Result` is the existing status shape. *Alternatives*: a class-level `status:` C
+  expression evaluated on every new handle (a new word, and a check on bindings that keep nothing);
+  answering `None` for a refused attach (loses the reason); keeping the trap and the library's
+  pre-checks (what cairo had to write).
 - Settled on the user's delegation 2026-11-11 (built on branch `array-refmaps`): **An array's descriptor carries a per-element reference map** (the
   runtime half of the union tag-and-payload layout, under Settled → unions → Representation). An
   array of elements `k` words wide names one of three tracers: every element one reference
@@ -5840,6 +5891,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   would put the next `elif` or `else` inside a continuation line. *Alternatives*: wrapping the
   `if` in brackets to break inside it (adds tokens, which the formatter never does); leaving any
   line holding an `if` long (also loses the safe break in the last branch).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **`BadShape` names what was expected**:
+  `BadShape(text, at, expected)`, its message `cannot read "2026/03/08": expected '-' at byte 4`, and
+  `Trailing`'s `expected the end at byte 10`, in place of the chapter's earlier `not the expected
+  shape at byte 4`. *Why*: a reader fixing the text needs to know what would have been accepted
+  there, and the parser knows it at the point it stops. *Alternatives*: `BadShape(text, at)` with one
+  fixed message (says where but not what); a separate `expected` method computing it again from the
+  text (a second parser).
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **a parse reads the whole shape first, then checks the
+  fields in the order they are written**, so `2026-02-30T24:00` is refused for its day and
+  `2026-02-30T24:00 ` for its trailing space; a zone name is looked up last. The fields an
+  `OutOfRange` names are `year`, `month`, `day`, `date` (past `Date.Min`/`Date.Max` inside their
+  own years), `hour`, `minute`, `second`, `fraction`, `offset`, `instant` (past
+  `Instant.Min`/`Instant.Max`), `months` and `days`. *Why*: one rule for which error a text with
+  several faults gets, and a shape error never hides behind a range error further left.
+  *Alternatives*: failing at the first fault left to right (a range error could then mask a
+  shape error after it, and the answer would depend on how far the reader had got).
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **a year of four digits has no sign, and a signed year has
+  four digits or more**, even inside `0` to `9999` (`+2026`, `-0000` read); an unsigned fifth digit
+  is a shape error at byte 4. A seventh digit of fraction is `OutOfRange(text, "fraction")` even
+  when it is `0`. `t`, `z`, a comma as the decimal sign, `−` (U+2212) and a bare `±hh` offset are
+  refused. *Why*: the display never writes them, and each accepted alternative is one more form
+  every other reader of the text would have to accept. *Alternatives*: ISO 8601's lowercase and
+  comma variants (wider, and nothing here writes them).
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **`parseZoned` with a zone name checks the offset against
+  the zone**: the reading minus the offset is the instant, and the zone's clocks must show that
+  offset then, or the text is `OutOfRange(text, "offset")`; so both readings of an autumn overlap
+  read and a reading in a spring gap is refused. Any `ZoneError` from looking the name up
+  (unknown, not a name, an undecodable file) is `UnknownZone(text, name)`. A fixed zone's name in
+  brackets (`+05:30[+05:30]`, `Z[UTC]`) reads as the fixed zone. Built over `zone(name)`, which is
+  on dev ahead of the rest of step 3. *Why*: the offset makes the instant unambiguous, and a text
+  whose offset the zone never shows names no reading of that zone. *Alternatives*: trusting the
+  zone and re-reading the instant from the reading alone (needs step 3's `Resolution` for gaps and
+  overlaps, and drops the offset the text gave); trusting the offset and ignoring the zone's (keeps
+  a `Zoned` whose offset its zone contradicts). Review with the user whether a mismatch deserves a
+  variant of its own rather than `OutOfRange`'s `offset`.
+- Settled on the user's delegation 2026-11-11 (built on branch `time-parse`): **`parsePeriod(text)`**, named as the chapter's other
+  readers are, reads `P`, then a number of years `Y`, of months `M` and of days `D` in that order, at
+  least one, each with its own `-` where negative, so every `toIsoString()` reads back equal. Forms
+  `toIsoString()` does not write but whose numbers are plain also read (`P12M` as `P1Y`, `P0Y`,
+  `P007D`, `P-0D`); a total of months or days beyond an `int` is out of range. `+`, `W`, a `T` time
+  part, a fraction and lower-case letters are refused. *Why*: a reader for the writer, settled as
+  the step 5 follow-up to the `toIsoString()` entry above. *Alternatives*: `Period.parse` on the
+  companion (unlike the chapter's other readers); accepting only the canonical form (refuses
+  `P12M`, which means one exact period); ISO's weeks (`P2W`, fourteen days, which `toIsoString`
+  never writes).
 
 **Deferred**
 

@@ -335,6 +335,22 @@ thread the last reference goes, unpins it, and runs no Avin code. An `attach:` e
 non-zero stops the program at the call, since what it would keep could not be kept. Without `attach:`,
 `keeps:` holds only as long as the handle ([proposed](/spec/decisions/#proposed)).
 
+**A binding answering its handle in a `Result[H, E]` answers that failure instead**
+([proposed](/spec/decisions/#proposed)): `Ok` of the handle where C was told, and otherwise `Err` of
+what `attach:` answered — `E` an integer type, checked against its width, or an enum mirror, a value no
+variant holds stopping the program — the handle's reference given back and nothing kept. Cairo answers
+a surface it could not make as a surface in an error state, and `cairo_surface_set_user_data` on it
+answers that surface's status, so the status comes back as the error, with no check before the call:
+
+```avin
+@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
+   keeps: "pixels")
+private surfaceForData(pixels: ByteBlock, format: Format, width: int, height: int, stride: int) -> Result[Surface, Status]
+```
+
+Such a binding answers no out values, its handle is never in an `Option`, its class has `attach:` and
+it keeps something; a C result that is null still stops the program.
+
 The record belongs to one handle object: a later `keeps:` through the same handle adds to it, and the
 handle lets go of it when its reference goes back, by `close()` or its finalizer, while C keeps it until
 `destroy`. On such a class every kept object, a handle or a `ByteBlock`, is held as the Avin object, so
@@ -497,7 +513,7 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
 - **The field is a member path of the struct `self` points at**, `"width"`, `"origin.x"`,
   `"glyph->bitmap.rows"`, read as `self->` followed by it. The handle's type must point at a struct
   the headers define; one they only declare is refused when the C unit compiles the accessor.
-- **A field is read as an integer type, `byte`, `bool`, `real`, a string or a handle**, or the memory
+- **A field is read as an integer type, `byte`, `bool`, `real`, an enum mirror, a string or a handle**, or the memory
   a byte pointer points at is lent as a [view](#buffers) with `view` and `length:`. The C unit
   checks the field is the kind its Avin type needs (an integer or enumeration, one byte wide for
   `byte`, a `bool` or an integer for `bool`, a floating-point type for `real`, `char *` or
@@ -505,6 +521,18 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
   sign, so an integer the Avin type cannot hold stops the program at the read, as a result does. A
   null string is `None` for an `Option[string]` and stops the program otherwise; a string is copied
   and checked as UTF-8, and never freed, since the struct owns it.
+- **A field may be read and written as an [enum mirror](#enums-and-constants)**
+  ([proposed](/spec/decisions/#proposed)): the field is of an integer type, the enum the mirror
+  mirrors or another (a union member C declares `int`), measured as any integer field is. A value
+  read that no variant holds stops the program at the read
+  (`` the field `cells[i].header.kind` of `Path` held a value no variant of `PathDataType` holds``),
+  and a variant is written as its enumerator's value. A mirror in an `Option` is neither, since a field
+  is never null. Cairo's path data is a union whose header holds the element's kind:
+
+  ```avin
+  @c(field: "data[i].header.type", bound: "self->num_data")
+  kind(i: int) -> PathDataType
+  ```
 - **A handle read from a field is lent**, as a `borrowed` result is: it takes a reference of its own
   through its class's `retain`, so the class must declare one, and a class with `kept:` cannot be
   read, since the accessor keeps nothing. `borrowed` is not written.
@@ -677,7 +705,9 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   parameter marked `length(data)`, which is not an Avin parameter, converted to that parameter's C
   type as any `int` argument is: an array too long for it stops the program at the call. The length
   may come before the array or after it, and a call may take several arrays, each with its own. A
-  binding taking an array whose length nothing carries is refused, since C could read past its end.
+  binding taking an array whose length nothing carries is refused, since C could read past its end;
+  one C fills with as many elements as another call says is [an `out` array](#arrays-and-out-parameters)
+  the binding allocates.
   An `Option` of an array passes null and a length of zero for `None`.
 
   ```avin
@@ -720,6 +750,55 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   array, an empty array where the length is zero, and stops the program otherwise, as a negative
   length does; where a status fails, the array is freed unread ([proposed](/spec/decisions/#proposed)).
   `bytes:` is the same for an `Array[byte]`.
+
+- **An array C fills is allocated by the binding** ([proposed](/spec/decisions/#proposed)): an `out`
+  pointer to the elements themselves, `out double *dashes`, named with `array:` and given a
+  `length:`, a C expression over the parameters evaluated in the glue *before* the call, since C
+  writes as many elements as some other call says and no parameter tells it how many. The glue
+  allocates that many, C fills them, and the array is copied into a new `Array` and freed. Cairo's dash
+  pattern is as long as `cairo_get_dash_count` says:
+
+  ```avin
+  @c("void cairo_get_dash(cairo_t *self, out double *dashes, out double *offset)",
+     array: "dashes", length: "cairo_get_dash_count(self)")
+  dash() -> (Array[real], real)
+  ```
+
+  A length of zero is an empty array, C still called. A negative length, or one longer than an array
+  holds, calls nothing and stops the program (`` `cairo_get_dash` answered through `dashes` a negative
+  length``). The array is never null, so never in an `Option`, and the binding frees it, so it takes
+  no `free:`; its elements are those of an array C allocates, and an out value's name is not yet
+  written when the length is evaluated, so a `length:` naming one is refused by clang in the glue.
+
+- **Several arrays in one call are named as a list** ([proposed](/spec/decisions/#proposed)):
+  `array:` (or `bytes:`) a list of the out parameters, `length:` a list of their lengths in the same
+  order, and `free:`, where it is given, a list of how each is freed, `""` for an array C fills or one
+  nothing frees. Each array is copied and freed by its own entry, and where a status fails every array
+  C answered is freed unread. The result keeps the prototype's order whatever order the lists name the
+  arrays in. A list names each array once, each an `out` parameter, and a list of lengths or of frees
+  comes only with a list of arrays.
+
+- **A pointer marked `null` is passed null** ([proposed](/spec/decisions/#proposed)): the word is
+  written before the parameter's type, as `out` is, for a pointer C allows to be null — an out value
+  the binding does not want, or an optional pointer it leaves out. It is no Avin parameter and no part
+  of the result, and the header check holds it to the header's type like any other. A function whose
+  caller chooses is bound twice. Cairo's `cairo_scaled_font_text_to_glyphs` answers glyphs and
+  clusters, each allocated by Cairo with its own count and its own free function, and takes null for
+  the clusters, their count and their flags where they are not wanted:
+
+  ```avin
+  @c("cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, out cairo_text_cluster_t **clusters, out int *num_clusters, out cairo_text_cluster_flags_t *cluster_flags)",
+     array: ["glyphs", "clusters"], length: ["num_glyphs", "num_clusters"],
+     free: ["cairo_glyph_free", "cairo_text_cluster_free"])
+  private textToGlyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int, Array[TextCluster], int, ClusterFlags), Status]
+
+  @c("cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, null cairo_text_cluster_t **clusters, null int *num_clusters, null cairo_text_cluster_flags_t *cluster_flags)",
+     array: "glyphs", length: "num_glyphs", free: "cairo_glyph_free")
+  private glyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int), Status]
+  ```
+
+  `null` is never `out`, `inout` or `userdata` besides, never an array a length is filled in from, and
+  never a callback's parameter.
 
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without
