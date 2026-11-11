@@ -379,22 +379,25 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    a program, edit it and hold each rebuild to a clean build's program and text; hold `off` to reading
    and writing nothing; survive damaged files, a manifest of nonsense, another compiler's cache and
    trimming; and run two `avin test`, and a `run` beside a `test`, of one program at once.
-   On marshal (one `avin build`, `--units 8`, load average 70 to 146, so the times are rough;
-   `emit` and `lower` from the build log):
+   On marshal's 138 modules (one `avin build`, the whole machine reserved, load average 4 to 6 at the
+   start and end; the object-unit cache emptied before each cold build and the edit new to it on every
+   edit build; median of 3 runs, spread in brackets; `emit` from the build log):
 
    | Build | `-O0` | `-O2` |
    | --- | --- | --- |
-   | No cache | 39.3 s (emit 6.3 s) | 67.4 s (emit 11.6 s) |
-   | Cold, with the cache | 31.8 s (emit 7.3 s) | 55.3 s (emit 12.9 s) |
-   | Warm, no edit | 27.7 s (emit 2.4 s) | 39.8 s (emit 2.6 s) |
-   | One-line edit, no cache | 47.9 s (emit 15.9 s) | 58.9 s (emit 10.7 s) |
-   | One-line edit, with the cache | 63.8 s (emit 4.4 s) | 53.8 s (emit 2.5 s) |
-   | The edit undone, with the cache | 62.3 s (emit 5.2 s) | 42.7 s (emit 2.9 s) |
+   | Cold, no cache | 6.06 s [5.99 to 6.09] | 8.79 s [8.75 to 8.84] |
+   | Cold, with the cache | 6.54 s [6.52 to 6.66] | 9.33 s [9.32 to 9.39] |
+   | Warm, no edit | 4.88 s [4.86 to 4.92] | 4.93 s [4.92 to 4.96] |
+   | One-line edit, no cache | 5.81 s [5.77 to 5.85] (emit 1.21 s) | 7.47 s [7.41 to 7.95] (emit 1.32 s) |
+   | One-line edit, with the cache | 5.02 s [5.01 to 5.09] (emit 0.30 s) | 6.72 s [6.69 to 6.80] (emit 0.30 s) |
 
-   24,267 of 41,583 instances' code and every unchanged text came from the cache; emission falls to
-   about a quarter, but checking (7 to 21 s here) and lowering (10 to 28 s), whose passes still run
-   over every instance, are what an edit's rebuild is now made of, and the `-O0` edits ran at the
-   load's peak. A level's directory is 185 MB in 22 module files.
+   An edit's rebuild is 14% faster at `-O0` and 10% at `-O2` with the cache: the cache read (0.23 s)
+   and write (0.04 s) cost less than the 0.9 s of emission it saves, and what remains is loading
+   (0.06 s), checking (1.4 s), lowering (2.0 s, 11,902 of 15,447 instances reused, the rest lowered
+   again), splitting and linking, which the cache does not touch; at `-O2` clang's compile of the
+   changed units (2.1 s) is the other part. A cold build with the cache costs 0.5 s more than
+   without it (the store). A level's directory is 185 MB in 22 module files.
+
 8. **Only if measured after 7:** the front end. If checking becomes the larger part of an edit's
    rebuild, a design for checked interfaces per module (today one checker holds the whole program by
    index, so this is a rewrite of how symbols are numbered, not a cache).
