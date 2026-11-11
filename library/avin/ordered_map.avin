@@ -1,0 +1,278 @@
+module avin
+
+// A map whose iteration visits the entries in the order their keys were first added: an update of a
+// key already present keeps its place, a removed key that is added again goes to the end. `SeqMap` is
+// the trait, a `Map` with that order; `OrderedMap` is the immutable map that conforms to it. An update
+// through `SeqMap` answers a `SeqMap`, so `ordered.updated(k, v).keys()` stays in insertion order.
+// Two maps are equal when they hold the same keys bound to equal values, so an `OrderedMap` equals a
+// `HashMap` of the same entries whatever order each was built in.
+trait SeqMap[K, +V]: Map[K, V]
+    override updated[W >: V](key: K, value: W) -> SeqMap[K, W]
+
+    override removed(key: K) -> SeqMap[K, V]
+
+    // The set of the keys, in the same order.
+    override keySet() -> SeqSet[K]
+
+    override transform[W](f: (K, V) -> W) -> SeqMap[K, W]
+
+    override mapValues[W](f: (V) -> W) -> SeqMap[K, W] = transform((k, v) -> f(v))
+
+    override ++[W >: V](other: Iterable[(K, W)]) -> SeqMap[K, W]
+        var m: SeqMap[K, W] = self
+        for (k, v) in other do m = m.updated(k, v)
+        m
+
+    override --(keys: Iterable[K]) -> SeqMap[K, V]
+        var m: SeqMap[K, V] = self
+        for k in keys do m = m.removed(k)
+        m
+
+    override updatedWith[W >: V](key: K, f: (Option[V]) -> Option[W]) -> SeqMap[K, W] = f(get(key)) match
+        Some(v) -> updated(key, v)
+        None -> removed(key)
+
+    override filterKeys(p: (K) -> bool) -> SeqMap[K, V]
+        var m: SeqMap[K, V] = self
+        for k in keysIterator()
+            if !p(k) then m = m.removed(k)
+        m
+
+    override partition(p: (K, V) -> bool) -> (SeqMap[K, V], SeqMap[K, V])
+        var yes: SeqMap[K, V] = self
+        var no: SeqMap[K, V] = self
+        for (k, v) in iterator()
+            if p(k, v) then no = no.removed(k) else yes = yes.removed(k)
+        (yes, no)
+
+    override filter(p: (K, V) -> bool) -> SeqMap[K, V]
+        var m: SeqMap[K, V] = self
+        for (k, v) in iterator()
+            if !p(k, v) then m = m.removed(k)
+        m
+
+    // The entries from the last added to the first.
+    reverseIterator() -> Iterator[(K, V)]
+
+// The seq map companion builds ordered maps, typed as seq maps, as a map literal does where a
+// `SeqMap` is expected.
+object SeqMap
+    // A seq map with no entries.
+    empty[K, V]() -> SeqMap[K, V] = OrderedMap[K, V](Empty, Vector.empty[Option[(K, V)]](), 0)
+
+    // A seq map of the pairs given, in order, a later pair's value replacing an earlier one's for the
+    // same key without moving it.
+    apply[K: Eq + Hash, V](pairs: (K, V)*) -> SeqMap[K, V]
+        var m = OrderedMap.empty[K, V]()
+        for (k, v) in pairs do m = m.updated(k, v)
+        m
+
+    // A builder of a seq map: the pairs it is given, in order.
+    newBuilder[K, V]() -> Builder[(K, V), SeqMap[K, V]] = OrderedMapBuilder[K, V]()
+
+// The insertion-ordered immutable map. The entries sit in `slots` in the order of their first
+// addition, a removed entry leaving a gap (`None`) that is dropped when gaps come to outnumber the
+// entries; `index` finds a key's slot by its hash. A lookup is a hash lookup and one vector read, an
+// update one of each plus a vector write or append, both in the logarithm of the size, and an update
+// answers a new map sharing all but the changed paths with the old one, which is left as it was.
+// `OrderedMap.empty[K, V]()` is the empty map, and `OrderedMap.newBuilder[K, V]()` builds one from
+// pairs.
+data OrderedMap[K: Eq + Hash, +V](
+    index: HashTrie[K, int] = Empty,
+    slots: Vector[Option[(K, V)]] = Vector.empty[Option[(K, V)]](),
+    live: int = 0
+)
+
+impl[K, V] SeqMap[K, V] for OrderedMap[K, V]
+    size() -> int = live
+
+    isEmpty() -> bool = live == 0
+
+    nonEmpty() -> bool = live != 0
+
+    get(key: K) -> Option[V] = trieFind(index, spreadHash(key.hash()), key) match
+        Some(i) -> slots(i) match
+            Some((_, v)) -> Some(v)
+            None -> None
+        None -> None
+
+    updated[W >: V](key: K, value: W) -> OrderedMap[K, W]
+        val h = spreadHash(key.hash())
+        val entry: Option[(K, W)] = Some((key, value))
+        trieFind(index, h, key) match
+            Some(i) -> OrderedMap[K, W](index, slots.updated(i, entry), live)
+            None -> OrderedMap[K, W](trieInsert[K, int](index, h, key, slots.length()), slots :+ entry, live + 1)
+
+    removed(key: K) -> OrderedMap[K, V]
+        val h = spreadHash(key.hash())
+        trieFind(index, h, key) match
+            Some(i) -> compactedMap(trieRemove(index, h, key), slots.updated(i, None), live - 1)
+            None -> self
+
+    ++[W >: V](other: Iterable[(K, W)]) -> OrderedMap[K, W]
+        var m: OrderedMap[K, W] = self
+        for (k, v) in other do m = m.updated(k, v)
+        m
+
+    --(keys: Iterable[K]) -> OrderedMap[K, V]
+        var m = self
+        for k in keys do m = m.removed(k)
+        m
+
+    updatedWith[W >: V](key: K, f: (Option[V]) -> Option[W]) -> OrderedMap[K, W] = f(get(key)) match
+        Some(v) -> updated(key, v)
+        None -> removed(key)
+
+    keySet() -> OrderedSet[K] = OrderedSet(index, slots.map(entryKey), live)
+
+    filterKeys(p: (K) -> bool) -> OrderedMap[K, V]
+        var m = self
+        for k in keysIterator()
+            if !p(k) then m = m.removed(k)
+        m
+
+    filter(p: (K, V) -> bool) -> OrderedMap[K, V]
+        var m = self
+        for (k, v) in iterator()
+            if !p(k, v) then m = m.removed(k)
+        m
+
+    // The entries whose key and value satisfy `p` and those that do not, as two ordered maps that
+    // keep the order of this one; `p` is called once for each entry.
+    partition(p: (K, V) -> bool) -> (OrderedMap[K, V], OrderedMap[K, V])
+        var yes = self
+        var no = self
+        for (k, v) in iterator()
+            if p(k, v) then no = no.removed(k) else yes = yes.removed(k)
+        (yes, no)
+
+    // The same keys in the same order, each bound to `f` of the key and its value, called in order.
+    transform[W](f: (K, V) -> W) -> OrderedMap[K, W]
+        entryValue(slot: Option[(K, V)]) -> Option[(K, W)] = slot match
+            Some((k, v)) -> Some((k, f(k, v)))
+            None -> None
+        OrderedMap[K, W](index, slots.map(entryValue), live)
+
+    mapValues[W](f: (V) -> W) -> OrderedMap[K, W] = transform((k, v) -> f(v))
+
+    iterator() -> Iterator[(K, V)] = OrderedEntries(slots, false)
+
+    reverseIterator() -> Iterator[(K, V)] = OrderedEntries(slots, true)
+
+// The key of a slot, or the gap it is.
+private entryKey[K, V](slot: Option[(K, V)]) -> Option[K] = slot match
+    Some((k, _)) -> Some(k)
+    None -> None
+
+// A map of these parts, its gaps dropped and its keys renumbered once they are more than half the
+// slots (and more than a few), so a map that is added to and removed from for ever stays within twice
+// its size, the cost of a renumbering shared by the removals that caused it.
+private compactedMap[K: Eq + Hash, V](index: HashTrie[K, int], slots: Vector[Option[(K, V)]], live: int) -> OrderedMap[K, V]
+    if live == 0 then return OrderedMap[K, V](Empty, Vector.empty[Option[(K, V)]](), 0)
+    if slots.length() - live <= 8 || slots.length() <= 2 * live then return OrderedMap[K, V](index, slots, live)
+    var t: HashTrie[K, int] = Empty
+    val b = Vector.newBuilder[Option[(K, V)]]()
+    var n = 0
+    for slot in slots
+        if slot is Some((k, _))
+            t = trieInsert[K, int](t, spreadHash(k.hash()), k, n)
+            n = n + 1
+            b.addOne(slot)
+    OrderedMap[K, V](t, b.result(), live)
+
+// Steps through the slots of an ordered map from the first or the last, skipping gaps.
+private class OrderedEntries[K, V](slots: Vector[Option[(K, V)]], reverse: bool): Iterator[(K, V)]
+    private var at: int = if reverse then slots.length() - 1 else 0
+    private var ready: Option[(K, V)] = None
+    advance()
+
+    override hasNext() -> bool = ready is Some(_)
+
+    override next() -> (K, V) = ready match
+        Some(entry) ->
+            advance()
+            entry
+        None -> fail("next on an exhausted iterator")
+
+    // Moves the next entry, if any, into `ready`.
+    private advance()
+        ready = None
+        while ready is None && 0 <= at < slots.length()
+            ready = slots(at)
+            at = if reverse then at - 1 else at + 1
+
+impl[K, V: Eq] Eq for OrderedMap[K, V]
+    equals(other: OrderedMap[K, V]) -> bool
+        if size() != other.size() then return false
+        for (k, v) in iterator()
+            other.get(k) match
+                Some(w) -> if w != v then return false
+                None -> return false
+        true
+
+// A sum over the entries, so that the hash does not depend on the order they are visited in; a hash
+// map of the same entries hashes alike.
+impl[K, V: Hash] Hash for OrderedMap[K, V]
+    hash() -> long
+        var h: long = 0
+        for (k, v) in iterator() do h = h +% spreadHash(k.hash() *% 31 +% v.hash())
+        h
+
+// A map of displayable keys and values displays as `{a: 1, b: 2}`, the shape of a map literal, in
+// insertion order. A field width pads the whole.
+impl[K: Display, V: Display] Display for OrderedMap[K, V]
+    display(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.display(w, FormatSpec())
+            w.write(": ")
+            entry.1.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+// A map's diagnostic form is its keys' and values' diagnostic forms in braces, in insertion order.
+impl[K: Debug, V: Debug] Debug for OrderedMap[K, V]
+    debug(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.debug(w, FormatSpec())
+            w.write(": ")
+            entry.1.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+object OrderedMap
+    // An ordered map with no entries.
+    empty[K, V]() -> OrderedMap[K, V] = OrderedMap[K, V](Empty, Vector.empty[Option[(K, V)]](), 0)
+
+    // An ordered map of the pairs given, in order, a later pair's value replacing an earlier one's
+    // for the same key without moving it: `OrderedMap((2, "two"), (1, "one"))`.
+    apply[K: Eq + Hash, V](pairs: (K, V)*) -> OrderedMap[K, V]
+        var m = OrderedMap.empty[K, V]()
+        for (k, v) in pairs do m = m.updated(k, v)
+        m
+
+    // An ordered map of the pairs of `pairs`, in order, a later pair's value replacing an earlier
+    // one's for the same key without moving it.
+    from[K: Eq + Hash, V](pairs: Iterable[(K, V)]) -> OrderedMap[K, V]
+        val b = OrderedMapBuilder[K, V]()
+        b.addAll(pairs)
+        b.result()
+
+    // A builder of an ordered map: the pairs it is given, in order.
+    newBuilder[K, V]() -> Builder[(K, V), OrderedMap[K, V]] = OrderedMapBuilder[K, V]()
+
+// Builds an ordered map from `(key, value)` pairs.
+class OrderedMapBuilder[K: Eq + Hash, V]: Builder[(K, V), OrderedMap[K, V]]
+    private var map: OrderedMap[K, V] = OrderedMap.empty[K, V]()
+    private var spent = false
+
+    override addOne(element: (K, V))
+        if spent then fail("add to a builder whose result was taken")
+        val (k, v) = element
+        map = map.updated(k, v)
+
+    override result() -> OrderedMap[K, V]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        map
+
+    override clear()
+        map = OrderedMap.empty[K, V]()
+        spent = false

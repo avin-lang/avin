@@ -1737,6 +1737,12 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _, _) -> ()
+    // An impl without `for` adds methods to the tuples or the functions its type matches, as one adds
+    // to any other type built from its parameters: `impl[A, B] (A, B)`, `impl[A, B] (A) -> B`. The
+    // tuple and function types are the core library's, so written elsewhere it is an extension.
+    if d.trait_name is None && (d.target.kind is Tuple(_) || d.target.kind is Function(_, _, _))
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != CoreModule))
+        return invalid
     if d.target.kind is Tuple(_) then return resolve_tuple_impl(c, unit, module_name, d)
     val path = d.target.kind match
         Named(p, _) -> p
@@ -1744,7 +1750,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
             c.note(unit, d.target.span, s"an `impl` names a declared type, and `${show_union(d.target)}` is a union; declare a data type to give it methods")
             return invalid
         _ ->
-            c.note(unit, d.target.span, "an impl adds to a data type, a class, an object or a built-in type")
+            if d.trait_name is Some(_) then c.note(unit, d.target.span, "an impl of a trait is for a data type, a class, an object or a built-in type")
+            else c.note(unit, d.target.span, "an impl adds to a data type, a class, an object, a built-in type, a tuple or a function type")
             return invalid
     val written = d.target.kind match
         Named(_, args) -> args
@@ -2091,6 +2098,14 @@ private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
             Data(e, _, _) -> d == e
             _ -> false
         Class(k, _, _) -> trait_view(c, x, k) is Some(_)
+        // Every tuple is an instance of the tuples, whatever its arity, and every function of the
+        // functions, so a call on one of another shape says what the receiver would need to be.
+        Tuple(_) -> *x is Tuple(_)
+        Function(_, _, _) -> *x match
+            Function(_, _, _) -> true
+            Data(_, _, _) -> function_ancestor(c.classes, c.data, x) is Some(_)
+            Class(_, _, _) -> function_ancestor(c.classes, c.data, x) is Some(_)
+            _ -> false
         _ -> added_args(c, x, tm) is Some(_)
 
 /** The impl's type arguments a call of method `tm` takes on a value of type `t`: what the
@@ -2141,9 +2156,18 @@ private match_target(c: *Checker, pattern: &Type, t: &Type, owner: usize, binds:
         Tuple(ps) -> *x match
             Tuple(xs) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, covariant)
             _ -> false
-        Function(ps, r, _) -> *x match
-            Function(xs, s, _) -> ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
-            _ -> false
+        Function(ps, r, sendable) ->
+            // A value of a type that is a subtype of a function type, a class or a data type naming
+            // one, is seen as that function where it would be passed as one. A `@sendable` pattern
+            // matches only a `@sendable` function, as only one is passed where it is expected.
+            val seen = *x match
+                Function(_, _, _) -> x
+                Data(_, _, _) -> if covariant then function_ancestor(c.classes, c.data, x).unwrap_or(x) else x
+                Class(_, _, _) -> if covariant then function_ancestor(c.classes, c.data, x).unwrap_or(x) else x
+                _ -> x
+            *seen match
+                Function(xs, s, marked) -> (marked || !sendable) && ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
+                _ -> false
         _ -> same_type(pattern, x)
 
 // The type arguments `ps` of a pattern matched against `xs`, each in a covariant position where the
@@ -2168,6 +2192,15 @@ private added_target_phrase(tm: TraitMethod) -> string = target_phrase(tm.target
 private target_phrase(t: &Type) -> string
     val inner = *t match
         Tuple(items) -> return if items.len() == 2 then "a pair" else s"a tuple of ${items.len()}"
+        Function(params, result, sendable) ->
+            // A function of any types is named by its number of parameters; one with a part of its
+            // own is written out.
+            var plain = *result is TypeVar(_, _, _)
+            for p in params
+                if !(*p is TypeVar(_, _, _)) then plain = false
+            if !plain then return s"`${type_name(t)}`"
+            val kind = if sendable then "a `@sendable` function" else "a function"
+            return if params.len() == 1 then s"$kind of 1 parameter" else s"$kind of ${params.len()} parameters"
         Data(_, _, args) -> args
         Class(_, _, args) -> args
         _ -> return s"`${type_name(t)}`"
@@ -3747,12 +3780,17 @@ private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize])
         var hidden = false
         for o in own
             if same_params_seen(c, t, o, m) then hidden = true
-        if hidden && (tm.on_trait || tm.extension || !matches) then continue
+        if hidden && (tm.on_trait || tm.extension || adds_to_function(tm) || !matches) then continue
         if matches then matching.push(m) else unmatched.push(m)
     val offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
     for m in offered
         if !hidden_by_nearer_trait(c, t, m, offered) then out.push(m)
     out
+
+/** Whether method `tm` is added to a function type, `impl[A, B] (A) -> B`. A function type is a trait,
+ * so a type's own method of the same parameter types is found first, as for a method added to any
+ * trait. */
+private adds_to_function(tm: TraitMethod) -> bool = *tm.target is Function(_, _, _)
 
 // Whether method `m`, which an impl adds to a trait, is hidden among `offered` by one of the same
 // parameter types that an impl adds to a trait requiring that trait: the nearer trait's is the
@@ -3871,7 +3909,7 @@ private refuse_trait_clash(c: *Checker, at: Span, t: &Type, name: string, ms: Bu
         val a = trait_method_of(c, ms[i]) match
             Some(x) -> x
             None -> continue
-        if !a.on_trait && !a.extension && added_args(c, t, a) is Some(_)
+        if !a.on_trait && !a.extension && !adds_to_function(a) && added_args(c, t, a) is Some(_)
             for o in ms
                 if trait_method_of(c, o) is Some(_) then continue
                 if same_params_seen(c, t, o, ms[i])
@@ -5257,6 +5295,10 @@ private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) ->
     var fits = alike_or_error(own, want) || *own is Nothing || forgets_sendable(zonk(c, own), zonk(c, want))
     if *want is Class(b, _, _)
         if ancestor_type(c.classes, c.data, own, b) is Some(up) then fits = alike_or_error(up, want)
+    // A result is a covariant position: a type seen as the base's with no conversion fits, such as
+    // a tuple of subclasses, an instance of a covariant generic type or a function with a narrower
+    // result. A value that would need a box, such as an `int` for an `Any`, does not.
+    if !fits && is_reference(own) then fits = conforms(view_part(conformances(c), zonk(c, own), zonk(c, want)), zonk(c, want))
     if fits then None else Some(s"which yields ${type_name(want)}, not ${type_name(own)}")
 
 // A class, trait or data type that is a function is one function type, and has an `apply` taking
@@ -5595,6 +5637,17 @@ private declare_defaults(c: *Checker, id: usize)
         var own: Buf[&Type] = buf()
         for k in 0..<f.decl.type_params.len()
             own.push(TypeVar(did, k, f.decl.type_params[k].name))
+        // The default's own copies of the function's type parameters have the function's bounds, so
+        // that `T.MaxValue` or `T(0)` reads in a default as in the body.
+        if !shared
+            for k in 0..<f.decl.type_params.len()
+                val tp = f.decl.type_params[k]
+                if c.bounds.get(bound_key(id, k, tp)) is Some(bounds)
+                    var copied: Buf[&Type] = buf()
+                    for b in bounds
+                        copied.push(substitute(b, id, own))
+                    c.bounds.put(bound_key(did, k, tp), copied)
+                if c.lowers.get(bound_key(id, k, tp)) is Some(lower) then c.lowers.put(bound_key(did, k, tp), substitute(lower, id, own))
         var params: Buf[&Type] = buf()
         var names: Buf[string] = buf()
         var decls: Buf[Param] = buf()
@@ -10593,11 +10646,12 @@ private is_option_data(c: *Checker, d: usize) -> bool = core_data(c, "Option") m
 
 // A built-in value or a tuple expected as a trait it conforms to converts to it where it is written:
 // it is put in a box, as for `Any`, whose method table holds the type's implementations. A data value
-// and an object already are values of every trait they conform to.
+// and an object already are values of every trait they conform to, and so is a union of references,
+// laid out as an `Any` holding one; a union with a scalar member converts by its tag.
 private to_trait(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
     if !is_trait_type(c, want) then return typed
     val t = zonk(c, typed.ty)
-    if !(is_builtin(t) || *t is Tuple(_)) then return typed
+    if !(is_builtin(t) || *t is Tuple(_) || *t is Union(_) && !is_reference(t)) then return typed
     if !conforms_to_bound(c, t, want) then return typed
     TExpr(typed.span, want, Box(typed))
 
@@ -10909,6 +10963,13 @@ private union_rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usiz
 struct UnionLookup
     owners: Buf[&Type]
     methods: Buf[usize]
+
+/** The union value `value` as `owner`, the class or trait a member is found on: a union of
+ * references is that type already, laid out as an `Any` holding its member; one with a scalar member
+ * converts to it, which lowering does by the union's tag. */
+private union_as_owner(c: *Checker, value: &TExpr, owner: &Type) -> &TExpr
+    if is_reference(zonk(c, value.ty)) then TExpr(value.span, owner, value.kind)
+    else TExpr(value.span, owner, Box(value))
 
 /** The class or trait the members of a union agree on, as the branches of an `if` yielding each
  * would: what a member call on the union is looked up on first. */
@@ -11262,9 +11323,18 @@ private limit_constant(c: *Checker, at: Span, target: &Expr, name: string) -> Op
     if !is_capitalized(name) then return None
     val ty = static_receiver(c, target, name)?
     val t = zonk(c, ty)
-    if !(*t is Int(_) || *t is Byte || *t is Char || *t is Real) then return None
     val least = name == "MinValue"
     val greatest = name == "MaxValue"
+    // A type parameter bounded by `Integer` has the limits every integer width has, each instance's
+    // own: the constant is folded at the width the instance is made at.
+    if is_integer_param(c, t)
+        if greatest || least then return Some(TExpr(at, t, IntLimit(greatest)))
+        c.note(unit_of(c), at, s"`${type_name(t)}` has no member `$name`")
+        return Some(TExpr(at, ErrorType, UnitConst))
+    if *t is TypeVar(_, _, _) && (greatest || least)
+        c.note(unit_of(c), at, s"`${type_name(t)}` has no member `$name`: a type parameter has the integer limits where it is bounded by `Integer`, as in `[${type_name(t)}: Integer]`")
+        return Some(TExpr(at, ErrorType, UnitConst))
+    if !(*t is Int(_) || *t is Byte || *t is Char || *t is Real) then return None
     *t match
         Int(bits) ->
             if greatest then return Some(TExpr(at, t, IntConst(max_digits(bits))))
@@ -11299,7 +11369,7 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         if found.owners.len() > 1
             c.note(unit, e.span, union_clash(ty, name, found.owners))
             return TExpr(e.span, ErrorType, UnitConst)
-        if found.owners.len() == 1 then return member_of(c, e, TExpr(value.span, found.owners[0], value.kind), name, expected)
+        if found.owners.len() == 1 then return member_of(c, e, union_as_owner(c, value, found.owners[0]), name, expected)
     // A field of a data type with one variant comes before a method of the same name.
     if !(*ty is Class(_, _, _)) && !one_variant_field(c, ty, name)
         val ms = methods_of(c, ty, name)
@@ -12637,8 +12707,8 @@ private collection_shape(c: *Checker, t: &Type) -> string
         _ -> return ""
     if module_name != CoreModule && module_name != MutableModule then return ""
     val core = module_name == CoreModule
-    if name == "Set" || (core && (name == "HashSet" || name == "SortedSet" || name == "TreeSet")) then return "set"
-    if name == "Map" || (core && (name == "HashMap" || name == "SortedMap" || name == "TreeMap")) then return "map"
+    if name == "Set" || (core && (name == "HashSet" || name == "SortedSet" || name == "TreeSet" || name == "SeqSet" || name == "OrderedSet")) then return "set"
+    if name == "Map" || (core && (name == "HashMap" || name == "SortedMap" || name == "TreeMap" || name == "SeqMap" || name == "OrderedMap")) then return "map"
     ""
 
 // A collection literal is built with a builder, except where a `List` is expected (see
@@ -13178,8 +13248,15 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
                 return TExpr(at, ErrorType, UnitConst)
             if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
             return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
-        // `&`, `^`, `|`, `<<` and `>>` on such a type are methods of those names, which this one lacks.
-        if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
+        // `&`, `^`, `|`, `<<` and `>>` on such a type are methods of those names, which this one lacks,
+        // and the wrapping and saturating operators have no methods at all.
+        // A type parameter bounded by `Integer` has them as the machine's operators at each width.
+        if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight || wrapping_or_saturating(op)
+            if integer_type(c, zonk(c, l.ty))
+                if !same_type(zonk(c, l.ty), zonk(c, r.ty))
+                    c.note(unit_of(c), at, s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+                    return TExpr(at, ErrorType, UnitConst)
+                return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
             c.note(unit_of(c), at, s"`${type_name(zonk(c, l.ty))}` has no method `$spelling`")
             return TExpr(at, ErrorType, UnitConst)
     if !numeric || !same_type(l.ty, r.ty)
@@ -13194,6 +13271,15 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, l.ty, Arith(op, l, r, op_at))
+
+private wrapping_or_saturating(op: BinaryOp) -> bool = op match
+    AddWrapping -> true
+    SubtractWrapping -> true
+    MultiplyWrapping -> true
+    AddSaturating -> true
+    SubtractSaturating -> true
+    MultiplySaturating -> true
+    _ -> false
 
 /** Whether a value of type `t` takes its operators from the core traits rather than the machine: a
  * type parameter, a data type or a class. */
@@ -15695,9 +15781,10 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
     var object = named_value match
         Some(v) -> v
         None -> check_expr(c, target, None)
-    // A union's member is called through the members' join or a trait the union conforms to, the
-    // union seen as that type with no conversion, as an `Any` holding its member; a name more than
-    // one of those has is not chosen between.
+    // A union's member is called through the members' join or a trait the union conforms to: a
+    // union of references seen as that type with no conversion, as an `Any` holding its member, and
+    // one with a scalar member converted to it; a name more than one of those has is not chosen
+    // between.
     if *zonk(c, object.ty) is Union(_)
         val found = union_lookup(c, zonk(c, object.ty), name)
         if found.owners.len() > 1
@@ -15705,7 +15792,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-        if found.owners.len() == 1 then object = TExpr(object.span, found.owners[0], object.kind)
+        if found.owners.len() == 1 then object = union_as_owner(c, object, found.owners[0])
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
         if ms.len() > 0
@@ -15971,6 +16058,13 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
     c.note(unit_of(c), at, s"`${symbol.decl.name}` is a method of `${c.classes[k].name}`, which ${type_name(t)} does not implement")
     true
 
+// A local or a parameter converted where it is the receiver, as a union with a scalar member is to
+// the trait its method is found on, is read where the call is made like the variable itself, so
+// lowering sees the union and can call its member's method by its tag.
+private boxed_variable(receiver: &TExpr) -> bool = receiver.kind match
+    Box(inner) -> inner.kind is Local(_) || inner.kind is Param(_)
+    _ -> false
+
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool, checked: Buf[Option[&TExpr]]) -> &TExpr
@@ -15983,7 +16077,14 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
     var object = receiver
-    if !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
+    if receiver.kind is Box(inner) && *zonk(c, inner.ty) is Union(_)
+        // A union converted to the type its method is found on is held as the union, and converted
+        // where the call is made.
+        if !boxed_variable(receiver)
+            val held = hidden_local(c, inner.ty)
+            setup = Some(TExpr(receiver.span, Unit, Let(held, inner)))
+            object = TExpr(receiver.span, receiver.ty, Box(TExpr(inner.span, inner.ty, Local(held))))
+    elif !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
@@ -16906,6 +17007,8 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
                             t = to_trait(c, t, zonk(c, p))
+                            // A value given for a union parameter is injected where it is written.
+                            if *zonk(c, p) is Union(_) then t = inject(c, t, zonk(c, p))
                             if converts_none(c, t.ty, p) then t = TExpr(t.span, p, NoneAs(t))
                             val agrees = *t.ty is Nothing || same_type(t.ty, p) || constrain(c, p, t.ty, open, true)
                             if !agrees
@@ -18595,6 +18698,15 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
             Tuple(ys) ->
                 if xs.len() != ys.len() then return false
                 for i in 0..<xs.len()
+                    // A tuple is of the type it was made with, seen only where each part keeps its
+                    // layout, so where either side of a part is no reference (a number, a `bool`, a
+                    // union with a scalar member) the part is exactly what it was made with: an
+                    // `(int, bool)` is never an `(Any, bool)` or an `(int | string, bool)`, nor a
+                    // `(string, bool)` an `(int | string, bool)`.
+                    val part = zonk(c, xs[i])
+                    val wanted = zonk(c, ys[i])
+                    val open = *part is TypeVar(_, _, _) || *wanted is TypeVar(_, _, _) || !settled(part) || !settled(wanted) || *part is Nothing || *part is ErrorType || *wanted is ErrorType
+                    if !open && (!is_reference(part) || !is_reference(wanted)) && !same_type(part, wanted) then return false
                     if !may_match(c, xs[i], ys[i]) then return false
                 true
             _ -> false

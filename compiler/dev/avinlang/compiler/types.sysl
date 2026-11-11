@@ -81,8 +81,8 @@ members_of(t: &Type) -> Buf[&Type] = *t match
         one.push(t)
         one
 
-/** `t` with every union in it, at any depth, replaced by `Any`: the layout a union value has at run
- * time, one reference to an object, a scalar member in a box. */
+/** `t` with every union in it, at any depth, replaced by `Any`: the type its value is seen as once
+ * converted to an `Any`, a scalar member in a box. */
 erase_unions(t: &Type) -> &Type = *t match
     Union(_) -> AnyType
     Tuple(items) -> Tuple(erase_all(items))
@@ -97,6 +97,70 @@ private erase_all(items: Buf[&Type]) -> Buf[&Type]
     for item in items
         out.push(erase_unions(item))
     out
+
+/** `t` with every union whose members are all references replaced by `Any`, at any depth, since such
+ * a union is laid out as an `Any` holding its member. A union with a scalar member has a layout of
+ * its own, a tag and a payload, so it stays, its members erased the same way. */
+erase_reference_unions(t: &Type) -> &Type = *t match
+    Union(members) ->
+        val inner = erase_reference_all(members)
+        var scalar = false
+        for m in inner
+            if is_scalar_member(m) then scalar = true
+        if scalar then union_of(inner) else AnyType
+    Tuple(items) -> Tuple(erase_reference_all(items))
+    Function(params, result, sendable) -> Function(erase_reference_all(params), erase_reference_unions(result), sendable)
+    ByName(inner) -> ByName(erase_reference_unions(inner))
+    Data(id, name, args) -> Data(id, name, erase_reference_all(args))
+    Class(id, name, args) -> Class(id, name, erase_reference_all(args))
+    _ -> t
+
+private erase_reference_all(items: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for item in items
+        out.push(erase_reference_unions(item))
+    out
+
+/** Whether a member of a union is a scalar, kept in the union's bits rather than as a reference to an
+ * object: a number, a `char`, a `bool` or `unit`. */
+is_scalar_member(m: &Type) -> bool = !(mir_type(m) is Some(MRef))
+
+/** Whether `t` is a union with a scalar member, laid out as a tag and a payload. */
+is_scalar_union(t: &Type) -> bool = *t match
+    Union(members) ->
+        for m in members
+            if is_scalar_member(m) then return true
+        false
+    _ -> false
+
+/** Whether a scalar member of a union is wider than the union's 64 bits, an integer of more than 64
+ * bits: the union keeps it boxed, in its reference word, as a member kept as a reference is kept. */
+is_boxed_member(m: &Type) -> bool = *m match
+    Int(bits) -> bits > 64
+    _ -> false
+
+/** The scalar members of the union `t` kept in its bits, in the order of their keys, which is the
+ * normal form's and not the order written: member `i` has tag `i + 1`, and tag 0 says the union holds
+ * a reference, which an integer wider than 64 bits is boxed as. */
+union_scalars(t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    var keys: Buf[string] = buf()
+    for m in members_of(t)
+        if !is_scalar_member(m) || is_boxed_member(m) then continue
+        val k = type_key(m)
+        var at = keys.len()
+        while at > 0 && k < keys[at - 1]
+            at -= 1
+        keys.insert(at, k)
+        out.insert(at, m)
+    out
+
+/** Whether the union `t` has a member kept in its reference word: a reference, or an integer wider than
+ * 64 bits in its box. */
+union_holds_reference(t: &Type) -> bool
+    for m in members_of(t)
+        if !is_scalar_member(m) || is_boxed_member(m) then return true
+    false
 
 /** Whether `t` names a union anywhere in it. */
 has_union(t: &Type) -> bool = *t match
@@ -389,15 +453,16 @@ private type_list(items: Buf[&Type]) -> string
         out = out + type_name(items[i])
     out
 
-/** A spelling of a type that tells apart any two different types, for keying a table by type: a
- * data type or class is named with its index, since an object and its companion class share a
- * name, and so may types of different files. */
+/** A spelling of a type that tells apart any two different types, and spells one type one way, for
+ * keying a table by type: a data type or class is named by its index alone, since an object and its
+ * companion class share a name, and so may types of different files, while one type may be written
+ * under several names (`ActorContext` and the core library's `avin::actors.ActorContext`). */
 type_key(t: &Type) -> string = *t match
     Tuple(items) -> "(" + key_list(items) + ")"
     Function(params, result, sendable) -> (if sendable then "@sendable (" else "(") + key_list(params) + ") -> " + type_key(result)
     ByName(inner) -> "-> " + type_key(inner)
-    Data(id, name, args) -> s"$name#$id[" + key_list(args) + "]"
-    Class(id, name, args) -> s"class $name#$id[" + key_list(args) + "]"
+    Data(id, _, args) -> s"#$id[" + key_list(args) + "]"
+    Class(id, _, args) -> s"class #$id[" + key_list(args) + "]"
     // The members' keys in sorted order, so a union is one key whatever order it was written in.
     Union(members) ->
         var keys: Buf[string] = buf()

@@ -106,52 +106,128 @@ lowering makes it, and the front end stays a whole-program pass that runs on eve
 | Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/` |
 | Executable | the linked program | the build key of [running and testing](#running-and-testing) | `.avin/build/` (exists) |
 
-Instances are stored a file per source module, holding the instances of that module's functions,
-so a module whose functions' instances are all reused is a module not compiled again.
+Instances are stored a file per source module, holding the instances of that module's functions
+(the functions lowering makes are the module `<generated>`'s), so a module whose functions'
+instances are all reused is a module file read and not written again.
+
+An instance's entries are two. Its **lowered entry**, under its own key (the key's first part,
+below, which is known when the worklist reaches the instance), holds the requests lowering it made
+of the whole program, in order, then its code. A request is everything lowering an instance asks of
+or tells the program: a layout, a record, a box, a string, a trap site, another instance, a method
+table slot, a closure, a constant object, a call through a table, a type tested, a call of a function
+value. Each is made through one function of lowering, which records it while the instance is lowered
+for the cache, every type in it spelled by qualified names; only the outermost request is recorded,
+since replaying it makes the ones inside it again. In the code, every number that counts the
+program's functions, descriptors, records, strings, constants, closures, trap sites, module-level
+values or table slots is replaced by the name of what it counts. A later build that reaches an
+instance whose own key has an entry replays the requests, so the instances and tables grow exactly as
+lowering the instance would grow them, and reads the code back by those names; an entry naming a type
+or function the program no longer has is read without being made and lowered fresh instead. A trap
+site inside the instance's declaration is kept counted from the declaration's start, so a function
+that moved keeps its entry and its sites report their new lines. Only the program's own functions
+with bodies get lowered entries: closure entries, bindings and the functions lowering makes are small
+and lowered every build. Its **text entry**, under its finished key and the facts emission reads of
+the whole program for it (for each call, the callee's symbol and signature, whether it may collect
+and whether the call may close a cycle of the call graph; a shim's extensions), holds its LLVM text
+and the declarations the text needs.
 
 **The instance key.** An instance's text is reused only while everything it was made from is the
 same. The key is a hash over:
 
-- the compiler (its version and its executable's stamp), the level and whether the build is for
-  tests;
-- the instance's identity: the function's qualified name and parameter types, and its type
-  arguments, every type spelled by qualified names (never by the checker's indices, which an edit
-  elsewhere moves);
+- the compiler (its version and its executable's path and time) and whether the build is for tests;
+  lowering is the same at both levels, so the level is the instance directory's, not the key's;
+- the decisions every instance shares: whether the program keeps its pointer-shaped options as
+  pointers, which lowering decides for the whole program;
+- the instance's identity: its symbol, the function's qualified name, overload and type arguments,
+  every type spelled by qualified names (never by the checker's indices, which an edit elsewhere
+  moves); a function lowering makes is known by its kind and type;
 - the function's **body fingerprint**: its typed tree printed in a canonical form, which carries
   every callee, field and conversion the checker resolved and every type it inferred, so an edit to
-  another function's signature that changes what this body means changes its fingerprint;
-- the **interfaces it reads**: the layout of every type it allocates or reads a field of, and the
-  record of every type it tests against;
-- the **world facts** the whole-program passes used on it: for each call through a method table,
-  the descriptors and methods its static receiver type admits (what devirtualization decided from),
-  and for each callee scalar replacement inlined or summarized, that callee's key.
+  another function's signature that changes what this body means changes its fingerprint. Each node's
+  place is counted from the start of the declaration its trap sites are named by, so lines added
+  above it change nothing and a comment inside it changes it; a constant's place, which names no
+  trap, is left out. A local function or lambda shares its top-level function's table of locals, so
+  each fingerprint also holds what every function of that family captures (which decides the locals
+  kept in a box), and nothing else of a sibling's body;
+- the **interfaces it reads**: each callee's signature and annotations; the layout of every type it
+  makes, reads a field of or takes apart by variant, its fields' types in order (never their names,
+  since a field is reached by its place); the supertypes and method table of every type it tests
+  against and of every type argument, which choose what a call on a bound runs; and each module-level
+  value it reads, with, for one made at compile time, the fingerprint of its initializer;
+- the **world facts** the whole-program steps used on it: the slots lowering gave the methods with
+  type parameters of their own it calls through a table; what devirtualization decided at each of
+  its calls through a table (left, made direct to a method, or guarded by descriptors and their
+  methods); and what scalar replacement read of the others (each callee's summary, and where the
+  function has fences, whether each callee may return with a store not yet fenced), with the key of
+  every function it inlined.
+
+A function lowering makes for a type reads that type's supertypes and table, and, for equality and
+hashing field by field, its layout and its fields' types' supertypes and tables. The keys are made
+on every build in two parts: an instance's **own key** (the compiler, the shared decisions, its
+identity, its body fingerprint and the interfaces it reads) as the worklist reaches it, and its
+**finished key** (its own key and its world facts) after the whole-program passes; the build log's
+`keys` line counts them. The compiler's tests
+build a program of three modules, edit it in each way the design names and compare every key, the
+library's included: the keys that change are exactly those listed, and every function whose emitted
+text changed has a changed key.
 
 **Closed-world monomorphization stays correct** because the set of instances is computed on every
 build, by the same worklist as today: a reused instance contributes the requests it recorded
 instead of being lowered, so the set grows and shrinks exactly as a clean build's would. An
 instance no longer requested is not emitted; a new one is lowered fresh. **Devirtualization and
-scalar replacement** stay whole-program passes over summaries, which are small; an instance whose
-world facts changed (a new class implementing a trait it calls through, a callee it inlined edited)
-has its passes run again from its lowered form, and only it.
+scalar replacement** stay whole-program passes, run on every build over every instance's lowered
+form. Devirtualization's whole-program part runs over summaries: each function's summary is, for
+what it returns and for the object of each of its calls through a table, the set of what it may be
+(an object of one descriptor, what one function returns, or unknown), found once from the function
+alone, and the fixed point of what each function returns is found over the summaries; only a function
+that calls through a table is rewritten. The passes run over every instance rather than only where
+an instance's world facts changed, which needs a key over the cone of the call graph a function's
+passes read (see [decisions](/spec/decisions/#proposed)).
 
-**Stable names.** Today's emitted text numbers strings, descriptors, records, closures and trap
-sites in the order lowering finds them, so one new instance can renumber everything after it.
-Incremental builds name each by what it is: a string by its content's hash, a descriptor or record
-by its type's qualified spelling, a closure or trap site by its function and its place within it.
-The module-level tables (descriptors, records, the string descriptor, method tables) are made from
-the instance set on every build, into a codegen unit of their own, so a change to a table recompiles
-that unit and no other.
+**Stable names.** The emitted text names everything by what it is, never by the order the checker
+or lowering found it in, so one new function, string or type renames nothing else. Each table's
+symbol is `@"avin.<kind>:<name>"`:
+
+| Kind | Named by |
+| --- | --- |
+| a function | its module, name, overload and type arguments; a local function or lambda by its top-level function and its number among that function's local functions of its name (`<program>.pick.lambda#2`) |
+| a type in a name | its qualified spelling: `avin.Option[int]`, `class geo.Box[]`, `object geo.Box[]`, `(int, string)` |
+| `str` | the first 16 hexadecimal digits of the SHA-256 of its bytes |
+| `desc`, `methods`, `obj` | the type it lays out, a variant after its type's (`avin.Option[int].Some`); `box of <type>`, `cell of <machine type>`, `closure of <function>`, `string` |
+| `type` | the type the record describes |
+| `fn` | the function of the constant closure |
+| `data` | a shared constant object by a hash of what it holds; any other by its module-level value and its place among that value's objects |
+| `trap` | the innermost top-level function or method declared around it, the byte offset from that declaration's start, and 12 hexadecimal digits of a hash of its reason |
+| `global` | the module-level value's qualified name; one holding a reference is an alias of its slot of the roots frame |
+| `c.trampoline` | the binding passing it and its place among that binding's |
+
+Emission stops with the name where two things of one kind would share one, a defect of the naming
+the assembler would otherwise report as a redefinition. The module-level tables, every global and
+alias, are the last codegen unit, and the functions are spread over the others; a unit holds its
+pieces in the order of their names, and a trap site, which holds its line, is never copied into the
+units that reach it. So a function or string added to a program recompiles its unit and the tables'
+unit alone. The tables are made from the instance set on every build.
 
 **The `-O0`/`-O2` split.** Each level has its own instance directory; nothing is shared between
 them, since the passes and the copies made for inlining differ. A build at one level never trims the
 other's.
 
-**Two builds at once.** Every entry is content-addressed: written under a temporary name and
-published by rename, so two builds writing one key write the same bytes, and a reader that finds an
-entry missing, short or failing its checksum treats it as a miss. Each module file of a build is
-looked up by the hash of its contents; the manifest naming the module files of the last build is
-written last. No lock is taken. A build trims entries that neither its manifest names nor were used
-in the last hour, as the unit cache spares what is fresh.
+**Two builds at once.** Every entry is content-addressed, so two builds writing one key write the
+same bytes. A module file is named by a hash of its module and the keys it holds, starts with its
+format, the length and the CRC-32 of what follows, and is written under a temporary name and
+published by rename; a reader that finds one missing, short or failing its checksum passes over it,
+its entries misses, and the build writes it again. A file the build read whole is touched rather
+than written. The manifest naming the module files of the build is written last, the same way. No
+lock is taken: whichever manifest is published last names files the other build left in place. A
+build trims the module files that its manifest does not name and that no build used in the last
+hour, and any temporary file left that long, as the unit cache spares what is fresh; there is no
+size limit.
+
+**Turning it on.** `AVIN_INCREMENTAL=on` makes `avin build` and `avin emit-llvm` read and write the
+instance cache, kept in `.avin/build/incremental/<kind><level>/` of the program's root directory
+(`program-O2`, `tests-O0`); `verify` does that and then builds the program again without the cache,
+and stops with the first function whose text differs from the clean build's; `off`, or unset, uses
+no cache. Any other value is an error.
 
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
@@ -164,9 +240,12 @@ clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its
 | `load` | `modules`: the modules read, the library's included |
 | `check` | `modules`: the modules checked |
 | `cunit` | none: the C unit of the program's C bindings |
-| `lower` | `functions`, `strings`, `descriptors`, `tests` |
+| `cache` | with the instance cache only: `files`, `damaged`, `lowered`, `texts`: the module files the manifest names, those passed over, and the lowered and text entries read |
+| `lower` | `functions`, `strings`, `descriptors`, `tests`, `reused`: the last, the instances whose code came from the cache |
+| `keys` | `instances`, `bodies`, `distinct`: the instance keys made, one per function lowered; the bodies fingerprinted, a generic function's once for all its instances; and how many keys differ |
 | `shims` | `bindings`, `handles`: the Sysl shims built |
-| `emit` | `bytes`: the size of the LLVM text |
+| `emit` | `bytes`, `reused`: the size of the LLVM text, and the functions whose text came from the cache |
+| `store` | with the instance cache only: `written`, `kept`, `trimmed`: module files written, those left as they were, and those trimmed |
 | `split` | `units`: the codegen units the module was cut into |
 | `units` | `units`, `compiled`, `reused`: units clang compiled, and units taken from its cache |
 | `link` | none |
@@ -183,8 +262,13 @@ added that implements a trait passes again the instances that call through it an
 else; a field added lowers every user of the type; an instance no longer requested is gone from
 the output. **The oracle is a clean build**: for every edit, the incremental build's LLVM text is
 the same as a build with no cache, so a key that misses a dependency fails a test rather than
-shipping a stale instance. `AVIN_INCREMENTAL=verify` lowers everything and compares it with what the
-cache would have given, naming the first instance whose key failed to change.
+shipping a stale instance. `AVIN_INCREMENTAL=verify` builds with the cache and again without it and
+compares the two texts, naming the first function where they differ. The compiler's tests hold each
+edit of the matrix to lowering exactly the instances whose own keys no earlier build made an entry
+for, and to a clean build's text; a cache whose files are truncated, damaged or missing, or were made
+by another compiler, gives a clean build's text and is written again; two builds of one program at
+once both succeed and leave a cache a third build verifies; and a sample of the corpus builds warm to
+a clean build's text with every instance taken from the cache.
 
 ## Sysl bindings and the shim cache
 
@@ -570,8 +654,68 @@ three steps:
 So `for x in xs` over a `Vector`, a `List`, an `ArraySeq` or a `Range` value keeps its iterator in
 slots, `val (q, r) = divmod(a, b)` makes no tuple once `divmod` is inlined, and a derived method's
 visitor costs nothing. A tuple returned by a function too large to inline, or a recursive one, is
-still an object: results are not returned as several machine values. A `for` over an `Iterable`
-whose `iterator()` call stays guarded keeps its iterator on the heap.
+made only for a caller that keeps it: a caller taking it apart gets its parts as words (below). A
+`for` over an `Iterable` whose `iterator()` call stays guarded keeps its iterator on the heap.
+
+**Values of several machine words.** A value of more than one machine word is one MIR value per
+word, each of its own machine type: that many parameters, slots of a local, fields of an object or
+a closure, and slots where branches meet. A result is the one place needing more: a signature's
+`rest` lists the types of the words after the first, a call defines the first word as its value and
+each later one with `CallWord`, and a return gives the first as its value and each later one with a
+`ReturnWord` in its block, after anything that may collect. LLVM returns the words as one structure,
+in registers. Since every word is an ordinary value, the frame plan roots exactly the words of
+reference type that are live across a collection point and never a scalar word. A call in tail
+position whose every word the block returns at its own place is made as a tail call, its whole
+result returned; inlining stores each later word of a return to a slot of its own, which the
+`CallWord`s load; devirtualization makes such a call direct but never guards it.
+
+Lowering uses them for tuples taken apart from calls: `val (a, b) = f(x)`, where `f` is one of the
+program's functions with a body (no constructor, trait method or binding) and the tuple has at least
+two parts with runtime values, calls `f#words`, a copy of `f` answering with the tuple's parts. Each
+of its returns reads the parts out of the tuple, which scalar replacement then keeps as its parts, and
+a call in its tail position of a function yielding a tuple of the same words calls that function's
+copy and hands its words on. A caller that keeps the tuple calls `f`, which still makes it.
+
+**Unions with a scalar member.** `concrete` erases a union of references to `Any`, as which it is
+laid out, and keeps a union with a scalar member, whose words are a 32-bit tag, 64 bits for a scalar
+member and, where a member is a reference, the reference (`union_scalars` numbers the scalar members
+from 1 by their type keys; tag 0 is a reference). Lowering keeps such a value as a reference to its
+cell, an object of those words made once and only read, so every operation is written once, on the
+cell: injection (`inject_cell`, from a member, a smaller union, or a value boxed into a reference
+member), a type test by the tag and then the reference's record (`cell_test`), taking a member out
+(`cell_member`), widening to a wider union (`recell`) and narrowing to a smaller one
+(`narrow_cell`), conversion to and from an `Any` (`cell_as_any`, `any_as_cell`), `==` and the hash
+by the tag, and `display`, `debug` and `toString` by the member's own implementation. A signature
+names such a parameter or result `MCell`; `union_words` (`union_words.sysl`) then gives each
+function one parameter per word, a cell made from them at its entry, returns of the words read out
+of the returned cell, and each call its arguments' words and a cell made of the words it gets back,
+except a call whose value the block only returns, which passes the words straight on. Every cell of
+a function is then made in it and only read, so scalar replacement keeps it as its fields, and a
+union in a local, a parameter or a result allocates nothing. Storage holds the words themselves:
+`storage_type` gives such a union the machine type `MCell` wherever a value outlives a call (a field
+of a data value, a tuple or a class, an array element, a closure's capture, a captured `var`'s box,
+a module-level value), 24 bytes with a reference member and 16 without, and the descriptor's
+reference offsets, or an array's element map, list only the reference word. `store_at` reads the
+words out of the cell and stores each, and `load_at` loads them and makes a cell of them, which
+scalar replacement keeps as its fields again, so storing a union and reading it back allocates
+nothing. A load believes a tag of 0 (a reference) only beside a non-null reference word and reads
+any other zero tag as the first scalar member's, so a racing read or an array element not yet
+filled never yields a null reference. A module-level union keeps its tag and bits in 16 bytes of
+storage and its reference word in a module-level reference of its own, among the roots
+(`global_reference`, named `#reference`, after the `lazy val` state words). An `Atomic`'s field
+alone stays a reference to a cell (descriptors `union cell` and `union cell of scalars`), one word
+its operations access indivisibly. A tuple with a union part is never answered as words
+(`tuple_words`): the call makes the tuple. An integer member wider than 64 bits is no scalar of
+the bits (`is_boxed_member`): it is boxed and kept in the reference word under tag 0, its type
+tested by its box's record, so such a union has a reference word. The checker converts a union with a scalar member to
+an `Any` or a trait with `Box`, as it does a scalar; a member call through such a trait boxes the
+receiver too, keeping it a variable so `dispatch` sees the union and renders it by its tag.
+
+A tuple type pattern is tested by the tuple's record: each record of a type kept as a reference to
+an object lists `Any`'s record first among the ancestors a tuple's part is seen through, so a
+`(string, int)` is an `(Any, int)`, and a tuple type with an `Any` part is never tested by its record
+alone. A part naming a union of references, erased to `Any` in the record, is then tested on the
+object the tuple holds there (`union_part_tests`).
 
 A method with type parameters of its own, a trait's or an overridable class method, holds a
 position in the checker's tables like any other, but no one function fills it: each list of its own

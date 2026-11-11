@@ -24,6 +24,27 @@ of any type is expected:
 val n: int = if ok then 1 else fail("no")    // avin: trap: no at main.avin:2:36
 ```
 
+Beside it the prelude has two more that stop the program, each at its own call:
+
+- **`require(condition)`** and **`require(condition, message)`** check what a function was given:
+  where `condition` is false they trap with `requirement failed`, or `requirement failed: ` and the
+  message. The message is passed [by name](/spec/by-name/), so it is built only when the requirement
+  fails. `assert` (see [tests](/spec/declarations/#tests)) states what the program itself
+  guarantees; `require` states what its caller owes.
+- **`todo()`** and **`todo(message)`** stand for code not yet written. They have type `Nothing`, as
+  `fail` has, so a branch of any type may be one; reached, they trap with `not implemented`, or
+  `not implemented: ` and the message.
+
+```text
+half(n: int) -> int
+    require(n % 2 == 0, s"$n is even")   // avin: trap: requirement failed: 3 is even at main.avin:2:5
+    n / 2
+
+area(s: Shape) -> real = s match
+    Circle(r) -> r * r * 3.14159
+    Polygon(_) -> todo("polygons")       // avin: trap: not implemented: polygons at main.avin:7:19
+```
+
 **The location is in the program's own code.** A trap reached inside the core library, whether the
 library asked for it, as `m(k)` on a missing key does, or a check failed there, such as an overflow,
 reports the place where the program last called into the library, with the library's reason:
@@ -137,6 +158,11 @@ only for `None`, on the other. It also has `okOr[E](error: E) -> Result[T, E]` a
 `okOrElse` calls only for `None` (`Result`'s `ok()` and `err()` go the other way). It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
 `Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
 `isEmpty()`. There is no `orNull`, since Avin has no null.
+
+The companion makes an option from a condition: `Option.when(condition, value)` is `Some(value)`
+where `condition` holds and `None` where it does not, and `Option.unless(condition, value)` the other
+way round. The value is passed by name, so it is evaluated only for `Some`, and once:
+`Option.when(n > 0, expensive(n))` calls `expensive` only for a positive `n`.
 
 An `Option[T]` is an `Ord` when `T` is: `None` orders before every `Some`, and two `Some`s order as
 their values. So `derives Ord` works on a data type with an `Option` field, a `Vector[Option[int]]`

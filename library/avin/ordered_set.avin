@@ -1,0 +1,220 @@
+module avin
+
+// A set whose iteration visits the elements in the order they were first added: adding an element
+// already present leaves it where it was, and a removed element added again goes to the end. `SeqSet`
+// is the trait, a `Set` with that order; `OrderedSet` is the immutable set that conforms to it. An
+// update through `SeqSet` answers a `SeqSet`. Two sets are equal when they hold the same elements, so
+// an `OrderedSet` equals a `HashSet` of the same elements whatever order each was built in.
+trait SeqSet[A]: Set[A]
+    override incl(element: A) -> SeqSet[A]
+
+    override excl(element: A) -> SeqSet[A]
+
+    override ++(other: Iterable[A]) -> SeqSet[A]
+        var s: SeqSet[A] = self
+        for x in other do s = s.incl(x)
+        s
+
+    override --(other: Iterable[A]) -> SeqSet[A]
+        var s: SeqSet[A] = self
+        for x in other do s = s.excl(x)
+        s
+
+    // The elements in this set, then those of `other` that it lacks, in their order.
+    override union(other: Set[A]) -> SeqSet[A] = self ++ other
+
+    override intersect(other: Set[A]) -> SeqSet[A] = filter(x -> other.contains(x))
+
+    override diff(other: Set[A]) -> SeqSet[A] = filter(x -> !other.contains(x))
+
+    override filter(p: (A) -> bool) -> SeqSet[A]
+        var s: SeqSet[A] = self
+        for x in self
+            if !p(x) then s = s.excl(x)
+        s
+
+    // The elements from the last added to the first.
+    reverseIterator() -> Iterator[A]
+
+// The seq set companion builds ordered sets, typed as seq sets, as a set literal does where a
+// `SeqSet` is expected.
+object SeqSet
+    // A seq set with no elements.
+    empty[A]() -> SeqSet[A] = OrderedSet[A](Empty, Vector.empty[Option[A]](), 0)
+
+    // A seq set of the elements given, in order, each equal one once.
+    apply[A: Eq + Hash](elements: A*) -> SeqSet[A]
+        var s = OrderedSet.empty[A]()
+        for x in elements do s = s.incl(x)
+        s
+
+    // A builder of a seq set: the elements it is given, in order, each held once.
+    newBuilder[A]() -> Builder[A, SeqSet[A]] = OrderedSetBuilder[A]()
+
+// The insertion-ordered immutable set, laid out as `OrderedMap` is: the elements in `slots` in the
+// order of their first addition, a removed one leaving a gap (`None`) dropped when gaps come to
+// outnumber the elements, and `index` finding an element's slot by its hash. `OrderedSet.empty[A]()`
+// is the empty set, and `OrderedSet.newBuilder[A]()` builds one from elements.
+data OrderedSet[A: Eq + Hash](
+    index: HashTrie[A, int] = Empty,
+    slots: Vector[Option[A]] = Vector.empty[Option[A]](),
+    live: int = 0
+)
+
+impl[A] SeqSet[A] for OrderedSet[A]
+    size() -> int = live
+
+    isEmpty() -> bool = live == 0
+
+    nonEmpty() -> bool = live != 0
+
+    contains(element: A) -> bool = trieFind(index, spreadHash(element.hash()), element) is Some(_)
+
+    incl(element: A) -> OrderedSet[A]
+        val h = spreadHash(element.hash())
+        if trieFind(index, h, element) is Some(_) then return self
+        OrderedSet[A](trieInsert[A, int](index, h, element, slots.length()), slots :+ Some(element), live + 1)
+
+    excl(element: A) -> OrderedSet[A]
+        val h = spreadHash(element.hash())
+        trieFind(index, h, element) match
+            Some(i) -> compactedSet(trieRemove(index, h, element), slots.updated(i, None), live - 1)
+            None -> self
+
+    ++(other: Iterable[A]) -> OrderedSet[A]
+        var s = self
+        for x in other do s = s.incl(x)
+        s
+
+    --(other: Iterable[A]) -> OrderedSet[A]
+        var s = self
+        for x in other do s = s.excl(x)
+        s
+
+    union(other: Set[A]) -> OrderedSet[A] = self ++ other
+
+    intersect(other: Set[A]) -> OrderedSet[A] = filter(x -> other.contains(x))
+
+    diff(other: Set[A]) -> OrderedSet[A] = filter(x -> !other.contains(x))
+
+    filter(p: (A) -> bool) -> OrderedSet[A]
+        var s = self
+        for x in self
+            if !p(x) then s = s.excl(x)
+        s
+
+    iterator() -> Iterator[A] = OrderedElements(slots, false)
+
+    reverseIterator() -> Iterator[A] = OrderedElements(slots, true)
+
+impl[A] OrderedSet[A]
+    // The elements that satisfy `p` and those that do not, as two ordered sets that keep the order
+    // of this one; `p` is called once for each element.
+    partition(p: (A) -> bool) -> (OrderedSet[A], OrderedSet[A])
+        var yes = self
+        var no = self
+        for x in self
+            if p(x) then no = no.excl(x) else yes = yes.excl(x)
+        (yes, no)
+
+    // Calls `f` with each element, in order.
+    foreach(f: (A) -> unit)
+        for x in self do f(x)
+
+// A set of these parts, its gaps dropped and its elements renumbered once they are more than half the
+// slots (and more than a few).
+private compactedSet[A: Eq + Hash](index: HashTrie[A, int], slots: Vector[Option[A]], live: int) -> OrderedSet[A]
+    if live == 0 then return OrderedSet[A](Empty, Vector.empty[Option[A]](), 0)
+    if slots.length() - live <= 8 || slots.length() <= 2 * live then return OrderedSet[A](index, slots, live)
+    var t: HashTrie[A, int] = Empty
+    val b = Vector.newBuilder[Option[A]]()
+    var n = 0
+    for slot in slots
+        if slot is Some(x)
+            t = trieInsert[A, int](t, spreadHash(x.hash()), x, n)
+            n = n + 1
+            b.addOne(slot)
+    OrderedSet[A](t, b.result(), live)
+
+// Steps through the slots of an ordered set from the first or the last, skipping gaps.
+private class OrderedElements[A](slots: Vector[Option[A]], reverse: bool): Iterator[A]
+    private var at: int = if reverse then slots.length() - 1 else 0
+    private var ready: Option[A] = None
+    advance()
+
+    override hasNext() -> bool = ready is Some(_)
+
+    override next() -> A = ready match
+        Some(x) ->
+            advance()
+            x
+        None -> fail("next on an exhausted iterator")
+
+    // Moves the next element, if any, into `ready`.
+    private advance()
+        ready = None
+        while ready is None && 0 <= at < slots.length()
+            ready = slots(at)
+            at = if reverse then at - 1 else at + 1
+
+impl[A] Eq for OrderedSet[A]
+    equals(other: OrderedSet[A]) -> bool = size() == other.size() && subsetOf(other)
+
+// A sum over the elements, so that the hash does not depend on the order they are visited in; a hash
+// set of the same elements hashes alike.
+impl[A] Hash for OrderedSet[A]
+    hash() -> long
+        var h: long = 0
+        for x in self do h = h +% spreadHash(x.hash())
+        h
+
+// A set of displayable elements displays as `{1, 2, 3}`, in insertion order. A field width pads the
+// whole.
+impl[A: Display] Display for OrderedSet[A]
+    display(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: A) = x.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+// A set's diagnostic form is its elements' diagnostic forms in braces, in insertion order.
+impl[A: Debug] Debug for OrderedSet[A]
+    debug(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: A) = x.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+object OrderedSet
+    // An ordered set with no elements.
+    empty[A]() -> OrderedSet[A] = OrderedSet[A](Empty, Vector.empty[Option[A]](), 0)
+
+    // An ordered set of the elements given, in order, each equal one once: `OrderedSet(3, 1, 2)`.
+    apply[A: Eq + Hash](elements: A*) -> OrderedSet[A]
+        var s = OrderedSet.empty[A]()
+        for x in elements do s = s.incl(x)
+        s
+
+    // An ordered set of the elements of `elements`, in order, each equal one once, at its first
+    // place.
+    from[A: Eq + Hash](elements: Iterable[A]) -> OrderedSet[A]
+        val b = OrderedSetBuilder[A]()
+        b.addAll(elements)
+        b.result()
+
+    // A builder of an ordered set: the elements it is given, in order, each held once.
+    newBuilder[A]() -> Builder[A, OrderedSet[A]] = OrderedSetBuilder[A]()
+
+// Builds an ordered set from elements, an element added twice held once.
+class OrderedSetBuilder[A: Eq + Hash]: Builder[A, OrderedSet[A]]
+    private var set: OrderedSet[A] = OrderedSet.empty[A]()
+    private var spent = false
+
+    override addOne(element: A)
+        if spent then fail("add to a builder whose result was taken")
+        set = set.incl(element)
+
+    override result() -> OrderedSet[A]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        set
+
+    override clear()
+        set = OrderedSet.empty[A]()
+        spent = false

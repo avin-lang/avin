@@ -58,7 +58,8 @@ a decision changes, this page and the chapter change together.
   call a method or use `self`; a parameter's name in them reads the argument.
 - A subclass's fields are its superclass's, in order, then its own. Fields are never overridden.
 - Only public methods can be overridden. An override takes the same parameter types and yields the
-  same result or, for a class result, a subclass of it (covariant results). An override cannot be
+  same result or a type seen as it with no conversion (covariant results; see the Proposed entry
+  on override results below). An override cannot be
   private. A method with type parameters of its own is overridden by one declaring as many, matched
   by position (bounds, once they exist, must match too).
 - An abstract method is a method without a body, allowed only in an `abstract` class; an abstract
@@ -1125,7 +1126,8 @@ Settled by the user on 2026-11-04:
   `MaxValue`, `MinValue`, `MinPositiveValue`, `PositiveInfinity`, `NegativeInfinity` and `NaN`, all
   compile-time constants. Narrowing integer conversions (`i8(x)`, `int(l)`, `T(n)`, and a byte or char to
   a narrower integer) trap when the value does not fit; real-to-integer still saturates. The wrapping
-  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. Not yet: the limits of a type parameter bounded by `Integer` (`T.MaxValue`).
+  form, `i8.wrap(x)` (spelling proposed below), keeps the low bits. A type parameter bounded by `Integer` has the limits too, `T.MaxValue` and
+  `T.MinValue`, each instance's own ([generics](/spec/generics/)).
 - Settled by the user 2026-11-04: Nested data types ([generics](/spec/generics/#polymorphic-recursion)): a data type naming itself
   at a larger instance in its fields (`Deeper(inner: Tree[Nest[T]])` in `Tree[T]`) is rejected at
   the type as polymorphic recursion, even where no code compares, hashes or shows it, since every
@@ -1319,7 +1321,9 @@ Settled by the user on 2026-11-04:
   follows, it and the definitions before it after the same generator pair each element with its
   value through the source's `map`, so it is evaluated for every element before that guard tests
   any, and over a set or map the pair has to be hashable. A definition may not rebind a name its
-  generator or an earlier definition after it binds; a later generator may.
+  generator or an earlier definition after it binds; a later generator may. Settled on the user's
+  delegation 2026-11-11 as no longer open: built and pinned at `-O0` and `-O2` by
+  `tests/run/for_yield_definitions.avin` and `tests/run/spec_collections_comprehensions.avin`.
 - Settled by the user 2026-11-04: Comprehensions over the mutable collections ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   a mutable `Set` and `Map` have `withFilter`, a lazy view as the immutable ones have, and a
   mutable `Map` a `map` over its entries as pairs, so the first source's kind decides the result as
@@ -6017,6 +6021,844 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the user whether a public library type mirroring a package's enum is wanted: a variant `openssl`
   adds must be added to `TlsRefusal`, which Sysl reports as not matching until it is.
 
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **Each emitted table is named `@"avin.<kind>:<name>"`, the name
+  spelled by qualified names in full, with no hash suffix**: a type as `avin.Option[int]`,
+  `class geo.Box[]`, `object geo.Box[]`, `(int, string)`; a descriptor by its type, a variant after
+  its type's (`avin.Option[int].Some`); a record by its type; a constant closure by its function; a
+  module-level value by its qualified name (`object ` before an object's). WHY: readable in the
+  emitted text and in a profile, injective by construction (two types of one module never share a
+  name but an object and its companion, which the prefixes tell apart), and short enough: marshal's
+  longest symbol is 319 bytes, 275 of its 111,642 symbols are over 200, and every one is local to
+  the program, so no linker or object format limit is near. The emitted text grew 11% (126 MB to
+  140 MB for marshal). Alternatives: a hash of the spelling (shorter, unreadable, and a collision
+  is silent until the assembler reports it); the spelling cut at a length with a hash of the rest
+  (not needed at these lengths). Emission stops with the name where two of one kind would share
+  one, rather than the assembler reporting a redefinition.
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A string constant is named by the first 16 hexadecimal digits
+  of the SHA-256 of its bytes**, a later string sharing them by its index after a dot. WHY: the same
+  string has the same name in every program and every build; 64 bits make a shared prefix within one
+  program improbable past any program's size. Alternatives: the whole digest (32 more bytes on each of
+  thousands of strings); the text itself (unbounded, and escaping in a symbol).
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A trap site is named by the innermost top-level function or
+  method declared around it, the byte offset from that declaration's start, and 12 hexadecimal
+  digits of the SHA-256 of its reason**; a site in code the compiler wrote (an empty span) by the
+  instance being lowered; one in a declaration the checker copies (a derived `Display` and its
+  siblings, one method name on several types sharing a declaration) or outside every function by its
+  file and offset. Trap sites are never copied into the units that reach them at `-O2`. WHY: lines
+  added above a function move its sites' lines, which only the tables' unit holds, and leave every
+  function's text as it was; a copy of a site, which no code reads, would carry its line into the
+  units that reach it. Alternatives: the instance and its sites in order (a site is shared by every
+  instance of a generic function, so its name would depend on which instance was lowered first);
+  file and line (moves with every line added above). Review with the user: a site in a library
+  template is named by file and offset, which an edit to that library file moves.
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A local function or lambda is numbered among its top-level
+  function's local functions of its name, from 1 in declaration order** (`<program>.pick.lambda#2`).
+  WHY: two blocks may each declare a local function of one name, and the number counts only within
+  the function, which an edit elsewhere never changes. Alternatives: the checker's symbol index
+  (moves with every symbol declared before it); the byte offset within the function (moves with an
+  edit above the lambda inside the function, which changes the function's text anyway, and is longer).
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A shared constant object is named by a hash of what it holds,
+  an unshared one (a vector literal's) by its module-level value and its place among that value's
+  objects; a C trampoline by its binding and place.** WHY: equal shared objects are one object
+  already, so their content is their identity; an unshared object's identity is its value's.
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **A module-level value that holds a reference keeps its slot in the
+  roots frame, and its name is a private alias of that slot**; code names the alias. WHY: the slot's
+  position moves when a value is added before it, and the alias keeps that position in the tables'
+  unit alone; the runtime's view of the frame is unchanged. Alternatives: a global per value and a
+  frame of addresses (a runtime change for the same effect).
+- Settled on the user's delegation 2026-11-11 (built on branch `stable-names`): **The module-level tables are the last codegen unit of `n`, the
+  functions spread over the other `n - 1`, and a unit holds its pieces in the order of their names.**
+  WHY: a new string, type or trap site then changes the tables' unit and its user's alone, and a
+  unit whose own pieces are unchanged is the same text whatever order lowering found them in.
+  Alternatives: tables in the first unit that names them (a new early user moves them, changing two
+  units); one unit per kind of table (more units for no fewer recompilations). Left as it was: a
+  function called from one function alone still lives in its caller's unit, so a second caller in
+  another unit moves it; and a small function copied into its callers' units at `-O2` makes an edit
+  to it recompile those units too.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `manifest-avin-version`): **a package names the least Avin it builds with**
+  ([the manifest](/spec/packages/#the-manifest), [the Avin a package
+  needs](/spec/packages/#the-avin-a-package-needs)). `avin = "0.0.18"` in the `package` block, a
+  version, met by that Avin and every later one, compared number by number (0.0.9 before 0.0.18).
+  A minimum only: no ranges, no upper bound, no pre-release suffixes. Every package of the
+  resolved graph is held to it, the root and each dependency at any depth, fetched or by path, by
+  every command that reads manifests (build, run, test, check, `add`, `tidy`, `vendor`); a package
+  needing a later Avin is refused at its `avin` value, naming the package, its requirement and the
+  running version and saying to upgrade, before anything else wrong in that manifest. A malformed
+  value is an error at the value. `avin new` writes the running Avin's version. `avin lsp` reports
+  it on `avin.hocon` when the editor opens one, and on the manifest of the package a file being
+  edited belongs to. *Why*: `cairo` needed 0.0.18 and could only say so in its README, and a
+  package that needs a feature should fail with the upgrade named rather than with an unknown key
+  or a type error. The key's spelling follows `sysl.hocon`, which names the Sysl a package needs
+  as `sysl = "0.9.20"` in its `package` block. A minimum, because Avin's versions only add: a
+  later Avin that breaks a package is a bug or a deliberate break in a release, which a range
+  written in advance cannot foresee, and an upper bound would refuse every upgrade until each
+  package re-releases. Checked when each manifest is read, so every path that reads one is held to
+  it without a second walk of the graph; told first, because a manifest written for a later Avin
+  may hold a key this one does not know. *Alternatives*: a range (`>=0.0.18, <0.1`), refused for
+  the reasons above; a top-level `avin` key or a `requires { avin = … }` block (Sysl puts its own in
+  `package`); a warning rather than an error (the build would then fail later and less clearly);
+  checking only the root package (a dependency's need is the common case, as with `cairo`). Review
+  with the user whether `avin new` should write the running version (it ties a new package to the
+  Avin that made it, which may be later than the package needs).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
+  part (identity, body fingerprint, interfaces read) and the world facts the whole-program steps
+  decided for it, both made on every build after lowering** ([the instance
+  key](/compiler/#incremental-builds)). The facts are recorded where they are decided, as each step
+  runs: the slots of methods with type parameters of their own, each devirtualization decision at a
+  call through a table (not the whole set of descriptors a receiver type admits), and each summary
+  scalar replacement read, with the finished key of every function it inlined (never one that may
+  recur, so the inlined keys form no cycle). WHY: a decision is exactly what a step's rewriting of
+  a function depends on, so a new implementing class changes the keys of only the calls whose
+  decision it changes, and a callee's body edit reaches a caller only through a changed summary or
+  an inlining; and the cache (item 6) can reuse a lowered form on the first part and rerun only the
+  passes on the second. Alternatives: the callee's key for every summarized callee, as the pipeline
+  first wrote it (every leaf edit would reach every transitive caller); the admitted descriptors
+  rather than the decision (a class added past the guard limit would change keys for no change).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **The body fingerprint is per function, with its family's
+  captures, not per family.** A local function or lambda and its top-level function share one table
+  of locals; each fingerprint holds its own tree, the locals it owns or captures, and what every
+  function of the family captures (with each captured local's type and mutability), which decides
+  what is kept in a box. WHY: a lambda's body edit then changes the lambda and its closure entry and
+  not the function around it, unless its captures change. Alternatives: one fingerprint for the
+  whole family (every edit in it changes every member; simpler, and what the first build did).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **Places in the fingerprint follow trap-site naming**: a node
+  inside its declaration counts from the declaration's start; a node outside it (a constant default
+  argument copied into a call keeps its place in its own file) is named as `trap_name` would name
+  a trap there; a derived impl's shared template counts from the start of its file; the compiler's
+  own code (an empty span) is named by the instance. A constant's place is left out: no trap is
+  named by it. WHY: a trap site's name is the only place a function's text holds, so this is the
+  least that keeps the key sound; lines added between declarations change no key. A comment inside
+  a function changes its key whether or not a trap site follows it. Alternatives: only the places of
+  nodes that can trap (needs lowering's knowledge of which do, duplicated); no places at all
+  (unsound: an edit moving a trap site changes the text).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **What a key reads of types is conservative where the text
+  rarely depends on it**: every type argument's supertypes and method table (they choose the method
+  a call on a bound runs), and a class's or data type's whole layout for any read of a field (its
+  field types in order, never the names). So a new impl for a type changes the instances at that
+  type that never call through a bound, and a field appended to a class changes the readers of its
+  earlier fields; both cost a rebuild, never a stale instance. Review with the user if the cache's
+  hit rate after edits like these matters: narrowing needs the bound calls and the fields read
+  recorded during lowering, as the other facts are. Alternatives: record during lowering exactly
+  which table entries and fields each instance used (precise, more state threaded through
+  lowering).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **The key names the compiler by its version and its
+  executable's path and modification time, not the level.** WHY: lowering does not depend on the
+  level, and the pipeline keeps one instance directory per level. Alternatives: the level in the key
+  as well (redundant with the directory), the executable's hash (reads 8 MB per build).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **A lowered entry is the instance's requests and its
+  code by name, replayed; not a record of lowering's state** ([the instance
+  cache](/compiler/#incremental-builds)). Every request lowering an instance makes of the whole
+  program goes through one function of lowering (seventeen of them: a layout, a record, an object's
+  record, a box, a value box, a type tested, a string, a trap site, an instance, a generated
+  function, a slot, a slot of a method with type parameters of its own, a closure's shape, a constant
+  closure, a constant object, a call through a table, a call of a function value), which records it
+  while the instance is lowered for the cache; the outermost request alone is recorded. The code
+  names what it counts by its stable name. WHY: replaying a request runs the same code a fresh
+  lowering runs, so the instances, tables and records grow exactly as they would, in the same order,
+  and an incomplete record fails to read back (an unknown name) rather than silently differing. A
+  binding, a C callback and a C binding's body mark the instance as one no entry holds.
+  Alternatives: the difference in lowering's state before and after each instance (state is keyed by
+  the checker's indices, which an edit moves); a module's whole lowered program (a change anywhere
+  in the module loses all of it).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **Only the program's functions with bodies get lowered
+  entries.** Closure entries, bindings and the functions lowering makes (equality, hashing, rendering,
+  adapters, C callbacks) are lowered every build; every function gets a text entry. WHY: they are
+  small and many of them depend on the whole set of types; on marshal they are about 17,000 of
+  41,583 instances and a fraction of lowering's time. Alternatives: entries for every kind
+  (each kind's requests would need recording; generated functions read tables the worklist is still
+  filling).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **A text entry is keyed by the finished key and the
+  facts emission reads of the whole program**: for each call, the callee's symbol and signature,
+  whether it may collect and whether the call may close a cycle of the call graph, and a shim's
+  extensions. WHY: these decide the frame, the polls and the calling convention of a function's text
+  and are not in its finished key, which covers its code. Alternatives: emission facts in the
+  finished key itself (the keys would depend on emission's call graph); a hash of the finished code
+  (costs an encoding of every function each build).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The passes still run over every instance on every
+  build**; devirtualization's fixed point runs over per-function summaries (the set of objects a
+  receiver or a result may be) and rewrites only functions that call through a table, and the
+  dispatch sites are found once per position and class or trait. Both give byte-identical text.
+  WHY: measured on marshal, the passes are not where lowering an unchanged instance costs most, and
+  running them only where facts changed needs every function's post-pass code, scalar summary and
+  fence fact cached under a key over its callees' (a key over a cone of the call graph, with
+  dispatch targets as edges); that is a design of its own. Review with the user: it is what stands
+  between the cache and a lowering phase proportional to an edit. Alternatives: build the cone keys
+  now.
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The cache is opt-in in this step**: `AVIN_INCREMENTAL`
+  (`on`, `verify`, `off`) for `avin build` and `avin emit-llvm`, in
+  `.avin/build/incremental/<kind><level>/`. WHY: item 7 of the plan makes `build`, `run`, `test` and
+  the language server use it by default once the corpus has run warm. Alternatives: on by default now.
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The store is a file per module named by a hash of
+  its module and keys, with a length and CRC-32 header, a manifest written last, and no lock**; a
+  file is kept only if the build read it whole, and files neither named nor used in the last hour are
+  trimmed, with no size limit. WHY: a name from the keys costs nothing to compute (a content hash
+  would hash about 190 MB per build on marshal), the CRC catches truncation and damage, and two
+  builds write the same bytes for the same keys. Alternatives: an entry per file (41,000 files per
+  build); a SHA-256 per file; a size limit as the unit cache has (the unit cache's hour rule already
+  keeps it to what recent builds used).
+- Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **`verify` compares the whole text and names the first
+  function that differs**, in the clean build's order, or the first line where no function does.
+  WHY: the function's symbol says which key missed a dependency; its key adds nothing a reader can
+  act on. Alternatives: compare instance by instance before emission (needs the clean build's
+  instances matched to the cached build's).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-string`): **String
+  character-wise and parsing methods.** Choices the spec did not settle, in [`types.md`](/spec/types/#string):
+  - **`toBool` is exact.** Only `"true"` and `"false"`; `toBool` traps with the number-parse
+    message (`For input string: "…"`) on anything else, `toBoolOption` answers `None`. *Why:* a
+    parse that accepts `"True"`, `"1"` or `"yes"` hides data errors, and the exact form is the one
+    every program can state. *Alternatives:* case-insensitive; also `"1"`/`"0"`.
+  - **A `radix` outside 2 to 36 traps, in the `Option` forms too.** *Why:* a bad radix is the
+    caller's bug, not bad input, so `None` would hide it. *Alternative:* `None` from the `Option`
+    forms.
+  - **Radix digits are ASCII `0`–`9` and `a`–`z`, either case**, with the optional `+`/`-` sign of
+    the decimal forms, and no prefix (`"0x10".toInt(16)` is not a number). *Alternatives:* accept a
+    `0x`/`0b` prefix where it matches the radix.
+  - **`split(sep, limit)`: `limit` is the most pieces; the last holds the remaining text.** A
+    `limit` of 0 or less means no limit, 1 returns the whole string as one piece. *Why:* the
+    reading that needs no special negative case beyond "no limit". *Alternatives:* a limit of 0
+    dropping trailing empty pieces; a negative limit trapping.
+  - **`stripLineEnd` removes one terminator, `\n` or `\r\n`, never a lone `\r`**, agreeing with
+    `lines()`, which does not end a line at a `\r` either. *Alternative:* also a lone `\r`.
+  - **`compareIgnoreCase` compares the two after `toLowerCase`**, as `equalsIgnoreCase` equates
+    them, so its sign is `compare` of the lower-cased strings. *Alternative:* comparing character by
+    character after upper-casing.
+  - **`charIterator()` is a lazy `Iterator[char]` reading the string by offset**, with `next()` on
+    an exhausted one trapping like every iterator. `map`/`flatMap`/`filter` on a string answer a
+    `string`, not an iterator, and `tail`/`init` trap on the empty string as `Seq`'s do.
+  Review with the user: whether `toBool` should be this strict, and whether the `Option` forms
+  should answer `None` rather than trap for a radix outside 2 to 36.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordering`): **`clamp(x, lo,
+  hi)` is a free function, and `Vector` has no `Ord` yet.** A method
+  `x.clamp(lo, hi)` on every `Ord` type needs `impl[T: Ord] T`, which the checker refuses (an impl
+  adds to a type parameter only where it is bounded by `Integer` alone), so `clamp` is a free
+  function beside `max` and `min`, which are free functions too; it traps where `hi < lo`. Why: it
+  reads like `max`/`min` and needs no language change. Alternatives weighed: widening the blanket
+  impl rule (a language change with a wide reach); a method on `Integer` only (leaves strings,
+  chars and reals without). `impl[T: Ord] Ord for Vector[T]` is refused because `Vector` is an
+  abstract covariant class, whose added methods are variance positions, and `compare(other:
+  Vector[T])` takes `T` in; `ArraySeq` is a final class and has its `Ord`. `Seq[T]` gets no
+  `compare` method. Review with the user: how `Vector` should be `Ord`. The recommendation is that
+  a method a trait impl adds, and no subclass overrides, is called through the static type rather
+  than the method table, which would make `compare` on a covariant abstract class sound; that is a
+  language change, so it waits for the user.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordering`): **`Reverse`,
+  `compareBy`, `reverseOrder` and `thenBy` are in `avin` as plain names.**
+  `Reverse` is a `data` type with `Ord` reversed and equality as `T`'s; descending sorts are written
+  with it rather than a `sortedDescending()`. Why: it composes inside tuple keys, which a
+  descending method cannot. Alternatives weighed: `sortedDescending`/`sortByDescending` on `Seq`
+  (do not combine with a second key).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-seq`): **Seq search, slices
+  and combinatorics**, [collections](/spec/collections/):
+  - **`search` answers the first of equal elements.** `Found(i)` is the lowest index holding an
+    element equal to the one searched for, found by a lower-bound halving, so the answer is
+    deterministic. Why: a binary search that stops at the first hit returns whichever duplicate the
+    midpoints reach, which no caller can rely on and a test cannot pin; the lower bound costs the same
+    O(log n) comparisons and makes `Found(i)` and `InsertionPoint(i)` one index (`i` is where the
+    element is or would go, the insertion point of an equal element being its first). Alternatives:
+    any equal element, unspecified (cheaper by at most one comparison, not testable); the last one.
+  - **`search(x, from, until)` holds its window to the sequence** (`until` to `0 .. n`, then `from` to
+    `0 .. until`) rather than trapping, as counts are held (`take`, `drop`) and unlike `slice`, which
+    traps. Why: the window is a bound on where to look, not an index range to read, and an empty or
+    out-of-range one has the clear answer `InsertionPoint` of its edge. Alternative: trap as `slice`
+    does. `searchBy(key, wanted)` is included (the plan marked it optional); it takes the key
+    function first, as `sortBy`'s sibling `distinctBy` does, and `K: Ord`.
+  - **`combinations` and `permutations` are distinct by `equals` and ordered by first appearance.**
+    The classes of equal elements are found with a hash map on the elements (as `distinct` does), so
+    `equals` and `hash` must agree, and the vectors come in dictionary order of the classes' first
+    appearance. Why: the dictionary order is stepped with O(k) or O(n) work and no memory beyond the
+    class counts, and needs no `Ord`. Alternatives: the order of a recursive generation, which differs
+    for a multiset; positions rather than values (every permutation of equal elements, n! of them).
+    `k < 0` or `k > n` gives an empty iterator, `k == 0` and the empty sequence's permutations one
+    empty vector.
+  - **`indexOfSlice` and `lastIndexOfSlice` find the empty slice where the edges allow**: at
+    `max(from, 0)` while that is no further than the length, and at `min(end, n)` while `end >= 0`;
+    `lastIndexOfSlice(slice)` is the form with `end` the length, written as an overload as
+    `lastIndexOf` is. `patch` holds `from` to `0 .. n` and a `replaced` below 0 to 0 rather than
+    trapping, and takes `other` as an `Iterable[W]` with `W >: T`, widening as `++` does.
+    `reduceRightOption` accompanies `reduceRight` as `reduceOption` accompanies `reduce`.
+    Alternative for all: trap on an out-of-range count, as `slice` does for indices.
+  - **`inits()` and `tails()` copy the elements into a vector once and slice it per step**, so each
+    step is O(log n) and the n + 1 vectors share structure; they are lazy iterators, not a vector of
+    vectors. `transpose()` of rows of different lengths traps (the plan's decision), and answers an
+    empty vector, not a vector of empty ones, for no rows; for rows that are all empty it answers
+    empty too.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **the integer methods are an inherent impl over `Integer`, not
+  members of the trait.** `abs`, `sign`, `pow`, `gcd`, `lcm`, `floorDiv`, `floorMod`, `bitCount`,
+  `leadingZeros`, `trailingZeros`, `isPowerOfTwo` and `toRadix` are written once in
+  `library/avin/integer.avin` as `impl[T: Integer] T`, which the core library may declare. Why: it
+  gives every width the methods with no new trait and no change to the closed bound. The cost: a
+  type parameter bounded by `Integer` sees only the trait's members, so generic code cannot write
+  `x.abs()`. Alternatives weighed: putting the methods in `Integer` as required members (every
+  width implements them, but "no type implements it" then has an exception, and the arithmetic
+  traits would grow by a dozen); leaving them to free functions (`math.abs(x)`, unlike
+  `x.compare(y)`). Review with the user: whether generic code should reach these methods, which
+  means making them members of `Integer`.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **the bitwise and shift operators work on a type parameter
+  bounded by `Integer`.** `x & y`, `|`, `^`, `<<` and `>>` on a `T: Integer` are the machine's
+  operators at each instance's width, with both operands `T` (`x >> T(1)`); the checker had treated
+  every operator on a type parameter as a call of a method of that name, so `Integer` code had no
+  bit operations at all. Why: the bound is documented as having every integer operation, and the
+  integer methods need them. Alternatives weighed: methods `bitAnd`, `shiftLeft` on `Integer` (a
+  second spelling of what the operators already say); doing the bit work by division and remainder
+  (slower, and unreadable). A `T` with another bound still has them only as methods.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **choices inside the integer methods.** `pow(n: int)` takes an
+  `int` exponent at every width and traps on a negative one (a fraction is not an integer);
+  `x.pow(0)` is `1` for every `x`, `0.pow(0)` included. `gcd` is never negative and traps only when
+  its value is `MinValue`'s magnitude; `lcm` is `0` when either side is, otherwise positive. `sign`
+  is an `int`, as are `bitCount`, `leadingZeros` and `trailingZeros`, which count at the width
+  (`(-1).bitCount()` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
+  case, a `-` and the magnitude, as `f"%x"` does, with no prefix, and takes `int` from 2 to 36 and
+  traps outside it. Why: each is the usual meaning, the least surprising for a program moving
+  between widths. Alternatives weighed: a `long` exponent (never needed; an `int` is enough for
+  squaring by halves); a `gcd` that keeps a negative sign (an unsigned-looking result is what callers
+  want).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-math`): **`avin.math`
+  additions.** `round(x)` returns a `long`, a tie
+  going away from zero, and converts as `long(x)` does for NaN and out-of-range values; `trunc(x)`
+  returns a `real`, as `floor` and `ceil` do, keeping a negative zero's sign; `ulp` at the greatest
+  finite value is the gap below it (a finite answer rather than infinity); `nextUp` and `nextDown`
+  leave NaN and the infinity they move towards alone. Why: `round` is the one the program usually
+  wants as an integer and `rint` is already the `real` form; the others follow the platform's
+  functions. Alternatives weighed: `round` returning `real` (no saturation story to tell, but the
+  common use then needs `long(round(x))`); `trunc` returning `long` (loses negative zero and the
+  large values). Review with the user: the `round` and `trunc` result types differ, which is
+  unusual to read.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **The eager methods added to every `Iterable` answer
+  vectors.** `scanLeft` is a `Vector[B]`, `tapEach` and `concat` a `Vector[T]` (`Vector[W]` for
+  `concat[W >: T]`), `span` and `partitionMap` pairs of vectors, and `flatten()` of a collection of
+  collections a `Vector[T]`; `grouped` and `sliding` answer the `Iterator[Vector[T]]` a sequence's
+  do, by delegating to the iterator's forms. WHY: one predictable kind, the one `partition`, `span`
+  and `scanLeft` on a sequence already answer, with no higher-kinded types to name the receiver's
+  own. Alternatives: `Iterable[B]` as the `Iterable` transformations answer (hides that it is a
+  vector), or each collection keeping a same-kind form (a long tail of overrides). Review with the
+  user: whether `tapEach` on a list should answer a list.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **An iterator's new lazy forms are added by
+  `impl[T] Iterator[T]`, not declared in the trait.** So `padTo(total, element: T)` and
+  `zipAll(other, thisElement: T, thatElement)` take the element type in a parameter of the
+  covariant `Iterator`, and the forms are found before the eager ones every `Iterable` has. An
+  iterator whose static type is only `Iterable` gets the eager forms, as with `map`. Alternatives:
+  trait members with lower-bounded parameters (`padTo[W >: A]`), which a program's own iterator
+  could override, at the cost of a widened result everywhere.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **`it ++ other` takes `other` as an ordinary
+  `Iterable` and asks for its `iterator()` only once `it` is used up**; `concat` on an iterator is
+  the same lazy join. WHY: a strict argument reads like every other call, and the iterator taken late
+  is what keeps a mutable `other` read as it is when reached. Alternative: a by-name `other`, which
+  would delay even evaluating the expression.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **`Iterator.from` is two overloads over
+  `T: Integer`, `from(start)` and `from(start, step)`,** not one with `step = 1`, since the default
+  would have to be `T(1)` of the caller's type. An element is computed when it is read, so
+  `from(int.MaxValue)` gives `int.MaxValue` and overflow traps only when the element past it is read.
+  Alternatives: a default parameter written `T(1)`; `int` and `long` overloads only.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **The companion iterators compute when read.**
+  `fill` and `continually` evaluate their by-name element at each `next()`, `tabulate` calls `f` at
+  each `next()`, `iterate` calls `f` before each element after the first, and `unfold` calls `f`
+  when `hasNext()` is asked and holds the element it gave. WHY: an iterator does no work for an
+  element that is not read. Alternative: `fill` and `tabulate` building a vector and iterating it,
+  as the sequence companions do (eager, and `fill`'s element evaluated before any is read).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-iterator`): **`grouped` and `sliding` on an iterator give the
+  windows a sequence's give**, reading the next window when `hasNext()` is asked, holding no element
+  beyond the current window, and trapping on a size or step below 1 at the call, with the messages a
+  sequence's use. `BufferedIterator[A]` is a public class with `peek()` (trapping with "peek on an
+  exhausted iterator") and `peekOption()`; `buffered()` on one wraps it again. `flatten()` is also
+  on an iterator of collections, lazily, beside the eager one on every collection of collections.
+  Alternatives: windows read at `next()` only (no lookahead, but `hasNext()` could not answer for a
+  step that skips past the end); `buffered()` answering a buffered iterator itself.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-predef`): **an impl without `for` adds methods to tuple and function
+  types** built from its parameters (`impl[A, B] (A, B)`, `impl[A, B] (A) -> B`), as the impl chapter
+  already allowed for any type built from parameters and for traits, which function types are. The
+  checker refused both ("an impl adds to a data type, a class, an object or a built-in type"; "an
+  impl for every tuple of an arity implements a trait"); that was a bug against the design and is
+  fixed. The choices the chapter did not settle: **a function type's methods reach the types that
+  are subtypes of it** (a data type or class naming it, sequences, sets, maps, partial functions), as
+  a trait's added methods reach its implementers, and **the type's own method of the same parameter
+  types is found first**, as for a trait; a tuple pattern stays exact, as other non-trait patterns
+  do. **A `@sendable` function type in the pattern matches only `@sendable` functions.** Such an impl
+  outside the core library is an extension, since the tuple and function types are the core
+  library's. Rationale: these follow the existing rules for traits and for patterns, with no new
+  rule. Alternatives weighed: matching only receivers whose static type is a function type (a
+  `Vector` would then lack `andThen`, though it is passed wherever an `(int) -> T` is); treating a
+  `@sendable` pattern as plain (its methods would reach functions that may not run on another
+  thread, against what the impl names).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-predef`): **an impl naming a tuple or function type has at least one type
+  parameter.** `impl (int, int)` with none begins a function named `impl`, since `impl` is a
+  keyword only before a type and `impl(…)` declares a function; `impl() -> int` followed by a body
+  reads either way, so no rule on the tokens can tell them apart. A part may be written out
+  (`impl[A] (A, int)`). Alternatives weighed: allowing `impl[]` (an empty list says nothing and the
+  parser refuses it for every impl); making `impl` a full keyword (breaks a function of that name).
+  Review with the user: whether an impl for one concrete tuple or function type is wanted enough to
+  reserve `impl (`.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-predef`): **`require(condition, message)` takes the message by name**, so
+  it is built only when the requirement fails, while `assert(condition, message)` takes a plain
+  string. Rationale: `require` sits at the top of ordinary functions, called on every call, and its
+  message usually interpolates the arguments; building it every time would cost the common path.
+  Alternatives weighed: a plain string, as `assert` (cost on every call); changing `assert` to by-name
+  as well (out of this item's scope; it would be a separate change to a settled API). `todo(message)`
+  takes a plain string, since it always traps. **`ensuring` is not provided**: it needs an impl for
+  every type (`impl[T] T`), which only the integer family has; a postcondition is written with
+  `require`/`assert` on the result.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-inplace`): **in-place operations on `Buffer`, `Deque` and `Array`, and
+  `StringWriter` length and clear.** Choices the spec did not settle:
+  (1) **`remove(i, n)` is an overload of `remove(i)`**, and its count parameter is named `n`, so it
+  never shadows the buffer's own `count`. A range not within the collection traps (`n` greater than
+  `length() - i` included, tested without overflow); `n = 0` at `length()` is allowed.
+  (2) **`subtractOne(x)` answers a `bool`** (whether one was taken out) rather than the collection,
+  and is declared in an `impl[T: Eq]` block, so it exists only where elements compare; it takes the
+  first match, from the front. Alternatives: returning `self` for chaining (hides a miss), and a
+  `-=` operator (a bool-valued compound assignment reads badly).
+  (3) **`filterInPlace` and `mapInPlace` trap when the predicate or function changed the length**,
+  instead of leaving the outcome unspecified or silently working on a snapshot: the check is one
+  comparison per element and turns a corrupted result into a trap at the caller's line. Alternatives:
+  iterate a snapshot (hides the bug and costs a copy), or leave it undefined.
+  (4) **`mapInPlace` takes `(T) -> T`**, since the element type cannot change in place.
+  (5) **`patchInPlace(from, other, replaced)` reads `other` first** and traps for a `from` or
+  `replaced` outside the collection, where a clamping rule would hide a wrong index.
+  (6) **`fillInPlace` is a separate name from the companion's `Array.fill`**, as `fill` there makes a
+  new array; it shares the one value as `fill` does.
+  (7) **`Array.copyTo(dest, at, from = 0, count = length() - from)`** gives `count` a default that is
+  a function of `from`, which the declaration rules allow; it is overlap-safe in both directions
+  (the copy runs backwards when `dest` is the same array and `at > from`). All ranges are checked
+  before the first element moves.
+  (8) **`StringWriter.length()` is an `int` count of bytes**, as every offset into a string is, and
+  `clear()` drops the stored text so a text already taken is unaffected. A **`write(x: Display)`
+  overload on `Writer` is not added**: it would sit beside `write(text: string)` (a `string` is
+  `Display`) and make every call a resolution by specificity for no gain, `writeDisplayed` already
+  writing any `Display` value. Revisit if a user wants `out.write(42)`. Review with the user: the
+  length-change trap in (3), and leaving out `write(x: Display)` in (8).
+- Settled on the user's delegation 2026-11-11 (built on branch `neg-nan-sign`): **Unary minus on a
+  `real` flips the sign bit of every value, NaN included** (the machine's negation, not `-0.0 - x`,
+  which leaves a NaN's sign as it was), and **`math.signBit(x: real) -> bool`** answers whether the
+  sign bit is set, so the sign of a NaN or a zero can be observed. WHY: negation is the sign flip
+  for every value in IEEE 754, and without `signBit` a program could tell a NaN's sign by no means
+  (`hash` makes every NaN one value and both print as `NaN`). Alternatives: reading the sign through
+  `copySign(1.0, x)` only (works, but reads as a trick).
+- Settled on the user's delegation 2026-11-11 (built on branch `union-mir-words`): **Values of more than one machine word in the intermediate
+  code** (the first part of the union tag-and-payload layout, under Settled → unions →
+  Representation).
+  - **Each word is a value of its own** (scalar replacement): as parameters a multi-word value is one
+    parameter per word, in a local one slot per word, in an object or a closure one field per word,
+    and a merge at a join is one slot per word. Only a result needs new forms: a signature's `rest`
+    lists the types of the words after the first; a call defines the first word as its value and each
+    later one with `CallWord`, a return gives the first as its value and each later one with
+    `ReturnWord`; LLVM returns the words as one structure, in registers. *Why*: every word is an
+    ordinary typed value, so the frame plan roots exactly the words of reference type, wherever each
+    is live across a collection point, and never a scalar word, with no change to how roots are
+    found. *Alternatives*: an LLVM structure value carried whole (the root plan would have to look
+    inside it); returning the later words through slots of the caller passed by address (a slot whose
+    address is passed is no root the plan follows); returning them through the thread's context (a
+    store and a load per word, and a window where a reference is in no frame).
+  - **Proven on tuples taken apart from calls**: `val (a, b) = f(x)`, where `f` is one of the
+    program's functions with a body (not a constructor, a trait's method or a binding) and the tuple
+    has at least two parts with runtime values, calls a copy of `f`, `f#words`, that answers with the
+    tuple's parts, one word each; every return reads the parts out of the tuple, which is then made
+    and read in one function and kept as its parts, and a call in tail position of a function yielding
+    a tuple of the same words passes its words straight on. So a recursive or large function answering
+    with a tuple no longer allocates it for a caller that takes it apart; a caller that keeps the tuple
+    calls `f` itself, which still makes it. *Why*: a real path the existing programs run, with
+    references beside scalars in every combination, and with no change to any type's representation
+    or to what a program sees. *Alternatives*: a compiler-internal pair type no program could reach
+    (exercised only by tests); every function yielding a tuple answering with words and callers that
+    keep it making it again (a made-again tuple's type record could differ from the one the function
+    made, which a type pattern on an `Any` would see).
+  - **A small function answering with words is inlined where it is called**, each later word through a
+    slot of its own, so `val (q, r) = divmod(a, b)` still makes no call and no tuple. Guarded calls
+    through a method table meet in one value, so devirtualization leaves a call of several words
+    through the table rather than guarding it. A call in tail position whose every word the block
+    returns at its own place is a tail call, its whole result returned, so functions answering with
+    words call each other in constant stack as functions yielding tuples do. *Alternatives*: never
+    inlining such functions (a call where there was none at `-O0`); no tail calls of several words
+    (deep mutual recursion through `val (a, b) = f(x)` would overflow the stack).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **`PriorityQueue` gives the greatest element first** (branch `stdlib-priority-queue`),
+  [collections](/spec/collections/#priority-queues). `PriorityQueue[T]()` orders by `T`'s `Ord`, and
+  `PriorityQueue.withOrdering(compare)` by a comparison; the element `compare` finds greatest comes
+  out first. Why: it matches `max`, which every `Ord` type already answers, and `dequeue` then takes
+  the same element `max()` would; a least-first queue is one `Reverse` or `reverseOrder` away either
+  way. Alternative: least first (the order of a sorted sequence read from the front, the usual choice
+  for shortest-path searches); it makes `PriorityQueue[int]()` the odd one out against `max`.
+  Review with the user: it is the default every caller will meet.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **A queue's `iterator()` and `toVector()` are in heap order, and `toSortedVector()` is the sorted
+  form** (branch `stdlib-priority-queue`). Heap order starts with the greatest element and is
+  otherwise unspecified; the iterator is a snapshot taken when it is made, so enqueuing or dequeuing
+  while iterating neither traps nor changes what it gives. Why: heap order costs nothing, a sorted
+  iteration costs O(n log n) and a copy, and `Iterable` conformance wants the cheap one; a snapshot
+  makes mutation during iteration defined. Alternatives: iterating in dequeue order; an iterator
+  over the live heap (cheaper, but what it gives after a change is arbitrary).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-priority-queue`): **Equal elements come out in no promised order** (branch `stdlib-priority-queue`): a binary heap
+  is not stable. Alternative: a sequence number breaking ties first-in-first-out, at the cost of a
+  word per element and a wider comparison; a caller wanting it orders by `thenBy` on its own counter.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordered-map`): **Insertion-ordered maps and sets: names, update order, equality** (branch `stdlib-ordered-map`).
+  The concrete types are `OrderedMap[K, +V]` and `OrderedSet[A]`, conforming to the traits `SeqMap[K, +V]`
+  and `SeqSet[A]`. *Why:* the concrete names say what the collection does, as `HashMap` says how it
+  finds and `TreeMap` how it sorts, and no implementation (a vector of keys) leaks into them; the
+  trait names follow the sequence-like "in the order added" meaning of `Seq`. *Alternatives:*
+  `VectorMap`/`VectorSet` (names the layout, not the behaviour), `InsertionOrderedMap`,
+  `LinkedHashMap`-style names, and `OrderedMap` as the trait with the concrete type named for its
+  layout. *Update order:* updating a key already present keeps its place and replaces its value;
+  removing and re-adding moves it to the end. *Why:* an update is not a new arrival, so a map used as
+  a record keeps its field order. *Alternative:* an update moves the key to the end. *Equality:* two
+  maps are equal when they hold the same keys bound to equal values, and two sets when they hold the
+  same elements, whatever the order, and equal ones hash alike, so an `OrderedMap` equals a
+  `HashMap` of the same entries as every kind of `Map` does. *Why:* the existing rule makes map
+  equality independent of the kind, and an order-sensitive `==` on one kind would break transitivity
+  through the traits. *Alternative:* an order-sensitive `==` between two ordered maps (reached by
+  comparing `iterator()`s). *Layout:* a hash trie from key to slot and a vector of slots, removal
+  leaving a gap, compacted when gaps exceed both eight and the entries. `map`, `collect` and
+  `flatMap` through the trait answer hash-based collections, as for `TreeMap` through `Map`. A
+  `{k: v}` or `{a, b}` literal builds one where `SeqMap`, `OrderedMap`, `SeqSet` or `OrderedSet` is
+  expected. Review with the user: the names.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-ordered-map`): **A call through a method table or a bound reaches only methods of types that conform** (branch
+  `stdlib-ordered-map`; a fix, recorded because it changes what the polymorphic-recursion check
+  reports). The type arguments of a method's own type parameters flowed into every method of the same
+  name and arity of any type, so a generic method that called a sequence's `updated` with a type built
+  from its own parameter was reported as recursing into itself. They now flow only into methods of
+  types that have the called method's class or trait among their ancestors. *Alternative:* keep the
+  name-only approximation and rename the method (rejected: `updated` is the name every map has).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-linked-map`): **`avin.collections.mutable.LinkedMap[K, V]` and
+  `LinkedSet[A]`, the insertion-ordered mutable map and set.** The choices:
+  1. *Re-binding a present key keeps its place*; `putLast(k, v)` and `moveToEnd(k)` (and a set's
+     `addLast` and `moveToEnd`) make it the newest, and a key removed and bound again is new. Why:
+     `m(k) = v` is a plain update everywhere else, and an insertion-ordered map whose update reorders
+     it would make `m(k) += 1` shuffle the iteration; an LRU cache that wants the move says so
+     with `moveToEnd`. Alternatives: every put moves to the end (access order for caches, but
+     surprising for a plain map); a constructor flag selecting access order (one type with two
+     behaviours).
+  2. *Equality and hash ignore order*: two linked maps (or sets) are equal when they hold the same
+     entries, as two mutable maps are; a `LinkedMap` is not comparable with a `Map` of the other
+     kind (they are different classes). Why: `==` on maps is about contents, and the order is
+     observable through iteration anyway. Alternative: order-sensitive equality, which makes
+     `{a: 1, b: 2}` differ from `{b: 2, a: 1}`, unlike every other map.
+  3. *The oldest and newest ends*: `headOption()` and `lastOption()` answer the ends in constant
+     time (overriding `Iterable`'s, so `head()` and `last()` trap when empty), and `removeFirst()`
+     and `removeLast()` answer the removed `(key, value)` (a set's, the element) and trap when empty.
+     Why: `removeFirst` is the eviction step of an LRU cache. Alternatives: `removeFirst` answering
+     an `Option` (an empty map is then silently ignored by a cache that expected an entry);
+     `pollFirst`-style names.
+  4. *Mutation during iteration*: replacing values and removing entries are defined (a removed
+     entry the iterator has not reached is skipped); binding new keys never traps but whether the
+     iterator visits them is not defined. Why: the entries sit in a buffer, a removal leaves a gap
+     the iterator skips, and the buffer is squeezed only by an insertion, which hands the map a new
+     buffer and leaves an iterator in progress stepping through the old one. Alternative: trapping on
+     a structural change (a version counter), which the other mutable maps do not do either.
+  5. *Representation*: a `Map[K, int]` from each key to its position, and a `Buffer` of entries in
+     insertion order with gaps for removed ones, squeezed when gaps are half of at least 32
+     positions; every operation is amortized constant time. Alternative: open addressing with
+     order links threaded through the table, one structure instead of two but a second copy of the
+     table's removal logic; it can replace this without changing the API.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-queue`): **`Queue[+T]` (immutable, two lists), built by the stdlib-queue branch.**
+  - *Choice:* `Queue` is an abstract covariant class with a private two-list implementation, so its
+    constructor cannot be called with a state that breaks the invariant (the front is empty only
+    when the back is). It has `Queue(xs*)`, `Queue.empty[T]()` and `Queue.newBuilder`, but no
+    `tabulate` or `fill`, no `++`, and no literal form. `dequeue()` answers `(T, Queue[T])`;
+    `front()` is the name of the head read; `apply(i)` is O(i) and `map`/`filter` answer queues.
+  - *Why:* the abstract class keeps the invariant that gives constant-time `front()` and amortized
+    constant `dequeue`; a pair return keeps the type immutable; `Seq` conformance gives equality,
+    hashing and the sequence methods for free, so a queue equals a vector of its elements.
+  - *Alternatives weighed:* a `data` type with public `Cons`-like variants (exposes the lists and the
+    invariant); a banker's queue with lazy rebalancing (worst-case bounds, but heavier and no
+    better for the usual single-threaded use); `dequeue` answering `Option` only (loses the trap
+    that every other `removeHead` has); `head`/`tail` names only (they remain, from `Seq`, with `tail`
+    answering a `Vector`).
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` (immutable and mutable): representation and negatives** (branch `stdlib-bitset`).
+  Proposed: the immutable `BitSet` is a class over a `Vector[long]` of words, kept without empty words
+  at the end, so an update copies one path and `toBitMask()` is the words; the mutable one is over a
+  `Buffer[long]`. A negative element is not in any bit set: `contains` and `excl`/`remove` treat it as
+  absent (`false`, set unchanged), and everything that would add one traps (`incl`, `++`, `apply`,
+  the builder, `add`, `+=`, `++=`, `addAll`); the ordered queries and slices take any `int`. Why: a
+  query about a number that cannot be present has the honest answer "no", which keeps generic
+  code over `Set[int]` from trapping on `s(x)`, while storing a number the set cannot hold must not
+  silently succeed. Alternatives weighed: trapping in `contains`/`remove` too (strict, but breaks
+  `Set[int]` code that probes with arbitrary ints); ignoring negatives in `incl` (silently drops an
+  element, so `s.incl(x).contains(x)` can be false); offsetting by a minimum (a different set type).
+  Review with the user if bit sets of negatives (a signed range) are wanted.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` method names beyond the `Set` ones** (branch `stdlib-bitset`). Proposed: the immutable
+  set adds `symmetricDiff` and `toBitMask`, with `BitSet.fromBitMask`; the mutable one adds
+  `unionInPlace`, `intersectInPlace`, `diffInPlace`, `symmetricDiffInPlace` (taking a mutable bit
+  set), the non-mutating `union`, `intersect`, `diff` and `symmetricDiff` over mutable bit sets,
+  `copy()` and `toSet()` (the immutable one), beside the mutable `Set`'s `add`, `remove`, `addAll`,
+  `+=`, `-=`, `++=`, `--=` and `filterInPlace`. Why: the `…InPlace` suffix names the in-place form of a
+  method the set already has (as `filterInPlace` and `sortInPlace` do) and spells out what the symbol
+  forms `|=` and `&=` would, which are free method names but carry no word for a reader. Alternatives:
+  `|=`, `&=`, `-=` as the in-place algebra (`-=` is taken by removing an element); `unionWith` and so on
+  (suggests a combining function); `addAll(other)` for the union (already means adding elements of
+  any `Iterable`). `symmetricDiff` is `xor` in some libraries; the longer name reads without
+  knowing bit-twiddling. The mutable bit set's `union`/`intersect`/`diff` take a mutable bit set only
+  rather than any `Set[int]`, the mutable `Set` not being a `Set` trait member either.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **A mutable `BitSet` iterates over a snapshot, and its ordered queries copy it** (branch
+  `stdlib-bitset`). Proposed: `iterator()`, `headOption()`, `lastOption()`, `minAfter` and
+  `maxBefore` of a mutable bit set read an immutable copy of its words, so changing the set during a
+  `for` is safe and visits the elements it had when the loop began. Why: it makes the iterator the
+  same code as the immutable one, and a mutable hash set's iterator has no defined behaviour under
+  change at all, so a stable one is the safer promise. Cost: one pass over the words per call, so a
+  loop calling `minAfter` repeatedly on a large sparse set is quadratic in the words. Alternative: a
+  live iterator that reads the words as it goes (no copy, but sees its own changes); revisit if
+  `minAfter` is used as a scan.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree map or set holds an immutable one and
+  replaces it; iterating it while updating it is legal and sees the collection as it was.**
+  `avin.collections.mutable.TreeMap` and `TreeSet` keep a private immutable `TreeMap` or `TreeSet`
+  and assign a new one at each update. Why: the persistent tree is already balanced and tested, its
+  `SortedTree` is private to module `avin` (so a second module could not share it without widening
+  it), every ordered query comes for free, and `toTreeMap()`/`toTreeSet()` become O(1) snapshots.
+  Consequence: an iterator made before an update visits the entries as they were, so a loop that
+  removes or adds entries cannot skip, repeat or fault, unlike the hash-based mutable collections,
+  whose iteration while updating is unspecified. Alternatives weighed: a mutable balanced tree with
+  in-place rotations (faster constants, no allocation per update, but a second tree implementation,
+  and iterators would need invalidation rules); a skip list (same objection). Updates allocate
+  O(log n) nodes, which a mutable tree would not; revisit if a profile shows it. Review with the user:
+  the snapshot-iteration guarantee is a promise a later in-place tree would have to keep.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **Two types are named `TreeMap` (and `TreeSet`), one in
+  `avin` and one in `avin.collections.mutable`.** As `Map` and `Set` already are. Inside the mutable
+  module the bare name is the mutable one and the immutable one is imported under an alias; a program
+  importing the mutable one unaliased while also using the prelude's gets the mutable one for the bare
+  name, and reaches the immutable one through an aliased import (both forms are tested). Alternatives:
+  distinct names (`MutableTreeMap`) which would break the parallel with `Map`/`Set`.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **`removeFirst()`/`removeLast()` trap on an empty
+  collection; `removeFirstOption()`/`removeLastOption()` answer `None`.** The immutable sorted
+  collections pair `head()` (trapping) with `headOption()`; the removal operations follow the same
+  split, the plain name being the trapping form. Alternatives: answering an `Option` from the plain
+  name (as `remove(key)` does), or a `pollFirst` name.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **The `range*` forms of a mutable tree collection answer a
+  new mutable collection, not a view.** As `filter` and `copy()` do on the hash-based mutable
+  collections; a write to the slice does not reach the original. Sharing the tree makes the slice O(log
+  n) to make. Alternative: live views, which would need the mutable tree to be in place.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree set's `union`, `intersect`, `diff` and
+  `subsetOf` take a mutable tree set**, as the mutable hash set's take a mutable hash set; the
+  `keySet()` of a mutable tree map is an immutable `TreeSet` snapshot, as a mutable `Map`'s is an
+  immutable `Set`.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `tuple-result-override`): **an override's or an implementation's result may be
+  any type seen as the declared result with no conversion**
+  ([declarations](/spec/declarations/)), the covariant position [generics](/spec/generics/#variance)
+  already names: `-> (Dog, Dog)` overrides `-> (Animal, Animal)`, `-> (HashMap[K, V], HashMap[K, V])`
+  implements `-> (Map[K, V], Map[K, V])`, `-> Option[Dog]` overrides `-> Option[Animal]`,
+  `-> () -> Dog` overrides `-> () -> Animal`, and `-> string` overrides `-> Any`. A result that
+  would need a box (`-> int` for `-> Any`, `-> (int, int)` for `-> (Any, int)`) or that differs at
+  an invariant argument (`Array[Dog]` for `Array[Animal]`) is still refused. Rationale: the chapter
+  said "for a class, a subclass", which refused exactly the shapes the variance rules call
+  subtypes with one representation, so a value returned through the base needs no conversion;
+  the checker now asks the same no-conversion question an element of a covariant collection does.
+  Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
+  a differently named method, as own-kind `partition` met); also boxing a scalar result, which
+  would make an override's call site convert behind a virtual call.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
+  private `lazy val`**, and the expression that computes the cell is dropped once it has run. The
+  cell is `Option[(T, LazyList[T])]`; the class holds a function that reads the real expression out
+  of a captured variable and empties it, so an evaluated cell keeps nothing the expression captured.
+  WHY: a covariant class may hold no `var` of its element type, and a `lazy val` is the one immutable
+  field that is computed once and kept, with its trap on a read during its own evaluation. Keeping
+  the expression would hold everything it captured for as long as the cell lives (a `filter` cell
+  would hold every source cell it skipped). ALTERNATIVES: an invariant node class with `var`s (the
+  list could then not be covariant); a `var` of type `Any` cast back on each read (no type checking
+  of the cell); keeping the expression (simpler, a space leak).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
+  strictly and the tail by name, and the tail is evaluated when the list's second cell is first
+  read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
+  cell is then exactly the head, and a function building a list recursively runs one step per cell
+  read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
+  at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
+  next step).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **There is no lazy cons operator; `x +: xs`
+  prepends to a list already made.** A symbol method whose name ends in `:` takes its receiver on
+  the right, and a receiver is evaluated where it is written, so the tail of `x op: tail` cannot be
+  delayed; a left-grouping name would need a method on every element type, which only the core
+  library may declare by an `impl` over all types, and would group `1 op 2 op xs` the wrong way.
+  `LazyList.cons(x, tail)` is the delayed form. **Review with the user**: a language form (a
+  by-name receiver for `:`-ending methods, or `::` building a lazy list where one is expected) would
+  give `head #:: tail`; and `head :: tail` patterns on a lazy list need the pattern rules to reach
+  beyond `List`: both are language changes, left to the user.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
+  a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
+  never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from
+  it; sequence patterns over it would call `length()` too. As an `Iterable` it keeps the forcing
+  methods every collection has, its own lazy forms found first. ALTERNATIVES: a `Seq` overriding the
+  methods that would not return (most of them), or a `Seq` whose `length()` simply does not return
+  on an endless list.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
+  evaluated prefix and `…`, evaluating nothing**: `[0, 1, 4]`, `[0, 1, …]`, `[…]`, with a field
+  width padding the whole. WHY: displaying an endless list must return, and a display that
+  evaluated cells would run a program's functions while printing. ALTERNATIVES: forcing every cell
+  (does not return on an endless list); a fixed prefix forced (side effects while printing);
+  `<not computed>` text (longer, and not a form the other collections use). No `Eq`, `Hash` or
+  `Ord`, which could not answer for two equal endless lists.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
+  the thread that made it; the cells' `lazy val` evaluation would be safe between threads, but the
+  expressions not yet evaluated are functions that may capture anything. ALTERNATIVES: sendable when
+  every expression is a `@sendable` function (every lazy method would need a sendable form).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
+  **`flatMap` takes `(T) -> Iterable[U]`**, reading each collection through its iterator as cells are
+  read; **`++` takes its right operand by name**, evaluated only when the cell after the left's last
+  is read (the iterator's `++` takes a strict `Iterable`, since an iterator is read once anyway);
+  `toLazyList()` on every `Iterable` converts, since `from` is the integer counter's name as on
+  `Iterator`. Also added beyond the item: `filterNot`, `zipWithIndex`, `fill`, `tabulate`, `lift`,
+  `force()` and `isEvaluated()`.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-map-extras`): **Map defaults, own-kind `partition` and `Set.subsets`** (branch `stdlib-map-extras`).
+  Proposed: `withDefault(f)` and `withDefaultValue(v)` on every map answer a `DefaultMap`, a
+  wrapper whose `apply` of an absent key answers the default and whose every other read (`get`,
+  `contains`, `getOrElse`, `size`, iteration, `keySet`) sees only the real entries; the default is
+  never stored. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` keep the wrapper and
+  its default; `transform` and `mapValues` answer the wrapped map's own kind, because a default
+  of the old value type cannot be carried across the function. The wrapper equals, and hashes as,
+  the map it wraps and every map of the same entries, ignoring the default. A default of a
+  supertype widens the map, as `updated` does. Why: `get` answering `Option` is how a program
+  asks whether a key is there, and a counter wants `apply` alone to be total. Alternatives
+  weighed: `get` also answering the default (hides absence, makes `contains` and `get`
+  disagree); the default taking part in equality (two maps of the same entries would differ by a
+  closure that cannot be compared); the wrapper mapping its default through `mapValues`
+  (needs the value function to be applied to a default on every miss, a surprise at each read).
+  `partition` of a hash, tree or ordered map and of a hash, tree, ordered or bit set is a method
+  of the concrete type answering that type, `p` called once per element; it is not on `Map`,
+  `Set`, `SortedMap`, `SeqMap`, `SortedSet` or `SeqSet`, so through a trait a set's partition is
+  `Iterable`'s and answers vectors, as the settled `Iterable` decision says, and a map's
+  `partition` of a pair function answers the own kind only where the type is known. Why: a
+  tuple of two collections is not a subtype of a tuple of two supertypes in an override's
+  result, and a set's partition over the trait cannot change `Iterable`'s result type.
+  Amended on the user's delegation 2026-11-11 (built on branch `partition-override`): with an override's result free to
+  narrow, `Map`, `SortedMap` and `SeqMap` declare `partition(p: (K, V) -> bool)` answering maps
+  of their own trait (`Map` carries a default built on `removed`, so a user class implementing
+  `Map` needs no change), and each concrete map overrides it with its own kind, so a call through
+  `Map` answers maps of the receiver's kind. Sets keep `Iterable`'s `(Vector, Vector)` through
+  `Set`, since a set is not a vector and `Set` cannot narrow it; the own-kind set `partition`
+  stays on the concrete types. Alternatives weighed: a `Set.partition` answering `(Set, Set)`
+  (conflicts with `Iterable`'s result, which is not a supertype of it). Alternatives weighed
+  originally: trait methods answering `(Map, Map)` (the concrete type then could not
+  narrow the result); two `filter` calls (calls `p` twice, which a predicate with an effect
+  shows). `subsets()` and `subsets(k)` are iterators on `Set` that read the elements into a
+  vector and generate combinations by size, so the order is by size then by position and nothing
+  is made ahead; every subset is a set of the receiver's kind. Why by size: the empty set first
+  and the set last, the same order for every kind, and no `2^n` counter to overflow for a set of
+  more than 62 elements. Alternatives weighed: bitmask order (overflows past 62 elements, and
+  puts the subsets in an order a reader cannot predict from the sizes).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-from`): **Companion `from`, `Vector.iterate`, `unfold` and the sorted conversions** (branch
+  `stdlib-from`). Proposed: `from(xs: Iterable[T])` on every immutable collection companion and
+  on the mutable ones (`Buffer`, `Map`, `Set`, `TreeMap`, `TreeSet`, `LinkedMap`, `LinkedSet`,
+  `BitSet`, `PriorityQueue`), a map's taking `Iterable[(K, V)]`; for a duplicate key the later
+  pair's value wins (an ordered map keeping the key's first place), the rule `apply` and the
+  builders already follow. `Vector.iterate(start, length, f)` takes the length as its second
+  parameter and calls `f` `length - 1` times; `Vector.unfold` and `List.unfold` are the eager forms
+  of `Iterator.unfold`. `toSortedSet()` and `toSortedMap()` are `impl` blocks on `Iterable` bounded
+  by `Ord`, like `toSet()` and `toMap()`. Why: one spelling that works for every source and target,
+  where the collection-specific conversions need a method per pair. Alternatives weighed: a
+  `to(factory)` conversion (needs higher-kinded types); a universal `into(builder)` (not added:
+  `builder.addAll(xs)` already reads as well, and `from` covers the target-first reading);
+  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
+  `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
+  counting iterator and keeps its name.
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
+  where they live** (the second part of Settled → unions → Representation, built on the multi-word
+  values above).
+  - **Three words**: a 32-bit tag, 64 bits for a scalar member and, where a member is a reference, the
+    reference. Tag 0 says the union holds a reference, whose header names its type; tag `i + 1` says
+    it holds scalar member `i`, the scalar members ordered by their type keys, so the order written
+    never changes the layout. A scalar is kept in the bits as its value: an integer sign-extended, a
+    `byte` and a `char` zero-extended, a `bool` as 0 or 1, a `real`'s bits unchanged (so a NaN's
+    payload and a zero's sign survive), `unit` as nothing. A union of scalars alone has two words.
+    *Why*: the reference word is the only one the frame plan can root, and a separate 64-bit word
+    holds every scalar unchanged. *Alternatives*: one word for the tag and the bits together (a
+    `long` member needs all 64 bits); a word per scalar member (more words for nothing); numbering by
+    the order written (`int | string` and `string | int` would differ).
+  - **In lowering, the union is a reference to its cell**, an object of those words that is made once
+    and only read; a function takes and gives each union as its words (`MCell` in a signature,
+    replaced by the words before anything else reads the program), and makes a cell of the words it
+    receives. So scalar replacement keeps every cell of a local, a parameter or a result as its
+    fields in slots, and none of them allocates; a call in tail position passes its callee's words
+    straight on. *Why*: every operation on a union (injection, a `match`, `==`, the hash,
+    rendering) is written once, on the cell, and the existing scalar replacement makes it words
+    everywhere a value stays in its function. *Alternatives*: lowering carrying several operands for
+    one value through every expression form (a much larger change to every join, local and call
+    path, for the same code after scalar replacement).
+  - **Where a union is stored** (a field, an element, a capture, a module-level value, a generic
+    type's storage at a union argument), **its cell stays an object**, traced through its reference
+    word, until those places lay a union out as its words too: storing a union allocates its cell as
+    boxing a scalar did, a string member included. *Why*: one representation per type everywhere, so
+    generic code at a union type argument needs no conversion where it meets its storage.
+    *Alternatives*: converting to an `Any` at every such boundary (a box only for a scalar member, but
+    a conversion at every generic call and field access, each a place to get wrong). Superseded by
+    the next entry (branch `union-words-storage`): storage now holds the words.
+  - **Converting to an `Any` or a trait** boxes a scalar member there and passes a reference member
+    as it is; **a member call** through a trait every member has converts the union the same way,
+    except `display`, `debug` and `toString`, which call the member's own implementation by the tag
+    with no box. `===` with an object compares the union as an `Any`, so a scalar member, a new box,
+    is never identical to it. **`==` and the hash** are decided by the tag: two values of one member
+    compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
+    `Any` are equal and hash alike. Review with the user: storing a union with a string member now
+    allocates its cell where an `Any` did not, until fields and collections take the words.
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+    `Any` are equal and hash alike. (The review flag this entry carried, a stored union with a string
+    member allocating its cell, is closed by the next entry.)
+- Settled on the user's delegation 2026-11-11 (built on branch `union-words-storage`): **A union with a scalar member is stored as its
+  words** (the storage half of the entry above).
+  - **Every storage place holds the words**: a field of a data value, a class or a tuple, an array
+    element (so a `Vector`, a `Buffer` and a map), a closure's capture, a captured `var`'s box and a
+    module-level value lay the union out as its tag (in an 8-byte slot), its bits and, with a
+    reference member, its reference, 24 bytes or 16, and only the reference word is traced (a
+    descriptor's reference offsets, an array's element map). Storing reads the words out of the
+    value's cell; loading makes a cell of the words read, which scalar replacement removes, so storing
+    and reading allocate nothing for any member. *Why*: it removes the allocation the entry above
+    flagged, and every place reuses one pair of helpers. *Alternatives*: the cell kept as an object
+    in storage (an allocation per store, a string member included); converting to an `Any` there (a
+    box for each scalar member, and type tests on read).
+  - **Generic code at a union type argument stores the words in each instance** (`Vector[int |
+    string]` holds 24-byte elements), never boxing at a generic boundary. *Why*: generic code is
+    compiled per instance already, so the instance's storage is the union's own; nothing converts at
+    a call. *Alternatives*: boxing a union to an `Any` where it enters generic code (an allocation
+    per element and a type test per read, for no gain).
+  - **A module-level union keeps its tag and bits in its own 16 bytes and its reference word in a
+    module-level reference of its own**, named `<value>#reference`, after every value and `lazy val`
+    state word. *Why*: the program's roots are a frame of references, so the reference word has to be
+    one of them; the rest is plain data. *Alternatives*: the cell kept on the heap for module-level
+    values (an allocation per assignment of a `var`); teaching the root frame a word map (a runtime
+    change for one case).
+  - **`Atomic` keeps a reference to a cell**: its value is one word that `load`, `store`, `swap` and
+    the hardware compare-and-set access indivisibly, so an `Atomic[int | string]` allocates the cell
+    on each store. *Why*: three words cannot be swapped atomically without a lock. *Alternatives*:
+    a lock for `Atomic`s of unions (as for integers wider than 64 bits; slower for every operation).
+  - **A load from storage reads a tag of 0 (a reference) only beside a non-null reference word, and
+    any other zero tag as the first scalar member's.** A racing read may combine a tag and a reference
+    from two writes, as it may an `i128`'s words, and an array element not yet filled is all zero;
+    either way the value read is one of a member, never a null taken for a reference. *Why*: the
+    promise that a race never breaks memory safety; it costs two compares and two selects per load.
+    *Alternatives*: no check (a racing read could dereference null); a lock per union field (a cost
+    on every access for a race the program should not have). Review with the user: a racing read of a
+    union may now combine two writes, an exception the threads chapter states beside wide integers.
+  - **An integer member wider than 64 bits is kept boxed in the reference word under tag 0**, its
+    type told by its box's record, so `i128 | int` has a reference word and injecting an `i128`
+    allocates its box. This fixes the layout above, which kept such a member in the 64 bits and lost
+    its high bits. *Why*: the bits slot stays 64 bits for every union, and a wide integer, rare in a
+    union, costs a box as it does in an `Any`. *Alternatives*: a bits slot as wide as the widest
+    member (a layout per union type, and every helper and the call words taking a width); refusing
+    integers wider than 64 bits as members (a gap in the language).
+  - **A tuple with a union part is not answered as words** by `val (a, b) = f(x)`: the call makes the
+    tuple, and the parts are read from it. *Why*: a result's words do not nest a union's words yet.
+    *Alternatives*: flattening the union's words into the result's (a later optimization).
+- Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+  A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
+  part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a
+  function, or a union of references) is seen as an `Any` part, so a `(string, string)` and a
+  `(Dog, string)` are `(Any, string)`s; a scalar part, or a union with a scalar member, is only that
+  very part, so an `(int, string)` is no `(Any, string)` and an `(int, bool)` no
+  `(int | string, bool)`; a part naming a **union of references** takes any object there and then
+  tests that object's own type against the members, so `(Dog | Cat, int)` matches a tuple made as
+  `(Dog, int)`, as `(Dog | Cat, int)` or as `(Any, int)` holding a `Cat`, and not one holding a `Bird`
+  or a boxed number. A pattern on a tuple of known type that could never match by this rule is the
+  error any such pattern is (`a value of type (int, bool) is never a (int | string, bool), so this
+  type pattern never matches`). *Why*: the chapter's rule that a tuple converts only where each part
+  keeps its layout decides which tuples a pattern can take as its type; a union of references is
+  laid out as an `Any`, so a tuple made with one records an `Any` there and only the object can say
+  which member it is. *Alternatives*: matching only a tuple made with exactly the pattern's type
+  (what was built: `("a", "b")` was no `(Any, string)`); testing every part by the value it holds
+  (rebuilding the tuple at the pattern's layout where a scalar part would need a box, an allocation
+  hidden in a `match`). Review with the user: a union-of-references part tests the object, while a
+  class part tests the type the tuple was made with.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
@@ -6034,8 +6876,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   beside its declarations, and the IntelliJ plugin's resolution following an export to the
   declaration (go-to-definition, find usages, renaming through an export).
 
-- Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
-  over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
+- What a comprehension over a `Map` yields when its values are not pairs (it needs `Iterable`'s own
+  transformations).
 
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
   - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a

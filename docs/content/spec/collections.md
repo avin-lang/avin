@@ -14,6 +14,7 @@ have.
 ```text
 Iterable[+A]                 iterator(), and the operation families below
 ├── Iterator[+A]             single-pass; iterator() returns itself
+│   └── BufferedIterator[A]  also peek() at the next element
 ├── Seq[+A]                  ordered, (Int) -> A
 │   ├── List[+A]             immutable linked list
 │   ├── Vector[+A]           immutable, persistent tree; the default sequence
@@ -21,24 +22,39 @@ Iterable[+A]                 iterator(), and the operation families below
 │   ├── Range[A]             immutable arithmetic progression
 │   ├── Array[A]             mutable, fixed length, contiguous
 │   ├── Buffer[A]            mutable, growable at the end, contiguous
-│   └── Deque[A]             mutable, growable at both ends
+│   ├── Deque[A]             mutable, growable at both ends
+│   └── Queue[+A]            immutable first-in, first-out, two lists
+├── LazyList[+T]             immutable, elements computed on demand and remembered
+├── PriorityQueue[T]         mutable binary heap, greatest first (avin.collections.mutable)
+├── Set[A]                   mutable hash set (avin.collections.mutable)
+├── LinkedSet[A]             mutable hash set, in insertion order (avin.collections.mutable)
+├── TreeSet[A]               mutable sorted set, by Ord (avin.collections.mutable)
+├── BitSet                   mutable set of non-negative ints, as bits (avin.collections.mutable)
+├── Map[K, V]                mutable hash map (avin.collections.mutable)
+├── LinkedMap[K, V]          mutable hash map, in insertion order (avin.collections.mutable)
+├── TreeMap[K, V]            mutable sorted map, by Ord (avin.collections.mutable)
 ├── Set[A]                   immutable sets, (A) -> bool
 │   ├── HashSet[A]           by hash; what {a, b} and Set(...) build
+│   ├── SeqSet[A]            in insertion order
+│   │   └── OrderedSet[A]    by hash, with the order of first insertion
 │   └── SortedSet[A]         in order, with the ordered operations
-│       └── TreeSet[A]       sorted by Ord
+│       ├── TreeSet[A]       sorted by Ord
+│       └── BitSet           SortedSet[int] of non-negative ints, as bits
 └── Map[K, +V]               immutable maps, (K) -> V
     ├── HashMap[K, +V]       by hash; what {k: v} and Map(...) build
+    ├── SeqMap[K, +V]        in insertion order
+    │   └── OrderedMap[K, +V]  by hash, with the order of first insertion
     └── SortedMap[K, +V]     in key order, with the ordered operations
         └── TreeMap[K, +V]   sorted by Ord
 ```
 
-`Set`, `SortedSet`, `Map` and `SortedMap` are traits; the hash-based and tree collections are the
-data types that conform to them.
+`Set`, `SeqSet`, `SortedSet`, `Map`, `SeqMap` and `SortedMap` are traits; the hash-based, insertion-ordered
+and tree collections are the data types that conform to them.
 
 `[]T` is shorthand for `Vector[T]` in any type position (`xs: []int`, `[][]int`); see
 [types](/spec/types/).
 
-The mutable `Set` and `Map` variants live in `avin.collections.mutable`. `Buffer` is the one
+The mutable `Set`, `Map` and `BitSet` variants live in `avin.collections.mutable`. `Buffer` is the one
 growable mutable sequence; code that adds and removes at both ends uses a `Deque`.
 
 **Iterator is Iterable.** Asking an iterator for its iterator returns the same iterator, at its
@@ -130,6 +146,13 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 | `toMap()`, on pairs | `Map[K, V]`, a later key's value replacing | O(n) |
 | `zipWithIndex()` | `Vector[(T, int)]`, positions from 0 | O(n) |
 | `collectFirst(pf)` | `Option[B]` | O(n) |
+| `scanLeft(initial, f)` | `Vector[B]`: `initial`, then each partial result of `foldLeft(initial, f)`; one more than there are elements | O(n) |
+| `tapEach(f)` | `Vector[T]`, the elements, `f` called with each in order before it is answered | O(n) |
+| `partitionMap(f)` (`f: (T) -> Either[A, B]`) | `(Vector[A], Vector[B])`: the values of the `Left`s and of the `Right`s, each in order | O(n) |
+| `span(p)` | `(Vector[T], Vector[T])`: the elements before the first that fails `p`, and the rest; `p` not called after that | O(n) |
+| `grouped(size)`, `sliding(size, step = 1)` | `Iterator[Vector[T]]`, an iterator's own `grouped` and `sliding` of the elements; a size or step below 1 traps | O(n) |
+| `concat(other)` | `Vector[W]`, the elements then `other`'s, `W` a supertype of both element types | O(n) |
+| `flatten()`, on a collection of collections | `Vector[T]`, their elements in order | O(n) |
 | `view()` | `Iterator[T]`, lazy; see below | O(1) |
 
 Each group of `groupBy` and `groupMap` keeps its elements' order; `groupMapReduce` combines a key's
@@ -151,6 +174,47 @@ the collection made of the one before is used up, `zip` ends with the shorter si
 `zipWithIndex` here is an `Iterator[(T, int)]` rather than a vector. The new iterator shares its
 source, which must not then be read on its own. `withFilter(p)` is its `filter(p)`, already lazy, so a
 comprehension over an iterator is an iterator, read element by element.
+
+An iterator's own forms of more of the methods are lazy too, found before the ones every `Iterable`
+has, which build vectors:
+
+| Method on `Iterator[T]` | Result, an iterator |
+|---|---|
+| `it ++ other`, `it.concat(other)` | the elements, then `other`'s, whose `iterator()` is asked for only once these are used up; `Iterator[W]`, `W` a supertype of both |
+| `scanLeft(initial, f)` | `initial`, then each partial fold, `f` called as each result is read |
+| `grouped(size)`, `sliding(size, step = 1)` | `Iterator[Vector[T]]`, windows as a [sequence's](#methods-every-seq-has) are, each read from the source when it is asked for and no element held beyond it; a size or step below 1 traps at the call |
+| `distinct()`, `distinctBy(key)` | the elements with each one equal to, or whose key equals, an earlier one's left out; `key` once per element read |
+| `zipAll(other, thisElement, thatElement)` | pairs as many as the longer side has, the side that has run out filled |
+| `padTo(total, element)` | the elements, then copies of `element` up to `total` of them |
+| `tapEach(f)` | the elements, `f` called with each as it is read |
+| `buffered()` | a `BufferedIterator[T]` of the elements |
+| `flatten()`, on an iterator of collections | their elements, each collection read when it is reached |
+
+A `BufferedIterator` is an iterator that can look ahead: `peek()` is the element `next()` would give,
+read from the source if it has not been and held until `next()` gives it, and traps when none is left;
+`peekOption()` is `Some` of it or `None`. Since each lazy form reads only as far as it is asked, an
+endless source works with all of them: `Iterator.from(1).sliding(2).take(3)` reads four elements.
+
+**`object Iterator` makes iterators from a value or a function.** Each is lazy, computing an element
+when it is read; an endless one is used through `take`, `takeWhile` and the other methods that stop.
+
+| Function | Elements |
+|---|---|
+| `Iterator.empty[T]()` | none |
+| `Iterator.single(x)` | `x` |
+| `Iterator.iterate(start, f)` | `start`, `f(start)`, `f(f(start))`, …, endless, each call of `f` made when its result is read |
+| `Iterator.unfold(state, f)` (`f: (S) -> Option[(T, S)]`) | while `f(state)` is `Some((x, next))`, `x`, with `next` the state after it; the first `None` ends it, and `f` is called when another element is asked for |
+| `Iterator.continually(element)` | the by-name `element`, evaluated once for each element read, endless |
+| `Iterator.from(start)`, `Iterator.from(start, step)` | `start`, `start + step`, …, endless, of any integer type, `step` 1 when left out; an overflowing addition traps only when the element past the type's limit is read |
+| `Iterator.fill(count, element)` | `count` values of the by-name `element`, evaluated as each is read |
+| `Iterator.tabulate(count, f)` | `f(0)`, …, `f(count - 1)`, each computed when it is read |
+
+`fill` and `tabulate` with a `count` that is not positive give no elements.
+
+```text
+Iterator.unfold((0, 1), p -> Some((p.0, (p.1, p.0 + p.1)))).take(6).toVector()   // [0, 1, 1, 2, 3, 5]
+Iterator.from(1).map(x -> x * x).takeWhile(x -> x < 50).toVector()              // [1, 4, 9, 16, 25, 36, 49]
+```
 
 **An iterator counts by being used up.** `size()` and `length()` on an `Iterator` answer the number of
 elements remaining as an `int`, found by reading them all: `hasNext()` is false afterwards and a second
@@ -251,6 +315,34 @@ array of the type the call asks for.
 | `lastIndexOf(x)`, `lastIndexWhere(p)`, each also `(…, end)` | `int`, the last index at or before `end`; -1 when none | | O(n), by `reverseIterator()` |
 | `startsWith(prefix)`, `endsWith(suffix)` | `bool` | | O(m), plus `length()` for `endsWith` |
 | `sameElements(other)` | `bool`: as many, each equal in order | | O(min(n, m)) |
+| `corresponds(other, p)` | `bool`: as many, and `p` holds of each pair | | O(min(n, m)) |
+| `indexOfSlice(slice, from = 0)` | `int`, the first index at or after `from` where `slice` occurs; -1 when none; an empty `slice` occurs at `from` while `from <= n` | | O(n · m) |
+| `lastIndexOfSlice(slice)`, `lastIndexOfSlice(slice, end)` | `int`, the last index at or before `end` where `slice` occurs; -1 when none | | O(n · m) |
+| `containsSlice(slice)` | `bool`; the empty slice is in every sequence | | O(n · m) |
+| `patch(from, other, replaced)` | `Vector[W]` (`W >: T`): `replaced` elements from `from` taken out and `other` put in; `from` held to `0 .. n`, `replaced` below 0 is 0 and past the end takes the rest | | O(n + m) |
+| `segmentLength(p, from = 0)` | `int`, the run of elements satisfying `p` from `from` (below 0 is 0) | | O(run) |
+| `findLast(p)` | `Option[T]`, by `reverseIterator()` | | O(n) |
+| `scanRight(initial, f)` | `Vector[B]`: `f(x0, f(x1, … initial))` first, `initial` last, n + 1 | | O(n) |
+| `reduceRight(f)`, `reduceRightOption(f)` | `f(x0, f(x1, … f(x(n-2), x(n-1))))`; `reduceRight` traps when empty, the `Option` form answers `None` | | O(n) |
+| `inits()`, `tails()` | `Iterator[Vector[T]]`: the n + 1 prefixes (longest first, the empty one last) or suffixes (likewise) | | O(n) to copy the elements, then O(log n) a vector |
+| `combinations(k)` | `Iterator[Vector[T]]`: each distinct selection of `k` elements once; `k` of 0 gives `[]` once, `k` below 0 or above n none | | O(k) a step after an O(n) set-up |
+| `permutations()` | `Iterator[Vector[T]]`: each distinct order of all the elements once; the empty sequence gives `[]` once | | O(n) a step after an O(n) set-up |
+| `search(x)`, `search(x, from, until)` (`T: Ord`) | `SearchResult`: `Found(i)` or `InsertionPoint(i)`, see [sorting](#sorting) | | O(log n) comparisons |
+| `searchBy(key, wanted)` | `SearchResult`, the sequence in ascending order of `key` | | O(log n) calls of `key` |
+
+On a `Seq[Seq[T]]`, `transpose()` answers the `Vector[Vector[T]]` of the columns: the first elements of
+the rows, then the seconds, and so on. There are no columns for no rows, and rows that are not all as
+long as the first trap. On a `Seq[(A, B, C)]`, `unzip3()` answers `(Vector[A], Vector[B], Vector[C])`
+as `unzip()` answers two.
+
+**`combinations` and `permutations` are distinct by `equals`, and lazy.** Two elements are one where
+`==` says so, so `[1, 1, 2].combinations(2)` is `[1, 1]` and `[1, 2]`, and `[1, 1, 2].permutations()`
+is `[1, 1, 2]`, `[1, 2, 1]` and `[2, 1, 1]`; the elements need no `Hash` or `Ord`. They come as a
+dictionary lists words, the elements ranked by their first appearance in the receiver, and each
+vector is made when the iterator is stepped, so the first few of `(1 .. 20).permutations()` cost
+nothing for the other twenty factorial. The iterator holds the classes of the elements as they were
+when it was made, so a buffer that changes afterwards does not change it. A count is the multiset
+formula: `[a, a, b, b, c].permutations()` has 5! / (2! · 2!) = 30.
 
 Each also has `length()`, `apply(i)`, `lift(i)` (the element as an `Option`), `head()`, `last()` and
 their `Option` forms read by index, `contains`, `foldRight`, `reverseIterator()`, the sorts
@@ -260,6 +352,11 @@ their `Option` forms read by index, `contains`, `foldRight`, `reverseIterator()`
 [1, 2, 3, 4, 5].sliding(3, 2).toVector()     // [[1, 2, 3], [3, 4, 5]]
 [1, 2, 3, 4, 5].grouped(2).toVector()        // [[1, 2], [3, 4], [5]]
 (1 .. 4).scanLeft(0, (s, x) -> s + x)        // [0, 1, 3, 6, 10]
+(1 .. 3).scanRight(0, (x, s) -> x + s)       // [6, 5, 3, 0]
+[1, 2, 3, 1, 2].indexOfSlice([2, 3])         // 1
+[1, 2, 3].patch(1, [9, 9, 9], 1)             // [1, 9, 9, 9, 3]
+[1, 2, 3].tails().toVector()                 // [[1, 2, 3], [2, 3], [3], []]
+[[1, 2, 3], [4, 5, 6]].transpose()           // [[1, 4], [2, 5], [3, 6]]
 val l: List[int] = [1, 2, 3]
 val s: Seq[int] = l
 l.takeWhile(x -> x < 3)                      // a List: [1, 2]
@@ -292,6 +389,23 @@ squares(n: int) -> List[int]
     b.result()
 ```
 
+### Building from another collection
+
+Every collection companion, immutable or mutable, has `from(xs)`, which takes any `Iterable` of the
+element type and builds the collection from its elements in iteration order: `List.from(1..4)`,
+`TreeSet.from(words)`, `HashMap.from(pairs)`, `BitSet.from(ids)`. A map's `from` takes an `Iterable` of
+`(key, value)` pairs, and a later pair's value replaces an earlier one's for the same key (an ordered
+map keeps the key at its first place). A set holds an element equal to an earlier one once. Sorted
+targets take their input in any order, and `BitSet.from` traps on a negative element. The result's
+element type may be wider than the source's where the collection is covariant.
+
+Beside it, `Vector.iterate(start, length, f)` is the vector of `start`, `f(start)`, `f(f(start))` and
+so on, `length` of them (`f` is called `length - 1` times, and a length that is not positive gives an
+empty vector); `Vector.unfold(state, f)` and `List.unfold(state, f)` repeat `f` from `state` while it
+answers `Some((element, next))`, adding each element, and end at its first `None`. Any `Iterable` of
+ordered elements has `toSortedSet()`, a `TreeSet`, and any `Iterable` of pairs with ordered keys has
+`toSortedMap()`, a `TreeMap`.
+
 ## Maps and sets
 
 `Map[K, +V]` and `Set[A]` are traits, the immutable maps and sets: a function over `Map[string, int]`
@@ -314,6 +428,20 @@ elements of another type, `map`, `collect` and `flatMap`, answer a hash-based co
 trait, and the tree collection's own versions answer a tree collection where its type is known. The
 hash-based kinds are hash tries, branching on one bit of the spread hash at a time, so an update
 copies a path proportional to the logarithm of the size.
+
+`OrderedMap` and `OrderedSet`, the `SeqMap` and `SeqSet` data types, find keys by hash as the hash-based
+kinds do and iterate in the order their keys were first added: `OrderedMap(("b", 1), ("a", 2))` visits
+`b` then `a`, whatever the hashes. Updating a key already present replaces its value and keeps its
+place; a key removed and added again goes to the end. `keys()`, `values()`, `keySet()`, the
+iterators, `display` and `toString` all follow that order, and `reverseIterator()` visits it backwards.
+They are persistent like the others: the entries sit in a vector in insertion order, a removed entry
+leaving a gap that is dropped, with the keys renumbered, once the gaps outnumber the entries, so a
+lookup, an update or a removal takes time in the logarithm of the size (a compaction costs the size,
+paid for by the removals that caused it) and the slots never exceed about twice the entries. Equality
+ignores the order: an `OrderedMap` equals a `HashMap` or `TreeMap` of the same entries, an
+`OrderedSet` equals a `HashSet` of the same elements, and equal ones hash alike. Updates through
+`SeqMap` and `SeqSet` answer a `SeqMap` or `SeqSet`; `map`, `collect` and `flatMap` answer hash-based
+collections. A literal `{k: v}` or `{a, b}` where one of them is expected builds it in the order written.
 
 A map's values are covariant, so a method that puts a value in takes any supertype of `V`, as
 [lower bounds](/spec/generics/#lower-bounds) allow: `updated[W >: V](key, value: W) -> Map[K, W]`,
@@ -346,6 +474,31 @@ them lazily instead. `m.filterKeys(p)` keeps the entries whose key passes, `m.tr
 binds each key to a value made from both, and `m.updatedWith(k, f)` calls `f` with `m.get(k)` and
 binds `k` to the `Some` it answers or leaves it unbound for `None`, so it adds, replaces or removes.
 
+`m.withDefault(f)` and `m.withDefaultValue(v)` see a map of any kind with a default for the keys it
+does not hold: `apply` of an absent key answers `f(key)` (or `v`) where the map's own `apply` traps,
+and the default is never stored. Everything else sees only the real entries: `get` answers `None`,
+`contains` `false`, `getOrElse` its own default, and `size`, iteration, `keys()` and `keySet()` are
+those of the wrapped map. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` answer a map
+with the same default, and `transform` and `mapValues` the wrapped map's own, with none. The wrapper
+is equal to the map it wraps, and to every map of the same entries whatever its default, and hashes
+and displays as it does. A default of a supertype of the values makes a map of that type. A
+counter reads `val counts = HashMap.empty[string, int]().withDefaultValue(0)` and then
+`counts.updated(w, counts(w) + 1)`.
+
+A hash, tree or ordered map's `partition((k, v) -> bool)` answers two maps of its own kind, the
+entries that pass and those that do not, each keeping the order of the whole and `p` called once per
+entry; this holds through `Map`, `SortedMap` and `SeqMap` as well, whose `partition((k, v) -> bool)`
+answers maps of the receiver's kind (a class implementing `Map` inherits a default built on
+`removed`, and may override it). Likewise `partition(p)` of a hash, tree, ordered or bit set answers
+two sets of its own kind; held as a `Set`, `partition` is `Iterable`'s and answers vectors, since a
+set is not a vector. Given a function of one pair, a map's `partition` is `Iterable`'s and answers
+vectors. `s.subsets()` visits every subset of a set and `s.subsets(k)` those of `k` elements, as
+iterators that make each subset only when it is asked for: each is a set of the receiver's kind,
+visited by size, the empty set first and the set itself last, and those of one size in the
+lexicographic order of their elements' positions in iteration order. A set of `n` elements has `2^n`
+subsets and `C(n, k)` of size `k`; `subsets(k)` of a `k` below 0 or above `n` is empty, and the empty
+set's `subsets()` is itself alone.
+
 `avin.collections.mutable` holds `Map[K, V]` and `Set[A]`, invariant, updated in place:
 `m(k) = v` binds a key, `m(k) += 1` updates its value, and `remove` answers the value removed as an
 `Option`. They are open-addressed tables, probed linearly, kept at most two thirds full. A program
@@ -369,6 +522,19 @@ set's `union`, `intersect` and `diff` — answer a new mutable one; a mutable ma
 Iteration visits a map's entries as `(key, value)` pairs in an order the program cannot rely on. For
 the immutable collections it depends only on the keys' hashes, so equal maps iterate alike; for the
 mutable ones it is the table's order.
+
+`avin.collections.mutable` also holds `LinkedMap[K, V]` and `LinkedSet[A]`, which have everything
+`Map` and `Set` have and iterate in insertion order, oldest first, in `keys()`, `values()`, the
+display and every method that builds a collection (which answers a linked one). Binding a key that
+is present replaces its value and leaves it in place; `putLast(k, v)` and `moveToEnd(k)` make it the
+newest, and a key that was removed and bound again is new. `headOption()` and `lastOption()` answer
+the oldest and newest entry, and `removeFirst()` and `removeLast()` remove and answer one, trapping
+when the map is empty, so a least-recently-used cache is a `moveToEnd` on each hit and a
+`removeFirst()` when it is full. A set has the same, with `addLast`, `moveToEnd`, `removeFirst()` and
+`removeLast()` answering elements. Removing entries while iterating is safe and an entry removed
+before the iterator reaches it is not visited; binding new keys while iterating never traps, but
+whether the iterator visits them is not defined. Two linked maps, or sets, are equal when they hold
+the same entries, whatever order they were bound in.
 
 Mutable maps and sets, like arrays, compare and hash by their contents at the moment they are
 compared; `===` tells two of them apart. Every map and set displays in the shape of its literal,
@@ -430,6 +596,75 @@ their hash-based counterparts' companions do, and a set or map literal builds on
 `SortedMap` and `SortedSet` have the same companions, making tree collections typed as the sorted
 traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tree collection.
 
+**Mutable sorted maps and sets.** `avin.collections.mutable.TreeMap[K: Ord, V]` and `TreeSet[A: Ord]`
+are the in-place counterparts, with the whole mutable `Map` and `Set` API (`m(k) = v`, `get`,
+`remove`, `getOrElseUpdate`, `updateWith`, `+=`, `-=`, `++=`, `--=`, `filterInPlace`, `copy()`, and
+for a set `add`, `union`, `intersect`, `diff`, `subsetOf`) and the ordered operations of the table
+above: `headOption()`, `lastOption()`, `head()`, `last()`, `firstKey()`, `lastKey()`, `minAfter`,
+`maxBefore`, `reverseIterator()` and the four `range` forms. The slices are new mutable collections,
+not views. Two operations are their own: `removeFirst()` and `removeLast()` unbind the least or the
+greatest key and answer its entry (a set's element), trapping when empty, and `removeFirstOption()` and
+`removeLastOption()` answer an `Option` instead. A mutable tree collection holds an immutable `TreeMap`
+or `TreeSet` and replaces it at each update, so the cost of every operation is the logarithmic one of
+the persistent tree, `toTreeMap()` and `toTreeSet()` hand out the current tree in constant time as a
+snapshot later updates do not reach, and an iterator, or a `for` loop, goes on over the entries as they
+were when it began: updating the collection inside the loop is legal and the loop does not see the
+change. Equality and hash follow the contents, and equal an immutable tree collection's of the same
+entries. The two collections of one name are told apart by their modules, the immutable one being
+`avin.TreeMap` and the mutable one `avin.collections.mutable.TreeMap`; where both are used, one is
+imported under another name, as for `Map` and `Set`.
+
+```text
+import avin.collections.mutable.{TreeMap as MutableTreeMap}
+
+val queue = MutableTreeMap[int, string]()
+queue(30) = "c"
+queue(10) = "a"
+queue(20) = "b"
+println(queue.removeFirst())        // (10, a)
+println(queue.minAfter(21))         // Some((30, c))
+for (k, v) in queue
+    queue.remove(k)                 // the loop still visits both entries
+println(queue.isEmpty())            // true
+```
+
+### Bit sets
+
+`BitSet` is an immutable `SortedSet[int]` that holds its elements as bits: element `e` is bit `e % 64`
+of word `e / 64`. Membership takes constant time, `union`, `intersect`, `diff`, `symmetricDiff` and
+`subsetOf` work a word, 64 elements, at a time, and it takes a word for each 64 of its greatest
+element, so it suits a dense run of small numbers rather than a few large ones. It has every
+operation of a `SortedSet`, and an update answers a `BitSet` that copies the words it changes and
+leaves the old set as it was. It is equal to any set of the same elements, a `TreeSet` or a `HashSet`
+included, and hashes as they do. `BitSet(3, 1, 2)`, `BitSet.empty()` and `BitSet.newBuilder()` make
+one.
+
+A negative number is not an element of any `BitSet`. `contains` of one answers `false` and `excl` of
+one leaves the set as it was, but anything that would put one in traps: `incl`, `++`, `BitSet(…)`
+and the builder. `minAfter`, `maxBefore` and the four slices take any `int`, so `rangeFrom(-5)` is
+the whole set.
+
+`toBitMask()` answers the words as a `Vector[long]`, the lowest element in bit 0 of the first, with no
+empty word at the end (so the empty set's is `[]`), and `BitSet.fromBitMask(words)` is its inverse,
+accepting empty words at the end.
+
+```text
+val s = BitSet(1, 3, 64)
+println(s.toBitMask())                  // [10, 1]
+println(BitSet.fromBitMask([10, 1]))    // {1, 3, 64}
+println(s.rangeFrom(2))                 // {3, 64}
+```
+
+`avin.collections.mutable.BitSet` is the same set changed in place. `add(x)` and `remove(x)` answer
+whether the set changed, `+=`, `-=`, `++=` and `--=` need no `var`, `addAll(xs)` and `filterInPlace(p)`
+are as the mutable `Set`'s, and the in-place algebra `unionInPlace(other)`, `intersectInPlace(other)`,
+`diffInPlace(other)` and `symmetricDiffInPlace(other)` takes another mutable bit set. `union`,
+`intersect`, `diff` and `symmetricDiff` answer new mutable bit sets, `toSet()` an immutable `BitSet`
+and `BitSet.fromBitMask(words)` builds one from words. A negative element is refused as above, `add`
+trapping and `contains` and `remove` answering `false`. Iteration is over the elements the set had when
+it began, in ascending order. Like the other mutable collections it compares and hashes by its
+contents, and an equal immutable set hashes alike.
+
 ## Indexing and callable sequences
 
 A `Seq[A]` is a function from index to element: `xs(i)` reads an element. Mutable sequences assign
@@ -488,6 +723,13 @@ val none = Array.empty[string]()
 distinct objects (an `Array`'s `fill` shares one value). A length that is not positive gives an empty
 collection.
 
+An array changes in place with `reverseInPlace()`, `mapInPlace(f)` (`f` of each element, in index
+order, of the element type), `fillInPlace(x)` (every element the one value `x`, as `Array.fill`
+shares it) and `copyTo(dest, at, from = 0, count = length() - from)`, which copies `count` elements
+from index `from` into `dest` from index `at`. A range outside either array traps at the call. `dest`
+may be the array itself with the ranges overlapping, in either direction: the elements land as they
+were before the call.
+
 `Array[int]()` is an error. `xs.length()` is the length, which never changes; `xs.slice(from, until)`
 and `xs.copy()` make new arrays; `xs.lift(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`
 work as they do on a variable, evaluating `xs` and `i` once. Because a call with untyped arguments
@@ -526,6 +768,74 @@ such as `map` or `filter`, builds it reversed and turns it around. `head()`, `ta
 trap on the empty list, and `headOption()` and `lift(i)` return an `Option`. Lists compare and hash by
 their contents, and order element by element when their elements are ordered, a list ordering
 before every longer list it begins.
+
+## LazyList
+
+`LazyList[+T]` is an immutable list whose elements are computed when they are first needed and then
+kept. It is a chain of cells, each empty or an element with the lazy list of the rest; a cell is
+evaluated the first time something reads it, **at most once**, and every later read, through the
+same list, a list made from it or another iterator over it, gives the cell kept. So a lazy list may
+be endless, and may be defined by reference to itself:
+
+```text
+lazy val fibs: LazyList[long] = LazyList.cons(0, LazyList.cons(1, fibs.zip(fibs.tail()).map(p -> p.0 + p.1)))
+
+sieve(xs: LazyList[int]) -> LazyList[int]
+    val p = xs.head()
+    LazyList.cons(p, sieve(xs.tail().filter(n -> n % p != 0)))
+
+fibs(90)                                 // 2880067194370816120
+sieve(LazyList.from(2)).take(5)          // the first five primes, once read
+```
+
+**Making one.** `LazyList.empty[T]()` is the empty list. `LazyList.cons(head, tail)` takes `tail`
+[by name](/spec/by-name/): it is evaluated when the list's second cell is first read, once, and not at
+all if that cell never is; `head` is an ordinary argument. `x +: xs` puts `x` in front of a list
+already made. The companion's makers have `Iterator`'s names and argument orders, and evaluate
+nothing when called: `from(start)` and `from(start, step)` over any integer type (an addition that
+overflows traps only when the cell past the greatest value is read), `iterate(start, f)`,
+`unfold(state, f)`, `continually(element)` (by name, evaluated once per cell), `fill(count, element)`
+and `tabulate(count, f)`. `xs.toLazyList()` on every `Iterable` reads one iterator of it as the cells
+are first read; made from an iterator, the list takes the iterator over.
+
+**Lazy methods** evaluate nothing when called; each makes a list whose cells read the source's cells
+as they are themselves read: `map`, `filter`, `filterNot`, `take`, `drop`, `takeWhile`, `dropWhile`,
+`zip` (with another lazy list), `zipWithIndex`, `flatMap` (`f` yielding any `Iterable`, read through
+its iterator) and `++`, whose right operand is by name and evaluated only when the cell after the
+left's last is first read. `take(n)` never reads the cell after its `n`th; `takeWhile` reads the
+element that ends it and nothing after.
+
+**Forcing methods** evaluate the cells they need: `head()`, `tail()` and `headOption()` the first
+cell, `isEmpty()` and `nonEmpty()` the first cell, `apply(i)` and `lift(i)` the cells up to `i` (none
+for a negative index), and `length()`, `force()` and every method an `Iterable` has (`toVector()`,
+`foldLeft`, `foreach`, `mkString`, `sum` and the rest) all of them; on an endless list such a method
+does not return. `head()`, `tail()` and an index out of range trap. `isEvaluated()` says whether the
+first cell has been evaluated, evaluating nothing, and `knownSize()` is 0 only for a list already seen
+to be empty.
+
+**Depth.** Every method that reads many cells reads them in a loop, and so does `filter`,
+`dropWhile`, `drop` or `flatMap` skipping any number of elements to reach the next, so a list of
+millions of cells is walked, counted and converted without deepening the stack. Only a pipeline adds
+depth: one frame per stage when a cell of its last stage is first read.
+
+**Memory.** Once a cell is evaluated, the expression that computed it is dropped along with
+everything it captured, so a list holds its evaluated elements and the expressions of the cells not
+yet evaluated. A list whose head nothing holds is collected cell by cell as a `for` loop or an
+iterator walks it; a method called on a list holds that list for the length of the call.
+
+**Threads.** A lazy list is not [sendable](/spec/threads/): the cells not yet evaluated are functions
+that may hold anything, so a thread's body may not reach one, and each list belongs to the thread
+that made it. A cell is evaluated as a [`lazy val`](/spec/declarations/#initialization) is
+initialized, and a cell whose evaluation reads that same cell (an empty list joined to itself,
+`lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read, as a `lazy val`
+initializer reading itself does.
+
+**Display.** A lazy list's `Display` and `Debug` show the elements evaluated so far, in brackets,
+and evaluate nothing: `[0, 1, 4, 9]` when every cell has been evaluated, `[0, 1, …]` when the cell
+after 1 has not, `[…]` when nothing has.
+
+`LazyList` is an `Iterable` and not a `Seq`, and `::` and list patterns are `List`'s: a lazy list is
+taken apart with `headOption()` and `tail()`, or with `head()` after `isEmpty()`.
 
 ## Sequence patterns
 
@@ -633,6 +943,17 @@ Literals always build the library's types, even when a user type named `Vector` 
 places the elements it held when the call began, once. `b(i)` and `b(i) = v` read and replace an element, and an index outside `0 ..< length()` traps
 at the caller's line. Its elements live in an array with spare capacity, which never holds a value
 that is read before one is written, so a buffer needs no value to fill it with.
+
+A buffer changes in place beyond adding and removing one element: `remove(i, n)` takes out `n`
+elements from `i` on, `trimStart(n)` and `trimEnd(n)` the first or last `n`, `filterInPlace(p)` keeps
+the elements that satisfy `p`, `mapInPlace(f)` replaces each with `f` of it (`f` returns the element
+type), `patchInPlace(from, other, replaced)` replaces the `replaced` elements from `from` with those
+of `other` (read before any change, so `b.patchInPlace(i, b, n)` is well defined), and
+`reverseInPlace()` reverses. A buffer of `Eq` elements has `subtractOne(x)`, which takes out the first
+element equal to `x` and answers whether there was one. A range or count outside the buffer traps at
+the call (`n = 0` is always fine at `0 ..< length()` and at `length()`). A predicate or function given
+to `filterInPlace` or `mapInPlace` must not change the buffer: the call traps once it returns to a
+buffer whose length changed.
 
 ## Vector
 
@@ -750,10 +1071,66 @@ around from the array's end to its start, doubling as a buffer's does when full.
 hashes by its elements in order, displays as `[1, 2, 3]`, has `mkString` where its elements display,
 and is built by `Deque.newBuilder` and by a sequence literal where one is expected.
 
+A deque has the same in-place operations as a buffer, with the same traps and the same meaning in
+terms of the elements front first: `remove(i, n)`, `trimStart(n)`, `trimEnd(n)`, `filterInPlace(p)`,
+`mapInPlace(f)`, `patchInPlace(from, other, replaced)`, `reverseInPlace()` and, for `Eq` elements,
+`subtractOne(x)`. They work wherever the ring's elements wrap around the array's end.
+
 ```text
 val pending: Deque[string] = ["build", "test"]
 pending.prepend("fetch")
 while pending.nonEmpty() do run(pending.removeHead())
+```
+
+## Priority queues
+
+`avin.collections.mutable.PriorityQueue[T]` is a mutable binary heap: elements go in in any order
+and `dequeue()` takes out the greatest. `PriorityQueue[int]()` orders by the element type's `Ord`;
+`PriorityQueue.withOrdering(compare)` takes a comparison, positive where its first argument is to
+come out before its second. A queue giving the least first is made with `Reverse` elements or with
+`reverseOrder`, and `compareBy` and `thenBy` build the comparison from keys.
+
+```text
+val q = PriorityQueue[int]()
+q.enqueue(3, 9, 1)
+q += 5
+q.head()           // 9, left in the queue
+q.dequeue()        // 9
+q.dequeueAll()     // [5, 3, 1], and q is empty
+
+val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
+```
+
+`enqueue(xs*)`, `addOne(x)`, `addAll(xs)`, `+=` and `++=` add, each in O(log n) per element;
+`dequeue()` and `head()` trap on an empty queue, `dequeueOption()` and `headOption()` answer `None`;
+`size()`, `isEmpty()` and `nonEmpty()` take constant time, and `clear()` empties the queue.
+`copy()` makes an independent queue with the same comparison, and `PriorityQueue.newBuilder` a
+builder. A queue is `Iterable`: `iterator()` and `toVector()` give the elements in heap order, the
+greatest first and the rest in no promised order, and an iterator is a snapshot, unaffected by
+changes made while it runs. `toSortedVector()` gives the elements in the order `dequeue` would,
+leaving the queue as it is. Elements the comparison finds equal come out in no promised order; the
+queue is not stable.
+
+## Queue
+
+`Queue[+T]` is an immutable first-in, first-out sequence. `Queue(1, 2, 3)` has 1 at its front and
+`Queue.empty[int]()` is empty. `q.enqueue(x)` makes a queue with `x` after the others and
+`q.enqueueAll(xs)` one with every element of `xs`; `q.dequeue()` answers the front element and the
+queue of the rest as a pair, trapping on an empty queue, `q.dequeueOption()` answers `None` instead,
+and `q.front()` and `q.frontOption()` read the front. Each leaves `q` as it was, so any earlier
+version stays usable. The elements are held in two lists, the front in order and the back reversed;
+when the front runs out the back is turned around into it. `enqueue`, `dequeue`, `front` and `isEmpty`
+take amortized constant time, and `q(i)` takes time proportional to `i`.
+
+A queue is a `Seq`, front first, so it has every sequence method, compares and hashes as any sequence
+does (equal to a `Vector` or `List` of the same elements, however its two lists are split),
+displays as `[1, 2, 3]` and is built by `Queue.newBuilder`. It is covariant: `enqueue` and
+`enqueueAll` take `W >: T`, so enqueueing a `Cat` to a `Queue[Dog]` makes a `Queue[Animal]`. `map`,
+`filter`, `filterNot` and `flatMap` answer queues.
+
+```text
+val jobs = Queue("build", "test")
+val (next, rest) = jobs.enqueue("deploy").dequeue()
 ```
 
 ## Sorting
@@ -792,6 +1169,35 @@ entries.sortBy(e -> e.rank)                         // a, b, c: b still before c
 entries.sortWith((x, y) -> y.rank.compare(x.rank))   // b, c, a
 val scores: Array[int] = [3, 1, 2]
 scores.sortInPlace()                                 // [1, 2, 3]
+```
+
+**Ordering toolkit.** An `ArraySeq` is `Ord` where its elements are, as a `List` is: element by
+element, the first pair that differs deciding, and a sequence ordering before every longer one it
+begins. **Descending order is `Reverse`**, so there is no `sortedDescending()`:
+`data Reverse[T: Ord](value: T)` orders the opposite way to `value`, and as a sort key, alone or one
+part of a tuple, it sorts descending: `people.sortBy(p -> (Reverse(p.age), p.name))` is oldest first,
+ties by name. `Reverse(Reverse(x))` orders as `x`. `clamp(x, lo, hi)` is `x` limited to `lo ..= hi`
+and traps where `hi < lo`. For `sortWith`, `compareBy(key)` is the comparison of two values by their
+keys, `reverseOrder(cmp)` the same comparison the other way round, and `thenBy(first, second)` the
+first, with the second deciding where the first finds two values equal:
+`people.sortWith(thenBy(reverseOrder(compareBy(p -> p.age)), compareBy(p -> p.name)))`.
+
+**A sequence in ascending order is searched by halving.** On a `Seq[T]` with `T: Ord`,
+`search(x)` answers a `SearchResult`: `Found(i)` where `i` is the index of the **first** element equal
+to `x`, or `InsertionPoint(i)` where `i` is the index `x` would have if put in, that of the first
+element ordering after it, or the length. It takes O(log n) comparisons, and an index read by
+position is O(log n) on a vector, an array or a range. `search(x, from, until)` looks only at that
+window, the two held to the sequence as a count is, and answers indices of the whole sequence.
+`searchBy(key, wanted)` is the same for a sequence in ascending order of `key`, comparing `key` of
+an element with `wanted` (a `K: Ord`). A sequence that is not in order gives some answer but not a
+meaningful one. `SearchResult` is a data type, so `==` and `match` work on it.
+
+```text
+val xs = [1, 3, 3, 5]
+xs.search(3)      // Found(1)
+xs.search(4)      // InsertionPoint(3)
+xs.search(9)      // InsertionPoint(4)
+xs.search(3, 2, 4) // Found(2)
 ```
 
 Strings order by code point (their bytes, which in UTF-8 order the same), so every capital comes

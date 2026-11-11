@@ -544,9 +544,11 @@ LLVM's `unordered` atomic ordering: it costs nothing on the machines Avin target
 the promise that a word is never torn and a racing load is never undefined. A reference is one word,
 and so is every built-in scalar.
 
-**An integer wider than 64 bits is the one exception.** An `i128` or an `i257` is several words,
-and a field or variable of one is read and written as untorn 64-bit words, so a racing read of it
-may combine words of different writes. Each word is still one some write stored, and a program that
+**An integer wider than 64 bits and a union with a scalar member are the exceptions.** An `i128` or
+an `i257` is several words, and so is a union such as `int | string` (its tag, its bits and its
+reference); a field or variable of one is read and written as untorn 64-bit words, so a racing read
+of it may combine words of different writes. Each word is still one some write stored, a union read
+so is still a value of one of its members (never a reference no write stored), and a program that
 shares such a value under the edges above, or through an `Atomic` or a `Mutex`, never sees a mixture.
 
 **An object is complete before any thread can see it.** A constructor ends with a release fence, so

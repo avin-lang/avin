@@ -1,0 +1,325 @@
+module avin.collections.mutable
+
+import avin.{BitSet as ImmutableBitSet}
+
+// A mutable set of non-negative `int`s kept as bits: element `e` is bit `e % 64` of word `e / 64`.
+// `add` and `remove` change it in place, membership takes constant time, and the set algebra works a
+// word, 64 elements, at a time. It grows by a word for each 64 of its greatest element, so it suits a
+// dense run of small numbers, not a few large ones. It iterates in ascending order, over the elements
+// it had when the iteration began, and is the predicate of membership, `(int) -> bool`.
+//
+// A negative element cannot be in the set: `add` traps on one, `contains` answers `false` and
+// `remove` answers `false` and changes nothing. The in-place algebra, `unionInPlace`,
+// `intersectInPlace`, `diffInPlace` and `symmetricDiffInPlace`, takes another bit set and changes this
+// one; `union`, `intersect`, `diff` and `symmetricDiff` answer new sets. `toBitMask()` gives the words,
+// the lowest element in bit 0 of the first, and `BitSet.fromBitMask` is its inverse.
+class BitSet: Iterable[int], (int) -> bool
+    private val words = Buffer[long]()
+
+    // The number of elements.
+    override size() -> int
+        var n = 0
+        for w in words do n += bitCount(w)
+        n
+
+    // The number of elements, which the set holds: the same as `size()`.
+    override knownSize() -> int = size()
+
+    isEmpty() -> bool = words.forall(w -> w == 0)
+
+    nonEmpty() -> bool = !isEmpty()
+
+    contains(element: int) -> bool =
+        element >= 0 && (element >> 6) < words.length() && (words(element >> 6) & bitOf(element)) != 0
+
+    // Whether `element` is in the set: `s(x)` is `s.contains(x)`.
+    apply(element: int) -> bool = contains(element)
+
+    // Adds `element`, answering whether it was absent; traps when `element` is negative.
+    add(element: int) -> bool
+        if contains(element) then return false
+        setBit(words, element)
+        true
+
+    // Removes `element`, answering whether it was present; a negative element never is.
+    remove(element: int) -> bool
+        if !contains(element) then return false
+        clearBit(words, element)
+        true
+
+    // Removes every element.
+    clear() = words.clear()
+
+    // Adds every element of `elements`; traps on a negative one.
+    addAll(elements: Iterable[int])
+        for x in elements do setBit(words, x)
+
+    // Adds `element`: `s += x`, which needs no `var`; traps when `element` is negative.
+    +=(element: int)
+        setBit(words, element)
+
+    // Removes `element` if it is present: `s -= x`.
+    -=(element: int)
+        clearBit(words, element)
+
+    // Adds every element of `elements`: `s ++= xs`.
+    ++=(elements: Iterable[int]) = addAll(elements)
+
+    // Removes every element of `elements` that is present: `s --= xs`. A set with itself removed is
+    // empty.
+    --=(elements: Iterable[int])
+        if elements === self then return clear()
+        for x in elements do clearBit(words, x)
+
+    // Removes every element that does not satisfy `p`.
+    filterInPlace(p: (int) -> bool)
+        for x in toSet()
+            if !p(x) then clearBit(words, x)
+
+    // Adds every element of `other` to this set.
+    unionInPlace(other: BitSet)
+        val theirs = other.snapshot()
+        combineInto(words, theirs, (a, b) -> a | b)
+
+    // Keeps only the elements that are also in `other`.
+    intersectInPlace(other: BitSet)
+        val theirs = other.snapshot()
+        combineInto(words, theirs, (a, b) -> a & b)
+
+    // Removes every element of `other` from this set.
+    diffInPlace(other: BitSet)
+        val theirs = other.snapshot()
+        combineInto(words, theirs, (a, b) -> a & ~b)
+
+    // Keeps the elements that are in exactly one of this set and `other`.
+    symmetricDiffInPlace(other: BitSet)
+        val theirs = other.snapshot()
+        combineInto(words, theirs, (a, b) -> a ^ b)
+
+    // A new set of the elements in this set, in `other`, or in both.
+    union(other: BitSet) -> BitSet
+        val result = copy()
+        result.unionInPlace(other)
+        result
+
+    // A new set of the elements in both this set and `other`.
+    intersect(other: BitSet) -> BitSet
+        val result = copy()
+        result.intersectInPlace(other)
+        result
+
+    // A new set of the elements in this set and not in `other`.
+    diff(other: BitSet) -> BitSet
+        val result = copy()
+        result.diffInPlace(other)
+        result
+
+    // A new set of the elements in exactly one of this set and `other`.
+    symmetricDiff(other: BitSet) -> BitSet
+        val result = copy()
+        result.symmetricDiffInPlace(other)
+        result
+
+    // Whether every element of this set is in `other`.
+    subsetOf(other: BitSet) -> bool
+        val theirs = other.snapshot()
+        for i in 0 ..< words.length()
+            if (words(i) & ~wordOf(theirs, i)) != 0 then return false
+        true
+
+    // A new set of the elements that satisfy `p`.
+    filter(p: (int) -> bool) -> BitSet
+        val result = BitSet()
+        for x in toSet()
+            if p(x) then result.add(x)
+        result
+
+    // A new set of `f` of each element; elements that `f` maps alike become one. `f` must answer
+    // non-negative numbers.
+    map(f: (int) -> int) -> BitSet
+        val result = BitSet()
+        for x in toSet() do result.add(f(x))
+        result
+
+    // A new set of the elements of the collections `f` makes of each element.
+    flatMap(f: (int) -> Iterable[int]) -> BitSet
+        val result = BitSet()
+        for x in toSet() do result.addAll(f(x))
+        result
+
+    // The elements that satisfy `p`, tested only as `map`, `flatMap` or `foreach` reaches each one.
+    withFilter(p: (int) -> bool) -> FilteredBitSet = FilteredBitSet(self, p)
+
+    // Calls `f` with each element, in ascending order.
+    foreach(f: (int) -> unit)
+        for x in toSet() do f(x)
+
+    // The least element, or `None` when the set is empty.
+    override headOption() -> Option[int] = toSet().headOption()
+
+    // The greatest element, or `None` when the set is empty.
+    override lastOption() -> Option[int] = toSet().lastOption()
+
+    // The least element at least `x`, or `None` when every element is less.
+    minAfter(x: int) -> Option[int] = toSet().minAfter(x)
+
+    // The greatest element less than `x`, or `None` when no element is less.
+    maxBefore(x: int) -> Option[int] = toSet().maxBefore(x)
+
+    // A new set of the same elements.
+    copy() -> BitSet
+        val result = BitSet()
+        result.words.addAll(words)
+        result
+
+    // An immutable bit set of the same elements.
+    toSet() -> ImmutableBitSet = ImmutableBitSet.fromBitMask(snapshot())
+
+    // The words of the set, element `e` being bit `e % 64` of word `e / 64`; the last word is not zero.
+    toBitMask() -> Vector[long] = snapshot()
+
+    // The elements in ascending order, those the set has when this is called.
+    override iterator() -> Iterator[int] = toSet().iterator()
+
+    // The words as a vector, without the empty ones at the end.
+    private snapshot() -> Vector[long] = trimmed(words.toVector())
+
+// A mutable bit set seen through a test, which a guard of a `for` with `yield` makes: each element is
+// tested just before the call after it would use it, so a guard runs in turn with the rest of the
+// comprehension, element by element. What it makes is a new mutable bit set.
+class FilteredBitSet(private val set: BitSet, private val p: (int) -> bool)
+    // A new set of `f` of each element that passes the test.
+    map(f: (int) -> int) -> BitSet
+        val result = BitSet()
+        for x in set
+            if p(x) then result.add(f(x))
+        result
+
+    // A new set of the elements of the collections `f` makes of each element that passes the test.
+    flatMap(f: (int) -> Iterable[int]) -> BitSet
+        val result = BitSet()
+        for x in set
+            if p(x) then result.addAll(f(x))
+        result
+
+    // The elements that pass this test and then `q`.
+    withFilter(q: (int) -> bool) -> FilteredBitSet = FilteredBitSet(set, x -> p(x) && q(x))
+
+    // Calls `f` with each element that passes the test.
+    foreach(f: (int) -> unit)
+        for x in set
+            if p(x) then f(x)
+
+// Two mutable bit sets are equal when they hold the same elements at the moment they are compared.
+impl Eq for BitSet
+    equals(other: BitSet) -> bool
+        val a = toBitMask()
+        val b = other.toBitMask()
+        if a.length() != b.length() then return false
+        for i in 0 ..< a.length()
+            if a(i) != b(i) then return false
+        true
+
+// A sum over the elements, so that the hash is that of an immutable set of the same elements.
+impl Hash for BitSet
+    hash() -> long
+        var h: long = 0
+        for x in self do h = h +% spreadHash(x.hash())
+        h
+
+// Displays as `{1, 2, 3}`, as an immutable set does.
+impl Display for BitSet
+    display(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: int) = x.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+// The diagnostic form is `{1, 2, 3}`, as an immutable set's is.
+impl Debug for BitSet
+    debug(out: Writer, spec: FormatSpec)
+        writeElement(w: Writer, x: int) = x.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeElement)
+
+object BitSet
+    // A new, empty bit set.
+    empty() -> BitSet = BitSet()
+
+    // A new bit set of the elements given, each equal one once; traps on a negative one.
+    apply(elements: int*) -> BitSet
+        val result = BitSet()
+        result.addAll(elements)
+        result
+
+    // A new bit set of the elements of `elements`, each equal one once; traps on a negative one.
+    from(elements: Iterable[int]) -> BitSet
+        val result = BitSet()
+        result.addAll(elements)
+        result
+
+    // The bit set whose words are `words`: element `e` is in the set when bit `e % 64` of word
+    // `e / 64` is set. The inverse of `toBitMask()`.
+    fromBitMask(words: Vector[long]) -> BitSet
+        val result = BitSet()
+        result.words.addAll(trimmed(words))
+        result
+
+    // A builder of a mutable bit set: the elements it is given, each held once.
+    newBuilder() -> Builder[int, BitSet] = BitSetBuilder()
+
+// Builds a mutable bit set by adding to it.
+class BitSetBuilder: Builder[int, BitSet]
+    private var set = BitSet()
+    private var spent = false
+
+    override addOne(element: int)
+        if spent then fail("add to a builder whose result was taken")
+        set.add(element)
+
+    override result() -> BitSet
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        set
+
+    // Starts a new set, leaving one already handed over as it is.
+    override clear()
+        set = BitSet()
+        spent = false
+
+    override knownSize() -> int = set.size()
+
+// The bit of a word that element `e` is.
+private bitOf(e: int) -> long = long(1) << long(e & 63)
+
+// The number of bits set in a word.
+private bitCount(w: long) -> int
+    var x = w
+    var n = 0
+    while x != 0
+        x = x & (x -% 1)
+        n += 1
+    n
+
+// Word `i` of `ws`, zero beyond the last.
+private wordOf(ws: Vector[long], i: int) -> long = if 0 <= i < ws.length() then ws(i) else 0
+
+// `ws` without the empty words at its end.
+private trimmed(ws: Vector[long]) -> Vector[long]
+    var n = ws.length()
+    while n > 0 && ws(n - 1) == 0 do n -= 1
+    if n == ws.length() then ws else ws.take(n)
+
+// Puts element `e` in the words of `b`, growing them to hold it.
+private setBit(b: Buffer[long], e: int)
+    if e < 0 then fail(s"BitSet element is negative: $e")
+    val i = e >> 6
+    while b.length() <= i do b.addOne(0)
+    b(i) = b(i) | bitOf(e)
+
+// Takes element `e` out of the words of `b`; nothing when it is not there.
+private clearBit(b: Buffer[long], e: int)
+    if e >= 0 && (e >> 6) < b.length() then b(e >> 6) = b(e >> 6) & ~bitOf(e)
+
+// Replaces each word of `b` by what `f` makes of it and the word of `other` at its place, `b`
+// growing to the longer of the two.
+private combineInto(b: Buffer[long], other: Vector[long], f: (long, long) -> long)
+    while b.length() < other.length() do b.addOne(0)
+    for i in 0 ..< b.length() do b(i) = f(b(i), wordOf(other, i))

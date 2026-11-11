@@ -1,0 +1,327 @@
+module avin.collections.mutable
+
+import avin.{TreeMap as ImmutableTreeMap, TreeSet as ImmutableTreeSet}
+
+// A mutable map kept in the order of its keys' `compare`, so any `Ord` type can be a key. It holds
+// an immutable `TreeMap` and replaces it at every update, so the structure under it is the sorted
+// tree the immutable map shares between versions: an update, a lookup and each ordered query take
+// time in the logarithm of the size, and `toTreeMap()` hands out the current tree in constant time,
+// a snapshot that later updates do not reach. Iteration visits the entries in ascending order of
+// their keys, and an iterator made before an update goes on over the entries as they were then. A
+// map is the function `(K) -> V` from its keys to their values, its `apply`.
+class TreeMap[K: Ord, V]: Iterable[(K, V)], (K) -> V
+    private var tree = ImmutableTreeMap.empty[K, V]()
+
+    // The number of entries.
+    override size() -> int = tree.size()
+
+    // The number of entries, which the map holds: the same as `size()`.
+    override knownSize() -> int = tree.size()
+
+    isEmpty() -> bool = tree.isEmpty()
+
+    nonEmpty() -> bool = tree.nonEmpty()
+
+    // The value bound to `key`, or `None` when there is none.
+    get(key: K) -> Option[V] = tree.get(key)
+
+    // The value bound to `key`, which traps when there is none.
+    apply(key: K) -> V = tree.get(key) match
+        Some(v) -> v
+        None -> fail("key not found in the map")
+
+    // The value bound to `key`, or `default`, which is evaluated only when there is none.
+    getOrElse(key: K, default: -> V) -> V = tree.get(key) match
+        Some(v) -> v
+        None -> default
+
+    contains(key: K) -> bool = tree.get(key) is Some(_)
+
+    // Binds `key` to `value`, replacing the value it had; `m(key) = value` calls it.
+    update(key: K, value: V)
+        tree = tree.updated(key, value)
+
+    // The value bound to `key`; when there is none, `default` is evaluated, bound to `key` and
+    // returned.
+    getOrElseUpdate(key: K, default: -> V) -> V = tree.get(key) match
+        Some(v) -> v
+        None ->
+            val value = default
+            update(key, value)
+            value
+
+    // Unbinds `key`, answering the value it had, or `None` when it had none.
+    remove(key: K) -> Option[V]
+        val old = tree.get(key)
+        if old is Some(_) then tree = tree.removed(key)
+        old
+
+    // Removes every entry.
+    clear()
+        tree = ImmutableTreeMap.empty[K, V]()
+
+    // Binds every key of `entries` to its value, in order.
+    addAll(entries: Iterable[(K, V)])
+        for (k, v) in entries do update(k, v)
+
+    // The keys, in ascending order.
+    keysIterator() -> Iterator[K] = tree.keysIterator()
+
+    // The values, in the ascending order of their keys.
+    valuesIterator() -> Iterator[V] = tree.valuesIterator()
+
+    // The keys in ascending order, as a vector snapshot.
+    keys() -> Vector[K] = keysIterator().toVector()
+
+    // The values as a vector snapshot: the value at each index belongs to the key at the same index
+    // of `keys()`.
+    values() -> Vector[V] = valuesIterator().toVector()
+
+    // An immutable sorted set of the keys, a snapshot.
+    keySet() -> ImmutableTreeSet[K] = tree.keySet()
+
+    // Calls `f` with each key and its value, in ascending order of the keys.
+    foreach(f: (K, V) -> unit)
+        for (k, v) in tree.iterator() do f(k, v)
+
+    // Binds `key` to `value`: `m += (key, value)`, which needs no `var`.
+    +=(entry: (K, V))
+        update(entry.0, entry.1)
+
+    // Unbinds `key` if it is bound: `m -= key`.
+    -=(key: K)
+        remove(key)
+        ()
+
+    // Binds every key of `entries` to its value, in order: `m ++= entries`.
+    ++=(entries: Iterable[(K, V)]) = addAll(entries)
+
+    // Unbinds every key of `ks` that is bound: `m --= ks`.
+    --=(ks: Iterable[K])
+        for k in ks do remove(k)
+
+    // Replaces the value of `key` by what `f` makes of the value it has now, or of `None` when it has
+    // none: `Some(v)` binds `key` to `v` and `None` leaves it unbound. Answers the new binding.
+    updateWith(key: K, f: (Option[V]) -> Option[V]) -> Option[V]
+        val updated = f(get(key))
+        updated match
+            Some(v) -> update(key, v)
+            None -> remove(key)
+        updated
+
+    // Unbinds every entry whose key and value do not satisfy `p`.
+    filterInPlace(p: (K, V) -> bool)
+        tree = tree.filter(p)
+
+    // A new map of the entries whose key satisfies `p`.
+    filterKeys(p: (K) -> bool) -> TreeMap[K, V] = fromTree(tree.filterKeys(p))
+
+    // A new map of the same keys, each bound to `f` of its value.
+    mapValues[W](f: (V) -> W) -> TreeMap[K, W] = TreeMap.fromTree(tree.mapValues(f))
+
+    // A new map of the same keys, each bound to `f` of the key and its value.
+    transform[W](f: (K, V) -> W) -> TreeMap[K, W] = TreeMap.fromTree(tree.transform(f))
+
+    // A new map of the pairs `f` makes of each entry; where two make the same key, the later in key
+    // order is kept.
+    map[L: Ord, W](f: (K, V) -> (L, W)) -> TreeMap[L, W] = TreeMap.fromTree(tree.map(f))
+
+    // A new map of the pairs `f` makes of each entry, given as a pair, as a `for` with `yield` gives
+    // it; where two make the same key, the later in key order is kept.
+    map[L: Ord, W](f: ((K, V)) -> (L, W)) -> TreeMap[L, W] = TreeMap.fromTree(tree.map(f))
+
+    // A new map of the pairs in the collections `f` makes of each entry.
+    flatMap[L: Ord, W](f: ((K, V)) -> Iterable[(L, W)]) -> TreeMap[L, W] =
+        TreeMap.fromTree(tree.flatMap(f))
+
+    // The entries that satisfy `p`, tested only as `map`, `flatMap` or `foreach` reaches each one.
+    withFilter(p: ((K, V)) -> bool) -> FilteredTreeMap[K, V] = FilteredTreeMap(self, p)
+
+    // A new map of the entries whose key and value satisfy `p`.
+    filter(p: (K, V) -> bool) -> TreeMap[K, V] = fromTree(tree.filter(p))
+
+    // A new map of the same entries.
+    copy() -> TreeMap[K, V] = fromTree(tree)
+
+    // The immutable tree map of the entries now in this one, in constant time.
+    toTreeMap() -> ImmutableTreeMap[K, V] = tree
+
+    // The entries as `(key, value)` pairs, in ascending order of the keys. The iterator goes over the
+    // entries as they are when it is made.
+    override iterator() -> Iterator[(K, V)] = tree.iterator()
+
+    // The entries in descending order of their keys.
+    reverseIterator() -> Iterator[(K, V)] = tree.reverseIterator()
+
+    // The entry with the least key, or `None` when the map is empty.
+    override headOption() -> Option[(K, V)] = tree.headOption()
+
+    // The entry with the greatest key, or `None` when the map is empty.
+    override lastOption() -> Option[(K, V)] = tree.lastOption()
+
+    // The entry with the least key; traps when the map is empty.
+    override head() -> (K, V) = tree.headOption() match
+        Some(e) -> e
+        None -> fail("head of an empty map")
+
+    // The entry with the greatest key; traps when the map is empty.
+    override last() -> (K, V) = tree.lastOption() match
+        Some(e) -> e
+        None -> fail("last of an empty map")
+
+    // The least key; traps when the map is empty.
+    firstKey() -> K = head().0
+
+    // The greatest key; traps when the map is empty.
+    lastKey() -> K = last().0
+
+    // Unbinds the least key, answering its entry; traps when the map is empty.
+    removeFirst() -> (K, V)
+        val e = head()
+        tree = tree.removed(e.0)
+        e
+
+    // Unbinds the greatest key, answering its entry; traps when the map is empty.
+    removeLast() -> (K, V)
+        val e = last()
+        tree = tree.removed(e.0)
+        e
+
+    // Unbinds the least key, answering its entry, or `None` when the map is empty.
+    removeFirstOption() -> Option[(K, V)]
+        val e = tree.headOption()
+        if e is Some(entry) then tree = tree.removed(entry.0)
+        e
+
+    // Unbinds the greatest key, answering its entry, or `None` when the map is empty.
+    removeLastOption() -> Option[(K, V)]
+        val e = tree.lastOption()
+        if e is Some(entry) then tree = tree.removed(entry.0)
+        e
+
+    // The entry with the least key at least `key`, or `None` when every key is less.
+    minAfter(key: K) -> Option[(K, V)] = tree.minAfter(key)
+
+    // The entry with the greatest key less than `key`, or `None` when no key is less.
+    maxBefore(key: K) -> Option[(K, V)] = tree.maxBefore(key)
+
+    // A new map of the entries whose keys are at least `low`.
+    rangeFrom(low: K) -> TreeMap[K, V] = fromTree(tree.rangeFrom(low))
+
+    // A new map of the entries whose keys are at most `high`.
+    rangeTo(high: K) -> TreeMap[K, V] = fromTree(tree.rangeTo(high))
+
+    // A new map of the entries whose keys are less than `high`.
+    rangeUntil(high: K) -> TreeMap[K, V] = fromTree(tree.rangeUntil(high))
+
+    // A new map of the entries whose keys are at least `low` and less than `high`; none when `high`
+    // is not greater than `low`.
+    range(low: K, high: K) -> TreeMap[K, V] = fromTree(tree.range(low, high))
+
+    private fromTree(t: ImmutableTreeMap[K, V]) -> TreeMap[K, V]
+        val result = TreeMap[K, V]()
+        result.tree = t
+        result
+
+// A mutable tree map seen through a test of its entries, which a guard of a `for` with `yield`
+// makes: each entry is tested just before the call after it would use it, in key order. What it makes
+// is a new mutable tree map.
+class FilteredTreeMap[K: Ord, V](private val source: TreeMap[K, V], private val p: ((K, V)) -> bool)
+    // A new map of the pairs `f` makes of each entry that passes the test.
+    map[L: Ord, W](f: ((K, V)) -> (L, W)) -> TreeMap[L, W]
+        val result = TreeMap[L, W]()
+        for entry in source
+            if p(entry) then result += f(entry)
+        result
+
+    // A new map of the pairs in the collections `f` makes of each entry that passes the test.
+    flatMap[L: Ord, W](f: ((K, V)) -> Iterable[(L, W)]) -> TreeMap[L, W]
+        val result = TreeMap[L, W]()
+        for entry in source
+            if p(entry) then result ++= f(entry)
+        result
+
+    // The entries that pass this test and then `q`.
+    withFilter(q: ((K, V)) -> bool) -> FilteredTreeMap[K, V] =
+        FilteredTreeMap(source, e -> p(e) && q(e))
+
+    // Calls `f` with each entry that passes the test.
+    foreach(f: ((K, V)) -> unit)
+        for entry in source
+            if p(entry) then f(entry)
+
+// Two mutable tree maps are equal when they hold the same keys bound to equal values at the moment
+// they are compared, as arrays compare by their contents; `===` tells two maps apart.
+impl[K, V: Eq] Eq for TreeMap[K, V]
+    equals(other: TreeMap[K, V]) -> bool = toTreeMap() == other.toTreeMap()
+
+// A sum over the entries, so that the hash agrees with an immutable tree map's of the same entries.
+impl[K: Hash, V: Hash] Hash for TreeMap[K, V]
+    hash() -> long = toTreeMap().hash()
+
+// Displays as `{a: 1, b: 2}`, in key order, as an immutable map does.
+impl[K: Display, V: Display] Display for TreeMap[K, V]
+    display(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.display(w, FormatSpec())
+            w.write(": ")
+            entry.1.display(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+// The diagnostic form is `{"a": 1}`, as an immutable map's is.
+impl[K: Debug, V: Debug] Debug for TreeMap[K, V]
+    debug(out: Writer, spec: FormatSpec)
+        writeEntry(w: Writer, entry: (K, V))
+            entry.0.debug(w, FormatSpec())
+            w.write(": ")
+            entry.1.debug(w, FormatSpec())
+        writeBraced(out, spec, iterator(), writeEntry)
+
+object TreeMap
+    // A new, empty map.
+    empty[K: Ord, V]() -> TreeMap[K, V] = TreeMap[K, V]()
+
+    // A new map of the pairs given, a later pair's value replacing an earlier one's for the same key.
+    apply[K: Ord, V](pairs: (K, V)*) -> TreeMap[K, V]
+        val result = TreeMap[K, V]()
+        for (k, v) in pairs do result(k) = v
+        result
+
+    // A new map of the pairs of `pairs`, a later pair's value replacing an earlier one's for the same
+    // key.
+    from[K: Ord, V](pairs: Iterable[(K, V)]) -> TreeMap[K, V]
+        val result = TreeMap[K, V]()
+        for (k, v) in pairs do result(k) = v
+        result
+
+    // A new map holding the entries of an immutable tree map.
+    fromTree[K: Ord, V](t: ImmutableTreeMap[K, V]) -> TreeMap[K, V]
+        val result = TreeMap[K, V]()
+        result.tree = t
+        result
+
+    // A builder of a mutable tree map: the pairs it is given, a later pair's value replacing an
+    // earlier one's for the same key. It is typed as a `Builder` of maps, so a literal where a
+    // `TreeMap[K, V]` is expected gives the call its `K` and `V`.
+    newBuilder[K: Ord, V]() -> Builder[(K, V), TreeMap[K, V]] = TreeMapBuilder[K, V]()
+
+// Builds a mutable tree map by storing each pair in it.
+class TreeMapBuilder[K: Ord, V]: Builder[(K, V), TreeMap[K, V]]
+    private var map = TreeMap[K, V]()
+    private var spent = false
+
+    override addOne(element: (K, V))
+        if spent then fail("add to a builder whose result was taken")
+        map(element.0) = element.1
+
+    override result() -> TreeMap[K, V]
+        if spent then fail("result of a builder whose result was taken")
+        spent = true
+        map
+
+    // Starts a new map, leaving one already handed over as it is.
+    override clear()
+        map = TreeMap[K, V]()
+        spent = false
+
+    override knownSize() -> int = map.size()
