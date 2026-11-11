@@ -5685,6 +5685,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Proposed (branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
   builds `Resolution` and the zone's handling of a skipped or repeated reading they rely on; step 2
   gives `Zoned` only `isoWeek()` and `isoWeekYear()`, which need no resolution.
+- **A shared variant name takes the type its siblings decide** (branch
+  `generic-variant-inference`): a bare or called variant name several data types share, passed for
+  a generic function's type argument, is decided by what the call's other arguments decide of that
+  type argument: `assertEq(p.segments(0), MoveTo(10.0, 20.0))` takes `T = Segment` from the first
+  argument, so `MoveTo` is `Segment`'s. It is checked after the arguments that are not such names,
+  wherever it is written, so `same(MoveTo(1.0, 2.0), segment)` resolves too, and named arguments go
+  the same way. The elements of a collection literal and the two branches of an `if` agree the same
+  way: `[Close, segment]`, `if c then Close else segment`. Only the data type is taken from the
+  others; its type arguments are left for the variant's own fields to decide, so a later argument
+  may still widen them, as any argument's may. Where every argument for the type argument is such a
+  name, or the others decide a type that is none of the name's owners, the use is refused with the
+  usual message. Why: the name's type is fixed by the call before it is chosen, exactly as with a
+  parameter of the data type itself, and checking the shared names last makes the result
+  independent of argument order, which a reader expects of `assertEq(a, b)` and `assertEq(b, a)`.
+  Alternatives: left to right only, so `same(MoveTo(…), segment)` is refused (order-dependent, and
+  the expected value usually comes second); taking the decided type with its type arguments fixed
+  too (refuses a later argument that widens them); a second checking pass over the whole call
+  (the same answers here, with each argument checked twice).
 
 ## Open
 
