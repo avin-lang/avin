@@ -5960,14 +5960,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Certificate(_)` patterns become `Certificate(_, _)`. Review with the user whether the
   `Certificate` arity change is wanted over a variant per kind.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `c-binding-gaps-2`): **A field accessor reads and writes a struct
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps-2`): **A field accessor reads and writes a struct
   mirror whole**: the C unit checks the field is the struct the mirror mirrors (any member path,
   through pointers and array elements); the reader's glue copies the field into memory Avin
   allocates, read into a new value as a filled `out` mirror is, the memory then freed; the writer
@@ -5980,8 +5973,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   fields; a field is never null. *Alternatives*: read only, no writer (writing is the scalar rule
   extended and costs one glue function); a writer that leaks or keeps the string copies (C would
   own Avin's allocation); answering a handle on the struct inside the owner (lifetime tied to the
-  owner, and every member a call).
-- Proposed (built on branch `c-binding-gaps-2`): **One pointer to a typedef of `char` is a
+  owner, and every member a call). Review with the user: a mirror holding a string is read-only.
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps-2`): **One pointer to a typedef of `char` is a
   string**: where a string crosses (parameter, result, `out` value, callback parameter), a C type
   written as one pointer to a typedef (`const FT_String *`, `FT_String const *`, `T *const`) is
   checked by the C unit as a typedef of the whole pointer: `char *` or `const char *` as a result,
@@ -5993,12 +5986,19 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   type comes from the header. *Alternatives*: rewriting the prototype's spelling to `char` (loses
   the header check's typedef names); a new C type kind in the parser for a pointer to a typedef
   (every handle `cairo_t *` is one, so each position would have to tell the two apart).
-- Proposed (built on branch `c-binding-gaps-2`): **The c-bindings chapter's FreeType library is
+- Settled on the user's delegation 2026-11-11 (built on branch `c-binding-gaps-2`): **The c-bindings chapter's FreeType library is
   released with `FT_Done_Library`**, not `FT_Done_FreeType`: the latter frees the library's memory
   manager whatever the reference count, so a face kept past the library's handle would allocate
   through freed memory. The chapter's prose and both examples say so. *Why*: a `release` must give
   back exactly one reference when the class declares `retain`. *Alternatives*: none that keeps
   `keeps:` sound; the manager's small record is not given back, as the freetype package notes.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
