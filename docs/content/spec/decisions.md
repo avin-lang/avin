@@ -6654,6 +6654,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
   a differently named method, as own-kind `partition` met); also boxing a scalar result, which
   would make an override's call site convert behind a virtual call.
+- Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
+  private `lazy val`**, and the expression that computes the cell is dropped once it has run. The
+  cell is `Option[(T, LazyList[T])]`; the class holds a function that reads the real expression out
+  of a captured variable and empties it, so an evaluated cell keeps nothing the expression captured.
+  WHY: a covariant class may hold no `var` of its element type, and a `lazy val` is the one immutable
+  field that is computed once and kept, with its trap on a read during its own evaluation. Keeping
+  the expression would hold everything it captured for as long as the cell lives (a `filter` cell
+  would hold every source cell it skipped). ALTERNATIVES: an invariant node class with `var`s (the
+  list could then not be covariant); a `var` of type `Any` cast back on each read (no type checking
+  of the cell); keeping the expression (simpler, a space leak).
+- Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
+  strictly and the tail by name, and the tail is evaluated when the list's second cell is first
+  read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
+  cell is then exactly the head, and a function building a list recursively runs one step per cell
+  read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
+  at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
+  next step).
+- Proposed (built on branch `stdlib-lazy-list`): **There is no lazy cons operator; `x +: xs`
+  prepends to a list already made.** A symbol method whose name ends in `:` takes its receiver on
+  the right, and a receiver is evaluated where it is written, so the tail of `x op: tail` cannot be
+  delayed; a left-grouping name would need a method on every element type, which only the core
+  library may declare by an `impl` over all types, and would group `1 op 2 op xs` the wrong way.
+  `LazyList.cons(x, tail)` is the delayed form. **Review with the user**: a language form (a
+  by-name receiver for `:`-ending methods, or `::` building a lazy list where one is expected) would
+  give `head #:: tail`; and `head :: tail` patterns on a lazy list need the pattern rules to reach
+  beyond `List`: both are language changes, left to the user.
+- Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
+  a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
+  never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from
+  it; sequence patterns over it would call `length()` too. As an `Iterable` it keeps the forcing
+  methods every collection has, its own lazy forms found first. ALTERNATIVES: a `Seq` overriding the
+  methods that would not return (most of them), or a `Seq` whose `length()` simply does not return
+  on an endless list.
+- Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
+  evaluated prefix and `…`, evaluating nothing**: `[0, 1, 4]`, `[0, 1, …]`, `[…]`, with a field
+  width padding the whole. WHY: displaying an endless list must return, and a display that
+  evaluated cells would run a program's functions while printing. ALTERNATIVES: forcing every cell
+  (does not return on an endless list); a fixed prefix forced (side effects while printing);
+  `<not computed>` text (longer, and not a form the other collections use). No `Eq`, `Hash` or
+  `Ord`, which could not answer for two equal endless lists.
+- Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
+  the thread that made it; the cells' `lazy val` evaluation would be safe between threads, but the
+  expressions not yet evaluated are functions that may capture anything. ALTERNATIVES: sendable when
+  every expression is a `@sendable` function (every lazy method would need a sendable form).
+- Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
+  **`flatMap` takes `(T) -> Iterable[U]`**, reading each collection through its iterator as cells are
+  read; **`++` takes its right operand by name**, evaluated only when the cell after the left's last
+  is read (the iterator's `++` takes a strict `Iterable`, since an iterator is read once anyway);
+  `toLazyList()` on every `Iterable` converts, since `from` is the integer counter's name as on
+  `Iterator`. Also added beyond the item: `filterNot`, `zipWithIndex`, `fill`, `tabulate`, `lift`,
+  `force()` and `isEvaluated()`.
 
 ## Open
 
