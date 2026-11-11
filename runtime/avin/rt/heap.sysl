@@ -199,8 +199,10 @@ var block: []u8 = [0u8; heap_limit()]
 var space: gc.Heap = gc.heap(&block[0], block.len, null)
 
 /** With `AVIN_GC_STRESS=1` every allocation collects first, which finds a missing root at the
- * first allocation it matters to. */
-var stress: bool = env.get("AVIN_GC_STRESS") == Some("1")
+ * first allocation it matters to. `AVIN_GC_STRESS=2` also collects at every safepoint poll, which
+ * finds a reference not kept alive across a loop that does not allocate. */
+var stress: bool = env.get("AVIN_GC_STRESS") == Some("1") || env.get("AVIN_GC_STRESS") == Some("2")
+var poll_stress: bool = env.get("AVIN_GC_STRESS") == Some("2")
 var budget: usize = Floor
 /** What the heap held when the last collection finished. A carrier's chunk is charged whole when it
  * is claimed, so what has been allocated since is at most what the heap holds now beyond this. */
@@ -256,6 +258,9 @@ var requested: Atomic[u32] = Atomic(0)
 const Stop: u32 = 1
 /** The bit of `requested` the scheduler raises for a lightweight thread to yield its carrier. */
 const Yield: u32 = 2
+/** The bit of `requested` raised for good under `AVIN_GC_STRESS=2`, so every poll calls the runtime,
+ * which collects. */
+const Poll: u32 = 4
 
 /** Whether a collection has asked the other threads to stop. */
 stop_requested() -> bool = (requested.load() & Stop) != 0
@@ -329,6 +334,7 @@ safepoint(c: *Context)
     if stop_requested()
         mark_safe(c)
         mark_running(c)
+    if poll_stress then collect(c)
     answer_yield(c)
 
 /** Takes the heap lock for `c`'s thread, safe while it waits, since the holder may be collecting.
@@ -360,7 +366,7 @@ stop_others(c: *Context) -> bool
 
 resume_others()
     world.lock_raw()
-    _ = requested.and(Yield)
+    _ = requested.and(~Stop)
     resumed.notify_all()
     world.unlock_raw()
 
@@ -494,6 +500,7 @@ start(argc: i32, argv: **u8) -> *Context
     keep_arguments(argc, argv)
     install_stack_guard()
     main_context.owner = fresh_owner()
+    if poll_stress then _ = requested.or(Poll)
     attach(&main_context)
     leave_safe(&main_context)
     current_context = &main_context

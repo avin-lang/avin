@@ -314,7 +314,9 @@ tree), so lowering can choose. A derivation's shapes are such values, so what a 
 them, a variant's index, a field's name, whether it has an annotation, is a constant in the
 compiled code. `AVIN_GC_STRESS=1` makes every
 allocation collect first, and the execution tests run that way, so a reference the compiler failed
-to root is found at the first allocation that could lose it.
+to root is found at the first allocation that could lose it. `AVIN_GC_STRESS=2` also collects at
+every safepoint poll, which finds a reference let go while a loop that allocates nothing still uses
+an address computed from it, such as the elements of an array laid out for C.
 
 An object of a class is laid out as a one-variant `data` value is: one 8-byte slot per field (wider integers take more), the class parameters first and then the fields
 the body declares, in order. A class with no fields still allocates, since every object has its own
