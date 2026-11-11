@@ -6668,15 +6668,61 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     boxing a scalar did, a string member included. *Why*: one representation per type everywhere, so
     generic code at a union type argument needs no conversion where it meets its storage.
     *Alternatives*: converting to an `Any` at every such boundary (a box only for a scalar member, but
-    a conversion at every generic call and field access, each a place to get wrong).
+    a conversion at every generic call and field access, each a place to get wrong). Superseded by
+    the next entry (branch `union-words-storage`): storage now holds the words.
   - **Converting to an `Any` or a trait** boxes a scalar member there and passes a reference member
     as it is; **a member call** through a trait every member has converts the union the same way,
     except `display`, `debug` and `toString`, which call the member's own implementation by the tag
     with no box. `===` with an object compares the union as an `Any`, so a scalar member, a new box,
     is never identical to it. **`==` and the hash** are decided by the tag: two values of one member
     compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
-    `Any` are equal and hash alike. Review with the user: storing a union with a string member now
-    allocates its cell where an `Any` did not, until fields and collections take the words.
+    `Any` are equal and hash alike. (The review flag this entry carried, a stored union with a string
+    member allocating its cell, is closed by the next entry.)
+- Proposed (built on branch `union-words-storage`): **A union with a scalar member is stored as its
+  words** (the storage half of the entry above).
+  - **Every storage place holds the words**: a field of a data value, a class or a tuple, an array
+    element (so a `Vector`, a `Buffer` and a map), a closure's capture, a captured `var`'s box and a
+    module-level value lay the union out as its tag (in an 8-byte slot), its bits and, with a
+    reference member, its reference, 24 bytes or 16, and only the reference word is traced (a
+    descriptor's reference offsets, an array's element map). Storing reads the words out of the
+    value's cell; loading makes a cell of the words read, which scalar replacement removes, so storing
+    and reading allocate nothing for any member. *Why*: it removes the allocation the entry above
+    flagged, and every place reuses one pair of helpers. *Alternatives*: the cell kept as an object
+    in storage (an allocation per store, a string member included); converting to an `Any` there (a
+    box for each scalar member, and type tests on read).
+  - **Generic code at a union type argument stores the words in each instance** (`Vector[int |
+    string]` holds 24-byte elements), never boxing at a generic boundary. *Why*: generic code is
+    compiled per instance already, so the instance's storage is the union's own; nothing converts at
+    a call. *Alternatives*: boxing a union to an `Any` where it enters generic code (an allocation
+    per element and a type test per read, for no gain).
+  - **A module-level union keeps its tag and bits in its own 16 bytes and its reference word in a
+    module-level reference of its own**, named `<value>#reference`, after every value and `lazy val`
+    state word. *Why*: the program's roots are a frame of references, so the reference word has to be
+    one of them; the rest is plain data. *Alternatives*: the cell kept on the heap for module-level
+    values (an allocation per assignment of a `var`); teaching the root frame a word map (a runtime
+    change for one case).
+  - **`Atomic` keeps a reference to a cell**: its value is one word that `load`, `store`, `swap` and
+    the hardware compare-and-set access indivisibly, so an `Atomic[int | string]` allocates the cell
+    on each store. *Why*: three words cannot be swapped atomically without a lock. *Alternatives*:
+    a lock for `Atomic`s of unions (as for integers wider than 64 bits; slower for every operation).
+  - **A load from storage reads a tag of 0 (a reference) only beside a non-null reference word, and
+    any other zero tag as the first scalar member's.** A racing read may combine a tag and a reference
+    from two writes, as it may an `i128`'s words, and an array element not yet filled is all zero;
+    either way the value read is one of a member, never a null taken for a reference. *Why*: the
+    promise that a race never breaks memory safety; it costs two compares and two selects per load.
+    *Alternatives*: no check (a racing read could dereference null); a lock per union field (a cost
+    on every access for a race the program should not have). Review with the user: a racing read of a
+    union may now combine two writes, an exception the threads chapter states beside wide integers.
+  - **An integer member wider than 64 bits is kept boxed in the reference word under tag 0**, its
+    type told by its box's record, so `i128 | int` has a reference word and injecting an `i128`
+    allocates its box. This fixes the layout above, which kept such a member in the 64 bits and lost
+    its high bits. *Why*: the bits slot stays 64 bits for every union, and a wide integer, rare in a
+    union, costs a box as it does in an `Any`. *Alternatives*: a bits slot as wide as the widest
+    member (a layout per union type, and every helper and the call words taking a width); refusing
+    integers wider than 64 bits as members (a gap in the language).
+  - **A tuple with a union part is not answered as words** by `val (a, b) = f(x)`: the call makes the
+    tuple, and the parts are read from it. *Why*: a result's words do not nest a union's words yet.
+    *Alternatives*: flattening the union's words into the result's (a later optimization).
 - Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
   A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
   part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a

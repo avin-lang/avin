@@ -691,9 +691,23 @@ function one parameter per word, a cell made from them at its entry, returns of 
 of the returned cell, and each call its arguments' words and a cell made of the words it gets back,
 except a call whose value the block only returns, which passes the words straight on. Every cell of
 a function is then made in it and only read, so scalar replacement keeps it as its fields, and a
-union in a local, a parameter or a result allocates nothing; a cell stored in an object, an array, a
-closure or a module-level value stays an object (descriptors `union cell` and `union cell of
-scalars`), traced through its reference word. The checker converts a union with a scalar member to
+union in a local, a parameter or a result allocates nothing. Storage holds the words themselves:
+`storage_type` gives such a union the machine type `MCell` wherever a value outlives a call (a field
+of a data value, a tuple or a class, an array element, a closure's capture, a captured `var`'s box,
+a module-level value), 24 bytes with a reference member and 16 without, and the descriptor's
+reference offsets, or an array's element map, list only the reference word. `store_at` reads the
+words out of the cell and stores each, and `load_at` loads them and makes a cell of them, which
+scalar replacement keeps as its fields again, so storing a union and reading it back allocates
+nothing. A load believes a tag of 0 (a reference) only beside a non-null reference word and reads
+any other zero tag as the first scalar member's, so a racing read or an array element not yet
+filled never yields a null reference. A module-level union keeps its tag and bits in 16 bytes of
+storage and its reference word in a module-level reference of its own, among the roots
+(`global_reference`, named `#reference`, after the `lazy val` state words). An `Atomic`'s field
+alone stays a reference to a cell (descriptors `union cell` and `union cell of scalars`), one word
+its operations access indivisibly. A tuple with a union part is never answered as words
+(`tuple_words`): the call makes the tuple. An integer member wider than 64 bits is no scalar of
+the bits (`is_boxed_member`): it is boxed and kept in the reference word under tag 0, its type
+tested by its box's record, so such a union has a reference word. The checker converts a union with a scalar member to
 an `Any` or a trait with `Box`, as it does a scalar; a member call through such a trait boxes the
 receiver too, keeping it a variable so `dispatch` sees the union and renders it by its tag.
 

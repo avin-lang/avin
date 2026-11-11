@@ -443,10 +443,22 @@ same at `-O0` and `-O2`:
   scalar member is boxed there, as any scalar is.
 - The tag numbering is fixed by the normal form, not by the order written, so `int | string` and
   `string | int` are one layout.
+- An integer member wider than 64 bits does not fit the bits slot: the union keeps it boxed in its
+  reference slot, as it keeps a reference, so `i128 | int` has a reference slot and injecting an
+  `i128` allocates its box. Every bit of it is kept.
+- Wherever a union with a scalar member is stored, it is stored as its slots: a field of a data
+  type, a class or a tuple, an element of an `Array` (and so of a `Vector`, a `Buffer` or a map), a
+  closure's captures, a captured `var`, a module-level value and an actor's message. Storing one and
+  reading it back allocates nothing, and the collector traces its reference slot and never the tag
+  or the bits. The one exception is `Atomic`, whose value is one word its operations read and write
+  indivisibly: an `Atomic` of such a union holds a reference to an object of its slots.
 - Generic code is compiled per instance, as all generic code is, so `Vector[T | int]` at `T = string`
   stores `string | int` values in the vector's own elements, unboxed, and at `T = int` stores `int`s.
-- A union inside a data type, a tuple, an `Array`, a `Buffer`, a closure's captures or an actor's
-  message is traced through its reference slot like any field.
+- A union in a heap field, an array element or a module-level `var` is several words, so, as with
+  an integer wider than 64 bits, a racing read may combine the words of two writes (see
+  [threads](/spec/threads/)). It still reads as a value of one of the members: the tag is believed
+  to name a reference only beside a reference, so a racing read never gives a reference that no
+  write stored.
 
 ## What is refused
 

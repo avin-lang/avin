@@ -1,0 +1,74 @@
+// expect: exit 0
+// A union crosses threads as its words: sent through a channel, carried in an actor's message,
+// answered through a promise and returned from a thread, a reference member still traced and a scalar
+// member's bits unchanged, while every allocation collects. An `Atomic` of a union holds a reference to
+// its value as one word, so a load sees a whole value some store wrote, and `compareAndSet` compares
+// with `==`.
+import avin.actors.{ActorRef, spawn as spawnActor}
+import avin.threads.{Atomic, Channel, Promise, spawn}
+
+data Msg
+    Put(value: long | string)
+    Total(reply: Promise[long | string])
+
+weight(u: long | string) -> long = u match
+    n: long -> n
+    s: string -> long(s.byteLength())
+
+actor Summer() receives Msg
+    var sum: long = 0
+    var last: long | string = 0
+
+    receive
+        Put(value) ->
+            sum += weight(value)
+            last = value
+        Total(reply) -> reply.complete(if sum % 2 == 0 then sum else s"odd $sum ${last}")
+
+made(i: int) -> long | string = if i % 2 == 0 then s"item $i" else long(i) * 1000000007
+
+main()
+    // A channel of unions between two threads.
+    val c = Channel[long | string](4)
+    val producer = spawn(() ->
+        for i in 0..<50 do c.send(made(i))
+        c.close())
+    var received: long = 0
+    var strings = 0
+    for u in c
+        received += weight(u)
+        if u is _: string then strings += 1
+    producer.join()
+    var expected: long = 0
+    for i in 0..<50 do expected += weight(made(i))
+    println(s"$received $strings ${received == expected}")
+    // A thread's result.
+    val t = spawn(() -> made(7))
+    println(t.join())
+    val t2 = spawn(() -> made(8))
+    println(t2.join())
+    // An actor's messages and its answer.
+    val summer = spawnActor(Summer())
+    for i in 0..<9 do summer.tell(Put(made(i)))
+    val p = Promise[long | string]()
+    summer.tell(Total(p))
+    println(p.future.await())
+    // An Atomic of a union.
+    val a = Atomic[int | string](1)
+    println(a.load())
+    a.store("two")
+    println(a.load())
+    println(a.compareAndSet("t" + "wo", 3))
+    println(a.compareAndSet("two", 4))
+    println(a.swap("five"))
+    println(a.load())
+    val counter = Atomic[int | string](0)
+    var threads: Vector[avin.threads.Thread[unit]] = []
+    for _ in 0..<4
+        threads = threads :+ spawn(() ->
+            for _ in 0..<100
+                counter.update(u -> u match
+                    n: int -> n + 1
+                    s: string -> s))
+    for th in threads do th.join()
+    println(counter.load())

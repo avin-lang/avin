@@ -29,6 +29,21 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     TypeVar(owner, _, _) -> if is_self_owner(owner) then Some(MRef) else None
     _ -> None
 
+/** The machine type a value of the concrete type `t` is stored as in memory that outlives a call: a
+ * field of an object, a data value or a tuple, an array element, a closure's capture, a captured
+ * variable's box or a module-level value. A union with a scalar member is stored as its words,
+ * `MCell`; every other type as its machine type. */
+private storage_type(t: &Type) -> Option[MirType]
+    if is_scalar_union(t) then return Some(MCell(union_holds_reference(t)))
+    mir_type(t)
+
+/** The machine type a value of type `t` of the code being lowered is stored as: see `storage_type`. */
+private stored(l: *Lowering, t: &Type) -> Option[MirType] = storage_type(concrete(l, t))
+
+/** Whether a class is `avin.threads.Atomic`, whose value is one word its operations access
+ * indivisibly. */
+private is_atomic_class(k: ClassSymbol) -> bool = k.module_name == "avin.threads" && k.name == "Atomic" && !k.decl.object
+
 /** Where a value is kept: the address of a slot, and the type stored there. */
 private struct Place
     address: Operand
@@ -372,11 +387,16 @@ lower_program(program: TProgram) -> MirProgram = lower_program_cached(program, m
  * an entry can hold gets one, in the program's `key_inputs`. */
 lower_program_cached(program: TProgram, cached: Map[string, string], caching: bool) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
-    for g in program.globals
-        global_types.push(mir_type(solve(program.vars, program.symbols[g.init].result.unwrap_or(Unit))))
+    for g in 0..<program.globals.len()
+        // A union with a scalar member keeps its tag and bits here, and its reference word apart.
+        val m = global_storage(program, g)
+        global_types.push(if m is Some(MCell(_)) then Some(MInt(128)) else m)
     // Each `lazy val` also has a state word, after every module-level value: see `lazy_state`.
     for g in program.globals
         if g.lazy then global_types.push(Some(MInt(64)))
+    // And each union with a reference member its reference word: see `global_reference`.
+    for g in 0..<program.globals.len()
+        if global_storage(program, g) is Some(MCell(true)) then global_types.push(Some(MRef))
     var generic_base = 0usize
     for k in program.classes
         if k.table.len() > generic_base then generic_base = k.table.len()
@@ -559,7 +579,24 @@ private const DescriptorTag: usize = 32
 
 private field_size(t: MirType) -> usize = t match
     MInt(bits) -> usize((bits + 63) / 64) * 8
+    // A union's words: the tag and the bits, and the reference where a member is one.
+    MCell(refs) -> if refs then 24 else 16
     _ -> 8
+
+/** Adds to `refs` the offset of each reference word a value of storage type `t` at `at` keeps: the
+ * value itself for a reference, and a union's reference word. */
+private push_reference_words(refs: *Buf[usize], t: MirType, at: usize)
+    if t is MRef then refs.push(at)
+    elif t is MCell(true) then refs.push(at + CellReferenceOffset)
+
+/** The descriptor of an array whose elements have the storage type `element`, from the map of which
+ * of an element's words hold references: a union's tag and bits never do, its reference word does. */
+private element_array_descriptor(name: string, element: Option[MirType], methods: Buf[Option[usize]], record: usize, call: Option[usize]) -> Descriptor
+    val size = element_size(element)
+    element match
+        Some(MCell(true)) -> array_descriptor(name, size, [false, false, true], methods, record, call)
+        Some(MCell(false)) -> array_descriptor(name, size, [false, false], methods, record, call)
+        _ -> array_descriptor(name, size, [element is Some(MRef)], methods, record, call)
 
 /** The layout of a data, tuple or class type, which must be concrete; made when first asked for. A
  * tuple is laid out as a data type with one variant whose fields are its parts, and a class as one
@@ -583,21 +620,21 @@ private layout_made(l: *Lowering, t: &Type) -> DataLayout
             val methods = method_table(l, t)
             val call = call_entry(l, t)
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, methods, record, call))
-        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, method_table(l, t), record, None))
+                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, true, methods, record, call))
+        Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, true, method_table(l, t), record, None))
         Class(id, _, args) ->
             if is_array_class(l.program.classes[id])
                 // An array's descriptor gives the size of an element; the elements follow the length.
-                val element = mir_type(args[0])
+                val element = storage_type(args[0])
                 val methods = method_table(l, t)
                 val shape = VariantLayout(l.descriptors.len(), buf())
-                l.descriptors.push(array_descriptor(key, element_size(element), [element is Some(MRef)], methods, record, call_entry(l, t)))
+                l.descriptors.push(element_array_descriptor(key, element, methods, record, call_entry(l, t)))
                 variants.push(shape)
             else
                 var fields: Buf[&Type] = buf()
                 for f in l.program.classes[id].fields
                     fields.push(substitute(f.ty.unwrap_or(ErrorType), class_owner(id), args))
-                val shape = variant_layout(l, key, 0, fields, false, method_table(l, t), record, call_entry(l, t))
+                val shape = variant_layout(l, key, 0, fields, false, !is_atomic_class(l.program.classes[id]), method_table(l, t), record, call_entry(l, t))
                 variants.push(shape)
                 // A Sysl handle has no fields of its own: its first word is the counted Sysl
                 // reference the shim keeps there, which the collector does not trace, and gives back
@@ -657,14 +694,17 @@ private handle_finalizer(id: usize, args: Buf[&Type]) -> string
 
 // One variant's fields at their offsets, and its descriptor; a variant with no field data is one
 // constant object, unless `shared` is false: every object of a class is its own, for its identity.
-private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, methods: Buf[Option[usize]], record: usize, call: Option[usize]) -> VariantLayout
+// A field of a union with a scalar member is the union's words where `words`, its reference word
+// traced and its tag and bits not, and otherwise a reference to its cell: an `Atomic`'s value is one
+// word, which its operations read and write indivisibly.
+private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[&Type], shared: bool, words: bool, methods: Buf[Option[usize]], record: usize, call: Option[usize]) -> VariantLayout
     var fields: Buf[Option[FieldSlot]] = buf()
     var refs: Buf[usize] = buf()
     var size = 0usize
     for field in field_types
-        mir_type(field) match
+        (if words then storage_type(field) else mir_type(field)) match
             Some(m) ->
-                if m is MRef then refs.push(size)
+                push_reference_words(&refs, m, size)
                 fields.push(Some(FieldSlot(size, m)))
                 size += field_size(m)
             None -> fields.push(None)
@@ -677,6 +717,7 @@ private variant_layout(l: *Lowering, name: string, tag: usize, field_types: Buf[
 private element_size(t: Option[MirType]) -> usize = t match
     Some(MInt(bits)) -> if bits <= 8 then 1 elif bits <= 16 then 2 elif bits <= 32 then 4 else field_size(MInt(bits))
     Some(MBool) -> 1
+    Some(MCell(refs)) -> field_size(MCell(refs))
     Some(_) -> 8
     None -> 0
 
@@ -1004,6 +1045,83 @@ private field_address(l: *Lowering, object: Operand, field: FieldSlot) -> Operan
     l.insts.push(Offset(dest, object, field.offset))
     Value(dest)
 
+/** Stores `v` in the field `field` of `object`. */
+private store_field(l: *Lowering, object: Operand, field: FieldSlot, v: Operand) = store_at(l, field_address(l, object, field), field.ty, v)
+
+// A union with a scalar member is stored as its words (`storage_type`): the tag at the address, the
+// bits 8 bytes past it and, where a member is a reference, the reference 16 bytes past it, except in a
+// module-level value, whose reference word is a value of its own among the roots (`global_words`).
+// Storing one reads the words out of its cell; loading one makes a cell of the words read, so a union
+// that goes from storage into a local, a call or a `match` is never an object of its own.
+
+/** Stores `v`, whose machine type is the storage type `t`, at `address`. */
+private store_at(l: *Lowering, address: Operand, t: MirType, v: Operand)
+    if t is MCell(refs)
+        val addresses = word_addresses(l, address, refs)
+        val words = cell_words(l, v, refs)
+        for k in 0..<words.len()
+            l.insts.push(Store(addresses[k], words[k]))
+    else l.insts.push(Store(address, v))
+
+/** The value of storage type `t` at `address`. */
+private load_at(l: *Lowering, address: Operand, t: MirType) -> Operand
+    if !(t is MCell(_))
+        val dest = fresh(l, t)
+        l.insts.push(Load(dest, address))
+        return Value(dest)
+    val refs = t is MCell(true)
+    val addresses = word_addresses(l, address, refs)
+    val tag = fresh(l, MInt(32))
+    l.insts.push(Load(tag, addresses[0]))
+    val bits = fresh(l, MInt(64))
+    l.insts.push(Load(bits, addresses[1]))
+    var reference: Option[Operand] = None
+    // A racing load may read a tag and a reference that different stores wrote, and an array's
+    // element not yet filled is all zero. A tag saying the union holds a reference is believed only
+    // beside a reference, and otherwise is the first scalar member's, so every union read from
+    // storage is one some member's value, never a null reference.
+    val zero = compare(l, CmpEq, Value(tag), ConstInt(32, "0"))
+    var fixed = select(l, MInt(32), zero, ConstInt(32, "1"), Value(tag))
+    if refs
+        val r = fresh(l, MRef)
+        l.insts.push(Load(r, addresses[2]))
+        reference = Some(Value(r))
+        fixed = select(l, MInt(32), compare(l, CmpEq, Value(r), NullAddress), fixed, Value(tag))
+    cell_of_words(l, refs, fixed, Value(bits), reference)
+
+/** The addresses of the words of a union stored at `address`, with a reference word where `refs`. */
+private word_addresses(l: *Lowering, address: Operand, refs: bool) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    out.push(address)
+    val bits = fresh(l, MPtr)
+    l.insts.push(Offset(bits, address, CellBitsOffset))
+    out.push(Value(bits))
+    if refs
+        if address is GlobalAddress(g) then out.push(GlobalAddress(global_reference(l.program, g)))
+        else
+            val reference = fresh(l, MPtr)
+            l.insts.push(Offset(reference, address, CellReferenceOffset))
+            out.push(Value(reference))
+    out
+
+/** The words of the union whose cell is `cell`: the tag, the bits and, where `refs`, the reference. */
+private cell_words(l: *Lowering, cell: Operand, refs: bool) -> Buf[Operand]
+    var out: Buf[Operand] = buf()
+    out.push(load_field(l, cell, cell_tag()))
+    out.push(load_field(l, cell, cell_bits()))
+    if refs then out.push(load_field(l, cell, cell_reference()))
+    out
+
+/** A new cell holding the words `tag`, `bits` and, where `refs`, `reference`. */
+private cell_of_words(l: *Lowering, refs: bool, tag: Operand, bits: Operand, reference: Option[Operand]) -> Operand
+    val cell = fresh(l, MRef)
+    l.insts.push(Alloc(cell, cell_descriptor(l, refs)))
+    l.insts.push(Store(field_address(l, Value(cell), cell_tag()), tag))
+    l.insts.push(Store(field_address(l, Value(cell), cell_bits()), bits))
+    if reference is Some(r) then l.insts.push(Store(field_address(l, Value(cell), cell_reference()), r))
+    l.insts.push(Publish)
+    Value(cell)
+
 // The fields are evaluated in order before the object is allocated, so a collection while
 // allocating sees every one of them as a root.
 private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) -> Option[Operand]
@@ -1023,7 +1141,7 @@ private construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&TExpr]) ->
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
         if shape.fields[i] is Some(field)
-            if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
+            if values[i] is Some(v) then store_field(l, Value(object), field, v)
     l.insts.push(Publish)
     Some(Value(object))
 
@@ -1073,13 +1191,16 @@ private global_name(program: TProgram, g: usize) -> string
     if global.object is Some(_) then "object " + name else name
 
 /** The name of each module-level value's storage, by its index among `global_types`: each value's
- * qualified name, then each `lazy val`'s state word as its value's name followed by `#state`. */
+ * qualified name, then each `lazy val`'s state word as its value's name followed by `#state`, then
+ * each union's reference word (see `global_reference`) followed by `#reference`. */
 private global_names(program: TProgram) -> Buf[string]
     var names: Buf[string] = buf()
     for g in 0..<program.globals.len()
         names.push(global_name(program, g))
     for g in 0..<program.globals.len()
         if program.globals[g].lazy then names.push(global_name(program, g) + "#state")
+    for g in 0..<program.globals.len()
+        if global_storage(program, g) is Some(MCell(true)) then names.push(global_name(program, g) + "#reference")
     names
 
 private constant_of(l: *Lowering, e: &TExpr) -> Option[Constant] = e.kind match
@@ -1118,6 +1239,8 @@ private constant_construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&T
     var fields: Buf[ConstantField] = buf()
     for i in 0..<values.len()
         if shape.fields[i] is Some(slot)
+            // A union's words are stored by the code that makes the value.
+            if slot.ty is MCell(_) then return None
             val v = values[i] match
                 Some(v) -> v
                 None -> return None
@@ -1137,6 +1260,7 @@ private constant_vector(l: *Lowering, e: &TExpr, elements: Buf[&TExpr]) -> Optio
         val empty = layout(l, Class(core_class(l, "Vector0")?, "Vector0", args)).variants[0]
         return Some(Constant(Some(constant_object(l, empty.descriptor, l.descriptors[empty.descriptor].size, buf(), false))))
     val element = mir_type(args[0])?
+    if is_scalar_union(args[0]) then return None
     val size = element_size(Some(element))
     var cells: Buf[ConstantField] = buf()
     cells.push(ConstantField(0, MInt(64), ConstInt(64, elements.len().to_string())))
@@ -1220,6 +1344,7 @@ private stable_constant_key(l: *Lowering, o: Operand) -> string = o match
 
 /** A field of an object made at compile time is its value; `None` for any other object. */
 private constant_field(l: *Lowering, object: Operand, field: FieldSlot) -> Option[Operand]
+    if field.ty is MCell(_) then return None
     val index = object match
         ConstData(k, _) -> k
         _ -> return None
@@ -1271,11 +1396,7 @@ private test_parts(l: *Lowering, pattern: &TPattern, value: &TExpr, fail: usize)
     test_pattern(l, pattern, v, fail)
 
 /** Reads a field of an object. */
-private load_field(l: *Lowering, object: Operand, field: FieldSlot) -> Operand
-    val address = field_address(l, object, field)
-    val dest = fresh(l, field.ty)
-    l.insts.push(Load(dest, address))
-    Value(dest)
+private load_field(l: *Lowering, object: Operand, field: FieldSlot) -> Operand = load_at(l, field_address(l, object, field), field.ty)
 
 // A generic function, or a local function of one, whose types depend on type arguments.
 private is_generic(program: TProgram, id: usize) -> bool
@@ -1411,7 +1532,7 @@ private box_descriptor_made(l: *Lowering, t: MirType) -> usize
     val key = machine_name(t)
     if l.boxes.get(key) is Some(d) then return d
     var refs: Buf[usize] = buf()
-    if t is MRef then refs.push(0)
+    push_reference_words(&refs, t, 0)
     val d = l.descriptors.len()
     l.descriptors.push(Descriptor("cell of " + key, 0, field_size(t), refs, false, buf(), 0, Fields, None))
     l.boxes.put(key, d)
@@ -1627,8 +1748,9 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
 // a value is shared by reference to it; every cell of a function is made there (an injection, or the
 // words a parameter or a call's result arrives as, see `union_words`) and only its fields are read
 // after, so scalar replacement keeps a cell that stays in its function as its fields, and a union in
-// a local, a parameter or a result allocates nothing. A cell stored in an object, an array, a closure
-// or a module-level value stays an object, traced through its reference word.
+// a local, a parameter or a result allocates nothing. Storage holds the words themselves (see
+// `store_at` and `load_at`), so a union stored and read back allocates nothing either; only an
+// `Atomic` keeps a reference to a cell, one word.
 
 private cell_tag() -> FieldSlot = FieldSlot(0, MInt(32))
 
@@ -1845,13 +1967,14 @@ private cell_test(l: *Lowering, t: &Type, to: &Type, cell: Operand, fail: usize)
         if same_type(scalars[i], to) || always_is(l, scalars[i], to)
             val next = new_block(l)
             finish_into(l, Branch(compare(l, CmpEq, tag, tag_constant(u32(i + 1))), matched, next), next)
-    // A reference is never of a scalar type: a scalar is always kept in the bits.
-    if union_holds_reference(t) && !is_scalar_member(to)
+    // A reference is never of a scalar type: a scalar is kept in the bits, except an integer wider
+    // than them, kept boxed.
+    if union_holds_reference(t) && (!is_scalar_member(to) || is_boxed_member(to))
         val reference = new_block(l)
         finish_into(l, Branch(compare(l, CmpEq, tag, tag_constant(0)), reference, fail), reference)
         var every = true
         for m in members_of(t)
-            if !is_scalar_member(m) && !always_is(l, m, to) then every = false
+            if (!is_scalar_member(m) || is_boxed_member(m)) && !always_is(l, m, to) then every = false
         if !every
             val object = load_field(l, cell, cell_reference())
             continue_if(l, type_test(l, object, to), fail)
@@ -2096,14 +2219,14 @@ private closure_shape_made(l: *Lowering, function: usize, type_args: Buf[&Type],
     symbol.root match
         Some(root) ->
             for x in symbol.captured_locals
-                if machine(l, l.locals[x].ty) is Some(t)
+                if stored(l, l.locals[x].ty) is Some(t)
                     val m = if l.boxed[x] then MRef else t
-                    if m is MRef then refs.push(size)
+                    push_reference_words(&refs, m, size)
                     fields.push(FieldSlot(size, m))
                     size += field_size(m)
             for x in symbol.captured_params
-                if machine(l, l.program.symbols[root].params[x]) is Some(m)
-                    if m is MRef then refs.push(size)
+                if stored(l, l.program.symbols[root].params[x]) is Some(m)
+                    push_reference_words(&refs, m, size)
                     fields.push(FieldSlot(size, m))
                     size += field_size(m)
         None -> ()
@@ -2179,7 +2302,7 @@ private function_value(l: *Lowering, function: usize, type_args: Buf[&Type]) -> 
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
-        l.insts.push(Store(field_address(l, Value(object), shape.fields[i]), values[i]))
+        store_field(l, Value(object), shape.fields[i], values[i])
     l.insts.push(Publish)
     Value(object)
 
@@ -2678,7 +2801,7 @@ private call_value(l: *Lowering, callee: &TExpr, args: Buf[&TExpr]) -> Option[Op
 private local_place(l: *Lowering, x: usize) -> Option[Place]
     val place = l.local_slots[x]?
     if !l.boxed[x] then return Some(place)
-    val t = machine(l, l.locals[x].ty).unwrap()
+    val t = stored(l, l.locals[x].ty).unwrap()
     val box = load(l, Some(place)).unwrap()
     Some(Place(field_address(l, box, FieldSlot(0, t)), t))
 
@@ -2688,10 +2811,10 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
     val v = value match
         Some(v) -> v
         None -> return
-    val t = machine(l, l.locals[x].ty).unwrap()
+    val t = stored(l, l.locals[x].ty).unwrap()
     val box = fresh(l, MRef)
     l.insts.push(Alloc(box, box_descriptor(l, t)))
-    l.insts.push(Store(field_address(l, Value(box), FieldSlot(0, t)), v))
+    store_field(l, Value(box), FieldSlot(0, t), v)
     l.insts.push(Publish)
     store(l, l.local_slots[x], Some(Value(box)))
 
@@ -2984,7 +3107,7 @@ private lower_entry(l: *Lowering, inst: Instance) -> MirFunction
     for x in symbol.captured_locals
         if machine(l, l.locals[x].ty) is Some(_)
             val field = shape.fields[i]
-            val slot = machine_slot(l, field.ty).unwrap()
+            val slot = machine_slot(l, value_machine(field.ty)).unwrap()
             l.insts.push(Store(slot.address, load_field(l, closure, field)))
             args.push(slot.address)
             i += 1
@@ -3032,7 +3155,10 @@ private tuple_words(l: *Lowering, t: &Type) -> Buf[FieldSlot]
     var out: Buf[FieldSlot] = buf()
     if !(*t is Tuple(_)) then return out
     for field in layout(l, t).variants[0].fields
-        if field is Some(f) then out.push(f)
+        if field is Some(f)
+            // A union part is several words of its own, which a result's words do not nest.
+            if f.ty is MCell(_) then return buf()
+            out.push(f)
     if out.len() < 2 then return buf()
     out
 
@@ -4202,7 +4328,7 @@ private c_assemble(l: *Lowering, t: &Type, values: Buf[Option[Operand]]) -> Opti
     l.insts.push(Alloc(object, shape.descriptor))
     for i in 0..<values.len()
         if shape.fields[i] is Some(field)
-            if values[i] is Some(v) then l.insts.push(Store(field_address(l, Value(object), field), v))
+            if values[i] is Some(v) then store_field(l, Value(object), field, v)
     l.insts.push(Publish)
     Some(Value(object))
 
@@ -4950,7 +5076,7 @@ private variant_object(l: *Lowering, t: &Type, name: string, value: Option[Opera
     l.insts.push(Alloc(object, shape.descriptor))
     if value is Some(x)
         if shape.fields.len() > 0
-            if shape.fields[0] is Some(field) then l.insts.push(Store(field_address(l, Value(object), field), x))
+            if shape.fields[0] is Some(field) then store_field(l, Value(object), field, x)
     l.insts.push(Publish)
     Value(object)
 
@@ -5434,7 +5560,7 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     val element: &Type = *array match
         Class(_, _, type_args) -> type_args[0]
         _ -> Unit
-    val m = mir_type(element)
+    val m = storage_type(element)
     val size = element_size(m)
     if name == "array_new"
         trap_if(l, compare(l, CmpLt, args[0], ConstInt(32, "0")), "negative array length", at)
@@ -5475,11 +5601,9 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     val address = fresh(l, MPtr)
     l.insts.push(Index(address, Value(elements), offset))
     if name == "array_update"
-        l.insts.push(Store(Value(address), args[2]))
+        store_at(l, Value(address), t, args[2])
         return None
-    val value = fresh(l, t)
-    l.insts.push(Load(value, Value(address)))
-    Some(Value(value))
+    Some(load_at(l, Value(address), t))
 
 /** Whether the `Atomic` type `atomic` holds values that have no identity, which `compareAndSet`
  * compares with `==`: a data value (an `Option` among them), a tuple, a string or an `Any`. A scalar,
@@ -5618,18 +5742,33 @@ private lazy_value_place(l: *Lowering, p: LazyPlace) -> Option[Place] = p.object
 
 /** Where a module-level value is kept, or `None` for one with no runtime value. */
 private global_place(l: *Lowering, g: usize) -> Option[Place] = l.global_types[g] match
-    Some(t) -> Some(Place(GlobalAddress(g), t))
+    Some(t) -> Some(Place(GlobalAddress(g), if global_storage(l.program, g) is Some(MCell(refs)) then MCell(refs) else t))
     None -> None
+
+/** The storage type of module-level value `g`: see `storage_type`. */
+private global_storage(program: TProgram, g: usize) -> Option[MirType] =
+    storage_type(solve(program.vars, program.symbols[program.globals[g].init].result.unwrap_or(Unit)))
+
+// A module-level union with a scalar member keeps its tag and bits in its own storage, 16 bytes, and
+// its reference word, where a member is a reference, in a module-level reference of its own, so the
+// collector finds it among the program's roots. Those references follow every value and every
+// `lazy val`'s state word, in the order of the values they belong to.
+
+/** The index of the reference word of module-level union `g`. */
+private global_reference(program: TProgram, g: usize) -> usize
+    var index = program.globals.len()
+    for x in program.globals
+        if x.lazy then index += 1
+    for i in 0..<g
+        if global_storage(program, i) is Some(MCell(true)) then index += 1
+    index
 
 private store(l: *Lowering, place: Option[Place], value: Option[Operand])
     if place is Some(p)
-        if value is Some(v) then l.insts.push(Store(p.address, v))
+        if value is Some(v) then store_at(l, p.address, p.ty, v)
 
 private load(l: *Lowering, place: Option[Place]) -> Option[Operand] = place match
-    Some(p) ->
-        val dest = fresh(l, p.ty)
-        l.insts.push(Load(dest, p.address))
-        Some(Value(dest))
+    Some(p) -> Some(load_at(l, p.address, p.ty))
     None -> None
 
 /** The trap site for `reason` at the start of `at`, in the function being lowered; made when first
@@ -5862,7 +6001,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None
         layout(l, concrete(l, object.ty)).variants[0].fields[index] match
-            Some(field) -> if v is Some(x) then l.insts.push(Store(field_address(l, target, field), x))
+            Some(field) -> if v is Some(x) then store_field(l, target, field, x)
             None -> ()
         if yields then v else None
     Block(items) ->
