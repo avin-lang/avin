@@ -381,6 +381,23 @@ squares(n: int) -> List[int]
     b.result()
 ```
 
+### Building from another collection
+
+Every collection companion, immutable or mutable, has `from(xs)`, which takes any `Iterable` of the
+element type and builds the collection from its elements in iteration order: `List.from(1..4)`,
+`TreeSet.from(words)`, `HashMap.from(pairs)`, `BitSet.from(ids)`. A map's `from` takes an `Iterable` of
+`(key, value)` pairs, and a later pair's value replaces an earlier one's for the same key (an ordered
+map keeps the key at its first place). A set holds an element equal to an earlier one once. Sorted
+targets take their input in any order, and `BitSet.from` traps on a negative element. The result's
+element type may be wider than the source's where the collection is covariant.
+
+Beside it, `Vector.iterate(start, length, f)` is the vector of `start`, `f(start)`, `f(f(start))` and
+so on, `length` of them (`f` is called `length - 1` times, and a length that is not positive gives an
+empty vector); `Vector.unfold(state, f)` and `List.unfold(state, f)` repeat `f` from `state` while it
+answers `Some((element, next))`, adding each element, and end at its first `None`. Any `Iterable` of
+ordered elements has `toSortedSet()`, a `TreeSet`, and any `Iterable` of pairs with ordered keys has
+`toSortedMap()`, a `TreeMap`.
+
 ## Maps and sets
 
 `Map[K, +V]` and `Set[A]` are traits, the immutable maps and sets: a function over `Map[string, int]`
