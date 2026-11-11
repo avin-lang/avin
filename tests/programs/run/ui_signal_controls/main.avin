@@ -1,0 +1,103 @@
+// expect: exit 0
+// A control writes the application's own signal, the one the program made and holds, not a copy
+// of it: the program reads the write at once, the next build shows it, and every other control on
+// that signal shows it too. A frame's posted work and a control's tap may both write one signal;
+// each is one write, and the later wins.
+import avin.threads.{Promise, sleep, spawn}
+import avin.time.millis
+import ui.{Rect, View, boolSignal, checkbox, column, handlePosted, inbox, intSignal, radio, recorder, row, slider, snapshot, stringSignal, switch, tabs, tap, text, textField, writes}
+
+val Screen = Rect(0, 0, 400, 300)
+
+// The words of every text on screen, in order.
+texts(v: View) -> string
+    val lines = snapshot(v, recorder(), Screen).dump().split("\n")
+    lines.filter(l -> l.contains(" text \"")).map(l -> l.split("\"")(1)).mkString(" ")
+
+dump(v: View) -> string = snapshot(v, recorder(), Screen).dump()
+
+main()
+    // One control, built afresh each time from the application's signal: the tap is read at once,
+    // is one write, and the next build shows it.
+    val done = boolSignal(false)
+    val tree = () -> column([checkbox(done, "Done").named("done"), text(s"done=${done.read()}")])
+    println(texts(tree()))
+    val w0 = writes()
+    println(tap(tree(), "done", Screen).isOk())
+    println(s"${done.read()} ${writes() - w0}")
+    println(texts(tree()))
+    tap(tree(), "done", Screen)
+    println(texts(tree()))
+
+    // Two controls on one signal: a tap on either is what the other shows on the next build.
+    val on = boolSignal(false)
+    val pair = () -> row([switch(on).named("sw"), checkbox(on, "Check").named("cb"), text(s"on=${on.read()}")])
+    val offDump = dump(pair())
+    tap(pair(), "sw", Screen)
+    println(texts(pair()))
+    val onDump = dump(pair())
+    println(onDump != offDump)
+    tap(pair(), "cb", Screen)
+    println(texts(pair()))
+    println(dump(pair()) == offDump)
+    // After the switch's tap both controls were drawn on, exactly as over a signal made holding
+    // `true`.
+    val other = boolSignal(true)
+    println(dump(row([switch(other).named("sw"), checkbox(other, "Check").named("cb"), text("on=true")])) == onDump)
+
+    // A radio and tabs over one int signal: the radio's tap chooses the tab the tabs show.
+    val chosen = intSignal(0)
+    val picker = () -> column([radio(chosen, 2, "Two").named("two"), tabs(["One", "Two", "Three"], chosen, i -> text(s"body $i"))])
+    println(texts(picker()).contains("body 0"))
+    tap(picker(), "two", Screen)
+    println(chosen.read())
+    println(texts(picker()).contains("body 2"))
+
+    // A slider and a text over one int signal; a set from the program moves the slider.
+    val level = intSignal(0)
+    val gauge = () -> column([slider(level, 0, 100, 200, step = 50).named("level"), text(s"level=${level.read()}")])
+    tap(gauge(), "level", Screen)
+    println(texts(gauge()))
+    level.set(100)
+    val atTop = dump(gauge())
+    level.set(0)
+    println(atTop != dump(gauge()))
+
+    // A text field shows the application's string signal, Unicode and empty included, and a write to
+    // the signal is what it shows next.
+    val name = stringSignal("héllo ✓")
+    val form = () -> column([textField(name, 1, hint = "name"), text(s"[${name.read()}]")])
+    println(texts(form()))
+    name.set("")
+    println(texts(form()))
+
+    // In one frame: work another thread posted runs at the frame's start, then the control's tap.
+    // Each is one write and the tap, coming later, is what the build shows.
+    val setLevel = inbox((n: int) -> level.set(n))
+    val sent = Promise[bool]()
+    spawn(() ->
+        setLevel.send(7)
+        sent.complete(true))
+    sent.future.await()
+    val w1 = writes()
+    println(handlePosted())
+    println(level.read())
+    tap(gauge(), "level", Screen)
+    println(s"${level.read()} ${writes() - w1}")
+    println(texts(gauge()))
+    // The other order: the tap in one frame, the posted write at the start of the next, which wins.
+    tap(gauge(), "level", Screen)
+    spawn(() -> setLevel.ask(9))
+    var ran = 0
+    while ran == 0
+        ran = handlePosted()
+        sleep(millis(1))
+    println(texts(gauge()))
+
+    // Many controls over one signal, built and tapped many times: the signal outlives every view
+    // made over it, and every tap reaches it.
+    val flips = boolSignal(false)
+    for i in 0..<200
+        tap(row([switch(flips).named("a"), checkbox(flips, s"flip $i").named("b")]), if i % 2 == 0 then "a" else "b", Screen)
+    println(flips.read())
+    println(texts(column([checkbox(flips, "after"), text(s"flips=${flips.read()}")])))
