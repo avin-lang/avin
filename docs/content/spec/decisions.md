@@ -6639,6 +6639,35 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **Map defaults, own-kind `partition` and `Set.subsets`** (branch `stdlib-map-extras`).
+  Proposed: `withDefault(f)` and `withDefaultValue(v)` on every map answer a `DefaultMap`, a
+  wrapper whose `apply` of an absent key answers the default and whose every other read (`get`,
+  `contains`, `getOrElse`, `size`, iteration, `keySet`) sees only the real entries; the default is
+  never stored. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` keep the wrapper and
+  its default; `transform` and `mapValues` answer the wrapped map's own kind, because a default
+  of the old value type cannot be carried across the function. The wrapper equals, and hashes as,
+  the map it wraps and every map of the same entries, ignoring the default. A default of a
+  supertype widens the map, as `updated` does. Why: `get` answering `Option` is how a program
+  asks whether a key is there, and a counter wants `apply` alone to be total. Alternatives
+  weighed: `get` also answering the default (hides absence, makes `contains` and `get`
+  disagree); the default taking part in equality (two maps of the same entries would differ by a
+  closure that cannot be compared); the wrapper mapping its default through `mapValues`
+  (needs the value function to be applied to a default on every miss, a surprise at each read).
+  `partition` of a hash, tree or ordered map and of a hash, tree, ordered or bit set is a method
+  of the concrete type answering that type, `p` called once per element; it is not on `Map`,
+  `Set`, `SortedMap`, `SeqMap`, `SortedSet` or `SeqSet`, so through a trait a set's partition is
+  `Iterable`'s and answers vectors, as the settled `Iterable` decision says, and a map's
+  `partition` of a pair function answers the own kind only where the type is known. Why: a
+  tuple of two collections is not a subtype of a tuple of two supertypes in an override's
+  result, and a set's partition over the trait cannot change `Iterable`'s result type.
+  Alternatives weighed: trait methods answering `(Map, Map)` (the concrete type then cannot
+  narrow the result); two `filter` calls (calls `p` twice, which a predicate with an effect
+  shows). `subsets()` and `subsets(k)` are iterators on `Set` that read the elements into a
+  vector and generate combinations by size, so the order is by size then by position and nothing
+  is made ahead; every subset is a set of the receiver's kind. Why by size: the empty set first
+  and the set last, the same order for every kind, and no `2^n` counter to overflow for a set of
+  more than 62 elements. Alternatives weighed: bitmask order (overflows past 62 elements, and
+  puts the subsets in an order a reader cannot predict from the sizes).
 - **Companion `from`, `Vector.iterate`, `unfold` and the sorted conversions** (branch
   `stdlib-from`). Proposed: `from(xs: Iterable[T])` on every immutable collection companion and
   on the mutable ones (`Buffer`, `Map`, `Set`, `TreeMap`, `TreeSet`, `LinkedMap`, `LinkedSet`,
