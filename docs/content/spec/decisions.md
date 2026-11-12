@@ -6947,14 +6947,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   gate (triples the corpus's compile time); an edit inside a function (moves trap lines the `.err`
   files record, or changes what a program does).
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
+- Settled on the user's delegation 2026-11-11 (built on branch `site-prime-sieve`): Proposed (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
   the page itself.** In `docs/content/**/*.md`, a fence whose info string carries the word `run`
   after its language (```` ```text run ````) holds a complete program, and the next fence, carrying
   `output` (```` ```text output ````), holds exactly what it prints, with prose allowed between
@@ -6970,6 +6963,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   page would need a third check against the `.out` file); an HTML comment before the fence as the
   marker (invisible in the page but present in its source, and a second line to keep beside the
   fence); a literate `.lavin` page (the site renders indented code differently from fences).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
