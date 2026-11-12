@@ -27,6 +27,25 @@ main()
     println(shapes.map(area).sum())
 ```
 
+A list may be endless. Here every prime there is, in one lazy list: `#::` puts a prime in front of a
+rest that is evaluated only when it is first read, so `sieve` takes one step for each prime the
+program asks for, and keeps every prime it has found.
+
+```text run
+sieve(s: LazyList[int]) -> LazyList[int] =
+    s.head() #:: sieve(s.tail().filter(_ % s.head() != 0))
+
+main()
+    val primes = sieve(LazyList.from(2))
+    println(primes.take(10).toVector())
+    println(primes(99))
+```
+
+```text output
+[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+541
+```
+
 - [The AVIN philosophy](/spec/philosophy/): Abstraction, Versatility, Intuition and Naturalness
 - [The specification](/spec/), starting with its [design choices](/spec/design/)
 - [The compiler architecture](/compiler/) and [roadmap](/compiler/roadmap/)

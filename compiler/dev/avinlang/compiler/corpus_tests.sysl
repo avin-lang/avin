@@ -34,6 +34,12 @@ import sysl.text.from_utf8_unchecked
 // `examples/*.avin` are held to the same standard as `tests/run`, so every example shown to a
 // reader builds and does what its header says.
 //
+// So is every program the website shows as one. In `docs/content/**/*.md`, a fence whose info string
+// carries the word `run` after its language (```` ```text run ````) holds a complete program, and the
+// next fence, carrying `output` (```` ```text output ````), holds exactly what it prints. Each such
+// program is built and run as an example is; the words after the language change nothing in how the
+// page renders.
+//
 // A program in any of these places may be a literate `.lavin` file; its expectation lines are
 // comments of its program, read from the program with the prose stripped.
 //
@@ -439,6 +445,183 @@ fixture_toolchain(tc: Toolchain, dir: string) -> Toolchain
 examples_run()
     val tc = repository_toolchain()
     finish("examples", run_all(tc, cases(tc, "examples")))
+
+/** A program a documentation page shows: the line its fence opens on, its text, and the output the
+ * page says it prints. */
+private struct DocProgram
+    line: int
+    program: string
+    output: string
+
+/** The programs a page marks, and what is wrong with its marks, one line per problem, or "". */
+private struct DocPrograms
+    programs: Buf[DocProgram]
+    problems: string
+
+/** The run of three or more backticks or tildes that opens a fence on `line`, or "" when none does. */
+private fence_marker(line: string) -> string
+    if line.bytes.len == 0 then return ""
+    val c = line.bytes[0]
+    if c != u8('`') && c != u8('~') then return ""
+    var i: usize = 0
+    while i < line.bytes.len && line.bytes[i] == c do i += 1
+    if i >= 3 then line[0..<i] else ""
+
+/** Whether `line` closes the fence `marker` opened: the same character, at least as many times, and
+ * nothing else. */
+private closes_fence(line: string, marker: string) -> bool
+    val t = line.trim()
+    if t.bytes.len < marker.bytes.len then return false
+    for b in t.bytes
+        if b != marker.bytes[0] then return false
+    true
+
+/** What a fence's info string marks it as: "run", "output", or "" for a fence that is only shown.
+ * The first word is the language, so only the words after it mark. */
+private fence_kind(info: string) -> string
+    var kind = ""
+    var first = true
+    for word in info.trim().split(" ")
+        if !first && (word == "run" || word == "output") then kind = word
+        if word != "" then first = false
+    kind
+
+/** The programs marked on the page `page`, whose text is `text`: each `run` fence paired with the
+ * `output` fence after it. A `run` fence followed by any other fence, or by none, an `output` fence
+ * with no `run` fence before it, and a marked fence never closed are problems. */
+private doc_programs(page: string, text: string) -> DocPrograms
+    var programs: Buf[DocProgram] = buf()
+    var problems = ""
+    var marker = ""
+    var kind = ""
+    var body = ""
+    var opened = 0
+    var waiting = false
+    var program = ""
+    var program_line = 0
+    var n = 0
+    for line in text.split("\n")
+        n = n + 1
+        if marker == ""
+            marker = fence_marker(line)
+            if marker != ""
+                kind = fence_kind(line[marker.bytes.len..])
+                body = ""
+                opened = n
+        elif closes_fence(line, marker)
+            if kind == "output"
+                if waiting then programs.push(DocProgram(program_line, program, body))
+                else problems = problems + s"$page:$opened: this `output` fence follows no `run` fence\n"
+                waiting = false
+            else
+                if waiting then problems = problems + s"$page:$program_line: this `run` fence has no `output` fence after it\n"
+                waiting = kind == "run"
+                program = body
+                program_line = opened
+            marker = ""
+        else body = body + line + "\n"
+    if marker != "" && kind != "" then problems = problems + s"$page:$opened: this `$kind` fence is never closed\n"
+    elif waiting then problems = problems + s"$page:$program_line: this `run` fence has no `output` fence after it\n"
+    DocPrograms(programs, problems)
+
+/** Every Markdown page under `dir`, at any depth. */
+private markdown_pages(dir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for name in entries(dir).unwrap_or(buf())
+        if name.starts_with(".") then continue
+        val inner = dir + "/" + name
+        if is_dir(inner)
+            for page in markdown_pages(inner) do out.push(page)
+        elif name.ends_with(".md") then out.push(inner)
+    out
+
+/** Builds and runs every program `text`, the page `page`, marks, at -O0 and -O2, as an example is
+ * run; the tally counts each program, and a page whose marks are wrong as one failure. */
+private run_doc_page(tc: Toolchain, page: string, text: string, scratch: string) -> Tally
+    val found = doc_programs(page, text)
+    var t = tally()
+    if found.problems != "" then t = record(t, found.problems)
+    for p in found.programs
+        val file = s"$scratch/shown_${p.line}.avin"
+        write_text(file, p.program).unwrap()
+        write_text(s"$scratch/shown_${p.line}.out", p.output).unwrap()
+        val program = case_at(file)
+        val failure = run_case(tc, file, program, expectation(program.text), scratch)
+        val described = if failure == "" then "" else s"$page:${p.line}: the program shown fails:\n$failure"
+        t = record(t, described)
+    t
+
+private add_tally(a: Tally, b: Tally) -> Tally
+    var ignored = a.ignored
+    for line in b.ignored do ignored.push(line)
+    Tally(a.failures + b.failures, a.passed + b.passed, a.failed + b.failed, ignored)
+
+@test("every program a documentation page marks `run` builds, exits and prints its `output` fence at -O0 and -O2")
+docs_programs_run()
+    val tc = repository_toolchain()
+    val scratch = make_temp_dir("avin-docs").unwrap()
+    defer _ = remove_dir_all(scratch)
+    val pages = markdown_pages(tc.root + "/docs/content")
+    assert(pages.len() > 0)
+    var t = tally()
+    for page in pages
+        t = add_tally(t, run_doc_page(tc, page, read_text(page).unwrap(), scratch))
+    assert(doc_programs("_index.md", read_text(tc.root + "/docs/content/_index.md").unwrap()).programs.len() > 0)
+    finish("docs", t)
+
+@test("a `run` fence pairs with the `output` fence after it, prose between them, and only the words after the language mark a fence")
+doc_programs_pair()
+    val page = "intro\n\n```text run\nmain()\n    println(1)\n```\n\nIt prints:\n\n```text output\n1\n```\n\n```text\nshown only\n```\n\n~~~text run\nmain() = ()\n~~~\n~~~ text output\n~~~\n\n```run\nlanguage only\n```\n"
+    val found = doc_programs("p.md", page)
+    assert_eq(found.problems, "")
+    assert_eq(found.programs.len(), 2)
+    assert_eq(found.programs[0].line, 3)
+    assert_eq(found.programs[0].program, "main()\n    println(1)\n")
+    assert_eq(found.programs[0].output, "1\n")
+    assert_eq(found.programs[1].line, 18)
+    assert_eq(found.programs[1].program, "main() = ()\n")
+    assert_eq(found.programs[1].output, "")
+
+@test("a marked fence inside a longer fence is only shown, and closes at nothing shorter than its opener")
+doc_programs_nested()
+    val page = "````text\n```text run\nmain() = ()\n```\n````\n\n````text run\nmain() = ()\n```\n````\n```text output\n```\n"
+    val found = doc_programs("p.md", page)
+    assert_eq(found.problems, "")
+    assert_eq(found.programs.len(), 1)
+    assert_eq(found.programs[0].line, 7)
+    assert_eq(found.programs[0].program, "main() = ()\n```\n")
+
+@test("a `run` fence with no `output` fence after it, or another fence first, an `output` fence with no `run` fence and an unclosed marked fence are each refused")
+doc_programs_refused()
+    assert_eq(doc_programs("p.md", "```text run\nmain() = ()\n```\n").problems, "p.md:1: this `run` fence has no `output` fence after it\n")
+    assert_eq(doc_programs("p.md", "```text run\nmain() = ()\n```\n```text\nshown\n```\n```text output\n```\n").problems, "p.md:1: this `run` fence has no `output` fence after it\np.md:7: this `output` fence follows no `run` fence\n")
+    assert_eq(doc_programs("p.md", "```text run\na\n```\n```text run\nb\n```\n```text output\n```\n").problems, "p.md:1: this `run` fence has no `output` fence after it\n")
+    assert_eq(doc_programs("p.md", "```text output\n1\n```\n").problems, "p.md:1: this `output` fence follows no `run` fence\n")
+    assert_eq(doc_programs("p.md", "```text run\nmain() = ()\n```\n```text output\n").problems, "p.md:4: this `output` fence is never closed\n")
+    assert_eq(doc_programs("p.md", "```text\nshown, never closed\n").problems, "")
+
+@test("a page's `run` fence whose program does not compile, prints other output or ends otherwise fails the docs check, naming the page and line")
+docs_program_failures()
+    val tc = repository_toolchain()
+    val scratch = make_temp_dir("avin-docs-fail").unwrap()
+    defer _ = remove_dir_all(scratch)
+    val good = run_doc_page(tc, "good.md", "```text run\nmain()\n    println(\"two\")\n```\n```text output\ntwo\n```\n", scratch)
+    assert_eq(good.failures, "")
+    assert_eq(good.passed, 1)
+    val broken = run_doc_page(tc, "broken.md", "Shown:\n\n```text run\nmain()\n    println(undefinedName)\n```\n```text output\n```\n", scratch)
+    assert_eq(broken.failed, 1)
+    assert(broken.failures.starts_with("broken.md:3: the program shown fails:\n"))
+    assert(broken.failures.contains("did not compile"))
+    val wrong = run_doc_page(tc, "wrong.md", "```text run\nmain()\n    println(\"three\")\n```\n```text output\nfour\n```\n", scratch)
+    assert_eq(wrong.failed, 1)
+    assert(wrong.failures.contains("-O0: standard output was:\nthree\n"))
+    assert(wrong.failures.contains("-O2: standard output was:\nthree\n"))
+    val trapped = run_doc_page(tc, "trapped.md", "```text run\nmain()\n    val v = [1]\n    println(v(5))\n```\n```text output\n```\n", scratch)
+    assert_eq(trapped.failed, 1)
+    assert(trapped.failures.contains("ended"))
+    val unpaired = run_doc_page(tc, "unpaired.md", "```text run\nmain() = ()\n```\n", scratch)
+    assert_eq(unpaired.failed, 1)
+    assert_eq(unpaired.passed, 0)
 
 @test("every example package under examples builds and links at -O0 and -O2; none is run, since each opens a window")
 example_packages_build()

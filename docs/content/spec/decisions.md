@@ -6954,6 +6954,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
+  the page itself.** In `docs/content/**/*.md`, a fence whose info string carries the word `run`
+  after its language (```` ```text run ````) holds a complete program, and the next fence, carrying
+  `output` (```` ```text output ````), holds exactly what it prints, with prose allowed between
+  them. The corpus test builds every marked program at `-O0` and `-O2`, runs it as an example is run,
+  and fails naming the page and line when it does not compile, ends other than with exit 0, or prints
+  anything but its output fence; a `run` fence with no `output` fence after it, an `output` fence with
+  no `run` fence and a marked fence never closed fail the same way. Unmarked fences stay
+  illustrations. WHY: the page is the one copy of the program, so what the reader sees is exactly
+  what was built; the words after the language leave the rendered page as it was (the site renders
+  the fence by its language alone); the run reuses the examples' check, so a shown program meets the
+  same standard as `examples/`. ALTERNATIVES: keep each program as a file under `examples/` and
+  check that the page's fence is byte-identical to it (two copies to edit, and the output on the
+  page would need a third check against the `.out` file); an HTML comment before the fence as the
+  marker (invisible in the page but present in its source, and a second line to keep beside the
+  fence); a literate `.lavin` page (the site renders indented code differently from fences).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

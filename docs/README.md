@@ -22,6 +22,13 @@ Pages use YAML frontmatter with `title`, `summary`, and optional navigation
 `weight`. Start Markdown headings at `##`, since the theme supplies the page title.
 Use `text` fences for illustrative Avin snippets until syntax highlighting exists.
 
+A complete program a page shows as one is run-checked: open its fence with ```` ```text run ````
+and follow it with a ```` ```text output ```` fence holding exactly what it prints (prose may sit
+between the two). The compiler's corpus test (`corpus_tests.sysl`) builds every such program at
+`-O0` and `-O2` and fails, naming the page and line, when it does not compile, does not exit 0, or
+prints anything else. The words after `text` do not change how the page renders. A fragment that is
+not a whole program stays an unmarked `text` fence.
+
 `spec/` says what the language **is**, never what the compiler happens to do today. Implementation
 status belongs only on `compiler/roadmap.md`. `spec/decisions.md` is the single list of decisions.
 
