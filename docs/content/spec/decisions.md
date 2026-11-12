@@ -6653,7 +6653,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
   a differently named method, as own-kind `partition` met); also boxing a scalar result, which
   would make an override's call site convert behind a virtual call.
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
   private `lazy val`**, and the expression that computes the cell is dropped once it has run. The
   cell is `Option[(T, LazyList[T])]`; the class holds a function that reads the real expression out
   of a captured variable and empties it, so an evaluated cell keeps nothing the expression captured.
@@ -6663,7 +6663,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   would hold every source cell it skipped). ALTERNATIVES: an invariant node class with `var`s (the
   list could then not be covariant); a `var` of type `Any` cast back on each read (no type checking
   of the cell); keeping the expression (simpler, a space leak).
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
   strictly and the tail by name, and the tail is evaluated when the list's second cell is first
   read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
   cell is then exactly the head, and a function building a list recursively runs one step per cell
@@ -6715,25 +6715,25 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the list's progress record holds while its cell's expression runs, rather than the `lazy val`'s
   own message, which named the private field `cell`. ALTERNATIVES: keeping the `lazy val`'s
   message (names an implementation detail).
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
   a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
   never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from
   it; sequence patterns over it would call `length()` too. As an `Iterable` it keeps the forcing
   methods every collection has, its own lazy forms found first. ALTERNATIVES: a `Seq` overriding the
   methods that would not return (most of them), or a `Seq` whose `length()` simply does not return
   on an endless list.
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
   evaluated prefix and `…`, evaluating nothing**: `[0, 1, 4]`, `[0, 1, …]`, `[…]`, with a field
   width padding the whole. WHY: displaying an endless list must return, and a display that
   evaluated cells would run a program's functions while printing. ALTERNATIVES: forcing every cell
   (does not return on an endless list); a fixed prefix forced (side effects while printing);
   `<not computed>` text (longer, and not a form the other collections use). No `Eq`, `Hash` or
   `Ord`, which could not answer for two equal endless lists.
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
   the thread that made it; the cells' `lazy val` evaluation would be safe between threads, but the
   expressions not yet evaluated are functions that may capture anything. ALTERNATIVES: sendable when
   every expression is a `@sendable` function (every lazy method would need a sendable form).
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
   **`flatMap` takes `(T) -> Iterable[U]`**, reading each collection through its iterator as cells are
   read; **`++` takes its right operand by name**, evaluated only when the cell after the left's last
   is read (the iterator's `++` takes a strict `Iterable`, since an iterator is read once anyway);
@@ -6792,7 +6792,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
   `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
   counting iterator and keeps its name.
-- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
   where they live** (the second part of Settled → unions → Representation, built on the multi-word
   values above).
   - **Three words**: a 32-bit tag, 64 bits for a scalar member and, where a member is a reference, the
@@ -6831,7 +6831,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
     `Any` are equal and hash alike. Review with the user: storing a union with a string member now
     allocates its cell where an `Any` did not, until fields and collections take the words.
-- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
     `Any` are equal and hash alike. (The review flag this entry carried, a stored union with a string
     member allocating its cell, is closed by the next entry.)
 - Settled on the user's delegation 2026-11-11 (built on branch `union-words-storage`): **A union with a scalar member is stored as its
@@ -6899,7 +6899,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   hidden in a `match`). Review with the user: a union-of-references part tests the object, while a
   class part tests the type the tuple was made with.
 
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **The instance cache is on by default** for
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **The instance cache is on by default** for
   every command that builds: `avin build`, `run`, `test` and `emit-llvm`. `AVIN_INCREMENTAL=off`
   turns it off, `verify` stays, and `on`, unset or empty are the default; any other value is an
   error for the commands that build, while `avin check` (even with `--bindings`) neither reads the
@@ -6911,7 +6911,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   much); an `--incremental` flag rather than a variable (a flag every command would carry for a
   setting nobody changes per build). Review with the user: the disk it takes, about the size of the
   program's text per kind and level (185 MB for marshal at `-O2`).
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **A program of one file names its cache
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **A program of one file names its cache
   directories after itself**, `.avin/build/incremental/<stem>-<kind><level>`, while a directory
   or package keeps `<kind><level>`. WHY: every file of a directory shares that directory's
   `.avin/build`, as their executables already do (named by stem); with one directory per kind and
@@ -6920,12 +6920,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives: a subdirectory per file (`incremental/<stem>/program-O2`, which a file named
   `tests-O0.avin` would make collide with a directory program's); one shared directory (correct,
   since entries are content-addressed, but each program would lose its reuse in turn).
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **A manifest names only module files of its own
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **A manifest names only module files of its own
   directory**: a name that is not hexadecimal digits and `.mod` is passed over as damaged and never
   read. WHY: a damaged manifest could otherwise send the reader to `../` paths outside the cache;
   nothing a build writes has another form. Alternatives: trusting the manifest (only the checksum
   would stand between a stray path and its contents being read as entries).
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **Code that calls the C unit's glue is never
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **Code that calls the C unit's glue is never
   taken from the cache's lowered entries, and the glue it calls is part of its text's key**; a C
   callback's body is keyed by its binding and its trampoline's name. The warm corpus run found three
   stale texts: the glue (`avin_c_call_<n>`, `avin_c_field_get_<n>`, `avin_c_retain_<n>` and the
@@ -6938,7 +6938,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and every place lowering calls into it); a digest of every C declaration's number in every key
   (a declaration added anywhere would re-lower a C program whole). Review with the user: stable C
   glue names would let these functions be reused too.
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **The warm corpus run is chosen by
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **The warm corpus run is chosen by
   `AVIN_INCREMENTAL=verify` in the environment of `sysl test compiler`**: each corpus program is
   built cold with an empty cache, edited by adding a function nothing calls at the end of its first
   non-literate file, and built again from the cache in `verify` mode, which also builds it clean; the
@@ -6949,7 +6949,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   gate (triples the corpus's compile time); an edit inside a function (moves trap lines the `.err`
   files record, or changes what a program does).
 
-- Settled on the user's delegation 2026-11-11 (built on branch `site-prime-sieve`): Proposed (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
+- Settled on the user's delegation 2026-11-11 (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
   the page itself.** In `docs/content/**/*.md`, a fence whose info string carries the word `run`
   after its language (```` ```text run ````) holds a complete program, and the next fence, carrying
   `output` (```` ```text output ````), holds exactly what it prints, with prose allowed between
@@ -7113,14 +7113,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   highlighter package's Sysl pin); a CI-only job (no CI runs here). Review with the user if the
   gate coupling is preferred.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `runner-orphans`): **Every program a runner starts leads a process
+- Settled on the user's delegation 2026-11-12 (built on branch `runner-orphans`): **Every program a runner starts leads a process
   group of its own, and nothing in that group outlives it.** `avin test` (each test and hook), the
   execution corpus and the documentation-programs check start each program with a new process
   group, so whatever it starts in turn is in the group too. Once the program has been waited for,
@@ -7141,6 +7134,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   signal sent to that group; marshal and `sysl test` both send `SIGTERM` first. A program that
   moves itself into another group or session is also beyond reach. `avin run` is unchanged: its
   program stays in the terminal's group so that Ctrl-C and job control reach it.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
