@@ -20,8 +20,8 @@ The release is also a tarball, `avin-<version>-darwin-arm64.tar.gz`, laid out as
 `bin/` on your `PATH`, and `avin` finds the standard library and runtime in `share/avin` beside
 itself, through any symbolic link to it. It never writes there: the runtime archives and binding
 shims it builds are kept in `~/Library/Caches/avin/<version>` (`$XDG_CACHE_HOME/avin` or
-`~/.cache/avin` elsewhere; `AVIN_CACHE` names another directory), and a program's executables in
-`.avin/` beside the program.
+`~/.cache/avin` elsewhere; `AVIN_CACHE` names another directory), and a program's executables and
+what its builds keep for the next in `.avin/` beside the program.
 
 What an installed `avin` runs:
 
@@ -68,7 +68,10 @@ when a trap stops the program, the status is 128 and the signal's number, as a s
 Everything after `--` is passed to the program as its arguments. The executable is kept in `.avin/build/`
 in the program's directory, and the next run of an unchanged program starts it without building it
 again. Any change to the program's sources, the standard library, the runtime or the compiler
-builds it afresh.
+builds it again, and every build, `avin build` and `avin test` included, keeps what it made of each
+function in `.avin/build/incremental/`, so a rebuild after an edit makes again only what the edit
+can change ([incremental builds](/compiler/#incremental-builds); `AVIN_INCREMENTAL=off` turns it
+off). Deleting `.avin/` is always safe.
 
 A program is a source file or a directory: `avin run my-program` builds every `.avin` and `.lavin`
 file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by

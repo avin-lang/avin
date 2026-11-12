@@ -103,7 +103,7 @@ lowering makes it, and the front end stays a whole-program pass that runs on eve
 | Cache | Holds | Key | Where |
 | --- | --- | --- | --- |
 | Unit objects | each codegen unit's object | the unit's text, clang's version, the level | the toolchain's cache (exists) |
-| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/` |
+| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/`, a one-file program's prefixed by its name |
 | Executable | the linked program | the build key of [running and testing](#running-and-testing) | `.avin/build/` (exists) |
 
 Instances are stored a file per source module, holding the instances of that module's functions
@@ -223,11 +223,29 @@ build trims the module files that its manifest does not name and that no build u
 hour, and any temporary file left that long, as the unit cache spares what is fresh; there is no
 size limit.
 
-**Turning it on.** `AVIN_INCREMENTAL=on` makes `avin build` and `avin emit-llvm` read and write the
-instance cache, kept in `.avin/build/incremental/<kind><level>/` of the program's root directory
-(`program-O2`, `tests-O0`); `verify` does that and then builds the program again without the cache,
-and stops with the first function whose text differs from the clean build's; `off`, or unset, uses
-no cache. Any other value is an error.
+**On by default.** Every command that builds a program reads and writes the instance cache: `avin
+build`, `avin run`, `avin test` and `avin emit-llvm`. It is kept in
+`.avin/build/incremental/<kind><level>/` beside the executables `run` and `test` build: in the
+package's or the program's directory, `program-O2` or `tests-O0`, since a build for tests is another
+program, with keys of its own, and the two kinds never share a file. A program of one file shares its
+directory's `.avin/build` with every other file there, so its directories are named after it
+(`hello-program-O2` for `hello.avin`) and two such programs never trim each other's entries. A run
+that finds its executable already built reads no cache at all. `avin check` keeps none, and the
+language server only checks, so it builds nothing to keep.
+
+`AVIN_INCREMENTAL` chooses otherwise: `off` uses no cache and reads none that is there; `verify` uses
+it and then builds the program again without it, and stops with the first function whose text
+differs from the clean build's; `on`, unset or empty is the default. Any other value is an error for
+the commands that build.
+
+A cache needs no care. Another compiler (a newer release, or the same one built again, since the
+compiler's executable and its time are in every key) finds no entry it can use, builds as from
+nothing and writes its own; the files it does not name are trimmed an hour after their last use. A
+module file that is short, damaged or missing, and a manifest naming anything but a module file of
+its own directory, are passed over and written again. Deleting `.avin/build` is always safe. Its size
+is about what the program's text is: on marshal (7,400 lines, with its packages and the library) a
+level's directory is 22 module files and 185 MB, so building and testing it at `-O2` keeps two of
+those.
 
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
@@ -268,7 +286,19 @@ edit of the matrix to lowering exactly the instances whose own keys no earlier b
 for, and to a clean build's text; a cache whose files are truncated, damaged or missing, or were made
 by another compiler, gives a clean build's text and is written again; two builds of one program at
 once both succeed and leave a cache a third build verifies; and a sample of the corpus builds warm to
-a clean build's text with every instance taken from the cache.
+a clean build's text with every instance taken from the cache. Through the commands themselves, they
+build, run and test a program, edit it, and hold each command's rebuild to a clean build's program and
+text, with `verify` passing; hold `off` to reading and writing nothing; survive damaged files, a
+manifest of nonsense, another compiler's cache and trimming; and run two `avin test`, and an `avin
+run` beside an `avin test`, of one program at once.
+
+**The corpus, warm.** With `AVIN_INCREMENTAL=verify` in the environment of `sysl test compiler`, the
+execution corpus is built warm as well as cold: each program is built once with an empty cache,
+edited (a function nothing calls is added at the end of its first file, which changes the file and
+no line of what the program does or reports), and built again from that cache in `verify` mode, so
+every program's warm build is compared with its clean one; the warm build is the one run. `avin
+test` of the library's and the packages' tests runs in `verify` mode the same way. Unset, the gate
+builds the corpus once, with no cache.
 
 ## Sysl bindings and the shim cache
 
