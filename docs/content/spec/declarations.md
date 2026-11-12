@@ -631,14 +631,62 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
   which match the arguments and not the receiver. A method may have type parameters of its own,
   after its class's.
-- A method named without a call is a function value bound to its receiver: `val f = acct.deposit`
-  is an `(int) -> unit` that deposits into `acct`, which is evaluated once, where the value is made.
-  Inside the class a bare method name is the same over `self`. Through a superclass's or a trait's
-  type the value calls the implementation the object's class has. A method's own type parameters
-  are written, `box.pair[bool]`, or come from the expected function type. The same holds for the
-  methods an `impl` adds to any type, `"hey".shout` included.
+- A method declared with a parameter list, `()` included, and named without a call is a function
+  value bound to its receiver: `val f = acct.deposit` is an `(int) -> unit` that deposits into
+  `acct`, which is evaluated once, where the value is made. Inside the class a bare method name is
+  the same over `self`. Through a superclass's or a trait's type the value calls the implementation
+  the object's class has. A method's own type parameters are written, `box.pair[bool]`, or come
+  from the expected function type. The same holds for the methods an `impl` adds to any type,
+  `"hey".repeat` included. A method declared with no parameter list has no such value; see below.
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
+
+### Parameterless methods
+
+```text
+class Chain(items: Vector[int])
+    head -> int = items(0)
+    tail -> Chain = Chain(items.slice(1, items.length()))
+    second -> int = tail.head
+    clear() -> Chain = Chain([])
+
+val c = Chain([1, 2, 3])
+c.tail.head        // 2
+c.clear()          // `()`: declared with a parameter list
+val f = () -> c.head
+```
+
+- **A method declared with no parameter list is called by its name alone.** `head -> int = …`
+  declares a method that `c.head` calls, with no parentheses; inside the class `head` and
+  `self.head` call it too. Each read runs the method again, on a receiver evaluated once for that
+  read, so `c.tail.head` and `s"${c.head}"` read as a field would and compute as a call does.
+- **A method declared with `()` keeps them at the call**: `buf.clear()`, `iter.next()`. The
+  parentheses say the call does something, so a method with an effect is declared with them.
+- **A parameterless method has no function value.** Naming it calls it; where a function is
+  wanted, a lambda says so, `() -> c.head`. Where a function type is expected and the method yields
+  something else, the error names the lambda.
+- **Parentheses after one call what it yields.** `t.adder(4)`, where `adder -> (int) -> int`, calls
+  the function `adder` yields, and `t.items(2)` indexes the sequence `items` yields. Where the
+  result is neither a function nor a sequence given an index, `c.head()` is an error naming the fix,
+  `head`.
+- **It is the only method of its name**: a class, a trait or the impls of a type cannot also have a
+  method of that name with a parameter list, in the type itself or inherited, since `x.head` would
+  leave no call to choose between them.
+- **The shape is part of the signature.** An override, or an implementation of a trait's method, is
+  declared without a parameter list exactly where the method it replaces is: overriding `head` with
+  `head()`, or the reverse, is an error.
+- **A public field implements an abstract one.** A trait's or an abstract class's `size -> int`
+  with no body is implemented by a method of the name, or by a public `val` or `var` field of the
+  name — a class parameter declared `val` among them — or, for a data type, by a field of its one
+  variant. The field's type is the method's result. A private field does not implement it, and a
+  field cannot share its name with a method that has a body.
+- **Only a member is declared without a parameter list**: a method of a class, trait, object or
+  impl, static ones included. A function at the top level or in a block takes a parameter list,
+  and a value computed once is a `val`. A parameterless method takes no type parameters of its own,
+  since `x.first[int]` would read as indexing its result; its class's type parameters it has.
+- It is not a field: `c.head = 3` is an error, and a class cannot declare a field and a method of
+  one name. `super.head` reads the superclass's implementation of one, where `super.describe` names
+  no function value of a method with a parameter list.
 
 ### Inheritance
 
@@ -839,7 +887,9 @@ p.pos = None
 
 - **A trait may declare fields with values**, `val name: T = expr` and `var name: T = expr`. Each
   declares its type, and is public. A field without a value is the abstract `val` above, and is
-  never `var`.
+  never `var`. A conforming type supplies an abstract `val` only with a field; an abstract
+  [parameterless method](#parameterless-methods), `size -> int`, is implemented by a method or by a
+  public field.
 - **Every class and object conforming to the trait stores the trait's fields**, each of its own. A
   subclass of a class that conforms stores them once, in the superclass; a generic trait's fields
   take the type arguments the class names it with, `class Ints: Box[int]`.

@@ -96,7 +96,9 @@ parse(src: Source) -> Parsed
         else
             if is_operator_spelling(p.ahead(0))
                 p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` names a function, but only a method can be named by a symbol: declare it in a class, trait, object or impl"))
-            file.items.push(FunctionItem(parse_function(&p, annotations)))
+            val f = parse_function(&p, annotations)
+            if f.parameterless then p.report.add(error(f.name_span, s"a function at the top level takes a parameter list, as in `${f.name}() -> …`; for a value computed once, declare `val ${f.name} = …`; a member of a class, trait, object or impl is the one declared without a parameter list"))
+            file.items.push(FunctionItem(f))
         file.private_items.push(hidden)
         val closed_block = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
         if !p.toks.at_end() && !p.at_kind(Newline) && !closed_block
@@ -614,7 +616,12 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     val name = if symbol then symbol_name(p) elif declaring then required_name(p) else declared_name(p, "a function")
     val name_span = start.to(p.ended())
     val type_params = parse_type_params(p)
-    val params = parse_params(p, true)
+    // A name followed by its result type, with no parameter list, declares a method called by its
+    // name alone.
+    val parameterless = !symbol && p.at("->")
+    if parameterless && type_params.len() > 0
+        p.report.add(error(name_span, s"`$name` has no parameter list, so it takes no type parameters: a call `$name[T]` would read as indexing its result; give it a parameter list, as in `$name[…]() -> …`"))
+    val params = if parameterless then buf() else parse_params(p, true)
     var result: Option[&TypeExpr] = None
     if p.accept("->") then result = Some(parse_type(p))
     if p.at("|")
@@ -642,7 +649,7 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
             val clause = parse_clause(p)
             end = clause.span
             clauses.push(clause)
-    Function(annotations, start.to(end), name_span, name, type_params, params, result, body, clauses)
+    Function(annotations, start.to(end), name_span, name, type_params, params, result, body, clauses, parameterless)
 
 // A declaration without a body that an annotation gives meaning to, such as an intrinsic, has no
 // clauses; `@tailrec` says something of a body, which clauses may be.
@@ -1110,8 +1117,49 @@ parse_class_member(p: *Parser) -> ClassMember
             _ ->
                 p.report.add(error(binding.span, "a field declaration names one field"))
                 return StatementMember(Expr(binding.span, Invalid))
-    if hidden || overrides || static_member || symbol_method_ahead(p) || local_function_ahead(p) || signature_ahead(p) then return MethodMember(parse_function(p, buf()), !hidden, overrides, static_member)
+    if hidden || overrides || static_member || symbol_method_ahead(p) || local_function_ahead(p) || signature_ahead(p) || parameterless_ahead(p) then return MethodMember(parse_function(p, buf()), !hidden, overrides, static_member)
     StatementMember(line_statement(p))
+
+/** Whether a member declared with no parameter list begins here: a name, perhaps type parameters
+ * (which such a member is refused), then `->` and its result type. No statement a class body runs
+ * starts with a name and an arrow. */
+parameterless_ahead(p: *Parser) -> bool
+    if !p.at_kind(Word) || reserved(p.ahead(0)) then return false
+    if p.ahead(1) == "->" then return true
+    if p.ahead(1) != "[" then return false
+    var depth = 0
+    var i = 1usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Dedent || token.value == Indent then return false
+        val text = p.spelling(token)
+        if text == "[" then depth += 1
+        elif text == "]"
+            depth -= 1
+            if depth == 0 then return p.ahead(i + 1) == "->"
+        i += 1
+    false
+
+/** Whether a block's line declares a local function with no parameter list, `name -> T = …`: a
+ * name, `->`, then `=` outside brackets later on the line. A lambda written as a statement has no
+ * `=` there. */
+local_parameterless_ahead(p: *Parser) -> bool
+    if !p.at_kind(Word) || reserved(p.ahead(0)) || p.ahead(1) != "->" then return false
+    var depth = 0
+    var i = 2usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Dedent || token.value == Indent then return false
+        val text = p.spelling(token)
+        if text == "(" || text == "[" || text == "{" then depth += 1
+        elif text == ")" || text == "]" || text == "}" then depth -= 1
+        elif text == "=" && depth == 0 then return true
+        i += 1
+    false
 
 // A member that is a name, type parameters perhaps, and a parameter list with a typed parameter,
 // ending its line, is the signature of an abstract method yielding `unit`: a call never has a `:`

@@ -343,8 +343,10 @@ There is no arity limit.
 function that runs `f` and then `g` on its result, and `f.compose(g)`, which runs `g` first; and to
 every function of two parameters `f.tupled()`, the function taking its two arguments as one pair. A
 function type is a trait, so they reach every value that is a function of that shape: a lambda, a
-reference to a function, a method value, and a value of a type naming a function type, a sequence or
-a map among them. A type's own method of the same name and parameter types is found first.
+reference to a function, a method value (of a method declared with a parameter list; a
+[parameterless method](/spec/declarations/#parameterless-methods) has none, and `() -> x.head` is the
+function that reads one), and a value of a type naming a function type, a sequence or a map among
+them. A type's own method of the same name and parameter types is found first.
 `identity`, in the prelude, is the function that gives back its argument, for passing where a
 function is asked for and nothing should change.
 

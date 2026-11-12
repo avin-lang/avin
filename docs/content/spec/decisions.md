@@ -185,7 +185,9 @@ a decision changes, this page and the chapter change together.
   specificity before any literal rule applies.
 - A method named without a call, `account.deposit`, is a function value bound to its receiver: a
   closure holding `account`, of the method's type without the receiver. Inside the class, a bare
-  method name is the same closure over `self`.
+  method name is the same closure over `self`. This holds for a method declared with a parameter
+  list, `()` included; a method declared with none (settled by the user 2026-11-12, below) is called
+  by its name and has no method value.
 - Settled 2026-11-03: a method value evaluates its receiver once, where the value is made. Through a
   trait-typed or open-class receiver it calls the implementation the object's class has, through
   the object's method table at each call; the object is fixed, so this is the implementation it had
@@ -6963,6 +6965,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   page would need a third check against the `.out` file); an HTML comment before the fence as the
   marker (invisible in the page but present in its source, and a second line to keep beside the
   fence); a literate `.lavin` page (the site renders indented code differently from fences).
+- Settled by the user 2026-11-12 (built on branch `parameterless-methods`): **a method declared with
+  no parameter list is called with no parentheses.** `head -> T = …` in a class, trait, object or
+  impl is called as `xs.head`; a method declared with `()` keeps them at the call, `buf.clear()`,
+  `iter.next()`. `account.deposit` stays a method value, bound to its receiver, for a method with a
+  parameter list. A parameterless method has no method value: the function that reads one is the
+  lambda `() -> xs.head`, and there is no `m _` form. REJECTED: omitting `()` at the call of any
+  method of no parameters, since `x.m` would then be both a call and a method value, and the
+  parentheses that mark a call with an effect would be gone.
 
 **Deferred**
 
@@ -6970,6 +6980,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   macros.
 
 ## Proposed
+
+- Proposed (built on branch `parameterless-methods`): **parentheses after a parameterless method
+  call what it yields.** `t.adder(4)`, where `adder -> (int) -> int`, calls the function `adder`
+  yields, and `t.items(2)` indexes the sequence `items` yields; `c.head()`, where `head` yields
+  neither (or a sequence given no index), is an error naming the fix, "`head` takes no parameter
+  list, so it is called without parentheses: write `head`, not `head()`". The same holds inside the
+  class by bare name and through `super`. WHY: `x.m(a)` must mean one thing, and the declaration says
+  `m` takes no arguments, so the only call the parentheses can make is of the result; reporting
+  `x.head()` instead of reading it as a call keeps the rule visible at every wrong use. ALTERNATIVES:
+  accepting `x.head()` as a synonym of `x.head` (two spellings of one call, and it hides a callable
+  result's call); refusing parentheses after a parameterless method altogether (then `t.adder(4)`
+  would need `(t.adder)(4)`).
+- Proposed (built on branch `parameterless-methods`): **the parameter-list shape is part of a
+  signature.** Overriding or implementing a parameterless method with a `()` one, or the reverse, is
+  an error naming the shape to write; it applies to class overrides, trait implementations in
+  classes and in a data type's impls. WHY: a call site written against the trait must be valid
+  against every implementation. ALTERNATIVE: letting the override's shape win (a call through the
+  trait and through the class would be written differently).
+- Proposed (built on branch `parameterless-methods`): **a public field implements an abstract
+  parameterless method.** A trait's or an abstract class's `size -> int` with no body is implemented
+  by a method, or by a public `val` or `var` field of the name (a `val` class parameter included),
+  or for a data type by a field of its one variant; the field's type must be the method's result. A
+  private field does not, and is named in the error; a field still cannot share its name with a
+  method that has a body (a default is not replaced by a field). The converse is unchanged: a
+  trait's abstract `val` is supplied only by a field. WHY: a parameterless method reads like a field
+  at every call, so a class whose answer is stored should be able to store it; only an abstract one
+  is implemented this way, so a default body is never silently replaced. ALTERNATIVES: methods only
+  (a stored answer needs a method that returns the field); letting a field replace a default too
+  (a field would override silently, without `override`). Review with the user: `var` fields are
+  accepted, so a parameterless method may yield a different value at each read through the field.
+- Proposed (built on branch `parameterless-methods`): **only members are declared without a
+  parameter list.** A top-level function or a local function declared `name -> T = …` is an error
+  naming `name() -> …` and `val name = …`. WHY: the smallest choice; a module value computed once is
+  already a `val`, and the call-without-parentheses reading is what a member of a value needs.
+  ALTERNATIVES: top-level parameterless functions called by bare name, recomputed at each read (a
+  second kind of module-level name that reads like a `val` and is not one). Review with the user if
+  module-level computed names are wanted.
+- Proposed (built on branch `parameterless-methods`): **a parameterless method is the only method
+  of its name** in its type, inherited ones and the methods impls add included; and **it takes no
+  type parameters of its own**, a parse error, since `x.first[int]` would read as indexing its
+  result (its class's type parameters it has). WHY: `x.head` calls the parameterless one, which
+  leaves no call to choose another overload with. ALTERNATIVES: overloading resolved by whether
+  parentheses follow (two methods behind one name with different call shapes); type parameters
+  written `x.first[int]` (indexing and type application become ambiguous after a member).
+- Proposed (built on branch `parameterless-methods`): **naming a parameterless method where a
+  function type is expected is an error naming the lambda**, "`head` takes no parameter list, so it
+  has no function value: naming it calls it; for a function, write a lambda, as in `() -> x.head`",
+  unless the method yields a function, which is then the value. `super.name` with no call reads a
+  superclass's parameterless method and is refused for one with a parameter list. WHY: the plain
+  type mismatch ("expected () -> int, found int") hides that the user meant a method value.
+  ALTERNATIVE: the generic type-mismatch error.
 
 ## Open
 
