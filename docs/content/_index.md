@@ -24,7 +24,7 @@ area(shape: Shape) -> real = shape match
 
 main()
     val shapes = [Circle(1.0), Rect(2.0, 3.0)]
-    println(shapes.map(area).sum())
+    println(shapes.map(area).sum)
 ```
 
 A list may be endless. Here every prime there is, in one lazy list: `#::` puts a prime in front of a
@@ -33,11 +33,11 @@ program asks for, and keeps every prime it has found.
 
 ```text run
 sieve(s: LazyList[int]) -> LazyList[int] =
-    s.head() #:: sieve(s.tail().filter(_ % s.head() != 0))
+    s.head #:: sieve(s.tail.filter(_ % s.head != 0))
 
 main()
     val primes = sieve(LazyList.from(2))
-    println(primes.take(10).toVector())
+    println(primes.take(10).toVector)
     println(primes(99))
 ```
 

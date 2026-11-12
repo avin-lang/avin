@@ -54,11 +54,11 @@ main() -> int
 import avin.threads.{Atomic, scope}
 
 main() -> int
-    val parts = (0..<4).map(_ -> Atomic(0)).toVector()
+    val parts = (0..<4).map(_ -> Atomic(0)).toVector
     scope(s ->
         for i in 0..<4
             s.spawn(() -> parts(i).store((i + 1) * 10)))
-    parts.map(p -> p.load()).sum()
+    parts.map(p -> p.load()).sum
 ```
 
 ### Cancellation
@@ -112,12 +112,12 @@ goes on running after the call. What a program can rely on:
 import avin.threads.{Channel, scope}
 
 fetchAll(urls: Vector[string]) -> Result[Vector[string], string]
-    val pages = Channel[Result[string, string]](urls.length())
+    val pages = Channel[Result[string, string]](urls.length)
     scope(s ->
         for u in urls do s.spawn(() -> pages.send(fetch(u)))
         var got: Vector[string] = []
         var failure: Option[string] = None
-        while got.length() < urls.length() && failure.isEmpty()
+        while got.length < urls.length && failure.isEmpty()
             pages.receive() match
                 Some(Ok(page)) -> got = got :+ page
                 Some(Err(e)) ->
@@ -428,7 +428,7 @@ main() -> int
     val page = Future(fetch(url))
     val counted = Future
         val words = load(path).split(" ")
-        words.length()
+        words.length
     val both = for p in page, n in counted yield s"${p.charCount()} characters, $n words"
     println(both.await())
     0
@@ -485,10 +485,10 @@ import avin.threads.{blocking, Channel, Future}
 
 main() -> int
     val jobs = Channel[int]()
-    val workers = (0..<64).map(i -> Future(blocking(jobs.receive().getOrElse(0)))).toVector()
+    val workers = (0..<64).map(i -> Future(blocking(jobs.receive().getOrElse(0)))).toVector
     Future
         for n in 1..64 do jobs.send(n)
-    println(Future.all(workers).await().sum())
+    println(Future.all(workers).await().sum)
     0
 ```
 
@@ -521,8 +521,8 @@ import avin.threads.{Executor, Future}
 
 main() -> int
     val io = Executor.fixed(4)
-    val sizes = (1..100).map(n -> io.future(n * n)).toVector()
-    val total = Future.all(sizes).await().sum()
+    val sizes = (1..100).map(n -> io.future(n * n)).toVector
+    val total = Future.all(sizes).await().sum
     io.shutdown()
     println(total)
     0

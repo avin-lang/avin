@@ -7032,6 +7032,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed 2026-11-12 (branch `parameterless-collections`): **the collections' pure accessors are
+  parameterless methods**, on `Iterable`, `Iterator`, `Seq`, `Set`, `Map`, every immutable and mutable
+  collection, `Builder` and their impls: `head`, `last`, `headOption`, `lastOption`, `tail`, `init`,
+  `size`, `length`, `knownSize`, `isEmpty`, `nonEmpty`, `min`, `max`, `minOption`, `maxOption`,
+  `sum`, `product`, `reverse`, `distinct`, `indices`, `flatten`, `transpose`, `unzip`,
+  `zipWithIndex`, `keys`, `values`, `keySet`, `toList`, `toVector`, `toArraySeq`, `toSet`, `toMap`,
+  `toSortedSet` and `toSortedMap`. **Kept with `()`**: `iterator()`, `toArray()` and `toBuffer()`
+  (each a fresh mutable object), `next()`, `hasNext()`, `buffered()`, `view()`, `peek()` and every
+  mutating method; the internal `erasedSize()`/`erasedLength()`. No accessor had an overload with
+  parameters to give up: `min`/`max` with an ordering are `minBy`/`maxBy`, and the free `min(a, b)`
+  and `max(a, b)` are functions, not methods. WHY: these answer from the collection without changing
+  it, which is what a parameterless method says; one spelling across every collection, since the
+  shape is part of the signature and generic code over `Iterable[T]` reads them the same way.
+  **Review with the user: an iterator is an `Iterable`, so `it.head`, `it.size`, `it.toVector` are
+  parameterless too and read from it**, against the rule that a method with an effect keeps its
+  `()`. ALTERNATIVES weighed: keep these `()` on `Iterable` and convert only where the receiver is a
+  collection (impossible while `Iterator` conforms to `Iterable`, the shape being part of the
+  signature); split a `Collection` trait off `Iterable` for the accessors so an iterator keeps `()`
+  (a library reshaping larger than this sweep); convert only `head`/`size`/`isEmpty` (a mixed
+  spelling a reader has to memorise). Option, Either, Result, `string` and the numerics keep `()`
+  for now (wave 2), since no trait they implement forced them.
+- Fixed 2026-11-12 (branch `parameterless-collections`): naming a parameterless method of a
+  generic class or trait where a function is expected, `val f: () -> int = xs.head` on a
+  `Vector[int]`, now gives the lambda error: what the call yields is read at the receiver's type
+  arguments, where before the method's own `T` hid it and the plain type mismatch was reported.
+  The compiler's own expansions (a `for` over an array or a range, a sequence pattern) read
+  `length` and `nonEmpty` without a call.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

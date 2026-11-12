@@ -19,7 +19,7 @@ import avin.process
 
 main()
     val files = process.args()
-    if files.isEmpty()
+    if files.isEmpty
         println(s"usage: ${process.programName()} FILE...")
         process.exit(2)
     val home = process.env("HOME").getOrElse("/")

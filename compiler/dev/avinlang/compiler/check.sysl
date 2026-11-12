@@ -11276,13 +11276,18 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     val unit = unit_of(c)
     if *receiver.ty is Nothing then return receiver
     // A method declared without a parameter list has no value: naming it calls it.
+    // Where a function is expected, what the call yields is read with the receiver's type arguments
+    // in place, so a method of a generic class or trait, `xs.head` on a `Vector[int]`, is judged by
+    // its `int` and not by its `T`.
     if is_parameterless(c, m)
-        if expected is Some(want)
-            val yields = zonk(c, result_of(c, m, at))
-            if *zonk(c, want) is Function(_, _, _) && !(*yields is Function(_, _, _) || *yields is TypeVar(_, _, _)) && settled(yields)
+        if expected is Some(want) && *zonk(c, want) is Function(_, _, _)
+            val call = method_call(c, at, at, receiver, m, buf(), explicit, None, false, buf())
+            val yields = zonk(c, call.ty)
+            if !(*yields is Function(_, _, _) || *yields is TypeVar(_, _, _) || *yields is ErrorType) && settled(yields)
                 val name = c.symbols[m].decl.name
                 c.note(unit, at, s"`$name` takes no parameter list, so it has no function value: naming it calls it; for a function, write a lambda, as in `() -> x.$name`")
                 return TExpr(at, ErrorType, UnitConst)
+            return call
         return method_call(c, at, at, receiver, m, buf(), explicit, expected, false, buf())
     if refuse_unmet_conformance(c, at, receiver.ty, m) then return TExpr(at, ErrorType, UnitConst)
     if refuse_static_on_value(c, at, receiver, m) then return TExpr(at, ErrorType, UnitConst)
@@ -14656,7 +14661,7 @@ private stepped_range(at: Span, tag: string, pattern: &Pattern, body: &Expr, ite
     items.push(Expr(at, Binding(step, None, Expr(at, Member(r, "step")), false)))
     items.push(Expr(at, Binding(inclusive, None, Expr(at, Member(r, "inclusive")), false)))
     items.push(Expr(at, Binding(i, None, Expr(at, Member(r, "start")), true)))
-    items.push(Expr(at, Binding(go, None, call_at(at, r, "nonEmpty"), true)))
+    items.push(Expr(at, Binding(go, None, Expr(at, Member(r, "nonEmpty")), true)))
     val zero = Expr(at, IntLit("0"))
     val upward = compare_at(at, Greater, name_at(at, step), zero)
     val n = name_at(at, next)
@@ -14675,7 +14680,7 @@ private indexed_array(at: Span, tag: string, pattern: &Pattern, body: &Expr, ite
     val a = name_at(at, s"for source $tag")
     val n = s"for length $tag"
     val i = s"for i $tag"
-    items.push(Expr(at, Binding(n, None, call_at(at, a, "length"), false)))
+    items.push(Expr(at, Binding(n, None, Expr(at, Member(a, "length")), false)))
     items.push(Expr(at, Binding(i, None, Expr(at, IntLit("0")), true)))
     var args: Buf[Argument] = buf()
     args.push(Argument(at, None, name_at(at, i), false))
@@ -19040,7 +19045,7 @@ private seq_element(c: *Checker, t: &Type) -> Option[&Type]
 
 // A sequence pattern on a sequence other than a list, `[a, b, c]`, matches one of exactly that many
 // elements. The matched sequence is held in a local of its own, through which the pattern asks its
-// `length()` once and then reads each element it tests with `apply`, in order, stopping at the first
+// `length` once and then reads each element it tests with `apply`, in order, stopping at the first
 // that fails; an element matched by `_` is not read. Ending in `rest*`, it matches a sequence of at
 // least the elements before it, and binds the rest to `rest` as `drop` gives it, `[rest*]` included:
 // it binds what `drop(0)` answers for the sequence's type.
@@ -19050,7 +19055,7 @@ private sequence_pattern(c: *Checker, p: &Pattern, items: Buf[&Pattern], ty: &Ty
     val fixed = if rest then items.len() - 1 else items.len()
     val name = s"sequence pattern ${at.start}"
     val local = declare_local(c, at, name, ty, false)
-    val length = check_expr(c, compare_at(at, if rest then GreaterEqual else Equal, call_at(at, name_at(at, name), "length"), Expr(at, IntLit(fixed.to_string()))), None)
+    val length = check_expr(c, compare_at(at, if rest then GreaterEqual else Equal, Expr(at, Member(name_at(at, name), "length")), Expr(at, IntLit(fixed.to_string()))), None)
     var elements: Buf[&TExpr] = buf()
     var typed: Buf[&TPattern] = buf()
     for i in 0..<fixed

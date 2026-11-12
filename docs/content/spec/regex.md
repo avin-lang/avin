@@ -18,7 +18,7 @@ main()
     date.findFirstMatchIn("due 2024-06") match
         Some(m) -> println(m.group("month"))         // Some(06)
         None -> println("no date")
-    println("[a-z]+".r().findAllIn("one, two").toList())   // [one, two]
+    println("[a-z]+".r().findAllIn("one, two").toList)   // [one, two]
     println(Regex("a+b").matches("aab"))              // true
 ```
 
