@@ -7113,3 +7113,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reports a bad binding without linking). The language server already stops at checking, so it
   matches the new `check`. Review with the user: whether `--bindings` should instead be the
   default for packages that have bindings.
+
+- Proposed (branch `library-version`): **the standard library carries the compiler's version, and
+  the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
+  stamped by `scripts/release.sh` in the same commit as `const Version` and `compiler/sysl.hocon`,
+  and a compiler checks it against its own before it compiles anything: `check`, `build`, `run`,
+  `test` and `lsp` print one error naming both versions and the library's path, and nothing else.
+  A library with no version, or a `library.hocon` that is missing or unreadable, is refused the
+  same way. The rule is an **exact match**. A compiler built between releases carries the last
+  release's version, and so does the library in its own checkout, so a development build matches
+  its own tree; only a library from another release, through `AVIN_ROOT` or an install, differs.
+  Why: a library of another version fails as dozens of errors inside `library/avin/*.avin`, which
+  points a reader at the library rather than at the mismatch. Alternatives weighed: a dev compiler
+  accepting a library from the same commit (needs a commit id stamped into both and a build step
+  that keeps them in step, to answer a case the exact rule already passes); "the library is newer
+  than the compiler" (a newer library declares what an older compiler cannot check, which is the
+  failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
+  library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
