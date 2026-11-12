@@ -66,9 +66,9 @@ impl Add for Point
 | Assignment | `=` and compound forms (`+=`, `<<=`, `+%=`, …) |
 | Yielding assignment | `:=` and compound forms, which return the stored value |
 | Update | prefix and postfix `++` `--`; prefix yields the new value, postfix the old |
-| Symbol methods | any other run of operator characters names a method, called infix at the level of its first character, or tightest when it has a `~` in it: `xs ++ ys`, `x +: xs`, `a <~ b` |
+| Symbol methods | any other run of operator characters names a method, called infix at the level of its first character, or tightest when it has a `~` in it: `xs ++ ys`, `x +: xs`, `a <~ b`, `x #:: rest` |
 
-An operator is the longest run of the characters `+ - * / % < > = ! & | ^ ~ : ?`, so a prefix
+An operator is the longest run of the characters `+ - * / % < > = ! & | ^ ~ : ? #`, so a prefix
 operator written directly after another operator needs a space: `a = -1`, `x * -y`. A run stops
 before `//`, which begins a comment. The range operators `..` and `..<` are spelled with dots, which
 are not operator characters.
@@ -201,8 +201,10 @@ on two `int`s is always the machine's addition. `==` and `!=` stay `Eq`'s.
 A symbol method's call binds at the level of the language's operator its name's first character
 belongs to, so a name reads with the operator it resembles. One character overrides the first: a
 name with `~` anywhere in it binds at the tightest symbol level, so `~`, `~>`, `<~`, `<~>`, `~!` and
-`^~` all bind together, the way a grammar's sequencing operators are read. The levels, tightest
-first:
+`^~` all bind together, the way a grammar's sequencing operators are read. A leading `#` is passed
+over, so a name starting with `#` binds at the level of its first other character: `#::` binds as
+`::` does and `#+` as `+`. A name of `#` alone, `##`, binds at the tightest symbol level, and a
+single `#` is no operator. The levels, tightest first:
 
 | Level | Operators | Symbol methods whose name starts with |
 | --- | --- | --- |
@@ -213,7 +215,7 @@ first:
 | Bitwise and | `&` | `&`: `&&&` |
 | Bitwise exclusive or | `^` | `^`: `^^` |
 | Bitwise or | `\|` | `\|`: `\|>` |
-| Cons | `::` | `:`: `:+`, `:::` |
+| Cons | `::` | `:`: `:+`, `:::`, `#::` |
 | Range | `..` `..<` | |
 | Named calls | `a max b` | |
 | Comparison | `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `is` | `<` `>` `=` `!`: `<=>`, `<>`, `!!` |
@@ -233,6 +235,37 @@ are still evaluated in the order written, `x` before `xs`. Operators of one leve
 opposite directions, whether symbol methods or the language's own, do not mix without parentheses:
 `a ++ b +: c`, `a + b +: c` and `1 :: xs :+ 2` are errors, and `(a ++ b) :+ c` and `1 :: (xs :+ 2)`
 are not. Operators of different levels need none: `1 +: xs :+ 2` is `(1 +: xs) :+ 2`.
+
+#### A right operand taken by name
+
+A companion object may declare an operator whose name ends in `:` as a function of two parameters,
+the left operand and then the right, with the right [by name](/spec/by-name/). Then `x op: r`, where
+`r`'s type is the companion's class or data type, calls the companion's `op:(x, r)`: `x` is evaluated
+where it is written and `r` is passed unevaluated, as any by-name argument is. The library's lazy
+list is built this way, so `0 #:: 1 #:: rest` evaluates `rest` only when the list's third cell is
+read:
+
+```text
+class Chain(val label: string, private val after: () -> Chain)
+    next() -> Chain = after()
+
+object Chain
+    #::(label: string, rest: -> Chain) -> Chain = Chain(label, () -> rest)
+
+endless(n: int) -> Chain = s"c$n" #:: endless(n + 1)     // returns; each next() makes one more
+```
+
+- **The right operand's type decides**, and it is known without evaluating it: where that type's
+  companion declares such an `op:`, it is called, and it may be called dotted too,
+  `Chain.#::("a", rest)`. A type with a method `op:` of its own, or one from an impl, whose
+  companion also declares one, makes `x op: r` an error naming both.
+- **Wherever some companion declares `op:` so, the right operand of every `x op: r` is checked as a
+  delayed expression**, since its type is known only once it is checked. On a type whose `op:` is an
+  ordinary method, the right operand is then evaluated once, at the call, after `x`, as a strict
+  receiver is; a `return`, `break` or `continue` leaving it is an error, as in any delayed
+  expression. Operators no companion declares so, `+:` and `::` among them, are unaffected.
+- A companion's `op:` with a strict second parameter is not called infix; it is an ordinary function
+  of the object.
 
 There are no prefix or postfix symbol methods, beyond the [method `-`](#operator-methods) taking no
 argument that a prefix `-` calls. `++` and `--` keep their update meaning when no

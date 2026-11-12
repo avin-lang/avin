@@ -15320,6 +15320,8 @@ private literal_own_type(e: &Expr) -> &Type
 // takes it strictly evaluates it once, at the call.
 private delayed_unchosen(c: *Checker, arg: Argument, inner: Option[&Type]) -> &TExpr
     if inner is Some(t) then return delayed_argument(c, arg, ByName(t), t)
+    if arg.value.kind is Checked(slot)
+        if *c.checked_slots[slot].ty is ByName(_) then return c.checked_slots[slot]
     if arg.value.kind is Name(n)
         if binding_ref(c, arg.value.span, n) is Some(t)
             if *t.ty is ByName(_) then return t
@@ -15849,11 +15851,95 @@ private infix_call(c: *Checker, at: Span, target: &Expr, name: string, name_span
     var args: Buf[Argument] = buf()
     args.push(Argument(arg.span, None, arg, false))
     var callee_span = target.span.to(name_span)
+    var receiver = target
     if groups_right(name)
         c.operand_first.push(name_span)
         callee_span = name_span.to(target.span)
-    val callee = Expr(callee_span, Member(target, name))
-    member_call(c, at, callee, name_span, target, name, args, None, expected, true)
+        if declares_lazy_operator(c, name)
+            val unit = unit_of(c)
+            val before = c.units[unit].report.len()
+            // Where the call is expected to give a type whose companion declares the operator, the
+            // right operand is expected to be of that type too, as the operator's result is the
+            // list it extends: `val xs: LazyList[long] = 1 #:: 2 #:: LazyList.empty()`.
+            var hint: Option[&Type] = None
+            if expected is Some(want)
+                if lazy_operator_of(c, zonk(c, want), name) is Some(_) && !has_unknowns(zonk(c, want)) then hint = Some(zonk(c, want))
+            val delayed = delayed_operand(c, target, hint)
+            val delayed_type: &Type = *delayed.ty match
+                ByName(t) -> t
+                _ -> ErrorType
+            val yields = zonk(c, delayed_type)
+            if *yields is ErrorType || c.units[unit].report.len() > before
+                check_statement(c, arg)
+                return TExpr(at, ErrorType, UnitConst)
+            if lazy_operator_of(c, yields, name) is Some(o)
+                if has_own_method(c, yields, name)
+                    c.note(unit_of(c), name_span, s"`${type_name(yields)}` has a method `$name` and its companion `${c.classes[o].name}` declares `$name` too, so `x $name ${type_name(yields)}` could call either: rename one of them")
+                    check_statement(c, arg)
+                    return TExpr(at, ErrorType, UnitConst)
+                // `x op: r` is the companion's `op:(x, r)`, which takes `r` by name: `r` was checked
+                // above as the delayed expression the call passes on unevaluated.
+                var both: Buf[Argument] = buf()
+                both.push(Argument(arg.span, None, arg, false))
+                both.push(Argument(target.span, None, Expr(target.span, Checked(c.checked_slots.len())), false))
+                c.checked_slots.push(delayed)
+                val companion = global_read(c, name_span, c.classes[o].global.unwrap())
+                return call_method(c, at, name_span, companion, name, lazy_operators(c, o, name), both, None, expected, false)
+            // Another type's method of the name takes its receiver as any method does: the delayed
+            // expression is evaluated once, at the call.
+            val evaluated = TExpr(target.span, yields, CallValue(delayed, buf()))
+            receiver = Expr(target.span, Checked(c.checked_slots.len()))
+            c.checked_slots.push(evaluated)
+    val callee = Expr(callee_span, Member(receiver, name))
+    member_call(c, at, callee, name_span, receiver, name, args, None, expected, true)
+
+// The right operand of an operator some companion declares by name, checked as the delayed
+// expression it is passed as: a lambda of no parameters, yielding `hint` where one is given.
+private delayed_operand(c: *Checker, operand: &Expr, hint: Option[&Type]) -> &TExpr
+    val wanted: Option[&Type] = hint match
+        Some(t) -> Some(Function(buf(), t, false))
+        None -> None
+    val delayed = lambda_expr(c, operand, buf(), operand, wanted, true)
+    val yields: &Type = *delayed.ty match
+        Function(_, r, _) -> r
+        _ -> ErrorType
+    TExpr(operand.span, ByName(yields), delayed.kind)
+
+// Whether a companion object of the program declares an operator `name`, ending in `:`, that takes
+// its right operand by name: then the right operand of every `x name r` is checked as a delayed
+// expression, before `r`'s type says whose `name` is called.
+private declares_lazy_operator(c: *Checker, name: string) -> bool
+    for k in 0..<c.classes.len()
+        if c.classes[k].decl.object && (c.classes[k].companion is Some(_) || c.classes[k].companion_data is Some(_))
+            if lazy_operators(c, k, name).len() > 0 then return true
+    false
+
+// The functions `name` object `o` declares as an operator taking its right operand by name: two
+// parameters, the second by name.
+private lazy_operators(c: *Checker, o: usize, name: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for m in c.classes[o].methods
+        val s = c.symbols[m]
+        if s.decl.name == name && s.params.len() == 3 && method_visible(c, m)
+            if *s.params[2] is ByName(_) then out.push(m)
+    out
+
+// The companion object of `t`'s class or data type, where it declares the operator `name` taking its
+// right operand by name.
+private lazy_operator_of(c: *Checker, t: &Type, name: string) -> Option[usize]
+    val o = *t match
+        Class(k, _, _) -> if c.classes[k].decl.object then None else c.classes[k].companion
+        Data(d, _, _) -> c.data[d].companion
+        _ -> None
+    if o is Some(k)
+        if lazy_operators(c, k, name).len() > 0 then return Some(k)
+    None
+
+// Whether a value of type `t` has a method `name` of its own or from an impl.
+private has_own_method(c: *Checker, t: &Type, name: string) -> bool
+    if *t is Class(k, _, _)
+        if methods_named(c, k, name).len() > 0 then return true
+    receiver_methods(c, t, name).len() > 0
 
 // An operator is the longest run of operator characters, so `x=-1` reads `=-` as one name. When a
 // name is an operator of the language followed by a prefix operator, the message says so.
@@ -17788,6 +17874,10 @@ private settle(c: *Checker, i: usize, t: &Type)
 // is forwarded as it is, still unevaluated.
 private delayed_argument(c: *Checker, arg: Argument, param: &Type, inner: &Type) -> &TExpr
     val unit = unit_of(c)
+    // The right operand of an operator taking it by name, checked as a delayed expression before
+    // the call was chosen: the caller relates what it yields to the parameter.
+    if arg.value.kind is Checked(slot)
+        if *c.checked_slots[slot].ty is ByName(_) then return c.checked_slots[slot]
     if arg.value.kind is Name(n)
         if binding_ref(c, arg.value.span, n) is Some(t)
             if *t.ty is ByName(_)

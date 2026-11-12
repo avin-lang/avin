@@ -1467,7 +1467,8 @@ Settled by the user on 2026-11-04:
     text, any status but success an `Err`), `lines()` (an iterator as output arrives) and `start()`
     (a `Child`). Importing the module adds `run()` and `output()` to `string`. **Operators Avin cannot
     define**: postfix `!` and `!!` (no method is called postfix, and `!` is the language's), and
-    anything spelled with `#` (not an operator character), so `#|` is `|`, and `#&&`, `#||`, `###`,
+    the spellings with `#` (`#` was no operator character when this was built; it is one since
+    branch `lazy-cons-operator`, and the words stay), so `#|` is `|`, and `#&&`, `#||`, `###`,
     `#>`, `#>>` and `#<` are words; `run()` is the status, where the reference's `run()` starts the
     process, which here is `start()`. Bindings: `sysl.process.spawn` and `pipe`, with a mirror of
     `Stdio` holding a `sysl.fs.File` handle, `Spawned` a handle waited for `blocking`, `Status`
@@ -6583,15 +6584,51 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
   at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
   next step).
-- Proposed (built on branch `stdlib-lazy-list`): **There is no lazy cons operator; `x +: xs`
-  prepends to a list already made.** A symbol method whose name ends in `:` takes its receiver on
-  the right, and a receiver is evaluated where it is written, so the tail of `x op: tail` cannot be
-  delayed; a left-grouping name would need a method on every element type, which only the core
-  library may declare by an `impl` over all types, and would group `1 op 2 op xs` the wrong way.
-  `LazyList.cons(x, tail)` is the delayed form. **Review with the user**: a language form (a
-  by-name receiver for `:`-ending methods, or `::` building a lazy list where one is expected) would
-  give `head #:: tail`; and `head :: tail` patterns on a lazy list need the pattern rules to reach
-  beyond `List`: both are language changes, left to the user.
+- Proposed (built on branch `stdlib-lazy-list`, replaced on branch `lazy-cons-operator`): `x +:
+  xs` prepends to a lazy list already made, and `LazyList.cons(x, tail)` is the delayed form. The
+  user then decided (2026-11-11): *"yes, a lazy head #:: tail operator would be good to include."*
+  The operator is the entry below; `+:` stays strict.
+- Proposed (built on branch `lazy-cons-operator`): **A companion object may declare an operator
+  ending in `:` with its right operand by name, and `x op: r` calls it where `r`'s type is the
+  companion's type.** `object LazyList` declares `#::[T](head: T, tail: -> LazyList[T])`, so
+  `0 #:: 1 #:: fibs.zip(fibs.tail()).map((a, b) -> a + b)` evaluates its tail only when the cell
+  after the head is first read. The right operand's type decides which `op:` is called, and that
+  type is known only once the operand is checked, so wherever some companion declares `op:` this
+  way, the right operand of every `x op: r` is checked as a delayed expression; a type whose `op:`
+  is its own strict method evaluates it once at the call, after `x`, as before. A type with its own
+  `op:` whose companion also declares one makes the call an error naming both. Where the call is
+  expected to give a type whose companion declares the operator, the right operand is checked
+  against that type (`val xs: LazyList[long] = 1 #:: 2 #:: LazyList.empty()` takes `long`
+  literals). WHY: it reuses two rules the language already has, a companion holding what belongs
+  to a type and by-name parameters with all their restrictions, and adds no declaration syntax;
+  the operator reads as the list it builds, and nothing changes for operators no companion declares
+  so (`+:`, `::`, `:+`). ALTERNATIVES: a by-name receiver for a method (`self` a delayed
+  expression: no value to dispatch on, a new declaration form, and every bare member read in the
+  body would evaluate it again); a `lazy` modifier on a method (reads as a memoized result); `::`
+  building a lazy list where one is expected (overloads the language's own `List` operator on the
+  expected type); a special case for `LazyList` in the checker (not available to other types).
+  **Review with the user**: the cost of the rule is that a `return`, `break` or `continue` inside
+  the right operand of `#::` is an error on every type, since `LazyList` declares `#::` for the
+  whole program.
+- Proposed (built on branch `lazy-cons-operator`): **`#` is an operator character**, and a leading
+  `#` is passed over when a symbol name's level is decided: `#::` binds as `::`, `#+` as `+`, a name
+  of `#` alone (`##`) binds tightest, and a single `#` is no operator. WHY: `#::` must bind more
+  loosely than arithmetic (`n + 1 #:: rest`), and a `#` prefix marks a variant of an operator
+  without changing how it reads. `#` was unused in code before, so no program changes meaning.
+  ALTERNATIVES: `#` at the tightest level as other unclaimed characters are (then `n + 1 #:: rest`
+  would be `n + (1 #:: rest)`); `#` its own level. This replaces the earlier note that `#` is no
+  operator character, which kept `avin.process` from spelling `#|`; those combinators keep their
+  word names.
+- Proposed (built on branch `lazy-cons-operator`): **There is no `head #:: tail` pattern.** A
+  pattern names an extractor by a word (`Name(p1, p2)`), and the only operator written between a
+  pattern's parts is `List`'s `::`, so an infix extractor pattern would be a further language change.
+  A lazy list is taken apart with `headOption()` and `tail()`. **Review with the user** if infix
+  extractor patterns are wanted.
+- Proposed (built on branch `lazy-cons-operator`): **A lazy list's cell read while it is being
+  evaluated traps with `a LazyList cell is read while it is being evaluated`**, checked by a flag
+  the list's progress record holds while its cell's expression runs, rather than the `lazy val`'s
+  own message, which named the private field `cell`. ALTERNATIVES: keeping the `lazy val`'s
+  message (names an implementation detail).
 - Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
   a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
   never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from

@@ -658,20 +658,24 @@ same list, a list made from it or another iterator over it, gives the cell kept.
 be endless, and may be defined by reference to itself:
 
 ```text
-lazy val fibs: LazyList[long] = LazyList.cons(0, LazyList.cons(1, fibs.zip(fibs.tail()).map(p -> p.0 + p.1)))
+lazy val fibs: LazyList[long] = 0 #:: 1 #:: fibs.zip(fibs.tail()).map((a, b) -> a + b)
 
 sieve(xs: LazyList[int]) -> LazyList[int]
     val p = xs.head()
-    LazyList.cons(p, sieve(xs.tail().filter(n -> n % p != 0)))
+    p #:: sieve(xs.tail().filter(n -> n % p != 0))
 
 fibs(90)                                 // 2880067194370816120
 sieve(LazyList.from(2)).take(5)          // the first five primes, once read
 ```
 
-**Making one.** `LazyList.empty[T]()` is the empty list. `LazyList.cons(head, tail)` takes `tail`
-[by name](/spec/by-name/): it is evaluated when the list's second cell is first read, once, and not at
-all if that cell never is; `head` is an ordinary argument. `x +: xs` puts `x` in front of a list
-already made. The companion's makers have `Iterator`'s names and argument orders, and evaluate
+**Making one.** `LazyList.empty[T]()` is the empty list. `head #:: tail` is a list of `head` and then
+`tail`, which is taken [by name](/spec/by-name/): it is evaluated when the list's second cell is first
+read, once, and not at all if that cell never is; `head` is evaluated where it is written. `#::`
+groups to the right, so `0 #:: 1 #:: rest` is `0 #:: (1 #:: rest)`, and binds as `::` does, more
+loosely than arithmetic: `n + 1 #:: rest` puts `n + 1` in front. It is the companion's
+[operator](/spec/operators-and-control-flow/#a-right-operand-taken-by-name) `LazyList.#::(head,
+tail)`, the same as `LazyList.cons(head, tail)`. `x +: xs` puts `x` in front of a list already made,
+evaluating `xs` at once. The companion's makers have `Iterator`'s names and argument orders, and evaluate
 nothing when called: `from(start)` and `from(start, step)` over any integer type (an addition that
 overflows traps only when the cell past the greatest value is read), `iterate(start, f)`,
 `unfold(state, f)`, `continually(element)` (by name, evaluated once per cell), `fill(count, element)`
@@ -705,17 +709,23 @@ iterator walks it; a method called on a list holds that list for the length of t
 
 **Threads.** A lazy list is not [sendable](/spec/threads/): the cells not yet evaluated are functions
 that may hold anything, so a thread's body may not reach one, and each list belongs to the thread
-that made it. A cell is evaluated as a [`lazy val`](/spec/declarations/#initialization) is
+that made it. A cell is evaluated once, as a [`lazy val`](/spec/declarations/#initialization) is
 initialized, and a cell whose evaluation reads that same cell (an empty list joined to itself,
-`lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read, as a `lazy val`
-initializer reading itself does.
+`lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read:
+``avin: trap: a LazyList cell is read while it is being evaluated``.
+
+A list that refers to itself is a `lazy val`, at module level or in a class: a module-level `val`
+initializes before `main` and may not need its own value at all, even inside a delayed expression,
+so `val fibs = 0 #:: fibs` is an error naming `fibs` as needed by its own initializer.
 
 **Display.** A lazy list's `Display` and `Debug` show the elements evaluated so far, in brackets,
 and evaluate nothing: `[0, 1, 4, 9]` when every cell has been evaluated, `[0, 1, …]` when the cell
 after 1 has not, `[…]` when nothing has.
 
-`LazyList` is an `Iterable` and not a `Seq`, and `::` and list patterns are `List`'s: a lazy list is
-taken apart with `headOption()` and `tail()`, or with `head()` after `isEmpty()`.
+`LazyList` is an `Iterable` and not a `Seq`, and `::` and list patterns are `List`'s: there is no
+`head #:: tail` pattern, since a pattern names an extractor by a word and only `::` is written between
+its parts. A lazy list is taken apart with `headOption()` and `tail()`, or with `head()` after
+`isEmpty()`.
 
 ## Sequence patterns
 

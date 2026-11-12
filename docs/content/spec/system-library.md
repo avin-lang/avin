@@ -350,9 +350,9 @@ an [extension](/spec/declarations/#extensions): `"ls -l".run()` is `Command.pars
 
 **Combining is spelled with words where an operator cannot be.** `|` is free on any type but the
 integers and bytes, so a pipeline is `a | b`. Running is a method rather than a postfix `!` or `!!`,
-because no method is called postfix and `!` is the language's own; `#` is no operator character,
-and `&&` and `||` are the language's, so sequencing is `andThen`, `orElse` and `followedBy`, and
-redirection `toFile`, `appendTo` and `fromFile`.
+because no method is called postfix and `!` is the language's own; `&&` and `||` are the
+language's, so sequencing is `andThen`, `orElse` and `followedBy`, and redirection `toFile`,
+`appendTo` and `fromFile`, words that say what each does where `#&&` or `#>` would not.
 
 **Waiting is safe for the collector.** A thread waiting in `run`, `output` or `waitFor` holds
 nothing the collector waits on, as `await` does not.
