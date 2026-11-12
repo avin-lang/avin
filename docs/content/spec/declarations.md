@@ -36,6 +36,12 @@ main()
   how it was composed. Names in different scripts that merely look alike (Latin `a`, Cyrillic `а`)
   are different names.
 - A module's name is a path of names, so each directory of a program is named by the same rule.
+- **The keywords name no value, type or parameter**: `abstract`, `as`, `break`, `class`, `continue`,
+  `data`, `def`, `derives`, `do`, `elif`, `else`, `false`, `for`, `if`, `impl`, `import`, `is`,
+  `loop`, `match`, `module`, `object`, `override`, `private`, `return`, `static`, `super`, `then`,
+  `trait`, `true`, `val`, `var`, `while` and `yield`. `object`, `trait` and `impl` followed by a
+  parameter list name a function; `end`, `open` and `self` have rules of their own, and the words of
+  actors and machines are keywords only where they [begin their forms](/spec/actors/#keywords).
 - **Capitalized** means the first character is an uppercase or titlecase letter (Unicode `Lu` or
   `Lt`): `Ärger`, `Δelta` and `ǅemal` are capitalized. A letter with no case, as in Chinese,
   Japanese or Arabic, is not, so such a name is written where a lowercase one is. Types and
@@ -57,6 +63,25 @@ Every parameter has a declared type. The result type may be inferred, except for
 An indented body with no `=` and no result type returns `unit`; with `=` or a result type it yields
 its last expression. Default arguments (`size: int = 16`) and named arguments (`open(path, create = true)`)
 are supported, as described next.
+
+**`def` may begin any function or method declaration**, and changes nothing about it: `def area(width:
+int, height: int) -> int = …` is `area(width: int, height: int) -> int = …`. It is written only where
+it is needed, which is a top-level or local function with no parameter list (see
+[parameterless methods](#parameterless-methods)).
+
+```text
+def now -> int = clock.millis()
+
+class Rect(w: real, h: real): Shape
+    override def area() -> real = w * h
+    private def half() -> real = w * h / 2.0
+```
+
+- `def` comes after the modifiers (`private`, `static`, `override`) and after the annotations, as in
+  `@tailrec` then `private def go(…)`. It is written once; before the modifiers, or before a `val`,
+  `var` or `lazy val`, it is refused.
+- A function defined by clauses takes `def` on its signature, never on its clauses.
+- `def` is a keyword: it names no function, type, value or parameter.
 
 ### Default and named arguments
 
@@ -689,13 +714,49 @@ val f = () -> c.head
   name — a class parameter declared `val` among them — or, for a data type, by a field of its one
   variant. The field's type is the method's result. A private field does not implement it, and a
   field cannot share its name with a method that has a body.
-- **Only a member is declared without a parameter list**: a method of a class, trait, object or
-  impl, static ones included. A function at the top level or in a block takes a parameter list,
-  and a value computed once is a `val`. A parameterless method takes no type parameters of its own,
+- **A member is declared without a parameter list as it is; a function at the top level or in a
+  block, with `def`** (below). A parameterless method takes no type parameters of its own,
   since `x.first[int]` would read as indexing its result; its class's type parameters it has.
+- **With `def`, the result type may be left to inference**: `def perimeter = 2.0 * (w + h)`. Without
+  `def`, a name followed by `=` is an assignment.
 - It is not a field: `c.head = 3` is an error, and a class cannot declare a field and a method of
   one name. `super.head` reads the superclass's implementation of one, where `super.describe` names
   no function value of a method with a parameter list.
+
+#### Functions with no parameter list
+
+```text
+var ticks = 0
+
+def now -> int
+    ticks += 1
+    ticks
+
+def adder -> (int) -> int = x -> x + now
+
+main()
+    println(s"$now $now")      // 1 2
+    def step -> int = now * 10
+    println(step)              // 30
+    println(adder(100))        // 104
+    val f = () -> now
+```
+
+- **A function at the top level or in a block is declared without a parameter list with `def`**:
+  `def now -> int = …`. It follows the rules of a parameterless method: it is called by its bare
+  name, `now`, its body running again at every read; parentheses after it call what it yields, a
+  function or a sequence given an index, and are otherwise an error naming the fix, `now`; it has
+  no function value, so where a function is wanted a lambda names it, `() -> now`, and the error
+  where one is missing says so; it takes no type parameters of its own; and it is no variable, so
+  `now = 3` is an error.
+- **Without `def`, `now -> int = …` at the top level or in a block is an error** that names `def now
+  -> int = …`, `val now = …` for a value computed once, and `now() -> …`.
+- **It is the only function of its name in its scope**, and shares the scope's one namespace: a
+  `val` and a `def` of one name in one module or one block, or a `def now` beside a `now(x: int)`,
+  is an error.
+- A local one captures what is in scope where it is declared, as a local function does, and may be
+  read before its declaration in its block. A public one is read from another module as
+  `clock.now`, or by its imported name.
 
 ### Inheritance
 

@@ -7002,15 +7002,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   at every call, so a class whose answer is stored should be able to store it; only an abstract one
   is implemented this way, so a default body is never silently replaced. ALTERNATIVES: methods only
   (a stored answer needs a method that returns the field); letting a field replace a default too
-  (a field would override silently, without `override`). Review with the user: `var` fields are
+  (a field would override silently, without `override`). Reviewed with the user 2026-11-12 and kept: `var` fields are
   accepted, so a parameterless method may yield a different value at each read through the field.
-- Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`): **only members are declared without a
+- Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`), then
+  revised by the user the same day (next entry): **only members are declared without a
   parameter list.** A top-level function or a local function declared `name -> T = …` is an error
   naming `name() -> …` and `val name = …`. WHY: the smallest choice; a module value computed once is
   already a `val`, and the call-without-parentheses reading is what a member of a value needs.
   ALTERNATIVES: top-level parameterless functions called by bare name, recomputed at each read (a
   second kind of module-level name that reads like a `val` and is not one). Review with the user if
-  module-level computed names are wanted.
+  module-level computed names are wanted. It was reviewed: the user chose the alternative, written
+  with `def`.
+- Settled by the user 2026-11-12 (built on branch `def`): **optional `def`; `def` permits a
+  parameterless top-level/local function.** `def` may begin any function or method declaration,
+  members of a class, trait, object or impl, statics, top-level and local functions, with or without
+  a parameter list and on functions defined by clauses, and means nothing more there: `def f(x: int)
+  -> int = …` is `f(x: int) -> int = …`. At the top level and in a block, `def now -> int = …`
+  declares a function with no parameter list, by the rules of a parameterless method: read by its
+  bare name and run again at every read, parentheses after it calling what it yields (a function or
+  a sequence given an index, and otherwise an error naming `now`), no function value (the lambda
+  `() -> now`, named by the error where a function is wanted), no type parameters of its own, never
+  assigned, the only function of its name in its scope and sharing that scope's namespace with
+  values. Written without `def` there, `now -> int = …` is an error naming `def now -> …` first,
+  then `val now = …` and `now() -> …`. `def` is a keyword. Style: `def` is written only where it is
+  required; the library and tests use it nowhere else, apart from the tests of the optional form.
+  Also built on branch `def`: a method of a data type's or a built-in type's impl defined by clauses
+  matches its arguments and not its receiver, as a class's method's clauses already did (they were
+  refused for counting the receiver as an argument).
 - Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`): **a parameterless method is the only method
   of its name** in its type, inherited ones and the methods impls add included; and **it takes no
   type parameters of its own**, a parse error, since `x.first[int]` would read as indexing its
@@ -7039,7 +7057,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and `max(a, b)` are functions, not methods. WHY: these answer from the collection without changing
   it, which is what a parameterless method says; one spelling across every collection, since the
   shape is part of the signature and generic code over `Iterable[T]` reads them the same way.
-  **Review with the user: an iterator is an `Iterable`, so `it.head`, `it.size`, `it.toVector` are
+  **Reviewed with the user 2026-11-12 and kept: an iterator is an `Iterable`, so `it.head`, `it.size`, `it.toVector` are
   parameterless too and read from it**, against the rule that a method with an effect keeps its
   `()`. ALTERNATIVES weighed: keep these `()` on `Iterable` and convert only where the receiver is a
   collection (impossible while `Iterator` conforms to `Iterable`, the shape being part of the
@@ -7053,6 +7071,48 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   arguments, where before the method's own `T` hid it and the plain type mismatch was reported.
   The compiler's own expansions (a `for` over an array or a range, a sequence pattern) read
   `length` and `nonEmpty` without a call.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `def`): **`def` comes after the modifiers and the
+  annotations, once**: `@tailrec` on the line before, then `private override static def f(…)`;
+  `def private f` is an error naming `private def f`, `def def f` an error, and `def` before `val`,
+  `var` or `lazy val` an error saying a value is declared without it. WHY: the modifiers describe
+  the declaration and `def` begins it, so `def` sits next to the name it introduces, as `val` does in
+  `private val x`; one place keeps declarations uniform to read and to search. ALTERNATIVES: `def`
+  first and modifiers after it (`def private f`), or either order (two spellings of one declaration).
+- Settled on the user's delegation 2026-11-12 (built on branch `def`): **`def name = body` with no parameter list and no
+  result type is a parameterless function or method whose result is inferred**, at the top level, in
+  a block and as a member (`def perimeter = 2.0 * (w + h)`). Without `def` a name followed by `=` is
+  an assignment, so only `def` can say this. WHY: a parameter list's absence is what `def` permits,
+  and every other function may leave its result to inference; refusing it would make `def` require
+  a written type for no reason of its own. ALTERNATIVE: requiring `-> T` after a parameterless
+  `def` (one shape, more to write). An indented body after `def name` with neither `=` nor `->` is
+  refused, naming `def name -> T = …`, `def name = …` and `name()`, since a body run for its effect
+  is declared with `()`. Review with the user: whether the inferred form is wanted at all.
+- Settled on the user's delegation 2026-11-12 (built on branch `def`): **`def` on a clause and on a field is refused**:
+  `def` belongs to a function's signature, never to the clauses after it (a clause written with
+  `def` is reported and then read as the clause it is), and `def val x` is an error rather than a
+  field (then read as the `val` it is). WHY: one keyword per declaration, and a field already has
+  its own. ALTERNATIVE: `def` accepted and ignored before a clause (two spellings of one clause).
+- Settled on the user's delegation 2026-11-12 (built on branch `def`): **`override def` and `def` on trait members change
+  nothing about overriding**: a parameterless `def name -> T` overrides or implements only a
+  parameterless method, exactly as without `def`, and `override` is still required where it was.
+  WHY: `def` adds no meaning to a member. ALTERNATIVE: `def` implying `override` (two spellings
+  would mean different things).
+- Settled on the user's delegation 2026-11-12 (built on branch `def`): **the diagnostics for a parameterless function name
+  it by its own name, also when it is reached through a module**: `val f: () -> int = clock.now`
+  reports "`now` takes no parameter list …, as in `() -> now`". WHY: the checker sees the resolved
+  function; the module-qualified spelling would need the source text. ALTERNATIVE: name the
+  qualified spelling, `() -> clock.now` (more exact; a small later change).
+
+- Settled on the user's delegation 2026-11-12 (built on branch `grammar-tests`): Settled on the user's delegation 2026-11-12 (built on branch `grammar-tests`): **the editor grammar tests run in the release flow, not in the compiler gate.** `sysl test
+  editors/grammar-tests` is a package of its own so the compiler gate does not need Oniguruma; it
+  broke unnoticed on a Sysl upgrade because nothing ran it. `scripts/release.sh` runs it (step
+  `03b-grammar`, through the slot wrapper) before tagging, and the director runs it after any Sysl bump or
+  grammar change. WHY: the grammar ships in the VS Code extension and the IntelliJ plugin, so a
+  release must not carry a grammar whose tests cannot build; the run takes seconds. ALTERNATIVES:
+  adding it to the compiler gate (couples the gate to a native Oniguruma build and to the
+  highlighter package's Sysl pin); a CI-only job (no CI runs here). Review with the user if the
+  gate coupling is preferred.
 
 **Deferred**
 
