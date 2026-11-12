@@ -153,7 +153,12 @@ Choosing an overload works as follows:
   can hold its value (`int`, `long`, the other widths, `byte`, `real`), and the lambda a parameter
   that is a function of as many parameters, or a function of one tuple of as many elements, which
   the lambda [takes apart](/spec/types/#tuples). A candidate that has a lambda take a tuple apart is
-  chosen only where no candidate takes it as written. Every other argument is checked once, on its own, and
+  chosen only where no candidate takes it as written. Where the candidates left all give a lambda
+  the same parameter types, known without their own type arguments, and differ only in the result
+  they need of it, the lambda is checked once, with those parameter types and its result left to its
+  body, and then fits a candidate as any other argument's type does: a map's
+  `map((k, v) -> Summary(k, v))` takes the overload whose function may answer anything, and
+  `map((k, v) -> (v, k))` the one that needs a pair, as the more specific. Every other argument is checked once, on its own, and
   only its type is tried against each candidate; when every candidate gives it the same parameter
   type it is checked against that type. Neither `int` and `long` nor `int` and `real` conforms to the
   other, so where no overload is the most specific an integer literal prefers its own type, `int`,

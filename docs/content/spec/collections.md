@@ -82,6 +82,27 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   whatever collection it holds. An impl adding to a trait is passed over where one adding the same
   name and parameter types to a trait requiring it applies, so `Seq`'s `map` is a sequence's, not
   `Iterable`'s.
+- A map's `map` and `flatMap` make a map where their function makes pairs, and otherwise answer the
+  `Iterable` every collection's would, its results in the map's iteration order:
+  `counts.map((word, n) -> Summary(word, n))` is a collection of summaries, and
+  `counts.map((word, n) -> (n, word))` a map. The function may take the key and the value or the
+  entry as one pair, and a `for` comprehension over a map, guarded or not, chooses the same way by
+  what it yields. Every map has this, the sorted, ordered and mutable ones included. The body of a
+  lambda decides it: where the overloads a call could choose all give a lambda the same parameter
+  types and differ only in the result they need of it, the lambda is checked once with those
+  parameters and the call chooses by the type its body gives it
+  ([overloads](/spec/declarations/#default-and-named-arguments)).
+- Every collection's `flatMap`, and every iterator's, also takes a function answering an `Option`,
+  and keeps the values of those that hold one, in a collection of its own kind:
+  `words.flatMap(_.toIntOption())` is a vector of the numbers, a list's a list, a set's a set, and a
+  map's a map where the options hold pairs. A collection or an iterator of options has `flatten`,
+  the values they hold (`[Some(1), None].flatten` is `[1]`). So a `for` comprehension may draw from
+  collections and options alike: `for w in words, n in parse(w) yield n` keeps the numbers, guarded
+  or not, and an option's `flatMap` of a function answering a collection is a `Vector` of its
+  elements, none for `None`, so one drawing from an option and then from a collection yields a
+  vector. An option's own `flatMap` of a function answering an option still answers an option. An
+  option is not itself an `Iterable`: `toList` or `toVector` makes one where a collection is
+  needed.
 - `xs.view()` returns a lazy `Iterator`, for pipelines that should not build intermediate
   collections (see [views](#methods-every-iterable-has) below).
 - Operations that need something of the elements are added by impls bounding the element type, so

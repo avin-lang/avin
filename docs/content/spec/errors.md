@@ -155,7 +155,7 @@ An `Option` also has `toRight[L](left: -> L) -> Either[L, T]` and `toLeft[R](rig
 Either[T, R]`, which put its value on one side of an [`Either`](#either) and the argument, evaluated
 only for `None`, on the other. It also has `okOr[E](error: E) -> Result[T, E]` and
 `okOrElse[E](f: () -> E) -> Result[T, E]`, giving `Ok` of the value or `Err` of the error, which
-`okOrElse` calls only for `None` (`Result`'s `ok()` and `err()` go the other way). It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
+`okOrElse` calls only for `None` (`Result`'s `ok()` and `err()` go the other way). It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), and a second `flatMap` taking a function that answers a collection, which answers a `Vector` (empty for `None`); every collection's `flatMap` takes a function answering an option, so `xs.flatMap(_.toIntOption())` keeps the numbers and a `for` comprehension draws from options and collections alike ([collections](/spec/collections/#operations-without-higher-kinded-types)). An
 `Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
 `isEmpty()`. There is no `orNull`, since Avin has no null.
 
