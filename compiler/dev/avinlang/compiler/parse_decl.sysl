@@ -53,7 +53,12 @@ parse(src: Source) -> Parsed
             continue
         if hidden && p.at("impl")
             p.report.add(error(start.to(p.ended()), "an impl has no name, so it cannot be private: mark its methods `private`"))
-        if p.accept("data") then file.items.push(DataItem(parse_data(&p, start, annotations)))
+        // `def` comes after `private` and begins a function, with or without a parameter list.
+        if accept_def(&p)
+            if is_operator_spelling(p.ahead(0))
+                p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` names a function, but only a method can be named by a symbol: declare it in a class, trait, object or impl"))
+            file.items.push(FunctionItem(parse_def_function(&p, annotations)))
+        elif p.accept("data") then file.items.push(DataItem(parse_data(&p, start, annotations)))
         elif p.at("class") || (p.ahead(1) == "class" && (p.at("open") || p.at("abstract")))
             file.items.push(ClassItem(parse_class(&p, start, annotations)))
         elif p.at("object") && p.ahead(1) != "("
@@ -97,7 +102,7 @@ parse(src: Source) -> Parsed
             if is_operator_spelling(p.ahead(0))
                 p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` names a function, but only a method can be named by a symbol: declare it in a class, trait, object or impl"))
             val f = parse_function(&p, annotations)
-            if f.parameterless then p.report.add(error(f.name_span, s"a function at the top level takes a parameter list, as in `${f.name}() -> body`; for a value computed once, declare `val ${f.name} = value`; a member of a class, trait, object or impl is the one declared without a parameter list"))
+            if f.parameterless then p.report.add(error(f.name_span, s"a function at the top level declared without a parameter list is written with `def`, as in `def ${f.name} -> body`, and runs again at every read; for a value computed once, declare `val ${f.name} = value`; or give it a parameter list, `${f.name}() -> body`"))
             file.items.push(FunctionItem(f))
         file.private_items.push(hidden)
         val closed_block = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
@@ -607,7 +612,53 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
 /** A function: `name[T](params) -> Result = body`, an indented body, the clauses on the lines after
  * a signature with no body, or neither (a declaration completed by an annotation such as
  * `@intrinsic`). */
-parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
+parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function = parse_declared_function(p, annotations, false)
+
+/** A function declared after `def`. The keyword is optional before any function, and is what lets a
+ * name with no parameter list be followed by `=` alone, its result type inferred. */
+parse_def_function(p: *Parser, annotations: Buf[Annotation]) -> &Function = parse_declared_function(p, annotations, true)
+
+// At `(` after a name written with `def`: whether what follows is a clause's patterns rather than a
+// parameter list. Every parameter has a type after a `:`; patterns with no `:` among them, such as
+// `(0)` or `((a, _))`, are a clause's.
+private clause_shaped(p: *Parser) -> bool
+    if p.ahead(1) == ")" then return false
+    var depth = 0
+    var i = 0usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Indent || token.value == Dedent then return false
+        val text = p.spelling(token)
+        if text == "(" || text == "[" || text == "{" then depth += 1
+        elif text == ")" || text == "]" || text == "}"
+            depth -= 1
+            if depth == 0 then return true
+        elif text == ":" && depth == 1 then return false
+        i += 1
+    false
+
+/** Accepts `def`, reporting it written twice, and whether it was there. A `val`, `var` or `lazy val`
+ * after it is reported too, and is then parsed as the value it declares. */
+accept_def(p: *Parser) -> bool
+    if !p.accept("def") then return false
+    // `def def(…)` names a function `def`, which the name's own check reports.
+    val after = p.ahead(1)
+    if p.at("def") && after != "(" && after != "[" && after != "->" && after != "="
+        p.report.add(error(p.toks.here(), "`def` is written once before a declaration"))
+        loop
+            if !p.accept("def") then break
+    if p.at("private") || p.at("static") || p.at("override")
+        p.report.add(error(p.toks.here(), s"`def` comes after the modifiers, as in `${p.ahead(0)} def ${p.ahead(1)}`"))
+        loop
+            if !(p.accept("private") || p.accept("static") || p.accept("override")) then break
+    if p.at("val") || p.at("var") || lazy_ahead(p)
+        p.report.add(error(p.toks.here(), s"`def` declares a function or a method, and a value is declared with `${p.ahead(0)}` alone: remove `def`"))
+        return false
+    true
+
+private parse_declared_function(p: *Parser, annotations: Buf[Annotation], defined: bool) -> &Function
     val start = p.toks.here()
     // `object`, `trait` and `impl` begin a declaration only when no parenthesis follows, so
     // `object(x: int) = x` declares a function.
@@ -617,8 +668,16 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
     val name_span = start.to(p.ended())
     val type_params = parse_type_params(p)
     // A name followed by its result type, with no parameter list, declares a method called by its
-    // name alone.
-    val parameterless = !symbol && p.at("->")
+    // name alone; after `def`, a name followed by `=` does too, its result type inferred.
+    var parameterless = !symbol && (p.at("->") || (defined && p.at("=")))
+    if defined && !parameterless && !p.at("(")
+        // `def go` and an indented body: a body run for its effect is declared with `()`.
+        p.report.add(error(name_span, s"`$name` has neither a parameter list nor a result type: write `def $name -> int = value` or `def $name = value` for a function read by its name, or `$name()` for one called for its effect"))
+        parameterless = true
+    if defined && p.at("(") && clause_shaped(p)
+        p.report.add(error(start.to(p.ended()), s"`def` begins a function's signature, and its clauses are written without it, as in `$name(parameters) = body`"))
+        skip_to_next_declaration(p)
+        return Function(annotations, start.to(p.ended()), name_span, name, type_params, buf(), None, None, buf(), false)
     if parameterless && type_params.len() > 0
         p.report.add(error(name_span, s"`$name` has no parameter list, so it takes no type parameters: a call `$name[T]` would read as indexing its result; give it a parameter list, as in `$name[T]() -> body`"))
     val params = if parameterless then buf() else parse_params(p, true)
@@ -644,7 +703,12 @@ parse_function(p: *Parser, annotations: Buf[Annotation]) -> &Function
         // A clause is a line that starts with the function's name and an argument list. After a
         // clause with an indented body, the next line follows the end of that block directly.
         loop
-            if p.at_kind(Newline) && p.ahead(1) == name && p.ahead(2) == "(" && clause_ahead(p, 1) then p.toks.advance()
+            if p.at_kind(Newline) && p.ahead(1) == "def" && p.ahead(2) == name && p.ahead(3) == "(" && clause_ahead(p, 2)
+                // A clause written with `def` is reported and read as the clause it is.
+                p.toks.advance()
+                p.report.add(error(p.toks.here(), s"`def` begins a function's signature, and its clauses are written without it, as in `$name(parameters) = body`"))
+    p.toks.advance()
+            elif p.at_kind(Newline) && p.ahead(1) == name && p.ahead(2) == "(" && clause_ahead(p, 1) then p.toks.advance()
             elif !(after_block(p) && p.at(name) && p.ahead(1) == "(" && clause_ahead(p, 0)) then break
             val clause = parse_clause(p)
             end = clause.span
@@ -1089,6 +1153,8 @@ parse_class_member(p: *Parser) -> ClassMember
     var static_member = p.accept("static")
     val overrides = p.accept("override")
     if !static_member then static_member = p.accept("static")
+    // `def` follows the modifiers and begins a method, with or without a parameter list.
+    if p.at("def") && accept_def(p) then return MethodMember(parse_def_function(p, annotations), !hidden, overrides, static_member)
     val lazy = lazy_ahead(p)
     if lazy then p.toks.advance()
     if annotations.len() > 0
