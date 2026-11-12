@@ -7060,6 +7060,28 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `runner-orphans`): **Every program a runner starts leads a process
+  group of its own, and nothing in that group outlives it.** `avin test` (each test and hook), the
+  execution corpus and the documentation-programs check start each program with a new process
+  group, so whatever it starts in turn is in the group too. Once the program has been waited for,
+  whatever is left of its group is sent `SIGTERM`, given **200 ms** to go (the same grace the
+  system layer gives a program that outstays its limit), then sent `SIGKILL`: after every run, not
+  only after a timeout, since a test that passed but left a server's worker running orphans it just
+  the same. A runner stopped by `SIGINT`, `SIGTERM` or now also `SIGHUP` (exiting 130, 143, 129)
+  sends `SIGKILL` at once to every group still running, with no grace, because whoever stopped it is
+  itself about to make it stop. WHY: the orphans found 2026-11-12 (a corpus program spinning for
+  8 h; two left idle for 30 h) were programs and grandchildren that the runner never reached once
+  the timeout had killed only the leader, or once the runner itself was stopped. ALTERNATIVES
+  weighed: enforcing the limit on the whole group at once (`SIGTERM` to the group at the deadline
+  rather than to the leader first) needs a watchdog thread of the runner's own in place of the
+  system layer's timeout, for a difference only in the order the grandchildren hear `SIGTERM`; a
+  child-side check that its parent has gone (macOS has no parent-death signal, so every Avin program
+  would poll); a longer grace (a test's tidy-up has its whole limit already). Known limit: a runner
+  killed with `SIGKILL` cannot act, and its programs, no longer in its group, are not reached by a
+  signal sent to that group; marshal and `sysl test` both send `SIGTERM` first. A program that
+  moves itself into another group or session is also beyond reach. `avin run` is unchanged: its
+  program stays in the terminal's group so that Ctrl-C and job control reach it.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

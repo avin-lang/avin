@@ -1,0 +1,151 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
+import sysl.process.{Exited, FromPath, Group, Inherit, Signalled, TimedOut, Var, start}
+import sysl.signal
+import sysl.text.parse_int
+import sysl.time.{millis, monotonic, sleep}
+
+// The programs a runner starts, each in a process group of its own, leave nothing running behind
+// them: not when they outstay their limit, not when they started something and ended, and not when
+// the runner is stopped. A shell stands in for a program that starts another; each writes the
+// process ids to check to a file of its own, and a check asks for exactly those processes.
+
+/** The process ids written, separated by spaces, in `file`; none when it is missing. */
+pids_in(file: string) -> Buf[int]
+    var out: Buf[int] = buf()
+    for word in read_text(file).unwrap_or("").split(" ")
+        val w = word.trim()
+        if w != "" then out.push(int(parse_int(w).unwrap()))
+    out
+
+/** Whether process `pid` has gone, allowing two seconds for it to be reaped. One still there is
+ * killed, so that a failing check leaves nothing behind either. */
+gone(pid: int) -> bool
+    var waited = 0
+    while waited < 2000
+        if signal.send(i64(pid), 0) is Err(_) then return true
+        sleep(millis(20))
+        waited += 20
+    _ = signal.send(i64(pid), signal.KILL)
+    false
+
+// Runs `script` with `sh -c` contained, `$F` naming the file it writes its process ids to, and
+// answers how it ended, the ids and how long the run took in milliseconds.
+private contained_shell(script: string, timeout: int) -> (string, Buf[int], int)
+    val dir = make_temp_dir("avin-children").unwrap()
+    defer _ = remove_dir_all(dir)
+    var env: Buf[Var] = buf()
+    env.push(Var("F", dir + "/pids"))
+    val began = monotonic().us / 1000
+    val out = run_contained("/bin/sh", ["-c", script], env.view(), FromPath("/dev/null"), timeout).unwrap()
+    val took = int(monotonic().us / 1000 - began)
+    (out.status.to_string(), pids_in(dir + "/pids"), took)
+
+@test("a program that runs past its limit is stopped and reported timed out, and is gone")
+outstays_its_limit()
+    val (ended, pids, _) = contained_shell("echo $$ > $F; exec sleep 100000", 1000)
+    assert_eq(ended, TimedOut.to_string())
+    assert_eq(pids.len(), 1)
+    assert(gone(pids[0]))
+
+@test("a program that runs past its limit with a grandchild that sleeps for ever leaves neither behind")
+outstays_its_limit_with_a_grandchild()
+    val (ended, pids, _) = contained_shell("sleep 100000 & echo \"$$ $!\" > $F; wait", 1000)
+    assert_eq(ended, TimedOut.to_string())
+    assert_eq(pids.len(), 2)
+    assert(gone(pids[0]))
+    assert(gone(pids[1]))
+
+@test("a grandchild left running by a program that exited is stopped when the program ends")
+grandchild_of_a_finished_program()
+    val (ended, pids, _) = contained_shell("sleep 100000 & echo $! > $F; exit 0", 0)
+    assert_eq(ended, Exited(0).to_string())
+    assert_eq(pids.len(), 1)
+    assert(gone(pids[0]))
+
+@test("a grandchild left by a program a signal stopped is stopped too")
+grandchild_of_a_signalled_program()
+    val (ended, pids, _) = contained_shell("sleep 100000 & echo $! > $F; kill -9 $$", 0)
+    assert_eq(ended, Signalled(9).to_string())
+    assert_eq(pids.len(), 1)
+    assert(gone(pids[0]))
+
+@test("a grandchild that ignores SIGTERM is killed once the grace has passed")
+grandchild_that_ignores_term()
+    val (ended, pids, took) = contained_shell("(trap '' TERM; exec sleep 100000) & echo $! > $F; exit 0", 0)
+    assert_eq(ended, Exited(0).to_string())
+    assert_eq(pids.len(), 1)
+    assert(gone(pids[0]))
+    // It was asked first, and given the whole grace before it was made to stop.
+    assert(took >= GroupGrace, s"took ${took}ms")
+
+@test("a grandchild that has started a child of its own is stopped with it")
+great_grandchild()
+    val (_, pids, _) = contained_shell("sh -c 'sleep 100000 & echo $! > $F; wait' & wait", 1000)
+    assert_eq(pids.len(), 1)
+    assert(gone(pids[0]))
+
+@test("a program that starts nothing ends as it would have: its status, output, error and input are its own")
+contained_output()
+    val out = run_contained("/bin/sh", ["-c", "echo out; echo err >&2; cat; exit 3"], [], FromPath("/dev/null"), 10000).unwrap()
+    assert_eq(out.status, Exited(3))
+    assert_eq(out.text, "out\n")
+    assert_eq(out.err.unwrap_or(""), "err\n")
+
+@test("a program that cannot be started is an error, and records no group")
+contained_missing_program()
+    assert(run_contained("/nonexistent/avin-no-such-program", [], [], FromPath("/dev/null"), 1000).is_err())
+
+@test("a group is recorded only when it names one, a slot is answered until they run out, and a slot out of range is ignored")
+tracking_slots()
+    assert_eq(track_group(0), -1)
+    assert_eq(track_group(-5), -1)
+    untrack_group(-1)
+    untrack_group(GroupSlots)
+    // Other tests may hold slots while this runs, so fill what is free and count it.
+    var taken: Buf[int] = buf()
+    loop
+        val slot = track_group(999999)
+        if slot < 0 then break
+        assert(slot < GroupSlots)
+        taken.push(slot)
+    assert(taken.len() >= 1 && taken.len() <= usize(GroupSlots))
+    for slot in taken do untrack_group(slot)
+    val again = track_group(999999)
+    assert(again >= 0)
+    untrack_group(again)
+
+@test("a group with nobody left in it is not alive and has nothing to stop")
+empty_groups()
+    assert(!group_alive(0))
+    assert(!group_alive(-1))
+    var child = start("/bin/sh", ["-c", "exit 0"], group = Group.New).unwrap()
+    val pgid = child.group()
+    assert_eq(child.wait().unwrap().status, Exited(0))
+    assert(!group_alive(pgid))
+    assert(!stop_group(pgid))
+
+@test("killing the running groups, as a runner stopped by a signal does, ends every recorded group and its grandchildren")
+kill_recorded_groups()
+    val dir = make_temp_dir("avin-children").unwrap()
+    defer _ = remove_dir_all(dir)
+    var env: Buf[Var] = buf()
+    env.push(Var("F", dir + "/pids"))
+    var child = start("/bin/sh", ["-c", "sleep 100000 & echo \"$$ $!\" > $F; wait"], env = env.view(), stdin = FromPath("/dev/null"), group = Group.New).unwrap()
+    val slot = track_group(child.group())
+    assert(slot >= 0)
+    var waited = 0
+    while pids_in(dir + "/pids").len() < 2 && waited < 10000
+        sleep(millis(20))
+        waited += 20
+    val pids = pids_in(dir + "/pids")
+    assert_eq(pids.len(), 2)
+    kill_running_groups()
+    assert_eq(child.wait().unwrap().status, Signalled(9))
+    assert(gone(pids[0]))
+    assert(gone(pids[1]))
+    // The slot was let go: it is free for the next group.
+    untrack_group(slot)

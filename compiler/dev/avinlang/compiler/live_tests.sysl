@@ -46,7 +46,6 @@ slots_fill_and_free()
     live_end(third)
     live_end(-1)
     live_phase(-1, PhaseRun)
-    live_process(-1, 0)
 
 private struct Scene
     dir: string
@@ -117,6 +116,47 @@ stops_on_interrupt()
     assert(log.contains("run      slow.avin  slow one  "), log)
     assert_eq(code, 130)
     assert(took < 5000, s"took ${took}ms to exit")
+
+// A test file whose test starts a grandchild that sleeps for ever, writes its own process id and the
+// grandchild's to `pids`, and sleeps for ever itself, under a limit of `seconds`.
+private hanging_source(pids: string, seconds: int) -> string =
+    "import avin.fs\nimport avin.process\nimport avin.process.Command\nimport avin.threads.sleep\nimport avin.time\n\n" +
+    "@test(\"hangs with a grandchild\", timeout: " + seconds.to_string() + ")\nhangs()\n" +
+    "    val g = Command(\"/bin/sleep\", \"100000\").start().ok().get().detach()\n" +
+    "    fs.writeText(\"" + pids + "\", s\"${process.pid()} $g\\n\").ok().get()\n" +
+    "    sleep(time.millis(1000000))\n"
+
+// Checks that both processes `pids` names are gone.
+private none_left(pids: string, what: string)
+    val ids = pids_in(pids)
+    assert(ids.len() == 2, s"$what: the test never wrote its process ids")
+    assert(gone(ids[0]), s"$what: the test's process outlived the run")
+    assert(gone(ids[1]), s"$what: the grandchild the test started outlived the run")
+
+@test("no process a test starts outlives `avin test`: not a test that times out, at -O0 or -O2, and not one running when the runner is stopped by SIGTERM, SIGINT or SIGHUP")
+nothing_outlives_the_runner()
+    val s = scene()
+    defer _ = remove_dir_all(s.dir)
+    for level in ["-O0", "-O2"]
+        val pids = s.dir + "/timeout" + level + ".pids"
+        val source = s.dir + "/hang" + level + ".avin"
+        write_text(source, hanging_source(pids, 1)).unwrap()
+        val ran = capture(s.bin, ["test", source, level], env = root_env().view(), stderr = true, timeout = 600000).unwrap()
+        assert(ran.text.contains("timed out after 1s"), ran.text + ran.err.unwrap_or(""))
+        none_left(pids, "timed out at " + level)
+    val signals = [15, 2, 1]
+    val codes = [143, 130, 129]
+    for k in 0..<3
+        val sig = signals[k]
+        val pids = s.dir + s"/signal$sig.pids"
+        val source = s.dir + s"/stopped$sig.avin"
+        // A limit the run is stopped well inside.
+        write_text(source, hanging_source(pids, 600)).unwrap()
+        val child = spawn(s.bin, ["test", source], env = root_env().view(), stdout = Stdio.ToPath(s.dir + "/run.log"), stderr = Stdio.ToPath(s.dir + "/run.err")).unwrap()
+        assert(appears(pids, " ", 120000), s"signal $sig: the test never wrote its process ids")
+        child.kill(sig).unwrap()
+        assert_eq(child.wait().unwrap(), Exited(codes[k]))
+        none_left(pids, s"stopped by signal $sig")
 
 @test("a signal during the build names the build as in progress, in the compile phase")
 stops_during_the_build()
