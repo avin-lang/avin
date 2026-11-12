@@ -107,7 +107,7 @@ what would compile there:
 | After `.` on a value | Its static type's members: fields, methods, inherited ones and those of the traits it conforms to, the methods impls add to it or to its traits, and an extension's where the file sees it; a private member only where the code may use it |
 | After a module's name, `io.` | The module's public declarations |
 | After a type's name, `Map.` | Its static members, and the members of its companion object |
-| A name in an expression | The locals and parameters in scope at the cursor, then the enclosing class's members, then the module's declarations, then the file's imports, then the core library's, then the keywords that begin an expression: `val`, `var`, `if`, `match`, `for`, `while`, `loop`, `return`, `break`, `continue`, `true`, `false` |
+| A name in an expression | The locals and parameters in scope at the cursor, then the enclosing class's members, then the module's declarations, then the file's imports, then the core library's, then the keywords that begin an expression or a local declaration: `def`, `val`, `var`, `if`, `match`, `for`, `while`, `loop`, `return`, `break`, `continue`, `true`, `false` |
 | Where a type is written: after `:`, after `->`, in `[…]` | Types only: type parameters, the module's types, imported ones, the core library's and the built-in types |
 | In an import, `import a.` or `import a.b.{…}` | The modules below the one named and its public declarations; inside braces, the declarations only |
 
