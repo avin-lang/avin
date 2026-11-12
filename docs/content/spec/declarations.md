@@ -638,6 +638,15 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
   the object's class has. A method's own type parameters are written, `box.pair[bool]`, or come
   from the expected function type. The same holds for the methods an `impl` adds to any type,
   `"hey".repeat` included. A method declared with no parameter list has no such value; see below.
+- **A method declared with an empty parameter list is a value only where a function type is
+  expected.** `val f: () -> int = c.bump`, `apply(c.bump)` with `apply(f: () -> int)`, and an
+  element of a `Vector[() -> int]` make the value; anywhere else, `println(xs.sorted)`,
+  `s"${s.isEmpty}"`, `c.bump == 0`, `val v = c.bump` with no type, or an argument whose parameter
+  is a type parameter or `Any`, naming it without a call is an error naming both fixes: the call,
+  `xs.sorted()`, and the lambda, `() -> xs.sorted()`. Among overloads that include one of no
+  parameters, a bare name with no expected function type gets the same error. A missing `()` is
+  far likelier there than a wanted function, which would otherwise surface only as wrong output.
+  A method with parameters, `acct.deposit`, is a value wherever it is named.
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
 
