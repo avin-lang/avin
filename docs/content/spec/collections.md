@@ -849,7 +849,7 @@ iterator walks it; a method called on a list holds that list for the length of t
 **Threads.** A lazy list is not [sendable](/spec/threads/): the cells not yet evaluated are functions
 that may hold anything, so a thread's body may not reach one, and each list belongs to the thread
 that made it. A cell is evaluated once, as a [`lazy val`](/spec/declarations/#initialization) is
-initialized, and a cell whose evaluation reads that same cell (an empty list joined to itself,
+initialized (without a lock, since only one thread reaches it), and a cell whose evaluation reads that same cell (an empty list joined to itself,
 `lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read:
 ``avin: trap: a LazyList cell is read while it is being evaluated``.
 

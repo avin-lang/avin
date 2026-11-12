@@ -7060,6 +7060,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `lazylist-perf`): **A lazy list's cell is one object of three words,
+  filled in place by the one function that evaluates it.** `LazyList[+T]` holds `pending` (the
+  evaluating function until it has run, a constant trapping function while it runs, then `None`),
+  `first` and `rest`; an empty cell is one whose `rest` is itself, and a cell evaluated as another
+  list's first cell whose rest would be itself points at that other cell instead (the same element,
+  then itself again), so a list that is its own tail still repeats. Making a cell allocates the cell
+  and the function that evaluates it, and evaluating it allocates only the cells after it and the
+  elements; a cell is read with a test of `pending` and no lock, since a lazy list is not sendable.
+  To keep the element and the rest in a covariant class, the core library gains the intrinsic
+  **`field_unset`**: `private var x: T = fieldUnset()` is a field the constructor leaves as the zero
+  bytes the object was made with (not yet a value, as an array's spare capacity is not), which the
+  class's own code writes before reading it; such a field must be a `private var` with its type
+  written, is not a position for the class's variance (it is written only with values computed for
+  that instance), and the intrinsic is the core library's alone; called anywhere but as a field's
+  initializer it traps (`a field is read before it is set`). Measured at `-O2` (`LazyList.from(0)`
+  and the stages named, then `take(n)`, the cost per element; time under a loaded machine, user
+  time): bytes kept per evaluated cell 256 → 48 (resident growth per held cell 304 → 96); bytes
+  allocated per element of `from`, `map`, `filter` or `take` 304 in 7 objects → 96 in 2, and of
+  `#::` 544 in 13 → 192 in 4 (two cells, each with its function); time per element of
+  `from.take` 0.118 → 0.035 µs, `map` 0.18 → 0.058, `filter` 0.24 → 0.079, `#::` 0.18 → 0.065, the
+  4000th prime by the sieve 4.8 → 1.7 s; at `-O0` `from.take` 0.16 → 0.06 µs. `lazy_list_deep` runs
+  a million cells again. WHY: each cell was a `LazyList` object, a progress object, the closure of
+  its `lazy val`, a box and a closure to drop the pending function, the function itself, and a
+  tuple for the evaluated element and rest, with a lock-taking `lazy val` read on every access; the
+  element and rest belong in the cell, which only a field left unset can hold, since a covariant
+  class may not otherwise keep a `var` of its parameter and a field must otherwise be given a value
+  when the object is made. The counts are pinned by `lazy_list_cell_tests.sysl`, which reads them
+  from the code each maker compiles to; no runtime allocation counter was added, since the code is
+  where an allocation is decided and the test holds however a run is timed. ALTERNATIVES: a cheaper
+  `lazy val` (no closure per object) with the tuple kept (three objects per element, still a lock
+  per read); `Option[T]` for the element (allocates a `Some` for every scalar element); a separate
+  evaluated node per cell (two objects); an annotation exempting a field from variance, with an
+  initial value supplied some other way (two mechanisms where one does); a runtime allocation
+  counter exposed to programs (a hook in every allocation, for a check the code already answers).
+  Review with the user: `field_unset` is a new escape from the variance and initialization rules,
+  though only the core library may use it.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
