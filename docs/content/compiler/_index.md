@@ -103,7 +103,7 @@ lowering makes it, and the front end stays a whole-program pass that runs on eve
 | Cache | Holds | Key | Where |
 | --- | --- | --- | --- |
 | Unit objects | each codegen unit's object | the unit's text, clang's version, the level | the toolchain's cache (exists) |
-| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/` |
+| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/`, a one-file program's prefixed by its name |
 | Executable | the linked program | the build key of [running and testing](#running-and-testing) | `.avin/build/` (exists) |
 
 Instances are stored a file per source module, holding the instances of that module's functions
@@ -223,11 +223,29 @@ build trims the module files that its manifest does not name and that no build u
 hour, and any temporary file left that long, as the unit cache spares what is fresh; there is no
 size limit.
 
-**Turning it on.** `AVIN_INCREMENTAL=on` makes `avin build` and `avin emit-llvm` read and write the
-instance cache, kept in `.avin/build/incremental/<kind><level>/` of the program's root directory
-(`program-O2`, `tests-O0`); `verify` does that and then builds the program again without the cache,
-and stops with the first function whose text differs from the clean build's; `off`, or unset, uses
-no cache. Any other value is an error.
+**On by default.** Every command that builds a program reads and writes the instance cache: `avin
+build`, `avin run`, `avin test` and `avin emit-llvm`. It is kept in
+`.avin/build/incremental/<kind><level>/` beside the executables `run` and `test` build: in the
+package's or the program's directory, `program-O2` or `tests-O0`, since a build for tests is another
+program, with keys of its own, and the two kinds never share a file. A program of one file shares its
+directory's `.avin/build` with every other file there, so its directories are named after it
+(`hello-program-O2` for `hello.avin`) and two such programs never trim each other's entries. A run
+that finds its executable already built reads no cache at all. `avin check` keeps none, and the
+language server only checks, so it builds nothing to keep.
+
+`AVIN_INCREMENTAL` chooses otherwise: `off` uses no cache and reads none that is there; `verify` uses
+it and then builds the program again without it, and stops with the first function whose text
+differs from the clean build's; `on`, unset or empty is the default. Any other value is an error for
+the commands that build.
+
+A cache needs no care. Another compiler (a newer release, or the same one built again, since the
+compiler's executable and its time are in every key) finds no entry it can use, builds as from
+nothing and writes its own; the files it does not name are trimmed an hour after their last use. A
+module file that is short, damaged or missing, and a manifest naming anything but a module file of
+its own directory, are passed over and written again. Deleting `.avin/build` is always safe. Its size
+is about what the program's text is: on marshal (7,400 lines, with its packages and the library) a
+level's directory is 22 module files and 185 MB, so building and testing it at `-O2` keeps two of
+those.
 
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
@@ -268,7 +286,19 @@ edit of the matrix to lowering exactly the instances whose own keys no earlier b
 for, and to a clean build's text; a cache whose files are truncated, damaged or missing, or were made
 by another compiler, gives a clean build's text and is written again; two builds of one program at
 once both succeed and leave a cache a third build verifies; and a sample of the corpus builds warm to
-a clean build's text with every instance taken from the cache.
+a clean build's text with every instance taken from the cache. Through the commands themselves, they
+build, run and test a program, edit it, and hold each command's rebuild to a clean build's program and
+text, with `verify` passing; hold `off` to reading and writing nothing; survive damaged files, a
+manifest of nonsense, another compiler's cache and trimming; and run two `avin test`, and an `avin
+run` beside an `avin test`, of one program at once.
+
+**The corpus, warm.** With `AVIN_INCREMENTAL=verify` in the environment of `sysl test compiler`, the
+execution corpus is built warm as well as cold: each program is built once with an empty cache,
+edited (a function nothing calls is added at the end of its first file, which changes the file and
+no line of what the program does or reports), and built again from that cache in `verify` mode, so
+every program's warm build is compared with its clean one; the warm build is the one run. `avin
+test` of the library's and the packages' tests runs in `verify` mode the same way. Unset, the gate
+builds the corpus once, with no cache.
 
 ## Sysl bindings and the shim cache
 
@@ -675,6 +705,47 @@ two parts with runtime values, calls `f#words`, a copy of `f` answering with the
 of its returns reads the parts out of the tuple, which scalar replacement then keeps as its parts, and
 a call in its tail position of a function yielding a tuple of the same words calls that function's
 copy and hands its words on. A caller that keeps the tuple calls `f`, which still makes it.
+
+**Unions with a scalar member.** `concrete` erases a union of references to `Any`, as which it is
+laid out, and keeps a union with a scalar member, whose words are a 32-bit tag, 64 bits for a scalar
+member and, where a member is a reference, the reference (`union_scalars` numbers the scalar members
+from 1 by their type keys; tag 0 is a reference). Lowering keeps such a value as a reference to its
+cell, an object of those words made once and only read, so every operation is written once, on the
+cell: injection (`inject_cell`, from a member, a smaller union, or a value boxed into a reference
+member), a type test by the tag and then the reference's record (`cell_test`), taking a member out
+(`cell_member`), widening to a wider union (`recell`) and narrowing to a smaller one
+(`narrow_cell`), conversion to and from an `Any` (`cell_as_any`, `any_as_cell`), `==` and the hash
+by the tag, and `display`, `debug` and `toString` by the member's own implementation. A signature
+names such a parameter or result `MCell`; `union_words` (`union_words.sysl`) then gives each
+function one parameter per word, a cell made from them at its entry, returns of the words read out
+of the returned cell, and each call its arguments' words and a cell made of the words it gets back,
+except a call whose value the block only returns, which passes the words straight on. Every cell of
+a function is then made in it and only read, so scalar replacement keeps it as its fields, and a
+union in a local, a parameter or a result allocates nothing. Storage holds the words themselves:
+`storage_type` gives such a union the machine type `MCell` wherever a value outlives a call (a field
+of a data value, a tuple or a class, an array element, a closure's capture, a captured `var`'s box,
+a module-level value), 24 bytes with a reference member and 16 without, and the descriptor's
+reference offsets, or an array's element map, list only the reference word. `store_at` reads the
+words out of the cell and stores each, and `load_at` loads them and makes a cell of them, which
+scalar replacement keeps as its fields again, so storing a union and reading it back allocates
+nothing. A load believes a tag of 0 (a reference) only beside a non-null reference word and reads
+any other zero tag as the first scalar member's, so a racing read or an array element not yet
+filled never yields a null reference. A module-level union keeps its tag and bits in 16 bytes of
+storage and its reference word in a module-level reference of its own, among the roots
+(`global_reference`, named `#reference`, after the `lazy val` state words). An `Atomic`'s field
+alone stays a reference to a cell (descriptors `union cell` and `union cell of scalars`), one word
+its operations access indivisibly. A tuple with a union part is never answered as words
+(`tuple_words`): the call makes the tuple. An integer member wider than 64 bits is no scalar of
+the bits (`is_boxed_member`): it is boxed and kept in the reference word under tag 0, its type
+tested by its box's record, so such a union has a reference word. The checker converts a union with a scalar member to
+an `Any` or a trait with `Box`, as it does a scalar; a member call through such a trait boxes the
+receiver too, keeping it a variable so `dispatch` sees the union and renders it by its tag.
+
+A tuple type pattern is tested by the tuple's record: each record of a type kept as a reference to
+an object lists `Any`'s record first among the ancestors a tuple's part is seen through, so a
+`(string, int)` is an `(Any, int)`, and a tuple type with an `Any` part is never tested by its record
+alone. A part naming a union of references, erased to `Any` in the record, is then tested on the
+object the tuple holds there (`union_part_tests`).
 
 A method with type parameters of its own, a trait's or an overridable class method, holds a
 position in the checker's tables like any other, but no one function fills it: each list of its own

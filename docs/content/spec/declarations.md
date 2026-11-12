@@ -668,7 +668,13 @@ class Square(label: string, side: int): Rect(label, side, side)
   field or method. A private member stays private to the class that declares it.
 - **A method a subclass may override** is a public method of an `open` or `abstract` class. An
   override is marked `override`, takes the same parameter types (with the superclass's type
-  arguments substituted) and yields the same result type or, for a class, a subclass of it. A method
+  arguments substituted) and yields the same result type or one seen as it with no conversion, since
+  a result is a covariant position: a subclass, a tuple whose parts are (`(Dog, Dog)` for
+  `(Animal, Animal)`), an instance of a covariant generic type at narrower arguments
+  (`HashMap[K, V]` for `Map[K, V]`, `Option[Dog]` for `Option[Animal]`), a function with a narrower
+  result, or a string or object for `Any`. A result that would need a box is not one: `-> int`
+  does not override `-> Any`, nor `-> (int, int)` `-> (Any, int)`. The same holds for a method
+  implementing a trait's. A method
   with type parameters of its own is overridden by one declaring as many, matched by position:
   `override tag[V](item: V)` overrides `tag[U](item: U)`. An override assumes no more of its type
   arguments than the method it overrides, since a call through the base type passes any type the

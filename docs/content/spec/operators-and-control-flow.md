@@ -589,9 +589,15 @@ legs(a: Animal) -> int = a match
 A tuple's type at run time is the one it was [made with](/spec/types/#any-and-nothing), so a tuple
 type pattern compares that type, not the classes of the objects inside it: `t: (Animal, int)` holding
 a `Dog` does not match `_: (Dog, int)`, nor does `(a, 1)` with `a: Animal` as an `Any`, while a
-tuple made as a `(Dog, int)` matches it wherever it is held. Each part is tested on its own by a
-tuple pattern with a type pattern inside it, `(d: Dog, n) -> …`, on a value of a tuple type; an `Any`
-is first matched by its tuple type, `p: (Animal, int)`.
+tuple made as a `(Dog, int)` matches it wherever it is held. A tuple's type is seen as another where
+each part [converts with no box](/spec/types/#any-and-nothing): a part that is an object is its own
+`Any`, so `("a", "b")` matches `_: (Any, string)`, while `(1, "b")` does not, its `int` being no
+object, and an `(int, bool)` matches `_: (int | string, bool)` only when made with that union there.
+A part naming a union of objects, `_: (Dog | Cat, int)`, takes the object the tuple holds there when
+it is one of the union's members, whatever the part was made as. A pattern on a tuple of known type
+that no tuple of that type could match is an error, as any such type pattern is. Each part is tested
+on its own by a tuple pattern with a type pattern inside it, `(d: Dog, n) -> …`, on a value of a tuple
+type; an `Any` is first matched by its tuple type, `p: (Animal, int)`.
 
 A type pattern that can never match, such as `s: string` on an `int`, is an error. A type pattern
 covers every value only when its type is one the matched value already has, so a `match` on an `Any`

@@ -3,7 +3,8 @@ module dev.avinlang.compiler
 import sysl.buf.{Buf, buf}
 import sysl.checksum.crc32
 import sysl.container.{Map, map}
-import sysl.fs.{entries, make_dir_all, metadata, pending_name, publish_file, read_text, remove_file, set_modified, write_text}
+import sysl.fs.{entries, is_dir, make_dir_all, metadata, pending_name, publish_file, read_text, remove_file, set_modified, write_text}
+import sysl.path.stem
 import sysl.slices.sort
 import sysl.text.{StrBuilder, parse_ulong, str_builder}
 import sysl.time.now
@@ -21,7 +22,9 @@ import sysl.time.now
 // - a **text** entry, under the instance's finished key and the facts of the whole program its text
 //   was emitted with: the instance's LLVM text, and the declarations it needs.
 //
-// The entries live in `.avin/build/incremental/<kind><level>/` beside the program's executables: a
+// Every command that builds keeps the cache unless `AVIN_INCREMENTAL` is `off`. The entries live in
+// `.avin/build/incremental/<kind><level>/` beside the program's executables (a program of one file's
+// directories named after it, `<stem>-<kind><level>`; see `program_instance_cache`): a
 // file per source module, `<name>.mod`, holding the entries of that module's instances (the functions
 // lowering makes are the module `<generated>`'s), named by a hash of the keys it holds, and a
 // `manifest` naming the module files of the last build. A module file is written under a temporary
@@ -53,11 +56,12 @@ const InstanceCacheFresh: long = 3600000000
 private var incremental_mode: u8 = 0
 private var incremental_dir: string = ""
 
-/** The mode `AVIN_INCREMENTAL` names: unset, empty or `off` for none, `on`, or `verify`. */
+/** The mode `AVIN_INCREMENTAL` names: `off` for none, `verify`, or `on`, which is also what it is
+ * unset or empty. */
 incremental_mode_of(value: Option[string]) -> Result[u8, string]
     val v = value.unwrap_or("")
-    if v == "" || v == "off" then return Ok(IncrementalOff)
-    if v == "on" then return Ok(IncrementalOn)
+    if v == "off" then return Ok(IncrementalOff)
+    if v == "" || v == "on" then return Ok(IncrementalOn)
     if v == "verify" then return Ok(IncrementalVerify)
     Err(s"avin: $IncrementalVariable is `$v`; it is `on`, `verify` or `off`")
 
@@ -81,6 +85,15 @@ incremental_directory() -> string = if incremental_mode == IncrementalOff then "
  * for its tests or not, at `optimization` (`-O0` or `-O2`): each kind and level has its own. */
 instance_cache_dir(cache: string, testing: bool, optimization: string) -> string =
     cache + "/incremental/" + (if testing then "tests" else "program") + optimization
+
+/** The instance cache of the program at `program` (a directory, or a program of one file), as
+ * `instance_cache_dir`: a program of one file shares its directory's `.avin/build` with every other
+ * file there, so its directories are named after it, `<stem>-program-O2`, and two such programs never
+ * trim each other's entries. */
+program_instance_cache(program: string, testing: bool, optimization: string) -> string
+    if is_dir(program) then return instance_cache_dir(build_cache(program), testing, optimization)
+    val name = stem(program).unwrap_or("program")
+    build_cache(program) + "/incremental/" + name + "-" + (if testing then "tests" else "program") + optimization
 
 /** What `verify` reports where the text a build made with the instance cache differs from a clean
  * build's: the first function, in the clean build's order, whose definition differs or is missing,
@@ -158,7 +171,8 @@ struct InstanceStore
 instance_store_at(dir: string) -> InstanceStore = InstanceStore(dir, map(), map(), map(), 0, 0, map())
 
 /** The entries of the last build kept in `dir`: none where there is no manifest. A module file the
- * manifest names that is missing, short or damaged is passed over, its entries misses. */
+ * manifest names that is missing, short or damaged is passed over, its entries misses, and so is a
+ * name that is not a module file's of this directory, which a damaged manifest can hold. */
 read_instance_store(dir: string) -> InstanceStore
     var store = instance_store_at(dir)
     val manifest = read_text(dir + "/manifest") match
@@ -167,8 +181,18 @@ read_instance_store(dir: string) -> InstanceStore
     for name in manifest.split("\n")
         if name == "" then continue
         store.files += 1
-        if read_module_file(&store, dir + "/" + name) then store.whole.put(name, true) else store.damaged += 1
+        val whole = is_module_file_name(name) && read_module_file(&store, dir + "/" + name)
+        if whole then store.whole.put(name, true) else store.damaged += 1
     store
+
+/** Whether `name` is one a build gives a module file: hexadecimal digits and `.mod`, nothing that
+ * could reach outside the directory. */
+is_module_file_name(name: string) -> bool
+    if !name.ends_with(".mod") || name.bytes.len == 4 then return false
+    for i in 0..<name.bytes.len - 4
+        val b = name.bytes[i]
+        if !(u8('0') <= b <= u8('9') || u8('a') <= b <= u8('f')) then return false
+    true
 
 // Reads one module file into `store`, or answers false, adding nothing, for one that is not whole.
 private read_module_file(store: *InstanceStore, file: string) -> bool
@@ -233,7 +257,7 @@ write_instance_store(store: InstanceStore) -> StoreWritten
     var modules: Buf[string] = buf()
     for (m, _) in store.keep
         modules.push(m)
-    val ordered = modules.view()
+    val ordered = modules.view_mut()
     sort(ordered)
     var names: Buf[string] = buf()
     for m in ordered
@@ -241,7 +265,7 @@ write_instance_store(store: InstanceStore) -> StoreWritten
         var keys: Buf[string] = buf()
         for (k, _) in row
             keys.push(k)
-        val sorted = keys.view()
+        val sorted = keys.view_mut()
         sort(sorted)
         var listed = str_builder()
         listed.push(ModuleFormat + "\n" + m + "\n")
@@ -531,6 +555,7 @@ write_machine(w: *EntryWriter, t: MirType)
         MReal -> w.word("Re")
         MPtr -> w.word("P")
         MRef -> w.word("O")
+        MCell(refs) -> w.word(if refs then "U" else "Us")
 
 read_machine(r: *EntryReader) -> Option[MirType]
     val tag = r.word()
@@ -539,6 +564,8 @@ read_machine(r: *EntryReader) -> Option[MirType]
     if tag == "Re" then return Some(MReal)
     if tag == "P" then return Some(MPtr)
     if tag == "O" then return Some(MRef)
+    if tag == "U" then return Some(MCell(true))
+    if tag == "Us" then return Some(MCell(false))
     None
 
 write_machines(w: *EntryWriter, items: Buf[MirType])
@@ -660,7 +687,8 @@ conv_number(c: MirConv) -> usize = c match
     RealToInt -> 5
     Binary32ToReal -> 6
     RealToBinary32 -> 7
+    Bitcast -> 8
 
 conv_of(n: usize) -> Option[MirConv]
-    val all = [SignExtend, ZeroExtend, Truncate, SignedToReal, UnsignedToReal, RealToInt, Binary32ToReal, RealToBinary32]
+    val all = [SignExtend, ZeroExtend, Truncate, SignedToReal, UnsignedToReal, RealToInt, Binary32ToReal, RealToBinary32, Bitcast]
     if n < all.len then Some(all[n]) else None

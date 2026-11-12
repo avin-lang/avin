@@ -1,0 +1,110 @@
+// expect: exit 0
+// The collector traces a stored union's reference word and never its tag or bits: strings made as the
+// program runs are kept, beside scalar members whose bits look like addresses, in every storage
+// place (a data value's field, a class's field, a tuple's part, an array's elements, a vector's, a
+// buffer's and a map's, a generic class's field, a closure's capture, a captured `var` and a
+// module-level `var`), while every allocation collects (the corpus runs this under GC stress), and
+// each moves between places, field to local to array to capture to result, staying alive throughout.
+
+data Holder(label: string, value: long | string)
+
+class Box(var current: long | string)
+
+class Slot[T](var item: T)
+
+var lastSeen: long | string = 0
+
+// A scalar member whose bits would be an address if they were taken for a reference.
+lookalike(i: int) -> long | string = if i % 2 == 0 then s"str $i" else long(4096 + i * 16)
+
+weight(u: long | string) -> long = u match
+    n: long -> n
+    s: string -> long(s.byteLength())
+
+// Allocates enough for several collections while `u` is held only in storage.
+churn(n: int) -> int
+    var junk: Vector[string] = []
+    for i in 0..<n do junk = junk :+ s"junk $i"
+    junk.length()
+
+// Moves a union from a field into a local, an array, a closure and out as the result, allocating
+// between every step.
+travel(h: Holder) -> long | string
+    val local = h.value
+    churn(3)
+    val arr: Array[long | string] = Array.fill(3, 0)
+    arr(2) = local
+    churn(3)
+    val captured = arr(2)
+    val f = () -> captured
+    churn(3)
+    f()
+
+main()
+    val n = 60
+    var expected: long = 0
+    var holders: Vector[Holder] = []
+    val boxes: Buffer[Box] = Buffer()
+    var tuples: Vector[(long | string, int)] = []
+    val arr: Array[long | string] = Array.fill(n, 0)
+    val buffer: Buffer[long | string] = Buffer()
+    var table: Map[int, long | string] = {}
+    val slots: Buffer[Slot[long | string]] = Buffer()
+    var closures: Vector[() -> long | string] = []
+    var held: long | string = 0
+    val keep = () ->
+        held = held match
+            k: long -> s"k$k"
+            s: string -> long(s.byteLength())
+    for i in 0..<n
+        val u = lookalike(i)
+        expected += weight(u)
+        holders = holders :+ Holder(s"h$i", u)
+        boxes.append(Box(u))
+        tuples = tuples :+ (u, i)
+        arr(i) = u
+        buffer.append(u)
+        table = table.updated(i, u)
+        slots.append(Slot[long | string](u))
+        val captured = u
+        closures = closures :+ (() -> captured)
+        lastSeen = u
+        keep()
+        churn(2)
+    churn(20)
+    var fields: long = 0
+    var classFields: long = 0
+    var parts: long = 0
+    var elements: long = 0
+    var buffered: long = 0
+    var mapped: long = 0
+    var slotted: long = 0
+    var captures: long = 0
+    var travelled: long = 0
+    for h in holders
+        fields += weight(h.value)
+        travelled += weight(travel(h))
+    for b in boxes do classFields += weight(b.current)
+    for (u, _) in tuples do parts += weight(u)
+    for i in 0..<n do elements += weight(arr(i))
+    for u in buffer do buffered += weight(u)
+    for i in 0..<n
+        table.get(i) match
+            Some(u) -> mapped += weight(u)
+            None -> ()
+    for s in slots do slotted += weight(s.item)
+    for f in closures do captures += weight(f())
+    println(expected)
+    println(s"$fields $classFields $parts $elements $buffered $mapped $slotted $captures $travelled")
+    println(s"${fields == expected && classFields == expected && parts == expected && elements == expected}")
+    println(s"${buffered == expected && mapped == expected && slotted == expected && captures == expected && travelled == expected}")
+    println(lastSeen)
+    println(held)
+    // Replacing a reference by a scalar and back, in place, while collecting.
+    for b in boxes
+        b.current = weight(b.current)
+        churn(1)
+        b.current = s"again ${b.current}"
+    var again: long = 0
+    for b in boxes do again += weight(b.current)
+    println(again)

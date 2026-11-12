@@ -58,7 +58,8 @@ a decision changes, this page and the chapter change together.
   call a method or use `self`; a parameter's name in them reads the argument.
 - A subclass's fields are its superclass's, in order, then its own. Fields are never overridden.
 - Only public methods can be overridden. An override takes the same parameter types and yields the
-  same result or, for a class result, a subclass of it (covariant results). An override cannot be
+  same result or a type seen as it with no conversion (covariant results; see the Proposed entry
+  on override results below). An override cannot be
   private. A method with type parameters of its own is overridden by one declaring as many, matched
   by position (bounds, once they exist, must match too).
 - An abstract method is a method without a body, allowed only in an `abstract` class; an abstract
@@ -1320,7 +1321,9 @@ Settled by the user on 2026-11-04:
   follows, it and the definitions before it after the same generator pair each element with its
   value through the source's `map`, so it is evaluated for every element before that guard tests
   any, and over a set or map the pair has to be hashable. A definition may not rebind a name its
-  generator or an earlier definition after it binds; a later generator may.
+  generator or an earlier definition after it binds; a later generator may. Settled on the user's
+  delegation 2026-11-11 as no longer open: built and pinned at `-O0` and `-O2` by
+  `tests/run/for_yield_definitions.avin` and `tests/run/spec_collections_comprehensions.avin`.
 - Settled by the user 2026-11-04: Comprehensions over the mutable collections ([for comprehensions](/spec/collections/#generators-guards-and-yield)):
   a mutable `Set` and `Map` have `withFilter`, a lazy view as the immutable ones have, and a
   mutable `Map` a `map` over its entries as pairs, so the first source's kind decides the result as
@@ -6088,7 +6091,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   edited belongs to. *Why*: `cairo` needed 0.0.18 and could only say so in its README, and a
   package that needs a feature should fail with the upgrade named rather than with an unknown key
   or a type error. The key's spelling follows `sysl.hocon`, which names the Sysl a package needs
-  as `sysl = "0.9.20"` in its `package` block. A minimum, because Avin's versions only add: a
+  as `sysl = "0.10.0"` in its `package` block. A minimum, because Avin's versions only add: a
   later Avin that breaks a package is a bug or a deliberate break in a release, which a range
   written in advance cannot foresee, and an upper bound would refuse every upgrade until each
   package re-releases. Checked when each manifest is read, so every path that reads one is held to
@@ -6188,6 +6191,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (`on`, `verify`, `off`) for `avin build` and `avin emit-llvm`, in
   `.avin/build/incremental/<kind><level>/`. WHY: item 7 of the plan makes `build`, `run`, `test` and
   the language server use it by default once the corpus has run warm. Alternatives: on by default now.
+  Superseded by the Proposed default for every command that builds (branch `incremental-default`).
 - Settled on the user's delegation 2026-11-11 (built on branch `instance-cache`): **The store is a file per module named by a hash of
   its module and keys, with a length and CRC-32 header, a manifest written last, and no lock**; a
   file is kept only if the build read it whole, and files neither named nor used in the last hour are
@@ -6560,14 +6564,94 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     that every other `removeHead` has); `head`/`tail` names only (they remain, from `Seq`, with `tail`
     answering a `Vector`).
 
-**Deferred**
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` (immutable and mutable): representation and negatives** (branch `stdlib-bitset`).
+  Proposed: the immutable `BitSet` is a class over a `Vector[long]` of words, kept without empty words
+  at the end, so an update copies one path and `toBitMask()` is the words; the mutable one is over a
+  `Buffer[long]`. A negative element is not in any bit set: `contains` and `excl`/`remove` treat it as
+  absent (`false`, set unchanged), and everything that would add one traps (`incl`, `++`, `apply`,
+  the builder, `add`, `+=`, `++=`, `addAll`); the ordered queries and slices take any `int`. Why: a
+  query about a number that cannot be present has the honest answer "no", which keeps generic
+  code over `Set[int]` from trapping on `s(x)`, while storing a number the set cannot hold must not
+  silently succeed. Alternatives weighed: trapping in `contains`/`remove` too (strict, but breaks
+  `Set[int]` code that probes with arbitrary ints); ignoring negatives in `incl` (silently drops an
+  element, so `s.incl(x).contains(x)` can be false); offsetting by a minimum (a different set type).
+  Review with the user if bit sets of negatives (a signed range) are wanted.
 
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **`BitSet` method names beyond the `Set` ones** (branch `stdlib-bitset`). Proposed: the immutable
+  set adds `symmetricDiff` and `toBitMask`, with `BitSet.fromBitMask`; the mutable one adds
+  `unionInPlace`, `intersectInPlace`, `diffInPlace`, `symmetricDiffInPlace` (taking a mutable bit
+  set), the non-mutating `union`, `intersect`, `diff` and `symmetricDiff` over mutable bit sets,
+  `copy()` and `toSet()` (the immutable one), beside the mutable `Set`'s `add`, `remove`, `addAll`,
+  `+=`, `-=`, `++=`, `--=` and `filterInPlace`. Why: the `…InPlace` suffix names the in-place form of a
+  method the set already has (as `filterInPlace` and `sortInPlace` do) and spells out what the symbol
+  forms `|=` and `&=` would, which are free method names but carry no word for a reader. Alternatives:
+  `|=`, `&=`, `-=` as the in-place algebra (`-=` is taken by removing an element); `unionWith` and so on
+  (suggests a combining function); `addAll(other)` for the union (already means adding elements of
+  any `Iterable`). `symmetricDiff` is `xor` in some libraries; the longer name reads without
+  knowing bit-twiddling. The mutable bit set's `union`/`intersect`/`diff` take a mutable bit set only
+  rather than any `Set[int]`, the mutable `Set` not being a `Set` trait member either.
 
-## Proposed
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-bitset`): **A mutable `BitSet` iterates over a snapshot, and its ordered queries copy it** (branch
+  `stdlib-bitset`). Proposed: `iterator()`, `headOption()`, `lastOption()`, `minAfter` and
+  `maxBefore` of a mutable bit set read an immutable copy of its words, so changing the set during a
+  `for` is safe and visits the elements it had when the loop began. Why: it makes the iterator the
+  same code as the immutable one, and a mutable hash set's iterator has no defined behaviour under
+  change at all, so a stable one is the safer promise. Cost: one pass over the words per call, so a
+  loop calling `minAfter` repeatedly on a large sparse set is quadratic in the words. Alternative: a
+  live iterator that reads the words as it goes (no copy, but sees its own changes); revisit if
+  `minAfter` is used as a scan.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree map or set holds an immutable one and
+  replaces it; iterating it while updating it is legal and sees the collection as it was.**
+  `avin.collections.mutable.TreeMap` and `TreeSet` keep a private immutable `TreeMap` or `TreeSet`
+  and assign a new one at each update. Why: the persistent tree is already balanced and tested, its
+  `SortedTree` is private to module `avin` (so a second module could not share it without widening
+  it), every ordered query comes for free, and `toTreeMap()`/`toTreeSet()` become O(1) snapshots.
+  Consequence: an iterator made before an update visits the entries as they were, so a loop that
+  removes or adds entries cannot skip, repeat or fault, unlike the hash-based mutable collections,
+  whose iteration while updating is unspecified. Alternatives weighed: a mutable balanced tree with
+  in-place rotations (faster constants, no allocation per update, but a second tree implementation,
+  and iterators would need invalidation rules); a skip list (same objection). Updates allocate
+  O(log n) nodes, which a mutable tree would not; revisit if a profile shows it. Review with the user:
+  the snapshot-iteration guarantee is a promise a later in-place tree would have to keep.
 
-- Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **Two types are named `TreeMap` (and `TreeSet`), one in
+  `avin` and one in `avin.collections.mutable`.** As `Map` and `Set` already are. Inside the mutable
+  module the bare name is the mutable one and the immutable one is imported under an alias; a program
+  importing the mutable one unaliased while also using the prelude's gets the mutable one for the bare
+  name, and reaches the immutable one through an aliased import (both forms are tested). Alternatives:
+  distinct names (`MutableTreeMap`) which would break the parallel with `Map`/`Set`.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **`removeFirst()`/`removeLast()` trap on an empty
+  collection; `removeFirstOption()`/`removeLastOption()` answer `None`.** The immutable sorted
+  collections pair `head()` (trapping) with `headOption()`; the removal operations follow the same
+  split, the plain name being the trapping form. Alternatives: answering an `Option` from the plain
+  name (as `remove(key)` does), or a `pollFirst` name.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **The `range*` forms of a mutable tree collection answer a
+  new mutable collection, not a view.** As `filter` and `copy()` do on the hash-based mutable
+  collections; a write to the slice does not reach the original. Sharing the tree makes the slice O(log
+  n) to make. Alternative: live views, which would need the mutable tree to be in place.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-mutable-tree`): **A mutable tree set's `union`, `intersect`, `diff` and
+  `subsetOf` take a mutable tree set**, as the mutable hash set's take a mutable hash set; the
+  `keySet()` of a mutable tree map is an immutable `TreeSet` snapshot, as a mutable `Map`'s is an
+  immutable `Set`.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `tuple-result-override`): **an override's or an implementation's result may be
+  any type seen as the declared result with no conversion**
+  ([declarations](/spec/declarations/)), the covariant position [generics](/spec/generics/#variance)
+  already names: `-> (Dog, Dog)` overrides `-> (Animal, Animal)`, `-> (HashMap[K, V], HashMap[K, V])`
+  implements `-> (Map[K, V], Map[K, V])`, `-> Option[Dog]` overrides `-> Option[Animal]`,
+  `-> () -> Dog` overrides `-> () -> Animal`, and `-> string` overrides `-> Any`. A result that
+  would need a box (`-> int` for `-> Any`, `-> (int, int)` for `-> (Any, int)`) or that differs at
+  an invariant argument (`Array[Dog]` for `Array[Animal]`) is still refused. Rationale: the chapter
+  said "for a class, a subclass", which refused exactly the shapes the variance rules call
+  subtypes with one representation, so a value returned through the base needs no conversion;
+  the checker now asks the same no-conversion question an element of a covariant collection does.
+  Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
+  a differently named method, as own-kind `partition` met); also boxing a scalar result, which
+  would make an override's call site convert behind a virtual call.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
   private `lazy val`**, and the expression that computes the cell is dropped once it has run. The
   cell is `Option[(T, LazyList[T])]`; the class holds a function that reads the real expression out
   of a captured variable and empties it, so an evaluated cell keeps nothing the expression captured.
@@ -6577,15 +6661,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   would hold every source cell it skipped). ALTERNATIVES: an invariant node class with `var`s (the
   list could then not be covariant); a `var` of type `Any` cast back on each read (no type checking
   of the cell); keeping the expression (simpler, a space leak).
-- Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
   strictly and the tail by name, and the tail is evaluated when the list's second cell is first
   read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
   cell is then exactly the head, and a function building a list recursively runs one step per cell
   read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
   at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
   next step).
-- Proposed (built on branch `stdlib-lazy-list`, replaced on branch `lazy-cons-operator`): `x +:
-  xs` prepends to a lazy list already made, and `LazyList.cons(x, tail)` is the delayed form. The
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`, replaced on
+  branch `lazy-cons-operator`): `x +: xs` prepends to a lazy list already made, and `LazyList.cons(x, tail)` is the delayed form. The
   user then decided (2026-11-11): *"yes, a lazy head #:: tail operator would be good to include."*
   The operator is the entry below; `+:` stays strict.
 - Proposed (built on branch `lazy-cons-operator`): **A companion object may declare an operator
@@ -6629,31 +6713,246 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the list's progress record holds while its cell's expression runs, rather than the `lazy val`'s
   own message, which named the private field `cell`. ALTERNATIVES: keeping the `lazy val`'s
   message (names an implementation detail).
-- Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
   a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
   never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from
   it; sequence patterns over it would call `length()` too. As an `Iterable` it keeps the forcing
   methods every collection has, its own lazy forms found first. ALTERNATIVES: a `Seq` overriding the
   methods that would not return (most of them), or a `Seq` whose `length()` simply does not return
   on an endless list.
-- Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
   evaluated prefix and `…`, evaluating nothing**: `[0, 1, 4]`, `[0, 1, …]`, `[…]`, with a field
   width padding the whole. WHY: displaying an endless list must return, and a display that
   evaluated cells would run a program's functions while printing. ALTERNATIVES: forcing every cell
   (does not return on an endless list); a fixed prefix forced (side effects while printing);
   `<not computed>` text (longer, and not a form the other collections use). No `Eq`, `Hash` or
   `Ord`, which could not answer for two equal endless lists.
-- Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
   the thread that made it; the cells' `lazy val` evaluation would be safe between threads, but the
   expressions not yet evaluated are functions that may capture anything. ALTERNATIVES: sendable when
   every expression is a `@sendable` function (every lazy method would need a sendable form).
-- Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
   **`flatMap` takes `(T) -> Iterable[U]`**, reading each collection through its iterator as cells are
   read; **`++` takes its right operand by name**, evaluated only when the cell after the left's last
   is read (the iterator's `++` takes a strict `Iterable`, since an iterator is read once anyway);
   `toLazyList()` on every `Iterable` converts, since `from` is the integer counter's name as on
   `Iterator`. Also added beyond the item: `filterNot`, `zipWithIndex`, `fill`, `tabulate`, `lift`,
   `force()` and `isEvaluated()`.
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-map-extras`): **Map defaults, own-kind `partition` and `Set.subsets`** (branch `stdlib-map-extras`).
+  Proposed: `withDefault(f)` and `withDefaultValue(v)` on every map answer a `DefaultMap`, a
+  wrapper whose `apply` of an absent key answers the default and whose every other read (`get`,
+  `contains`, `getOrElse`, `size`, iteration, `keySet`) sees only the real entries; the default is
+  never stored. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` keep the wrapper and
+  its default; `transform` and `mapValues` answer the wrapped map's own kind, because a default
+  of the old value type cannot be carried across the function. The wrapper equals, and hashes as,
+  the map it wraps and every map of the same entries, ignoring the default. A default of a
+  supertype widens the map, as `updated` does. Why: `get` answering `Option` is how a program
+  asks whether a key is there, and a counter wants `apply` alone to be total. Alternatives
+  weighed: `get` also answering the default (hides absence, makes `contains` and `get`
+  disagree); the default taking part in equality (two maps of the same entries would differ by a
+  closure that cannot be compared); the wrapper mapping its default through `mapValues`
+  (needs the value function to be applied to a default on every miss, a surprise at each read).
+  `partition` of a hash, tree or ordered map and of a hash, tree, ordered or bit set is a method
+  of the concrete type answering that type, `p` called once per element; it is not on `Map`,
+  `Set`, `SortedMap`, `SeqMap`, `SortedSet` or `SeqSet`, so through a trait a set's partition is
+  `Iterable`'s and answers vectors, as the settled `Iterable` decision says, and a map's
+  `partition` of a pair function answers the own kind only where the type is known. Why: a
+  tuple of two collections is not a subtype of a tuple of two supertypes in an override's
+  result, and a set's partition over the trait cannot change `Iterable`'s result type.
+  Amended on the user's delegation 2026-11-11 (built on branch `partition-override`): with an override's result free to
+  narrow, `Map`, `SortedMap` and `SeqMap` declare `partition(p: (K, V) -> bool)` answering maps
+  of their own trait (`Map` carries a default built on `removed`, so a user class implementing
+  `Map` needs no change), and each concrete map overrides it with its own kind, so a call through
+  `Map` answers maps of the receiver's kind. Sets keep `Iterable`'s `(Vector, Vector)` through
+  `Set`, since a set is not a vector and `Set` cannot narrow it; the own-kind set `partition`
+  stays on the concrete types. Alternatives weighed: a `Set.partition` answering `(Set, Set)`
+  (conflicts with `Iterable`'s result, which is not a supertype of it). Alternatives weighed
+  originally: trait methods answering `(Map, Map)` (the concrete type then could not
+  narrow the result); two `filter` calls (calls `p` twice, which a predicate with an effect
+  shows). `subsets()` and `subsets(k)` are iterators on `Set` that read the elements into a
+  vector and generate combinations by size, so the order is by size then by position and nothing
+  is made ahead; every subset is a set of the receiver's kind. Why by size: the empty set first
+  and the set last, the same order for every kind, and no `2^n` counter to overflow for a set of
+  more than 62 elements. Alternatives weighed: bitmask order (overflows past 62 elements, and
+  puts the subsets in an order a reader cannot predict from the sizes).
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-from`): **Companion `from`, `Vector.iterate`, `unfold` and the sorted conversions** (branch
+  `stdlib-from`). Proposed: `from(xs: Iterable[T])` on every immutable collection companion and
+  on the mutable ones (`Buffer`, `Map`, `Set`, `TreeMap`, `TreeSet`, `LinkedMap`, `LinkedSet`,
+  `BitSet`, `PriorityQueue`), a map's taking `Iterable[(K, V)]`; for a duplicate key the later
+  pair's value wins (an ordered map keeping the key's first place), the rule `apply` and the
+  builders already follow. `Vector.iterate(start, length, f)` takes the length as its second
+  parameter and calls `f` `length - 1` times; `Vector.unfold` and `List.unfold` are the eager forms
+  of `Iterator.unfold`. `toSortedSet()` and `toSortedMap()` are `impl` blocks on `Iterable` bounded
+  by `Ord`, like `toSet()` and `toMap()`. Why: one spelling that works for every source and target,
+  where the collection-specific conversions need a method per pair. Alternatives weighed: a
+  `to(factory)` conversion (needs higher-kinded types); a universal `into(builder)` (not added:
+  `builder.addAll(xs)` already reads as well, and `from` covers the target-first reading);
+  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
+  `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
+  counting iterator and keeps its name.
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
+  where they live** (the second part of Settled → unions → Representation, built on the multi-word
+  values above).
+  - **Three words**: a 32-bit tag, 64 bits for a scalar member and, where a member is a reference, the
+    reference. Tag 0 says the union holds a reference, whose header names its type; tag `i + 1` says
+    it holds scalar member `i`, the scalar members ordered by their type keys, so the order written
+    never changes the layout. A scalar is kept in the bits as its value: an integer sign-extended, a
+    `byte` and a `char` zero-extended, a `bool` as 0 or 1, a `real`'s bits unchanged (so a NaN's
+    payload and a zero's sign survive), `unit` as nothing. A union of scalars alone has two words.
+    *Why*: the reference word is the only one the frame plan can root, and a separate 64-bit word
+    holds every scalar unchanged. *Alternatives*: one word for the tag and the bits together (a
+    `long` member needs all 64 bits); a word per scalar member (more words for nothing); numbering by
+    the order written (`int | string` and `string | int` would differ).
+  - **In lowering, the union is a reference to its cell**, an object of those words that is made once
+    and only read; a function takes and gives each union as its words (`MCell` in a signature,
+    replaced by the words before anything else reads the program), and makes a cell of the words it
+    receives. So scalar replacement keeps every cell of a local, a parameter or a result as its
+    fields in slots, and none of them allocates; a call in tail position passes its callee's words
+    straight on. *Why*: every operation on a union (injection, a `match`, `==`, the hash,
+    rendering) is written once, on the cell, and the existing scalar replacement makes it words
+    everywhere a value stays in its function. *Alternatives*: lowering carrying several operands for
+    one value through every expression form (a much larger change to every join, local and call
+    path, for the same code after scalar replacement).
+  - **Where a union is stored** (a field, an element, a capture, a module-level value, a generic
+    type's storage at a union argument), **its cell stays an object**, traced through its reference
+    word, until those places lay a union out as its words too: storing a union allocates its cell as
+    boxing a scalar did, a string member included. *Why*: one representation per type everywhere, so
+    generic code at a union type argument needs no conversion where it meets its storage.
+    *Alternatives*: converting to an `Any` at every such boundary (a box only for a scalar member, but
+    a conversion at every generic call and field access, each a place to get wrong). Superseded by
+    the next entry (branch `union-words-storage`): storage now holds the words.
+  - **Converting to an `Any` or a trait** boxes a scalar member there and passes a reference member
+    as it is; **a member call** through a trait every member has converts the union the same way,
+    except `display`, `debug` and `toString`, which call the member's own implementation by the tag
+    with no box. `===` with an object compares the union as an `Any`, so a scalar member, a new box,
+    is never identical to it. **`==` and the hash** are decided by the tag: two values of one member
+    compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
+    `Any` are equal and hash alike. Review with the user: storing a union with a string member now
+    allocates its cell where an `Any` did not, until fields and collections take the words.
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+    `Any` are equal and hash alike. (The review flag this entry carried, a stored union with a string
+    member allocating its cell, is closed by the next entry.)
+- Settled on the user's delegation 2026-11-11 (built on branch `union-words-storage`): **A union with a scalar member is stored as its
+  words** (the storage half of the entry above).
+  - **Every storage place holds the words**: a field of a data value, a class or a tuple, an array
+    element (so a `Vector`, a `Buffer` and a map), a closure's capture, a captured `var`'s box and a
+    module-level value lay the union out as its tag (in an 8-byte slot), its bits and, with a
+    reference member, its reference, 24 bytes or 16, and only the reference word is traced (a
+    descriptor's reference offsets, an array's element map). Storing reads the words out of the
+    value's cell; loading makes a cell of the words read, which scalar replacement removes, so storing
+    and reading allocate nothing for any member. *Why*: it removes the allocation the entry above
+    flagged, and every place reuses one pair of helpers. *Alternatives*: the cell kept as an object
+    in storage (an allocation per store, a string member included); converting to an `Any` there (a
+    box for each scalar member, and type tests on read).
+  - **Generic code at a union type argument stores the words in each instance** (`Vector[int |
+    string]` holds 24-byte elements), never boxing at a generic boundary. *Why*: generic code is
+    compiled per instance already, so the instance's storage is the union's own; nothing converts at
+    a call. *Alternatives*: boxing a union to an `Any` where it enters generic code (an allocation
+    per element and a type test per read, for no gain).
+  - **A module-level union keeps its tag and bits in its own 16 bytes and its reference word in a
+    module-level reference of its own**, named `<value>#reference`, after every value and `lazy val`
+    state word. *Why*: the program's roots are a frame of references, so the reference word has to be
+    one of them; the rest is plain data. *Alternatives*: the cell kept on the heap for module-level
+    values (an allocation per assignment of a `var`); teaching the root frame a word map (a runtime
+    change for one case).
+  - **`Atomic` keeps a reference to a cell**: its value is one word that `load`, `store`, `swap` and
+    the hardware compare-and-set access indivisibly, so an `Atomic[int | string]` allocates the cell
+    on each store. *Why*: three words cannot be swapped atomically without a lock. *Alternatives*:
+    a lock for `Atomic`s of unions (as for integers wider than 64 bits; slower for every operation).
+  - **A load from storage reads a tag of 0 (a reference) only beside a non-null reference word, and
+    any other zero tag as the first scalar member's.** A racing read may combine a tag and a reference
+    from two writes, as it may an `i128`'s words, and an array element not yet filled is all zero;
+    either way the value read is one of a member, never a null taken for a reference. *Why*: the
+    promise that a race never breaks memory safety; it costs two compares and two selects per load.
+    *Alternatives*: no check (a racing read could dereference null); a lock per union field (a cost
+    on every access for a race the program should not have). Review with the user: a racing read of a
+    union may now combine two writes, an exception the threads chapter states beside wide integers.
+  - **An integer member wider than 64 bits is kept boxed in the reference word under tag 0**, its
+    type told by its box's record, so `i128 | int` has a reference word and injecting an `i128`
+    allocates its box. This fixes the layout above, which kept such a member in the 64 bits and lost
+    its high bits. *Why*: the bits slot stays 64 bits for every union, and a wide integer, rare in a
+    union, costs a box as it does in an `Any`. *Alternatives*: a bits slot as wide as the widest
+    member (a layout per union type, and every helper and the call words taking a width); refusing
+    integers wider than 64 bits as members (a gap in the language).
+  - **A tuple with a union part is not answered as words** by `val (a, b) = f(x)`: the call makes the
+    tuple, and the parts are read from it. *Why*: a result's words do not nest a union's words yet.
+    *Alternatives*: flattening the union's words into the result's (a later optimization).
+- Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+  A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
+  part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a
+  function, or a union of references) is seen as an `Any` part, so a `(string, string)` and a
+  `(Dog, string)` are `(Any, string)`s; a scalar part, or a union with a scalar member, is only that
+  very part, so an `(int, string)` is no `(Any, string)` and an `(int, bool)` no
+  `(int | string, bool)`; a part naming a **union of references** takes any object there and then
+  tests that object's own type against the members, so `(Dog | Cat, int)` matches a tuple made as
+  `(Dog, int)`, as `(Dog | Cat, int)` or as `(Any, int)` holding a `Cat`, and not one holding a `Bird`
+  or a boxed number. A pattern on a tuple of known type that could never match by this rule is the
+  error any such pattern is (`a value of type (int, bool) is never a (int | string, bool), so this
+  type pattern never matches`). *Why*: the chapter's rule that a tuple converts only where each part
+  keeps its layout decides which tuples a pattern can take as its type; a union of references is
+  laid out as an `Any`, so a tuple made with one records an `Any` there and only the object can say
+  which member it is. *Alternatives*: matching only a tuple made with exactly the pattern's type
+  (what was built: `("a", "b")` was no `(Any, string)`); testing every part by the value it holds
+  (rebuilding the tuple at the pattern's layout where a scalar part would need a box, an allocation
+  hidden in a `match`). Review with the user: a union-of-references part tests the object, while a
+  class part tests the type the tuple was made with.
+
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **The instance cache is on by default** for
+  every command that builds: `avin build`, `run`, `test` and `emit-llvm`. `AVIN_INCREMENTAL=off`
+  turns it off, `verify` stays, and `on`, unset or empty are the default; any other value is an
+  error for the commands that build, while `avin check` (even with `--bindings`) neither reads the
+  variable nor keeps a cache. The language server only checks, so it has no build to cache. WHY: the
+  whole corpus built warm under `verify` matched its clean builds, the commands' tests hold every
+  command to a clean build after an edit, and the cache needs no care (another compiler's entries
+  are misses and trimmed after an hour; damage is a miss). Alternatives: on for `run` and `test`
+  only, `build` staying clean for release builds (a release build has the same oracle and gains as
+  much); an `--incremental` flag rather than a variable (a flag every command would carry for a
+  setting nobody changes per build). Review with the user: the disk it takes, about the size of the
+  program's text per kind and level (185 MB for marshal at `-O2`).
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **A program of one file names its cache
+  directories after itself**, `.avin/build/incremental/<stem>-<kind><level>`, while a directory
+  or package keeps `<kind><level>`. WHY: every file of a directory shares that directory's
+  `.avin/build`, as their executables already do (named by stem); with one directory per kind and
+  level, two programs built in turn would overwrite each other's manifest and an hour later trim each
+  other's entries. The suffix is one of four fixed words, so no stem makes two programs' names meet.
+  Alternatives: a subdirectory per file (`incremental/<stem>/program-O2`, which a file named
+  `tests-O0.avin` would make collide with a directory program's); one shared directory (correct,
+  since entries are content-addressed, but each program would lose its reuse in turn).
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **A manifest names only module files of its own
+  directory**: a name that is not hexadecimal digits and `.mod` is passed over as damaged and never
+  read. WHY: a damaged manifest could otherwise send the reader to `../` paths outside the cache;
+  nothing a build writes has another form. Alternatives: trusting the manifest (only the checksum
+  would stand between a stray path and its contents being read as entries).
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **Code that calls the C unit's glue is never
+  taken from the cache's lowered entries, and the glue it calls is part of its text's key**; a C
+  callback's body is keyed by its binding and its trampoline's name. The warm corpus run found three
+  stale texts: the glue (`avin_c_call_<n>`, `avin_c_field_get_<n>`, `avin_c_retain_<n>` and the
+  rest) is named by the checker's indices, which a declaration added earlier renumbers, and no key
+  held those numbers; and every callback body had one key, so one binding's callback took
+  another's text. WHY: the functions that call glue directly are the bindings' own bodies, fields
+  and handles, which are small and already mostly lowered every build, and covering the names in
+  the text key also covers the copies inlining makes of them. Alternatives: name the glue by what it
+  glues, as the stable names do for everything else (the right end state, but it changes the C unit
+  and every place lowering calls into it); a digest of every C declaration's number in every key
+  (a declaration added anywhere would re-lower a C program whole). Review with the user: stable C
+  glue names would let these functions be reused too.
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **The warm corpus run is chosen by
+  `AVIN_INCREMENTAL=verify` in the environment of `sysl test compiler`**: each corpus program is
+  built cold with an empty cache, edited by adding a function nothing calls at the end of its first
+  non-literate file, and built again from the cache in `verify` mode, which also builds it clean; the
+  warm build is the one run. Unset, the gate builds each program once with no cache. WHY: the warm run
+  builds every program three times, so it belongs before a release or after a change to the cache,
+  not in every gate; the edit changes the source and the executable's key but no line any program
+  prints or traps at, so the corpus's expectations still hold. Alternatives: the warm run in every
+  gate (triples the corpus's compile time); an edit inside a function (moves trap lines the `.err`
+  files record, or changes what a program does).
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
@@ -6665,8 +6964,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   beside its declarations, and the IntelliJ plugin's resolution following an export to the
   declaration (go-to-definition, find usages, renaming through an export).
 
-- Value definitions between a comprehension's generators (`y = f(x)`), and what a comprehension
-  over a `Map` yields when its values are not pairs (it needs `Iterable`'s own transformations).
+- What a comprehension over a `Map` yields when its values are not pairs (it needs `Iterable`'s own
+  transformations).
 
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
   - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a

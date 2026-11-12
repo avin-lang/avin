@@ -5295,6 +5295,10 @@ private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) ->
     var fits = alike_or_error(own, want) || *own is Nothing || forgets_sendable(zonk(c, own), zonk(c, want))
     if *want is Class(b, _, _)
         if ancestor_type(c.classes, c.data, own, b) is Some(up) then fits = alike_or_error(up, want)
+    // A result is a covariant position: a type seen as the base's with no conversion fits, such as
+    // a tuple of subclasses, an instance of a covariant generic type or a function with a narrower
+    // result. A value that would need a box, such as an `int` for an `Any`, does not.
+    if !fits && is_reference(own) then fits = conforms(view_part(conformances(c), zonk(c, own), zonk(c, want)), zonk(c, want))
     if fits then None else Some(s"which yields ${type_name(want)}, not ${type_name(own)}")
 
 // A class, trait or data type that is a function is one function type, and has an `apply` taking
@@ -10642,11 +10646,12 @@ private is_option_data(c: *Checker, d: usize) -> bool = core_data(c, "Option") m
 
 // A built-in value or a tuple expected as a trait it conforms to converts to it where it is written:
 // it is put in a box, as for `Any`, whose method table holds the type's implementations. A data value
-// and an object already are values of every trait they conform to.
+// and an object already are values of every trait they conform to, and so is a union of references,
+// laid out as an `Any` holding one; a union with a scalar member converts by its tag.
 private to_trait(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
     if !is_trait_type(c, want) then return typed
     val t = zonk(c, typed.ty)
-    if !(is_builtin(t) || *t is Tuple(_)) then return typed
+    if !(is_builtin(t) || *t is Tuple(_) || *t is Union(_) && !is_reference(t)) then return typed
     if !conforms_to_bound(c, t, want) then return typed
     TExpr(typed.span, want, Box(typed))
 
@@ -10958,6 +10963,13 @@ private union_rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usiz
 struct UnionLookup
     owners: Buf[&Type]
     methods: Buf[usize]
+
+/** The union value `value` as `owner`, the class or trait a member is found on: a union of
+ * references is that type already, laid out as an `Any` holding its member; one with a scalar member
+ * converts to it, which lowering does by the union's tag. */
+private union_as_owner(c: *Checker, value: &TExpr, owner: &Type) -> &TExpr
+    if is_reference(zonk(c, value.ty)) then TExpr(value.span, owner, value.kind)
+    else TExpr(value.span, owner, Box(value))
 
 /** The class or trait the members of a union agree on, as the branches of an `if` yielding each
  * would: what a member call on the union is looked up on first. */
@@ -11357,7 +11369,7 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         if found.owners.len() > 1
             c.note(unit, e.span, union_clash(ty, name, found.owners))
             return TExpr(e.span, ErrorType, UnitConst)
-        if found.owners.len() == 1 then return member_of(c, e, TExpr(value.span, found.owners[0], value.kind), name, expected)
+        if found.owners.len() == 1 then return member_of(c, e, union_as_owner(c, value, found.owners[0]), name, expected)
     // A field of a data type with one variant comes before a method of the same name.
     if !(*ty is Class(_, _, _)) && !one_variant_field(c, ty, name)
         val ms = methods_of(c, ty, name)
@@ -15771,9 +15783,10 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
     var object = named_value match
         Some(v) -> v
         None -> check_expr(c, target, None)
-    // A union's member is called through the members' join or a trait the union conforms to, the
-    // union seen as that type with no conversion, as an `Any` holding its member; a name more than
-    // one of those has is not chosen between.
+    // A union's member is called through the members' join or a trait the union conforms to: a
+    // union of references seen as that type with no conversion, as an `Any` holding its member, and
+    // one with a scalar member converted to it; a name more than one of those has is not chosen
+    // between.
     if *zonk(c, object.ty) is Union(_)
         val found = union_lookup(c, zonk(c, object.ty), name)
         if found.owners.len() > 1
@@ -15781,7 +15794,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             for a in args
                 check_statement(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
-        if found.owners.len() == 1 then object = TExpr(object.span, found.owners[0], object.kind)
+        if found.owners.len() == 1 then object = union_as_owner(c, object, found.owners[0])
     if *zonk(c, object.ty) is Class(k, _, _)
         val ms = with_trait_methods(c, object.ty, name, methods_named(c, k, name))
         if ms.len() > 0
@@ -16131,6 +16144,13 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
     c.note(unit_of(c), at, s"`${symbol.decl.name}` is a method of `${c.classes[k].name}`, which ${type_name(t)} does not implement")
     true
 
+// A local or a parameter converted where it is the receiver, as a union with a scalar member is to
+// the trait its method is found on, is read where the call is made like the variable itself, so
+// lowering sees the union and can call its member's method by its tag.
+private boxed_variable(receiver: &TExpr) -> bool = receiver.kind match
+    Box(inner) -> inner.kind is Local(_) || inner.kind is Param(_)
+    _ -> false
+
 // A method call passes the receiver first. The class's type arguments come from the receiver's
 // type, and the method's own, which follow them, are written or inferred as for a function.
 private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool, checked: Buf[Option[&TExpr]]) -> &TExpr
@@ -16143,7 +16163,14 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
     var object = receiver
-    if !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
+    if receiver.kind is Box(inner) && *zonk(c, inner.ty) is Union(_)
+        // A union converted to the type its method is found on is held as the union, and converted
+        // where the call is made.
+        if !boxed_variable(receiver)
+            val held = hidden_local(c, inner.ty)
+            setup = Some(TExpr(receiver.span, Unit, Let(held, inner)))
+            object = TExpr(receiver.span, receiver.ty, Box(TExpr(inner.span, inner.ty, Local(held))))
+    elif !(receiver.kind is Local(_) || receiver.kind is Param(_) || receiver.kind is TypeReceiver)
         val held = hidden_local(c, receiver.ty)
         setup = Some(TExpr(receiver.span, Unit, Let(held, receiver)))
         object = TExpr(receiver.span, receiver.ty, Local(held))
@@ -17066,6 +17093,8 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
                             t = to_trait(c, t, zonk(c, p))
+                            // A value given for a union parameter is injected where it is written.
+                            if *zonk(c, p) is Union(_) then t = inject(c, t, zonk(c, p))
                             if converts_none(c, t.ty, p) then t = TExpr(t.span, p, NoneAs(t))
                             val agrees = *t.ty is Nothing || same_type(t.ty, p) || constrain(c, p, t.ty, open, true)
                             if !agrees
@@ -18759,6 +18788,15 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
             Tuple(ys) ->
                 if xs.len() != ys.len() then return false
                 for i in 0..<xs.len()
+                    // A tuple is of the type it was made with, seen only where each part keeps its
+                    // layout, so where either side of a part is no reference (a number, a `bool`, a
+                    // union with a scalar member) the part is exactly what it was made with: an
+                    // `(int, bool)` is never an `(Any, bool)` or an `(int | string, bool)`, nor a
+                    // `(string, bool)` an `(int | string, bool)`.
+                    val part = zonk(c, xs[i])
+                    val wanted = zonk(c, ys[i])
+                    val open = *part is TypeVar(_, _, _) || *wanted is TypeVar(_, _, _) || !settled(part) || !settled(wanted) || *part is Nothing || *part is ErrorType || *wanted is ErrorType
+                    if !open && (!is_reference(part) || !is_reference(wanted)) && !same_type(part, wanted) then return false
                     if !may_match(c, xs[i], ys[i]) then return false
                 true
             _ -> false

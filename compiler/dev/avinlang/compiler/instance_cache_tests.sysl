@@ -250,7 +250,7 @@ private module_files(dir: string) -> Buf[string]
     var out: Buf[string] = buf()
     for name in entries(dir).unwrap()
         if name.ends_with(".mod") then out.push(dir + "/" + name)
-    val sorted = out.view()
+    val sorted = out.view_mut()
     sort(sorted)
     var files: Buf[string] = buf()
     for f in sorted
@@ -317,6 +317,32 @@ missing_files_are_misses()
     val second = cached(files, cache)
     assert_eq(lowered_of(second).reused.len(), 0)
     assert_eq(second.llvm, clean(files))
+
+@test("a manifest naming anything but a module file of its directory has that name passed over, never read")
+manifest_names_only_module_files()
+    assert(is_module_file_name("6d0d4281df094b2437783940fb8deb16.mod"))
+    assert(!is_module_file_name(".mod"))
+    assert(!is_module_file_name("../6d0d4281df094b2437783940fb8deb16.mod"))
+    assert(!is_module_file_name("sub/6d0d.mod"))
+    assert(!is_module_file_name("6D0D.mod"))
+    assert(!is_module_file_name("6d0d.mod.pending-1-1"))
+    assert(!is_module_file_name("manifest"))
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val files = program_of(dir, Main, Geo, Extra)
+    val cache = dir + "/cache"
+    _ = cached(files, cache)
+    // A whole module file moved one directory up is still whole, but the manifest may not reach it.
+    val moved = module_files(cache)
+    val name = moved[0][cache.bytes.len + 1..]
+    write_text(dir + "/" + name, read_text(moved[0]).unwrap()).unwrap()
+    write_text(cache + "/manifest", "../" + name + "\n").unwrap()
+    val store = read_instance_store(cache)
+    assert_eq(store.files, 1)
+    assert_eq(store.damaged, 1)
+    assert_eq(store.lowered.len(), 0)
+    assert_eq(store.texts.len(), 0)
+    assert_eq(cached(files, cache).llvm, clean(files))
 
 @test("another compiler's entries are never used: its keys name another stamp")
 compiler_change_invalidates()
@@ -468,11 +494,13 @@ build_log_counts_the_cache()
     assert_eq(count_in(warm, "store", "kept"), modules)
     assert_eq(count_in(warm, "store", "trimmed"), 0)
 
-@test("AVIN_INCREMENTAL is on, verify, off or unset; anything else is an error naming it")
+@test("AVIN_INCREMENTAL is on, verify, off or unset, unset and empty meaning on; anything else is an error naming it")
 incremental_modes()
-    assert_eq(incremental_mode_of(None).unwrap(), IncrementalOff)
-    assert_eq(incremental_mode_of(Some("")).unwrap(), IncrementalOff)
+    assert_eq(incremental_mode_of(None).unwrap(), IncrementalOn)
+    assert_eq(incremental_mode_of(Some("")).unwrap(), IncrementalOn)
     assert_eq(incremental_mode_of(Some("off")).unwrap(), IncrementalOff)
+    assert(incremental_mode_of(Some("OFF")) is Err(_))
+    assert(incremental_mode_of(Some(" off")) is Err(_))
     assert_eq(incremental_mode_of(Some("on")).unwrap(), IncrementalOn)
     assert_eq(incremental_mode_of(Some("verify")).unwrap(), IncrementalVerify)
     assert(incremental_mode_of(Some("yes")).unwrap_err().contains("AVIN_INCREMENTAL is `yes`"))
@@ -489,6 +517,21 @@ incremental_modes()
 directories_by_kind_and_level()
     assert_eq(instance_cache_dir("p/.avin/build", false, "-O2"), "p/.avin/build/incremental/program-O2")
     assert_eq(instance_cache_dir("p/.avin/build", true, "-O0"), "p/.avin/build/incremental/tests-O0")
+
+@test("a program of one file has directories named after it, so two files of one directory keep apart")
+directories_of_one_file_programs()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/one.avin", "main() = 0\n").unwrap()
+    write_text(dir + "/two.lavin", "main() = 0\n").unwrap()
+    assert_eq(program_instance_cache(dir, false, "-O2"), dir + "/.avin/build/incremental/program-O2")
+    assert_eq(program_instance_cache(dir, true, "-O0"), dir + "/.avin/build/incremental/tests-O0")
+    assert_eq(program_instance_cache(dir + "/one.avin", false, "-O2"), dir + "/.avin/build/incremental/one-program-O2")
+    assert_eq(program_instance_cache(dir + "/one.avin", true, "-O2"), dir + "/.avin/build/incremental/one-tests-O2")
+    assert_eq(program_instance_cache(dir + "/two.lavin", false, "-O0"), dir + "/.avin/build/incremental/two-program-O0")
+    // A file whose name is a directory's own name for its caches still gets a directory of its own.
+    write_text(dir + "/program.avin", "main() = 0\n").unwrap()
+    assert_eq(program_instance_cache(dir + "/program.avin", false, "-O2"), dir + "/.avin/build/incremental/program-program-O2")
 
 // --- the entries' text -----------------------------------------------------------------------------
 
@@ -605,8 +648,8 @@ corpus_sample_warm_equals_clean()
     defer _ = remove_dir_all(dir)
     var names: Buf[string] = buf()
     for name in entries("tests/run").unwrap()
-        if name.ends_with(".avin") then names.push(name)
-    val sorted = names.view()
+        if name.ends_with(".avin") && !name.starts_with(".") then names.push(name)
+    val sorted = names.view_mut()
     sort(sorted)
     var checked = 0
     var i = 0usize
@@ -627,19 +670,50 @@ corpus_sample_warm_equals_clean()
         checked += 1
     assert(checked * 2 >= sorted.len / 47, s"only $checked of the sample compiled")
 
+/** `files` with a file of one function nobody calls put first, so every declaration after it, the C
+ * bindings' included, is numbered one later by the checker. */
+private declaration_first(files: Buf[ProgramFile], dir: string) -> Buf[ProgramFile]
+    var out: Buf[ProgramFile] = buf()
+    out.push(ProgramFile(source_of(dir + "/a0.avin", "firstOfAll() -> int = 1\n"), None, false, buf(), files[0].package))
+    for f in files
+        out.push(f)
+    out
+
+@test("a program of C bindings, edited so its bindings, fields and callbacks are numbered anew, builds warm to a clean build's text")
+c_bindings_renumbered_build_warm_to_clean()
+    val scratch = make_temp_dir("avin-ic-c").unwrap()
+    defer _ = remove_dir_all(scratch)
+    val tc = fixture_toolchain(repository_toolchain(), scratch)
+    // Calls through the C unit's glue, a view field and a field of a mirror, two bindings' callbacks
+    // each named `callback#1`, and a callback's finalizers.
+    for name in ["c_buffer_collects", "c_view_field_closed_trap", "c_field_mirror_collects", "c_callback_body_trap", "c_callback_finalizers", "c_struct_blocking_collects"]
+        val root = current_dir().unwrap() + "/tests/programs/run/" + name
+        val fetching = default_fetching()
+        val p = load_package(root, Fetching(fetching.cache, fetching.base, false)).unwrap()
+        for edit in 0..<2
+            val cache = scratch + "/" + name + edit.to_string()
+            open_incremental(cache, IncrementalOn)
+            val cold = compile_program(tc, p.files, false, p.sysl, p.c)
+            assert_eq(cold.diagnostics, "", name)
+            val files = if edit == 0 then warm_edit(p.files) else declaration_first(p.files, root)
+            open_incremental(cache, IncrementalVerify)
+            val warm = compile_program(tc, files, false, p.sysl, p.c)
+            close_incremental()
+            assert_eq(warm.diagnostics, "", s"$name, edit $edit")
+            // And back: the cache now holds the edited program's entries too.
+            open_incremental(cache, IncrementalVerify)
+            val back = compile_program(tc, p.files, false, p.sysl, p.c)
+            close_incremental()
+            assert_eq(back.diagnostics, "", s"$name, edit $edit and back")
+            assert_eq(back.llvm, cold.llvm, name)
+
 @test("two builds of one program at once both succeed, and leave a cache a third build verifies")
 two_builds_at_once()
     val dir = make_temp_dir("avin-ic-twice").unwrap()
     defer _ = remove_dir_all(dir)
-    val bin = dir + "/avin"
-    val built = capture(repository_toolchain().sysl, ["build", "compiler", "-o", bin], stderr = true, timeout = 900000).unwrap()
-    assert(built.status.ok(), built.err.unwrap_or(""))
+    val bin = compiler_in(dir)
     val program = dir + "/prog"
-    make_dir_all(program + "/geo").unwrap()
-    make_dir_all(program + "/extra").unwrap()
-    write_text(program + "/geo/geo.avin", Geo).unwrap()
-    write_text(program + "/extra/extra.avin", Extra).unwrap()
-    write_text(program + "/main.avin", Main).unwrap()
+    write_program(program)
     var env: Buf[Var] = buf()
     env.push(Var("AVIN_ROOT", current_dir().unwrap()))
     env.push(Var("AVIN_INCREMENTAL", "on"))
@@ -685,3 +759,227 @@ both_levels()
     for o in outputs
         assert_eq(o, outputs[0])
     assert(outputs[0].contains("cat tom"))
+
+// --- the commands -----------------------------------------------------------------------------------
+
+/** The compiler of this tree, built into `dir`, for the tests that start it as a person would. */
+private compiler_in(dir: string) -> string
+    val bin = dir + "/avin"
+    val built = capture(repository_toolchain().sysl, ["build", "compiler", "-o", bin], stderr = true, timeout = 900000).unwrap()
+    assert(built.status.ok(), built.err.unwrap_or(""))
+    bin
+
+/** The program of three modules at `dir`, with a file of one test beside its main module. */
+private write_program(dir: string)
+    make_dir_all(dir + "/geo").unwrap()
+    make_dir_all(dir + "/extra").unwrap()
+    write_text(dir + "/geo/geo.avin", Geo).unwrap()
+    write_text(dir + "/extra/extra.avin", Extra).unwrap()
+    write_text(dir + "/main.avin", Main).unwrap()
+    write_text(dir + "/checks.avin", "import extra.helper\n\n@test\nhelps()\n    assert(helper(1) > 100)\n").unwrap()
+
+/** What a command printed, its exit status, and the build log it wrote, empty if it wrote none. */
+private struct Ran
+    status: int
+    text: string
+    log: Buf[string]
+
+/** `avin <args>` with `AVIN_INCREMENTAL` set to `mode` ("" is the default) and its build log in `dir`. */
+private avin_in(bin: string, dir: string, mode: string, args: []const string) -> Ran
+    val log = dir + "/build.log"
+    _ = remove_file(log)
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env.push(Var("AVIN_INCREMENTAL", mode))
+    env.push(Var("AVIN_BUILD_LOG", log))
+    val out = capture(bin, args, env = env.view(), stderr = true, timeout = 600000).unwrap()
+    val code = out.status match
+        Exited(c) -> c
+        _ -> -1
+    Ran(code, out.text + out.err.unwrap_or(""), if exists(log) then logged_phases(log) else buf())
+
+/** What the executable at `exe` prints. */
+private output_of(exe: string) -> string = capture(exe, [], timeout = 60000).unwrap().text
+
+/** The module files of every directory of the instance cache under `caches`, by directory. */
+private names_in(dir: string) -> Map[string, bool]
+    var out: Map[string, bool] = map()
+    for f in module_files(dir)
+        out.put(f[dir.bytes.len..], true)
+    out
+
+@test("build, run and test keep the instance cache by default, each kind and level apart, and rebuild an edit to a clean build's program")
+commands_use_the_cache_by_default()
+    val dir = make_temp_dir("avin-ic-commands").unwrap()
+    defer _ = remove_dir_all(dir)
+    val bin = compiler_in(dir)
+    val prog = dir + "/prog"
+    write_program(prog)
+    val caches = prog + "/.avin/build/incremental"
+    // Cold: each command writes its own kind's and level's directory and reuses nothing.
+    val run1 = avin_in(bin, dir, "", ["run", prog])
+    assert_eq(run1.status, 0, run1.text)
+    assert(run1.text.contains("\n101\n"), run1.text)
+    assert_eq(count_in(run1.log, "lower", "reused"), 0)
+    assert(count_in(run1.log, "store", "written") >= 3)
+    val test1 = avin_in(bin, dir, "", ["test", prog])
+    assert_eq(test1.status, 0, test1.text)
+    assert(test1.text.contains("1 passed, 0 failed"), test1.text)
+    assert_eq(count_in(test1.log, "lower", "reused"), 0)
+    val build1 = avin_in(bin, dir, "", ["build", prog, "-O0", "-o", dir + "/built"])
+    assert_eq(build1.status, 0, build1.text)
+    assert_eq(count_in(build1.log, "lower", "reused"), 0)
+    val program = names_in(caches + "/program-O2")
+    val tests = names_in(caches + "/tests-O2")
+    assert(program.len() >= 3)
+    assert(tests.len() >= 3)
+    assert(names_in(caches + "/program-O0").len() >= 3)
+    for (name, _) in tests
+        assert(program.get(name) is None, "the tests' build and the program's share " + name)
+    // The edit; each command then reuses what it left alone and makes a clean build's program.
+    write_text(prog + "/extra/extra.avin", edited(Extra, "n + 100", "n + 200")).unwrap()
+    val clean = avin_in(bin, dir, "off", ["build", prog, "-o", dir + "/clean"])
+    assert_eq(clean.status, 0, clean.text)
+    val want = output_of(dir + "/clean")
+    assert(want.contains("\n201\n"), want)
+    val run2 = avin_in(bin, dir, "", ["run", prog])
+    assert_eq(run2.status, 0, run2.text)
+    assert_eq(run2.text, want)
+    assert(count_in(run2.log, "lower", "reused") > 0)
+    assert(count_in(run2.log, "emit", "reused") > 0)
+    val test2 = avin_in(bin, dir, "", ["test", prog])
+    assert_eq(test2.status, 0, test2.text)
+    assert(test2.text.contains("1 passed, 0 failed"), test2.text)
+    assert(count_in(test2.log, "lower", "reused") > 0)
+    val build2 = avin_in(bin, dir, "", ["build", prog, "-O0", "-o", dir + "/built"])
+    assert_eq(build2.status, 0, build2.text)
+    assert(count_in(build2.log, "lower", "reused") > 0)
+    assert_eq(output_of(dir + "/built"), want)
+    // The text, against a clean build's.
+    val warm_ll = avin_in(bin, dir, "", ["emit-llvm", prog, "-o", dir + "/warm.ll"])
+    assert_eq(warm_ll.status, 0, warm_ll.text)
+    assert_eq(count_in(warm_ll.log, "emit", "reused"), count_in(warm_ll.log, "lower", "functions"))
+    assert_eq(avin_in(bin, dir, "off", ["emit-llvm", prog, "-o", dir + "/clean.ll"]).status, 0)
+    assert_eq(read_text(dir + "/warm.ll").unwrap(), read_text(dir + "/clean.ll").unwrap())
+    // `verify` for each command: the executables are made again, so each builds twice and compares.
+    remove_file(prog + "/.avin/build/prog-O2.key").unwrap()
+    remove_file(prog + "/.avin/build/prog-tests-O2.key").unwrap()
+    val run3 = avin_in(bin, dir, "verify", ["run", prog])
+    assert_eq(run3.status, 0, run3.text)
+    assert_eq(run3.text, want)
+    val test3 = avin_in(bin, dir, "verify", ["test", prog])
+    assert_eq(test3.status, 0, test3.text)
+    assert(test3.text.contains("1 passed, 0 failed"), test3.text)
+    assert_eq(avin_in(bin, dir, "verify", ["build", prog, "-O0", "-o", dir + "/built"]).status, 0)
+    // A run that finds its executable built compiles nothing and reads no cache.
+    val again = avin_in(bin, dir, "", ["run", prog])
+    assert_eq(again.text, want)
+    assert_eq(phase_names(again.log), "cached ")
+
+@test("off keeps no cache and reads none; a damaged cache, another compiler's and a stale one are survived")
+off_and_damage()
+    val dir = make_temp_dir("avin-ic-off").unwrap()
+    defer _ = remove_dir_all(dir)
+    val bin = compiler_in(dir)
+    val prog = dir + "/prog"
+    write_program(prog)
+    val cache = prog + "/.avin/build/incremental/program-O2"
+    val off = avin_in(bin, dir, "off", ["run", prog])
+    assert_eq(off.status, 0, off.text)
+    val want = off.text
+    assert(want.contains("\n101\n"), want)
+    assert_eq(phase_names(off.log), "load check cunit lower keys shims emit split units link ")
+    assert(!exists(prog + "/.avin/build/incremental"))
+    assert_eq(avin_in(bin, dir, "off", ["test", prog]).status, 0)
+    assert_eq(avin_in(bin, dir, "off", ["build", prog, "-o", dir + "/x"]).status, 0)
+    assert(!exists(prog + "/.avin/build/incremental"))
+    // Made by the default, then damaged: `off` never reads it, and the default passes over it.
+    assert_eq(avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"]).status, 0)
+    val files = module_files(cache)
+    assert(files.len() >= 3)
+    for f in files
+        write_text(f, "avin instances 1\nnot what the header says\n").unwrap()
+    val ignored = avin_in(bin, dir, "off", ["build", prog, "-o", dir + "/x"])
+    assert_eq(phase_names(ignored.log), "load check cunit lower keys shims emit split units link ")
+    for f in files
+        assert_eq(read_text(f).unwrap(), "avin instances 1\nnot what the header says\n")
+    val damaged = avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"])
+    assert_eq(damaged.status, 0, damaged.text)
+    assert_eq(count_in(damaged.log, "cache", "damaged"), int(files.len()))
+    assert_eq(count_in(damaged.log, "lower", "reused"), 0)
+    assert_eq(output_of(dir + "/x"), want)
+    // A manifest of nonsense, naming files that are not there and one outside the directory.
+    write_text(cache + "/manifest", "\u{1}\u{2}nonsense\nmissing.mod\n../../main.avin\n\n").unwrap()
+    val nonsense = avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"])
+    assert_eq(nonsense.status, 0, nonsense.text)
+    assert_eq(output_of(dir + "/x"), want)
+    assert_eq(read_text(prog + "/main.avin").unwrap(), Main)
+    assert_eq(avin_in(bin, dir, "verify", ["build", prog, "-o", dir + "/x"]).status, 0)
+    // Another compiler: the same executable at another time makes keys of its own and reuses nothing.
+    val warm = avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"])
+    assert(count_in(warm.log, "lower", "reused") > 0)
+    val before = names_in(cache)
+    set_modified(bin, now() - micros(7200000000)).unwrap()
+    val other = avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"])
+    assert_eq(other.status, 0, other.text)
+    assert_eq(count_in(other.log, "lower", "reused"), 0)
+    assert_eq(count_in(other.log, "emit", "reused"), 0)
+    assert_eq(count_in(other.log, "store", "trimmed"), 0)
+    assert_eq(output_of(dir + "/x"), want)
+    // The older compiler's files, used within the hour, are kept; once an hour old they are trimmed.
+    for (name, _) in before
+        assert(exists(cache + name), name)
+    val old = now() - micros(InstanceCacheFresh + 60000000)
+    for f in module_files(cache)
+        set_modified(f, old).unwrap()
+    val trimmed = avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"])
+    assert_eq(trimmed.status, 0, trimmed.text)
+    assert_eq(count_in(trimmed.log, "store", "trimmed"), int(before.len()))
+    assert(count_in(trimmed.log, "lower", "reused") > 0)
+    for (name, _) in before
+        assert(!exists(cache + name), name)
+    assert_eq(output_of(dir + "/x"), want)
+    assert_eq(avin_in(bin, dir, "verify", ["build", prog, "-o", dir + "/x"]).status, 0)
+
+@test("two avin test runs of one program at once both pass, cold and warm, and so do a run and a test at once")
+two_tests_at_once()
+    val dir = make_temp_dir("avin-ic-tests").unwrap()
+    defer _ = remove_dir_all(dir)
+    val bin = compiler_in(dir)
+    val prog = dir + "/prog"
+    write_program(prog)
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env.push(Var("AVIN_INCREMENTAL", ""))
+    for round in 0..<2
+        if round == 1 then write_text(prog + "/extra/extra.avin", edited(Extra, "n + 100", "n + 200")).unwrap()
+        val a = spawn(bin, ["test", prog], env = env.view(), stdout = Stdio.ToPath(dir + "/a.out"), stderr = Stdio.ToPath(dir + "/a.err")).unwrap()
+        val b = spawn(bin, ["test", prog], env = env.view(), stdout = Stdio.ToPath(dir + "/b.out"), stderr = Stdio.ToPath(dir + "/b.err")).unwrap()
+        val ea = a.wait().unwrap()
+        val eb = b.wait().unwrap()
+        assert(ea is Exited(0), s"round $round: " + read_text(dir + "/a.err").unwrap_or("") + read_text(dir + "/a.out").unwrap_or(""))
+        assert(eb is Exited(0), s"round $round: " + read_text(dir + "/b.err").unwrap_or("") + read_text(dir + "/b.out").unwrap_or(""))
+        assert(read_text(dir + "/a.out").unwrap().contains("1 passed, 0 failed"))
+        assert(read_text(dir + "/b.out").unwrap().contains("1 passed, 0 failed"))
+    // A run and a test at once, after another edit: two kinds, two directories, both right.
+    write_text(prog + "/extra/extra.avin", edited(Extra, "n + 100", "n + 300")).unwrap()
+    val r = spawn(bin, ["run", prog], env = env.view(), stdout = Stdio.ToPath(dir + "/r.out"), stderr = Stdio.ToPath(dir + "/r.err")).unwrap()
+    val t = spawn(bin, ["test", prog], env = env.view(), stdout = Stdio.ToPath(dir + "/t.out"), stderr = Stdio.ToPath(dir + "/t.err")).unwrap()
+    assert(r.wait().unwrap() is Exited(0), read_text(dir + "/r.err").unwrap_or(""))
+    assert(t.wait().unwrap() is Exited(0), read_text(dir + "/t.err").unwrap_or(""))
+    assert(read_text(dir + "/r.out").unwrap().contains("\n301\n"))
+    assert(read_text(dir + "/t.out").unwrap().contains("1 passed, 0 failed"))
+    // What they left verifies, with no write half done and no file damaged.
+    for kind in ["program-O2", "tests-O2"]
+        val cache = prog + "/.avin/build/incremental/" + kind
+        for name in entries(cache).unwrap()
+            assert(!name.contains(".pending-"), name)
+        assert_eq(read_instance_store(cache).damaged, 0)
+    remove_file(prog + "/.avin/build/prog-tests-O2.key").unwrap()
+    remove_file(prog + "/.avin/build/prog-O2.key").unwrap()
+    val verified = avin_in(bin, dir, "verify", ["test", prog])
+    assert_eq(verified.status, 0, verified.text)
+    assert(count_in(verified.log, "lower", "reused") > 0)
+    val ran = avin_in(bin, dir, "verify", ["run", prog])
+    assert_eq(ran.status, 0, ran.text)
+    assert(ran.text.contains("\n301\n"), ran.text)

@@ -11,7 +11,7 @@
 import avin.fs
 import avin.io.{ConnectionRefused, ConnectionReset, IoError, TimedOut}
 import avin.net.{TcpListener, TcpStream, UnixListener, UnixStream}
-import avin.threads.{Atomic, Future, Promise, scope, sleep, spawn}
+import avin.threads.{Atomic, Future, Promise, blocking, scope, sleep, spawn}
 import avin.time.{Duration, millis, monotonic}
 
 @sysl("avin.rt.scheduler_workers")
@@ -33,9 +33,20 @@ ok[T](r: Result[T, IoError]) -> T = r match
     Ok(v) -> v
     Err(e) -> fail(e.message())
 
-// Waits until at least `n` threads are parked on sockets.
+// Waits until at least `n` threads are parked on sockets, and stops the program, rather than waiting for
+// ever, where they have not parked within a minute: a thread that failed before it parked never will.
 parkedAtLeast(n: long)
+    val deadline = monotonic() + millis(60000)
     while socketWaiters() < n
+        if monotonic() > deadline then fail(s"only ${socketWaiters()} of $n threads parked on sockets")
+        sleep(millis(1))
+
+// Waits until the sockets' threads have parked at least `n` times since there had been `from` parks,
+// stopping the program where they have not within a minute.
+parksReach(from: long, n: long)
+    val deadline = monotonic() + millis(60000)
+    while socketParks() - from < n
+        if monotonic() > deadline then fail(s"only ${socketParks() - from} of $n parks on sockets")
         sleep(millis(1))
 
 // The two ends of one connection: the client's and the one a listener of its own accepted.
@@ -87,6 +98,11 @@ main() -> int
     // Start the workers first, so the count compared below is the one the connections find.
     val warm = (0..<int(processors()) * 2).map(_ -> spawn(() -> sleep(millis(1)))).toVector()
     for t in warm do t.join()
+    // And make the program's first wait counted by the futures' pools here: it initializes their shared
+    // `lazy val`, and threads that wait for a `lazy val` another thread is initializing hold their
+    // workers, which the runtime replaces once they have held them a tick. Left to the hundred clients
+    // below, whose first `await`s run at once, that would count against the replacements compared.
+    blocking(())
     val started = workers()
     val released = releases()
     val parks = socketParks()
@@ -214,8 +230,10 @@ main() -> int
     ok(c7.writeText("done\n"))
     println(s"kept while parked: ${keeper.join()}, garbage $garbage")
 
-    // A write far larger than the socket's buffers, read slowly at the other end in small pieces:
-    // the writer parks for room many times and every byte arrives in order.
+    // A write far larger than the socket's buffers, read at the other end only once the writer has
+    // filled them and parked, and then once more after one piece has made room: the writer parks for
+    // room again, and every byte arrives in order. Reading at once instead would race the writer, which
+    // need never fill the buffers of a reader that keeps up with it.
     val (c5, s5) = pair()
     val size = 4 << 20
     val parksBefore = socketParks()
@@ -224,7 +242,10 @@ main() -> int
         s5.close())
     var total = 0
     var inOrder = true
+    var pieces = 0
     while true
+        if pieces < 2 then parksReach(parksBefore, long(pieces + 1))
+        pieces += 1
         val got = ok(c5.read(65536))
         if got.length() == 0 then break
         for k in 0..<got.length()
