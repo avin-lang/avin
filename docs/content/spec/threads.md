@@ -43,7 +43,8 @@ main() -> int
   running.
 - **The program ends when `main` returns**, whatever other threads are still running: standard
   output is flushed, the main thread runs the exit hooks, and the process exits with `main`'s
-  status, taking the other threads with it.
+  status, taking the other threads with it. A `main` answering `Err` ends it the same way, its
+  error line written first and with status 1 (see [`main`](/spec/declarations/#main)).
 - A library scope makes the joins structural: `scope(s -> …)` returns its body's result only once
   every thread started through `s.spawn` has finished. `s.spawn` takes the same arguments as
   `spawn` and is called by the thread that runs the scope's body, while the scope is open; a call

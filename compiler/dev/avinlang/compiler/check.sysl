@@ -1082,6 +1082,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
     var entry: Option[usize] = None
+    var entry_answer: Buf[&Type] = buf()
     c.scope.get(qualified(root_module, "main")) match
         Some(ids) ->
             entry = Some(ids[0])
@@ -1107,9 +1108,17 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
             if takes_arguments && main.defaults.len() > 0 && main.defaults[0] is Some(_)
                 c.note(main_unit, main.decl.name_span, "`main`'s `args` has no default; `main` is `main()` or `main(args: Vector[string])`")
             if main.decl.type_params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` cannot be generic")
-            val result = main.result.unwrap_or(ErrorType)
-            if !(*result is Unit || *result is Int(_) || *result is Nothing || *result is ErrorType)
-                c.note(main_unit, main.decl.name_span, s"`main` yields unit or an integer, not ${type_name(result)}")
+            val result = zonk(&c, main.result.unwrap_or(ErrorType))
+            main_answer(&c, result) match
+                Some(args) ->
+                    if !(*args[0] is Unit || *args[0] is Int(_) || *args[0] is Nothing || *args[0] is ErrorType)
+                        c.note(main_unit, main.decl.name_span, s"`main` answers with a `Result[unit, E]` or a `Result[int, E]`, and its `Ok` holds ${type_name(args[0])}: `Ok` exits with 0 or with the integer, so it holds nothing or an exit status")
+                    elif !(*args[1] is ErrorType) && !displays(&c, args[1])
+                        c.note(main_unit, main.decl.name_span, s"`main`'s error is shown by its `Display`, and `${type_name(args[1])}`, the error `main` answers, does not implement `Display`")
+                    else entry_answer = args
+                None ->
+                    if !(*result is Unit || *result is Int(_) || *result is Nothing || *result is ErrorType)
+                        c.note(main_unit, main.decl.name_span, s"`main` yields unit, an integer or a `Result[unit, E]` or `Result[int, E]`, not ${type_name(result)}")
         // A program built for its tests runs them rather than `main`, so it may have none.
         None -> if !testing then c.note(main_unit, Span(0, 0), "a program needs a `main` function")
     report_derived(&c)
@@ -1130,7 +1139,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1251,6 +1260,15 @@ private test_answer(c: *Checker, result: &Type) -> Option[&Type]
         None -> return None
     *result match
         Data(id, _, args) -> if id == result_id && args.len() == 2 && *args[0] is Unit then Some(args[1]) else None
+        _ -> None
+
+// The two type arguments of a `main` that answers with a `Result`: its `Ok` type and its error.
+private main_answer(c: *Checker, result: &Type) -> Option[Buf[&Type]]
+    val result_id = core_data(c, "Result") match
+        Some(r) -> r
+        None -> return None
+    *result match
+        Data(id, _, args) -> if id == result_id && args.len() == 2 then Some(args) else None
         _ -> None
 
 // Whether values of `t` implement the core library's `Display`.

@@ -416,6 +416,45 @@ needed once the callee has started:
 A trap reports the place it happened as always, but the frames a tail call replaced are gone: a
 program stopped after a million tail calls was not a million calls deep.
 
+### `main`
+
+A program starts at `main`, a function of the root module written `main()` or
+`main(args: Vector[string])`, whose `args` are the program's arguments after its name. It is not
+generic, overloaded, or given a default or a repeated parameter. What it yields decides how the
+program exits:
+
+```text
+import avin.fs
+import avin.io.IoError
+
+main(args: Vector[string]) -> Result[unit, IoError | ParseError]
+    for file in args
+        val settings = parse(fs.readText(file)?)?
+        println(s"$file: ${settings.size} settings")
+    Ok(())
+```
+
+- **unit**: the program exits with status 0.
+- **An integer type**: the program exits with that integer as its status (its low 8 bits are what
+  the operating system keeps).
+- **`Nothing`**: `main` never returns, so whatever ends it, `exit` or a trap, sets the status.
+- **`Result[unit, E]` or `Result[int, E]`**, so that `?` can be used in `main`. `Ok(())` exits with 0, and
+  `Ok(n)` exits with `n`. `Ok` may hold any integer type, and `Nothing` for a `main` that only
+  answers `Err`, such as `main() = Err("nothing to do")`. **`Err(e)` writes `error: ` and `e`'s
+  `Display` to standard error as one line, and exits with status 1.** It does this after whatever
+  `main` wrote to standard output and before the exit hooks run. `E` must implement `Display`;
+  an error type with no `Display`, even one with `Debug`, is refused. A union of errors, `IoError |
+  ParseError`, is shown by the `Display` of the member it holds, so every member must have one. An
+  `Ok` of any other type, such as `Result[string, E]`, is refused, since there is no status to read
+  from it.
+- Any other type is refused.
+
+Returning from `main`, with any of these, ends the program the same way: standard output is flushed,
+the exit hooks run on the main thread, and the process exits, ending the
+[threads](/spec/threads/) and actors still running. A trap in `main`, or in the error's `Display`
+while it is written, stops the program as a trap does anywhere, so no `error: ` line is written.
+A program built by `avin test` runs its tests and not `main`, so `main` is checked but not run.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.

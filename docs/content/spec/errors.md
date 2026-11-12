@@ -110,7 +110,9 @@ function yielding errors of `F`:
   and each instance calls its type argument's `from`.
 
 An `Option` `?` cannot exit a function returning `Result`, and the enclosing function's result type
-must be able to carry the failure.
+must be able to carry the failure. `main` may answer with `Result[unit, E]` or `Result[int, E]`,
+so a whole program can use `?`: an `Err` reaching the end of `main` is written to standard error as
+`error: ` and its `Display`, and the program exits with 1 (see [`main`](/spec/declarations/#main)).
 
 `?` returns from the function it is written in; inside a lambda, from the lambda. That function's
 result type must be declared, or for a lambda known where it is written, as in
