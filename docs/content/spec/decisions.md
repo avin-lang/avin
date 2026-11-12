@@ -7060,10 +7060,10 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
-- **The editor grammar tests run in the release flow, not in the compiler gate.** `sysl test
+- Settled on the user's delegation 2026-11-12 (built on branch `grammar-tests`): **the editor grammar tests run in the release flow, not in the compiler gate.** `sysl test
   editors/grammar-tests` is a package of its own so the compiler gate does not need Oniguruma; it
-  broke unnoticed on a Sysl upgrade because nothing ran it. Proposed: `scripts/release.sh` runs it
-  (one marshal job, one unit) before tagging, and the director runs it after any Sysl bump or
+  broke unnoticed on a Sysl upgrade because nothing ran it. `scripts/release.sh` runs it (step
+  `03b-grammar`, through the slot wrapper) before tagging, and the director runs it after any Sysl bump or
   grammar change. WHY: the grammar ships in the VS Code extension and the IntelliJ plugin, so a
   release must not carry a grammar whose tests cannot build; the run takes seconds. ALTERNATIVES:
   adding it to the compiler gate (couples the gate to a native Oniguruma build and to the
