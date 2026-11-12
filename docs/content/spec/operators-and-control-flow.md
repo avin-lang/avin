@@ -95,7 +95,7 @@ An infix call by a word groups to the left and binds more loosely than the arith
 shift, cons and range operators, and more tightly than comparisons, `is`, `&&` and `||` (a method
 named by a symbol binds by [its first character](#methods-named-by-symbols)): `a max b + 1` is
 `a max (b + 1)`, `a max b max c` is `(a max b) max c`, and `xs contains x && ok` is
-`(xs contains x) && ok`. There is no postfix form: `xs size` is an error, written `xs.size()`.
+`(xs contains x) && ok`. There is no postfix form: `xs size` is an error, written `xs.size`.
 
 An infix call stays on one line. A line that ends with the method's name continues it: the argument
 is the indented block on the lines that follow.

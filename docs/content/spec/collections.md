@@ -125,7 +125,10 @@ read by name with no parentheses, `xs.head`, `xs.size`, `m.keys`, on every colle
 `tail`, `init`, `size`, `length`, `knownSize`, `isEmpty`, `nonEmpty`, `min`, `max`, `minOption`,
 `maxOption`, `sum`, `product`, `reverse`, `distinct`, `indices`, `flatten`, `transpose`, `unzip`,
 `zipWithIndex`, `keys`, `values`, `keySet`, and the conversions to immutable collections `toList`,
-`toVector`, `toArraySeq`, `toSet`, `toMap`, `toSortedSet` and `toSortedMap`. Each answers from the
+`toVector`, `toArraySeq`, `toSet`, `toMap`, `toSortedSet` and `toSortedMap`; so are `sorted`, a
+sorted map's or set's `firstKey` and `lastKey`, a mutable tree map's `toTreeMap`, a bit set's
+`toBitMask`, and a queue's `front`, `frontOption`, `dequeue`, `dequeueOption` and `toQueue`, since
+dequeuing an immutable queue answers the element and the rest. Each answers from the
 collection without changing it. **What hands out something to change or to use up keeps its
 parentheses**: `iterator()`, `toArray()` and `toBuffer()`, each a fresh mutable object, and an
 iterator's `next()` and `hasNext()`, a mutable collection's `clear()` and the rest of its changes. A
@@ -584,7 +587,7 @@ The ordered operations, members of `SortedMap` and `SortedSet`, answering a map'
 |---|---|
 | `headOption`, `lastOption` | the least and the greatest entry, as an `Option` |
 | `head`, `last` | the least and the greatest entry; trap when empty |
-| `firstKey()`, `lastKey()` | the least and the greatest key (of a set, element); trap when empty |
+| `firstKey`, `lastKey` | the least and the greatest key (of a set, element); trap when empty |
 | `minAfter(k)` | the entry with the least key at least `k`, as an `Option` |
 | `maxBefore(k)` | the entry with the greatest key less than `k`, as an `Option` |
 | `rangeFrom(low)` | the entries whose keys are at least `low` |
@@ -616,13 +619,13 @@ traits, and a literal where a `SortedMap` or `SortedSet` is expected builds a tr
 are the in-place counterparts, with the whole mutable `Map` and `Set` API (`m(k) = v`, `get`,
 `remove`, `getOrElseUpdate`, `updateWith`, `+=`, `-=`, `++=`, `--=`, `filterInPlace`, `copy()`, and
 for a set `add`, `union`, `intersect`, `diff`, `subsetOf`) and the ordered operations of the table
-above: `headOption`, `lastOption`, `head`, `last`, `firstKey()`, `lastKey()`, `minAfter`,
+above: `headOption`, `lastOption`, `head`, `last`, `firstKey`, `lastKey`, `minAfter`,
 `maxBefore`, `reverseIterator()` and the four `range` forms. The slices are new mutable collections,
 not views. Two operations are their own: `removeFirst()` and `removeLast()` unbind the least or the
 greatest key and answer its entry (a set's element), trapping when empty, and `removeFirstOption()` and
 `removeLastOption()` answer an `Option` instead. A mutable tree collection holds an immutable `TreeMap`
 or `TreeSet` and replaces it at each update, so the cost of every operation is the logarithmic one of
-the persistent tree, `toTreeMap()` and `toTreeSet()` hand out the current tree in constant time as a
+the persistent tree, `toTreeMap` and `toTreeSet()` hand out the current tree in constant time as a
 snapshot later updates do not reach, and an iterator, or a `for` loop, goes on over the entries as they
 were when it began: updating the collection inside the loop is legal and the loop does not see the
 change. Equality and hash follow the contents, and equal an immutable tree collection's of the same
@@ -660,13 +663,13 @@ one leaves the set as it was, but anything that would put one in traps: `incl`, 
 and the builder. `minAfter`, `maxBefore` and the four slices take any `int`, so `rangeFrom(-5)` is
 the whole set.
 
-`toBitMask()` answers the words as a `Vector[long]`, the lowest element in bit 0 of the first, with no
+`toBitMask` answers the words as a `Vector[long]`, the lowest element in bit 0 of the first, with no
 empty word at the end (so the empty set's is `[]`), and `BitSet.fromBitMask(words)` is its inverse,
 accepting empty words at the end.
 
 ```text
 val s = BitSet(1, 3, 64)
-println(s.toBitMask())                  // [10, 1]
+println(s.toBitMask)                  // [10, 1]
 println(BitSet.fromBitMask([10, 1]))    // {1, 3, 64}
 println(s.rangeFrom(2))                 // {3, 64}
 ```
@@ -1074,7 +1077,7 @@ total(Array.fill(4, 1))            // an Array
 Impls add more to every sequence ([impl](/spec/declarations/#impl)), written once on `Seq` and
 reached through generic code over `Seq[T]` as on each sequence type: `contains(element)` and
 `indexOf(element)`, which compare with `equals` and are `exists` and `indexWhere`, so a list walks
-itself once; where the elements are ordered, the sorts, `sorted()`, `sortBy` and `sortWith`
+itself once; where the elements are ordered, the sorts, `sorted`, `sortBy` and `sortWith`
 ([sorting](#sorting)); and the transformations and structural methods in
 [methods every Seq has](#methods-every-seq-has).
 
@@ -1114,7 +1117,7 @@ while pending.nonEmpty do run(pending.removeHead())
 ## Priority queues
 
 `avin.collections.mutable.PriorityQueue[T]` is a mutable binary heap: elements go in in any order
-and `dequeue()` takes out the greatest. `PriorityQueue[int]()` orders by the element type's `Ord`;
+and `dequeue` takes out the greatest. `PriorityQueue[int]()` orders by the element type's `Ord`;
 `PriorityQueue.withOrdering(compare)` takes a comparison, positive where its first argument is to
 come out before its second. A queue giving the least first is made with `Reverse` elements or with
 `reverseOrder`, and `compareBy` and `thenBy` build the comparison from keys.
@@ -1124,14 +1127,14 @@ val q = PriorityQueue[int]()
 q.enqueue(3, 9, 1)
 q += 5
 q.head           // 9, left in the queue
-q.dequeue()        // 9
+q.dequeue        // 9
 q.dequeueAll()     // [5, 3, 1], and q is empty
 
 val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
 ```
 
 `enqueue(xs*)`, `addOne(x)`, `addAll(xs)`, `+=` and `++=` add, each in O(log n) per element;
-`dequeue()` and `head` trap on an empty queue, `dequeueOption()` and `headOption` answer `None`;
+`dequeue` and `head` trap on an empty queue, `dequeueOption` and `headOption` answer `None`;
 `size`, `isEmpty` and `nonEmpty` take constant time, and `clear()` empties the queue.
 `copy()` makes an independent queue with the same comparison, and `PriorityQueue.newBuilder` a
 builder. A queue is `Iterable`: `iterator()` and `toVector` give the elements in heap order, the
@@ -1144,9 +1147,9 @@ queue is not stable.
 
 `Queue[+T]` is an immutable first-in, first-out sequence. `Queue(1, 2, 3)` has 1 at its front and
 `Queue.empty[int]()` is empty. `q.enqueue(x)` makes a queue with `x` after the others and
-`q.enqueueAll(xs)` one with every element of `xs`; `q.dequeue()` answers the front element and the
-queue of the rest as a pair, trapping on an empty queue, `q.dequeueOption()` answers `None` instead,
-and `q.front()` and `q.frontOption()` read the front. Each leaves `q` as it was, so any earlier
+`q.enqueueAll(xs)` one with every element of `xs`; `q.dequeue` answers the front element and the
+queue of the rest as a pair, trapping on an empty queue, `q.dequeueOption` answers `None` instead,
+and `q.front` and `q.frontOption` read the front. Each leaves `q` as it was, so any earlier
 version stays usable. The elements are held in two lists, the front in order and the back reversed;
 when the front runs out the back is turned around into it. `enqueue`, `dequeue`, `front` and `isEmpty`
 take amortized constant time, and `q(i)` takes time proportional to `i`.
@@ -1159,7 +1162,7 @@ displays as `[1, 2, 3]` and is built by `Queue.newBuilder`. It is covariant: `en
 
 ```text
 val jobs = Queue("build", "test")
-val (next, rest) = jobs.enqueue("deploy").dequeue()
+val (next, rest) = jobs.enqueue("deploy").dequeue
 ```
 
 ## Sorting
@@ -1168,7 +1171,7 @@ Every sequence sorts into a new one, and the mutable sequences also sort in plac
 what `Ord.compare` answers: negative, zero or positive as its first argument orders before, with or
 after its second.
 
-- On every `Seq`: `sorted()` where the elements are `Ord`, ascending; `sortBy(key)`, ascending by
+- On every `Seq`: `sorted` where the elements are `Ord`, ascending; `sortBy(key)`, ascending by
   a key that is `Ord`; and `sortWith(compare)`, by any comparison. They answer a `Vector` and leave
   the sequence as it was. A `List` has its own three, which answer a `List`, as its `map` and
   `filter` do: a list sorted is usually used as a list, walked from its front or matched with `::`,
@@ -1176,7 +1179,7 @@ after its second.
   since `Seq`'s already answer a vector.
 - On `Array`, `Buffer` and `Deque`: `sortInPlace()`, `sortInPlaceBy(key)` and
   `sortInPlaceWith(compare)` reorder the elements in place and answer unit. A deque sorts front
-  first, wherever its ring starts. Being sequences, they also have `sorted()`, `sortBy` and
+  first, wherever its ring starts. Being sequences, they also have `sorted`, `sortBy` and
   `sortWith`, answering a sorted `Vector` and leaving the collection as it was.
 
 **Every sort is stable**: elements that compare equal keep the order they had, so sorting by one
@@ -1188,7 +1191,7 @@ pairwise between the elements and one scratch array, the runs doubling each pass
 **`sortBy` and `sortInPlaceBy` compute `key` once for each element**, before any comparison, and
 sort the elements as their keys sort; so a key that is costly to compute, such as a string built from
 the element, costs n computations rather than one per comparison, at the price of an array of the
-keys. `sortWith` calls `compare` as the sort needs it, and `sorted()` is `sortWith` by `compare`.
+keys. `sortWith` calls `compare` as the sort needs it, and `sorted` is `sortWith` by `compare`.
 
 ```text
 data Entry(rank: int, name: string)
@@ -1231,7 +1234,7 @@ xs.search(3, 2, 4) // Found(2)
 
 Strings order by code point (their bytes, which in UTF-8 order the same), so every capital comes
 before every small letter; reals order as IEEE 754 does. Sorting elements without `Ord` by
-`sorted()` or `sortInPlace()` is a compile-time error naming the bound, and `sortWith` is the way to sort
+`sorted` or `sortInPlace()` is a compile-time error naming the bound, and `sortWith` is the way to sort
 them.
 
 ## Ranges

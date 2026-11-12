@@ -371,7 +371,7 @@ infer is.
   first one in the call whose parameter types are known, declared by it or decided by the arguments
   checked so far. So what a typed lambda decides reaches one written before it:
   `both(match n -> n + 1, (x: int) -> x * 10)` for `both[A, B](g: (A) -> B, f: (A) -> B)`,
-  and `back(match s -> s.byteLength(), (x: int) -> s"<$x>")` for `back[A, B](g: (B) -> A, f: (A) -> B)`,
+  and `back(match s -> s.byteLength, (x: int) -> s"<$x>")` for `back[A, B](g: (B) -> A, f: (A) -> B)`,
   whose `match` takes `B` from the lambda's result. Where none is known, the first one left is
   checked and reports what it cannot infer.
 - A lambda whose parameter types are known takes part in the tiers above by what it yields, as any

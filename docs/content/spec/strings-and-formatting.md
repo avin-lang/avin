@@ -247,10 +247,10 @@ writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)
   form under any other. `withWidth` and `withPrecision` set a count as a specifier's hole does.
   `writeField` writes a text in the field a spec describes, padded with spaces, which is how most
   `display` methods end.
-- `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
+- `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text`.
   `StandardOutput` is the writer for standard output; it writes an integer's digits without making
-  a string of them. A `StringWriter` also answers `length()`, the number of bytes written so far (a
-  character of several bytes counts them all), and `isEmpty()`, and `clear()` forgets everything
+  a string of them. A `StringWriter` also answers `length`, the number of bytes written so far (a
+  character of several bytes counts them all), and `isEmpty`, and `clear()` forgets everything
   written so it is as new; a text already taken is unchanged. `StandardError` is the writer for standard error, which keeps no buffer.
 - `print` and `println` are each one ordinary library function, `print(values: Any*)` and
   `println(values: Any*)`. `print` writes its arguments to standard output separated by `, ` (they

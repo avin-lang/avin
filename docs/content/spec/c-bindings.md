@@ -853,7 +853,7 @@ is unchanged. A binding answers such memory in one of two ways:
   `length:`, a C expression over the call's parameters and out values, evaluated in the glue after
   the call. The array never reads C's memory.
 - **Borrowed**, as a `ByteView` from `avin.c`, named with `view:` and given a `length:`: a handle on
-  the C memory that reads it in place, bounds-checked — `length()`, `apply(i)`, `slice(from, until)`
+  the C memory that reads it in place, bounds-checked — `length`, `apply(i)`, `slice(from, until)`
   copying a range out, and `copy()` — and holds a reference to the handle that owns the memory, so
   the owner is not collected while the view is open. **A view is valid until its owner is used
   again**: any bound method of the owner, or its `close()`, closes every view it lent first, since a
@@ -949,7 +949,7 @@ private surfaceForData(pixels: ByteBlock, format: Format, width: int, height: in
 ```
 
 Cairo reads `height * stride` bytes from `pixels` and no prototype says so; the library checks
-`pixels.length() >= height * stride` before the call, a precondition the binding takes on trust like
+`pixels.length >= height * stride` before the call, a precondition the binding takes on trust like
 any `length`.
 
 `ByteBlock(length)` with a negative length stops the program, and the class's own constructor,

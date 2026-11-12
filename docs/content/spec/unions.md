@@ -305,7 +305,7 @@ clause naming a member:
 ```text
 size(x: int | string) -> int
 size(n: int) = n
-size(s: string) = s.charCount()
+size(s: string) = s.charCount
 ```
 
 ### is
@@ -316,11 +316,11 @@ value:
 
 ```text
 lengthOf(v: int | string) -> int
-    if v is s: string then return s.charCount()
+    if v is s: string then return s.charCount
     0
 ```
 
-The union value itself keeps its type: `if v is _: string then v.charCount()` is an error, since `v`
+The union value itself keeps its type: `if v is _: string then v.charCount` is an error, since `v`
 is still an `int | string`; the pattern binds the narrower value to a name of its own.
 
 ### Generic members
@@ -359,7 +359,7 @@ type the branches of an `if` yielding each member agree on, and in the traits th
 ```text
 pet(a: Dog | Cat) -> string = a.name()        // Dog and Cat join to Animal, which has `name`
 shown(v: int | string) -> string = v.toString()     // Display
-v.charCount()
+v.charCount
 // error: `int | string` has no member `charCount`: its members share no type that has one; take it
 // apart with a `match` or `is` first
 ```
