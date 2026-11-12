@@ -1418,6 +1418,9 @@ private declare_unit(c: *Checker, unit: usize)
                 if matching_overload(c, symbol, set) is Some(first)
                     note_duplicate(c, unit, f.name_span, s"`${f.name}` is declared more than once with the same parameter types; overloads differ in their parameter types, and a function that chooses by its arguments' values is written with clauses", c.symbols[first].unit, c.symbols[first].decl.name_span)
                     continue
+                if parameterless_clash(c, f, set) is Some(first)
+                    note_duplicate(c, unit, f.name_span, parameterless_function_overload_message(f.name), c.symbols[first].unit, c.symbols[first].decl.name_span)
+                    continue
                 if set.len() == 0 && c.variants.get(key) is Some(v)
                     note_duplicate(c, unit, f.name_span, s"`${f.name}` is already a variant of ${variant_owners(c, key)}", c.data[v.data].unit, c.data[v.data].variants[v.index].span)
                 if set.len() == 0 && c.class_types.get(key) is Some(k)
@@ -4093,6 +4096,16 @@ private check_data_parameterless_overloads(c: *Checker, id: usize)
     for entry in d.table
         if entry is Some(m) then all.push(m)
     report_parameterless_overloads(c, d.methods, all, own_type(d, id))
+
+/** The first of `set`, the functions already declared with `f`'s name in its scope, that `f` may not
+ * join: any of them, when either `f` or it is declared without a parameter list. */
+private parameterless_clash(c: *Checker, f: &Function, set: Buf[usize]) -> Option[usize]
+    for other in set
+        if f.parameterless || c.symbols[other].decl.parameterless then return Some(other)
+    None
+
+private parameterless_function_overload_message(name: string) -> string =
+    s"`$name` is declared both with and without a parameter list: the one without is the only function of its name, since `$name` calls it and leaves no call to choose an overload with; give the functions different names"
 
 private parameterless_overload_message(name: string) -> string =
     s"`$name` is declared both with and without a parameter list: the one without is the only method of its name, since `x.$name` calls it and leaves no call to choose an overload with; give the methods different names"
@@ -9826,8 +9839,9 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     val symbol = c.symbols[id]
     val decl = symbol.decl
     val unit = symbol.unit
-    // A method's clauses match its arguments, not its receiver.
-    val skip = if symbol.owner_class is Some(_) then 1usize else 0usize
+    // A method's clauses match its arguments, not its receiver: that of a class's, a trait's or an
+    // impl's method, which only a static member lacks.
+    val skip = if symbol.params.len() > decl.params.len() then symbol.params.len() - decl.params.len() else 0usize
     var params: Buf[&Type] = buf()
     var matched: Buf[&TExpr] = buf()
     for i in skip..<symbol.params.len()
@@ -10237,6 +10251,9 @@ private declare_local_functions(c: *Checker, items: Buf[&Expr])
             symbol.root = Some(c.body.root)
             if same_as_overload(c, symbol, set)
                 c.note(unit_of(c), decl.name_span, s"`${decl.name}` is declared more than once in this block with the same parameter types")
+                continue
+            if parameterless_clash(c, decl, set) is Some(_)
+                c.note(unit_of(c), decl.name_span, parameterless_function_overload_message(decl.name))
                 continue
             c.symbols.push(symbol)
             c.states.push(0)
@@ -11006,6 +11023,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
                     if found.len() == 0 then return apply_value(c, at, name, o, ids, ps, expected)
         return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
+        if parameterless_function(c, name) is Some(f) then return parameterless_function_read(c, at, f, expected)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         if adapted_function(c, at, name, id, expected) is Some(lambda) then return lambda
         return named_function_value(c, at, name, None, expected)
@@ -15117,6 +15135,8 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     // the name. An object that declares `apply` is called through it, and a companion's `apply`
     // methods overload the constructor its name has in call position.
     val ids = lookup_functions(c, name)
+    // The parentheses after a function declared without a parameter list call what it yields.
+    if parameterless_function(c, name) is Some(f) then return parameterless_function_called(c, at, named.span, f, args, explicit)
     if applying_object(c, name, ids) is Some(o) then return apply_call(c, at, named.span, name, o, ids, args, explicit, expected)
     var global = if explicit is None && ids.len() == 0 then global_named(c, name) else None
     if global is Some(g)
@@ -17343,6 +17363,11 @@ private local_use(c: *Checker, id: usize, at: Span)
 // function type: of the overloads whose parameters accept that type's, the most specific.
 private named_function_value(c: *Checker, at: Span, name: string, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     var ids = lookup_functions(c, name)
+    if parameterless_function(c, name) is Some(f)
+        if explicit is Some(_)
+            c.note(unit_of(c), at, s"`$name` takes no type parameters: it is declared without a parameter list")
+            return TExpr(at, ErrorType, UnitConst)
+        return parameterless_function_read(c, at, f, expected)
     // Type arguments written on the name choose among the overloads with that many type parameters.
     if explicit is Some(written)
         var taking: Buf[usize] = buf()
@@ -17374,6 +17399,49 @@ private named_function_value(c: *Checker, at: Span, name: string, explicit: Opti
         None ->
             c.note(unit, at, s"`$name` used as ${type_name(zonk(c, expected.unwrap()))} is ambiguous: ${overload_list(c, fitting)} each accept it")
             TExpr(at, ErrorType, UnitConst)
+
+/** The function `name` refers to when it is one declared without a parameter list: `def now -> int`
+ * at the top level or in a block. Such a function is the only one of its name in its scope. */
+private parameterless_function(c: *Checker, name: string) -> Option[usize]
+    val ids = lookup_functions(c, name)
+    for id in ids
+        if c.symbols[id].decl.parameterless then return Some(id)
+    None
+
+// A function declared without a parameter list, named: naming it calls it, so each read runs its body
+// again. It has no function value; where a function type is expected and it yields something else,
+// the error names the lambda.
+private parameterless_function_read(c: *Checker, at: Span, id: usize, expected: Option[&Type]) -> &TExpr
+    if expected is Some(want) && *zonk(c, want) is Function(_, _, _)
+        val call = call_function(c, at, at, id, buf(), None, None, buf())
+        val yields = zonk(c, call.ty)
+        if !(*yields is Function(_, _, _) || *yields is TypeVar(_, _, _) || *yields is ErrorType) && settled(yields)
+            val name = c.symbols[id].decl.name
+            c.note(unit_of(c), at, s"`$name` takes no parameter list, so it has no function value: naming it calls it; for a function, write a lambda, as in `() -> $name`")
+            return TExpr(at, ErrorType, UnitConst)
+        return call
+    call_function(c, at, at, id, buf(), None, expected, buf())
+
+// `name(args)` where `name` is a function declared without a parameter list: the parentheses call
+// what it yields, which must then be a function, or a value with `apply` given arguments.
+private parameterless_function_called(c: *Checker, at: Span, name_span: Span, id: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]]) -> &TExpr
+    val name = c.symbols[id].decl.name
+    if explicit is Some(_)
+        c.note(unit_of(c), name_span, s"`$name` takes no type parameters: it is declared without a parameter list")
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    val value = call_function(c, name_span, name_span, id, buf(), None, None, buf())
+    val ty = zonk(c, value.ty)
+    if *ty is ErrorType || *ty is Nothing
+        for a in args
+            check_statement(c, a.value)
+        return TExpr(at, ty, UnitConst)
+    if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
+    c.note(unit_of(c), name_span, s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
+    for a in args
+        check_statement(c, a.value)
+    TExpr(at, ErrorType, UnitConst)
 
 // A named function used as a value. A generic one is instantiated as a call would be, with its type
 // arguments written or decided by the expected function type.
