@@ -3,6 +3,7 @@
 // itself has ended. A pipeline's stages share the group; a sequence's later part leads a new one
 // where every member of the group has ended; the outermost command's setting decides for its parts.
 import avin.fs
+import avin.io
 import avin.io.IoError
 import avin.process.{Child, Command}
 import avin.signal
@@ -11,7 +12,7 @@ import avin.time.millis
 
 ok[T](r: Result[T, IoError]) -> T = r match
   Ok(v) -> v
-  Err(e) -> fail(e.message())
+  Err(e) -> fail(e.message)
 
 // Waits until `file` holds a line, and answers it.
 written(file: string) -> string
@@ -20,15 +21,18 @@ written(file: string) -> string
       Ok(text) if text.endsWith("\n") -> return text.trim()
       _ -> threads.sleep(millis(5))
 
-// Signals the group with zero until nobody is left in it, and answers the refusal.
-emptied(c: Child) -> Result[unit, IoError]
+// Signals the group with zero until nobody is left in it, and answers the refusal's kind.
+emptied(c: Child) -> Result[unit, io.ErrorKind]
   loop
     val r = c.signalGroup(0)
-    if r.isErr() then return r
+    if r.isErr() then return r.mapErr(kind)
     threads.sleep(millis(5))
 
 // The process group the program `pid` is in, as `ps` says.
-groupOf(pid: string) -> string = ok(Command("/bin/ps", "-o", "pgid=", "-p", pid).output().mapErr(e -> IoError.Other("ps"))).trim()
+groupOf(pid: string) -> string = ok(Command("/bin/ps", "-o", "pgid=", "-p", pid).output().mapErr(e -> IoError(io.Other("ps")))).trim()
+
+// An error's kind, without the process group its message names.
+kind(e: IoError) -> io.ErrorKind = e.kind
 
 main()
   val dir = ok(fs.createTempDir("avin-child-group"))
@@ -36,7 +40,7 @@ main()
   val leader = ok(Command("/bin/sleep", "30").inNewGroup().start())
   println(leader.group() == Some(leader.pid()))
   println(groupOf(leader.pid().toString()) == leader.pid().toString())
-  println(leader.signalGroup(signal.Terminate))
+  println(leader.signalGroup(signal.Terminate).mapErr(kind))
   println(leader.waitFor())
   println(emptied(leader))
 
@@ -47,15 +51,15 @@ main()
   println(groupOf(grandchild) == tree.pid().toString())
   println(tree.signal(signal.Kill))
   println(tree.waitFor())
-  println(tree.signalGroup(0))
-  println(tree.signalGroup(signal.Terminate))
+  println(tree.signalGroup(0).mapErr(kind))
+  println(tree.signalGroup(signal.Terminate).mapErr(kind))
   println(emptied(tree))
 
   // A leader that exits at once, leaving a grandchild running: the group outlives it.
   val left = ok(Command("/bin/sh", "-c", "/bin/sleep 300 & echo started").inNewGroup().toFile(dir + "/left").start())
   println(left.waitFor())
-  println(left.signalGroup(0))
-  println(left.signalGroup(signal.Kill))
+  println(left.signalGroup(0).mapErr(kind))
+  println(left.signalGroup(signal.Kill).mapErr(kind))
   println(emptied(left))
 
   // A pipeline's stages share the group its first stage leads.
@@ -65,7 +69,7 @@ main()
   println(piped.group() == Some(a.toLong()))
   println(groupOf(a) == a)
   println(groupOf(b) == a)
-  println(piped.signalGroup(signal.Terminate))
+  println(piped.signalGroup(signal.Terminate).mapErr(kind))
   println(piped.waitFor())
 
   // A sequence: its second part joins the group while the first is in it...
@@ -74,7 +78,7 @@ main()
   println(joins.waitFor())
   println(Some(written(dir + "/joined").toLong()) == firstGroup)
   println(joins.group() == firstGroup)
-  println(joins.signalGroup(signal.Kill))
+  println(joins.signalGroup(signal.Kill).mapErr(kind))
   println(emptied(joins))
   // ...and leads a new one, which the group becomes, where every member had ended.
   val leads = ok((Command("/usr/bin/true") andThen Command("/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 30", dir + "/leads")).inNewGroup().start())
@@ -88,18 +92,18 @@ main()
   println(leads.group() == Some(second.toLong()))
   println(leads.group() != before)
   println(groupOf(second) == second)
-  println(leads.signalGroup(signal.Terminate))
+  println(leads.signalGroup(signal.Terminate).mapErr(kind))
   println(leads.waitFor())
 
   // A part asking for a group inside a command started in one joins the outer one.
   val nested = ok((Command("/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 30", dir + "/outer") | Command("/bin/sh", "-c", "echo $$ > \"$0\"; exec /bin/sleep 30", dir + "/inner").inNewGroup()).inNewGroup().start())
   val outer = written(dir + "/outer")
   println(groupOf(written(dir + "/inner")) == outer)
-  println(nested.signalGroup(signal.Kill))
+  println(nested.signalGroup(signal.Kill).mapErr(kind))
   println(nested.waitFor())
   // A part asking for a group in a command that did not: the part leads one, which the command's is.
   val partly = ok((Command("/bin/sh", "-c", "exit 0") | Command("/bin/sleep", "30").inNewGroup()).start())
   println(partly.group() == Some(partly.pid()))
-  println(partly.signalGroup(signal.Terminate))
+  println(partly.signalGroup(signal.Terminate).mapErr(kind))
   println(partly.waitFor())
   fs.removeDirAll(dir)

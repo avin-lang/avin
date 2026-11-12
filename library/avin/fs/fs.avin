@@ -1,9 +1,11 @@
 module avin.fs
 
 // Files and directories: whole files read and written at once, and the directories that hold them.
-// Every failure is an `IoError` value, which `?` passes on.
+// Every failure is an `IoError` value, which `?` passes on, naming what was being done and the path
+// it was done to: `cannot read app.conf: no such file or directory`.
 
 import avin.io
+import avin.io.ErrorKind
 import avin.io.IoError
 import avin.time.Instant
 import avin.time.epochMicros
@@ -25,7 +27,7 @@ private data SyslError
     InvalidUtf8(offset: long)
     Other(code: int)
 
-private ioError(e: SyslError) -> IoError = e match
+private kindOf(e: SyslError) -> ErrorKind = e match
     NotFound -> io.NotFound
     PermissionDenied -> io.PermissionDenied
     AlreadyExists -> io.AlreadyExists
@@ -34,6 +36,10 @@ private ioError(e: SyslError) -> IoError = e match
     DirectoryNotEmpty -> io.DirectoryNotEmpty
     InvalidUtf8(at) -> io.InvalidUtf8(at)
     _ -> io.Other(syslMessage(e))
+
+// The error `operation` on `subject` failed with, of the kind Sysl's error `e` is.
+private failed(operation: string, subject: string) -> (SyslError) -> IoError =
+    e -> IoError(kindOf(e), operation, subject)
 
 // The platform's own sentence for a Sysl error, as Sysl words it.
 @sysl("avin.rt.io_error_message")
@@ -92,26 +98,28 @@ private syslEntries(dir: string) -> Result[Vector[string], SyslError]
 
 // The whole of `file` as text. Bytes that are not UTF-8 are `InvalidUtf8`, at the first one that
 // is not.
-readText(file: string) -> Result[string, IoError] = syslReadText(file).mapErr(ioError)
+readText(file: string) -> Result[string, IoError] = syslReadText(file).mapErr(failed("read", file))
 
 // The whole of `file` as bytes, in a new array the caller owns.
-readBytes(file: string) -> Result[Array[byte], IoError] = syslReadBytes(file).mapErr(ioError)
+readBytes(file: string) -> Result[Array[byte], IoError] = syslReadBytes(file).mapErr(failed("read", file))
 
 // Makes `file` hold exactly `text`, creating it if it does not exist and replacing what it held if
 // it does.
-writeText(file: string, text: string) -> Result[unit, IoError] = syslWriteText(file, text).mapErr(ioError)
+writeText(file: string, text: string) -> Result[unit, IoError] =
+    syslWriteText(file, text).mapErr(failed("write", file))
 
 // Adds `text` to the end of `file`, creating it if it does not exist.
-appendText(file: string, text: string) -> Result[unit, IoError] = syslAppendText(file, text).mapErr(ioError)
+appendText(file: string, text: string) -> Result[unit, IoError] =
+    syslAppendText(file, text).mapErr(failed("append to", file))
 
 // Makes `file` hold exactly `bytes`, creating it if it does not exist and replacing what it held if
 // it does.
 writeBytes(file: string, bytes: Array[byte]) -> Result[unit, IoError] =
-    syslWriteBytes(file, bytes).mapErr(ioError)
+    syslWriteBytes(file, bytes).mapErr(failed("write", file))
 
 // Adds `bytes` to the end of `file`, creating it if it does not exist.
 appendBytes(file: string, bytes: Array[byte]) -> Result[unit, IoError] =
-    syslAppendBytes(file, bytes).mapErr(ioError)
+    syslAppendBytes(file, bytes).mapErr(failed("append to", file))
 
 // Whether anything, file or directory, exists at `file`. A symbolic link is followed.
 exists(file: string) -> bool = syslExists(file)
@@ -126,32 +134,36 @@ isFile(file: string) -> bool = syslIsFile(file)
 // `IsADirectory` on every platform, whatever the platform's own refusal says. A link to a directory
 // is a file here, and is removed.
 remove(file: string) -> Result[unit, IoError] =
-    syslRemoveFile(file).mapErr(e -> if isDir(file) then io.IsADirectory else ioError(e))
+    syslRemoveFile(file).mapErr(e ->
+        if isDir(file) then IoError(io.IsADirectory, "remove", file) else failed("remove", file)(e))
 
 // Removes the empty directory `dir`.
-removeDir(dir: string) -> Result[unit, IoError] = syslRemoveDir(dir).mapErr(ioError)
+removeDir(dir: string) -> Result[unit, IoError] = syslRemoveDir(dir).mapErr(failed("remove directory", dir))
 
 // Removes `dir` and everything in it. A symbolic link inside is removed, never followed.
-removeDirAll(dir: string) -> Result[unit, IoError] = syslRemoveDirAll(dir).mapErr(ioError)
+removeDirAll(dir: string) -> Result[unit, IoError] =
+    syslRemoveDirAll(dir).mapErr(failed("remove directory", dir))
 
 // Moves `from` to `to`, a file or a directory, in one step: a reader sees the old `to` or the new
 // one, never a mixture. A file already at `to` is replaced; an empty directory at `to` is replaced
 // by a directory; a directory that holds entries is `DirectoryNotEmpty`. The directory that is to
 // hold `to` must exist, and both names must be on one file system, or the call fails and moves
 // nothing. Renaming a name to itself changes nothing and succeeds.
-rename(from: string, to: string) -> Result[unit, IoError] = syslRename(from, to).mapErr(ioError)
+rename(from: string, to: string) -> Result[unit, IoError] =
+    syslRename(from, to).mapErr(failed("rename", s"$from to $to"))
 
 // Makes the directory `dir`, whose parent must exist; `AlreadyExists` if something is there.
-createDir(dir: string) -> Result[unit, IoError] = syslMakeDir(dir).mapErr(ioError)
+createDir(dir: string) -> Result[unit, IoError] = syslMakeDir(dir).mapErr(failed("create directory", dir))
 
 // Makes the directory `dir` and every missing directory above it. A directory already there is no
 // error; a file in the way is.
-createDirAll(dir: string) -> Result[unit, IoError] = syslMakeDirAll(dir).mapErr(ioError)
+createDirAll(dir: string) -> Result[unit, IoError] = syslMakeDirAll(dir).mapErr(failed("create directory", dir))
 
 // Makes a new, empty directory in the platform's place for temporary files, its name starting with
 // `prefix`, and answers its path. No other call makes the same directory; the program removes it
 // when it is done.
-createTempDir(prefix: string) -> Result[string, IoError] = syslMakeTempDir(prefix).mapErr(ioError)
+createTempDir(prefix: string) -> Result[string, IoError] =
+    syslMakeTempDir(prefix).mapErr(failed("create temporary directory", prefix))
 
 // One reading of a path, as the runtime makes it.
 @sysl("avin.rt.FsStat")
@@ -175,7 +187,7 @@ data Metadata(size: long, modified: Instant, isDir: bool, isFile: bool)
 // Everything `Metadata` holds, read at once so the fields describe one entry. A symbolic link is
 // followed. A path that is not there is `NotFound`.
 metadata(file: string) -> Result[Metadata, IoError] =
-    syslStat(file).map(s -> Metadata(s.sizeBytes(), epochMicros(s.modifiedMicros()), s.isDir(), s.isFile())).mapErr(ioError)
+    syslStat(file).map(s -> Metadata(s.sizeBytes(), epochMicros(s.modifiedMicros()), s.isDir(), s.isFile())).mapErr(failed("read metadata of", file))
 
 // The size of the file `file` in bytes. A symbolic link is followed.
 size(file: string) -> Result[long, IoError] = metadata(file).map(m -> m.size)
@@ -188,7 +200,7 @@ modified(file: string) -> Result[Instant, IoError] = metadata(file).map(m -> m.m
 // with it. A symbolic link is followed. Reading it back may round `when` to the file system's
 // resolution. A path that is not there is `NotFound`.
 setModified(file: string, when: Instant) -> Result[unit, IoError] =
-    syslSetModified(file, when.epochMicros).mapErr(ioError)
+    syslSetModified(file, when.epochMicros).mapErr(failed("set modification time of", file))
 
 // A file Sysl holds open. It closes when it is closed or, for one the program forgot, when the
 // collector frees it.
@@ -222,11 +234,6 @@ private syslCreateUpdate(file: string) -> Result[SyslFile, SyslError]
 // How much a line or a read-everything call takes from the file at once.
 private val ChunkSize = 8192
 
-private closedError() -> IoError = io.Other("the file is closed")
-
-private notReadable() -> IoError = io.Other("the file is not open for reading")
-
-private notWritable() -> IoError = io.Other("the file is not open for writing")
 
 // The text of the bytes `from` up to `until`, a `\r` at the end dropped, bytes that are not UTF-8
 // becoming U+FFFD.
@@ -240,27 +247,28 @@ private lineText(bytes: Array[byte], from: int, until: int) -> string
 // that has grown since a read reached its end gives the new bytes to the next read, so a program can
 // follow a file another writes. A file belongs to the thread that opened it. It is closed by `close`
 // or, if the program forgot, when the collector frees it; every call on a closed file is an `Err`.
-class File(private val handle: SyslFile, private val readable: bool, private val writable: bool,
-        private var ahead: Array[byte], private var at: int, private var closed: bool): io.Reader
+class File(private val name: string, private val handle: SyslFile, private val readable: bool,
+        private val writable: bool, private var ahead: Array[byte], private var at: int,
+        private var closed: bool): io.Reader
     // How many bytes the file holds now, what other handles have written included.
     size() -> Result[long, IoError]
-        if closed then return Err(closedError())
-        handle.size().mapErr(ioError)
+        if closed then return Err(closedError("read the size of"))
+        handle.size().mapErr(failed("read the size of", name))
 
     // Where the next read or write happens, in bytes from the start of the file.
     position() -> Result[long, IoError]
-        if closed then return Err(closedError())
-        val sysl = handle.tell().mapErr(ioError)?
+        if closed then return Err(closedError("read the position in"))
+        val sysl = handle.tell().mapErr(failed("read the position in", name))?
         Ok(sysl - long(ahead.length - at))
 
     // Moves to `offset` bytes from the start. Past the end is allowed: a read there finds the end
     // and a write leaves a gap of zero bytes. A negative offset is an `Err`.
     seek(offset: long) -> Result[unit, IoError]
-        if closed then return Err(closedError())
-        if offset < 0 then return Err(io.Other(s"a negative offset: $offset"))
+        if closed then return Err(closedError("seek in"))
+        if offset < 0 then return Err(IoError(io.Other(s"a negative offset: $offset"), "seek in", name))
         ahead = Array.empty[byte]()
         at = 0
-        handle.seek(offset).mapErr(ioError)
+        handle.seek(offset).mapErr(failed("seek in", name))
 
     // Moves to the end of the file as it is now, so the next read waits for what is written after.
     seekToEnd() -> Result[unit, IoError]
@@ -269,7 +277,7 @@ class File(private val handle: SyslFile, private val readable: bool, private val
     // Up to `max` bytes from the position, fewer only where the file ends first; empty at the end.
     // A `max` below zero traps.
     override read(max: int) -> Result[Array[byte], IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read"))
         if !readable then return Err(notReadable())
         if max < 0 then fail(s"a read of $max bytes: a read takes none or more")
         if max == 0 then return Ok(Array.empty[byte]())
@@ -282,7 +290,7 @@ class File(private val handle: SyslFile, private val readable: bool, private val
 
     // Everything from the position to the end of the file as it is while the read runs.
     readAll() -> Result[Array[byte], IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read"))
         if !readable then return Err(notReadable())
         val all = Buffer[byte]()
         for k in at..<ahead.length
@@ -301,7 +309,7 @@ class File(private val handle: SyslFile, private val readable: bool, private val
         val bytes = readAll()?
         string.fromUtf8(bytes) match
             Ok(text) -> Ok(text)
-            Err(e) -> Err(io.InvalidUtf8(e.offset))
+            Err(e) -> Err(IoError(io.InvalidUtf8(e.offset), "read", name))
 
     // The next line without its terminator, or `None` at the end of the file. A line ends at `\n`,
     // a `\r` before it going too; the last line needs no terminator, and a file another program is
@@ -315,11 +323,11 @@ class File(private val handle: SyslFile, private val readable: bool, private val
 
     // Writes all of `bytes` at the position.
     write(bytes: Array[byte]) -> Result[unit, IoError]
-        if closed then return Err(closedError())
-        if !writable then return Err(notWritable())
+        if closed then return Err(closedError("write"))
+        if !writable then return Err(IoError(io.Other("the file is not open for writing"), "write", name))
         unread()?
         handle.write(bytes)
-        if handle.failed() then Err(io.Other("the write failed")) else Ok(())
+        if handle.failed() then Err(IoError(io.Other("the write failed"), "write", name)) else Ok(())
 
     // Writes `text` as UTF-8.
     writeText(text: string) -> Result[unit, IoError]
@@ -328,8 +336,8 @@ class File(private val handle: SyslFile, private val readable: bool, private val
     // Hands what has been written to the platform, so another handle or program reading the file
     // sees it. A failure that only now shows, a full disk, is the `Err`.
     flush() -> Result[unit, IoError]
-        if closed then return Err(closedError())
-        handle.flush().mapErr(ioError)
+        if closed then return Err(closedError("flush"))
+        handle.flush().mapErr(failed("flush", name))
 
     // Flushes and releases the file; closing a closed file is not an error. Every later call
     // answers an `Err`.
@@ -338,23 +346,28 @@ class File(private val handle: SyslFile, private val readable: bool, private val
         closed = true
         ahead = Array.empty[byte]()
         at = 0
-        handle.release().mapErr(ioError)
+        handle.release().mapErr(failed("close", name))
 
     // Whether `close` has been called.
     isClosed() -> bool = closed
 
+    // What a call on the closed file answers, `operation` being what it was to do.
+    private closedError(operation: string) -> IoError = IoError(io.Other("the file is closed"), operation, name)
+
+    private notReadable() -> IoError = IoError(io.Other("the file is not open for reading"), "read", name)
+
     // Up to `max` bytes from the file itself.
     private pull(max: int) -> Result[Array[byte], IoError]
         val got = handle.read(Array.fill(max, byte(0)))
-        if got.length == 0 && handle.failed() then Err(io.Other("the read failed")) else Ok(got)
+        if got.length == 0 && handle.failed() then Err(IoError(io.Other("the read failed"), "read", name)) else Ok(got)
 
     // Gives back what was read ahead and not handed out, so the file's own position is the
     // logical one, which a write needs.
     private unread() -> Result[unit, IoError]
         val left = ahead.length - at
         if left > 0
-            val sysl = handle.tell().mapErr(ioError)?
-            handle.seek(sysl - long(left)).mapErr(ioError)?
+            val sysl = handle.tell().mapErr(failed("write", name))?
+            handle.seek(sysl - long(left)).mapErr(failed("write", name))?
         ahead = Array.empty[byte]()
         at = 0
         Ok(())
@@ -372,7 +385,7 @@ class File(private val handle: SyslFile, private val readable: bool, private val
         Ok(true)
 
     private nextLine(terminated: bool) -> Result[Option[string], IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read"))
         if !readable then return Err(notReadable())
         var scanned = 0
         while true
@@ -394,26 +407,26 @@ class File(private val handle: SyslFile, private val readable: bool, private val
 
 // Opens the existing file `file` for reading, at its start. A directory is `IsADirectory`.
 open(file: string) -> Result[File, IoError]
-    if isDir(file) then return Err(io.IsADirectory)
-    syslOpen(file).mapErr(ioError).map(h -> File(h, true, false, Array.empty[byte](), 0, false))
+    if isDir(file) then return Err(IoError(io.IsADirectory, "open", file))
+    syslOpen(file).mapErr(failed("open", file)).map(h -> File(file, h, true, false, Array.empty[byte](), 0, false))
 
 // Opens `file` for writing, making it if it is not there and emptying it if it is.
 create(file: string) -> Result[File, IoError]
-    syslCreate(file).mapErr(ioError).map(h -> File(h, false, true, Array.empty[byte](), 0, false))
+    syslCreate(file).mapErr(failed("create", file)).map(h -> File(file, h, false, true, Array.empty[byte](), 0, false))
 
 // Opens `file` for writing at its end, making it if it is not there. Every write goes to the end,
 // however many handles append to the file at once.
 append(file: string) -> Result[File, IoError]
-    syslAppend(file).mapErr(ioError).map(h -> File(h, false, true, Array.empty[byte](), 0, false))
+    syslAppend(file).mapErr(failed("open", file)).map(h -> File(file, h, false, true, Array.empty[byte](), 0, false))
 
 // Opens the existing file `file` for reading and writing, at its start, keeping what it holds.
 openUpdate(file: string) -> Result[File, IoError]
-    if isDir(file) then return Err(io.IsADirectory)
-    syslOpenUpdate(file).mapErr(ioError).map(h -> File(h, true, true, Array.empty[byte](), 0, false))
+    if isDir(file) then return Err(IoError(io.IsADirectory, "open", file))
+    syslOpenUpdate(file).mapErr(failed("open", file)).map(h -> File(file, h, true, true, Array.empty[byte](), 0, false))
 
 // Opens `file` for reading and writing, making it if it is not there and emptying it if it is.
 createUpdate(file: string) -> Result[File, IoError]
-    syslCreateUpdate(file).mapErr(ioError).map(h -> File(h, true, true, Array.empty[byte](), 0, false))
+    syslCreateUpdate(file).mapErr(failed("create", file)).map(h -> File(file, h, true, true, Array.empty[byte](), 0, false))
 
 // Every byte of `file` from `offset` on, empty where the file is no longer than `offset`: what has
 // been appended since a program last read to `offset`. A negative `offset` traps.
@@ -478,4 +491,5 @@ readTailLines(file: string, count: int) -> Result[Vector[string], IoError]
 // The names of the entries of the directory `dir`, without `dir` before them and without `.` and
 // `..`, sorted by code point, so two listings of an unchanged directory agree. A name that is not
 // UTF-8 makes the whole listing `InvalidUtf8`.
-listDir(dir: string) -> Result[Vector[string], IoError] = syslEntries(dir).map(names -> names.sorted()).mapErr(ioError)
+listDir(dir: string) -> Result[Vector[string], IoError] =
+    syslEntries(dir).map(names -> names.sorted()).mapErr(failed("list", dir))

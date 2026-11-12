@@ -26,18 +26,24 @@ impl ExitStatus
     _ -> false
 
 // Why `output()` has no text to give: the command could not be run, or it ran and did not succeed.
+// `command` names the programs it ran, `ls` or `ls | wc`.
 data CommandError
   Io(error: IoError)
-  Failed(status: ExitStatus)
+  Failed(status: ExitStatus, command: string)
 
-impl CommandError
+impl Error for CommandError
   // A sentence saying why the command gave no text, for a message to a person: the start failure's
-  // own message, or how the program ended.
-  message() -> string = self match
-    Io(e) -> e.message()
-    Failed(Exited(code)) -> s"exited with status $code"
-    Failed(Signalled(sig)) -> s"killed by signal $sig (${signalName(sig)})"
-    Failed(TimedOut) -> "timed out"
+  // own message, `cannot run nosuch: no such file or directory`, or how the program ended,
+  // `ls exited with status 1`.
+  message -> string = self match
+    Io(e) -> e.message
+    Failed(status, command) -> if command == "" then ending(status) else s"$command ${ending(status)}"
+
+// How a program that did not succeed ended, in words.
+private ending(status: ExitStatus) -> string = status match
+  Exited(code) -> s"exited with status $code"
+  Signalled(sig) -> s"killed by signal $sig (${signalName(sig)})"
+  TimedOut -> "timed out"
 
 // The name of a signal this library has a name for, otherwise "unknown".
 private signalName(sig: int) -> string
@@ -168,7 +174,7 @@ class Command(
     val opened = createFile(file)
     if opened.isErr()
       fs.removeDirAll(dir)
-      return Err(Io(ioError(opened.err().get())))
+      return Err(Io(ioError(opened.err().get(), "create", file)))
     val into = opened.ok().get()
     val started = launch(Context.outermost(Track()), Streams.into(into))
     val outcome = started.map(job -> finished(job))
@@ -176,7 +182,7 @@ class Command(
     fs.removeDirAll(dir)
     outcome.flatten() match
       Err(e) -> Err(Io(e))
-      Ok(status) if !status.isSuccess() -> Err(Failed(status))
+      Ok(status) if !status.isSuccess() -> Err(Failed(status, describe()))
       Ok(_) -> bytes match
         Ok(b) -> Ok(string.fromUtf8Lossy(b))
         Err(e) -> Err(Io(e))
@@ -185,7 +191,7 @@ class Command(
   // `\n` or `\r\n`, bytes that are not UTF-8 replaced with U+FFFD. Its status is not checked; once the
   // output has ended the command is waited for.
   lines() -> Result[Iterator[string], IoError]
-    val (from, into) = makePipe().mapErr(ioError)?
+    val (from, into) = makePipe().mapErr(failed("create a pipe for", describe()))?
     // A sequence starts its later parts as its earlier ones end, which has to happen while the
     // output is read, so a command holding one is started and driven on a thread of its own, which
     // the job belongs to; whether it started comes back through a promise.
@@ -207,7 +213,7 @@ class Command(
       if descriptor.isErr()
         closeFile(Some(from))
         driver.join()
-        return Err(ioError(descriptor.err().get()))
+        return Err(ioError(descriptor.err().get(), "read the output of", describe()))
       return Ok(OutputLines(from, fdReader(descriptor.ok().get()), () -> driver.join()))
     val started = launch(Context.outermost(Track()), Streams.into(into))
     if started.isErr()
@@ -218,13 +224,21 @@ class Command(
     if descriptor.isErr()
       closeFile(Some(from))
       job.finish()
-      return Err(ioError(descriptor.err().get()))
+      return Err(ioError(descriptor.err().get(), "read the output of", describe()))
     Ok(OutputLines(from, fdReader(descriptor.ok().get()), () -> job.finish()))
 
   // Starts the command and answers at once, with the `Child` it is waited for and stopped by.
   start() -> Result[Child, IoError]
     val track = Track()
     launch(Context.outermost(track), Streams.own()).map(job -> Child(job, newOwner(), track))
+
+  // The programs the command runs, for an error to name: `ls`, `ls | wc`, `make && ./app`.
+  private describe() -> string = shape match
+    Program(program, _) -> program
+    Piped(from, into) -> s"${from.describe()} | ${into.describe()}"
+    Joined(first, WhenSucceeded, second) -> s"${first.describe()} && ${second.describe()}"
+    Joined(first, WhenFailed, second) -> s"${first.describe()} || ${second.describe()}"
+    Joined(first, Always, second) -> s"${first.describe()}; ${second.describe()}"
 
   // Whether the command holds a sequence, whose later parts start as its earlier ones end.
   private sequenced() -> bool = shape match
@@ -250,7 +264,7 @@ class Command(
         val ends = makePipe()
         if ends.isErr()
           streams.release()
-          return Err(ioError(ends.err().get()))
+          return Err(ioError(ends.err().get(), "create a pipe for", describe()))
         val (reading, writing) = ends.ok().get()
         // Both stages write their errors to the pipeline's; the second, started last, closes its file.
         val left = from.launch(context, Streams(streams.input, streams.inputFile, ToFile(writing), Some(writing), streams.errors, None, false))
@@ -277,7 +291,7 @@ class Command(
         Ok(f) -> streams = streams.withOutput(f)
         Err(e) ->
           streams.release()
-          return Err(ioError(e))
+          return Err(ioError(e, "open", file))
     errors match
       OwnErrors -> ()
       // The program's own output is reached through the name the platform gives it, opened to add to
@@ -287,16 +301,16 @@ class Command(
           Ok(f) -> streams = streams.withErrors(f)
           Err(e) ->
             streams.release()
-            return Err(ioError(e))
+            return Err(ioError(e, "open", "/dev/stdout"))
         _ -> streams = streams.errorsToOutput()
       ErrorsTo(file, append) -> (if append then appendFile(file) else createFile(file)) match
         Ok(f) -> streams = streams.withErrors(f)
         Err(e) ->
           streams.release()
-          return Err(ioError(e))
+          return Err(ioError(e, "open", file))
     val input = feed match
       OwnInput -> return Ok(streams)
-      InputFrom(file) -> openFile(file).mapErr(ioError)
+      InputFrom(file) -> openFile(file).mapErr(failed("open", file))
       InputText(text) -> textFile(text)
     input match
       Ok(f) -> Ok(streams.withInput(f))
@@ -383,7 +397,7 @@ class Child(private val job: Job, private val owner: Owner, private val track: T
   // or one with no program started, is `Err(NotFound)`; a detached one is asked by its process id.
   residentBytes() -> Result[long, IoError]
     val p = track.pid.load()
-    if p == 0 || track.ended.load() then return Err(io.NotFound)
+    if p == 0 || track.ended.load() then return Err(IoError(io.NotFound, "read the memory of", s"process $p"))
     residentBytesOf(p)
 
   // Checks the child belongs to the code running and is still its to wait for.
@@ -409,8 +423,8 @@ class Child(private val job: Job, private val owner: Owner, private val track: T
   // to its next part as its status says.
   signal(sig: int) -> Result[unit, IoError]
     val p = track.pid.load()
-    if p == 0 || track.ended.load() then return Err(ioError(Other(3)))
-    sendSignal(p, sig).mapErr(ioError)
+    if p == 0 || track.ended.load() then return Err(noSuchProcess("signal", p))
+    sendSignal(p, sig).mapErr(failed("signal", s"process $p"))
 
   // Sends the signal `sig` to every process in the command's group, its programs and every program
   // they started that stays in it, however the command itself has ended; a group with no one left in
@@ -420,10 +434,10 @@ class Child(private val job: Job, private val owner: Owner, private val track: T
   // own and is refused, `Err(Other("the command has no group of its own"))`. Any thread may signal
   // it.
   signalGroup(sig: int) -> Result[unit, IoError] = track.group.load() match
-    0 -> Err(io.Other("the command has no group of its own"))
+    0 -> Err(IoError(io.Other("the command has no group of its own"), "signal the group of", s"process ${pid()}"))
     g -> sendSignal(-g, sig) match
-      Err(NotPermitted) -> Err(ioError(Other(3)))
-      r -> r.mapErr(ioError)
+      Err(NotPermitted) -> Err(ioError(Other(3), "signal", s"process group $g"))
+      r -> r.mapErr(failed("signal", s"process group $g"))
 
 // What the command is: one program, a pipeline, or two commands one after the other.
 private data Shape
@@ -557,7 +571,7 @@ private textFile(text: string) -> Result[File, IoError]
   val dir = fs.createTempDir("avin-input")?
   val file = dir + "/input"
   val written = fs.writeText(file, text)
-  val opened = if written.isOk() then openFile(file).mapErr(ioError) else Err(written.err().get())
+  val opened = if written.isOk() then openFile(file).mapErr(failed("open", file)) else Err(written.err().get())
   fs.removeDirAll(dir)
   opened
 
@@ -635,8 +649,8 @@ private startProgram(program: string, args: Vector[string], context: Context, st
     Ok(child) ->
       context.track.pid.store(long(child.pid()))
       if leads then context.track.group.store(long(child.group()))
-      Ok(Process(child, context.deadline))
-    Err(e) -> Err(ioError(e))
+      Ok(Process(child, context.deadline, program))
+    Err(e) -> Err(ioError(e, "run", program))
 
 // A started command: one program, a pipeline or a sequence. `poll` moves it on without waiting and
 // says whether it has ended; `finish` waits for it to end; `outcome` is its status once it has.
@@ -660,7 +674,7 @@ private class Ended(private val result: Result[ExitStatus, IoError]): Job
   override release() = ()
 
 // One running program.
-private class Process(private val child: Spawned, private val deadline: Option[Duration]): Job
+private class Process(private val child: Spawned, private val deadline: Option[Duration], private val program: string): Job
   private var result: Option[Result[ExitStatus, IoError]] = None
 
   override sequenced() -> bool = false
@@ -677,11 +691,11 @@ private class Process(private val child: Spawned, private val deadline: Option[D
     child.tryWait() match
       Ok(Some(status)) -> ended(Ok(status))
       Ok(None) -> return false
-      Err(e) -> ended(Err(ioError(e)))
+      Err(e) -> ended(Err(ioError(e, "wait for", program)))
     true
 
   override finish()
-    if result.isEmpty() then ended(child.wait().mapErr(ioError))
+    if result.isEmpty() then ended(child.wait().mapErr(failed("wait for", program)))
 
   override outcome() -> Result[ExitStatus, IoError] = result.get()
 
@@ -855,7 +869,7 @@ private data SyslError
   InvalidUtf8(offset: long)
   Other(code: int)
 
-private ioError(e: SyslError) -> IoError = e match
+private kindOf(e: SyslError) -> io.ErrorKind = e match
   NotFound -> io.NotFound
   PermissionDenied -> io.PermissionDenied
   AlreadyExists -> io.AlreadyExists
@@ -864,6 +878,16 @@ private ioError(e: SyslError) -> IoError = e match
   DirectoryNotEmpty -> io.DirectoryNotEmpty
   InvalidUtf8(at) -> io.InvalidUtf8(at)
   _ -> io.Other(syslMessage(e))
+
+// The error `operation` on `subject` failed with, of the kind Sysl's error `e` is.
+private ioError(e: SyslError, operation: string, subject: string) -> IoError = IoError(kindOf(e), operation, subject)
+
+// `ioError` as a function of the Sysl error, for `mapErr`.
+private failed(operation: string, subject: string) -> (SyslError) -> IoError =
+  e -> ioError(e, operation, subject)
+
+// What a process that is not there answers, as the platform words it.
+private noSuchProcess(operation: string, pid: long) -> IoError = ioError(Other(3), operation, s"process $pid")
 
 // The platform's own sentence for a Sysl error, as Sysl words it.
 @sysl("avin.rt.io_error_message")

@@ -117,6 +117,61 @@ result type must be declared, or for a lambda known where it is written, as in
 `val f: (string) -> Option[int] = s -> Some(parse(s)? + 1)`. A delayed argument and a class body
 cannot be left by `?`, as they cannot by `return`.
 
+## The Error trait
+
+An error meant for a person to read is an `Error`, a core trait in the prelude:
+
+```text
+trait Error: Display
+    message -> string
+    cause -> Option[Error] = None
+    override display(out: Writer, spec: FormatSpec)   // message, then ": " and the cause
+```
+
+- **`message` is the error's own sentence**, without its cause's; `cause` is the failure that led to
+  it, `None` by default. Both are [parameterless](/spec/declarations/#parameterless-methods): they
+  read what the error holds, so `e.message` and `e.cause` take no parentheses. A data type's field
+  named `message` implements the first.
+- **An error shows as its whole chain.** The display is the message, then `: ` and the cause as
+  it shows, so each level adds its sentence in front: `loading config: cannot read app.conf: no such
+  file or directory`. A message that is empty is left out with its `: `. A data type implementing
+  `Error` takes this display in place of the one it would have by its fields; one with a `Display`
+  of its own keeps it, and its cause, if any, is then its own to show.
+- **Every error type of the standard library is an `Error`**: `IoError`, `CommandError`,
+  `HttpError`, `UrlError`, `TlsError`, `TimeParseError`, `ZoneError`, `PatternError`,
+  `MatchError`, `AskError` and `Utf8Error`, and the json package's `JsonError`.
+  An error that only wraps another one, as `CommandError.Io(e)` does, has `e`'s message and no
+  cause of its own, so it shows once.
+- **A type of the program's own becomes one** by giving it a message:
+
+```text
+data ParseError(line: int, text: string)
+
+impl Error for ParseError
+    message -> string = s"line $line: cannot read \"$text\""
+```
+
+**`context` puts an error in context.** On a `Result[T, E]` whose `E` is an `Error`,
+`context(text)` keeps an `Ok` and wraps an `Err(e)` as `Err(ContextError(text, e))`, an error whose
+message is `text` and whose cause is `e`. The text is passed [by name](/spec/by-name/), so it is
+built only for an `Err`. Contexts nest, the outermost first when shown:
+
+```text
+loadConfig(path: string) -> Result[Config, ContextError]
+    val text = fs.readText(path).context(s"loading $path")?
+    parseConfig(text).context("reading the settings")
+// Err(loading app.conf: cannot read app.conf: no such file or directory)
+```
+
+`ContextError(message: string, inner: Error)` is a data type of the prelude; a program reaches the
+error it wraps by `inner`, or through `cause`, and takes it apart by a type pattern, `io: IoError`
+in a `match` arm or `e.inner is _: IoError`, since its static type is the trait.
+`context` takes any error that is an `Error`: a type parameter bounded by `Error`, and a
+[union](/spec/unions/) of error types each of which is one, so `load(path).context("loading")` works
+on a `Result[Config, IoError | ParseError]`. And `Error` is a type like any trait: a function
+answering `Result[T, Error]` can `?` every error type, each passed on unchanged, which is what a
+`main` that answers a `Result` wants.
+
 ## Option and Result
 
 Both are `data` types of the core library, written in Avin:

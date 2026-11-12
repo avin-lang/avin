@@ -49,7 +49,7 @@ exit(code: int) -> Nothing
 private workingDir() -> Result[string, SyslError]
 
 // The directory relative paths are read from.
-currentDir() -> Result[string, IoError] = workingDir().mapErr(ioError)
+currentDir() -> Result[string, IoError] = workingDir().mapErr(failed("read the working directory", ""))
 
 // The user's home directory, `None` where the platform names none.
 @sysl("sysl.fs.home_dir")
@@ -76,7 +76,7 @@ pid() -> long = long(processId())
 private machineMemory() -> Result[long, SyslError]
 
 // The physical memory the machine has, in bytes: what is installed, not what is free.
-totalMemory() -> Result[long, IoError] = machineMemory().mapErr(ioError)
+totalMemory() -> Result[long, IoError] = machineMemory().mapErr(failed("read the machine's memory", ""))
 
 @sysl("sysl.process.resident_bytes")
 private residentOf(pid: int) -> Result[long, SyslError]
@@ -88,10 +88,11 @@ private residentOf(pid: int) -> Result[long, SyslError]
 residentBytes(pid: long) -> Result[long, IoError] = residentBytesOf(pid)
 
 private residentBytesOf(pid: long) -> Result[long, IoError]
-  if !(0 < pid <= long(int.MaxValue)) then return Err(io.NotFound)
+  val subject = s"process $pid"
+  if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.NotFound, "read the memory of", subject))
   residentOf(int(pid)).mapErr(e -> e match
-    NotPermitted -> io.PermissionDenied
-    other -> ioError(other))
+    NotPermitted -> IoError(io.PermissionDenied, "read the memory of", subject)
+    other -> ioError(other, "read the memory of", subject))
 
 @sysl("sysl.process.group_members")
 private listedGroup(pgid: int) -> Result[Vector[int], SyslError]
@@ -106,16 +107,18 @@ private listedChildren(pid: int) -> Result[Vector[int], SyslError]
 // `pgid` of zero or less, or one no process id can be, is `Err(Other(...))`. The list is a snapshot:
 // a process may have started or ended by the time it is read.
 groupMembers(pgid: long) -> Result[Vector[long], IoError]
-  if !(0 < pgid <= long(int.MaxValue)) then return Err(io.Other("Invalid argument"))
-  listedGroup(int(pgid)).map(pids -> pids.map(p -> long(p))).mapErr(ioError)
+  val subject = s"process group $pgid"
+  if !(0 < pgid <= long(int.MaxValue)) then return Err(IoError(io.Other("Invalid argument"), "list", subject))
+  listedGroup(int(pgid)).map(pids -> pids.map(p -> long(p))).mapErr(failed("list", subject))
 
 // The live processes whose parent is `pid`, as pids, in no particular order, found as `groupMembers`
 // finds a group's: `children(pid())` is the programs this one started and not yet waited for, and
 // not their own children. A `pid` with no children, or none at all, is `Ok([])`; a `pid` of zero or
 // less, or one no process id can be, is `Err(Other(...))`.
 children(pid: long) -> Result[Vector[long], IoError]
-  if !(0 < pid <= long(int.MaxValue)) then return Err(io.Other("Invalid argument"))
-  listedChildren(int(pid)).map(pids -> pids.map(p -> long(p))).mapErr(ioError)
+  val subject = s"process $pid"
+  if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.Other("Invalid argument"), "list the children of", subject))
+  listedChildren(int(pid)).map(pids -> pids.map(p -> long(p))).mapErr(failed("list the children of", subject))
 
 @sysl("sysl.process.exec")
 private replaceImage(program: string, args: Vector[string], env: Vector[Var], inheritEnv: bool) -> SyslError
@@ -128,7 +131,8 @@ private replaceImage(program: string, args: Vector[string], env: Vector[Var], in
 // and its signal watches end. A bare name is looked for on the `PATH`. A program that is not there
 // is `Err(NotFound)` and one that may not be run `Err(PermissionDenied)`, and the program then
 // carries on exactly as it was.
-exec(program: string, args: Vector[string]) -> Result[Nothing, IoError] = Err(ioError(replaceImage(program, args, [], true)))
+exec(program: string, args: Vector[string]) -> Result[Nothing, IoError] =
+  Err(ioError(replaceImage(program, args, [], true), "run", program))
 
 // `exec` with `environment` as the whole of the new program's environment, nothing of this program's
 // inherited: `process.environment().updated("NAME", "value")` adds to this program's. A bare name is looked for on
@@ -136,7 +140,7 @@ exec(program: string, args: Vector[string]) -> Result[Nothing, IoError] = Err(io
 exec(program: string, args: Vector[string], environment: Map[string, string]) -> Result[Nothing, IoError]
   var vars: Vector[Var] = []
   for (name, value) in environment do vars = vars :+ Var(name, value)
-  Err(ioError(replaceImage(program, args, vars, false)))
+  Err(ioError(replaceImage(program, args, vars, false), "run", program))
 
 @sysl("sysl.process.wait_pid", blocking)
 private waitedPid(pid: int) -> Result[ExitStatus, SyslError]
@@ -150,20 +154,20 @@ private polledPid(pid: int) -> Result[Option[ExitStatus], SyslError]
 // `Err(NotFound)`, as is a `pid` that is not this program's child and a `pid` of zero or less. A
 // lightweight thread waiting leaves its worker to run others.
 waitPid(pid: long) -> Result[ExitStatus, IoError]
-  if !(0 < pid <= long(int.MaxValue)) then return Err(io.NotFound)
-  waitedPid(int(pid)).mapErr(waitError)
+  if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.NotFound, "wait for", s"process $pid"))
+  waitedPid(int(pid)).mapErr(waitError(pid))
 
 // Whether this program's child `pid` has ended, without waiting: `None` while it runs, and how it
 // ended once it has, reaping it then. The errors are `waitPid`'s.
 tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]
-  if !(0 < pid <= long(int.MaxValue)) then return Err(io.NotFound)
-  polledPid(int(pid)).mapErr(waitError)
+  if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.NotFound, "wait for", s"process $pid"))
+  polledPid(int(pid)).mapErr(waitError(pid))
 
 // The platform's "no child process" (10 on every platform the library runs on) is the child not
 // being there to wait for.
-private waitError(e: SyslError) -> IoError = e match
-  Other(10) -> io.NotFound
-  other -> ioError(other)
+private waitError(pid: long) -> (SyslError) -> IoError = e -> e match
+  Other(10) -> IoError(io.NotFound, "wait for", s"process $pid")
+  other -> ioError(other, "wait for", s"process $pid")
 
 // The operating system the program was compiled for.
 @sysl("sysl.Os")
@@ -187,7 +191,8 @@ private sendSignal(pid: long, sig: int) -> Result[unit, SyslError]
 // `Err(Other("No such process"))`; one the program may not signal is `Err(Other(...))` with the
 // platform's sentence, and a signal number the platform does not have is refused before anything
 // is sent.
-signal(pid: long, sig: int) -> Result[unit, IoError] = sendSignal(pid, sig).mapErr(ioError)
+signal(pid: long, sig: int) -> Result[unit, IoError] =
+  sendSignal(pid, sig).mapErr(failed("signal", if pid < 0 then s"process group ${-pid}" else s"process $pid"))
 
 @sysl("sysl.process.new_session")
 private startSession() -> Result[int, SyslError]
@@ -196,4 +201,4 @@ private startSession() -> Result[int, SyslError]
 // controlling terminal, and answers the session's number, which is the program's process id: what a
 // daemon does to leave the terminal and the job it was started from. A program that already leads a
 // process group, one started `inNewGroup` among them, is refused and stays where it was.
-newSession() -> Result[long, IoError] = startSession().map(s -> long(s)).mapErr(ioError)
+newSession() -> Result[long, IoError] = startSession().map(s -> long(s)).mapErr(failed("start a new session", ""))

@@ -47,7 +47,7 @@ data TlsRefusal
 
 impl TlsRefusal
     // The reason in words.
-    message() -> string = self match
+    message -> string = self match
         HostMismatch -> "the certificate is for another host"
         Expired -> "the certificate has expired"
         NotYetValid -> "the certificate is not yet valid"
@@ -55,7 +55,7 @@ impl TlsRefusal
         Other(c) -> s"the certificate was refused (code $c)"
 
 impl Display for TlsRefusal
-    display(out: Writer, spec: FormatSpec) = out.writeField(message(), spec)
+    display(out: Writer, spec: FormatSpec) = out.writeField(message, spec)
 
 impl TlsError
     // Why the peer's certificate was refused, or `None` for any other failure.
@@ -63,15 +63,13 @@ impl TlsError
         Certificate(_, r) -> Some(r)
         _ -> None
 
+impl Error for TlsError
     // A sentence saying what went wrong, for a message to a person.
-    message() -> string = self match
-        Transport(e) -> e.message()
-        Certificate(_, r) -> s"certificate refused: ${r.message()}"
+    message -> string = self match
+        Transport(e) -> e.message
+        Certificate(_, r) -> s"certificate refused: ${r.message}"
         Handshake(t) -> s"TLS handshake failed: $t"
         Credentials(t) -> s"unusable certificate or key: $t"
-
-impl Display for TlsError
-    display(out: Writer, spec: FormatSpec) = out.writeField(message(), spec)
 
 // What OpenSSL says went wrong: its verdict on the call, the top of its error queue (or the
 // certificate check's result), and both in words.
@@ -139,20 +137,22 @@ private serverEngine(of: ServerContext) -> Result[Engine, TlsFailure]
 // The `TlsError` an OpenSSL failure in a handshake is. A refused certificate is told apart by its
 // reason, OpenSSL's "certificate verify failed" (134), or by the check made after a handshake that
 // completed, whose code is the certificate check's own small result.
-private handshakeError(f: TlsFailure) -> TlsError
-    if f.reason == 5 then return Transport(io.ConnectionReset)
+private handshakeError(f: TlsFailure, peer: string) -> TlsError
+    if f.reason == 5 then return Transport(IoError(io.ConnectionReset, "connect to", peer))
     val verifyFailed = f.code % 8388608 == 134
     val checkedAfter = 0 < f.code < 4096
     if verifyFailed || checkedAfter then Certificate(f.message, refusalOf(f)) else Handshake(f.message)
 
 // The `IoError` a TLS failure after the handshake is, for a connection's reads and writes.
-private streamError(f: TlsFailure) -> IoError = io.Other(s"TLS: ${f.message}")
+private streamError(f: TlsFailure, operation: string, peer: string) -> IoError =
+    IoError(io.Other(s"TLS: ${f.message}"), operation, peer)
 
 // How much ciphertext a connection moves at a time: one TLS record and its overhead.
 private val RecordSize = 17408
 
-// What a read or write on a closed connection answers.
-private closedError() -> IoError = io.Other("the connection is closed")
+// What `operation` on the closed connection to `peer` answers.
+private closedError(operation: string, peer: string) -> IoError =
+    IoError(io.Other("the connection is closed"), operation, peer)
 
 // `text` as UTF-8 bytes.
 private utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength(), i -> text.byteAt(i))
@@ -200,27 +200,27 @@ private serverContext(server: TlsServer) -> Result[ServerContext, TlsError] =
 // ends where the peer closes TLS or the TCP connection beneath. It may be handed to another thread
 // or actor, which takes it over, as a `TcpStream` is.
 class TlsStream(private val tcp: TcpStream, private val engine: Engine, private val buffered: ReadAhead,
-                private val scratch: Array[byte], private var closed: bool): Sendable, ByteStream
+                private val scratch: Array[byte], private var closed: bool, private val peer: string): Sendable, ByteStream
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     override read(max: int) -> Result[Array[byte], IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.read(max, received)
 
     // The next line, without its terminator, or `None` once the other end has finished sending and
     // every line has been read, as a `TcpStream` reads one.
     override readLine() -> Result[Option[string], IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.readLine(received)
 
     // Everything the other end sends until it finishes, after what earlier reads left.
     override readAll() -> Result[Array[byte], IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.readAll(received)
 
     // Sends all of `bytes`.
     override write(bytes: Array[byte]) -> Result[unit, IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("write to", peer))
         var at = 0
         while at < bytes.length
             val part = if at == 0 then bytes else bytes.slice(at, bytes.length)
@@ -230,8 +230,8 @@ class TlsStream(private val tcp: TcpStream, private val engine: Engine, private 
                     flush()?
                 Ok(Wants) ->
                     flush()?
-                    if !pull()? then return Err(io.ConnectionReset)
-                Err(f) -> return Err(streamError(f))
+                    if !pull()? then return Err(IoError(io.ConnectionReset, "write to", peer))
+                Err(f) -> return Err(streamError(f, "write to", peer))
         Ok(())
 
     // Sends `text` as UTF-8.
@@ -240,13 +240,13 @@ class TlsStream(private val tcp: TcpStream, private val engine: Engine, private 
     // A wait on the connection beneath longer than `d` fails with `TimedOut` from now on, as a
     // `TcpStream`'s does; zero or less takes the limit away.
     override setTimeout(d: Duration) -> Result[unit, IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("set the timeout of", peer))
         tcp.setTimeout(d)
 
     // Tells the other end nothing more will be sent, closing TLS and then the TCP connection's
     // sending side; reading goes on.
     override shutdownOutput() -> Result[unit, IoError]
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("shut down", peer))
         engine.notifyClose()
         flush()?
         tcp.shutdownOutput()
@@ -271,7 +271,7 @@ class TlsStream(private val tcp: TcpStream, private val engine: Engine, private 
             val done = step match
                 Ok(Done) -> true
                 Ok(Wants) -> false
-                Err(f) -> return Err(handshakeError(f))
+                Err(f) -> return Err(handshakeError(f, peer))
             sent.mapErr(e -> Transport(e))?
             if done then return Ok(())
             if !pull().mapErr(e -> Transport(e))?
@@ -290,7 +290,7 @@ class TlsStream(private val tcp: TcpStream, private val engine: Engine, private 
     private pull() -> Result[bool, IoError]
         val got = tcp.read(RecordSize)?
         if got.length == 0 then return Ok(false)
-        engine.incoming(got).mapErr(streamError)?
+        engine.incoming(got).mapErr(f -> streamError(f, "read from", peer))?
         Ok(true)
 
     // Up to `max` bytes of plaintext, waiting for at least one; empty once the peer has closed TLS
@@ -308,7 +308,7 @@ class TlsStream(private val tcp: TcpStream, private val engine: Engine, private 
                 Ok(Wants) ->
                     flush()?
                     if !pull()? then return Ok(Array.empty[byte]())
-                Err(f) -> return Err(streamError(f))
+                Err(f) -> return Err(streamError(f, "read from", peer))
         Ok(Array.empty[byte]())
 
 object TlsStream
@@ -316,19 +316,23 @@ object TlsStream
     // `client` trusts.
     connect(host: string, port: int, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError]
         val tcp = TcpStream.connect(host, port).mapErr(e -> Transport(e))?
-        val made = TlsStream.client(tcp, host, settings)
+        val made = TlsStream.clientOver(tcp, host, settings, s"$host:$port")
         if made.isErr() then tcp.close()
         made
 
     // TLS as the client over `tcp`, a connection to `host`, its certificate checked for `host`
     // against what `client` trusts. The handshake's waits keep `tcp`'s limit. Where it fails, `tcp`
     // is left for the caller to close.
-    client(tcp: TcpStream, host: string, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError]
+    client(tcp: TcpStream, host: string, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError] =
+        clientOver(tcp, host, settings, host)
+
+    // `client`, the connection's errors naming `peer`.
+    private clientOver(tcp: TcpStream, host: string, settings: TlsClient, peer: string) -> Result[TlsStream, TlsError]
         val context = clientContext(settings)?
         val made = clientEngine(context, host)
         context.close()
         val engine = made.mapErr(f -> Handshake(f.message))?
-        opened(tcp, engine)
+        opened(tcp, engine, peer)
 
     // TLS as the server over `tcp`, an accepted connection, presenting `server`'s certificate. The
     // handshake's waits keep `tcp`'s limit. Where it fails, `tcp` is left for the caller to close.
@@ -337,12 +341,12 @@ object TlsStream
         val made = serverEngine(context)
         context.close()
         val engine = made.mapErr(f -> Handshake(f.message))?
-        opened(tcp, engine)
+        opened(tcp, engine, "a TLS client")
 
     // A TLS connection over `tcp` once `engine`'s handshake is done; where it fails, `engine` is
-    // released and `tcp` left open.
-    private opened(tcp: TcpStream, engine: Engine) -> Result[TlsStream, TlsError]
-        val stream = TlsStream(tcp, engine, ReadAhead(Array.empty[byte](), 0), Array.fill(RecordSize, byte(0)), false)
+    // released and `tcp` left open. Its errors name `peer`.
+    private opened(tcp: TcpStream, engine: Engine, peer: string) -> Result[TlsStream, TlsError]
+        val stream = TlsStream(tcp, engine, ReadAhead(Array.empty[byte](), 0), Array.fill(RecordSize, byte(0)), false, peer)
         stream.handshake() match
             Ok(_) -> Ok(stream)
             Err(e) ->

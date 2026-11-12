@@ -7060,6 +7060,54 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `io-errors`): **an `IoError` carries its kind, operation and subject:
+  `data IoError(kind: ErrorKind, operation: string = "", subject: string = "")`**, the former
+  variants becoming `ErrorKind`'s, each with a `description`. It shows as `cannot <operation>
+  <subject>: <description>` (`cannot read nope.txt: no such file or directory`), leaving out what is
+  empty, and every error `avin.fs`, `avin.process`, `avin.signal` and `avin.net` make names both: a
+  path (`old to new` for a rename), a program, `process N`, `host:port`, a socket's path, `a client
+  of <address>` for an accepted connection. A program tells kinds apart with
+  `Err(IoError(NotFound, _, _))`, a guard on `e.kind`, or `==`. *Why*: the error a program prints
+  must say what failed and on what, and one type keeps `Reader`, `?` and every signature as they
+  were. *Alternatives*: a wrapper per module (`FileError(path, kind)`), which would split the one
+  error every reader shares and change every signature; a subject field on each variant, which
+  repeats it eleven times; keeping the variants and adding the path only to the message, which
+  leaves the value unable to say what it was about. **Review with the user**: matching moved from
+  `Err(NotFound)` to `Err(IoError(NotFound, _, _))`, longer at every site that tells kinds apart.
+- Proposed (built on branch `io-errors`): **`CommandError.Failed(status, command)`** names the
+  command's programs (`ls`, `ls | wc`, `make && ./app`, `a || b`, `a; b`), and its message is
+  `false exited with status 1`; an empty `command` leaves it out. *Why*: a failed status must say
+  which command failed. *Alternative*: the command only in the message, not matchable.
+- Proposed (built on branch `io-errors`): **the core trait `Error: Display`, with parameterless
+  `message -> string` and `cause -> Option[Error] = None`, and a default `display` that shows the
+  message, then `: ` and the cause as it shows**, leaving out an empty message. *Why
+  parameterless*: both read what the error holds, the parameterless rule's case, and a data field
+  named `message` then implements the first (the json package's `JsonError` does). *Why the
+  cause's display rather than its message*: an error with a `Display` of its own (`JsonError`'s
+  place) keeps it inside a chain. Every standard-library error type implements it (`IoError`,
+  `CommandError`, `HttpError`, `UrlError`, `TlsError`, `TimeParseError`, `ZoneError`,
+  `PatternError`, `MatchError`, `AskError`, `Utf8Error`, `JsonError`), each `message()` becoming
+  `message`, and `TlsRefusal.message` with them. A wrapper that only re-tags another error
+  (`CommandError.Io`, `HttpError.Io`, `TlsError.Transport`) has that error's message and no cause,
+  so it shows once. *Alternatives*: `message()` with parentheses, as before (against the
+  parameterless rule); a `source` chain printed separately rather than in the display (a program
+  would have to walk it to print anything useful).
+- Proposed (built on branch `io-errors`): **a data type implementing a core trait that gives
+  `display` (or `debug`) a body takes that method rather than the automatic one** made from its
+  fields, as it does where its own impl declares the method. *Why*: `impl Error for ParseError`
+  must show the sentence, not `ParseError(3)`. Only core-library traits are looked at, since the
+  automatic derivation is decided before names resolve. *Alternative*: making each error type also
+  write `impl Display`, which every program's error type would have to repeat.
+- Proposed (built on branch `io-errors`): **`Result[T, E].context(text: -> string) ->
+  Result[T, ContextError]`, for `E: Error`, and `data ContextError(message: string, inner: Error)`
+  in the prelude**, whose cause is `inner`. It works on a union of `Error` types and a type
+  parameter bounded by `Error`, and `?` passes it, and every other error type, unchanged into
+  `Result[T, Error]`. *Why by name*: the text is usually interpolated and is needed only for an
+  `Err`. *Alternatives*: `withContext(f: () -> string)` beside an eager `context` (two names for one
+  thing, which by-name already covers); a context method on `Option` too (not added: `okOr` makes the
+  error first); keeping the wrapped error's static type (`ContextError[E]`), which a chain of
+  contexts would nest in its type.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

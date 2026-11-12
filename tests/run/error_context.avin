@@ -1,0 +1,126 @@
+// expect: exit 0
+// The `Error` trait and `context`: an error shows as its message and its causes, outermost first;
+// `context` wraps an error of any `Error` type, a union of them or a type parameter bounded by
+// `Error`; `?` passes every error type on into `Result[T, Error]`; a data type implementing `Error`
+// shows as the trait says unless it has a `Display` of its own.
+import avin.fs
+import avin.io.{IoError, NotFound}
+
+data ParseError(line: int)
+
+impl Error for ParseError
+    message -> string = s"bad number on line $line"
+
+// A class implementing the trait, its cause its own.
+class Wrapped(val message: string, private val under: Option[Error]): Error
+    override cause -> Option[Error] = under
+
+// A data type whose field implements `message`, and whose own `Display` wins over the trait's.
+data Coded(message: string, code: int)
+
+impl Error for Coded
+
+impl Display for Coded
+    display(out: Writer, spec: FormatSpec) = out.writeField(s"E$code: $message", spec)
+
+// A data type with no `message` of its own but a cause: its empty message is left out.
+data Silent(inner: IoError)
+
+impl Error for Silent
+    message -> string = ""
+    cause -> Option[Error] = Some(inner)
+
+readIt(path: string) -> Result[string, IoError] = fs.readText(path)
+
+load(path: string) -> Result[int, IoError | ParseError]
+    val text = readIt(path)?
+    val n = text.trim().toIntOption().okOr(ParseError(1))?
+    Ok(n)
+
+// `?` passes each error type on, unchanged, into `Error`.
+anything(which: int) -> Result[int, Error]
+    if which == 0 then Err(ParseError(9))?
+    if which == 1 then readIt("/nonexistent/any")?
+    if which == 2 then load("/nonexistent/u").context("in a union")?
+    Ok(which)
+
+// A type parameter bounded by `Error` displays, has a message and takes context.
+describe[E: Error](e: E) -> string = s"[${e.message}] $e"
+
+wrapped[T, E: Error](r: Result[T, E], what: string) -> Result[T, ContextError] = r.context(what)
+
+// Every message in the chain, outermost first.
+chain(e: Error) -> Vector[string]
+    var out: Vector[string] = [e.message]
+    var at = e.cause
+    while at.isDefined()
+        val c = at.get()
+        out = out :+ c.message
+        at = c.cause
+    out
+
+var built = 0
+
+label(text: string) -> string
+    built += 1
+    text
+
+main()
+    // Depth 0: the error alone.
+    println(readIt("/nonexistent/zero"))
+    // Depth 1.
+    println(readIt("/nonexistent/one").context("loading config"))
+    // Depth 3.
+    println(readIt("/nonexistent/three").context("a").context("b").context("c"))
+    // An `Ok` passes through, its context never built.
+    println(Ok[int, IoError](5).context(label("never")))
+    println(built)
+    println(readIt("/nonexistent/lazy").context(label("built")).isErr())
+    println(built)
+    // A union of error types each an `Error`.
+    println(load("/nonexistent/union").context("loading"))
+    println(load("/nonexistent/union").context("a").context("b"))
+    // A user's error type, a class, a field-made message, an own display, an empty message.
+    println(Err[int, ParseError](ParseError(4)).context("parsing"))
+    println(Wrapped("outer", Some(Wrapped("inner", None))))
+    println(Err[int, Coded](Coded("bad", 7)).context("ctx"))
+    println(Coded("bad", 7).message)
+    println(Silent(IoError(NotFound, "read", "s")))
+    println(Err[int, Silent](Silent(IoError(NotFound, "read", "s"))).context("top"))
+    // Into `Result[T, Error]`.
+    println(anything(0))
+    println(anything(1))
+    println(anything(2))
+    println(anything(3))
+    // Generic over `E: Error`.
+    println(describe(ParseError(2)))
+    println(describe(IoError(NotFound, "open", "g")))
+    println(describe(ContextError("ctx", ParseError(3))))
+    println(wrapped(load("/nonexistent/g"), "generic"))
+    println(wrapped(Ok[int, ParseError](1), "unused"))
+    // The chain, walked by `cause`, and the wrapped error reached by type.
+    readIt("/nonexistent/walk").context("one").context("two") match
+        Err(e) ->
+            println(chain(e))
+            println(e.message)
+            println(e.inner is _: ContextError)
+            e.inner match
+                c: ContextError -> c match
+                    ContextError(m, io: IoError) -> println(s"$m / ${io.operation} / ${io.subject} / ${io.kind == NotFound}")
+                    _ -> println("no")
+                _ -> println("no")
+            e.cause match
+                Some(c: ContextError) -> println(c.cause.get() is _: IoError)
+                _ -> println("no cause")
+        Ok(_) -> ()
+    // Interpolation with a width pads the whole chain.
+    val short = ContextError("x", ParseError(1))
+    println(s"[${short}]")
+    println(f"[${short}%30s]")
+    println(f"[${short}%-30s]")
+    // A long chain.
+    var deep: Result[int, ContextError] = Err(ContextError("0", ParseError(0)))
+    for i in 1..<1000 do deep = deep.context(i.toString())
+    deep match
+        Err(e) -> println(e.toString().byteLength())
+        Ok(_) -> ()
