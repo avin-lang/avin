@@ -6672,7 +6672,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   branch `lazy-cons-operator`): `x +: xs` prepends to a lazy list already made, and `LazyList.cons(x, tail)` is the delayed form. The
   user then decided (2026-11-11): *"yes, a lazy head #:: tail operator would be good to include."*
   The operator is the entry below; `+:` stays strict.
-- Proposed (built on branch `lazy-cons-operator`): **A companion object may declare an operator
+- Settled on the user's delegation 2026-11-11 (built on branch `lazy-cons-operator`): **A companion object may declare an operator
   ending in `:` with its right operand by name, and `x op: r` calls it where `r`'s type is the
   companion's type.** `object LazyList` declares `#::[T](head: T, tail: -> LazyList[T])`, so
   `0 #:: 1 #:: fibs.zip(fibs.tail()).map((a, b) -> a + b)` evaluates its tail only when the cell
@@ -6694,7 +6694,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   **Review with the user**: the cost of the rule is that a `return`, `break` or `continue` inside
   the right operand of `#::` is an error on every type, since `LazyList` declares `#::` for the
   whole program.
-- Proposed (built on branch `lazy-cons-operator`): **`#` is an operator character**, and a leading
+- Settled on the user's delegation 2026-11-11 (built on branch `lazy-cons-operator`): **`#` is an operator character**, and a leading
   `#` is passed over when a symbol name's level is decided: `#::` binds as `::`, `#+` as `+`, a name
   of `#` alone (`##`) binds tightest, and a single `#` is no operator. WHY: `#::` must bind more
   loosely than arithmetic (`n + 1 #:: rest`), and a `#` prefix marks a variant of an operator
@@ -6703,12 +6703,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   would be `n + (1 #:: rest)`); `#` its own level. This replaces the earlier note that `#` is no
   operator character, which kept `avin.process` from spelling `#|`; those combinators keep their
   word names.
-- Proposed (built on branch `lazy-cons-operator`): **There is no `head #:: tail` pattern.** A
+- Settled on the user's delegation 2026-11-11 (built on branch `lazy-cons-operator`): **There is no `head #:: tail` pattern.** A
   pattern names an extractor by a word (`Name(p1, p2)`), and the only operator written between a
   pattern's parts is `List`'s `::`, so an infix extractor pattern would be a further language change.
   A lazy list is taken apart with `headOption()` and `tail()`. **Review with the user** if infix
   extractor patterns are wanted.
-- Proposed (built on branch `lazy-cons-operator`): **A lazy list's cell read while it is being
+- Settled on the user's delegation 2026-11-11 (built on branch `lazy-cons-operator`): **A lazy list's cell read while it is being
   evaluated traps with `a LazyList cell is read while it is being evaluated`**, checked by a flag
   the list's progress record holds while its cell's expression runs, rather than the `lazy val`'s
   own message, which named the private field `cell`. ALTERNATIVES: keeping the `lazy val`'s
