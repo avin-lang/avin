@@ -7025,14 +7025,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   type mismatch ("expected () -> int, found int") hides that the user meant a method value.
   ALTERNATIVE: the generic type-mismatch error.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed 2026-11-12 (branch `parameterless-collections`): **the collections' pure accessors are
+- Settled on the user's delegation 2026-11-12 (built on branch `parameterless-collections`): **the collections' pure accessors are
   parameterless methods**, on `Iterable`, `Iterator`, `Seq`, `Set`, `Map`, every immutable and mutable
   collection, `Builder` and their impls: `head`, `last`, `headOption`, `lastOption`, `tail`, `init`,
   `size`, `length`, `knownSize`, `isEmpty`, `nonEmpty`, `min`, `max`, `minOption`, `maxOption`,
@@ -7059,6 +7052,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   arguments, where before the method's own `T` hid it and the plain type mismatch was reported.
   The compiler's own expansions (a `for` over an array or a range, a sequence pattern) read
   `length` and `nonEmpty` without a call.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
