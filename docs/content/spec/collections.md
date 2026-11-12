@@ -778,14 +778,17 @@ same list, a list made from it or another iterator over it, gives the cell kept.
 be endless, and may be defined by reference to itself:
 
 ```text
+sieve(s: LazyList[int]) -> LazyList[int] =
+    s.head() #:: sieve(s.tail().filter(_ % s.head() != 0))
+
+val primes = sieve(LazyList.from(2))
+
+primes.take(5).toVector()                // [2, 3, 5, 7, 11]
+primes(99)                               // 541, the hundredth prime
+
 lazy val fibs: LazyList[long] = 0 #:: 1 #:: fibs.zip(fibs.tail()).map((a, b) -> a + b)
 
-sieve(xs: LazyList[int]) -> LazyList[int]
-    val p = xs.head()
-    p #:: sieve(xs.tail().filter(n -> n % p != 0))
-
 fibs(90)                                 // 2880067194370816120
-sieve(LazyList.from(2)).take(5)          // the first five primes, once read
 ```
 
 **Making one.** `LazyList.empty[T]()` is the empty list. `head #:: tail` is a list of `head` and then
