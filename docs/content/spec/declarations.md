@@ -628,6 +628,14 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
   a member of the same name, and a member hides a top-level declaration. `self.balance` always
   reaches the field, so a method's parameter may share a field's name. In the class body, a class
   parameter's name is its field, so it reads what an assignment to a `var` stored.
+- **A field may share its name with a trait's method that takes a parameter list**, so a field of
+  any name leaves a type its `Display`, `Debug`, `Eq`, `Hash`, `Ord`, `Iterable` and every other
+  trait's methods, written or derived: `data Config(host: string, debug: bool)` prints, compares
+  and hashes. `x.name` and a bare `name` read the field; `x.name(args)` and a bare `name(args)` call
+  the method, so a field holding a function is called by reading it first, `val f = x.name`;
+  through the trait, or a type parameter it bounds, only the method is seen. Every
+  other method of a field's name is an error at its declaration: a method of no trait, and a
+  method of no parameter list, which the field implements instead.
 - Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
   which match the arguments and not the receiver. A method may have type parameters of its own,
   after its class's.
