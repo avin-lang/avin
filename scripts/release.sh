@@ -213,6 +213,14 @@ build_compiler() {
 
 step 03-compiler build_compiler
 
+# The editor grammar ships in the VS Code extension and the IntelliJ plugin; its tests are a package
+# of their own, so the compiler gate does not run them.
+grammar_tests() {
+    heavy $repo sysl test editors/grammar-tests
+}
+
+step 03b-grammar grammar_tests
+
 # --- 4. the prefix -------------------------------------------------------------------------------
 
 stage=$out/stage
