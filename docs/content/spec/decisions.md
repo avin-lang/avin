@@ -798,7 +798,9 @@ Settled by the user on 2026-11-04:
   formatted. Spaces go around binary operators (ranges included, `0 ..< n`), `=` and `->`, after
   `,` and `:`, and nowhere inside brackets; a prefix operator stays against its operand. At most
   one blank line in a row, none at either end of the file, and one between two top-level
-  declarations unless both are one line; a declaration's comments and annotations stay with it.
+  declarations unless both are one line; a declaration's comments and annotations stay with it,
+  and a function's clauses are one declaration with its signature, no blank line among them
+  (Proposed, under [Proposed](#proposed)).
   Comments are kept exactly, a trailing one a space after the code. A line longer than 120
   characters has a list broken one item per line, a call's or a literal's items two columns in and
   a parameter list's four, the closing bracket on its own line; a list the source wrote one item
@@ -8194,6 +8196,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `x.` placeholder (it names a variable the program does not have). The opposite message, for
   `x.m()` on a parameterless `m`, is unchanged: it already reads well inside lambdas, placeholders
   and chains.
+- Proposed (built on branch `fmt-two-space`, decided by the director on the user's delegation):
+  **`avin fmt` keeps a function's clauses together.** No blank line goes between a function's
+  signature and its first clause or between two of its clauses, at the top level, in a class, an
+  object, a trait or a block alike, and blank lines the source wrote there are dropped, around
+  any comments between the clauses too (the comments stay). A clause is recognised as the parser
+  recognises one: the name of the signature or clause before it at its level, an argument list,
+  then `=`, a guard or an indented block of guards; the signature is a line naming the function
+  with typed parameters, no `=` and no indented body. The function counts as one declaration, so
+  the blank line between it and a different declaration before or after it stays as before, and a
+  blank line inside a clause's body is the body's own and stays. In a literate file, blank lines
+  beside prose are the document's and are kept even between clauses. Why: a function written as
+  clauses is one declaration and the preferred form for a function that matches on its
+  parameters; a blank line before a multi-line clause, which the rule for top-level declarations
+  put there, makes it read as several declarations. Alternatives weighed: keeping the blank lines
+  the source wrote and only not adding any (a file would read differently by who wrote it, and the
+  formatter is meant to settle exactly this); a blank line between clauses only around a
+  multi-line one (it still splits one function in two); a blank line between every clause
+  (it spreads a short definition over twice its lines).
 
 
 ## Proposed

@@ -706,11 +706,52 @@ private fmt_annotations_only(f: Fmt, a: usize, b: usize) -> bool
         if k < b && f.toks[k].text == "(" then k = f.partner[k] + 1
     k == b && b > a
 
+// The name of the function the head line `l` declares when it is a signature that clauses may
+// follow: `private`, `static`, `override` or `def` at most before the name, then its type
+// parameters or parameters, no `=` outside brackets and no indented body; "" for any other line.
+private fmt_signature_name(f: Fmt, l: usize) -> string
+    val ln = f.lines[l]
+    if ln.next_level > ln.level then return ""
+    var k = ln.first
+    while k < ln.end && (f.toks[k].text == "private" || f.toks[k].text == "static" || f.toks[k].text == "override" || f.toks[k].text == "def")
+        k += 1
+    if k + 1 >= ln.end || f.toks[k].kind != Word then return ""
+    val open = f.toks[k + 1].text
+    if open != "(" && open != "[" then return ""
+    val name = f.toks[k].text
+    k += 1
+    // Its parameters carry types, which tells it from a `match` arm such as `Some(n) -> n`.
+    var typed = false
+    while k < ln.end
+        if is_opener(f.toks[k].text)
+            val close = f.partner[k]
+            if close >= ln.end then return ""
+            if f.toks[k].text == "(" && !typed
+                for i in k..<close
+                    if f.toks[i].text == ":" then typed = true
+            k = close + 1
+        elif f.toks[k].text == "="
+            return ""
+        else
+            k += 1
+    if typed then name else ""
+
+// Whether the head line `l` is a clause of the function `name`: the name and an argument list,
+// followed by `=`, a guard, or an indented block of guards, as the parser reads one.
+private fmt_clause_of(f: Fmt, l: usize, name: string) -> bool
+    val ln = f.lines[l]
+    if name == "" || ln.first + 1 >= ln.end then return false
+    if f.toks[ln.first].text != name || f.toks[ln.first + 1].text != "(" then return false
+    val close = f.partner[ln.first + 1]
+    if close >= ln.end then return false
+    if close + 1 == ln.end then return ln.next_level > ln.level
+    f.toks[close + 1].text == "=" || f.toks[close + 1].text == "|"
+
 // ---- the output ----
 
 private struct FmtOut
     lines: Buf[string]
-    /** 0 code, 1 comment, 2 blank, 3 prose. */
+    /** 0 code, 1 comment, 2 blank, 3 prose, 4 a blank line dropped between clauses. */
     kinds: Buf[u8]
     /** Whether a blank line goes before the line. */
     gaps: Buf[bool]
@@ -758,6 +799,18 @@ private struct FmtOut
         if self.kinds.len() == 0 || self.kinds[self.kinds.len() - 1] != 1 then self.run = self.lines.len()
         self.push(text, 1)
 
+    /** Before a clause: the clauses of one function are one declaration, so no blank line separates
+     * a clause from its signature or the clause before it, around the comments between them too.
+     * Blank lines beside prose are the document's and stay. */
+    join(*self)
+        var i = self.lines.len()
+        while i > 0 && (self.kinds[i - 1] == 1 || self.kinds[i - 1] == 2 || self.kinds[i - 1] == 4)
+            i -= 1
+        if i > 0 && self.kinds[i - 1] == 3 then return
+        self.blanks = 0
+        for j in i..<self.lines.len()
+            if self.kinds[j] == 2 then self.kinds[j] = 4
+
     /** A line of code; `item` is 1 for the first line of a top-level declaration, 2 for a top-level
      * line that belongs to the declaration before it, 0 for any other. */
     code(*self, text: string, item: u8)
@@ -785,6 +838,7 @@ private struct FmtOut
         self.close_item()
         var out = str_builder()
         for i in 0..<self.lines.len()
+            if self.kinds[i] == 4 then continue
             if self.gaps[i] then out.push("\n")
             out.push(self.lines[i])
             out.push("\n")
@@ -803,7 +857,7 @@ private fmt_layout(doc: Source, program: Source, reflow: bool) -> Result[string,
     val pad = fmt_spaces(margin)
     var out = fmt_out()
     var after_annotation = false
-    var annotated = ""
+    var names: Buf[string] = buf()
     var l = 1usize
     while l <= n
         val ln = f.lines[l]
@@ -818,14 +872,21 @@ private fmt_layout(doc: Source, program: Source, reflow: bool) -> Result[string,
             if ln.comment == "" then out.blank() else out.comment(pad + fmt_spaces(ln.indent) + ln.comment)
             l += 1
             continue
+        // A clause belongs to the signature or clause before it at its level: the function's name
+        // is kept for each level open, and forgotten for the deeper ones once a line leaves them.
+        var clause = false
+        if ln.head
+            while names.len() <= ln.level do names.push("")
+            var deeper = ln.level + 1
+            while deeper < names.len()
+                names[deeper] = ""
+                deeper += 1
+            clause = fmt_clause_of(f, l, names[ln.level])
+            if clause then out.join() else names[ln.level] = fmt_signature_name(f, l)
         var item = 0u8
         if ln.head && ln.level == 0
             val word = f.toks[ln.first].text
-            // The clauses of an annotated function, `@tailrec` on its signature, belong to it.
-            val clause = annotated != "" && word == annotated && ln.first + 1 < f.toks.len() && f.toks[ln.first + 1].text == "("
             item = if after_annotation || clause || word == "else" || word == "elif" || word == "end" || word == "yield" then 2u8 else 1u8
-            if after_annotation then annotated = word
-            elif !clause then annotated = ""
             after_annotation = fmt_annotations_only(f, ln.first, ln.end)
         if ln.head && reflow && fmt_reflowable(f, l) is Some(last)
             var rendered: Buf[string] = buf()
