@@ -320,7 +320,7 @@ hello() {
 
 bindings() {
     mkdir -p $work/bindings || return 1
-    print -r -- 'main() = println("avin".toUpperCase())' > $work/bindings/upper.avin
+    print -r -- 'main() = println("avin".toUpperCase)' > $work/bindings/upper.avin
     local said
     said=$(cd $work/bindings && installed run upper.avin) || return 1
     print -r -- $said
