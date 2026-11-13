@@ -239,7 +239,7 @@ where that is one of the two, and otherwise takes the earlier.
 `ZoneError` is `UnknownZone(name)` where the database has no such zone, `NotAZoneName(name)` where
 the text cannot be one — it is empty, starts with `/`, holds a `..` segment, or a character outside
 ASCII letters, digits and `/ _ + -` — which is decided before anything is read, and
-`Malformed(name)` where the database's file for it cannot be decoded. `e.message` and its display
+`Malformed(name)` where the database's file for it cannot be decoded. It is an [`Error`](/spec/errors/#the-error-trait): `e.message` and its display
 name the zone: `no zone is named 'Mars/Olympus_Mons'`.
 
 The database is the host's (the directory `TZDIR` names, otherwise `/usr/share/zoneinfo`), kept

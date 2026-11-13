@@ -168,8 +168,8 @@ atomic group ends the search too; it is never read as the body's failing, so `(?
 into a match. The regex is unchanged by an error, and its next search starts with a full budget.
 
 `MatchError(pattern, inputLength, budget)` is a `data` type of `avin.regex`: the pattern as written,
-the number of characters in the text searched, and the steps each attempt had. `message` and its
-`Display` give `` pattern `p` backtracked too far on a N-character input, past its budget of B
+the number of characters in the text searched, and the steps each attempt had. It is an
+[`Error`](/spec/errors/#the-error-trait): `message` and its `Display` give `` pattern `p` backtracked too far on a N-character input, past its budget of B
 steps ``.
 
 What a group captured is what it matched on the path that succeeded, with these rules where a group
@@ -255,7 +255,7 @@ the empty text included. With `limit` above 0 there are at most `limit` pieces, 
 the text; with 0, the empty pieces at the end are dropped, so `Regex(",").split("a,,b,,")` is
 `["a", "", "b"]` and `Regex(",").split(",,")` has none; below 0 every piece is kept.
 A `PatternError` has a `description`, the `pattern` and the `index` of the character the error was
-found at (-1 where no one character is to blame); `message` writes the description, ` near index`
+found at (-1 where no one character is to blame); `message` (it is an `Error`) writes the description, ` near index`
 and the index, then the pattern on a line of its own and, where the index is inside it, a caret
 under that character. The descriptions are those of the table below, among others:
 

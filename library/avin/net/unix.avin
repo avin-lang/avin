@@ -62,18 +62,19 @@ private unixListenRaw(at: UnixAddress, backlog: int) -> Result[UnixListenSocket,
 private unixConnectRaw(to: UnixAddress) -> Result[UnixSocket, SyslError]
 
 // The address of `path`, its failure as an `IoError`.
-private addressAt(path: string) -> Result[UnixAddress, IoError] = unixAddressRaw(path).mapErr(ioError)
+private addressAt(path: string, operation: string) -> Result[UnixAddress, IoError] =
+    unixAddressRaw(path).mapErr(failed(operation, path))
 
 // A connection to a program listening at a path, made by `UnixStream.connect` or a listener's
 // `accept`. It reads and writes as a `TcpStream` does: bytes `readLine` reads beyond its line are
 // kept for the next read, and a connection handed to another thread or actor takes them with it.
 class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, private var closed: bool,
-                 private var limitMs: int): Sendable, ByteStream
+                 private var limitMs: int, private val peer: string): Sendable, ByteStream
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     override read(max: int) -> Result[Array[byte], IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.read(max, received)
 
     // The next line, without its terminator, or `None` once the other end has finished sending and
@@ -81,20 +82,20 @@ class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, 
     // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
     override readLine() -> Result[Option[string], IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.readLine(received)
 
     // Everything the other end sends until it finishes, after what earlier reads left.
     override readAll() -> Result[Array[byte], IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.readAll(received)
 
     // Sends all of `bytes`.
     override write(bytes: Array[byte]) -> Result[unit, IoError]
         mine()
-        if closed then return Err(closedError())
-        afterWait(unixSendAll(conn, bytes, limitMs)).mapErr(ioError)
+        if closed then return Err(closedError("write to", peer))
+        afterWait(unixSendAll(conn, bytes, limitMs)).mapErr(failed("write to", peer))
 
     // Sends `text` as UTF-8.
     override writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
@@ -103,15 +104,15 @@ class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, 
     // zero or less takes the limit away, as a `TcpStream`'s does.
     override setTimeout(d: Duration) -> Result[unit, IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("set the timeout of", peer))
         limitMs = millisOf(d)
         Ok(())
 
     // Tells the other end nothing more will be sent; reading goes on.
     override shutdownOutput() -> Result[unit, IoError]
         mine()
-        if closed then return Err(closedError())
-        conn.shutdown(Write).mapErr(ioError)
+        if closed then return Err(closedError("shut down", peer))
+        conn.shutdown(Write).mapErr(failed("shut down", peer))
 
     // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
     override close()
@@ -127,22 +128,22 @@ class UnixStream(private val conn: UnixSocket, private val buffered: ReadAhead, 
     // Up to `max` bytes from the connection itself.
     private received(max: int) -> Result[Array[byte], IoError]
         val into = Array.fill(max, byte(0))
-        val n = afterWait(unixRecv(conn, into, limitMs)).mapErr(ioError)?
+        val n = afterWait(unixRecv(conn, into, limitMs)).mapErr(failed("read from", peer))?
         Ok(if n == long(max) then into else into.slice(0, int(n)))
 
 object UnixStream
     // A connection to the program listening at `path`. A path nothing exists at is `NotFound`, and a
     // socket file nobody listens on any more is `ConnectionRefused`.
     connect(path: string) -> Result[UnixStream, IoError]
-        val at = addressAt(path)?
+        val at = addressAt(path, "connect to")?
         unixConnectRaw(at) match
             Ok(c) ->
                 unixNonBlocking(c) match
-                    Ok(_) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
+                    Ok(_) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, path))
                     Err(e) ->
                         c.close()
-                        Err(ioError(e))
-            Err(e) -> Err(if fs.exists(path) then ioError(e) else io.NotFound)
+                        Err(failed("connect to", path)(e))
+            Err(e) -> Err(if fs.exists(path) then failed("connect to", path)(e) else IoError(io.NotFound, "connect to", path))
 
 // A socket listening for connections at a path, made by `UnixListener.bind`. Like a connection, it may
 // be handed to another thread, which takes it over. Closing it leaves its socket file in the file
@@ -156,10 +157,10 @@ class UnixListener(private val conn: UnixListenSocket, private val at: string, p
     // Waits for the next connection.
     accept() -> Result[UnixStream, IoError]
         mine()
-        if closed then return Err(io.Other("the listener is closed"))
+        if closed then return Err(IoError(io.Other("the listener is closed"), "accept on", at))
         afterWait(unixAcceptOn(conn)) match
-            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
-            Err(e) -> Err(ioError(e))
+            Ok(c) -> Ok(UnixStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, s"a client of $at"))
+            Err(e) -> Err(failed("accept on", at)(e))
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
     close()
@@ -178,29 +179,29 @@ object UnixListener
     // program. A path the platform cannot carry, too long above all (103 bytes on macOS, 107 on
     // Linux), is an error saying so, and so is a missing directory on the way.
     bind(path: string) -> Result[UnixListener, IoError]
-        val a = addressAt(path)?
+        val a = addressAt(path, "listen on")?
         unixListenRaw(a, 128) match
             Ok(c) ->
                 unixListenerNonBlocking(c) match
                     Ok(_) -> Ok(UnixListener(c, path, false))
                     Err(e) ->
                         c.close()
-                        Err(ioError(e))
-            Err(e) -> Err(if fs.exists(path) then io.AlreadyExists else ioError(e))
+                        Err(failed("listen on", path)(e))
+            Err(e) -> Err(if fs.exists(path) then IoError(io.AlreadyExists, "listen on", path) else failed("listen on", path)(e))
 
     // Listens at `path`, first clearing a socket file left behind by a program that is gone: where
     // the path holds a socket nobody listens on, it is removed and bound. A live listener's path is
     // `AlreadyExists` and is left alone, and so is anything that is not a refused socket. Finding
     // out connects once, so a live listener sees one connection that closes without a word.
     bindReplacing(path: string) -> Result[UnixListener, IoError]
-        val a = addressAt(path)?
+        val a = addressAt(path, "listen on")?
         if fs.exists(path)
             unixConnectRaw(a) match
                 Ok(c) ->
                     c.close()
-                    return Err(io.AlreadyExists)
+                    return Err(IoError(io.AlreadyExists, "listen on", path))
                 Err(e) -> netFailure(e) match
                     Refused -> ()
-                    _ -> return Err(io.AlreadyExists)
+                    _ -> return Err(IoError(io.AlreadyExists, "listen on", path))
             fs.remove(path)?
         bind(path)

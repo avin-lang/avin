@@ -335,15 +335,18 @@ data ExitStatus
 
 data CommandError
     Io(error: IoError)
-    Failed(status: ExitStatus)
+    Failed(status: ExitStatus, command: string)
 ```
 
-`CommandError` has `message -> string`, as `IoError` does: an `Io` error's own message,
-`exited with status 1`, `killed by signal 15 (Terminate)` (the name of a signal of `avin.signal`,
-`unknown` for any other number) or `timed out`.
+A `CommandError` is an [`Error`](/spec/errors/#the-error-trait), as `IoError` is, and shows as its
+`message`: an `Io` error's own message, or the command's programs, as `ls`, `ls | wc` or
+`make && ./app`, and how it ended: `false exited with status 1`, `sleep killed by signal 15
+(Terminate)` (the name of a signal of `avin.signal`, `unknown` for any other number) or `sleep timed
+out`. `Failed`'s `command` is the programs alone; one built with an empty `command` leaves it out.
 
 `isSuccess` is `true` of `Exited(0)` alone. A program that is not there fails to start: `run`
-answers `Err(NotFound)` and `output` `Err(Io(NotFound))`.
+answers an `IoError` of kind `NotFound`, `cannot run nosuch: no such file or directory`, and `output`
+the same error in `Io`.
 
 **A string runs as a command.** Importing `avin.process` adds `run()` and `output()` to `string`, as
 an [extension](/spec/declarations/#extensions): `"ls -l".run()` is `Command.parse("ls -l").run()`.
@@ -419,9 +422,12 @@ writers `StandardOutput` and `StandardError`; each is one function taking `Any*`
 ### `IoError`
 
 What every module that reads or writes shares: the error an input or output operation fails with.
+It says what kind of failure it was, what was being done, and what it was done to.
 
 ```text
-data IoError
+data IoError(kind: ErrorKind, operation: string = "", subject: string = "")
+
+data ErrorKind
     NotFound
     PermissionDenied
     AlreadyExists
@@ -429,26 +435,61 @@ data IoError
     NotADirectory
     DirectoryNotEmpty
     InvalidUtf8(offset: long)
+    ConnectionRefused
+    ConnectionReset
+    TimedOut
     Other(text: string)
 ```
 
-| Variant | Meaning |
-| --- | --- |
-| `NotFound` | Nothing exists at the path, or a directory on the way to it is missing. |
-| `PermissionDenied` | The program may not read, write or search what the path names. |
-| `AlreadyExists` | Something is already where a new file or directory was to be made. |
-| `IsADirectory` | A directory was used where a file was expected. |
-| `NotADirectory` | A file was used where a directory was expected. |
-| `DirectoryNotEmpty` | A directory to be removed still holds entries. |
-| `InvalidUtf8(offset)` | Text read is not UTF-8; `offset` is the first byte where it stops being. |
-| `Other(text)` | Any other failure, described in words. |
+| Kind | Meaning | `description` |
+| --- | --- | --- |
+| `NotFound` | Nothing exists at the path, or a directory on the way to it is missing. | `no such file or directory` |
+| `PermissionDenied` | The program may not read, write or search what the path names. | `permission denied` |
+| `AlreadyExists` | Something is already where a new file or directory was to be made. | `already exists` |
+| `IsADirectory` | A directory was used where a file was expected. | `is a directory` |
+| `NotADirectory` | A file was used where a directory was expected. | `not a directory` |
+| `DirectoryNotEmpty` | A directory to be removed still holds entries. | `directory not empty` |
+| `InvalidUtf8(offset)` | Text read is not UTF-8; `offset` is the first byte where it stops being. | `not UTF-8 at byte 2` |
+| `ConnectionRefused` | Nothing listens at the address a connection was made to. | `connection refused` |
+| `ConnectionReset` | The other end reset or closed a connection while it was in use. | `connection reset by peer` |
+| `TimedOut` | A read or write on a connection waited past its timeout. | `timed out` |
+| `Other(text)` | Any other failure, described in words. | `text` |
 
-An `IoError` is a value like any other: it is matched by its variants, shows as one (`NotFound`,
-`InvalidUtf8(2)`) wherever a value is displayed, and `e.message` gives a sentence for a person
-(`no such file or directory`). **The named cases have one sentence each, the same on every platform;
-`Other` carries the platform's own wording** (`File name too long`), so a failure with no case of its
-own still says what happened. An operation that can fail answers a `Result[T, IoError]`, so `?`
-passes the failure on from a function that answers one too.
+**An `IoError` names its subject.** `operation` is what was being done, in words that follow
+`cannot`: `read`, `write`, `append to`, `open`, `create`, `remove`, `remove directory`, `rename`,
+`create directory`, `list`, `read metadata of`, `connect to`, `listen on`, `accept on`, `read from`,
+`write to`, `run`, `wait for`, `signal`. `subject` is what it was done to: a path, `old to new` for a
+rename, `host:port` or a socket's path for a connection, a program's name, `process 4242`. Every
+error the standard library makes has both, so it is an [`Error`](/spec/errors/#the-error-trait)
+whose `message`, and so its display, is a sentence:
+
+```text
+fs.readText("nope.txt")          // Err(cannot read nope.txt: no such file or directory)
+TcpStream.connect("localhost", 1) // Err(cannot connect to localhost:1: connection refused)
+Command("nosuch").run()          // Err(cannot run nosuch: no such file or directory)
+```
+
+The sentence is `cannot <operation> <subject>: <description>`; an error with no subject leaves it
+out (`cannot read: …`), and one with no operation either is the kind's description alone, so a
+program's own `IoError(Other("disk on fire"))` shows as `disk on fire`. **The named kinds have one
+description each, the same on every platform; `Other` carries the platform's own wording** (`File
+name too long`), so a failure with no kind of its own still says what happened.
+
+**A program tells failures apart by the kind**, which a pattern reaches inside the error, a guard or
+an `==` reads, and the operation and subject come along to be used:
+
+```text
+fs.readText(path) match
+    Ok(text) -> use(text)
+    Err(IoError(NotFound, _, _)) -> useDefaults()
+    Err(e) if e.kind == PermissionDenied -> eprintln(s"$e; try sudo")
+    Err(e) -> fail(e.message)
+```
+
+An operation that can fail answers a `Result[T, IoError]`, so `?` passes the failure on from a
+function that answers one too, and `context` wraps it in what the program was doing. Where this
+chapter says an operation answers `Err(NotFound)` or `Err(Other("No such process"))`, it means an
+`IoError` of that kind, naming the operation and its subject.
 
 ### Standard input
 
@@ -1005,7 +1046,7 @@ way to accept a certificate these refuse, a private authority, a corporate one a
 being the same case. The choices are [proposed](/spec/decisions/#proposed).
 
 **After the handshake a connection is a `ByteStream`**: a failure of TLS itself while reading or
-writing is an `IoError.Other` whose text begins `TLS:`, and the connection's end, by the peer's
+writing is an `IoError` of kind `Other` whose text begins `TLS:`, and the connection's end, by the peer's
 `close_notify` or by the TCP connection closing, reads as the end of a TCP connection's does.
 
 `TlsError` says why a connection could not be made: `Transport(IoError)`, the connection beneath

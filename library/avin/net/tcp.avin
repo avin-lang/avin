@@ -9,6 +9,7 @@ module avin.net
 // body hands it over, so a server accepts a connection and gives it to the code that serves it.
 
 import avin.io
+import avin.io.ErrorKind
 import avin.io.IoError
 import avin.time.Duration
 
@@ -27,11 +28,19 @@ private class SyslError
 @sysl("avin.rt.net_failure")
 private netFailure(e: SyslError) -> NetFailure
 
-private ioError(e: SyslError) -> IoError = netFailure(e) match
+private kindOf(e: SyslError) -> ErrorKind = netFailure(e) match
     Refused -> io.ConnectionRefused
     Reset -> io.ConnectionReset
     TimedOut -> io.TimedOut
     Failed(m) -> io.Other(m)
+
+// The error `operation` on `subject`, an address, failed with, of the kind the socket's error `e` is.
+private failed(operation: string, subject: string) -> (SyslError) -> IoError =
+    e -> IoError(kindOf(e), operation, subject)
+
+// What `operation` on the closed connection or listener `subject` answers.
+private closedError(operation: string, subject: string) -> IoError =
+    IoError(io.Other("the connection is closed"), operation, subject)
 
 // Where a socket connects or listens: an address and a port, as the host's name resolved.
 @sysl("sysl.net.Address")
@@ -118,10 +127,7 @@ private addressesOf(host: string, port: int) -> Result[Vector[Address], IoError]
     if port < 0 || port > 65535 then fail(s"port $port is outside 0 to 65535")
     resolveRaw(host, port) match
         Ok(found) if found.nonEmpty -> Ok(found)
-        _ -> Err(io.Other(s"no address found for $host"))
-
-// What a read or write on a closed connection answers.
-private closedError() -> IoError = io.Other("the connection is closed")
+        _ -> Err(IoError(io.Other("no address found"), "resolve", host))
 
 // How much a read takes from the connection at once when it reads ahead.
 private val ChunkSize = 8192
@@ -189,12 +195,12 @@ private utf8Of(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i 
 // A read or write waits at most `limitMs` milliseconds at a time for the connection, zero for no
 // limit.
 class TcpStream(private val conn: Socket, private val buffered: ReadAhead, private var closed: bool,
-                private var limitMs: int): Sendable, ByteStream
+                private var limitMs: int, private val peer: string): Sendable, ByteStream
     // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
     // sending. `max` is at least one.
     override read(max: int) -> Result[Array[byte], IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.read(max, received)
 
     // The next line, without its terminator, or `None` once the other end has finished sending and
@@ -202,20 +208,20 @@ class TcpStream(private val conn: Socket, private val buffered: ReadAhead, priva
     // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
     override readLine() -> Result[Option[string], IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.readLine(received)
 
     // Everything the other end sends until it finishes, after what earlier reads left.
     override readAll() -> Result[Array[byte], IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("read from", peer))
         buffered.readAll(received)
 
     // Sends all of `bytes`.
     override write(bytes: Array[byte]) -> Result[unit, IoError]
         mine()
-        if closed then return Err(closedError())
-        afterWait(sendAll(conn, bytes, limitMs)).mapErr(ioError)
+        if closed then return Err(closedError("write to", peer))
+        afterWait(sendAll(conn, bytes, limitMs)).mapErr(failed("write to", peer))
 
     // Sends `text` as UTF-8.
     override writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
@@ -226,15 +232,15 @@ class TcpStream(private val conn: Socket, private val buffered: ReadAhead, priva
     // room several times fails only where one of those waits runs out.
     override setTimeout(d: Duration) -> Result[unit, IoError]
         mine()
-        if closed then return Err(closedError())
+        if closed then return Err(closedError("set the timeout of", peer))
         limitMs = millisOf(d)
         Ok(())
 
     // Tells the other end nothing more will be sent; reading goes on.
     override shutdownOutput() -> Result[unit, IoError]
         mine()
-        if closed then return Err(closedError())
-        conn.shutdown(Write).mapErr(ioError)
+        if closed then return Err(closedError("shut down", peer))
+        conn.shutdown(Write).mapErr(failed("shut down", peer))
 
     // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
     override close()
@@ -251,7 +257,7 @@ class TcpStream(private val conn: Socket, private val buffered: ReadAhead, priva
     // Up to `max` bytes from the connection itself.
     private received(max: int) -> Result[Array[byte], IoError]
         val into = Array.fill(max, byte(0))
-        val n = afterWait(recv(conn, into, limitMs)).mapErr(ioError)?
+        val n = afterWait(recv(conn, into, limitMs)).mapErr(failed("read from", peer))?
         Ok(if n == long(max) then into else into.slice(0, int(n)))
 
 // The text of a line's bytes, a `\r` at its end dropped.
@@ -272,22 +278,24 @@ object TcpStream
     // the last address's; a host that resolves to nothing is `Other`.
     connect(host: string, port: int) -> Result[TcpStream, IoError]
         val addresses = addressesOf(host, port)?
-        var last = io.Other(s"no address found for $host")
+        val peer = s"$host:$port"
+        var last = IoError(io.Other("no address found"), "connect to", peer)
         for a in addresses
             openConnection(a) match
                 Ok(c) ->
                     connectSocket(c, a) match
-                        Ok(_) -> return Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
+                        Ok(_) -> return Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, peer))
                         Err(e) ->
                             c.close()
                             stopIfCancelled()
-                            last = ioError(e)
-                Err(e) -> last = ioError(e)
+                            last = failed("connect to", peer)(e)
+                Err(e) -> last = failed("connect to", peer)(e)
         Err(last)
 
 // A socket listening for connections, made by `TcpListener.bind`. Like a connection, it may be handed
 // to another thread, which takes it over, and every operation first checks its socket's owner.
-class TcpListener(private val conn: ListenSocket, private val boundPort: int, private var closed: bool): Sendable
+class TcpListener(private val conn: ListenSocket, private val boundPort: int, private var closed: bool,
+                  private val host: string): Sendable
     // The port it listens on, the one the platform chose where `bind` was given port 0.
     port() -> int
         mine()
@@ -296,10 +304,11 @@ class TcpListener(private val conn: ListenSocket, private val boundPort: int, pr
     // Waits for the next connection.
     accept() -> Result[TcpStream, IoError]
         mine()
-        if closed then return Err(io.Other("the listener is closed"))
+        val here = s"$host:$boundPort"
+        if closed then return Err(IoError(io.Other("the listener is closed"), "accept on", here))
         afterWait(acceptOn(conn)) match
-            Ok((c, _)) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0))
-            Err(e) -> Err(ioError(e))
+            Ok((c, _)) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, s"a client of $here"))
+            Err(e) -> Err(failed("accept on", here)(e))
 
     // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
     close()
@@ -317,15 +326,16 @@ object TcpListener
     // for every address it answers on; port `0` lets the platform choose, and `port()` says which.
     bind(host: string, port: int) -> Result[TcpListener, IoError]
         val addresses = addressesOf(host, port)?
+        val here = s"$host:$port"
         val a = addresses(0)
-        val c = openListenSocket(a).mapErr(ioError)?
+        val c = openListenSocket(a).mapErr(failed("listen on", here))?
         listening(c, a) match
             Ok(_) -> ()
             Err(e) ->
                 c.close()
-                return Err(ioError(e))
+                return Err(failed("listen on", here)(e))
         c.local() match
-            Ok(at) -> Ok(TcpListener(c, at.port(), false))
+            Ok(at) -> Ok(TcpListener(c, at.port(), false, host))
             Err(e) ->
                 c.close()
-                Err(ioError(e))
+                Err(failed("listen on", here)(e))
