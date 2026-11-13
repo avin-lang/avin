@@ -7676,6 +7676,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **2026-11-13, branch `build-dir`: `avin run` and `avin test` build into the user's cache
+  directory, not into `.avin/` beside the program.** A program's executables and its instance cache
+  go to `build/<name>-<key>/` in the toolchain's cache (`~/Library/Caches/avin/<version>/` on macOS,
+  `$XDG_CACHE_HOME/avin/<version>/` or `~/.cache/avin/<version>/` elsewhere, or `AVIN_CACHE`), where
+  `<name>` is the program's directory's or file's name and `<key>` twelve hex digits of a SHA-256 of
+  its absolute, canonical path. `.avin/build/` beside the program is used only on a machine with no
+  cache directory (no `AVIN_CACHE`, `HOME` or `XDG_CACHE_HOME`; the runtime's archives then go to the
+  temporary directory, which is cleared under a long-lived cache). `avin build` and `-o` are
+  unchanged. The new `avin clean [<program>]` removes the program's directory and any `.avin/build/`
+  beside it (on the fallback, a program of one file's entries only, and `.avin/` once empty);
+  `avin clean --all` removes the whole `build/` of this version and nothing else of the cache, and on
+  the fallback means the current program's. `avin new` writes `/<name>` (the executable `avin build`
+  leaves at the root) and `.avin/` into an application's `.gitignore`, `.avin/` alone into a
+  library's. Why: a one-file script run from anywhere left an `.avin/` next to it; Sysl keeps its
+  builds and run cache in the machine cache directory keyed by version and target and uses a
+  project's `.sysl/` only where there is none, and Avin already keeps its fetched packages, runtime
+  archives and shims there, so a build cache beside the source was the one exception. Keying by path
+  keeps two worktrees of one repository apart (each has its own sources), and the version in the
+  path keeps one compiler's entries from another's. The executables and records are still published
+  by rename and the instance cache is lock-free as before, so two builds of one program at once stay
+  safe. Alternatives weighed: keep `.avin/` beside projects and move only one-file programs (two
+  rules to explain, and a repository still grows a directory to ignore); key by the program's content
+  rather than its path (every edit would start a new cache, and nothing would ever trim the old);
+  `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
+  then fetches again over the network); a lock around a program's cache (the content-addressed,
+  rename-published entries need none). Review with the user: whether a cache of a deleted project
+  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
