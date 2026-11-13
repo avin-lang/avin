@@ -771,7 +771,7 @@ Settled by the user on 2026-11-03:
 - A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
   of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
   the library's collections takes any `Iterable` from its function, or an `Option` (see the
-  Proposed entry on `flatMap` with options, branch `map-flatmap`); a `Range` maps to a `Vector`;
+  entry on `flatMap` with options, branch `map-flatmap`); a `Range` maps to a `Vector`;
   a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
   a function of one pair, and yield a `Map` where they yield pairs, a collection otherwise.
 - A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
@@ -1932,7 +1932,7 @@ their words are reserved.
   collection back is withdrawn. The review this entry carried, a `Map` receiver offering only its
   pair-making `map`, is superseded by the Proposed entry on a map's `map` to other results (branch
   `map-flatmap`).
-- **Proposed** (branch `map-flatmap`): **a map's `map` and `flatMap` to anything other than pairs
+- Settled on the user's delegation 2026-11-12 (built on branch `map-flatmap`): **a map's `map` and `flatMap` to anything other than pairs
   answer a collection** ([collections](/spec/collections/#operations-without-higher-kinded-types)),
   on the user's direction that Avin adopt the conveniences of a rich collections library that add
   no complexity. `m.map((k, v) -> Summary(k, v))`, `m.map(e -> e.0)`, a `match` function or a
@@ -1958,7 +1958,7 @@ their words are reserved.
   since the sorted overload hides `Iterable`'s of the same parameter types and the candidates are
   not held to their bounds while choosing. Review with the user: whether that fallback is wanted
   too, and `Iterable` versus `Vector` as the result.
-- **Proposed** (branch `map-flatmap`): **`flatMap` takes an option-making function on every
+- Settled on the user's delegation 2026-11-12 (built on branch `map-flatmap`): **`flatMap` takes an option-making function on every
   collection**, by an overload `flatMap[U](f: (T) -> Option[U])` beside each collection's own
   `flatMap` of a collection-making function, answering the same kind: `Iterable` (a `Vector`),
   every `Seq`, `Vector`, `List`, `ArraySeq`, `Array`, `Buffer`, `Deque`, `Queue`, `LazyList` (lazily),
@@ -7226,14 +7226,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (same objection, and weaker). The user may want to revisit this if programs commonly hit errors
   that have only `Debug`.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed 2026-11-12 (branch `parameterless-wave2`): **the rest of the standard library's pure
+- Settled on the user's delegation 2026-11-12 (built on branch `parameterless-wave2`): **the rest of the standard library's pure
   accessors are parameterless.** The rule applied: a public method of no parameters is declared
   without a parameter list when it answers from its receiver (or, static, from its type), changes
   nothing, and hands out nothing to change or use up; the same rule wave 1 applied to collections,
@@ -7290,7 +7283,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   A trap to know: `opt.get()` where `opt: Option[() -> T]` now calls the function the option holds;
   the library's one such site was rewritten to `opt.get`.
 
-- Proposed 2026-11-12 (branch `bare-method-ref`): **a method declared with an empty parameter list,
+- Settled on the user's delegation 2026-11-12 (built on branch `bare-method-ref`): **a method declared with an empty parameter list,
   `m()`, named without a call is a function value only where a function type is expected.** Anywhere
   else (`println(xs.sorted)`, `s"${s.isEmpty}"`, `c.bump == 0`, `val v = c.bump` with no type, an
   argument for a type parameter or `Any`), it is an error naming the call `x.m()` and the lambda
@@ -7303,7 +7296,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `spawn(worker.run)` needs a lambda); a warning instead of an error (wrong output still ships);
   extending the rule to top-level functions of no parameters (they are always called with `()`, so
   the slip does not arise). Review with the user: `val f = c.bump` no longer infers a function.
-- Proposed 2026-11-12 (branch `bare-method-ref`): **a function value stays without `Display`**, so
+- Settled on the user's delegation 2026-11-12 (built on branch `bare-method-ref`): **a function value stays without `Display`**, so
   interpolating one is an error, now with the hint "a function value is never shown: to show what
   it returns, call it"; `print`/`println` keep taking `Any` and show a function as `<function>`.
   WHY: the empty-list rule above already stops the missing-`()` slip at its source, and the
@@ -7313,7 +7306,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   function-typed argument to `print`/`println` (a special case); refusing any conversion of a
   function to `Any` (breaks heterogeneous `Any` containers holding callbacks).
 
-- Proposed (built on branch `lazylist-perf`): **A lazy list's cell is one object of three words,
+- Settled on the user's delegation 2026-11-12 (built on branch `lazylist-perf`): **A lazy list's cell is one object of three words,
   filled in place by the one function that evaluates it.** `LazyList[+T]` holds `pending` (the
   evaluating function until it has run, a constant trapping function while it runs, then `None`),
   `first` and `rest`; an empty cell is one whose `rest` is itself, and a cell evaluated as another
@@ -7349,6 +7342,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   counter exposed to programs (a hook in every allocation, for a check the code already answers).
   Review with the user: `field_unset` is a new escape from the variance and initialization rules,
   though only the core library may use it.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `library-version`): **the standard library carries the compiler's version, and
+  the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
+  stamped by `scripts/release.sh` in the same commit as `const Version` and `compiler/sysl.hocon`,
+  and a compiler checks it against its own before it compiles anything: `check`, `build`, `run`,
+  `test` and `lsp` print one error naming both versions and the library's path, and nothing else.
+  A library with no version, or a `library.hocon` that is missing or unreadable, is refused the
+  same way. The rule is an **exact match**. A compiler built between releases carries the last
+  release's version, and so does the library in its own checkout, so a development build matches
+  its own tree; only a library from another release, through `AVIN_ROOT` or an install, differs.
+  Why: a library of another version fails as dozens of errors inside `library/avin/*.avin`, which
+  points a reader at the library rather than at the mismatch. Alternatives weighed: a dev compiler
+  accepting a library from the same commit (needs a commit id stamped into both and a build step
+  that keeps them in step, to answer a case the exact rule already passes); "the library is newer
+  than the compiler" (a newer library declares what an older compiler cannot check, which is the
+  failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
+  library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
+
+
+## Proposed
 
 ## Open
 
@@ -7403,20 +7421,3 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reports a bad binding without linking). The language server already stops at checking, so it
   matches the new `check`. Review with the user: whether `--bindings` should instead be the
   default for packages that have bindings.
-
-- Proposed (branch `library-version`): **the standard library carries the compiler's version, and
-  the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
-  stamped by `scripts/release.sh` in the same commit as `const Version` and `compiler/sysl.hocon`,
-  and a compiler checks it against its own before it compiles anything: `check`, `build`, `run`,
-  `test` and `lsp` print one error naming both versions and the library's path, and nothing else.
-  A library with no version, or a `library.hocon` that is missing or unreadable, is refused the
-  same way. The rule is an **exact match**. A compiler built between releases carries the last
-  release's version, and so does the library in its own checkout, so a development build matches
-  its own tree; only a library from another release, through `AVIN_ROOT` or an install, differs.
-  Why: a library of another version fails as dozens of errors inside `library/avin/*.avin`, which
-  points a reader at the library rather than at the mismatch. Alternatives weighed: a dev compiler
-  accepting a library from the same commit (needs a commit id stamped into both and a build step
-  that keeps them in step, to answer a case the exact rule already passes); "the library is newer
-  than the compiler" (a newer library declares what an older compiler cannot check, which is the
-  failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
-  library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
