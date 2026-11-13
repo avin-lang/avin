@@ -8061,6 +8061,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   for one changed entry, and no gain for numbers of one width). Review with the user: the 32-
   character limit, and whether a short list deliberately written one per line should stay so.
 
+- Proposed (built on branch `discarded-result`): **A dropped `Result` or `Future` is an error, and
+  `_ = e` drops one on purpose** ([errors](/spec/errors/#a-result-is-not-dropped)). A value of
+  either type is reported where it is thrown away: a block's statement, the last line of a function
+  or lambda yielding `unit`, a branch of an `if` without `else` or of an `if`/`match` written as a
+  statement, a loop's body. `_ = e` evaluates `e` and keeps nothing. A deferred statement is exempt,
+  and so is an expression the checker reads only for its own errors after the form around it failed.
+  The standard library's call sites were each handled or marked `_ =` (a socket or pipe closed once
+  its exchange is over, a temporary directory removed, a signal to a program that may have ended).
+  - *Why*: `fs.writeText("/nonexistent/x", "hi")` as a statement compiled and failed silently (gap
+    audit C8). An error, not a warning: Avin has no warnings channel, every diagnostic is an error,
+    and a warning shown only sometimes is the one that is missed (as for unreachable match arms).
+    `_ = e` is the spelling a reader already knows from destructuring, where `_` drops a part. A
+    deferred statement is exempt because it runs while its block is being left, where no `?` or
+    `return` can carry a failure anywhere, and `defer f.close()` is the form `defer` exists for. A
+    `Future` is included because dropping one loses its answer the same way.
+  - *Alternatives weighed*: a warning (no channel to carry it); a `@mustUse` annotation on types or
+    functions (more general, but a new attribute for two types, and a library author could forget
+    it); `Result` only (a dropped `Future[Result[…]]` loses the failure just as surely); reporting
+    a dropped `Result` in `defer` too, which would make `defer _ = f.close()` the idiom (noise on the
+    one form `defer` is for); `val _ = e` as the only discard (it already works, but reads as a
+    declaration).
+  - **Review with the user**: whether `defer` should stay exempt (decisions above left "whether
+    discarding a `close`'s `Result` in `defer` deserves a warning" open), and whether a lambda yielding
+    `unit` should be held to the rule (it is, so `xs.foreach(f -> fs.remove(f))` is an error).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

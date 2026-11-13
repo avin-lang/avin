@@ -291,8 +291,11 @@ struct BodyState
      * those, a `return` and a `?` would leave the statement, which runs while its block is being
      * left. `None` outside one, and inside a lambda or a local function written in one. */
     defer_floor: Option[usize]
+    /** Above zero while an expression is checked only to report its own errors, after the form
+     * around it already failed: a value it drops is not reported as discarded (`check_ignored`). */
+    quiet_discards: usize
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None)
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0)
 
 /** A function passed to a binding's `@threaded` parameter `param` of `binding`. */
 struct ThreadedArgument
@@ -10042,6 +10045,9 @@ private check_body(c: *Checker, id: usize, body: &Expr, hint: Option[&Type])
         Some(declared) ->
             if !fits(c,typed.ty, declared) && !(*declared is Unit)
                 c.note(symbol.unit, body.span, s"${described(symbol)} yields ${type_name(typed.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, typed.ty)}")
+            // A body of a function that yields unit drops its value, as a statement does: a lambda
+            // passed where a `(T) -> unit` is wanted, most of all.
+            if *declared is Unit then report_discarded(c, yielding(body), typed)
         None -> c.symbols[id].result = Some(typed.ty)
     c.bodies[id] = Some(typed)
 
@@ -10632,6 +10638,14 @@ check_expr(c: *Checker, e: &Expr, expected: Option[&Type]) -> &TExpr = check_val
 /** Checks an expression whose value is discarded, so the branches of an `if` need not agree. */
 private check_statement(c: *Checker, e: &Expr) -> &TExpr = check_value(c, e, None, false)
 
+/** Checks an expression only for its own errors, where the form around it already failed, so a
+ * `Result` it drops is not reported as discarded on top of that failure. */
+private check_ignored(c: *Checker, e: &Expr) -> &TExpr
+    c.body.quiet_discards += 1
+    val t = check_value(c, e, None, false)
+    c.body.quiet_discards -= 1
+    t
+
 // A value expected as `Any` converts to it where it is written. Only the forms that yield one of
 // their parts (a block, `if`, `match`, a loop) pass `Any` on to those parts, so each converts its
 // own; for any other the expected `Any` says nothing about how to check it.
@@ -10989,7 +11003,31 @@ private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     if completing_expr(c, e) then return TExpr(e.span, ErrorType, UnitConst)
     val t = check_kind(c, e, expected, used)
     if c.index is Some(_) then index_expr(c, e, t)
+    if !used && !yields_a_part(e) then report_discarded(c, e, t)
     t
+
+/** The part of `e` that gives its value: the last item of a block that yields one, or `e` itself. */
+private yielding(e: &Expr) -> &Expr = e.kind match
+    Block(items, false) -> if items.len() > 0 then yielding(items[items.len() - 1]) else e
+    _ -> e
+
+/** Whether `e` is a form that yields one of its parts: a block, `if`, `match` or a loop. */
+private yields_a_part(e: &Expr) -> bool =
+    e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
+
+// A `Result` or a `Future` made by a statement and dropped is a failure or a computation nobody looks
+// at, so it is an error; `_ = e` drops one on purpose. A form that yields one of its parts (a block,
+// `if`, `match`, a loop) is not judged itself: each of its parts is, where it is discarded. A
+// deferred statement may drop one: it runs while its block is being left, where no `?` or `return`
+// could pass a failure on, so `defer f.close()` stays as it is written.
+private report_discarded(c: *Checker, e: &Expr, t: &TExpr)
+    if c.body.defer_floor is Some(_) || c.body.quiet_discards > 0 then return
+    val what = *zonk(c, t.ty) match
+        Data(id, name, _) -> if name == "Result" && c.data[id].module_name == "avin" then "a `Result`" else return
+        Class(k, name, _) -> if name == "Future" && c.classes[k].module_name == "avin.threads" then "a `Future`" else return
+        _ -> return
+    val hint = if what == "a `Result`" then "handle it (`?`, `match`, `getOrElse`)" else "`await` it"
+    c.note(unit_of(c), e.span, s"$what is discarded here; $hint, or write `_ = …` to drop it on purpose")
 
 // A module-level `@c(const: "NAME") val` is the C constant, of its declared type: an integer type, a
 // `real` or a `string`. The C unit measures it, and the driver checks that it fits.
@@ -11026,7 +11064,8 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
         TExpr(e.span, ErrorType, UnitConst)
     Checked(slot) -> c.checked_slots[slot]
     Member(target, name) ->
-        if module_use(c, e) is Some(q) then check_form(c, q, expected, used)
+        // The rewritten use is judged as this one is, by the caller, so it is checked as used.
+        if module_use(c, e) is Some(q) then check_form(c, q, expected, true)
         elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e.span, found, explicit, expected)
         elif limit_constant(c, e.span, target, name) is Some(k) then k
         elif static_value(c, e.span, target, name, expected) is Some(v) then v
@@ -11066,12 +11105,12 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Return(value) -> return_expr(c, e, value)
     Defer(body) ->
         c.note(unit_of(c), e.span, "a `defer` is a statement of a block, run when that block is left; it is written on a line of its own in an indented body of a function, a lambda, a branch or a loop")
-        check_statement(c, body)
+        check_ignored(c, body)
         TExpr(e.span, ErrorType, UnitConst)
     Propagate(value) -> propagate_expr(c, e, value)
     Splice(value) ->
         c.note(unit_of(c), e.span, "`*` after an argument passes a sequence as a repeated parameter's arguments; it is written only as the last argument of a call to a function with one")
-        check_statement(c, value)
+        check_ignored(c, value)
         TExpr(e.span, ErrorType, UnitConst)
     Match(subject, arms) -> match_expr(c, e, subject, arms, expected, used)
     Is(_, _, _) -> check_condition(c, e).expr
@@ -11920,7 +11959,7 @@ private with_expr(c: *Checker, e: &Expr, base: &Expr, changes: Buf[FieldChange])
     val typed_base = check_expr(c, base, None)
     val ty = zonk(c, typed_base.ty)
     if !with_base(c, base.span, ty)
-        for change in changes do check_statement(c, change.value)
+        for change in changes do check_ignored(c, change.value)
         return TExpr(e.span, ErrorType, UnitConst)
     var items: Buf[&TExpr] = buf()
     val held = hidden_local(c, ty)
@@ -11936,7 +11975,7 @@ private with_expr(c: *Checker, e: &Expr, base: &Expr, changes: Buf[FieldChange])
             Some(r) -> r
             None ->
                 failed = true
-                check_statement(c, change.value)
+                check_ignored(c, change.value)
                 continue
         val spelled = joined_path(change.path, change.path.len())
         var clash = false
@@ -12388,7 +12427,7 @@ private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
     val place = field_place(c, target) match
         Some(p) -> p
         None ->
-            check_statement(c, value)
+            check_ignored(c, value)
             return TExpr(e.span, ErrorType, UnitConst)
     val current = place_read(c, place, target.span)
     if c.index is Some(_) then index_expr(c, target, current)
@@ -12635,13 +12674,13 @@ private qualified_variant_call(c: *Checker, at: Span, name_span: Span, found: Op
         Some(v) -> v
         None ->
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
     if c.data[v.data].variants[v.index].fields.len() == 0
         val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
         c.note(unit, at, s"`$written` has no fields; write it without parentheses")
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     construct(c, at, name_span, v, args, explicit, expected)
 
@@ -12703,7 +12742,7 @@ private writable_global(c: *Checker, at: Span, g: usize) -> bool
 
 private assign_global(c: *Checker, e: &Expr, target: &Expr, g: usize, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
     if !writable_global(c, target.span, g)
-        check_statement(c, value)
+        check_ignored(c, value)
         return TExpr(e.span, ErrorType, UnitConst)
     val ty = global_type(c, g, target.span)
     val current = TExpr(target.span, ty, Global(g))
@@ -12878,7 +12917,7 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
             // value reports something else.
             if lookup_local(c, n) is None && param_index(c, n) is None && class_member(c, n) is Some(MethodOf(_))
                 assignable(c, target)
-                check_statement(c, value)
+                check_ignored(c, value)
                 return TExpr(e.span, ErrorType, UnitConst)
         Member(object, field) ->
             if !(object.kind is Name(_))
@@ -12897,7 +12936,7 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
     val current = check_expr(c, place, None)
     var result: &TExpr = TExpr(e.span, ErrorType, UnitConst)
     if c.units[unit].report.len() > before || *zonk(c, current.ty) is ErrorType
-        check_statement(c, value)
+        check_ignored(c, value)
     else
         val ms = methods_of(c, current.ty, spelling)
         if ms.len() > 0
@@ -12914,7 +12953,7 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
             val name = spelling[0..<spelling.bytes.len - 1]
             if language_operator(name) || groups_right(name)
                 c.note(unit, op_span, s"`${type_name(current.ty)}` has no method `$spelling`, and `$name` is not a method that `$spelling` can assign through")
-                check_statement(c, value)
+                check_ignored(c, value)
             else
                 val combined = Expr(e.span, InfixCall(place, name, op_span, value))
                 result = assign_place(c, e, place, None, combined, false, op_span)
@@ -12924,6 +12963,12 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
     TExpr(e.span, result.ty, Block(typed))
 
 private assign_place(c: *Checker, e: &Expr, written: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
+    // `_ = e` evaluates `e` and drops its value on purpose: the way to discard a `Result`.
+    if written.kind is Name("_") && op is None && !yields
+        val dropped = check_expr(c, value, None)
+        var items: Buf[&TExpr] = buf()
+        items.push(dropped)
+        return TExpr(e.span, if *dropped.ty is Nothing then Nothing else Unit, Block(items))
     val target = module_target(c, written)
     if target.kind is Call(callee, args) then return check_form(c, element_assignment(e, callee, args, op, value, yields, op_span), None, yields)
     if targets_field(c, target) then return assign_field(c, e, target, op, value, yields, op_span)
@@ -12932,7 +12977,7 @@ private assign_place(c: *Checker, e: &Expr, written: &Expr, op: Option[BinaryOp]
     val index = assignable(c, target) match
         Some(i) -> i
         None ->
-            check_statement(c, value)
+            check_ignored(c, value)
             return TExpr(e.span, ErrorType, UnitConst)
     val local = c.body.locals[index]
     val current = TExpr(target.span, local.ty, Local(index))
@@ -13199,9 +13244,9 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             val written = if wanted_shape == "sequence" then "`[a, b]`" elif wanted_shape == "set" then "`{a, b}`" else "`{k: v}`"
             c.note(unit, at, s"${type_name(t)} is a $wanted_shape, written as a $wanted_shape literal, $written, not a $shape literal")
             for item in items
-                check_statement(c, item)
+                check_ignored(c, item)
             for value in values
-                check_statement(c, value)
+                check_ignored(c, value)
             return TExpr(at, ErrorType, UnitConst)
     val from_expected = collection is Some(_)
     if collection is None
@@ -13212,9 +13257,9 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
         Some(o) -> o
         None ->
             for item in items
-                check_statement(c, item)
+                check_ignored(c, item)
             for value in values
-                check_statement(c, value)
+                check_ignored(c, value)
             c.note(unit, at, s"a $shape literal needs the core library's `${if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"}`")
             return TExpr(at, ErrorType, UnitConst)
     val companion = global_read(c, at, c.classes[o].global.unwrap())
@@ -13238,9 +13283,9 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
         c.unknowns[i].message = s"cannot infer the element type of an empty collection literal; give it a type, as in $example"
     if *builder.ty is ErrorType
         for item in items
-            check_statement(c, item)
+            check_ignored(c, item)
         for value in values
-            check_statement(c, value)
+            check_ignored(c, value)
         return builder
     val held = hidden_local(c, builder.ty)
     val receiver = TExpr(at, builder.ty, Local(held))
@@ -13272,9 +13317,9 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
         if parts.len() != 2
             c.note(unit, at, s"${type_name(builder.ty)} takes elements of type ${type_name(element)}, not `(key, value)` pairs, so a map literal cannot build it")
             for item in items
-                check_statement(c, item)
+                check_ignored(c, item)
             for value in values
-                check_statement(c, value)
+                check_ignored(c, value)
             return TExpr(at, ErrorType, UnitConst)
         val typed_keys = literal_parts(c, items, parts[0], "keys")
         val typed_values = literal_parts(c, values, parts[1], "values")
@@ -14085,7 +14130,7 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
         val hidden = c.hidden_module
         if found.len() == 0
             for h in holes
-                check_statement(c, h)
+                check_ignored(c, h)
             return TExpr(e.span, ErrorType, UnitConst)
         val before = c.reported_count
         val result = check_expr(c, interpolator_call(e.span, prefix, parts, holes), expected)
@@ -15177,19 +15222,19 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     val symbol = c.symbols[c.current]
     if c.body.defer_floor is Some(_)
         c.note(unit, e.span, deferred_exit("return"))
-        if value is Some(v) then check_statement(c, v)
+        if value is Some(v) then check_ignored(c, v)
         return TExpr(e.span, Nothing, UnitConst)
     if symbol.delayed
         c.note(unit, e.span, "`return` cannot leave a delayed argument, which is evaluated where its parameter is read")
-        if value is Some(v) then check_statement(c, v)
+        if value is Some(v) then check_ignored(c, v)
         return TExpr(e.span, Nothing, UnitConst)
     if comprehension_part(symbol)
         c.note(unit, e.span, comprehension_exit("return"))
-        if value is Some(v) then check_statement(c, v)
+        if value is Some(v) then check_ignored(c, v)
         return TExpr(e.span, Nothing, UnitConst)
     if symbol.constructor
         c.note(unit, e.span, "`return` cannot leave a class body, which runs to its end to make the object")
-        if value is Some(v) then check_statement(c, v)
+        if value is Some(v) then check_ignored(c, v)
         return TExpr(e.span, Nothing, UnitConst)
     var typed: Option[&TExpr] = None
     symbol.result match
@@ -15571,7 +15616,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             if c.super_args
                 c.note(unit, named.span, s"`$name` is a method, which a superclass's arguments cannot call: they run before the object is initialized")
                 for a in args
-                    check_statement(c, a.value)
+                    check_ignored(c, a.value)
                 return TExpr(at, ErrorType, UnitConst)
             val receiver = self_ref(c, named.span)
             var ms = bare_methods(c, name)
@@ -15604,7 +15649,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         if c.globals[g].object is Some(_)
             c.note(unit, named.span, s"`$name` is an object, made once before `main`; it is called only through an `apply` method it declares")
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
         return value_call(c, at, callee, args)
     if ids.len() == 0
@@ -15613,12 +15658,12 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             if c.data[v.data].variants[v.index].fields.len() == 0
                 c.note(unit, at, s"`$name` has no fields; write it without parentheses")
                 for a in args
-                    check_statement(c, a.value)
+                    check_ignored(c, a.value)
                 return TExpr(at, ErrorType, UnitConst)
             return construct(c, at, named.span, v, args, explicit, expected)
         if is_variant
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
         if explicit is None
             if builtin_type(name) is Some(target) then return conversion(c, at, target, args, false)
@@ -15627,7 +15672,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                 if names_type_param(scope.params, name)
                     c.note(unit, named.span, s"`$name` is a type parameter, which a call converts to only where it is bounded by `Integer`")
                     for a in args
-                        check_statement(c, a.value)
+                        check_ignored(c, a.value)
                     return TExpr(at, ErrorType, UnitConst)
         c.note(unit, named.span, alias_not_value(c, unit, name).unwrap_or(s"`$name` is not defined"))
         return TExpr(at, ErrorType, UnitConst)
@@ -15641,7 +15686,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
 private call_function(c: *Checker, at: Span, name_span: Span, id: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], typed: Buf[Option[&TExpr]]) -> &TExpr
     if abstract_constructor(c, id, name_span)
         for i in 0..<args.len()
-            if i >= typed.len() || typed[i] is None then check_statement(c, args[i].value)
+            if i >= typed.len() || typed[i] is None then check_ignored(c, args[i].value)
         return TExpr(at, ErrorType, UnitConst)
     local_use(c, id, at)
     val declared = result_of(c, id, at)
@@ -16464,7 +16509,7 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
             if ms.len() > 0 then c.note(unit, name_span, s"`$name` is a method of a value of `${type_name(t)}`, not of the type; call it on a value")
             elif !(scalar_builtin(t) && refuse_private_trait_method(c, name_span, t, name)) then c.note(unit, name_span, s"`${type_name(t)}` has no static member `$name`")
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     // The width `i1` holds 0 and -1 only, so it has no `1` for `one()` to give, as `val x: i1 = 1`
     // has no value. Reached through a generic, `one()` at `i1` traps instead.
@@ -16610,7 +16655,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if found.owners.len() > 1
             c.note(unit, name_span, union_clash(zonk(c, object.ty), name, found.owners))
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
         if found.owners.len() == 1 then object = union_as_owner(c, object, found.owners[0])
     if *zonk(c, object.ty) is Class(k, _, _)
@@ -16621,11 +16666,11 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if method_named(c, k, name) is Some(m)
             c.note(unit, name_span, s"`$name` is private to `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
     if methods_of(c, object.ty, name).len() == 0 && refuse_private_trait_method(c, name_span, object.ty, name)
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     // A value of a type parameter has the methods of its bounds, and no others but the `equals` and
     // `hash` every value has.
@@ -16641,7 +16686,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if !universal && bound_field(c, ty, name) is None && bound_class_field(c, ty, name) is None
             no_bound_member(c, name_span, ty, name)
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
     val all = in_scope_on_context(c, zonk(c, object.ty), receiver_methods(c, zonk(c, object.ty), name))
     val ms = in_scope_on_context(c, zonk(c, object.ty), with_trait_methods(c, object.ty, name, visible_methods(c, all)))
@@ -16649,7 +16694,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if ms.len() == 0
             c.note(unit, name_span, s"`$name` is private to the impls of `${type_name(c.symbols[all[0]].receiver.unwrap())}`")
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             return TExpr(at, ErrorType, UnitConst)
         if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
         return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
@@ -16668,11 +16713,11 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if !(*zonk(c, object.ty) is ErrorType)
             c.note(unit, name_span, s"`${type_name(zonk(c, object.ty))}` has no method `$name` to call infix" + split_hint(name))
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     if explicit is Some(_)
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return unsupported(c, callee, "type arguments on a call of a field")
     call_checked(c, at, name_span, member_of(c, callee, object, name, None), args)
 
@@ -16701,12 +16746,12 @@ private infix_call(c: *Checker, at: Span, target: &Expr, name: string, name_span
                 _ -> ErrorType
             val yields = zonk(c, delayed_type)
             if *yields is ErrorType || c.units[unit].report.len() > before
-                check_statement(c, arg)
+                check_ignored(c, arg)
                 return TExpr(at, ErrorType, UnitConst)
             if lazy_operator_of(c, yields, name) is Some(o)
                 if has_own_method(c, yields, name)
                     c.note(unit_of(c), name_span, s"`${type_name(yields)}` has a method `$name` and its companion `${c.classes[o].name}` declares `$name` too, so `x $name ${type_name(yields)}` could call either: rename one of them")
-                    check_statement(c, arg)
+                    check_ignored(c, arg)
                     return TExpr(at, ErrorType, UnitConst)
                 // `x op: r` is the companion's `op:(x, r)`, which takes `r` by name: `r` was checked
                 // above as the delayed expression the call passes on unevaluated.
@@ -16825,7 +16870,7 @@ private infix_arity_error(c: *Checker, at: Span, name_span: Span, target: &Expr,
     val counted = if count == 1 then "1 argument" else s"$count arguments"
     c.note(unit, name_span, s"`$name` takes $counted, and only a method of one argument is called infix; write `$receiver.$name($inner)`")
     for a in args
-        check_statement(c, a.value)
+        check_ignored(c, a.value)
     TExpr(at, ErrorType, UnitConst)
 
 // `super.name(args)` calls the superclass's implementation of a method on `self`, directly, even where
@@ -16846,7 +16891,7 @@ private super_call(c: *Checker, at: Span, name_span: Span, super_span: Span, nam
         ms = buf()
     if ms.len() == 0
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     // `super.name` with no call reaches only a method declared without a parameter list.
     if !called && !(ms.len() == 1 && is_parameterless(c, ms[0]))
@@ -16861,7 +16906,7 @@ private super_call(c: *Checker, at: Span, name_span: Span, super_span: Span, nam
     if is_abstract_method(c.symbols[m])
         c.note(unit, name_span, s"`${c.symbols[m].name}` is abstract, so `super` cannot call it")
         for i in 0..<args.len()
-            if i >= choice.typed.len() || choice.typed[i] is None then check_statement(c, args[i].value)
+            if i >= choice.typed.len() || choice.typed[i] is None then check_ignored(c, args[i].value)
         return TExpr(at, ErrorType, UnitConst)
     // The parentheses after a method declared without a parameter list call what it yields.
     if called && is_parameterless(c, m) then return parameterless_called(c, at, name_span, receiver, m, args, explicit, true)
@@ -16880,7 +16925,7 @@ private pick_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, na
 private call_method(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, name: string, ms: Buf[usize], args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], direct: bool) -> &TExpr
     if refuse_trait_clash(c, name_span, receiver.ty, name, ms)
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     if ms.len() == 1 && is_parameterless(c, ms[0]) then return parameterless_called(c, at, name_span, receiver, ms[0], args, explicit, direct)
     val choice = pick_method(c, at, name_span, receiver, name, ms, args, explicit)
@@ -16900,12 +16945,12 @@ private parameterless_called(c: *Checker, at: Span, name_span: Span, receiver: &
     val ty = zonk(c, value.ty)
     if *ty is ErrorType || *ty is Nothing
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ty, UnitConst)
     if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
     c.note(unit_of(c), Span(name_span.start, at.end), s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
     for a in args
-        check_statement(c, a.value)
+        check_ignored(c, a.value)
     TExpr(at, ErrorType, UnitConst)
 
 // A method's signature as a call on `receiver` sees it: its parameters past the receiver, and the
@@ -17003,7 +17048,7 @@ private method_call(c: *Checker, at: Span, name_span: Span, receiver: &TExpr, m:
     val unmet = refuse_unmet_conformance(c, name_span, receiver.ty, m) || refuse_static_on_value(c, name_span, receiver, m)
     if *receiver.ty is Nothing || unmet
         for i in 0..<args.len()
-            if i >= checked.len() || checked[i] is None then check_statement(c, args[i].value)
+            if i >= checked.len() || checked[i] is None then check_ignored(c, args[i].value)
         return if unmet then TExpr(at, ErrorType, UnitConst) else receiver
     // The receiver is evaluated before the arguments, so one that is computed is held while they are.
     var setup: Option[&TExpr] = None
@@ -18079,18 +18124,18 @@ private parameterless_function_called(c: *Checker, at: Span, name_span: Span, id
     if explicit is Some(_)
         c.note(unit_of(c), name_span, s"`$name` takes no type parameters: it is declared without a parameter list")
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     val value = call_function(c, name_span, name_span, id, buf(), None, None, buf())
     val ty = zonk(c, value.ty)
     if *ty is ErrorType || *ty is Nothing
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ty, UnitConst)
     if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
     c.note(unit_of(c), Span(name_span.start, at.end), s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
     for a in args
-        check_statement(c, a.value)
+        check_ignored(c, a.value)
     TExpr(at, ErrorType, UnitConst)
 
 // A named function used as a value. A generic one is instantiated as a call would be, with its type
@@ -18177,7 +18222,7 @@ private call_checked(c: *Checker, at: Span, callee_span: Span, f: &TExpr, args: 
             if *ty is Union(_) then c.note(unit, callee_span, s"a union is not called: `${type_name(ty)}` may hold a value that is no function; take it apart with a `match` first")
             elif settled(ty) then c.note(unit, callee_span, s"a value of type ${type_name(ty)} cannot be called; only a function can")
             for a in args
-                check_statement(c, a.value)
+                check_ignored(c, a.value)
             TExpr(at, if *ty is Nothing then Nothing else ErrorType, UnitConst)
 
 // Whether a lambda's parameter declared `declared` may stand where `wanted` is expected though the two
@@ -18831,12 +18876,12 @@ private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument], wr
     if wrap && !(*as_integer(c, target) is Int(_))
         c.note(unit, at, s"`wrap` converts to an integer type, which `${type_name(target)}` is not")
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     if args.len() != 1 || args[0].name is Some(_)
         c.note(unit, at, s"`${type_name(target)}(value)` converts exactly one value")
         for a in args
-            check_statement(c, a.value)
+            check_ignored(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     val arg = args[0].value
     // A literal is read at its own width, which is at least `int`'s, so that `i8(300)` narrows 300.
