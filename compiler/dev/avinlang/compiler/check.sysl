@@ -10625,7 +10625,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
         Some(w) -> w
         None -> return check_form(c, e, None, used)
     if *zonk(c, want) is Union(_) then return union_value(c, e, zonk(c, want), used)
-    if !(*zonk(c, want) is AnyType) then return to_trait(c, none_as(c, to_sendable(c, check_form(c, e, expected, used), want), want), zonk(c, want))
+    if !(*zonk(c, want) is AnyType) then return to_trait(c, none_as(c, results_as(c, to_sendable(c, check_form(c, e, expected, used), want), want), want), zonk(c, want))
     val passes =e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
@@ -10868,6 +10868,72 @@ private same_shape(t: &Type, m: &Type) -> bool = *t match
 private none_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr =
     if converts_none(c, typed.ty, want) then TExpr(typed.span, zonk(c, want), NoneAs(typed)) else typed
 
+// A function value whose result is `Nothing`, or a function whose result is such a function, used
+// where a function type is expected that yields another type there, converts to it where it is
+// written: it is made a lambda of the expected type that calls it. No value has type `Nothing`, so
+// the function is one of every result type, but a call of it yields no value at all while a call
+// of the expected type yields one of its type, so it is not that type without conversion. Only
+// where the expected type is settled, its parameters are the function's on the terms a function
+// type's parameters vary by, and both are `@sendable` or the expected one is not.
+private results_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
+    if !widens_results(c, typed.ty, want) then return typed
+    val at = typed.span
+    // The value is evaluated once, where it is written, into a local the lambda captures; a name
+    // with a space in it is one no program can write.
+    val local = c.body.locals.len()
+    val name = s"adapted value $local"
+    c.body.locals.push(TLocal(name, typed.ty, false, c.current))
+    val mark = c.body.visible.len()
+    c.body.visible.push(local)
+    val lambda = calling_lambda(c, at, name, function_arity(zonk(c, want)), want)
+    c.body.visible.truncate(mark)
+    var items: Buf[&TExpr] = buf()
+    items.push(TExpr(at, Unit, Let(local, typed)))
+    items.push(lambda)
+    TExpr(at, lambda.ty, Block(items))
+
+/** A lambda of `arity` parameters, checked against `want`, that passes them on to a call of `callee`. */
+private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want: &Type) -> &TExpr
+    var params: Buf[LambdaParam] = buf()
+    var args: Buf[Argument] = buf()
+    for i in 0..<arity
+        val param = s"adapted $i"
+        params.push(LambdaParam(at, param, None))
+        args.push(Argument(at, None, name_at(at, param), false))
+    val body = Expr(at, Call(name_at(at, callee), args))
+    lambda_expr(c, Expr(at, Lambda(params, body)), params, body, Some(want), false)
+
+private function_arity(t: &Type) -> usize = *t match
+    Function(ps, _, _) -> ps.len()
+    _ -> 0
+
+/** Whether a value of type `t` converts to `want` as `results_as` converts it. */
+private widens_results(c: *Checker, t: &Type, want: &Type) -> bool
+    val x = zonk(c, t)
+    val w = zonk(c, want)
+    if has_unknowns(x) || has_unknowns(w) then return false
+    nothing_results_as(c, x, w) match
+        Some(u) -> conforms(view_as(conformances(c), u, w), w)
+        None -> false
+
+// The function type `x` with each result of `Nothing`, at any depth of results, made `want`'s result
+// there; `None` where `x` has no such result that `want` gives another type, or where `want` is not a
+// function type of as many parameters at each depth.
+private nothing_results_as(c: *Checker, x: &Type, want: &Type) -> Option[&Type]
+    val (xs, r, m) = *zonk(c, x) match
+        Function(xs, r, m) -> (xs, r, m)
+        _ -> return None
+    val (ys, s) = *zonk(c, want) match
+        Function(ys, s, _) -> (ys, s)
+        _ -> return None
+    if xs.len() != ys.len() then return None
+    val result = zonk(c, r)
+    val target = zonk(c, s)
+    if *result is Nothing
+        if *target is Nothing || *target is ErrorType then return None
+        return Some(Function(xs, target, m))
+    Some(Function(xs, nothing_results_as(c, result, target)?, m))
+
 /** Whether a value of type `t` converts to `want` as `none_as` converts it. */
 private converts_none(c: *Checker, t: &Type, want: &Type) -> bool
     if !nothing_option(c, t) then return false
@@ -11073,7 +11139,9 @@ param_index(c: *Checker, name: string) -> Option[usize]
 // A named function with a union parameter, written where a function type is expected whose parameter
 // there is one of the union's members (or a smaller union), is made at that site as a lambda calling
 // it, so each argument is injected as a call's would be: `val f: (int) -> string = describe` for
-// `describe(x: int | string)`.
+// `describe(x: int | string)`. So is a named function whose result is `Nothing`, where the expected
+// type yields another (see `results_as`): `val f: (int) -> Option[int] = refuse` for
+// `refuse(x: int) -> Nothing`. Such a lambda captures nothing.
 private adapted_function(c: *Checker, at: Span, name: string, id: usize, expected: Option[&Type]) -> Option[&TExpr]
     val want = zonk(c, expected?)
     val ps = *want match
@@ -11086,15 +11154,11 @@ private adapted_function(c: *Checker, at: Span, name: string, id: usize, expecte
     for i in 0..<ps.len()
         val declared = zonk(c, symbol.params[i])
         if *declared is Union(_) && !same_type(declared, zonk(c, ps[i])) then adapts = true
+    // The lambda is held to the rules for a `@sendable` function where one is expected, as a lambda
+    // written there is, so the function is taken as one.
+    if !adapts && widens_results(c, Function(symbol.params, result_of(c, id, at), is_sendable_function(want)), want) then adapts = true
     if !adapts then return None
-    var params: Buf[LambdaParam] = buf()
-    var args: Buf[Argument] = buf()
-    for i in 0..<ps.len()
-        val param = s"adapted $i"
-        params.push(LambdaParam(at, param, None))
-        args.push(Argument(at, None, name_at(at, param), false))
-    val body = Expr(at, Call(name_at(at, name), args))
-    Some(lambda_expr(c, Expr(at, Lambda(params, body)), params, body, expected, false))
+    Some(calling_lambda(c, at, name, ps.len(), want))
 
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
     if name == "_"
@@ -13199,6 +13263,13 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                     for i in 0..<checked.len()
                         if checked[i] is Some(before) then checked[i] = Some(none_as(c, before, t.ty))
                     agreed = Some(t.ty)
+                // So does an element that is a function yielding `Nothing`, to the others' function
+                // type, and the elements before one of another function type, to that.
+                t = results_as(c, t, so_far)
+                if widens_results(c, so_far, t.ty)
+                    for i in 0..<checked.len()
+                        if checked[i] is Some(before) then checked[i] = Some(results_as(c, before, t.ty))
+                    agreed = Some(t.ty)
             checked[k] = Some(t)
             agreed = agreed match
                 None -> Some(t.ty)
@@ -14451,6 +14522,9 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
         // A branch that is an `Option[Nothing]` converts to the other's option.
         y = none_as(c, y, n.ty)
         n = none_as(c, n, y.ty)
+        // A branch that is a function yielding `Nothing` converts to the other's function type.
+        y = results_as(c, y, n.ty)
+        n = results_as(c, n, y.ty)
     if *y.ty is Nothing && !(*n.ty is Nothing) then bring_into_scope(c, condition.span, tested.no)
     elif *n.ty is Nothing && !(*y.ty is Nothing) then bring_into_scope(c, condition.span, tested.yes)
     var ty: &Type = Unit
@@ -17220,6 +17294,12 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     // The type arguments written or inferred conform to their parameters' bounds; those the receiver
     // gives were held to them where its type was made.
     hold_to_bounds_except(c, unit, name_span, s"`$name`", owner, type_params, solved, known.len(), sent_matches)
+    // A function argument whose result is `Nothing` converts to its parameter's function type, as the
+    // other arguments decided it: `pick(c, refuse, (x: int) -> Some(x))` passes `refuse` as an
+    // `(int) -> Option[int]`.
+    for j in 0..<typed.len()
+        if j < targets.len()
+            if targets[j] is Some(p) then typed[j] = results_as(c, typed[j], p)
     var ty = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then ty = Nothing
@@ -18789,6 +18869,14 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                 for i in 0..<typed.len()
                     val before = typed[i]
                     typed[i] = TArm(before.pattern, before.guard, none_as(c, before.body, body.ty))
+                ty = body.ty
+            // So does an arm that is a function yielding `Nothing`, to the other arms' function type,
+            // and the arms before an arm of another function type, to that.
+            body = results_as(c, body, ty)
+            if widens_results(c, ty, body.ty)
+                for i in 0..<typed.len()
+                    val before = typed[i]
+                    typed[i] = TArm(before.pattern, before.guard, results_as(c, before.body, body.ty))
                 ty = body.ty
             join_expected(c, ty, body.ty, wanted) match
                 Some(t) -> ty = t
