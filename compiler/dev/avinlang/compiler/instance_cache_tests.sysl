@@ -783,8 +783,9 @@ private const Label: string = "import geo.{Mapper, Holder, Other}\n\nlabel(m: Ma
 
 /** Builds the program of `main0`, `geo0` and `extra0`, then the edited one of `main1`, `geo1` and
  * `extra1` with the same cache, at -O0 and at -O2, each level with a cache of its own. The edited
- * build reuses entries, its text is a clean build's, and its program prints `want`. */
-private rebuild_prints(main0: string, geo0: string, extra0: string, main1: string, geo1: string, extra1: string, want: string)
+ * build reuses the entry of the function `kept` (unless it is empty), its text is a clean build's, and its program prints
+ * `want`. */
+private rebuild_prints(main0: string, geo0: string, extra0: string, main1: string, geo1: string, extra1: string, kept: string, want: string)
     val dir = make_temp_dir("avin-ic-slots").unwrap()
     defer _ = remove_dir_all(dir)
     val tc = repository_toolchain()
@@ -792,7 +793,11 @@ private rebuild_prints(main0: string, geo0: string, extra0: string, main1: strin
     val oracle = clean(after)
     _ = cached(program_of(dir, main0, geo0, extra0), dir + "/cache")
     val second = cached(after, dir + "/cache")
-    assert(lowered_of(second).reused.len() > 0)
+    val reused = lowered_of(second).reused
+    var named = ""
+    for s in reused
+        if s.starts_with("<program>") then named = named + s + " "
+    if kept != "" then assert(holds(reused, kept), s"`$kept` was lowered again; reused: $named")
     assert_eq(second.llvm, oracle)
     for level in ["-O0", "-O2"]
         val cache = instance_cache_dir(dir + "/.avin/build", false, level)
@@ -810,44 +815,50 @@ private rebuild_prints(main0: string, geo0: string, extra0: string, main1: strin
 
 @test("a reused lambda's call of a library method with its own type parameter reaches its own slot after an edit makes another slot first")
 reused_generic_slot_after_new_slot()
-    rebuild_prints(ShowMain, PlainGeo, PlainExtra, ShowMain + "    println([\"1\"].map(p -> p.toInt()).sum)\n", PlainGeo, PlainExtra, "[<x>|<y>]\n1\n")
+    rebuild_prints(ShowMain, PlainGeo, PlainExtra, ShowMain + "    println([\"1\"].map(p -> p.toInt()).sum)\n", PlainGeo, PlainExtra, "<program>.show.lambda#1", "[<x>|<y>]\n1\n")
 
 @test("a reused call of a program's own method with a type parameter reaches its own slot after a new instance of the method")
 reused_own_generic_slot_after_new_instance()
     val before = Label + "    println(label(Holder(1)))\n    println(label(Other(1)))\n"
     val after = Label + "    val m: Mapper = Holder(5)\n    println(m.mapTo(n -> n * 2))\n    println(label(Holder(1)))\n    println(label(Other(1)))\n"
-    rebuild_prints(before, Mappers, PlainExtra, after, Mappers, PlainExtra, "10\n<1>\n<2>\n")
+    rebuild_prints(before, Mappers, PlainExtra, after, Mappers, PlainExtra, "<program>.label", "10\n<1>\n<2>\n")
+
+@test("a method added to a trait ahead of one with its own type parameter moves its slot, and a call kept in the program reaches it")
+generic_method_moved_in_its_trait()
+    val main = Label + "    val m: Mapper = Holder(5)\n    println(m.mapTo(n -> n * 2))\n    println(label(Holder(1)))\n    println(label(Other(1)))\n"
+    val moved = Mappers.replace_all("trait Mapper\n", "trait Mapper\n    first() -> int = 0\n")
+    rebuild_prints(main, Mappers, PlainExtra, main, moved, PlainExtra, "", "10\n<1>\n<2>\n")
 
 @test("a new lambda calling a generic method ahead of a reused one leaves the reused one's slot its own")
 reused_generic_slot_after_new_lambda()
     val after = Show + "\nmain()\n    println([3, 4].map(n -> n + 1).mkString(\",\"))\n    println(show([[\"x\", \"y\"]]))\n"
-    rebuild_prints(ShowMain, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "4,5\n[<x>|<y>]\n")
+    rebuild_prints(ShowMain, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "<program>.show.lambda#1", "4,5\n[<x>|<y>]\n")
 
 @test("a new string literal ahead of a reused function leaves its strings and slots its own")
 reused_generic_slot_after_new_string()
     val after = Show + "\nmain()\n    println(\"fresh\")\n    println(show([[\"x\", \"y\"], [\"fresh\"]]))\n"
-    rebuild_prints(ShowMain, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "fresh\n[<x>|<y>] [<fresh>]\n")
+    rebuild_prints(ShowMain, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "<program>.show.lambda#1", "fresh\n[<x>|<y>] [<fresh>]\n")
 
 @test("a function removed with the slot it made leaves a reused call reaching its own slot, now numbered lower")
 reused_generic_slot_after_removed_function()
     val before = Count + "\n" + Show + "\nmain()\n    println(count([\"2\"]))\n    println(show([[\"x\", \"y\"]]))\n"
-    rebuild_prints(before, PlainGeo, PlainExtra, ShowMain, PlainGeo, PlainExtra, "[<x>|<y>]\n")
+    rebuild_prints(before, PlainGeo, PlainExtra, ShowMain, PlainGeo, PlainExtra, "<program>.show.lambda#1", "[<x>|<y>]\n")
 
 @test("a signature changed in another module, whose new body makes a slot first, leaves a reused call's slot its own")
 reused_generic_slot_after_signature_change()
     val main = "import extra.tag\n\n" + Show + "\nmain()\n    println(tag(7))\n    println(show([[\"x\", \"y\"]]))\n"
-    rebuild_prints(main, PlainGeo, "module extra\n\ntag(n: int) -> int = n\n", main, PlainGeo, "module extra\n\ntag(n: int) -> long = [n].map(x -> long(x) * 2).sum\n", "14\n[<x>|<y>]\n")
+    rebuild_prints(main, PlainGeo, "module extra\n\ntag(n: int) -> int = n\n", main, PlainGeo, "module extra\n\ntag(n: int) -> long = [n].map(x -> long(x) * 2).sum\n", "<program>.show.lambda#1", "14\n[<x>|<y>]\n")
 
 @test("a new instance in another module, made first, leaves a reused call's slot its own")
 reused_generic_slot_after_instance_in_another_module()
     val main = "import extra.twice\n\n" + Show + "\nmain()\n    println(twice(3))\n    println(show([[\"x\", \"y\"]]))\n"
-    rebuild_prints(main, PlainGeo, "module extra\n\ntwice(n: int) -> int = n * 2\n", main, PlainGeo, "module extra\n\ntwice(n: int) -> int = [n, n].map(x -> x).sum\n", "6\n[<x>|<y>]\n")
+    rebuild_prints(main, PlainGeo, "module extra\n\ntwice(n: int) -> int = n * 2\n", main, PlainGeo, "module extra\n\ntwice(n: int) -> int = [n, n].map(x -> x).sum\n", "<program>.show.lambda#1", "6\n[<x>|<y>]\n")
 
 @test("two reused functions whose calls make their slots in the other order each reach their own")
 reused_generic_slots_in_the_other_order()
     val before = Count + "\n" + Show + "\nmain()\n    println(show([[\"x\", \"y\"]]))\n    println(count([\"2\"]))\n"
     val after = Count + "\n" + Show + "\nmain()\n    println(count([\"2\"]))\n    println(show([[\"x\", \"y\"]]))\n"
-    rebuild_prints(before, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "2\n[<x>|<y>]\n")
+    rebuild_prints(before, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "<program>.count", "2\n[<x>|<y>]\n")
 
 // --- the commands -----------------------------------------------------------------------------------
 
