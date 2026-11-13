@@ -7399,7 +7399,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "Display", "Debug", "Sendable", "Boundary"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "Display", "Debug", "Sendable", "Boundary"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -13697,10 +13697,35 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
     val expected = operand_hint(c, wanted)
     if is_literal(left) && !is_literal(right)
         val r = check_expr(c, right, expected)
-        return operate(c, e.span, op_span, op, binary_spelling(op), check_expr(c, left, Some(r.ty)), r)
+        val l = check_expr(c, left, Some(r.ty))
+        // A literal that became a value of a type with a method of the operator's name calls it.
+        if operator_method(c, op, l.ty) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, r), expected)
+        return operate(c, e.span, op_span, op, binary_spelling(op), l, r)
     val l = check_expr(c, left, expected)
-    if operator_method(c, op, l.ty) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
+    if operator_method(c, op, l.ty)
+        // An integer argument of a method on a type that takes integers is converted to that type,
+        // as an operand of the core trait's operator is, unless an overload takes an integer itself.
+        if takes_integers(c, l.ty) && !is_literal(right)
+            val ms = methods_of(c, zonk(c, l.ty), binary_spelling(op))
+            if !takes_an_integer(c, ms)
+                // The one method's parameter, where it is the receiver's type, is the argument's
+                // expected type, as it is in a call.
+                var hint: Option[&Type] = None
+                if ms.len() == 1 && c.symbols[ms[0]].params.len() >= 2
+                    if same_type(zonk(c, c.symbols[ms[0]].params[1]), zonk(c, l.ty)) then hint = Some(zonk(c, l.ty))
+                val r = check_expr(c, right, hint)
+                val arg = if integer_type(c, zonk(c, r.ty)) then from_integer(c, r, zonk(c, l.ty)) else r
+                return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, arg), expected)
+        return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
     operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
+
+// Whether one of the methods `ms` takes an integer as its first argument.
+private takes_an_integer(c: *Checker, ms: Buf[usize]) -> bool
+    for m in ms
+        val s = c.symbols[m]
+        if s.params.len() >= 2
+            if integer_type(c, zonk(c, s.params[1])) then return true
+    false
 
 /** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`. `op` is `&`, `^`, `|`, `<<` or
  * `>>`, and `t` is not an integer or a byte, whose bitwise and shift operators are the machine's, but
@@ -13736,6 +13761,16 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         // An operand that never finishes means the operation never finishes.
         val ty: &Type = if *l.ty is ErrorType || *r.ty is ErrorType then ErrorType else Nothing
         return TExpr(at, ty, Arith(op, l, r, op_at))
+    // An integer meets a type that takes integers, `BigInt` among them, as a value of that type:
+    // `big * i` and `i * big`. A compound assignment's target keeps its type, so only its value is
+    // converted.
+    if binary_operator_method(op) is Some(_)
+        if takes_integers(c, l.ty) && integer_type(c, zonk(c, r.ty))
+            return operate(c, at, op_at, op, spelling, l, from_integer(c, r, zonk(c, l.ty)))
+        if !compound_spelling(spelling) && integer_type(c, zonk(c, l.ty)) && takes_integers(c, r.ty)
+            val converted = from_integer(c, l, zonk(c, r.ty))
+            if operator_method(c, op, converted.ty) then return operator_method_call(c, at, op_at, checked_slot(c, converted), converted, spelling, checked_slot(c, r), None)
+            return operate(c, at, op_at, op, spelling, converted, r)
     if *l.ty is Str && *r.ty is Str
         if op is Add then return TExpr(at, Str, Arith(op, l, r, op_at))
         c.note(unit_of(c), at, s"`$spelling` is not defined on strings; `+` joins two strings")
@@ -13791,6 +13826,22 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, l.ty, Arith(op, l, r, op_at))
+
+/** Whether integers convert to `t`: `t` implements the core library's `FromInteger`, or is a type
+ * parameter bounded by it, and is not itself an integer. An integer literal where a `t` is expected
+ * is a `t`, and an integer operand beside a `t` is converted to one. */
+private takes_integers(c: *Checker, t: &Type) -> bool
+    val k = zonk(c, t)
+    if !settled(k) || !has_operator_traits(k) || integer_type(c, k) then return false
+    core_trait_type(c, "FromInteger") match
+        Some(b) -> conforms_to_bound(c, k, b)
+        None -> false
+
+/** `value`, an integer, as a value of `to`, a type that takes integers: `to.fromInteger(value)`. */
+private from_integer(c: *Checker, value: &TExpr, to: &Type) -> &TExpr
+    var args: Buf[Argument] = buf()
+    args.push(Argument(value.span, None, checked_slot(c, value), false))
+    static_call(c, value.span, value.span, checked_slot(c, TExpr(value.span, to, TypeReceiver)), to, "fromInteger", args, None, Some(to), false)
 
 // Whether an operator spelled `spelling` is a compound assignment's, as `+=` and `+:=` are, whose
 // target keeps its type.
@@ -13915,6 +13966,15 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         early[i] match
             Some(t) -> typed.push(t)
             None -> typed.push(check_expr(c, operands[i], anchor))
+    // An integer compared with a value of a type that takes integers is converted to that type, so
+    // `big < n` and `n == big` compare two numbers. A chain converts each integer beside one, the
+    // pass back reaching an integer whose neighbour was converted on the way forward.
+    for pass in 0..<2
+        for j in 0..<ops.len()
+            val i = if pass == 0 then j else ops.len() - 1 - j
+            if !(ops[i] is Same || ops[i] is NotSame)
+                if integer_type(c, zonk(c, typed[i].ty)) && takes_integers(c, typed[i + 1].ty) then typed[i] = from_integer(c, typed[i], zonk(c, typed[i + 1].ty))
+                elif takes_integers(c, typed[i].ty) && integer_type(c, zonk(c, typed[i + 1].ty)) then typed[i + 1] = from_integer(c, typed[i + 1], zonk(c, typed[i].ty))
     // `==` between an `Any` and a value of another type compares the value as an `Any`.
     if ops.len() == 1 && (ops[0] is Equal || ops[0] is NotEqual)
         val x = zonk(c, typed[0].ty)
@@ -18984,6 +19044,15 @@ private integer_literal(c: *Checker, at: Span, spelling: string, negative: bool,
         for b in digits.bytes
             value = value * 10.0 + real(b - u8('0'))
         return TExpr(at, Real, RealConst(if negative then -value else value))
+    // Where a type that takes integers is expected, a literal of any size is that type's value, made
+    // from the literal as a `long`, or as the narrowest integer wider than that which holds it.
+    if expected is Some(t)
+        if takes_integers(c, t)
+            var width: u32 = 64
+            while !fits(digits, width, negative)
+                width += 64
+            val literal = TExpr(at, Int(width), IntConst(if negative && digits != "0" then "-" + digits else digits))
+            return from_integer(c, literal, zonk(c, t))
     val ty: &Type = Int(bits)
     if !fits(digits, bits, negative)
         c.note(unit_of(c), at, s"integer literal does not fit in ${type_name(ty)}")
@@ -19980,6 +20049,11 @@ private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
     if *zonk(c, ty) is AnyType
         c.note(unit, value.span, "a literal does not match an Any; match the value by its type first, as in `n: int`")
         check_expr(c, value, None)
+        return TExpr(value.span, ErrorType, UnitConst)
+    // A literal is a `BigInt` where one is expected by a conversion, a call and not a constant, so it
+    // is no pattern: such a value is compared with `==`.
+    if is_literal(value) && takes_integers(c, ty)
+        c.note(unit, value.span, s"an integer literal does not match a ${type_name(zonk(c, ty))} as a pattern; compare it with `==`, as in `if x == 0`")
         return TExpr(value.span, ErrorType, UnitConst)
     val t = check_expr(c, value, Some(ty))
     if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)

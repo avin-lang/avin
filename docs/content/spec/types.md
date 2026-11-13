@@ -105,22 +105,32 @@ unary `-`, `Ord`, `Display`, `Debug`, `BigInt.zero()`, `BigInt.one()` and `toRea
 by value.
 
 ```text
-var f = BigInt.one()
-for i in 2 .. 100 do f = f * BigInt(i)
+var f: BigInt = 1
+for i in 2 .. 100 do f *= i
 println(f)                              // 100!, all 158 digits
+println(f % 1000 == 0)                  // true
 println(f"${BigInt(2).pow(100)}%,d")     // 1,267,650,600,228,229,401,496,703,205,376
-println(BigInt("ff", 16) + BigInt(1))   // 256
+val big: BigInt = 123456789012345678901234567890
+println(big * 2 + 1)                    // 246913578024691357802469135781
+println(BigInt("ff", 16) + 1)           // 256
 println(BigInt.parse("12x"))            // None
 ```
 
-- **Making one.** `BigInt(n)` takes an integer of any width; a literal argument is a `long`, so it
-  may be as large as one. `BigInt(text)` reads decimal and `BigInt(text, radix)` digits of base 2 to
+- **Making one.** A `BigInt` takes integers by [`FromInteger`](#integers-meet-a-type-that-takes-them):
+  where one is expected, an integer literal of any size and base is that `BigInt`
+  (`val big: BigInt = 123456789012345678901234567890`, `val m: BigInt = 0xffffffffffffffffffffffff`),
+  and an integer of any width beside one under an operator is converted to one. `BigInt(n)` takes an
+  integer of any width; a literal argument there is a `long`, so it may be as large as one.
+  `BigInt(text)` reads decimal and `BigInt(text, radix)` digits of base 2 to
   36 (`0` to `9`, then `a` to `z` in either case), each after an optional `-` or `+`, with at least
   one digit and nothing else: no white space, separators, prefix or exponent. Text that is not that
   traps, as `toLong` does; `BigInt.parse(text)` and `BigInt.parse(text, radix)` answer `None`
   instead. A radix outside 2 to 36 traps under both, being the caller's mistake. `-0` is zero, and
   zero has no sign.
-- **Arithmetic is exact.** `+`, `-`, `*` and unary `-` never trap. `/` rounds towards zero and `%`
+- **Arithmetic is exact.** `+`, `-`, `*` and unary `-` never trap, between two `BigInt`s or a
+  `BigInt` and an integer on either side: `f * i`, `i * f`, `f - 1`, `f /= n`. The comparisons and
+  `==` take an integer on either side too, chains included: `f == 0`, `0 < f < limit`. The bitwise,
+  shift, wrapping and saturating operators are the integers' alone. `/` rounds towards zero and `%`
   takes the dividend's sign, as on the integer types; `floorDiv` and `floorMod` round towards
   negative infinity, and `divRem(o)` gives `(self / o, self % o)` from one division. A zero divisor
   traps with `division by zero` under every one of them.
@@ -138,6 +148,40 @@ println(BigInt.parse("12x"))            // None
   never written once made, so a `BigInt` is an immutable value that may be shared freely. Decimal
   text is read and written a limb at a time; other bases go through division by a power of the radix.
   Multiplication and division are the schoolbook algorithms, quadratic in the number of limbs.
+- **Identities.** `BigInt.zero()` and `BigInt.one()` are `Add`'s and `Mul`'s static members, kept
+  with `()` as every type's are; `val z: BigInt = 0` is the same value.
+
+### Integers meet a type that takes them
+
+A type that implements the core trait `FromInteger` takes integers, of every width and without loss.
+`BigInt` is the library's one; a program's own number type joins by implementing it:
+
+```text
+trait FromInteger
+  static fromInteger[N: Integer](n: N) -> Self
+```
+
+- **A literal where one is expected is its value**, wherever a type is expected: an annotation, an
+  argument, a default, a result, a branch of an `if`, a collection literal's element, and the other
+  operand of an operator. The literal may be of any size and in any base, with separators; it is
+  passed to `fromInteger` as a `long` where it fits one, and otherwise as the narrowest wider
+  integer that holds it (`i128`, `i192`, …). A type parameter bounded by `FromInteger` takes one the
+  same way: `val x: T = 42` is `T.fromInteger(42)` in each instance.
+- **An integer operand beside one is converted to it.** In `a op b`, where `op` is `+`, `-`, `*`,
+  `/` or `%`, and in a comparison or `==`/`!=`, an operand whose type is an integer, or a type
+  parameter bounded by `Integer`, meets an operand of a type that takes integers as
+  `T.fromInteger(n)`, on either side: `big * i`, `i * big`, `big < n`, `0 == big`. A chain converts
+  each integer beside such an operand. The converted operand is evaluated once, where it stands. A
+  compound assignment converts its value into a `BigInt` target, `f *= i`; an integer target keeps
+  its type, so `n += big` is an error. Where the type has an [operator method](/spec/operators-and-control-flow/#operator-methods)
+  of the operator's name and no overload of it takes an integer, its integer argument is converted
+  too, and an integer on its left calls it.
+- **Nothing else converts.** Two integer widths still meet only through a conversion (`long(x)`),
+  a `real` or a `byte` never converts to a type that takes integers, nor such a value back to an
+  integer, `===` compares no converted value, and the bitwise, shift, wrapping and saturating
+  operators stay the integers' own. An integer literal is no [pattern](/spec/operators-and-control-flow/#match) for such a
+  type, since its value is a call and not a constant: `b match 0 -> …` is an error that says to
+  compare with `==`.
 
 ## byte
 
