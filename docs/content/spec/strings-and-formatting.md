@@ -100,10 +100,10 @@ There is no `%%`.
   `${-2147483648}%,d` is `-2,147,483,648`, and a value under a thousand has no comma. The sign comes
   before the first group, and a width and `-` pad the grouped text with spaces
   (`${1234567}%,12d` is `   1,234,567`). The zeros a precision asks for are grouped with the
-  digits (`${5}%,.6d` is `000,005`), and so are the zeros `0` fills a width with, added until the
-  field is full: `${1234}%0,10d` is `00,001,234`, and where the last zero begins a group its comma
-  makes the field one wider than asked (`${1234}%0,8d` is `0,001,234`). Under any other conversion
-  the flag has no effect, which is an error.
+  digits (`${5}%,.6d` is `000,005`). The zeros `0` fills a width with are not: they come before the
+  grouped digits, and the commas and the sign count in the width, so the field is exactly as wide as
+  asked unless the number is wider (`${1234}%0,8d` is `0001,234`, `${-1234}%0,8d` is `-001,234`).
+  Under any other conversion the flag has no effect, which is an error.
 - **The width** is the least number of characters the field takes; a value wider is written whole.
 - **The precision** is, for an integer, the least number of digits, so a precision of 0 writes zero as
   no digits; for `f`, `e` and `E` the number of decimals, and for `g` and `G` of significant digits;

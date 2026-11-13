@@ -7383,12 +7383,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Proposed (built on branch `text-papercuts`): **the `,` format flag groups a decimal integer's
   digits in threes with commas**, under `%d` and `%i` only; under every other conversion it is the
   "has no effect" error. The zeros of a precision are grouped with the digits (`${5}%,.6d` is
-  `000,005`), and the zeros of the `0` flag fill the width in groups, added until the field is full,
-  so a comma can make the field one character wider than asked (`${1234}%0,8d` is `0,001,234`).
-  `FormatSpec` gains `grouping: bool = false` as its last field, so code that builds one by position
-  is unchanged. Why: grouping the fill keeps a zero-padded column reading as one number; never
-  exceeding the width would need either an ungrouped run of zeros (`0001,234`) or a leading space,
-  both worse. Alternatives weighed: leave the fill zeros ungrouped (`000001,234`); `_` or a locale's
+  `000,005`), but the zeros of the `0` flag are not: they fill the width before the grouped digits,
+  the commas and the sign counting in it, so the field is never wider than asked unless the number
+  is (`${1234}%0,8d` is `0001,234`, `${-1234}%0,8d` is `-001,234`). `FormatSpec` gains
+  `grouping: bool = false` as its last field, so code that builds one by position is unchanged.
+  Why: a width is a column's width, and a column that a comma can widen by one does not line up;
+  precision zeros are digits of the number, fill zeros are padding. Alternatives weighed: grouping
+  the fill zeros too, added until the field is full (`0,001,234` for width 8: one wider than asked);
+  `_` or a locale's
   separator (no locale exists; a comma is the common reading); allowing `,` under `%f` (a real's
   grouping is a separate item, not asked for yet). Always a comma, never locale-dependent.
 - Proposed (built on branch `text-papercuts`): **`string.utf8` answers a new `Array[byte]`**, a
