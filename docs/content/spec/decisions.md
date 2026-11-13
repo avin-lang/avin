@@ -7368,6 +7368,42 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `http-verbs`): **the HTTP client has a function per common verb, each taking
+  its headers.** `http.get`, `head` and `delete(url, headers = [])`; `http.post`, `put` and
+  `patch(url, body: string, contentType, headers = [])`, the content type sent first and the body
+  as UTF-8. Headers are a `Vector[(string, string)]`, as `Request` and `Response` already hold
+  them. Why: one call for the everyday request, with the shape `post` already had; anything rarer
+  (another method, a byte body, a timeout, TLS settings) stays `send(Request(...))`. Alternatives
+  weighed: an options record per call (a second way to spell `Request`); a `Map` for headers (loses
+  order and repeated names, which HTTP allows); byte-body overloads of `post`/`put`/`patch` (left to
+  `Request.withBody`, to keep one overload per verb).
+
+- Proposed (branch `http-verbs`): **a `Request`'s headers are checked as it is made, those given to
+  its constructor too.** The constructor traps on a header name that is not a token or a value
+  holding a line break, as `withHeader` did; before, a header passed to the constructor was written
+  unchecked, so a value holding `\r\n` could add a header of its own. Why: a verb's `headers`
+  reach the constructor, so this is where every path meets. Alternative weighed: checking as the
+  head is written (as the server does for a `Response`), which would trap later, away from the
+  code that built the request. `withHeaders(more)` adds several in order.
+
+- Proposed (branch `http-verbs`): **query parameters are added one at a time by
+  `Request.withQueryParam(name, value)`**, each encoded by `Url.encode` (so a space is `%20`, not
+  `+`), joined with `?` or `&` and placed before any fragment, by text on the request's URL, which is
+  parsed only when sent. Why: the cheapest form that reads well in a chain and needs no parse that
+  could fail at build time. Alternatives weighed: a `query` parameter on every verb (a fifth
+  parameter on `post`/`put`/`patch`); a `Url.withQueryParam` (useful too, but not needed for a
+  request); form encoding with `+` (only `application/x-www-form-urlencoded` bodies need it).
+  Review with the user: whether the verbs should also take a `query` vector.
+
+- Proposed (branch `http-verbs`): **`Response.json(status, text: string)` takes JSON already
+  written** and sends it as `application/json` without checking it. Why: JSON lives in a package
+  today (moving to the standard library as `avin.json`), and `avin.net.http` must not depend on a
+  package; a text overload needs nothing. Once `avin.json` is in the standard library,
+  `Response.json(status, value: Json)` can sit beside it as an overload. Alternatives weighed:
+  leaving `Response.json` out until then (every JSON handler spells the content type by hand);
+  `charset=utf-8` in the type (RFC 8259 defines none for `application/json`). Review with the user:
+  the `Json` overload once `avin.json` lands.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
