@@ -286,8 +286,8 @@ multiple assignment uses only the language's compound forms.
 
 ### Continuation lines
 
-A line that starts with a binary operator, indented deeper than the line above it, continues the
-expression that line left open:
+A line that starts with a binary operator or a member's `.`, indented deeper than the line above
+it, continues the expression that line left open:
 
 ```text
 val atom = number
@@ -297,26 +297,35 @@ val atom = number
 val total = a
     + b * c
     - d
+
+val names = people
+    .filter(_.age >= 18)
+    .map(_.name)
+    .sorted
 ```
 
 The line break means nothing to precedence: the operators group exactly as they would on one line,
 so `total` is `(a + (b * c)) - d`, `atom` has three alternatives, and `a + b` with `* c` on the
-next line is `a + (b * c)`. A comparison chain goes on across the lines too.
+next line is `a + (b * c)`. A comparison chain goes on across the lines too. A `.` binds as it does
+on one line, to the operand right before it, so `names` is `people.filter(…).map(…).sorted`, and
+`a + b` with `.toString` on the next line is `a + b.toString`.
 
 - **What starts one.** Every operator that stands between two operands: the arithmetic, wrapping,
   saturating, shift, bitwise, comparison, logical, range and cons operators, a method named by a
   symbol, `~`, and `++` or `--` with an operand after it. `-` and `+` there are binary, written
-  `- d` or `-d`. A word never starts one (a named infix call ends its line instead, as
-  [above](#infix-method-calls)), and neither do `!`, `.`, `?`, a bracket, `=` and the compound
-  assignments.
+  `- d` or `-d`. And the `.` of a member, a method call or a field read, after which the line goes
+  on as any line does: with `?` (`.get("a")?`), more members, calls and operators. A word never
+  starts one (a named infix call ends its line instead, as [above](#infix-method-calls)), and
+  neither do `!`, `?`, a bracket, `=` and the compound assignments.
 - **Where.** Wherever an expression ends a line and has a complete operand: a binding's value, an
   assignment, a `return` value, a call's argument, a `match` arm's or a lambda's body, a branch of a
   one-line `if`, an expression statement.
-- **How far.** Each following line that starts with such an operator and is still deeper than the
+- **How far.** Each following line that starts with such an operator or a `.` and is still deeper than the
   line the expression began on continues it, at the depth of a continuation line above it or deeper
   (indentation that matches no line above is an error, as in any block); the depth means nothing
   beyond that. The expression ends at the first line back at the depth it began
-  on, or shallower. A line inside the continuation that does not start with an operator is an error,
+  on, or shallower, so a `.` line at the depth the expression began on is a new statement and an
+  error. A line inside the continuation that does not start with an operator or a `.` is an error,
   except a call's trailing block or an infix call's argument, indented under its own line as usual.
 - **Blank lines and comments** between continuation lines are skipped, as they are everywhere.
 - **Not after a header.** The indented lines after the test of `if`, `elif`, `while` and

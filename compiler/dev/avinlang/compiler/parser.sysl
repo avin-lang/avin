@@ -103,7 +103,7 @@ struct Parser
         // After an indented block that closed inside a continuation, the next continuation line
         // follows the block's last line with no layout token of its own.
         elif self.open_lines == 0 || !after_dedent(self) then return None
-        if starts_binary(self, skipped) then Some(skipped) else None
+        if starts_continuation(self, skipped) then Some(skipped) else None
 end Parser
 
 impl TokenStream for Parser
@@ -131,6 +131,13 @@ parser_for(src: Source) -> Parser
 
 private after_dedent(p: Parser) -> bool = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
 
+// Whether the token at `index` starts its line: it is the first, or a line break, an indent or a
+// dedent comes right before it.
+private starts_line(p: *Parser, index: usize) -> bool
+    if index == 0 then return true
+    val before = p.toks.items[index - 1].value
+    before == Newline || before == Indent || before == Dedent
+
 // The token `t`, `offset` places ahead, as the operator loop sees it after a complete operand. A name
 // there is an infix method call; inside brackets, where a line break makes no token, the name may be
 // on a later line, which `infix_call` rejects. A method named by a symbol binds at the level its
@@ -147,18 +154,18 @@ private as_infix(p: Parser, t: Spanned[Token], offset: usize) -> Spanned[Token]
     if t.value == Postfix && operand_follows(p, t, offset) then return Spanned(SymbolAdd, t.span)
     t
 
-// Whether the token `offset` places ahead is an operator that can stand between two operands, and so
-// can start a continuation line: every operator of the language's binary families, a method named by
-// a symbol, `~`, and `++` or `--` with an operand after it. `!`, `=` and the compound assignments,
-// `.`, `?` and brackets cannot.
-private starts_binary(p: Parser, offset: usize) -> bool
+// Whether the token `offset` places ahead can start a continuation line: an operator that can stand
+// between two operands (every operator of the language's binary families, a method named by a
+// symbol, `~`, and `++` or `--` with an operand after it), or the `.` of a member, which goes on with
+// the operand the line above ended on. `!`, `=` and the compound assignments, `?` and brackets cannot.
+private starts_continuation(p: Parser, offset: usize) -> bool
     val t = p.toks.peek_at(offset) match
         Some(t) -> t
         None -> return false
     t.value match
         AddOp | MultiplyOp | CompareOp | RangeOp | ConsOp | BitOrOp | BitXorOp | BitAndOp | AndOp | OrOp | SymbolOp -> true
         Symbol -> p.spelling(t) == "~"
-        Postfix -> operand_follows(p, t, offset)
+        Postfix -> p.spelling(t) == "." || operand_follows(p, t, offset)
         _ -> false
 
 // Whether the last token taken completes an operand, so that a continuation line may follow it: a
@@ -194,7 +201,7 @@ private leave_lines(p: *Parser, base: usize)
         if t.value == Dedent then p.open_lines -= 1
         elif t.value == Indent then p.open_lines += 1
         elif !reported && t.value != Newline
-            p.report.add(error(t.span, "a line indented under a continued expression continues it, so it starts with a binary operator"))
+            p.report.add(error(t.span, "a line indented under a continued expression continues it, so it starts with a binary operator or `.`"))
             reported = true
 
 // Whether the `++` or `--` token `t`, `offset` places ahead, is followed on its own line by something
@@ -418,6 +425,12 @@ private prefix(t: Spanned[Token], p: *Parser) -> &Expr
             if text == "[" then return collection(p, t.span, false)
             if text == "{" then return collection(p, t.span, true)
             if text == "(" then return parenthesized(p, t.span)
+            if text == "." && starts_line(p, p.toks.position - 1)
+                // A `.` that starts a line here continues nothing: the member after it is passed
+                // over with it, so the one mistake is reported once.
+                p.report.add(error(t.span, "a line starting with `.` continues the expression above only when it is indented deeper than the line that expression began on, and not in the header of a form whose body follows"))
+                if p.at_kind(Word) then p.toks.advance()
+                return Expr(t.span, Invalid)
             p.report.add(expected(t.span, "an expression", found_at(p.src, t.span)))
             Expr(t.span, Invalid)
 
