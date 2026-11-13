@@ -7744,6 +7744,30 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   to the settled rule); pointing at the whole operation (the hint names one operand, so the caret
   should too); suggesting a narrowing of the wider operand (loses values).
 
+- **Parse recovery and the hints for `Map(k -> v)` and an argument's type** (branch
+  `diag-spans-recovery`). A line of a block, class, actor or machine the parser cannot read to its
+  end is skipped to the next line, and reported only when nothing in it was reported already; an
+  argument list or parenthesized group meeting a token other than `,` or `)` reports it once and
+  skips to its `)`. `->` there says "write a map as `{"a": 1}`" when the callee's name ends in `Map`
+  and "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{"a": 1}`" otherwise;
+  `x: T` says "give the type argument instead, as in `f[T](x, …)`" (Avin has no expression
+  ascription: a value takes its type from where it is used, or from a declared `val`'s type), "a
+  lambda's parameter with a type is written in parentheses" when `->` follows the type, and "declare
+  the value with it, as in `val x: T = …`" in a group. WHY: one mistake made five to ten errors,
+  each naming a token rather than the mistake, and the token shows exactly which mistake it is.
+  ALTERNATIVES: suppressing every error after the first in a statement (panic mode), which also
+  hides a genuinely separate mistake on the same line; accepting `k -> v` as a pair (a second
+  spelling of a tuple, and `x -> body` is a lambda); accepting `x: T` as an ascription (a second way
+  to state a type the language deliberately gives through declarations and type arguments).
+- **A member's mistake is shown at the member** (branch `diag-spans-recovery`). The checker reports
+  a missing or private member, an argument-count mistake and `()` on a parameterless member at the
+  member's name and argument list; the call's own span, used for a type mismatch and for traps,
+  stays the whole expression. WHY: in a chain written over leading-`.` lines the whole span starts
+  lines above the member at fault, and the rendering shows only its first line. ALTERNATIVES:
+  narrowing the call's span itself (a wrong-type value would then be shown at its last member only);
+  storing the name's span in the syntax tree (every `Member` match changes, for a span the source
+  already determines).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

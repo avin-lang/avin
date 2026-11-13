@@ -11759,7 +11759,11 @@ private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string, expected
     if target.kind is Name("super")
         if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
             return super_call(c, e.span, e.span, target.span, name, buf(), None, expected, false)
-    member_of(c, e, check_expr(c, target, None), name, expected)
+    // A mistake in reading a member is shown at the member's name, never across the receiver,
+    // which in a chain can span many lines; the read itself is still the whole expression.
+    val object = check_expr(c, target, None)
+    val read = member_of(c, Expr(member_name_span(c, e, name), e.kind), object, name, expected)
+    TExpr(e.span, read.ty, read.kind)
 
 private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
@@ -15482,6 +15486,17 @@ private from_sources(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
 // Arguments that are not bare literals are checked first, so a literal takes the type the others
 // settle. Every type argument must be decided by the end of the call. A variant of a data type is
 // called the same way, with the type's parameters as its type parameters.
+// The span of the name in `target.name`, the member expression `e`: a member written in the
+// source ends with its name. A member made by the compiler, whose span does not end with its name,
+// keeps the whole span.
+private member_name_span(c: *Checker, e: &Expr, name: string) -> Span
+    val length = name.bytes.len
+    if length == 0 || e.span.end - e.span.start < length then return e.span
+    val src = c.units[unit_of(c)].src
+    if e.span.end > src.bytes.len then return e.span
+    val span = Span(e.span.end - length, e.span.end)
+    if from_utf8_unchecked(src.text(span)) == name then span else e.span
+
 private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     var explicit: Option[Buf[&TypeExpr]] = None
@@ -15494,7 +15509,12 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         return call_expr(c, at, q, args, expected)
     if named.kind is Member(target, member)
         if variant_use(c, named.span, target, member) is Some((found, on_type)) then return qualified_variant_call(c, at, named.span, found, on_type, explicit, args, expected)
-        return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
+        // A mistake in calling a member is shown at the member's name and its arguments, never
+        // across the receiver, which in a chain can span many lines; the call itself is still the
+        // whole expression.
+        val name_span = member_name_span(c, named, member)
+        val called = member_call(c, Span(name_span.start, at.end), callee, name_span, target, member, args, explicit, expected, false)
+        return TExpr(at, called.ty, called.kind)
     val name = named.kind match
         Name(n) -> n
         _ -> return value_call(c, at, callee, args)
@@ -16589,7 +16609,8 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         for a in args
             check_statement(c, a.value)
         return unsupported(c, callee, "type arguments on a call of a field")
-    call_checked(c, at, name_span, member_of(c, callee, object, name, None), args)
+    // A field read for its function, or a missing member, is reported at the member's name.
+    call_checked(c, at, name_span, member_of(c, Expr(name_span, callee.kind), object, name, None), args)
 
 // `a m b` is the call `a.m(b)`. It names a method of `a`'s type: a field holding a function and a
 // function `m` of two parameters are not called infix.
@@ -16818,7 +16839,7 @@ private parameterless_called(c: *Checker, at: Span, name_span: Span, receiver: &
             check_statement(c, a.value)
         return TExpr(at, ty, UnitConst)
     if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
-    c.note(unit_of(c), name_span, s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
+    c.note(unit_of(c), Span(name_span.start, at.end), s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
     for a in args
         check_statement(c, a.value)
     TExpr(at, ErrorType, UnitConst)
@@ -18003,7 +18024,7 @@ private parameterless_function_called(c: *Checker, at: Span, name_span: Span, id
             check_statement(c, a.value)
         return TExpr(at, ty, UnitConst)
     if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
-    c.note(unit_of(c), name_span, s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
+    c.note(unit_of(c), Span(name_span.start, at.end), s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
     for a in args
         check_statement(c, a.value)
     TExpr(at, ErrorType, UnitConst)
