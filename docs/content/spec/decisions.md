@@ -7343,6 +7343,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Review with the user: `field_unset` is a new escape from the variance and initialization rules,
   though only the core library may use it.
 
+- Settled on the user's delegation 2026-11-12 (built on branch `train-c-fix`): **Proposed (branch `train-c-fix`): an argument that cannot be checked before an overload is chosen
+  is tried against each candidate.** Where a lambda's body, checked with its result left open (the
+  rule `map-flatmap` added for `flatMap`'s `Iterable`/`Option` overloads), reports an error, or a
+  generic function named as a value cannot be checked without the parameter's type, the argument is
+  checked against each remaining candidate with nothing reported and nothing it settles kept; when
+  exactly one candidate takes it, that one is chosen and the argument checked against it. Otherwise
+  the argument is checked as before and reports what is wrong. A lambda whose body never returns
+  (`x -> fail(…)`) fits every candidate, and the first declared is chosen (an option's own `flatMap`
+  on an option). WHY: with one `flatMap`, `v.flatMap(n -> if … then aList else aVector)` and
+  `xs.flatMap(identity)` checked against its `Iterable[U]`; the second overload took that expected
+  type away, so the branches no longer joined and `identity` could not be instantiated — a call that
+  compiled stopped compiling because an overload was added. ALTERNATIVES: always prefer the
+  `Iterable` overload (a rule naming library types, and wrong for `[Some(1)].flatMap(identity)`);
+  report such calls as ambiguous and ask for a type (breaks code that worked); join the branches to
+  their least common supertype without an expected type (changes `if` typing everywhere). A trial
+  checks the argument once per candidate, which costs only where candidates disagree.
+- Settled on the user's delegation 2026-11-12 (built on branch `train-c-fix`): **Proposed (branch `train-c-fix`): a class with a field left unset by `field_unset` is made only by
+  its own code and its companion's.** `LazyList[int]()` from a program made a cell whose function,
+  element and rest were zero bytes, and reading it crashed the program. The constructor of such a
+  class is refused anywhere else: `` `LazyList` keeps fields its own code fills in, so only the class
+  and its companion make one``. WHY: Avin has no private constructors, and the unset fields are safe
+  only because the class's own code writes them before reading. ALTERNATIVES: module-private
+  constructors in general (a language feature, reviewed separately for `Time`/`Zoned`); a constructor
+  parameter of a private type (an extra field in every cell). Review with the user: it is a special
+  case of private constructors, which may want to be the general feature.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
@@ -7367,32 +7393,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
-
-- **Proposed (branch `train-c-fix`): an argument that cannot be checked before an overload is chosen
-  is tried against each candidate.** Where a lambda's body, checked with its result left open (the
-  rule `map-flatmap` added for `flatMap`'s `Iterable`/`Option` overloads), reports an error, or a
-  generic function named as a value cannot be checked without the parameter's type, the argument is
-  checked against each remaining candidate with nothing reported and nothing it settles kept; when
-  exactly one candidate takes it, that one is chosen and the argument checked against it. Otherwise
-  the argument is checked as before and reports what is wrong. A lambda whose body never returns
-  (`x -> fail(…)`) fits every candidate, and the first declared is chosen (an option's own `flatMap`
-  on an option). WHY: with one `flatMap`, `v.flatMap(n -> if … then aList else aVector)` and
-  `xs.flatMap(identity)` checked against its `Iterable[U]`; the second overload took that expected
-  type away, so the branches no longer joined and `identity` could not be instantiated — a call that
-  compiled stopped compiling because an overload was added. ALTERNATIVES: always prefer the
-  `Iterable` overload (a rule naming library types, and wrong for `[Some(1)].flatMap(identity)`);
-  report such calls as ambiguous and ask for a type (breaks code that worked); join the branches to
-  their least common supertype without an expected type (changes `if` typing everywhere). A trial
-  checks the argument once per candidate, which costs only where candidates disagree.
-- **Proposed (branch `train-c-fix`): a class with a field left unset by `field_unset` is made only by
-  its own code and its companion's.** `LazyList[int]()` from a program made a cell whose function,
-  element and rest were zero bytes, and reading it crashed the program. The constructor of such a
-  class is refused anywhere else: `` `LazyList` keeps fields its own code fills in, so only the class
-  and its companion make one``. WHY: Avin has no private constructors, and the unset fields are safe
-  only because the class's own code writes them before reading. ALTERNATIVES: module-private
-  constructors in general (a language feature, reviewed separately for `Time`/`Zoned`); a constructor
-  parameter of a private type (an extra field in every cell). Review with the user: it is a special
-  case of private constructors, which may want to be the general feature.
 
 ## Open
 
