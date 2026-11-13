@@ -18,12 +18,12 @@ The running program's process: the arguments it was started with, its environmen
 import avin.process
 
 main()
-    val files = process.args()
-    if files.isEmpty
-        println(s"usage: ${process.programName()} FILE...")
-        process.exit(2)
-    val home = process.env("HOME").getOrElse("/")
-    for f in files do println(s"$home: $f")
+  val files = process.args()
+  if files.isEmpty
+    println(s"usage: ${process.programName()} FILE...")
+    process.exit(2)
+  val home = process.env("HOME").getOrElse("/")
+  for f in files do println(s"$home: $f")
 ```
 
 | Function | Meaning |
@@ -42,8 +42,8 @@ remain available everywhere.
 
 ```text
 main(args: Vector[string]) -> int
-    for f in args do println(f)
-    0
+  for f in args do println(f)
+  0
 ```
 
 **The program's name is not an argument.** `args()` holds only what the user typed after it, so
@@ -67,10 +67,10 @@ screen, a lock file, puts it back in an exit hook, which runs however the progra
 import avin.process
 
 main(args: Vector[string]) -> int
-    print("\u001b[?1049h")
-    process.onExit(() -> print("\u001b[?1049l"))
-    draw(args)
-    0
+  print("\u001b[?1049h")
+  process.onExit(() -> print("\u001b[?1049l"))
+  draw(args)
+  0
 ```
 
 **They run when the program ends, once each, newest first.** The thread that ends the program runs
@@ -164,12 +164,12 @@ old one started, waiting for them by pid:
 import avin.process
 
 upgrade(state: string, jobs: Vector[long]) -> Result[unit, IoError]
-    fs.writeText(state, saved())?
-    process.exec(installed, ["--resume", state] ++ jobs.map(j -> s"$j"))?
-    Ok(())
+  fs.writeText(state, saved())?
+  process.exec(installed, ["--resume", state] ++ jobs.map(j -> s"$j"))?
+  Ok(())
 
 resume(jobs: Vector[long])
-    for pid in jobs do report(pid, process.waitPid(pid))
+  for pid in jobs do report(pid, process.waitPid(pid))
 ```
 
 **`exec` comes back only when it failed.** On success the process goes on, the same id, the same
@@ -210,13 +210,13 @@ pipelines and sequences, and what combines is again a command.
 import avin.process.{Command, CommandError}
 
 sources(dir: string) -> Result[Vector[string], CommandError]
-    val listing = Command("ls", dir) | Command("grep", "\\.avin$")
-    Ok(listing.output()?.lines)
+  val listing = Command("ls", dir) | Command("grep", "\\.avin$")
+  Ok(listing.output()?.lines)
 
 main() -> int
-    "make test".run() match
-        Ok(status) if status.isSuccess -> 0
-        _ -> 1
+  "make test".run() match
+    Ok(status) if status.isSuccess -> 0
+    _ -> 1
 ```
 
 | Making | Meaning |
@@ -301,10 +301,10 @@ import avin.signal
 import avin.threads
 
 stopped() -> Result[ExitStatus, IoError]
-    val job = Command("sh", "-c", "worker & worker & wait").inNewGroup.toFile("job.log").errorsToOutput().start()?
-    val waiter = threads.spawn(() -> job.waitFor())
-    job.signalGroup(signal.Terminate)?
-    waiter.join()
+  val job = Command("sh", "-c", "worker & worker & wait").inNewGroup.toFile("job.log").errorsToOutput().start()?
+  val waiter = threads.spawn(() -> job.waitFor())
+  job.signalGroup(signal.Terminate)?
+  waiter.join()
 ```
 
 **A started command does not outlive its `Child` unless it is detached.** A `Child` collected while
@@ -332,13 +332,13 @@ The iterator `lines()` answers is not sendable: the thread that reads a command'
 
 ```text
 data ExitStatus
-    Exited(code: int)
-    Signalled(signal: int)
-    TimedOut
+  Exited(code: int)
+  Signalled(signal: int)
+  TimedOut
 
 data CommandError
-    Io(error: IoError)
-    Failed(status: ExitStatus, command: string)
+  Io(error: IoError)
+  Failed(status: ExitStatus, command: string)
 ```
 
 A `CommandError` is an [`Error`](/spec/errors/#the-error-trait), as `IoError` is, and shows as its
@@ -374,18 +374,18 @@ declared with. The help and the usage line are written from the same declaration
 import avin.cli
 
 val parser = cli.Parser("wc", "Count lines, words and characters.", version = "1.0")
-    .flag("lines", short = 'l', help = "count lines")
-    .flag("words", short = 'w', help = "count words")
-    .int("top", help = "list the N commonest words", value = "N")
-    .choice("format", ["text", "json"], default = "text")
-    .positionals("file", help = "the files to count", required = true)
+  .flag("lines", short = 'l', help = "count lines")
+  .flag("words", short = 'w', help = "count words")
+  .int("top", help = "list the N commonest words", value = "N")
+  .choice("format", ["text", "json"], default = "text")
+  .positionals("file", help = "the files to count", required = true)
 
 main(args: Vector[string]) -> int
-    val opts = parser.parseOrExit(args)
-    for f in opts.strings("file")
-        if opts.flag("lines") then println(s"$f: lines")
-    println(s"top ${opts.int("top")} as ${opts.string("format")}")
-    0
+  val opts = parser.parseOrExit(args)
+  for f in opts.strings("file")
+    if opts.flag("lines") then println(s"$f: lines")
+  println(s"top ${opts.int("top")} as ${opts.string("format")}")
+  0
 ```
 
 `wc -lw --top=3 a.txt b.txt` gives both flags, 3 and the two files; `wc --help` writes
@@ -490,11 +490,11 @@ import avin.io.IoError
 import avin.signal
 
 serve() -> Result[unit, IoError]
-    val stop = signal.watch(signal.Terminate)?
-    while !stop.take()
-        serveOne()
-    cleanUp()
-    Ok(())
+  val stop = signal.watch(signal.Terminate)?
+  while !stop.take()
+    serveOne()
+  cleanUp()
+  Ok(())
 ```
 
 | Constant | Signal |
@@ -545,17 +545,17 @@ It says what kind of failure it was, what was being done, and what it was done t
 data IoError(kind: ErrorKind, operation: string = "", subject: string = "")
 
 data ErrorKind
-    NotFound
-    PermissionDenied
-    AlreadyExists
-    IsADirectory
-    NotADirectory
-    DirectoryNotEmpty
-    InvalidUtf8(offset: long)
-    ConnectionRefused
-    ConnectionReset
-    TimedOut
-    Other(text: string)
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  IsADirectory
+  NotADirectory
+  DirectoryNotEmpty
+  InvalidUtf8(offset: long)
+  ConnectionRefused
+  ConnectionReset
+  TimedOut
+  Other(text: string)
 ```
 
 | Kind | Meaning | `description` |
@@ -597,10 +597,10 @@ an `==` reads, and the operation and subject come along to be used:
 
 ```text
 fs.readText(path) match
-    Ok(text) -> use(text)
-    Err(IoError(NotFound, _, _)) -> useDefaults()
-    Err(e) if e.kind == PermissionDenied -> eprintln(s"$e; try sudo")
-    Err(e) -> fail(e.message)
+  Ok(text) -> use(text)
+  Err(IoError(NotFound, _, _)) -> useDefaults()
+  Err(e) if e.kind == PermissionDenied -> eprintln(s"$e; try sudo")
+  Err(e) -> fail(e.message)
 ```
 
 An operation that can fail answers a `Result[T, IoError]`, so `?` passes the failure on from a
@@ -614,12 +614,12 @@ chapter says an operation answers `Err(NotFound)` or `Err(Other("No such process
 import avin.io
 
 main()
-    var total = 0
-    for line in io.lines()
-        line.trim.toIntOption() match
-            Some(n) -> total += n
-            None -> eprintln(s"not a number: $line")
-    println(total)
+  var total = 0
+  for line in io.lines()
+    line.trim.toIntOption() match
+      Some(n) -> total += n
+      None -> eprintln(s"not a number: $line")
+  println(total)
 ```
 
 | Function | Meaning |
@@ -666,7 +666,7 @@ connection, or a source the program writes itself, holding no more of the input 
 
 ```text
 trait Reader
-    read(max: int) -> Result[Array[byte], IoError]
+  read(max: int) -> Result[Array[byte], IoError]
 ```
 
 `read(max)` gives up to `max` bytes, `max` being at least one, waiting for at least one where the
@@ -681,7 +681,7 @@ A `Close` is something held outside the program that `close()` gives back:
 
 ```text
 trait Close
-    close() -> Result[unit, IoError]
+  close() -> Result[unit, IoError]
 ```
 
 Every resource the library hands out is one: `fs.File`, `fs.TempDir`, every `net.ByteStream`
@@ -692,10 +692,10 @@ close it first to see the `Err`, a flush that failed or a directory that could n
 
 ```text
 save(name: string, text: string) -> Result[unit, IoError]
-    val f = fs.create(name)?
-    defer f.close()
-    f.writeText(text)?
-    f.close()
+  val f = fs.create(name)?
+  defer f.close()
+  f.writeText(text)?
+  f.close()
 ```
 
 A generic function takes any resource as `[R: Close]`, and a class of the program's own is one by
@@ -713,10 +713,10 @@ import avin.io.{IoError, Source}
 count(src: Source) -> int = src.lines().count(l -> !l.isEmpty)
 
 main() -> int
-    Source.fromFile("notes.txt") match
-        Ok(src) -> println(count(src))
-        Err(e) -> eprintln(e.message)
-    0
+  Source.fromFile("notes.txt") match
+    Ok(src) -> println(count(src))
+    Err(e) -> eprintln(e.message)
+  0
 ```
 
 | Function | Meaning |
@@ -745,9 +745,9 @@ import avin.fs
 import avin.io.IoError
 
 copyNotes(from: string, to: string) -> Result[unit, IoError]
-    val text = fs.readText(from)?
-    fs.createDirAll(to)?
-    fs.writeText(to + "/notes.txt", text)
+  val text = fs.readText(from)?
+  fs.createDirAll(to)?
+  fs.writeText(to + "/notes.txt", text)
 ```
 
 | Function | Meaning |
@@ -789,14 +789,14 @@ import avin.time
 import avin.time.Duration
 
 evictOlderThan(dir: string, age: Duration) -> Result[long, IoError]
-    var freed: long = 0
-    for name in fs.listDir(dir)?
-        val file = dir + "/" + name
-        val m = fs.metadata(file)?
-        if m.isFile && time.now() - m.modified > age
-            fs.remove(file)?
-            freed += m.size
-    Ok(freed)
+  var freed: long = 0
+  for name in fs.listDir(dir)?
+    val file = dir + "/" + name
+    val m = fs.metadata(file)?
+    if m.isFile && time.now() - m.modified > age
+      fs.remove(file)?
+      freed += m.size
+  Ok(freed)
 ```
 
 Recording that an entry was used is `fs.setModified(file, time.now())`, which writes nothing to the file.
@@ -818,7 +818,7 @@ listing `InvalidUtf8` rather than leaving that name out.
 
 ```text
 for name in fs.listDir(dir)?
-    if name.endsWith(".txt") then println(name)
+  if name.endsWith(".txt") then println(name)
 ```
 
 ### Paths
@@ -831,9 +831,9 @@ path that starts with `/` starts at the root.
 import avin.fs
 
 backupOf(file: string) -> string
-    val dir = fs.parent(file).getOrElse(".")
-    val stem = fs.stem(file).getOrElse("file")
-    fs.join([dir, "backup", stem + ".bak"])
+  val dir = fs.parent(file).getOrElse(".")
+  val stem = fs.stem(file).getOrElse("file")
+  fs.join([dir, "backup", stem + ".bak"])
 ```
 
 | Function | Meaning |
@@ -883,8 +883,8 @@ import avin.fs
 import avin.io.IoError
 
 sourcesIn(dir: string) -> Result[Vector[string], IoError]
-    val found = fs.walk(dir)?.filter(e -> !e.isDir && fs.matches("**/*.avin", e.relative))
-    Ok(found.map(e -> e.path))
+  val found = fs.walk(dir)?.filter(e -> !e.isDir && fs.matches("**/*.avin", e.relative))
+  Ok(found.map(e -> e.path))
 ```
 
 **A pattern is matched component by component**, so doubled and trailing `/` do not matter, and an
@@ -914,7 +914,7 @@ has no `Err`. The empty pattern answers nothing, and `/` answers `/`.
 
 ```text
 for file in fs.glob("tests/**/*.avin")
-    println(file)
+  println(file)
 ```
 
 ### Open files
@@ -927,12 +927,12 @@ import avin.fs
 import avin.threads.sleep
 
 follow(log: string) -> Result[unit, IoError]
-    val f = fs.open(log)?
-    f.seekToEnd()?
-    while true
-        f.readCompleteLine()? match
-            Some(line) -> println(line)
-            None -> sleep(250.millis)
+  val f = fs.open(log)?
+  f.seekToEnd()?
+  while true
+    f.readCompleteLine()? match
+      Some(line) -> println(line)
+      None -> sleep(250.millis)
 ```
 
 | Function | Meaning |
@@ -996,9 +996,9 @@ import avin.math
 import avin.math.{Pi, sqrt}
 
 main()
-    println(sqrt(2.0))
-    println(math.atan2(1.0, -1.0) / Pi)
-    println(math.log(0.0))
+  println(sqrt(2.0))
+  println(math.atan2(1.0, -1.0) / Pi)
+  println(math.log(0.0))
 ```
 
 | Function | Meaning |
@@ -1039,10 +1039,10 @@ seed.
 import avin.random.Random
 
 main()
-    val dice = Random(42)
-    println(dice.between(1, 7))
-    println(Random.nextInt(100))
-    println(Random.shuffle([1, 2, 3, 4]))
+  val dice = Random(42)
+  println(dice.between(1, 7))
+  println(Random.nextInt(100))
+  println(Random.shuffle([1, 2, 3, 4]))
 ```
 
 `Random(seed: long)` is a generator whose numbers are fixed by its seed, the same on every platform
@@ -1097,12 +1097,12 @@ hexadecimal text for any digest.
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
 
 main()
-    println(toHex(sha256("abc")))
-    println(toHex(hmacSha256("key", "message")))
-    val file = Sha256()
-    file.update("a piece")
-    file.update("and another")
-    println(toHex(file.finish()))
+  println(toHex(sha256("abc")))
+  println(toHex(hmacSha256("key", "message")))
+  val file = Sha256()
+  file.update("a piece")
+  file.update("and another")
+  println(toHex(file.finish()))
 ```
 
 A digest is a `Vector[byte]`, the bytes the standard defines, so it compares by value, can key a map
@@ -1139,11 +1139,11 @@ or writing waits safe for the collector.
 import avin.net.http
 
 main() -> int
-    http.get("https://example.com/") match
-        Ok(r) if r.status == 200 -> println(r.text)
-        Ok(r) -> eprintln(s"status ${r.status}")
-        Err(e) -> eprintln(e.message)
-    0
+  http.get("https://example.com/") match
+    Ok(r) if r.status == 200 -> println(r.text)
+    Ok(r) -> eprintln(s"status ${r.status}")
+    Err(e) -> eprintln(e.message)
+  0
 ```
 
 ### TCP
@@ -1172,14 +1172,14 @@ import avin.net.{TcpListener, TcpStream}
 import avin.threads.spawn
 
 main()
-    TcpListener.bind("127.0.0.1", 0) match
-        Ok(l) ->
-            val server = spawn(() -> l.accept().flatMap(s -> s.readLine()))
-            TcpStream.connect("127.0.0.1", l.port()).flatMap(c -> c.writeText("hello\n"))
-            server.join() match
-                Ok(Some(line)) -> println(line)
-                _ -> eprintln("no line")
-        Err(e) -> eprintln(e.message)
+  TcpListener.bind("127.0.0.1", 0) match
+    Ok(l) ->
+      val server = spawn(() -> l.accept().flatMap(s -> s.readLine()))
+      TcpStream.connect("127.0.0.1", l.port()).flatMap(c -> c.writeText("hello\n"))
+      server.join() match
+        Ok(Some(line)) -> println(line)
+        _ -> eprintln("no line")
+    Err(e) -> eprintln(e.message)
 ```
 
 ### Unix domain sockets
@@ -1261,11 +1261,11 @@ import avin.io.IoError
 import avin.net.tls.{TlsError, TlsStream}
 
 main() -> Result[unit, TlsError | IoError]
-    val s = TlsStream.connect("example.com", 443)?
-    defer s.close()
-    s.writeText("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")?
-    println(s.readLine()?.getOrElse(""))
-    Ok(())
+  val s = TlsStream.connect("example.com", 443)?
+  defer s.close()
+  s.writeText("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")?
+  println(s.readLine()?.getOrElse(""))
+  Ok(())
 ```
 
 | Member | Meaning |
@@ -1314,10 +1314,10 @@ a bug in the code serving one ends that connection alone:
 import avin.net.TcpServer
 
 main()
-    val server = TcpServer.start("0.0.0.0", 7000, (s, _) ->
-        while s.readLine() is Ok(Some(line))
-            s.writeText(line + "\n")).ok.get
-    server.join()
+  val server = TcpServer.start("0.0.0.0", 7000, (s, _) ->
+    while s.readLine() is Ok(Some(line))
+      s.writeText(line + "\n")).ok.get
+  server.join()
 ```
 
 | Member | Meaning |
@@ -1359,8 +1359,8 @@ main()
 
 ```text
 serveLines(s: TcpStream, server: TcpServer)
-    while server.idle(() -> s.readLine()) is Some(Ok(Some(line)))
-        s.writeText(handle(line) + "\n")
+  while server.idle(() -> s.readLine()) is Some(Ok(Some(line)))
+    s.writeText(handle(line) + "\n")
 ```
 
 ### HTTP server
@@ -1373,10 +1373,13 @@ import avin.net.http
 import avin.net.http.{Response, Route, Router}
 
 main()
-    val router = Router([
-        Route.get("/hello/:name", r -> Response.text(200, s"hello, ${r.param("name")}\n")),
-        Route.post("/echo", r -> Response.bytes(200, r.body, "application/octet-stream"))])
-    http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+  val router = Router(
+    [
+      Route.get("/hello/:name", r -> Response.text(200, s"hello, ${r.param("name")}\n")),
+      Route.post("/echo", r -> Response.bytes(200, r.body, "application/octet-stream"))
+    ]
+  )
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
 ```
 
 `http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,

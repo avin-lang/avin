@@ -431,9 +431,9 @@ order needs neither a second mutable list type nor a `reverse` at the end:
 
 ```text
 squares(n: int) -> List[int]
-    val b = List.newBuilder[int]()
-    for i in 1..n do b.addOne(i * i)
-    b.result()
+  val b = List.newBuilder[int]()
+  for i in 1 .. n do b.addOne(i * i)
+  b.result()
 ```
 
 ### Building from another collection
@@ -668,11 +668,11 @@ val queue = MutableTreeMap[int, string]()
 queue(30) = "c"
 queue(10) = "a"
 queue(20) = "b"
-println(queue.removeFirst())        // (10, a)
-println(queue.minAfter(21))         // Some((30, c))
+println(queue.removeFirst()) // (10, a)
+println(queue.minAfter(21)) // Some((30, c))
 for (k, v) in queue
-    queue.remove(k)                 // the loop still visits both entries
-println(queue.isEmpty)            // true
+  queue.remove(k) // the loop still visits both entries
+println(queue.isEmpty) // true
 ```
 
 ### Bit sets
@@ -759,7 +759,7 @@ Avin has no null reference, so an array never holds an element that is not yet a
 is made with each element set:
 
 ```text
-val zeros = Array.fill(8, 0)              // eight 0s; the value is evaluated once and shared
+val zeros = Array.fill(8, 0) // eight 0s; the value is evaluated once and shared
 val squares = Array.tabulate(5, i -> i * i)
 val none = Array.empty[string]()
 ```
@@ -791,12 +791,12 @@ apart in a pattern, and `[]` is the empty list:
 
 ```text
 sum(xs: List[int]) -> int = xs match
-    [] -> 0
-    head :: tail -> head + sum(tail)
+  [] -> 0
+  head :: tail -> head + sum(tail)
 
 pairs[A](xs: List[A]) -> List[(A, A)] = xs match
-    a :: b :: rest -> (a, b) :: pairs(rest)
-    _ -> []
+  a :: b :: rest -> (a, b) :: pairs(rest)
+  _ -> []
 ```
 
 `::` needs a `List` on its right, so a literal there is built as one: in `1 :: 2 :: []`, the `[]` is
@@ -826,16 +826,16 @@ be endless, and may be defined by reference to itself:
 
 ```text
 sieve(s: LazyList[int]) -> LazyList[int] =
-    s.head #:: sieve(s.tail.filter(_ % s.head != 0))
+  s.head #:: sieve(s.tail.filter(_ % s.head != 0))
 
 val primes = sieve(LazyList.from(2))
 
-primes.take(5).toVector                // [2, 3, 5, 7, 11]
-primes(99)                               // 541, the hundredth prime
+primes.take(5).toVector // [2, 3, 5, 7, 11]
+primes(99) // 541, the hundredth prime
 
 lazy val fibs: LazyList[long] = 0 #:: 1 #:: fibs.zip(fibs.tail).map((a, b) -> a + b)
 
-fibs(90)                                 // 2880067194370816120
+fibs(90) // 2880067194370816120
 ```
 
 **Making one.** `LazyList.empty[T]()` is the empty list. `head #:: tail` is a list of `head` and then
@@ -907,10 +907,10 @@ for lists only, since splitting off a head is what a list does in constant time.
 
 ```text
 describe(xs: Vector[string]) -> string = xs match
-    [] -> "nobody"
-    [one] -> one
-    [first, second] -> s"$first and $second"
-    _ -> s"${xs(0)} and ${xs.length - 1} others"
+  [] -> "nobody"
+  [one] -> one
+  [first, second] -> s"$first and $second"
+  _ -> s"${xs(0)} and ${xs.length - 1} others"
 ```
 
 The last part may be `rest*`, or `_*` where the rest is not used: the pattern then matches a
@@ -923,12 +923,12 @@ made when the pattern matches.
 
 ```text
 total(xs: List[int]) -> int = xs match
-    [] -> 0
-    [head, tail*] -> head + total(tail)
+  [] -> 0
+  [head, tail*] -> head + total(tail)
 
 firstTwo(xs: Vector[string]) -> string = xs match
-    [a, b, _*] -> s"$a and $b"
-    _ -> "fewer than two"
+  [a, b, _*] -> s"$a and $b"
+  _ -> "fewer than two"
 ```
 
 For exhaustiveness, a sequence pattern covers its own length, and one ending in a rest covers
@@ -953,8 +953,8 @@ literal a `Set` and a map literal a `Map`. When the expected type is another col
 annotation, a parameter or a field — the literal builds that one instead:
 
 ```text
-val xs = [1, 2, 3]                  // Vector[int]
-val queue: Buffer[int] = [1, 2, 3]  // growable and mutable
+val xs = [1, 2, 3] // Vector[int]
+val queue: Buffer[int] = [1, 2, 3] // growable and mutable
 val header: Array[byte] = [0x89, 0x50, 0x4e, 0x47]
 val stack: List[string] = []
 val seen: mutable.Set[int] = {}
@@ -1060,8 +1060,8 @@ does `toArraySeq` on any collection, or a literal whose expected type is an `Arr
 
 ```avin
 val xs: ArraySeq[int] = [1, 2, 3]
-val ys = xs :+ 4                    // [1, 2, 3, 4], a copy; xs is unchanged
-val v = ys.toVector               // a Vector of the same elements
+val ys = xs :+ 4 // [1, 2, 3, 4], a copy; xs is unchanged
+val v = ys.toVector // a Vector of the same elements
 ```
 
 | Operation | Cost |
@@ -1332,10 +1332,10 @@ lets `break`, `continue` and `return` leave the body directly. A source with no 
 `int`, is an error.
 
 ```text
-for i in 0..<n do total += i
+for i in 0 ..< n do total += i
 for (name, age) in people
-    if age < 18 then continue
-    println(name)
+  if age < 18 then continue
+  println(name)
 ```
 
 ### Generators, guards and `yield`
@@ -1352,10 +1352,10 @@ adding a guard to the generator or definition above it, and `yield` starts the l
 val pairs = for x in xs, y in ys if x < y yield (x, y)
 
 val grid = for
-    row in 0 ..< height
-    if row % 2 == 0
-    col in 0 ..< width
-    cell = row * width + col
+  row in 0 ..< height
+  if row % 2 == 0
+  col in 0 ..< width
+  cell = row * width + col
 yield cell * cell
 
 val priced = for item in order, (name, cost) = lookup(item) if cost > 0 yield s"$name: $cost"
@@ -1378,8 +1378,8 @@ function passed to its generator's source, as `val`s are in a block:
 ```text
 for x in xs, y = f(x), z in g(y) yield h(z)
 xs.flatMap(x ->
-    val y = f(x)
-    g(y).map(z -> h(z)))
+  val y = f(x)
+  g(y).map(z -> h(z)))
 ```
 
 A guard after a definition has to see its value before the element goes on, so the definition, and

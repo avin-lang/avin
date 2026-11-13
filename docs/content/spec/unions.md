@@ -58,8 +58,8 @@ followed by `|` and a type name is reported with the parenthesized form to write
 
 ```text
 v match
-    x: int | string -> …     // error: a union in a type pattern is written in parentheses,
-                             // `x: (int | string)`
+  x: int | string -> … // error: a union in a type pattern is written in parentheses,
+  // `x: (int | string)`
 ```
 
 **The parser tells the three uses of `|` apart by position.** Where a type is expected (after the
@@ -90,12 +90,12 @@ Written out by hand, each of these but flattening and order is a mistake, and an
 the type to write:
 
 ```text
-val a: int | int = 1              // error: `int` is named twice in this union
-val b: Dog | Animal = rex         // error: a `Dog` is already an `Animal`, so `Dog | Animal` is
-                                  // `Animal`; write `Animal`
-val c: string | Any = "x"         // error: every member converts to `Any`, so this union is `Any`;
-                                  // write `Any`
-val d: int | Nothing = 1          // error: `Nothing` adds no value to a union; write `int`
+val a: int | int = 1 // error: `int` is named twice in this union
+val b: Dog | Animal = rex // error: a `Dog` is already an `Animal`, so `Dog | Animal` is
+// `Animal`; write `Animal`
+val c: string | Any = "x" // error: every member converts to `Any`, so this union is `Any`;
+// write `Any`
+val d: int | Nothing = 1 // error: `Nothing` adds no value to a union; write `int`
 ```
 
 Where the members come together through a type argument or an alias, the same cases are absorbed
@@ -126,8 +126,8 @@ val x = if ok then 1 else "none"
 // error: the branches of this `if` agree on no type: `int` and `string`; to keep either, declare
 // the type it yields, such as `int | string`
 
-val y: int | string = if ok then 1 else "none"      // each branch becomes the union
-val zs: Vector[int | string] = [1, "two", 3]         // each element too
+val y: int | string = if ok then 1 else "none" // each branch becomes the union
+val zs: Vector[int | string] = [1, "two", 3] // each element too
 ```
 
 The same holds for collection literals, generic calls and lambdas: `[1, "two"]` is an error, and
@@ -246,9 +246,9 @@ covers a member when every value of the member matches it:
 data Token(text: string)
 
 render(v: int | string | Token) -> string = v match
-    n: int -> s"$n"
-    s: string -> s
-    Token(t) -> t
+  n: int -> s"$n"
+  s: string -> s
+  Token(t) -> t
 ```
 
 - **Type patterns** test the member, as they test any value: `n: int`, `_: string`.
@@ -264,11 +264,11 @@ render(v: int | string | Token) -> string = v match
 
   ```text
   sign(v: int | string) -> string = v match
-      n < 0 -> "negative"          // the int member
-      0 -> "zero"
-      _: int -> "positive"
-      "" -> "empty"                // the string member
-      _: string -> "text"
+    n < 0 -> "negative" // the int member
+    0 -> "zero"
+    _: int -> "positive"
+    "" -> "empty" // the string member
+    _: string -> "text"
   ```
 
   A pattern that more than one member could match is an error that names them and suggests a type
@@ -279,8 +279,8 @@ render(v: int | string | Token) -> string = v match
 
   ```text
   v match
-      b: bool -> …      // error: `bool` is no member of `int | string`, so this pattern can never
-                        // match
+    b: bool -> … // error: `bool` is no member of `int | string`, so this pattern can never
+    // match
   ```
 
 - **`_` and a bare binding** cover every member; a binding binds the union.
@@ -289,8 +289,8 @@ A `match` that leaves a member uncovered names one value it leaves out, as a pat
 
 ```text
 kind(v: int | string | bool) -> string = v match
-    _: int -> "int"
-    _: string -> "string"
+  _: int -> "int"
+  _: string -> "string"
 // error: this `match` does not cover every `int | string | bool` value, such as `_: bool`
 ```
 
@@ -316,8 +316,8 @@ value:
 
 ```text
 lengthOf(v: int | string) -> int
-    if v is s: string then return s.charCount
-    0
+  if v is s: string then return s.charCount
+  0
 ```
 
 The union value itself keeps its type: `if v is _: string then v.charCount` is an error, since `v`
@@ -381,9 +381,9 @@ without a wrapper type:
 
 ```text
 load(path: string) -> Result[Config, IoError | ParseError]
-    val text = readText(path)?          // Result[string, IoError]
-    val doc = parseDocument(text)?      // Result[Document, ParseError]
-    configOf(doc)                       // Result[Config, ParseError], converted as a result
+  val text = readText(path)? // Result[string, IoError]
+  val doc = parseDocument(text)? // Result[Document, ParseError]
+  configOf(doc) // Result[Config, ParseError], converted as a result
 ```
 
 On `Err(e)`, with `e` of type `E` and the enclosing function yielding errors of `F`:
@@ -404,8 +404,9 @@ On `Err(e)`, with `e` of type `E` and the enclosing function yielding errors of 
 
 ```text
 fetch(url: Url) -> Result[Page, NetError]
+
 load(path: string) -> Result[Config, IoError | ParseError]
-    val page = fetch(url)?
+  val page = fetch(url)?
 // error: `?` cannot pass on a `NetError` from a function whose errors are `IoError | ParseError`:
 // it is no member of the union, and no member implements `From[NetError]`
 ```

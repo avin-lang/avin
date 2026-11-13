@@ -133,12 +133,12 @@ clamp(n: int, low: int, high: int) -> int = if n < low then low elif n > high th
 
 @test("clamps below the low bound")
 below()
-    assertEq(clamp(0, 1, 3), 1)
+  assertEq(clamp(0, 1, 3), 1)
 
 @test
 leavesInRange()
-    println("clamping 4")
-    assert(clamp(4, 1, 3) == 4, "four is left as it is")
+  println("clamping 4")
+  assert(clamp(4, 1, 3) == 4, "four is left as it is")
 ```
 
 `assert(condition)` and `assert(condition, message)` stop the program when the condition is false;
@@ -168,7 +168,7 @@ running 2 tests
 clamp.avin
   ok    clamps below the low bound  2ms
   FAIL  leavesInRange               1ms
-        assertion failed: four is left as it is at clamp.avin:10:5
+        assertion failed: four is left as it is at clamp.avin:10:3
         > clamping 4
 
 1 passed, 1 failed — 4ms

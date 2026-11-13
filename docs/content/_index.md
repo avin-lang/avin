@@ -15,16 +15,16 @@ UTF-8 type, and failures are values.
 module demo
 
 data Shape
-    Circle(radius: real)
-    Rect(width: real, height: real)
+  Circle(radius: real)
+  Rect(width: real, height: real)
 
 area(shape: Shape) -> real = shape match
-    Circle(r) -> 3.14159 * r * r
-    Rect(w, h) -> w * h
+  Circle(r) -> 3.14159 * r * r
+  Rect(w, h) -> w * h
 
 main()
-    val shapes = [Circle(1.0), Rect(2.0, 3.0)]
-    println(shapes.map(area).sum)
+  val shapes = [Circle(1.0), Rect(2.0, 3.0)]
+  println(shapes.map(area).sum)
 ```
 
 A list may be endless. Here every prime there is, in one lazy list: `#::` puts a prime in front of a
@@ -33,12 +33,12 @@ program asks for, and keeps every prime it has found.
 
 ```text run
 sieve(s: LazyList[int]) -> LazyList[int] =
-    s.head #:: sieve(s.tail.filter(_ % s.head != 0))
+  s.head #:: sieve(s.tail.filter(_ % s.head != 0))
 
 main()
-    val primes = sieve(LazyList.from(2))
-    println(primes.take(10).toVector)
-    println(primes(99))
+  val primes = sieve(LazyList.from(2))
+  println(primes.take(10).toVector)
+  println(primes(99))
 ```
 
 ```text output

@@ -12,13 +12,13 @@ through [Sysl bindings](/spec/sysl-bindings/), and the calendar arithmetic is Sy
 import avin.time.{now, monotonic, date, dateTime, zone, hours, months}
 
 main()
-    val start = monotonic()
-    val toronto = zone("America/Toronto")?
-    val meeting = dateTime(2026, 3, 7, 9, 0).atZone(toronto)?
-    println(meeting.plusDays(1))            // 2026-03-08T09:00:00-04:00[America/Toronto]
-    println(meeting + hours(24))            // 2026-03-08T10:00:00-04:00[America/Toronto]
-    println(date(2026, 1, 31) + months(1))  // 2026-02-28
-    println(s"stamped ${now()}, took ${monotonic() - start}")
+  val start = monotonic()
+  val toronto = zone("America/Toronto")?
+  val meeting = dateTime(2026, 3, 7, 9, 0).atZone(toronto)?
+  println(meeting.plusDays(1)) // 2026-03-08T09:00:00-04:00[America/Toronto]
+  println(meeting + hours(24)) // 2026-03-08T10:00:00-04:00[America/Toronto]
+  println(date(2026, 1, 31) + months(1)) // 2026-02-28
+  println(s"stamped ${now()}, took ${monotonic() - start}")
 ```
 
 ## Eight types

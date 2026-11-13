@@ -22,17 +22,17 @@ library is `avin.actors`.
 import avin.actors.{ActorRef, spawn}
 
 data CounterMsg
-    Increment(by: int)
-    Get(replyTo: ActorRef[int])
-    Reset
+  Increment(by: int)
+  Get(replyTo: ActorRef[int])
+  Reset
 
 actor Counter(start: int) receives CounterMsg
-    var count = start
+  var count = start
 
-    receive
-        Increment(by) -> count += by
-        Get(replyTo) -> replyTo.tell(count)
-        Reset -> count = 0
+  receive
+    Increment(by) -> count += by
+    Get(replyTo) -> replyTo.tell(count)
+    Reset -> count = 0
 ```
 
 - **`actor Name(params) receives M`** declares an actor whose messages are of type `M`, usually a
@@ -73,16 +73,16 @@ import avin.actors.{Behaviour, spawn}
 import avin.threads.Promise
 
 main()
-    val total = Promise[int]()
-    val counter = spawn(Behaviour[int]("Counter", me ->
-        var count = 0
-        n ->
-            count += n
-            if n == 0 then total.complete(count)))
-    counter.tell(5)
-    counter tell 2
-    counter.tell(0)
-    println(total.future.await())
+  val total = Promise[int]()
+  val counter = spawn(Behaviour[int]("Counter", me ->
+    var count = 0
+    n ->
+      count += n
+      if n == 0 then total.complete(count)))
+  counter.tell(5)
+  counter tell 2
+  counter.tell(0)
+  println(total.future.await())
 ```
 
 ## Starting, telling and asking
@@ -92,13 +92,13 @@ import avin.actors.{spawn, AskError}
 import avin.time
 
 main() -> int
-    val counter = spawn(Counter(10))
-    counter.tell(Increment(5))
-    counter tell Increment(2)
-    val answer = counter.ask(r -> Get(r), timeout = time.seconds(1)).await()
-    answer match
-        Ok(n) -> n
-        Err(_) -> 1
+  val counter = spawn(Counter(10))
+  counter.tell(Increment(5))
+  counter tell Increment(2)
+  val answer = counter.ask(r -> Get(r), timeout = time.seconds(1)).await()
+  answer match
+    Ok(n) -> n
+    Err(_) -> 1
 ```
 
 - **`spawn[M](behaviour: Behaviour[M], onFailure: Supervision = Escalate, executor: Executor =
@@ -219,9 +219,9 @@ connection, and a large buffer filled by one actor goes to the next.
 
   ```text
   val chunk = isolate
-      val b = Buffer[byte]()
-      for i in 0..<size do b.append(byte.wrap(i))
-      b
+    val b = Buffer[byte]()
+    for i in 0 ..< size do b.append(byte.wrap(i))
+    b
   worker tell Fill(chunk)
   ```
 
@@ -415,30 +415,30 @@ must be shared; a `Mutex` is sendable for that reason.
 
 ```text
 data DoorEvent
-    Open
-    Close
-    Lock(code: int)
-    Unlock(code: int)
+  Open
+  Close
+  Lock(code: int)
+  Unlock(code: int)
 
 machine Door receives DoorEvent
-    var opened = 0
+  var opened = 0
 
-    state Closed
-        Open ->
-            opened += 1
-            Opened
-        Lock(code) -> Locked(code)
+  state Closed
+    Open ->
+      opened += 1
+      Opened
+    Lock(code) -> Locked(code)
 
-    state Opened
-        enter
-            println("open")
-        Close -> Closed
+  state Opened
+    enter
+      println("open")
+    Close -> Closed
 
-    state Locked(code: int)
-        Unlock(c) if c == code -> Closed
+  state Locked(code: int)
+    Unlock(c) if c == code -> Closed
 
-    receive
-        _ -> stay
+  receive
+    _ -> stay
 ```
 
 - **Each `state` declares a state**, optionally with parameters, the data that state holds; its
@@ -485,38 +485,38 @@ driven by its mailbox. Each message is an event, the arms yield the next state, 
 
 ```text
 data ConnMsg
-    Connect(host: string)
-    Connected(socket: Socket)
-    Send(bytes: Vector[byte])
-    Closed
+  Connect(host: string)
+  Connected(socket: Socket)
+  Send(bytes: Vector[byte])
+  Closed
 
 actor Connection receives ConnMsg
-    var pending = Vector[Vector[byte]]()
+  var pending = Vector[Vector[byte]]()
 
-    state Idle
-        Connect(host) ->
-            pipeToSelf(openSocket(host), s -> Connected(s))
-            Connecting
+  state Idle
+    Connect(host) ->
+      pipeToSelf(openSocket(host), s -> Connected(s))
+      Connecting
 
-    state Connecting
-        Connected(socket) ->
-            for b in pending do socket.write(b)
-            pending = Vector()
-            Ready(socket)
-        Send(bytes) ->
-            pending = pending :+ bytes
-            stay
+  state Connecting
+    Connected(socket) ->
+      for b in pending do socket.write(b)
+      pending = Vector()
+      Ready(socket)
+    Send(bytes) ->
+      pending = pending :+ bytes
+      stay
 
-    state Ready(socket: Socket)
-        leave
-            socket.close()
-        Send(bytes) ->
-            socket.write(bytes)
-            stay
-        Closed -> Idle
+  state Ready(socket: Socket)
+    leave
+      socket.close()
+    Send(bytes) ->
+      socket.write(bytes)
+      stay
+    Closed -> Idle
 
-    receive
-        _ -> stay
+  receive
+    _ -> stay
 ```
 
 An actor with states needs no `receive` block; its shared arms, where it has them, yield states as

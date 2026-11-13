@@ -15,9 +15,9 @@ of its own and wait for it to finish. A thread runs a closure and is joined for 
 import avin.threads.spawn
 
 main() -> int
-    val worker = spawn(() -> sum(1..1000000))
-    val mine = sum(1000001..2000000)
-    worker.join() + mine
+  val worker = spawn(() -> sum(1 .. 1000000))
+  val mine = sum(1000001 .. 2000000)
+  worker.join() + mine
 ```
 
 - `spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]` starts `body`
@@ -55,11 +55,11 @@ main() -> int
 import avin.threads.{Atomic, scope}
 
 main() -> int
-    val parts = (0..<4).map(_ -> Atomic(0)).toVector
-    scope(s ->
-        for i in 0..<4
-            s.spawn(() -> parts(i).store((i + 1) * 10)))
-    parts.map(p -> p.load()).sum
+  val parts = (0 ..< 4).map(_ -> Atomic(0)).toVector
+  scope(s ->
+    for i in 0 ..< 4
+      s.spawn(() -> parts(i).store((i + 1) * 10)))
+  parts.map(p -> p.load()).sum
 ```
 
 ### Cancellation
@@ -113,21 +113,21 @@ goes on running after the call. What a program can rely on:
 import avin.threads.{Channel, scope}
 
 fetchAll(urls: Vector[string]) -> Result[Vector[string], string]
-    val pages = Channel[Result[string, string]](urls.length)
-    scope(s ->
-        for u in urls do s.spawn(() -> pages.send(fetch(u)))
-        var got: Vector[string] = []
-        var failure: Option[string] = None
-        while got.length < urls.length && failure.isEmpty
-            pages.receive() match
-                Some(Ok(page)) -> got = got :+ page
-                Some(Err(e)) ->
-                    failure = Some(e)
-                    s.cancel()
-                None -> ()
-        failure match
-            Some(e) -> Err(e)
-            None -> Ok(got))
+  val pages = Channel[Result[string, string]](urls.length)
+  scope(s ->
+    for u in urls do s.spawn(() -> pages.send(fetch(u)))
+    var got: Vector[string] = []
+    var failure: Option[string] = None
+    while got.length < urls.length && failure.isEmpty
+      pages.receive() match
+        Some(Ok(page)) -> got = got :+ page
+        Some(Err(e)) ->
+          failure = Some(e)
+          s.cancel()
+        None -> ()
+    failure match
+      Some(e) -> Err(e)
+      None -> Ok(got))
 ```
 
 ## Lightweight threads
@@ -279,8 +279,8 @@ argument is held to the bound as written.
 take[U: Sendable](value: U) -> U = value
 
 val vowel: PartialFunction[char, int] = take(match
-    'a' -> 1
-    'e' -> 2)
+  'a' -> 1
+  'e' -> 2)
 ```
 
 ```avin
@@ -310,7 +310,7 @@ var hits = 0
 record() = hits += 1
 
 main()
-    spawn(() -> record()).join()
+  spawn(() -> record()).join()
 ```
 
 ```text
@@ -394,18 +394,18 @@ will own its handles across every message, whichever thread runs it.
 import avin.threads.{Channel, scope}
 
 main() -> int
-    val jobs = Channel[int](16)
-    val results = Channel[int]()
-    scope(s ->
-        for w in 0..<4
-            s.spawn(() ->
-                for n in jobs do results.send(n * n))
-        for n in 1..100 do jobs.send(n)
-        jobs.close())
-    results.close()
-    var total = 0
-    for r in results do total += r
-    total % 256
+  val jobs = Channel[int](16)
+  val results = Channel[int]()
+  scope(s ->
+    for w in 0 ..< 4
+      s.spawn(() ->
+        for n in jobs do results.send(n * n))
+    for n in 1 .. 100 do jobs.send(n)
+    jobs.close())
+  results.close()
+  var total = 0
+  for r in results do total += r
+  total % 256
 ```
 
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
@@ -426,13 +426,13 @@ the body, like the functions of `map`, `flatMap` and `onComplete`, is `@sendable
 import avin.threads.Future
 
 main() -> int
-    val page = Future(fetch(url))
-    val counted = Future
-        val words = load(path).split(" ")
-        words.length
-    val both = for p in page, n in counted yield s"${p.charCount} characters, $n words"
-    println(both.await())
-    0
+  val page = Future(fetch(url))
+  val counted = Future
+    val words = load(path).split(" ")
+    words.length
+  val both = for p in page, n in counted yield s"${p.charCount} characters, $n words"
+  println(both.await())
+  0
 ```
 
 - **`await() -> T`** waits for the value and gives it back, the same value at every call, safe for
@@ -485,12 +485,12 @@ about thirty years. A thread that sleeps parks, freeing the operating system thr
 import avin.threads.{blocking, Channel, Future}
 
 main() -> int
-    val jobs = Channel[int]()
-    val workers = (0..<64).map(i -> Future(blocking(jobs.receive().getOrElse(0)))).toVector
-    Future
-        for n in 1..64 do jobs.send(n)
-    println(Future.all(workers).await().sum)
-    0
+  val jobs = Channel[int]()
+  val workers = (0 ..< 64).map(i -> Future(blocking(jobs.receive().getOrElse(0)))).toVector
+  Future
+    for n in 1 .. 64 do jobs.send(n)
+  println(Future.all(workers).await().sum)
+  0
 ```
 
 ### Executors
@@ -521,12 +521,12 @@ after `shutdown` still runs, as the functions of futures do.
 import avin.threads.{Executor, Future}
 
 main() -> int
-    val io = Executor.fixed(4)
-    val sizes = (1..100).map(n -> io.future(n * n)).toVector
-    val total = Future.all(sizes).await().sum
-    io.shutdown()
-    println(total)
-    0
+  val io = Executor.fixed(4)
+  val sizes = (1 .. 100).map(n -> io.future(n * n)).toVector
+  val total = Future.all(sizes).await().sum
+  io.shutdown()
+  println(total)
+  0
 ```
 
 ## The memory model

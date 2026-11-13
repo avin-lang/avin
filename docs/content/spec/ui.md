@@ -30,14 +30,14 @@ import ui.{View, app, button, column, invalidate, run, text}
 var count = 0
 
 add()
-    count += 1
-    invalidate()
+  count += 1
+  invalidate()
 
 screen() -> View = column([text(s"$count"), button("Add one", add)], 16)
 
 main() -> int = run(app("Counter", screen, () -> 0x1E1E2E)) match
-    Ok(_) -> 0
-    Err(_) -> 1
+  Ok(_) -> 0
+  Err(_) -> 1
 ```
 
 ## Views
@@ -206,8 +206,8 @@ one. A state of a reference holds the reference: changing the object in place is
 import ui.{View, button, column, component, root, text}
 
 counter(step: int) -> View = component c ->
-    val count = c.state(0)
-    column([text(s"${count.get()}"), button(s"Add $step", () -> count.update(n -> n + step))])
+  val count = c.state(0)
+  column([text(s"${count.get()}"), button(s"Add $step", () -> count.update(n -> n + step))])
 ```
 
 ### Components
@@ -308,9 +308,9 @@ import ui.{inbox, state}
 val ticks = state(0)
 val tick = inbox((n: int) -> ticks.set(n))
 spawn(() ->
-    for n in 1..10
-        sleep(millis(100))
-        tick.ask(n))
+  for n in 1 .. 10
+    sleep(millis(100))
+    tick.ask(n))
 ```
 
 - **Everything runs on the main thread, in the order it was sent.** Messages to every inbox and

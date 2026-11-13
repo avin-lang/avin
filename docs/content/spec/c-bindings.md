@@ -14,11 +14,11 @@ module mlt
 
 @c(type: "mlt_properties", release: "mlt_properties_close", retain: "mlt_properties_inc_ref")
 class Properties
-    @c("char *mlt_properties_get(mlt_properties self, const char *name)")
-    get(name: string) -> Option[string]
+  @c("char *mlt_properties_get(mlt_properties self, const char *name)")
+  get(name: string) -> Option[string]
 
-    @c("int mlt_properties_set(mlt_properties self, const char *name, const char *value)")
-    set(name: string, value: string) -> Result[unit, int]
+  @c("int mlt_properties_set(mlt_properties self, const char *name, const char *value)")
+  set(name: string, value: string) -> Result[unit, int]
 
 @c("mlt_properties mlt_properties_new(void)")
 newProperties() -> Option[Properties]
@@ -265,11 +265,10 @@ A C object Avin holds without seeing inside is a **handle**: a `class` declared 
 naming the C pointer type, and the function that gives the object back:
 
 ```avin
-@c(type: "mlt_producer", release: "mlt_producer_close",
-   retain: "mlt_properties_inc_ref(mlt_producer_properties(self))")
+@c(type: "mlt_producer", release: "mlt_producer_close", retain: "mlt_properties_inc_ref(mlt_producer_properties(self))")
 class Producer
-    @c("int mlt_producer_get_length(mlt_producer self)")
-    length() -> int
+  @c("int mlt_producer_get_length(mlt_producer self)")
+  length() -> int
 ```
 
 A handle is the [Sysl handle](/spec/sysl-bindings/#handles) over a C pointer, and keeps its rules:
@@ -330,8 +329,13 @@ the surface was made over. A library that tells its objects' owner when C frees 
 tie a kept object to **the C object's** lifetime instead, with `attach:`:
 
 ```avin
-@c(type: "cairo_surface_t *", release: "cairo_surface_destroy", retain: "cairo_surface_reference",
-   attach: "cairo_surface_set_user_data(self, key, data, destroy)", key: "cairo_user_data_key_t")
+@c(
+    type: "cairo_surface_t *",
+    release: "cairo_surface_destroy",
+    retain: "cairo_surface_reference",
+    attach: "cairo_surface_set_user_data(self, key, data, destroy)",
+    key: "cairo_user_data_key_t"
+)
 class Surface
 ```
 
@@ -352,9 +356,17 @@ a surface it could not make as a surface in an error state, and `cairo_surface_s
 answers that surface's status, so the status comes back as the error, with no check before the call:
 
 ```avin
-@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
-   keeps: "pixels")
-private surfaceForData(pixels: ByteBlock, format: Format, width: int, height: int, stride: int) -> Result[Surface, Status]
+@c(
+    "cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
+    keeps: "pixels"
+)
+private surfaceForData(
+    pixels: ByteBlock,
+    format: Format,
+    width: int,
+    height: int,
+    stride: int
+) -> Result[Surface, Status]
 ```
 
 Such a binding answers no out values, its handle is never in an `Option`, its class has `attach:` and
@@ -392,8 +404,7 @@ freed memory at its next load:
 @c(type: "FT_Library", release: "FT_Done_Library", retain: "FT_Reference_Library")
 class Library
 
-@c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)",
-   keeps: "library")
+@c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)", keeps: "library")
 private newFace(library: Library, path: string, index: long) -> Result[Face, int]
 ```
 
@@ -440,8 +451,7 @@ module cairo
 
 import freetype.Face
 
-@c("cairo_font_face_t *cairo_ft_font_face_create_for_ft_face(FT_Face face, int load_flags)",
-   keeps: "face")
+@c("cairo_font_face_t *cairo_ft_font_face_create_for_ft_face(FT_Face face, int load_flags)", keeps: "face")
 private ftFontFace(face: Face, loadFlags: int) -> FontFace
 ```
 
@@ -468,14 +478,19 @@ service, and a service is a property bag. A handle declares the other C types it
 each with the C function or expression that makes one:
 
 ```avin
-@c(type: "mlt_playlist", release: "mlt_playlist_close",
-   retain: "mlt_properties_inc_ref(mlt_playlist_properties(self))",
-   as: ["mlt_producer = mlt_playlist_producer(self)",
-        "mlt_service = mlt_playlist_service(self)",
-        "mlt_properties = mlt_playlist_properties(self)"])
+@c(
+    type: "mlt_playlist",
+    release: "mlt_playlist_close",
+    retain: "mlt_properties_inc_ref(mlt_playlist_properties(self))",
+    as: [
+      "mlt_producer = mlt_playlist_producer(self)",
+      "mlt_service = mlt_playlist_service(self)",
+      "mlt_properties = mlt_playlist_properties(self)"
+    ]
+)
 class Playlist
-    @c("int mlt_properties_set_int(mlt_properties self, const char *name, int value)")
-    setInt(name: string, value: int) -> Result[unit, int]
+  @c("int mlt_properties_set_int(mlt_properties self, const char *name, int value)")
+  setInt(name: string, value: int) -> Result[unit, int]
 ```
 
 A handle is passed where a prototype names one of its `as` types, receiver or parameter, through
@@ -514,10 +529,10 @@ answers `unit`:
 ```avin
 @c(type: "mlt_profile", release: "mlt_profile_close")
 class Profile
-    @c(field: "width")
-    width() -> int
-    @c(field: "frame_rate_num")
-    frameRateNum() -> int
+  @c(field: "width")
+  width() -> int
+  @c(field: "frame_rate_num")
+  frameRateNum() -> int
 ```
 
 The field's C type is the header's, so its conversion is the [scalar](#scalars) one for that type; a
@@ -558,6 +573,7 @@ field that is a pointer is read as a string or a borrowed handle by the same rul
   ```avin
   @c(field: "bbox")
   boundingBox() -> BBox
+
   @c(field: "size->metrics")
   sizeMetrics() -> SizeMetrics
   ```
@@ -587,16 +603,16 @@ union is read — Cairo's `cairo_path_t`, whose `data` is `num_data` elements of
 ```avin
 @c(type: "cairo_path_t *", release: "cairo_path_destroy")
 class CPath
-    @c(field: "num_data")
-    count() -> int
-    @c(field: "data[i].header.type", bound: "self->num_data")
-    kind(i: int) -> PathDataType
-    @c(field: "data[i].header.length", bound: "self->num_data")
-    span(i: int) -> int
-    @c(field: "data[i].point.x", bound: "self->num_data")
-    x(i: int) -> real
-    @c(field: "data[i].point.y", bound: "self->num_data")
-    y(i: int) -> real
+  @c(field: "num_data")
+  count() -> int
+  @c(field: "data[i].header.type", bound: "self->num_data")
+  kind(i: int) -> PathDataType
+  @c(field: "data[i].header.length", bound: "self->num_data")
+  span(i: int) -> int
+  @c(field: "data[i].point.x", bound: "self->num_data")
+  x(i: int) -> real
+  @c(field: "data[i].point.y", bound: "self->num_data")
+  y(i: int) -> real
 ```
 
 The library walks the handle once, by each header's `length`, into immutable Avin data (a
@@ -636,7 +652,7 @@ writes into one it fills are copied out and left to C.
 ```avin
 @c(struct: "mlt_color")
 data Color
-    Color(r: byte, g: byte, b: byte, a: byte)
+  Color(r: byte, g: byte, b: byte, a: byte)
 ```
 
 A struct passed by value whose layout Avin does not mirror — a union, a struct with a bit-field or a
@@ -649,8 +665,8 @@ bindings taking the value as their receiver:
 ```avin
 @c(value: "mlt_event_data")
 class EventData
-    @c("int mlt_event_data_to_int(mlt_event_data self)")
-    toInt() -> int
+  @c("int mlt_event_data_to_int(mlt_event_data self)")
+  toInt() -> int
 ```
 
 **A call that passes or answers a struct by value goes through glue.** LLVM IR does not lower an
@@ -670,12 +686,12 @@ one its own `@c("name")` names:
 ```avin
 @c(enum: "mlt_image_format", prefix: "mlt_image_")
 data ImageFormat
-    None
-    Rgb
-    Rgba
-    Yuv422
-    @c("mlt_image_yuv420p")
-    Yuv420p
+  None
+  Rgb
+  Rgba
+  Yuv422
+  @c("mlt_image_yuv420p")
+  Yuv420p
 ```
 
 The words are matched in the prefix's case, so an upper-case prefix matches upper-case enumerators:
@@ -751,7 +767,9 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   twice, once with no buffer for the table's size and once to fill one:
 
   ```avin
-  @c("FT_Error FT_Load_Sfnt_Table(FT_Face self, FT_ULong tag, FT_Long offset, FT_Byte *buffer, length(buffer) inout FT_ULong *length)")
+  @c(
+    "FT_Error FT_Load_Sfnt_Table(FT_Face self, FT_ULong tag, FT_Long offset, FT_Byte *buffer, length(buffer) inout FT_ULong *length)"
+  )
   private loadSfntTableRaw(tag: long, offset: long, buffer: Option[Array[byte]]) -> Result[long, int]
   ```
 
@@ -763,7 +781,7 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   ```avin
   @c(struct: "cairo_glyph_t")
   data Glyph
-      Glyph(index: long, x: real, y: real)
+    Glyph(index: long, x: real, y: real)
 
   @c("void cairo_show_glyphs(cairo_t *self, const cairo_glyph_t *glyphs, length(glyphs) int num_glyphs)")
   showGlyphs(glyphs: Array[Glyph])
@@ -787,8 +805,11 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   pattern is as long as `cairo_get_dash_count` says:
 
   ```avin
-  @c("void cairo_get_dash(cairo_t *self, out double *dashes, out double *offset)",
-     array: "dashes", length: "cairo_get_dash_count(self)")
+  @c(
+      "void cairo_get_dash(cairo_t *self, out double *dashes, out double *offset)",
+      array: "dashes",
+      length: "cairo_get_dash_count(self)"
+  )
   dash() -> (Array[real], real)
   ```
 
@@ -815,13 +836,23 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   the clusters, their count and their flags where they are not wanted:
 
   ```avin
-  @c("cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, out cairo_text_cluster_t **clusters, out int *num_clusters, out cairo_text_cluster_flags_t *cluster_flags)",
-     array: ["glyphs", "clusters"], length: ["num_glyphs", "num_clusters"],
-     free: ["cairo_glyph_free", "cairo_text_cluster_free"])
-  private textToGlyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int, Array[TextCluster], int, ClusterFlags), Status]
+  @c(
+      "cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, out cairo_text_cluster_t **clusters, out int *num_clusters, out cairo_text_cluster_flags_t *cluster_flags)",
+      array: ["glyphs", "clusters"],
+      length: ["num_glyphs", "num_clusters"],
+      free: ["cairo_glyph_free", "cairo_text_cluster_free"]
+  )
+  private textToGlyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[
+    (Array[Glyph], int, Array[TextCluster], int, ClusterFlags),
+    Status
+  ]
 
-  @c("cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, null cairo_text_cluster_t **clusters, null int *num_clusters, null cairo_text_cluster_flags_t *cluster_flags)",
-     array: "glyphs", length: "num_glyphs", free: "cairo_glyph_free")
+  @c(
+      "cairo_status_t cairo_scaled_font_text_to_glyphs(cairo_scaled_font_t *self, double x, double y, const char *utf8, int utf8_len, out cairo_glyph_t **glyphs, out int *num_glyphs, null cairo_text_cluster_t **clusters, null int *num_clusters, null cairo_text_cluster_flags_t *cluster_flags)",
+      array: "glyphs",
+      length: "num_glyphs",
+      free: "cairo_glyph_free"
+  )
   private glyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int), Status]
   ```
 
@@ -865,20 +896,26 @@ is unchanged. A binding answers such memory in one of two ways:
   ```
 
 ```avin
-@c(type: "mlt_frame", release: "mlt_frame_close",
-   retain: "mlt_properties_inc_ref(mlt_frame_properties(self))")
+@c(type: "mlt_frame", release: "mlt_frame_close", retain: "mlt_properties_inc_ref(mlt_frame_properties(self))")
 class Frame
-    @c("int mlt_frame_get_image(mlt_frame self, out uint8_t **buffer, inout mlt_image_format *format, out int *width, out int *height, int writable)",
-       view: "buffer", length: "mlt_image_format_size(format, width, height, NULL)")
-    private imageRaw(format: ImageFormat, writable: int) -> Result[(ByteView, ImageFormat, int, int), int]
+  @c(
+      "int mlt_frame_get_image(mlt_frame self, out uint8_t **buffer, inout mlt_image_format *format, out int *width, out int *height, int writable)",
+      view: "buffer",
+      length: "mlt_image_format_size(format, width, height, NULL)"
+  )
+  private imageRaw(format: ImageFormat, writable: int) -> Result[(ByteView, ImageFormat, int, int), int]
 ```
 
 A binding whose C *result* is the pointer to the memory says `view` with no name, and its `length:`
 is a C expression over the parameters:
 
 ```avin
-@c("unsigned char *cairo_image_surface_get_data(cairo_surface_t *self)", view, writable,
-   length: "cairo_image_surface_get_stride(self) * cairo_image_surface_get_height(self)")
+@c(
+    "unsigned char *cairo_image_surface_get_data(cairo_surface_t *self)",
+    view,
+    writable,
+    length: "cairo_image_surface_get_stride(self) * cairo_image_surface_get_height(self)"
+)
 private dataRaw() -> Option[MutByteView]
 ```
 
@@ -889,8 +926,11 @@ view's own rule, since that load is a use of the face. `pitch` is negative for a
 row first, and the buffer then begins with the bottom row, so the length takes its magnitude:
 
 ```avin
-@c(field: "glyph->bitmap.buffer", view,
-   length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows")
+@c(
+    field: "glyph->bitmap.buffer",
+    view,
+    length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows"
+)
 private bitmapRaw() -> Option[ByteView]
 ```
 
@@ -943,8 +983,10 @@ call. A binding that hands it to C for keeps says `keeps:`, and on a class with
 [`attach:`](#when-c-holds-the-object-longer-than-avin-does) the block lives as long as C's object:
 
 ```avin
-@c("cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
-   keeps: "pixels")
+@c(
+    "cairo_surface_t *cairo_image_surface_create_for_data(unsigned char *pixels, cairo_format_t format, int width, int height, int stride)",
+    keeps: "pixels"
+)
 private surfaceForData(pixels: ByteBlock, format: Format, width: int, height: int, stride: int) -> Surface
 ```
 
@@ -1002,8 +1044,10 @@ function-pointer type takes an Avin function, and the `void *` marked `userdata`
 prototype and in the function pointer's own, carries it:
 
 ```avin
-@c("mlt_event mlt_events_listen(mlt_properties self, userdata void *data, const char *id, void (*listener)(mlt_properties owner, userdata void *data, mlt_event_data event))",
-   keeps: "listener")
+@c(
+    "mlt_event mlt_events_listen(mlt_properties self, userdata void *data, const char *id, void (*listener)(mlt_properties owner, userdata void *data, mlt_event_data event))",
+    keeps: "listener"
+)
 on(event: string, @threaded listener: (Properties, EventData) -> unit)
 ```
 
@@ -1027,18 +1071,20 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
   type:
 
   ```avin
-  @c("cairo_status_t cairo_surface_write_to_png_stream(cairo_surface_t *self, cairo_status_t (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)")
+  @c(
+    "cairo_status_t cairo_surface_write_to_png_stream(cairo_surface_t *self, cairo_status_t (*write)(userdata void *closure, const unsigned char *data, length(data) unsigned int length), userdata void *closure)"
+  )
   private writePngStream(write: (ByteView) -> Status) -> Result[unit, Status]
 
   toPng(surface: Surface) -> Result[Array[byte], CairoError] =
-      val out = Buffer[byte]()
+    val out = Buffer[byte]()
 
-      collect(chunk: ByteView) -> Status =
-          out.appendAll(chunk.copy())
-          Status.Success
+    collect(chunk: ByteView) -> Status =
+      out.appendAll(chunk.copy())
+      Status.Success
 
-      surface.writePngStream(collect).mapErr(CairoError.from)?
-      Ok(out.toArray())
+    surface.writePngStream(collect).mapErr(CairoError.from)?
+    Ok(out.toArray())
   ```
 
   The length may come before its pointer and be of any integer type; a function may be lent several
@@ -1134,20 +1180,20 @@ import avin.threads
 import avin.time
 
 data MltError
-    UnknownService(kind: string, name: string)
-    InvalidProfile(name: string)
-    Failed(call: string, code: int)
+  UnknownService(kind: string, name: string)
+  InvalidProfile(name: string)
+  Failed(call: string, code: int)
 
 @c(type: "mlt_profile", release: "mlt_profile_close")
 class Profile
-    @c(field: "width")
-    width() -> int
+  @c(field: "width")
+  width() -> int
 
 @c("mlt_profile mlt_profile_init(const char *name)")
 private profileInit(name: string) -> Option[Profile]
 
 profile(name: string) -> Result[Profile, MltError] =
-    profileInit(name).toRight(InvalidProfile(name))
+  profileInit(name).toRight(InvalidProfile(name))
 
 @c(type: "mlt_properties", release: "mlt_properties_close", retain: "mlt_properties_inc_ref")
 class Properties
@@ -1155,81 +1201,96 @@ class Properties
 @c(value: "mlt_event_data")
 class EventData
 
-@c(type: "mlt_producer", release: "mlt_producer_close",
-   retain: "mlt_properties_inc_ref(mlt_producer_properties(self))",
-   as: ["mlt_service = mlt_producer_service(self)"])
+@c(
+    type: "mlt_producer",
+    release: "mlt_producer_close",
+    retain: "mlt_properties_inc_ref(mlt_producer_properties(self))",
+    as: ["mlt_service = mlt_producer_service(self)"]
+)
 class Producer
 
-@c("mlt_producer mlt_factory_producer(mlt_profile profile, const char *service, const char *resource)",
-   keeps: "profile")
+@c(
+    "mlt_producer mlt_factory_producer(mlt_profile profile, const char *service, const char *resource)",
+    keeps: "profile"
+)
 private factoryProducer(profile: Profile, service: Option[string], resource: string) -> Option[Producer]
 
 producer(profile: Profile, resource: string) -> Result[Producer, MltError] =
-    factoryProducer(profile, None, resource).toRight(UnknownService("producer", resource))
+  factoryProducer(profile, None, resource).toRight(UnknownService("producer", resource))
 
-@c(type: "mlt_playlist", release: "mlt_playlist_close",
-   retain: "mlt_properties_inc_ref(mlt_playlist_properties(self))",
-   as: ["mlt_service = mlt_playlist_service(self)"])
+@c(
+    type: "mlt_playlist",
+    release: "mlt_playlist_close",
+    retain: "mlt_properties_inc_ref(mlt_playlist_properties(self))",
+    as: ["mlt_service = mlt_playlist_service(self)"]
+)
 class Playlist
-    @c("int mlt_playlist_append_io(mlt_playlist self, mlt_producer producer, int in, int out)")
-    private appendIoRaw(clip: Producer, from: int, to: int) -> Result[unit, int]
+  @c("int mlt_playlist_append_io(mlt_playlist self, mlt_producer producer, int in, int out)")
+  private appendIoRaw(clip: Producer, from: int, to: int) -> Result[unit, int]
 
-    appendIo(clip: Producer, from: int, to: int) -> Result[unit, MltError] =
-        appendIoRaw(clip, from, to).mapErr(code -> Failed("mlt_playlist_append_io", code))
+  appendIo(clip: Producer, from: int, to: int) -> Result[unit, MltError] =
+    appendIoRaw(clip, from, to).mapErr(code -> Failed("mlt_playlist_append_io", code))
 
 @c("mlt_playlist mlt_playlist_new(mlt_profile profile)", keeps: "profile")
 private playlistNew(profile: Profile) -> Option[Playlist]
 
 playlist(profile: Profile) -> Result[Playlist, MltError] =
-    playlistNew(profile).toRight(Failed("mlt_playlist_new", 0))
+  playlistNew(profile).toRight(Failed("mlt_playlist_new", 0))
 
-@c(type: "mlt_consumer", release: "mlt_consumer_close",
-   retain: "mlt_properties_inc_ref(mlt_consumer_properties(self))",
-   as: ["mlt_properties = mlt_consumer_properties(self)"],
-   forget: "mlt_events_disconnect(mlt_consumer_properties(self), userdata)")
+@c(
+    type: "mlt_consumer",
+    release: "mlt_consumer_close",
+    retain: "mlt_properties_inc_ref(mlt_consumer_properties(self))",
+    as: ["mlt_properties = mlt_consumer_properties(self)"],
+    forget: "mlt_events_disconnect(mlt_consumer_properties(self), userdata)"
+)
 class Consumer
-    @c("int mlt_properties_set(mlt_properties self, const char *name, const char *value)")
-    private setRaw(name: string, value: string) -> Result[unit, int]
+  @c("int mlt_properties_set(mlt_properties self, const char *name, const char *value)")
+  private setRaw(name: string, value: string) -> Result[unit, int]
 
-    @c("int mlt_properties_set_int(mlt_properties self, const char *name, int value)")
-    private setIntRaw(name: string, value: int) -> Result[unit, int]
+  @c("int mlt_properties_set_int(mlt_properties self, const char *name, int value)")
+  private setIntRaw(name: string, value: int) -> Result[unit, int]
 
-    @c("mlt_event mlt_events_listen(mlt_properties self, userdata void *data, const char *id, void (*listener)(mlt_properties owner, userdata void *data, mlt_event_data event))",
-       keeps: "listener")
-    on(event: string, @threaded listener: (Properties, EventData) -> unit)
+  @c(
+      "mlt_event mlt_events_listen(mlt_properties self, userdata void *data, const char *id, void (*listener)(mlt_properties owner, userdata void *data, mlt_event_data event))",
+      keeps: "listener"
+  )
+  on(event: string, @threaded listener: (Properties, EventData) -> unit)
 
-    @c("int mlt_consumer_connect(mlt_consumer self, mlt_service producer)", keeps: "source")
-    private connectRaw(source: Playlist) -> Result[unit, int]
+  @c("int mlt_consumer_connect(mlt_consumer self, mlt_service producer)", keeps: "source")
+  private connectRaw(source: Playlist) -> Result[unit, int]
 
-    @c("int mlt_consumer_start(mlt_consumer self)")
-    private startRaw() -> Result[unit, int]
+  @c("int mlt_consumer_start(mlt_consumer self)")
+  private startRaw() -> Result[unit, int]
 
-    @c("int mlt_consumer_is_stopped(mlt_consumer self)")
-    private isStoppedRaw() -> int
+  @c("int mlt_consumer_is_stopped(mlt_consumer self)")
+  private isStoppedRaw() -> int
 
-    @c("int mlt_consumer_stop(mlt_consumer self)", blocking)
-    private stopRaw() -> Result[unit, int]
+  @c("int mlt_consumer_stop(mlt_consumer self)", blocking)
+  private stopRaw() -> Result[unit, int]
 
-    set(name: string, value: string) -> Result[unit, MltError] =
-        setRaw(name, value).mapErr(code -> Failed("mlt_properties_set", code))
+  set(name: string, value: string) -> Result[unit, MltError] =
+    setRaw(name, value).mapErr(code -> Failed("mlt_properties_set", code))
 
-    setInt(name: string, value: int) -> Result[unit, MltError] =
-        setIntRaw(name, value).mapErr(code -> Failed("mlt_properties_set_int", code))
+  setInt(name: string, value: int) -> Result[unit, MltError] =
+    setIntRaw(name, value).mapErr(code -> Failed("mlt_properties_set_int", code))
 
-    connect(source: Playlist) -> Result[unit, MltError] =
-        connectRaw(source).mapErr(code -> Failed("mlt_consumer_connect", code))
+  connect(source: Playlist) -> Result[unit, MltError] =
+    connectRaw(source).mapErr(code -> Failed("mlt_consumer_connect", code))
 
-    run() -> Result[unit, MltError] =
-        startRaw().mapErr(code -> Failed("mlt_consumer_start", code))?
-        while isStoppedRaw() == 0 do threads.sleep(time.millis(10))
-        stopRaw().mapErr(code -> Failed("mlt_consumer_stop", code))
+  run() -> Result[unit, MltError] =
+    startRaw().mapErr(code -> Failed("mlt_consumer_start", code))?
+    while isStoppedRaw() == 0 do threads.sleep(time.millis(10))
+    stopRaw().mapErr(code -> Failed("mlt_consumer_stop", code))
 
-@c("mlt_consumer mlt_factory_consumer(mlt_profile profile, const char *service, const char *input)",
-   keeps: "profile")
+@c(
+    "mlt_consumer mlt_factory_consumer(mlt_profile profile, const char *service, const char *input)",
+    keeps: "profile"
+)
 private factoryConsumer(profile: Profile, service: string, input: string) -> Option[Consumer]
 
 consumer(profile: Profile, service: string, target: string) -> Result[Consumer, MltError] =
-    factoryConsumer(profile, service, target).toRight(UnknownService("consumer", service))
+  factoryConsumer(profile, service, target).toRight(UnknownService("consumer", service))
 ```
 
 The program: two coloured clips, one second each, rendered to an MP4, counting the frames the
@@ -1240,22 +1301,22 @@ import mlt.{profile, playlist, producer, consumer, MltError}
 import avin.threads.Atomic
 
 renderTitle(file: string) -> Result[int, MltError] =
-    val prof = profile("atsc_720p_25")?
-    val show = playlist(prof)?
+  val prof = profile("atsc_720p_25")?
+  val show = playlist(prof)?
 
-    show.appendIo(producer(prof, "color:#202020")?, 0, 24)?
-    show.appendIo(producer(prof, "color:#c04000")?, 0, 24)?
+  show.appendIo(producer(prof, "color:#202020")?, 0, 24)?
+  show.appendIo(producer(prof, "color:#c04000")?, 0, 24)?
 
-    val out = consumer(prof, "avformat", file)?
-    val frames = Atomic(0)
+  val out = consumer(prof, "avformat", file)?
+  val frames = Atomic(0)
 
-    out.set("vcodec", "mpeg4")?
-    out.setInt("an", 1)?
-    out.on("consumer-frame-show", (_, _) -> frames.add(1))
-    out.connect(show)?
-    out.run()?
+  out.set("vcodec", "mpeg4")?
+  out.setInt("an", 1)?
+  out.on("consumer-frame-show", (_, _) -> frames.add(1))
+  out.connect(show)?
+  out.run()?
 
-    Ok(frames.load())
+  Ok(frames.load())
 ```
 
 What each piece of the chapter does here: `profile` answers `None` for a null `mlt_profile_init`;
@@ -1275,15 +1336,15 @@ program uses:
 module freetype
 
 data FreeTypeError
-    Failed(call: string, code: int)
+  Failed(call: string, code: int)
 
 @c(enum: "FT_Render_Mode", prefix: "FT_RENDER_MODE_")
 data RenderMode
-    Normal
-    Light
-    Mono
-    Lcd
-    LcdV
+  Normal
+  Light
+  Mono
+  Lcd
+  LcdV
 
 @c(const: "FT_LOAD_DEFAULT")
 val loadDefault: int
@@ -1296,85 +1357,96 @@ private initRaw() -> Result[Library, int]
 
 init() -> Result[Library, FreeTypeError] = initRaw().mapErr(code -> Failed("FT_Init_FreeType", code))
 
-@c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)",
-   keeps: "library")
+@c("FT_Error FT_New_Face(FT_Library library, const char *path, FT_Long index, out FT_Face *face)", keeps: "library")
 private newFaceRaw(library: Library, path: string, index: long) -> Result[Face, int]
 
-@c("FT_Error FT_New_Memory_Face(FT_Library library, const FT_Byte *base, length(base) FT_Long size, FT_Long index, out FT_Face *face)",
-   keeps: ["library", "base"])
+@c(
+    "FT_Error FT_New_Memory_Face(FT_Library library, const FT_Byte *base, length(base) FT_Long size, FT_Long index, out FT_Face *face)",
+    keeps: ["library", "base"]
+)
 private memoryFaceRaw(library: Library, base: ByteBlock, index: long) -> Result[Face, int]
 
 openFace(library: Library, path: string) -> Result[Face, FreeTypeError] =
-    newFaceRaw(library, path, 0).mapErr(code -> Failed("FT_New_Face", code))
+  newFaceRaw(library, path, 0).mapErr(code -> Failed("FT_New_Face", code))
 
 data Glyph
-    Glyph(width: int, rows: int, left: int, top: int, advance: real, pixels: Array[byte])
+  Glyph(width: int, rows: int, left: int, top: int, advance: real, pixels: Array[byte])
 
 @c(struct: "FT_BBox")
 data BBox(@c("xMin") xMin: long, @c("yMin") yMin: long, @c("xMax") xMax: long, @c("yMax") yMax: long)
 
 @c(struct: "FT_Size_Metrics")
-data SizeMetrics(xPpem: int, yPpem: int, xScale: long, yScale: long, ascender: long, descender: long,
-                 height: long, maxAdvance: long)
+data SizeMetrics(
+    xPpem: int,
+    yPpem: int,
+    xScale: long,
+    yScale: long,
+    ascender: long,
+    descender: long,
+    height: long,
+    maxAdvance: long
+)
 
-@c(type: "FT_Face", release: "FT_Done_Face", retain: "FT_Reference_Face",
-   as: ["FT_GlyphSlot = self->glyph"])
+@c(type: "FT_Face", release: "FT_Done_Face", retain: "FT_Reference_Face", as: ["FT_GlyphSlot = self->glyph"])
 class Face
-    @c(field: "family_name")
-    familyName() -> Option[string]
+  @c(field: "family_name")
+  familyName() -> Option[string]
 
-    @c(field: "num_glyphs")
-    glyphCount() -> long
+  @c(field: "num_glyphs")
+  glyphCount() -> long
 
-    @c(field: "bbox")
-    boundingBox() -> BBox
+  @c(field: "bbox")
+  boundingBox() -> BBox
 
-    @c(field: "size->metrics")
-    sizeMetrics() -> SizeMetrics
+  @c(field: "size->metrics")
+  sizeMetrics() -> SizeMetrics
 
-    @c("FT_Error FT_Set_Pixel_Sizes(FT_Face self, FT_UInt width, FT_UInt height)")
-    private setPixelSizesRaw(width: int, height: int) -> Result[unit, int]
+  @c("FT_Error FT_Set_Pixel_Sizes(FT_Face self, FT_UInt width, FT_UInt height)")
+  private setPixelSizesRaw(width: int, height: int) -> Result[unit, int]
 
-    @c("FT_Error FT_Load_Char(FT_Face self, FT_ULong code, FT_Int32 flags)")
-    private loadCharRaw(code: long, flags: int) -> Result[unit, int]
+  @c("FT_Error FT_Load_Char(FT_Face self, FT_ULong code, FT_Int32 flags)")
+  private loadCharRaw(code: long, flags: int) -> Result[unit, int]
 
-    @c("FT_Error FT_Render_Glyph(FT_GlyphSlot self, FT_Render_Mode mode)")
-    private renderRaw(mode: RenderMode) -> Result[unit, int]
+  @c("FT_Error FT_Render_Glyph(FT_GlyphSlot self, FT_Render_Mode mode)")
+  private renderRaw(mode: RenderMode) -> Result[unit, int]
 
-    @c(field: "glyph->bitmap.width")
-    private bitmapWidth() -> int
-    @c(field: "glyph->bitmap.rows")
-    private bitmapRows() -> int
-    @c(field: "glyph->bitmap.pitch")
-    private bitmapPitch() -> int
-    @c(field: "glyph->bitmap_left")
-    private bitmapLeft() -> int
-    @c(field: "glyph->bitmap_top")
-    private bitmapTop() -> int
-    @c(field: "glyph->advance.x")
-    private advanceX() -> long
+  @c(field: "glyph->bitmap.width")
+  private bitmapWidth() -> int
+  @c(field: "glyph->bitmap.rows")
+  private bitmapRows() -> int
+  @c(field: "glyph->bitmap.pitch")
+  private bitmapPitch() -> int
+  @c(field: "glyph->bitmap_left")
+  private bitmapLeft() -> int
+  @c(field: "glyph->bitmap_top")
+  private bitmapTop() -> int
+  @c(field: "glyph->advance.x")
+  private advanceX() -> long
 
-    @c(field: "glyph->bitmap.buffer", view,
-       length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows")
-    private bitmapRaw() -> Option[ByteView]
+  @c(
+      field: "glyph->bitmap.buffer",
+      view,
+      length: "(self->glyph->bitmap.pitch < 0 ? -self->glyph->bitmap.pitch : self->glyph->bitmap.pitch) * self->glyph->bitmap.rows"
+  )
+  private bitmapRaw() -> Option[ByteView]
 
-    setPixelSizes(width: int, height: int) -> Result[unit, FreeTypeError] =
-        setPixelSizesRaw(width, height).mapErr(code -> Failed("FT_Set_Pixel_Sizes", code))
+  setPixelSizes(width: int, height: int) -> Result[unit, FreeTypeError] =
+    setPixelSizesRaw(width, height).mapErr(code -> Failed("FT_Set_Pixel_Sizes", code))
 
-    render(c: char, mode: RenderMode = RenderMode.Normal) -> Result[Glyph, FreeTypeError] =
-        loadCharRaw(long(int(c)), loadDefault).mapErr(code -> Failed("FT_Load_Char", code))?
-        renderRaw(mode).mapErr(code -> Failed("FT_Render_Glyph", code))?
-        val (width, rows, pitch) = (bitmapWidth(), bitmapRows(), bitmapPitch())
-        val (left, top, advance) = (bitmapLeft(), bitmapTop(), real(advanceX()) / 64.0)
-        val stride = if pitch < 0 then -pitch else pitch
-        val pixels = Buffer[byte]()
-        bitmapRaw() match
-            Some(bits) ->
-                for r in 0..<rows
-                    val row = if pitch > 0 then r else rows - 1 - r
-                    pixels.appendAll(bits.slice(row * stride, row * stride + width))
-            None -> ()
-        Ok(Glyph(width, rows, left, top, advance, pixels.toArray()))
+  render(c: char, mode: RenderMode = RenderMode.Normal) -> Result[Glyph, FreeTypeError] =
+    loadCharRaw(long(int(c)), loadDefault).mapErr(code -> Failed("FT_Load_Char", code))?
+    renderRaw(mode).mapErr(code -> Failed("FT_Render_Glyph", code))?
+    val (width, rows, pitch) = (bitmapWidth(), bitmapRows(), bitmapPitch())
+    val (left, top, advance) = (bitmapLeft(), bitmapTop(), real(advanceX()) / 64.0)
+    val stride = if pitch < 0 then -pitch else pitch
+    val pixels = Buffer[byte]()
+    bitmapRaw() match
+      Some(bits) ->
+        for r in 0 ..< rows
+          val row = if pitch > 0 then r else rows - 1 - r
+          pixels.appendAll(bits.slice(row * stride, row * stride + width))
+      None -> ()
+    Ok(Glyph(width, rows, left, top, advance, pixels.toArray()))
 ```
 
 What each piece does here: a `Face` holds a C reference to its `Library`, so the two are given back
@@ -1403,20 +1475,24 @@ module cairo
 
 import freetype.Face
 
-@c(type: "cairo_font_face_t *", release: "cairo_font_face_destroy", retain: "cairo_font_face_reference",
-   attach: "cairo_font_face_set_user_data(self, key, data, destroy)", key: "cairo_user_data_key_t")
+@c(
+    type: "cairo_font_face_t *",
+    release: "cairo_font_face_destroy",
+    retain: "cairo_font_face_reference",
+    attach: "cairo_font_face_set_user_data(self, key, data, destroy)",
+    key: "cairo_user_data_key_t"
+)
 class FontFace
-    @c("cairo_status_t cairo_font_face_status(cairo_font_face_t *self)")
-    status() -> Result[unit, Status]
+  @c("cairo_status_t cairo_font_face_status(cairo_font_face_t *self)")
+  status() -> Result[unit, Status]
 
-@c("cairo_font_face_t *cairo_ft_font_face_create_for_ft_face(FT_Face face, int load_flags)",
-   keeps: "face")
+@c("cairo_font_face_t *cairo_ft_font_face_create_for_ft_face(FT_Face face, int load_flags)", keeps: "face")
 private ftFontFace(face: Face, loadFlags: int) -> FontFace
 
 fontFace(face: Face) -> Result[FontFace, CairoError] =
-    val made = ftFontFace(face, 0)
-    made.status().mapErr(CairoError.from)?
-    Ok(made)
+  val made = ftFontFace(face, 0)
+  made.status().mapErr(CairoError.from)?
+  Ok(made)
 ```
 
 The manifest adds the `cairo-ft` module (`pkg-config = "cairo-ft"`, `headers = ["<cairo-ft.h>"]`),

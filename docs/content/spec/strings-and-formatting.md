@@ -170,10 +170,10 @@ in scope is an error that names the module to import:
 
 ```text
 trait SqlInterpolation
-    sql(args: SqlValue*) -> Query
+  sql(args: SqlValue*) -> Query
 
 impl SqlInterpolation for StringContext
-    sql(args: SqlValue*) -> Query = Query(parts, args)
+  sql(args: SqlValue*) -> Query = Query(parts, args)
 
 val q = sql"select * from users where id = $id and name = $name"
 ```
@@ -206,40 +206,48 @@ and `println` take their arguments as `Any`, so they show such a value by its na
 
 ```avin
 trait Pet
-    name() -> string
+  name() -> string
 
 class Cat(): Pet
-    override name() -> string = "cat"
+  override name() -> string = "cat"
 
 main()
-    val xs: Seq[int] = [1, 2, 3]
-    val pet: Pet = Cat()
-    val anything: Any = (1, "two")
-    println(s"$xs $pet $anything")    // [1, 2, 3] Cat (1, two)
+  val xs: Seq[int] = [1, 2, 3]
+  val pet: Pet = Cat()
+  val anything: Any = (1, "two")
+  println(s"$xs $pet $anything") // [1, 2, 3] Cat (1, two)
 ```
 
 The core library declares the traits:
 
 ```text
 trait Writer
-    write(text: string)
-    writeChar(c: char) = …
-    writeInt(n: long) = …
-    writeField(text: string, spec: FormatSpec) = …
-    writeSpaces(n: long) = …
+  write(text: string)
+  writeChar(c: char) = …
+  writeInt(n: long) = …
+  writeField(text: string, spec: FormatSpec) = …
+  writeSpaces(n: long) = …
 
-data FormatSpec(width: int = 0, precision: int = -1, left: bool = false,
-                zeroPad: bool = false, plus: bool = false, space: bool = false,
-                alternate: bool = false, conversion: char = 's', grouping: bool = false)
-    withWidth[T: Integer](n: T) -> FormatSpec = …
-    withPrecision[T: Integer](n: T) -> FormatSpec = …
+data FormatSpec(
+    width: int = 0,
+    precision: int = -1,
+    left: bool = false,
+    zeroPad: bool = false,
+    plus: bool = false,
+    space: bool = false,
+    alternate: bool = false,
+    conversion: char = 's',
+    grouping: bool = false
+)
+  withWidth[T: Integer](n: T) -> FormatSpec = …
+  withPrecision[T: Integer](n: T) -> FormatSpec = …
 
 trait Display
-    display(out: Writer, spec: FormatSpec)
-    toString() -> string = …
+  display(out: Writer, spec: FormatSpec)
+  toString() -> string = …
 
 trait Debug
-    debug(out: Writer, spec: FormatSpec)
+  debug(out: Writer, spec: FormatSpec)
 
 writeDisplayed[T: Display](out: Writer, value: T, spec: FormatSpec)
 writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)

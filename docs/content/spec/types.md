@@ -195,21 +195,21 @@ by value, `FromInteger` and [`FromDecimal`](#decimals-meet-a-type-that-takes-the
 ```text run
 main()
   val price: BigDecimal = 19.99
-  println(price * 3)                          // 59.97
+  println(price * 3) // 59.97
   val tenth: BigDecimal = 0.1
-  println(tenth + 0.2 == 0.3)                 // true
+  println(tenth + 0.2 == 0.3) // true
   val one: BigDecimal = 1
-  println(one / 3)                            // 0.3333333333333333333333333333333333
-  println(one.div(3, scale = 4))              // 0.3333
-  println(one.exactDiv(8))                    // Some(0.125)
-  println(one.exactDiv(3))                    // None
+  println(one / 3) // 0.3333333333333333333333333333333333
+  println(one.div(3, scale = 4)) // 0.3333
+  println(one.exactDiv(8)) // Some(0.125)
+  println(one.exactDiv(3)) // None
   val x: BigDecimal = 2.345
-  println(x.round(2))                         // 2.34
-  println(x.round(2, rounding = HalfUp))      // 2.35
+  println(x.round(2)) // 2.34
+  println(x.round(2, rounding = HalfUp)) // 2.35
   val two: BigDecimal = 2.0
-  println(two == 2.00)                        // true
-  println(BigDecimal.fromRealShortest(0.1))   // 0.1
-  println(f"$x%.1f")                          // 2.3
+  println(two == 2.00) // true
+  println(BigDecimal.fromRealShortest(0.1)) // 0.1
+  println(f"$x%.1f") // 2.3
 ```
 
 ```text output
@@ -478,8 +478,8 @@ so a tuple there is parenthesized.
 divmod(a: int, b: int) -> (int, int) = a / b, a % b
 
 bounds(a: int, b: int) -> (int, int)
-    if a > b then return b, a
-    a, b
+  if a > b then return b, a
+  a, b
 ```
 
 A tuple is taken apart by a binding (`val q, r = divmod(17, 5)`, `val (a, (b, c)) = t`), by a
@@ -529,7 +529,7 @@ parentheses, `((A, B)) -> C`, since `(A, B) -> C` takes two parameters.
 
 ```text
 twice(f: int -> int, x: int) -> int = f(f(x))
-adder(n: int) -> int -> int = x -> x + n      // the result is a function type
+adder(n: int) -> int -> int = x -> x + n // the result is a function type
 val fs: List[int -> int] = [adder(1), adder(2)]
 val add: int -> int -> int = a -> b -> a + b
 ```
@@ -604,10 +604,10 @@ checked there as a thread's body is. Inside a function, a parameter marked
 [`@sendable`](/spec/threads/#what-is-shared) that takes a function holds a `@sendable` function.
 
 ```text
-val step: @sendable (int) -> int = (x) -> x + 1       // checked: captures nothing
-val named: @sendable (int) -> int = double            // checked: what `double` reaches
-val plain: (int) -> int = step                        // a @sendable function is a plain one
-val back: @sendable (int) -> int = plain              // error: `plain`'s type does not say what it captures
+val step: @sendable (int) -> int = (x) -> x + 1 // checked: captures nothing
+val named: @sendable (int) -> int = double // checked: what `double` reaches
+val plain: (int) -> int = step // a @sendable function is a plain one
+val back: @sendable (int) -> int = plain // error: `plain`'s type does not say what it captures
 adder(n: int) -> @sendable (int) -> int = (x) -> x + n
 ```
 
@@ -698,11 +698,11 @@ fixed-length contiguous collection. Compiler messages print the type as `Vector[
 
 ```text
 describe(x: Any) -> string = x match
-    s: string -> s"text $s"
-    n: int -> s"number $n"
-    _ -> "something else"
+  s: string -> s"text $s"
+  n: int -> s"number $n"
+  _ -> "something else"
 
-describe(42)        // the int is boxed where it becomes an Any
+describe(42) // the int is boxed where it becomes an Any
 ```
 
 A value converts to `Any` wherever one is expected of it, at a single site: an argument, a binding,
@@ -752,7 +752,7 @@ not converted, as a value of a value type is not: a `Vector[(int) -> Nothing]` i
 refuse(x: int) -> Nothing = fail(s"refused $x")
 
 val f: (int) -> Option[int] = refuse
-val g = if strict then refuse else (x: int) -> Some(x)    // (int) -> Option[int]
+val g = if strict then refuse else (x: int) -> Some(x) // (int) -> Option[int]
 ```
 
 ## Union types
@@ -765,8 +765,8 @@ chapter, [union types](/spec/unions/).
 
 ```text
 describe(x: int | string) -> string = x match
-    n: int -> s"number $n"
-    s: string -> s"text $s"
+  n: int -> s"number $n"
+  s: string -> s"text $s"
 ```
 
 ## Reference types and value types

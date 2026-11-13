@@ -21,7 +21,7 @@ program with `message` at the place it is called, and has type `Nothing`, so it 
 of any type is expected:
 
 ```text
-val n: int = if ok then 1 else fail("no")    // avin: trap: no at main.avin:2:36
+val n: int = if ok then 1 else fail("no") // avin: trap: no at main.avin:2:36
 ```
 
 Beside it the prelude has two more that stop the program, each at its own call:
@@ -37,12 +37,12 @@ Beside it the prelude has two more that stop the program, each at its own call:
 
 ```text
 half(n: int) -> int
-    require(n % 2 == 0, s"$n is even")   // avin: trap: requirement failed: 3 is even at main.avin:2:5
-    n / 2
+  require(n % 2 == 0, s"$n is even") // avin: trap: requirement failed: 3 is even at main.avin:2:3
+  n / 2
 
 area(s: Shape) -> real = s match
-    Circle(r) -> r * r * 3.14159
-    Polygon(_) -> todo("polygons")       // avin: trap: not implemented: polygons at main.avin:7:19
+  Circle(r) -> r * r * 3.14159
+  Polygon(_) -> todo("polygons") // avin: trap: not implemented: polygons at main.avin:7:17
 ```
 
 **The location is in the program's own code.** A trap reached inside the core library, whether the
@@ -51,8 +51,8 @@ reports the place where the program last called into the library, with the libra
 
 ```text
 main()
-    val b = Buffer[int]()
-    b.remove(0)          // avin: trap: index out of range at main.avin:3:5
+  val b = Buffer[int]()
+  b.remove(0) // avin: trap: index out of range at main.avin:3:3
 ```
 
 That holds however deep in the library the trap is, and whether the program called the library
@@ -74,20 +74,20 @@ type differs:
 
 ```text
 data ConfigError
-    Unreadable(cause: IoError)
-    Malformed(cause: ParseError)
-    Invalid(key: string)
+  Unreadable(cause: IoError)
+  Malformed(cause: ParseError)
+  Invalid(key: string)
 
 impl From[IoError] for ConfigError
-    static from(value: IoError) -> ConfigError = Unreadable(value)
+  static from(value: IoError) -> ConfigError = Unreadable(value)
 
 impl From[ParseError] for ConfigError
-    static from(value: ParseError) -> ConfigError = Malformed(value)
+  static from(value: ParseError) -> ConfigError = Malformed(value)
 
 loadConfig(path: string) -> Result[Config, ConfigError]
-    val text = readText(path)?
-    val doc = parseDocument(text)?
-    configOf(doc)
+  val text = readText(path)?
+  val doc = parseDocument(text)?
+  configOf(doc)
 ```
 
 `From[E]` is a core trait with one static member, `static from(value: E) -> Self`, so an error type
@@ -133,7 +133,7 @@ not, with nobody to read it. A value is thrown away where it is:
 
 ```text
 save(text: string)
-    fs.writeText("out.txt", text)        // error: a `Result` is discarded here
+  fs.writeText("out.txt", text) // error: a `Result` is discarded here
 ```
 
 A failure is handled with `?`, a `match`, or one of `Result`'s methods (`getOrElse`, `isOk`, …).
@@ -156,9 +156,9 @@ An error meant for a person to read is an `Error`, a core trait in the prelude:
 
 ```text
 trait Error: Display
-    message -> string
-    cause -> Option[Error] = None
-    override display(out: Writer, spec: FormatSpec)   // message, then ": " and the cause
+  message -> string
+  cause -> Option[Error] = None
+  override display(out: Writer, spec: FormatSpec) // message, then ": " and the cause
 ```
 
 - **`message` is the error's own sentence**, without its cause's; `cause` is the failure that led to
@@ -181,7 +181,7 @@ trait Error: Display
 data ParseError(line: int, text: string)
 
 impl Error for ParseError
-    message -> string = s"line $line: cannot read \"$text\""
+  message -> string = s"line $line: cannot read \"$text\""
 ```
 
 **`context` puts an error in context.** On a `Result[T, E]` whose `E` is an `Error`,
@@ -191,8 +191,8 @@ built only for an `Err`. Contexts nest, the outermost first when shown:
 
 ```text
 loadConfig(path: string) -> Result[Config, ContextError]
-    val text = fs.readText(path).context(s"loading $path")?
-    parseConfig(text).context("reading the settings")
+  val text = fs.readText(path).context(s"loading $path")?
+  parseConfig(text).context("reading the settings")
 // Err(loading app.conf: cannot read app.conf: no such file or directory)
 ```
 
@@ -211,12 +211,12 @@ Both are `data` types of the core library, written in Avin:
 
 ```text
 data Option[+T]
-    Some(value: T)
-    None
+  Some(value: T)
+  None
 
 data Result[+T, +E]
-    Ok(value: T)
-    Err(error: E)
+  Ok(value: T)
+  Err(error: E)
 ```
 
 Their methods:
@@ -278,8 +278,8 @@ covariant in both sides:
 
 ```text
 data Either[+L, +R]
-    Left(value: L)
-    Right(value: R)
+  Left(value: L)
+  Right(value: R)
 ```
 
 `Result` is the type for something that can fail, and it is what `?` takes apart; `Either` is the

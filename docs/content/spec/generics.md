@@ -14,8 +14,8 @@ largest[T: Ord](xs: List[T]) -> Option[T] = …
 class Cache[K: Hash, V](capacity: int)
 
 data Result[+T, +E]
-    Ok(value: T)
-    Err(error: E)
+  Ok(value: T)
+  Err(error: E)
 ```
 
 ## Bounds
@@ -27,13 +27,13 @@ provides it. Errors are reported at the generic definition, not at an instantiat
 
 ```text
 trait Ordered
-    less(other: Self) -> bool
-    greater(other: Self) -> bool = other.less(self)
+  less(other: Self) -> bool
+  greater(other: Self) -> bool = other.less(self)
 
 max[T: Ordered](a: T, b: T) -> T = if a.less(b) then b else a
 
 class SortedPair[T: Ordered](first: T, second: T)
-    high() -> T = max(first, second)
+  high() -> T = max(first, second)
 ```
 
 - **A value of a bounded `T` has the members of its bounds**: their methods, those of the traits
@@ -115,12 +115,12 @@ mean[T: Numeric](xs: Vector[T]) -> real = xs.sum.toReal / real(xs.length)
 
 ```text
 digits[T: Integer](x: T) -> int
-    var n = 1
-    var rest = x / T(10)
-    while rest != T(0)
-        rest = rest / T(10)
-        n += 1
-    n
+  var n = 1
+  var rest = x / T(10)
+  while rest != T(0)
+    rest = rest / T(10)
+    n += 1
+  n
 ```
 
 - **The core library implements a trait for every integer width at once** with an impl over a
@@ -138,14 +138,14 @@ takes a value of its own parameter in: a `Map[K, +V]` cannot have `updated(key: 
 
 ```text
 trait Bag[K, +V]
-    put[W >: V](key: K, value: W) -> Bag[K, W]
+  put[W >: V](key: K, value: W) -> Bag[K, W]
 
 data Chain[+A]
-    Link(head: A, tail: Chain[A])
-    End
+  Link(head: A, tail: Chain[A])
+  End
 
 impl[A] Chain[A]
-    prepended[W >: A](x: W) -> Chain[W] = Link(x, self)
+  prepended[W >: A](x: W) -> Chain[W] = Link(x, self)
 ```
 
 - **Only a function's or a method's own type parameters have a lower bound**: those of a function,
@@ -229,8 +229,8 @@ A data type naming itself at a larger instance in its fields, a **nested data ty
 
 ```avin
 data Tree[T]
-    Leaf(value: T)
-    Deeper(inner: Tree[Nest[T]])
+  Leaf(value: T)
+  Deeper(inner: Tree[Nest[T]])
 ```
 
 is rejected the same way, at the type: every data type compares, hashes and shows its values field

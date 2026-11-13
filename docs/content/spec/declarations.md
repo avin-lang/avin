@@ -13,15 +13,15 @@ rule of Unicode Standard Annex #31).
 
 ```text
 data Ärger
-    Δelta(größe: int)
-    Ωmega
+  Δelta(größe: int)
+  Ωmega
 
 fläche(breite: int, höhe: int) -> int = breite * höhe
 
 main()
-    val 名前 = "名"
-    val x٣ = 3
-    println(s"$名前 ${fläche(x٣, 2)}")
+  val 名前 = "名"
+  val x٣ = 3
+  println(s"$名前 ${fläche(x٣, 2)}")
 ```
 
 - A digit of any script continues a name and none begins one: `x٣` is a name and `٣x` is refused.
@@ -56,7 +56,7 @@ main()
 area(width: int, height: int) -> int = width * height
 
 greet(name: string)
-    println(s"hello, $name")
+  println(s"hello, $name")
 ```
 
 Every parameter has a declared type. The result type may be inferred, except for recursive functions.
@@ -73,8 +73,8 @@ it is needed, which is a top-level or local function with no parameter list (see
 def now -> int = clock.millis()
 
 class Rect(w: real, h: real): Shape
-    override def area() -> real = w * h
-    private def half() -> real = w * h / 2.0
+  override def area() -> real = w * h
+  private def half() -> real = w * h / 2.0
 ```
 
 - `def` comes after the modifiers (`private`, `static`, `override`) and after the annotations, as in
@@ -122,11 +122,11 @@ Methods and class constructors take defaults and named arguments the same way:
 
 ```text
 class Account(owner: string, var balance: int = 0)
-    deposit(amount: int, note: string = s"$owner +$amount") -> string
-        balance += amount
-        note
+  deposit(amount: int, note: string = s"$owner +$amount") -> string
+    balance += amount
+    note
 
-Account("ann").deposit(5)               // "ann +5"
+Account("ann").deposit(5) // "ann +5"
 Account(balance = 3, owner = "bo")
 ```
 
@@ -232,16 +232,16 @@ chooses by its arguments' values is written with clauses, described next.
 
 ```text
 total(values: int*) -> int
-    var sum = 0
-    for v in values do sum += v
-    sum
+  var sum = 0
+  for v in values do sum += v
+  sum
 
-total()                                 // 0
-total(1, 2, 3)                          // 6
+total() // 0
+total(1, 2, 3) // 6
 val xs = [4, 5]
-total(xs*)                              // 9
-total((1..10)*)                         // 55
-max(0, xs*)                             // 5
+total(xs*) // 9
+total((1 .. 10)*) // 55
+max(0, xs*) // 5
 ```
 
 A parameter written `values: T*` is **repeated** (variadic): a call gives it zero or more `T`s, and
@@ -289,10 +289,11 @@ per line, each the function's name applied to a pattern per parameter:
 ```text
 classify(n: int) -> string
 classify(0) = "zero"
+
 classify(n)
-    | n < 0 = "negative"
-    | n < 10 = "small"
-    | _ = "large"
+  | n < 0 = "negative"
+  | n < 10 = "small"
+  | _ = "large"
 
 fib(n: int) -> int
 fib(n < 2) = n
@@ -339,12 +340,12 @@ themselves, not copies, so a `var` it changes is changed for the code around it:
 
 ```text
 counter() -> int
-    var count = 0
-    bump(by: int)
-        count += by
-    bump(2)
-    bump(3)
-    count                // 5
+  var count = 0
+  bump(by: int)
+    count += by
+  bump(2)
+  bump(3)
+  count // 5
 ```
 
 A call made before the local function's declaration must not reach a local that is not yet
@@ -367,10 +368,10 @@ not reuse the name of one already in scope:
 
 ```text
 pairs[T: Display](first: T) -> string
-    pair[U](x: U) -> (T, U) = (first, x)
-    s"${pair(1)} ${pair("a")} ${pair[real](2.5)}"
+  pair[U](x: U) -> (T, U) = (first, x)
+  s"${pair(1)} ${pair("a")} ${pair[real](2.5)}"
 
-pairs("p")               // "(p, 1) (p, a) (p, 2.5)"
+pairs("p") // "(p, 1) (p, a) (p, 2.5)"
 ```
 
 ### Tail calls
@@ -424,12 +425,12 @@ optimization level, with no annotation:
 isEven(n: long) -> bool = if n == 0 then true else isOdd(n - 1)
 isOdd(n: long) -> bool = n != 0 && isEven(n - 1)
 
-isEven(10000000)         // true, in constant stack
+isEven(10000000) // true, in constant stack
 
 sumTo(n: long, k: (long) -> long) -> long =
-    if n == 0 then k(0) else sumTo(n - 1, s -> k(s + n))
+  if n == 0 then k(0) else sumTo(n - 1, s -> k(s + n))
 
-sumTo(1000000, s -> s)   // 500000500000: a million continuations, each calling the next
+sumTo(1000000, s -> s) // 500000500000: a million continuations, each calling the next
 ```
 
 A call in tail position keeps its frame in a few places, where something of the caller is still
@@ -464,10 +465,10 @@ import avin.fs
 import avin.io.IoError
 
 main(args: Vector[string]) -> Result[unit, IoError | ParseError]
-    for file in args
-        val settings = parse(fs.readText(file)?)?
-        println(s"$file: ${settings.size} settings")
-    Ok(())
+  for file in args
+    val settings = parse(fs.readText(file)?)?
+    println(s"$file: ${settings.size} settings")
+  Ok(())
 ```
 
 - **unit**: the program exits with status 0.
@@ -497,14 +498,14 @@ A program built by `avin test` runs its tests and not `main`, so `main` is check
 
 ```text
 data Shape
-    Circle(radius: real)
-    Rect(width: real, height: real)
+  Circle(radius: real)
+  Rect(width: real, height: real)
 
 data Point(x: int, y: int)
 
 data Option[+T]
-    Some(value: T)
-    None
+  Some(value: T)
+  None
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
@@ -557,13 +558,13 @@ module's own, as the [scoping order](#visibility-and-modules) says:
 
 ```avin
 data ImageFormat
-    None
-    Png
+  None
+  Png
 
-find(n: int) -> Option[int] = if n > 0 then Some(n) else None   // Option's
+find(n: int) -> Option[int] = if n > 0 then Some(n) else None // Option's
 
-val f = None                           // ImageFormat's: nothing expects an Option
-val o: Option[ImageFormat] = Some(None)  // Option's Some, ImageFormat's None
+val f = None // ImageFormat's: nothing expects an Option
+val o: Option[ImageFormat] = Some(None) // Option's Some, ImageFormat's None
 ```
 
 Only the hidden variant's own type chooses it: an expected `int`, `Any` or a trait leaves the
@@ -586,12 +587,12 @@ companion object cannot declare a method or field named after one of its type's 
 
 ```text
 area(s: Shape) -> real = s match
-    Shape.Circle(r) -> 3.0 * r * r
-    Rect(w, h) -> w * h
+  Shape.Circle(r) -> 3.0 * r * r
+  Rect(w, h) -> w * h
 
 main()
-    println(area(Shape.Rect(2.0, 3.0)))   // 6
-    val none: Option[string] = Option.None
+  println(area(Shape.Rect(2.0, 3.0))) // 6
+  val none: Option[string] = Option.None
 ```
 
 `data` values have no identity, derive
@@ -613,10 +614,10 @@ data Point(x: int, y: int)
 data Sprite(pos: Point, name: string)
 
 main()
-    val s = Sprite(Point(1, 2), "ship")
-    val t = s with { pos.x = 3, name = "ghost" }
-    println(s)   // Sprite(Point(1, 2), ship)
-    println(t)   // Sprite(Point(3, 2), ghost)
+  val s = Sprite(Point(1, 2), "ship")
+  val t = s with {pos.x = 3, name = "ghost"}
+  println(s) // Sprite(Point(1, 2), ship)
+  println(t) // Sprite(Point(3, 2), ghost)
 ```
 
 - **A path makes again only the values along it.** `s with { pos.x = 3 }` is a new `Sprite` holding
@@ -658,18 +659,18 @@ a method or a local may be called `with`, and `a with b` stays an infix call of 
 
 ```text
 open class Account(owner: string, var balance: int)
-    if balance < 0 then panic("an account cannot open overdrawn")
-    val opened = clock.now()
-    println(s"opened an account for $owner")
+  if balance < 0 then panic("an account cannot open overdrawn")
+  val opened = clock.now()
+  println(s"opened an account for $owner")
 
-    deposit(amount: int)
-        balance += amount
+  deposit(amount: int)
+    balance += amount
 
-    describe() -> string = s"$owner: $balance"
+  describe() -> string = s"$owner: $balance"
 
 class Savings(owner: string, balance: int, rate: real): Account(owner, balance), Display
-    override describe() -> string = "savings " + super.describe()
-    override display(out: Writer, spec: FormatSpec) = out.write(describe())
+  override describe() -> string = "savings " + super.describe()
+  override display(out: Writer, spec: FormatSpec) = out.write(describe())
 ```
 
 - **The class is its constructor.** The parameter list after the name is the constructor's
@@ -745,14 +746,14 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 
 ```text
 class Chain(items: Vector[int])
-    head -> int = items(0)
-    tail -> Chain = Chain(items.slice(1, items.length))
-    second -> int = tail.head
-    clear() -> Chain = Chain([])
+  head -> int = items(0)
+  tail -> Chain = Chain(items.slice(1, items.length))
+  second -> int = tail.head
+  clear() -> Chain = Chain([])
 
 val c = Chain([1, 2, 3])
-c.tail.head        // 2
-c.clear()          // `()`: declared with a parameter list
+c.tail.head // 2
+c.clear() // `()`: declared with a parameter list
 val f = () -> c.head
 ```
 
@@ -810,17 +811,17 @@ val f = () -> c.head
 var ticks = 0
 
 def now -> int
-    ticks += 1
-    ticks
+  ticks += 1
+  ticks
 
 def adder -> (int) -> int = x -> x + now
 
 main()
-    println(s"$now $now")      // 1 2
-    def step -> int = now * 10
-    println(step)              // 30
-    println(adder(100))        // 104
-    val f = () -> now
+  println(s"$now $now") // 1 2
+  def step -> int = now * 10
+  println(step) // 30
+  println(adder(100)) // 104
+  val f = () -> now
 ```
 
 - **A function at the top level or in a block is declared without a parameter list with `def`**:
@@ -843,14 +844,14 @@ main()
 
 ```text
 abstract class Shape(val label: string)
-    area() -> int
-    describe() -> string = s"$label: ${area()}"
+  area() -> int
+  describe() -> string = s"$label: ${area()}"
 
 open class Rect(label: string, val w: int, val h: int): Shape(label)
-    override area() -> int = w * h
+  override area() -> int = w * h
 
 class Square(label: string, side: int): Rect(label, side, side)
-    override describe() -> string = "square " + super.describe()
+  override describe() -> string = "square " + super.describe()
 ```
 
 - **Only an `open` or `abstract` class can be extended**; extending a final class is an error. A
@@ -909,8 +910,8 @@ class Square(label: string, side: int): Rect(label, side, side)
 
 ```text
 trait Shape
-    area() -> real
-    describe() -> string = s"area ${area()}"
+  area() -> real
+  describe() -> string = s"area ${area()}"
 ```
 
 A trait declares methods, which may have default bodies, abstract `val` members a class supplies
@@ -937,13 +938,13 @@ override that member. There is no trait linearization.
 
 ```text
 trait Named
-    label() -> string
+  label() -> string
 
 trait Tagged: Named
-    tag() -> string = s"<${label()}>"
+  tag() -> string = s"<${label()}>"
 
 class Item(text: string): Tagged
-    override label() -> string = text
+  override label() -> string = text
 
 val t: Tagged = Item("x")
 val n: Named = t
@@ -994,8 +995,8 @@ val n: Named = t
 
 ```text
 trait Named
-    val name: string
-    greet() -> string = s"hello, $name"
+  val name: string
+  greet() -> string = s"hello, $name"
 
 class Person(val name: string, age: int): Named
 class Counter(var name: string): Named
@@ -1069,12 +1070,12 @@ p.pos = None
 
 ```text
 trait Add
-    add(other: Self) -> Self
-    static zero() -> Self
+  add(other: Self) -> Self
+  static zero() -> Self
 
 impl Add for Point
-    add(other: Point) -> Point = Point(x + other.x, y + other.y)
-    static zero() -> Point = Point(0, 0)
+  add(other: Point) -> Point = Point(x + other.x, y + other.y)
+  static zero() -> Point = Point(0, 0)
 
 total[T: Add](a: T, b: T) -> T = T.zero() + a + b
 
@@ -1119,11 +1120,11 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
 
 ```text
 impl string
-    static fromUtf8(bytes: Array[byte]) -> Result[string, Utf8Error] = …
-    static fromUtf8Lossy(bytes: Array[byte]) -> string = …
+  static fromUtf8(bytes: Array[byte]) -> Result[string, Utf8Error] = …
+  static fromUtf8Lossy(bytes: Array[byte]) -> string = …
 
 impl int
-    static parity(n: int) -> string = if n % 2 == 0 then "even" else "odd"
+  static parity(n: int) -> string = if n % 2 == 0 then "even" else "odd"
 
 val text = string.fromUtf8Lossy(bytes)
 ```
@@ -1156,10 +1157,10 @@ built-in types:
 
 ```text
 impl Display for Shape
-    display(out: Writer, spec: FormatSpec) = …
+  display(out: Writer, spec: FormatSpec) = …
 
 impl Shape
-    perimeter() -> real = …
+  perimeter() -> real = …
 ```
 
 `impl Type` without a trait adds methods to a type, and may be written in any module: in the type's
@@ -1271,7 +1272,7 @@ built-in type implements every method of the trait, defaults included.
 
 ```text
 impl[T] Seq[T]
-    contains(element: T) -> bool = exists(x -> x.equals(element))
+  contains(element: T) -> bool = exists(x -> x.equals(element))
 
 present[T](xs: Seq[T], x: T) -> bool = xs.contains(x)
 ```
@@ -1287,15 +1288,15 @@ An impl without `for` written outside the module of the type or trait it adds to
 module words
 
 impl string
-    shout() -> string = s"${self}!"
+  shout() -> string = s"${self}!"
 
 impl[T: Ord] Seq[T]
-    median() -> T = sorted().apply(length / 2)
+  median() -> T = sorted().apply(length / 2)
 
 // main.avin
 import words
 
-main() = println("hey".shout())       // hey!
+main() = println("hey".shout()) // hey!
 ```
 
 - **An extension's methods are seen by its own module and by every file that imports the module**:
@@ -1327,9 +1328,9 @@ main() = println("hey".shout())       // hey!
 
 ```text
 object Config
-    val defaultPort = 8080
-    var verbose = false
-    port(env: Map[string, string]) -> int = …
+  val defaultPort = 8080
+  var verbose = false
+  port(env: Map[string, string]) -> int = …
 ```
 
 An `object` is a singleton value. An `object` with the same name as a class or `data` type in the same
@@ -1337,8 +1338,8 @@ module is its companion and may access its private members. `object`s may extend
 
 ```text
 object Default: Account("none", 0), Display
-    override describe() -> string = "default " + super.describe()
-    override display(out: Writer, spec: FormatSpec) = out.write(describe())
+  override describe() -> string = "default " + super.describe()
+  override display(out: Writer, spec: FormatSpec) = out.write(describe())
 ```
 
 An object extending a class is made as a subclass's instance is: the superclass's constructor runs
@@ -1356,12 +1357,12 @@ any other. There is no second instance to make, so calling the object's name, `N
 
 ```text
 object Twice
-    apply(n: int) -> int = n * 2
-    apply(s: string) -> string = s + s
+  apply(n: int) -> int = n * 2
+  apply(s: string) -> string = s + s
 
 main()
-    println(Twice(21))       // 42
-    println(Twice("ab"))     // abab
+  println(Twice(21)) // 42
+  println(Twice("ab")) // abab
 ```
 
 An object shares its name only with its companion class or `data` type. Where both exist, the name in
@@ -1371,15 +1372,15 @@ members.
 
 ```text
 class Account(owner: string, private var balance: int)
-    private val id = Account.issue()
+  private val id = Account.issue()
 
 object Account
-    private var next = 0
-    open(owner: string) -> Account = Account(owner, 0)
-    balanceOf(a: Account) -> int = a.balance
-    private issue() -> int
-        next++
-        next
+  private var next = 0
+  open(owner: string) -> Account = Account(owner, 0)
+  balanceOf(a: Account) -> int = a.balance
+  private issue() -> int
+    next++
+    next
 ```
 
 A `data` type has a companion the same way: an object of its name in its module. A variant of the
@@ -1394,10 +1395,10 @@ name is already a value.
 data Point(x: int, y: int)
 
 object Point
-    origin() -> Point = Point(0, 0)
+  origin() -> Point = Point(0, 0)
 
 object List
-    newBuilder[T]() -> ListBuilder[T] = ListBuilder()
+  newBuilder[T]() -> ListBuilder[T] = ListBuilder()
 ```
 
 ### A companion's `apply`
@@ -1414,14 +1415,14 @@ name.
 class Future[T](private val cell: Cell[T])
 
 object Future
-    apply[T](body: -> T) -> Future[T] = Future(Cell(body))
+  apply[T](body: -> T) -> Future[T] = Future(Cell(body))
 
 main()
-    val direct = Future(Cell(1))       // the constructor: a `Cell` fits only it
-    val page = Future(fetch(url))      // `apply`: the body runs inside it
-    val sum = Future
-        val a = 20
-        a + 1
+  val direct = Future(Cell(1)) // the constructor: a `Cell` fits only it
+  val page = Future(fetch(url)) // `apply`: the body runs inside it
+  val sum = Future
+    val a = 20
+    a + 1
 ```
 
 Inside the `apply`, `Future(Cell(body))` is the constructor: both candidates accept a `Cell[T]`, and
@@ -1525,11 +1526,11 @@ module shapes
 import geometry.Point
 
 class Circle(val r: int)
-    center() -> Point = Point(r, 0)
+  center() -> Point = Point(r, 0)
 
 area(c: Circle) -> int = scale() * c.r * c.r
 
-private scale() -> int = 3          // seen by every file of `shapes`, and nowhere else
+private scale() -> int = 3 // seen by every file of `shapes`, and nowhere else
 
 // main.avin, in the program's root directory
 import shapes.{Circle, area as circleArea}
@@ -1660,8 +1661,8 @@ The program that file holds is the indented lines, and it is an ordinary Avin pr
 half(n: int) -> int = n / 2
 
 main()
-    val h = half(9)
-    println(h)
+  val h = half(9)
+  println(h)
 ```
 
 The code appears in the order it runs and nothing reorders it, so the file reads correctly as it
@@ -1752,9 +1753,9 @@ parse(text: string) -> Result[int, string] = if text == "" then Err("empty input
 
 @test("reads a word")
 readsAWord() -> Result[unit, string]
-    val n = parse("word")?
-    assertEq(n, 4)
-    Ok(())
+  val n = parse("word")?
+  assertEq(n, 4)
+  Ok(())
 ```
 
 `@test` names the test after its function, or after a description written first, a string that is
@@ -1802,13 +1803,14 @@ helpers, types made for the tests, and tests themselves.
 
 ```text
 module shapes
+
 @tests
 
 unitSquare() -> Square = Square(1)
 
 @test
 perimeterOfTheUnitSquare()
-    assertEq(unitSquare().perimeter(), 4)
+  assertEq(unitSquare().perimeter(), 4)
 ```
 
 Every command checks it with the rest of the program, and only `avin test` builds it: a program that
@@ -1842,13 +1844,13 @@ test the core library or a dependency declares.
 
   ```text
   class Counter(start: int)
-      var count = start
-      println(describe())            // error: `describe` is called before `label` is initialized
-      register(self)               // error: `self` is passed, stored or returned before `label` is initialized
-      val reader = () -> count     // error: a lambda that captures `self` is made before `label` is initialized
-      val label = s"counter $start"
-      register(self)               // every field is set: the body may use `self` freely
-      describe() -> string = s"$label: $count"
+    var count = start
+    println(describe()) // error: `describe` is called before `label` is initialized
+    register(self) // error: `self` is passed, stored or returned before `label` is initialized
+    val reader = () -> count // error: a lambda that captures `self` is made before `label` is initialized
+    val label = s"counter $start"
+    register(self) // every field is set: the body may use `self` freely
+    describe() -> string = s"$label: $count"
   ```
 
   Up to and including the initializer of its last field, a body uses `self` only to read a field
@@ -1871,7 +1873,7 @@ test the core library or a dependency declares.
 
   ```text
   val a = b + 1
-  val b = readA() * 2      // error: module-level values need one another to initialize: `a` → `b` → `a`
+  val b = readA() * 2 // error: module-level values need one another to initialize: `a` → `b` → `a`
   readA() -> int = a
   ```
 - **`lazy val name = expr`** (its type optional, as for `val`) is computed on its first read instead,
@@ -1882,10 +1884,10 @@ test the core library or a dependency declares.
   data field or a local, each of which is given its value where it is made.
 
   ```avin
-  lazy val table: Vector[string] = loadTable()     // read the file when something first needs it
+  lazy val table: Vector[string] = loadTable() // read the file when something first needs it
 
   class Report(title: string)
-      lazy val heading = s"== $title =="           // per instance, on the instance's first read
+    lazy val heading = s"== $title ==" // per instance, on the instance's first read
   ```
 
   A module-level `lazy val` takes no place in the initialization order: its initializer runs where

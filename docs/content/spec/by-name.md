@@ -10,8 +10,9 @@ evaluates it. There is no memoization; a body that needs the value twice binds i
 
 ```text
 twice(value: -> int) = value + value
+
 unless(condition: bool, action: -> unit)
-    if !condition then action
+  if !condition then action
 ```
 
 The arrow is Sysl's `->`, as in every Avin function type.
@@ -49,13 +50,13 @@ a control form of the language:
 
 ```text
 times(n: int, action: -> unit)
-    var i = 0
-    while i < n
-        action
-        i += 1
+  var i = 0
+  while i < n
+    action
+    i += 1
 
 times(3)
-    println("tick")
+  println("tick")
 ```
 
 The block is the delayed expression, with every rule above: it runs at each read of `action`, never

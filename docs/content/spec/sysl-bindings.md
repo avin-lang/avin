@@ -15,7 +15,7 @@ module avin.fs
 private readTextRaw(path: string) -> Result[string, SyslIoError]
 
 readText(path: string) -> Result[string, IoError] =
-    readTextRaw(path).mapErr(IoError.fromSysl)
+  readTextRaw(path).mapErr(IoError.fromSysl)
 ```
 
 A binding is a top-level function declaration with no body. `@sysl` takes one string: the Sysl
@@ -98,7 +98,14 @@ never repeats a Sysl default, so it never goes stale when the Sysl function's de
 
 ```text
 @sysl("sh.sysl.ui_sdl.app", named)
-private appOf(title: string, tree: () -> View, ground: () -> long, width: int, height: int, onFrame: real -> unit) -> App
+private appOf(
+    title: string,
+    tree: () -> View,
+    ground: () -> long,
+    width: int,
+    height: int,
+    onFrame: real -> unit
+) -> App
 ```
 
 `app` declares `on_event`, `font` and `size` between `height` and `on_frame`, with defaults; the
@@ -148,7 +155,7 @@ or `u64` result is bound as a `long`, and a narrower type is fine where the valu
 ```text
 @sysl("sysl.math.bigint.BigInt")
 class BigInt
-    limbs() -> long
+  limbs() -> long
 ```
 
 A value the declared type cannot hold — a `u64` past the largest `long`, an `i64` result bound as
@@ -182,7 +189,7 @@ reaches an `i32` or an `i8` too where its value fits. syslui takes a colour this
 ```text
 @sysl("sh.sysl.ui.View")
 class View
-    background(color: int, radius: int = 0) -> View
+  background(color: int, radius: int = 0) -> View
 ```
 
 A value the Sysl type cannot hold — a negative one for a `u32` or a `u64`, one past its largest
@@ -223,7 +230,17 @@ as an `f32`, and a binding gives it a `real`:
 
 ```text
 @sysl("sh.sysl.ui_sdl.app")
-appOf(title: string, tree: () -> View, ground: () -> long, width: int, height: int, onEvent: Event -> bool, font: string, size: real, onFrame: real -> unit) -> App
+appOf(
+    title: string,
+    tree: () -> View,
+    ground: () -> long,
+    width: int,
+    height: int,
+    onEvent: Event -> bool,
+    font: string,
+    size: real,
+    onFrame: real -> unit
+) -> App
 ```
 
 Going in — a binding's own parameter, a mirror's field, a callback's answer — the value is rounded to
@@ -299,8 +316,8 @@ The function's result says how much it wrote, and the rest of the array keeps wh
 fillDigits(n: long, into: Array[byte]) -> long
 
 main()
-    val buffer = Array.fill(6, byte(9))
-    println(s"${fillDigits(42, buffer)} $buffer")
+  val buffer = Array.fill(6, byte(9))
+  println(s"${fillDigits(42, buffer)} $buffer")
 ```
 
 ```text
@@ -349,19 +366,19 @@ either convert into the other wherever a binding's types hold one.
 ```text
 @sysl("sysl.fs.IoError")
 data IoError
-    NotFound
-    PermissionDenied
-    AlreadyExists
-    NotADirectory
-    IsADirectory
-    DirectoryNotEmpty
-    TooManyOpenFiles
-    NoSpaceLeft
-    Interrupted
-    NotOpen
-    NotPermitted
-    InvalidUtf8(offset: long)
-    Other(code: int)
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  Other(code: int)
 
 @sysl("sysl.fs.read_text")
 readText(file: string) -> Result[string, IoError]
@@ -392,15 +409,15 @@ readText(file: string) -> Result[string, IoError]
   ```text
   @sysl("sysl.fs.File")
   class File
-      closed() -> bool
+    closed() -> bool
 
   @sysl("sysl.process.Stdio")
   data Stdio
-      Inherit
-      ToFile(file: File)
-      ToPath(path: string)
-      FromFile(file: File)
-      FromPath(path: string)
+    Inherit
+    ToFile(file: File)
+    ToPath(path: string)
+    FromFile(file: File)
+    FromPath(path: string)
   ```
 
 - A mirror has no type parameters, and none of its fields holds the mirror itself, directly or
@@ -425,18 +442,18 @@ with a body is an ordinary method, may call the bound ones, and takes no `@sysl`
 ```text
 @sysl("sh.sysl.openssl.Refusal")
 data TlsRefusal
-    HostMismatch
-    Expired
-    NotYetValid
-    Untrusted
-    Other(code: long)
+  HostMismatch
+  Expired
+  NotYetValid
+  Untrusted
+  Other(code: long)
 
 @sysl("sh.sysl.openssl.Error")
 data TlsFailure(reason: int, code: long, message: string, verify: long)
 
 impl TlsFailure
-    refusal() -> Option[TlsRefusal]
-    refused() -> bool = refusal() is Some(_)
+  refusal() -> Option[TlsRefusal]
+  refused() -> bool = refusal() is Some(_)
 ```
 
 - **The receiver is converted at each call.** The mirror goes into Sysl as a binding's parameter of
@@ -469,17 +486,17 @@ body is an ordinary method, and may call the bound ones:
 ```avin
 @sysl("sysl.checksum.Crc32")
 class Crc32
-    update(bytes: Array[byte])
-    finish() -> long
-    hex() -> string = s"${finish()}"
+  update(bytes: Array[byte])
+  finish() -> long
+  hex() -> string = s"${finish()}"
 
 @sysl("sysl.checksum.new_crc32")
 newCrc32() -> Crc32
 
 @sysl("sysl.math.bigint.BigInt")
 class BigInt
-    sign() -> int
-    neg() -> BigInt
+  sign() -> int
+  neg() -> BigInt
 
 @sysl("sysl.math.bigint.parse")
 parseBigInt(s: string) -> Option[BigInt]
@@ -506,11 +523,11 @@ parseBigInt(s: string) -> Option[BigInt]
   ```avin
   @sysl("sysl.net.Address")
   class Address
-      port() -> int
+    port() -> int
 
   @sysl("sysl.net.Socket")
   class Socket
-      connect(to: Address) -> Result[unit, IoError]
+    connect(to: Address) -> Result[unit, IoError]
 
   @sysl("sysl.net.resolve")
   resolve(host: string, port: int) -> Result[Vector[Address], IoError]
@@ -583,7 +600,7 @@ one among them, and a method answering the trait is a handle of its own:
 ```text
 @sysl("syslui.View")
 class View
-    padding(n: int) -> View
+  padding(n: int) -> View
 
 @sysl("syslui.text")
 text(s: string) -> View
@@ -638,8 +655,8 @@ brackets after the type's name, each written as Avin writes it:
 ```text
 @sysl("syslui.Signal[string]")
 class StringSignal
-    get() -> string
-    set(v: string)
+  get() -> string
+  set(v: string)
 
 @sysl("syslui.signal")
 stringSignal(v: string) -> StringSignal
@@ -673,10 +690,10 @@ private acceptRaw(listener: long) -> Result[long, SyslIoError]
 
 @sysl("sysl.net.Socket")
 class Socket
-    @sysl(blocking)
-    recv(max: long) -> Result[Array[byte], SyslIoError]
-    @sysl("send_all", blocking)
-    write(bytes: Array[byte]) -> Result[unit, SyslIoError]
+  @sysl(blocking)
+  recv(max: long) -> Result[Array[byte], SyslIoError]
+  @sysl("send_all", blocking)
+  write(bytes: Array[byte]) -> Result[unit, SyslIoError]
 ```
 
 While a blocking call waits, its thread is **safe for the collector**, as a thread waiting on a
@@ -777,9 +794,9 @@ every instance, and a method may have type parameters of its own, bounded the sa
 ```text
 @sysl("syslui.Signal")
 class Signal[T: Boundary]
-    get() -> T
-    set(v: T)
-    paired[U: Boundary](u: U) -> (T, U)
+  get() -> T
+  set(v: T)
+  paired[U: Boundary](u: U) -> (T, U)
 
 @sysl("syslui.signal")
 signal[T: Boundary](v: T) -> Signal[T]

@@ -39,16 +39,16 @@ code reaches them through the bound:
 
 ```text
 total[T: Add](items: Vector[T]) -> T
-    var sum = T.zero()
-    for x in items
-        sum = sum + x
-    sum
+  var sum = T.zero()
+  for x in items
+    sum = sum + x
+  sum
 
 data Point(x: int, y: int)
 
 impl Add for Point
-    add(other: Point) -> Point = Point(x + other.x, y + other.y)
-    static zero() -> Point = Point(0, 0)
+  add(other: Point) -> Point = Point(x + other.x, y + other.y)
+  static zero() -> Point = Point(0, 0)
 ```
 
 | Family | Operators |
@@ -104,7 +104,7 @@ is the indented block on the lines that follow.
 
 ```text
 val widest = current max
-    measure(header) + padding
+  measure(header) + padding
 ```
 
 A name that starts a line never continues the line above, inside brackets too: end the line with the
@@ -132,8 +132,8 @@ trait, object or impl, and called infix or dotted:
 
 ```text
 class Bag(val items: Vector[int])
-    ++(other: Bag) -> Bag = Bag(items ++ other.items)
-    +:(x: int) -> Bag = Bag(x +: items)
+  ++(other: Bag) -> Bag = Bag(items ++ other.items)
+  +:(x: int) -> Bag = Bag(x +: items)
 ```
 
 `a ++ b` is `a.++(b)`, and `a.++(b)` may be written as such. A function outside a type cannot be
@@ -154,8 +154,8 @@ combinator (`p >> f`), a set of flags, a stream or a query builder can be writte
 data Flags(bits: int)
 
 impl Flags
-    |(other: Flags) -> Flags = Flags(bits | other.bits)
-    &(other: Flags) -> Flags = Flags(bits & other.bits)
+  |(other: Flags) -> Flags = Flags(bits | other.bits)
+  &(other: Flags) -> Flags = Flags(bits & other.bits)
 
 val rw = Flags(1) | Flags(2)
 ```
@@ -172,14 +172,14 @@ parameter's bound, has one taking one argument, at the built-in `+`'s own preced
 data Instant(epochMicros: long)
 
 impl Instant
-    +(d: Duration) -> Instant = Instant(epochMicros + d.micros)
-    -(d: Duration) -> Instant = Instant(epochMicros - d.micros)
-    -(earlier: Instant) -> Duration = Duration(epochMicros - earlier.epochMicros)
+  +(d: Duration) -> Instant = Instant(epochMicros + d.micros)
+  -(d: Duration) -> Instant = Instant(epochMicros - d.micros)
+  -(earlier: Instant) -> Duration = Duration(epochMicros - earlier.epochMicros)
 
 class Vec(val x: real, val y: real)
-    *(k: real) -> Vec = Vec(x * k, y * k)
-    *(other: Vec) -> real = x * other.x + y * other.y
-    -() -> Vec = Vec(-x, -y)
+  *(k: real) -> Vec = Vec(x * k, y * k)
+  *(other: Vec) -> real = x * other.x + y * other.y
+  -() -> Vec = Vec(-x, -y)
 
 val deadline = start + timeout
 val waited = now - start
@@ -249,12 +249,12 @@ read:
 
 ```text
 class Chain(val label: string, private val after: () -> Chain)
-    next() -> Chain = after()
+  next() -> Chain = after()
 
 object Chain
-    #::(label: string, rest: -> Chain) -> Chain = Chain(label, () -> rest)
+  #::(label: string, rest: -> Chain) -> Chain = Chain(label, () -> rest)
 
-endless(n: int) -> Chain = s"c$n" #:: endless(n + 1)     // returns; each next() makes one more
+endless(n: int) -> Chain = s"c$n" #:: endless(n + 1) // returns; each next() makes one more
 ```
 
 - **The right operand's type decides**, and it is known without evaluating it: where that type's
@@ -293,17 +293,17 @@ it, continues the expression that line left open:
 
 ```text
 val atom = number
-    | symbol("(") ~> later(expr) <~ symbol(")")
-    | ident ^^ Var
+  | symbol("(") ~> later(expr) <~ symbol(")")
+  | ident ^^ Var
 
 val total = a
-    + b * c
-    - d
+  + b * c
+  - d
 
 val names = people
-    .filter(_.age >= 18)
-    .map(_.name)
-    .sorted
+  .filter(_.age >= 18)
+  .map(_.name)
+  .sorted
 ```
 
 The line break means nothing to precedence: the operators group exactly as they would on one line,
@@ -337,13 +337,13 @@ on one line, to the operand right before it, so `names` is `people.filter(…).m
 
 ```text
 negate(x: int) -> int
-    -x
+  -x
 
 sign(x: int) -> int
-    if x < 0
-        -1
-    else
-        1
+  if x < 0
+    -1
+  else
+    1
 ```
 
 Inside brackets a line break is not significant, so a line in a call's arguments may start with any
@@ -357,13 +357,13 @@ after its `)`, and the block is given to the callee's **last parameter**:
 
 ```text
 retry(3)
-    fetch(url)
+  fetch(url)
 
 withFile("data.txt") f ->
-    process(f)
+  process(f)
 
 zipWith(xs, ys) (x, y) ->
-    x * y
+  x * y
 ```
 
 A [by-name](/spec/by-name/) parameter (`body: -> T`) takes the block as its delayed expression,
@@ -377,11 +377,11 @@ application, then the block, or one parameter name and `->`:
 
 ```text
 scope s ->
-    s.spawn
-        part(1)
+  s.spawn
+    part(1)
 
 xs.foreach x ->
-    println(x)
+  println(x)
 ```
 
 A lambda of several parameters needs the call's parentheses before it, `run() (x, y) ->`: the
@@ -431,10 +431,10 @@ value is discarded, and the branches of an unused `if` or `match` need not agree
 
 ```text
 answer() -> int
-    val result =
-        val base = 21
-        base * 2
-    result
+  val result =
+    val base = 21
+    base * 2
+  result
 ```
 
 A binding may take a value apart by a pattern that cannot fail: `val q, r = divmod(17, 5)`, or
@@ -462,24 +462,24 @@ line, so it is not the body of a one-line `if` or `while`.
 
 ```text
 extendedGcd(a: int, b: int) -> (int, int, int)
-    var r0, r1 = a, b
-    var s0, s1 = 1, 0
-    var t0, t1 = 0, 1
-    while r1 != 0
-        val q = r0 / r1
-        r0, r1 = r1, r0 - q * r1
-        s0, s1 = s1, s0 - q * s1
-        t0, t1 = t1, t0 - q * t1
-    r0, s0, t0
+  var r0, r1 = a, b
+  var s0, s1 = 1, 0
+  var t0, t1 = 0, 1
+  while r1 != 0
+    val q = r0 / r1
+    r0, r1 = r1, r0 - q * r1
+    s0, s1 = s1, s0 - q * s1
+    t0, t1 = t1, t0 - q * t1
+  r0, s0, t0
 ```
 
 ## if
 
 ```text
 label(n: int) -> string
-    if n < 0 then "negative"
-    elif n == 0 then "zero"
-    else "positive"
+  if n < 0 then "negative"
+  elif n == 0 then "zero"
+  else "positive"
 ```
 
 A one-line branch needs `then`; an indented branch may omit it. The condition must be a `bool`.
@@ -489,8 +489,8 @@ Without an `else`, an `if` yields `unit`.
 
 ```text
 val found = while n < 10 do
-    n += 1
-    if n == 5 then break n
+  n += 1
+  if n == 5 then break n
 else -1
 ```
 
@@ -503,9 +503,10 @@ A `while true` loop that no `break` leaves never finishes, so its type is `Nothi
 
 ```text
 var k = 0
+
 val found = loop
-    k += 5
-    if k > 12 then break k * 2
+  k += 5
+  if k > 12 then break k * 2
 ```
 
 `loop` repeats its body until a `break` or `return` leaves it; `continue` starts the body again. A
@@ -580,9 +581,9 @@ every integer need no catch-all:
 
 ```text
 bucket(n: int) -> string = n match
-    n < 0 -> "negative"
-    0 <= n < 10 -> "digit"
-    n >= 10 -> "large"
+  n < 0 -> "negative"
+  0 <= n < 10 -> "digit"
+  n >= 10 -> "large"
 ```
 
 Guards do not count, since a guard may fail.
@@ -595,9 +596,9 @@ taken down to a class. A downcast is written this way, never as a cast:
 
 ```text
 legs(a: Animal) -> int = a match
-    d: Dog -> d.legs
-    b: Bird -> b.legs
-    _ -> 0
+  d: Dog -> d.legs
+  b: Bird -> b.legs
+  _ -> 0
 ```
 
 A tuple's type at run time is the one it was [made with](/spec/types/#any-and-nothing), so a tuple
@@ -638,15 +639,15 @@ the extractors answer.
 
 ```text
 data Phase
-    Open
-    Closing
+  Open
+  Closing
 
 code(p: Phase) -> int = p match
-    Open -> 1
-    Live -> 2         // binds a new name, matching every Phase
-    Closing -> 3      // error: this arm is never reached: the arm `Live` on line 7 already matches
-                      // every value it would; `Live` binds a new value there, since no variant
-                      // `Live` is in scope
+  Open -> 1
+  Live -> 2 // binds a new name, matching every Phase
+  Closing -> 3 // error: this arm is never reached: the arm `Live` on line 7 already matches
+  // every value it would; `Live` binds a new value there, since no variant
+  // `Live` is in scope
 ```
 
 A bare name that is not a variant in scope binds, so a variant's name misspelled or not imported
@@ -702,11 +703,13 @@ method's name at the end of a line:
 
 ```text
 val radii = shapes.collect(match Circle(r) -> r)
+
 val sizes = shapes.map(match
-    Circle(r) -> r * r * 3.14
-    Rect(w, h) -> w * h)
+  Circle(r) -> r * r * 3.14
+  Rect(w, h) -> w * h)
+
 val firstBig = shapes collectFirst match
-    Circle(r) if r > 10.0 -> r
+  Circle(r) if r > 10.0 -> r
 ```
 
 The type of the value it matches comes from the type expected where it is written, as a lambda's
@@ -731,16 +734,16 @@ where the test is known to have matched:
 
 ```text
 area(shape: Option[Shape]) -> int
-    if shape is not Some(Rect(w, h)) then return 0
-    w * h
+  if shape is not Some(Rect(w, h)) then return 0
+  w * h
 
 total(xs: List[int]) -> int
-    var rest = xs
-    var sum = 0
-    while rest is head :: more
-        sum += head
-        rest = more
-    sum
+  var rest = xs
+  var sum = 0
+  while rest is head :: more
+    sum += head
+    rest = more
+  sum
 ```
 
 - `if x is P` binds them in the `then` branch, `while x is P` in the body, and `a && b` in `b`.
@@ -775,12 +778,12 @@ a `defer` written beside the code that took it, rather than at every way out:
 
 ```text
 copy(from: string, to: string) -> Result[unit, IoError]
-    val source = fs.open(from)?
-    defer source.close()
-    val target = fs.create(to)?
-    defer target.close()
-    target.write(source.readAll()?)?
-    target.close()
+  val source = fs.open(from)?
+  defer source.close()
+  val target = fs.create(to)?
+  defer target.close()
+  target.write(source.readAll()?)?
+  target.close()
 ```
 
 **It runs on every ordinary way out of its block**: falling off the end, `return`, `?` taking its
@@ -807,9 +810,9 @@ changes a `var` does not change a value already computed:
 
 ```text
 next() -> int
-    var n = 1
-    defer n = 100
-    n            // 1
+  var n = 1
+  defer n = 100
+  n // 1
 ```
 
 **No jump may leave a deferred statement**, at any depth: no `return`, no `?`, and no `break` or

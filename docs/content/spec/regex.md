@@ -14,12 +14,12 @@ import avin.regex
 import avin.regex.Regex
 
 main()
-    val date = Regex("(?<year>\\d{4})-(?<month>\\d\\d)")
-    date.findFirstMatchIn("due 2024-06") match
-        Some(m) -> println(m.group("month"))         // Some(06)
-        None -> println("no date")
-    println("[a-z]+".r().findAllIn("one, two").toList)   // [one, two]
-    println(Regex("a+b").matches("aab"))              // true
+  val date = Regex("(?<year>\\d{4})-(?<month>\\d\\d)")
+  date.findFirstMatchIn("due 2024-06") match
+    Some(m) -> println(m.group("month")) // Some(06)
+    None -> println("no date")
+  println("[a-z]+".r().findAllIn("one, two").toList) // [one, two]
+  println(Regex("a+b").matches("aab")) // true
 ```
 
 ## Text, characters and offsets
@@ -154,10 +154,10 @@ program searching text or with patterns from outside it uses the checked forms, 
 
 ```text
 grep(r: Regex, lines: Vector[string]) -> Result[int, MatchError]
-    var n = 0
-    for line in lines
-        if r.tryMatches(line)? then n += 1
-    Ok(n)
+  var n = 0
+  for line in lines
+    if r.tryMatches(line)? then n += 1
+  Ok(n)
 ```
 
 The error ends the whole search wherever in the text it is met: `tryFindAllIn` and the replacing and
@@ -224,11 +224,11 @@ a `Match` found by any regex the same way, and does not match a match of a patte
 val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
 
 describe(s: string) -> string = s match
-    date(year, month, day) -> s"day $day of month $month in $year"
-    _ -> "not a date"
+  date(year, month, day) -> s"day $day of month $month in $year"
+  _ -> "not a date"
 
 for m in "(\\d+)x(\\d+)".r().findAllMatchIn("3x4 and 10x20")
-    if m is Groups(w, h) then println(s"$w by $h")
+  if m is Groups(w, h) then println(s"$w by $h")
 ```
 
 **Replacements.** In a replacement, `$` followed by digits is what a group matched: the first digit

@@ -39,17 +39,23 @@ meet the bound it declares, a failure reported at the `derives` entry, naming th
 The core library declares the descriptions, as plain data:
 
 ```text
-data TypeShape(name: string, variantCount: int, variants: Vector[VariantShape],
-               annotations: Vector[Annotation])
-data VariantShape(name: string, index: int, fieldCount: int, fields: Vector[FieldShape],
-                  annotations: Vector[Annotation])
+data TypeShape(name: string, variantCount: int, variants: Vector[VariantShape], annotations: Vector[Annotation])
+
+data VariantShape(
+    name: string,
+    index: int,
+    fieldCount: int,
+    fields: Vector[FieldShape],
+    annotations: Vector[Annotation]
+)
+
 data FieldShape(name: string, index: int, hasDefault: bool, annotations: Vector[Annotation])
 
 trait Annotation
 
-impl FieldShape                                 // and the same on TypeShape and VariantShape
-    annotation[A: Annotation]() -> Option[A]    // the first annotation of type A
-    has(a: Annotation) -> bool                  // whether a is among them, by ==
+impl FieldShape // and the same on TypeShape and VariantShape
+  annotation[A: Annotation]() -> Option[A] // the first annotation of type A
+  has(a: Annotation) -> bool // whether a is among them, by ==
 ```
 
 - **A data type's shape** has one variant per variant, in declaration order, each with its fields.
@@ -74,9 +80,9 @@ members, written once for a type named after `for`.
 
 ```text
 derive JsonEncoder for T
-    encode(out: JsonWriter) =
-        T.walk(self, FieldWriter(out, T.shape()))
-        out.endObject()
+  encode(out: JsonWriter) =
+    T.walk(self, FieldWriter(out, T.shape()))
+    out.endObject()
 ```
 
 - **One template per trait, in the trait's module**, as a conformance lives in the trait's or the
@@ -99,11 +105,11 @@ derive JsonEncoder for T
 
 ```text
 trait Shaped
-    static shape() -> TypeShape
-    static variantOf(value: Self) -> VariantShape
-    static walk[V: ShapeVisitor](value: Self, visitor: V) -> V
-    static walkPair[V: ShapePairVisitor](a: Self, b: Self, visitor: V) -> V
-    static build[B: ShapeBuilder[E], E](builder: B) -> Result[Self, E]
+  static shape() -> TypeShape
+  static variantOf(value: Self) -> VariantShape
+  static walk[V: ShapeVisitor](value: Self, visitor: V) -> V
+  static walkPair[V: ShapePairVisitor](a: Self, b: Self, visitor: V) -> V
+  static build[B: ShapeBuilder[E], E](builder: B) -> Result[Self, E]
 ```
 
 ### Walking a value
@@ -114,13 +120,13 @@ returned. `finish` does nothing unless the visitor's type says otherwise:
 
 ```text
 trait ShapeVisitor
-    variant(v: VariantShape) -> Self
-    finish(v: VariantShape) -> Self = self
+  variant(v: VariantShape) -> Self
+  finish(v: VariantShape) -> Self = self
 
 // for data Shape = Circle(radius: real) | Rect(width: real, height: real), the compiler writes:
 value match
-    Circle(r) -> visitor.variant(CIRCLE).field[real](CIRCLE_RADIUS, r).finish(CIRCLE)
-    Rect(w, h) -> visitor.variant(RECT).field[real](RECT_WIDTH, w).field[real](RECT_HEIGHT, h).finish(RECT)
+  Circle(r) -> visitor.variant(CIRCLE).field[real](CIRCLE_RADIUS, r).finish(CIRCLE)
+  Rect(w, h) -> visitor.variant(RECT).field[real](RECT_WIDTH, w).field[real](RECT_HEIGHT, h).finish(RECT)
 ```
 
 Each arm passes its own variant's shape, so what a hook reads of it is known where the arm is
@@ -142,8 +148,8 @@ result. `T.variantOf(x)` is the shape of the variant `x` is, a class's one varia
 
 ```text
 trait ShapePairVisitor
-    variants(a: VariantShape, b: VariantShape) -> Self
-    // and field[F: Bound](f: FieldShape, a: F, b: F) -> Self
+  variants(a: VariantShape, b: VariantShape) -> Self
+  // and field[F: Bound](f: FieldShape, a: F, b: F) -> Self
 ```
 
 ### Building a value
@@ -153,23 +159,23 @@ the fields **in any order**, so a decoder reads its input as it comes:
 
 ```text
 trait ShapeBuilder[E]
-    variant(t: TypeShape) -> Result[int, E]          // the variant's index
-    next(v: VariantShape) -> Result[Option[int], E]  // the next field's index; None when done
-    duplicate(f: FieldShape) -> E
-    // and field[F: Bound](f: FieldShape) -> Result[F, E]
-    //     missing[F: Bound](f: FieldShape) -> Result[F, E]
+  variant(t: TypeShape) -> Result[int, E] // the variant's index
+  next(v: VariantShape) -> Result[Option[int], E] // the next field's index; None when done
+  duplicate(f: FieldShape) -> E
+  // and field[F: Bound](f: FieldShape) -> Result[F, E]
+  //     missing[F: Bound](f: FieldShape) -> Result[F, E]
 ```
 
 What the compiler writes, for each variant, is equivalent to:
 
 ```text
-var slot0: Option[F0] = None                   // one slot per field, each at its own type
+var slot0: Option[F0] = None // one slot per field, each at its own type
 var slot1: Option[F1] = None
 while b.next(VARIANT)? is Some(i)
-    i match
-        0 -> if slot0.isDefined then return Err(b.duplicate(FIELD_0))
-             else slot0 = Some(b.field[F0](FIELD_0)?)
-        1 -> …
+  i match
+    0 -> if slot0.isDefined then return Err(b.duplicate(FIELD_0))
+         else slot0 = Some(b.field[F0](FIELD_0)?)
+    1 -> …
 val x0 = slot0 or else field 0's default or else b.missing[F0](FIELD_0)?
 val x1 = …
 Ok(Variant(x0, x1))
@@ -206,8 +212,8 @@ object JsonOmit: Annotation
 
 @JsonTag("kind")
 data Shape derives JsonEncoder
-    @JsonKey("circle") Circle(radius: real)
-    Rect(width: real, height: real)
+  @JsonKey("circle") Circle(radius: real)
+  Rect(width: real, height: real)
 
 data Person(@JsonKey("full_name") name: string, age: int, @JsonOmit score: int = 0)
 ```
@@ -262,12 +268,12 @@ is the hand-written encoder:
 
 ```text
 encode(out: JsonWriter) =
-    out.beginObject()
-    out.key("name")
-    out.string(name)
-    out.key("age")
-    out.long(long(age))
-    out.endObject()
+  out.beginObject()
+  out.key("name")
+  out.string(name)
+  out.key("age")
+  out.long(long(age))
+  out.endObject()
 ```
 
 The hooks are inlined at `-O0` too, since the compiler inlines them to keep the visitor as its
@@ -282,27 +288,27 @@ reads events from text in hand or from any `Reader`, one at a time.
 
 ```text
 data PathStep
-    Key(name: string)
-    Index(at: int)
+  Key(name: string)
+  Index(at: int)
 
 data JsonError(message: string, line: long, column: long, offset: long, path: List[PathStep] = [])
 
 impl JsonError
-    inField(name: string) -> JsonError = JsonError(message, line, column, offset, Key(name) :: path)
-    atIndex(i: int) -> JsonError = JsonError(message, line, column, offset, Index(i) :: path)
+  inField(name: string) -> JsonError = JsonError(message, line, column, offset, Key(name) :: path)
+  atIndex(i: int) -> JsonError = JsonError(message, line, column, offset, Index(i) :: path)
 
 trait JsonEncoder
-    encode(out: JsonWriter)
+  encode(out: JsonWriter)
 
 trait JsonDecoder
-    static decode(r: JsonReader) -> Result[Self, JsonError]
-    static whenMissing() -> Option[Self]      // a value for a field absent from the input
+  static decode(r: JsonReader) -> Result[Self, JsonError]
+  static whenMissing() -> Option[Self] // a value for a field absent from the input
 
-data JsonKey(name: string)                    // a field's or variant's name in JSON
+data JsonKey(name: string) // a field's or variant's name in JSON
 impl Annotation for JsonKey
-data JsonTag(key: string)                     // a sum type's discriminator key
+data JsonTag(key: string) // a sum type's discriminator key
 impl Annotation for JsonTag
-object JsonOmit: Annotation                   // never written; read only from its default
+object JsonOmit: Annotation // never written; read only from its default
 
 keyOf(f: FieldShape) -> string = f.annotation[JsonKey]().map(k -> k.name).getOrElse(f.name)
 nameOf(v: VariantShape) -> string = v.annotation[JsonKey]().map(k -> k.name).getOrElse(v.name)
@@ -314,51 +320,51 @@ element:
 
 ```text
 impl JsonEncoder for string
-    encode(out: JsonWriter) = out.string(self)
+  encode(out: JsonWriter) = out.string(self)
 
 impl JsonDecoder for string
-    static decode(r: JsonReader) -> Result[string, JsonError] = r.readString()
-    static whenMissing() -> Option[string] = None
+  static decode(r: JsonReader) -> Result[string, JsonError] = r.readString()
+  static whenMissing() -> Option[string] = None
 
 impl[A: JsonDecoder] JsonDecoder for Option[A]
-    static decode(r: JsonReader) -> Result[Option[A], JsonError] =
-        if r.takeNull() then Ok(None) else A.decode(r).map(a -> Some(a))
-    static whenMissing() -> Option[Option[A]] = Some(None)
+  static decode(r: JsonReader) -> Result[Option[A], JsonError] =
+    if r.takeNull() then Ok(None) else A.decode(r).map(a -> Some(a))
+  static whenMissing() -> Option[Option[A]] = Some(None)
 
 impl[A: JsonDecoder] JsonDecoder for Vector[A]
-    static decode(r: JsonReader) -> Result[Vector[A], JsonError] =
-        r.beginArray()?
-        val items = Buffer[A]()
-        while r.nextElement()?
-            items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
-        Ok(items.toVector)
-    static whenMissing() -> Option[Vector[A]] = None
+  static decode(r: JsonReader) -> Result[Vector[A], JsonError] =
+    r.beginArray()?
+    val items = Buffer[A]()
+    while r.nextElement()?
+      items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
+    Ok(items.toVector)
+  static whenMissing() -> Option[Vector[A]] = None
 ```
 
 The encoder's derivation. A sum type writes its discriminator first:
 
 ```text
 derive JsonEncoder for T
-    encode(out: JsonWriter) =
-        T.walk(self, FieldWriter(out, T.shape()))
-        out.endObject()
+  encode(out: JsonWriter) =
+    T.walk(self, FieldWriter(out, T.shape()))
+    out.endObject()
 
 data FieldWriter(out: JsonWriter, shape: TypeShape)
 
 impl ShapeVisitor for FieldWriter
-    variant(v: VariantShape) -> FieldWriter =
-        out.beginObject()
-        if shape.variantCount > 1
-            out.key(tagOf(shape))
-            out.string(nameOf(v))
-        self
+  variant(v: VariantShape) -> FieldWriter =
+    out.beginObject()
+    if shape.variantCount > 1
+      out.key(tagOf(shape))
+      out.string(nameOf(v))
+    self
 
 impl FieldWriter
-    field[F: JsonEncoder](f: FieldShape, value: F) -> FieldWriter =
-        if !f.has(JsonOmit)
-            out.key(keyOf(f))
-            value.encode(out)
-        self
+  field[F: JsonEncoder](f: FieldShape, value: F) -> FieldWriter =
+    if !f.has(JsonOmit)
+      out.key(keyOf(f))
+      value.encode(out)
+    self
 ```
 
 The decoder's derivation streams: it reads the discriminator, then each key as it comes, decoding
@@ -366,38 +372,38 @@ the value at that field's type, skipping keys it does not know:
 
 ```text
 derive JsonDecoder for T
-    static decode(r: JsonReader) -> Result[T, JsonError] = T.build(FieldReader(r))
-    static whenMissing() -> Option[T] = None
+  static decode(r: JsonReader) -> Result[T, JsonError] = T.build(FieldReader(r))
+  static whenMissing() -> Option[T] = None
 
 data FieldReader(r: JsonReader)
 
 impl ShapeBuilder[JsonError] for FieldReader
-    variant(t: TypeShape) -> Result[int, JsonError] =
-        r.beginObject()?
-        if t.variantCount == 1 then return Ok(0)
-        if r.nextKey()? != Some(tagOf(t))
-            return Err(r.error(s"expected \"${tagOf(t)}\" first, naming the variant"))
-        val name = r.readString().mapErr(e -> e.inField(tagOf(t)))?
-        t.variants.find(v -> nameOf(v) == name) match
-            Some(v) -> Ok(v.index)
-            None -> Err(r.error(s"unknown variant \"$name\"").inField(tagOf(t)))
+  variant(t: TypeShape) -> Result[int, JsonError] =
+    r.beginObject()?
+    if t.variantCount == 1 then return Ok(0)
+    if r.nextKey()? != Some(tagOf(t))
+      return Err(r.error(s"expected \"${tagOf(t)}\" first, naming the variant"))
+    val name = r.readString().mapErr(e -> e.inField(tagOf(t)))?
+    t.variants.find(v -> nameOf(v) == name) match
+      Some(v) -> Ok(v.index)
+      None -> Err(r.error(s"unknown variant \"$name\"").inField(tagOf(t)))
 
-    next(v: VariantShape) -> Result[Option[int], JsonError]
-        while r.nextKey()? is Some(key)
-            if v.fields.find(f -> !f.has(JsonOmit) && keyOf(f) == key) is Some(f) then return Ok(Some(f.index))
-            r.skipValue()?
-        Ok(None)
+  next(v: VariantShape) -> Result[Option[int], JsonError]
+    while r.nextKey()? is Some(key)
+      if v.fields.find(f -> !f.has(JsonOmit) && keyOf(f) == key) is Some(f) then return Ok(Some(f.index))
+      r.skipValue()?
+    Ok(None)
 
-    duplicate(f: FieldShape) -> JsonError = r.error(s"duplicate field \"${keyOf(f)}\"")
+  duplicate(f: FieldShape) -> JsonError = r.error(s"duplicate field \"${keyOf(f)}\"")
 
 impl FieldReader
-    field[F: JsonDecoder](f: FieldShape) -> Result[F, JsonError] =
-        F.decode(r).mapErr(e -> e.inField(keyOf(f)))
+  field[F: JsonDecoder](f: FieldShape) -> Result[F, JsonError] =
+    F.decode(r).mapErr(e -> e.inField(keyOf(f)))
 
-    missing[F: JsonDecoder](f: FieldShape) -> Result[F, JsonError] =
-        F.whenMissing() match
-            Some(v) -> Ok(v)
-            None -> Err(r.error(s"missing field \"${keyOf(f)}\""))
+  missing[F: JsonDecoder](f: FieldShape) -> Result[F, JsonError] =
+    F.whenMissing() match
+      Some(v) -> Ok(v)
+      None -> Err(r.error(s"missing field \"${keyOf(f)}\""))
 ```
 
 Using it:
@@ -405,14 +411,18 @@ Using it:
 ```text
 data Address(street: string, city: string) derives JsonEncoder, JsonDecoder
 
-data Person(@JsonKey("full_name") name: string, age: int, home: Option[Address],
-            @JsonOmit visits: int = 0) derives JsonEncoder, JsonDecoder
+data Person(
+    @JsonKey("full_name") name: string,
+    age: int,
+    home: Option[Address],
+    @JsonOmit visits: int = 0
+) derives JsonEncoder, JsonDecoder
 
 @JsonTag("kind")
 data Shape derives JsonEncoder, JsonDecoder
-    @JsonKey("circle") Circle(radius: real)
-    @JsonKey("rect") Rect(width: real, height: real)
-    Empty
+  @JsonKey("circle") Circle(radius: real)
+  @JsonKey("rect") Rect(width: real, height: real)
+  Empty
 ```
 
 `Person("Ada", 36, None)` encodes as `{"full_name":"Ada","age":36,"home":null}`; decoding that, or
@@ -430,19 +440,19 @@ trait's own file of the core library, compiled for each deriving type as any lib
 
 ```text
 derive Hash for T
-    hash() -> long = T.walk(self, hashFrom).h
+  hash() -> long = T.walk(self, hashFrom).h
 
 private data HashFields(h: long)
 private val hashFrom = HashFields(0)
 
 impl ShapeVisitor for HashFields
-    variant(v: VariantShape) -> HashFields = if v.index == 0 then self else HashFields(long(v.index))
+  variant(v: VariantShape) -> HashFields = if v.index == 0 then self else HashFields(long(v.index))
 
 impl HashFields
-    field[F: Hash](f: FieldShape, value: F) -> HashFields = HashFields(h *% 31 +% value.hash())
+  field[F: Hash](f: FieldShape, value: F) -> HashFields = HashFields(h *% 31 +% value.hash())
 
 derive Ord for T
-    compare(other: T) -> int = T.walkPair(self, other, orderedSoFar).result
+  compare(other: T) -> int = T.walkPair(self, other, orderedSoFar).result
 
 private data OrderFields(result: int)
 private val orderedSoFar = OrderFields(0)
@@ -450,40 +460,40 @@ private val orderedBefore = OrderFields(-1)
 private val orderedAfter = OrderFields(1)
 
 impl ShapePairVisitor for OrderFields
-    variants(a: VariantShape, b: VariantShape) -> OrderFields =
-        if a.index == b.index then self elif a.index < b.index then orderedBefore else orderedAfter
+  variants(a: VariantShape, b: VariantShape) -> OrderFields =
+    if a.index == b.index then self elif a.index < b.index then orderedBefore else orderedAfter
 
 impl OrderFields
-    field[F: Ord](f: FieldShape, a: F, b: F) -> OrderFields =
-        if result != 0 then return self
-        val c = a.compare(b)
-        if c == 0 then self elif c < 0 then orderedBefore else orderedAfter
+  field[F: Ord](f: FieldShape, a: F, b: F) -> OrderFields =
+    if result != 0 then return self
+    val c = a.compare(b)
+    if c == 0 then self elif c < 0 then orderedBefore else orderedAfter
 
 derive Display for T
-    display(out: Writer, spec: FormatSpec)
-        if spec.width > 0
-            val text = StringWriter()
-            display(text, FormatSpec())
-            out.writeField(text.text, spec)
-        else
-            T.walk(self, DisplayFields(out))
+  display(out: Writer, spec: FormatSpec)
+    if spec.width > 0
+      val text = StringWriter()
+      display(text, FormatSpec())
+      out.writeField(text.text, spec)
+    else
+      T.walk(self, DisplayFields(out))
 
 private data DisplayFields(out: Writer)
 
 impl ShapeVisitor for DisplayFields
-    variant(v: VariantShape) -> DisplayFields =
-        out.write(v.name)
-        self
+  variant(v: VariantShape) -> DisplayFields =
+    out.write(v.name)
+    self
 
-    finish(v: VariantShape) -> DisplayFields =
-        if v.fieldCount > 0 then out.write(")")
-        self
+  finish(v: VariantShape) -> DisplayFields =
+    if v.fieldCount > 0 then out.write(")")
+    self
 
 impl DisplayFields
-    field[F: Display](f: FieldShape, value: F) -> DisplayFields =
-        out.write(if f.index == 0 then "(" else ", ")
-        value.display(out, FormatSpec())
-        self
+  field[F: Display](f: FieldShape, value: F) -> DisplayFields =
+    out.write(if f.index == 0 then "(" else ", ")
+    value.display(out, FormatSpec())
+    self
 ```
 
 `Eq` is `Ord`'s shape with `equals`, and `Debug` is `Display`'s with `debug`. The visitors of `Eq`
@@ -508,32 +518,32 @@ its variants as values:
 
 ```avin
 data Color derives Enumerable
-    Red
-    Green
-    Blue
+  Red
+  Green
+  Blue
 
 main()
-    for c in Color.values
-        println(s"${c.ordinal} ${c.name}")   // 0 Red, 1 Green, 2 Blue
-    println(Color.valueOf("Green"))              // Some(Green)
-    println(Color.valueOf("green"))              // None
+  for c in Color.values
+    println(s"${c.ordinal} ${c.name}") // 0 Red, 1 Green, 2 Blue
+  println(Color.valueOf("Green")) // Some(Green)
+  println(Color.valueOf("green")) // None
 ```
 
 ```text
 trait Enumerable
-    static values() -> Vector[Self]
-    ordinal() -> int
-    name() -> string
-    static valueOf(name: string) -> Option[Self]
+  static values() -> Vector[Self]
+  ordinal() -> int
+  name() -> string
+  static valueOf(name: string) -> Option[Self]
 
 derive Enumerable for T
-    static values() -> Vector[T] = Vector.tabulate(T.shape().variantCount, i -> T.build(ChooseVariant(i)).ok.get)
-    ordinal() -> int = T.variantOf(self).index
-    name() -> string = T.variantOf(self).name
-    static valueOf(name: string) -> Option[T] =
-        for v in T.shape().variants
-            if v.name == name then return T.build(ChooseVariant(v.index)).ok
-        None
+  static values() -> Vector[T] = Vector.tabulate(T.shape().variantCount, i -> T.build(ChooseVariant(i)).ok.get)
+  ordinal() -> int = T.variantOf(self).index
+  name() -> string = T.variantOf(self).name
+  static valueOf(name: string) -> Option[T] =
+    for v in T.shape().variants
+      if v.name == name then return T.build(ChooseVariant(v.index)).ok
+    None
 ```
 
 - **`T.values`** is every variant in declaration order, as a new `Vector` each call.
