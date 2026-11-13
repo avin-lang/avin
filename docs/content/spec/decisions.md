@@ -7135,14 +7135,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   moves itself into another group or session is also beyond reach. `avin run` is unchanged: its
   program stays in the terminal's group so that Ctrl-C and job control reach it.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-## Proposed
-
-- Proposed (built on branch `field-shadow`): **A field may share its name with a trait's method
+- Settled on the user's delegation 2026-11-12 (built on branch `field-shadow`): **A field may share its name with a trait's method
   that takes a parameter list.** `x.name` and a bare `name` read the field; `x.name(args)` and a
   bare `name(args)` call the method (a bare call is `self.name(args)`, which already put methods
   first); through the trait or a type parameter it bounds only the method is seen. A method of no
@@ -7159,6 +7152,36 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and it would fix only the library's calls, not a program's own impl); refusing the field with a
   better message (keeps `debug: bool` illegal). Review with the user: it widens what a type may
   declare.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `main-result`): **`main` may answer with `Result[unit, E]` or
+  `Result[N, E]` for any integer type `N`, and also with `Result[Nothing, E]`. An `Err` is written to
+  standard error as `error: ` followed by its `Display`, and the program exits with 1.** The line is
+  written before the exit hooks run. `Ok(n)` exits with `n`, as a plain integer `main` does.
+  WHY: this lets a whole script use `?`. The `error: ` prefix matches the compiler's own
+  diagnostics and is what a command-line user expects. Status 1 is the ordinary failure status, and
+  it is distinct from a trap, which ends the program with a signal. Allowing any integer type matches
+  the plain `main`, which may yield any integer. `Nothing` covers `main() = Err(…)`, whose `Ok` type is
+  inferred as `Nothing`. ALTERNATIVES: allow only `int` in `Ok` (narrower than plain `main` for no
+  reason); give each error type its own status (there is no agreed way to choose one, and a program
+  that wants a particular status calls `exit`); trap on `Err` (a trap reports a source position
+  and signals, which is wrong for an expected failure such as a missing file).
+- Settled on the user's delegation 2026-11-12 (built on branch `main-result`): **The error type of a `Result`-answering `main` must
+  implement `Display`. There is no fallback to `Debug`.** A union of errors needs `Display` on every
+  member. WHY: the line is meant for the program's user, and a `Debug` form, such as quoted strings
+  or field names, reads as an accident. This is the same rule that applies to the error of a
+  `@test` function answering `Result[unit, E]`, so the two `Result` readers agree. Data types get
+  `Display` automatically wherever their fields have it, so the requirement rarely costs anything.
+  ALTERNATIVES: fall back to `Debug` when there is no `Display` (more programs compile, but some
+  errors would be shown in a form nobody chose); show any value at all through the runtime renderer
+  (same objection, and weaker). The user may want to revisit this if programs commonly hit errors
+  that have only `Debug`.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+## Proposed
 
 ## Open
 
