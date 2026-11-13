@@ -32,7 +32,7 @@ shapes/main.avin           the root module, with main
 shapes/shapes/area.avin    module shapes
 shapes/shapes/solid/*.avin module shapes.solid
 shapes/tests/*.avin        module tests, the package's own tests
-shapes/.avin/              what building leaves; not source
+shapes/.avin/              builds, only on a machine with no cache directory; not source
 ```
 
 The manifest is optional: a directory or a single file with none above it is a program as it always
@@ -522,8 +522,13 @@ without one, as before.
   `main` to start from, refuse it.
 - `avin new <dir>` writes a program package named by the directory's last segment: its manifest,
   whose `avin` is the version of the Avin that wrote it, a module of that name (with `-` written `_`) holding one function, `main.avin` using it, a test of it in
-  `tests/`, and a `.gitignore` naming `.avin/`. `avin new <dir> --lib` writes a library, the same
-  without `main.avin`. It refuses a directory that exists and a name that is not a package's.
+  `tests/`, and a `.gitignore` naming the executable `avin build` writes at the root (`/shapes`) and
+  `.avin/`. `avin new <dir> --lib` writes a library, the same without `main.avin`, its `.gitignore`
+  naming `.avin/` alone. It refuses a directory that exists and a name that is not a package's.
+- `avin clean [<path>]` removes the builds `avin run` and `avin test` keep for the package, which are
+  in the user's cache directory, a directory per package and keyed by where the package is, so two
+  checkouts of it never share one ([running and testing](/compiler/#running-and-testing)).
+  `avin clean --all` removes every program's builds this version of Avin keeps; fetched packages stay.
 - `avin add <coordinate>[@<version>|@<rev>] [<package>]` adds a git dependency to the package's
   manifest: the version given, the commit given (written to the manifest as its full id), or the
   highest release the repository has tagged. It fetches the package, lists

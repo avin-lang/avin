@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
+import sysl.fs.{canonicalize, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
 import sysl.process.Stdio
 
 // `avin run` and `avin test`, through the command line as a person types it, with the program's
@@ -19,12 +19,15 @@ private struct Session
 private session(dir: string, args: []const string) -> Session = session_in(".", dir, args)
 
 // A session whose current directory, the program a command uses when it is given none, is `here`.
-private session_in(here: string, dir: string, args: []const string) -> Session
+private session_in(here: string, dir: string, args: []const string) -> Session = session_with(repository_toolchain(), here, dir, args)
+
+// A session with the toolchain `tc`.
+private session_with(tc: Toolchain, here: string, dir: string, args: []const string) -> Session
     var said = ""
     var noted = ""
     val out = dir + "/run.out"
     val err = dir + "/run.err"
-    val status = run_cli_in(here, args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(err))
+    val status = run_cli_in(here, args, Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(err))
     Session(status, said, noted, read_text(out).unwrap_or(""), read_text(err).unwrap_or(""))
 
 @test("avin alone runs the package, or the directory program, it is in")
@@ -182,13 +185,17 @@ run_forwards_output_and_status()
     assert_eq(run.out, "hello\n")
     assert_eq(run.err, "")
     assert_eq(run.status, 3)
-    // The executable is kept in the cache beside the source, never written beside it as `build` does.
-    assert(exists(dir + "/.avin/build/greet-O2"))
+    // The executable is kept in the program's own build cache, never written beside the source as
+    // `build` does, and nothing is left in the source's directory.
+    val cache = build_cache(repository_toolchain().builds, source)
+    assert(exists(cache + "/greet-O2"))
     assert(!exists(dir + "/greet"))
+    assert(!exists(dir + "/.avin"))
     val unoptimized = session(dir, ["avin", "run", source, "-O0"])
     assert_eq(unoptimized.status, 3)
     assert_eq(unoptimized.out, "hello\n")
-    assert(exists(dir + "/.avin/build/greet-O0"))
+    assert(exists(cache + "/greet-O0"))
+    assert(!exists(dir + "/.avin"))
 
 @test("the arguments after run's `--` are the program's, read through avin.process, flags and `--` included")
 run_passes_arguments_to_the_program()
@@ -332,6 +339,151 @@ cache_follows_sysl_packages()
     assert(!cached_build(tc, source, single_file(source_of(source, text)), false, "-O0", released, buf()).unwrap().built)
     assert(cached_build(tc, source, single_file(source_of(source, text)), false, "-O0", raised, buf()).unwrap().built)
     assert(cached_build(tc, source, single_file(source_of(source, text)), false, "-O0", buf(), buf()).unwrap().built)
+
+// --- where the builds are kept ----------------------------------------------------------------------
+
+@test("a program's build cache is a directory of its own under the builds, named after it and keyed by its absolute path")
+build_cache_is_named_and_keyed()
+    val dir = canonicalize(make_temp_dir("avin-where").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/one/proj").unwrap()
+    make_dir_all(dir + "/two/proj").unwrap()
+    write_text(dir + "/one/proj/main.avin", "main() = 0\n").unwrap()
+    write_text(dir + "/two/proj/main.avin", "main() = 0\n").unwrap()
+    write_text(dir + "/one/run.avin", "main() = 0\n").unwrap()
+    write_text(dir + "/one/héllo wörld.avin", "main() = 0\n").unwrap()
+    val builds = dir + "/builds"
+    val one = build_cache(builds, dir + "/one/proj")
+    val two = build_cache(builds, dir + "/two/proj")
+    // Two copies of one project, as two worktrees are, never share a cache.
+    assert(one != two)
+    assert(one.starts_with(builds + "/proj-"), one)
+    assert(two.starts_with(builds + "/proj-"), two)
+    assert_eq(one.len, (builds + "/proj-").len + 12)
+    // The same program named another way is the same program.
+    assert_eq(build_cache(builds, dir + "/one/proj/"), one)
+    assert_eq(build_cache(builds, dir + "/one/../one/proj"), one)
+    // A program of one file has its own, named after the file, apart from its directory's.
+    val script = build_cache(builds, dir + "/one/run.avin")
+    assert(script.starts_with(builds + "/run-"), script)
+    assert(script != build_cache(builds, dir + "/one"))
+    assert(build_cache(builds, dir + "/one/héllo wörld.avin").starts_with(builds + "/héllo wörld-"))
+    // With no builds directory, the cache is `.avin/build` beside the program.
+    assert_eq(build_cache("", dir + "/one/proj"), dir + "/one/proj/.avin/build")
+    assert_eq(build_cache("", dir + "/one/run.avin"), dir + "/one/.avin/build")
+    // The instance cache is in the program's build cache, each kind and level apart.
+    assert_eq(program_instance_cache(builds, dir + "/one/run.avin", false, "-O2"), script + "/incremental/program-O2")
+    assert_eq(program_instance_cache(builds, dir + "/one/run.avin", true, "-O0"), script + "/incremental/tests-O0")
+    assert_eq(program_instance_cache(builds, dir + "/one/proj", true, "-O2"), one + "/incremental/tests-O2")
+
+@test("the builds are kept in the toolchain's cache, apart for each version, and in no cache on a machine with none")
+build_root_follows_the_cache()
+    assert_eq(build_root(Some("/tmp/mine"), None, "/tmp/mine"), "/tmp/mine/build")
+    assert_eq(build_root(Some("/tmp/mine"), Some("/Users/u/Library/Caches"), "/tmp/mine"), "/tmp/mine/build")
+    val machine = toolchain_cache(None, Some("/Users/u/Library/Caches"), None)
+    assert_eq(build_root(None, Some("/Users/u/Library/Caches"), machine), "/Users/u/Library/Caches/avin/" + Version + "/build")
+    // An empty AVIN_CACHE is no AVIN_CACHE.
+    assert_eq(build_root(Some(""), Some("/Users/u/Library/Caches"), machine), machine + "/build")
+    // With no cache directory the toolchain's archives go to the temporary directory, and the builds
+    // beside each program.
+    assert_eq(build_root(None, None, toolchain_cache(None, None, Some("/tmp"))), "")
+    assert_eq(build_root(Some(""), None, toolchain_cache(Some(""), None, Some("/tmp"))), "")
+    // A compiler of another version never reads this one's builds.
+    val older = toolchain_cache_of(None, Some("/c"), None, "0.0.1")
+    val newer = toolchain_cache_of(None, Some("/c"), None, "0.0.2")
+    assert(older != newer)
+    assert(build_cache(build_root(None, Some("/c"), older), "/p/x.avin") != build_cache(build_root(None, Some("/c"), newer), "/p/x.avin"))
+    assert(build_cache(build_root(None, Some("/c"), newer), "/p/x.avin").starts_with("/c/avin/0.0.2/build/x-"))
+
+@test("running a program of one file leaves nothing beside it, and two copies of it each build their own")
+run_leaves_nothing_beside_the_program()
+    val dir = make_temp_dir("avin-where").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain().building_in(dir + "/builds")
+    make_dir_all(dir + "/a").unwrap()
+    make_dir_all(dir + "/b").unwrap()
+    val text = "main() -> int = 4\n\n@test\nfour()\n    assertEq(main(), 4)\n"
+    write_text(dir + "/a/same.avin", text).unwrap()
+    write_text(dir + "/b/same.avin", text).unwrap()
+    assert_eq(session_with(tc, dir, dir, ["avin", "run", dir + "/a/same.avin"]).status, 4)
+    assert_eq(session_with(tc, dir, dir, ["avin", "test", dir + "/a/same.avin"]).status, 0)
+    assert(!exists(dir + "/a/.avin"))
+    assert(exists(build_cache(tc.builds, dir + "/a/same.avin") + "/same-O2"))
+    assert(exists(build_cache(tc.builds, dir + "/a/same.avin") + "/incremental/program-O2"))
+    // The second copy is built, not taken from the first's cache.
+    val first = cached_build(tc, dir + "/a/same.avin", single_file(source_of(dir + "/a/same.avin", text)), false, "-O2", buf(), buf()).unwrap()
+    assert(!first.built)
+    val second = cached_build(tc, dir + "/b/same.avin", single_file(source_of(dir + "/b/same.avin", text)), false, "-O2", buf(), buf()).unwrap()
+    assert(second.built)
+    assert(second.path != first.path)
+    assert(!exists(dir + "/b/.avin"))
+
+@test("on a machine with no cache directory the builds are kept in .avin/build beside the program")
+run_falls_back_to_the_program_directory()
+    val dir = make_temp_dir("avin-where").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain().building_in("")
+    write_text(dir + "/one.avin", "main() -> int = 5\n").unwrap()
+    write_text(dir + "/two.avin", "main() -> int = 6\n").unwrap()
+    assert_eq(session_with(tc, dir, dir, ["avin", "run", dir + "/one.avin"]).status, 5)
+    assert_eq(session_with(tc, dir, dir, ["avin", "run", dir + "/two.avin", "-O0"]).status, 6)
+    assert(exists(dir + "/.avin/build/one-O2"))
+    assert(exists(dir + "/.avin/build/incremental/one-program-O2"))
+    assert(exists(dir + "/.avin/build/two-O0"))
+    // `avin clean` of one program removes its own entries and leaves the other's.
+    val cleaned = session_with(tc, dir, dir, ["avin", "clean", dir + "/one.avin"])
+    assert_eq(cleaned.status, 0, cleaned.noted)
+    assert(cleaned.said.contains("removed " + dir + "/.avin/build/one-O2\n"), cleaned.said)
+    assert(!exists(dir + "/.avin/build/one-O2"))
+    assert(!exists(dir + "/.avin/build/one-O2.key"))
+    assert(!exists(dir + "/.avin/build/incremental/one-program-O2"))
+    assert(exists(dir + "/.avin/build/two-O0"))
+    // Cleaning the last one takes `.avin` with it; `--all` with no cache directory is the program's.
+    assert_eq(session_with(tc, dir, dir, ["avin", "clean", "--all"]).status, 0)
+    assert(!exists(dir + "/.avin"))
+    assert_eq(session_with(tc, dir, dir, ["avin", "clean", dir + "/two.avin"]).said, "nothing to clean\n")
+
+@test("avin clean removes the program's builds, --all every program's, and leaves the rest of the cache")
+clean_removes_the_builds()
+    val dir = make_temp_dir("avin-clean").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain().building_in(dir + "/cache/build")
+    make_dir_all(dir + "/cache/runtime").unwrap()
+    new_package(dir + "/app", false).unwrap()
+    write_text(dir + "/lone.avin", "main() -> int = 2\n").unwrap()
+    assert_eq(session_with(tc, dir + "/app", dir, ["avin", "run"]).out, "Hello, world!\n")
+    assert_eq(session_with(tc, dir, dir, ["avin", "run", dir + "/lone.avin"]).status, 2)
+    val app = build_cache(tc.builds, dir + "/app")
+    val lone = build_cache(tc.builds, dir + "/lone.avin")
+    assert(is_dir(app))
+    assert(is_dir(lone))
+    // From inside the package, the package is the program, as every command reads it.
+    val cleaned = session_with(tc, dir + "/app/app", dir, ["avin", "clean"])
+    assert_eq(cleaned.status, 0, cleaned.noted)
+    assert_eq(cleaned.said, "removed " + app + "\n")
+    assert(!exists(app))
+    assert(is_dir(lone))
+    assert_eq(session_with(tc, dir + "/app", dir, ["avin", "clean"]).said, "nothing to clean\n")
+    // A package keeping an `.avin/build` from before has it removed too.
+    make_dir_all(dir + "/app/.avin/build/incremental").unwrap()
+    assert_eq(session_with(tc, dir, dir, ["avin", "clean", dir + "/app"]).status, 0)
+    assert(!exists(dir + "/app/.avin"))
+    // `--all` removes every program's builds and nothing else of the cache.
+    _ = session_with(tc, dir + "/app", dir, ["avin", "run"])
+    val all = session_with(tc, dir, dir, ["avin", "clean", "--all"])
+    assert_eq(all.status, 0, all.noted)
+    assert_eq(all.said, "removed " + tc.builds + "\n")
+    assert(!exists(tc.builds))
+    assert(is_dir(dir + "/cache/runtime"))
+    assert(exists(dir + "/lone.avin"))
+    assert(exists(dir + "/app/avin.hocon"))
+    // The errors.
+    assert_eq(session_with(tc, dir, dir, ["avin", "clean", "--all", dir + "/lone.avin"]).status, 2)
+    assert_eq(session_with(tc, dir, dir, ["avin", "clean", "--bogus"]).status, 2)
+    assert_eq(session_with(tc, dir, dir, ["avin", "clean", "a", "b"]).status, 2)
+    val missing = session_with(tc, dir, dir, ["avin", "clean", dir + "/absent.avin"])
+    assert_eq(missing.status, 1)
+    assert(missing.noted.contains("does not exist"), missing.noted)
 
 // A program of two modules: three tests that fail in different ways among ones that pass.
 private write_tree(dir: string)
