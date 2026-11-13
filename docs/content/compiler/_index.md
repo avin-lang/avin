@@ -51,6 +51,19 @@ becomes a space, so the program has the document's bytes at the document's offse
 measures indentation past the four-column margin. Every later stage reads that program as its
 unit's source, and every span, line and column is the document's with no mapping.
 
+**One mistake, one diagnostic, at the place that is wrong.** The parser reports a mistake once and
+reads on: a line it could not read to its end is skipped to the next line of its block (a
+declaration to the next declaration, a class's, actor's or machine's member to the next member), and
+says nothing more about the tokens it skipped; an argument list or a parenthesized group with a token
+where `,` or `)` belongs is skipped to its `)`, so the expression around it, and a separate mistake
+later on the same line, are still read. Where the token shows what was meant, the error says it:
+`Map("a" -> 1)` is told the map literal `{"a": 1}`, `f(x: T)` the type argument `f[T](x)`, and
+`map(x: int -> …)` the parenthesized parameter `(x: int) -> …`. The checker shows a mistake in
+calling or reading a member (a missing member, a private one, the argument count, parentheses on a
+parameterless one) at the member's name and its argument list, never across the receiver, which in a
+chain of leading-`.` lines starts lines above; the expression's own span stays whole, so a value of
+the wrong type is still shown across all of it (`diagnostic_place_tests.sysl`).
+
 Names are resolved by module. Every top-level declaration is held under its qualified name, `a.b.X`
 (a root module's under `X`), and a bare name in a file resolves to the first of its own module's
 declaration, its file's import, and the `avin` module's public declaration that exists. Imports are
