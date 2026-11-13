@@ -141,7 +141,7 @@ Listing a group replaces a `pgrep -g` subprocess, for instance to signal or coun
 command left running:
 
 ```avin
-match Command("/bin/sh", "-c", "sleep 30 & wait").inNewGroup().start()
+match Command("/bin/sh", "-c", "sleep 30 & wait").inNewGroup.start()
   Ok(child) ->
     val members = process.groupMembers(child.pid())   // the shell and its `sleep`
     val direct = process.children(child.pid())        // just the `sleep`
@@ -209,11 +209,11 @@ import avin.process.{Command, CommandError}
 
 sources(dir: string) -> Result[Vector[string], CommandError]
     val listing = Command("ls", dir) | Command("grep", "\\.avin$")
-    Ok(listing.output()?.lines())
+    Ok(listing.output()?.lines)
 
 main() -> int
     "make test".run() match
-        Ok(status) if status.isSuccess() -> 0
+        Ok(status) if status.isSuccess -> 0
         _ -> 1
 ```
 
@@ -223,17 +223,17 @@ main() -> int
 | `Command.parse(line: string)` | The line split at runs of white space, the first word the program; no quoting and no shell. A line with no word traps. |
 | `c.inDir(dir: string)` | The same command, run in `dir`. |
 | `c.withEnv(name: string, value: string)` | The same command, with the variable set for it; the rest of the program's environment is passed on. |
-| `c.clearEnv()` | The same command, started from an empty environment: none of the program's variables is passed on and none set by an earlier `withEnv` stays. A bare program name is then looked for on the `PATH` the command was given, or on the system's default search path where it has none, never the running program's. |
+| `c.clearEnv` | The same command, started from an empty environment: none of the program's variables is passed on and none set by an earlier `withEnv` stays. A bare program name is then looked for on the `PATH` the command was given, or on the system's default search path where it has none, never the running program's. |
 | `c.withoutEnv(name: string)` | The same command without the variable: the program's value is not passed on and an earlier `withEnv` of it is dropped. A name that is not set is no error. |
-| `c.withEnvironment(vars: Map[string, string])` | The same command with exactly these variables: `clearEnv()`, then a `withEnv` for each. |
+| `c.withEnvironment(vars: Map[string, string])` | The same command with exactly these variables: `clearEnv`, then a `withEnv` for each. |
 
-Environment changes apply in the order called; on a pipeline or a sequence the command's come first and each part's own after them, so a part's `clearEnv()` discards what the command set.
+Environment changes apply in the order called; on a pipeline or a sequence the command's come first and each part's own after them, so a part's `clearEnv` discards what the command set.
 | `c.withTimeout(d: Duration)` | The same command, stopped when it has run for `d`; its status is then `TimedOut`. |
 | `c.toFile(file: string)`, `c.appendTo(file: string)` | The same command, its standard output written to the file, emptied first or added to. |
 | `c.fromFile(file: string)`, `c.withInput(text: string)` | The same command, reading the file, or the text, as its standard input. |
 | `c.errorsToFile(file: string)`, `c.errorsAppendTo(file: string)` | The same command, its standard error written to the file, emptied first or added to. |
 | `c.errorsToOutput()` | The same command, its standard error going where its standard output goes: into the same open file, so neither empties what the other wrote, and into what `output()` and `lines()` capture. |
-| `c.inNewGroup()` | The same command, started in a process group of its own, which every program it starts joins ([proposed](/spec/decisions/#proposed)). |
+| `c.inNewGroup` | The same command, started in a process group of its own, which every program it starts joins ([proposed](/spec/decisions/#proposed)). |
 | `a andThen b` | `a`, then `b` only where `a` succeeded; the status is the last one run. |
 | `a orElse b` | `a`, then `b` only where `a` did not succeed. |
 | `a followedBy b` | `a`, then `b` whatever `a`'s status. |
@@ -298,7 +298,7 @@ import avin.signal
 import avin.threads
 
 stopped() -> Result[ExitStatus, IoError]
-    val job = Command("sh", "-c", "worker & worker & wait").inNewGroup().toFile("job.log").errorsToOutput().start()?
+    val job = Command("sh", "-c", "worker & worker & wait").inNewGroup.toFile("job.log").errorsToOutput().start()?
     val waiter = threads.spawn(() -> job.waitFor())
     job.signalGroup(signal.Terminate)?
     waiter.join()
@@ -344,7 +344,7 @@ A `CommandError` is an [`Error`](/spec/errors/#the-error-trait), as `IoError` is
 (Terminate)` (the name of a signal of `avin.signal`, `unknown` for any other number) or `sleep timed
 out`. `Failed`'s `command` is the programs alone; one built with an empty `command` leaves it out.
 
-`isSuccess()` is `true` of `Exited(0)` alone. A program that is not there fails to start: `run`
+`isSuccess` is `true` of `Exited(0)` alone. A program that is not there fails to start: `run`
 answers an `IoError` of kind `NotFound`, `cannot run nosuch: no such file or directory`, and `output`
 the same error in `Io`.
 
@@ -499,7 +499,7 @@ import avin.io
 main()
     var total = 0
     for line in io.lines()
-        line.trim().toIntOption() match
+        line.trim.toIntOption() match
             Some(n) -> total += n
             None -> eprintln(s"not a number: $line")
     println(total)
@@ -566,7 +566,7 @@ or standard input alike.
 ```text
 import avin.io.{IoError, Source}
 
-count(src: Source) -> int = src.lines().count(l -> !l.isEmpty())
+count(src: Source) -> int = src.lines().count(l -> !l.isEmpty)
 
 main() -> int
     Source.fromFile("notes.txt") match
@@ -690,7 +690,7 @@ follow(log: string) -> Result[unit, IoError]
     while true
         f.readCompleteLine()? match
             Some(line) -> println(line)
-            None -> sleep(250.millis())
+            None -> sleep(250.millis)
 ```
 
 | Function | Meaning |
@@ -824,7 +824,7 @@ and in every release; `Random()` is seeded by the platform, differently each tim
 
 **Repeated draws from one distribution use `Weighted`.** `Weighted(pairs)` keeps the running totals
 of the weights, built once with the same checks, and `sample(rng)` draws an item by binary search, in
-O(log n); it draws exactly as `rng.chooseWeighted(pairs)` would. `size()` is the number of items.
+O(log n); it draws exactly as `rng.chooseWeighted(pairs)` would. `size` is the number of items.
 
 ```text
 val weather = Weighted([("sun", 6.0), ("rain", 3.0), ("snow", 1.0)])
@@ -898,7 +898,7 @@ import avin.net.http
 
 main() -> int
     http.get("https://example.com/") match
-        Ok(r) if r.status == 200 -> println(r.text())
+        Ok(r) if r.status == 200 -> println(r.text)
         Ok(r) -> eprintln(s"status ${r.status}")
         Err(e) -> eprintln(e.message)
     0
@@ -1046,7 +1046,7 @@ way to accept a certificate these refuse, a private authority, a corporate one a
 being the same case. The choices are [proposed](/spec/decisions/#proposed).
 
 **After the handshake a connection is a `ByteStream`**: a failure of TLS itself while reading or
-writing is an `IoError.Other` whose text begins `TLS:`, and the connection's end, by the peer's
+writing is an `IoError` of kind `Other` whose text begins `TLS:`, and the connection's end, by the peer's
 `close_notify` or by the TCP connection closing, reads as the end of a TCP connection's does.
 
 `TlsError` says why a connection could not be made: `Transport(IoError)`, the connection beneath
@@ -1074,7 +1074,7 @@ import avin.net.TcpServer
 main()
     val server = TcpServer.start("0.0.0.0", 7000, (s, _) ->
         while s.readLine() is Ok(Some(line))
-            s.writeText(line + "\n")).ok().get()
+            s.writeText(line + "\n")).ok.get
     server.join()
 ```
 
@@ -1134,7 +1134,7 @@ main()
     val router = Router([
         Route.get("/hello/:name", r -> Response.text(200, s"hello, ${r.param("name")}\n")),
         Route.post("/echo", r -> Response.bytes(200, r.body, "application/octet-stream"))])
-    http.serve("0.0.0.0", 8080, router.handle).ok().get().join()
+    http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
 ```
 
 `http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,
@@ -1157,10 +1157,10 @@ would have to be written through TLS the handler's turn held.
 
 A `ServerRequest` has its `method`, its `target` as the request line gave it, its `version`
 (`HTTP/1.1` or `HTTP/1.0`), its `headers` in order with `header(name)` looking one up without regard
-to case, its `body` with `text()` reading it as UTF-8, and the `params` its route bound, with
+to case, its `body` with `text` reading it as UTF-8, and the `params` its route bound, with
 `param(name)` trapping where the route has none of that name. From the target come `path`, its
 escapes decoded, `segments`, the path's segments each decoded (so `/a%2Fb` is the one segment
-`a/b`, and `/` one empty one), `query` as written, and `queryParams()` as `Url.queryParams` reads
+`a/b`, and `/` one empty one), `query` as written, and `queryParams` as `Url.queryParams` reads
 them. A target is a path beginning with `/` or an absolute `http` URL; `ServerRequest(method,
 target)` traps on any other, so a handler can be tried without a connection.
 
@@ -1231,8 +1231,8 @@ equal, and a `Url` displays as the text it was read from with exactly those diff
 
 | Member | Meaning |
 | --- | --- |
-| `u.portOrDefault() -> Option[int]` | The port, or where none is written the scheme's default: 80 for `http` and `ws`, 443 for `https` and `wss`. |
-| `u.queryParams() -> Vector[(string, string)]` | The query split at each `&` (an empty piece skipped) and each piece at its first `=`, decoded, a `+` standing for a space as a form writes one; no `=` gives an empty value, no query no pairs. |
+| `u.portOrDefault -> Option[int]` | The port, or where none is written the scheme's default: 80 for `http` and `ws`, 443 for `https` and `wss`. |
+| `u.queryParams -> Vector[(string, string)]` | The query split at each `&` (an empty piece skipped) and each piece at its first `=`, decoded, a `+` standing for a space as a form writes one; no `=` gives an empty value, no query no pairs. |
 | `u.resolve(ref: string) -> Result[Url, UrlError]` | The reference, relative or absolute, resolved against `u` by RFC 3986 §5.2: its missing components taken from `u` and its dot segments removed, strictly, so `http:g` stays `http:g`. |
 | `u.resolve(ref: Url) -> Url` | An absolute reference with its dot segments removed. |
 | `u.withScheme(s)`, `withUserInfo(i)`, `withHost(h)`, `withPort(p)`, `withPath(p)`, `withQuery(q)`, `withFragment(f)` | The URL with one component replaced, as written with its escapes, held as `parse` holds it; the optional ones take a value or an `Option`, `None` taking the component away. A component the URL cannot hold traps: one with a character it may not, a port outside 0 to 65535, user information or a port without a host, a path beside a host not beginning with `/`. |
@@ -1255,7 +1255,7 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url)` with `withHeader`, `withBody`, `withTimeout` and `withTls`. |
 
 A `Response` has its `status` and `reason`, its `headers` as a vector of name and value pairs,
-`header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text()`
+`header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text`
 reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, `Unsupported(text)` for a scheme
 other than `http` and `https`, and `Tls(TlsError)` for TLS that could not be set up (a connection

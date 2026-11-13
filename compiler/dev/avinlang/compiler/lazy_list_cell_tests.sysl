@@ -1,0 +1,110 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// A lazy list's cell is one object of three words: the function that evaluates it until it has
+// been, the element and the rest, the two the core library leaves unset (`field_unset`) until that
+// function stores them. Making a cell allocates the cell and the one function that evaluates it, and
+// evaluating it allocates nothing more than the cells after it; reading a cell takes no lock. These
+// tests read the counts from the code each maker compiles to, so they hold however a run is timed.
+
+private const Cells: string = "up(k: int) -> LazyList[int] = k #:: up(k + 1)\n\nmain()\n    println(LazyList.from(0).map(x -> x + 1).filter(x -> x % 2 == 0).take(5).toVector)\n    println(up(0).take(3).toVector)\n    println(LazyList.from(0).drop(2).dropWhile(x -> x < 5).takeWhile(x -> x < 9).zip(LazyList.iterate(1, x -> x * 2)).toVector)\n    println(LazyList.from(0).map(x -> s\"<$x>\").take(2).toVector)\n"
+
+private cells_ir() -> string
+    val program = lower_source(repository_toolchain(), source_of("cells.avin", Cells)) match
+        Ok(p) -> p
+        Err(d) -> panic(d)
+    emit_llvm(program)
+
+/** The lines of the function whose symbol is `symbol`; empty when there is none. */
+private cell_body(ir: string, symbol: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define ") && line.contains("@\"" + symbol + "\"(") then inside = true
+        elif inside
+            if line == "}" then return out
+            out.push(line)
+    out
+
+/** How many of `lines` allocate an object. */
+private allocations(lines: Buf[string]) -> usize
+    var n: usize = 0
+    for line in lines
+        if line.contains("@avin_rt_alloc(") then n += 1
+    n
+
+/** The descriptor of `name`'s layout: its line in the module, or empty. */
+private layout_of(ir: string, name: string) -> string
+    for line in ir.split("\n")
+        if line.starts_with("@\"avin.methods:" + name + "\" =") then return line
+    ""
+
+private listing(lines: Buf[string]) -> string
+    var out = ""
+    for line in lines
+        out = out + line + "\n"
+    out
+
+@test("a lazy list cell is three words: the pending function, the element and the rest")
+cell_is_three_words()
+    val ir = cells_ir()
+    // The payload, after the collector's header: 24 bytes, with the function and the rest as
+    // references, and for a string element the element too.
+    val ints = layout_of(ir, "class avin.LazyList[int]")
+    assert(ints.contains("i64 0, i64 24, i64 2, "), ints)
+    assert(ints.contains("[2 x i64] [i64 0, i64 16]"), ints)
+    val strings = layout_of(ir, "class avin.LazyList[string]")
+    assert(strings.contains("i64 0, i64 24, i64 3, "), strings)
+
+@test("making a cell allocates the cell alone, and leaves its element and rest unstored")
+cell_construction_allocates_once()
+    val ir = cells_ir()
+    val made = cell_body(ir, "avin.LazyList[int]")
+    assert(made.len() > 0, "no constructor")
+    assert(allocations(made) == 1, listing(made))
+    // No lazy value's state, no progress object, no box around the pending function.
+    var stores: usize = 0
+    for line in made
+        if line.contains("store atomic") then stores += 1
+    assert(stores == 0, listing(made))
+    val lazily = cell_body(ir, "avin.object LazyList.lazily[int]")
+    assert(allocations(lazily) == 0, listing(lazily))
+    var calls_constructor = false
+    for line in lazily
+        if line.contains("@\"avin.LazyList[int]\"(") then calls_constructor = true
+    assert(calls_constructor, listing(lazily))
+
+@test("each lazy list maker allocates one function besides the cell")
+makers_allocate_one_function()
+    val ir = cells_ir()
+    for maker in ["avin.object LazyList.from(T, T)[int]", "avin.object LazyList.countedAfter[int]", "avin.object LazyList.mapped[int, int]", "avin.object LazyList.mapped[int, string]", "avin.object LazyList.filtered[int]", "avin.object LazyList.taken[int]", "avin.object LazyList.dropped[int]", "avin.object LazyList.droppedWhile[int]", "avin.object LazyList.takenWhile[int]", "avin.object LazyList.zipped[int, int]", "avin.object LazyList.iterate[int]", "avin.object LazyList.iteratedAfter[int]"]
+        val lines = cell_body(ir, maker)
+        assert(lines.len() > 0, "no " + maker)
+        assert(allocations(lines) == 1, maker + "\n" + listing(lines))
+        var own = false
+        for line in lines
+            if line.contains("@avin_rt_alloc(") && line.contains("closure of " + maker + ".lambda#1") then own = true
+        assert(own, maker + "\n" + listing(lines))
+
+@test("evaluating a cell allocates nothing but the element and the cells after it")
+evaluation_allocates_nothing_more()
+    val ir = cells_ir()
+    for lambda in ["avin.object LazyList.from(T, T)[int].lambda#1", "avin.object LazyList.countedAfter[int].lambda#1", "avin.object LazyList.mapped[int, int].lambda#1", "avin.object LazyList.filtered[int].lambda#1", "avin.object LazyList.taken[int].lambda#1", "avin.object LazyList.dropped[int].lambda#1", "avin.object LazyList.droppedWhile[int].lambda#1", "avin.object LazyList.takenWhile[int].lambda#1", "avin.object LazyList.iteratedAfter[int].lambda#1", "avin.object LazyList.filterInto[int]", "avin.object LazyList.store[int]", "avin.object LazyList.copy[int]"]
+        val lines = cell_body(ir, lambda)
+        assert(lines.len() > 0, "no " + lambda)
+        assert(allocations(lines) == 0, lambda + "\n" + listing(lines))
+    // A pair of a zip is its element, the one object its evaluation makes.
+    val zipped = cell_body(ir, "avin.object LazyList.zipped[int, int].lambda#1")
+    assert(allocations(zipped) == 1, listing(zipped))
+
+@test("reading a cell takes no lock and allocates nothing")
+cell_read_takes_no_lock()
+    val ir = cells_ir()
+    val ended = cell_body(ir, "avin.LazyList.ended[int]")
+    assert(ended.len() > 0, "no ended")
+    assert(allocations(ended) == 0, listing(ended))
+    for line in ended
+        assert(!line.contains("avin_rt_lazy_") && !line.contains("cmpxchg") && !line.contains("atomicrmw"), listing(ended))

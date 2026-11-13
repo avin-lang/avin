@@ -178,7 +178,12 @@ Choosing an overload works as follows:
   can hold its value (`int`, `long`, the other widths, `byte`, `real`), and the lambda a parameter
   that is a function of as many parameters, or a function of one tuple of as many elements, which
   the lambda [takes apart](/spec/types/#tuples). A candidate that has a lambda take a tuple apart is
-  chosen only where no candidate takes it as written. Every other argument is checked once, on its own, and
+  chosen only where no candidate takes it as written. Where the candidates left all give a lambda
+  the same parameter types, known without their own type arguments, and differ only in the result
+  they need of it, the lambda is checked once, with those parameter types and its result left to its
+  body, and then fits a candidate as any other argument's type does: a map's
+  `map((k, v) -> Summary(k, v))` takes the overload whose function may answer anything, and
+  `map((k, v) -> (v, k))` the one that needs a pair, as the more specific. Every other argument is checked once, on its own, and
   only its type is tried against each candidate; when every candidate gives it the same parameter
   type it is checked against that type. Neither `int` and `long` nor `int` and `real` conforms to the
   other, so where no overload is the most specific an integer literal prefers its own type, `int`,
@@ -441,6 +446,45 @@ needed once the callee has started:
 A trap reports the place it happened as always, but the frames a tail call replaced are gone: a
 program stopped after a million tail calls was not a million calls deep.
 
+### `main`
+
+A program starts at `main`, a function of the root module written `main()` or
+`main(args: Vector[string])`, whose `args` are the program's arguments after its name. It is not
+generic, overloaded, or given a default or a repeated parameter. What it yields decides how the
+program exits:
+
+```text
+import avin.fs
+import avin.io.IoError
+
+main(args: Vector[string]) -> Result[unit, IoError | ParseError]
+    for file in args
+        val settings = parse(fs.readText(file)?)?
+        println(s"$file: ${settings.size} settings")
+    Ok(())
+```
+
+- **unit**: the program exits with status 0.
+- **An integer type**: the program exits with that integer as its status (its low 8 bits are what
+  the operating system keeps).
+- **`Nothing`**: `main` never returns, so whatever ends it, `exit` or a trap, sets the status.
+- **`Result[unit, E]` or `Result[int, E]`**, so that `?` can be used in `main`. `Ok(())` exits with 0, and
+  `Ok(n)` exits with `n`. `Ok` may hold any integer type, and `Nothing` for a `main` that only
+  answers `Err`, such as `main() = Err("nothing to do")`. **`Err(e)` writes `error: ` and `e`'s
+  `Display` to standard error as one line, and exits with status 1.** It does this after whatever
+  `main` wrote to standard output and before the exit hooks run. `E` must implement `Display`;
+  an error type with no `Display`, even one with `Debug`, is refused. A union of errors, `IoError |
+  ParseError`, is shown by the `Display` of the member it holds, so every member must have one. An
+  `Ok` of any other type, such as `Result[string, E]`, is refused, since there is no status to read
+  from it.
+- Any other type is refused.
+
+Returning from `main`, with any of these, ends the program the same way: standard output is flushed,
+the exit hooks run on the main thread, and the process exits, ending the
+[threads](/spec/threads/) and actors still running. A trap in `main`, or in the error's `Display`
+while it is written, stops the program as a trap does anywhere, so no `error: ` line is written.
+A program built by `avin test` runs its tests and not `main`, so `main` is checked but not run.
+
 ## data
 
 `data` declares an algebraic data type: an immutable value with one or more variants.
@@ -548,8 +592,8 @@ main()
 `Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
 derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)). A data type whose
-variants have no fields is an enumeration, and `derives Enumerable` gives it `values()`, `ordinal()`,
-`name()` and `valueOf(name)` ([Enumerations](/spec/derivation/#enumerations)).
+variants have no fields is an enumeration, and `derives Enumerable` gives it `values`, `ordinal`,
+`name` and `valueOf(name)` ([Enumerations](/spec/derivation/#enumerations)).
 
 ### Changing fields: `with`
 
@@ -653,6 +697,14 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
   a member of the same name, and a member hides a top-level declaration. `self.balance` always
   reaches the field, so a method's parameter may share a field's name. In the class body, a class
   parameter's name is its field, so it reads what an assignment to a `var` stored.
+- **A field may share its name with a trait's method that takes a parameter list**, so a field of
+  any name leaves a type its `Display`, `Debug`, `Eq`, `Hash`, `Ord`, `Iterable` and every other
+  trait's methods, written or derived: `data Config(host: string, debug: bool)` prints, compares
+  and hashes. `x.name` and a bare `name` read the field; `x.name(args)` and a bare `name(args)` call
+  the method, so a field holding a function is called by reading it first, `val f = x.name`;
+  through the trait, or a type parameter it bounds, only the method is seen. Every
+  other method of a field's name is an error at its declaration: a method of no trait, and a
+  method of no parameter list, which the field implements instead.
 - Methods take the forms top-level functions take: a body after `=`, an indented body, or clauses,
   which match the arguments and not the receiver. A method may have type parameters of its own,
   after its class's.
@@ -663,6 +715,15 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
   the object's class has. A method's own type parameters are written, `box.pair[bool]`, or come
   from the expected function type. The same holds for the methods an `impl` adds to any type,
   `"hey".repeat` included. A method declared with no parameter list has no such value; see below.
+- **A method declared with an empty parameter list is a value only where a function type is
+  expected.** `val f: () -> int = c.bump`, `apply(c.bump)` with `apply(f: () -> int)`, and an
+  element of a `Vector[() -> int]` make the value; anywhere else, `println(xs.sorted)`,
+  `s"${s.isEmpty}"`, `c.bump == 0`, `val v = c.bump` with no type, or an argument whose parameter
+  is a type parameter or `Any`, naming it without a call is an error naming both fixes: the call,
+  `xs.sorted()`, and the lambda, `() -> xs.sorted()`. Among overloads that include one of no
+  parameters, a bare name with no expected function type gets the same error. A missing `()` is
+  far likelier there than a wanted function, which would otherwise surface only as wrong output.
+  A method with parameters, `acct.deposit`, is a value wherever it is named.
 - A field declared in the body without a type has its initializer's type. The body cannot
   `return`: it runs to its end to make the object.
 
@@ -692,7 +753,7 @@ val f = () -> c.head
   something else, the error names the lambda.
 - **Parentheses after one call what it yields.** `t.adder(4)`, where `adder -> (int) -> int`, calls
   the function `adder` yields, and `t.items(2)` indexes the sequence `items` yields. Where the
-  result is neither a function nor a sequence given an index, `c.head()` is an error naming the fix,
+  result is neither a function nor a sequence given an index, `c.head` is an error naming the fix,
   `head`.
 - **It is the only method of its name**: a class, a trait or the impls of a type cannot also have a
   method of that name with a parameter list, in the type itself or inherited, since `x.head` would
@@ -708,6 +769,21 @@ val f = () -> c.head
 - **A member is declared without a parameter list as it is; a function at the top level or in a
   block, with `def`** (below). A parameterless method takes no type parameters of its own,
   since `x.first[int]` would read as indexing its result; its class's type parameters it has.
+- **A static one is read on its type the same way**: `Color.values`, and through a type parameter
+  bounded by its trait, `T.values`, the type argument's own in each instance; `T.values()` is the
+  error naming the fix.
+- **The standard library declares every pure accessor without a parameter list**: a method of no
+  parameters that answers from its receiver, or a static one from its type, changing nothing and
+  handing out nothing to change or use up. `opt.isDefined`, `opt.get`, `r.isOk`, `e.swap`,
+  `s.trim`, `s.headOption`, `c.isDigit`, `n.abs`, `x.isNaN`, `d.toSeconds`, `date.year`,
+  `5.seconds`, `m.groupCount`, `err.message`, `json.keys`. What keeps `()` is what has an effect or
+  hands out a fresh mutable object or an iterator (`next()`, `iterator()`, `toBuffer()`,
+  `charIterator()`); what reaches a resource outside the program (a file, a socket, a child process,
+  a lock, a future, a signal); a constructor or factory (`Vector.empty[int]()`, `newBuilder()`); a
+  name that also has an overload with parameters (`s.toInt()` beside `s.toInt(16)`, and with it the
+  whole family `toLong()`, `toReal()`, `toBool()` and their `…Option()`; `stripMargin()` beside
+  `stripMargin('#')`); and the methods of the traits every type implements and derives produce,
+  `toString()`, `hash()`, `zero()`, `one()`, `negate()` and `shape()`.
 - **With `def`, the result type may be left to inference**: `def perimeter = 2.0 * (w + h)`. Without
   `def`, a name followed by `=` is an assignment.
 - It is not a field: `c.head = 3` is an error, and a class cannot declare a field and a method of
@@ -1655,7 +1731,7 @@ an `Err` fails the test with the error shown as the reason (`test answered Err: 
 reported at the test's name).
 
 ```text
-parse(text: string) -> Result[int, string] = if text == "" then Err("empty input") else Ok(text.length())
+parse(text: string) -> Result[int, string] = if text == "" then Err("empty input") else Ok(text.byteLength)
 
 @test("reads a word")
 readsAWord() -> Result[unit, string]

@@ -22,8 +22,8 @@ main()
     val event = json.parse("{\"id\": 7, \"cmd\": \"make\", \"tags\": [\"a\", \"b\"]}") match
         Ok(j) -> j
         Err(e) -> fail(s"bad event: $e")
-    println(event("cmd").asString())                    // Some(make)
-    println(event.get("exit").flatMap(x -> x.asInt()))  // None
+    println(event("cmd").asString)                    // Some(make)
+    println(event.get("exit").flatMap(x -> x.asInt))  // None
     println(event.with("exit", Json.num(0)))            // {"id":7,"cmd":"make","tags":["a","b"],"exit":0}
 ```
 
@@ -119,7 +119,7 @@ import avin.fs
 
 // The sum of every record's "bytes", read from a log far larger than memory.
 totalBytes(path: string) -> Result[long, json.JsonError]
-    val r = JsonReader.fromReader(fs.open(path).ok().get())
+    val r = JsonReader.fromReader(fs.open(path).ok.get)
     var sum: long = 0
     r.beginArray()?
     while r.nextElement()?
@@ -195,11 +195,11 @@ Each call but `depth`, `takeNull` and `error` answers a `Result`, so a decoder c
 
 ## Writing
 
-- `render()` is the compact text, with no white space: `{"a":[1,2]}`.
+- `render` is the compact text, with no white space: `{"a":[1,2]}`.
 - `pretty(indent = 2)` puts each element and member on its own line, `indent` spaces deeper than its
   container, with a space after each member's colon; an empty array or object stays `[]` or `{}`.
-  `pretty(0)` is `render()`.
-- `renderAscii()` is the compact text with every character beyond ASCII written as a `\u` escape,
+  `pretty(0)` is `render`.
+- `renderAscii` is the compact text with every character beyond ASCII written as a `\u` escape,
   one beyond U+FFFF as its surrogate pair.
 - `writeTo(out: Writer)` writes the compact text to a writer, and `quote(s, ascii = false)` is one
   string as a JSON string literal.
@@ -210,7 +210,7 @@ are written as they are. A `Long` is written as its digits. A `Real` is written 
 digits that read back as the same value, and always with a fraction or an exponent, so it reads back
 as a `Real`: `2.5`, `1.0`, `-0.0`, `100000000000000000000.0`. From 1e-6 up to 1e21 it is written out
 in full, and otherwise with an exponent: `1e+21`, `1.5e-7`, `5e-324`. A NaN or an infinity, which
-JSON cannot write, is written `null`. So `parse(j.render())` is `j` for every value with no NaN or
+JSON cannot write, is written `null`. So `parse(j.render)` is `j` for every value with no NaN or
 infinity in it, as are `pretty` and `renderAscii` read back, and the text read is the text rendered
 for any document already written compactly.
 
@@ -221,16 +221,16 @@ for any document already written compactly.
 | A member, or None | `j.get("key")`, the last member where the key is written twice |
 | An element, or None | `j.get(i)`, None outside the array |
 | A member or element that must be there | `j("key")`, `j(i)`, which trap naming the key or index when it is not |
-| A field's value of a kind | `asBool()`, `asString()`, `asVector()`, `asMembers()`, each an `Option` |
-| A number | `asLong()`: a `Long`, or a `Real` that is a whole number within a `long` (`3.0`, `1e3`); `asInt()` where that fits an `int`; `asReal()`: a `Real`, or a `Long` rounded to the nearest `real` |
-| Whether it is null, or has a member | `isNull()`, `has("key")` |
-| An object's keys, the size of an array or object | `keys()`, `size()` (0 for any other value) |
+| A field's value of a kind | `asBool`, `asString`, `asVector`, `asMembers`, each an `Option` |
+| A number | `asLong`: a `Long`, or a `Real` that is a whole number within a `long` (`3.0`, `1e3`); `asInt` where that fits an `int`; `asReal`: a `Real`, or a `Long` rounded to the nearest `real` |
+| Whether it is null, or has a member | `isNull`, `has("key")` |
+| An object's keys, the size of an array or object | `keys`, `size` (0 for any other value) |
 | An object with a member set | `j.with("key", value)`: the member replaced in place, or added at the end; any other value is returned unchanged |
 
 The accessors are Options so that they chain with `?` in a function answering an `Option`:
 
 ```avin
-exitCode(event: Json) -> Option[int] = event.get("result")?.get("exit")?.asInt()
+exitCode(event: Json) -> Option[int] = event.get("result")?.get("exit")?.asInt
 ```
 
 ## A program's own types
@@ -257,7 +257,7 @@ data Shape derives JsonEncoder, JsonDecoder
 main()
     println(json.encode(Person("Ada", 36, None)))     // {"full_name":"Ada","age":36,"home":null}
     println(json.encode[Shape](Circle(1.5)))         // {"kind":"Circle","radius":1.5}
-    println(json.decode[Person]("{\"full_name\": \"Ada\", \"age\": 36, \"home\": {\"street\": 1}}").err().get())
+    println(json.decode[Person]("{\"full_name\": \"Ada\", \"age\": 36, \"home\": {\"street\": 1}}").err.get)
     // home.street: expected a string, found a number at line 1, column 52
 ```
 

@@ -96,6 +96,10 @@ trait Iterator[+A]: Iterable[A]
     // an element only once the elements of the collection before it are used up.
     flatMap[B](f: (A) -> Iterable[B]) -> Iterator[B] = FlatMappedIterator(self, f, None)
 
+    // The values of the options `f` makes of each element, those that hold one, read as the source
+    // is read past each element.
+    flatMap[B](f: (A) -> Option[B]) -> Iterator[B] = CollectedIterator(self, f, None)
+
     // `pf` of each element it is defined at, tested as the source is read past each one.
     collect[B](pf: PartialFunction[A, B]) -> Iterator[B] = CollectedIterator(self, pf.lift(), None)
 
@@ -176,11 +180,15 @@ impl[T] Iterator[T]
 impl[T] Iterator[Iterable[T]]
     flatten -> Iterator[T] = FlatMappedIterator(self, x -> x, None)
 
+// An iterator of options yields the values they hold, lazily.
+impl[T] Iterator[Option[T]]
+    flatten -> Iterator[T] = CollectedIterator(self, x -> x, None)
+
 // An iterator that can look at its next element without moving past it. `peek()` answers the element
 // `next()` would, reading it from the source when it has not already, and traps when none is left;
 // `peekOption()` answers `Some` of it, or `None`.
 class BufferedIterator[A](private val source: Iterator[A], private var held: Option[A]): Iterator[A]
-    override hasNext() -> bool = held.isDefined() || source.hasNext()
+    override hasNext() -> bool = held.isDefined || source.hasNext()
 
     override next() -> A = held match
         Some(x) ->
@@ -189,7 +197,7 @@ class BufferedIterator[A](private val source: Iterator[A], private var held: Opt
         None -> source.next()
 
     peekOption() -> Option[A]
-        if held.isEmpty() && source.hasNext() then held = Some(source.next())
+        if held.isEmpty && source.hasNext() then held = Some(source.next())
         held
 
     peek() -> A = peekOption() match
@@ -411,6 +419,9 @@ impl[T] Iterable[T]
     // The elements of the collections `f` makes of each element, joined in order.
     flatMap[B](f: (T) -> Iterable[B]) -> Iterable[B] = flatMappedInto(self, f, Vector.newBuilder[B]())
 
+    // The values of the options `f` makes of each element, those that hold one, in order.
+    flatMap[B](f: (T) -> Option[B]) -> Iterable[B] = keptSomeInto(self, f, Vector.newBuilder[B]())
+
     // The elements that satisfy `p`.
     filter(p: (T) -> bool) -> Iterable[T] = keptInto(self, p, true, Vector.newBuilder[T]())
 
@@ -435,7 +446,7 @@ impl[T] Iterable[T]
         val it = iterator()
         while it.hasNext()
             val found = f(it.next())
-            if found.isDefined() then return found
+            if found.isDefined then return found
         None
 
     // A set of the elements, each equal one once.
@@ -486,6 +497,14 @@ impl[T] Iterable[Iterable[T]]
     flatten -> Vector[T]
         val b = Vector.newBuilder[T]()
         for xs in iterator() do b.addAll(xs)
+        b.result()
+
+// A collection of options flattens into one vector of the values they hold, in order.
+impl[T] Iterable[Option[T]]
+    flatten -> Vector[T]
+        val b = Vector.newBuilder[T]()
+        for o in iterator()
+            if o is Some(x) then b.addOne(x)
         b.result()
 
 // Ordered elements have a greatest and a least.
@@ -570,10 +589,10 @@ private class MappedIterator[A, B](source: Iterator[A], f: (A) -> B): Iterator[B
 // Holds the next element that satisfies `p` once `hasNext()` has found it.
 private class FilteredIterator[A](source: Iterator[A], p: (A) -> bool, private var found: Option[A]): Iterator[A]
     override hasNext() -> bool
-        while found.isEmpty() && source.hasNext()
+        while found.isEmpty && source.hasNext()
             val x = source.next()
             if p(x) then found = Some(x)
-        found.isDefined()
+        found.isDefined
 
     override next() -> A
         hasNext()
@@ -610,7 +629,7 @@ private class DroppedIterator[A](source: Iterator[A], private var skip: int): It
 private class TakenWhileIterator[A](source: Iterator[A], p: (A) -> bool, private var found: Option[A], private var done: bool): Iterator[A]
     override hasNext() -> bool
         if done then return false
-        if found.isDefined() then return true
+        if found.isDefined then return true
         if !source.hasNext()
             done = true
             return false
@@ -639,7 +658,7 @@ private class DroppedWhileIterator[A](source: Iterator[A], p: (A) -> bool, priva
 
     override hasNext() -> bool
         start()
-        found.isDefined() || source.hasNext()
+        found.isDefined || source.hasNext()
 
     override next() -> A
         start()
@@ -670,8 +689,8 @@ private class FlatMappedIterator[A, B](source: Iterator[A], f: (A) -> Iterable[B
 // Holds the next value `f` gives `Some` of once `hasNext()` has found it.
 private class CollectedIterator[A, B](source: Iterator[A], f: (A) -> Option[B], private var found: Option[B]): Iterator[B]
     override hasNext() -> bool
-        while found.isEmpty() && source.hasNext() do found = f(source.next())
-        found.isDefined()
+        while found.isEmpty && source.hasNext() do found = f(source.next())
+        found.isDefined
 
     override next() -> B
         hasNext()
@@ -754,11 +773,11 @@ private class WindowIterator[A](source: Iterator[A], size: int, step: int, priva
         Some(b.result())
 
     override hasNext() -> bool
-        if pending.isDefined() then return true
+        if pending.isDefined then return true
         if done then return false
         pending = following()
-        if pending.isEmpty() then done = true
-        pending.isDefined()
+        if pending.isEmpty then done = true
+        pending.isDefined
 
     override next() -> Vector[A]
         if !hasNext() then fail("next on an exhausted iterator")
@@ -772,13 +791,13 @@ private class WindowIterator[A](source: Iterator[A], size: int, step: int, priva
 // Holds the next element whose key is not in `seen` once `hasNext()` has found it.
 private class DistinctIterator[A, K](source: Iterator[A], key: (A) -> K, private var seen: Set[K], private var found: Option[A]): Iterator[A]
     override hasNext() -> bool
-        while found.isEmpty() && source.hasNext()
+        while found.isEmpty && source.hasNext()
             val x = source.next()
             val k = key(x)
             if !seen.contains(k)
                 seen = seen.incl(k)
                 found = Some(x)
-        found.isDefined()
+        found.isDefined
 
     override next() -> A
         hasNext()
@@ -839,14 +858,14 @@ private class IteratedIterator[A](private var current: A, f: (A) -> A, private v
 // Holds the element `f` gave once `hasNext()` has asked for it, and stops at the first `None`.
 private class UnfoldedIterator[A, S](private var state: S, f: (S) -> Option[(A, S)], private var found: Option[A], private var done: bool): Iterator[A]
     override hasNext() -> bool
-        if found.isDefined() then return true
+        if found.isDefined then return true
         if done then return false
         f(state) match
             Some((x, next)) ->
                 found = Some(x)
                 state = next
             None -> done = true
-        found.isDefined()
+        found.isDefined
 
     override next() -> A
         hasNext()

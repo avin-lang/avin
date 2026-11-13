@@ -174,6 +174,10 @@ struct FieldSymbol
     /** A `lazy val`, whose value is computed on its first read. The two fields after it hold its
      * state, which a read tests, and the closure that computes it, which the constructor stores. */
     lazy: bool
+    /** A core-library field initialized with `fieldUnset()`: the constructor stores nothing in it, so
+     * it holds zero bytes, not yet a value, until the class's own code writes it, and the class's
+     * variance is not checked against it (see `field_unset`). */
+    unset: bool
 
 /** A `data` type and its variants. Field types name the type's own parameters as
  * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
@@ -1082,6 +1086,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
     var entry: Option[usize] = None
+    var entry_answer: Buf[&Type] = buf()
     c.scope.get(qualified(root_module, "main")) match
         Some(ids) ->
             entry = Some(ids[0])
@@ -1107,9 +1112,17 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
             if takes_arguments && main.defaults.len() > 0 && main.defaults[0] is Some(_)
                 c.note(main_unit, main.decl.name_span, "`main`'s `args` has no default; `main` is `main()` or `main(args: Vector[string])`")
             if main.decl.type_params.len() > 0 then c.note(main_unit, main.decl.name_span, "`main` cannot be generic")
-            val result = main.result.unwrap_or(ErrorType)
-            if !(*result is Unit || *result is Int(_) || *result is Nothing || *result is ErrorType)
-                c.note(main_unit, main.decl.name_span, s"`main` yields unit or an integer, not ${type_name(result)}")
+            val result = zonk(&c, main.result.unwrap_or(ErrorType))
+            main_answer(&c, result) match
+                Some(args) ->
+                    if !(*args[0] is Unit || *args[0] is Int(_) || *args[0] is Nothing || *args[0] is ErrorType)
+                        c.note(main_unit, main.decl.name_span, s"`main` answers with a `Result[unit, E]` or a `Result[int, E]`, and its `Ok` holds ${type_name(args[0])}: `Ok` exits with 0 or with the integer, so it holds nothing or an exit status")
+                    elif !(*args[1] is ErrorType) && !displays(&c, args[1])
+                        c.note(main_unit, main.decl.name_span, s"`main`'s error is shown by its `Display`, and `${type_name(args[1])}`, the error `main` answers, does not implement `Display`")
+                    else entry_answer = args
+                None ->
+                    if !(*result is Unit || *result is Int(_) || *result is Nothing || *result is ErrorType)
+                        c.note(main_unit, main.decl.name_span, s"`main` yields unit, an integer or a `Result[unit, E]` or `Result[int, E]`, not ${type_name(result)}")
         // A program built for its tests runs them rather than `main`, so it may have none.
         None -> if !testing then c.note(main_unit, Span(0, 0), "a program needs a `main` function")
     report_derived(&c)
@@ -1130,7 +1143,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1251,6 +1264,15 @@ private test_answer(c: *Checker, result: &Type) -> Option[&Type]
         None -> return None
     *result match
         Data(id, _, args) -> if id == result_id && args.len() == 2 && *args[0] is Unit then Some(args[1]) else None
+        _ -> None
+
+// The two type arguments of a `main` that answers with a `Result`: its `Ok` type and its error.
+private main_answer(c: *Checker, result: &Type) -> Option[Buf[&Type]]
+    val result_id = core_data(c, "Result") match
+        Some(r) -> r
+        None -> return None
+    *result match
+        Data(id, _, args) -> if id == result_id && args.len() == 2 then Some(args) else None
         _ -> None
 
 // Whether values of `t` implement the core library's `Display`.
@@ -2457,6 +2479,25 @@ private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
     None -> d.target.span
 
 /** Whether the trait `t` declares a method named `name`, or one of the traits it requires does. */
+/** Whether a trait class `id` conforms to declares a method `name`: one written after `:` by the
+ * class or a superclass, or one an impl of the class implements. Such a method with a parameter
+ * list may share its name with a field: `x.name` reads the field and `x.name(args)` calls it. */
+private class_trait_declares(c: *Checker, id: usize, name: string, depth: usize) -> bool
+    if depth > c.classes.len() then return false
+    for t in c.classes[id].traits
+        if *t is Class(r, _, _)
+            if trait_declares(c, r, name, 0) then return true
+    for block in c.impls
+        if *block.target is Class(k, _, _)
+            if k == id && block.trait_type is Some(tt)
+                if *tt is Class(r, _, _)
+                    if trait_declares(c, r, name, 0) then return true
+    c.classes[id].superclass match
+        Some(s) -> *s match
+            Class(p, _, _) -> class_trait_declares(c, p, name, depth + 1)
+            _ -> false
+        None -> false
+
 private trait_declares(c: *Checker, t: usize, name: string, depth: usize) -> bool
     if depth > c.classes.len() then return false
     for m in c.classes[t].decl.members
@@ -2641,7 +2682,7 @@ private declare_fields(c: *Checker, unit: usize)
                         val keyword = if f.mutable then "var" else "val"
                         if !f.public then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be private")
                         elif f.lazy then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be lazy: each conforming class computes it as it is made")
-                        elif f.declared is None then c.note(unit, f.span, s"`${f.name}` is a trait's field, so it declares its type, as in `$keyword ${f.name}: int = …`")
+                        elif f.declared is None then c.note(unit, f.span, s"`${f.name}` is a trait's field, so it declares its type, as in `$keyword ${f.name}: int = 0`")
                     AbstractFieldMember(f) ->
                         if f.mutable then c.note(unit, f.span, s"`${f.name}` has no value, so it is a trait's `val`, which is never assigned through the trait; write `val ${f.name}`, or give the `var` a value")
                         elif !f.public then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be private")
@@ -2704,7 +2745,7 @@ private declare_fields(c: *Checker, unit: usize)
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
             val written = resolve_type(c, unit, cp.param.ty)
             val field_type = if cp.param.variadic then vector_of(c, written) else written
-            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false))
+            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false, false))
         var state: Buf[TraitState] = buf()
         for m in d.members
             if m is FieldMember(f)
@@ -2719,12 +2760,12 @@ private declare_fields(c: *Checker, unit: usize)
                         for s in state
                             if s.field.name == f.name then seen = true
                         if seen then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
-                        else state.push(TraitState(FieldSymbol(f.name, f.span, ty, f.mutable, true, false, id, false), f, 0, None, 0))
+                        else state.push(TraitState(FieldSymbol(f.name, f.span, ty, f.mutable, true, false, id, false, false), f, 0, None, 0))
                     continue
-                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id, f.lazy))
+                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id, f.lazy, false))
                 if f.lazy
-                    fields.push(FieldSymbol(s"<state of ${f.name}>", f.span, Some(Int(64)), false, false, false, id, false))
-                    fields.push(FieldSymbol(s"<initializer of ${f.name}>", f.span, lazy_initializer_type(ty), false, false, false, id, false))
+                    fields.push(FieldSymbol(s"<state of ${f.name}>", f.span, Some(Int(64)), false, false, false, id, false, false))
+                    fields.push(FieldSymbol(s"<initializer of ${f.name}>", f.span, lazy_initializer_type(ty), false, false, false, id, false, false))
         c.classes[id].fields = fields
         c.classes[id].state = state
         c.generic = outer_generic
@@ -2807,7 +2848,7 @@ private superclass_of(c: *Checker, unit: usize, id: usize, parent: &Expr) -> Opt
     for t in written
         args.push(resolve_type(c, unit, t))
     if args.len() != s.decl.type_params.len()
-        if args.len() == 0 then c.note(unit, named.span, s"`$name` is generic; write its type arguments, as in `$name[int](…)`")
+        if args.len() == 0 then c.note(unit, named.span, s"`$name` is generic; write its type arguments, as in `$name[int](arguments)`")
         else c.note(unit, named.span, s"`$name` takes ${count(s.decl.type_params.len(), "type argument")}, not ${args.len()}")
         return None
     Some(Class(sid, name, args))
@@ -3428,7 +3469,7 @@ private declare_methods(c: *Checker, unit: usize)
             var clash: Option[usize] = None
             for i in 0..<k.fields.len()
                 if k.fields[i].name == f.name && (i >= k.inherited || k.fields[i].public) then clash = Some(i)
-            if clash is Some(i)
+            if clash is Some(i) && (f.parameterless || !class_trait_declares(c, id, f.name, 0))
                 c.note(file_unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
                 continue
             val bodyless = f.body is None && f.clauses.len() == 0
@@ -3621,11 +3662,17 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         if language_static(target, f.name)
             c.note(unit, f.name_span, s"`$type_name_of.${f.name}` is the language's own, and no static member can redefine it")
             return
+    // A method implementing a trait's method with a parameter list may share its name with a field:
+    // `x.name` reads the field and `x.name(args)` calls the method, so a field of any name leaves
+    // the type its `Display`, `Debug`, `Eq`, `Ord` and every other trait's methods.
+    val implements_trait = trait_id match
+        Some(t) -> !f.parameterless && trait_declares(c, t, f.name, 0)
+        None -> false
     if *target is Data(id, _, _)
         var field = false
         for v in c.data[id].variants
             if contains_name(v.field_names, f.name) then field = true
-        if field
+        if field && !implements_trait
             c.note(unit, f.name_span, s"`${f.name}` is already a field of `$type_name_of`")
             return
     // The methods of this name the type's impls have added so far, which this one overloads.
@@ -4063,7 +4110,7 @@ private check_apply_overloads(c: *Checker, o: usize)
         None -> return
     for m in k.methods
         if c.symbols[m].decl.name == "apply" && clashes(c, made, m)
-            c.note(k.unit, c.symbols[m].decl.name_span, s"`apply` takes the same parameter types as ${made.what}, which `${k.name}(…)` also calls, so no call could choose between them")
+            c.note(k.unit, c.symbols[m].decl.name_span, s"`apply` takes the same parameter types as ${made.what}, which `${k.name}(arguments)` also calls, so no call could choose between them")
 
 // A method declared without a parameter list is the only method of its name a class, trait or data
 // type has: `x.name` calls it, so there is no call left to choose another overload with. Each of
@@ -4569,6 +4616,7 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                                 slots[j] = field_getter(c, k.unit, k.module_name, k.name, k.fields[i].span, k.fields[i].name, own_class_type(k, id), class_owner(id), k.decl.type_params, Some(id))
                                 filled = true
                     if filled then continue
+                    if !is_parameterless(c, m) && is_trait(c, c.symbols[m].owner_class.unwrap()) then continue
                     if actor_own_method(k.name, owner) then c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is one of every actor's own methods, `${c.symbols[m].name}`; name the field something else")
                     else c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is already a method of `$owner`")
     var conformed: Buf[&Type] = buf()
@@ -4583,7 +4631,9 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
     for f in k.fields
         if f.owner == id && f.public
             if trait_method(c, id, f.name) is Some(m)
-                if !is_trait_field(c, m) && !field_may_implement(c, m) then c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
+                // A trait's method with a parameter list leaves the name to a field: `x.name` reads
+                // the field and `x.name(args)` calls the method.
+                if !is_trait_field(c, m) && !field_may_implement(c, m) && is_parameterless(c, m) then c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
     val self_type = own_class_type(k, id)
     for i in 0..<k.methods.len()
         val m = k.methods[i]
@@ -4864,13 +4914,18 @@ private data_supplied_field(c: *Checker, id: usize, tm: usize) -> usize
 // A problem with data type `id`'s conformance to trait `t` is reported at the impl that brings the
 // trait in: the impl of `t` itself, or of a trait requiring it.
 private report_conformance(c: *Checker, id: usize, t: usize, message: string)
-    for block in c.impls
+    for i in 0..<c.impls.len()
+        val block = c.impls[i]
         if *block.target is Data(d, _, _)
             if d != id then continue
             if block.trait_type is Some(tt)
                 if *tt is Class(k, _, _)
                     if k == t || requires_trait(c, t, k, 0)
-                        c.note(block.unit, block.decl.target.span, message)
+                        // An impl a template made is the deriving type's: what it lacks is reported
+                        // at the type's `derives` entry, never inside the library's template.
+                        if derived_of_impl(c, i) is Some(x)
+                            c.note(c.derived[x].site.unit, c.derived[x].site.at, message)
+                        else c.note(block.unit, block.decl.target.span, message)
                         return
     c.note(c.data[id].unit, c.data[id].decl.span, message)
 
@@ -5120,7 +5175,7 @@ private shape_mismatch(c: *Checker, m: usize, target: usize) -> Option[string]
     val mine = is_parameterless(c, m)
     if mine == is_parameterless(c, target) then return None
     val name = c.symbols[m].decl.name
-    if mine then Some(s"which is declared with a parameter list, `$name()`; declare this one `$name() -> …` too") else Some(s"which is declared without a parameter list; declare this one `$name -> …` too")
+    if mine then Some(s"which is declared with a parameter list, `$name()`; declare this one `$name() -> body` too") else Some(s"which is declared without a parameter list; declare this one `$name -> body` too")
 
 // The results of overrides, compared once every body is checked, since a result may be inferred: an
 // override yields the overridden method's result or, where that is a class, a subclass of it.
@@ -5151,6 +5206,9 @@ private check_class_variance(c: *Checker, id: usize)
         // A trait's field the class stores is checked with the trait, and the trait's arguments with
         // the class's traits.
         if f.owner != id then continue
+        // A field the class fills itself is written only with values its own code made for this
+        // instance; see `field_unset`.
+        if f.unset then continue
         val ty = f.ty.unwrap_or(ErrorType)
         if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
         else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
@@ -5733,6 +5791,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         elif name == "holds_handles"
             if module_name != "avin.actors" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.actors`")
             elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
+        // A field's initializer that leaves the field zero, `[T]() -> T`, the core library's.
+        elif name == "field_unset"
+            if module_name != CoreModule then c.note(unit, f.name_span, s"`$name` is an intrinsic of the core library")
+            elif params.len() != 0 || type_params.len() != 1 || !(*result.unwrap_or(Unit) is TypeVar(_, _, _)) then c.note(unit, f.name_span, s"intrinsic `$name` takes no value and answers its type parameter")
         // The operations of memory crossing a C binding in place, on objects laid out as the runtime's
         // `CMemory`, which only `avin.c` declares.
         elif is_c_memory_intrinsic(name)
@@ -5843,6 +5905,19 @@ private intrinsic_of(c: *Checker, unit: usize, module_name: string, f: &Function
 
 /** Whether `name` is one of the operations of `avin.c`'s views and blocks. */
 is_c_memory_intrinsic(name: string) -> bool = name.starts_with("c_view_") || name == "c_block_new"
+
+// `field_unset` is the core library's way to give a class a field that holds no value until the
+// class's own code writes one, for a cell that is filled once, after the object is made, with values
+// computed then: a lazy list's element and the rest of the list. A field initialized with a call of
+// it is a `private var` with a declared type; the constructor stores nothing in it, so it holds
+// the zero bytes the object was made with, which are not yet a value (as an array's spare capacity
+// is not) and must be written before they are read. Since the class writes it only with values it
+// computed for that same instance, the field is no position for the class's variance, as a `val`'s
+// value computed in the constructor is not. Called anywhere else it traps.
+/** Whether `e` is a call of the `field_unset` intrinsic. */
+private is_field_unset(c: *Checker, e: &TExpr) -> bool = e.kind match
+    Call(f, _, _) -> c.symbols[f].intrinsic.unwrap_or("") == "field_unset"
+    _ -> false
 
 /** Whether `name` is one of the operations of `avin.threads.Atomic`. */
 is_atomic_intrinsic(name: string) -> bool =
@@ -7770,7 +7845,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 None -> c.classes.len()
             if k < c.classes.len() && c_value_type(c.classes[k].decl) is Some(_) then value_receiver = Some(k)
             elif k >= c.classes.len() || c_handle_type(c.classes[k].decl) is None
-                c.note(unit, a.span, "`@c` on a method binds a method of a C handle, a class declared with `@c(type: …)`, or of an opaque value, one declared with `@c(value: …)`; a C binding is otherwise a top-level function")
+                c.note(unit, a.span, "`@c` on a method binds a method of a C handle, a class declared with `@c(type: \"int *\")`, or of an opaque value, one declared with `@c(value: \"struct point\")`; a C binding is otherwise a top-level function")
                 continue
             else receiver_class = Some(k)
         if f.type_params.len() > 0
@@ -8947,7 +9022,7 @@ private check_c_struct_declaration(c: *Checker, unit: usize, d: &DataDecl)
     if d.type_params.len() > 0 then c.note(unit, d.type_params[0].span, "a C struct mirror has no type parameters: it mirrors one C struct")
     if d.variants.len() != 1 || d.variants[0].name != d.name
         val at = if d.variants.len() > 0 then d.variants[if d.variants.len() > 1 then 1 else 0].span else d.span
-        c.note(unit, at, s"a C struct mirror has one variant, named as the type, whose fields are the struct's: `${d.name}(…)`")
+        c.note(unit, at, s"a C struct mirror has one variant, named as the type, whose fields are the struct's: `${d.name}(fields)`")
     for v in d.variants
         for va in v.annotations
             if va.name == "c" then c.note(unit, va.span, "`@c` on a variant names an enumerator of a C enum mirror; a struct mirror's fields name their C fields with `@c(\"name\")`")
@@ -9146,7 +9221,7 @@ private check_c_value_declaration(c: *Checker, unit: usize, d: &ClassDecl)
                 Ok(t) -> t.ty match
                     CTypedef(_) -> ""
                     CRecordType(_) -> ""
-                    CPointerType -> s"`$text` is a pointer, which is a handle, a class declared `@c(type: …)`"
+                    CPointerType -> s"`$text` is a pointer, which is a handle, a class declared `@c(type: \"int *\")`"
                     CText(_) -> s"`$text` is a C string, which crosses as `string`"
                     _ -> s"`$text` is not a struct or a union: a scalar crosses as itself"
                 Err(why) -> s"`$text` is not a C type: $why"
@@ -10050,11 +10125,16 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
                     None ->
                         val inferred = zonk(c, typed.ty)
                         if has_unknowns(inferred)
-                            c.note(unit, f.span, s"cannot infer the type of the field `${f.name}`; declare it, as in `val ${f.name}: int = …`")
+                            c.note(unit, f.span, s"cannot infer the type of the field `${f.name}`; declare it, as in `val ${f.name}: int = 0`")
                             c.classes[k].fields[index].ty = Some(ErrorType)
                         else c.classes[k].fields[index].ty = Some(if *inferred is Nothing then ErrorType else inferred)
                 if *typed.ty is Nothing then made.finishes = false
-                made.items.push(TExpr(f.span, Unit, StoreField(made.receiver, index, typed, false)))
+                if is_field_unset(c, typed)
+                    // The object is made all zero, so the field is left as it is: see `field_unset`.
+                    if declared is None then c.note(unit, f.span, s"a field left unset by the intrinsic `field_unset` declares its type, as in `private var ${f.name}: T = …`")
+                    if f.public || !f.mutable then c.note(unit, f.span, s"a field left unset by the intrinsic `field_unset` is a `private var`, which the class's own code writes before it reads it")
+                    c.classes[k].fields[index].unset = true
+                else made.items.push(TExpr(f.span, Unit, StoreField(made.receiver, index, typed, false)))
                 made.index = index + 1
                 c.classes[k].ready = made.index
             StatementMember(s) ->
@@ -10094,7 +10174,7 @@ private lazy_field(c: *Checker, k: usize, made: *Construction, f: FieldDecl)
             Function(_, r, _) -> r
             _ -> ErrorType
         if has_unknowns(result)
-            c.note(unit, f.span, s"cannot infer the type of the field `${f.name}`; declare it, as in `lazy val ${f.name}: int = …`")
+            c.note(unit, f.span, s"cannot infer the type of the field `${f.name}`; declare it, as in `lazy val ${f.name}: int = 0`")
             c.classes[k].fields[index].ty = Some(ErrorType)
         else c.classes[k].fields[index].ty = Some(if *result is Nothing then ErrorType else result)
     c.classes[k].fields[index + 2].ty = lazy_initializer_type(c.classes[k].fields[index].ty)
@@ -10432,6 +10512,14 @@ private is_trait_self(t: &Type) -> bool = *t is TypeVar(_, _, _) && !is_integer_
 
 /** `self`, the instance the enclosing constructor or method works on. A static member works on no
  * instance, so there the receiver's members are an error. */
+/** Whether `self`'s type has a method `name`, beside the field of that name a bare `name` reads. */
+private self_has_method(c: *Checker, at: Span, name: string) -> bool
+    if in_static(c) then return false
+    val me = binding_ref(c, at, "self") match
+        Some(t) -> t
+        None -> return false
+    methods_of(c, me.ty, name).len() > 0
+
 private self_ref(c: *Checker, at: Span) -> &TExpr
     if refuse_static_self(c, at, " and cannot use the members of a value") then return TExpr(at, ErrorType, UnitConst)
     binding_ref(c, at, "self").unwrap()
@@ -10605,7 +10693,7 @@ private one_of(c: *Checker, e: &Expr, what: string, want: &Type, found: Buf[&Typ
     var names: Buf[string] = buf()
     for m in found
         names.push(s"`${type_name(m)}`")
-    c.note(unit_of(c), e.span, s"$what could be ${spoken_list(names)}, more than one member of `${type_name(want)}`; give it the type you mean first, as in `val x: ${type_name(found[0])} = …`")
+    c.note(unit_of(c), e.span, s"$what could be ${spoken_list(names)}, more than one member of `${type_name(want)}`; give it the type you mean first, as in `val x: ${type_name(found[0])} = value`")
     None
 
 private first_if_one(found: Buf[&Type]) -> Option[&Type] = if found.len() == 1 then Some(found[0]) else None
@@ -10716,7 +10804,7 @@ private inject(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
             var names: Buf[string] = buf()
             for m in shaped
                 names.push(s"`${type_name(m)}`")
-            c.note(unit_of(c), typed.span, s"this value could be ${spoken_list(names)}, more than one member of `${type_name(w)}`; give it the type you mean first, as in `val x: ${type_name(shaped[0])} = …`")
+            c.note(unit_of(c), typed.span, s"this value could be ${spoken_list(names)}, more than one member of `${type_name(w)}`; give it the type you mean first, as in `val x: ${type_name(shaped[0])} = value`")
             return TExpr(typed.span, ErrorType, typed.kind)
         if shaped.len() == 0 then return typed
         val m = shaped[0]
@@ -10743,7 +10831,7 @@ private inject(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
                 names.push(type_article_quoted(m))
             val first = type_name(candidates[0])
             val local = to_lower(first[0..<1])
-            c.note(unit_of(c), typed.span, s"${type_article_quoted(t)} is ${if candidates.len() == 2 then "both " else ""}${spoken_list(names)}, so it could be either member of `${type_name(w)}`; give it the type you mean first, as in `val $local: $first = …`")
+            c.note(unit_of(c), typed.span, s"${type_article_quoted(t)} is ${if candidates.len() == 2 then "both " else ""}${spoken_list(names)}, so it could be either member of `${type_name(w)}`; give it the type you mean first, as in `val $local: $first = value`")
             return TExpr(typed.span, ErrorType, typed.kind)
     fits(c, t, chosen)
     TExpr(typed.span, w, Box(to_trait(c, typed, chosen)))
@@ -10856,7 +10944,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
         else member_expr(c, e, target, name, expected)
     Call(callee, args) ->
         if bare_placeholder(args) is Some(blank)
-            c.note(unit_of(c), blank, "`_` alone as an argument makes the call around it a lambda, which stands only as another call's argument or a declared `val`'s value; write the lambda out, as in `x -> …`")
+            c.note(unit_of(c), blank, "`_` alone as an argument makes the call around it a lambda, which stands only as another call's argument or a declared `val`'s value; write the lambda out, as in `x -> body`")
             TExpr(e.span, ErrorType, UnitConst)
         else call_expr(c, e.span, callee, args, expected)
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
@@ -10911,9 +10999,18 @@ private bare_placeholder(args: Buf[Argument]) -> Option[Span]
 // The diagnostic for a lambda's parameter whose type nothing gives; a placeholder lambda's
 // parameter is one of its `_`s, which has no place for a type, so the lambda is written out.
 private untyped_param(name: string, more: bool) -> string
-    val rest = if more then ", …" else ""
-    if name.starts_with("_$") then return s"cannot infer the type of this `_`; write the lambda out with the type, as in `(x: int$rest) -> …`"
-    s"cannot infer the type of `$name`; write it, as in `($name: int$rest) -> …`"
+    val rest = if more then ", other: int" else ""
+    if name.starts_with("_$") then return s"cannot infer the type of this `_`; write the lambda out with the type, as in `(x: int$rest) -> body`"
+    if name.starts_with("yield ") then return untyped_generator(name)
+    s"cannot infer the type of `$name`; write it, as in `($name: int$rest) -> body`"
+
+/** The diagnostic for the function a `for` with `yield` makes of a generator, whose parameter is
+ * named `yield item N` and then, for a generator that binds one name, that name: the user wrote the
+ * generator and its source, so the diagnostic names them and suggests typing the source. */
+private untyped_generator(name: string) -> string
+    val parts = name.split(" ")
+    val written = if parts.len == 4 then s"`${parts[3]}`" else "an element"
+    s"cannot infer the type of $written, which comes from this generator's source; give the source its type arguments where it is made, as in `Err[int, string](message)`, or the collection a type, as in `val source: Vector[int] = items`"
 
 private placeholder_lambda(params: Buf[LambdaParam]) -> bool = params.len() > 0 && params[0].name.starts_with("_$")
 
@@ -11030,7 +11127,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     val (chosen, is_variant) = choose_variant(c, at, name, expected)
     if chosen is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
-        c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(…)`")
+        c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(arguments)`")
     elif is_variant then ()
     elif tested_named(c, name) then c.note(symbol.unit, at, s"`$name` is bound by an `is` test, and is in scope only where that test is known to hold")
     elif alias_not_value(c, unit_of(c), name) is Some(message) then c.note(symbol.unit, at, message)
@@ -11088,7 +11185,7 @@ private field_type(c: *Checker, k: usize, index: usize, at: Span) -> &Type
         check_class_body_upto(c, k, index)
         return c.classes[k].fields[index].ty.unwrap_or(ErrorType)
     val name = c.classes[k].fields[index].name
-    c.note(unit_of(c), at, s"the type of the field `$name` is needed before its initializer is checked; declare it, as in `val $name: int = …`")
+    c.note(unit_of(c), at, s"the type of the field `$name` is needed before its initializer is checked; declare it, as in `val $name: int = 0`")
     ErrorType
 
 // The method `name` that a value of type `t` has: its class's, or one an impl adds to its data or
@@ -11212,6 +11309,12 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
     val params = wanted match
         Some(ps) -> ps
         None ->
+            // With an overload of no parameters among them, the likelier slip is a call missing its
+            // parentheses, so the error names the call.
+            for m in ms
+                if c.symbols[m].params.len() == 1
+                    empty_list_without_call(c, at, receiver, name)
+                    return TExpr(at, ErrorType, UnitConst)
             c.note(unit, at, s"`$name` is overloaded, so as a value with no expected function type it is ambiguous: ${overload_list(c, ms)} could each be meant")
             return TExpr(at, ErrorType, UnitConst)
     var fitting: Buf[usize] = buf()
@@ -11309,6 +11412,9 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
         return method_call(c, at, at, receiver, m, buf(), explicit, expected, false, buf())
     if refuse_unmet_conformance(c, at, receiver.ty, m) then return TExpr(at, ErrorType, UnitConst)
     if refuse_static_on_value(c, at, receiver, m) then return TExpr(at, ErrorType, UnitConst)
+    if c.symbols[m].params.len() == 1 && !function_expected(c, expected)
+        empty_list_without_call(c, at, receiver, c.symbols[m].decl.name)
+        return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols[m]
     val name = target.decl.name
     val known = receiver_type_args(c, receiver.ty, m)
@@ -11378,6 +11484,21 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     if !on_type then items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
     items.push(TExpr(at, ty, FunctionValue(id, buf())))
     TExpr(at, ty, Block(items))
+
+// Whether the expected type is a function type: the one place a method declared with an empty
+// parameter list may be named without a call.
+private function_expected(c: *Checker, expected: Option[&Type]) -> bool
+    expected match
+        Some(want) -> *zonk(c, want) is Function(_, _, _) || *zonk(c, want) is ErrorType
+        None -> false
+
+// `x.m` with no call, where `m` is declared `m()`, and no function type is expected: almost always a
+// call missing its parentheses, so this is an error naming the call and the lambda.
+private empty_list_without_call(c: *Checker, at: Span, receiver: &TExpr, name: string)
+    // A bare name inside the class has the name's own span for its implicit `self`.
+    val bare = receiver.span.start == at.start && receiver.span.end == at.end
+    val shown = if receiver.kind is TypeReceiver then s"${type_name(zonk(c, receiver.ty))}.$name" else if bare then name else s"x.$name"
+    c.note(unit_of(c), at, s"`$name` is declared with an empty parameter list, so naming it without a call makes a function value, which is allowed only where a function type is expected: call it, as in `$shown()`, or for a function write a lambda, as in `() -> $shown()`")
 
 // Whether code that may use the private members of class `k` is being checked: code of the class
 // itself, or of its companion; for a data type's companion object, a method an impl adds to the type.
@@ -12331,13 +12452,13 @@ private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef]
         None -> return TExpr(at, ErrorType, UnitConst)
     if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), explicit, expected)
     val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
-    c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(…)`")
+    c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(arguments)`")
     TExpr(at, ErrorType, UnitConst)
 
 // A variant with fields named with type arguments and not called, as in `Some[int]`: reported, since
 // a variant with fields is not a value.
 private variant_needs_call(c: *Checker, at: Span, name: string) -> &TExpr
-    c.note(unit_of(c), at, s"`$name` has fields; call it, as in `$name(…)`")
+    c.note(unit_of(c), at, s"`$name` has fields; call it, as in `$name(arguments)`")
     TExpr(at, ErrorType, UnitConst)
 
 // `T.V(args)`: the variant made from the arguments. Type arguments are written once, on the type,
@@ -12386,7 +12507,7 @@ private global_type(c: *Checker, g: usize, at: Span) -> &Type
         check_function(c, init)
         return c.symbols[init].result.unwrap_or(ErrorType)
     val name = c.globals[g].name
-    c.note(unit_of(c), at, s"the type of `$name` is needed while its initializer is checked; declare it, as in `val $name: int = …`")
+    c.note(unit_of(c), at, s"the type of `$name` is needed while its initializer is checked; declare it, as in `val $name: int = 0`")
     ErrorType
 
 // A `lazy val` is read through its initializer's call, which the read makes when it is the first.
@@ -12402,7 +12523,7 @@ private settle_global(c: *Checker, g: usize)
     if global.object is Some(_) then return
     val t = zonk(c, c.symbols[global.init].result.unwrap_or(ErrorType))
     if has_unknowns(t)
-        c.note(global.unit, global.span, s"cannot infer the type of `${global.name}`; declare it, as in `val ${global.name}: int = …`")
+        c.note(global.unit, global.span, s"cannot infer the type of `${global.name}`; declare it, as in `val ${global.name}: int = 0`")
         c.symbols[global.init].result = Some(ErrorType)
     else c.symbols[global.init].result = Some(t)
 
@@ -12593,7 +12714,13 @@ private compound_assign(c: *Checker, e: &Expr, target: &Expr, spelling: string, 
     var items: Buf[&Expr] = buf()
     var place = target
     target.kind match
-        Name(_) -> ()
+        Name(n) ->
+            // A method of the enclosing class is no place to assign: say so, before reading it as a
+            // value reports something else.
+            if lookup_local(c, n) is None && param_index(c, n) is None && class_member(c, n) is Some(MethodOf(_))
+                assignable(c, target)
+                check_statement(c, value)
+                return TExpr(e.span, ErrorType, UnitConst)
         Member(object, field) ->
             if !(object.kind is Name(_))
                 val held = s"compound object ${op_span.start}"
@@ -13709,7 +13836,7 @@ private interpolate_expr(c: *Checker, e: &Expr, prefix: string, chunks: Buf[stri
         // Where a call fails and another module also declares an interpolator of the name, which
         // the file does not import, the error is followed by the module that would be imported.
         if hidden != "" && c.reported_count > before
-            c.note(unit, e.span, s"another interpolator `$prefix\"…\"` is declared in ${module_label(hidden)}, which this file does not import; add `import $hidden`")
+            c.note(unit, e.span, s"another interpolator `$prefix\"text\"` is declared in ${module_label(hidden)}, which this file does not import; add `import $hidden`")
         return result
     formatted_text(c, e, prefix == "f", chunks, holes)
 
@@ -13810,13 +13937,13 @@ private formatted_text(c: *Checker, e: &Expr, specifiers: bool, chunks: Buf[stri
                 else ok = false
             Some(p) -> specified(c, value, p) match
                 Some(layout) ->
-                    if (p.conversion == "s" || p.conversion == "?") && (p.precision != "" || p.precision_hole is Some(_))
+                    if (p.conversion == "s" || p.conversion == "?") && (p.precision != "" || p.precision_hole is Some(_) || (!fills_its_own_field(c, value) && (p.width != "" || p.width_hole is Some(_))))
                         items.push(cut_to_precision(c, at, held, writer.ty, value, if p.conversion == "?" then "writeDebugged" else "writeDisplayed", layout))
                     else items.push(rendered(c, at, held, writer.ty, value, if p.conversion == "?" then "debug" else "display", layout))
                 None -> ok = false
     if text != "" then items.push(writer_call(c, at, held, writer.ty, "write", Expr(at, StringLit(text)), None))
     if !ok then return TExpr(at, ErrorType, UnitConst)
-    items.push(Expr(at, Call(Expr(at, Member(checked_slot(c, TExpr(at, writer.ty, Local(held))), "text")), buf())))
+    items.push(Expr(at, Member(checked_slot(c, TExpr(at, writer.ty, Local(held))), "text")))
     check_expr(c, block_of(at, items), None)
 
 private is_format_flag(b: u8) -> bool = b == u8('-') || b == u8('+') || b == u8(' ') || b == u8('0') || b == u8('#')
@@ -13850,13 +13977,20 @@ private cut_to_precision(c: *Checker, at: Span, held: usize, ty: &Type, value: &
     args.push(Argument(at, None, layout, false))
     Expr(at, Call(Expr(at, Name(core_path(writer))), args))
 
+// Whether a hole of this type is a built-in value, whose `Display` and `Debug` always write their
+// text in the field the spec describes, so a width needs no field made around them.
+private fills_its_own_field(c: *Checker, h: &TExpr) -> bool = *zonk(c, h.ty) match
+    Unit | Bool | Char | Real | Str | Byte | Int(_) -> true
+    _ -> false
+
 // Whether the hole's type implements `Display`, reporting why not when it does not.
 private implements_display(c: *Checker, h: &TExpr) -> bool
     val t = zonk(c, h.ty)
     core_trait(c, "Display") match
         Some(display) ->
             if conforms_to_bound(c, t, display) then return true
-            c.note(unit_of(c), h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated${underived_reason(c, t, "Display")}")
+            val hint = if *t is Function(_, _, _) then "; a function value is never shown: to show what it returns, call it" else underived_reason(c, t, "Display")
+            c.note(unit_of(c), h.span, s"`${type_name(t)}` does not implement `Display`, so it cannot be interpolated$hint")
             false
         None ->
             c.note(unit_of(c), h.span, "the core library declares no `Display`")
@@ -14014,8 +14148,8 @@ private interpolators_named(c: *Checker, at: Span, name: string) -> Buf[usize]
         if elsewhere.len() > 0 then c.hidden_module = elsewhere[0]
         return seen
     if elsewhere.len() > 0
-        c.note(unit, at, s"the interpolator `$name\"…\"` is declared in ${module_label(elsewhere[0])}, which this file does not import; add `import ${elsewhere[0]}`")
-    else c.note(unit, at, s"`$name\"…\"` names no interpolator: `StringContext` has no method `$name` here")
+        c.note(unit, at, s"the interpolator `$name\"text\"` is declared in ${module_label(elsewhere[0])}, which this file does not import; add `import ${elsewhere[0]}`")
+    else c.note(unit, at, s"`$name\"text\"` names no interpolator: `StringContext` has no method `$name` here")
     seen
 
 // `StringContext([parts…]).prefix(holes…)`, naming the core library's `StringContext` whatever the
@@ -14499,7 +14633,7 @@ private for_expr(c: *Checker, e: &Expr, pattern: &Pattern, source: &Expr, body: 
 // bound in the function the elements are passed to, beside the element, as `val`s in one block.
 private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: &Expr, expected: Option[&Type]) -> &TExpr
     val g = generators[0]
-    val item = s"yield item ${g.span.start}"
+    val item = yield_param("item", g.span.start, g.pattern)
     var rest = body
     if generators.len() > 1
         var later: Buf[Generator] = buf()
@@ -14509,13 +14643,13 @@ private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: 
     var pattern = g.pattern
     // A guard's function is named apart, so a diagnostic about its result names the guard.
     for guard in g.guards
-        source = comprehension_call(c, g.span, g.source.span, source, "withFilter", element_function(pattern, s"yield guard ${g.span.start}", buf(), guard), None)
+        source = comprehension_call(c, g.span, g.source.span, source, "withFilter", element_function(pattern, yield_param("guard", g.span.start, pattern), buf(), guard), None)
     var paired = 0
     for i in 0 ..< g.definitions.len()
         if g.definitions[i].guards.len() > 0 then paired = i + 1
     for i in 0 ..< paired
         val d = g.definitions[i]
-        val pair = s"yield pair ${d.span.start}"
+        val pair = yield_param("pair", d.span.start, pattern)
         var parts: Buf[&Expr] = buf()
         parts.push(name_at(d.span, pair))
         parts.push(d.value)
@@ -14525,13 +14659,19 @@ private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: 
         shapes.push(d.pattern)
         pattern = Pattern(g.pattern.span.to(d.pattern.span), Tuple(shapes))
         for guard in d.guards
-            source = comprehension_call(c, d.span, g.source.span, source, "withFilter", element_function(pattern, s"yield guard ${d.span.start}", buf(), guard), None)
+            source = comprehension_call(c, d.span, g.source.span, source, "withFilter", element_function(pattern, yield_param("guard", d.span.start, pattern), buf(), guard), None)
     var definitions: Buf[&Expr] = buf()
     for i in paired ..< g.definitions.len()
         val d = g.definitions[i]
         definitions.push(element_binding(d.pattern, d.value))
     val name = if generators.len() > 1 then "flatMap" else "map"
     comprehension_call(c, e.span, g.source.span, source, name, element_function(pattern, item, definitions, rest), expected)
+
+/** The name of the parameter of a function a `for` with `yield` makes: `yield KIND START`, then
+ * the name the generator's pattern binds when it is one name, so a diagnostic can say it. */
+private yield_param(kind: string, start: usize, pattern: &Pattern) -> string = pattern.kind match
+    Name(n) -> s"yield $kind $start $n"
+    _ -> s"yield $kind $start"
 
 /** The function of one element that binds it by `pattern`, then each of `definitions`, and yields
  * `body`. */
@@ -14772,7 +14912,7 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
                     if !(*r is Unit || *r is ErrorType)
                         c.note(unit, e.span, s"`return` needs a value, because ${described(symbol)} yields ${type_name(r)}")
         None ->
-            if symbol.lambda then c.note(unit, e.span, "this lambda uses `return`, so its result type must be known where it is written, as in `val f: (int) -> int = …`")
+            if symbol.lambda then c.note(unit, e.span, "this lambda uses `return`, so its result type must be known where it is written, as in `val f: (int) -> int = body`")
             else c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
             if value is Some(v) then typed = Some(check_expr(c, v, None))
     TExpr(e.span, Nothing, Return(typed))
@@ -14876,7 +15016,7 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     val declared = symbol.result match
         Some(r) -> zonk(c, r)
         None ->
-            if symbol.lambda then c.note(unit, e.span, "this lambda uses `?`, so its result type must be known where it is written, as in `val f: (string) -> Option[int] = …`")
+            if symbol.lambda then c.note(unit, e.span, "this lambda uses `?`, so its result type must be known where it is written, as in `val f: (string) -> Option[int] = body`")
             else c.note(unit, e.span, s"`${symbol.name}` uses `?`, so it needs a declared result type")
             return TExpr(e.span, ErrorType, UnitConst)
     if *declared is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
@@ -15120,8 +15260,14 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             var ms = bare_methods(c, name)
             if ms.len() == 0 then ms.push(m)
             return call_method(c, at, named.span, receiver, name, ms, args, explicit, expected, false)
-        Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
-        Some(DataFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
+        // `name(args)` is `self.name(args)`: where the type has a method of the name as well as a
+        // field, which a trait's method may, the call is the method's.
+        Some(FieldOf(_)) ->
+            if self_has_method(c, named.span, name) then return member_call(c, at, callee, named.span, Expr(named.span, Name("self")), name, args, explicit, expected, false)
+            if explicit is None then return value_call(c, at, callee, args)
+        Some(DataFieldOf(_)) ->
+            if self_has_method(c, named.span, name) then return member_call(c, at, callee, named.span, Expr(named.span, Name("self")), name, args, explicit, expected, false)
+            if explicit is None then return value_call(c, at, callee, args)
         Some(TraitFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
@@ -15416,6 +15562,13 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
         val apart = untuples_lambda(c, bound_signatures[k], views[k], bindings[k], args)
         untupling.push(apart)
         if !apart && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then direct_fits = true
+    var considered: Buf[bool] = buf()
+    for k in 0..<bound.len()
+        considered.push(!(fixed_fits && bound_signatures[k].variadic) && !(direct_fits && untupling[k]) && fits_call(c, bound_signatures[k], bindings[k], args, typed, written))
+    for j in 0..<args.len()
+        if typed[j] is None
+            if result_open_params(c, bound_signatures, views, bindings, args, j, considered) is Some(want)
+                typed[j] = Some(check_expr(c, argument_value(args[j]), Some(want)))
     for k in 0..<bound.len()
         if fixed_fits && bound_signatures[k].variadic then continue
         if direct_fits && untupling[k] then continue
@@ -15431,6 +15584,11 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
         for t in typed
             if t is Some(x)
                 if *zonk(c, x.ty) is Union(_) && hint == "" then hint = s"; `${type_name(zonk(c, x.ty))}` does not choose among overloads for its members, since its member is known only while running: take it apart with a `match` first"
+        // A lambda checked before choosing, by the parameters the candidates agree on, is named with
+        // the type its body gave it, which is what none of them accepts.
+        for j in 0..<args.len()
+            if typed[j] is Some(x)
+                if takes_parameter_type(argument_value(args[j])) && hint == "" then hint = s"; the function given is ${type_name(zonk(c, x.ty))}"
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${joined_labels(labels)}$hint")
         return Choice(None, typed)
     var owners: Buf[usize] = buf()
@@ -15446,6 +15604,11 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             literal_preferred(c, owners, counts, compared, args) match
                 Some(k) -> Choice(Some(fitting[k]), typed)
                 None ->
+                    // A lambda whose body was already reported fits every candidate alike; the call
+                    // goes on with the first rather than reporting the same error again as ambiguity.
+                    for j in 0..<args.len()
+                        if typed[j] is Some(x)
+                            if takes_parameter_type(argument_value(args[j])) && yields_error(c, x.ty) then return Choice(Some(fitting[0]), typed)
                     c.note(unit, name_span, s"this call to `$name` is ambiguous: ${joined_labels(fitting_labels)} each accept it, and none is more specific than the others")
                     Choice(None, typed)
 
@@ -15580,6 +15743,64 @@ private untuples_lambda(c: *Checker, s: Signature, params: Buf[&Type], binding: 
                         if ps.len() != written.len() then return true
                 None -> ()
     false
+
+// The function type a lambda argument `j` is checked against before an overload is chosen, where the
+// candidates still `considered` all give it the same parameter types, known without any candidate's
+// own type arguments, and differ in its result: those parameters, and a result left for its body to
+// decide. The lambda is then checked once, and its result chooses among the candidates as any
+// argument's type does, so `m.map((k, v) -> Summary(k, v))` reaches the overload whose function may
+// answer anything where another needs a pair, and `xs.flatMap(x -> Some(x))` on an option keeps the
+// option's own. None where the candidates agree on the result too, or differ in the parameters.
+private result_open_params(c: *Checker, signatures: Buf[Signature], views: Buf[Buf[&Type]], bindings: Buf[Binding], args: Buf[Argument], j: usize, considered: Buf[bool]) -> Option[&Type]
+    val value = argument_value(args[j])
+    val written = value.kind match
+        Lambda(ps, _) -> ps.len()
+        MatchFunction(_) -> 1usize
+        _ -> return None
+    var shared: Buf[&Type] = buf()
+    var first_result: &Type = ErrorType
+    var sendable = false
+    var count = 0usize
+    var results_differ = false
+    for k in 0..<signatures.len()
+        if !considered[k] then continue
+        val p = argument_type(c, signatures[k], views[k], bindings[k], args, j) match
+            Some(t) -> zonk(c, strict(t))
+            None -> return None
+        val ps = *p match
+            Function(params, _, _) -> params
+            _ -> return None
+        val r = *p match
+            Function(_, result, _) -> result
+            _ -> return None
+        val s = is_sendable_function(p)
+        // A lambda taking a tuple apart sees the same elements from every candidate giving it that
+        // tuple, so its body decides the result alike.
+        val apart = ps.len() == 1 && written >= 2 && tuple_elements(zonk(c, ps[0])).len() == written
+        if ps.len() != written && !apart then return None
+        val sig = signatures[k]
+        for i in sig.known.len()..<sig.type_params.len()
+            if any_names_param(ps, sig.owner, i) then return None
+        for q in ps
+            if has_unknowns(q) then return None
+        if count == 0
+            shared = ps
+            first_result = r
+            sendable = s
+        else
+            if s != sendable || ps.len() != shared.len() then return None
+            for i in 0..<ps.len()
+                if !same_type(ps[i], shared[i]) then return None
+            if !same_type(r, first_result) then results_differ = true
+        count += 1
+    if count < 2 || !results_differ then return None
+    Some(Function(shared, fresh_var(c), sendable))
+
+/** Whether `t` is the error type, or a function whose result is. */
+private yields_error(c: *Checker, t: &Type) -> bool = *zonk(c, t) match
+    ErrorType -> true
+    Function(_, result, _) -> *zonk(c, result) is ErrorType
+    _ -> false
 
 // Whether a literal or a lambda, which takes its type from its parameter, can be given one of type
 // `p`.
@@ -15787,7 +16008,15 @@ private static_value(c: *Checker, at: Span, target: &Expr, name: string, expecte
     if !(target.kind is Name(_) || target.kind is TypeApply(_, _)) then return None
     val ty = static_receiver(c, target, name)?
     val t = zonk(c, ty)
-    if *t is TypeVar(_, _, _) || *t is ErrorType then return None
+    // Through a type parameter, `T.values` reads the bound's static member declared without a
+    // parameter list, in each instance its type argument's own, as `T.values()` would call one with.
+    if *t is TypeVar(_, _, _)
+        var bound: Buf[usize] = buf()
+        for m in bound_methods(c, t, name)
+            if c.symbols[m].static_member then bound.push(m)
+        if bound.len() == 1 && is_parameterless(c, bound[0]) then return Some(static_call(c, at, at, target, ty, name, buf(), None, expected, true))
+        return None
+    if *t is ErrorType then return None
     var statics: Buf[usize] = buf()
     for m in members_of_type(c, t, name)
         if c.symbols[m].static_member then statics.push(m)
@@ -15803,10 +16032,12 @@ private static_value(c: *Checker, at: Span, target: &Expr, name: string, expecte
                     for i in 0..<ps.len()
                         if !same_type(zonk(c, ps[i]), params[i + 1]) then fits = false
                     if fits then return Some(method_value(c, at, receiver, m, None, expected))
-    c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant; give it a function type, as in `val f: (…) -> … = ${type_name(t)}.$name`")
+    c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant; give it a function type, as in `val f: (int) -> int = ${type_name(t)}.$name`")
     Some(TExpr(at, ErrorType, UnitConst))
 
-private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &Type, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+// `bare` is a read of a member declared without a parameter list, `T.values`, where no parentheses
+// were written.
+private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &Type, name: string, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], bare: bool) -> &TExpr
     // In an impl made from a template, `T`'s shape and the code over its fields are written here,
     // for the deriving type.
     if target.kind is Name(n)
@@ -15846,6 +16077,7 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
             if implemented_several_times(c, k) && c.symbols[statics[0]].decl.type_params.len() == 0
                 val instances = from_sources(c, t, k)
                 if instances.len() > 1 then return several_bound_call(c, at, name_span, TExpr(target.span, t, TypeReceiver), statics[0], instances, args)
+    if bare && statics.len() == 1 then return method_call(c, at, name_span, TExpr(target.span, t, TypeReceiver), statics[0], buf(), None, expected, false, buf())
     call_method(c, at, name_span, TExpr(target.span, t, TypeReceiver), name, statics, args, explicit, expected, false)
 
 // A static member of a trait a type parameter is bounded by at several type arguments,
@@ -15948,7 +16180,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         if names_fieldless_value(c, target) is Some(id)
             if !has_static_member(c, id, name) then named_value = Some(check_expr(c, target, None))
         if named_value is None
-            if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected)
+            if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected, false)
     var object = named_value match
         Some(v) -> v
         None -> check_expr(c, target, None)
@@ -16166,7 +16398,7 @@ private infix_arity_error(c: *Checker, at: Span, name_span: Span, target: &Expr,
     val count = c.symbols[ms[0]].params.len() - 1
     val src = c.units[unit].src
     val receiver = from_utf8_unchecked(src.text(target.span))
-    var inner = "…"
+    var inner = "arguments"
     if args[0].value.kind is Tuple(items)
         inner = ""
         for i in 0..<items.len()
@@ -16645,7 +16877,7 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                 for i in 0..<s.names.len()
                     if s.names[i] == n && n != "_" then k = Some(i)
                 if k is Some(i) && repeated == Some(i)
-                    if report then c.note(unit, a.span, s"`$n` is a repeated parameter, given its arguments by position: `${s.name}(…, a, b)` or `${s.name}(…, xs*)`")
+                    if report then c.note(unit, a.span, s"`$n` is a repeated parameter, given its arguments by position: `${s.name}(first, a, b)` or `${s.name}(first, xs*)`")
                     fits = false
                     targets.push(None)
                     continue
@@ -16817,7 +17049,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
                 val before = zonk(c, type_args[j])
                 val text = if *before is Var(_) then type_params[j].name else type_name(before)
                 written = written + text + ", "
-            val example = if called then s"`$name[${written}int](…)`" else s"`$name[${written}int]`"
+            val example = if called then s"`$name[${written}int](arguments)`" else s"`$name[${written}int]`"
             val message = s"cannot infer `${type_params[i].name}` for $subject; write it, as in $example"
             if bounds_at(c, owner, type_params, i).len() == 0
                 // Named only where a value is read out, by the parameters and the result, it has
@@ -18175,7 +18407,7 @@ private conversion(c: *Checker, at: Span, target: &Type, args: Buf[Argument], wr
             check_statement(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
     if args.len() != 1 || args[0].name is Some(_)
-        c.note(unit, at, s"`${type_name(target)}(…)` converts exactly one value")
+        c.note(unit, at, s"`${type_name(target)}(value)` converts exactly one value")
         for a in args
             check_statement(c, a.value)
         return TExpr(at, ErrorType, UnitConst)
@@ -18671,7 +18903,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             val (chosen, is_variant) = choose_variant(c, p.span, name, Some(ty))
             if chosen is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() > 0
-                    c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(…)`")
+                    c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(fields)`")
                     return TPattern(p.span, ErrorType, PWildcard)
                 return variant_pattern(c, p, v, buf(), ty, no_bind)
             if is_variant then return TPattern(p.span, ErrorType, PWildcard)
@@ -18739,7 +18971,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             val (chosen, is_variant) = choose_variant(c, p.span, path, Some(ty))
             if chosen is Some(v)
                 if !parens && c.data[v.data].variants[v.index].fields.len() > 0
-                    c.note(unit, p.span, s"`$path` has fields; match them, as in `$path(…)`")
+                    c.note(unit, p.span, s"`$path` has fields; match them, as in `$path(fields)`")
                     return TPattern(p.span, ErrorType, PWildcard)
                 return variant_pattern(c, p, v, args, ty, no_bind)
             if is_variant || no_such_variant(c, p.span, path) then return failed_extractor(c, p, args, no_bind)

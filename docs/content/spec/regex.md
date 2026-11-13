@@ -202,20 +202,20 @@ is repeated or tried more than once:
 | `replaceAllIn(s, f)` | `s` with every match `m` replaced by `f(m)`, `f` a `(Match) -> string`; its result is read as a replacement |
 | `replaceFirstIn(s, replacement)` | `s` with its first match replaced |
 | `replaceSomeIn(s, f)` | `s` with each match `m` replaced where `f(m)`, an `Option[string]`, is `Some`, and kept where it is `None` |
-| `split(s)` | `pattern().split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
+| `split(s)` | `pattern.split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
 | `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; it makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
-| `unanchored()`, `anchored()` | The same regex with `matches` and the extractor asking about any part, or the whole |
+| `unanchored`, `anchored` | The same regex with `matches` and the extractor asking about any part, or the whole |
 | `withStepLimit(n)` | The same regex, each attempt at a start allowed `n` steps in place of the [default budget](#matching); `n` must be above 0 |
 | `tryMatches(s)`, `tryFindFirstIn(s)`, `tryFindFirstMatchIn(s)`, `tryFindPrefixOf(s)`, `tryFindPrefixMatchOf(s)` | The [checked](#matching) searches: `Result[T, MatchError]`, `T` what the plain search answers |
 | `tryFindAllIn(s)`, `tryFindAllMatchIn(s)` | Every match, gathered: `Result[Vector[string], MatchError]` and `Result[Vector[Match], MatchError]` |
 | `tryReplaceAllIn(s, …)`, `tryReplaceFirstIn(s, r)`, `tryReplaceSomeIn(s, f)`, `trySplit(s)` | The replacing and splitting searches, checked: `Result[string, MatchError]` and `Result[Array[string], MatchError]`; `Pattern` has `trySplit(s, limit = 0)` |
-| `regex()`, `toString()`, `pattern()` | The pattern as written; `pattern()` is a `Pattern`, with `pattern()`, `groupCount()` and `split` |
+| `regex`, `toString()`, `pattern` | The pattern as written; `pattern` is a `Pattern`, with `pattern`, `groupCount` and `split` |
 | `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
 | `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |
 
 **Extractors.** A regex is an [extractor](/spec/operators-and-control-flow/#extractor-patterns)
 whose patterns match its groups' texts in order: `case date(y, m, d)` matches a text the whole of
-which the regex matches (any part of it, for a regex made by `unanchored()`), and needs one pattern
+which the regex matches (any part of it, for a regex made by `unanchored`), and needs one pattern
 for each group, or `rest*` for those left. A group that took no part gives the empty string. A
 regex with no groups is a test, written `word()`. `Groups`, imported from `avin.regex`, takes apart
 a `Match` found by any regex the same way, and does not match a match of a pattern with no groups.
@@ -287,21 +287,21 @@ A `Match` holds its `source` text and where the match and each group start and e
 
 | Member | What it answers |
 | --- | --- |
-| `matched()` | The text matched |
+| `matched` | The text matched |
 | `start()`, `end()` | Where the match starts and ends |
 | `start(i)`, `end(i)` | Where group `i` starts and ends, -1 when it took no part; group 0 is the whole match |
 | `group(i)`, `group(name)` | `Option[string]`: the group's text, `None` when it took no part |
-| `groupCount()` | The number of capturing groups |
-| `subgroups()` | `List[Option[string]]`, groups 1 on |
+| `groupCount` | The number of capturing groups |
+| `subgroups` | `List[Option[string]]`, groups 1 on |
 | `before()`, `after()` | The text before and after the match |
 | `before(i)`, `after(i)` | The text before and after group `i`, `None` when it took no part |
-| `groupNames()` | The names given to the `Regex` |
+| `groupNames` | The names given to the `Regex` |
 
-A group number outside `0..groupCount()` traps, and so does a name no group has: by the names given
+A group number outside `0..groupCount` traps, and so does a name no group has: by the names given
 to the `Regex` where there are any (`""` is group 0), otherwise by the pattern's own.
 
 A `MatchIterator` is an `Iterator[string]` of the matched texts. After `next()`, until the following
-`hasNext()`, its `start()`, `end()`, `start(i)`, `end(i)`, `group(i)`, `groupCount()` and `matched()`
+`hasNext()`, its `start()`, `end()`, `start(i)`, `end(i)`, `group(i)`, `groupCount` and `matched`
 answer for that match, and before the first `next()` for the first match; asked when no match is
 left, they trap. `matchData()` turns
 it into an `Iterator[Match]`.

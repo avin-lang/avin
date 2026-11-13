@@ -25,63 +25,64 @@ module avin
 // cell is evaluated, the expression that computed it is dropped, along with everything it held, so a
 // list holds only the elements evaluated and the expressions for the cells not yet evaluated. A list
 // whose head nothing holds is collected cell by cell as a `for` loop or an iterator walks it.
-class LazyList[+T](private val pending: () -> Option[(T, LazyList[T])], private val progress: LazyListProgress): Iterable[T]
-    private lazy val kept: Option[(T, LazyList[T])] = evaluate()
+//
+// Each cell is one object: the function that evaluates it until it has been, then its element and
+// the list after it, which the function stores into the cell. A list is read by the thread that made
+// it, so evaluating a cell takes no lock.
+class LazyList[+T]: Iterable[T]
+    // The function that evaluates the cell, given the cell to store its element and rest into; while
+    // it runs, one that traps, since a read then is the cell needing itself; once it has run, `None`,
+    // which drops it and everything it held.
+    private var pending: Option[(LazyList[T]) -> unit] = fieldUnset()
+    // The element, once the cell is evaluated and is not empty.
+    private var first: T = fieldUnset()
+    // The list after the element, once the cell is evaluated; the list itself when it is empty. A
+    // list whose elements repeat for ever, `lazy val ones = LazyList.cons(1, ones)`, is two cells
+    // that are each other's rest (see `LazyList.copy`).
+    private var rest: LazyList[T] = fieldUnset()
 
-    private evaluate() -> Option[(T, LazyList[T])]
-        progress.evaluating = true
-        val evaluated = pending()
-        progress.evaluating = false
-        progress.evaluated = true
-        evaluated
-
-    // The first cell, evaluated on the first read. A read made while the cell is being evaluated, by
-    // the expression that computes it, traps.
-    private cell() -> Option[(T, LazyList[T])] =
-        if progress.evaluating then fail("a LazyList cell is read while it is being evaluated") else kept
+    // Evaluates the cell, unless it has been, and answers whether the list is empty.
+    private ended() -> bool
+        if pending is Some(evaluate)
+            pending = Some(list -> fail("a LazyList cell is read while it is being evaluated"))
+            evaluate(self)
+            pending = None
+        rest === self
 
     // An iterator over the elements, evaluating each cell as it reaches it. It holds only the cell it
     // has reached, so a list read through it alone is collected behind it.
     override iterator() -> Iterator[T] = LazyListIterator(self)
 
     // Whether the list has no elements, which evaluates its first cell.
-    isEmpty -> bool = cell().isEmpty()
+    isEmpty -> bool = ended()
 
     // Whether the list has an element, which evaluates its first cell.
-    nonEmpty -> bool = cell().isDefined()
+    nonEmpty -> bool = !ended()
 
     // The first element, or `None` on the empty list; it evaluates the first cell only.
-    override headOption -> Option[T] = cell() match
-        Some((x, _)) -> Some(x)
-        None -> None
+    override headOption -> Option[T] = if ended() then None else Some(first)
 
     // The first element, which traps on the empty list.
-    override head -> T = cell() match
-        Some((x, _)) -> x
-        None -> fail("head of an empty lazy list")
+    override head -> T = if ended() then fail("head of an empty lazy list") else first
 
     // The list after the first element, which traps on the empty list. It evaluates the first cell
     // and not the rest.
-    tail -> LazyList[T] = cell() match
-        Some((_, rest)) -> rest
-        None -> fail("tail of an empty lazy list")
+    tail -> LazyList[T] = if ended() then fail("tail of an empty lazy list") else rest
 
     // 0 when the list is known to be empty without evaluating anything, otherwise `-1`.
-    override knownSize -> int = if progress.evaluated && cell().isEmpty() then 0 else -1
+    override knownSize -> int = if pending is None && rest === self then 0 else -1
 
     // Whether the first cell has been evaluated. It evaluates nothing.
-    isEvaluated() -> bool = progress.evaluated
+    isEvaluated() -> bool = pending is None
 
     // The number of elements, evaluating every cell; on an endless list it does not return.
     length -> int
         var n = 0
         var xs = self
-        loop
-            xs.cell() match
-                Some((_, rest)) ->
-                    n += 1
-                    xs = rest
-                None -> return n
+        while !xs.ended()
+            n += 1
+            xs = xs.rest
+        n
 
     // The number of elements: the same as `length`.
     override size -> int = length
@@ -98,13 +99,11 @@ class LazyList[+T](private val pending: () -> Option[(T, LazyList[T])], private 
         if index < 0 then return None
         var i = 0
         var xs = self
-        loop
-            xs.cell() match
-                Some((x, rest)) ->
-                    if i == index then return Some(x)
-                    i += 1
-                    xs = rest
-                None -> return None
+        while !xs.ended()
+            if i == index then return Some(xs.first)
+            i += 1
+            xs = xs.rest
+        None
 
     // The list itself, once every cell has been evaluated; on an endless list it does not return.
     force() -> LazyList[T]
@@ -112,131 +111,55 @@ class LazyList[+T](private val pending: () -> Option[(T, LazyList[T])], private 
         self
 
     // The list of `f` of each element, each computed when its cell is first read.
-    map[U](f: (T) -> U) -> LazyList[U] = lazyListOf(() -> mappedCell(f))
-
-    private mappedCell[U](f: (T) -> U) -> Option[(U, LazyList[U])] = cell() match
-        Some((x, rest)) -> Some((f(x), rest.map(f)))
-        None -> None
+    map[U](f: (T) -> U) -> LazyList[U] = LazyList.mapped(self, f)
 
     // The elements for which `p` holds, in order. Reading a cell runs `p` over the source's elements
     // up to the next one it accepts, in one loop.
-    filter(p: (T) -> bool) -> LazyList[T] = lazyListOf(() -> filteredCell(p))
-
-    private filteredCell(p: (T) -> bool) -> Option[(T, LazyList[T])]
-        var xs = self
-        loop
-            xs.cell() match
-                Some((x, rest)) ->
-                    if p(x) then return Some((x, rest.filter(p)))
-                    xs = rest
-                None -> return None
+    filter(p: (T) -> bool) -> LazyList[T] = LazyList.filtered(self, p)
 
     // The elements for which `p` does not hold.
     filterNot(p: (T) -> bool) -> LazyList[T] = filter(x -> !p(x))
 
     // The first `n` elements, or all of them when there are fewer; empty when `n` is not positive.
     // The cell after the `n`th is never read.
-    take(n: int) -> LazyList[T] = if n <= 0 then LazyList.empty[T]() else lazyListOf(() -> takenCell(n))
-
-    private takenCell(n: int) -> Option[(T, LazyList[T])] = cell() match
-        Some((x, rest)) -> Some((x, rest.take(n - 1)))
-        None -> None
+    take(n: int) -> LazyList[T] = if n <= 0 then LazyList.empty[T]() else LazyList.taken(self, n)
 
     // The elements after the first `n`; the whole list when `n` is not positive. The `n` cells are
     // skipped when the first cell of the result is read.
-    drop(n: int) -> LazyList[T] = if n <= 0 then self else lazyListOf(() -> droppedCell(n))
-
-    private droppedCell(n: int) -> Option[(T, LazyList[T])]
-        var xs = self
-        var left = n
-        while left > 0
-            xs.cell() match
-                Some((_, rest)) -> xs = rest
-                None -> return None
-            left -= 1
-        xs.cell()
+    drop(n: int) -> LazyList[T] = if n <= 0 then self else LazyList.dropped(self, n)
 
     // The longest prefix of elements for which `p` holds. The element that ends it is read, and
     // nothing after it.
-    takeWhile(p: (T) -> bool) -> LazyList[T] = lazyListOf(() -> takenWhileCell(p))
-
-    private takenWhileCell(p: (T) -> bool) -> Option[(T, LazyList[T])] = cell() match
-        Some((x, rest)) -> if p(x) then Some((x, rest.takeWhile(p))) else None
-        None -> None
+    takeWhile(p: (T) -> bool) -> LazyList[T] = LazyList.takenWhile(self, p)
 
     // The elements from the first for which `p` does not hold.
-    dropWhile(p: (T) -> bool) -> LazyList[T] = lazyListOf(() -> droppedWhileCell(p))
-
-    private droppedWhileCell(p: (T) -> bool) -> Option[(T, LazyList[T])]
-        var xs = self
-        loop
-            xs.cell() match
-                Some((x, rest)) ->
-                    if !p(x) then return xs.cell()
-                    xs = rest
-                None -> return None
+    dropWhile(p: (T) -> bool) -> LazyList[T] = LazyList.droppedWhile(self, p)
 
     // Pairs of this list's elements and `other`'s, in order, as long as the shorter.
-    zip[U](other: LazyList[U]) -> LazyList[(T, U)] = lazyListOf(() -> zippedCell(other))
-
-    private zippedCell[U](other: LazyList[U]) -> Option[((T, U), LazyList[(T, U)])] = cell() match
-        Some((x, rest)) -> other.headOption match
-            Some(y) -> Some(((x, y), rest.zip(other.tail)))
-            None -> None
-        None -> None
+    zip[U](other: LazyList[U]) -> LazyList[(T, U)] = LazyList.zipped(self, other)
 
     // Each element paired with its index, from 0.
     zipWithIndex -> LazyList[(T, int)] = zip(LazyList.from(0))
 
     // This list's elements and then `other`'s. `other` is evaluated when the cell after this list's
     // last element is first read, and not at all until then.
-    ++[W >: T](other: -> LazyList[W]) -> LazyList[W] = appended(() -> other)
-
-    private appended[W >: T](other: () -> LazyList[W]) -> LazyList[W] = lazyListOf(() -> appendedCell(other))
-
-    private appendedCell[W >: T](other: () -> LazyList[W]) -> Option[(W, LazyList[W])] = cell() match
-        Some((x, rest)) -> Some((x, rest.appended(other)))
-        None -> other().evaluatedCell()
+    ++[W >: T](other: -> LazyList[W]) -> LazyList[W] = LazyList.appended[W](self, () -> other)
 
     // The elements of `f` of each element, in order. A collection `f` gives is read through its
     // iterator as the cells are read; reading a cell runs `f` over as many elements as give nothing.
-    flatMap[U](f: (T) -> Iterable[U]) -> LazyList[U] = lazyListOf(() -> flatMappedCell(f))
+    flatMap[U](f: (T) -> Iterable[U]) -> LazyList[U] = LazyList.flatMapped(self, f)
 
-    private flatMappedCell[U](f: (T) -> Iterable[U]) -> Option[(U, LazyList[U])]
-        var xs = self
-        loop
-            xs.cell() match
-                Some((x, rest)) ->
-                    val inner = f(x).iterator()
-                    if inner.hasNext()
-                        val first = inner.next()
-                        return Some((first, inner.toLazyList() ++ rest.flatMap(f)))
-                    xs = rest
-                None -> return None
+    // The values of the options `f` makes of each element, those that hold one, in order; reading a
+    // cell runs `f` over as many elements as give `None`.
+    flatMap[U](f: (T) -> Option[U]) -> LazyList[U] = LazyList.someMapped(self, f)
 
     // The list with `element` in front of it: `x +: xs`. The list after `element` is this one, whose
     // cells stay as they are.
-    +:[W >: T](element: W) -> LazyList[W]
-        val rest: LazyList[W] = self
-        lazyListOf(() -> Some((element, rest)))
+    +:[W >: T](element: W) -> LazyList[W] = LazyList.prepended[W](element, self)
 
-    // The cell, evaluated, for a list made from another's.
-    private evaluatedCell() -> Option[(T, LazyList[T])] = cell()
-
-// Whether a lazy list's first cell has been evaluated, which `Display` and `knownSize` ask without
-// evaluating it, and whether it is being evaluated now.
-private class LazyListProgress(var evaluated: bool)
-    var evaluating = false
-
-// The lazy list whose first cell `f` computes. `f` is called at most once, and is dropped once it
-// has been, so a cell evaluated holds nothing of the expression that made it.
-private lazyListOf[T](f: () -> Option[(T, LazyList[T])]) -> LazyList[T]
-    var held: Option[() -> Option[(T, LazyList[T])]] = Some(f)
-    val once = () ->
-        val compute = held.get()
-        held = None
-        compute()
-    LazyList(once, LazyListProgress(false))
+// A zero-filled field the class's own code writes before reading it; see `LazyList`'s fields.
+@intrinsic("field_unset")
+private fieldUnset[T]() -> T
 
 private class LazyListIterator[T](private var rest: LazyList[T]): Iterator[T]
     override hasNext() -> bool = rest.nonEmpty
@@ -254,7 +177,7 @@ impl[T: Display] Display for LazyList[T]
         if spec.width > 0
             val text = StringWriter()
             display(text, FormatSpec())
-            out.writeField(text.text(), spec)
+            out.writeField(text.text, spec)
             return
         out.write("[")
         var first = true
@@ -263,13 +186,11 @@ impl[T: Display] Display for LazyList[T]
             if !xs.isEvaluated()
                 out.write(if first then "…" else ", …")
                 break
-            xs.cell() match
-                Some((x, rest)) ->
-                    if !first then out.write(", ")
-                    x.display(out, FormatSpec())
-                    first = false
-                    xs = rest
-                None -> break
+            if xs.isEmpty then break
+            if !first then out.write(", ")
+            xs.head.display(out, FormatSpec())
+            first = false
+            xs = xs.tail
         out.write("]")
 
 // A lazy list's diagnostic form is the diagnostic forms of the elements evaluated so far, in
@@ -279,7 +200,7 @@ impl[T: Debug] Debug for LazyList[T]
         if spec.width > 0
             val text = StringWriter()
             debug(text, FormatSpec())
-            out.writeField(text.text(), spec)
+            out.writeField(text.text, spec)
             return
         out.write("[")
         var first = true
@@ -288,24 +209,22 @@ impl[T: Debug] Debug for LazyList[T]
             if !xs.isEvaluated()
                 out.write(if first then "…" else ", …")
                 break
-            xs.cell() match
-                Some((x, rest)) ->
-                    if !first then out.write(", ")
-                    x.debug(out, FormatSpec())
-                    first = false
-                    xs = rest
-                None -> break
+            if xs.isEmpty then break
+            if !first then out.write(", ")
+            xs.head.debug(out, FormatSpec())
+            first = false
+            xs = xs.tail
         out.write("]")
 
 // Lazy lists made from a value, a function or a collection. Each evaluates nothing when it is made;
 // the names and argument orders are `Iterator`'s.
 object LazyList
     // The empty lazy list.
-    empty[T]() -> LazyList[T] = lazyListOf(() -> None)
+    empty[T]() -> LazyList[T] = lazily(list -> markEmpty(list))
 
     // The list of `head` and then the list `tail` gives. `tail` is evaluated when the cell after
     // `head` is first read, once, and not at all if it never is; `head` is evaluated at the call.
-    cons[T](head: T, tail: -> LazyList[T]) -> LazyList[T] = lazyListOf(() -> Some((head, lazyListOf(() -> tail.evaluatedCell()))))
+    cons[T](head: T, tail: -> LazyList[T]) -> LazyList[T] = lazily(list -> store(list,head, lazily(after -> copy(after, tail))))
 
     // `head #:: tail`, the operator form of `cons(head, tail)`: `tail`, written on the right, is
     // evaluated when the cell after `head` is first read, so `0 #:: 1 #:: rest` reads like the list
@@ -314,23 +233,23 @@ object LazyList
 
     // The endless list of `start`, `f(start)`, `f(f(start))` and so on, each call of `f` made when its
     // cell is first read.
-    iterate[T](start: T, f: (T) -> T) -> LazyList[T] = lazyListOf(() -> Some((start, iteratedAfter(start, f))))
+    iterate[T](start: T, f: (T) -> T) -> LazyList[T] = lazily(list -> store(list,start, iteratedAfter(start, f)))
 
-    private iteratedAfter[T](previous: T, f: (T) -> T) -> LazyList[T] = lazyListOf(() ->
+    private iteratedAfter[T](previous: T, f: (T) -> T) -> LazyList[T] = lazily(list ->
         val x = f(previous)
-        Some((x, iteratedAfter(x, f))))
+        store(list,x, iteratedAfter(x, f)))
 
     // The elements `f` gives from `state`: while `f` of the state is `Some((element, next))`, the
     // element is given and `next` becomes the state; the first `None` ends the list. `f` is called
     // when the cell is first read.
-    unfold[T, S](state: S, f: (S) -> Option[(T, S)]) -> LazyList[T] = lazyListOf(() ->
+    unfold[T, S](state: S, f: (S) -> Option[(T, S)]) -> LazyList[T] = lazily(list ->
         f(state) match
-            Some((x, next)) -> Some((x, unfold(next, f)))
-            None -> None)
+            Some((x, next)) -> store(list,x, unfold(next, f))
+            None -> markEmpty(list))
 
     // The endless list of the values of `element`, evaluated once for each cell, when it is first
     // read.
-    continually[T](element: -> T) -> LazyList[T] = lazyListOf(() -> Some((element, continually(element))))
+    continually[T](element: -> T) -> LazyList[T] = lazily(list -> store(list,element, continually(element)))
 
     // The endless list of `start`, `start + 1`, `start + 2` and so on, of any integer type. An
     // element is computed when its cell is first read, so an addition that overflows traps only when
@@ -339,11 +258,11 @@ object LazyList
 
     // The endless list of `start`, `start + step`, `start + 2 * step` and so on; a negative `step`
     // counts down. Overflow traps as `from(start)`'s does.
-    from[T: Integer](start: T, step: T) -> LazyList[T] = lazyListOf(() -> Some((start, countedAfter(start, step))))
+    from[T: Integer](start: T, step: T) -> LazyList[T] = lazily(list -> store(list,start, countedAfter(start, step)))
 
-    private countedAfter[T: Integer](previous: T, step: T) -> LazyList[T] = lazyListOf(() ->
+    private countedAfter[T: Integer](previous: T, step: T) -> LazyList[T] = lazily(list ->
         val x = previous + step
-        Some((x, countedAfter(x, step))))
+        store(list,x, countedAfter(x, step)))
 
     // A list of `count` elements, each the value of `element`, evaluated when its cell is first read;
     // empty when `count` is not positive.
@@ -352,6 +271,99 @@ object LazyList
     // A list of `count` elements, the one at `i` being `f(i)`, computed when its cell is first read;
     // empty when `count` is not positive.
     tabulate[T](count: int, f: (int) -> T) -> LazyList[T] = from(0).take(count).map(f)
+
+    // The list whose first cell `evaluate` computes, storing it into the list it is given, when it is
+    // first read. The list is its one object, with `evaluate` the one function it holds.
+    private lazily[T](evaluate: (LazyList[T]) -> unit) -> LazyList[T]
+        val list = LazyList[T]()
+        list.pending = Some(evaluate)
+        list
+
+    // Evaluates `list`'s cell as `head` and then `rest`.
+    private store[T](list: LazyList[T], head: T, rest: LazyList[T])
+        list.first = head
+        list.rest = rest
+
+    // Evaluates `list`'s cell as the empty one.
+    private markEmpty[T](list: LazyList[T])
+        list.rest = list
+
+    // Evaluates `list`'s cell as `other`'s first cell, which it evaluates.
+    private copy[T](list: LazyList[T], other: LazyList[T])
+        if other.ended() then list.rest = list
+        else
+            list.first = other.first
+            // A cell whose rest is itself is the empty one, so where `other`'s rest is `list` (a list
+            // that is its own tail, `lazy val ones = LazyList.cons(1, ones)`) the rest is `other`,
+            // which holds the same element and then `list` again.
+            list.rest = if other.rest === list then other else other.rest
+
+    private mapped[T, U](source: LazyList[T], f: (T) -> U) -> LazyList[U] = lazily(list ->
+        if source.ended() then markEmpty(list) else store(list, f(source.first), mapped(source.rest, f)))
+
+    private filtered[T](source: LazyList[T], p: (T) -> bool) -> LazyList[T] = lazily(list -> filterInto(list, source, p))
+
+    private filterInto[T](list: LazyList[T], source: LazyList[T], p: (T) -> bool)
+        var xs = source
+        while !xs.ended()
+            val x = xs.first
+            if p(x)
+                store(list,x, filtered(xs.rest, p))
+                return
+            xs = xs.rest
+        markEmpty(list)
+
+    private taken[T](source: LazyList[T], n: int) -> LazyList[T] = lazily(list ->
+        if source.ended() then markEmpty(list) else store(list,source.first, source.rest.take(n - 1)))
+
+    private dropped[T](source: LazyList[T], n: int) -> LazyList[T] = lazily(list ->
+        var xs = source
+        var left = n
+        while left > 0 && !xs.ended()
+            xs = xs.rest
+            left -= 1
+        copy(list, xs))
+
+    private takenWhile[T](source: LazyList[T], p: (T) -> bool) -> LazyList[T] = lazily(list ->
+        if source.ended() || !p(source.first) then markEmpty(list) else store(list,source.first, takenWhile(source.rest, p)))
+
+    private droppedWhile[T](source: LazyList[T], p: (T) -> bool) -> LazyList[T] = lazily(list ->
+        var xs = source
+        while !xs.ended() && p(xs.first)
+            xs = xs.rest
+        copy(list, xs))
+
+    private zipped[T, U](source: LazyList[T], other: LazyList[U]) -> LazyList[(T, U)] = lazily(list ->
+        if source.ended() || other.ended() then markEmpty(list) else store(list,(source.first, other.first), zipped(source.rest, other.rest)))
+
+    private appended[T](source: LazyList[T], other: () -> LazyList[T]) -> LazyList[T] = lazily(list ->
+        if source.ended() then copy(list, other()) else store(list,source.first, appended(source.rest, other)))
+
+    private flatMapped[T, U](source: LazyList[T], f: (T) -> Iterable[U]) -> LazyList[U] = lazily(list -> flatMapInto(list, source, f))
+
+    private flatMapInto[T, U](list: LazyList[U], source: LazyList[T], f: (T) -> Iterable[U])
+        var xs = source
+        while !xs.ended()
+            val inner = f(xs.first).iterator()
+            if inner.hasNext()
+                val first = inner.next()
+                store(list,first, inner.toLazyList() ++ flatMapped(xs.rest, f))
+                return
+            xs = xs.rest
+        markEmpty(list)
+
+    private someMapped[T, U](source: LazyList[T], f: (T) -> Option[U]) -> LazyList[U] = lazily(list -> someMapInto(list, source, f))
+
+    private someMapInto[T, U](list: LazyList[U], source: LazyList[T], f: (T) -> Option[U])
+        var xs = source
+        while !xs.ended()
+            if f(xs.first) is Some(y)
+                store(list, y, someMapped(xs.rest, f))
+                return
+            xs = xs.rest
+        markEmpty(list)
+
+    private prepended[T](element: T, rest: LazyList[T]) -> LazyList[T] = lazily(list -> store(list,element, rest))
 
 // Every collection and iterator converts to a lazy list.
 impl[T] Iterable[T]

@@ -73,15 +73,15 @@ a result does not fit:
 
 | Method | Result |
 | --- | --- |
-| `abs()` | The magnitude; traps for `MinValue`, whose magnitude does not fit |
-| `sign()` | `-1`, `0` or `1`, as an `int` at every width |
+| `abs` | The magnitude; traps for `MinValue`, whose magnitude does not fit |
+| `sign` | `-1`, `0` or `1`, as an `int` at every width |
 | `pow(n)` | The number to the power `n`, an `int`; `x.pow(0)` is `1`, `0.pow(0)` included. Traps when the result does not fit and when `n` is negative |
 | `gcd(o)` | The greatest common divisor, never negative; `0.gcd(0)` is `0`. Traps only when it is `MinValue`'s magnitude, as in `MinValue.gcd(0)` |
 | `lcm(o)` | The least positive common multiple, `0` when either is `0`; traps when it does not fit |
 | `floorDiv(o)`, `floorMod(o)` | The quotient rounded towards negative infinity, and the remainder that takes the divisor's sign, so `a == a.floorDiv(d) * d + a.floorMod(d)`. They trap where `/` and `%` do: a zero divisor, and `MinValue.floorDiv(-1)` |
-| `bitCount()` | The number of one bits of the two's-complement form at the width: `(-1).bitCount()` is `32` for an `int` |
-| `leadingZeros()`, `trailingZeros()` | The zero bits above the highest one and below the lowest one, an `int`; the width for zero. `leadingZeros()` is `0` for a negative number |
-| `isPowerOfTwo()` | Whether the number is `1`, `2`, `4`, and so on; never for zero or a negative number |
+| `bitCount` | The number of one bits of the two's-complement form at the width: `(-1).bitCount` is `32` for an `int` |
+| `leadingZeros`, `trailingZeros` | The zero bits above the highest one and below the lowest one, an `int`; the width for zero. `leadingZeros` is `0` for a negative number |
+| `isPowerOfTwo` | Whether the number is `1`, `2`, `4`, and so on; never for zero or a negative number |
 | `toRadix(r)` | The digits in radix `r` from 2 to 36, lower case, with a `-` for a negative number and no prefix, as `f"%x"` and `f"%b"` write them; any other radix traps |
 
 The bitwise operators `&`, `|`, `^` and the shifts also work on a type parameter bounded by
@@ -99,7 +99,7 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 ## real and char
 
 `real` arithmetic follows IEEE 754, including NaN and signed zero; comparisons with NaN are false
-except `!=`. `x.isNaN()`, `x.isInfinite()` (either infinity) and `x.isFinite()` (neither) classify a
+except `!=`. `x.isNaN`, `x.isInfinite` (either infinity) and `x.isFinite` (neither) classify a
 value, and each value is exactly one of NaN, infinite or finite. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
 the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
 `math.sqrt(x)`. `char` supports ordering and equality but no
@@ -109,15 +109,15 @@ A `char` has these methods, classifying by the Unicode Character Database:
 
 | Method | Meaning |
 |---|---|
-| `isDigit()` | A decimal digit of any script (category `Nd`) |
-| `isLetter()` | A letter of any script (categories `Lu`, `Ll`, `Lt`, `Lm`, `Lo`) |
-| `isLetterOrDigit()` | `isLetter()` or `isDigit()` |
-| `isWhitespace()` | A space separator other than the non-breaking ones (U+00A0, U+2007, U+202F), or U+0009 to U+000D, or U+001C to U+001F; this is not `strip`'s test, which is the `White_Space` property and so counts U+00A0 |
-| `isSpaceChar()` | A character of category `Zs`, `Zl` or `Zp` |
-| `isUpper()`, `isLower()` | Cased and upper, cased and lower |
-| `isControl()` | U+0000 to U+001F and U+007F to U+009F |
-| `toUpper()`, `toLower()` | The simple case mapping, one character for one: `'ß'.toUpper()` is `'ß'` |
-| `asDigit()` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
+| `isDigit` | A decimal digit of any script (category `Nd`) |
+| `isLetter` | A letter of any script (categories `Lu`, `Ll`, `Lt`, `Lm`, `Lo`) |
+| `isLetterOrDigit` | `isLetter` or `isDigit` |
+| `isWhitespace` | A space separator other than the non-breaking ones (U+00A0, U+2007, U+202F), or U+0009 to U+000D, or U+001C to U+001F; this is not `strip`'s test, which is the `White_Space` property and so counts U+00A0 |
+| `isSpaceChar` | A character of category `Zs`, `Zl` or `Zp` |
+| `isUpper`, `isLower` | Cased and upper, cased and lower |
+| `isControl` | U+0000 to U+001F and U+007F to U+009F |
+| `toUpper`, `toLower` | The simple case mapping, one character for one: `'ß'.toUpper` is `'ß'` |
+| `asDigit` | The digit's value in radix 36: a decimal digit of any script gives its value, an ASCII or fullwidth letter, either case, gives 10 to 35; any other character gives -1 |
 
 ## string
 
@@ -129,7 +129,7 @@ bytes inline in one object; it gets its methods from the library through `impl s
 conforms to traits through `impl` (`Eq`, `Hash`, `Ord`, `Display`). A type pattern `s: string` on an
 `Any` matches it like any other type.
 
-- `s.byteLength()` is O(1). Iteration is by `char` (`s.chars()`) or by byte (`s.bytes()`).
+- `s.byteLength` is O(1). Iteration is by `char` (`s.chars`) or by byte (`s.bytes`).
 - There is no `s(i)` returning a char by index, because that would be O(n) behind O(1) syntax.
   Slicing takes byte offsets and traps on an offset that is not a character boundary.
 - `+` concatenates two strings and nothing else. Other values reach text through interpolation
@@ -141,34 +141,34 @@ most the largest `int` bytes.
 
 | Method | Result |
 | --- | --- |
-| `byteLength()` | The number of bytes, O(1) |
-| `charCount()` | The number of characters, O(n) |
-| `isEmpty()`, `nonEmpty()` | Whether it has no bytes, or some |
+| `byteLength` | The number of bytes, O(1) |
+| `charCount` | The number of characters, O(n) |
+| `isEmpty`, `nonEmpty` | Whether it has no bytes, or some |
 | `startsWith(p)`, `endsWith(p)`, `contains(p)` | Whether `p` occurs at the start, the end, anywhere; the empty string occurs in every string |
 | `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
 | `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
-| `toUpperCase()`, `toLowerCase()` | Each character's simple case mapping, one character for one: `"straße".toUpperCase()` is `STRAßE` |
-| `strip()`, `stripLeading()`, `stripTrailing()` | Without the Unicode `White_Space` characters at both ends, the start, the end |
-| `trim()` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
+| `toUpperCase`, `toLowerCase` | Each character's simple case mapping, one character for one: `"straße".toUpperCase` is `STRAßE` |
+| `strip`, `stripLeading`, `stripTrailing` | Without the Unicode `White_Space` characters at both ends, the start, the end |
+| `trim` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
 | `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, a string or a `char`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from` |
-| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength()`); -1 when there is none. The empty string is found at `end`, or at `byteLength()` when `end` is past it |
+| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength`); -1 when there is none. The empty string is found at `end`, or at `byteLength` when `end` is past it |
 | `indexWhere(f)`, `indexWhere(f, from)` | The byte offset of the first character satisfying `f`, at or after `from`; -1 when none does |
 | `lastIndexWhere(f)`, `lastIndexWhere(f, end)` | The byte offset of the last character satisfying `f` that begins at or before `end` (default: the whole string); -1 when none does or `end` is below 0 |
-| `head()`, `last()` | The first and the last character; each traps on the empty string |
-| `headOption()`, `lastOption()` | `Some` of the first or the last character; `None` for the empty string |
+| `head`, `last` | The first and the last character; each traps on the empty string |
+| `headOption`, `lastOption` | `Some` of the first or the last character; `None` for the empty string |
 | `stripPrefix(p)`, `stripSuffix(s)` | Without `p` at the start, without `s` at the end; the string unchanged where it is not there |
-| `capitalize()` | With a lower-case first character mapped to upper case, and unchanged otherwise |
+| `capitalize` | With a lower-case first character mapped to upper case, and unchanged otherwise |
 | `stripMargin()`, `stripMargin(c)` | Each line with its leading characters up to U+0020 and the margin character after them (a vertical bar, or `c`) removed; a line whose first other character is not the margin is unchanged, and the line terminators stay |
-| `chars()` | The characters, in order, as a `Vector[char]` |
-| `bytes()` | The bytes of the encoding, in order, as a `Vector[byte]` |
+| `chars` | The characters, in order, as a `Vector[char]` |
+| `bytes` | The bytes of the encoding, in order, as a `Vector[byte]` |
 | `count(p)` | The number of characters satisfying `p` |
 | `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
-| `lines()` | The lines as a `Vector[string]`, each ended by `\n` or `\r\n` and shown without it; a terminator at the very end starts no further line, so `"a\nb\n".lines()` is two lines and `""` has none. A `\r` not before `\n` stays in its line |
-| `isBlank()` | Whether it has only `White_Space` characters, so the empty string is blank |
-| `reverse()` | The characters in the opposite order |
+| `lines` | The lines as a `Vector[string]`, each ended by `\n` or `\r\n` and shown without it; a terminator at the very end starts no further line, so `"a\nb\n".lines` is two lines and `""` has none. A `\r` not before `\n` stays in its line |
+| `isBlank` | Whether it has only `White_Space` characters, so the empty string is blank |
+| `reverse` | The characters in the opposite order |
 | `padStart(w, c)`, `padEnd(w, c)` | At least `w` characters, `c` (default `' '`) repeated before, after; `w` counts characters, not bytes, and a string already that long is unchanged |
 | `padTo(n, c)` | As `padEnd(n, c)`, the name a sequence's padding has |
 | `equalsIgnoreCase(o)` | Whether the two are equal after each character's simple lower-case mapping |
@@ -188,15 +188,15 @@ most the largest `int` bytes.
 | `takeWhile(p)`, `dropWhile(p)` | The longest prefix whose characters all satisfy `p`, and the string without it |
 | `span(p)`, `partition(p)` | A pair of strings: the longest prefix satisfying `p` and the rest; the characters that satisfy `p` and those that do not |
 | `splitAt(n)` | The pair of the first `n` characters and the rest; `n` is clamped as `take`'s is |
-| `tail()`, `init()` | All but the first, and all but the last, character; each traps on the empty string |
+| `tail`, `init` | All but the first, and all but the last, character; each traps on the empty string |
 | `charIterator()` | The characters as an `Iterator[char]` that decodes one character for each `next()`, making no vector |
 | `split(c)`, `split(sep, limit)`, `split(c, limit)` | `split` with a `char` separator; and with at most `limit` pieces, the last holding the rest of the text with its separators. A `limit` of 0 or less sets none, 1 gives the whole string, and an empty string separator traps |
-| `stripLineEnd()` | Without one `\n` or `\r\n` at its end; a lone `\r`, or no terminator, leaves it unchanged |
+| `stripLineEnd` | Without one `\n` or `\r\n` at its end; a lone `\r`, or no terminator, leaves it unchanged |
 | `compareIgnoreCase(o)` | The sign of the comparison after each character's simple lower-case mapping: negative, zero or positive |
 
 ```text
 val word = "café"
-println(s"${word.byteLength()} ${word.charCount()}")   // 5 4
+println(s"${word.byteLength} ${word.charCount}")   // 5 4
 println(word.slice(3, 5))                               // é
 println(word.slice(0, 4))                               // traps: offset 4 is inside `é`
 ```
@@ -219,7 +219,7 @@ could make a character. Refused are a continuation byte that begins nothing, an 
 sequence begins with (`FF`), and a sequence cut short.
 
 ```text
-val bytes = "naïve".bytes().toArray()
+val bytes = "naïve".bytes.toArray()
 println(string.fromUtf8(bytes))                          // Ok(naïve)
 val cut: Array[byte] = [0x61, 0xE2, 0x82]
 println(string.fromUtf8(cut))                            // Err(Utf8Error(1, true))
@@ -236,8 +236,8 @@ returns `unit`.
 
 `(A, B, …)` is a tuple type of any arity, written and matched with parentheses: `(1, "one")`,
 `(n, name) -> …`. Elements are read with `t.0`, `t.1`. Tuples are values with no identity and derive
-`Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do. A pair has `swap()`, the pair
-with its parts the other way round: `(1, "one").swap()` is `("one", 1)`. A program adds methods to
+`Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do. A pair has `swap`, the pair
+with its parts the other way round: `(1, "one").swap` is `("one", 1)`. A program adds methods to
 tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from its parameters,
 `impl[A, B] (A, B)` or `impl[A] (A, A)`; only the core library implements a trait for tuples.
 
@@ -325,7 +325,7 @@ class Shout: (string) -> string
 data Lengths(extra: int)
 
 impl (string) -> int for Lengths
-    apply(s: string) -> int = s.charCount() + extra
+    apply(s: string) -> int = s.charCount + extra
 
 val f: (string) -> string = Shout()
 ["a", "b"].map(Lengths(1))      // [2, 2]
@@ -343,7 +343,8 @@ There is no arity limit.
 function that runs `f` and then `g` on its result, and `f.compose(g)`, which runs `g` first; and to
 every function of two parameters `f.tupled()`, the function taking its two arguments as one pair. A
 function type is a trait, so they reach every value that is a function of that shape: a lambda, a
-reference to a function, a method value (of a method declared with a parameter list; a
+reference to a function, a method value (of a method declared with a parameter list, one declared
+with an empty list `()` only where a function type is expected; a
 [parameterless method](/spec/declarations/#parameterless-methods) has none, and `() -> x.head` is the
 function that reads one), and a value of a type naming a function type, a sequence or a map among
 them. A type's own method of the same name and parameter types is found first.
@@ -406,7 +407,7 @@ val inc: (int) -> int = _ + 1
 
 - **The lambda is the nearest argument holding the `_`.** A `_` is found through operators of every
   precedence, member access and method calls on it, tuple parts (`(_, 0)`), `is`, a range's bounds,
-  `with`'s base and a call's callee, so `_.name.byteLength() + 1` is one lambda. Another call's
+  `with`'s base and a call's callee, so `_.name.byteLength + 1` is one lambda. Another call's
   argument is a lambda of its own: in `orders.map(_.items.map(_ * 2))` the first `_` is an order and
   the second an item. A name ending in `:` is written after its argument, so in `_ +: _` the first
   `_` is the element.

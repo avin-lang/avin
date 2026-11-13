@@ -187,7 +187,8 @@ a decision changes, this page and the chapter change together.
   closure holding `account`, of the method's type without the receiver. Inside the class, a bare
   method name is the same closure over `self`. This holds for a method declared with a parameter
   list, `()` included; a method declared with none (settled by the user 2026-11-12, below) is called
-  by its name and has no method value.
+  by its name and has no method value. One declared with an empty list `()` is a value only where a
+  function type is expected (Proposed 2026-11-12, below).
 - Settled 2026-11-03: a method value evaluates its receiver once, where the value is made. Through a
   trait-typed or open-class receiver it calls the implementation the object's class has, through
   the object's method table at each call; the object is fixed, so this is the implementation it had
@@ -769,9 +770,10 @@ Settled by the user on 2026-11-03:
   generator and no guards.
 - A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
   of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
-  the library's collections takes any `Iterable` from its function; a `Range` maps to a `Vector`;
+  the library's collections takes any `Iterable` from its function, or an `Option` (see the
+  entry on `flatMap` with options, branch `map-flatmap`); a `Range` maps to a `Vector`;
   a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
-  a function of one pair, and yield a `Map`.
+  a function of one pair, and yield a `Map` where they yield pairs, a collection otherwise.
 - A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
   elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
   guards or yielded value.
@@ -1245,7 +1247,7 @@ Settled by the user on 2026-11-04:
   `partition` answers `(Vector[T], Vector[T])`, `groupBy` a `Map[K, Vector[T]]`, `zipWithIndex` a
   `Vector[(T, int)]`, so a set's or a map's partition keeps every element, equal results included,
   and a list's comes back indexed. A type's own method of the same signature still answers where the
-  type is known (`List.toList()` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
+  type is known (`List.toList` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
   `drop`, `takeWhile`, `dropWhile`, `zip` and `zipWithIndex` answering iterators; its
   `zipWithIndex` is the trait's own method and so is found before `Iterable`'s. To compile these, a
   method table holds a method at a position only for the types a call through that position can
@@ -1438,7 +1440,7 @@ Settled by the user on 2026-11-04:
   elapsed time is `monotonic() - start`. Makers: `now()`, `monotonic()`, `date(y, m, d)`,
   `time(h, m, s)`, `dateTime(…)`, `zone("America/Toronto")`, `localZone()`, and `utc`, a value
   rather than a call; `epochSeconds`, `epochMillis` and `epochMicros` to and from counts; the
-  durations `micros millis seconds minutes hours days weeks`, also as methods (`2.hours()`); the
+  durations `micros millis seconds minutes hours days weeks`, also as methods (`2.hours`); the
   periods `months` and `years`. The implementation binds with `@sysl` over Sysl 0.10.0's `sysl.time`
   (`Date`, `Time`, `DateTime`, `YearMonthDay`, `Offset`, `Weekday`, `Resolution`, `Zone` over
   `sysl.time.tzif` with `offset_at` and `resolve`, `Zoned`, `Period`), with the system clock and the
@@ -1927,9 +1929,57 @@ their words are reserved.
   concrete collection back at run time; that would make every collection's `map` an `override`,
   rule out the bounded versions (`TreeSet.map[B: Ord]` cannot override an unbounded `map[B]`),
   and dispatch every call. The chapter's earlier claim that generic code gets the concrete
-  collection back is withdrawn. **Review with the user**: a `Map` receiver still offers only its
-  pair-making `map`, so `m.map(e -> e.0)` is rejected rather than answering an `Iterable`; making
-  it fall back needs overload resolution that checks a lambda's body against each candidate.
+  collection back is withdrawn. The review this entry carried, a `Map` receiver offering only its
+  pair-making `map`, is superseded by the Proposed entry on a map's `map` to other results (branch
+  `map-flatmap`).
+- Settled on the user's delegation 2026-11-12 (built on branch `map-flatmap`): **a map's `map` and `flatMap` to anything other than pairs
+  answer a collection** ([collections](/spec/collections/#operations-without-higher-kinded-types)),
+  on the user's direction that Avin adopt the conveniences of a rich collections library that add
+  no complexity. `m.map((k, v) -> Summary(k, v))`, `m.map(e -> e.0)`, a `match` function or a
+  method value making non-pairs, and a comprehension over a map yielding non-pairs, guarded or
+  not, answer `Iterable[B]` (a `Vector` underneath) in the map's iteration order; a pair still
+  makes a map of the receiver's kind (`HashMap` through `Map`, `TreeMap`, the mutable ones). Every
+  map has a `map[B](f: (K, V) -> B) -> Iterable[B]` overload beside its pair-making one, and the
+  filtered views a comprehension's guard makes have `map[B]` and `flatMap[B]` of one pair; a
+  function of the entry as one pair reaches `Iterable`'s own. To choose by the lambda's body,
+  overload resolution gains one rule ([declarations](/spec/declarations/#default-and-named-arguments)):
+  where the candidates left all give a lambda (or a `match` function) the same parameter types,
+  known without the candidates' own type arguments, and differ only in the result, the lambda is
+  checked once with those parameters and an open result, and then fits as any typed argument does;
+  of two that fit, the pair-making one is the more specific. WHY: one check of the body, with no
+  speculative re-checking or rollback, settles the common shape exactly, and the rule is
+  invisible where the overloads already agree. ALTERNATIVES: checking the lambda's body against
+  each candidate in turn and discarding the failures (general, but every check would have to be
+  undone, captures and nested lambdas included); answering a `Vector` rather than an `Iterable`
+  (handier to index, but `Iterable`'s own `map`, which a one-pair function reaches, answers
+  `Iterable`, and the two shapes of function should agree); a diagnostic suggesting `.toVector`
+  first (the audit's stopgap). Not done: a sorted collection's `map` to an element or key that is
+  not `Ord` is still refused naming the bound, rather than falling back to an unsorted result,
+  since the sorted overload hides `Iterable`'s of the same parameter types and the candidates are
+  not held to their bounds while choosing. Review with the user: whether that fallback is wanted
+  too, and `Iterable` versus `Vector` as the result.
+- Settled on the user's delegation 2026-11-12 (built on branch `map-flatmap`): **`flatMap` takes an option-making function on every
+  collection**, by an overload `flatMap[U](f: (T) -> Option[U])` beside each collection's own
+  `flatMap` of a collection-making function, answering the same kind: `Iterable` (a `Vector`),
+  every `Seq`, `Vector`, `List`, `ArraySeq`, `Array`, `Buffer`, `Deque`, `Queue`, `LazyList` (lazily),
+  `Iterator` (lazily), `Set`, `TreeSet`, the mutable sets and bit set, and every filtered view a
+  comprehension's guard makes. A map's takes `((K, V)) -> Option[(L, W)]` into a map of its kind,
+  and any other option into a collection (through `Iterable`'s, or the filtered view's own).
+  `Iterable[Option[T]]` has `flatten` into a `Vector`, `Iterator[Option[T]]` into a lazy iterator.
+  `Option` gains `flatMap[U](f: (T) -> Iterable[U]) -> Vector[U]`, so a comprehension drawing from
+  an option and then a collection yields a vector; one drawing from a collection and then options
+  yields the collection's kind. The lambda's body chooses between the two `flatMap`s by the rule of
+  the entry above. WHY: the overload is a library addition that every call path sees, generic code
+  through `Iterable` included, and leaves options' representation alone. ALTERNATIVES: making
+  `Option` an `Iterable` of at most one element (`impl[T] Iterable[T] for Option[T]`), which was
+  built and works, `++`, `concat` and `Iterable` parameters taking options included, but the
+  library's `Iterator[Iterable[T]]` impl then views a type parameter through a trait `Option`
+  conforms to, so the representation plan keeps every option of every program as an object rather
+  than a bare pointer (an allocation per `Some`, and `None` read through `Any` changes); a
+  conversion at the call (a mechanism Avin does not have). Not done: `xs ++ maybe`, `concat` and
+  an option given for an `Iterable` parameter, which need the conformance; `toList` covers them.
+  Review with the user: whether options as iterables are worth reworking the representation plan
+  for, and the `Vector` from an option's `flatMap` of a collection.
 - Settled on the user's delegation 2026-11-05: **`rest*` binds what `drop(n)` answers**
   ([collections](/spec/collections/#sequence-patterns)), branch `coll-followups`. One rule for every `n`,
   `n = 0` included: `[rest*]` binds `drop(0)`, the list itself on a list and a `Vector` on a range,
@@ -2050,7 +2100,7 @@ their words are reserved.
   failing with `Io(InvalidUtf8)`; the alternative is the failure, which would lose the whole output
   over one byte. **Review with the user**: the decoding.
 - Settled on the user's delegation 2026-11-06 (branch `command-clear-env`): **A command's environment: `clearEnv`, `withoutEnv`, `withEnvironment`** ([commands](/spec/system-library/#commands)).
-  A command keeps its environment changes as an ordered list (set, remove, clear), applied in the order called; on a joined command the command's list comes before each part's own. `clearEnv()` starts from an empty environment, `withoutEnv(name)` drops one inherited variable (an unset name is no error), `withEnvironment(map)` is `clearEnv()` then each entry. With only sets, the running program's environment is left to Sysl's `inherit_env`; once a list clears or removes, the whole environment is built from `environment()` and handed over with `inherit_env = false`. A bare program name after a clear is looked for on the `PATH` the command was given, or the system's default path where none, never the running program's: that is Sysl's `spawn` rule, kept so a command never finds a program through a variable it was told not to have. Variables whose name or value is not UTF-8 are not passed once a command removes or clears (`environment()` passes them over). WHY: a daemon must start jobs from the submitter's environment, not its own. ALTERNATIVES: a single `withEnvironment` only (cannot remove one variable cheaply); a settings pair of a base flag and a removed set (loses the order of calls, so `clearEnv().withEnv(x)` and `withEnv(x).clearEnv()` could not differ); looking the program up on the parent's `PATH` (a cleared command would still find programs by a variable it lacks). Review with the user: the `PATH` lookup rule.
+  A command keeps its environment changes as an ordered list (set, remove, clear), applied in the order called; on a joined command the command's list comes before each part's own. `clearEnv()` starts from an empty environment, `withoutEnv(name)` drops one inherited variable (an unset name is no error), `withEnvironment(map)` is `clearEnv()` then each entry. With only sets, the running program's environment is left to Sysl's `inherit_env`; once a list clears or removes, the whole environment is built from `environment()` and handed over with `inherit_env = false`. A bare program name after a clear is looked for on the `PATH` the command was given, or the system's default path where none, never the running program's: that is Sysl's `spawn` rule, kept so a command never finds a program through a variable it was told not to have. Variables whose name or value is not UTF-8 are not passed once a command removes or clears (`environment()` passes them over). WHY: a daemon must start jobs from the submitter's environment, not its own. ALTERNATIVES: a single `withEnvironment` only (cannot remove one variable cheaply); a settings pair of a base flag and a removed set (loses the order of calls, so `clearEnv().withEnv(x)` and `withEnv(x).clearEnv` could not differ); looking the program up on the parent's `PATH` (a cleared command would still find programs by a variable it lacks). Review with the user: the `PATH` lookup rule.
 - Settled on the user's delegation 2026-11-05 (built on branch `process-commands`), with one change: **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
   Proposed: `Child.kill()` sends signal 15 to every program of the command still running and starts
   no part not yet started; `waitFor()` then answers `Signalled(15)` for a program it stopped. A
@@ -3473,7 +3523,7 @@ spelling is better, as each entry says.
   so `zoned + days(1)` keeps the wall clock, which contradicts the settled list. **Review with the
   user**: the two spellings answer differently across a daylight-saving change.
 - **Names where slate leaves them open, and where slate's are kept.** `t.atZone(z)`, `d.atTime(t)`,
-  `t.atDate(d)`, `d.atStartOfDay()`, `zt.toInstant()`, `plusYears`/`plusMonths`/`plusWeeks`/
+  `t.atDate(d)`, `d.atStartOfDay()`, `zt.toInstant`, `plusYears`/`plusMonths`/`plusWeeks`/
   `plusDays` (no `minus` forms: a negative count), `withYear`/`withMonth`/`withDay`/`withHour`…,
   `isBefore`/`isAfter`/`isSameInstant`, a duration's `toHours()` (whole) and `toHoursPart()`, a
   date's `daysUntil`/`monthsUntil`/`until`. Kept from slate as better: `weekday()` (shorter, and the
@@ -3482,7 +3532,7 @@ spelling is better, as each entry says.
   is spelt `atZone`/`atTime`/`atDate`, since one overloaded word hides which conversion is meant and
   `atZone` names what can fail. `startOf("month")` becomes `startOfMonth()` and its siblings, so a
   date's `startOfHour` is a compile error rather than a run-time one. *Alternatives*: slate's
-  `d.minutes()` for whole minutes (the same word makes and measures), `dayOfMonth`.
+  `d.minutes` for whole minutes (the same word makes and measures), `dayOfMonth`.
 - **Choosing an instant for a skipped or repeated reading.** `dt.atZone(z)` answers
   `Result[Zoned, ZoneTimeError]` (`Skipped`, `Repeated`), and `atZoneEarlier(z)`/`atZoneLater(z)`,
   Sysl's `at_earlier`/`at_later`, always answer: the earlier or later instant of a repeated hour, and
@@ -4461,19 +4511,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   (more machinery for a rare shape). Review with the user: whether `match` arms such as `Some(2)`
   beside `Some(big)` should also agree.
 
-- Settled on the user's delegation 2026-11-06 (branch `okor-command-message`): **`Option.okOr` / `okOrElse` and `CommandError.message()`**.
+- Settled on the user's delegation 2026-11-06 (branch `okor-command-message`): **`Option.okOr` / `okOrElse` and `CommandError.message`**.
   `Option[T]` gains `okOr[E](error: E) -> Result[T, E]` and `okOrElse[E](f: () -> E)`, the `Result`
-  counterparts of `toRight`; `Result.ok()` and `err()` already existed. `okOr` takes its argument
+  counterparts of `toRight`; `Result.ok` and `err()` already existed. `okOr` takes its argument
   by value and `okOrElse` a function called only for `None`. WHY: the two names say which form
   evaluates; the by-name form already exists as a lambda call, and a by-name `okOr` would leave
   `okOrElse` redundant. Alternatives: a by-name `okOr` only (as `toRight` is; one method, but an
   argument with effects reads as eager and is not), or `toRight`-style names (`toOk`). Review
   with the user if `okOr`'s eagerness should instead match `toRight`'s.
-  `CommandError.message() -> string` reads `exited with status N`, `killed by signal N (Name)`
+  `CommandError.message -> string` reads `exited with status N`, `killed by signal N (Name)`
   (`unknown` for a signal `avin.signal` has no name for), `timed out`, and an `Io` error's own
-  `IoError.message()`. WHY: one sentence per variant in `IoError.message`'s lower-case style, the
+  `IoError.message`. WHY: one sentence per variant in `IoError.message`'s lower-case style, the
   signal's name beside its number as `avin.signal` names them. Alternatives: the number alone;
-  `ExitStatus.message()` as well (not added: nothing needs it yet).
+  `ExitStatus.message` as well (not added: nothing needs it yet).
 
 - Settled on the user's delegation 2026-11-06 (branch `sysl-098`): **`Child.detach()`** ([commands](/spec/system-library/#commands)).
   `detach() -> long` lets go of every program of the command still running without stopping it
@@ -5665,7 +5715,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`startOfYear()`, `startOfMonth()` and `startOfWeek()` on a
   `DateTime` answer midnight** of that day, while `endOfMonth()` keeps the time of day, as the
   chapter says. *Why*: a start is the first moment of its span, as `startOfDay` is; keeping the
-  time would make `r.startOfMonth()` mean "the same time on the 1st", which `r.withDay(1)` already
+  time would make `r.startOfMonth` mean "the same time on the 1st", which `r.withDay(1)` already
   says. *Alternatives*: keep the time of day for all four (symmetric with `endOfMonth`, but two
   spellings of `withDay(1)`); make `endOfMonth` the last microsecond of the month too (a start/end
   pair, but the chapter decided "at the same time of day"). Review with the user whether
@@ -5682,7 +5732,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   integer overflow trap everywhere (shorter code, a less useful message); clamping to the bounds
   (silently wrong).
 - Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`withYear` takes a `long`**, the type `year()` answers, so
-  `d.withYear(d.year() + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
+  `d.withYear(d.year + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
   `int` like the makers (a conversion at every use of `year()`), or changing `year()` to `int`
   (every year of a `Date` fits, but a change to step 1's fields).
 - Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
@@ -5871,7 +5921,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with `a + months(n) <= b` (answers 1 for 2026-01-31 to 2026-02-28, against the chapter); counting
   backward periods from `b` so the reverse is the negation (breaks `a + a.until(b) == b` for
   `a > b`).
-- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`p.toIsoString()` writes a period in ISO 8601's form**,
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`p.toIsoString` writes a period in ISO 8601's form**,
   `P1Y2M3D`, the months split into years as the display splits them, `P0D` for the empty period,
   and a negative part with its own sign (`P-1Y-2M`, `P1M-3D`). *Why*: the display `1y 2mo 3d` is
   for people; exchange formats want ISO's, and a period's parts may differ in sign, which a single
@@ -6313,7 +6363,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `x.pow(0)` is `1` for every `x`, `0.pow(0)` included. `gcd` is never negative and traps only when
   its value is `MinValue`'s magnitude; `lcm` is `0` when either side is, otherwise positive. `sign`
   is an `int`, as are `bitCount`, `leadingZeros` and `trailingZeros`, which count at the width
-  (`(-1).bitCount()` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
+  (`(-1).bitCount` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
   case, a `-` and the magnitude, as `f"%x"` does, with no prefix, and takes `int` from 2 to 36 and
   traps outside it. Why: each is the usual meaning, the least surprising for a program moving
   between widths. Alternatives weighed: a `long` exponent (never needed; an `int` is enough for
@@ -6653,7 +6703,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives weighed: keeping results to classes only (tuples and covariant instances then need
   a differently named method, as own-kind `partition` met); also boxing a scalar result, which
   would make an override's call site convert behind a virtual call.
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList[+T]` is a class whose cell is a
   private `lazy val`**, and the expression that computes the cell is dropped once it has run. The
   cell is `Option[(T, LazyList[T])]`; the class holds a function that reads the real expression out
   of a captured variable and empties it, so an evaluated cell keeps nothing the expression captured.
@@ -6663,9 +6713,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   would hold every source cell it skipped). ALTERNATIVES: an invariant node class with `var`s (the
   list could then not be covariant); a `var` of type `Any` cast back on each read (no type checking
   of the cell); keeping the expression (simpler, a space leak).
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
   strictly and the tail by name, and the tail is evaluated when the list's second cell is first
-  read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
+  read**, not when the first is: `xs.head` never evaluates the tail expression. WHY: the first
   cell is then exactly the head, and a function building a list recursively runs one step per cell
   read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
   at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
@@ -6677,7 +6727,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Settled on the user's delegation 2026-11-11 (built on branch `lazy-cons-operator`): **A companion object may declare an operator
   ending in `:` with its right operand by name, and `x op: r` calls it where `r`'s type is the
   companion's type.** `object LazyList` declares `#::[T](head: T, tail: -> LazyList[T])`, so
-  `0 #:: 1 #:: fibs.zip(fibs.tail()).map((a, b) -> a + b)` evaluates its tail only when the cell
+  `0 #:: 1 #:: fibs.zip(fibs.tail).map((a, b) -> a + b)` evaluates its tail only when the cell
   after the head is first read. The right operand's type decides which `op:` is called, and that
   type is known only once the operand is checked, so wherever some companion declares `op:` this
   way, the right operand of every `x op: r` is checked as a delayed expression; a type whose `op:`
@@ -6715,25 +6765,25 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the list's progress record holds while its cell's expression runs, rather than the `lazy val`'s
   own message, which named the private field `cell`. ALTERNATIVES: keeping the `lazy val`'s
   message (names an implementation detail).
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList` is an `Iterable`, not a `Seq`.** WHY:
   a `Seq` answers `length()`, `apply`, `lift`, `isEmpty`, `==` and its hash through `length()`, which
   never returns on an endless list, and every eager method a `Seq` adds would build a `Vector` from
   it; sequence patterns over it would call `length()` too. As an `Iterable` it keeps the forcing
   methods every collection has, its own lazy forms found first. ALTERNATIVES: a `Seq` overriding the
   methods that would not return (most of them), or a `Seq` whose `length()` simply does not return
   on an endless list.
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **A lazy list's `Display` and `Debug` show the
   evaluated prefix and `…`, evaluating nothing**: `[0, 1, 4]`, `[0, 1, …]`, `[…]`, with a field
   width padding the whole. WHY: displaying an endless list must return, and a display that
   evaluated cells would run a program's functions while printing. ALTERNATIVES: forcing every cell
   (does not return on an endless list); a fixed prefix forced (side effects while printing);
   `<not computed>` text (longer, and not a form the other collections use). No `Eq`, `Hash` or
   `Ord`, which could not answer for two equal endless lists.
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **A lazy list is not sendable**, so each belongs to
   the thread that made it; the cells' `lazy val` evaluation would be safe between threads, but the
   expressions not yet evaluated are functions that may capture anything. ALTERNATIVES: sendable when
   every expression is a `@sendable` function (every lazy method would need a sendable form).
-- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): Proposed (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
+- Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`zip` takes another `LazyList`** and stays lazy;
   **`flatMap` takes `(T) -> Iterable[U]`**, reading each collection through its iterator as cells are
   read; **`++` takes its right operand by name**, evaluated only when the cell after the left's last
   is read (the iterator's `++` takes a strict `Iterable`, since an iterator is read once anyway);
@@ -6789,10 +6839,10 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   where the collection-specific conversions need a method per pair. Alternatives weighed: a
   `to(factory)` conversion (needs higher-kinded types); a universal `into(builder)` (not added:
   `builder.addAll(xs)` already reads as well, and `from` covers the target-first reading);
-  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
+  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList` is one call);
   `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
   counting iterator and keeps its name.
-- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
   where they live** (the second part of Settled → unions → Representation, built on the multi-word
   values above).
   - **Three words**: a 32-bit tag, 64 bits for a scalar member and, where a member is a reference, the
@@ -6831,7 +6881,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     compare and hash as that member, and a reference as an `Any`, so a union and the same value as an
     `Any` are equal and hash alike. Review with the user: storing a union with a string member now
     allocates its cell where an `Any` did not, until fields and collections take the words.
-- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+- Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
     `Any` are equal and hash alike. (The review flag this entry carried, a stored union with a string
     member allocating its cell, is closed by the next entry.)
 - Settled on the user's delegation 2026-11-11 (built on branch `union-words-storage`): **A union with a scalar member is stored as its
@@ -6899,7 +6949,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   hidden in a `match`). Review with the user: a union-of-references part tests the object, while a
   class part tests the type the tuple was made with.
 
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **The instance cache is on by default** for
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **The instance cache is on by default** for
   every command that builds: `avin build`, `run`, `test` and `emit-llvm`. `AVIN_INCREMENTAL=off`
   turns it off, `verify` stays, and `on`, unset or empty are the default; any other value is an
   error for the commands that build, while `avin check` (even with `--bindings`) neither reads the
@@ -6911,7 +6961,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   much); an `--incremental` flag rather than a variable (a flag every command would carry for a
   setting nobody changes per build). Review with the user: the disk it takes, about the size of the
   program's text per kind and level (185 MB for marshal at `-O2`).
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **A program of one file names its cache
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **A program of one file names its cache
   directories after itself**, `.avin/build/incremental/<stem>-<kind><level>`, while a directory
   or package keeps `<kind><level>`. WHY: every file of a directory shares that directory's
   `.avin/build`, as their executables already do (named by stem); with one directory per kind and
@@ -6920,12 +6970,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives: a subdirectory per file (`incremental/<stem>/program-O2`, which a file named
   `tests-O0.avin` would make collide with a directory program's); one shared directory (correct,
   since entries are content-addressed, but each program would lose its reuse in turn).
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **A manifest names only module files of its own
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **A manifest names only module files of its own
   directory**: a name that is not hexadecimal digits and `.mod` is passed over as damaged and never
   read. WHY: a damaged manifest could otherwise send the reader to `../` paths outside the cache;
   nothing a build writes has another form. Alternatives: trusting the manifest (only the checksum
   would stand between a stray path and its contents being read as entries).
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **Code that calls the C unit's glue is never
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **Code that calls the C unit's glue is never
   taken from the cache's lowered entries, and the glue it calls is part of its text's key**; a C
   callback's body is keyed by its binding and its trampoline's name. The warm corpus run found three
   stale texts: the glue (`avin_c_call_<n>`, `avin_c_field_get_<n>`, `avin_c_retain_<n>` and the
@@ -6938,7 +6988,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and every place lowering calls into it); a digest of every C declaration's number in every key
   (a declaration added anywhere would re-lower a C program whole). Review with the user: stable C
   glue names would let these functions be reused too.
-- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): Proposed (built on branch `incremental-default`): **The warm corpus run is chosen by
+- Settled on the user's delegation 2026-11-11 (built on branch `incremental-default`): **The warm corpus run is chosen by
   `AVIN_INCREMENTAL=verify` in the environment of `sysl test compiler`**: each corpus program is
   built cold with an empty cache, edited by adding a function nothing calls at the end of its first
   non-literate file, and built again from the cache in `verify` mode, which also builds it clean; the
@@ -6949,7 +6999,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   gate (triples the corpus's compile time); an edit inside a function (moves trap lines the `.err`
   files record, or changes what a program does).
 
-- Settled on the user's delegation 2026-11-11 (built on branch `site-prime-sieve`): Proposed (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
+- Settled on the user's delegation 2026-11-11 (built on branch `site-prime-sieve`): **A program the website shows is run-checked from
   the page itself.** In `docs/content/**/*.md`, a fence whose info string carries the word `run`
   after its language (```` ```text run ````) holds a complete program, and the next fence, carrying
   `output` (```` ```text output ````), holds exactly what it prints, with prose allowed between
@@ -6976,13 +7026,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 - Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`): **parentheses after a parameterless method
   call what it yields.** `t.adder(4)`, where `adder -> (int) -> int`, calls the function `adder`
-  yields, and `t.items(2)` indexes the sequence `items` yields; `c.head()`, where `head` yields
+  yields, and `t.items(2)` indexes the sequence `items` yields; `c.head`, where `head` yields
   neither (or a sequence given no index), is an error naming the fix, "`head` takes no parameter
   list, so it is called without parentheses: write `head`, not `head()`". The same holds inside the
   class by bare name and through `super`. WHY: `x.m(a)` must mean one thing, and the declaration says
   `m` takes no arguments, so the only call the parentheses can make is of the result; reporting
-  `x.head()` instead of reading it as a call keeps the rule visible at every wrong use. ALTERNATIVES:
-  accepting `x.head()` as a synonym of `x.head` (two spellings of one call, and it hides a callable
+  `x.head` instead of reading it as a call keeps the rule visible at every wrong use. ALTERNATIVES:
+  accepting `x.head` as a synonym of `x.head` (two spellings of one call, and it hides a callable
   result's call); refusing parentheses after a parameterless method altogether (then `t.adder(4)`
   would need `(t.adder)(4)`).
 - Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`): **the parameter-list shape is part of a
@@ -7113,10 +7163,208 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   highlighter package's Sysl pin); a CI-only job (no CI runs here). Review with the user if the
   gate coupling is preferred.
 
+- Settled on the user's delegation 2026-11-12 (built on branch `runner-orphans`): **Every program a runner starts leads a process
+  group of its own, and nothing in that group outlives it.** `avin test` (each test and hook), the
+  execution corpus and the documentation-programs check start each program with a new process
+  group, so whatever it starts in turn is in the group too. Once the program has been waited for,
+  whatever is left of its group is sent `SIGTERM`, given **200 ms** to go (the same grace the
+  system layer gives a program that outstays its limit), then sent `SIGKILL`: after every run, not
+  only after a timeout, since a test that passed but left a server's worker running orphans it just
+  the same. A runner stopped by `SIGINT`, `SIGTERM` or now also `SIGHUP` (exiting 130, 143, 129)
+  sends `SIGKILL` at once to every group still running, with no grace, because whoever stopped it is
+  itself about to make it stop. WHY: the orphans found 2026-11-12 (a corpus program spinning for
+  8 h; two left idle for 30 h) were programs and grandchildren that the runner never reached once
+  the timeout had killed only the leader, or once the runner itself was stopped. ALTERNATIVES
+  weighed: enforcing the limit on the whole group at once (`SIGTERM` to the group at the deadline
+  rather than to the leader first) needs a watchdog thread of the runner's own in place of the
+  system layer's timeout, for a difference only in the order the grandchildren hear `SIGTERM`; a
+  child-side check that its parent has gone (macOS has no parent-death signal, so every Avin program
+  would poll); a longer grace (a test's tidy-up has its whole limit already). Known limit: a runner
+  killed with `SIGKILL` cannot act, and its programs, no longer in its group, are not reached by a
+  signal sent to that group; marshal and `sysl test` both send `SIGTERM` first. A program that
+  moves itself into another group or session is also beyond reach. `avin run` is unchanged: its
+  program stays in the terminal's group so that Ctrl-C and job control reach it.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `field-shadow`): **A field may share its name with a trait's method
+  that takes a parameter list.** `x.name` and a bare `name` read the field; `x.name(args)` and a
+  bare `name(args)` call the method (a bare call is `self.name(args)`, which already put methods
+  first); through the trait or a type parameter it bounds only the method is seen. A method of no
+  trait, or of no parameter list, still may not share a field's name, and is reported at its own
+  declaration; what a derived impl lacks is reported at the `derives` entry, never in the library's
+  template. WHY: `display`, `debug`, `compare` and the rest are ordinary field names
+  (`data Config(host: string, debug: bool)`), and every data type derives `Display` and `Debug`
+  without asking, so refusing the pair made such a type unprintable with an error inside
+  `format.avin`; the read/call split is the rule member access and calls already followed, so no
+  program changes meaning. A field holding a function under such a name is called by reading it
+  first (`val f = x.name`). ALTERNATIVES: renaming the protocol methods to reserved spellings
+  (breaks every hand-written impl and still leaves a name a field can take); having the library and
+  templates call through a qualified trait form such as `Display.display(x, …)` (no such form exists,
+  and it would fix only the library's calls, not a program's own impl); refusing the field with a
+  better message (keeps `debug: bool` illegal). Review with the user: it widens what a type may
+  declare.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `main-result`): **`main` may answer with `Result[unit, E]` or
+  `Result[N, E]` for any integer type `N`, and also with `Result[Nothing, E]`. An `Err` is written to
+  standard error as `error: ` followed by its `Display`, and the program exits with 1.** The line is
+  written before the exit hooks run. `Ok(n)` exits with `n`, as a plain integer `main` does.
+  WHY: this lets a whole script use `?`. The `error: ` prefix matches the compiler's own
+  diagnostics and is what a command-line user expects. Status 1 is the ordinary failure status, and
+  it is distinct from a trap, which ends the program with a signal. Allowing any integer type matches
+  the plain `main`, which may yield any integer. `Nothing` covers `main() = Err(…)`, whose `Ok` type is
+  inferred as `Nothing`. ALTERNATIVES: allow only `int` in `Ok` (narrower than plain `main` for no
+  reason); give each error type its own status (there is no agreed way to choose one, and a program
+  that wants a particular status calls `exit`); trap on `Err` (a trap reports a source position
+  and signals, which is wrong for an expected failure such as a missing file).
+- Settled on the user's delegation 2026-11-12 (built on branch `main-result`): **The error type of a `Result`-answering `main` must
+  implement `Display`. There is no fallback to `Debug`.** A union of errors needs `Display` on every
+  member. WHY: the line is meant for the program's user, and a `Debug` form, such as quoted strings
+  or field names, reads as an accident. This is the same rule that applies to the error of a
+  `@test` function answering `Result[unit, E]`, so the two `Result` readers agree. Data types get
+  `Display` automatically wherever their fields have it, so the requirement rarely costs anything.
+  ALTERNATIVES: fall back to `Debug` when there is no `Display` (more programs compile, but some
+  errors would be shown in a form nobody chose); show any value at all through the runtime renderer
+  (same objection, and weaker). The user may want to revisit this if programs commonly hit errors
+  that have only `Debug`.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `parameterless-wave2`): **the rest of the standard library's pure
+  accessors are parameterless.** The rule applied: a public method of no parameters is declared
+  without a parameter list when it answers from its receiver (or, static, from its type), changes
+  nothing, and hands out nothing to change or use up; the same rule wave 1 applied to collections,
+  where `reverse`, `distinct` and the immutable conversions count as accessors. Converted: Option's
+  `isDefined`, `isEmpty`, `nonEmpty`, `get`, `toList`, `toVector`, `toArraySeq`, `knownSize`,
+  `flatten`, `unzip`; Either's `isLeft`, `isRight`, `swap`, `toOption`, `toList`, `toVector`,
+  `merge`, `joinLeft`, `joinRight`; Result's `isOk`, `isErr`, `ok`, `err`, `toList`, `flatten`; a
+  pair's `swap`; string's `byteLength`, `charCount`, `isEmpty`, `nonEmpty`, `isBlank`, `head`,
+  `last`, `headOption`, `lastOption`, `tail`, `init`, `reverse`, `chars`, `bytes`, `lines`, `trim`,
+  `strip`, `stripLeading`, `stripTrailing`, `stripLineEnd`, `capitalize`, `toUpperCase`,
+  `toLowerCase`; char's `isDigit`, `isLetter`, `isLetterOrDigit`, `isSpaceChar`, `isWhitespace`,
+  `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower`, `asDigit`; the integers' `abs`, `sign`,
+  `bitCount`, `leadingZeros`, `trailingZeros`, `isPowerOfTwo`; real's `isNaN`, `isInfinite`,
+  `isFinite`; Enumerable's `values` (static), `ordinal`, `name`; StringWriter's `text`, `length`,
+  `isEmpty`; ByteView's `length`; `sorted`, `firstKey`, `lastKey`, `toTreeMap`, `toBitMask` and a
+  queue's `front`, `frontOption`, `dequeue`, `dequeueOption`, `toQueue`, which wave 1 missed;
+  regex's `pattern`, `regex`, `anchored`, `unanchored`, `groupCount`, `groupNames`, `matched`,
+  `start`, `end`, `before`, `after`, `subgroups`; time's int and long `micros` … `weeks`,
+  Duration's `toDays` … `toSecondsReal`, `isNegative`, `isZero`, `abs`, Instant's and Zoned's
+  `epochSeconds`/`epochMillis`/`epochMicros`, every Date, Time, DateTime and Zoned field reader
+  (`year`, `month`, `day`, `weekday`, `hour`, `startOfMonth`, `date`, `time`, `abbreviation`, …),
+  Period's `months`/`years` and readers, Weekday's `isoNumber`, Zone's `name` and `isFixed`; every
+  error type's `message`; Url's `portOrDefault` and `queryParams`, an HTTP response's and request's
+  `text`, a request's `queryParams`; ExitStatus's `isSuccess`, Command's `clearEnv` and
+  `inNewGroup`; Weighted's `size`; Json's `isNull`, `asBool` … `asMembers`, `keys`, `size`,
+  `render`, `renderAscii`. A trait's static member declared without a parameter list is now read
+  through a type parameter too, `T.values` (it was refused as "`T` is not defined"), and the
+  infix-postfix diagnostic names both spellings, `xs.size` and `xs.size()`.
+  **Kept with `()`, the borderline calls**: (1) string's `toInt()`, `toLong()`, `toIntOption()`,
+  `toLongOption()` have overloads taking a radix, and a parameterless method is the only one of its
+  name, so they keep `()`, and `toReal()`, `toRealOption()`, `toBool()`, `toBoolOption()` keep them
+  with them, one spelling for the family of parsers; `stripMargin()` likewise beside
+  `stripMargin(c)`. (2) The core traits' members every type implements or derives —
+  `toString()`, `hash()`, `zero()`, `one()`, `negate()`, `shape()`, Codec's `whenMissing()` and
+  `jsonKey()` — and so Duration's and Period's `zero()`/`negate()`, since changing these changes
+  every program's own impls and derives; **review with the user**, as a wave of its own. (3)
+  Reads of shared or outside state: a `Mutex`'s and a UI state's `get()`, a signal's `read()`,
+  a future's `isCompleted()`/`value()`/`peek()`, an executor's `isShutdown()`, an actor mailbox's
+  `isEmpty()`, and every method of a file, socket, listener, child process or command's handle
+  (`pid()`, `isAlive()`, `isClosed()`, `port()`), whose answer can change under the reader. (4)
+  Constructors and factories, `Vector.empty[T]()`, `BitSet.empty()`, `newBuilder()`, `copy()`,
+  `Random()`. (5) A UI view's modifiers `padded()` and `panel()`, beside `padding(n)` and
+  `pad(…)`, one spelling for the modifier chain. (6) Private helpers and binding classes.
+  **Borderline converted**: `opt.get` and `s.head` trap on None and on an empty string, as `xs.head`
+  does; `q.dequeue` reads like an action but answers a new queue and changes nothing; a regex
+  matcher's `matched`, `start` and `end` read the current match of a cursor that `findNext()`
+  moves, as a buffer's `size` reads a buffer that `push` changes. WHY: one rule across the library,
+  so a reader knows a call's spelling from what it does; the families above stay uniform.
+  ALTERNATIVES weighed: converting only the brief's types (Option, Either, Result, string) and
+  leaving char, integer, time and regex for later (two spellings for one kind of method, read side
+  by side in the same expression, `s.trim.toInt()` beside `c.isDigit()`); renaming the radix
+  overloads (`toIntRadix(16)`) so `toInt` could lose its `()` (a rename of a settled API for
+  spelling alone); converting `toString()` and `hash()` now (every class's impls change with them).
+  A trap to know: `opt.get()` where `opt: Option[() -> T]` now calls the function the option holds;
+  the library's one such site was rewritten to `opt.get`.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `bare-method-ref`): **a method declared with an empty parameter list,
+  `m()`, named without a call is a function value only where a function type is expected.** Anywhere
+  else (`println(xs.sorted)`, `s"${s.isEmpty}"`, `c.bump == 0`, `val v = c.bump` with no type, an
+  argument for a type parameter or `Any`), it is an error naming the call `x.m()` and the lambda
+  `() -> x.m()`; among overloads with one of no parameters, a bare name with no expected function
+  type gets the same error rather than "ambiguous". Instance, static and trait methods alike;
+  methods with parameters (`account.deposit`) are values wherever named, as settled. WHY: with
+  parameterless and `()` methods side by side, a missing `()` is the commonest slip, and `print`
+  takes `Any`, so it compiled and printed `<function>`; where a function type is expected the value
+  is wanted and type-checks. ALTERNATIVES: refusing method values of `()` methods altogether (then
+  `spawn(worker.run)` needs a lambda); a warning instead of an error (wrong output still ships);
+  extending the rule to top-level functions of no parameters (they are always called with `()`, so
+  the slip does not arise). Review with the user: `val f = c.bump` no longer infers a function.
+- Settled on the user's delegation 2026-11-12 (built on branch `bare-method-ref`): **a function value stays without `Display`**, so
+  interpolating one is an error, now with the hint "a function value is never shown: to show what
+  it returns, call it"; `print`/`println` keep taking `Any` and show a function as `<function>`.
+  WHY: the empty-list rule above already stops the missing-`()` slip at its source, and the
+  remaining ways to print a function (a variable or lambda, a method value of a method with
+  parameters) are deliberate; a special refusal inside `print` would make it unlike every other
+  `Any` parameter, against its settled "one ordinary library function". ALTERNATIVES: refusing a
+  function-typed argument to `print`/`println` (a special case); refusing any conversion of a
+  function to `Any` (breaks heterogeneous `Any` containers holding callbacks).
+
+- Settled on the user's delegation 2026-11-12 (built on branch `lazylist-perf`): **A lazy list's cell is one object of three words,
+  filled in place by the one function that evaluates it.** `LazyList[+T]` holds `pending` (the
+  evaluating function until it has run, a constant trapping function while it runs, then `None`),
+  `first` and `rest`; an empty cell is one whose `rest` is itself, and a cell evaluated as another
+  list's first cell whose rest would be itself points at that other cell instead (the same element,
+  then itself again), so a list that is its own tail still repeats. Making a cell allocates the cell
+  and the function that evaluates it, and evaluating it allocates only the cells after it and the
+  elements; a cell is read with a test of `pending` and no lock, since a lazy list is not sendable.
+  To keep the element and the rest in a covariant class, the core library gains the intrinsic
+  **`field_unset`**: `private var x: T = fieldUnset()` is a field the constructor leaves as the zero
+  bytes the object was made with (not yet a value, as an array's spare capacity is not), which the
+  class's own code writes before reading it; such a field must be a `private var` with its type
+  written, is not a position for the class's variance (it is written only with values computed for
+  that instance), and the intrinsic is the core library's alone; called anywhere but as a field's
+  initializer it traps (`a field is read before it is set`). Measured at `-O2` (`LazyList.from(0)`
+  and the stages named, then `take(n)`, the cost per element; time under a loaded machine, user
+  time): bytes kept per evaluated cell 256 → 48 (resident growth per held cell 304 → 96); bytes
+  allocated per element of `from`, `map`, `filter` or `take` 304 in 7 objects → 96 in 2, and of
+  `#::` 544 in 13 → 192 in 4 (two cells, each with its function); time per element of
+  `from.take` 0.118 → 0.035 µs, `map` 0.18 → 0.058, `filter` 0.24 → 0.079, `#::` 0.18 → 0.065, the
+  4000th prime by the sieve 4.8 → 1.7 s; at `-O0` `from.take` 0.16 → 0.06 µs. `lazy_list_deep` runs
+  a million cells again. WHY: each cell was a `LazyList` object, a progress object, the closure of
+  its `lazy val`, a box and a closure to drop the pending function, the function itself, and a
+  tuple for the evaluated element and rest, with a lock-taking `lazy val` read on every access; the
+  element and rest belong in the cell, which only a field left unset can hold, since a covariant
+  class may not otherwise keep a `var` of its parameter and a field must otherwise be given a value
+  when the object is made. The counts are pinned by `lazy_list_cell_tests.sysl`, which reads them
+  from the code each maker compiles to; no runtime allocation counter was added, since the code is
+  where an allocation is decided and the test holds however a run is timed. ALTERNATIVES: a cheaper
+  `lazy val` (no closure per object) with the tuple kept (three objects per element, still a lock
+  per read); `Option[T]` for the element (allocates a `Some` for every scalar element); a separate
+  evaluated node per cell (two objects); an annotation exempting a field from variance, with an
+  initial value supplied some other way (two mechanisms where one does); a runtime allocation
+  counter exposed to programs (a hook in every allocation, for a check the code already answers).
+  Review with the user: `field_unset` is a new escape from the variance and initialization rules,
+  though only the core library may use it.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
   macros.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `library-version`): **the standard library carries the compiler's version, and
+  the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
+  stamped by `scripts/release.sh` in the same commit as `const Version` and `compiler/sysl.hocon`,
+  and a compiler checks it against its own before it compiles anything: `check`, `build`, `run`,
+  `test` and `lsp` print one error naming both versions and the library's path, and nothing else.
+  A library with no version, or a `library.hocon` that is missing or unreadable, is refused the
+  same way. The rule is an **exact match**. A compiler built between releases carries the last
+  release's version, and so does the library in its own checkout, so a development build matches
+  its own tree; only a library from another release, through `AVIN_ROOT` or an install, differs.
+  Why: a library of another version fails as dozens of errors inside `library/avin/*.avin`, which
+  points a reader at the library rather than at the mismatch. Alternatives weighed: a dev compiler
+  accepting a library from the same commit (needs a commit id stamped into both and a build step
+  that keeps them in step, to answer a case the exact rule already passes); "the library is newer
+  than the compiler" (a newer library declares what an older compiler cannot check, which is the
+  failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
+  library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
+
 
 ## Proposed
 

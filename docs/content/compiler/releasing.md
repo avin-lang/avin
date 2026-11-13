@@ -15,7 +15,9 @@ commit, which is how a branch is put through a dry run, and `--repo <dir>` anoth
 each step timed into `release-out/<version>/release.log` with its output beside it:
 
 1. **The version.** It stamps `const Version` in `compiler/dev/avinlang/compiler/cli.sysl` and
-   `package.version` in `compiler/sysl.hocon`, which a test holds in step, and commits the stamp as
+   `package.version` in `compiler/sysl.hocon`, which a test holds in step, and in
+   `library/library.hocon`, which the compiler checks against its own version and refuses a library
+   that differs from, and commits the stamp as
    `avin <version>` on the local branch, unless the tree carries that version already.
 2. **The compiler**, built at `-O2` by the `sysl` on `PATH`.
 3. **The prefix.** `bin/avin`; `share/avin/library` and `share/avin/runtime` as git tracks them;

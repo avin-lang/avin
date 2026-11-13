@@ -241,16 +241,19 @@ writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)
   `?`. Under those two the precision is the formatter's: `writeDisplayed(out, value, spec)` and
   `writeDebugged(out, value, spec)`, which a formatted hole is written through, render the value
   with no width and no precision, keep its first `precision` characters and write them in the
-  field, so a renderer never cuts its own text. `zeroPad`, `plus`, `space` and
+  field, so a renderer never cuts its own text. Under those two the width is the formatter's as well:
+  with no precision, the value is rendered with the whole spec, and whatever it writes is padded to
+  the field, so a `display` that ignores its spec, or writes no text at all, still fills `%8s`, and
+  one that fills the field itself is not padded twice. `zeroPad`, `plus`, `space` and
   `alternate` are the flags `0`, `+`, space and `#`, and `conversion` the letter of the specifier,
   `s` when none was written; a renderer reads the conversions its type takes and renders its own
   form under any other. `withWidth` and `withPrecision` set a count as a specifier's hole does.
   `writeField` writes a text in the field a spec describes, padded with spaces, which is how most
   `display` methods end.
-- `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text()`.
+- `toString()` renders into a `StringWriter`, a writer building a string, and returns its `text`.
   `StandardOutput` is the writer for standard output; it writes an integer's digits without making
-  a string of them. A `StringWriter` also answers `length()`, the number of bytes written so far (a
-  character of several bytes counts them all), and `isEmpty()`, and `clear()` forgets everything
+  a string of them. A `StringWriter` also answers `length`, the number of bytes written so far (a
+  character of several bytes counts them all), and `isEmpty`, and `clear()` forgets everything
   written so it is as new; a text already taken is unchanged. `StandardError` is the writer for standard error, which keeps no buffer.
 - `print` and `println` are each one ordinary library function, `print(values: Any*)` and
   `println(values: Any*)`. `print` writes its arguments to standard output separated by `, ` (they
@@ -278,7 +281,8 @@ writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)
 For `s` and `f`, the compiler does not call the method. It parses the specifiers while compiling and
 writes the literal out to calls on one `StringWriter` made for it, with the same result: each decoded
 piece of text is written to it, each hole is rendered into it by `display`, or by `debug` under
-`%?`, with the `FormatSpec` its specifier describes, a hole under `%s` or `%?` with a precision
-through `writeDisplayed` or `writeDebugged`, and the writer's text is the value. A string hole
+`%?`, with the `FormatSpec` its specifier describes, a hole under `%s` or `%?` with a precision, or
+with a width when its type is not a built-in one, through `writeDisplayed` or `writeDebugged`, and
+the writer's text is the value. A string hole
 with no specifier is written as it is. No value is boxed to format it. Every other interpolator is
 compiled as the method call it denotes.

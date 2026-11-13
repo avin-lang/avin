@@ -110,7 +110,9 @@ function yielding errors of `F`:
   and each instance calls its type argument's `from`.
 
 An `Option` `?` cannot exit a function returning `Result`, and the enclosing function's result type
-must be able to carry the failure.
+must be able to carry the failure. `main` may answer with `Result[unit, E]` or `Result[int, E]`,
+so a whole program can use `?`: an `Err` reaching the end of `main` is written to standard error as
+`error: ` and its `Display`, and the program exits with 1 (see [`main`](/spec/declarations/#main)).
 
 `?` returns from the function it is written in; inside a lambda, from the lambda. That function's
 result type must be declared, or for a lambda known where it is written, as in
@@ -190,9 +192,9 @@ Their methods:
 
 | `Option[T]` | `Result[T, E]` |
 |---|---|
-| `isDefined()`, `isEmpty()` | `isOk()`, `isErr()` |
+| `isDefined`, `isEmpty` | `isOk`, `isErr` |
 | `getOrElse[B >: T](default: -> B) -> B` | `getOrElse[U >: T](default: -> U) -> U` |
-| `orElse[B >: T](other: -> Option[B]) -> Option[B]` | `ok() -> Option[T]`, `err() -> Option[E]` |
+| `orElse[B >: T](other: -> Option[B]) -> Option[B]` | `ok -> Option[T]`, `err -> Option[E]` |
 | `map[U](f: (T) -> U) -> Option[U]` | `map[U](f: (T) -> U) -> Result[U, E]` |
 | `flatMap[U](f: (T) -> Option[U]) -> Option[U]` | `mapErr[F](f: (E) -> F) -> Result[T, F]` |
 | `filter(p: (T) -> bool) -> Option[T]` | `flatMap[U, F >: E](f: (T) -> Result[U, F]) -> Result[U, F]` |
@@ -201,18 +203,18 @@ Their methods:
 | `exists(p: (T) -> bool) -> bool` | `exists(p: (T) -> bool) -> bool` |
 | `forall(p: (T) -> bool) -> bool` | `forall(p: (T) -> bool) -> bool` |
 | `contains[T1 >: T](x: T1) -> bool` | `orElse[U >: T, F](f: (E) -> Result[U, F]) -> Result[U, F]` |
-| `toList() -> List[T]`, `toVector() -> Vector[T]` | `toList() -> List[T]` |
+| `toList -> List[T]`, `toVector -> Vector[T]` | `toList -> List[T]` |
 | `zip[T1 >: T, U](other: Option[U]) -> Option[(T1, U)]` | |
-| `get() -> T`, trapping on `None` | |
+| `get -> T`, trapping on `None` | |
 | `filterNot(p: (T) -> bool) -> Option[T]` | |
 
 An `Option` also has `toRight[L](left: -> L) -> Either[L, T]` and `toLeft[R](right: -> R) ->
 Either[T, R]`, which put its value on one side of an [`Either`](#either) and the argument, evaluated
 only for `None`, on the other. It also has `okOr[E](error: E) -> Result[T, E]` and
 `okOrElse[E](f: () -> E) -> Result[T, E]`, giving `Ok` of the value or `Err` of the error, which
-`okOrElse` calls only for `None` (`Result`'s `ok()` and `err()` go the other way). It also has `iterator()` (one element or none) and `knownSize()` (1 or 0), an
-`Option[(A, B)]` has `unzip()` giving the two options, an `Option[Option[T]]` also has `flatten()`, and an `Option` has `nonEmpty()` beside `isDefined()` and
-`isEmpty()`. There is no `orNull`, since Avin has no null.
+`okOrElse` calls only for `None` (`Result`'s `ok` and `err` go the other way). It also has `iterator()` (one element or none) and `knownSize` (1 or 0), and a second `flatMap` taking a function that answers a collection, which answers a `Vector` (empty for `None`); every collection's `flatMap` takes a function answering an option, so `xs.flatMap(_.toIntOption())` keeps the numbers and a `for` comprehension draws from options and collections alike ([collections](/spec/collections/#operations-without-higher-kinded-types)). An
+`Option[(A, B)]` has `unzip` giving the two options, an `Option[Option[T]]` also has `flatten`, and an `Option` has `nonEmpty` beside `isDefined` and
+`isEmpty`. There is no `orNull`, since Avin has no null.
 
 The companion makes an option from a condition: `Option.when(condition, value)` is `Some(value)`
 where `condition` holds and `None` where it does not, and `Option.unless(condition, value)` the other
@@ -255,9 +257,9 @@ value look at a `Right`'s and pass a `Left` through unchanged, so a `Left` is wh
 
 | Method | On a `Right(b)` | On a `Left(a)` |
 |---|---|---|
-| `isLeft()`, `isRight()` | false, true | true, false |
+| `isLeft`, `isRight` | false, true | true, false |
 | `fold[C](fa: (L) -> C, fb: (R) -> C) -> C` | `fb(b)` | `fa(a)` |
-| `swap() -> Either[R, L]` | `Left(b)` | `Right(a)` |
+| `swap -> Either[R, L]` | `Left(b)` | `Right(a)` |
 | `map[R2](f: (R) -> R2) -> Either[L, R2]` | `Right(f(b))` | itself |
 | `flatMap[L1 >: L, R2](f: (R) -> Either[L1, R2]) -> Either[L1, R2]` | `f(b)` | itself |
 | `getOrElse[R1 >: R](default: -> R1) -> R1` | `b` | `default` |
@@ -266,17 +268,17 @@ value look at a `Right`'s and pass a `Left` through unchanged, so a `Left` is wh
 | `exists(p: (R) -> bool) -> bool` | `p(b)` | false |
 | `forall(p: (R) -> bool) -> bool` | `p(b)` | true |
 | `filterOrElse[L1 >: L](p: (R) -> bool, zero: -> L1) -> Either[L1, R]` | itself if `p(b)`, else `Left(zero)` | itself |
-| `toOption() -> Option[R]` | `Some(b)` | `None` |
-| `toList() -> List[R]`, `toVector() -> Vector[R]` | one element | empty |
+| `toOption -> Option[R]` | `Some(b)` | `None` |
+| `toList -> List[R]`, `toVector -> Vector[R]` | one element | empty |
 | `foreach(f: (R) -> unit)` | calls `f(b)` | nothing |
 | `iterator() -> Iterator[R]` | one element | empty |
 
 Some methods are for an `Either` of a particular shape, added by an `impl` on it as `Option`'s
 `flatten` is:
 
-- `merge()` on an `Either[A, A]` gives the value from whichever side holds it.
-- `joinLeft()` on an `Either[Either[C, R], R]` gives the inner either of a `Left`, and keeps a `Right`.
-- `joinRight()` on an `Either[L, Either[L, C]]` gives the inner either of a `Right`, and keeps a `Left`.
+- `merge` on an `Either[A, A]` gives the value from whichever side holds it.
+- `joinLeft` on an `Either[Either[C, R], R]` gives the inner either of a `Left`, and keeps a `Right`.
+- `joinRight` on an `Either[L, Either[L, C]]` gives the inner either of a `Right`, and keeps a `Left`.
 
 `Either.cond[L, R](test: bool, right: -> R, left: -> L) -> Either[L, R]` is `Right(right)` when
 `test` holds and `Left(left)` otherwise, evaluating only the side it uses. Defaults and alternatives
@@ -286,7 +288,7 @@ settle its right side is an `Either[int, Nothing]`, an instance of any `Either[i
 
 A `match` covers an `Either` with a `Left` and a `Right` arm that each cover their value. Eithers are
 equal, hash and show by side and value: `Right(4)`, `Left(no)`, and under `debug` `Left("no")`.
-There is no left projection: `swap()` turns the left side into the one the methods work on.
+There is no left projection: `swap` turns the left side into the one the methods work on.
 
 An `Either[L, R]` is an `Ord` when `L` and `R` are: every `Left` orders before every `Right`, and two
 on the same side order as their values. A `Result[T, E]` is ordered the same way with `Err` in the

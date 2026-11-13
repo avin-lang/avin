@@ -1,0 +1,94 @@
+module dev.avinlang.compiler
+
+import sysl.fs.IoError
+import sysl.process.{Group, Output, Stdio, Var, start}
+import sysl.signal
+import sysl.sync.SpinLock
+import sysl.time.{millis, sleep}
+
+// The programs the runners start -- a test of `avin test`, a program of the execution corpus -- and
+// how none of them outlives its runner. Each is started as the leader of a process group of its own,
+// so whatever it starts in turn (a server's workers, a child it spawns) is in that group too and is
+// reached by one signal to the group. Once the leader has been waited for, whatever is left of its
+// group is stopped; and a runner asked to stop by `SIGINT`, `SIGTERM` or `SIGHUP` kills every group
+// still running before it exits.
+
+/** How long, in milliseconds, what is left of a group after its leader ended has to stop once asked
+ * with `SIGTERM`, before `SIGKILL` makes it. */
+const GroupGrace: int = 200
+
+/** How many groups can be recorded as running at once. */
+const GroupSlots: int = 64
+
+private var group_guard: SpinLock = SpinLock(0)
+private var running_groups: [64]int
+
+/** Records process group `pgid` as running, so that `kill_running_groups` reaches it. Answers the slot
+ * to forget it with, or -1 when `pgid` names no group or every slot is taken. */
+track_group(pgid: int) -> int
+    if pgid <= 0 then return -1
+    group_guard.lock()
+    var slot = -1
+    for i in 0..<GroupSlots
+        if running_groups[i] == 0
+            running_groups[i] = pgid
+            slot = i
+            break
+    group_guard.unlock()
+    slot
+
+/** Forgets the group recorded in `slot`; -1 is no slot, and does nothing. */
+untrack_group(slot: int)
+    if slot < 0 || slot >= GroupSlots then return
+    group_guard.lock()
+    running_groups[slot] = 0
+    group_guard.unlock()
+
+/** How many groups are recorded as running. */
+running_group_count() -> int
+    group_guard.lock()
+    var n = 0
+    for i in 0..<GroupSlots
+        if running_groups[i] != 0 then n += 1
+    group_guard.unlock()
+    n
+
+/** Sends `SIGKILL` to every group recorded as running and forgets them: what a runner does on its way
+ * out, when there is no time left for a grace. */
+kill_running_groups()
+    group_guard.lock()
+    for i in 0..<GroupSlots
+        if running_groups[i] > 0
+            _ = signal.send(-i64(running_groups[i]), signal.KILL)
+            running_groups[i] = 0
+    group_guard.unlock()
+
+/** Whether process group `pgid` still has a process in it. */
+group_alive(pgid: int) -> bool = pgid > 0 && signal.send(-i64(pgid), 0) is Ok(_)
+
+/** Stops whatever is left of process group `pgid`: `SIGTERM` to the group, up to `GroupGrace`
+ * milliseconds for it to empty, then `SIGKILL`. Answers whether anything was left to stop. Called once
+ * the group's leader has been waited for, so that a process it started and left behind ends too. */
+stop_group(pgid: int) -> bool
+    if !group_alive(pgid) then return false
+    _ = signal.send(-i64(pgid), signal.TERM)
+    var waited = 0
+    while waited < GroupGrace && group_alive(pgid)
+        sleep(millis(5))
+        waited += 5
+    if group_alive(pgid) then _ = signal.send(-i64(pgid), signal.KILL)
+    true
+
+/** Runs `program` with `args` and `env`, reading `stdin`, as the leader of a process group of its own,
+ * and captures its standard output and error as `capture` does. A program still running after
+ * `timeout` milliseconds (0 for no limit) is stopped and `TimedOut`; once it has ended, anything it
+ * started that is still running is stopped with `stop_group`. While it runs its group is recorded, so
+ * a runner that is interrupted kills it. */
+run_contained(program: string, args: []const string, env: []const Var, stdin: Stdio, timeout: int) -> Result[Output, IoError]
+    var child = start(program, args, env = env, stderr = true, timeout = timeout, stdin = stdin, group = Group.New)?
+    val pgid = child.group()
+    val slot = track_group(pgid)
+    val waited = child.wait()
+    _ = stop_group(pgid)
+    untrack_group(slot)
+    waited

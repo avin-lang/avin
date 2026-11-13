@@ -5,7 +5,7 @@ import sysl.container.{Map, map}
 import sysl.env.current_exe
 import sysl.fs.{canonicalize, exists, is_dir, make_dir_all, metadata, read_text, write_text_atomic}
 import sysl.path.{file_name, parent, stem}
-import sysl.process.{Exited, Signalled, Status, Stdio, TimedOut, run, start}
+import sysl.process.{Exited, Signalled, Status, Stdio, TimedOut, run}
 import sysl.text.{StrBuilder, from_utf8_unchecked, parse_int, str_builder}
 import sysl.time.monotonic
 
@@ -204,7 +204,7 @@ run_tests(built: Built, root: string, filter: string, prefix: bool, say: string 
             continue
         val slot = live_begin(s"$shown  ${t.name}", PhaseRun)
         if t.setup_all != "" && set_up.get(t.module_name) is None
-            val ran = run_part(built, i, "a", TestTimeout, slot)
+            val ran = run_part(built, i, "a", TestTimeout)
             set_up.put(t.module_name, if ran.status == Exited(0) then "" else ran.reason)
             if ran.status != Exited(0)
                 failed += 1
@@ -222,7 +222,7 @@ run_tests(built: Built, root: string, filter: string, prefix: bool, say: string 
             Some(seconds) -> seconds * 1000
             None -> TestTimeout
         val began = monotonic()
-        val ran = run_part(built, i, "", limit, slot)
+        val ran = run_part(built, i, "", limit)
         val ms = (monotonic() - began).us / 1000
         // Why the test failed, or "" when it passed; whether its process ended before the module's
         // `@teardown` could run in it; and whether that teardown, run in the test's process, failed.
@@ -259,14 +259,14 @@ run_tests(built: Built, root: string, filter: string, prefix: bool, say: string 
             out(s"  FAIL  @teardown ${t.teardown}")
             report(ran, out)
         if teardown_apart && t.teardown != ""
-            val apart = run_part(built, i, "t", TestTimeout, slot)
+            val apart = run_part(built, i, "t", TestTimeout)
             if apart.status != Exited(0)
                 failed += 1
                 out(s"  FAIL  @teardown ${t.teardown}")
                 report(apart, out)
         if t.teardown_all != "" && last.get(t.module_name) is Some(final)
             if final == i
-                val ran_last = run_part(built, i, "z", TestTimeout, slot)
+                val ran_last = run_part(built, i, "z", TestTimeout)
                 if ran_last.status != Exited(0)
                     failed += 1
                     out(s"  FAIL  @teardown_all ${t.teardown_all}")
@@ -296,18 +296,12 @@ private const CouldNotRun: string = "could not be run"
 // Runs one part of test `i` in a process of its own: the module's setup, the test and the module's
 // teardown for `part` "", or one hook (`part` "t", "a" or "z"), stopping it after `limit` milliseconds
 // unless `limit` is 0. A test reads no input: it never waits on the terminal `avin test` was started
-// from.
-private run_part(built: Built, i: usize, part: string, limit: int, slot: int) -> Ran
+// from. It runs in a process group of its own, so nothing it starts outlives it (`run_contained`).
+private run_part(built: Built, i: usize, part: string, limit: int) -> Ran
     var args: Buf[string] = buf()
     args.push(i.to_string())
     if part != "" then args.push(part)
-    val child = start(built.path, args.view(), stderr = true, timeout = limit, stdin = Stdio.FromPath("/dev/null")) match
-        Ok(c) -> c
-        Err(e) -> return Ran(Exited(1), false, false, s"$CouldNotRun: ${e.to_string()}", buf(), "")
-    live_process(slot, child.pid())
-    val waited = child.wait()
-    live_process(slot, 0)
-    val output = waited match
+    val output = run_contained(built.path, args.view(), [], Stdio.FromPath("/dev/null"), limit) match
         Ok(o) -> o
         Err(e) -> return Ran(Exited(1), false, false, s"$CouldNotRun: ${e.to_string()}", buf(), "")
     val err = output.err.unwrap_or("")

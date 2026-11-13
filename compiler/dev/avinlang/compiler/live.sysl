@@ -54,11 +54,9 @@ private var used: [8]bool
 private var phases: [8]int
 private var began: [8]long
 private var lens: [8]int
-private var pids: [8]int
 private var texts: [1920]u8
 private var ready: i32
-
-private extern "kill" c_kill(pid: int, sig: int) -> int
+private var reporting: bool = false
 
 /** Records that `what` is in progress in `phase`, answering a slot to end or change it with. `what`
  * is cut to fit; an eighth simultaneous item and beyond are not recorded, and answer -1. */
@@ -73,7 +71,6 @@ live_begin(what: string, phase: int) -> int
         used[slot] = true
         phases[slot] = phase
         began[slot] = monotonic().us / 1000
-        pids[slot] = 0
         var n = 0
         val b = what.bytes
         while n < int(b.len) && n < SlotText
@@ -91,19 +88,11 @@ live_phase(slot: int, phase: int)
     began[slot] = monotonic().us / 1000
     guard.unlock()
 
-/** Notes the process a slot's item runs in, so an interrupt can stop it. 0 for none. */
-live_process(slot: int, pid: int)
-    if slot < 0 then return
-    guard.lock()
-    pids[slot] = pid
-    guard.unlock()
-
 /** The item in `slot` is no longer in progress. */
 live_end(slot: int)
     if slot < 0 then return
     guard.lock()
     used[slot] = false
-    pids[slot] = 0
     guard.unlock()
 
 // The thread that waits for the signals. Nothing sysl runs inside a handler, so the signals are
@@ -112,22 +101,26 @@ live_end(slot: int)
 private watcher(flag: *i32) -> unit
     val term = signal.watch(signal.TERM)
     val interrupt = signal.watch(signal.INT)
-    if term is Err(_) || interrupt is Err(_)
+    val hangup = signal.watch(signal.HUP)
+    if term is Err(_) || interrupt is Err(_) || hangup is Err(_)
         *flag = 2
         return
     var t = term.unwrap()
     var i = interrupt.unwrap()
+    var h = hangup.unwrap()
     *flag = 1
     loop
         if t.take()
             interrupted("SIGTERM", 143)
         if i.take()
             interrupted("SIGINT", 130)
+        if h.take()
+            interrupted("SIGHUP", 129)
         sleep(millis(20))
 
-/** Starts watching for SIGTERM and SIGINT, which stop the run as `interrupted` describes. Answers
- * whether the watch is in place. */
-watch_for_interrupts() -> bool
+// Starts the watcher once; answers whether it is in place.
+private start_watcher() -> bool
+    if ready == 1 then return true
     ready = 0
     if spawn(&watcher, &ready) is None then return false
     var waited = 0
@@ -136,8 +129,24 @@ watch_for_interrupts() -> bool
         waited += 1
     ready == 1
 
-// Writes out what is held back, names everything in progress, stops those processes and exits.
+/** Starts watching for SIGTERM, SIGINT and SIGHUP, which stop the run as `interrupted` describes:
+ * the report, then every process group the run has started killed. Answers whether the watch is in
+ * place. */
+watch_for_interrupts() -> bool
+    reporting = true
+    start_watcher()
+
+/** Starts watching for SIGTERM, SIGINT and SIGHUP in a program that runs other programs but writes
+ * no report: each of them kills every process group recorded as running and exits, 128 and the
+ * signal's number. Starting it again does nothing more. */
+watch_for_runner_signals() -> bool = start_watcher()
+
+// Writes out what is held back, names everything in progress, kills every process group still
+// running and exits.
 private interrupted(name: string, code: int)
+    if !reporting
+        kill_running_groups()
+        exit(code)
     flush()
     val now = monotonic().us / 1000
     guard.lock()
@@ -155,8 +164,7 @@ private interrupted(name: string, code: int)
         prints(s"  ${tenths / 10}.${tenths % 10}s\n")
     if !any then prints(s"\navin test: interrupted by $name; nothing in progress\n")
     flush()
-    for i in 0..<Slots
-        if used[i] && pids[i] > 0 then _ = c_kill(pids[i], 9)
     guard.unlock()
+    kill_running_groups()
     exit(code)
 end interrupted
