@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
-import sysl.text.{chars_of, from_utf8_unchecked, str_builder, to_lower}
+import sysl.text.{chars_of, from_utf8_unchecked, parse_int, str_builder, to_lower}
 
 /** A source file in a program, with the report its diagnostics go to. */
 struct SourceUnit
@@ -583,6 +583,11 @@ struct Checker
     /** Each name a module exports, by its qualified name in the exporting module, holding the
      * qualified name of the declaration it presents, through any chain of exports. */
     exports: Map[string, string]
+    /** Where a diagnostic is shown in place of the span it is reported at, nearest last: while a
+     * member is read or called, its mistakes are shown at the member's name rather than across the
+     * receiver, while the expression's own span, the one its traps and code are placed at, stays
+     * whole. */
+    shown: Buf[(Span, Span)]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -596,8 +601,18 @@ struct Checker
             self.derived[i].notes = notes
             return
         self.reported_count = self.reported_count + 1
-        self.units[unit].report.add(error(at, message))
+        self.units[unit].report.add(error(shown_at(self.shown, at), message))
 end Checker
+
+/** Where a diagnostic reported at `at` is shown: the place the nearest entry of `shown` for `at`
+ * gives, or `at` itself. */
+private shown_at(shown: Buf[(Span, Span)], at: Span) -> Span
+    var k = shown.len()
+    while k > 0
+        k = k - 1
+        val (whole, place) = shown[k]
+        if whole.start == at.start && whole.end == at.end then return place
+    at
 
 /** An impl a `derives` entry made from a template: where it was asked for, its place among the
  * impls, the type `T` stands for in it, and what went wrong while it was checked. */
@@ -974,7 +989,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -10639,7 +10654,7 @@ private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) 
         Some(w) -> w
         None -> return check_form(c, e, None, used)
     if *zonk(c, want) is Union(_) then return union_value(c, e, zonk(c, want), used)
-    if !(*zonk(c, want) is AnyType) then return to_trait(c, none_as(c, to_sendable(c, check_form(c, e, expected, used), want), want), zonk(c, want))
+    if !(*zonk(c, want) is AnyType) then return to_trait(c, none_as(c, results_as(c, to_sendable(c, check_form(c, e, expected, used), want), want), want), zonk(c, want))
     val passes =e.kind is Block(_, _) || e.kind is If(_, _, _) || e.kind is Match(_, _) || e.kind is While(_, _, _) || e.kind is Loop(_) || e.kind is DoWhile(_, _, _)
     to_any(c, check_form(c, e, if passes then expected else None, used))
 
@@ -10882,6 +10897,72 @@ private same_shape(t: &Type, m: &Type) -> bool = *t match
 private none_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr =
     if converts_none(c, typed.ty, want) then TExpr(typed.span, zonk(c, want), NoneAs(typed)) else typed
 
+// A function value whose result is `Nothing`, or a function whose result is such a function, used
+// where a function type is expected that yields another type there, converts to it where it is
+// written: it is made a lambda of the expected type that calls it. No value has type `Nothing`, so
+// the function is one of every result type, but a call of it yields no value at all while a call
+// of the expected type yields one of its type, so it is not that type without conversion. Only
+// where the expected type is settled, its parameters are the function's on the terms a function
+// type's parameters vary by, and both are `@sendable` or the expected one is not.
+private results_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
+    if !widens_results(c, typed.ty, want) then return typed
+    val at = typed.span
+    // The value is evaluated once, where it is written, into a local the lambda captures; a name
+    // with a space in it is one no program can write.
+    val local = c.body.locals.len()
+    val name = s"adapted value $local"
+    c.body.locals.push(TLocal(name, typed.ty, false, c.current))
+    val mark = c.body.visible.len()
+    c.body.visible.push(local)
+    val lambda = calling_lambda(c, at, name, function_arity(zonk(c, want)), want)
+    c.body.visible.truncate(mark)
+    var items: Buf[&TExpr] = buf()
+    items.push(TExpr(at, Unit, Let(local, typed)))
+    items.push(lambda)
+    TExpr(at, lambda.ty, Block(items))
+
+/** A lambda of `arity` parameters, checked against `want`, that passes them on to a call of `callee`. */
+private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want: &Type) -> &TExpr
+    var params: Buf[LambdaParam] = buf()
+    var args: Buf[Argument] = buf()
+    for i in 0..<arity
+        val param = s"adapted $i"
+        params.push(LambdaParam(at, param, None))
+        args.push(Argument(at, None, name_at(at, param), false))
+    val body = Expr(at, Call(name_at(at, callee), args))
+    lambda_expr(c, Expr(at, Lambda(params, body)), params, body, Some(want), false)
+
+private function_arity(t: &Type) -> usize = *t match
+    Function(ps, _, _) -> ps.len()
+    _ -> 0
+
+/** Whether a value of type `t` converts to `want` as `results_as` converts it. */
+private widens_results(c: *Checker, t: &Type, want: &Type) -> bool
+    val x = zonk(c, t)
+    val w = zonk(c, want)
+    if has_unknowns(x) || has_unknowns(w) then return false
+    nothing_results_as(c, x, w) match
+        Some(u) -> conforms(view_as(conformances(c), u, w), w)
+        None -> false
+
+// The function type `x` with each result of `Nothing`, at any depth of results, made `want`'s result
+// there; `None` where `x` has no such result that `want` gives another type, or where `want` is not a
+// function type of as many parameters at each depth.
+private nothing_results_as(c: *Checker, x: &Type, want: &Type) -> Option[&Type]
+    val (xs, r, m) = *zonk(c, x) match
+        Function(xs, r, m) -> (xs, r, m)
+        _ -> return None
+    val (ys, s) = *zonk(c, want) match
+        Function(ys, s, _) -> (ys, s)
+        _ -> return None
+    if xs.len() != ys.len() then return None
+    val result = zonk(c, r)
+    val target = zonk(c, s)
+    if *result is Nothing
+        if *target is Nothing || *target is ErrorType then return None
+        return Some(Function(xs, target, m))
+    Some(Function(xs, nothing_results_as(c, result, target)?, m))
+
 /** Whether a value of type `t` converts to `want` as `none_as` converts it. */
 private converts_none(c: *Checker, t: &Type, want: &Type) -> bool
     if !nothing_option(c, t) then return false
@@ -11112,7 +11193,9 @@ param_index(c: *Checker, name: string) -> Option[usize]
 // A named function with a union parameter, written where a function type is expected whose parameter
 // there is one of the union's members (or a smaller union), is made at that site as a lambda calling
 // it, so each argument is injected as a call's would be: `val f: (int) -> string = describe` for
-// `describe(x: int | string)`.
+// `describe(x: int | string)`. So is a named function whose result is `Nothing`, where the expected
+// type yields another (see `results_as`): `val f: (int) -> Option[int] = refuse` for
+// `refuse(x: int) -> Nothing`. Such a lambda captures nothing.
 private adapted_function(c: *Checker, at: Span, name: string, id: usize, expected: Option[&Type]) -> Option[&TExpr]
     val want = zonk(c, expected?)
     val ps = *want match
@@ -11125,15 +11208,11 @@ private adapted_function(c: *Checker, at: Span, name: string, id: usize, expecte
     for i in 0..<ps.len()
         val declared = zonk(c, symbol.params[i])
         if *declared is Union(_) && !same_type(declared, zonk(c, ps[i])) then adapts = true
+    // The lambda is held to the rules for a `@sendable` function where one is expected, as a lambda
+    // written there is, so the function is taken as one.
+    if !adapts && widens_results(c, Function(symbol.params, result_of(c, id, at), is_sendable_function(want)), want) then adapts = true
     if !adapts then return None
-    var params: Buf[LambdaParam] = buf()
-    var args: Buf[Argument] = buf()
-    for i in 0..<ps.len()
-        val param = s"adapted $i"
-        params.push(LambdaParam(at, param, None))
-        args.push(Argument(at, None, name_at(at, param), false))
-    val body = Expr(at, Call(name_at(at, name), args))
-    Some(lambda_expr(c, Expr(at, Lambda(params, body)), params, body, expected, false))
+    Some(calling_lambda(c, at, name, ps.len(), want))
 
 private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) -> &TExpr
     if name == "_"
@@ -11553,10 +11632,28 @@ private function_expected(c: *Checker, expected: Option[&Type]) -> bool
 // `x.m` with no call, where `m` is declared `m()`, and no function type is expected: almost always a
 // call missing its parentheses, so this is an error naming the call and the lambda.
 private empty_list_without_call(c: *Checker, at: Span, receiver: &TExpr, name: string)
+    val shown = shown_member(c, at, receiver, name)
+    // A placeholder's `_` cannot stand in a lambda of its own, so its call alone is the fix.
+    var text = s"`$name` is called with `()`: write `$shown()`, or `() -> $shown()` for a function value"
+    if shown.starts_with("_.") then text = s"`$name` is called with `()`: write `$shown()`"
+    elif shown.starts_with(".") then text = s"`$name` is called with `()`: write `$shown()`, or a lambda calling it for a function value"
+    c.note(unit_of(c), at, text)
+
+// A member `name` of `receiver` as a diagnostic writes it out: after a named local or parameter, `_`
+// for a placeholder's, a type for a static member, and alone for the implicit `self` of a bare name.
+// Any other receiver's own text the diagnostic does not repeat, so the member follows a bare dot.
+private shown_member(c: *Checker, at: Span, receiver: &TExpr, name: string) -> string
+    if receiver.kind is TypeReceiver then return s"${type_name(zonk(c, receiver.ty))}.$name"
     // A bare name inside the class has the name's own span for its implicit `self`.
-    val bare = receiver.span.start == at.start && receiver.span.end == at.end
-    val shown = if receiver.kind is TypeReceiver then s"${type_name(zonk(c, receiver.ty))}.$name" else if bare then name else s"x.$name"
-    c.note(unit_of(c), at, s"`$name` is declared with an empty parameter list, so naming it without a call makes a function value, which is allowed only where a function type is expected: call it, as in `$shown()`, or for a function write a lambda, as in `() -> $shown()`")
+    if receiver.span.start == at.start && receiver.span.end == at.end then return name
+    receiver.kind match
+        Local(i) ->
+            val local = c.body.locals[i].name
+            if local.starts_with("_$") then s"_.$name" else s"$local.$name"
+        Param(i) ->
+            val names = c.symbols[c.body.root].param_names
+            if i < names.len() && !names[i].starts_with("_$") && names[i] != "_" then s"${names[i]}.$name" else s".$name"
+        _ -> s".$name"
 
 // Whether code that may use the private members of class `k` is being checked: code of the class
 // itself, or of its companion; for a data type's companion object, a method an impl adds to the type.
@@ -11716,7 +11813,14 @@ private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string, expected
     if target.kind is Name("super")
         if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
             return super_call(c, e.span, e.span, target.span, name, buf(), None, expected, false)
-    member_of(c, e, check_expr(c, target, None), name, expected)
+    // A mistake in reading a member is shown at the member's name, never across the receiver,
+    // which in a chain can span many lines; the read itself, where its traps and code are placed,
+    // is still the whole expression.
+    val object = check_expr(c, target, None)
+    c.shown.push((e.span, member_name_span(c, e, name)))
+    val read = member_of(c, e, object, name, expected)
+    c.shown.pop()
+    read
 
 private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
@@ -11757,13 +11861,26 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         ErrorType -> ()
         Nothing -> return value
         Union(_) -> c.note(unit, e.span, union_no_member(ty, name))
-        _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`${string_length_hint(ty, name)}")
+        _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`${string_length_hint(ty, name)}${tuple_part_hint(ty, name)}")
     TExpr(e.span, ErrorType, UnitConst)
+
+// What a tuple offers where a program asks it for `_1`, `_2` and so on: its parts are read by
+// position from 0, `.0`, `.1`, so `_n` names the part `.(n - 1)`; empty for any other member.
+private tuple_part_hint(ty: &Type, name: string) -> string
+    if *ty is Tuple(types) && name.starts_with("_") && name.bytes.len > 1
+        for b in name.bytes[1..]
+            if !(u8('0') <= b <= u8('9')) then return ""
+        if parse_int(name[1..]) is Ok(n) && 1 <= n <= int(types.len()) then return s"; a tuple's parts are numbered from 0, so write `.${n - 1}`"
+        return s"; a tuple's parts are numbered from 0 and read as `.0` to `.${types.len() - 1}`"
+    ""
 
 // What a string offers where a program asks it for a `length` or a `size`, which it has neither of,
 // since a string's length is counted in characters or in bytes; empty for any other member.
+// A string's case mappings are `toUpper` and `toLower`, the names a `char` has for its own.
 private string_length_hint(ty: &Type, name: string) -> string =
-    if *ty is Str && (name == "length" || name == "size") then "; a string counts its characters with `charCount` and its bytes with `byteLength`" else ""
+    if *ty is Str && (name == "length" || name == "size") then "; a string counts its characters with `charCount` and its bytes with `byteLength`"
+    elif *ty is Str && (name == "toUpperCase" || name == "toLowerCase") then "; a string maps its case with `toUpper` and `toLower`, as a `char` does"
+    else ""
 
 /** What is said of a member a union does not have. */
 union_no_member(t: &Type, name: string) -> string =
@@ -13244,6 +13361,13 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                     for i in 0..<checked.len()
                         if checked[i] is Some(before) then checked[i] = Some(none_as(c, before, t.ty))
                     agreed = Some(t.ty)
+                // So does an element that is a function yielding `Nothing`, to the others' function
+                // type, and the elements before one of another function type, to that.
+                t = results_as(c, t, so_far)
+                if widens_results(c, so_far, t.ty)
+                    for i in 0..<checked.len()
+                        if checked[i] is Some(before) then checked[i] = Some(results_as(c, before, t.ty))
+                    agreed = Some(t.ty)
             checked[k] = Some(t)
             agreed = agreed match
                 None -> Some(t.ty)
@@ -13628,7 +13752,11 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
     if !numeric && has_operator_traits(zonk(c, l.ty))
         if binary_operator_method(op) is Some(om)
             if !same_type(zonk(c, l.ty), zonk(c, r.ty))
-                c.note(unit_of(c), at, s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+                val what = s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+                if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
+                    c.note(unit_of(c), operand, s"$what; $hint")
+                else
+                    c.note(unit_of(c), at, what)
                 return TExpr(at, ErrorType, UnitConst)
             if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
             return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
@@ -13638,13 +13766,21 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight || wrapping_or_saturating(op)
             if integer_type(c, zonk(c, l.ty))
                 if !same_type(zonk(c, l.ty), zonk(c, r.ty))
-                    c.note(unit_of(c), at, s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+                    val what = s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+                    if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
+                        c.note(unit_of(c), operand, s"$what; $hint")
+                    else
+                        c.note(unit_of(c), at, what)
                     return TExpr(at, ErrorType, UnitConst)
                 return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
             c.note(unit_of(c), at, s"`${type_name(zonk(c, l.ty))}` has no method `$spelling`")
             return TExpr(at, ErrorType, UnitConst)
     if !numeric || !same_type(l.ty, r.ty)
-        c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+        val what = s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+        if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
+            c.note(unit_of(c), operand, s"$what; $hint")
+        else
+            c.note(unit_of(c), at, what)
         return TExpr(at, ErrorType, UnitConst)
     val bitwise = op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
     val arithmetic = op is Add || op is Subtract || op is Multiply || op is Divide || op is Remainder
@@ -13655,6 +13791,76 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, l.ty, Arith(op, l, r, op_at))
+
+// Whether an operator spelled `spelling` is a compound assignment's, as `+=` and `+:=` are, whose
+// target keeps its type.
+private compound_spelling(spelling: string) -> bool = spelling.ends_with("=")
+
+/** The conversion that makes two numbers of different types one type, as the span of the operand to
+ * convert and the hint that says how. An integer converts to a wider integer, to `real` and to a type
+ * parameter bounded by `Integer` (`T(n)`), a `byte` to an integer or `real`, and a value of a type parameter bounded by `Numeric` to `real` by `toReal`. Where `fixed`, the left
+ * operand is a compound assignment's target, whose type cannot change, so the right one converts to
+ * it by any conversion there is, a narrowing one included. `None` where no conversion joins the two. */
+private width_conversion(c: *Checker, l: &TExpr, r: &TExpr, fixed: bool) -> Option[(Span, string)]
+    val x = zonk(c, l.ty)
+    val y = zonk(c, r.ty)
+    if fixed
+        if converts_to(c, y, x) then return Some((r.span, conversion_hint(c, r, x)))
+        return None
+    if widens_to(c, x, y) then return Some((l.span, conversion_hint(c, l, y)))
+    if widens_to(c, y, x) then return Some((r.span, conversion_hint(c, r, x)))
+    None
+
+// Whether a value of type `from` converts to `to` without losing its meaning: the direction a mixed
+// operation is joined in.
+private widens_to(c: *Checker, from: &Type, to: &Type) -> bool = *from match
+    Int(a) -> *to match
+        Int(b) -> a < b
+        Real -> true
+        TypeVar(_, _, _) -> integer_type(c, to)
+        _ -> false
+    Byte -> *to is Int(_) || *to is Real
+    TypeVar(_, _, _) -> *to is Real && numeric_param(c, from)
+    _ -> false
+
+// Whether a value of type `from` converts to the number type `to` by a call of `to`, or by `toReal`,
+// narrowing or not. A `byte` is no target: it has no arithmetic for the converted value to meet.
+private converts_to(c: *Checker, from: &Type, to: &Type) -> bool = *from match
+    Int(_) -> *to is Int(_) || *to is Real || (*to is TypeVar(_, _, _) && integer_type(c, to))
+    Real -> *to is Int(_)
+    Byte -> *to is Int(_) || *to is Real
+    TypeVar(_, _, _) -> (*to is Real && numeric_param(c, from)) || (*to is Int(_) && integer_type(c, from))
+    _ -> false
+
+// Whether `t` is a type parameter bounded by `Numeric`, whose values have `toReal`.
+private numeric_param(c: *Checker, t: &Type) -> bool
+    if !(*t is TypeVar(_, _, _)) then return false
+    core_trait(c, "Numeric") match
+        Some(numeric) -> conforms_to_bound(c, t, numeric)
+        None -> false
+
+/** How to write `operand` as a value of type `to`: `write `long(n)``, with the operand as written, or
+ * `write `n.toReal`` for a value of a type parameter becoming a `real`. An operand longer than a line
+ * of a message, or written over several lines, is named by its type instead. */
+private conversion_hint(c: *Checker, operand: &TExpr, to: &Type) -> string
+    val src = c.units[unit_of(c)].src
+    val text = from_utf8_unchecked(src.text(operand.span))
+    val short = text.bytes.len <= 40 && src.locate(operand.span.start).line == src.locate(operand.span.end).line
+    val from = zonk(c, operand.ty)
+    if *from is TypeVar(_, _, _) && *to is Real
+        if !short then return s"convert the ${type_name(from)} with `toReal`"
+        if simple_operand(text) then return s"write `$text.toReal`"
+        return s"write `($text).toReal`"
+    if !short then return s"convert the ${type_name(from)} with a call of `${type_name(to)}`"
+    s"write `${type_name(to)}($text)`"
+
+// Whether `text` is an operand a member can follow without parentheses: a name, a member, a call or
+// an index, with no operator or space at its top.
+private simple_operand(text: string) -> bool
+    for b in chars_of(text.bytes)
+        if !(('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9') || b == '_' || b == '.' || b == '(' || b == ')' || b == '[' || b == ']')
+            return false
+    true
 
 private wrapping_or_saturating(op: BinaryOp) -> bool = op match
     AddWrapping -> true
@@ -13781,6 +13987,11 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
     val identity = op is Same || op is NotSame
+    // Two numbers of different types compare once one is converted, which the diagnostic says how.
+    if !identity && !same_type(zonk(c, a.ty), zonk(c, b.ty)) && !fits(c, zonk(c, a.ty), zonk(c, b.ty)) && !fits(c, zonk(c, b.ty), zonk(c, a.ty))
+        if width_conversion(c, a, b, false) is Some((operand, hint))
+            c.note(unit_of(c), operand, s"`$spelling` cannot compare ${type_name(zonk(c, a.ty))} with ${type_name(zonk(c, b.ty))}; $hint")
+            return
     if op is Equal || op is NotEqual then return equality_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     if !identity then return ordering_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     val x = zonk(c, a.ty)
@@ -14496,6 +14707,9 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
         // A branch that is an `Option[Nothing]` converts to the other's option.
         y = none_as(c, y, n.ty)
         n = none_as(c, n, y.ty)
+        // A branch that is a function yielding `Nothing` converts to the other's function type.
+        y = results_as(c, y, n.ty)
+        n = results_as(c, n, y.ty)
     if *y.ty is Nothing && !(*n.ty is Nothing) then bring_into_scope(c, condition.span, tested.no)
     elif *n.ty is Nothing && !(*y.ty is Nothing) then bring_into_scope(c, condition.span, tested.yes)
     var ty: &Type = Unit
@@ -15348,6 +15562,17 @@ private from_sources(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
 // Arguments that are not bare literals are checked first, so a literal takes the type the others
 // settle. Every type argument must be decided by the end of the call. A variant of a data type is
 // called the same way, with the type's parameters as its type parameters.
+// The span of the name in `target.name`, the member expression `e`: a member written in the
+// source ends with its name. A member made by the compiler, whose span does not end with its name,
+// keeps the whole span.
+private member_name_span(c: *Checker, e: &Expr, name: string) -> Span
+    val length = name.bytes.len
+    if length == 0 || e.span.end - e.span.start < length then return e.span
+    val src = c.units[unit_of(c)].src
+    if e.span.end > src.bytes.len then return e.span
+    val span = Span(e.span.end - length, e.span.end)
+    if from_utf8_unchecked(src.text(span)) == name then span else e.span
+
 private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
     var explicit: Option[Buf[&TypeExpr]] = None
@@ -15360,7 +15585,18 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
         return call_expr(c, at, q, args, expected)
     if named.kind is Member(target, member)
         if variant_use(c, named.span, target, member) is Some((found, on_type)) then return qualified_variant_call(c, at, named.span, found, on_type, explicit, args, expected)
-        return member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
+        // A mistake in calling a member is shown at the member's name and its arguments, never
+        // across the receiver, which in a chain can span many lines; the call itself, where its
+        // traps and code are placed, is still the whole expression.
+        val name_span = member_name_span(c, named, member)
+        c.shown.push((at, Span(name_span.start, at.end)))
+        c.shown.push((named.span, name_span))
+        c.shown.push((callee.span, name_span))
+        val called = member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
+        c.shown.pop()
+        c.shown.pop()
+        c.shown.pop()
+        return called
     val name = named.kind match
         Name(n) -> n
         _ -> return value_call(c, at, callee, args)
@@ -16684,7 +16920,7 @@ private parameterless_called(c: *Checker, at: Span, name_span: Span, receiver: &
             check_ignored(c, a.value)
         return TExpr(at, ty, UnitConst)
     if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
-    c.note(unit_of(c), name_span, s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
+    c.note(unit_of(c), Span(name_span.start, at.end), s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
     for a in args
         check_ignored(c, a.value)
     TExpr(at, ErrorType, UnitConst)
@@ -17265,6 +17501,12 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     // The type arguments written or inferred conform to their parameters' bounds; those the receiver
     // gives were held to them where its type was made.
     hold_to_bounds_except(c, unit, name_span, s"`$name`", owner, type_params, solved, known.len(), sent_matches)
+    // A function argument whose result is `Nothing` converts to its parameter's function type, as the
+    // other arguments decided it: `pick(c, refuse, (x: int) -> Some(x))` passes `refuse` as an
+    // `(int) -> Option[int]`.
+    for j in 0..<typed.len()
+        if j < targets.len()
+            if targets[j] is Some(p) then typed[j] = results_as(c, typed[j], p)
     var ty = zonk(c, declared)
     for t in typed
         if *t.ty is Nothing then ty = Nothing
@@ -17863,7 +18105,7 @@ private parameterless_function_called(c: *Checker, at: Span, name_span: Span, id
             check_ignored(c, a.value)
         return TExpr(at, ty, UnitConst)
     if *ty is Function(_, _, _) || (args.len() > 0 && apply_methods(c, ty).len() > 0) then return call_checked(c, at, name_span, value, args)
-    c.note(unit_of(c), name_span, s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
+    c.note(unit_of(c), Span(name_span.start, at.end), s"`$name` takes no parameter list, so it is called without parentheses: write `$name`, not `$name()`")
     for a in args
         check_ignored(c, a.value)
     TExpr(at, ErrorType, UnitConst)
@@ -18834,6 +19076,14 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                 for i in 0..<typed.len()
                     val before = typed[i]
                     typed[i] = TArm(before.pattern, before.guard, none_as(c, before.body, body.ty))
+                ty = body.ty
+            // So does an arm that is a function yielding `Nothing`, to the other arms' function type,
+            // and the arms before an arm of another function type, to that.
+            body = results_as(c, body, ty)
+            if widens_results(c, ty, body.ty)
+                for i in 0..<typed.len()
+                    val before = typed[i]
+                    typed[i] = TArm(before.pattern, before.guard, results_as(c, before.body, body.ty))
                 ty = body.ty
             join_expected(c, ty, body.ty, wanted) match
                 Some(t) -> ty = t

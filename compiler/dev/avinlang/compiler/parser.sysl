@@ -521,8 +521,10 @@ private parenthesized(p: *Parser, start: Span) -> &Expr
     if p.accept(")") then return Expr(start.to(p.ended()), UnitLit)
     val outer = p.in_list
     p.in_list = true
+    var reported = p.report.len()
     val first = expression(p, 0)
     if !p.at(",")
+        if !p.at(")") && !p.toks.at_end() then misread_item(p, None, first, reported)
         p.in_list = outer
         p.expect(")")
         p.grouped.push(first.span)
@@ -531,7 +533,12 @@ private parenthesized(p: *Parser, start: Span) -> &Expr
     items.push(first)
     while p.accept(",")
         if p.at(")") then break
-        items.push(expression(p, 0))
+        reported = p.report.len()
+        val item = expression(p, 0)
+        items.push(item)
+        if !p.at(",") && !p.at(")") && !p.toks.at_end()
+            misread_item(p, None, item, reported)
+            break
     p.in_list = outer
     val end = p.toks.here()
     p.expect(")")
@@ -752,8 +759,12 @@ private call(left: &Expr, p: *Parser) -> &Expr
                 reject_keyword(p, p.toks.here(), p.ahead(0), "an argument")
                 name = Some(p.spelling(p.toks.advance().unwrap()))
                 p.toks.advance()
+            val reported = p.report.len()
             val value = placeholder_scope(p, expression(p, 0))
             args.push(Argument(start.to(value.span), name, value, false))
+            if !p.at(",") && !p.at(")") && !p.toks.at_end()
+                misread_item(p, Some(callee_name(left)), value, reported)
+                break
             if !p.accept(",") || p.at(")") then break
     p.in_list = outer
     var end = p.toks.here()
@@ -764,6 +775,72 @@ private call(left: &Expr, p: *Parser) -> &Expr
             end = block.span
         None -> ()
     Expr(left.span.to(end), Call(left, args))
+
+// An item of a parenthesized list, a call's argument (`callee` is the name the call is written
+// with, or empty) or a part of a group or tuple (`None`), followed by something other than `,` or
+// `)`. The mistake is reported once, saying what was meant where the token shows it, and the rest
+// of the list is skipped up to its `)`, so the expression and the statement around it are read on
+// as written. An item that already reported an error, or a `=>` the lexer reported, adds nothing.
+private misread_item(p: *Parser, callee: Option[string], value: &Expr, reported: usize)
+    val at = p.toks.here()
+    if p.report.len() > reported || p.at("=>") then ()
+    elif p.at("->")
+        val message = if callee is Some(name) && name.ends_with("Map")
+            s"write a map as `{\"a\": 1}`: a key and its value are joined by `:` inside braces, not by `->`"
+        else "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{\"a\": 1}`"
+        p.report.add(error(at, message))
+    elif p.at(":") && value.kind is Name(_) && lambda_arrow_ahead(p) is Some(arrow)
+        // `x: int -> body`: a lambda whose typed parameter lacks its parentheses.
+        val item = from_utf8_unchecked(p.src.text(value.span))
+        val first = p.toks.peek_at(1).unwrap().span
+        val last = p.toks.peek_at(arrow - 1).unwrap().span
+        val shown = from_utf8_unchecked(p.src.text(first.to(last)))
+        if p.report.len() == reported then p.report.add(error(at.to(last), s"a lambda's parameter with a type is written in parentheses: `($item: $shown) -> …`"))
+    elif p.at(":")
+        p.toks.advance()
+        val written = parse_type(p)
+        val item = from_utf8_unchecked(p.src.text(value.span))
+        val shown = from_utf8_unchecked(p.src.text(written.span))
+        val rest = if p.at(",") then ", …" else ""
+        val message = callee match
+            Some(name) ->
+                if name == "" then s"an argument is not given a type: give the type argument of the function it is passed to, `[$shown]`"
+                else s"an argument is not given a type: give the type argument instead, as in `$name[$shown]($item$rest)`"
+            None -> s"an expression is not given a type: declare the value with it, as in `val x: $shown = $item`"
+        if p.report.len() == reported then p.report.add(error(at.to(written.span), message))
+    else p.report.add(expected(at, "`)`", found_at(p.src, at)))
+    var depth = 0
+    loop
+        if p.toks.at_end() then return
+        val word = p.ahead(0)
+        if depth == 0 && word == ")" then return
+        if word == "(" || word == "[" || word == "{" then depth += 1
+        if word == ")" || word == "]" || word == "}" then depth -= 1
+        p.toks.advance()
+
+// How many tokens ahead of the `:` the parser is at stands the `->` (or `=>`) of a lambda whose
+// typed parameter was written without parentheses, `x: int -> body`: an arrow at the list's own
+// bracket depth, after at least one token of the type, before the `,` or `)` that ends the item.
+private lambda_arrow_ahead(p: *Parser) -> Option[usize]
+    var depth = 0
+    var i = 1usize
+    loop
+        val word = p.toks.peek_at(i) match
+            Some(t) -> p.spelling(t)
+            None -> return None
+        if depth == 0 && (word == "," || word == ")") then return None
+        if depth == 0 && i > 1 && (word == "->" || word == "=>") then return Some(i)
+        if word == "(" || word == "[" || word == "{" then depth += 1
+        if word == ")" || word == "]" || word == "}" then depth -= 1
+        i += 1
+
+// The name a call's callee is written with: `f` in `f(x)` and `f[T](x)`, `foldLeft` in
+// `xs.foldLeft(…)`; empty for a callee that is not a name.
+private callee_name(callee: &Expr) -> string = callee.kind match
+    Name(name) -> name
+    Member(_, name) -> name
+    TypeApply(target, _) -> callee_name(target)
+    _ -> ""
 
 /** A placeholder lambda: where `value` holds `_`, each `_` is a parameter of its own, in the order
  * written, and `value` is the body of a lambda of them, so `_ + _` is `(a, b) -> a + b`. A `_` is

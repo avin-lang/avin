@@ -27,7 +27,11 @@ All other types — user types, library types, collections — are PascalCase by
 ## Integers
 
 Arithmetic keeps the operand width: `i8 + i8` is `i8`. Mixed widths need an explicit conversion
-(`long(x)`); there is no implicit widening. Diagnostics name `i32` and `i64` by their aliases. A literal takes its width from context (an annotation,
+(`long(x)`); there is no implicit widening. Diagnostics name `i32` and `i64` by their aliases, and
+an operation or comparison on two number types names the conversion that joins them, pointing at
+the operand to convert: ``error: `*` needs two numbers of one type, not long and int; write
+`long(n)` `` (an integer converts to the wider integer or to `real`, a byte to the other side's
+type; a compound assignment's target keeps its type, so there the value converts to it). A literal takes its width from context (an annotation,
 a parameter, the other operand, the other branches of an `if` or elements of a collection literal) and defaults to `int`; a literal that does not fit is a compile error.
 Where a `real` is expected, an integer literal is that real (`x * 2`), provided it is exact: its
 magnitude is at most 2^53.
@@ -85,6 +89,8 @@ a result does not fit:
 | `leadingZeros`, `trailingZeros` | The zero bits above the highest one and below the lowest one, an `int`; the width for zero. `leadingZeros` is `0` for a negative number |
 | `isPowerOfTwo` | Whether the number is `1`, `2`, `4`, and so on; never for zero or a negative number |
 | `toRadix(r)` | The digits in radix `r` from 2 to 36, lower case, with a `-` for a negative number and no prefix, as `f"%x"` and `f"%b"` write them; any other radix traps |
+| `toInt`, `toLong` | The number as an `int` or a `long`, exactly `int(n)` and `long(n)`: trapping when it does not fit |
+| `toReal` | The number as a `real`, exactly `real(n)`; it is `Numeric`'s, so generic code has it too |
 
 The bitwise operators `&`, `|`, `^` and the shifts also work on a type parameter bounded by
 `Integer`, as the machine's operators at each width, with both operands of one type: `x >> T(1)`.
@@ -102,7 +108,9 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 
 `real` arithmetic follows IEEE 754, including NaN and signed zero; comparisons with NaN are false
 except `!=`. `x.isNaN`, `x.isInfinite` (either infinity) and `x.isFinite` (neither) classify a
-value, and each value is exactly one of NaN, infinite or finite. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
+value, and each value is exactly one of NaN, infinite or finite. `x.toInt` and `x.toLong` are
+`int(x)` and `long(x)`, truncating toward zero, saturating at the bounds and mapping NaN to zero;
+`x.toReal` is `x`. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
 the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
 `math.sqrt(x)`. `char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
@@ -150,7 +158,7 @@ most the largest `int` bytes.
 | `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
 | `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
-| `toUpperCase`, `toLowerCase` | Each character's simple case mapping, one character for one: `"straße".toUpperCase` is `STRAßE` |
+| `toUpper`, `toLower` | Each character's simple case mapping, one character for one, as `char`'s methods of the same names map it: `"straße".toUpper` is `STRAßE` |
 | `strip`, `stripLeading`, `stripTrailing` | Without the Unicode `White_Space` characters at both ends, the start, the end |
 | `trim` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
@@ -209,6 +217,7 @@ asking for one names both; nor does `*` repeat it, and the error names `repeat`:
 
 ```text
 word.length    // string has no field `length`; a string counts its characters with `charCount` and its bytes with `byteLength`
+word.toUpperCase  // string has no field `toUpperCase`; a string maps its case with `toUpper` and `toLower`, as a `char` does
 "-" * 3        // `*` needs two numbers of one type, not string and int; a string is repeated by `repeat`, as in `text.repeat(n)`
 ```
 
@@ -246,7 +255,9 @@ returns `unit`.
 ## Tuples
 
 `(A, B, …)` is a tuple type of any arity, written and matched with parentheses: `(1, "one")`,
-`(n, name) -> …`. Elements are read with `t.0`, `t.1`. Tuples are values with no identity and derive
+`(n, name) -> …`. Elements are read with `t.0`, `t.1`, numbered from 0; asked for `t._1` or
+`t._2`, the error names the part to write (``(string, int) has no field `_2`; a tuple's parts are
+numbered from 0, so write `.1` ``). Tuples are values with no identity and derive
 `Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do. A pair has `swap`, the pair
 with its parts the other way round: `(1, "one").swap` is `("one", 1)`. A program adds methods to
 tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from its parameters,
@@ -519,6 +530,24 @@ value's type, and with it the other comparisons that type has.
 never returns. It is a subtype of every type, and an expression of type `Nothing` never produces a
 value. An empty collection literal or `None` does **not** have a `Nothing` type argument; its type
 comes from context (see [inference](/spec/generics/#inference)).
+
+A function's result is a covariant position, so a function whose result is `Nothing` is a function
+of every result type: a named function, a lambda, a method value or any other value of type
+`(A) -> Nothing` may be used where an `(A) -> R` is expected, and so may a `() -> () -> Nothing` where
+a `() -> () -> R` is. It converts where it is written, in a declared type, an argument (also one
+whose parameter type the other arguments decide), a result, a field, and the branches of an `if` or
+`match` or the elements of a collection literal, which agree on the other function type; the value
+is evaluated once, there. Its parameters still vary as a function's do: an `(Animal) -> Nothing` is a
+`(Dog) -> string`, and a `(Dog) -> Nothing` is no `(Animal) -> string`. Inside another type it is
+not converted, as a value of a value type is not: a `Vector[(int) -> Nothing]` is no
+`Vector[(int) -> int]` ([proposed](/spec/decisions/#proposed)).
+
+```text
+refuse(x: int) -> Nothing = fail(s"refused $x")
+
+val f: (int) -> Option[int] = refuse
+val g = if strict then refuse else (x: int) -> Some(x)    // (int) -> Option[int]
+```
 
 ## Union types
 

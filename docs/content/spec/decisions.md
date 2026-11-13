@@ -208,7 +208,8 @@ a decision changes, this page and the chapter change together.
   by the type pattern `s: string` like any other type.
 - Settled 2026-11-03: the library's [string methods](/spec/types/#string) are `byteLength`,
   `charCount`, `isEmpty`, `nonEmpty`, `startsWith`, `endsWith`, `contains`, `slice`,
-  `toUpperCase`, `toLowerCase`, `trim`, `strip`, `stripLeading`, `stripTrailing`, `repeat`,
+  `toUpper`, `toLower` (named `toUpperCase` and `toLowerCase` until the Proposed entry on one
+  family of case names), `trim`, `strip`, `stripLeading`, `stripTrailing`, `repeat`,
   `replace` and `padTo` beside `padStart` and `padEnd`, with the reference library's names (user,
   2026-11-04), and, with the reference's names and behaviour (user, 2026-11-04), `stripPrefix`,
   `stripSuffix`, `capitalize` (only a lower-case first character changes), `stripMargin` with the
@@ -6278,7 +6279,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     dropping trailing empty pieces; a negative limit trapping.
   - **`stripLineEnd` removes one terminator, `\n` or `\r\n`, never a lone `\r`**, agreeing with
     `lines()`, which does not end a line at a `\r` either. *Alternative:* also a lone `\r`.
-  - **`compareIgnoreCase` compares the two after `toLowerCase`**, as `equalsIgnoreCase` equates
+  - **`compareIgnoreCase` compares the two after `toLower`**, as `equalsIgnoreCase` equates
     them, so its sign is `compare` of the lower-cased strings. *Alternative:* comparing character by
     character after upper-casing.
   - **`charIterator()` is a lazy `Iterator[char]` reading the string by offset**, with `next()` on
@@ -7238,8 +7239,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `merge`, `joinLeft`, `joinRight`; Result's `isOk`, `isErr`, `ok`, `err`, `toList`, `flatten`; a
   pair's `swap`; string's `byteLength`, `charCount`, `isEmpty`, `nonEmpty`, `isBlank`, `head`,
   `last`, `headOption`, `lastOption`, `tail`, `init`, `reverse`, `chars`, `bytes`, `lines`, `trim`,
-  `strip`, `stripLeading`, `stripTrailing`, `stripLineEnd`, `capitalize`, `toUpperCase`,
-  `toLowerCase`; char's `isDigit`, `isLetter`, `isLetterOrDigit`, `isSpaceChar`, `isWhitespace`,
+  `strip`, `stripLeading`, `stripTrailing`, `stripLineEnd`, `capitalize`, `toUpper`,
+  `toLower`; char's `isDigit`, `isLetter`, `isLetterOrDigit`, `isSpaceChar`, `isWhitespace`,
   `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower`, `asDigit`; the integers' `abs`, `sign`,
   `bitCount`, `leadingZeros`, `trailingZeros`, `isPowerOfTwo`; real's `isNaN`, `isInfinite`,
   `isFinite`; Enumerable's `values` (static), `ordinal`, `name`; StringWriter's `text`, `length`,
@@ -7651,6 +7652,153 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   line above, which hides the call being made. Review with the user whether `.` after an operator
   line should bind to the whole expression instead.
 
+- Settled on the user's delegation 2026-11-13 (built on branch `nothing-conversion`): **A function whose result is `Nothing` converts to one of another result where it is written, as a
+  lambda calling it, and not inside another type** ([types](/spec/types/#any-and-nothing); branch
+  `nothing-conversion`). The subtyping rules already made `(A) -> Nothing` a subtype of every
+  `(A) -> R`, but no function value of it was accepted where one was expected (only a lambda whose
+  body never finishes, checked against the expected type), while an inferred type argument let one
+  through with no conversion, and the call through the wider type then called code yielding no value
+  as code yielding one. A call of a `Nothing` function yields no value at all, and one of an
+  `(A) -> R` yields an `R`, so the two are laid out differently and one is not the other as it
+  stands. The choice: at a declared type, an argument (after inference too), a result, a field, and
+  the branches of an `if`/`match` or elements of a collection literal, the value is evaluated once
+  into a local and made a lambda of the expected type calling it (a named function is called by name
+  and nothing is captured, so it may be `@sendable`); nested results (`() -> () -> Nothing`) convert
+  one level at a time. Parameters keep their variance; a `Vector[(int) -> Nothing]` is no
+  `Vector[(int) -> int]`, as a `Vector[int]` is no `Vector[Any]`. Why: it gives the subtyping rule
+  its meaning with no change to how functions are called, and matches how a value of a value type
+  becomes an `Any` or a trait (at the site, never inside a container). Alternatives weighed: a view
+  with no conversion, the closure's entry for a `Nothing` result answering every result's layout
+  (impossible in one entry: an `int`, a `real`, a reference and no value are returned differently);
+  a dedicated adapter node in lowering (the same conversion, built by hand rather than as a checked
+  lambda); refusing the conversion and keeping only lambdas (contradicts the subtyping rule, and the
+  inferred case had to be closed anyway). Review with the user: whether a function held inside a
+  collection should convert too, which needs a copy of the collection.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `numeric-widths`): **numbers have `toInt`, `toLong` and `toReal` as
+  parameterless members, each exactly the conversion call of its type.** Every integer type has
+  `n.toInt` and `n.toLong` (`int(n)`, `long(n)`: a narrowing one traps when the value does not fit,
+  as the call does); `real` has `x.toInt` and `x.toLong` (`int(x)`, `long(x)`: truncation toward zero,
+  saturation at the bounds, NaN to zero); `toReal` was already `Numeric`'s. They are members of the
+  integer family's impl and of `real`'s, not of `Numeric`, so a number type of a program's own owes
+  only `toReal`. WHY: `string.toLong()` and `xs.sum.toReal` put conversions where a reader reaches for
+  them, and `n.toLong` answering ``int has no field `toLong` `` was the surprise; making the member the
+  call, rather than a second semantics, keeps one rule for what a conversion does. A narrowing
+  `toInt` traps, as `string.toInt()` traps on a number that does not fit and as `int(n)` does, so the
+  trap/`Option` split stays where it is (`toIntOption()` is for text, whose failure is the input's).
+  ALTERNATIVES: no members, only a hint naming `long(n)` (leaves `toReal` the odd one out); a
+  narrowing `toInt` answering `Option[int]` (differs from `int(n)` and from `string.toInt()`); no
+  narrowing members at all, `toLong` only (an `int` from a `long` is as common as the reverse); members
+  on `byte` too (a byte is not a number, and `int(b)` reads as what it is). Review with the user:
+  whether `real.toInt` should trap on NaN and out-of-range values instead of saturating, as
+  `string.toInt()` traps on text that is no number.
+- Settled on the user's delegation 2026-11-13 (built on branch `numeric-widths`): **mixed-width arithmetic stays an error, and its diagnostic
+  names the conversion**, pointing at the operand to convert: ``error: `*` needs two numbers of one
+  type, not long and int; write `long(n)` ``, the operand quoted as written (or, when it is longer
+  than 40 bytes or spans lines, ``convert the int with a call of `long` ``). The narrower integer
+  converts to the wider, an integer or a byte to `real`, a byte to an integer, an integer to a type
+  parameter bounded by `Integer` (`T(n)`), and a value of a `Numeric` parameter to `real` by
+  ``x.toReal``. Comparisons (`<`, `==`, …, each link of a chain) say the same. A compound
+  assignment's target keeps its type, so there the value converts to it, a narrowing call included
+  (`n -= total` suggests `int(total)`). A `char` beside a number gets no conversion hint: it is no
+  number, and `'-' * 3` meant `repeat`. WHY: the spec settles that integers are never widened
+  implicitly; the error was right and only lacked the fix. ALTERNATIVES: implicit widening (contrary
+  to the settled rule); pointing at the whole operation (the hint names one operand, so the caret
+  should too); suggesting a narrowing of the wider operand (loses values).
+
+- Settled on the user's delegation 2026-11-13 (built on branch `diag-spans-recovery`): **Parse recovery and the hints for `Map(k -> v)` and an argument's type** (branch
+  `diag-spans-recovery`). A line of a block, class, actor or machine the parser cannot read to its
+  end is skipped to the next line, and reported only when nothing in it was reported already; an
+  argument list or parenthesized group meeting a token other than `,` or `)` reports it once and
+  skips to its `)`. `->` there says "write a map as `{"a": 1}`" when the callee's name ends in `Map`
+  and "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{"a": 1}`" otherwise;
+  `x: T` says "give the type argument instead, as in `f[T](x, …)`" (Avin has no expression
+  ascription: a value takes its type from where it is used, or from a declared `val`'s type), "a
+  lambda's parameter with a type is written in parentheses" when `->` follows the type, and "declare
+  the value with it, as in `val x: T = …`" in a group. WHY: one mistake made five to ten errors,
+  each naming a token rather than the mistake, and the token shows exactly which mistake it is.
+  ALTERNATIVES: suppressing every error after the first in a statement (panic mode), which also
+  hides a genuinely separate mistake on the same line; accepting `k -> v` as a pair (a second
+  spelling of a tuple, and `x -> body` is a lambda); accepting `x: T` as an ascription (a second way
+  to state a type the language deliberately gives through declarations and type arguments).
+- Settled on the user's delegation 2026-11-13 (built on branch `diag-spans-recovery`): **A member's mistake is shown at the member** (branch `diag-spans-recovery`). The checker reports
+  a missing or private member, an argument-count mistake and `()` on a parameterless member at the
+  member's name and argument list; the call's own span, used for a type mismatch and for traps,
+  stays the whole expression. WHY: in a chain written over leading-`.` lines the whole span starts
+  lines above the member at fault, and the rendering shows only its first line. ALTERNATIVES:
+  narrowing the call's span itself (a wrong-type value would then be shown at its last member only);
+  storing the name's span in the syntax tree (every `Member` match changes, for a span the source
+  already determines).
+
+- Settled on the user's delegation 2026-11-13 (built on branch `argparse`): **`avin.cli`: a declared parser read by name** (branch `argparse`). Proposed: the standard
+  library's argument parser is a `Parser` value built by chained declarations (`flag`, `string`,
+  `int`, `real`, `choice`, `positional`, `positionals`, each with named `short`, `help`, `default`,
+  `required`, `repeated`, `value`), and `parse(args)` answers `Result[Args, ArgsError]`; values are
+  asked for by name and type (`a.int("top")`, `a.strings("file")`), and asking for an undeclared
+  name or the wrong type traps. `parseOrExit` covers the usual `main`: help or version to standard
+  output and status 0, a mistake to standard error with the usage line and status 2. Why: it needs
+  no language feature, a program reads in the order its help does, and every mistake a user can
+  make is a value with a sentence naming what they wrote. Alternatives weighed: deriving a parser
+  from a `data` type's fields (`data Options(...) derives Args`), which checks names at compile time
+  but needs a derivation and a way to attach help, short letters and defaults to fields; a
+  getopt-style loop the program drives, which is what `wc` hand-rolled; one getter returning
+  `Option` for everything, which makes every read a `match`. Review with the user: whether a
+  derived form is wanted on top of this one.
+  The rules it settles, each the common command-line convention: `--name=value` and `--name value`
+  alike; bundled letters (`-lw`, `-n5`, `-lwn5`); an option's value is the next argument whatever
+  it starts with (`--top -1`); `-` alone and the empty argument are positional; `--` ends the
+  options; options and arguments interleave; a single option given twice keeps the last (so an
+  alias's option can be overridden), a `repeated` one keeps all, and a flag is counted (`-vvv`).
+  Every parser has `--help`/`-h`, and `--version` where it has a version, unless the program
+  declares that name or letter itself; each acts where it stands, left to right. An option with no
+  `default` reads as its type's zero (`""`, `0`, `0.0`) and `given(name)` tells whether it was on
+  the command line; the help shows a default only where it is not that zero, since a default
+  parameter cannot tell an explicit zero from an omitted one. Every option has a long name (the
+  name `Args` looks it up by); positional arguments are strings. The reasons read ``unknown option
+  `--x` ``, `` `--count` needs an int, not `abc` `` and `` `--scale` needs a number, not `x` ``
+  (a user of the program knows "number" better than "real"). Alternatives weighed: refusing an
+  option given twice (catches typos, breaks overriding an alias); refusing a value that starts with
+  `-` unless it is a number; typed positional arguments, left out until a program needs one;
+  `Option`-typed defaults (`default = Some(3)`), exact but noisy at every declaration.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **one family of case names, `toUpper` and `toLower`, for
+  `char` and `string` alike.** `string.toUpperCase` and `toLowerCase` are renamed to `toUpper` and
+  `toLower`, the names `char` already had, across the library, its tests, the corpus, the scripts
+  and the spec; `"a".toUpperCase` is refused with ``string has no field `toUpperCase`; a string
+  maps its case with `toUpper` and `toLower`, as a `char` does``. WHY: one name for one operation
+  on both types, and the shorter one, which conflicts with nothing on either type. There is no
+  deprecation mechanism to keep the old names as aliases, so the old names are gone and the error
+  names the new ones. ALTERNATIVES: rename `char`'s to `toUpperCase` (longer, and `isUpper`/`isLower`
+  on `char` would then disagree with it); keep both names on `string` as plain aliases (two names for
+  one method forever, with no way to retire one). Review with the user: it breaks source using the
+  old names (marshal, tui and typing-practice use them), so their call sites change in the release
+  that carries it.
+- Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **`avin` takes its options before or after the program.**
+  The program is the first argument that is neither an option nor an option's value, wherever it
+  stands before `run`'s `--`; for `avin test`, only an existing path is the program and any other
+  word is the filter, as before. `avin run -O2 main.avin`, `avin run main.avin -O2`,
+  `avin -O2 main.avin` and `avin build -o out -O0 main.avin` are all accepted, and only what follows
+  `--` reaches the program. A first argument that is any option (not only `-O0`, `-O2` or `--`) now
+  means `avin run`, which checks the options itself. WHY: the audit's `avin run -O2 file.avin`
+  printed the whole usage; the order of avin's own options carries no meaning, and `--` already
+  separates the program's arguments. ALTERNATIVES: options after the program only, with an error
+  saying so (keeps a rule nobody needs); treating words after the program as its arguments without
+  `--` (makes `avin run main.avin -O2` pass `-O2` to the program, which surprises in the other
+  direction).
+- Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **`Result.toOption` beside `ok`, and `StringWriter` is
+  `Display`.** `toOption` answers exactly what `ok` does, under the name `Either` and the
+  collections use; `ok` stays. `StringWriter` implements `Display` (its `text`, padded to a field's
+  width, as a string) and `toString()` returns its `text`. WHY: the names people reach for first,
+  and a writer that interpolates as what it holds. ALTERNATIVES: renaming `ok` to `toOption`
+  (breaks callers for no gain; `ok`/`err` read as a pair); a `StringWriter` with `toString()` only
+  (it would still show as its type's name in `s"$w"`).
+- Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **`t._1` on a tuple names the part to write.** A member
+  `_` followed by decimal digits asked of a tuple adds ``; a tuple's parts are numbered from 0, so
+  write `.n-1` `` when `1 <= n <=` its arity, and ``; a tuple's parts are numbered from 0 and read as
+  `.0` to `.k` `` otherwise (`_0`, a part beyond the arity, a number too large to read). WHY: the
+  `_1` spelling is what readers of other notations write first, and `_n` meaning part `n - 1` is the
+  likely intent. ALTERNATIVES: accepting `_1` as a second spelling (two ways to write one thing).
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
@@ -7672,6 +7820,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   than the compiler" (a newer library declares what an older compiler cannot check, which is the
   failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
   library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
+- Proposed (built on branch `c1-diagnostics`): **A method declared `m()` and named bare where a
+  value is expected is reported as "`m` is called with `()`: write `c.m()`, or `() -> c.m()` for a
+  function value"**, the call first, written on the receiver as the program named it (a local or
+  parameter by name, `self`, a type for a static member, nothing for a bare name's implicit `self`),
+  `_.m()` alone for a placeholder, and `.m()` with "a lambda calling it" for any other receiver.
+  Why: the error is almost always a missing `()` now that pure accessors are declared without a
+  parameter list, so the fix leads, and a fix written on the program's own receiver is what the
+  reader types; the old text ("is declared with an empty parameter list, so naming it without a
+  call makes a function value, which is allowed only where …") put the rule before the fix and
+  showed `x.m()` for every receiver. Alternatives weighed: repeating a complex receiver's source
+  text (the checker holds no source text, and a long chain would crowd the message); keeping the
+  `x.` placeholder (it names a variable the program does not have). The opposite message, for
+  `x.m()` on a parameterless `m`, is unchanged: it already reads well inside lambdas, placeholders
+  and chains.
 
 
 ## Proposed
