@@ -75,7 +75,7 @@ There is no `%%`.
 
 | Conversion | Takes | Writes |
 | --- | --- | --- |
-| `d`, `i` | an integer of any width, or a `byte` | decimal |
+| `d`, `i` | an integer of any width, a `byte`, or a [`BigInt`](/spec/types/#bigint) | decimal |
 | `x`, `X` | the same | hexadecimal, in lower or upper case |
 | `o`, `b` | the same | octal, binary |
 | `f` | a `real` | fixed point, 6 decimals unless a precision says otherwise |

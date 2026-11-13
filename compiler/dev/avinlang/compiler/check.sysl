@@ -14055,6 +14055,14 @@ private integer_type(c: *Checker, t: &Type) -> bool = *t match
         None -> false
     _ -> false
 
+// Whether `t` is a whole number the integer conversions write: an integer, a `byte`, or the core
+// library's `BigInt`, whose `display` lays its digits out under them as an integer's are.
+private whole_number_type(c: *Checker, t: &Type) -> bool
+    if integer_type(c, t) || *t is Byte then return true
+    if *t is Class(k, _, _)
+        if c.class_types.get(qualified(CoreModule, "BigInt")) is Some(big) then return big == k
+    false
+
 // The `FormatSpec` an `f"…"` specifier describes, after checking it against the hole it follows: the
 // conversion is one the hole's type takes, each flag has an effect under it, and a width or precision
 // written as a hole is an integer. `None` when it has been reported.
@@ -14078,13 +14086,13 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
         zeros = true
         grouping = true
         wanted = "an integer"
-        fits = integer_type(c, t) || *t is Byte
+        fits = whole_number_type(c, t)
     elif letter == "x" || letter == "X" || letter == "o" || letter == "b"
         signs = true
         zeros = true
         alternate = true
         wanted = "an integer"
-        fits = integer_type(c, t) || *t is Byte
+        fits = whole_number_type(c, t)
     elif letter == "f" || letter == "e" || letter == "g" || letter == "E" || letter == "G"
         signs = true
         zeros = true
@@ -14096,7 +14104,7 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
         fits = *t is Char
     elif letter == "s"
         wanted = "a string or another value that is not a number"
-        fits = !(integer_type(c, t) || *t is Byte || *t is Real)
+        fits = !(whole_number_type(c, t) || *t is Real)
     elif letter == "?"
         fits = true
     elif letter == "u"
@@ -16125,7 +16133,9 @@ static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
         _ -> return None
     if name == "self" || name == "super" || name == "_" then return None
     if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return None
-    if class_member(c, name) is Some(_) || global_named(c, name) is Some(_) then return None
+    if class_member(c, name) is Some(_) then return None
+    if global_named(c, name) is Some(_)
+        if !companion_leaves_static(c, name, member) then return None
     // A class's name is also its constructor's, which a call on the name does not mean.
     for f in lookup_functions(c, name)
         if !c.symbols[f].constructor then return None
@@ -16305,6 +16315,24 @@ private names_fieldless_value(c: *Checker, target: &Expr) -> Option[usize]
     for v in variants_named(c, name)
         if c.data[v.data].name == name && c.data[v.data].variants[v.index].fields.len() == 0 then return Some(v.data)
     None
+
+// Whether `Name.member`, where `name` names a class or a data type and its companion object both,
+// means the type's static member `member`: the companion declares no member of that name and the
+// type has a static one, as `BigInt.zero()` calls `Add`'s `zero` beside `object BigInt`'s `apply`.
+private companion_leaves_static(c: *Checker, name: string, member: string) -> bool
+    val key = resolve_name(c, unit_of(c), name)
+    if c.class_types.get(key) is Some(k)
+        if c.classes[k].decl.object then return false
+        if c.classes[k].companion is Some(o)
+            if companion_member(c, o, member) then return false
+            for m in methods_named(c, k, member)
+                if c.symbols[m].static_member then return true
+        return false
+    if c.types.get(key) is Some(t)
+        if c.data[t].companion is Some(o)
+            if companion_member(c, o, member) then return false
+            return has_static_member(c, t, member)
+    false
 
 // Whether data type `id` has a static member `name`, which a call on the type's name means even
 // where the name is also a value.

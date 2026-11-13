@@ -7676,6 +7676,55 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `bigint`): **`BigInt` is a class of the core module `avin`, written in Avin, its
+  magnitude in limbs of nine decimal digits held in `long`s.** It is visible with no import, as
+  `BitSet` is; its limbs are a `FrozenArray[long]`, a type no program can name, so its constructor
+  cannot be called with a malformed magnitude from outside the library, and the value is immutable
+  and sendable. Multiplication is schoolbook and division is long division with a normalized
+  divisor, both quadratic. *Why*: base 10^9 makes decimal text, by far the commonest, a limb at a
+  time in both directions, and keeps a limb product plus a carry inside a `long` with no wrapping
+  arithmetic; living in `avin` lets it reuse the integer formatter's private layout code, so `%d`
+  and its flags behave exactly as for `long`. *Alternatives*: binding Sysl's `sysl.math.bigint`
+  through a handle (faster, but its behaviour, text forms and traps would be Sysl's to change, and
+  the library is meant to be Avin); base 2^32 limbs (cheaper bit operations, which `BigInt` does not
+  have yet, but every decimal conversion becomes a division per nine digits and products need
+  wrapping or 128-bit arithmetic); a module `avin.math` needing an import (keeps the core namespace
+  smaller); Karatsuba multiplication (not needed at the sizes programs meet so far). Review with the
+  user: whether `BigInt` should be in the core namespace, and whether it should gain the bitwise
+  operators and shifts.
+
+- Proposed (branch `bigint`): **`BigInt`'s API mirrors the integer methods: `abs`, `sign`, `pow`,
+  `gcd`, `lcm`, `floorDiv`, `floorMod`, `toRadix(r)`, plus `isZero`, `divRem`, `toLong`/`toInt`
+  that trap and `toLongOption`/`toIntOption` that answer `None`.** Made by `BigInt(n)` from any
+  integer width (a non-generic `apply(n: long)` beside the generic one, so a literal as large as a
+  `long` is accepted), `BigInt(text)`/`BigInt(text, radix)` that trap on bad text as `toLong` does
+  (`For input string: "…"`), and `BigInt.parse(text[, radix])` answering `Option`. A zero divisor
+  traps with `division by zero`. *Why*: one vocabulary for whole numbers, so code moves between
+  `long` and `BigInt` by changing a type; the trapping and `Option` pairs follow `string.toLong` /
+  `toLongOption`. *Alternatives*: `toString(radix)` instead of `toRadix` (the integer types already
+  chose `toRadix`); only `Option` conversions (forces `.get` at every call that knows the value
+  fits); a `string.toBigInt` extension (adds to every string a method for one type).
+
+- Proposed (branch `bigint`): **the integer format conversions `%d`, `%i`, `%x`, `%X`, `%o` and
+  `%b` take a `BigInt`, and `%s` refuses it as it refuses every number.** The checker names the core
+  library's `BigInt` beside the integer widths and `byte`. *Why*: a whole number is formatted as one,
+  with grouping, signs, zero padding and bases; refusing `%s` keeps the rule that a number's
+  conversion says how its digits are laid out. *Alternatives*: a trait (say `WholeNumber`) a type
+  implements to be taken by the integer conversions (general, but a new trait and a display
+  contract for one type); accepting `BigInt` under `%s` (inconsistent with every other number).
+  Review with the user: whether a trait should open the integer conversions to other types.
+
+- Proposed (branch `bigint`): **a type's static member is called on its name even where the type
+  has a companion object.** `Cup.zero()` with `object Cup` declared reported "`Cup` has no member
+  `zero`" (and `Period.zero()` the same), since the name was read as the object. Now `Name.member`
+  is the companion's where the companion declares a member of that name, and otherwise the type's
+  static member where it has one, for classes and data types, written with type arguments or not,
+  called or named as a function value. *Why*: the spec calls a static member on the type's name, and
+  a companion is where a type keeps its factories, so a type with both is the ordinary case
+  (`BigInt.zero()` beside `BigInt.apply`). *Alternatives*: refusing a static member and a
+  companion on one type (rules out the common case); the type's static member winning over the
+  companion's member of the same name (makes a companion unable to shadow it deliberately).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

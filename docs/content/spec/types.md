@@ -90,6 +90,49 @@ The bitwise operators `&`, `|`, `^` and the shifts also work on a type parameter
 `Integer`, as the machine's operators at each width, with both operands of one type: `x >> T(1)`.
 The methods above are not members of `Integer`, so generic code cannot call them on a `T`.
 
+## BigInt
+
+`BigInt`, a class of the core library, is a whole number of any size: it holds as many digits as
+its value needs, so its arithmetic never overflows. It is not a member of `Integer`, whose widths are
+fixed, but it is a number, an ordered value and a key: it implements `Numeric` (the five operators,
+unary `-`, `Ord`, `Display`, `Debug`, `BigInt.zero()`, `BigInt.one()` and `toReal`), `Eq` and `Hash`
+by value.
+
+```text
+var f = BigInt.one()
+for i in 2 .. 100 do f = f * BigInt(i)
+println(f)                              // 100!, all 158 digits
+println(f"${BigInt(2).pow(100)}%,d")     // 1,267,650,600,228,229,401,496,703,205,376
+println(BigInt("ff", 16) + BigInt(1))   // 256
+println(BigInt.parse("12x"))            // None
+```
+
+- **Making one.** `BigInt(n)` takes an integer of any width; a literal argument is a `long`, so it
+  may be as large as one. `BigInt(text)` reads decimal and `BigInt(text, radix)` digits of base 2 to
+  36 (`0` to `9`, then `a` to `z` in either case), each after an optional `-` or `+`, with at least
+  one digit and nothing else: no white space, separators, prefix or exponent. Text that is not that
+  traps, as `toLong` does; `BigInt.parse(text)` and `BigInt.parse(text, radix)` answer `None`
+  instead. A radix outside 2 to 36 traps under both, being the caller's mistake. `-0` is zero, and
+  zero has no sign.
+- **Arithmetic is exact.** `+`, `-`, `*` and unary `-` never trap. `/` rounds towards zero and `%`
+  takes the dividend's sign, as on the integer types; `floorDiv` and `floorMod` round towards
+  negative infinity, and `divRem(o)` gives `(self / o, self % o)` from one division. A zero divisor
+  traps with `division by zero` under every one of them.
+- **Methods.** `isZero`; `sign`, `abs`, `pow(n)`, `gcd(o)`, `lcm(o)` and `toRadix(r)` as the integer
+  types have them, except that nothing overflows: `pow` traps only for a negative `n`, and `gcd` and
+  `lcm` never. `toLong` and `toInt` give the value as that type and trap when it does not fit, with
+  `value out of range for long` (or `int`); `toLongOption` and `toIntOption` answer `None` instead.
+  `toReal` is the nearest `real`, a tie going to the even one, and an infinity of the number's sign
+  past the greatest finite `real`.
+- **Text.** A `BigInt` displays as an integer does, in decimal with a `-` when negative, and its
+  `Debug` form is the same. The integer conversions `%d`, `%i`, `%x`, `%X`, `%o` and `%b` take it
+  with every flag, width and precision, laying it out exactly as they lay out a `long` of the same
+  value; like every number it is refused under `%s`, `%f` and `%c`.
+- **Representation.** The magnitude is held in limbs of nine decimal digits, least significant first,
+  never written once made, so a `BigInt` is an immutable value that may be shared freely. Decimal
+  text is read and written a limb at a time; other bases go through division by a power of the radix.
+  Multiplication and division are the schoolbook algorithms, quadratic in the number of limbs.
+
 ## byte
 
 `byte` is an octet with a value from 0 to 255. It is the element of binary data — file contents,
