@@ -7818,6 +7818,188 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `_1` spelling is what readers of other notations write first, and `_n` meaning part `n - 1` is the
   likely intent. ALTERNATIVES: accepting `_1` as a second spelling (two ways to write one thing).
 
+- Settled on the user's delegation 2026-11-13 (built on branch `build-dir`): **`avin run` and `avin test` build into the user's cache
+  directory, not into `.avin/` beside the program.** A program's executables and its instance cache
+  go to `build/<name>-<key>/` in the toolchain's cache (`~/Library/Caches/avin/<version>/` on macOS,
+  `$XDG_CACHE_HOME/avin/<version>/` or `~/.cache/avin/<version>/` elsewhere, or `AVIN_CACHE`), where
+  `<name>` is the program's directory's or file's name and `<key>` twelve hex digits of a SHA-256 of
+  its absolute, canonical path. `.avin/build/` beside the program is used only on a machine with no
+  cache directory (no `AVIN_CACHE`, `HOME` or `XDG_CACHE_HOME`; the runtime's archives then go to the
+  temporary directory, which is cleared under a long-lived cache). `avin build` and `-o` are
+  unchanged. The new `avin clean [<program>]` removes the program's directory and any `.avin/build/`
+  beside it (on the fallback, a program of one file's entries only, and `.avin/` once empty);
+  `avin clean --all` removes the whole `build/` of this version and nothing else of the cache, and on
+  the fallback means the current program's. `avin new` writes `/<name>` (the executable `avin build`
+  leaves at the root) and `.avin/` into an application's `.gitignore`, `.avin/` alone into a
+  library's. Why: a one-file script run from anywhere left an `.avin/` next to it; Sysl keeps its
+  builds and run cache in the machine cache directory keyed by version and target and uses a
+  project's `.sysl/` only where there is none, and Avin already keeps its fetched packages, runtime
+  archives and shims there, so a build cache beside the source was the one exception. Keying by path
+  keeps two worktrees of one repository apart (each has its own sources), and the version in the
+  path keeps one compiler's entries from another's. The executables and records are still published
+  by rename and the instance cache is lock-free as before, so two builds of one program at once stay
+  safe. Alternatives weighed: keep `.avin/` beside projects and move only one-file programs (two
+  rules to explain, and a repository still grows a directory to ignore); key by the program's content
+  rather than its path (every edit would start a new cache, and nothing would ever trim the old);
+  `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
+  then fetches again over the network); a lock around a program's cache (the content-addressed,
+  rename-published entries need none). Review with the user: whether a cache of a deleted project
+  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+
+- Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
+  tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
+  `match` arm, `Status.Shipped` qualified, `Some(Shipped)` nested and `f(Shipped) = …` in a clause
+  all mean `Shipped(_, _)`, with the variant's own number of `_`; coverage and unreachable arms
+  treat it as that pattern. `Shipped()`, written with parentheses, is still matched against the
+  fields by number and refused for a variant that has some. Why: the commonest test of a variant
+  asks only which one it is, and counting `_`s to say so is noise that changes whenever a field is
+  added; the previous error suggested `Shipped(fields)`, which is not Avin, and the bare name could
+  mean nothing else, since a variant in scope is never a binding. One rule for every place a
+  pattern goes, because `x is P` takes exactly the patterns a `match` arm takes. Alternatives: only
+  in `is` (two pattern languages, and a `match` arm refactored from an `if … is` would break);
+  keeping the error and suggesting `Shipped(_, _)` with the right number of `_` (valid, but the
+  test still has to change with the fields). Review with the user: a reader may take `Shipped`
+  for a variant without fields.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **`open`, `abstract` and `override` where they
+  mean nothing are one error each, and the declaration then parses as written.** Before a method:
+  "a method takes no `open`: every public method of an `open` or `abstract` class, and every
+  method of a trait, may be overridden already; remove `open`", and for `abstract` that a method
+  declared without a body is abstract already; before a field, that a field cannot be overridden
+  or is abstract by having no value; before a top-level function, that it belongs to no class or
+  overrides nothing; before `trait`, `data` and `object`, why each takes none; `override class`,
+  that a class replaces nothing and extends with `: Base`. Why: the words were read as names, so
+  `open sound() -> string` reported `open` and `string` as undefined and then every override of
+  `sound` as overriding nothing. The spec settles that every public method of an open class may be
+  overridden, so methods have no `open` to accept. Alternatives: accepting `open` on a method as a
+  harmless no-op (two spellings of one meaning); a method-level `open` with classes' methods
+  final by default (a language change the settled rules do not ask for). `open(…)`, `open = …`
+  and a method named `open` keep their meaning: the word is a modifier only before a name or a
+  declaration keyword.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `bigint`): **`BigInt` is a class of the core module `avin`, written in Avin, its
+  magnitude in limbs of nine decimal digits held in `long`s.** It is visible with no import, as
+  `BitSet` is; its limbs are a `FrozenArray[long]`, a type no program can name, so its constructor
+  cannot be called with a malformed magnitude from outside the library, and the value is immutable
+  and sendable. Multiplication is schoolbook and division is long division with a normalized
+  divisor, both quadratic. *Why*: base 10^9 makes decimal text, by far the commonest, a limb at a
+  time in both directions, and keeps a limb product plus a carry inside a `long` with no wrapping
+  arithmetic; living in `avin` lets it reuse the integer formatter's private layout code, so `%d`
+  and its flags behave exactly as for `long`. *Alternatives*: binding Sysl's `sysl.math.bigint`
+  through a handle (faster, but its behaviour, text forms and traps would be Sysl's to change, and
+  the library is meant to be Avin); base 2^32 limbs (cheaper bit operations, which `BigInt` does not
+  have yet, but every decimal conversion becomes a division per nine digits and products need
+  wrapping or 128-bit arithmetic); a module `avin.math` needing an import (keeps the core namespace
+  smaller); Karatsuba multiplication (not needed at the sizes programs meet so far). Review with the
+  user: whether `BigInt` should be in the core namespace, and whether it should gain the bitwise
+  operators and shifts.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `bigint`): **`BigInt`'s API mirrors the integer methods: `abs`, `sign`, `pow`,
+  `gcd`, `lcm`, `floorDiv`, `floorMod`, `toRadix(r)`, plus `isZero`, `divRem`, `toLong`/`toInt`
+  that trap and `toLongOption`/`toIntOption` that answer `None`.** Made by `BigInt(n)` from any
+  integer width (a non-generic `apply(n: long)` beside the generic one, so a literal as large as a
+  `long` is accepted), `BigInt(text)`/`BigInt(text, radix)` that trap on bad text as `toLong` does
+  (`For input string: "…"`), and `BigInt.parse(text[, radix])` answering `Option`. A zero divisor
+  traps with `division by zero`. *Why*: one vocabulary for whole numbers, so code moves between
+  `long` and `BigInt` by changing a type; the trapping and `Option` pairs follow `string.toLong` /
+  `toLongOption`. *Alternatives*: `toString(radix)` instead of `toRadix` (the integer types already
+  chose `toRadix`); only `Option` conversions (forces `.get` at every call that knows the value
+  fits); a `string.toBigInt` extension (adds to every string a method for one type).
+
+- Settled on the user's delegation 2026-11-13 (built on branch `bigint`): **the integer format conversions `%d`, `%i`, `%x`, `%X`, `%o` and
+  `%b` take a `BigInt`, and `%s` refuses it as it refuses every number.** The checker names the core
+  library's `BigInt` beside the integer widths and `byte`. *Why*: a whole number is formatted as one,
+  with grouping, signs, zero padding and bases; refusing `%s` keeps the rule that a number's
+  conversion says how its digits are laid out. *Alternatives*: a trait (say `WholeNumber`) a type
+  implements to be taken by the integer conversions (general, but a new trait and a display
+  contract for one type); accepting `BigInt` under `%s` (inconsistent with every other number).
+  Review with the user: whether a trait should open the integer conversions to other types.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `bigint`): **a type's static member is called on its name even where the type
+  has a companion object.** `Cup.zero()` with `object Cup` declared reported "`Cup` has no member
+  `zero`" (and `Period.zero()` the same), since the name was read as the object. Now `Name.member`
+  is the companion's where the companion declares a member of that name, and otherwise the type's
+  static member where it has one, for classes and data types, written with type arguments or not,
+  called or named as a function value. *Why*: the spec calls a static member on the type's name, and
+  a companion is where a type keeps its factories, so a type with both is the ordinary case
+  (`BigInt.zero()` beside `BigInt.apply`). *Alternatives*: refusing a static member and a
+  companion on one type (rules out the common case); the type's static member winning over the
+  companion's member of the same name (makes a companion unable to shadow it deliberately).
+
+- Settled on the user's delegation 2026-11-13 (built on branch `json-package`): **the corpus programs that test the compiler with
+  JSON depend on the sibling checkout `~/dev/avin-lang/json` by path** (`../../../../../json` from
+  `tests/programs/{run,reject}/NAME/`). *Why*: the corpus loads packages without fetching, and a copy
+  of the package inside this repository would drift from the real one; the compiler already reaches
+  `~/dev/sysl-lang/parsing` the same way. *Alternatives*: a vendored copy under `tests/packages/json`
+  (self-contained, but two sources of one package); a git dependency (the corpus does not fetch).
+  Review with the user: it makes the avin gate need the json checkout beside it.
+- Settled on the user's delegation 2026-11-13 (built on branch `json-package`): **a trap inside a package is placed in the package's
+  source**, as before for any module that is not the core library: `j("absent")` now reports
+  `at json.avin:98:9` where, as `avin.json`, it reported the program's call. The corpus programs
+  `json_missing_key_trap` and `json_missing_index_trap` hide the package's line and column. *Why*: the
+  rule that a trap is placed where the program last called in is the core library's ([errors](/spec/errors/)),
+  and widening it to every dependency is a design change of its own. *Alternatives*: placing a trap
+  at the last call from the root package's own code (better for a package's users, worse for its
+  author debugging it); a per-package opt-in. Review with the user: a package's user would usually
+  rather see their own call.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `script-deps`): **A program of one file names its dependencies in a header of
+  comment lines at its top**: the line `// avin.hocon`, then `//` lines whose text after the `//` is
+  exactly a manifest's `dependencies` block, ending at the first line that is not a `//` comment
+  ([packages](/spec/packages/#programs-of-one-file)). Why: domain libraries are packages (JSON, CSV),
+  and a script must reach them without becoming a directory with a manifest; reusing the manifest's
+  own HOCON means one syntax, one parser and one set of errors, shown at the header's line in the
+  file. Being comments, the header needs no change to the lexer, the parser, the formatter or the
+  IntelliJ plugin, and a file with one is still Avin to every tool. `// avin.hocon` reads as "this
+  file's manifest", and the editor grammar colours the block as embedded HOCON. Alternatives weighed:
+  a `---` front-matter fence (a second lexical form every tool must learn, and a file no older
+  compiler reads); a declaration in the language, `dependencies { … }` or an annotation on the file
+  (dependencies are the build's business, not the program's, and the checker would have to ignore
+  it); one `@dep("github.com/…@1.0")` comment per dependency (a second syntax for what a manifest
+  already says, without `path`, `rev`, `member` or features); a block comment (Avin has none).
+  Review with the user: the marker's spelling.
+- Settled on the user's delegation 2026-11-13 (built on branch `script-deps`): **The header holds `dependencies` only, and is at the top or
+  refused.** `workspace = true` and `optional` are refused (no workspace, no features of its own);
+  `package`, `features`, `sysl-dependencies` and `c-libraries` are refused at the key, a program that
+  needs them being a package. It begins on the first line, or the second after a `#!` line; a
+  `// avin.hocon` line anywhere else is an error, because a header silently not read is a missing
+  dependency reported as an unknown module. Alternatives weighed: allowing `sysl-dependencies` and
+  `c-libraries` (each works through the same resolution, and may be added when a script needs one);
+  allowing other comments or blank lines before it (a header that moves is harder to find, and the
+  rule "first line" is one a reader can check at a glance).
+- Settled on the user's delegation 2026-11-13 (built on branch `script-deps`): **A header in a file of a package, or of a program of many files,
+  is refused at the header**, rather than merged with the manifest or passed over. Why: two places
+  naming a package's dependencies would disagree, and passing it over hides a mistake; a directory
+  program has no manifest, and the way to give it dependencies is to make it a package. Only the
+  package's own files are checked; a dependency's files are not.
+- Settled on the user's delegation 2026-11-13 (built on branch `script-deps`): **A program of one file's sum file is beside it, named after it**:
+  `tool.avin.sum`, written and checked as `avin.sum` is, absent when nothing is fetched, rewritten by
+  `avin tidy tool.avin`. A program of one file is **not vendored**: `avin vendor` refuses it, and
+  `avin add` (which edits a manifest) refuses it too. Why: the sum file is where a manifest's is,
+  beside what names the dependencies, and naming it after the file lets several scripts share a
+  directory. A `vendor/` beside the file would be shared by every script in the directory, and
+  vendoring one would remove the others' packages. Alternatives weighed: no lock at all, trusting
+  the cache's recorded hash (a moved tag would go unnoticed on a second machine); one `avin.sum` per
+  directory (scripts would add and `tidy` would remove each other's lines); the hashes written into
+  the header (the build would rewrite the user's source); a `vendor/<file>/` per script. Review with
+  the user: whether a script's sum file is wanted, or is clutter next to a one-file tool.
+- Settled on the user's delegation 2026-11-13 (built on branch `script-deps`): **A
+  first line beginning `#!` is not Avin**, in every file, and the line is written
+  `#!/usr/bin/env avin`. **`avin <file> ...` (the form a `#!` line runs, with no command word)
+  for a file whose first line begins `#!` gives every argument after the file to the program**, so
+  `./tool.avin -O0 x` passes `-O0` and `x`. Every other form keeps the command line's rule:
+  `avin run tool.avin -O0 -- x` and `avin -O2 tool.avin -- x` take the options as avin's and pass
+  only what follows `--`. Why: `./tool.avin a b` runs `avin ./tool.avin a b` through the `#!` line,
+  and without the rule the program's arguments would need a `--` that a command's caller cannot know
+  to write; while a person typing `avin run` is using avin, and its options mean the same wherever
+  they stand. Alternatives weighed: every argument after any `#!` file the program's, `avin run`
+  included (the branch's first form; it made `avin run tool.avin -O0` mean something different for
+  one kind of file); `#!/usr/bin/env -S avin run` as the line (needs `env -S`, and runs through
+  `avin run`, where the options are avin's); `#!` lines needing `avin run --` (env passes the file
+  after the `--`, so it would be an argument, not the program); taking options before the first
+  non-option and the rest as the program's (`./tool -O0` would still be eaten). Review with the
+  user: the argument rule, which makes `-O0` after a `#!` file the program's when run as a command.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
@@ -7856,188 +8038,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
-
-- **2026-11-13, branch `build-dir`: `avin run` and `avin test` build into the user's cache
-  directory, not into `.avin/` beside the program.** A program's executables and its instance cache
-  go to `build/<name>-<key>/` in the toolchain's cache (`~/Library/Caches/avin/<version>/` on macOS,
-  `$XDG_CACHE_HOME/avin/<version>/` or `~/.cache/avin/<version>/` elsewhere, or `AVIN_CACHE`), where
-  `<name>` is the program's directory's or file's name and `<key>` twelve hex digits of a SHA-256 of
-  its absolute, canonical path. `.avin/build/` beside the program is used only on a machine with no
-  cache directory (no `AVIN_CACHE`, `HOME` or `XDG_CACHE_HOME`; the runtime's archives then go to the
-  temporary directory, which is cleared under a long-lived cache). `avin build` and `-o` are
-  unchanged. The new `avin clean [<program>]` removes the program's directory and any `.avin/build/`
-  beside it (on the fallback, a program of one file's entries only, and `.avin/` once empty);
-  `avin clean --all` removes the whole `build/` of this version and nothing else of the cache, and on
-  the fallback means the current program's. `avin new` writes `/<name>` (the executable `avin build`
-  leaves at the root) and `.avin/` into an application's `.gitignore`, `.avin/` alone into a
-  library's. Why: a one-file script run from anywhere left an `.avin/` next to it; Sysl keeps its
-  builds and run cache in the machine cache directory keyed by version and target and uses a
-  project's `.sysl/` only where there is none, and Avin already keeps its fetched packages, runtime
-  archives and shims there, so a build cache beside the source was the one exception. Keying by path
-  keeps two worktrees of one repository apart (each has its own sources), and the version in the
-  path keeps one compiler's entries from another's. The executables and records are still published
-  by rename and the instance cache is lock-free as before, so two builds of one program at once stay
-  safe. Alternatives weighed: keep `.avin/` beside projects and move only one-file programs (two
-  rules to explain, and a repository still grows a directory to ignore); key by the program's content
-  rather than its path (every edit would start a new cache, and nothing would ever trim the old);
-  `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
-  then fetches again over the network); a lock around a program's cache (the content-addressed,
-  rename-published entries need none). Review with the user: whether a cache of a deleted project
-  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
-
-- Proposed (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
-  tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
-  `match` arm, `Status.Shipped` qualified, `Some(Shipped)` nested and `f(Shipped) = …` in a clause
-  all mean `Shipped(_, _)`, with the variant's own number of `_`; coverage and unreachable arms
-  treat it as that pattern. `Shipped()`, written with parentheses, is still matched against the
-  fields by number and refused for a variant that has some. Why: the commonest test of a variant
-  asks only which one it is, and counting `_`s to say so is noise that changes whenever a field is
-  added; the previous error suggested `Shipped(fields)`, which is not Avin, and the bare name could
-  mean nothing else, since a variant in scope is never a binding. One rule for every place a
-  pattern goes, because `x is P` takes exactly the patterns a `match` arm takes. Alternatives: only
-  in `is` (two pattern languages, and a `match` arm refactored from an `if … is` would break);
-  keeping the error and suggesting `Shipped(_, _)` with the right number of `_` (valid, but the
-  test still has to change with the fields). Review with the user: a reader may take `Shipped`
-  for a variant without fields.
-
-- Proposed (built on branch `variant-test-open`): **`open`, `abstract` and `override` where they
-  mean nothing are one error each, and the declaration then parses as written.** Before a method:
-  "a method takes no `open`: every public method of an `open` or `abstract` class, and every
-  method of a trait, may be overridden already; remove `open`", and for `abstract` that a method
-  declared without a body is abstract already; before a field, that a field cannot be overridden
-  or is abstract by having no value; before a top-level function, that it belongs to no class or
-  overrides nothing; before `trait`, `data` and `object`, why each takes none; `override class`,
-  that a class replaces nothing and extends with `: Base`. Why: the words were read as names, so
-  `open sound() -> string` reported `open` and `string` as undefined and then every override of
-  `sound` as overriding nothing. The spec settles that every public method of an open class may be
-  overridden, so methods have no `open` to accept. Alternatives: accepting `open` on a method as a
-  harmless no-op (two spellings of one meaning); a method-level `open` with classes' methods
-  final by default (a language change the settled rules do not ask for). `open(…)`, `open = …`
-  and a method named `open` keep their meaning: the word is a modifier only before a name or a
-  declaration keyword.
-
-- Proposed (branch `bigint`): **`BigInt` is a class of the core module `avin`, written in Avin, its
-  magnitude in limbs of nine decimal digits held in `long`s.** It is visible with no import, as
-  `BitSet` is; its limbs are a `FrozenArray[long]`, a type no program can name, so its constructor
-  cannot be called with a malformed magnitude from outside the library, and the value is immutable
-  and sendable. Multiplication is schoolbook and division is long division with a normalized
-  divisor, both quadratic. *Why*: base 10^9 makes decimal text, by far the commonest, a limb at a
-  time in both directions, and keeps a limb product plus a carry inside a `long` with no wrapping
-  arithmetic; living in `avin` lets it reuse the integer formatter's private layout code, so `%d`
-  and its flags behave exactly as for `long`. *Alternatives*: binding Sysl's `sysl.math.bigint`
-  through a handle (faster, but its behaviour, text forms and traps would be Sysl's to change, and
-  the library is meant to be Avin); base 2^32 limbs (cheaper bit operations, which `BigInt` does not
-  have yet, but every decimal conversion becomes a division per nine digits and products need
-  wrapping or 128-bit arithmetic); a module `avin.math` needing an import (keeps the core namespace
-  smaller); Karatsuba multiplication (not needed at the sizes programs meet so far). Review with the
-  user: whether `BigInt` should be in the core namespace, and whether it should gain the bitwise
-  operators and shifts.
-
-- Proposed (branch `bigint`): **`BigInt`'s API mirrors the integer methods: `abs`, `sign`, `pow`,
-  `gcd`, `lcm`, `floorDiv`, `floorMod`, `toRadix(r)`, plus `isZero`, `divRem`, `toLong`/`toInt`
-  that trap and `toLongOption`/`toIntOption` that answer `None`.** Made by `BigInt(n)` from any
-  integer width (a non-generic `apply(n: long)` beside the generic one, so a literal as large as a
-  `long` is accepted), `BigInt(text)`/`BigInt(text, radix)` that trap on bad text as `toLong` does
-  (`For input string: "…"`), and `BigInt.parse(text[, radix])` answering `Option`. A zero divisor
-  traps with `division by zero`. *Why*: one vocabulary for whole numbers, so code moves between
-  `long` and `BigInt` by changing a type; the trapping and `Option` pairs follow `string.toLong` /
-  `toLongOption`. *Alternatives*: `toString(radix)` instead of `toRadix` (the integer types already
-  chose `toRadix`); only `Option` conversions (forces `.get` at every call that knows the value
-  fits); a `string.toBigInt` extension (adds to every string a method for one type).
-
-- Proposed (branch `bigint`): **the integer format conversions `%d`, `%i`, `%x`, `%X`, `%o` and
-  `%b` take a `BigInt`, and `%s` refuses it as it refuses every number.** The checker names the core
-  library's `BigInt` beside the integer widths and `byte`. *Why*: a whole number is formatted as one,
-  with grouping, signs, zero padding and bases; refusing `%s` keeps the rule that a number's
-  conversion says how its digits are laid out. *Alternatives*: a trait (say `WholeNumber`) a type
-  implements to be taken by the integer conversions (general, but a new trait and a display
-  contract for one type); accepting `BigInt` under `%s` (inconsistent with every other number).
-  Review with the user: whether a trait should open the integer conversions to other types.
-
-- Proposed (branch `bigint`): **a type's static member is called on its name even where the type
-  has a companion object.** `Cup.zero()` with `object Cup` declared reported "`Cup` has no member
-  `zero`" (and `Period.zero()` the same), since the name was read as the object. Now `Name.member`
-  is the companion's where the companion declares a member of that name, and otherwise the type's
-  static member where it has one, for classes and data types, written with type arguments or not,
-  called or named as a function value. *Why*: the spec calls a static member on the type's name, and
-  a companion is where a type keeps its factories, so a type with both is the ordinary case
-  (`BigInt.zero()` beside `BigInt.apply`). *Alternatives*: refusing a static member and a
-  companion on one type (rules out the common case); the type's static member winning over the
-  companion's member of the same name (makes a companion unable to shadow it deliberately).
-
-- Proposed 2026-11-13 (branch `json-package`): **the corpus programs that test the compiler with
-  JSON depend on the sibling checkout `~/dev/avin-lang/json` by path** (`../../../../../json` from
-  `tests/programs/{run,reject}/NAME/`). *Why*: the corpus loads packages without fetching, and a copy
-  of the package inside this repository would drift from the real one; the compiler already reaches
-  `~/dev/sysl-lang/parsing` the same way. *Alternatives*: a vendored copy under `tests/packages/json`
-  (self-contained, but two sources of one package); a git dependency (the corpus does not fetch).
-  Review with the user: it makes the avin gate need the json checkout beside it.
-- Proposed 2026-11-13 (branch `json-package`): **a trap inside a package is placed in the package's
-  source**, as before for any module that is not the core library: `j("absent")` now reports
-  `at json.avin:98:9` where, as `avin.json`, it reported the program's call. The corpus programs
-  `json_missing_key_trap` and `json_missing_index_trap` hide the package's line and column. *Why*: the
-  rule that a trap is placed where the program last called in is the core library's ([errors](/spec/errors/)),
-  and widening it to every dependency is a design change of its own. *Alternatives*: placing a trap
-  at the last call from the root package's own code (better for a package's users, worse for its
-  author debugging it); a per-package opt-in. Review with the user: a package's user would usually
-  rather see their own call.
-
-- Proposed (branch `script-deps`): **A program of one file names its dependencies in a header of
-  comment lines at its top**: the line `// avin.hocon`, then `//` lines whose text after the `//` is
-  exactly a manifest's `dependencies` block, ending at the first line that is not a `//` comment
-  ([packages](/spec/packages/#programs-of-one-file)). Why: domain libraries are packages (JSON, CSV),
-  and a script must reach them without becoming a directory with a manifest; reusing the manifest's
-  own HOCON means one syntax, one parser and one set of errors, shown at the header's line in the
-  file. Being comments, the header needs no change to the lexer, the parser, the formatter or the
-  IntelliJ plugin, and a file with one is still Avin to every tool. `// avin.hocon` reads as "this
-  file's manifest", and the editor grammar colours the block as embedded HOCON. Alternatives weighed:
-  a `---` front-matter fence (a second lexical form every tool must learn, and a file no older
-  compiler reads); a declaration in the language, `dependencies { … }` or an annotation on the file
-  (dependencies are the build's business, not the program's, and the checker would have to ignore
-  it); one `@dep("github.com/…@1.0")` comment per dependency (a second syntax for what a manifest
-  already says, without `path`, `rev`, `member` or features); a block comment (Avin has none).
-  Review with the user: the marker's spelling.
-- Proposed (branch `script-deps`): **The header holds `dependencies` only, and is at the top or
-  refused.** `workspace = true` and `optional` are refused (no workspace, no features of its own);
-  `package`, `features`, `sysl-dependencies` and `c-libraries` are refused at the key, a program that
-  needs them being a package. It begins on the first line, or the second after a `#!` line; a
-  `// avin.hocon` line anywhere else is an error, because a header silently not read is a missing
-  dependency reported as an unknown module. Alternatives weighed: allowing `sysl-dependencies` and
-  `c-libraries` (each works through the same resolution, and may be added when a script needs one);
-  allowing other comments or blank lines before it (a header that moves is harder to find, and the
-  rule "first line" is one a reader can check at a glance).
-- Proposed (branch `script-deps`): **A header in a file of a package, or of a program of many files,
-  is refused at the header**, rather than merged with the manifest or passed over. Why: two places
-  naming a package's dependencies would disagree, and passing it over hides a mistake; a directory
-  program has no manifest, and the way to give it dependencies is to make it a package. Only the
-  package's own files are checked; a dependency's files are not.
-- Proposed (branch `script-deps`): **A program of one file's sum file is beside it, named after it**:
-  `tool.avin.sum`, written and checked as `avin.sum` is, absent when nothing is fetched, rewritten by
-  `avin tidy tool.avin`. A program of one file is **not vendored**: `avin vendor` refuses it, and
-  `avin add` (which edits a manifest) refuses it too. Why: the sum file is where a manifest's is,
-  beside what names the dependencies, and naming it after the file lets several scripts share a
-  directory. A `vendor/` beside the file would be shared by every script in the directory, and
-  vendoring one would remove the others' packages. Alternatives weighed: no lock at all, trusting
-  the cache's recorded hash (a moved tag would go unnoticed on a second machine); one `avin.sum` per
-  directory (scripts would add and `tidy` would remove each other's lines); the hashes written into
-  the header (the build would rewrite the user's source); a `vendor/<file>/` per script. Review with
-  the user: whether a script's sum file is wanted, or is clutter next to a one-file tool.
-- Proposed (branch `script-deps`, narrowed on train `train-f` to meet `small-papercuts`' rule): **A
-  first line beginning `#!` is not Avin**, in every file, and the line is written
-  `#!/usr/bin/env avin`. **`avin <file> ...` (the form a `#!` line runs, with no command word)
-  for a file whose first line begins `#!` gives every argument after the file to the program**, so
-  `./tool.avin -O0 x` passes `-O0` and `x`. Every other form keeps the command line's rule:
-  `avin run tool.avin -O0 -- x` and `avin -O2 tool.avin -- x` take the options as avin's and pass
-  only what follows `--`. Why: `./tool.avin a b` runs `avin ./tool.avin a b` through the `#!` line,
-  and without the rule the program's arguments would need a `--` that a command's caller cannot know
-  to write; while a person typing `avin run` is using avin, and its options mean the same wherever
-  they stand. Alternatives weighed: every argument after any `#!` file the program's, `avin run`
-  included (the branch's first form; it made `avin run tool.avin -O0` mean something different for
-  one kind of file); `#!/usr/bin/env -S avin run` as the line (needs `env -S`, and runs through
-  `avin run`, where the options are avin's); `#!` lines needing `avin run --` (env passes the file
-  after the `--`, so it would be an argument, not the program); taking options before the first
-  non-option and the rest as the program's (`./tool -O0` would still be eaten). Review with the
-  user: the argument rule, which makes `-O0` after a `#!` file the program's when run as a command.
 
 ## Open
 
