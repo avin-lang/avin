@@ -63,7 +63,9 @@ The integer types are one family, `iN` for every width from `i1` to `i8388608`, 
 trait `Integer` has exactly them as members (`byte` is not one). The core library implements its
 traits once for the whole family, so every width compares, orders, prints in decimal and debugs
 alike, and meets a bound such as `Ord` or `Display` as `int` does; a parameter bounded by `Integer`
-has every integer operation and conversion ([Bounds](generics.md#bounds)). A value that fits in a
+has every integer operation and conversion ([Bounds](generics.md#bounds)). The integers and `real`
+together are the numbers, the members of the core trait `Numeric`, which `Integer` requires: a
+parameter bounded by it has the arithmetic, the ordering and `toReal`. A value that fits in a
 `long` renders through it, at no cost for widths up to 64 bits; a wider one renders in chunks of
 eighteen digits.
 

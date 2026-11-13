@@ -97,6 +97,21 @@ class SortedPair[T: Ordered](first: T, second: T)
   with any other bound has them only as methods of those names. So do the wrapping operators `+%`,
   `-%`, `*%` and the saturating `+|`, `-|`, `*|` (and their compound forms), which a `T` with any other
   bound lacks.
+- **`Numeric` is the numbers' bound**: every integer width and `real` meet it, the integers
+  because `Integer` requires it. It requires `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Ord`,
+  `Display` and `Debug`, so `[T: Numeric]` has the five arithmetic operators, negation, the
+  comparisons, both text forms and the identities `T.zero()` and `T.one()`; and it declares
+  `toReal -> real`, the value as a `real` (exact for an integer up to 2⁵³ in magnitude, the nearest
+  `real` beyond). In each instance an operator is the instance's own: integer overflow and integer
+  division by zero trap, a `real` divides by zero to an infinity. A `T` bounded only by `Numeric` has
+  nothing integer-only: no conversion by a call (`T(n)`, `real(x)`; `x.toReal` converts), no limits,
+  no bitwise or wrapping operators and no integer methods, and it does not meet `Integer`. Unlike
+  `Integer` it is open: a type of a program's own that implements the traits it requires and
+  `toReal` is a number too, as a rational type is.
+
+```text
+mean[T: Numeric](xs: Vector[T]) -> real = xs.sum.toReal / real(xs.length)
+```
 
 ```text
 digits[T: Integer](x: T) -> int
