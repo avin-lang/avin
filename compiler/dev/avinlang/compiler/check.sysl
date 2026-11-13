@@ -174,6 +174,10 @@ struct FieldSymbol
     /** A `lazy val`, whose value is computed on its first read. The two fields after it hold its
      * state, which a read tests, and the closure that computes it, which the constructor stores. */
     lazy: bool
+    /** A core-library field initialized with `fieldUnset()`: the constructor stores nothing in it, so
+     * it holds zero bytes, not yet a value, until the class's own code writes it, and the class's
+     * variance is not checked against it (see `field_unset`). */
+    unset: bool
 
 /** A `data` type and its variants. Field types name the type's own parameters as
  * `TypeVar(data_owner(id), i)`, so a field of a particular value's type is its declared type with the
@@ -2741,7 +2745,7 @@ private declare_fields(c: *Checker, unit: usize)
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
             val written = resolve_type(c, unit, cp.param.ty)
             val field_type = if cp.param.variadic then vector_of(c, written) else written
-            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false))
+            fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false, false))
         var state: Buf[TraitState] = buf()
         for m in d.members
             if m is FieldMember(f)
@@ -2756,12 +2760,12 @@ private declare_fields(c: *Checker, unit: usize)
                         for s in state
                             if s.field.name == f.name then seen = true
                         if seen then c.note(unit, f.span, s"the field `${f.name}` is declared more than once")
-                        else state.push(TraitState(FieldSymbol(f.name, f.span, ty, f.mutable, true, false, id, false), f, 0, None, 0))
+                        else state.push(TraitState(FieldSymbol(f.name, f.span, ty, f.mutable, true, false, id, false, false), f, 0, None, 0))
                     continue
-                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id, f.lazy))
+                fields.push(FieldSymbol(f.name, f.span, ty, f.mutable, f.public, false, id, f.lazy, false))
                 if f.lazy
-                    fields.push(FieldSymbol(s"<state of ${f.name}>", f.span, Some(Int(64)), false, false, false, id, false))
-                    fields.push(FieldSymbol(s"<initializer of ${f.name}>", f.span, lazy_initializer_type(ty), false, false, false, id, false))
+                    fields.push(FieldSymbol(s"<state of ${f.name}>", f.span, Some(Int(64)), false, false, false, id, false, false))
+                    fields.push(FieldSymbol(s"<initializer of ${f.name}>", f.span, lazy_initializer_type(ty), false, false, false, id, false, false))
         c.classes[id].fields = fields
         c.classes[id].state = state
         c.generic = outer_generic
@@ -5202,6 +5206,9 @@ private check_class_variance(c: *Checker, id: usize)
         // A trait's field the class stores is checked with the trait, and the trait's arguments with
         // the class's traits.
         if f.owner != id then continue
+        // A field the class fills itself is written only with values its own code made for this
+        // instance; see `field_unset`.
+        if f.unset then continue
         val ty = f.ty.unwrap_or(ErrorType)
         if f.mutable then variance_in(c, k.unit, params, owner, ty, 0, f.span, s"the mutable field `${f.name}`")
         else variance_in(c, k.unit, params, owner, ty, 1, f.span, s"the field `${f.name}`")
@@ -5784,6 +5791,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         elif name == "holds_handles"
             if module_name != "avin.actors" then c.note(unit, f.name_span, s"`$name` is an intrinsic of `avin.actors`")
             elif params.len() != 1 || !(*result.unwrap_or(Unit) is Bool) then c.note(unit, f.name_span, s"intrinsic `$name` takes one value and answers a `bool`")
+        // A field's initializer that leaves the field zero, `[T]() -> T`, the core library's.
+        elif name == "field_unset"
+            if module_name != CoreModule then c.note(unit, f.name_span, s"`$name` is an intrinsic of the core library")
+            elif params.len() != 0 || type_params.len() != 1 || !(*result.unwrap_or(Unit) is TypeVar(_, _, _)) then c.note(unit, f.name_span, s"intrinsic `$name` takes no value and answers its type parameter")
         // The operations of memory crossing a C binding in place, on objects laid out as the runtime's
         // `CMemory`, which only `avin.c` declares.
         elif is_c_memory_intrinsic(name)
@@ -5894,6 +5905,19 @@ private intrinsic_of(c: *Checker, unit: usize, module_name: string, f: &Function
 
 /** Whether `name` is one of the operations of `avin.c`'s views and blocks. */
 is_c_memory_intrinsic(name: string) -> bool = name.starts_with("c_view_") || name == "c_block_new"
+
+// `field_unset` is the core library's way to give a class a field that holds no value until the
+// class's own code writes one, for a cell that is filled once, after the object is made, with values
+// computed then: a lazy list's element and the rest of the list. A field initialized with a call of
+// it is a `private var` with a declared type; the constructor stores nothing in it, so it holds
+// the zero bytes the object was made with, which are not yet a value (as an array's spare capacity
+// is not) and must be written before they are read. Since the class writes it only with values it
+// computed for that same instance, the field is no position for the class's variance, as a `val`'s
+// value computed in the constructor is not. Called anywhere else it traps.
+/** Whether `e` is a call of the `field_unset` intrinsic. */
+private is_field_unset(c: *Checker, e: &TExpr) -> bool = e.kind match
+    Call(f, _, _) -> c.symbols[f].intrinsic.unwrap_or("") == "field_unset"
+    _ -> false
 
 /** Whether `name` is one of the operations of `avin.threads.Atomic`. */
 is_atomic_intrinsic(name: string) -> bool =
@@ -10105,7 +10129,12 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
                             c.classes[k].fields[index].ty = Some(ErrorType)
                         else c.classes[k].fields[index].ty = Some(if *inferred is Nothing then ErrorType else inferred)
                 if *typed.ty is Nothing then made.finishes = false
-                made.items.push(TExpr(f.span, Unit, StoreField(made.receiver, index, typed, false)))
+                if is_field_unset(c, typed)
+                    // The object is made all zero, so the field is left as it is: see `field_unset`.
+                    if declared is None then c.note(unit, f.span, s"a field left unset by the intrinsic `field_unset` declares its type, as in `private var ${f.name}: T = …`")
+                    if f.public || !f.mutable then c.note(unit, f.span, s"a field left unset by the intrinsic `field_unset` is a `private var`, which the class's own code writes before it reads it")
+                    c.classes[k].fields[index].unset = true
+                else made.items.push(TExpr(f.span, Unit, StoreField(made.receiver, index, typed, false)))
                 made.index = index + 1
                 c.classes[k].ready = made.index
             StatementMember(s) ->
