@@ -187,7 +187,8 @@ a decision changes, this page and the chapter change together.
   closure holding `account`, of the method's type without the receiver. Inside the class, a bare
   method name is the same closure over `self`. This holds for a method declared with a parameter
   list, `()` included; a method declared with none (settled by the user 2026-11-12, below) is called
-  by its name and has no method value.
+  by its name and has no method value. One declared with an empty list `()` is a value only where a
+  function type is expected (Proposed 2026-11-12, below).
 - Settled 2026-11-03: a method value evaluates its receiver once, where the value is made. Through a
   trait-typed or open-class receiver it calls the implementation the object's class has, through
   the object's method table at each call; the object is fixed, so this is the implementation it had
@@ -7239,6 +7240,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   spelling alone); converting `toString()` and `hash()` now (every class's impls change with them).
   A trap to know: `opt.get()` where `opt: Option[() -> T]` now calls the function the option holds;
   the library's one such site was rewritten to `opt.get`.
+
+- Proposed 2026-11-12 (branch `bare-method-ref`): **a method declared with an empty parameter list,
+  `m()`, named without a call is a function value only where a function type is expected.** Anywhere
+  else (`println(xs.sorted)`, `s"${s.isEmpty}"`, `c.bump == 0`, `val v = c.bump` with no type, an
+  argument for a type parameter or `Any`), it is an error naming the call `x.m()` and the lambda
+  `() -> x.m()`; among overloads with one of no parameters, a bare name with no expected function
+  type gets the same error rather than "ambiguous". Instance, static and trait methods alike;
+  methods with parameters (`account.deposit`) are values wherever named, as settled. WHY: with
+  parameterless and `()` methods side by side, a missing `()` is the commonest slip, and `print`
+  takes `Any`, so it compiled and printed `<function>`; where a function type is expected the value
+  is wanted and type-checks. ALTERNATIVES: refusing method values of `()` methods altogether (then
+  `spawn(worker.run)` needs a lambda); a warning instead of an error (wrong output still ships);
+  extending the rule to top-level functions of no parameters (they are always called with `()`, so
+  the slip does not arise). Review with the user: `val f = c.bump` no longer infers a function.
+- Proposed 2026-11-12 (branch `bare-method-ref`): **a function value stays without `Display`**, so
+  interpolating one is an error, now with the hint "a function value is never shown: to show what
+  it returns, call it"; `print`/`println` keep taking `Any` and show a function as `<function>`.
+  WHY: the empty-list rule above already stops the missing-`()` slip at its source, and the
+  remaining ways to print a function (a variable or lambda, a method value of a method with
+  parameters) are deliberate; a special refusal inside `print` would make it unlike every other
+  `Any` parameter, against its settled "one ordinary library function". ALTERNATIVES: refusing a
+  function-typed argument to `print`/`println` (a special case); refusing any conversion of a
+  function to `Any` (breaks heterogeneous `Any` containers holding callbacks).
 
 ## Open
 
