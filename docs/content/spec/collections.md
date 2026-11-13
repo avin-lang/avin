@@ -120,6 +120,11 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
   and the identity (`T.zero()`, `T.one()`) when empty, so `[1, 2, 3].sum` is `6`, `(1..5).product`
   is `120`, and the `sum` of no `real`s is `0.0` and of no strings is `""`. Overflow traps as `+` does,
   and strings concatenate in `sum` but have no `product`.
+  `average` and `averageOption` are added for elements that are
+  [`Numeric`](/spec/generics/#bounds): the mean, a `real`, with the elements totalled as `real`s
+  through `toReal`, so integers whose sum would overflow their type still average
+  (`[i8(127), i8(127)].average` is `127.0`). `average` traps on an empty collection and
+  `averageOption` answers `None` for it; `[1, 2, 3, 4].average` is `2.5`.
 - `collect(pf)` takes a [`PartialFunction`](/spec/types/#partial-functions) and keeps `pf` of each
   element it is defined at, in order, in the collection `map` would make: `shapes.collect(match
   Circle(r) -> r)` is the radii of the circles. Every collection with `map` has it, and so does
@@ -144,7 +149,7 @@ Collections they make are vectors, maps and sets; n is the number of elements.
 read by name with no parentheses, `xs.head`, `xs.size`, `m.keys`, on every collection and through
 `Iterable[T]`, `Seq[T]`, `Map[K, V]` and `Set[A]` alike: `head`, `last`, `headOption`, `lastOption`,
 `tail`, `init`, `size`, `length`, `knownSize`, `isEmpty`, `nonEmpty`, `min`, `max`, `minOption`,
-`maxOption`, `sum`, `product`, `reverse`, `distinct`, `indices`, `flatten`, `transpose`, `unzip`,
+`maxOption`, `sum`, `product`, `average`, `averageOption`, `reverse`, `distinct`, `indices`, `flatten`, `transpose`, `unzip`,
 `zipWithIndex`, `keys`, `values`, `keySet`, and the conversions to immutable collections `toList`,
 `toVector`, `toArraySeq`, `toSet`, `toMap`, `toSortedSet` and `toSortedMap`; so are `sorted`, a
 sorted map's or set's `firstKey` and `lastKey`, a mutable tree map's `toTreeMap`, a bit set's
@@ -176,6 +181,8 @@ parameterless accessors, and on an iterator they read from it: `it.head` takes o
 | `min`, `max` (`T: Ord`) | `T`, the first of equal ones; traps when empty | O(n) |
 | `minOption`, `maxOption` (`T: Ord`) | `Option[T]`, the first of equal ones | O(n) |
 | `sum` (`T: Add`), `product` (`T: Mul`) | `T`; the identity when empty | O(n) |
+| `average` (`T: Numeric`) | `real`, the mean; traps when empty | O(n) |
+| `averageOption` (`T: Numeric`) | `Option[real]`, the mean, or `None` when empty | O(n) |
 | `mkString(sep)`, `mkString(start, sep, end)` (`T: Display`) | `string` | O(n) |
 | `partition(p)` | `(Vector[T], Vector[T])`: those that satisfy `p`, those that do not | O(n) |
 | `groupBy(key)` | `Map[K, Vector[T]]` | O(n) |

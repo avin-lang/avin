@@ -7368,6 +7368,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `numeric`): **`Numeric`, the numbers' bound.** A core trait
+  `Numeric: Add, Sub, Mul, Div, Rem, Neg, Ord, Display, Debug` declaring `toReal -> real`; `Integer`
+  now requires it (`trait Integer: Numeric`), so every width meets it through one
+  `impl[T: Integer] Numeric for T`, and `real` has its own impl. Why: a mean, a clamp or a running
+  total over `int` and `real` alike had no bound to name (`[T: Add]` cannot reach a `real`, and
+  `Integer` excludes `real`); taking every operator the integers and `real` share (`Div` and `Rem`
+  included, though their meaning differs: integer division truncates and traps on zero) gives the
+  most generic code, and `zero`/`one` are already `Add`'s and `Mul`'s. Alternatives: only
+  `Add + Sub + Mul + Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
+  `Numeric` that also offered `fromInt`/`T(n)` construction, left out since `zero`/`one` cover the
+  identities and a conversion from integers is lossy at narrow widths; a separate `Fractional` for
+  `real`, not needed while `real` is the one non-integer. **Review with the user**: whether `Div`
+  and `Rem` belong in it.
+- Proposed (built on branch `numeric`): **`Numeric` is open.** Unlike `Integer`, a program's own
+  type that implements the required traits and `toReal` is a number (a rational type is the
+  example in the tests). Why: a library number type (a decimal, a rational, a fixed-point) should
+  reach every `[T: Numeric]` function. Alternative: closed like `Integer`, which would keep `toReal`
+  meaningful only for built-ins at the cost of every user number.
+- Proposed (built on branch `numeric`): **`average` totals as `real` and traps when empty.**
+  `average` on a collection of `Numeric` elements is a `real` mean summed through `toReal`, so
+  integers whose sum overflows their type still average (beyond 2⁵³ the total rounds);
+  `average` traps on an empty collection as `max` and `min` do, and `averageOption` answers
+  `None`. Alternatives: summing in `T` and converting once (exact for small integers, but traps
+  where the mean is representable); NaN for an empty collection (silent, unlike `max`); only
+  `averageOption`. `sum`, `product`, `min` and `max` were already generic over `Add`, `Mul` and `Ord`
+  and are left as they were rather than duplicated on `Numeric`.
+- Proposed (built on branch `numeric`): **`real(x)` on a `Numeric` parameter is refused, naming
+  `.toReal`.** A call converts only a type parameter bounded by `Integer`; a `T: Numeric` converts
+  with its own method. Why: a conversion call on a type parameter is lowered per instance by the
+  compiler for integers only, while `toReal` is an ordinary trait method a program's own number
+  implements. Alternative: lower `real(x)` to `x.toReal` for a `Numeric` parameter, more uniform
+  with the integers' `real(x)`, at the cost of a second meaning for a conversion call.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
