@@ -194,7 +194,7 @@ Their methods:
 |---|---|
 | `isDefined`, `isEmpty` | `isOk`, `isErr` |
 | `getOrElse[B >: T](default: -> B) -> B` | `getOrElse[U >: T](default: -> U) -> U` |
-| `orElse[B >: T](other: -> Option[B]) -> Option[B]` | `ok -> Option[T]`, `err -> Option[E]` |
+| `orElse[B >: T](other: -> Option[B]) -> Option[B]` | `ok -> Option[T]`, `err -> Option[E]`; `toOption -> Option[T]`, the same as `ok` |
 | `map[U](f: (T) -> U) -> Option[U]` | `map[U](f: (T) -> U) -> Result[U, E]` |
 | `flatMap[U](f: (T) -> Option[U]) -> Option[U]` | `mapErr[F](f: (E) -> F) -> Result[T, F]` |
 | `filter(p: (T) -> bool) -> Option[T]` | `flatMap[U, F >: E](f: (T) -> Result[U, F]) -> Result[U, F]` |
