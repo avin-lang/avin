@@ -38,28 +38,29 @@ trait Writer
 // How a value is laid out: the `width` of the field it fills, where 0 asks for no padding, padded on
 // the left, or on the right when `left`; and a `precision`, -1 for none, which a renderer that takes
 // one reads in its own terms. The rest is what an `f"…"` specifier writes: `zeroPad` for the `0`
-// flag, `plus` for `+`, `space` for a space, `alternate` for `#`, and the `conversion` letter, `s`
-// when none is written. A renderer reads the conversions its type takes and renders its own form
+// flag, `plus` for `+`, `space` for a space, `alternate` for `#`, the `conversion` letter, `s`
+// when none is written, and `grouping` for `,`, which writes an integer's decimal digits in groups of
+// three separated by commas. A renderer reads the conversions its type takes and renders its own form
 // under any other.
-data FormatSpec(width: int = 0, precision: int = -1, left: bool = false, zeroPad: bool = false, plus: bool = false, space: bool = false, alternate: bool = false, conversion: char = 's')
+data FormatSpec(width: int = 0, precision: int = -1, left: bool = false, zeroPad: bool = false, plus: bool = false, space: bool = false, alternate: bool = false, conversion: char = 's', grouping: bool = false)
 
 impl FormatSpec
     // This spec with the width `n`, counted when the program runs: a negative count asks for a field
     // of its magnitude, padded on the right, and a count beyond `int` is the largest `int`.
     withWidth[T: Integer](n: T) -> FormatSpec =
         val count = clampedCount(n)
-        if count < 0 then FormatSpec(-count, precision, true, zeroPad, plus, space, alternate, conversion)
-        else FormatSpec(count, precision, left, zeroPad, plus, space, alternate, conversion)
+        if count < 0 then FormatSpec(-count, precision, true, zeroPad, plus, space, alternate, conversion, grouping)
+        else FormatSpec(count, precision, left, zeroPad, plus, space, alternate, conversion, grouping)
 
     // This spec with the precision `n`, counted when the program runs: a negative count is as though
     // no precision were written.
     withPrecision[T: Integer](n: T) -> FormatSpec =
         val count = clampedCount(n)
-        FormatSpec(width, if count < 0 then -1 else count, left, zeroPad, plus, space, alternate, conversion)
+        FormatSpec(width, if count < 0 then -1 else count, left, zeroPad, plus, space, alternate, conversion, grouping)
 
 // `spec` with no width and no precision, its flags and conversion kept.
 private unbounded(spec: FormatSpec) -> FormatSpec =
-    FormatSpec(0, -1, false, spec.zeroPad, spec.plus, spec.space, spec.alternate, spec.conversion)
+    FormatSpec(0, -1, false, spec.zeroPad, spec.plus, spec.space, spec.alternate, spec.conversion, spec.grouping)
 
 // `n` held to the range an `int` holds with room to negate it.
 private clampedCount[T: Integer](n: T) -> int
@@ -367,14 +368,17 @@ private writeLong(out: Writer, n: long, spec: FormatSpec)
 // Whether `spec` asks for an integer's decimal digits padded with spaces and nothing more.
 private plainInteger(spec: FormatSpec) -> bool =
     val c = spec.conversion
-    (c == 's' || c == 'd' || c == 'i') && spec.precision < 0 && !spec.zeroPad && !spec.plus && !spec.space
+    (c == 's' || c == 'd' || c == 'i') && spec.precision < 0 && !spec.zeroPad && !spec.plus && !spec.space && !spec.grouping
 
 // `x` under an integer conversion, everything but the spaces that pad it: the sign, `-` when
 // negative or else `+` or a space when asked; the base's prefix under `#` (`0x`, `0X` or `0b` before
 // a value other than zero, a leading `0` in octal); then the digits of the magnitude, at least
 // `precision` of them, where a precision of 0 writes zero as no digits; and, under `0` with neither
 // `-` nor a precision, zeros after the sign and prefix to fill the width. Every base writes a
-// negative value as its sign and magnitude.
+// negative value as its sign and magnitude. Under `,` a decimal conversion writes its digits, the
+// zeros of a precision and of the `0` flag among them, in groups of three from the right separated by
+// commas. The zeros that fill a width are grouped too, added until the field is full; where the
+// last one added begins a group, its comma makes the field one character wider than asked.
 private integerText[T: Integer](x: T, spec: FormatSpec) -> string
     val c = spec.conversion
     val base: long = if c == 'x' || c == 'X' then 16 elif c == 'o' then 8 elif c == 'b' then 2 else 10
@@ -391,10 +395,33 @@ private integerText[T: Integer](x: T, spec: FormatSpec) -> string
         if base == 16 && !zero then lead = lead + (if upper then "0X" else "0x")
         elif base == 2 && !zero then lead = lead + "0b"
         elif base == 8 && !digits.startsWith("0") then digits = "0" + digits
+    if spec.grouping && base == 10
+        val room = spec.width - lead.byteLength
+        if spec.zeroPad && !spec.left && spec.precision < 0
+            while groupedLength(digits.byteLength) < room do digits = "0" + digits
+        return lead + grouped(digits)
     if spec.zeroPad && !spec.left && spec.precision < 0
         val fill = spec.width - lead.byteLength - digits.byteLength
         if fill > 0 then digits = "0".repeat(fill) + digits
     lead + digits
+
+// The length of `count` digits written in groups of three with a comma between groups.
+private groupedLength(count: int) -> int = if count == 0 then 0 else count + (count - 1) / 3
+
+// `digits`, a run of ASCII digits, in groups of three from the right with a comma between groups.
+private grouped(digits: string) -> string
+    val n = digits.byteLength
+    if n <= 3 then return digits
+    val out = StringWriter()
+    var from = 0
+    var until = n % 3
+    if until == 0 then until = 3
+    while from < n
+        if from > 0 then out.write(",")
+        out.write(digits.slice(from, until))
+        from = until
+        until += 3
+    out.text
 
 // Writes the digits of the magnitude of `x` in `base`, most significant first.
 private writeDigits[T: Integer](out: Writer, x: T, base: T, upper: bool)

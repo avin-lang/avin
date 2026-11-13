@@ -1192,14 +1192,16 @@ Every sequence sorts into a new one, and the mutable sequences also sort in plac
 what `Ord.compare` answers: negative, zero or positive as its first argument orders before, with or
 after its second.
 
-- On every `Seq`: `sorted` where the elements are `Ord`, ascending; `sortBy(key)`, ascending by
+- On every `Seq`: `sorted` where the elements are `Ord`, ascending, and `sortedDescending`,
+  descending; `sortBy(key)`, ascending by
   a key that is `Ord`; and `sortWith(compare)`, by any comparison. They answer a `Vector` and leave
-  the sequence as it was. A `List` has its own three, which answer a `List`, as its `map` and
+  the sequence as it was. A `List` has its own four, which answer a `List`, as its `map` and
   `filter` do: a list sorted is usually used as a list, walked from its front or matched with `::`,
   and the conversion would otherwise be the caller's every time. A vector needs no sorts of its own,
   since `Seq`'s already answer a vector.
 - On `Array`, `Buffer` and `Deque`: `sortInPlace()`, `sortInPlaceBy(key)` and
-  `sortInPlaceWith(compare)` reorder the elements in place and answer unit. A deque sorts front
+  `sortInPlaceWith(compare)` reorder the elements in place and answer unit, and where the elements
+  are `Ord`, `sortInPlaceDescending()` as well. A deque sorts front
   first, wherever its ring starts. Being sequences, they also have `sorted`, `sortBy` and
   `sortWith`, answering a sorted `Vector` and leaving the collection as it was.
 
@@ -1226,8 +1228,9 @@ scores.sortInPlace()                                 // [1, 2, 3]
 
 **Ordering toolkit.** An `ArraySeq` is `Ord` where its elements are, as a `List` is: element by
 element, the first pair that differs deciding, and a sequence ordering before every longer one it
-begins. **Descending order is `Reverse`**, so there is no `sortedDescending()`:
-`data Reverse[T: Ord](value: T)` orders the opposite way to `value`, and as a sort key, alone or one
+begins. **Descending order by a key is `Reverse`**; `sortedDescending` is only the whole elements'
+order turned round, and being stable it keeps equal elements in their order, which `sorted.reverse`
+would turn round with the rest. `data Reverse[T: Ord](value: T)` orders the opposite way to `value`, and as a sort key, alone or one
 part of a tuple, it sorts descending: `people.sortBy(p -> (Reverse(p.age), p.name))` is oldest first,
 ties by name. `Reverse(Reverse(x))` orders as `x`. `clamp(x, lo, hi)` is `x` limited to `lo ..= hi`
 and traps where `hi < lo`. For `sortWith`, `compareBy(key)` is the comparison of two values by their

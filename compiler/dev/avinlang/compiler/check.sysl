@@ -11686,8 +11686,13 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         ErrorType -> ()
         Nothing -> return value
         Union(_) -> c.note(unit, e.span, union_no_member(ty, name))
-        _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`")
+        _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`${string_length_hint(ty, name)}")
     TExpr(e.span, ErrorType, UnitConst)
+
+// What a string offers where a program asks it for a `length` or a `size`, which it has neither of,
+// since a string's length is counted in characters or in bytes; empty for any other member.
+private string_length_hint(ty: &Type, name: string) -> string =
+    if *ty is Str && (name == "length" || name == "size") then "; a string counts its characters with `charCount` and its bytes with `byteLength`" else ""
 
 /** What is said of a member a union does not have. */
 union_no_member(t: &Type, name: string) -> string =
@@ -13529,6 +13534,9 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         if op is Add then return TExpr(at, Str, Arith(op, l, r, op_at))
         c.note(unit_of(c), at, s"`$spelling` is not defined on strings; `+` joins two strings")
         return TExpr(at, ErrorType, UnitConst)
+    if op is Multiply && (*l.ty is Str && *r.ty is Int(_) || *l.ty is Int(_) && *r.ty is Str)
+        c.note(unit_of(c), at, s"`*` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}; a string is repeated by `repeat`, as in `text.repeat(n)`")
+        return TExpr(at, ErrorType, UnitConst)
     if *l.ty is Str && op is Add || *r.ty is Str && op is Add
         val other = if *l.ty is Str then r.ty else l.ty
         c.note(unit_of(c), at, s"`+` joins two strings, not a string and ${type_name(other)}")
@@ -13849,6 +13857,7 @@ struct Specifier
     space: bool
     zero: bool
     alternate: bool
+    grouping: bool
     width: string
     width_hole: Option[&TExpr]
     precision: string
@@ -13882,7 +13891,7 @@ private formatted_text(c: *Checker, e: &Expr, specifiers: bool, chunks: Buf[stri
         if text != "" then items.push(writer_call(c, at, held, writer.ty, "write", Expr(at, StringLit(text)), None))
         var spec: Option[Specifier] = None
         if specifiers && rest.bytes.len > 0 && rest.bytes[0] == u8('%')
-            var p = Specifier(false, false, false, false, false, "", None, "", None, "")
+            var p = Specifier(false, false, false, false, false, false, "", None, "", None, "")
             var b = rest.bytes
             var i = 1usize
             while i < b.len && is_format_flag(b[i])
@@ -13891,6 +13900,7 @@ private formatted_text(c: *Checker, e: &Expr, specifiers: bool, chunks: Buf[stri
                 if b[i] == u8(' ') then p.space = true
                 if b[i] == u8('0') then p.zero = true
                 if b[i] == u8('#') then p.alternate = true
+                if b[i] == u8(',') then p.grouping = true
                 i += 1
             if i == b.len && k < typed.len()
                 p.width_hole = Some(typed[k])
@@ -13946,7 +13956,7 @@ private formatted_text(c: *Checker, e: &Expr, specifiers: bool, chunks: Buf[stri
     items.push(Expr(at, Member(checked_slot(c, TExpr(at, writer.ty, Local(held))), "text")))
     check_expr(c, block_of(at, items), None)
 
-private is_format_flag(b: u8) -> bool = b == u8('-') || b == u8('+') || b == u8(' ') || b == u8('0') || b == u8('#')
+private is_format_flag(b: u8) -> bool = b == u8('-') || b == u8('+') || b == u8(' ') || b == u8('0') || b == u8('#') || b == u8(',')
 
 // Written code that stands for `t`, already checked.
 private checked_slot(c: *Checker, t: &TExpr) -> &Expr
@@ -14023,11 +14033,13 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
     var signs = false
     var zeros = false
     var alternate = false
+    var grouping = false
     var wanted = ""
     var fits = false
     if letter == "d" || letter == "i"
         signs = true
         zeros = true
+        grouping = true
         wanted = "an integer"
         fits = integer_type(c, t) || *t is Byte
     elif letter == "x" || letter == "X" || letter == "o" || letter == "b"
@@ -14064,6 +14076,7 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
     if p.space && !signs then ok = no_effect(c, at, "the space flag", letter)
     if p.zero && !zeros then ok = no_effect(c, at, "the flag `0`", letter)
     if p.alternate && !alternate then ok = no_effect(c, at, "the flag `#`", letter)
+    if p.grouping && !grouping then ok = no_effect(c, at, "the flag `,`, which groups decimal digits,", letter)
     if letter == "c" && (p.precision != "" || p.precision_hole is Some(_))
         c.note(unit, at, "`%c` takes no precision")
         ok = false
@@ -14088,6 +14101,7 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
     if p.plus then args.push(Argument(at, Some("plus"), Expr(at, BoolLit(true)), false))
     if p.space then args.push(Argument(at, Some("space"), Expr(at, BoolLit(true)), false))
     if p.alternate then args.push(Argument(at, Some("alternate"), Expr(at, BoolLit(true)), false))
+    if p.grouping then args.push(Argument(at, Some("grouping"), Expr(at, BoolLit(true)), false))
     args.push(Argument(at, Some("conversion"), Expr(at, CharLit(char(u32(letter.bytes[0])))), false))
     var layout = Expr(at, Call(Expr(at, Name(core_path("FormatSpec"))), args))
     if p.width_hole is Some(h)
