@@ -4,7 +4,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
-import sysl.fs.{current_dir, entries, exists, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, set_modified, write_text}
+import sysl.fs.{current_dir, entries, exists, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, set_modified, symlink, write_text}
 import sysl.process.{Exited, Stdio, Var, capture, spawn}
 import sysl.slices.sort
 import sysl.text.parse_int
@@ -515,23 +515,38 @@ incremental_modes()
 
 @test("each kind and level has its own directory beside the executables")
 directories_by_kind_and_level()
-    assert_eq(instance_cache_dir("p/.avin/build", false, "-O2"), "p/.avin/build/incremental/program-O2")
-    assert_eq(instance_cache_dir("p/.avin/build", true, "-O0"), "p/.avin/build/incremental/tests-O0")
+    assert_eq(instance_cache_dir("c/build/p-0123456789ab", false, "-O2"), "c/build/p-0123456789ab/incremental/program-O2")
+    assert_eq(instance_cache_dir("c/build/p-0123456789ab", true, "-O0"), "c/build/p-0123456789ab/incremental/tests-O0")
 
-@test("a program of one file has directories named after it, so two files of one directory keep apart")
+@test("with no cache directory, a program of one file has directories named after it, so two files of one directory keep apart")
 directories_of_one_file_programs()
     val dir = make_temp_dir("avin-ic").unwrap()
     defer _ = remove_dir_all(dir)
     write_text(dir + "/one.avin", "main() = 0\n").unwrap()
     write_text(dir + "/two.lavin", "main() = 0\n").unwrap()
-    assert_eq(program_instance_cache(dir, false, "-O2"), dir + "/.avin/build/incremental/program-O2")
-    assert_eq(program_instance_cache(dir, true, "-O0"), dir + "/.avin/build/incremental/tests-O0")
-    assert_eq(program_instance_cache(dir + "/one.avin", false, "-O2"), dir + "/.avin/build/incremental/one-program-O2")
-    assert_eq(program_instance_cache(dir + "/one.avin", true, "-O2"), dir + "/.avin/build/incremental/one-tests-O2")
-    assert_eq(program_instance_cache(dir + "/two.lavin", false, "-O0"), dir + "/.avin/build/incremental/two-program-O0")
+    assert_eq(program_instance_cache("", dir, false, "-O2"), dir + "/.avin/build/incremental/program-O2")
+    assert_eq(program_instance_cache("", dir, true, "-O0"), dir + "/.avin/build/incremental/tests-O0")
+    assert_eq(program_instance_cache("", dir + "/one.avin", false, "-O2"), dir + "/.avin/build/incremental/one-program-O2")
+    assert_eq(program_instance_cache("", dir + "/one.avin", true, "-O2"), dir + "/.avin/build/incremental/one-tests-O2")
+    assert_eq(program_instance_cache("", dir + "/two.lavin", false, "-O0"), dir + "/.avin/build/incremental/two-program-O0")
     // A file whose name is a directory's own name for its caches still gets a directory of its own.
     write_text(dir + "/program.avin", "main() = 0\n").unwrap()
-    assert_eq(program_instance_cache(dir + "/program.avin", false, "-O2"), dir + "/.avin/build/incremental/program-program-O2")
+    assert_eq(program_instance_cache("", dir + "/program.avin", false, "-O2"), dir + "/.avin/build/incremental/program-program-O2")
+
+@test("with a cache directory, every program has a build cache of its own, and two files of one directory keep apart")
+directories_in_the_cache()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/one.avin", "main() = 0\n").unwrap()
+    write_text(dir + "/two.avin", "main() = 0\n").unwrap()
+    val builds = dir + "/builds"
+    val one = program_instance_cache(builds, dir + "/one.avin", false, "-O2")
+    val two = program_instance_cache(builds, dir + "/two.avin", false, "-O2")
+    assert(one != two)
+    assert_eq(one, build_cache(builds, dir + "/one.avin") + "/incremental/program-O2")
+    assert(program_instance_cache(builds, dir + "/one.avin", true, "-O2") != one)
+    assert(program_instance_cache(builds, dir + "/one.avin", false, "-O0") != one)
+    assert(program_instance_cache(builds, dir, false, "-O2") != one)
 
 // --- the entries' text -----------------------------------------------------------------------------
 
@@ -714,9 +729,7 @@ two_builds_at_once()
     val bin = compiler_in(dir)
     val program = dir + "/prog"
     write_program(program)
-    var env: Buf[Var] = buf()
-    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
-    env.push(Var("AVIN_INCREMENTAL", "on"))
+    val env = command_env(dir, "on")
     for round in 0..<2
         val a = spawn(bin, ["build", program, "-O0", "-o", dir + "/a"], env = env.view(), stdout = Stdio.ToPath(dir + "/a.out"), stderr = Stdio.ToPath(dir + "/a.err")).unwrap()
         val b = spawn(bin, ["build", program, "-O0", "-o", dir + "/b"], env = env.view(), stdout = Stdio.ToPath(dir + "/b.out"), stderr = Stdio.ToPath(dir + "/b.err")).unwrap()
@@ -728,12 +741,11 @@ two_builds_at_once()
         val rb = capture(dir + "/b", [], timeout = 60000).unwrap()
         assert_eq(ra.text, rb.text)
         assert(ra.text.starts_with("21\n"), ra.text)
-    var verify: Buf[Var] = buf()
-    verify.push(Var("AVIN_ROOT", current_dir().unwrap()))
-    verify.push(Var("AVIN_INCREMENTAL", "verify"))
+    val verify = command_env(dir, "verify")
     val checked = spawn(bin, ["build", program, "-O0", "-o", dir + "/c"], env = verify.view(), stdout = Stdio.ToPath(dir + "/c.out"), stderr = Stdio.ToPath(dir + "/c.err")).unwrap()
     assert(checked.wait().unwrap() is Exited(0), read_text(dir + "/c.err").unwrap_or(""))
-    val cache = instance_cache_dir(program + "/.avin/build", false, "-O0")
+    assert(!exists(program + "/.avin"))
+    val cache = instance_cache_dir(build_of(dir, program), false, "-O0")
     for name in entries(cache).unwrap()
         assert(!name.contains(".pending-"), name)
     assert_eq(read_instance_store(cache).damaged, 0)
@@ -760,6 +772,106 @@ both_levels()
         assert_eq(o, outputs[0])
     assert(outputs[0].contains("cat tom"))
 
+// --- slots of methods with type parameters of their own ---------------------------------------------
+//
+// Such a method has a table slot for each list of its own type arguments, numbered in the order the
+// program's calls make them. An entry names the slot of each of its calls by the method and type
+// arguments, so an edit that makes the slots in another order, or makes one more or one fewer, leaves
+// every reused call reaching the method it reached in a clean build.
+
+private const Show: string = "show(rs: Vector[Vector[string]]) -> string = rs.map(r -> \"[\" + r.map(f -> s\"<$f>\").mkString(\"|\") + \"]\").mkString(\" \")\n"
+
+private const Count: string = "count(xs: Vector[string]) -> int = xs.map(s -> s.toInt()).sum\n"
+
+private const ShowMain: string = Show + "\nmain()\n    println(show([[\"x\", \"y\"]]))\n"
+
+private const PlainGeo: string = "module geo\n\nnothing() -> int = 0\n"
+
+private const PlainExtra: string = "module extra\n\nnone() -> int = 0\n"
+
+private const Mappers: string = "module geo\n\ntrait Mapper\n    mapTo[B](f: (int) -> B) -> B\n\nclass Holder(val n: int): Mapper\n    override mapTo[B](f: (int) -> B) -> B = f(n)\n\nclass Other(val n: int): Mapper\n    override mapTo[B](f: (int) -> B) -> B = f(n + 1)\n"
+
+private const Label: string = "import geo.{Mapper, Holder, Other}\n\nlabel(m: Mapper) -> string = m.mapTo(n -> s\"<$n>\")\n\nmain()\n"
+
+/** Builds the program of `main0`, `geo0` and `extra0`, then the edited one of `main1`, `geo1` and
+ * `extra1` with the same cache, at -O0 and at -O2, each level with a cache of its own. The edited
+ * build reuses the entry of the function `kept` (unless it is empty), its text is a clean build's, and its program prints
+ * `want`. */
+private rebuild_prints(main0: string, geo0: string, extra0: string, main1: string, geo1: string, extra1: string, kept: string, want: string)
+    val dir = make_temp_dir("avin-ic-slots").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    val after = program_of(dir, main1, geo1, extra1)
+    val oracle = clean(after)
+    _ = cached(program_of(dir, main0, geo0, extra0), dir + "/cache")
+    val second = cached(after, dir + "/cache")
+    val reused = lowered_of(second).reused
+    var named = ""
+    for s in reused
+        if s.starts_with("<program>") then named = named + s + " "
+    if kept != "" then assert(holds(reused, kept), s"`$kept` was lowered again; reused: $named")
+    assert_eq(second.llvm, oracle)
+    for level in ["-O0", "-O2"]
+        val cache = instance_cache_dir(dir + "/.avin/build", false, level)
+        open_incremental(cache, IncrementalOn)
+        val first = compile_program(tc, program_of(dir, main0, geo0, extra0), false, buf(), buf())
+        assert_eq(first.diagnostics, "")
+        val compiled = compile_program(tc, after, false, buf(), buf())
+        close_incremental()
+        assert_eq(compiled.diagnostics, "")
+        val llvm = compiled.llvm.unwrap()
+        assert_eq(llvm, oracle)
+        val exe = dir + s"/run$level"
+        link(tc, llvm, compiled.archive, exe, level, compiled.c_link).unwrap()
+        assert_eq(capture(exe, [], timeout = 60000).unwrap().text, want)
+
+@test("a reused lambda's call of a library method with its own type parameter reaches its own slot after an edit makes another slot first")
+reused_generic_slot_after_new_slot()
+    rebuild_prints(ShowMain, PlainGeo, PlainExtra, ShowMain + "    println([\"1\"].map(p -> p.toInt()).sum)\n", PlainGeo, PlainExtra, "<program>.show.lambda#1", "[<x>|<y>]\n1\n")
+
+@test("a reused call of a program's own method with a type parameter reaches its own slot after a new instance of the method")
+reused_own_generic_slot_after_new_instance()
+    val before = Label + "    println(label(Holder(1)))\n    println(label(Other(1)))\n"
+    val after = Label + "    val m: Mapper = Holder(5)\n    println(m.mapTo(n -> n * 2))\n    println(label(Holder(1)))\n    println(label(Other(1)))\n"
+    rebuild_prints(before, Mappers, PlainExtra, after, Mappers, PlainExtra, "<program>.label", "10\n<1>\n<2>\n")
+
+@test("a method added to a trait ahead of one with its own type parameter moves its slot, and a call kept in the program reaches it")
+generic_method_moved_in_its_trait()
+    val main = Label + "    val m: Mapper = Holder(5)\n    println(m.mapTo(n -> n * 2))\n    println(label(Holder(1)))\n    println(label(Other(1)))\n"
+    val moved = Mappers.replace_all("trait Mapper\n", "trait Mapper\n    first() -> int = 0\n")
+    rebuild_prints(main, Mappers, PlainExtra, main, moved, PlainExtra, "", "10\n<1>\n<2>\n")
+
+@test("a new lambda calling a generic method ahead of a reused one leaves the reused one's slot its own")
+reused_generic_slot_after_new_lambda()
+    val after = Show + "\nmain()\n    println([3, 4].map(n -> n + 1).mkString(\",\"))\n    println(show([[\"x\", \"y\"]]))\n"
+    rebuild_prints(ShowMain, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "<program>.show.lambda#1", "4,5\n[<x>|<y>]\n")
+
+@test("a new string literal ahead of a reused function leaves its strings and slots its own")
+reused_generic_slot_after_new_string()
+    val after = Show + "\nmain()\n    println(\"fresh\")\n    println(show([[\"x\", \"y\"], [\"fresh\"]]))\n"
+    rebuild_prints(ShowMain, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "<program>.show.lambda#1", "fresh\n[<x>|<y>] [<fresh>]\n")
+
+@test("a function removed with the slot it made leaves a reused call reaching its own slot, now numbered lower")
+reused_generic_slot_after_removed_function()
+    val before = Count + "\n" + Show + "\nmain()\n    println(count([\"2\"]))\n    println(show([[\"x\", \"y\"]]))\n"
+    rebuild_prints(before, PlainGeo, PlainExtra, ShowMain, PlainGeo, PlainExtra, "<program>.show.lambda#1", "[<x>|<y>]\n")
+
+@test("a signature changed in another module, whose new body makes a slot first, leaves a reused call's slot its own")
+reused_generic_slot_after_signature_change()
+    val main = "import extra.tag\n\n" + Show + "\nmain()\n    println(tag(7))\n    println(show([[\"x\", \"y\"]]))\n"
+    rebuild_prints(main, PlainGeo, "module extra\n\ntag(n: int) -> int = n\n", main, PlainGeo, "module extra\n\ntag(n: int) -> long = [n].map(x -> long(x) * 2).sum\n", "<program>.show.lambda#1", "14\n[<x>|<y>]\n")
+
+@test("a new instance in another module, made first, leaves a reused call's slot its own")
+reused_generic_slot_after_instance_in_another_module()
+    val main = "import extra.twice\n\n" + Show + "\nmain()\n    println(twice(3))\n    println(show([[\"x\", \"y\"]]))\n"
+    rebuild_prints(main, PlainGeo, "module extra\n\ntwice(n: int) -> int = n * 2\n", main, PlainGeo, "module extra\n\ntwice(n: int) -> int = [n, n].map(x -> x).sum\n", "<program>.show.lambda#1", "6\n[<x>|<y>]\n")
+
+@test("two reused functions whose calls make their slots in the other order each reach their own")
+reused_generic_slots_in_the_other_order()
+    val before = Count + "\n" + Show + "\nmain()\n    println(show([[\"x\", \"y\"]]))\n    println(count([\"2\"]))\n"
+    val after = Count + "\n" + Show + "\nmain()\n    println(count([\"2\"]))\n    println(show([[\"x\", \"y\"]]))\n"
+    rebuild_prints(before, PlainGeo, PlainExtra, after, PlainGeo, PlainExtra, "<program>.count", "2\n[<x>|<y>]\n")
+
 // --- the commands -----------------------------------------------------------------------------------
 
 /** The compiler of this tree, built into `dir`, for the tests that start it as a person would. */
@@ -784,13 +896,35 @@ private struct Ran
     text: string
     log: Buf[string]
 
+/** The environment of a command run by these tests, with `AVIN_INCREMENTAL` set to `mode` and
+ * `AVIN_CACHE` naming a cache in `dir` (see `private_cache`). */
+private command_env(dir: string, mode: string) -> Buf[Var]
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env.push(Var("AVIN_INCREMENTAL", mode))
+    env.push(Var("AVIN_CACHE", private_cache(dir)))
+    env
+
+/** A cache in `dir` whose programs' builds are its own, so they go with `dir`, and whose runtime,
+ * shims and objects are the user's cache's, so the runtime is not built again for every test. */
+private private_cache(dir: string) -> string
+    val cache = dir + "/cache"
+    if exists(cache) then return cache
+    make_dir_all(cache).unwrap()
+    val real = repository_toolchain()
+    for (name, shared) in [("runtime", real.runtime_cache()), ("shims", real.shim_cache()), ("cunit", real.c_unit_cache()), ("units", real.unit_cache())]
+        make_dir_all(shared).unwrap()
+        symlink(shared, cache + "/" + name).unwrap()
+    cache
+
+/** The build cache of the program at `prog` run by these tests from `dir`. */
+private build_of(dir: string, prog: string) -> string = build_cache(private_cache(dir) + "/build", prog)
+
 /** `avin <args>` with `AVIN_INCREMENTAL` set to `mode` ("" is the default) and its build log in `dir`. */
 private avin_in(bin: string, dir: string, mode: string, args: []const string) -> Ran
     val log = dir + "/build.log"
     _ = remove_file(log)
-    var env: Buf[Var] = buf()
-    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
-    env.push(Var("AVIN_INCREMENTAL", mode))
+    var env = command_env(dir, mode)
     env.push(Var("AVIN_BUILD_LOG", log))
     val out = capture(bin, args, env = env.view(), stderr = true, timeout = 600000).unwrap()
     val code = out.status match
@@ -815,7 +949,7 @@ commands_use_the_cache_by_default()
     val bin = compiler_in(dir)
     val prog = dir + "/prog"
     write_program(prog)
-    val caches = prog + "/.avin/build/incremental"
+    val caches = build_of(dir, prog) + "/incremental"
     // Cold: each command writes its own kind's and level's directory and reuses nothing.
     val run1 = avin_in(bin, dir, "", ["run", prog])
     assert_eq(run1.status, 0, run1.text)
@@ -862,8 +996,10 @@ commands_use_the_cache_by_default()
     assert_eq(avin_in(bin, dir, "off", ["emit-llvm", prog, "-o", dir + "/clean.ll"]).status, 0)
     assert_eq(read_text(dir + "/warm.ll").unwrap(), read_text(dir + "/clean.ll").unwrap())
     // `verify` for each command: the executables are made again, so each builds twice and compares.
-    remove_file(prog + "/.avin/build/prog-O2.key").unwrap()
-    remove_file(prog + "/.avin/build/prog-tests-O2.key").unwrap()
+    // Nothing was kept beside the program, by any of the commands.
+    assert(!exists(prog + "/.avin"))
+    remove_file(build_of(dir, prog) + "/prog-O2.key").unwrap()
+    remove_file(build_of(dir, prog) + "/prog-tests-O2.key").unwrap()
     val run3 = avin_in(bin, dir, "verify", ["run", prog])
     assert_eq(run3.status, 0, run3.text)
     assert_eq(run3.text, want)
@@ -883,16 +1019,16 @@ off_and_damage()
     val bin = compiler_in(dir)
     val prog = dir + "/prog"
     write_program(prog)
-    val cache = prog + "/.avin/build/incremental/program-O2"
+    val cache = build_of(dir, prog) + "/incremental/program-O2"
     val off = avin_in(bin, dir, "off", ["run", prog])
     assert_eq(off.status, 0, off.text)
     val want = off.text
     assert(want.contains("\n101\n"), want)
     assert_eq(phase_names(off.log), "load check cunit lower keys shims emit split units link ")
-    assert(!exists(prog + "/.avin/build/incremental"))
+    assert(!exists(build_of(dir, prog) + "/incremental"))
     assert_eq(avin_in(bin, dir, "off", ["test", prog]).status, 0)
     assert_eq(avin_in(bin, dir, "off", ["build", prog, "-o", dir + "/x"]).status, 0)
-    assert(!exists(prog + "/.avin/build/incremental"))
+    assert(!exists(build_of(dir, prog) + "/incremental"))
     // Made by the default, then damaged: `off` never reads it, and the default passes over it.
     assert_eq(avin_in(bin, dir, "", ["build", prog, "-o", dir + "/x"]).status, 0)
     val files = module_files(cache)
@@ -948,9 +1084,7 @@ two_tests_at_once()
     val bin = compiler_in(dir)
     val prog = dir + "/prog"
     write_program(prog)
-    var env: Buf[Var] = buf()
-    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
-    env.push(Var("AVIN_INCREMENTAL", ""))
+    val env = command_env(dir, "")
     for round in 0..<2
         if round == 1 then write_text(prog + "/extra/extra.avin", edited(Extra, "n + 100", "n + 200")).unwrap()
         val a = spawn(bin, ["test", prog], env = env.view(), stdout = Stdio.ToPath(dir + "/a.out"), stderr = Stdio.ToPath(dir + "/a.err")).unwrap()
@@ -971,12 +1105,14 @@ two_tests_at_once()
     assert(read_text(dir + "/t.out").unwrap().contains("1 passed, 0 failed"))
     // What they left verifies, with no write half done and no file damaged.
     for kind in ["program-O2", "tests-O2"]
-        val cache = prog + "/.avin/build/incremental/" + kind
+        val cache = build_of(dir, prog) + "/incremental/" + kind
         for name in entries(cache).unwrap()
             assert(!name.contains(".pending-"), name)
         assert_eq(read_instance_store(cache).damaged, 0)
-    remove_file(prog + "/.avin/build/prog-tests-O2.key").unwrap()
-    remove_file(prog + "/.avin/build/prog-O2.key").unwrap()
+    // Nothing is kept beside the program.
+    assert(!exists(prog + "/.avin"))
+    remove_file(build_of(dir, prog) + "/prog-tests-O2.key").unwrap()
+    remove_file(build_of(dir, prog) + "/prog-O2.key").unwrap()
     val verified = avin_in(bin, dir, "verify", ["test", prog])
     assert_eq(verified.status, 0, verified.text)
     assert(count_in(verified.log, "lower", "reused") > 0)

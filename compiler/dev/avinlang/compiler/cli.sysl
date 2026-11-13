@@ -2,14 +2,14 @@ module dev.avinlang.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.get
-import sysl.fs.{canonicalize, entries, exists, is_dir, read_text, write_text_atomic}
-import sysl.path.stem
+import sysl.fs.{canonicalize, entries, exists, is_dir, read_text, remove_dir_all, remove_file, write_text_atomic}
+import sysl.path.{parent, stem}
 import sysl.process.Stdio
 import sysl.slices.sort_by
 
 const Version: string = "0.0.20"
 const NoToolchain: string = "avin: cannot find the Avin library and runtime: they are installed in `share/avin` beside `bin/avin`; for a source checkout, set AVIN_ROOT to the directory that holds `library/` and `runtime/`"
-const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>] [--bindings] [<features>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2] [<features>]\n       avin run [<program>] [-O0 | -O2] [<features>] [-- <argument>...]\n       avin test [<program>] [<filter>] [--prefix] [-O0 | -O2] [<features>]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>] [<features>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; options may come before or after <program>, and only the arguments after `--` are the program's; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists; `--prefix` puts each file's path and a colon before every result line\n`avin check` stops after type checking; `--bindings` also builds the shims of the Sysl bindings and the C unit, so a binding Sysl or the C compiler rejects is reported\n<features> are `--features a,b`, `--no-default-features` and `--all-features`, choosing the package's features; `avin test`, `avin check` and `avin vendor` turn every feature on unless one is given"
+const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>] [--bindings] [<features>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2] [<features>]\n       avin run [<program>] [-O0 | -O2] [<features>] [-- <argument>...]\n       avin test [<program>] [<filter>] [--prefix] [-O0 | -O2] [<features>]\n       avin clean [<program>] [--all]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>] [<features>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; options may come before or after <program>, and only the arguments after `--` are the program's, except that `avin <file> ...` gives every argument after a file whose first line begins `#!` to the program, as a `#!/usr/bin/env avin` line runs it; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists; `--prefix` puts each file's path and a colon before every result line\n`avin check` stops after type checking; `--bindings` also builds the shims of the Sysl bindings and the C unit, so a binding Sysl or the C compiler rejects is reported\n`avin run` and `avin test` keep what they build in the user's cache directory (`AVIN_CACHE` names another), a directory per program; `avin clean` removes the program's, and `--all` every program's\n<features> are `--features a,b`, `--no-default-features` and `--all-features`, choosing the package's features; `avin test`, `avin check` and `avin vendor` turn every feature on unless one is given"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -23,7 +23,7 @@ run_cli_with(args: []const string, tc: Option[Toolchain], say: string -> unit, n
 
 /** Every command name; a first argument that is one is that command, never a path. */
 is_command(word: string) -> bool
-    for c in ["parse", "check", "emit-llvm", "build", "run", "test", "new", "add", "tidy", "vendor", "fmt", "tangle", "weave", "lsp"]
+    for c in ["parse", "check", "emit-llvm", "build", "run", "test", "clean", "new", "add", "tidy", "vendor", "fmt", "tangle", "weave", "lsp"]
         if c == word then return true
     false
 
@@ -46,6 +46,15 @@ run_cli_in(here: string, args: []const string, tc: Option[Toolchain], say: strin
         if args.len >= 2 && !args[1].starts_with("-") && !exists(args[1])
             note(s"avin: unknown command or file `${args[1]}`\n" + Usage)
             return 2
+        // `avin <file> ...` for a file whose first line begins `#!` is how a `#!/usr/bin/env avin` line
+        // runs it as a command, so every argument after the file is the program's own, as an
+        // interpreter passes its script's arguments.
+        if args.len >= 2 && !args[1].starts_with("-") && runs_as_command(args[1])
+            full.push(args[1])
+            full.push("--")
+            for i in 2..<args.len
+                full.push(args[i])
+            return run_command(here, full.view(), tc, say, note, stdout, stderr)
         for i in 1..<args.len
             full.push(args[i])
         return run_command(here, full.view(), tc, say, note, stdout, stderr)
@@ -55,6 +64,7 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     if args.len >= 2 && args[1] == "lsp" then return lsp_command(args, tc, note)
     if args.len >= 2 && (args[1] == "tangle" || args[1] == "weave") then return literate_command(args, say, note)
     if args.len >= 2 && args[1] == "new" then return new_command(args, say, note)
+    if args.len >= 2 && args[1] == "clean" then return clean_command(here, args, tc, say, note)
     if args.len >= 2 && args[1] == "tidy" then return tidy_command(args, say, note)
     if args.len >= 2 && args[1] == "fmt" then return fmt_command(args, say, note)
     if args.len >= 2 && args[1] == "add" then return add_command(args, say, note)
@@ -157,7 +167,7 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
             note(message)
             return 1
     if command == "run" || command == "test"
-        if mode != IncrementalOff then open_incremental(program_instance_cache(program.root, command == "test", level), mode)
+        if mode != IncrementalOff then open_incremental(program_instance_cache(toolchain.builds, program.root, command == "test", level), mode)
         defer close_incremental()
         val building = live_begin(program.root, PhaseCompile)
         val built = cached_build(toolchain, program.root, files, command == "test", level, program.sysl, program.c) match
@@ -188,7 +198,7 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
             return 1
         say("checked " + path)
         return 0
-    if mode != IncrementalOff then open_incremental(program_instance_cache(program.root, testing, level), mode)
+    if mode != IncrementalOff then open_incremental(program_instance_cache(toolchain.builds, program.root, testing, level), mode)
     defer close_incremental()
     val compiled = compile_program(toolchain, files, testing, program.sysl, program.c)
     if compiled.diagnostics != ""
@@ -221,6 +231,81 @@ holds_program(dir: string) -> bool
     program_files(dir) match
         Ok(files) -> files.len() > 0
         Err(_) -> true
+
+/** `avin clean [<program>] [--all]`: removes what `avin run` and `avin test` keep for the program at
+ * `<program>` (`here` when it is left out): its directory in the toolchain's `builds`, and the
+ * `.avin/build` beside it that a machine with no cache directory keeps instead. `--all` removes every
+ * program's builds this compiler's version keeps, and on a machine with no cache directory, where
+ * there are none outside the programs, it removes the current program's. Fetched packages, the
+ * runtime's archives and the shims stay. */
+clean_command(here: string, args: []const string, tc: Option[Toolchain], say: string -> unit, note: string -> unit) -> int
+    var named: Option[string] = None
+    var all = false
+    for i in 2..<args.len
+        if args[i] == "--all" && !all then all = true
+        elif !args[i].starts_with("-") && named is None then named = Some(args[i])
+        else
+            note(Usage)
+            return 2
+    if all && named is Some(_)
+        note("avin: `avin clean --all` removes every program's builds, and names no program")
+        return 2
+    val toolchain = tc match
+        Some(t) -> t
+        None ->
+            note(NoToolchain)
+            return 1
+    var removed: Buf[string] = buf()
+    val done = if all && toolchain.builds != "" then remove_path(toolchain.builds, &removed)
+    else clean_program(toolchain.builds, named.unwrap_or(here), &removed)
+    if done is Err(message)
+        note(message)
+        return 1
+    if removed.len() == 0 then say("nothing to clean")
+    for p in removed
+        say("removed " + p)
+    0
+
+/** Removes the builds of the program at `path` as `clean_command` does, naming each path removed in
+ * `removed`. The program is the package `path` is in, as every command reads it, or else `path`. */
+private clean_program(builds: string, path: string, removed: *Buf[string]) -> Result[unit, string]
+    if !exists(path) then return Err(s"avin: $path does not exist")
+    val root = enclosing_package(path)? match
+        Some(d) -> d
+        None -> path
+    if builds != "" then remove_path(build_cache(builds, root), removed)?
+    val local = local_build_cache(root)
+    if is_dir(root)
+        remove_path(local, removed)?
+    else
+        // A program of one file shares the `.avin/build` of its directory, so only its own entries go.
+        val name = stem(root).unwrap_or("program")
+        for kind in ["", "-tests"]
+            for level in ["-O0", "-O2"]
+                remove_path(local + "/" + name + kind + level, removed)?
+                remove_path(local + "/" + name + kind + level + ".key", removed)?
+        for kind in ["-program", "-tests"]
+            for level in ["-O0", "-O2"]
+                remove_path(local + "/incremental/" + name + kind + level, removed)?
+    // The directories left empty go too, up to `.avin`: nothing else is kept there.
+    remove_if_empty(local + "/incremental")
+    remove_if_empty(local)
+    remove_if_empty(parent(local).unwrap_or("."))
+    Ok(())
+
+/** Removes the directory `dir` when it is there and empty. */
+private remove_if_empty(dir: string)
+    if !is_dir(dir) then return
+    if entries(dir) is Ok(left)
+        if left.len() == 0 then _ = remove_dir_all(dir)
+
+/** Removes the file or directory at `p` when there is one, naming it in `removed`. */
+private remove_path(p: string, removed: *Buf[string]) -> Result[unit, string]
+    if !exists(p) then return Ok(())
+    val done = if is_dir(p) then remove_dir_all(p) else remove_file(p)
+    done.map_err(e -> s"avin: $p: ${e.to_string()}")?
+    removed.push(p)
+    Ok(())
 
 /** `avin new <dir> [--lib]`: a new package at `dir`, a program or with `--lib` a library. */
 new_command(args: []const string, say: string -> unit, note: string -> unit) -> int
@@ -287,10 +372,17 @@ tidy_command(args: []const string, say: string -> unit, note: string -> unit) ->
         else
             note(Usage)
             return 2
-    val home = project_of(dir.unwrap_or("."), "tidy", note) match
-        Some(h) -> h
-        None -> return 1
-    tidy(home, default_fetching(), check, say) match
+    val given = dir.unwrap_or(".")
+    // A program of one file keeps its sum file beside it.
+    var tidied: Result[bool, string] = Ok(true)
+    if is_script(given)
+        tidied = tidy_script(given, default_fetching(), check, say)
+    else
+        val home = project_of(given, "tidy", note) match
+            Some(h) -> h
+            None -> return 1
+        tidied = tidy(home, default_fetching(), check, say)
+    tidied match
         Ok(true) -> 0
         Ok(false) ->
             if !check then return 0
@@ -378,6 +470,9 @@ vendor_command(args: []const string, say: string -> unit, note: string -> unit) 
             note(Usage)
             return 2
         i += 1
+    if is_script(dir.unwrap_or("."))
+        note(s"avin: ${dir.unwrap_or(".")} is a program of one file, which is not vendored: it reads its packages from the machine's cache. A program that must build with the network off is a package, `avin new`, whose `vendor/` holds them")
+        return 1
     val home = project_of(dir.unwrap_or("."), "vendor", note) match
         Some(h) -> h
         None -> return 1
@@ -420,6 +515,16 @@ private feature_flag(args: []const string, i: usize, flags: *FeatureFlags) -> us
             if n != "" then flags.names.push(n)
         return 2
     0
+
+// Whether `path` is a file whose first line begins `#!`.
+private runs_as_command(path: string) -> bool
+    if is_dir(path) then return false
+    read_text(path) match
+        Ok(text) -> text.starts_with("#!")
+        Err(_) -> false
+
+// Whether `given` is a program of one file: a file in no package.
+private is_script(given: string) -> bool = exists(given) && !is_dir(given) && enclosing_package(given) is Ok(None)
 
 // The package or workspace `avin <command>` given `given` works on: a workspace's root whole, and any
 // other path the package it is in. Says through `note` why there is none.

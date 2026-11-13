@@ -1,0 +1,490 @@
+module avin
+
+// Whole numbers of any size. A `BigInt` holds as many digits as its value needs, so its arithmetic
+// never overflows: `+`, `-`, `*`, `/`, `%` and unary `-` answer exactly, and only a zero divisor
+// traps, as it does for an `int`. `/` rounds towards zero and `%` takes the dividend's sign, as on
+// the integer types; `floorDiv` and `floorMod` round towards negative infinity. A `BigInt` is a
+// number (`Numeric`), ordered, compared and hashed by value, and written in decimal by `Display`,
+// in any base the integer conversions name under `%d`, `%x`, `%o` and `%b`, and by `toRadix`.
+//
+// It is made from an integer of any width, `BigInt(42)`, or from its digits: `BigInt("-123")` and
+// `BigInt("ff", 16)` trap on text that is not a number, as `toLong` does, and `BigInt.parse` answers
+// None instead. `toLong` and `toInt` trap when the value does not fit, and `toLongOption` and
+// `toIntOption` answer None.
+
+// A whole number: its sign and its magnitude, the magnitude in limbs of nine decimal digits each,
+// least significant first, with no zero limb at the top, so zero has none and is never negative. The
+// limbs are never written once the number is made.
+class BigInt(private val negative: bool, private val limbs: FrozenArray[long])
+    // Whether the number is zero.
+    isZero -> bool = limbs.length == 0
+
+    // `-1`, `0` or `1` by whether the number is negative, zero or positive.
+    sign -> int = if limbs.length == 0 then 0 elif negative then -1 else 1
+
+    // The magnitude.
+    abs -> BigInt = if negative then BigInt(false, limbs) else self
+
+    // The number raised to the power `n`, which traps when `n` is negative. `x.pow(0)` is `1`,
+    // `0.pow(0)` included.
+    pow(n: int) -> BigInt
+        if n < 0 then fail("pow: negative exponent")
+        var result = BigInt.one()
+        var base = self
+        var rest = n
+        while rest != 0
+            if rest & 1 == 1 then result = result * base
+            rest = rest >> 1
+            if rest != 0 then base = base * base
+        result
+
+    // The greatest number that divides both, never negative; `gcd` of two zeros is zero.
+    gcd(other: BigInt) -> BigInt
+        var a = abs
+        var b = other.abs
+        while !b.isZero
+            val r = a % b
+            a = b
+            b = r
+        a
+
+    // The least positive number both divide, zero when either is zero.
+    lcm(other: BigInt) -> BigInt
+        if isZero || other.isZero then return BigInt.zero()
+        (self / gcd(other)).abs * other.abs
+
+    // The quotient rounded towards zero and the remainder with the dividend's sign, from one
+    // division: `(self / other, self % other)`. A zero divisor traps.
+    divRem(other: BigInt) -> (BigInt, BigInt) = bigDivRem(limbs, other.limbs, negative != other.negative, negative)
+
+    // The quotient rounded towards negative infinity, where `/` rounds towards zero. A zero divisor
+    // traps.
+    floorDiv(other: BigInt) -> BigInt
+        val (q, r) = divRem(other)
+        if !r.isZero && r.sign != other.sign then q - BigInt.one() else q
+
+    // The remainder that takes the sign of the divisor, so `self == self.floorDiv(o) * o +
+    // self.floorMod(o)`. A zero divisor traps.
+    floorMod(other: BigInt) -> BigInt
+        val r = self % other
+        if !r.isZero && r.sign != other.sign then r + other else r
+
+    // The number's digits in `radix`, from 2 to 36, lower case, with a `-` for a negative number and
+    // no prefix: `BigInt(255).toRadix(16)` is `"ff"`. Any other radix traps.
+    toRadix(radix: int) -> string
+        if !(2 <= radix <= 36) then fail("toRadix: radix must be from 2 to 36")
+        if limbs.length == 0 then return "0"
+        val out = StringWriter()
+        if negative then out.writeChar('-')
+        bigWriteMagnitude(out, limbs, radix, false)
+        out.text
+
+    // The value as a `long`, or None when it does not fit one.
+    toLongOption -> Option[long]
+        if limbs.length > 3 then return None
+        val least = long(-9223372036854775807) - 1
+        // The value builds on the negative side, which holds every `long` including the least.
+        var acc: long = 0
+        var i = limbs.length - 1
+        while i >= 0
+            if acc < least / bigLimbBase then return None
+            acc = acc * bigLimbBase
+            if acc < least + limbs(i) then return None
+            acc -= limbs(i)
+            i -= 1
+        if negative then Some(acc) elif acc == least then None else Some(-acc)
+
+    // The value as an `int`, or None when it does not fit one.
+    toIntOption -> Option[int]
+        val v = toLongOption?
+        if v < long(-2147483647) - 1 || v > 2147483647 then return None
+        Some(int(v))
+
+    // The value as a `long`, trapping when it does not fit one.
+    toLong -> long
+        if toLongOption is Some(n) then return n
+        fail("value out of range for long")
+
+    // The value as an `int`, trapping when it does not fit one.
+    toInt -> int
+        if toIntOption is Some(n) then return n
+        fail("value out of range for int")
+
+// A `BigInt` is a number: the operators, the identities `BigInt.zero()` and `BigInt.one()`, and its
+// value as a `real`, the nearest one, a tie going to the even one, and an infinity of its sign beyond
+// the greatest finite `real`.
+impl Numeric for BigInt
+    toReal -> real = bigRadixText(negative, limbs, 10).toRealOption() match
+        Some(x) -> x
+        None -> if negative then real.NegativeInfinity else real.PositiveInfinity
+
+impl Add for BigInt
+    add(other: BigInt) -> BigInt = bigSum(negative, limbs, other.negative, other.limbs)
+    static zero() -> BigInt = bigZero
+
+impl Sub for BigInt
+    subtract(other: BigInt) -> BigInt = bigSum(negative, limbs, !other.negative, other.limbs)
+
+impl Mul for BigInt
+    multiply(other: BigInt) -> BigInt = bigProduct(negative != other.negative, limbs, other.limbs)
+    static one() -> BigInt = bigOne
+
+// `/` rounds towards zero and `%` takes the dividend's sign; a zero divisor traps.
+impl Div for BigInt
+    divide(other: BigInt) -> BigInt = bigDivRem(limbs, other.limbs, negative != other.negative, negative).0
+
+impl Rem for BigInt
+    remainder(other: BigInt) -> BigInt = bigDivRem(limbs, other.limbs, negative != other.negative, negative).1
+
+impl Neg for BigInt
+    negate() -> BigInt = if limbs.length == 0 then self else BigInt(!negative, limbs)
+
+// Numbers order by value.
+impl Ord for BigInt
+    compare(other: BigInt) -> int
+        if negative != other.negative then return if negative then -1 else 1
+        val c = bigCompareMagnitudes(limbs, other.limbs)
+        if negative then -c else c
+
+// Two `BigInt`s are equal when their values are.
+impl Eq for BigInt
+    equals(other: BigInt) -> bool = negative == other.negative && bigCompareMagnitudes(limbs, other.limbs) == 0
+
+// Equal numbers hash alike: the limbs folded in, multiplying by 31 and adding, from a start the sign
+// sets.
+impl Hash for BigInt
+    hash() -> long
+        var h: long = if negative then 1 else 0
+        for i in 0 ..< limbs.length do h = h *% 31 +% limbs(i)
+        h
+
+// A `BigInt` displays as an integer does: in decimal, with a `-` when negative, and under an integer
+// conversion with that conversion's base, flags, precision and width.
+impl Display for BigInt
+    display(out: Writer, spec: FormatSpec)
+        if plainInteger(spec) then out.writeField(bigRadixText(negative, limbs, 10), spec)
+        else out.writeField(bigIntegerText(negative, limbs, spec), spec)
+    toString() -> string = bigRadixText(negative, limbs, 10)
+
+// The diagnostic form is the display form, as it is for the integer types.
+impl Debug for BigInt
+    debug(out: Writer, spec: FormatSpec) = display(out, spec)
+
+object BigInt
+    // The number `n`; a literal takes this one, so it may be as large as a `long`.
+    apply(n: long) -> BigInt = bigOfLong(n)
+
+    // The number `n`, an integer of any width.
+    apply[T: Integer](n: T) -> BigInt
+        val wide = long.wrap(n)
+        if T(wide) == n then return bigOfLong(wide)
+        // A value too wide for a `long` is cut into limbs at its own width, which holds the limb base.
+        val base = T.wrap(1000000000)
+        var count = 0
+        var rest = n
+        while rest != T(0)
+            rest = rest / base
+            count += 1
+        val a = newArray[long](count)
+        rest = n
+        for i in 0 ..< count
+            val d = long(rest % base)
+            a(i) = if d < 0 then -d else d
+            rest = rest / base
+        bigMade(n < T(0), a, count)
+
+    // The number `text` writes in decimal, with an optional leading `-` or `+` and at least one digit,
+    // and nothing else: no white space, separators or exponent. Any other text traps.
+    apply(text: string) -> BigInt
+        if bigParsed(text, 10) is Some(n) then return n
+        notANumber(text)
+
+    // The number `text` writes with digits of base `radix`, 2 to 36: `0` to `9`, then `a` to `z` in
+    // either case, after an optional sign. Any other text traps, and so does a radix outside 2 to 36.
+    apply(text: string, radix: int) -> BigInt
+        if bigParsed(text, radix) is Some(n) then return n
+        notANumber(text)
+
+    // The number `BigInt(text)` reads, or None when the text is not one.
+    parse(text: string) -> Option[BigInt] = bigParsed(text, 10)
+
+    // The number `BigInt(text, radix)` reads, or None when the text is not one; a `radix` outside 2 to
+    // 36 still traps, being the caller's mistake and not the text's.
+    parse(text: string, radix: int) -> Option[BigInt] = bigParsed(text, radix)
+
+// Each limb holds nine decimal digits: a product of two limbs, with a limb carried in, fits a `long`.
+private val bigLimbBase: long = 1000000000
+
+private lazy val bigZero: BigInt = BigInt(false, freeze(newArray[long](0)))
+
+private lazy val bigOne: BigInt = bigOfLong(1)
+
+// The number of the sign `negative` whose magnitude is in the first `n` limbs of `a`, an array this
+// code made and nothing else holds: the zero limbs at the top are dropped, and zero is never
+// negative.
+private bigMade(negative: bool, a: Array[long], n: int) -> BigInt
+    var count = n
+    while count > 0 && a(count - 1) == 0 do count -= 1
+    if count == 0 then return bigZero
+    publish(a)
+    val frozen = freeze(a)
+    BigInt(negative, if count == a.length then frozen else frozen.slice(0, count))
+
+// The number `n`. A negative one is split on the negative side, which holds the least `long`.
+private bigOfLong(n: long) -> BigInt
+    val a = newArray[long](3)
+    var rest = n
+    var count = 0
+    while rest != 0
+        val d = rest % bigLimbBase
+        a(count) = if d < 0 then -d else d
+        rest = rest / bigLimbBase
+        count += 1
+    bigMade(n < 0, a, count)
+
+// Whether the magnitude `a` is less than, equal to or greater than `b`: `-1`, `0` or `1`.
+private bigCompareMagnitudes(a: FrozenArray[long], b: FrozenArray[long]) -> int
+    if a.length != b.length then return if a.length < b.length then -1 else 1
+    var i = a.length - 1
+    while i >= 0
+        if a(i) != b(i) then return if a(i) < b(i) then -1 else 1
+        i -= 1
+    0
+
+// The sum of two signed magnitudes: the magnitudes added where the signs agree, and otherwise the
+// smaller taken from the larger, with the larger's sign.
+private bigSum(aNegative: bool, a: FrozenArray[long], bNegative: bool, b: FrozenArray[long]) -> BigInt
+    if aNegative == bNegative then return bigAddMagnitudes(aNegative, a, b)
+    val c = bigCompareMagnitudes(a, b)
+    if c == 0 then bigZero
+    elif c > 0 then bigSubtractMagnitudes(aNegative, a, b)
+    else bigSubtractMagnitudes(bNegative, b, a)
+
+private bigAddMagnitudes(negative: bool, a: FrozenArray[long], b: FrozenArray[long]) -> BigInt
+    val n = if a.length > b.length then a.length else b.length
+    val r = newArray[long](n + 1)
+    var carry: long = 0
+    for i in 0 ..< n
+        val s = (if i < a.length then a(i) else 0) + (if i < b.length then b(i) else 0) + carry
+        carry = if s >= bigLimbBase then 1 else 0
+        r(i) = s - carry * bigLimbBase
+    r(n) = carry
+    bigMade(negative, r, n + 1)
+
+// The magnitude `a` less `b`, where `a` is the larger.
+private bigSubtractMagnitudes(negative: bool, a: FrozenArray[long], b: FrozenArray[long]) -> BigInt
+    val r = newArray[long](a.length)
+    var borrow: long = 0
+    for i in 0 ..< a.length
+        val d = a(i) - (if i < b.length then b(i) else 0) - borrow
+        borrow = if d < 0 then 1 else 0
+        r(i) = d + borrow * bigLimbBase
+    bigMade(negative, r, a.length)
+
+// The product of two magnitudes, limb by limb.
+private bigProduct(negative: bool, a: FrozenArray[long], b: FrozenArray[long]) -> BigInt
+    if a.length == 0 || b.length == 0 then return bigZero
+    val r = newArray[long](a.length + b.length)
+    for i in 0 ..< a.length
+        val x = a(i)
+        var carry: long = 0
+        if x != 0
+            for j in 0 ..< b.length
+                val t = r(i + j) + x * b(j) + carry
+                r(i + j) = t % bigLimbBase
+                carry = t / bigLimbBase
+        r(i + b.length) = carry
+    bigMade(negative, r, a.length + b.length)
+
+// The magnitude `a` times `d`, a number from 1 up to the limb base, written into `into`, whose limb
+// past `a`'s takes the last carry where it has one.
+private bigScaleInto(a: FrozenArray[long], d: long, into: Array[long])
+    var carry: long = 0
+    for i in 0 ..< a.length
+        val t = a(i) * d + carry
+        into(i) = t % bigLimbBase
+        carry = t / bigLimbBase
+    if into.length > a.length then into(a.length) = carry
+
+// Divides the magnitude in the first `n` limbs of `a` by `d`, from 1 up to the limb base, in place,
+// and answers the remainder.
+private bigDivideInPlace(a: Array[long], n: int, d: long) -> long
+    var rem: long = 0
+    var j = n - 1
+    while j >= 0
+        val cur = rem * bigLimbBase + a(j)
+        a(j) = cur / d
+        rem = cur % d
+        j -= 1
+    rem
+
+// The quotient and the remainder of the magnitudes `a` and `b`, with the signs given, the quotient's
+// rounded towards zero. Long division takes one limb of the quotient at a time: both magnitudes are
+// first scaled so that the divisor's top limb is at least half the base, which keeps each limb's
+// estimate from the top two limbs of what is left at most two above the true one.
+private bigDivRem(a: FrozenArray[long], b: FrozenArray[long], quotientNegative: bool, remainderNegative: bool) -> (BigInt, BigInt)
+    if b.length == 0 then fail("division by zero")
+    if bigCompareMagnitudes(a, b) < 0
+        return (bigZero, if a.length == 0 then bigZero else BigInt(remainderNegative, a))
+    val n = b.length
+    val m = a.length - n
+    if n == 1
+        val q = newArray[long](a.length)
+        for i in 0 ..< a.length do q(i) = a(i)
+        val r = bigDivideInPlace(q, a.length, b(0))
+        return (bigMade(quotientNegative, q, a.length), bigOfLong(if remainderNegative then -r else r))
+    val base = bigLimbBase
+    val d = base / (b(n - 1) + 1)
+    val u = newArray[long](a.length + 1)
+    bigScaleInto(a, d, u)
+    val v = newArray[long](n)
+    bigScaleInto(b, d, v)
+    val q = newArray[long](m + 1)
+    var j = m
+    while j >= 0
+        val num = u(j + n) * base + u(j + n - 1)
+        var qhat = num / v(n - 1)
+        var rhat = num % v(n - 1)
+        while qhat >= base || qhat * v(n - 2) > rhat * base + u(j + n - 2)
+            qhat -= 1
+            rhat += v(n - 1)
+            if rhat >= base then break
+        // What is left less `qhat` times the divisor, limb by limb.
+        var borrow: long = 0
+        var carry: long = 0
+        for i in 0 ..< n
+            val p = qhat * v(i) + carry
+            carry = p / base
+            val t = u(i + j) - p % base - borrow
+            borrow = if t < 0 then 1 else 0
+            u(i + j) = t + borrow * base
+        val top = u(j + n) - carry - borrow
+        if top < 0
+            // The estimate was one too many: the divisor goes back once.
+            qhat -= 1
+            var c: long = 0
+            for i in 0 ..< n
+                val s = u(i + j) + v(i) + c
+                c = if s >= base then 1 else 0
+                u(i + j) = s - c * base
+            u(j + n) = top + c
+        else
+            u(j + n) = top
+        q(j) = qhat
+        j -= 1
+    bigDivideInPlace(u, n, d)
+    (bigMade(quotientNegative, q, m + 1), bigMade(remainderNegative, u, n))
+
+// The digit `c` stands for in a base up to 36, or 36 where it is no digit.
+private bigDigitValue(c: char) -> int
+    if '0' <= c <= '9' then int(c) - int('0')
+    elif 'a' <= c <= 'z' then int(c) - int('a') + 10
+    elif 'A' <= c <= 'Z' then int(c) - int('A') + 10
+    else 36
+
+// The number `text` writes in base `radix`, after an optional sign, or None where it is not one.
+private bigParsed(text: string, radix: int) -> Option[BigInt]
+    if !(2 <= radix <= 36) then fail(s"radix $radix is not in 2 to 36")
+    val n = text.byteLength
+    var start = 0
+    var negative = false
+    if n > 0
+        val first = char(int(text.byteAt(0)))
+        negative = first == '-'
+        if negative || first == '+' then start = 1
+    if start == n then return None
+    for i in start ..< n
+        if bigDigitValue(char(int(text.byteAt(i)))) >= radix then return None
+    if radix == 10
+        // Nine decimal digits make a limb, counted from the right.
+        val count = (n - start + 8) / 9
+        val a = newArray[long](count)
+        var until = n
+        for k in 0 ..< count
+            val from = if until - 9 > start then until - 9 else start
+            var v: long = 0
+            for i in from ..< until do v = v * 10 + long(bigDigitValue(char(int(text.byteAt(i)))))
+            a(k) = v
+            until = from
+        return Some(bigMade(negative, a, count))
+    // Any other base takes the digits in runs whose value stays below the limb base: the magnitude so
+    // far is multiplied by the run's scale and the run's value added, the first run being the short one.
+    val r = long(radix)
+    var run = 1
+    var scale = r
+    while scale * r < bigLimbBase
+        scale *= r
+        run += 1
+    val a = newArray[long]((n - start) / run + 2)
+    var length = 0
+    var at = start
+    var take = (n - start) % run
+    if take == 0 then take = run
+    while at < n
+        var value: long = 0
+        var factor: long = 1
+        for i in at ..< at + take
+            value = value * r + long(bigDigitValue(char(int(text.byteAt(i)))))
+            factor *= r
+        var carry = value
+        for i in 0 ..< length
+            val t = a(i) * factor + carry
+            a(i) = t % bigLimbBase
+            carry = t / bigLimbBase
+        if carry != 0
+            a(length) = carry
+            length += 1
+        at += take
+        take = run
+    Some(bigMade(negative, a, length))
+
+// The text of a number in `radix`: a `-` when negative, then the digits of its magnitude.
+private bigRadixText(negative: bool, limbs: FrozenArray[long], radix: int) -> string
+    if limbs.length == 0 then return "0"
+    val out = StringWriter()
+    if negative then out.writeChar('-')
+    bigWriteMagnitude(out, limbs, radix, false)
+    out.text
+
+// A number under an integer conversion, as `integerText` lays one out.
+private bigIntegerText(negative: bool, limbs: FrozenArray[long], spec: FormatSpec) -> string
+    val base = integerBase(spec)
+    val digits = StringWriter()
+    if limbs.length == 0 then digits.write("0") else bigWriteMagnitude(digits, limbs, int(base), spec.conversion == 'X')
+    signedIntegerText(negative, limbs.length == 0, digits.text, base, spec)
+
+// Writes the digits of the magnitude `limbs`, not zero, in `radix`, most significant first. In
+// decimal each limb is nine digits as it stands; any other base divides the magnitude down by the
+// largest power of the radix below the limb base, a run of digits at a time.
+private bigWriteMagnitude(out: Writer, limbs: FrozenArray[long], radix: int, upper: bool)
+    val r = long(radix)
+    if radix == 10
+        var i = limbs.length - 1
+        out.writeInt(limbs(i))
+        while i > 0
+            i -= 1
+            bigWriteRun(out, limbs(i), r, 9, upper)
+        return
+    var run = 1
+    var scale = r
+    while scale * r < bigLimbBase
+        scale *= r
+        run += 1
+    val work = newArray[long](limbs.length)
+    for i in 0 ..< limbs.length do work(i) = limbs(i)
+    var n = limbs.length
+    val runs = Buffer[long]()
+    while n > 0
+        runs.addOne(bigDivideInPlace(work, n, scale))
+        while n > 0 && work(n - 1) == 0 do n -= 1
+    var k = runs.length - 1
+    bigWriteRun(out, runs(k), r, 1, upper)
+    while k > 0
+        k -= 1
+        bigWriteRun(out, runs(k), r, run, upper)
+
+// Writes `v` in `radix` as at least `width` digits, with leading zeros.
+private bigWriteRun(out: Writer, v: long, radix: long, width: int, upper: bool)
+    if width > 1 || v >= radix then bigWriteRun(out, v / radix, radix, width - 1, upper)
+    val digit = v % radix
+    out.writeChar(char(int(if digit < 10 then long('0') + digit elif upper then long('A') + digit - 10 else long('a') + digit - 10)))

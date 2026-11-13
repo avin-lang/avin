@@ -24,8 +24,14 @@ struct Toolchain
     /** What answers for the C libraries' `pkg-config` modules: `pkg-config` itself, or the one a
      * build for another machine asks. */
     pkg_config: string
+    /** Where `avin run` and `avin test` keep what they build for each program, a directory per
+     * program (see `build_cache`), or "" on a machine with no cache directory, where each program
+     * keeps its own `.avin/build` beside it. */
+    builds: string
 
     library_dir(self) -> string = self.root + "/library"
+    /** This toolchain with the programs' builds kept under `builds`. */
+    building_in(self, builds: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, builds)
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
     /** The runtime's archive as a release ships it, built from the runtime's sources whose key is
@@ -43,12 +49,16 @@ end Toolchain
 
 /** A toolchain rooted at `root`, if `root` holds the library and the runtime, building into the
  * user's cache. */
-toolchain_at(root: string) -> Option[Toolchain] = toolchain_in(root, toolchain_cache(get("AVIN_CACHE"), cache_dir(), get("TMPDIR")))
+toolchain_at(root: string) -> Option[Toolchain]
+    val cache = toolchain_cache(get("AVIN_CACHE"), cache_dir(), get("TMPDIR"))
+    toolchain_in(root, cache) match
+        Some(tc) -> Some(tc.building_in(build_root(get("AVIN_CACHE"), cache_dir(), cache)))
+        None -> None
 
-/** A toolchain rooted at `root` that builds into `cache`, if `root` holds the library and the
- * runtime. */
+/** A toolchain rooted at `root` that builds into `cache`, programs' builds in its `build`, if `root`
+ * holds the library and the runtime. */
 toolchain_in(root: string, cache: string) -> Option[Toolchain]
-    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config")
+    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config", cache + "/build")
     if exists(tc.prelude_path()) && is_dir(tc.runtime_dir()) then Some(tc) else None
 
 /** Why the standard library of `tc` is not the one this compiler was built with, or `None` when it
@@ -74,13 +84,27 @@ library_version_error(tc: Toolchain) -> Option[string]
  * and otherwise `avin/<version>` in the user's cache directory, `machine` (`~/Library/Caches` on
  * macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere), or in the temporary directory `temp` (`TMPDIR`)
  * on a machine with none. The version keeps one release's archives from another's. */
-toolchain_cache(named: Option[string], machine: Option[string], temp: Option[string]) -> string
+toolchain_cache(named: Option[string], machine: Option[string], temp: Option[string]) -> string = toolchain_cache_of(named, machine, temp, Version)
+
+/** `toolchain_cache` for a compiler of version `version`. */
+toolchain_cache_of(named: Option[string], machine: Option[string], temp: Option[string], version: string) -> string
     if named is Some(dir)
         if dir != "" then return dir
     val base = machine match
         Some(d) -> d
         None -> temp.unwrap_or("/tmp")
-    (if base.ends_with("/") then base else base + "/") + "avin/" + Version
+    (if base.ends_with("/") then base else base + "/") + "avin/" + version
+
+/** Where `avin run` and `avin test` keep the programs' builds, given the toolchain's `cache` and the
+ * `named` (`AVIN_CACHE`) and `machine` cache directories it was chosen from: `build` in the cache, a
+ * directory per program under it, or "" on a machine with neither, where each program keeps its
+ * builds in `.avin/build` beside it rather than in the temporary directory, which is cleared under
+ * it. */
+build_root(named: Option[string], machine: Option[string], cache: string) -> string
+    if named is Some(dir)
+        if dir != "" then return cache + "/build"
+    if machine is Some(_) then return cache + "/build"
+    ""
 
 /** The toolchain an installed compiler finds, given the `AVIN_ROOT` it was run with and the path of
  * its own executable. `AVIN_ROOT` names one, for working on the library or the runtime; otherwise it
@@ -404,7 +428,10 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
         var report = units[k].report
         for i in units[k].file.imports
             if whole_library then break
-            if missing_library_module(i.path, modules, units) is Some(message)
+            if k >= library_units && package_module_meant(i.path, units) is Some(message)
+                report.add(error(import_path_span(i), message))
+                broken = true
+            elif missing_library_module(i.path, modules, units) is Some(message)
                 report.add(error(import_path_span(i), message))
                 broken = true
             elif k >= library_units
@@ -499,7 +526,7 @@ private missing_library_module(path: string, modules: Map[string, bool], units: 
     Some(s"the standard library has no module `$missing`; the modules under `$deepest` are $under")
 
 // An import whose first name is no module of the program but is one of the standard library's under
-// `avin`, as `import json` for `avin.json`: the import it means, written out. None where the program
+// `avin`, as `import fs` for `avin.fs`: the import it means, written out. None where the program
 // has a module or a declaration of that name, or the library no such module.
 private library_module_meant(path: string, modules: Map[string, bool], units: Buf[SourceUnit]) -> Option[string]
     if is_library_module_name(path) then return None
@@ -516,6 +543,24 @@ private library_module_meant(path: string, modules: Map[string, bool], units: Bu
         for item in u.file.items
             if item_name(item) == first then return None
     Some(s"there is no module `$first`; the standard library's is `$CoreModule.$first`, imported as `import $CoreModule.$path`")
+
+// JSON is a package, `dev.avinlang.json`, rather than a module of the standard library: an import of
+// `avin.json`, or of a declaration in it, is told so by name. So is `import json` in a program that
+// has no module or declaration `json` and does not depend on the package; one that does is told the
+// package's module name by the check, as for any other missing module.
+const JsonPackageModule: string = "dev.avinlang.json"
+
+private package_module_meant(path: string, units: Buf[SourceUnit]) -> Option[string]
+    if path == CoreModule + ".json" || path.starts_with(CoreModule + ".json.")
+        return Some(s"JSON is the package `$JsonPackageModule`; add it to your dependencies")
+    if path != "json" && !path.starts_with("json.") then return None
+    for u in units
+        val m = u.file.module_name
+        if m == "json" || m.starts_with("json.") || m == JsonPackageModule then return None
+        if is_library_module_name(m) then continue
+        for item in u.file.items
+            if item_name(item) == "json" then return None
+    Some(s"there is no module `json`; JSON is the package `$JsonPackageModule`; add it to your dependencies")
 
 // Whether a unit of module `module_name` declares `name`, a top-level declaration or a variant.
 private declares(units: Buf[SourceUnit], module_name: string, name: string) -> bool

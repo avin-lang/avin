@@ -1,0 +1,350 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.path.parent
+import sysl.process.{Stdio, capture}
+import sysl.text.from_utf8_unchecked
+
+// Programs of one file with a dependencies header: the header read from the file, its dependencies
+// resolved, fetched and summed as a manifest's are, and the commands that meet it.
+
+private struct ScriptRun
+    status: int
+    said: string
+    noted: string
+    out: string
+
+private script_avin(dir: string, args: []const string) -> ScriptRun
+    var said = ""
+    var noted = ""
+    val out = dir + "/run.out"
+    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.Inherit)
+    ScriptRun(status, said, noted, read_text(out).unwrap_or(""))
+
+private script_put(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+// The header of `text`, read as a file named `tool.avin`.
+private header_of(text: string) -> Option[ScriptHeader] = script_header(source_of("tool.avin", text)).unwrap()
+
+// The message the header of `text` is refused with.
+private header_error(text: string) -> string
+    script_header(source_of("tool.avin", text)) match
+        Ok(_) -> "read"
+        Err(d) -> d.message
+
+// The text of `h` with its blanks taken off each line.
+private hocon_of(h: ScriptHeader) -> string = from_utf8_unchecked(h.hocon.bytes)
+
+// A package `greeting` beside a program of one file that names it.
+private greeting_package(dir: string)
+    script_put(dir + "/libs/greeting/avin.hocon", "package {\n  name = \"greeting\"\n  version = \"0.1.0\"\n}\n")
+    script_put(dir + "/libs/greeting/greeting/greeting.avin", "module greeting\n\ngreet(name: string) -> string = \"Hello, \" + name + \"!\"\n")
+    script_put(dir + "/libs/greeting/main.avin", "main() = println(\"greeting's own main\")\n")
+
+private const PathHeader: string = "// avin.hocon\n// dependencies {\n//   greeting { path = \"libs/greeting\" }\n// }\n\n"
+
+@test("a dependencies header is the `// avin.hocon` line and the comment lines under it, on the first line or after a `#!` line")
+header_is_found()
+    assert(header_of("main() = ()\n") is None)
+    assert(header_of("") is None)
+    assert(header_of("#!/usr/bin/env avin\n") is None)
+    assert(header_of("// avin.hocon is the manifest\nmain() = ()\n") is None)
+    val h = header_of("// avin.hocon\n// dependencies {\n//   a { path = \"x\" }\n// }\nmain() = ()\n// a later comment\n").unwrap()
+    assert_eq(h.marker.start, 0)
+    assert_eq(h.marker.end, 13)
+    // The header's text keeps every byte where the file has it, `//` and what is outside it blanked.
+    assert_eq(hocon_of(h), "             \n   dependencies {\n     a { path = \"x\" }\n   }\n")
+    val shebang = header_of("#!/bin/avin\n  // avin.hocon  \n//dependencies {}\n").unwrap()
+    assert_eq(shebang.marker.start, 14)
+    assert_eq(hocon_of(shebang), "           \n                 \n  dependencies {}\n")
+    // The header ends at the first line that is not a comment, a blank one included.
+    assert_eq(hocon_of(header_of("// avin.hocon\n\n// dependencies {}\n").unwrap()), "             \n")
+    // A `\r\n` line break keeps its width, so a place in the header is the place in the file.
+    assert_eq(hocon_of(header_of("// avin.hocon\r\n// dependencies {}\r\nmain() = ()\r\n").unwrap()), "              \n   dependencies {} \n")
+    // Unicode in the header keeps its bytes.
+    assert_eq(hocon_of(header_of("// avin.hocon\n// # é 世界\n").unwrap()), "             \n   # é 世界\n")
+
+@test("a `// avin.hocon` line anywhere but the top is refused at it")
+header_not_at_top()
+    val message = "a dependencies header begins on the first line of its file, or on the second after a `#!` line: move `// avin.hocon` and the lines under it to the top"
+    assert_eq(header_error("main() = ()\n// avin.hocon\n"), message)
+    assert_eq(header_error("\n// avin.hocon\n"), message)
+    assert_eq(header_error("// a comment first\n// avin.hocon\n"), message)
+    assert_eq(header_error("#!/bin/avin\n#!/bin/avin\n// avin.hocon\n"), message)
+    assert_eq(header_error("main()\n    // avin.hocon\n    ()\n"), message)
+    // A second marker, even inside the first header, is one not at the top.
+    assert_eq(header_error("// avin.hocon\n// avin.hocon\n"), message)
+    val at = script_header(source_of("t.avin", "main() = ()\n   // avin.hocon\n")).unwrap_err().span
+    assert_eq(at.start, 15)
+    assert_eq(at.end, 28)
+
+@test("a header holds `dependencies` alone, each by `git` or `path`, and its mistakes are told at their place in the file")
+header_manifest()
+    val src = source_of("/x/tool.avin", "#!/bin/avin\n// avin.hocon\n// dependencies {\n//   a { path = \"../a\" }\n//   b { git = \"github.com/owner/b\", version = \"1.2.3\" }\n//   c { git = \"github.com/owner/c\", rev = \"3f9a2c1\" }\n// }\n")
+    val m = script_manifest("/x", src, script_header(src).unwrap().unwrap()).unwrap()
+    assert(m.has_package)
+    assert_eq(m.name, "")
+    assert_eq(m.dependencies.len(), 3)
+    assert(m.dependencies[0].origin is Local(_))
+    assert(m.dependencies[1].origin is Git(_, _))
+    assert(m.dependencies[2].origin is Rev(_, _))
+    assert_eq(src.locate(m.dependencies[1].span.start).line, 5)
+    assert_eq(src.locate(m.dependencies[1].span.start).col, 6)
+    val wrong = ["// avin.hocon\n// features { x = [] }\n", "// avin.hocon\n// workspace = [\"a\"]\n", "// avin.hocon\n// dependencies { a { workspace = true } }\n", "// avin.hocon\n// dependencies { a { path = \"a\", optional = true } }\n", "// avin.hocon\n// dependencies = 3\n", "// avin.hocon\n// dependencies {\n"]
+    val said = ["`features` is not a key of a dependencies header", "`workspace` is not a key of a dependencies header", "`a` is a workspace dependency, and a program of one file is in no workspace", "`a` is optional, and a program of one file has no features to turn it on", "`dependencies` is a block", "unclosed object"]
+    for i in 0..<wrong.len
+        val s = source_of("tool.avin", wrong[i])
+        val got = script_manifest("/x", s, script_header(s).unwrap().unwrap())
+        assert(got is Err(_), wrong[i])
+        assert(got.unwrap_err().message.contains(said[i]), got.unwrap_err().message)
+
+@test("a program of one file runs, builds, checks and tests with the path dependency its header names, and gets no sum file")
+script_path_dependency_commands()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    greeting_package(dir)
+    val file = dir + "/tool.avin"
+    script_put(file, PathHeader + "import greeting.greet\n\nmain(args: Vector[string])\n    println(greet(s\"${args.size}\"))\n\n@test\ngreets()\n    assertEq(greet(\"a\"), \"Hello, a!\")\n")
+    val run = script_avin(dir, ["avin", "run", file, "-O0", "--", "x", "y"])
+    assert_eq(run.noted, "")
+    assert_eq(run.out, "Hello, 2!\n")
+    assert_eq(run.status, 0)
+    assert_eq(script_avin(dir, ["avin", "check", file]).status, 0)
+    val tests = script_avin(dir, ["avin", "test", file, "-O0"])
+    assert_eq(tests.status, 0)
+    assert(tests.said.contains("greets"), tests.said)
+    // The executable is named after the file, not after a package.
+    val exe = dir + "/tool-out"
+    assert_eq(script_avin(dir, ["avin", "build", file, "-O0", "-o", exe]).status, 0)
+    assert(exists(exe))
+    val program = load_program(file, default_fetching()).unwrap()
+    assert_eq(program.package, None)
+    assert_eq(program.files.len(), 2)
+    assert_eq(program.files[1].src.name, file)
+    assert(program.files[0].dependency)
+    assert_eq(program.files[0].package, "greeting")
+    assert_eq(program.files[1].package, "")
+    // A path dependency is a directory being edited, so nothing is summed.
+    assert(!exists(file + ".sum"))
+    // The dependency's own `main` is its own.
+    assert(!program.files[0].src.name.ends_with("main.avin"))
+
+@test("a program of one file with a `#!` line, run as `avin <file> ...`, takes every argument after the file as its own")
+script_shebang_arguments()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    greeting_package(dir)
+    val file = dir + "/tool.avin"
+    script_put(file, "#!/usr/bin/env avin\n" + PathHeader + "import greeting.greet\n\nmain(args: Vector[string])\n    for a in args\n        println(greet(a))\n")
+    // `./tool.avin -O0 -- x` through `#!/usr/bin/env avin` is `avin ./tool.avin -O0 -- x`.
+    val run = script_avin(dir, ["avin", file, "-O0", "--", "x"])
+    assert_eq(run.noted, "")
+    assert_eq(run.out, "Hello, -O0!\nHello, --!\nHello, x!\n")
+    assert_eq(run.status, 0)
+    assert_eq(script_avin(dir, ["avin", file, "a"]).out, "Hello, a!\n")
+    assert_eq(script_avin(dir, ["avin", file, "--features", "x", "-o", "y"]).out, "Hello, --features!\nHello, x!\nHello, -o!\nHello, y!\n")
+    assert_eq(script_avin(dir, ["avin", file]).out, "")
+    // `avin run` keeps the command line's rule: its options are avin's, and only what follows `--`
+    // is the program's.
+    val named = script_avin(dir, ["avin", "run", file, "-O0", "--", "x"])
+    assert_eq(named.noted, "")
+    assert_eq(named.out, "Hello, x!\n")
+    assert_eq(script_avin(dir, ["avin", "run", "-O0", file, "--", "x", "-O2"]).out, "Hello, x!\nHello, -O2!\n")
+    // So does an option before the file, with no command word.
+    assert_eq(script_avin(dir, ["avin", "-O0", file, "--", "y"]).out, "Hello, y!\n")
+    // A file without the line keeps the options as the command's own in every form.
+    script_put(dir + "/plain.avin", "main(args: Vector[string]) = println(args.size)\n")
+    assert_eq(script_avin(dir, ["avin", "run", dir + "/plain.avin", "-O0", "--", "x"]).out, "1\n")
+    assert_eq(script_avin(dir, ["avin", dir + "/plain.avin", "-O0", "--", "x", "y"]).out, "2\n")
+    // A `#!` line that is not the first line is not one.
+    script_put(dir + "/late.avin", "\n#!/usr/bin/env avin\nmain(args: Vector[string]) = println(args.size)\n")
+    assert(script_avin(dir, ["avin", dir + "/late.avin", "-O0", "--", "x"]).status != 0)
+    // Parsing, formatting and checking pass the line over.
+    assert_eq(script_avin(dir, ["avin", "check", file]).status, 0)
+    assert_eq(format_text("t.avin", "#!/usr/bin/env avin\nmain() = ()\n").unwrap(), "#!/usr/bin/env avin\nmain() = ()\n")
+
+@test("a header in a file of a package, or of a program of many files, is refused at it")
+header_outside_a_script()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    greeting_package(dir)
+    script_put(dir + "/app/avin.hocon", "package {\n  name = \"app\"\n  version = \"0.1.0\"\n}\n")
+    script_put(dir + "/app/main.avin", "// avin.hocon\n// dependencies {\n//   greeting { path = \"../libs/greeting\" }\n// }\nmain() = ()\n")
+    val packaged = script_avin(dir, ["avin", "check", dir + "/app/main.avin"])
+    assert_eq(packaged.status, 1)
+    assert(packaged.noted.contains("this dependencies header is in a file that is in the package `app`, whose dependencies are named in its avin.hocon: name them there"), packaged.noted)
+    assert(packaged.noted.contains("app/main.avin:1:1"), packaged.noted)
+    script_put(dir + "/many/main.avin", "main() = ()\n")
+    script_put(dir + "/many/util/util.avin", "module util\n\n// avin.hocon\n")
+    val many = script_avin(dir, ["avin", "check", dir + "/many"])
+    assert_eq(many.status, 1)
+    assert(many.noted.contains("is one of the files of the program at"), many.noted)
+    // The same file run alone is a program of one file again.
+    script_put(dir + "/many/tool.avin", PathHeader.replace_all("libs/greeting", "../libs/greeting") + "import greeting.greet\n\nmain() = println(greet(\"z\"))\n")
+    assert_eq(script_avin(dir, ["avin", "run", dir + "/many/tool.avin"]).out, "Hello, z!\n")
+
+// Runs git in `dir` with the package tests' settings, and fails the test if it fails.
+private script_git(dir: string, args: []const string)
+    var all: Buf[string] = buf()
+    for a in ["-C", dir, "-c", "user.name=avin", "-c", "user.email=avin@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "init.defaultBranch=main", "-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+        all.push(a)
+    for a in args
+        all.push(a)
+    val result = capture("git", all.view(), stderr = true, timeout = 60000).unwrap()
+    if !result.status.ok() then eprints(result.err.unwrap_or("") + result.text)
+    assert(result.status.ok())
+
+// A bare repository at `remotes/example.com/avin/<name>.git`, as a host serves it, holding `shapes` at
+// 0.1.0 and 0.2.0 and `extra` at 0.1.0, which asks for `shapes` 0.2.0.
+private script_published(dir: string)
+    val shapes = dir + "/work/shapes"
+    script_put(shapes + "/avin.hocon", "package {\n  name = \"shapes\"\n  version = \"0.1.0\"\n}\n")
+    script_put(shapes + "/shapes/shapes.avin", "module shapes\n\nsize() -> int = 1\n")
+    script_git(shapes, ["init", "-q"])
+    script_git(shapes, ["add", "-A"])
+    script_git(shapes, ["commit", "-q", "-m", "one"])
+    script_git(shapes, ["tag", "v0.1.0"])
+    script_put(shapes + "/shapes/shapes.avin", "module shapes\n\nsize() -> int = 2\n")
+    script_put(shapes + "/solid/avin.hocon", "package {\n  name = \"solid\"\n  version = \"0.2.0\"\n}\n")
+    script_put(shapes + "/solid/solid/solid.avin", "module solid\n\nfaces() -> int = 6\n")
+    script_git(shapes, ["add", "-A"])
+    script_git(shapes, ["commit", "-q", "-m", "two"])
+    script_git(shapes, ["tag", "v0.2.0"])
+    val extra = dir + "/work/extra"
+    script_put(extra + "/avin.hocon", "package {\n  name = \"extra\"\n  version = \"0.1.0\"\n}\ndependencies {\n  shapes { git = \"example.com/avin/shapes\", version = \"0.2.0\" }\n}\n")
+    script_put(extra + "/extra/extra.avin", "module extra\n\nimport shapes.size\n\ndoubled() -> int = 2 * size()\n")
+    script_git(extra, ["init", "-q"])
+    script_git(extra, ["add", "-A"])
+    script_git(extra, ["commit", "-q", "-m", "one"])
+    script_git(extra, ["tag", "v0.1.0"])
+    make_dir_all(dir + "/remotes/example.com/avin").unwrap()
+    script_git(dir, ["clone", "-q", "--bare", shapes, dir + "/remotes/example.com/avin/shapes.git"])
+    script_git(dir, ["clone", "-q", "--bare", extra, dir + "/remotes/example.com/avin/extra.git"])
+
+@test("a program of one file's git dependencies are fetched into the cache, chosen at the highest version asked for, and summed beside the file")
+script_git_dependencies()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    script_published(dir)
+    val file = dir + "/tool.avin"
+    val header = "// avin.hocon\n// dependencies {\n//   shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n//   extra { git = \"example.com/avin/extra\", version = \"0.1.0\" }\n// }\n"
+    script_put(file, header + "import shapes.size\nimport extra.doubled\n\nmain() = println(s\"${size()} ${doubled()}\")\n")
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    val program = load_program(file, fetching).unwrap()
+    var names = ""
+    for f in program.files
+        names = names + f.src.name + "\n"
+    assert(names.contains("/cache/example.com/avin/shapes/@v0.2.0/shapes/shapes.avin"), names)
+    assert(!names.contains("@v0.1.0/shapes/"), names)
+    assert(names.contains("/cache/example.com/avin/extra/@v0.1.0/extra/extra.avin"), names)
+    assert_eq(compile_files(repository_toolchain(), program.files).diagnostics, "")
+    // The sum file is the file's name and `.sum`, with a line for every version read.
+    val sums = read_sums(file + ".sum").unwrap()
+    assert_eq(sums.len(), 3)
+    assert_eq(sums[0].coordinate, "example.com/avin/shapes")
+    assert_eq(sums[0].version, "0.1.0")
+    assert(!exists(dir + "/avin.sum"))
+    // A second load reads the cache and leaves the sum file as it was.
+    val before = read_text(file + ".sum").unwrap()
+    assert_eq(load_program(file, fetching).unwrap().files.len(), program.files.len())
+    assert_eq(read_text(file + ".sum").unwrap(), before)
+    // A package whose hash is not its line's is refused.
+    write_text(file + ".sum", before.replace_all("sha256:", "sha256:0")).unwrap()
+    val refused = load_program(file, fetching).unwrap_err()
+    assert(refused.contains("tool.avin.sum records example.com/avin/shapes v0.1.0 as"), refused)
+    write_text(file + ".sum", before).unwrap()
+    // `avin tidy` rewrites it to what the header reads, and `--check` fails while it is not that.
+    write_text(file + ".sum", before + "example.com/avin/gone v9.9.9 sha256:00\n").unwrap()
+    var said = ""
+    assert_eq(tidy_script(file, fetching, true, s -> said = said + s + "\n").unwrap(), false)
+    assert_eq(said, "would remove example.com/avin/gone v9.9.9\n")
+    assert_eq(tidy_script(file, fetching, false, s -> ()).unwrap(), false)
+    assert_eq(read_text(file + ".sum").unwrap(), before)
+    assert_eq(tidy_script(file, fetching, true, s -> ()).unwrap(), true)
+    // A file whose header is taken away reads nothing, so its sum file goes.
+    script_put(file, "main() = ()\n")
+    assert_eq(tidy_script(file, fetching, false, s -> ()).unwrap(), false)
+    assert(!exists(file + ".sum"))
+    assert_eq(tidy_script(file, fetching, true, s -> ()).unwrap(), true)
+
+@test("a program of one file's header names a member of a repository, and a commit, as a manifest does")
+script_member_and_rev()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    script_published(dir)
+    val file = dir + "/tool.avin"
+    script_put(file, "// avin.hocon\n// dependencies {\n//   solid { git = \"example.com/avin/shapes\", member = \"solid\", version = \"0.2.0\" }\n// }\nimport solid.faces\n\nmain() = println(faces())\n")
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    val program = load_program(file, fetching).unwrap()
+    assert_eq(program.files.len(), 2)
+    assert(program.files[0].src.name.ends_with("/@v0.2.0/solid/solid/solid.avin"), program.files[0].src.name)
+    assert_eq(compile_files(repository_toolchain(), program.files).diagnostics, "")
+    val member_sum = read_text(file + ".sum").unwrap()
+    assert(member_sum.starts_with("example.com/avin/shapes") && member_sum.contains(" v0.2.0 sha256:"), member_sum)
+    // The same repository at a commit, by its full id or an abbreviation.
+    val sha = capture("git", ["-C", dir + "/work/shapes", "rev-parse", "v0.1.0"], timeout = 60000).unwrap().text.trim()
+    script_put(file, s"// avin.hocon\n// dependencies {\n//   shapes { git = \"example.com/avin/shapes\", rev = \"${sha[0..<9]}\" }\n// }\nimport shapes.size\n\nmain() = println(size())\n")
+    val pinned = load_program(file, fetching).unwrap()
+    assert(pinned.files[0].src.name.contains(s"/@r$sha/"), pinned.files[0].src.name)
+    assert(read_text(file + ".sum").unwrap().contains(s"example.com/avin/shapes r$sha sha256:"))
+
+@test("a program of one file asks for a dependency's features as a manifest does, and a gated module it did not ask for is refused")
+script_dependency_features()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    greeting_package(dir)
+    script_put(dir + "/libs/greeting/avin.hocon", "package {\n  name = \"greeting\"\n  version = \"0.1.0\"\n}\nfeatures {\n  loud { modules = [greeting.loud] }\n}\n")
+    script_put(dir + "/libs/greeting/greeting/loud/loud.avin", "module greeting.loud\n\nshout(s: string) -> string = s + \"!!\"\n")
+    val file = dir + "/tool.avin"
+    script_put(file, "// avin.hocon\n// dependencies {\n//   greeting { path = \"libs/greeting\", features = [loud] }\n// }\nimport greeting.loud.shout\n\nmain() = println(shout(\"hey\"))\n")
+    assert_eq(script_avin(dir, ["avin", "run", file, "-O0"]).out, "hey!!\n")
+    script_put(file, PathHeader + "import greeting.loud.shout\n\nmain() = println(shout(\"hey\"))\n")
+    val off = script_avin(dir, ["avin", "check", file])
+    assert_eq(off.status, 1)
+    assert(off.noted.contains("loud"), off.noted)
+    // A feature the dependency does not declare is refused at the line asking for it.
+    script_put(file, "// avin.hocon\n// dependencies {\n//   greeting { path = \"libs/greeting\", features = [quiet] }\n// }\nmain() = ()\n")
+    val unknown = script_avin(dir, ["avin", "check", file])
+    assert_eq(unknown.status, 1)
+    assert(unknown.noted.contains("quiet"), unknown.noted)
+    assert(unknown.noted.contains("tool.avin:3:"), unknown.noted)
+
+@test("a program of one file's git dependency at a version not tagged, in a repository that does not exist, or not fetched while fetching is off, is refused")
+script_git_refusals()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    script_published(dir)
+    val file = dir + "/tool.avin"
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    script_put(file, "// avin.hocon\n// dependencies {\n//   shapes { git = \"example.com/avin/shapes\", version = \"0.3.0\" }\n// }\nmain() = ()\n")
+    assert(load_program(file, fetching).unwrap_err().contains("cannot fetch example.com/avin/shapes v0.3.0"))
+    script_put(file, "// avin.hocon\n// dependencies {\n//   nobody { git = \"example.com/avin/nobody\", version = \"0.1.0\" }\n// }\nmain() = ()\n")
+    assert(load_program(file, fetching).unwrap_err().contains("cannot fetch example.com/avin/nobody v0.1.0"))
+    script_put(file, "// avin.hocon\n// dependencies {\n//   shapes { git = \"example.com/avin/shapes\", version = \"0.1.0\" }\n// }\nmain() = ()\n")
+    assert(load_program(file, Fetching(dir + "/empty", "file://" + dir + "/remotes/", false)).unwrap_err().contains("example.com/avin/shapes v0.1.0 is not fetched yet"))
+    // Nothing refused was summed.
+    assert(!exists(file + ".sum"))
+
+@test("a program of one file is not vendored, and is not a package `avin add` writes into")
+script_not_vendored()
+    val dir = make_temp_dir("avin-script").unwrap()
+    defer _ = remove_dir_all(dir)
+    greeting_package(dir)
+    val file = dir + "/tool.avin"
+    script_put(file, PathHeader + "main() = ()\n")
+    val vendored = script_avin(dir, ["avin", "vendor", file])
+    assert_eq(vendored.status, 1)
+    assert(vendored.noted.contains("is a program of one file, which is not vendored"), vendored.noted)
+    assert(!exists(dir + "/vendor"))
+    val added = script_avin(dir, ["avin", "add", "github.com/owner/json@1.0.0", file])
+    assert_eq(added.status, 1)
+    assert(added.noted.contains("is in no package"), added.noted)
+    // `avin tidy` of a file with only path dependencies has nothing to record.
+    val tidied = script_avin(dir, ["avin", "tidy", "--check", file])
+    assert_eq(tidied.status, 0)
+    assert(!exists(file + ".sum"))

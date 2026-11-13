@@ -20,8 +20,9 @@ The release is also a tarball, `avin-<version>-darwin-arm64.tar.gz`, laid out as
 `bin/` on your `PATH`, and `avin` finds the standard library and runtime in `share/avin` beside
 itself, through any symbolic link to it. It never writes there: the runtime archives and binding
 shims it builds are kept in `~/Library/Caches/avin/<version>` (`$XDG_CACHE_HOME/avin` or
-`~/.cache/avin` elsewhere; `AVIN_CACHE` names another directory), and a program's executables and
-what its builds keep for the next in `.avin/` beside the program.
+`~/.cache/avin` elsewhere; `AVIN_CACHE` names another directory), and so are a program's executables
+and what its builds keep for the next, in a directory of the program's own under `build/` there.
+Nothing is written beside the program.
 
 What an installed `avin` runs:
 
@@ -38,7 +39,7 @@ A missing tool is reported by name, with what installs it.
 
 Working on the compiler, the library or the runtime needs:
 
-- Sysl 0.10.6, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
+- Sysl 0.10.7, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
   the repository: the repository is cloned into a directory named for its organization
   (`avin-lang/avin`), beside a `sysl-lang` directory holding `sysl-lang/parsing`
 - clang on `PATH`
@@ -65,13 +66,14 @@ location, and is only for development: an installed `avin` needs no setting.
 
 The program writes to the terminal as it runs, and `avin run` exits with the program's own status;
 when a trap stops the program, the status is 128 and the signal's number, as a shell reports it.
-Everything after `--` is passed to the program as its arguments. The executable is kept in `.avin/build/`
-in the program's directory, and the next run of an unchanged program starts it without building it
-again. Any change to the program's sources, the standard library, the runtime or the compiler
-builds it again, and every build, `avin build` and `avin test` included, keeps what it made of each
-function in `.avin/build/incremental/`, so a rebuild after an edit makes again only what the edit
-can change ([incremental builds](/compiler/#incremental-builds); `AVIN_INCREMENTAL=off` turns it
-off). Deleting `.avin/` is always safe.
+Everything after `--` is passed to the program as its arguments. The executable is kept in the
+program's own directory in the cache ([running and testing](/compiler/#running-and-testing)), and the
+next run of an unchanged program starts it without building it again. Any change to the program's
+sources, the standard library, the runtime or the compiler builds it again, and every build, `avin
+build` and `avin test` included, keeps what it made of each function there too, so a rebuild after an
+edit makes again only what the edit can change ([incremental builds](/compiler/#incremental-builds);
+`AVIN_INCREMENTAL=off` turns it off). `avin clean` removes the program's cache and `avin clean --all`
+every program's; either is always safe.
 
 A program is a source file or a directory: `avin run my-program` builds every `.avin` and `.lavin`
 file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by
@@ -216,6 +218,34 @@ package. Fetched packages are kept in the machine's cache, and `avin.sum` beside
 what each one hashed to; commit it. `avin add github.com/owner/json@1.4.0` writes the dependency
 into the manifest and fetches it, and without `@1.4.0` takes the highest release. `avin tidy` rewrites it to exactly what the package uses, and
 `avin tidy --check` fails when it is not. The [packages chapter](/spec/packages/) has the rest.
+
+A program of one file uses packages too, with no manifest: its first lines name them, after a
+`// avin.hocon` line, in the comment lines under it, written exactly as a manifest's `dependencies`
+block is. A `#!` line may come first, so the file runs as a command:
+
+```text
+#!/usr/bin/env avin
+// avin.hocon
+// dependencies {
+//   json { git = "github.com/avin-lang/json", version = "0.1.0" }
+// }
+
+import dev.avinlang.json
+
+main(args: Vector[string])
+    ...
+```
+
+```sh
+chmod +x tool.avin
+./tool.avin data.json
+```
+
+`avin run`, `build`, `check` and `test` fetch what the header names into the same cache, and the
+hashes go in `tool.avin.sum` beside the file. A blank line ends the header. Run through its `#!`
+line, `./tool.avin data.json` is `avin ./tool.avin data.json`, and every argument after the file is
+the program's own; `avin run tool.avin -O0 -- data.json` keeps the usual rule, with `-O0` avin's. The
+[packages chapter](/spec/packages/#programs-of-one-file) has the rules.
 
 ## Formatting
 

@@ -686,7 +686,11 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - After `:` comes at most one superclass, with its constructor arguments, followed by any number of
   traits.
 - Classes are **final unless declared `open` or `abstract`**. Overriding requires `override`.
-  An `abstract class` may leave members without bodies and cannot be instantiated.
+  An `abstract class` may leave members without bodies and cannot be instantiated. `open` and
+  `abstract` mark a class only: a method takes neither, since every public method of such a class
+  may be overridden and one without a body is abstract already; nor does a trait, a data type, an
+  object or a top-level function. `override` marks a method alone. Each misplaced
+  word is an error that says to remove it.
 - Instances are heap objects with identity. Unless the class implements or derives `Eq`, `==` and
   the hash are by identity, like `===`; `class Point(x: int, y: int) derives Eq, Hash, Display`
   compares and hashes by its fields, which for `derives` are its constructor parameters. Display
@@ -1084,7 +1088,10 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   `Pair[int, string].zero()`) or a type parameter whose bounds have it (`T.zero()` with `T: Add`).
   Through a bound each instance calls its type argument's own directly, an open class's included,
   since no object is involved. Calling one on a value is an error, and so is calling a value's method
-  on a type. A local, a parameter, a member or a module value of the name hides the type.
+  on a type. A local, a parameter, a member or a module value of the name hides the type. A
+  companion object does not: `BigInt.zero()` calls the type's static member beside
+  `object BigInt`'s `apply`, unless the companion declares a member of that name itself, which
+  `Name.member` then means.
 - **The name of a data type whose variant of its own name has no fields is also a value**, so
   `Lone.hi()` of `data Lone()` calls the method `hi` of that value, as `val l = Lone; l.hi()` does,
   and `Lone.hi` without a call is a function value bound to it. Where the type has a static member

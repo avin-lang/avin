@@ -4259,7 +4259,7 @@ item_name(item: Item) -> string = item match
 private global_name_taken(c: *Checker, unit: usize, name: string, at: Span, object: bool) -> bool
     val key = qualified(c.units[unit].file.module_name, name)
     if c.global_names.get(key) is Some(g)
-        note_duplicate(c, unit, at, s"`$name` is declared more than once", c.globals[g].unit, c.globals[g].span)
+        if !is_shape_value_name(name) then note_duplicate(c, unit, at, s"`$name` is declared more than once", c.globals[g].unit, c.globals[g].span)
         return true
     if object then return false
     if c.class_types.get(key) is Some(k)
@@ -14311,6 +14311,14 @@ private integer_type(c: *Checker, t: &Type) -> bool = *t match
         None -> false
     _ -> false
 
+// Whether `t` is a whole number the integer conversions write: an integer, a `byte`, or the core
+// library's `BigInt`, whose `display` lays its digits out under them as an integer's are.
+private whole_number_type(c: *Checker, t: &Type) -> bool
+    if integer_type(c, t) || *t is Byte then return true
+    if *t is Class(k, _, _)
+        if c.class_types.get(qualified(CoreModule, "BigInt")) is Some(big) then return big == k
+    false
+
 // The `FormatSpec` an `f"…"` specifier describes, after checking it against the hole it follows: the
 // conversion is one the hole's type takes, each flag has an effect under it, and a width or precision
 // written as a hole is an integer. `None` when it has been reported.
@@ -14334,13 +14342,13 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
         zeros = true
         grouping = true
         wanted = "an integer"
-        fits = integer_type(c, t) || *t is Byte
+        fits = whole_number_type(c, t)
     elif letter == "x" || letter == "X" || letter == "o" || letter == "b"
         signs = true
         zeros = true
         alternate = true
         wanted = "an integer"
-        fits = integer_type(c, t) || *t is Byte
+        fits = whole_number_type(c, t)
     elif letter == "f" || letter == "e" || letter == "g" || letter == "E" || letter == "G"
         signs = true
         zeros = true
@@ -14352,7 +14360,7 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
         fits = *t is Char
     elif letter == "s"
         wanted = "a string or another value that is not a number"
-        fits = !(integer_type(c, t) || *t is Byte || *t is Real)
+        fits = !(whole_number_type(c, t) || *t is Real)
     elif letter == "?"
         fits = true
     elif letter == "u"
@@ -16406,7 +16414,9 @@ static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
         _ -> return None
     if name == "self" || name == "super" || name == "_" then return None
     if lookup_local(c, name) is Some(_) || param_index(c, name) is Some(_) then return None
-    if class_member(c, name) is Some(_) || global_named(c, name) is Some(_) then return None
+    if class_member(c, name) is Some(_) then return None
+    if global_named(c, name) is Some(_)
+        if !companion_leaves_static(c, name, member) then return None
     // A class's name is also its constructor's, which a call on the name does not mean.
     for f in lookup_functions(c, name)
         if !c.symbols[f].constructor then return None
@@ -16586,6 +16596,24 @@ private names_fieldless_value(c: *Checker, target: &Expr) -> Option[usize]
     for v in variants_named(c, name)
         if c.data[v.data].name == name && c.data[v.data].variants[v.index].fields.len() == 0 then return Some(v.data)
     None
+
+// Whether `Name.member`, where `name` names a class or a data type and its companion object both,
+// means the type's static member `member`: the companion declares no member of that name and the
+// type has a static one, as `BigInt.zero()` calls `Add`'s `zero` beside `object BigInt`'s `apply`.
+private companion_leaves_static(c: *Checker, name: string, member: string) -> bool
+    val key = resolve_name(c, unit_of(c), name)
+    if c.class_types.get(key) is Some(k)
+        if c.classes[k].decl.object then return false
+        if c.classes[k].companion is Some(o)
+            if companion_member(c, o, member) then return false
+            for m in methods_named(c, k, member)
+                if c.symbols[m].static_member then return true
+        return false
+    if c.types.get(key) is Some(t)
+        if c.data[t].companion is Some(o)
+            if companion_member(c, o, member) then return false
+            return has_static_member(c, t, member)
+    false
 
 // Whether data type `id` has a static member `name`, which a call on the type's name means even
 // where the name is also a value.
@@ -19362,13 +19390,10 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
         Wildcard -> TPattern(p.span, ty, PWildcard)
         InvalidPattern -> TPattern(p.span, ErrorType, PWildcard)
         Name(name) ->
-            // A bare name is a variant with no fields when one is in scope, and otherwise binds.
+            // A bare name is a variant when one is in scope, and otherwise binds. A variant with
+            // fields named alone tests for the variant and binds none of them, as `V(_, _)` does.
             val (chosen, is_variant) = choose_variant(c, p.span, name, Some(ty))
-            if chosen is Some(v)
-                if c.data[v.data].variants[v.index].fields.len() > 0
-                    c.note(unit, p.span, s"`$name` has fields; match them, as in `$name(fields)`")
-                    return TPattern(p.span, ErrorType, PWildcard)
-                return variant_pattern(c, p, v, buf(), ty, no_bind)
+            if chosen is Some(v) then return variant_pattern(c, p, v, ignored_fields(c, p.span, v), ty, no_bind)
             if is_variant then return TPattern(p.span, ErrorType, PWildcard)
             if no_bind != ""
                 c.note(unit, p.span, no_bind)
@@ -19433,9 +19458,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
         Constructor(path, args, parens) ->
             val (chosen, is_variant) = choose_variant(c, p.span, path, Some(ty))
             if chosen is Some(v)
-                if !parens && c.data[v.data].variants[v.index].fields.len() > 0
-                    c.note(unit, p.span, s"`$path` has fields; match them, as in `$path(fields)`")
-                    return TPattern(p.span, ErrorType, PWildcard)
+                if !parens then return variant_pattern(c, p, v, ignored_fields(c, p.span, v), ty, no_bind)
                 return variant_pattern(c, p, v, args, ty, no_bind)
             if is_variant || no_such_variant(c, p.span, path) then return failed_extractor(c, p, args, no_bind)
             extractor_pattern(c, p, path, args, ty, no_bind)
@@ -19774,6 +19797,13 @@ private binder_local(c: *Checker, binder: &Pattern, ty: &Type, no_bind: string) 
 
 // A variant pattern matches a value of the variant's own type, and each field pattern the field's
 // type in the matched value's type.
+/** A `_` for each of a variant's fields: what a variant named alone in a pattern matches them by. */
+private ignored_fields(c: *Checker, at: Span, v: VariantRef) -> Buf[&Pattern]
+    var args: Buf[&Pattern] = buf()
+    for _ in 0..<c.data[v.data].variants[v.index].fields.len()
+        args.push(Pattern(at, Wildcard))
+    args
+
 private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Pattern], ty: &Type, no_bind: string) -> &TPattern
     val unit = unit_of(c)
     val d = c.data[v.data]

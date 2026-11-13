@@ -72,8 +72,20 @@ symbols carry the module path, so two modules may each declare `helper`.
 
 ## Running and testing
 
-`avin run` and `avin test` build through the same pipeline as `avin build`, into a cache in the
-program's directory, `.avin/build/` (beside the file, for a program of one file). Beside each
+`avin run` and `avin test` build through the same pipeline as `avin build`, into a cache of the
+program's own in the user's cache directory: `build/<name>-<key>/` in the toolchain's cache,
+`~/Library/Caches/avin/<version>/` on macOS, `$XDG_CACHE_HOME/avin/<version>/` or
+`~/.cache/avin/<version>/` elsewhere, or the directory `AVIN_CACHE` names. `<name>` is the program's
+directory's name, or its file's without the extension, and `<key>` twelve hex digits of a hash of its
+absolute path, so two copies of one program, such as two worktrees of a repository, never share a
+cache, and a compiler of another version never reads this one's. Nothing is written beside the
+program, and a program of one file run from anywhere leaves its directory as it was. Only on a
+machine with no cache directory (no `HOME`, no `XDG_CACHE_HOME`, no `AVIN_CACHE`) is the cache
+`.avin/build/` in the program's directory instead, or beside the file for a program of one file.
+`avin clean [<program>]` removes the program's cache, and the `.avin/build/` beside it if there is
+one; `avin clean --all` removes every program's cache this version keeps, and leaves the fetched
+packages, the runtime's archives and the shims. `avin build` is not a cache: it writes the
+executable where `-o` says, or in the working directory. Beside each
 executable, `<name>-O2` or `<name>-tests-O2`, a record holds the key it was built for: a hash over the
 compiler's version and its executable's modification time, the kind of build and its optimization,
 the runtime's sources, the standard library's and the program's. A run whose key matches the record
@@ -116,8 +128,8 @@ lowering makes it, and the front end stays a whole-program pass that runs on eve
 | Cache | Holds | Key | Where |
 | --- | --- | --- | --- |
 | Unit objects | each codegen unit's object | the unit's text, clang's version, the level | the toolchain's cache (exists) |
-| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `.avin/build/incremental/<kind><level>/`, a one-file program's prefixed by its name |
-| Executable | the linked program | the build key of [running and testing](#running-and-testing) | `.avin/build/` (exists) |
+| Instances | each instance's finished LLVM text, the instances, records, strings and trap sites it requests, and the summary the whole-program passes read of it | the instance key, below | `incremental/<kind><level>/` in the program's build cache |
+| Executable | the linked program | the build key of [running and testing](#running-and-testing) | the program's build cache (exists) |
 
 Instances are stored a file per source module, holding the instances of that module's functions
 (the functions lowering makes are the module `<generated>`'s), so a module whose functions'
@@ -231,18 +243,21 @@ format, the length and the CRC-32 of what follows, and is written under a tempor
 published by rename; a reader that finds one missing, short or failing its checksum passes over it,
 its entries misses, and the build writes it again. A file the build read whole is touched rather
 than written. The manifest naming the module files of the build is written last, the same way. No
-lock is taken: whichever manifest is published last names files the other build left in place. A
+lock is taken: whichever manifest is published last names files the other build left in place. The
+executables `run` and `test` keep beside it, and their records, are published by rename too. A
 build trims the module files that its manifest does not name and that no build used in the last
 hour, and any temporary file left that long, as the unit cache spares what is fresh; there is no
 size limit.
 
 **On by default.** Every command that builds a program reads and writes the instance cache: `avin
 build`, `avin run`, `avin test` and `avin emit-llvm`. It is kept in
-`.avin/build/incremental/<kind><level>/` beside the executables `run` and `test` build: in the
-package's or the program's directory, `program-O2` or `tests-O0`, since a build for tests is another
-program, with keys of its own, and the two kinds never share a file. A program of one file shares its
-directory's `.avin/build` with every other file there, so its directories are named after it
-(`hello-program-O2` for `hello.avin`) and two such programs never trim each other's entries. A run
+`incremental/<kind><level>/` in the program's build cache, beside the executables `run` and `test`
+build ([running and testing](#running-and-testing)): `program-O2` or `tests-O0`, since a build for
+tests is another program, with keys of its own, and the two kinds never share a file. Every program,
+a program of one file too, has a build cache of its own, so two programs never trim each other's
+entries. On a machine with no cache directory, where a program of one file shares its directory's
+`.avin/build` with every other file there, its directories are named after it (`hello-program-O2`
+for `hello.avin`) for the same reason. A run
 that finds its executable already built reads no cache at all. `avin check` keeps none, and the
 language server only checks, so it builds nothing to keep.
 
@@ -255,7 +270,8 @@ A cache needs no care. Another compiler (a newer release, or the same one built 
 compiler's executable and its time are in every key) finds no entry it can use, builds as from
 nothing and writes its own; the files it does not name are trimmed an hour after their last use. A
 module file that is short, damaged or missing, and a manifest naming anything but a module file of
-its own directory, are passed over and written again. Deleting `.avin/build` is always safe. Its size
+its own directory, are passed over and written again. Deleting a build cache, with `avin clean` or
+by hand, is always safe. Its size
 is about what the program's text is: on marshal (7,400 lines, with its packages and the library) a
 level's directory is 22 module files and 185 MB, so building and testing it at `-O2` keeps two of
 those.

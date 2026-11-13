@@ -673,7 +673,7 @@ trait Reader
 source is still going, and an empty array once it has ended. `fs.File` is a reader by its own
 `read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
-[`avin.json`](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
+JSON package's `JsonReader` ([`dev.avinlang.json`](/spec/json/)) reads JSON from any reader.
 
 ### `Close`
 
@@ -1555,5 +1555,6 @@ with futures reaches for is there, under these names:
 
 ## JSON
 
-JSON is part of the standard library: [`avin.json`](/spec/json/), in `library/avin/json`, which a
-script of one file imports with no manifest, `import avin.json`.
+JSON is not part of the standard library: it is the package [`dev.avinlang.json`](/spec/json/), in
+its own repository, which a program adds to its dependencies. `import avin.json` is an error naming
+the package.
