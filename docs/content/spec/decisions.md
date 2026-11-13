@@ -7672,6 +7672,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   than the compiler" (a newer library declares what an older compiler cannot check, which is the
   failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
   library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
+- Proposed (built on branch `c1-diagnostics`): **A method declared `m()` and named bare where a
+  value is expected is reported as "`m` is called with `()`: write `c.m()`, or `() -> c.m()` for a
+  function value"**, the call first, written on the receiver as the program named it (a local or
+  parameter by name, `self`, a type for a static member, nothing for a bare name's implicit `self`),
+  `_.m()` alone for a placeholder, and `.m()` with "a lambda calling it" for any other receiver.
+  Why: the error is almost always a missing `()` now that pure accessors are declared without a
+  parameter list, so the fix leads, and a fix written on the program's own receiver is what the
+  reader types; the old text ("is declared with an empty parameter list, so naming it without a
+  call makes a function value, which is allowed only where …") put the rule before the fix and
+  showed `x.m()` for every receiver. Alternatives weighed: repeating a complex receiver's source
+  text (the checker holds no source text, and a long chain would crowd the message); keeping the
+  `x.` placeholder (it names a variable the program does not have). The opposite message, for
+  `x.m()` on a parameterless `m`, is unchanged: it already reads well inside lambdas, placeholders
+  and chains.
 
 
 ## Proposed
