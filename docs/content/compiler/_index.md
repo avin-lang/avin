@@ -19,7 +19,7 @@ the standard library — in one run.
 | Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
 | C unit | `@c` declarations → C unit object + measurements | Generates one C file of header checks, measurements and glue, compiles it with clang under the C libraries' flags, and reads the measurements out of the object ([stage 13](/compiler/roadmap/)). |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
-| Lower | mono HIR → MIR | Explicit control flow, object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
+| Lower | mono HIR → MIR | Explicit control flow (a deferred statement lowered again at every edge that leaves its block), object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
 | Link | `.ll` + runtime + shim → executable | The module cut into codegen units, each compiled by its own clang at once and its object cached by its text; then clang links the objects, the runtime library, the cached shim library, the C unit's object and the C libraries' link flags. |
 

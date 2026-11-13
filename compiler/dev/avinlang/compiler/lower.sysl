@@ -55,6 +55,9 @@ private struct LoopTarget
     head: usize
     exit: usize
     slot: Option[Place]
+    /** How many deferred statements were reached outside the loop: a `break` or `continue` runs
+     * the ones past these. */
+    defers: usize
 
 /** Where each field of one variant is kept in its object: a byte offset and machine type, or
  * `None` for a field with no runtime value. */
@@ -285,6 +288,9 @@ private struct Lowering
     /** Where the instance being lowered answers with the parts of a tuple, one word each, the
      * tuple's fields its words are read from; empty for any other instance. */
     result_words: Buf[FieldSlot]
+    /** The deferred statements reached in the blocks enclosing the code being lowered, innermost
+     * last: each is lowered again at every edge that leaves its block. */
+    defers: Buf[&TExpr]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -410,7 +416,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     val ordinals = local_ordinals(program)
     var constant_globals: Buf[bool] = buf()
     val keyer = key_maker(program, ordinals, constant_globals, world)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -2956,6 +2962,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.blocks = buf()
     l.insts = buf()
     l.loops = buf()
+    l.defers = buf()
     l.unit = symbol.unit
     l.trap_blocks = map()
     l.library = library_instance(l, k)
@@ -6025,10 +6032,29 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
             None -> ()
         if yields then v else None
     Block(items) ->
+        // A deferred statement runs after the block's last item, which is then not in tail
+        // position; the block's value is kept in a slot while its deferred statements run.
+        val mark = l.defers.len()
+        var deferring = false
+        for x in items
+            if x.kind is Defer(_) then deferring = true
         var last: Option[Operand] = None
         for i in 0..<items.len()
-            last = lower_at(l, items[i], tail && i + 1 == items.len())
+            last = lower_at(l, items[i], tail && !deferring && i + 1 == items.len())
+        if l.defers.len() > mark
+            if machine(l, e.ty) is Some(_)
+                val slot = new_slot(l, e.ty)
+                store(l, slot, last)
+                run_defers(l, mark)
+                l.defers.truncate(mark)
+                return load(l, slot)
+            run_defers(l, mark)
+            l.defers.truncate(mark)
+            return None
         if machine(l, e.ty) is Some(_) then last else None
+    Defer(body) ->
+        l.defers.push(body)
+        None
     Let(local, value) ->
         bind_local(l, local, lower_expr(l, value))
         None
@@ -6100,20 +6126,33 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         var v: Option[Operand] = None
         if value is Some(x) then v = lower_expr(l, x)
         store(l, target.slot, v)
+        run_defers(l, target.defers)
         leave(l, Jump(target.exit))
         None
     Continue(label) ->
-        leave(l, Jump(loop_target(l, label).head))
+        val target = loop_target(l, label)
+        run_defers(l, target.defers)
+        leave(l, Jump(target.head))
         None
     Match(subject, arms) -> lower_match(l, e, subject, arms, tail)
     Is(value, pattern, negated) -> lower_is(l, value, pattern, negated)
     Clauses(subjects, clauses) -> lower_clauses(l, e, subjects, clauses, tail)
     Return(value) ->
+        // The value is computed first, then every deferred statement reached runs, innermost
+        // first; with one waiting, the value is not in tail position, and is kept in a slot.
         var v: Option[Operand] = None
         var dead = false
+        val deferring = l.defers.len() > 0
         if value is Some(x)
-            v = lower_at(l, x, true)
+            v = lower_at(l, x, !deferring)
             dead = *x.ty is Nothing
+            if deferring && !dead && machine(l, x.ty) is Some(_)
+                val slot = new_slot(l, x.ty)
+                store(l, slot, v)
+                run_defers(l, 0)
+                v = load(l, slot)
+            elif deferring && !dead then run_defers(l, 0)
+        elif deferring then run_defers(l, 0)
         leave(l, if dead then Unreachable else returning(l, v))
         None
 
@@ -6126,7 +6165,16 @@ private int_bits(t: &Type) -> u32 = *t match
 private loop_target(l: *Lowering, label: usize) -> LoopTarget
     for t in l.loops
         if t.label == label then return t
-    LoopTarget(label, 0, 0, None)
+    LoopTarget(label, 0, 0, None, 0)
+
+/** Lowers the deferred statements reached past the first `from`, the last reached first, where
+ * control leaves their blocks. None of them can leave by a jump, so each sees the others as they
+ * are. */
+private run_defers(l: *Lowering, from: usize)
+    var i = l.defers.len()
+    while i > from
+        i -= 1
+        lower_expr(l, l.defers[i])
 
 private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool, op_span: Span) -> Option[Operand]
     val slot = local_place(l, local)
@@ -6464,7 +6512,7 @@ private lower_while(l: *Lowering, e: &TExpr, label: usize, condition: &TExpr, bo
     val body_block = new_block(l)
     val else_block = if otherwise is Some(_) then new_block(l) else exit
     finish_into(l, Branch(c, body_block, else_block), body_block)
-    l.loops.push(LoopTarget(label, head, exit, slot))
+    l.loops.push(LoopTarget(label, head, exit, slot, l.defers.len()))
     lower_expr(l, body)
     l.loops.truncate(l.loops.len() - 1)
     finish(l, Jump(head))
@@ -7169,6 +7217,7 @@ private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     l.blocks = buf()
     l.insts = buf()
     l.loops = buf()
+    l.defers = buf()
     l.unit = 0
     l.trap_blocks = map()
     l.library = true

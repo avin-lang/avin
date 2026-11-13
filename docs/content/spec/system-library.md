@@ -261,6 +261,7 @@ it.
 | `waitFor() -> Result[ExitStatus, IoError]` | Waits for the command to end; the same answer every time. |
 | `isAlive() -> bool` | Whether it is still running, without waiting. |
 | `kill()` | Sends signal 15 to every program still running and starts no part not yet started. |
+| `close() -> Result[unit, IoError]` | A `Child` is an [`io.Close`](#close): stops the command as `kill` does where it has not been seen to end, then waits for it, the wait's `Err` being the answer. One already waited for is only waited for again, which answers at once; a detached one is let be, and closing it does nothing. |
 | `pid() -> long` | The process id of the program started last: the one program, a pipeline's last stage, a sequence's latest part; `0` where none started, its time having run out first. |
 | `group() -> Option[long]` | The process group of a command started `inNewGroup`: the number its first program leads it by. |
 | `signal(sig: int) -> Result[unit, IoError]` | Sends `sig` to the program `pid()` names. A command seen to have ended, by `waitFor` or by `isAlive` answering `false`, is `Err(Other("No such process"))`, its id being the platform's to give again. |
@@ -517,6 +518,33 @@ source is still going, and an empty array once it has ended. `fs.File` is a read
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
 [json package](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
 
+### `Close`
+
+A `Close` is something held outside the program that `close()` gives back:
+
+```text
+trait Close
+    close() -> Result[unit, IoError]
+```
+
+Every resource the library hands out is one: `fs.File`, `fs.TempDir`, every `net.ByteStream`
+(`TcpStream`, `UnixStream`, `TlsStream`), `TcpListener`, `UnixListener` and `process.Child`. **Closing
+a closed one does nothing and answers `Ok`**, so a [`defer`](/spec/operators-and-control-flow/#defer)
+beside the code that took it gives it back on every way out of the block, and the success path may
+close it first to see the `Err`, a flush that failed or a directory that could not be removed:
+
+```text
+save(name: string, text: string) -> Result[unit, IoError]
+    val f = fs.create(name)?
+    defer f.close()
+    f.writeText(text)?
+    f.close()
+```
+
+A generic function takes any resource as `[R: Close]`, and a class of the program's own is one by
+naming `io.Close` after `:` and overriding `close`. A `Channel`'s `close()` ends what it carries rather
+than giving anything back, and is not one; a Sysl or C handle's built-in `close()` answers `unit`.
+
 ### `Source`
 
 A `Source` is text to be read from somewhere, so one function can read a file, a string
@@ -583,6 +611,7 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `createDir(dir) -> Result[unit, IoError]` | Makes one directory, whose parent must exist; `AlreadyExists` if something is there. |
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success; a file where `dir` itself would go is `AlreadyExists`, and a file where one of the directories above it would go is `NotADirectory`. |
 | `createTempDir(prefix) -> Result[string, IoError]` | Makes a new, empty directory in the platform's place for temporary files, its name starting with `prefix`, and answers its path. |
+| `tempDir(prefix) -> Result[TempDir, IoError]` | Makes the directory as `createTempDir` does and holds it as an [`io.Close`](#close): `t.path` is its path, `t.close()` removes it and everything in it (closing again does nothing and answers `Ok`; one that failed may be closed again), and `t.isClosed` says whether it has been removed. One never closed stays on the disk. |
 | `metadata(file) -> Result[Metadata, IoError]` | One look at a path: a `Metadata` of `size` (bytes), `modified` (an `avin.time.Instant`), `isDir` and `isFile`. A symbolic link is followed; a missing path is `NotFound`. For a directory `size` is the file system's bookkeeping, not a count of entries. |
 | `size(file) -> Result[long, IoError]` | The size of the file in bytes. |
 | `modified(file) -> Result[Instant, IoError]` | When the contents of the file or directory last changed, to the file system's resolution. |
@@ -617,7 +646,8 @@ Recording that an entry was used is `fs.setModified(file, time.now())`, which wr
 
 **A temporary directory is the program's to remove.** `createTempDir` makes the directory rather than
 inventing a name, so no other program can take it in between, and nothing removes it at the end:
-`removeDirAll` is the call.
+`removeDirAll` is the call, or `tempDir` and a `defer t.close()` beside it, which removes it on every
+way out of the block.
 
 **Bytes are copied.** The array `readBytes` answers is new, and changing it changes nothing on disk;
 the array given to `writeBytes` is read once and left as it was.
@@ -671,7 +701,7 @@ follow(log: string) -> Result[unit, IoError]
 | `readAll()`, `readText()` | The rest of the file as bytes, or as text (`InvalidUtf8`, the offset counted from the position the read began at). |
 | `readLine()`, `readCompleteLine()` | The next line, `None` at the end. `readLine` also answers a last line with no `\n`; `readCompleteLine` answers only a line ended by `\n`, and leaves later bytes unread, so a line another program is still writing arrives whole. |
 | `write(bytes)`, `writeText(text)` | Writes at the position, buffered. |
-| `flush()`, `close()` | `flush` hands what is written to the platform, so other handles and programs see it. `close` flushes and releases; closing twice is fine. |
+| `flush()`, `close()` | `flush` hands what is written to the platform, so other handles and programs see it. `close` flushes and releases, answering the flush's `Err`; closing twice is fine and answers `Ok`. A file is an [`io.Close`](#close). |
 
 **One position serves reading and writing**, and lines, `read` and `position` agree on it: bytes the
 file has buffered ahead are never lost to a `seek`, a `write` or a `read`. **A read at the end does
@@ -878,11 +908,11 @@ uses it again.
 | `s.write(bytes: Array[byte])`, `s.writeText(text: string)` `-> Result[unit, IoError]` | Sends all of it. |
 | `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer for the other end fails with `TimedOut`; zero or less takes the limit away. Each wait has the whole limit, so a write that waits for room several times fails only where one wait runs out. |
 | `s.shutdownOutput() -> Result[unit, IoError]` | Tells the other end nothing more will be sent; reading goes on. |
-| `s.close()` | Ends the connection; closing again does nothing. |
+| `s.close() -> Result[unit, IoError]` | Ends the connection and answers `Ok`; closing again does nothing. Every connection and listener is an [`io.Close`](#close). |
 | `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
 | `l.port() -> int` | The port it listens on. |
 | `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
-| `l.close()` | Stops listening; closing again does nothing. |
+| `l.close() -> Result[unit, IoError]` | Stops listening and answers `Ok`; closing again does nothing. |
 
 ```text
 import avin.net.{TcpListener, TcpStream}
@@ -915,7 +945,7 @@ safe for the collector, as TCP's are.
 | `UnixListener.bindReplacing(path: string) -> Result[UnixListener, IoError]` | As `bind`, but a socket file left behind by a program that is gone (a connection to it is refused) is removed first. A live listener's path and anything that is not a socket file is `AlreadyExists` and untouched. |
 | `l.path() -> string` | The path it listens at. |
 | `l.accept() -> Result[UnixStream, IoError]` | Waits for the next connection. |
-| `l.close()` | Stops listening; closing again does nothing. The socket file stays; `fs.remove` or `bindReplacing` clears it. |
+| `l.close() -> Result[unit, IoError]` | Stops listening and answers `Ok`; closing again does nothing. The socket file stays; `fs.remove` or `bindReplacing` clears it. |
 
 A path the platform's socket address cannot carry is an `Err`: one longer than 103 bytes on macOS (107
 on Linux), an empty one, or one holding a zero byte. A missing directory on the way to a bound path is
@@ -992,7 +1022,7 @@ main()
 | `TlsStream.server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate. |
 | `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
 | `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
-| `s.close()` | Closes TLS as far as the peer can be told without waiting, then the connection; again does nothing. |
+| `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Again does nothing and answers `Ok`. |
 | `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |
 | `TlsServer(certificate, key)`, `TlsServer.of(certificate, key) -> Result[TlsServer, TlsError]` | A server's certificate (a chain, leaf first) and private key as PEM text; `of` checks they can be used and go together, and one made directly is checked at its first connection. |
 

@@ -244,6 +244,6 @@ tuples, and one with a part of a type that has no `Ord` has none.
 
 ## Not in Avin
 
-`throw`, `try`/`catch`/`finally`, `Try`, checked or unchecked exceptions, and `null`. Releasing a
-resource on every path uses a `defer`-style construct or a library helper such as `use`. Which of the
-two Avin adopts is still open.
+`throw`, `try`/`catch`/`finally`, `Try`, checked or unchecked exceptions, and `null`. A resource is
+given back on every path, the early `return`s and `?`s included, by a
+[`defer`](/spec/operators-and-control-flow/#defer) written beside the code that took it.
