@@ -7572,6 +7572,54 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `charset=utf-8` in the type (RFC 8259 defines none for `application/json`). Review with the user:
   the `Json` overload once `avin.json` lands.
 
+- **Paths are strings, and the path functions live in `avin.fs`** (branch `path-helpers`, 2026-11-12).
+  Proposed: no `Path` type; `fs.join`, `fs.parent`, `fs.fileName`, `fs.extension`, `fs.stem`,
+  `fs.normalize`, `fs.relativeTo`, `fs.components`, `fs.isAbsolute`/`isRelative` take and answer
+  `string`, bound to `sysl.path`, and sit in `avin.fs` beside the calls they feed. Why: every call
+  of `avin.fs`, `avin.process` and the rest already takes a `string`, so a type would mean a
+  conversion at every call or a second overload of each; every `string` method applies to a path as
+  it is; the separators and dots the functions look at are ASCII, so working on UTF-8 text is exact
+  for any name. Alternatives weighed: a `Path` class with `/` and methods (`p.parent`), which reads
+  well but splits the library in two; a separate `avin.path` module, which a program's own
+  `path` variable shadows at once (`fs.join` cannot be shadowed by a local of that name). Review with
+  the user: whether a `Path` type is wanted after all.
+- **`walk` answers a sorted vector, with an unreadable directory as an entry** (branch
+  `path-helpers`). Proposed: `fs.walk(root) -> Result[Vector[Entry], IoError]`, depth first, a
+  directory before its contents, each directory's names in code-point order (as `listDir`), the root
+  itself left out; `Entry(path, relative, depth, isDir, isLink, error)`. A link is listed and never
+  followed (`isDir` false for it), the root is followed when it is a link, and a directory that cannot
+  be listed is an entry whose `error` holds the reason, the walk going on past it; only a root that
+  cannot be listed makes the whole walk an `Err`. Why: one `?` at the call and an ordinary `for` over
+  the answer, deterministic order for tests and tools, no entry silently lost and no permission
+  problem deep in a tree spoiling the rest. Alternatives weighed: a lazy iterator of
+  `Result[Entry, IoError]` with pruning (sysl's shape: cheaper on a huge tree, but every item needs
+  its own `?` and the order is the file system's); failing the whole walk at the first error; skipping
+  unreadable directories silently; following links with cycle detection. Review with the user:
+  whether a lazy walk with pruning is wanted for very large trees.
+- **Pattern matching is by character, and `glob` ignores what it cannot read** (branch
+  `path-helpers`). Proposed: `fs.matches(pattern, path)` is written in Avin rather than bound to
+  `sysl.path.matches`: `?` and a class take one *character*, so `?.txt` fits `文.txt`. Pattern and path
+  are compared component by component (doubled and trailing `/` do not matter, an absolute pattern fits
+  only an absolute path); `**` as a whole component is zero or more components; a name starting with `.`
+  is fitted only by a component starting with a literal `.` (not `?`, `*` or `[.]`), and `**` does not
+  pass through one; an unclosed `[` is a literal `[` and a trailing `\` a literal `\`, so every pattern
+  is valid and `matches` never fails. `fs.glob(pattern) -> Vector[string]` expands component by
+  component, answers sorted and without repeats, follows a link named by a literal or wildcard
+  component but not under `**`, and treats a directory it cannot read as empty. Why: Avin strings are
+  characters, and a byte `?` would match a third of `文`; component-wise matching makes `glob`'s answers
+  fit `matches` by construction; the shell's hidden-name rule keeps `**` out of `.git`. Alternatives
+  weighed: binding sysl's byte matcher (one third of a character per `?`); an `Err` for a malformed
+  pattern (a `Result` on every `matches` call for a case a literal reading answers); `glob` answering
+  `Result` (an error deep in a tree would lose the rest, as with `walk`, and a pattern has no single
+  directory whose failure should be the answer). Review with the user: brace alternatives `{a,b}`,
+  left out.
+- **`isDir` and `isFile` ask `stat`** (branch `path-helpers`). Proposed: `fs.isDir` was bound to
+  `sysl.fs.is_dir`, which opens the path as a directory, so a directory the program may not read
+  answered `false` and `isFile` (`exists && !isDir`) answered `true` for it; both now read the same
+  `stat` as `metadata`. Why: the chapter says `isDir` is whether the path names a directory, and
+  `walk` needs the kind of an unreadable directory to report it. Alternatives weighed: keeping the
+  opening check (a permission answer dressed as a kind).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

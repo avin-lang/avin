@@ -643,7 +643,7 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `writeBytes(file, bytes) -> Result[unit, IoError]` | As `writeText`, with bytes. |
 | `appendBytes(file, bytes) -> Result[unit, IoError]` | As `appendText`, with bytes. |
 | `exists(file) -> bool` | Whether anything, file or directory, is at the path. |
-| `isDir(file) -> bool` | Whether the path names a directory. |
+| `isDir(file) -> bool` | Whether the path names a directory, one the program may not read included. |
 | `isFile(file) -> bool` | Whether the path names something that is not a directory. |
 | `remove(file) -> Result[unit, IoError]` | Removes a file; never a directory, which is `IsADirectory`. A link is removed, not what it names. |
 | `removeDir(dir) -> Result[unit, IoError]` | Removes an empty directory; `DirectoryNotEmpty` otherwise. |
@@ -703,6 +703,102 @@ listing `InvalidUtf8` rather than leaving that name out.
 ```text
 for name in fs.listDir(dir)?
     if name.endsWith(".txt") then println(name)
+```
+
+### Paths
+
+A path is a `string`, and `avin.fs` has the functions that take one apart and put one together.
+They answer from the text alone and touch no disk. Paths are POSIX: `/` separates components, and a
+path that starts with `/` starts at the root.
+
+```text
+import avin.fs
+
+backupOf(file: string) -> string
+    val dir = fs.parent(file).getOrElse(".")
+    val stem = fs.stem(file).getOrElse("file")
+    fs.join([dir, "backup", stem + ".bak"])
+```
+
+| Function | Meaning |
+| --- | --- |
+| `isAbsolute(p)`, `isRelative(p)` | Whether `p` starts with `/`; the empty path is relative. |
+| `components(p) -> Vector[string]` | The names between the separators, empty ones dropped: `/a//b/` has `a` and `b`. The root is not a component; `.` and `..` are kept. |
+| `join(a, b) -> string` | `b` after `a` with exactly one `/` between, however many `a` ends with. An empty side adds nothing; an absolute `b` replaces `a`: `join("/home/me", "/etc")` is `/etc`. |
+| `join(parts) -> string` | A `Vector[string]` joined in turn by the same rule; empty for no parts. |
+| `parent(p) -> Option[string]` | Everything above the last component: `/a/b` has `/a`, `/a` has `/`, `a/b/` has `a`. The root, the empty path and a relative path of one component have `None`. |
+| `fileName(p) -> Option[string]` | The last component; `None` for the root, the empty path, `.` and `..`. |
+| `extension(p) -> Option[string]` | What follows the last `.` of the file name: `gz` for `a.tar.gz`, the empty string for `a.`. `None` with no dot, and for a name whose only dot is its first: `.profile` has none, `.config.json` has `json`. |
+| `stem(p) -> Option[string]` | The file name without its extension and its dot: `a.tar` for `a.tar.gz`, `.profile` for `.profile`. |
+| `normalize(p) -> string` | `.` and `..` resolved in the text, doubled and trailing `/` dropped. A `..` at the root is dropped (`/..` is `/`), one leading a relative path is kept (`a/../..` is `..`), and a path that cancels to nothing is `/` or `.`. |
+| `relativeTo(p, base) -> Option[string]` | `p` written from `base`, both normalized: `../c` for `/a/c` from `/a/b`, `.` for a path from itself. `None` when one is absolute and the other not, or when `base` climbs above what it names with `..`. |
+
+The questions below ask the file system.
+
+| Function | Meaning |
+| --- | --- |
+| `absolute(p) -> Result[string, IoError]` | `p` from the root, normalized, a relative path read against the current directory. Links are not resolved. |
+| `canonicalize(p) -> Result[string, IoError]` | The one absolute path the file system gives `p`, every link resolved; `NotFound` when nothing is there. |
+| `isLink(p) -> bool` | Whether `p` is a symbolic link, dangling or not. |
+| `symlink(target, link) -> Result[unit, IoError]` | Makes `link` a symbolic link holding `target` as written; a relative target is read from the link's directory. `AlreadyExists` when something is at `link`. |
+| `readLink(link) -> Result[string, IoError]` | What a link holds, as written; a path that is not a link is an `Err`. |
+| `walk(root) -> Result[Vector[Entry], IoError]` | Every entry below the directory `root`, as described below. |
+| `matches(pattern, p) -> bool` | Whether `p` fits the pattern, as described below. |
+| `glob(pattern) -> Vector[string]` | The paths that exist and fit the pattern. |
+
+**`normalize` reads only the text, and the difference matters.** Where `a/lib` is a link to
+`src/lib`, `normalize("a/lib/../main.c")` is `a/main.c`, while the file system climbs out of
+`src/lib` into `src`: `canonicalize` of the same path names `src/main.c`. Whatever decides access to
+a file is decided on `canonicalize`.
+
+**A walk is the whole tree, sorted.** `walk` answers an `Entry(path, relative, depth, isDir, isLink,
+error)` for each file, directory and link below the root, the root itself left out: `relative` is the
+path from the root and `path` the root joined with it; `depth` is 1 for the root's own entries. The
+order is depth first, a directory before what it holds, and each directory's names in code-point
+order, as `listDir` sorts them, so two walks of an unchanged tree agree. **A symbolic link is listed
+and never followed**: its `isLink` is true and its `isDir` false, whatever it names, so a link back up
+the tree is one entry and not a loop. The root itself is followed when it is a link. **A directory the
+walk cannot list is still an entry**, with `isDir` true and the reason in `error` (for example
+`Some(PermissionDenied)`), and the walk goes on past it; only a root that cannot be listed makes the
+answer an `Err`: `NotFound`, `NotADirectory` or `PermissionDenied`.
+
+```text
+import avin.fs
+import avin.io.IoError
+
+sourcesIn(dir: string) -> Result[Vector[string], IoError]
+    val found = fs.walk(dir)?.filter(e -> !e.isDir && fs.matches("**/*.avin", e.relative))
+    Ok(found.map(e -> e.path))
+```
+
+**A pattern is matched component by component**, so doubled and trailing `/` do not matter, and an
+absolute pattern fits only an absolute path. Within a component:
+
+| Pattern | Fits |
+| --- | --- |
+| `*` | any run of characters, none included |
+| `?` | one character: `?.txt` fits `文.txt` |
+| `[abc]`, `[a-z]` | one character of the set; `]` first in the set, and `-` first or last, are members |
+| `[!a-z]`, `[^a-z]` | one character not in the set |
+| `\x` | the character `x` itself |
+| `**`, as a whole component | any number of whole components, none included: `src/**/main.c` fits `src/main.c` and `src/a/b/main.c` |
+
+**A name starting with `.` is hidden**: only a component that starts with a literal `.` fits it, so
+`*` does not fit `.git`, nor do `?git` and `[.]git`, while `.*` and `\.git` do; and `**` never passes
+through a hidden name, so `**/*.c` stays out of `.git`. `*/x` does not fit `../x`, for the same reason.
+**Every pattern is valid**: a `[` with no closing `]` is a literal `[`, and a `\` at the end a literal
+`\`. A `**` inside a component, as in `a**b`, is two `*`.
+
+**`glob` answers what is there.** A relative pattern is read from the current directory and answers
+relative paths; an absolute one answers absolute paths. The answer is in code-point order, each path
+once, and every path in it fits the pattern by `matches`. A `**` goes through directories as `walk`
+does, never through a link; a link a literal or wildcard component names is followed. A literal last
+component answers a dangling link too. A directory that cannot be read contributes nothing: `glob`
+has no `Err`. The empty pattern answers nothing, and `/` answers `/`.
+
+```text
+for file in fs.glob("tests/**/*.avin")
+    println(file)
 ```
 
 ### Open files
