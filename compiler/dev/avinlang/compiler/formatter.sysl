@@ -23,7 +23,9 @@ import sysl.text.{chars_of, from_utf8_unchecked, str_builder}
 // not significant, so a list too long for one line is broken one item per line there, the items
 // `FormatCallIndent` columns in (a parameter list `FormatDefinitionIndent`), the closing bracket on
 // a line of its own. A list the source already wrote one item per line, with a line break after
-// its opening bracket and before its closing one, is kept that way. A binding's value too long
+// its opening bracket and before its closing one, is kept that way. A sequence or set literal whose
+// items are all short and simple (`fmt_atom`: literals and names) is broken where any list would be,
+// but its lines are filled, as many items to a line as fit, however the source spread them. A binding's value too long
 // for a line and holding no list is broken before its loosest operators, as continuation lines. A
 // line holding a comment inside its brackets, or a block opened inside them, keeps its line breaks
 // and is only re-indented.
@@ -45,6 +47,10 @@ const FormatCallIndent: usize = 2
 
 /** The columns the items of a broken parameter list are indented by. */
 const FormatDefinitionIndent: usize = 4
+
+/** The widest an item of a sequence or set literal may be, in characters, for a broken literal of such
+ * items to be filled, as many to a line as fit, rather than broken one item per line. */
+const FormatPackedItem: usize = 32
 
 // One token, with what the formatter needs of its place in the source.
 private struct FmtToken
@@ -473,8 +479,10 @@ private fmt_width(text: string) -> usize
         if b < 0x80 || b >= 0xC0 then n += 1
     n
 
-// A parameter list: brackets whose items are typed, `name: T`.
+// A parameter list: brackets whose items are typed, `name: T`. Braces hold a map literal's
+// `key: value` entries, never parameters.
 private fmt_definition_list(f: Fmt, o: usize, c: usize) -> bool
+    if f.toks[o].text == "{" then return false
     var k = o + 1
     while k < c
         if f.toks[k].text == ":" then return true
@@ -505,6 +513,62 @@ private fmt_level(t: FmtToken) -> usize = t.kind match
         _ -> 11
     Symbol -> if t.text == "~" then 11 else 0
     _ -> 0
+
+// Whether tokens `a` to `b` are one short, simple item of a packed literal: a number, a character,
+// a plain string, `true` or `false`, or a name, a number with a sign written against it, and no
+// wider than `FormatPackedItem` columns.
+private fmt_atom(f: Fmt, a: usize, b: usize) -> bool
+    var k = a
+    if b == a + 2 && (f.toks[a].text == "-" || f.toks[a].text == "+")
+        val n = f.toks[a + 1].kind
+        if n != Number && n != RealNumber then return false
+        k = a + 1
+    if k + 1 != b then return false
+    val t = f.toks[k]
+    val simple = t.kind match
+        Number | RealNumber | Quoted | CharQuoted -> true
+        Word -> !is_keyword(t.text) || t.text == "true" || t.text == "false"
+        _ -> false
+    simple && fmt_width(fmt_flat(f, a, b)) <= FormatPackedItem
+
+// Whether the brackets `o` to `c` are a sequence or set literal whose items are all `fmt_atom`s, so
+// that a broken one fills its lines rather than taking one item to a line.
+private fmt_packable(f: Fmt, o: usize, c: usize) -> bool
+    val opener = f.toks[o].text
+    if opener != "[" && opener != "{" then return false
+    // After an operand, `[` indexes or takes type arguments, and is no literal.
+    if o > 0 && fmt_operand_end(f.toks[o - 1]) then return false
+    var e = o + 1
+    var items = 0usize
+    while e < c
+        var to = e
+        while to < c && f.toks[to].text != "," do to += 1
+        if to > e
+            if !fmt_atom(f, e, to) then return false
+            items += 1
+        elif to < c
+            return false
+        e = to + 1
+    items > 0
+
+// The items of the packable brackets `o` to `c`, as many to a line as fit at `indent`, separated by
+// `, `; a trailing comma stays after the last.
+private fmt_pack(f: Fmt, o: usize, c: usize, indent: usize, out: *Buf[string])
+    var line = ""
+    var e = o + 1
+    while e < c
+        var to = e
+        while to < c && f.toks[to].text != "," do to += 1
+        val item = fmt_flat(f, e, to) + (if to < c then "," else "")
+        if line == ""
+            line = item
+        elif indent + fmt_width(line) + 1 + fmt_width(item) <= FormatWidth
+            line = line + " " + item
+        else
+            out.push(fmt_spaces(indent) + line)
+            line = item
+        e = to + 1
+    if line != "" then out.push(fmt_spaces(indent) + line)
 
 /** Tokens `a` to `b`, one line or several, at `indent`. `value_from` is where a binding's value
  * starts when the tokens are a whole `val`, `var` or `return` line that may go on in continuation
@@ -539,6 +603,10 @@ private fmt_render(f: Fmt, a: usize, b: usize, indent: usize, nested: bool, valu
         val c = f.partner[o]
         out.push(fmt_spaces(indent) + fmt_flat(f, a, o + 1))
         val step = if fmt_definition_list(f, o, c) then FormatDefinitionIndent else FormatCallIndent
+        if fmt_packable(f, o, c)
+            fmt_pack(f, o, c, indent + step, out)
+            fmt_render(f, c, b, indent, nested, 0, out)
+            return
         var e = o + 1
         while e < c
             var to = e

@@ -802,7 +802,8 @@ Settled by the user on 2026-11-04:
   Comments are kept exactly, a trailing one a space after the code. A line longer than 120
   characters has a list broken one item per line, a call's or a literal's items two columns in and
   a parameter list's four, the closing bracket on its own line; a list the source wrote one item
-  per line stays so; a binding's value with no list to break is broken before its loosest operators
+  per line stays so, except that a broken sequence or set literal of short, simple items is filled
+  as many to a line as fit (Proposed, under [Proposed](#proposed)); a binding's value with no list to break is broken before its loosest operators
   as continuation lines, though only after the last `then`, `elif` or `else` of a one-line `if`
   (a line after an `if`'s test is its block, so a test and an earlier branch stay whole). No trailing commas are added. The formatter keeps every token and
   refuses a file that does not parse; its result parses to the same syntax tree.
@@ -7837,6 +7838,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
+
+- **`avin fmt` fills a broken literal of short, simple items, as many to a line as fit** (branch
+  `fmt-pack`). A sequence literal `[…]` or set literal `{…}` (brackets not after an operand, so no
+  index or type arguments) whose every item is a number, a character, a plain string, `true`,
+  `false` or a name, a number with a sign against it included, and no item wider than 32
+  characters, is broken where any list would be (past 120 characters, or written with a line
+  break after its opening bracket and before its closing one), but its items are then laid out
+  `, `-separated, as many to a line as fit in the 120 columns, two columns in, a trailing comma
+  kept after the last. Any other item (a call, a lambda, a tuple, a nested literal, an
+  interpolated string, a `key: value` entry) keeps the one-item-per-line layout, and a comment
+  among the items keeps the lines as written, as everywhere inside brackets. Arguments of a call
+  are never filled. The result is idempotent: a filled literal is broken after its opening bracket,
+  so formatting it again fills it the same way. WHY: a generated table (tui's `width_table.avin`,
+  about 640 pairs of code points) became ~1,280 lines of one number each; filled, it is 111 lines
+  and reads as a table. ALTERNATIVES: keep a source that is one per line one per line (leaves the
+  table unreadable, and a table that has been through `fmt` once could never recover); fill any
+  list of one-token items, call arguments included (a call's arguments are each a meaning, and
+  one per line shows them); fill short tuples `(a, b)` too (more rules for the reader of the style
+  to learn; a table of pairs is written flat, as tui's is); align items into columns (wider diffs
+  for one changed entry, and no gain for numbers of one width). Review with the user: the 32-
+  character limit, and whether a short list deliberately written one per line should stay so.
 
 ## Open
 
