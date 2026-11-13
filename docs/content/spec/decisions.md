@@ -7464,6 +7464,45 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   standard library holds from "what talks to the operating system" to "the formats nearly every
   script reads".
 
+- Proposed 2026-11-12 (branch `defer-use`): **resource cleanup is a block-scoped `defer` statement,
+  and the library's resources are each an `io.Close`**
+  ([defer](/spec/operators-and-control-flow/#defer), [`Close`](/spec/system-library/#close)).
+  - **`defer stmt`** (or `defer` and an indented block) runs the statement when control leaves the
+    block it is written in: at the block's end, `return`, `?`'s failure arm, `break` and `continue`.
+    The reached ones run last first; one not reached never runs; names are read when it runs, and a
+    block's, `return`'s or `break`'s value is computed before. No `return`, `?`, or `break`/`continue`
+    of an outer loop may leave a deferred statement. It is a statement of a block only: as a value, a
+    one-line branch or in a class body it is refused. While one waits, nothing is in tail position,
+    so `@tailrec` refuses a self-call there. `defer` becomes a keyword (one test function named
+    `defer` was renamed).
+  - **A trap, a cancelled thread and `process.exit` run no deferred statement.** There is no
+    unwinding; files and connections left open are closed by the collector's finalizers.
+  - **Lowering emits each deferred statement at every edge that leaves its block** (`lower.sysl`'s
+    `run_defers`), as Sysl does: no run-time list, no cost where nothing is deferred.
+  - **`trait io.Close { close() -> Result[unit, IoError] }`**, closing twice answering `Ok`:
+    `fs.File` (unchanged), the new `fs.TempDir` from `fs.tempDir(prefix)` (`close` removes the tree),
+    every `net.ByteStream`, `TcpListener` and `UnixListener` (their `close` now answers `Ok(())`
+    rather than `unit`; `TlsStream`'s answers the failure to send its close notice), and
+    `process.Child` (new `close`: kill if not seen to end, then wait; a detached child is let be).
+    `Mutex.with`/`update` release their lock through `defer`.
+  - *Why*: the paths that leak are early `return`, `?` and `break`, and only a construct the
+    compiler places at every exit covers them; a library `use(r)(body)` puts the body in a lambda,
+    where a `return`, a `?` of the enclosing function, a `break` or a `continue` cannot be written at
+    all. Block scope (not function scope) gives back each loop turn's resource before the next and
+    needs no run-time state; reading names at the exit needs no storage. The syntax and the rules
+    are Sysl's own `defer`, so the two languages read alike. `Close` answers a `Result` because a
+    flush, a removal and a wait can fail, and `File.close` already did.
+  - *Alternatives weighed*: a library `use(resource)(body)` over a `Close` trait (cannot leave the
+    enclosing function from the body; nests one lambda per resource); function-scoped `defer`
+    evaluating its arguments where written (holds every turn's resource until the function returns,
+    needs a run-time list); `try`/`finally` (a second block structure for one need); running deferred
+    statements on a trap (unwinding through a broken state); a `Close` whose `close` answers `unit`
+    (would drop `File.close`'s flush error and a `TempDir`'s removal error); `use x = e` binding sugar
+    over `defer x.close()` (left for later; `defer` covers it in one more line).
+  - **Review with the user**: whether a cancelled lightweight thread should run its deferred
+    statements (it needs cancellation points compiled as exits); whether discarding a `close`'s
+    `Result` in `defer` deserves a warning; whether `use x = e` sugar is wanted.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
@@ -7499,7 +7538,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
   and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
   safepoints, so no collection sees one half done.
-- Resource cleanup: a `defer` construct or a library `use`.
 - Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
 
 - Settled on the user's delegation 2026-11-06 (branch `check-stops-early`): **`avin check` stops after type checking**. Checking a

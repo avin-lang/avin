@@ -25,34 +25,44 @@ struct TailSite
     /** Why the call is not in tail position, when it is not. */
     reason: string
 
+/** The calls found so far, and how many deferred statements are waiting to run where the walk is:
+ * while one is, it runs after anything the function would leave by, so nothing is in tail position,
+ * not even the value of a `return`. */
+struct TailWalk
+    sites: Buf[TailSite]
+    deferred: usize
+
+/** Why a call is not in tail position where a deferred statement waits to run. */
+const DeferredReason: string = "a deferred statement runs after it"
+
 /** Every call of `function` in `body`, which is `function`'s, with whether each is in tail position. */
 tail_sites(function: usize, body: &TExpr) -> Buf[TailSite]
-    var out: Buf[TailSite] = buf()
+    var out = TailWalk(buf(), 0)
     tail_walk(function, body, true, "", &out)
-    out
+    out.sites
 
-private tail_walk_all(function: usize, items: Buf[&TExpr], why: string, out: *Buf[TailSite])
+private tail_walk_all(function: usize, items: Buf[&TExpr], why: string, out: *TailWalk)
     for e in items
         tail_walk(function, e, false, why, out)
 
-private tail_walk_option(function: usize, e: Option[&TExpr], tail: bool, why: string, out: *Buf[TailSite])
+private tail_walk_option(function: usize, e: Option[&TExpr], tail: bool, why: string, out: *TailWalk)
     if e is Some(x) then tail_walk(function, x, tail, why, out)
 
 // `tail` says whether `e` is in tail position; where it is not, `why` says why, as the innermost
 // expression using its value does; inside a loop, the loop is the reason for a whole block.
-private tail_walk(function: usize, e: &TExpr, tail: bool, why: string, out: *Buf[TailSite])
+private tail_walk(function: usize, e: &TExpr, tail: bool, why: string, out: *TailWalk)
     val argument = "its result is an argument of another call"
     val stored = "its result is stored"
     val looped = "it is inside a loop"
     e.kind match
         Call(id, args, type_args) ->
-            if id == function then out.push(TailSite(e.span, true, type_args, tail, why))
+            if id == function then out.sites.push(TailSite(e.span, true, type_args, tail, why))
             tail_walk_all(function, args, argument, out)
         Dispatch(id, _, args, type_args) ->
-            if id == function then out.push(TailSite(e.span, false, type_args, tail, why))
+            if id == function then out.sites.push(TailSite(e.span, false, type_args, tail, why))
             tail_walk_all(function, args, argument, out)
         BoundCall(id, _, args, type_args) ->
-            if id == function then out.push(TailSite(e.span, false, type_args, tail, why))
+            if id == function then out.sites.push(TailSite(e.span, false, type_args, tail, why))
             tail_walk_all(function, args, argument, out)
         Construct(_, args) -> tail_walk_all(function, args, "its result is a part of a new value", out)
         Collection(elements, built) ->
@@ -71,9 +81,17 @@ private tail_walk(function: usize, e: &TExpr, tail: bool, why: string, out: *Buf
             tail_walk(function, initialize, false, "it computes a `lazy val`", out)
         StoreGlobal(_, value, _) -> tail_walk(function, value, false, stored, out)
         Block(items) ->
+            // Each deferred statement the block reaches waits until the block is left.
+            val outer = out.deferred
             for i in 0..<items.len()
-                if i + 1 == items.len() then tail_walk(function, items[i], tail, why, out)
+                if items[i].kind is Defer(_)
+                    tail_walk(function, items[i], false, "it is in a deferred statement", out)
+                    out.deferred += 1
+                elif out.deferred > outer && i + 1 == items.len() then tail_walk(function, items[i], false, DeferredReason, out)
+                elif i + 1 == items.len() then tail_walk(function, items[i], tail, why, out)
                 else tail_walk(function, items[i], false, if !tail && why == looped then why else "more of its block follows it", out)
+            out.deferred = outer
+        Defer(body) -> tail_walk(function, body, false, "it is in a deferred statement", out)
         Let(_, value) -> tail_walk(function, value, false, stored, out)
         LetPattern(pattern, value) ->
             tail_pattern(function, pattern, out)
@@ -105,7 +123,11 @@ private tail_walk(function: usize, e: &TExpr, tail: bool, why: string, out: *Buf
             tail_walk_option(function, otherwise, false, looped, out)
         Break(_, value) -> tail_walk_option(function, value, false, "its result is the value of a `break`", out)
         // A `return` leaves the function with its value, wherever it is written.
-        Return(value) -> tail_walk_option(function, value, true, "", out)
+        // A `return` leaves the function with its value, wherever it is written, unless a deferred
+        // statement waits to run first.
+        Return(value) ->
+            if out.deferred > 0 then tail_walk_option(function, value, false, DeferredReason, out)
+            else tail_walk_option(function, value, true, "", out)
         Match(subject, arms) ->
             tail_walk(function, subject, false, "its result is matched", out)
             for arm in arms
@@ -125,7 +147,7 @@ private tail_walk(function: usize, e: &TExpr, tail: bool, why: string, out: *Buf
                     tail_walk(function, b.body, tail, why, out)
         _ -> ()
 
-private tail_pattern(function: usize, p: &TPattern, out: *Buf[TailSite])
+private tail_pattern(function: usize, p: &TPattern, out: *TailWalk)
     val inside = "it is inside a pattern"
     p.kind match
         PLiteral(value) -> tail_walk(function, value, false, inside, out)

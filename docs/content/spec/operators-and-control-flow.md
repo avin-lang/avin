@@ -291,7 +291,7 @@ expression that line left open:
 
 ```text
 val atom = number
-    | symbol("(") ~> defer(expr) <~ symbol(")")
+    | symbol("(") ~> later(expr) <~ symbol(")")
     | ident ^^ Var
 
 val total = a
@@ -751,3 +751,69 @@ at the comma, so `f(a = return 1, b = 2)` has two arguments and a tuple is writt
 An indented block inside the brackets starts a line again. Optional end markers
 (`end if`, `end while`, `end match`, `end val`, `end name`) are checked against the construct they
 close.
+
+## defer
+
+`defer stmt` runs `stmt` when control leaves the block the `defer` is written in. What a program takes
+from outside itself, a file, a connection, a temporary directory, a started command, is given back by
+a `defer` written beside the code that took it, rather than at every way out:
+
+```text
+copy(from: string, to: string) -> Result[unit, IoError]
+    val source = fs.open(from)?
+    defer source.close()
+    val target = fs.create(to)?
+    defer target.close()
+    target.write(source.readAll()?)?
+    target.close()
+```
+
+**It runs on every ordinary way out of its block**: falling off the end, `return`, `?` taking its
+failure arm, and `break` or `continue` leaving a loop the block is in. The statement is a single
+statement on the `defer` line, or an indented block below it (`end defer` may close that block).
+
+**A deferred statement belongs to its block**: a function's or a lambda's body, a branch of `if`, an
+arm of `match`, a loop's body, a turn of an actor, or any indented block. A loop body's statements run
+at the end of every turn, so each turn's resource is given back before the next is taken; a
+`continue` or `break` runs them too, and a `break` or `continue` of an outer loop runs the inner
+loops' as well. A nested block's run at its own end, before the code after it.
+
+**Several run in the reverse of the order they were written**, so resources are given back in the
+reverse of the order they were taken, and a later one may use what an earlier one guards.
+
+**Only a `defer` that was reached runs.** It is a statement, not a declaration: one after a `return`
+that left, or in a branch not taken, never runs, and one a call reached is not carried into the next
+call.
+
+**A deferred statement reads its names when it runs.** Nothing is evaluated where the `defer` is
+written; a `var` changed after it is seen changed. The value a block yields, and the value of a
+`return` or a `break`, are computed first, then the deferred statements run, so a statement that
+changes a `var` does not change a value already computed:
+
+```text
+next() -> int
+    var n = 1
+    defer n = 100
+    n            // 1
+```
+
+**No jump may leave a deferred statement**, at any depth: no `return`, no `?`, and no `break` or
+`continue` of a loop outside it, since it runs while its block is already being left. A loop written
+inside it is its own, and a lambda or a local function written inside it may return from itself.
+A `defer` inside a deferred statement belongs to that statement's block and runs at its end.
+
+**A `defer` is a statement of a block.** As a value (a binding's value, an argument, a one-line
+function's body), as a one-line branch (`if c then defer f()`), or in a class body, it is refused. Its
+statement's value is discarded, so `defer f.close()` on a `close` that answers a `Result` gives the
+`Result` up; a program that wants the `Err` closes on its success path first, which a resource's
+`close` allows, since [closing twice](/spec/system-library/#avin-io) does nothing.
+
+**A deferred statement takes a call out of tail position.** A self-call while one is waiting to run,
+the value of a `return` included, is a real call, and `@tailrec` refuses it.
+
+**A trap runs nothing.** A trap stops the program, or the actor's turn, where it happens, without
+running the deferred statements of the functions it stops: the program's state is already wrong, and
+cleanup run against it could do harm. An actor's `stopping` block still runs, as for any failed turn.
+A thread stopped by [cancellation](/spec/threads/#cancellation) and a program ended by
+`process.exit` run none either; a file or a connection left open then is closed when the collector
+frees it.

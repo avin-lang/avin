@@ -287,8 +287,12 @@ struct BodyState
     tested: Buf[usize]
     /** The functions the body passes to `@threaded` parameters, checked once its captures are known. */
     threaded: Buf[ThreadedArgument]
+    /** Inside a deferred statement, how many loops enclosed it: a `break` or `continue` of one of
+     * those, a `return` and a `?` would leave the statement, which runs while its block is being
+     * left. `None` outside one, and inside a lambda or a local function written in one. */
+    defer_floor: Option[usize]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None)
 
 /** A function passed to a binding's `@threaded` parameter `param` of `binding`. */
 struct ThreadedArgument
@@ -7060,6 +7064,7 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
             if value is Some(x) then out.push(x)
         Return(value) ->
             if value is Some(x) then out.push(x)
+        Defer(body) -> out.push(body)
         Match(subject, arms) ->
             out.push(subject)
             for arm in arms
@@ -10560,10 +10565,12 @@ private check_local_symbol(c: *Checker, id: usize)
     val decl = symbol.decl
     val previous = c.current
     val loops = c.body.loops
+    val floor = c.body.defer_floor
     val outer_start = c.body.block_start
     val mark = c.body.visible.len()
     c.current = id
     c.body.loops = buf()
+    c.body.defer_floor = None
     c.body.block_start = mark
     // A generic local function's own type parameters are in scope in its body, after the enclosing
     // ones it shares.
@@ -10581,6 +10588,7 @@ private check_local_symbol(c: *Checker, id: usize)
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
+    c.body.defer_floor = floor
     c.current = previous
     c.states[id] = 2
 
@@ -10975,6 +10983,10 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Break(value) -> break_expr(c, e, value)
     Continue -> continue_expr(c, e)
     Return(value) -> return_expr(c, e, value)
+    Defer(body) ->
+        c.note(unit_of(c), e.span, "a `defer` is a statement of a block, run when that block is left; it is written on a line of its own in an indented body of a function, a lambda, a branch or a loop")
+        check_statement(c, body)
+        TExpr(e.span, ErrorType, UnitConst)
     Propagate(value) -> propagate_expr(c, e, value)
     Splice(value) ->
         c.note(unit_of(c), e.span, "`*` after an argument passes a sequence as a repeated parameter's arguments; it is written only as the last argument of a call to a function with one")
@@ -12002,7 +12014,7 @@ private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expe
     for i in 0..<items.len()
         val item = items[i]
         val before = c.body.visible.len()
-        val t = if i + 1 == items.len() && !discard then check_value(c, item, expected, used) else check_statement(c, item)
+        val t = block_item(c, item, i + 1 == items.len() && !discard, expected, used)
         report_clashes_with_functions(c, item.span, before, function_mark)
         if *t.ty is Nothing then finishes = false
         typed.push(t)
@@ -12015,6 +12027,11 @@ private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expe
     if !finishes then ty = Nothing
     elif !discard && typed.len() > 0 then ty = typed[typed.len() - 1].ty
     TExpr(e.span, ty, Block(typed))
+
+/** An item of a block: a `defer`, the value the block yields when `last`, or a statement. */
+private block_item(c: *Checker, item: &Expr, last: bool, expected: Option[&Type], used: bool) -> &TExpr = item.kind match
+    Defer(body) -> defer_statement(c, item, body)
+    _ -> if last then check_value(c, item, expected, used) else check_statement(c, item)
 
 // Checks a branch of `if` or `while`, whose bindings are not visible after it.
 private branch(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr = tested_branch(c, e, buf(), expected, used)
@@ -14881,7 +14898,22 @@ private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
         elif comprehension_part(c.symbols[c.current]) then c.note(unit_of(c), e.span, comprehension_exit(word))
         else c.note(unit_of(c), e.span, s"`$word` is outside a loop")
         return None
+    if c.body.defer_floor is Some(floor) && c.body.loops.len() <= floor
+        c.note(unit_of(c), e.span, deferred_exit(word))
+        return None
     Some(c.body.loops[c.body.loops.len() - 1])
+
+/** Why a jump cannot leave a deferred statement. */
+private deferred_exit(word: string) -> string = s"a deferred statement runs while its block is being left, so it cannot leave by `$word`; there is no exit left to take"
+
+/** `defer body`, a statement of the block `items` being checked: the body is checked as a
+ * statement whose value is discarded, where no jump may leave it. */
+private defer_statement(c: *Checker, e: &Expr, body: &Expr) -> &TExpr
+    val outer = c.body.defer_floor
+    c.body.defer_floor = Some(c.body.loops.len())
+    val typed = check_statement(c, body)
+    c.body.defer_floor = outer
+    TExpr(e.span, Unit, Defer(typed))
 
 private break_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     val target = innermost_loop(c, e, "break")
@@ -14907,6 +14939,10 @@ private continue_expr(c: *Checker, e: &Expr) -> &TExpr = innermost_loop(c, e, "c
 private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     val unit = unit_of(c)
     val symbol = c.symbols[c.current]
+    if c.body.defer_floor is Some(_)
+        c.note(unit, e.span, deferred_exit("return"))
+        if value is Some(v) then check_statement(c, v)
+        return TExpr(e.span, Nothing, UnitConst)
     if symbol.delayed
         c.note(unit, e.span, "`return` cannot leave a delayed argument, which is evaluated where its parameter is read")
         if value is Some(v) then check_statement(c, v)
@@ -15024,6 +15060,9 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
             c.note(unit, value.span, s"`?` takes apart an Option or a Result, not ${type_name(ty)}")
             return TExpr(e.span, ErrorType, UnitConst)
     val symbol = c.symbols[c.current]
+    if c.body.defer_floor is Some(_)
+        c.note(unit, e.span, deferred_exit("?"))
+        return TExpr(e.span, ErrorType, UnitConst)
     if symbol.delayed
         c.note(unit, e.span, "`?` cannot return from a delayed argument, which is evaluated where its parameter is read")
         return TExpr(e.span, ErrorType, UnitConst)
@@ -17549,6 +17588,7 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
     DoWhile(body, condition, otherwise) -> exits_lambda(body) || exits_lambda(condition) || exits_option(otherwise)
     For(_, source, body) -> exits_lambda(source) || exits_lambda(body)
     Break(value) -> exits_option(value)
+    Defer(body) -> exits_lambda(body)
     Match(subject, arms) ->
         if exits_lambda(subject) then return true
         for a in arms
@@ -17948,10 +17988,12 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     // not its loops.
     val previous = c.current
     val loops = c.body.loops
+    val floor = c.body.defer_floor
     val outer_start = c.body.block_start
     val mark = c.body.visible.len()
     c.current = id
     c.body.loops = buf()
+    c.body.defer_floor = None
     c.body.block_start = mark
     var param_locals: Buf[usize] = buf()
     for i in 0..<params.len()
@@ -17968,6 +18010,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     c.body.visible.truncate(mark)
     c.body.block_start = outer_start
     c.body.loops = loops
+    c.body.defer_floor = floor
     c.current = previous
     c.states[id] = 2
     // Making the closure needs everything the lambda captures where it is written.
@@ -19977,6 +20020,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Return(value) -> value match
             Some(x) -> scan_init(c, s, x, unsafe)
             None -> true
+        Defer(body) -> scan_init(c, s, body, unsafe)
         Match(subject, arms) ->
             var ok = scan_init(c, s, subject, unsafe)
             for arm in arms

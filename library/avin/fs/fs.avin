@@ -165,6 +165,27 @@ createDirAll(dir: string) -> Result[unit, IoError] = syslMakeDirAll(dir).mapErr(
 createTempDir(prefix: string) -> Result[string, IoError] =
     syslMakeTempDir(prefix).mapErr(failed("create temporary directory", prefix))
 
+// A new, empty directory made as `createTempDir` makes one, held as a resource: `close()` removes it
+// and everything in it, so `defer dir.close()` removes it on every way out of the block.
+tempDir(prefix: string) -> Result[TempDir, IoError] = createTempDir(prefix).map(p -> TempDir(p, false))
+
+// A temporary directory that `close()` removes with everything in it. Closing it again does nothing
+// and answers `Ok`; one never closed stays on the disk.
+class TempDir(private val dir: string, private var removed: bool): io.Close
+    // The directory's path.
+    path -> string = dir
+
+    // Whether `close` has removed it.
+    isClosed -> bool = removed
+
+    // Removes the directory and everything in it; `Err` where that failed, which leaves it to be
+    // removed again by a later `close`.
+    override close() -> Result[unit, IoError]
+        if removed then return Ok(())
+        removeDirAll(dir)?
+        removed = true
+        Ok(())
+
 // One reading of a path, as the runtime makes it.
 @sysl("avin.rt.FsStat")
 private class SyslStat
@@ -249,7 +270,7 @@ private lineText(bytes: Array[byte], from: int, until: int) -> string
 // or, if the program forgot, when the collector frees it; every call on a closed file is an `Err`.
 class File(private val name: string, private val handle: SyslFile, private val readable: bool,
         private val writable: bool, private var ahead: Array[byte], private var at: int,
-        private var closed: bool): io.Reader
+        private var closed: bool): io.Reader, io.Close
     // How many bytes the file holds now, what other handles have written included.
     size() -> Result[long, IoError]
         if closed then return Err(closedError("read the size of"))
@@ -341,7 +362,7 @@ class File(private val name: string, private val handle: SyslFile, private val r
 
     // Flushes and releases the file; closing a closed file is not an error. Every later call
     // answers an `Err`.
-    close() -> Result[unit, IoError]
+    override close() -> Result[unit, IoError]
         if closed then return Ok(())
         closed = true
         ahead = Array.empty[byte]()

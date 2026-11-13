@@ -1,0 +1,141 @@
+// `defer` in every kind of function: a lambda's body is its own block, so its deferred statements run
+// when the lambda returns, by its end or its own `return`; a local function's likewise; a lambda or a
+// local function written inside a deferred statement may `return` from itself. Deferred statements in
+// methods, generic functions, recursion, and a self-call that would otherwise be a loop
+// all run once per call.
+// expect: exit 0
+import avin.threads.{Atomic, Mutex, spawn}
+
+class Counter()
+    var opened = 0
+    var closed = 0
+
+    open() -> int
+        opened += 1
+        opened
+
+    close()
+        closed += 1
+
+// A method's body is a block like any other.
+class Account(var balance: int)
+    withdraw(amount: int) -> Result[int, string]
+        defer println(s"  withdraw($amount): balance $balance")
+        if amount > balance then return Err("insufficient")
+        balance -= amount
+        Ok(balance)
+
+// A generic function: the deferred statement is compiled for each instance.
+around[T](label: string, value: T, show: (T) -> string) -> T
+    defer println(s"around $label: ${show(value)}")
+    value
+
+// Recursion: each call's deferred statement runs as that call returns, deepest first.
+depth(n: int, c: Counter) -> int
+    c.open()
+    defer c.close()
+    if n == 0 then return 0
+    1 + depth(n - 1, c)
+
+// A self-call after a deferred statement is not in tail position: the statement runs after it, once
+// per call, so the calls nest and unwind in order.
+countdown(n: int, out: Counter) -> int
+    defer out.close()
+    if n == 0 then return out.closed
+    countdown(n - 1, out)
+
+// A thread's work, counted on every way out.
+work(i: int, done: Atomic[int]) -> int
+    defer done.add(1)
+    if i % 3 == 0 then return -i
+    i
+
+main()
+    // A lambda's deferred statements run when it returns, by `return` or by its end.
+    val f: (int) -> int = n ->
+        defer println(s"lambda($n): done")
+        if n > 10 then return 10
+        n * 2
+    println(f(3))
+    println(f(30))
+
+    // A closure capturing a `var` that a deferred statement changes sees the change.
+    var shared = 0
+    val bump = () ->
+        defer shared += 1
+        shared
+    println(bump())
+    println(bump())
+    println(shared)
+
+    // A local function's deferred statements.
+    tally(xs: Vector[int]) -> int
+        var total = 0
+        defer println(s"tally: $total")
+        for x in xs
+            if x < 0 then return -1
+            total += x
+        total
+    println(tally([1, 2, 3]))
+    println(tally([1, -2, 3]))
+
+    // A lambda and a local function inside a deferred statement may return from themselves.
+    defer
+        val pick: (int) -> string = n ->
+            if n > 0 then return "positive"
+            "other"
+        first(xs: Vector[int]) -> int
+            for x in xs
+                if x > 1 then return x
+            0
+        println(s"main deferred: ${pick(1)} ${first([1, 5, 9])}")
+
+    // Every closure made by a map runs its own deferred statement.
+    val c = Counter()
+    val doubled = [1, 2, 3].map(x ->
+        c.open()
+        defer c.close()
+        x * 2)
+    println(s"$doubled ${c.opened} ${c.closed}")
+
+    val a = Account(50)
+    println(a.withdraw(80))
+    println(a.withdraw(20))
+
+    println(around("int", 7, n -> n.toString()))
+    println(around("string", "ünïcode", s -> s))
+    println(around("vector", [1, 2], xs -> xs.toString()))
+    val most: long = 9223372036854775807
+    println(around("long", most, n -> n.toString()))
+    println(around("int", -2147483648, n -> n.toString()))
+
+    val r = Counter()
+    println(depth(10000, r))
+    println(s"${r.opened} ${r.closed}")
+
+    val d = Counter()
+    println(countdown(5, d))
+    println(d.closed)
+
+    // A lightweight thread's body is a lambda: its deferred statements run before it ends, by every
+    // way out, and the thread's result is computed first.
+    val worker = spawn(() ->
+        val steps = Atomic(0)
+        defer steps.add(100)
+        steps.add(1)
+        steps.load())
+    println(worker.join())
+
+    val done = Atomic(0)
+    val threads = (0..<200).map(i -> spawn(() -> work(i, done)))
+    var sum = 0
+    for t in threads do sum += t.join()
+    println(s"$sum ${done.load()}")
+
+    // A mutex lets its lock go on every way out of the body.
+    val m = Mutex(0)
+    for i in 0..<5
+        m.update(v -> v + i)
+    println(m.get())
+    println(m.with(v -> if v > 5 then "big" else "small"))
+    println(m.update(v -> v * 2))
