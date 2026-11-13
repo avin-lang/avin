@@ -802,7 +802,8 @@ Settled by the user on 2026-11-04:
   Comments are kept exactly, a trailing one a space after the code. A line longer than 120
   characters has a list broken one item per line, a call's or a literal's items two columns in and
   a parameter list's four, the closing bracket on its own line; a list the source wrote one item
-  per line stays so; a binding's value with no list to break is broken before its loosest operators
+  per line stays so, except that a broken sequence or set literal of short, simple items is filled
+  as many to a line as fit (Proposed, under [Proposed](#proposed)); a binding's value with no list to break is broken before its loosest operators
   as continuation lines, though only after the last `then`, `elif` or `else` of a one-line `if`
   (a line after an `if`'s test is its block, so a test and an earlier branch stay whole). No trailing commas are added. The formatter keeps every token and
   refuses a file that does not parse; its result parses to the same syntax tree.
@@ -8000,6 +8001,85 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   non-option and the rest as the program's (`./tool -O0` would still be eaten). Review with the
   user: the argument rule, which makes `-O0` after a `#!` file the program's when run as a command.
 
+- Settled on the user's delegation 2026-11-13 (built on branch `fmt-pack`): **`avin fmt` fills a broken literal of short, simple items, as many to a line as fit** (branch
+  `fmt-pack`). A sequence literal `[…]` or set literal `{…}` (brackets not after an operand, so no
+  index or type arguments) whose every item is a number, a character, a plain string, `true`,
+  `false` or a name, a number with a sign against it included, and no item wider than 32
+  characters, is broken where any list would be (past 120 characters, or written with a line
+  break after its opening bracket and before its closing one), but its items are then laid out
+  `, `-separated, as many to a line as fit in the 120 columns, two columns in, a trailing comma
+  kept after the last. Any other item (a call, a lambda, a tuple, a nested literal, an
+  interpolated string, a `key: value` entry) keeps the one-item-per-line layout, and a comment
+  among the items keeps the lines as written, as everywhere inside brackets. Arguments of a call
+  are never filled. The result is idempotent: a filled literal is broken after its opening bracket,
+  so formatting it again fills it the same way. WHY: a generated table (tui's `width_table.avin`,
+  about 640 pairs of code points) became ~1,280 lines of one number each; filled, it is 111 lines
+  and reads as a table. ALTERNATIVES: keep a source that is one per line one per line (leaves the
+  table unreadable, and a table that has been through `fmt` once could never recover); fill any
+  list of one-token items, call arguments included (a call's arguments are each a meaning, and
+  one per line shows them); fill short tuples `(a, b)` too (more rules for the reader of the style
+  to learn; a table of pairs is written flat, as tui's is); align items into columns (wider diffs
+  for one changed entry, and no gain for numbers of one width). Review with the user: the 32-
+  character limit, and whether a short list deliberately written one per line should stay so.
+
+- Settled on the user's delegation 2026-11-13 (built on branch `discarded-result`): **A dropped `Result` or `Future` is an error, and
+  `_ = e` drops one on purpose** ([errors](/spec/errors/#a-result-is-not-dropped)). A value of
+  either type is reported where it is thrown away: a block's statement, the last line of a function
+  or lambda yielding `unit`, a branch of an `if` without `else` or of an `if`/`match` written as a
+  statement, a loop's body. `_ = e` evaluates `e` and keeps nothing. A deferred statement is exempt,
+  and so is an expression the checker reads only for its own errors after the form around it failed.
+  The standard library's call sites were each handled or marked `_ =` (a socket or pipe closed once
+  its exchange is over, a temporary directory removed, a signal to a program that may have ended).
+  - *Why*: `fs.writeText("/nonexistent/x", "hi")` as a statement compiled and failed silently (gap
+    audit C8). An error, not a warning: Avin has no warnings channel, every diagnostic is an error,
+    and a warning shown only sometimes is the one that is missed (as for unreachable match arms).
+    `_ = e` is the spelling a reader already knows from destructuring, where `_` drops a part. A
+    deferred statement is exempt because it runs while its block is being left, where no `?` or
+    `return` can carry a failure anywhere, and `defer f.close()` is the form `defer` exists for. A
+    `Future` is included because dropping one loses its answer the same way.
+  - *Alternatives weighed*: a warning (no channel to carry it); a `@mustUse` annotation on types or
+    functions (more general, but a new attribute for two types, and a library author could forget
+    it); `Result` only (a dropped `Future[Result[…]]` loses the failure just as surely); reporting
+    a dropped `Result` in `defer` too, which would make `defer _ = f.close()` the idiom (noise on the
+    one form `defer` is for); `val _ = e` as the only discard (it already works, but reads as a
+    declaration).
+  - **Review with the user**: whether `defer` should stay exempt (decisions above left "whether
+    discarding a `close`'s `Result` in `defer` deserves a warning" open), and whether a lambda yielding
+    `unit` should be held to the rule (it is, so `xs.foreach(f -> fs.remove(f))` is an error).
+
+- Settled on the user's delegation 2026-11-13 (built on branch `bigint-natural`): **Integers meet a type that takes them, through a core trait `FromInteger`** (2026-11-13, branch
+  `bigint-natural`; [types](/spec/types/#integers-meet-a-type-that-takes-them)). `trait FromInteger`
+  with one member, `static fromInteger[N: Integer](n: N) -> Self`; `BigInt` implements it. (1) An
+  integer literal where such a type is expected is `T.fromInteger(literal)`, the literal typed as a
+  `long` where it fits and otherwise at the narrowest width a multiple of 64 bits that holds it, so a
+  literal of any size and base is a `BigInt` (`val x: BigInt = 123456789012345678901234567890`). (2)
+  In `+ - * / %`, the comparisons and `==`/`!=`, an operand of an integer type (or a type parameter
+  bounded by `Integer`) beside an operand of such a type is converted with `fromInteger`, on either
+  side and in chains; a compound assignment converts only its value, so an integer target keeps its
+  type. (3) Where the type has an operator method of the name and no overload of it takes an
+  integer, its integer argument is converted, and a converted left operand calls it. (4) An integer
+  literal is refused as a pattern for such a type, since its value is a call. WHY: `f * i`,
+  `f == 0` and `val f: BigInt = 1` are what a reader writes, and `BigInt(i)` around every integer
+  hid the arithmetic. One trait serves both rules and any later number type (a decimal, a rational)
+  joins by an impl, with no type named in the checker; the conversion is lossless by the trait's
+  contract, which is why it is allowed where integer widths, which can lose, still need `long(x)`.
+  A literal too large for `long` reuses the arbitrary-width integers rather than a text form, so the
+  trait has one member. ALTERNATIVES: operator methods on `BigInt` taking `[N: Integer]` (covers
+  `big * i` only; `i * big` and `0 == big` still need a checker rule, so two mechanisms); a general
+  reversed-operand lookup on the right operand's type (larger, and it says nothing of literals or
+  `==`); implicit conversion of an integer to a `FromInteger` type at every expected type, arguments
+  included (wider than asked, and it makes overloads `f(BigInt)`/`f(long)` harder to read); a
+  `fromDigits(text)` member for literals past `long` (a second member every implementer writes, and
+  a parse at run time). Literal patterns for such a type (matching by `==`) were left out: a pattern
+  is a constant today, and coverage reasons about constants. **Review with the user**: whether the
+  conversion should reach plain arguments (`gcd(7)` already works for a literal; `gcd(i)` does not),
+  and whether `BigInt.zero()`/`one()` should lose their `()` with the core traits' wave.
+- Settled on the user's delegation 2026-11-13 (built on branch `bigint-natural`): **`BigInt(n)` with a literal past `long` stays an error** (2026-11-13, branch `bigint-natural`):
+  `apply(n: long)` and `apply[T: Integer](n: T)` give the literal no wider type, and the message says
+  it does not fit; `val x: BigInt = …` is the spelling. WHY: typing a literal at a free `Integer`
+  bound by its size would be a second literal rule for one call. ALTERNATIVE: an `apply` overload
+  the literal rule reaches.
+
 **Deferred**
 
 - Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
@@ -8039,38 +8119,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
-- **Integers meet a type that takes them, through a core trait `FromInteger`** (2026-11-13, branch
-  `bigint-natural`; [types](/spec/types/#integers-meet-a-type-that-takes-them)). `trait FromInteger`
-  with one member, `static fromInteger[N: Integer](n: N) -> Self`; `BigInt` implements it. (1) An
-  integer literal where such a type is expected is `T.fromInteger(literal)`, the literal typed as a
-  `long` where it fits and otherwise at the narrowest width a multiple of 64 bits that holds it, so a
-  literal of any size and base is a `BigInt` (`val x: BigInt = 123456789012345678901234567890`). (2)
-  In `+ - * / %`, the comparisons and `==`/`!=`, an operand of an integer type (or a type parameter
-  bounded by `Integer`) beside an operand of such a type is converted with `fromInteger`, on either
-  side and in chains; a compound assignment converts only its value, so an integer target keeps its
-  type. (3) Where the type has an operator method of the name and no overload of it takes an
-  integer, its integer argument is converted, and a converted left operand calls it. (4) An integer
-  literal is refused as a pattern for such a type, since its value is a call. WHY: `f * i`,
-  `f == 0` and `val f: BigInt = 1` are what a reader writes, and `BigInt(i)` around every integer
-  hid the arithmetic. One trait serves both rules and any later number type (a decimal, a rational)
-  joins by an impl, with no type named in the checker; the conversion is lossless by the trait's
-  contract, which is why it is allowed where integer widths, which can lose, still need `long(x)`.
-  A literal too large for `long` reuses the arbitrary-width integers rather than a text form, so the
-  trait has one member. ALTERNATIVES: operator methods on `BigInt` taking `[N: Integer]` (covers
-  `big * i` only; `i * big` and `0 == big` still need a checker rule, so two mechanisms); a general
-  reversed-operand lookup on the right operand's type (larger, and it says nothing of literals or
-  `==`); implicit conversion of an integer to a `FromInteger` type at every expected type, arguments
-  included (wider than asked, and it makes overloads `f(BigInt)`/`f(long)` harder to read); a
-  `fromDigits(text)` member for literals past `long` (a second member every implementer writes, and
-  a parse at run time). Literal patterns for such a type (matching by `==`) were left out: a pattern
-  is a constant today, and coverage reasons about constants. **Review with the user**: whether the
-  conversion should reach plain arguments (`gcd(7)` already works for a literal; `gcd(i)` does not),
-  and whether `BigInt.zero()`/`one()` should lose their `()` with the core traits' wave.
-- **`BigInt(n)` with a literal past `long` stays an error** (2026-11-13, branch `bigint-natural`):
-  `apply(n: long)` and `apply[T: Integer](n: T)` give the literal no wider type, and the message says
-  it does not fit; `val x: BigInt = …` is the spelling. WHY: typing a literal at a free `Integer`
-  bound by its size would be a second literal rule for one call. ALTERNATIVE: an `apply` overload
-  the literal rule reaches.
 - **`BigDecimal`: an immutable unscaled `BigInt` and a scale, rounding by a `Rounding` data type,
   no context object** (2026-11-13, branch `bigdecimal`; [types](/spec/types/#bigdecimal)). The class
   is `BigDecimal(val unscaled: BigInt, val scale: int)`; a negative scale traps in the constructor,

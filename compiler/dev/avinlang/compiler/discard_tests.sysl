@@ -1,0 +1,62 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+
+// A `Result` or a `Future` thrown away is an error, reported once at the expression that made it;
+// `_ = e` drops one on purpose, a deferred statement may drop one, and an expression checked only
+// for its own errors after the form around it failed reports none.
+
+/** The diagnostics `avin check` renders for `text`, or "" when it compiles. */
+private discard_diagnostics(text: string) -> string = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(_) -> ""
+    Err(d) -> d
+
+/** How many times `part` occurs in `text`. */
+private occurrences(text: string, part: string) -> int
+    val t = text.bytes
+    val p = part.bytes
+    var n = 0
+    var at = 0usize
+    while at + p.len <= t.len
+        var k = 0usize
+        while k < p.len && t[at + k] == p[k]
+            k += 1
+        if k == p.len
+            n += 1
+            at += p.len
+        else at += 1
+    n
+
+const Discarded: string = "is discarded here"
+
+const Fails: string = "fails(k: int) -> Result[int, string] = if k > 0 then Ok(k) else Err(\"no\")\n\n"
+
+@test("a dropped Result: a statement, the last line of a unit function, a method's and a generic function's, each reported once at its line")
+dropped_results_are_reported_once_each()
+    val d = discard_diagnostics(Fails + "class C\n    put() -> Result[unit, string] = Ok(())\n\ngeneric[T](x: T) -> Result[T, string] = Ok(x)\n\ntail()\n    fails(1)\n\nmain()\n    fails(2)\n    C().put()\n    generic(\"x\")\n    tail()\n")
+    assert_eq(occurrences(d, Discarded), 4)
+    assert(d.contains("probe.avin:9:5"), d)
+    assert(d.contains("probe.avin:12:5"), d)
+    assert(d.contains("probe.avin:13:5"), d)
+    assert(d.contains("probe.avin:14:5"), d)
+
+@test("`_ = e` drops a Result or a Future on purpose, and `val _ = e` does too; a value used is no discard")
+deliberate_drops_compile()
+    assert_eq(discard_diagnostics(Fails + "import avin.threads.Future\n\nmain()\n    _ = fails(1)\n    val _ = fails(2)\n    _ = Future(3)\n    val n = fails(4).getOrElse(0)\n    if fails(5).isOk then println(n)\n    println(fails(6))\n"), "")
+
+@test("a deferred statement may drop a Result, in a loop and with a block body; a lambda written in one may not")
+deferred_drops_are_exempt()
+    assert_eq(discard_diagnostics(Fails + "main()\n    defer fails(1)\n    for i in 0..<2\n        defer fails(i)\n    defer\n        fails(3)\n        fails(4)\n    println(\"x\")\n"), "")
+    val d = discard_diagnostics(Fails + "main()\n    defer [1].foreach(k -> fails(k))\n    println(\"x\")\n")
+    assert_eq(occurrences(d, Discarded), 1)
+
+@test("an argument checked only for its own errors after its call failed reports no discarded Result")
+recovery_reports_no_discard()
+    val d = discard_diagnostics(Fails + "main()\n    nowhere(fails(1))\n    val n = 3\n    n.nothing(fails(2))\n")
+    assert(d.contains("`nowhere` is not defined"), d)
+    assert_eq(occurrences(d, Discarded), 0)
+
+@test("a value of any other type is dropped freely, `unit`, an Option and a function's answer alike")
+other_values_drop_freely()
+    assert_eq(discard_diagnostics("main()\n    val b = Buffer[int]()\n    b.append(1)\n    Some(1)\n    \"text\".charCount\n    [1, 2].map(x -> x + 1)\n    println(b.length)\n"), "")

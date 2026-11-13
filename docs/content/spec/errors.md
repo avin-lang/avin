@@ -119,6 +119,37 @@ result type must be declared, or for a lambda known where it is written, as in
 `val f: (string) -> Option[int] = s -> Some(parse(s)? + 1)`. A delayed argument and a class body
 cannot be left by `?`, as they cannot by `return`.
 
+## A Result is not dropped
+
+**A `Result` whose value is thrown away is an error**, so a failure cannot pass unseen. A `Future`
+is held to the same rule, since dropping one leaves its computation's answer, a `Result` as often as
+not, with nobody to read it. A value is thrown away where it is:
+
+- a statement of a block, other than the value the block yields;
+- the last line of a function that yields `unit`, or of a lambda whose function type yields `unit`,
+  as in `xs.foreach(x -> fs.remove(x))`;
+- a branch of an `if` without `else`, or of an `if` or `match` written as a statement;
+- the body of a loop.
+
+```text
+save(text: string)
+    fs.writeText("out.txt", text)        // error: a `Result` is discarded here
+```
+
+A failure is handled with `?`, a `match`, or one of `Result`'s methods (`getOrElse`, `isOk`, …).
+**`_ = e` drops a value on purpose**: it evaluates `e` and keeps nothing, which says to a reader that
+the failure was considered and does not matter, as with a socket closed after its answer was read:
+
+```text
+_ = fs.remove(scratch)
+if closed then _ = conn.close() else _ = conn.held()
+```
+
+**A deferred statement may drop its `Result`**: `defer f.close()` runs while its block is being left,
+where no `?` or `return` could pass a failure on. A lambda written inside one is a function of its
+own and follows the rule. Values of every other type are dropped freely: a statement such as
+`buffer.append(x)` that answers the buffer needs no `_ =`.
+
 ## The Error trait
 
 An error meant for a person to read is an `Error`, a core trait in the prelude:
