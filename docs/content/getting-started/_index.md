@@ -259,7 +259,8 @@ not in it and fails, for a build or a commit hook:
 ```
 
 Each block level is two spaces in, and a line is broken only past 120 characters, one item of a list
-to a line. Comments and blank lines stay where they are, at most one blank line in a row. In a
+to a line; a sequence or set literal of short numbers, characters, strings, booleans or names is
+instead filled, as many items to a line as fit, so a table stays a table. Comments and blank lines stay where they are, at most one blank line in a row. In a
 literate file only the program is formatted, inside its four-column margin. A file that does not
 parse is left alone and its errors are reported. The [decisions](/spec/decisions/) list the style
 in full; the language server formats with the same rules.
