@@ -7801,7 +7801,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   separates the program's arguments. ALTERNATIVES: options after the program only, with an error
   saying so (keeps a rule nobody needs); treating words after the program as its arguments without
   `--` (makes `avin run main.avin -O2` pass `-O2` to the program, which surprises in the other
-  direction).
+  direction). One exception, from branch `script-deps` (below): `avin <file> ...`, with no command
+  word, for a file whose first line begins `#!`, gives every argument after the file to the program,
+  since that is how a `#!/usr/bin/env avin` line runs it as a command.
 - Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **`Result.toOption` beside `ok`, and `StringWriter` is
   `Display`.** `toOption` answers exactly what `ok` does, under the name `Either` and the
   collections use; `ok` stays. `StringWriter` implements `Display` (its `text`, padded to a field's
@@ -8020,15 +8022,22 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   directory (scripts would add and `tidy` would remove each other's lines); the hashes written into
   the header (the build would rewrite the user's source); a `vendor/<file>/` per script. Review with
   the user: whether a script's sum file is wanted, or is clutter next to a one-file tool.
-- Proposed (branch `script-deps`): **A first line beginning `#!` is not Avin**, in every file, and a
-  file whose first line begins `#!` takes every argument after it on the command line as the
-  program's own (`avin run tool.avin -O0` passes `-O0` to the program). Why: `./tool.avin a b` runs
-  `avin run ./tool.avin a b` through the `#!` line, and without the rule the program's arguments
-  would need a `--` that a command's caller cannot know to write. Alternatives weighed: `#!` lines
-  needing `avin run --` (env passes the file after the `--`, so it would be an argument, not the
-  program); taking options before the first non-option and the rest as the program's (`./tool -O0`
-  would still be eaten). Review with the user: the argument rule, which makes `-O0` after a `#!`
-  file the program's.
+- Proposed (branch `script-deps`, narrowed on train `train-f` to meet `small-papercuts`' rule): **A
+  first line beginning `#!` is not Avin**, in every file, and the line is written
+  `#!/usr/bin/env avin`. **`avin <file> ...` (the form a `#!` line runs, with no command word)
+  for a file whose first line begins `#!` gives every argument after the file to the program**, so
+  `./tool.avin -O0 x` passes `-O0` and `x`. Every other form keeps the command line's rule:
+  `avin run tool.avin -O0 -- x` and `avin -O2 tool.avin -- x` take the options as avin's and pass
+  only what follows `--`. Why: `./tool.avin a b` runs `avin ./tool.avin a b` through the `#!` line,
+  and without the rule the program's arguments would need a `--` that a command's caller cannot know
+  to write; while a person typing `avin run` is using avin, and its options mean the same wherever
+  they stand. Alternatives weighed: every argument after any `#!` file the program's, `avin run`
+  included (the branch's first form; it made `avin run tool.avin -O0` mean something different for
+  one kind of file); `#!/usr/bin/env -S avin run` as the line (needs `env -S`, and runs through
+  `avin run`, where the options are avin's); `#!` lines needing `avin run --` (env passes the file
+  after the `--`, so it would be an argument, not the program); taking options before the first
+  non-option and the rest as the program's (`./tool -O0` would still be eaten). Review with the
+  user: the argument rule, which makes `-O0` after a `#!` file the program's when run as a command.
 
 ## Open
 

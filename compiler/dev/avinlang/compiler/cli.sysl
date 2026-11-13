@@ -9,7 +9,7 @@ import sysl.slices.sort_by
 
 const Version: string = "0.0.20"
 const NoToolchain: string = "avin: cannot find the Avin library and runtime: they are installed in `share/avin` beside `bin/avin`; for a source checkout, set AVIN_ROOT to the directory that holds `library/` and `runtime/`"
-const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>] [--bindings] [<features>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2] [<features>]\n       avin run [<program>] [-O0 | -O2] [<features>] [-- <argument>...]\n       avin test [<program>] [<filter>] [--prefix] [-O0 | -O2] [<features>]\n       avin clean [<program>] [--all]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>] [<features>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; options may come before or after <program>, and only the arguments after `--` are the program's; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists; `--prefix` puts each file's path and a colon before every result line\n`avin check` stops after type checking; `--bindings` also builds the shims of the Sysl bindings and the C unit, so a binding Sysl or the C compiler rejects is reported\n`avin run` and `avin test` keep what they build in the user's cache directory (`AVIN_CACHE` names another), a directory per program; `avin clean` removes the program's, and `--all` every program's\n<features> are `--features a,b`, `--no-default-features` and `--all-features`, choosing the package's features; `avin test`, `avin check` and `avin vendor` turn every feature on unless one is given"
+const Usage: string = "usage: avin [<program>] [-O0 | -O2] [-- <argument>...]\n       avin parse [<program>]\n       avin check [<program>] [--bindings] [<features>]\n       avin emit-llvm [<program>] -o <module.ll>\n       avin build [<program>] [-o <executable>] [-O0 | -O2] [<features>]\n       avin run [<program>] [-O0 | -O2] [<features>] [-- <argument>...]\n       avin test [<program>] [<filter>] [--prefix] [-O0 | -O2] [<features>]\n       avin clean [<program>] [--all]\n       avin new <dir> [--lib]\n       avin add <source>[@<version>] [<package>]\n       avin tidy [--check] [<package>]\n       avin vendor [<package>] [<features>]\n       avin fmt [--check] [<path>...]\n       avin tangle <file.lavin> [-o <path>]\n       avin weave <file.lavin> [-o <file.html>]\n       avin lsp [--stdio]\n       avin --help\n       avin --version\n<program> is a path in a package (a directory holding avin.hocon), a source file (`.avin`, or `.lavin` for a literate one), or a directory holding a program's modules; left out, it is the current directory\n`avin` alone is `avin run`, and `avin <program> ...` is `avin run <program> ...` when the first argument is not a command; options may come before or after <program>, and only the arguments after `--` are the program's, except that `avin <file> ...` gives every argument after a file whose first line begins `#!` to the program, as a `#!/usr/bin/env avin` line runs it; reach a file or directory named like a command as `./test`\n`avin test`: an argument that names an existing file or directory is the program, any other is the filter; `avin test . <filter>` filters when a path of that name exists; `--prefix` puts each file's path and a colon before every result line\n`avin check` stops after type checking; `--bindings` also builds the shims of the Sysl bindings and the C unit, so a binding Sysl or the C compiler rejects is reported\n`avin run` and `avin test` keep what they build in the user's cache directory (`AVIN_CACHE` names another), a directory per program; `avin clean` removes the program's, and `--all` every program's\n<features> are `--features a,b`, `--no-default-features` and `--all-features`, choosing the package's features; `avin test`, `avin check` and `avin vendor` turn every feature on unless one is given"
 
 // Output channels, the exit status and the toolchain location stay outside command dispatch, so
 // every command can be run and tested in memory. 0 is success, 1 a source, I/O or build failure,
@@ -46,6 +46,15 @@ run_cli_in(here: string, args: []const string, tc: Option[Toolchain], say: strin
         if args.len >= 2 && !args[1].starts_with("-") && !exists(args[1])
             note(s"avin: unknown command or file `${args[1]}`\n" + Usage)
             return 2
+        // `avin <file> ...` for a file whose first line begins `#!` is how a `#!/usr/bin/env avin` line
+        // runs it as a command, so every argument after the file is the program's own, as an
+        // interpreter passes its script's arguments.
+        if args.len >= 2 && !args[1].starts_with("-") && runs_as_command(args[1])
+            full.push(args[1])
+            full.push("--")
+            for i in 2..<args.len
+                full.push(args[i])
+            return run_command(here, full.view(), tc, say, note, stdout, stderr)
         for i in 1..<args.len
             full.push(args[i])
         return run_command(here, full.view(), tc, say, note, stdout, stderr)
@@ -76,12 +85,6 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     var flags = FeatureFlags(false, false, false, buf())
     val takes_features = command == "build" || command == "run" || command == "check" || command == "test"
     var i = if named then 3usize else 2usize
-    // A file whose first line begins `#!` runs as a command, through that line, so every argument after
-    // it is the program's own, as an interpreter passes its script's.
-    if command == "run" && named && runs_as_command(path)
-        for j in 3..<args.len
-            program_args.push(args[j])
-        i = args.len
     while i < args.len
         val a = args[i]
         if a == "--" && command == "run"

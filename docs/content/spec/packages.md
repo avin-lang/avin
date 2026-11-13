@@ -472,7 +472,7 @@ line `// avin.hocon`, then comment lines holding exactly what a manifest's `depe
 holds:
 
 ```text
-#!/usr/bin/env -S avin run
+#!/usr/bin/env avin
 // avin.hocon
 // dependencies {
 //   json  { git = "github.com/avin-lang/json", version = "0.1.0" }
@@ -524,10 +524,13 @@ error: `gone` is a path dependency, and `../gone` is not a directory
   manifest to put them in until it becomes a package.
 
 **A first line beginning `#!` is not Avin**, in any file: it names the program that runs the file, so
-a program of one file can be run as a command (`chmod +x tool.avin`, then `./tool.avin a b`). A file
-whose first line begins `#!` takes every argument after it as its own: `avin run tool.avin -O0`
-passes `-O0` to the program, as an interpreter passes its script's arguments, since a command's
-caller does not know it is written in Avin.
+a program of one file can be run as a command (`chmod +x tool.avin`, then `./tool.avin a b`). The
+line is written `#!/usr/bin/env avin`, so `./tool.avin a b` runs `avin ./tool.avin a b`, and
+**`avin <file> ...` for a file whose first line begins `#!` gives every argument after the file to
+the program**: `./tool.avin -O0 x` passes `-O0` and `x`, as an interpreter passes its script's
+arguments, since a command's caller does not know it is written in Avin. Every other form keeps the
+rule of the command line: `avin run tool.avin -O0 -- x`, and `avin -O2 tool.avin -- x`, take `-O0`
+and `-O2` as avin's own and pass only what follows `--`.
 
 ## The standard library's modules
 
@@ -545,7 +548,7 @@ source checkout. Its version is the compiler's. It is never a dependency: no man
   error at the import, listing the modules under the deepest prefix that exists:
 
 ```text
-error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.threads`, `avin.time`
+error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cli`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.threads`, `avin.time`
  --> app/main.avin:1:8
 ```
 

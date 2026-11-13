@@ -39,7 +39,7 @@ A missing tool is reported by name, with what installs it.
 
 Working on the compiler, the library or the runtime needs:
 
-- Sysl 0.10.6, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
+- Sysl 0.10.7, with a checkout of Sysl's `parsing` package at `../../sysl-lang/parsing` relative to
   the repository: the repository is cloned into a directory named for its organization
   (`avin-lang/avin`), beside a `sysl-lang` directory holding `sysl-lang/parsing`
 - clang on `PATH`
@@ -224,7 +224,7 @@ A program of one file uses packages too, with no manifest: its first lines name 
 block is. A `#!` line may come first, so the file runs as a command:
 
 ```text
-#!/usr/bin/env -S avin run
+#!/usr/bin/env avin
 // avin.hocon
 // dependencies {
 //   json { git = "github.com/avin-lang/json", version = "0.1.0" }
@@ -242,7 +242,9 @@ chmod +x tool.avin
 ```
 
 `avin run`, `build`, `check` and `test` fetch what the header names into the same cache, and the
-hashes go in `tool.avin.sum` beside the file. A blank line ends the header. The
+hashes go in `tool.avin.sum` beside the file. A blank line ends the header. Run through its `#!`
+line, `./tool.avin data.json` is `avin ./tool.avin data.json`, and every argument after the file is
+the program's own; `avin run tool.avin -O0 -- data.json` keeps the usual rule, with `-O0` avin's. The
 [packages chapter](/spec/packages/#programs-of-one-file) has the rules.
 
 ## Formatting
