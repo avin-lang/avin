@@ -1050,8 +1050,8 @@ Settled by the user on 2026-11-04:
 - **A line that starts with a binary operator, indented deeper than the line where its expression
   began, continues that expression**, with the operator's own precedence: the line break means
   nothing. Every binary operator of the language, every method named by a symbol, `~`, and `++` or
-  `--` with an operand after it start one; a word, `!`, `.`, `?`, a bracket and the assignments do
-  not. It applies wherever an expression with a complete operand ends a line (a binding's value, an
+  `--` with an operand after it start one, and so does a member's `.` (see the Proposed entry on `.`
+  lines); a word, `!`, `?`, a bracket and the assignments do not. It applies wherever an expression with a complete operand ends a line (a binding's value, an
   assignment, a `return` value, an infix call's argument, a `match` arm's or a lambda's body, an
   expression statement) and ends at the first line back at the depth the expression began on; a
   line inside it that does not start with an operator is an error. Blank lines and comments between
@@ -5499,7 +5499,8 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   200 to 599. Responses are whole bodies; a streamed (chunked) response is later work.
   *Alternatives*: a builder `Router().get(…)` (a chain on one line, or a `var` reassigned); a
   response writer handed to the handler (streaming, but a handler that forgets to finish it).
-  Review with the user whether a line that starts with `.` should continue the expression above.
+  Whether a line that starts with `.` should continue the expression above, left for review here,
+  is answered under [Proposed](#proposed): it does, so a builder's chain may now span lines.
 - Settled on the user's delegation 2026-11-10 (built on branch `lwt-server`): **routing**: segments matched one for one with the request's
   decoded segments, `:name` binding a non-empty one, the first matching route winning; a `GET`
   route answers `HEAD`; `404` for a path no route matches and `405` with `Allow` for one matched for
@@ -7367,6 +7368,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
+
+- Proposed (branch `dot-chain`): **a line that starts with a member's `.`, indented deeper than the
+  line its expression began on, continues that expression**, exactly as a line starting with a binary
+  operator does: in the same places (a binding's value, an assignment, a `return` value, an infix
+  call's argument, a `match` arm's or a lambda's body, a branch of a one-line `if`, an expression
+  statement, a trailing lambda's body), never in the header of a form whose body follows, with blank
+  lines and comments between skipped, and ending at the first line back at the depth the expression
+  began on. `.` and the binary operators may alternate line by line, and a call's trailing block
+  ending inside the chain lets the next `.` line go on after it. The line break means nothing to
+  binding: `.` takes the operand right before it, so `a + b` then `    .toString` is
+  `a + b.toString`, as on one line. An indented line after a call that starts with `.` is a
+  continuation, not the call's trailing block. The error for a line inside a continuation that
+  starts with neither now says "a binary operator or `.`". *Why*: a pipeline of `filter`, `map` and
+  a builder's `.get(…)` calls reads one step per line, and wrapping it in parentheses to get there
+  was the only way before (audit item C2; the `lwt-server` routing entry chose a vector over a
+  builder for this reason). Reusing the operator continuation keeps one rule for where an expression
+  may go on, and the line break meaning nothing keeps one rule for precedence. *Alternatives*: a
+  `.` line binding to the whole expression above (`(a + b).toString`), which reads naturally for a
+  chain after an operator but makes the line break change meaning, unlike every operator line;
+  requiring a chain to start on its own line (`val ys =` then the receiver and the dots on deeper
+  lines), which adds nothing the depth rule does not already say; a trailing `.` at the end of the
+  line above, which hides the call being made. Review with the user whether `.` after an operator
+  line should bind to the whole expression instead.
 
 ## Open
 
