@@ -10,164 +10,175 @@ import avin.fs
 import avin.io.IoError
 import avin.net.{TcpListener, TcpStream}
 import avin.io
-import avin.net.tls.{Certificate, Credentials, Expired, Handshake, HostMismatch, NotYetValid, Other, TlsClient, TlsError, TlsRefusal, TlsServer, TlsStream, Transport, Untrusted}
+
+import avin.net.tls.{
+  Certificate, Credentials, Expired, Handshake, HostMismatch, NotYetValid, Other, TlsClient, TlsError, TlsRefusal,
+  TlsServer, TlsStream, Transport, Untrusted
+}
+
 import avin.threads.{Thread, spawn}
 import avin.time
 
 ok[T](r: Result[T, IoError]) -> T = r match
-    Ok(v) -> v
-    Err(e) -> fail(s"unexpected error: ${e.message}")
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
 
 tls[T](r: Result[T, TlsError]) -> T = r match
-    Ok(v) -> v
-    Err(e) -> fail(s"unexpected error: ${e.message}")
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
 
 // A test certificate or key, from the repository root or from `compiler/`.
 fixture(name: string) -> string
-    val here = "tests/fixtures/tls/" + name
-    ok(fs.readText(if fs.exists(here) then here else "../" + here))
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
 
 trusting() -> TlsClient = TlsClient().trust(fixture("ca.pem"))
 
 kind(e: TlsError) -> string = e match
-    Transport(_) -> "transport"
-    Certificate(_, _) -> "certificate"
-    Handshake(_) -> "handshake"
-    Credentials(_) -> "credentials"
+  Transport(_) -> "transport"
+  Certificate(_, _) -> "certificate"
+  Handshake(_) -> "handshake"
+  Credentials(_) -> "credentials"
 
 // The port of a listener whose next `count` connections are each answered by a TLS handshake
 // presenting `certificate`, and the thread serving them, which says how each handshake ended.
 serving(certificate: string, count: int) -> (int, Thread[unit])
-    val listener = ok(TcpListener.bind("127.0.0.1", 0))
-    val server = TlsServer(fixture(certificate), fixture("localhost.key"))
-    val port = listener.port()
-    val accepting = spawn(() ->
-        defer listener.close()
-        for _ in 0..<count
-            val tcp = ok(listener.accept())
-            ok(tcp.setTimeout(time.seconds(20)))
-            TlsStream.server(tcp, server) match
-                Ok(s) ->
-                    defer s.close()
-                    println("  server: the handshake succeeded")
-                    ok(s.writeText("hello\n"))
-                Err(_) ->
-                    defer tcp.close()
-                    println("  server: the handshake failed"))
-    (port, accepting)
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val server = TlsServer(fixture(certificate), fixture("localhost.key"))
+  val port = listener.port()
+  val accepting = spawn(() ->
+    defer listener.close()
+    for _ in 0 ..< count
+      val tcp = ok(listener.accept())
+      ok(tcp.setTimeout(time.seconds(20)))
+      TlsStream.server(tcp, server) match
+        Ok(s) ->
+          defer s.close()
+          println("  server: the handshake succeeded")
+          ok(s.writeText("hello\n"))
+        Err(_) ->
+          defer tcp.close()
+          println("  server: the handshake failed"))
+  (port, accepting)
 
 refused(certificate: string, host: string, client: TlsClient)
-    val (port, served) = serving(certificate, 1)
-    val tcp = ok(TcpStream.connect("127.0.0.1", port))
-    val e = TlsStream.client(tcp, host, client).err.get
-    _ = tcp.close()
-    served.join()
-    println(s"$certificate for $host: ${kind(e)}, the message names it: ${e.message.contains("certificate")}")
-    // The reason, as a value and in the message.
-    val why = e.refusal().get
-    println(s"  why: ${why}, in the message: ${e.message.contains(why.message)}")
-    println(s"  matched: ${reasonName(why)}")
+  val (port, served) = serving(certificate, 1)
+  val tcp = ok(TcpStream.connect("127.0.0.1", port))
+  val e = TlsStream.client(tcp, host, client).err.get
+  _ = tcp.close()
+  served.join()
+  println(s"$certificate for $host: ${kind(e)}, the message names it: ${e.message.contains("certificate")}")
+  // The reason, as a value and in the message.
+  val why = e.refusal().get
+  println(s"  why: ${why}, in the message: ${e.message.contains(why.message)}")
+  println(s"  matched: ${reasonName(why)}")
 
 reasonName(r: TlsRefusal) -> string = r match
-    HostMismatch -> "host mismatch"
-    Expired -> "expired"
-    NotYetValid -> "not yet valid"
-    Untrusted -> "untrusted"
-    Other(c) -> s"other $c"
+  HostMismatch -> "host mismatch"
+  Expired -> "expired"
+  NotYetValid -> "not yet valid"
+  Untrusted -> "untrusted"
+  Other(c) -> s"other $c"
 
 main()
-    refused("localhost.pem", "localhost", TlsClient())
-    refused("selfsigned.pem", "localhost", trusting())
-    refused("selfsigned.pem", "localhost", TlsClient())
-    refused("expired.pem", "localhost", trusting())
-    refused("localhost.pem", "elsewhere.example", trusting())
-    refused("localhost.pem", "127.0.0.2", trusting())
-    // A certificate whose first day is in the future, trusted as its own authority: the dates are
-    // refused whatever the chain.
-    refused("notyet.pem", "localhost", TlsClient().trust(fixture("notyet.pem")))
-    // Only a certificate refusal has a reason.
-    val plainPeer = ok(TcpListener.bind("127.0.0.1", 0))
-    val plainAt = plainPeer.port()
-    val plainThread = spawn(() ->
-        val s = ok(plainPeer.accept())
-        ok(s.writeText("HTTP/1.1 400 Bad Request\r\n\r\n"))
-        _ = s.close()
-        plainPeer.close())
-    val notCertificate = TlsStream.connect("localhost", plainAt, trusting()).err.get
-    println(s"a plain-text peer has a reason: ${notCertificate.refusal().isDefined}")
-    _ = plainThread.join()
-    println(s"a transport error has a reason: ${Transport(IoError(io.ConnectionReset)).refusal().isDefined}")
+  refused("localhost.pem", "localhost", TlsClient())
+  refused("selfsigned.pem", "localhost", trusting())
+  refused("selfsigned.pem", "localhost", TlsClient())
+  refused("expired.pem", "localhost", trusting())
+  refused("localhost.pem", "elsewhere.example", trusting())
+  refused("localhost.pem", "127.0.0.2", trusting())
+  // A certificate whose first day is in the future, trusted as its own authority: the dates are
+  // refused whatever the chain.
+  refused("notyet.pem", "localhost", TlsClient().trust(fixture("notyet.pem")))
+  // Only a certificate refusal has a reason.
+  val plainPeer = ok(TcpListener.bind("127.0.0.1", 0))
+  val plainAt = plainPeer.port()
+  val plainThread = spawn(() ->
+    val s = ok(plainPeer.accept())
+    ok(s.writeText("HTTP/1.1 400 Bad Request\r\n\r\n"))
+    _ = s.close()
+    plainPeer.close())
+  val notCertificate = TlsStream.connect("localhost", plainAt, trusting()).err.get
+  println(s"a plain-text peer has a reason: ${notCertificate.refusal().isDefined}")
+  _ = plainThread.join()
+  println(s"a transport error has a reason: ${Transport(IoError(io.ConnectionReset)).refusal().isDefined}")
 
-    // A self-signed certificate trusted as its own authority is accepted.
-    val (port, served) = serving("selfsigned.pem", 2)
-    val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("selfsigned.pem"))))
-    println(s"trusting the self-signed certificate: ${ok(c.readLine()).getOrElse("?")}")
-    _ = c.close()
-    // Trust only grows: the authority added beside it does not take that away.
-    val both = TlsClient().trust(fixture("ca.pem")).trust(fixture("selfsigned.pem"))
-    println(both.trusted.length)
-    val c2 = tls(TlsStream.connect("localhost", port, both))
-    println(s"trusting both: ${ok(c2.readLine()).getOrElse("?")}")
-    _ = c2.close()
-    served.join()
+  // A self-signed certificate trusted as its own authority is accepted.
+  val (port, served) = serving("selfsigned.pem", 2)
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("selfsigned.pem"))))
+  println(s"trusting the self-signed certificate: ${ok(c.readLine()).getOrElse("?")}")
+  _ = c.close()
+  // Trust only grows: the authority added beside it does not take that away.
+  val both = TlsClient().trust(fixture("ca.pem")).trust(fixture("selfsigned.pem"))
+  println(both.trusted.length)
+  val c2 = tls(TlsStream.connect("localhost", port, both))
+  println(s"trusting both: ${ok(c2.readLine()).getOrElse("?")}")
+  _ = c2.close()
+  served.join()
 
-    // A peer that is not TLS: it answers plain text and closes.
-    val plain = ok(TcpListener.bind("127.0.0.1", 0))
-    val plainPort = plain.port()
-    val answering = spawn(() ->
-        val s = ok(plain.accept())
-        ok(s.writeText("HTTP/1.1 400 Bad Request\r\n\r\n"))
-        _ = s.close()
-        plain.close())
-    println(s"a plain-text peer: ${kind(TlsStream.connect("localhost", plainPort, trusting()).err.get)}")
-    _ = answering.join()
+  // A peer that is not TLS: it answers plain text and closes.
+  val plain = ok(TcpListener.bind("127.0.0.1", 0))
+  val plainPort = plain.port()
+  val answering = spawn(() ->
+    val s = ok(plain.accept())
+    ok(s.writeText("HTTP/1.1 400 Bad Request\r\n\r\n"))
+    _ = s.close()
+    plain.close())
+  println(s"a plain-text peer: ${kind(TlsStream.connect("localhost", plainPort, trusting()).err.get)}")
+  _ = answering.join()
 
-    // A peer that closes without a word.
-    val closing = ok(TcpListener.bind("127.0.0.1", 0))
-    val closingPort = closing.port()
-    val closer = spawn(() ->
-        _ = ok(closing.accept()).close()
-        closing.close())
-    val ended = TlsStream.connect("localhost", closingPort, trusting()).err.get
-    println(s"a peer that closes: ${kind(ended) == "handshake" || kind(ended) == "transport"}")
-    _ = closer.join()
+  // A peer that closes without a word.
+  val closing = ok(TcpListener.bind("127.0.0.1", 0))
+  val closingPort = closing.port()
+  val closer = spawn(() ->
+    _ = ok(closing.accept()).close()
+    closing.close())
+  val ended = TlsStream.connect("localhost", closingPort, trusting()).err.get
+  println(s"a peer that closes: ${kind(ended) == "handshake" || kind(ended) == "transport"}")
+  _ = closer.join()
 
-    // Nothing listening.
-    val gone = ok(TcpListener.bind("127.0.0.1", 0))
-    val gonePort = gone.port()
-    _ = gone.close()
-    println(s"nothing listening: ${kind(TlsStream.connect("127.0.0.1", gonePort, trusting()).err.get)}")
+  // Nothing listening.
+  val gone = ok(TcpListener.bind("127.0.0.1", 0))
+  val gonePort = gone.port()
+  _ = gone.close()
+  println(s"nothing listening: ${kind(TlsStream.connect("127.0.0.1", gonePort, trusting()).err.get)}")
 
-    // A PEM to trust that holds no certificate is refused before the handshake.
-    val (p5, s5) = serving("localhost.pem", 1)
-    val t5 = ok(TcpStream.connect("127.0.0.1", p5))
-    println(s"trusting text that is not PEM: ${kind(TlsStream.client(t5, "localhost", TlsClient().trust("not a certificate")).err.get)}")
-    _ = t5.close()
-    s5.join()
+  // A PEM to trust that holds no certificate is refused before the handshake.
+  val (p5, s5) = serving("localhost.pem", 1)
+  val t5 = ok(TcpStream.connect("127.0.0.1", p5))
+  println(
+    s"trusting text that is not PEM: ${kind(TlsStream.client(t5, "localhost", TlsClient().trust("not a certificate")).err.get)}"
+  )
+  _ = t5.close()
+  s5.join()
 
-    // A server's credentials.
-    println(s"a key for another certificate: ${kind(TlsServer.of(fixture("localhost.pem"), fixture("other.key")).err.get)}")
-    println(s"a certificate that is not PEM: ${kind(TlsServer.of("nonsense", fixture("localhost.key")).err.get)}")
-    println(s"a key that is not PEM: ${kind(TlsServer.of(fixture("localhost.pem"), "").err.get)}")
-    println(s"a chain of two: ${TlsServer.of(fixture("localhost.pem") + fixture("ca.pem"), fixture("localhost.key")).isOk}")
-    // Made directly, a server is checked at its first connection, which fails on the server's side.
-    val wrong = TlsServer(fixture("localhost.pem"), fixture("other.key"))
-    val listener = ok(TcpListener.bind("127.0.0.1", 0))
-    val lp = listener.port()
-    val side = spawn(() ->
-        val tcp = ok(listener.accept())
-        val e = TlsStream.server(tcp, wrong).err.get
-        _ = tcp.close()
-        _ = listener.close()
-        kind(e))
-    val t6 = ok(TcpStream.connect("127.0.0.1", lp))
-    val clientSide = TlsStream.client(t6, "localhost", trusting())
-    _ = t6.close()
-    println(s"a mismatched server: ${side.join()}, the client's handshake failed: ${clientSide.isErr}")
+  // A server's credentials.
+  println(
+    s"a key for another certificate: ${kind(TlsServer.of(fixture("localhost.pem"), fixture("other.key")).err.get)}"
+  )
+  println(s"a certificate that is not PEM: ${kind(TlsServer.of("nonsense", fixture("localhost.key")).err.get)}")
+  println(s"a key that is not PEM: ${kind(TlsServer.of(fixture("localhost.pem"), "").err.get)}")
+  println(
+    s"a chain of two: ${TlsServer.of(fixture("localhost.pem") + fixture("ca.pem"), fixture("localhost.key")).isOk}"
+  )
+  // Made directly, a server is checked at its first connection, which fails on the server's side.
+  val wrong = TlsServer(fixture("localhost.pem"), fixture("other.key"))
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val lp = listener.port()
+  val side = spawn(() ->
+    val tcp = ok(listener.accept())
+    val e = TlsStream.server(tcp, wrong).err.get
+    _ = tcp.close()
+    _ = listener.close()
+    kind(e))
+  val t6 = ok(TcpStream.connect("127.0.0.1", lp))
+  val clientSide = TlsStream.client(t6, "localhost", trusting())
+  _ = t6.close()
+  println(s"a mismatched server: ${side.join()}, the client's handshake failed: ${clientSide.isErr}")
 
-    // A verdict with no kind of its own keeps OpenSSL's number, and every reason has its words.
-    println(Other(7))
-    println(Certificate("x", Other(7)).message)
-    println(Certificate("x", Expired).refusal().get)
-    for r in [HostMismatch, Expired, NotYetValid, Untrusted]
-        println(r)
+  // A verdict with no kind of its own keeps OpenSSL's number, and every reason has its words.
+  println(Other(7))
+  println(Certificate("x", Other(7)).message)
+  println(Certificate("x", Expired).refusal().get)
+  for r in [HostMismatch, Expired, NotYetValid, Untrusted]
+    println(r)
