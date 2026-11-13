@@ -1,6 +1,6 @@
 ---
 title: Packages
-summary: avin.hocon, dependencies by git, path and workspace, version selection, avin.sum, workspaces, features, members of a repository, vendoring, the standard library's modules, and the commands that make and keep them.
+summary: avin.hocon, dependencies by git, path and workspace, version selection, avin.sum, workspaces, features, members of a repository, vendoring, a program of one file's dependencies header, the standard library's modules, and the commands that make and keep them.
 weight: 24
 ---
 
@@ -465,6 +465,70 @@ checked against, and `avin tidy` still rewrites it to the resolution, independen
 holds. `avin tidy` and `avin add` read the machine's cache, fetching into it, whether or not there is
 a `vendor/`; after `avin add`, the build refuses the new package until `avin vendor` copies it in.
 
+## Programs of one file
+
+A program of one file has no manifest, and **names its dependencies in a header at its top**: the
+line `// avin.hocon`, then comment lines holding exactly what a manifest's `dependencies` block
+holds:
+
+```text
+#!/usr/bin/env -S avin run
+// avin.hocon
+// dependencies {
+//   json  { git = "github.com/avin-lang/json", version = "0.1.0" }
+//   table { path = "../table" }
+// }
+
+import dev.avinlang.json
+
+main(args: Vector[string])
+    ...
+```
+
+- **The header is comments**, so it is Avin to every tool that reads the file, and the file stays a
+  file: no directory, no manifest beside it. `avin run`, `build`, `check` and `test` and the
+  language server read it; nothing else needs to.
+- **It begins on the first line**, or on the second after a `#!` line, with `// avin.hocon` and
+  nothing else (blanks aside). It runs to the first line that is not a `//` comment, so a blank line
+  ends it, and a comment about the program goes after that. Its text is each line after its `//`,
+  read as HOCON. A `// avin.hocon` line anywhere else in the file is an error at that line, since a
+  header that is not read would be a dependency silently missing.
+- **It holds `dependencies` and nothing else.** A dependency is written as in a manifest, by `git`
+  with `version` or `rev`, with `member` for a [member of a repository](#members-of-a-repository),
+  or by `path`, relative to the file's directory; `features` and `default_features` ask for a
+  dependency's features as they do in a manifest. `workspace = true` and `optional` are refused: a
+  program of one file is in no workspace and has no features of its own to turn a dependency on.
+  Another key (`package`, `features`, `sysl-dependencies`, `c-libraries`) is refused at the key: a
+  program that needs one is a package.
+- **The dependencies resolve exactly as a manifest's do**: the same version selection, the same
+  cache, the same errors at the header's line in the file:
+
+```text
+error: `gone` is a path dependency, and `../gone` is not a directory
+ --> tool.avin:4:6
+  |
+4 | //   gone { path = "../gone" }
+  |      ^^^^
+```
+
+- **Its sum file is beside it, named after it**: `tool.avin.sum` for `tool.avin`, written as
+  `avin.sum` is, a line for every fetched package and version it reads, and committed with the file.
+  A program of one file with only path dependencies, or none, has none. `avin tidy tool.avin`
+  rewrites it, and removes it from a file whose header is gone.
+- **It is not vendored.** `vendor/` belongs to one project, and a directory of programs of one file
+  would share one; `avin vendor tool.avin` is refused, naming a package as the way to build with the
+  network off. `avin add` writes into a manifest, so it is refused too: the header is edited by hand.
+- **A file of a package, or of a program of many files, may not have one.** A package's
+  dependencies are its manifest's, and a header in one of its files is refused at the header rather
+  than merged with it or passed over; so is one in a file of a directory program, which has no
+  manifest to put them in until it becomes a package.
+
+**A first line beginning `#!` is not Avin**, in any file: it names the program that runs the file, so
+a program of one file can be run as a command (`chmod +x tool.avin`, then `./tool.avin a b`). A file
+whose first line begins `#!` takes every argument after it as its own: `avin run tool.avin -O0`
+passes `-O0` to the program, as an interpreter passes its script's arguments, since a command's
+caller does not know it is written in Avin.
+
 ## The standard library's modules
 
 **The standard library is the module `avin` and the modules under it**, written in Avin and shipped
@@ -522,7 +586,8 @@ opens the library's own source, which is read-only to a rename.
 **Every command finds the package from any path in it**, walking up from the file or directory it is
 given to the nearest `avin.hocon` with a `package` block: `avin run shapes/main.avin` and
 `avin check shapes/tests` both mean `shapes`. A path with no such manifest above it is a program
-without one, as before.
+without one, as before: a file being a [program of one file](#programs-of-one-file), whose header
+names its dependencies.
 
 - `avin build`, `run`, `test`, `check`, `emit-llvm` and `parse` compile the whole package with its
   dependencies. `avin build` names the executable after the package. A package without `main` is a

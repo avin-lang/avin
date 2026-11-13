@@ -219,6 +219,32 @@ what each one hashed to; commit it. `avin add github.com/owner/json@1.4.0` write
 into the manifest and fetches it, and without `@1.4.0` takes the highest release. `avin tidy` rewrites it to exactly what the package uses, and
 `avin tidy --check` fails when it is not. The [packages chapter](/spec/packages/) has the rest.
 
+A program of one file uses packages too, with no manifest: its first lines name them, after a
+`// avin.hocon` line, in the comment lines under it, written exactly as a manifest's `dependencies`
+block is. A `#!` line may come first, so the file runs as a command:
+
+```text
+#!/usr/bin/env -S avin run
+// avin.hocon
+// dependencies {
+//   json { git = "github.com/avin-lang/json", version = "0.1.0" }
+// }
+
+import dev.avinlang.json
+
+main(args: Vector[string])
+    ...
+```
+
+```sh
+chmod +x tool.avin
+./tool.avin data.json
+```
+
+`avin run`, `build`, `check` and `test` fetch what the header names into the same cache, and the
+hashes go in `tool.avin.sum` beside the file. A blank line ends the header. The
+[packages chapter](/spec/packages/#programs-of-one-file) has the rules.
+
 ## Formatting
 
 `avin fmt` rewrites every `.avin` and `.lavin` file under the paths it is given (the current

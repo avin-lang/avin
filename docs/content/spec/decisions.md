@@ -7980,6 +7980,56 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   author debugging it); a per-package opt-in. Review with the user: a package's user would usually
   rather see their own call.
 
+- Proposed (branch `script-deps`): **A program of one file names its dependencies in a header of
+  comment lines at its top**: the line `// avin.hocon`, then `//` lines whose text after the `//` is
+  exactly a manifest's `dependencies` block, ending at the first line that is not a `//` comment
+  ([packages](/spec/packages/#programs-of-one-file)). Why: domain libraries are packages (JSON, CSV),
+  and a script must reach them without becoming a directory with a manifest; reusing the manifest's
+  own HOCON means one syntax, one parser and one set of errors, shown at the header's line in the
+  file. Being comments, the header needs no change to the lexer, the parser, the formatter or the
+  IntelliJ plugin, and a file with one is still Avin to every tool. `// avin.hocon` reads as "this
+  file's manifest", and the editor grammar colours the block as embedded HOCON. Alternatives weighed:
+  a `---` front-matter fence (a second lexical form every tool must learn, and a file no older
+  compiler reads); a declaration in the language, `dependencies { … }` or an annotation on the file
+  (dependencies are the build's business, not the program's, and the checker would have to ignore
+  it); one `@dep("github.com/…@1.0")` comment per dependency (a second syntax for what a manifest
+  already says, without `path`, `rev`, `member` or features); a block comment (Avin has none).
+  Review with the user: the marker's spelling.
+- Proposed (branch `script-deps`): **The header holds `dependencies` only, and is at the top or
+  refused.** `workspace = true` and `optional` are refused (no workspace, no features of its own);
+  `package`, `features`, `sysl-dependencies` and `c-libraries` are refused at the key, a program that
+  needs them being a package. It begins on the first line, or the second after a `#!` line; a
+  `// avin.hocon` line anywhere else is an error, because a header silently not read is a missing
+  dependency reported as an unknown module. Alternatives weighed: allowing `sysl-dependencies` and
+  `c-libraries` (each works through the same resolution, and may be added when a script needs one);
+  allowing other comments or blank lines before it (a header that moves is harder to find, and the
+  rule "first line" is one a reader can check at a glance).
+- Proposed (branch `script-deps`): **A header in a file of a package, or of a program of many files,
+  is refused at the header**, rather than merged with the manifest or passed over. Why: two places
+  naming a package's dependencies would disagree, and passing it over hides a mistake; a directory
+  program has no manifest, and the way to give it dependencies is to make it a package. Only the
+  package's own files are checked; a dependency's files are not.
+- Proposed (branch `script-deps`): **A program of one file's sum file is beside it, named after it**:
+  `tool.avin.sum`, written and checked as `avin.sum` is, absent when nothing is fetched, rewritten by
+  `avin tidy tool.avin`. A program of one file is **not vendored**: `avin vendor` refuses it, and
+  `avin add` (which edits a manifest) refuses it too. Why: the sum file is where a manifest's is,
+  beside what names the dependencies, and naming it after the file lets several scripts share a
+  directory. A `vendor/` beside the file would be shared by every script in the directory, and
+  vendoring one would remove the others' packages. Alternatives weighed: no lock at all, trusting
+  the cache's recorded hash (a moved tag would go unnoticed on a second machine); one `avin.sum` per
+  directory (scripts would add and `tidy` would remove each other's lines); the hashes written into
+  the header (the build would rewrite the user's source); a `vendor/<file>/` per script. Review with
+  the user: whether a script's sum file is wanted, or is clutter next to a one-file tool.
+- Proposed (branch `script-deps`): **A first line beginning `#!` is not Avin**, in every file, and a
+  file whose first line begins `#!` takes every argument after it on the command line as the
+  program's own (`avin run tool.avin -O0` passes `-O0` to the program). Why: `./tool.avin a b` runs
+  `avin run ./tool.avin a b` through the `#!` line, and without the rule the program's arguments
+  would need a `--` that a command's caller cannot know to write. Alternatives weighed: `#!` lines
+  needing `avin run --` (env passes the file after the `--`, so it would be an argument, not the
+  program); taking options before the first non-option and the rest as the program's (`./tool -O0`
+  would still be eaten). Review with the user: the argument rule, which makes `-O0` after a `#!`
+  file the program's.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

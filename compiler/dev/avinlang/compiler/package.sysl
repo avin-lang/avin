@@ -9,7 +9,7 @@ import sysl.fs.{cache_dir, canonicalize, copy_file, current_dir, entries, exists
 import sysl.path.{is_absolute, normalize, parent}
 import sysl.process.capture
 import sysl.slices.sort
-import sysl.text.{parse_long, str_builder}
+import sysl.text.{from_utf8_unchecked, parse_long, str_builder}
 
 // Packages. A directory holding an `avin.hocon` is a package: the manifest names it, gives its
 // version, and lists the packages it depends on. The directory is the package's program root, so its
@@ -713,6 +713,17 @@ private struct Resolver
     /** Every request for a package's features made so far, each once. */
     requests: Buf[FeatureRequest]
     request_keys: Buf[string]
+    /** The manifest a program of one file's header makes, read in place of a manifest at its file's
+     * path, which is the key it is resolved under; or none. */
+    script: Option[Manifest]
+    script_file: string
+
+// The manifest of the package at `dir`: a program of one file's header when `dir` is that file, and
+// otherwise the manifest in the directory.
+private manifest_at(r: Resolver, dir: string) -> Result[Manifest, string]
+    if dir == r.script_file
+        if r.script is Some(m) then return Ok(m)
+    read_manifest(dir)
 
 /** A request for features of the package `key` names (its coordinate, or a directory), made at
  * `place` in `src` or, with no place, by the command line: every feature, or the defaults unless
@@ -816,7 +827,7 @@ private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: boo
     val vendor = sum_dir + "/" + VendorName
     val from_vendor = vendored && is_dir(vendor)
     val source = if from_vendor then Fetching(vendor, "", false) else fetching
-    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf(), buf(), buf())
+    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf(), buf(), buf(), None, "")
     val all_roots = whole && (m.has_workspace || !m.has_package)
     // The command line chooses the root's features; in a whole workspace, each member takes the names
     // it declares, and a name no member declares is refused.
@@ -835,6 +846,17 @@ private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: boo
     if all_roots
         for n in choice.names
             if !contains(declared, n) then return Err(s"avin: no member of the workspace at ${home} has a feature `$n`")
+    var walked: Buf[string] = buf()
+    if all_roots
+        for root in roots
+            walked.push(root)
+    else
+        walked.push(home)
+    walk_roots(&r, roots, walked, sum_file)
+
+// Walks the graph from `roots` until it settles, then reads it from `walked`, the roots whose packages
+// the resolution holds: the first is the package resolved first.
+private walk_roots(r: *Resolver, roots: Buf[string], walked: Buf[string], sum_file: string) -> Result[Resolution, string]
     // A version raised can name dependencies of its own, which can raise another, and a feature turned
     // on can take a dependency or ask for another's features: walk again until a walk changes nothing.
     loop
@@ -842,25 +864,37 @@ private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: boo
         var seen: Buf[string] = buf()
         var reached: Buf[ResolvedPackage] = buf()
         for root in roots
-            visit(&r, root, None, root, &seen, &reached)?
+            visit(r, root, None, root, &seen, &reached)?
         if !r.changed then break
     var seen: Buf[string] = buf()
     var packages: Buf[ResolvedPackage] = buf()
-    if all_roots
-        for root in roots
-            visit(&r, root, None, root, &seen, &packages)?
-    else
-        visit(&r, home, None, home, &seen, &packages)?
+    for root in walked
+        visit(r, root, None, root, &seen, &packages)?
     for p in packages
         if unmet_requirement(p.manifest.features, p.features) is Some(d) then return Err(d.render(p.manifest.src))
     Ok(Resolution(packages, sum_file, r.sums, r.read, r.cloned))
+
+/** Resolves the program of one file `file`, whose header `m` names its dependencies, as a package is
+ * resolved: every package it depends on, fetching what the cache has not got, each fetched one held to
+ * the sum file beside it, `file` and `.sum`. The packages are the program's own first, then every
+ * package it depends on. A program of one file has no `vendor/`, and reads the cache. */
+resolve_script(file: string, m: Manifest, fetching: Fetching) -> Result[Resolution, string]
+    val sum_file = file + ScriptSumSuffix
+    val sums = read_sums(sum_file)?
+    var r = Resolver(fetching, None, sums, buf(), buf(), buf(), false, false, buf(), buf(), buf(), Some(m), file)
+    add_request(&r, FeatureRequest(file, false, true, buf(), buf(), None, m.src))
+    var roots: Buf[string] = buf()
+    roots.push(file)
+    var walked: Buf[string] = buf()
+    walked.push(file)
+    walk_roots(&r, roots, walked, sum_file)
 
 // Visits the package at `dir`, which was fetched from `from` when that is given and whose feature
 // requests are made under `key`, and every package it depends on that its features take.
 private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
     if contains(*seen, dir) then return Ok(())
     seen.push(dir)
-    val m = read_manifest(dir)?
+    val m = manifest_at(*r, dir)?
     if !m.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
     val on = selected_features(*r, key, m)?
     val at = out.len()
@@ -892,7 +926,7 @@ private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen:
                     return Err(error(d.span, s"`${d.label}` pins $coordinate to the commit ${got.sha}, and another dependency pins it to ${pinned_sha(*r, coordinate)}: a package is read at one commit, so make them agree").render(m.src))
                 Reached(got.dir, Some(Clone(repository_of(coordinate), rev_key(got.sha), normalize(cached_revision_dir(r.fetching.cache, repository_of(coordinate), got.sha)))))
             Local(p) ->
-                val full = if is_absolute(p) then p else dir + "/" + p
+                val full = if is_absolute(p) then p else m.dir + "/" + p
                 val c = canonicalize(full) match
                     Ok(c) -> c
                     Err(_) -> return Err(error(d.span, s"`${d.label}` is a path dependency, and `$p` is not a directory").render(m.src))
@@ -1016,7 +1050,8 @@ private package_in(dir: string, coordinate: string, shown: string) -> Result[str
 private check_sum(r: *Resolver, coordinate: string, key: string, hash: string) -> Result[unit, string]
     if find_sum(r.sums, coordinate, key) is Some(line)
         if line.hash != hash
-            return Err(s"avin: $SumName records $coordinate ${sum_label(key)} as ${line.hash}, and the package hashes to $hash: the tag may have moved or the repository been rewritten. If the new contents are the ones you want, remove the line and build again")
+            val sum_name = if r.script_file != "" then r.script_file + ScriptSumSuffix else SumName
+            return Err(s"avin: $sum_name records $coordinate ${sum_label(key)} as ${line.hash}, and the package hashes to $hash: the tag may have moved or the repository been rewritten. If the new contents are the ones you want, remove the line and build again")
     if find_sum(r.read, coordinate, key) is None then r.read.push(SumLine(coordinate, key, hash))
     Ok(())
 
@@ -1141,8 +1176,24 @@ record_sums(res: Resolution) -> Result[unit, string]
  * removed and added. With `check`, it writes nothing and fails when the file is not already that.
  * Answers whether the file was tidy. The resolution, with every feature of the root on, is read from
  * the cache, whatever the project's `vendor/` holds. */
-tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string]
-    val res = resolve_from(dir, fetching, true, false, every_feature())?
+tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string] = tidy_resolution(resolve_from(dir, fetching, true, false, every_feature())?, check, say)
+
+/** Rewrites, as `tidy` does, the sum file of the program of one file `path` to exactly the fetched
+ * packages its dependencies header reads. A file with no header reads none. */
+tidy_script(path: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string]
+    val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
+    val src = source_of(path, text)
+    script_resolution(path, src, fetching)? match
+        Some(res) -> tidy_resolution(res, check, say)
+        None ->
+            val sum_file = path + ScriptSumSuffix
+            if !exists(sum_file) then return Ok(true)
+            say(s"${if check then "would remove" else "removed"} $sum_file, since $path has no dependencies header")
+            if !check then remove_file(sum_file).map_err(e -> s"avin: $sum_file: ${e.to_string()}")?
+            Ok(false)
+
+// Rewrites the sum file of the resolution `res` to exactly the packages it reads, as `tidy` does.
+private tidy_resolution(res: Resolution, check: bool, say: string -> unit) -> Result[bool, string]
     var lines: Buf[SumLine] = buf()
     var changed = false
     for l in res.sums
@@ -1330,7 +1381,7 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
     else
         version = latest_version(fetching, repository)?
     // Fetch it alone first: the name it gives itself is what the manifest lists it under.
-    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf(), buf(), buf())
+    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf(), buf(), buf(), None, "")
     var fetched = ""
     var shown = s"v$version"
     val within = if member == "" then "" else s", member = \"$member\""
@@ -1543,9 +1594,143 @@ load_program_with(path: string, fetching: Fetching, choice: FeatureChoice) -> Re
     if is_dir(path)
         val files = program_files(path).map_err(message -> "avin: " + message)?
         if files.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
+        refuse_headers(files, s"is one of the files of the program at $path, and only a program of one file names its dependencies in a header: give the program an $ManifestName and name them there")?
         return Ok(LoadedProgram(path, files, None, buf(), buf()))
     val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
-    Ok(LoadedProgram(path, single_file(source_of(path, text)), None, buf(), buf()))
+    load_script(path, source_of(path, text), fetching)
+
+// Programs of one file.
+
+/** The line that opens a program of one file's dependencies header. */
+const HeaderMarker: string = "// avin.hocon"
+
+/** What follows a program of one file's name to name the file beside it that records what each
+ * package it fetched hashed to: `tool.avin.sum` for `tool.avin`. */
+const ScriptSumSuffix: string = ".sum"
+
+/** A program of one file's dependencies header: the text of its lines with each one's `//` and
+ * everything outside the header made blanks, so that a place in it is the same place in the file, and
+ * the place of its `// avin.hocon` line. */
+struct ScriptHeader
+    hocon: Source
+    marker: Span
+
+/** The dependencies header of the file `src`, or none. A header is the line `// avin.hocon` and the
+ * `//` comment lines under it, up to the first line that is not one, whose text after `//` is HOCON
+ * as a manifest holds it; it is the first line of the file, or the second after a `#!` line. A
+ * `// avin.hocon` line anywhere else is an error at it. */
+script_header(src: Source) -> Result[Option[ScriptHeader], Diagnostic]
+    val count = src.line_count()
+    var first = 1usize
+    if count > 0 && from_utf8_unchecked(src.line_text(1)).starts_with("#!") then first = 2
+    var header: Option[ScriptHeader] = None
+    if first <= count && is_marker(src, first)
+        var hocon = str_builder()
+        for n in 1..<first + 1
+            hocon.push(blanks(src.line_text(n).len))
+            hocon.push(line_break(src, n))
+        var n = first + 1
+        while n <= count
+            val line = from_utf8_unchecked(src.line_text(n))
+            val body = line.trim_start()
+            if !body.starts_with("//") then break
+            hocon.push(blanks(line.bytes.len - body.bytes.len + 2))
+            hocon.push(body[2..])
+            hocon.push(line_break(src, n))
+            n += 1
+        header = Some(ScriptHeader(source_of(src.name, hocon.finish()), marker_span(src, first)))
+    for n in 1..<count + 1
+        if n == first && header is Some(_) then continue
+        if is_marker(src, n)
+            return Err(error(marker_span(src, n), s"a dependencies header begins on the first line of its file, or on the second after a `#!` line: move `$HeaderMarker` and the lines under it to the top"))
+    Ok(header)
+
+// Whether the line `n` of `src` is `// avin.hocon`, blanks around it aside.
+private is_marker(src: Source, n: usize) -> bool = from_utf8_unchecked(src.line_text(n)).trim() == HeaderMarker
+
+// The place of the `// avin.hocon` on the line `n` of `src`.
+private marker_span(src: Source, n: usize) -> Span
+    val line = src.line_span(n)
+    val text = from_utf8_unchecked(src.line_text(n))
+    val start = line.start + text.bytes.len - text.trim_start().bytes.len
+    Span(start, start + HeaderMarker.bytes.len)
+
+// What ends the line `n` of `src`, a `\r` made a blank: a line break, or nothing at the end.
+private line_break(src: Source, n: usize) -> string
+    val end = src.line_span(n).end
+    val next = if n < src.line_count() then src.line_span(n + 1).start else src.bytes.len
+    if next <= end then "" else blanks(next - end - 1) + "\n"
+
+// `n` blanks.
+private blanks(n: usize) -> string
+    var b = str_builder()
+    for i in 0..<n
+        b.push(" ")
+    b.finish()
+
+/** The manifest the header `h` of the program of one file whose directory is `dir` makes: a package
+ * with no name, whose dependencies are the header's, and whose places are shown in `src`, the file. A
+ * header holds `dependencies` and nothing else, and a dependency of it is by `git` or `path`, taken
+ * always: a program of one file is in no workspace and has no features to turn one on. */
+script_manifest(dir: string, src: Source, h: ScriptHeader) -> Result[Manifest, Diagnostic]
+    val doc = parse_hocon(h.hocon)?
+    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf())
+    for f in doc.root.fields()
+        if f.key != "dependencies"
+            return Err(error(f.key_span, s"`${f.key}` is not a key of a dependencies header, which holds only `dependencies`: a program that needs more is a package, with an $ManifestName"))
+        read_dependencies(f, false, &m.dependencies)?
+    for d in m.dependencies
+        if d.origin is Member
+            return Err(error(d.span, s"`${d.label}` is a workspace dependency, and a program of one file is in no workspace: name it by `path` or `git`"))
+        if d.optional
+            return Err(error(d.span, s"`${d.label}` is optional, and a program of one file has no features to turn it on"))
+    Ok(m)
+
+/** The program of one file `path`, whose text is `src`: the file alone, or with a dependencies header,
+ * the file and every package the header depends on, resolved as a package's manifest's are. Each
+ * fetched package is held to, and recorded in, the sum file beside it. */
+load_script(path: string, src: Source, fetching: Fetching) -> Result[LoadedProgram, string]
+    val res = script_resolution(path, src, fetching)? match
+        Some(r) -> r
+        None -> return Ok(LoadedProgram(path, single_file(src), None, buf(), buf()))
+    record_sums(res)?
+    assemble(path, res, Some(single_file(src)))
+
+/** What the dependencies header of the program of one file `path`, whose text is `src`, resolves to;
+ * none for a file with no header. What is wrong with the header is rendered at its place. */
+script_resolution(path: string, src: Source, fetching: Fetching) -> Result[Option[Resolution], string]
+    val h = script_header(src).map_err(d -> d.render(src))? match
+        Some(h) -> h
+        None -> return Ok(None)
+    val file = canonicalize(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
+    val m = script_manifest(parent(file).unwrap_or("/"), src, h).map_err(d -> d.render(src))?
+    Ok(Some(resolve_script(file, m, fetching)?))
+
+/** The files of the program of one file `path` with the editor's text `src`, and of every package its
+ * header depends on, as the cache holds them: what the language server reads, fetching nothing. What
+ * is wrong is a diagnostic in the file: the header's own errors at their places, and the rest at its
+ * `// avin.hocon` line. */
+script_files(path: string, src: Source) -> Result[Buf[ProgramFile], Diagnostic]
+    val h = script_header(src)? match
+        Some(h) -> h
+        None -> return Ok(single_file(src))
+    val file = canonicalize(path).unwrap_or(absolute_path(path))
+    val m = script_manifest(parent(file).unwrap_or("/"), src, h)?
+    val fetching = default_fetching()
+    val res = resolve_script(file, m, Fetching(fetching.cache, fetching.base, false)).map_err(message -> error(h.marker, message.trim()))?
+    Ok(assemble(path, res, Some(single_file(src))).map_err(message -> error(h.marker, message.trim()))?.files)
+
+// Refuses the first of `files` written in Avin, not literate, that has a dependencies header: such a
+// file `why` says why it may not.
+private refuse_headers(files: Buf[ProgramFile], why: string) -> Result[unit, string]
+    for f in files
+        if !f.src.name.ends_with(".avin") then continue
+        val text = from_utf8_unchecked(f.src.bytes)
+        if !text.contains(HeaderMarker) then continue
+        for n in 1..<f.src.line_count() + 1
+            if is_marker(f.src, n)
+                return Err(error(marker_span(f.src, n), s"this dependencies header is in a file that $why").render(f.src))
+    Ok(())
 
 /** The package at `root` with every package it depends on: each dependency's modules first, then the
  * package's own files. The sum file gains a line for any package fetched for the first time. A module
@@ -1557,13 +1742,23 @@ load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string] 
 load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Result[LoadedProgram, string]
     val res = resolve_with(root, fetching, false, choice)?
     record_sums(res)?
+    assemble(root, res, None)
+
+// The program resolution `res` reads: each dependency's modules first, then the program's own files,
+// which are `own` for a program of one file and otherwise the files of the package at `root`.
+private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]]) -> Result[LoadedProgram, string]
     // Each package's files, read without the modules its features that are off list, then the modules
     // each holds, which are what an import of an optional dependency is checked against.
     var each: Buf[Buf[ProgramFile]] = buf()
     var each_modules: Buf[Buf[string]] = buf()
     for i in 0..<res.packages.len()
         val p = res.packages[i]
-        val read = package_files_skipping(if i == 0 then root else p.dir, i > 0, gated_off(p.manifest.features, p.features)).map_err(message -> "avin: " + message)?
+        var read: Buf[ProgramFile] = buf()
+        if i == 0 && own is Some(_)
+            read = own.unwrap()
+        else
+            read = package_files_skipping(if i == 0 then root else p.dir, i > 0, gated_off(p.manifest.features, p.features)).map_err(message -> "avin: " + message)?
+            if i == 0 then refuse_headers(read, s"is in the package `${p.name}`, whose dependencies are named in its $ManifestName: name them there")?
         var names: Buf[string] = buf()
         for f in read
             val n = f.module_name.unwrap_or("")
@@ -1588,7 +1783,7 @@ load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Re
             file.fences = fences_of(p.manifest.features, f.module_name.unwrap_or(""), p.optional, optional_modules)
             file.package = p.name
             files.push(file)
-            owners.push(p.name)
+            owners.push(if i == 0 && own is Some(_) then root else p.name)
     var modules: Buf[string] = buf()
     var holders: Buf[string] = buf()
     for i in 0..<files.len()
@@ -1607,7 +1802,7 @@ load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Re
     for p in res.packages
         for library in p.manifest.c_libraries
             c.push(library)
-    Ok(LoadedProgram(root, files, Some(res.packages[0].name), sysl, c))
+    Ok(LoadedProgram(root, files, if own is Some(_) then None else Some(res.packages[0].name), sysl, c))
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
  * manifest, of the package with every feature on and its dependencies without fetching any: what the

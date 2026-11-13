@@ -76,6 +76,12 @@ run_command(here: string, args: []const string, tc: Option[Toolchain], say: stri
     var flags = FeatureFlags(false, false, false, buf())
     val takes_features = command == "build" || command == "run" || command == "check" || command == "test"
     var i = if named then 3usize else 2usize
+    // A file whose first line begins `#!` runs as a command, through that line, so every argument after
+    // it is the program's own, as an interpreter passes its script's.
+    if command == "run" && named && runs_as_command(path)
+        for j in 3..<args.len
+            program_args.push(args[j])
+        i = args.len
     while i < args.len
         val a = args[i]
         if a == "--" && command == "run"
@@ -363,10 +369,17 @@ tidy_command(args: []const string, say: string -> unit, note: string -> unit) ->
         else
             note(Usage)
             return 2
-    val home = project_of(dir.unwrap_or("."), "tidy", note) match
-        Some(h) -> h
-        None -> return 1
-    tidy(home, default_fetching(), check, say) match
+    val given = dir.unwrap_or(".")
+    // A program of one file keeps its sum file beside it.
+    var tidied: Result[bool, string] = Ok(true)
+    if is_script(given)
+        tidied = tidy_script(given, default_fetching(), check, say)
+    else
+        val home = project_of(given, "tidy", note) match
+            Some(h) -> h
+            None -> return 1
+        tidied = tidy(home, default_fetching(), check, say)
+    tidied match
         Ok(true) -> 0
         Ok(false) ->
             if !check then return 0
@@ -454,6 +467,9 @@ vendor_command(args: []const string, say: string -> unit, note: string -> unit) 
             note(Usage)
             return 2
         i += 1
+    if is_script(dir.unwrap_or("."))
+        note(s"avin: ${dir.unwrap_or(".")} is a program of one file, which is not vendored: it reads its packages from the machine's cache. A program that must build with the network off is a package, `avin new`, whose `vendor/` holds them")
+        return 1
     val home = project_of(dir.unwrap_or("."), "vendor", note) match
         Some(h) -> h
         None -> return 1
@@ -496,6 +512,16 @@ private feature_flag(args: []const string, i: usize, flags: *FeatureFlags) -> us
             if n != "" then flags.names.push(n)
         return 2
     0
+
+// Whether `path` is a file whose first line begins `#!`.
+private runs_as_command(path: string) -> bool
+    if is_dir(path) then return false
+    read_text(path) match
+        Ok(text) -> text.starts_with("#!")
+        Err(_) -> false
+
+// Whether `given` is a program of one file: a file in no package.
+private is_script(given: string) -> bool = exists(given) && !is_dir(given) && enclosing_package(given) is Ok(None)
 
 // The package or workspace `avin <command>` given `given` works on: a workspace's root whole, and any
 // other path the package it is in. Says through `note` why there is none.
