@@ -580,6 +580,11 @@ struct Checker
     /** Each name a module exports, by its qualified name in the exporting module, holding the
      * qualified name of the declaration it presents, through any chain of exports. */
     exports: Map[string, string]
+    /** Where a diagnostic is shown in place of the span it is reported at, nearest last: while a
+     * member is read or called, its mistakes are shown at the member's name rather than across the
+     * receiver, while the expression's own span, the one its traps and code are placed at, stays
+     * whole. */
+    shown: Buf[(Span, Span)]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -593,8 +598,18 @@ struct Checker
             self.derived[i].notes = notes
             return
         self.reported_count = self.reported_count + 1
-        self.units[unit].report.add(error(at, message))
+        self.units[unit].report.add(error(shown_at(self.shown, at), message))
 end Checker
+
+/** Where a diagnostic reported at `at` is shown: the place the nearest entry of `shown` for `at`
+ * gives, or `at` itself. */
+private shown_at(shown: Buf[(Span, Span)], at: Span) -> Span
+    var k = shown.len()
+    while k > 0
+        k = k - 1
+        val (whole, place) = shown[k]
+        if whole.start == at.start && whole.end == at.end then return place
+    at
 
 /** An impl a `derives` entry made from a template: where it was asked for, its place among the
  * impls, the type `T` stands for in it, and what went wrong while it was checked. */
@@ -971,7 +986,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -11760,10 +11775,13 @@ private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string, expected
         if lookup_local(c, "super") is None && enclosing_class(c) is Some(_)
             return super_call(c, e.span, e.span, target.span, name, buf(), None, expected, false)
     // A mistake in reading a member is shown at the member's name, never across the receiver,
-    // which in a chain can span many lines; the read itself is still the whole expression.
+    // which in a chain can span many lines; the read itself, where its traps and code are placed,
+    // is still the whole expression.
     val object = check_expr(c, target, None)
-    val read = member_of(c, Expr(member_name_span(c, e, name), e.kind), object, name, expected)
-    TExpr(e.span, read.ty, read.kind)
+    c.shown.push((e.span, member_name_span(c, e, name)))
+    val read = member_of(c, e, object, name, expected)
+    c.shown.pop()
+    read
 
 private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
@@ -15523,11 +15541,17 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
     if named.kind is Member(target, member)
         if variant_use(c, named.span, target, member) is Some((found, on_type)) then return qualified_variant_call(c, at, named.span, found, on_type, explicit, args, expected)
         // A mistake in calling a member is shown at the member's name and its arguments, never
-        // across the receiver, which in a chain can span many lines; the call itself is still the
-        // whole expression.
+        // across the receiver, which in a chain can span many lines; the call itself, where its
+        // traps and code are placed, is still the whole expression.
         val name_span = member_name_span(c, named, member)
-        val called = member_call(c, Span(name_span.start, at.end), callee, name_span, target, member, args, explicit, expected, false)
-        return TExpr(at, called.ty, called.kind)
+        c.shown.push((at, Span(name_span.start, at.end)))
+        c.shown.push((named.span, name_span))
+        c.shown.push((callee.span, name_span))
+        val called = member_call(c, at, callee, named.span, target, member, args, explicit, expected, false)
+        c.shown.pop()
+        c.shown.pop()
+        c.shown.pop()
+        return called
     val name = named.kind match
         Name(n) -> n
         _ -> return value_call(c, at, callee, args)
@@ -16622,8 +16646,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         for a in args
             check_statement(c, a.value)
         return unsupported(c, callee, "type arguments on a call of a field")
-    // A field read for its function, or a missing member, is reported at the member's name.
-    call_checked(c, at, name_span, member_of(c, Expr(name_span, callee.kind), object, name, None), args)
+    call_checked(c, at, name_span, member_of(c, callee, object, name, None), args)
 
 // `a m b` is the call `a.m(b)`. It names a method of `a`'s type: a field holding a function and a
 // function `m` of two parameters are not called infix.
