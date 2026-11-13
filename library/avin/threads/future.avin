@@ -24,126 +24,126 @@ private processors() -> long
 // The workers are never joined: the program ends when `main` returns, whatever they are doing. Once
 // shut down, a worker that finds no task left ends.
 private class Pool(private val target: int): Sendable
-    private val lock = Lock()
-    private val work = Condition(lock)
-    private val tasks = Deque[() -> unit]()
-    // Workers that have started serving and not yet ended.
-    private var running = 0
-    // Workers started that are not yet serving.
-    private var starting = 0
-    private var idle = 0
-    // The identities of the workers counted as waiting.
-    private val waiting = MutableSet[long]()
-    private var closed = false
+  private val lock = Lock()
+  private val work = Condition(lock)
+  private val tasks = Deque[() -> unit]()
+  // Workers that have started serving and not yet ended.
+  private var running = 0
+  // Workers started that are not yet serving.
+  private var starting = 0
+  private var idle = 0
+  // The identities of the workers counted as waiting.
+  private val waiting = MutableSet[long]()
+  private var closed = false
 
-    // Runs `task` on a worker, soon, then `finish` with what it returned; after a shutdown too,
-    // starting a worker where none is left. The Sysl handles `task` and `finish` reach that the
-    // calling code owns are the task's, an owner of its own whichever worker runs it, until `task`
-    // returns; then they are in transit, for the next code to use them, before `finish` runs. So
-    // `finish` is where the task's result is published: code that sees the result, a future's awaiter
-    // among them, finds every handle the task used already given up.
-    submit[R](task: () -> R, finish: (R) -> unit)
-        val owner = newOwner()
-        handOver(task, currentOwner(), owner)
-        handOver(finish, currentOwner(), owner)
-        val run: () -> unit = () ->
-            val worker = currentOwner()
-            runAs(owner)
-            val r = task()
-            handOver(task, owner, inTransit)
-            handOver(finish, owner, inTransit)
-            finish(r)
-            runAs(worker)
-        post(run)
+  // Runs `task` on a worker, soon, then `finish` with what it returned; after a shutdown too,
+  // starting a worker where none is left. The Sysl handles `task` and `finish` reach that the
+  // calling code owns are the task's, an owner of its own whichever worker runs it, until `task`
+  // returns; then they are in transit, for the next code to use them, before `finish` runs. So
+  // `finish` is where the task's result is published: code that sees the result, a future's awaiter
+  // among them, finds every handle the task used already given up.
+  submit[R](task: () -> R, finish: (R) -> unit)
+    val owner = newOwner()
+    handOver(task, currentOwner(), owner)
+    handOver(finish, currentOwner(), owner)
+    val run: () -> unit = () ->
+      val worker = currentOwner()
+      runAs(owner)
+      val r = task()
+      handOver(task, owner, inTransit)
+      handOver(finish, owner, inTransit)
+      finish(r)
+      runAs(worker)
+    post(run)
 
-    // Runs `task` on a worker, soon, as the worker's own code, handing nothing over; after a shutdown
-    // too, starting a worker where none is left.
-    post(task: () -> unit)
-        lock.acquire()
-        tasks.append(task)
-        if idle > 0 then work.notify()
-        if tasks.length > idle + starting && running + starting - waiting.size < target then start()
-        lock.release()
+  // Runs `task` on a worker, soon, as the worker's own code, handing nothing over; after a shutdown
+  // too, starting a worker where none is left.
+  post(task: () -> unit)
+    lock.acquire()
+    tasks.append(task)
+    if idle > 0 then work.notify()
+    if tasks.length > idle + starting && running + starting - waiting.size < target then start()
+    lock.release()
 
-    // Counts the worker `me` as waiting where it is not counted already, starting another where work is
-    // left with no thread free to run it; answers whether it counted it, so `resumed` undoes it.
-    countWaiting(me: long) -> bool
-        lock.acquire()
-        val fresh = waiting.add(me)
-        if fresh && tasks.length > idle + starting then start()
-        lock.release()
-        fresh
+  // Counts the worker `me` as waiting where it is not counted already, starting another where work is
+  // left with no thread free to run it; answers whether it counted it, so `resumed` undoes it.
+  countWaiting(me: long) -> bool
+    lock.acquire()
+    val fresh = waiting.add(me)
+    if fresh && tasks.length > idle + starting then start()
+    lock.release()
+    fresh
 
-    // Counts the worker `me`, which `countWaiting` counted, as working again.
-    resumed(me: long)
-        lock.acquire()
-        waiting.remove(me)
-        lock.release()
+  // Counts the worker `me`, which `countWaiting` counted, as working again.
+  resumed(me: long)
+    lock.acquire()
+    waiting.remove(me)
+    lock.release()
 
-    // Lets every worker end once no task is left.
-    shutdown()
-        lock.acquire()
-        closed = true
-        work.notifyAll()
-        lock.release()
+  // Lets every worker end once no task is left.
+  shutdown()
+    lock.acquire()
+    closed = true
+    work.notifyAll()
+    lock.release()
 
-    // Whether the pool has been shut down.
-    isShutdown() -> bool
-        lock.acquire()
-        val c = closed
-        lock.release()
-        c
+  // Whether the pool has been shut down.
+  isShutdown() -> bool
+    lock.acquire()
+    val c = closed
+    lock.release()
+    c
 
-    // Starts one more worker, counted at once; under the lock. The worker is enrolled as this pool's
-    // before it runs a task, so a wait in any task finds the pool to tell.
-    private start()
-        starting += 1
-        spawn(() ->
-            registry.enrol(current(), self)
-            lock.acquire()
-            starting -= 1
-            running += 1
-            serve())
+  // Starts one more worker, counted at once; under the lock. The worker is enrolled as this pool's
+  // before it runs a task, so a wait in any task finds the pool to tell.
+  private start()
+    starting += 1
+    spawn(() ->
+      registry.enrol(current(), self)
+      lock.acquire()
+      starting -= 1
+      running += 1
+      serve())
 
-    // A worker's life, from holding the lock: take the oldest task, run it without the lock, and wait
-    // while there is none, or end where the pool is shut down.
-    private serve()
-        loop
-            while tasks.isEmpty
-                if closed
-                    running -= 1
-                    lock.release()
-                    registry.leave(current())
-                    return
-                idle += 1
-                work.wait()
-                idle -= 1
-            val task = tasks.removeHead()
-            lock.release()
-            task()
-            lock.acquire()
+  // A worker's life, from holding the lock: take the oldest task, run it without the lock, and wait
+  // while there is none, or end where the pool is shut down.
+  private serve()
+    loop
+      while tasks.isEmpty
+        if closed
+          running -= 1
+          lock.release()
+          registry.leave(current())
+          return
+        idle += 1
+        work.wait()
+        idle -= 1
+      val task = tasks.removeHead()
+      lock.release()
+      task()
+      lock.acquire()
 
 // The pool each worker thread serves, by the thread's identity. Every thread reaches it, and its map
 // is read and changed only under its lock, so it is sendable.
 private class Registry(): Sendable
-    private val lock = Lock()
-    private val pools = MutableMap[long, Pool]()
+  private val lock = Lock()
+  private val pools = MutableMap[long, Pool]()
 
-    enrol(me: long, p: Pool)
-        lock.acquire()
-        pools(me) = p
-        lock.release()
+  enrol(me: long, p: Pool)
+    lock.acquire()
+    pools(me) = p
+    lock.release()
 
-    leave(me: long)
-        lock.acquire()
-        pools.remove(me)
-        lock.release()
+  leave(me: long)
+    lock.acquire()
+    pools.remove(me)
+    lock.release()
 
-    poolOf(me: long) -> Option[Pool]
-        lock.acquire()
-        val p = pools.get(me)
-        lock.release()
-        p
+  poolOf(me: long) -> Option[Pool]
+    lock.acquire()
+    val p = pools.get(me)
+    lock.release()
+    p
 
 // The workers of every pool, made with the first pool.
 private lazy val registry: Registry = Registry()
@@ -155,14 +155,14 @@ private lazy val pool: Pool = Pool(int(processors()))
 // Counts the calling thread as waiting where it is a worker of a pool that does not count it already,
 // and answers that pool, for `endWait`.
 private beginWait() -> Option[Pool]
-    val me = current()
-    registry.poolOf(me) match
-        Some(p) -> if p.countWaiting(me) then Some(p) else None
-        None -> None
+  val me = current()
+  registry.poolOf(me) match
+    Some(p) -> if p.countWaiting(me) then Some(p) else None
+    None -> None
 
 // Counts the calling thread as working again where `beginWait` counted it.
 private endWait(counted: Option[Pool])
-    if counted is Some(p) then p.resumed(current())
+  if counted is Some(p) then p.resumed(current())
 
 // Runs `body`, which waits on something other than a future (a lock, a channel, a blocking binding,
 // a sleep), and gives back what it returns. On a worker of a pool, the pool counts the worker as
@@ -172,88 +172,88 @@ private endWait(counted: Option[Pool])
 //
 //     Future(blocking(jobs.receive()))
 blocking[T](body: -> T) -> T
-    val counted = beginWait()
-    val v = body
-    endWait(counted)
-    v
+  val counted = beginWait()
+  val v = body
+  endWait(counted)
+  v
 
 // Runs `body` on `p` and gives back the future of what it returns.
 private startOn[T: Sendable](p: Pool, @sendable body: () -> T) -> Future[T]
-    val cell = Cell[T]()
-    p.submit(body, v ->
-        cell.complete(v)
-        ())
-    Future(cell, p)
+  val cell = Cell[T]()
+  p.submit(body, v ->
+    cell.complete(v)
+    ())
+  Future(cell, p)
 
 // Where a future's value is left, once, and what is to run with it.
 private class Cell[T]()
-    private val lock = Lock()
-    private val done = Condition(lock)
-    private var value: Option[T] = None
-    // What runs with the value once it is there, newest first, each on the thread that completes the
-    // cell.
-    private var waiting: List[(T) -> unit] = []
+  private val lock = Lock()
+  private val done = Condition(lock)
+  private var value: Option[T] = None
+  // What runs with the value once it is there, newest first, each on the thread that completes the
+  // cell.
+  private var waiting: List[(T) -> unit] = []
 
-    // Leaves `v` where there is no value yet, waking every thread waiting and running what waits;
-    // answers whether it did.
-    // The Sysl handles `v` reaches that the completing code owns are in transit from then on, for
-    // the next code to use them, whichever thread that is.
-    complete(v: T) -> bool
-        lock.acquire()
-        if value.isDefined
-            lock.release()
-            return false
-        handOver(v, currentOwner(), inTransit)
-        value = Some(v)
-        val run = waiting
-        waiting = []
-        done.notifyAll()
-        // Other threads wait for what runs here, so a cancellation of this thread does not cut it
-        // short.
-        enterUncancellable()
+  // Leaves `v` where there is no value yet, waking every thread waiting and running what waits;
+  // answers whether it did.
+  // The Sysl handles `v` reaches that the completing code owns are in transit from then on, for
+  // the next code to use them, whichever thread that is.
+  complete(v: T) -> bool
+    lock.acquire()
+    if value.isDefined
+      lock.release()
+      return false
+    handOver(v, currentOwner(), inTransit)
+    value = Some(v)
+    val run = waiting
+    waiting = []
+    done.notifyAll()
+    // Other threads wait for what runs here, so a cancellation of this thread does not cut it
+    // short.
+    enterUncancellable()
+    lock.release()
+    for f in run.reverse do f(v)
+    leaveUncancellable()
+    true
+
+  // The value, where there is one now.
+  peek() -> Option[T]
+    lock.acquire()
+    val v = value
+    lock.release()
+    v
+
+  // Runs `f` with the value on the thread that completes the cell, or now where it is complete. The
+  // Sysl handles `f` reaches that the calling code owns are in transit from now on, for wherever
+  // `f`, or what it hands them to, runs.
+  whenDone(f: (T) -> unit)
+    handOver(f, currentOwner(), inTransit)
+    lock.acquire()
+    value match
+      Some(v) ->
         lock.release()
-        for f in run.reverse do f(v)
-        leaveUncancellable()
-        true
-
-    // The value, where there is one now.
-    peek() -> Option[T]
-        lock.acquire()
-        val v = value
+        f(v)
+      None ->
+        waiting = f :: waiting
         lock.release()
-        v
 
-    // Runs `f` with the value on the thread that completes the cell, or now where it is complete. The
-    // Sysl handles `f` reaches that the calling code owns are in transit from now on, for wherever
-    // `f`, or what it hands them to, runs.
-    whenDone(f: (T) -> unit)
-        handOver(f, currentOwner(), inTransit)
-        lock.acquire()
-        value match
-            Some(v) ->
-                lock.release()
-                f(v)
-            None ->
-                waiting = f :: waiting
-                lock.release()
-
-    // Waits until there is a value, or for at most `timeoutMillis` milliseconds where it is given.
-    waitFor(timeoutMillis: Option[long]) -> Option[T]
-        if peek() is Some(v) then return Some(v)
-        val counted = beginWait()
-        lock.acquire()
-        timeoutMillis match
-            None -> while value.isEmpty do done.wait()
-            Some(limit) ->
-                val deadline = monotonicMillis() + limit
-                var left = limit
-                while value.isEmpty && left > 0
-                    done.waitFor(left)
-                    left = deadline - monotonicMillis()
-        val v = value
-        lock.release()
-        endWait(counted)
-        v
+  // Waits until there is a value, or for at most `timeoutMillis` milliseconds where it is given.
+  waitFor(timeoutMillis: Option[long]) -> Option[T]
+    if peek() is Some(v) then return Some(v)
+    val counted = beginWait()
+    lock.acquire()
+    timeoutMillis match
+      None -> while value.isEmpty do done.wait()
+      Some(limit) ->
+        val deadline = monotonicMillis() + limit
+        var left = limit
+        while value.isEmpty && left > 0
+          done.waitFor(left)
+          left = deadline - monotonicMillis()
+    val v = value
+    lock.release()
+    endWait(counted)
+    v
 
 // A future of a sendable value may be handed to another thread: completing and awaiting it are
 // synchronized.
@@ -271,133 +271,133 @@ impl[T: Sendable] Sendable for Future[T]
 // `map`, `flatMap` and `onComplete` run their functions there.
 @keeps_owners
 class Future[T](private val cell: Cell[T], private val home: Pool)
-    // Waits for the value, safe for the collector while it waits, and gives it back. A body on the pool
-    // that waits leaves its place to another worker, so waits nested in bodies never stall the pool.
-    await() -> T = cell.waitFor(None) match
-        Some(v) -> v
-        None -> fail("a future waited for without a time limit has no value")
+  // Waits for the value, safe for the collector while it waits, and gives it back. A body on the pool
+  // that waits leaves its place to another worker, so waits nested in bodies never stall the pool.
+  await() -> T = cell.waitFor(None) match
+    Some(v) -> v
+    None -> fail("a future waited for without a time limit has no value")
 
-    // Waits at most `timeoutMillis` milliseconds for the value: `Some` of it, or `None` where the time
-    // ran out first. A time that is not positive asks without waiting.
-    await(timeoutMillis: long) -> Option[T] = cell.waitFor(Some(timeoutMillis))
+  // Waits at most `timeoutMillis` milliseconds for the value: `Some` of it, or `None` where the time
+  // ran out first. A time that is not positive asks without waiting.
+  await(timeoutMillis: long) -> Option[T] = cell.waitFor(Some(timeoutMillis))
 
-    // Waits at most `timeout` for the value, as `await(timeoutMillis)` does, a part of a millisecond
-    // waited for as a whole one.
-    await(timeout: Duration) -> Option[T] = cell.waitFor(Some(waitMillis(timeout)))
+  // Waits at most `timeout` for the value, as `await(timeoutMillis)` does, a part of a millisecond
+  // waited for as a whole one.
+  await(timeout: Duration) -> Option[T] = cell.waitFor(Some(waitMillis(timeout)))
 
-    // Whether the value is there.
-    isCompleted() -> bool = cell.peek().isDefined
+  // Whether the value is there.
+  isCompleted() -> bool = cell.peek().isDefined
 
-    // The value, where it is there now; never waits.
-    value() -> Option[T] = cell.peek()
+  // The value, where it is there now; never waits.
+  value() -> Option[T] = cell.peek()
 
-    // Runs `f` with the value on a thread of this future's executor once it is there.
-    onComplete(@sendable f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v), u -> u))
+  // Runs `f` with the value on a thread of this future's executor once it is there.
+  onComplete(@sendable f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v), u -> u))
 
-    // The future of `f` of the value, which runs on a thread of this future's executor once the value
-    // is there.
-    map[U: Sendable](@sendable f: (T) -> U) -> Future[U]
-        val next = Cell[U]()
-        cell.whenDone(v -> home.submit(() -> f(v), u ->
-            next.complete(u)
-            ()))
-        Future(next, home)
+  // The future of `f` of the value, which runs on a thread of this future's executor once the value
+  // is there.
+  map[U: Sendable](@sendable f: (T) -> U) -> Future[U]
+    val next = Cell[U]()
+    cell.whenDone(v -> home.submit(() -> f(v), u ->
+      next.complete(u)
+      ()))
+    Future(next, home)
 
-    // The future of the value of the future `f` gives for the value; `f` runs on a thread of this
-    // future's executor once the value is there.
-    flatMap[U](@sendable f: (T) -> Future[U]) -> Future[U]
-        val next = Cell[U]()
-        cell.whenDone(v -> home.submit(() -> f(v), inner ->
-            inner.cell.whenDone(u ->
-                next.complete(u)
-                ())))
-        Future(next, home)
+  // The future of the value of the future `f` gives for the value; `f` runs on a thread of this
+  // future's executor once the value is there.
+  flatMap[U](@sendable f: (T) -> Future[U]) -> Future[U]
+    val next = Cell[U]()
+    cell.whenDone(v -> home.submit(() -> f(v), inner ->
+      inner.cell.whenDone(u ->
+        next.complete(u)
+        ())))
+    Future(next, home)
 
-    // The future of both values, once both are there.
-    zip[U](other: Future[U]) -> Future[(T, U)]
-        val next = Cell[(T, U)]()
-        cell.whenDone(t -> other.cell.whenDone(u ->
-            next.complete((t, u))
-            ()))
-        Future(next, home)
+  // The future of both values, once both are there.
+  zip[U](other: Future[U]) -> Future[(T, U)]
+    val next = Cell[(T, U)]()
+    cell.whenDone(t -> other.cell.whenDone(u ->
+      next.complete((t, u))
+      ()))
+    Future(next, home)
 
 // A future of a computation that can fail is composed through its `Ok` values: an `Err` passes
 // through every step unchanged.
 impl[T: Sendable, E: Sendable] Future[Result[T, E]]
-    // The future of `f` of the `Ok` value, or of the `Err` as it was.
-    mapOk[U: Sendable](@sendable f: (T) -> U) -> Future[Result[U, E]] = map(r -> r.map(f))
+  // The future of `f` of the `Ok` value, or of the `Err` as it was.
+  mapOk[U: Sendable](@sendable f: (T) -> U) -> Future[Result[U, E]] = map(r -> r.map(f))
 
-    // The future `f` gives for the `Ok` value, or the `Err` as it was.
-    flatMapOk[U: Sendable](@sendable f: (T) -> Future[Result[U, E]]) -> Future[Result[U, E]] = flatMap(r -> r match
-        Ok(v) -> f(v)
-        Err(e) -> Future.successful(Err(e)))
+  // The future `f` gives for the `Ok` value, or the `Err` as it was.
+  flatMapOk[U: Sendable](@sendable f: (T) -> Future[Result[U, E]]) -> Future[Result[U, E]] = flatMap(r -> r match
+    Ok(v) -> f(v)
+    Err(e) -> Future.successful(Err(e)))
 
-    // The future of the `Ok` value as it was, or of `f` of the `Err`: a failure turned into another.
-    mapErr[F: Sendable](@sendable f: (E) -> F) -> Future[Result[T, F]] = map(r -> r.mapErr(f))
+  // The future of the `Ok` value as it was, or of `f` of the `Err`: a failure turned into another.
+  mapErr[F: Sendable](@sendable f: (E) -> F) -> Future[Result[T, F]] = map(r -> r.mapErr(f))
 
-    // The future of the `Ok` value as it was, or, where this one ended in `Err`, the future `other`
-    // gives; `other` is evaluated only then, on a thread of this future's executor.
-    //
-    //     val page = fetch(primary).orElse(fetch(mirror))
-    orElse[U >: T: Sendable, F: Sendable](@sendable other: -> Future[Result[U, F]]) -> Future[Result[U, F]]
-        flatMap[Result[U, F]](r -> r match
-            Ok(v) -> Future.successful[Result[U, F]](Ok(v))
-            Err(_) -> other)
+  // The future of the `Ok` value as it was, or, where this one ended in `Err`, the future `other`
+  // gives; `other` is evaluated only then, on a thread of this future's executor.
+  //
+  //     val page = fetch(primary).orElse(fetch(mirror))
+  orElse[U >: T: Sendable, F: Sendable](@sendable other: -> Future[Result[U, F]]) -> Future[Result[U, F]]
+    flatMap[Result[U, F]](r -> r match
+      Ok(v) -> Future.successful[Result[U, F]](Ok(v))
+      Err(_) -> other)
 
 object Future
-    // Runs `body` on the shared pool and gives back the future of what it returns.
-    apply[T: Sendable](@sendable body: -> T) -> Future[T] = startOn(pool, () -> body)
+  // Runs `body` on the shared pool and gives back the future of what it returns.
+  apply[T: Sendable](@sendable body: -> T) -> Future[T] = startOn(pool, () -> body)
 
-    // A future already complete with `x`.
-    successful[T: Sendable](x: T) -> Future[T]
-        val cell = Cell[T]()
-        cell.complete(x)
-        Future(cell, pool)
+  // A future already complete with `x`.
+  successful[T: Sendable](x: T) -> Future[T]
+    val cell = Cell[T]()
+    cell.complete(x)
+    Future(cell, pool)
 
-    // The future of every value of `f` for the elements of `xs`, in their order, once all are there.
-    // `f` is called for each element in turn, on the calling thread, so the futures are started in
-    // that order.
-    //
-    //     val pages = Future.traverse(urls, u -> Future(fetch(u)))
-    traverse[A, B](xs: Iterable[A], f: (A) -> Future[B]) -> Future[Vector[B]]
-        val b = Vector.newBuilder[Future[B]]()
-        for x in xs do b.addOne(f(x))
-        all(b.result())
+  // The future of every value of `f` for the elements of `xs`, in their order, once all are there.
+  // `f` is called for each element in turn, on the calling thread, so the futures are started in
+  // that order.
+  //
+  //     val pages = Future.traverse(urls, u -> Future(fetch(u)))
+  traverse[A, B](xs: Iterable[A], f: (A) -> Future[B]) -> Future[Vector[B]]
+    val b = Vector.newBuilder[Future[B]]()
+    for x in xs do b.addOne(f(x))
+    all(b.result())
 
-    // The future of every future's value, in the order the futures were given, once all are there.
-    all[T](fs: Iterable[Future[T]]) -> Future[Vector[T]]
-        val futures = fs.toVector
-        val n = futures.length
-        val cell = Cell[Vector[T]]()
-        if n == 0
-            cell.complete([])
-            return Future(cell, pool)
-        val slots = Array.fill[Option[T]](n, None)
-        val left = Atomic(n)
-        for (f, i) in futures.zipWithIndex
-            f.cell.whenDone(v ->
-                slots(i) = Some(v)
-                if left.sub(1) == 0
-                    val b = Vector.newBuilder[T]()
-                    for s in slots
-                        s match
-                            Some(x) -> b.addOne(x)
-                            None -> fail("a future of all has a value missing")
-                    cell.complete(b.result())
-                    ())
-        Future(cell, pool)
+  // The future of every future's value, in the order the futures were given, once all are there.
+  all[T](fs: Iterable[Future[T]]) -> Future[Vector[T]]
+    val futures = fs.toVector
+    val n = futures.length
+    val cell = Cell[Vector[T]]()
+    if n == 0
+      cell.complete([])
+      return Future(cell, pool)
+    val slots = Array.fill[Option[T]](n, None)
+    val left = Atomic(n)
+    for (f, i) in futures.zipWithIndex
+      f.cell.whenDone(v ->
+        slots(i) = Some(v)
+        if left.sub(1) == 0
+          val b = Vector.newBuilder[T]()
+          for s in slots
+            s match
+              Some(x) -> b.addOne(x)
+              None -> fail("a future of all has a value missing")
+          cell.complete(b.result())
+          ())
+    Future(cell, pool)
 
-    // The future of the value of whichever of `fs` is complete first; traps where `fs` is empty.
-    first[T](fs: Iterable[Future[T]]) -> Future[T]
-        val cell = Cell[T]()
-        var any = false
-        for f in fs
-            any = true
-            f.cell.whenDone(v ->
-                cell.complete(v)
-                ())
-        if !any then fail("the first of no futures")
-        Future(cell, pool)
+  // The future of the value of whichever of `fs` is complete first; traps where `fs` is empty.
+  first[T](fs: Iterable[Future[T]]) -> Future[T]
+    val cell = Cell[T]()
+    var any = false
+    for f in fs
+      any = true
+      f.cell.whenDone(v ->
+        cell.complete(v)
+        ())
+    if !any then fail("the first of no futures")
+    Future(cell, pool)
 
 // Threads of one's own to run futures on, chosen explicitly: `ex.future(body)` runs `body` there, and
 // the `map`, `flatMap` and `onComplete` of a future made so run there too. `Executor.fixed(n)` keeps
@@ -411,44 +411,44 @@ object Future
 // An executor may be shared between threads: giving it work and shutting it down are synchronized.
 @keeps_owners
 class Executor(private val p: Pool, private val isShared: bool): Sendable
-    // Runs `body` on this executor and gives back the future of what it returns; traps after
-    // `shutdown`.
-    future[T: Sendable](@sendable body: -> T) -> Future[T]
-        if p.isShutdown() then fail("an executor is given work after its shutdown")
-        startOn(p, () -> body)
+  // Runs `body` on this executor and gives back the future of what it returns; traps after
+  // `shutdown`.
+  future[T: Sendable](@sendable body: -> T) -> Future[T]
+    if p.isShutdown() then fail("an executor is given work after its shutdown")
+    startOn(p, () -> body)
 
-    // Runs `task` on one of this executor's workers, soon, with no future of it: the way to give a
-    // pool work that queues itself again and again, as an actor's turns do. The task runs as an owner
-    // of its own, and nothing is handed to it: a Sysl handle it reaches that the giving code owns
-    // traps there, and one in transit is taken by its first use. Work given after `shutdown` still
-    // runs, on a worker started for it where none is left, as the functions of futures do.
-    execute(@sendable task: () -> unit)
-        val owner = newOwner()
-        p.post(() ->
-            val worker = currentOwner()
-            runAs(owner)
-            task()
-            runAs(worker))
+  // Runs `task` on one of this executor's workers, soon, with no future of it: the way to give a
+  // pool work that queues itself again and again, as an actor's turns do. The task runs as an owner
+  // of its own, and nothing is handed to it: a Sysl handle it reaches that the giving code owns
+  // traps there, and one in transit is taken by its first use. Work given after `shutdown` still
+  // runs, on a worker started for it where none is left, as the functions of futures do.
+  execute(@sendable task: () -> unit)
+    val owner = newOwner()
+    p.post(() ->
+      val worker = currentOwner()
+      runAs(owner)
+      task()
+      runAs(worker))
 
-    // Lets the workers end once the work queued is done. No new body may be given to the executor
-    // afterwards, but the functions of futures already made on it still run there, on a worker started
-    // for them where none is left. The shared executor is never shut down, and asking traps.
-    shutdown()
-        if isShared then fail("the shared executor is never shut down")
-        p.shutdown()
+  // Lets the workers end once the work queued is done. No new body may be given to the executor
+  // afterwards, but the functions of futures already made on it still run there, on a worker started
+  // for them where none is left. The shared executor is never shut down, and asking traps.
+  shutdown()
+    if isShared then fail("the shared executor is never shut down")
+    p.shutdown()
 
-    // Whether `shutdown` has been called.
-    isShutdown() -> bool = p.isShutdown()
+  // Whether `shutdown` has been called.
+  isShutdown() -> bool = p.isShutdown()
 
 object Executor
-    // A pool of `n` workers of its own, at least one; none is started until there is work for it.
-    fixed(n: int) -> Executor
-        if n < 1 then fail("an executor has at least one worker")
-        Executor(Pool(n), false)
+  // A pool of `n` workers of its own, at least one; none is started until there is work for it.
+  fixed(n: int) -> Executor
+    if n < 1 then fail("an executor has at least one worker")
+    Executor(Pool(n), false)
 
-    // The pool `Future(body)` runs on, one worker for each processor: the same executor every time,
-    // so `Executor.shared() === Executor.shared()`.
-    shared() -> Executor = sharedExecutor
+  // The pool `Future(body)` runs on, one worker for each processor: the same executor every time,
+  // so `Executor.shared() === Executor.shared()`.
+  shared() -> Executor = sharedExecutor
 
 // The executor of the shared pool, made by the first thread to ask for it.
 private lazy val sharedExecutor: Executor = Executor(pool, true)
@@ -464,17 +464,17 @@ impl[T: Sendable] Sendable for Promise[T]
 //     println(reply.future.await())
 @keeps_owners
 class Promise[T: Sendable]()
-    private val cell = Cell[T]()
+  private val cell = Cell[T]()
 
-    // The future this promise completes.
-    val future: Future[T] = Future(cell, pool)
+  // The future this promise completes.
+  val future: Future[T] = Future(cell, pool)
 
-    // Completes the future with `x`; traps where it is already complete.
-    complete(x: T)
-        if !cell.complete(x) then fail("a promise is completed twice")
+  // Completes the future with `x`; traps where it is already complete.
+  complete(x: T)
+    if !cell.complete(x) then fail("a promise is completed twice")
 
-    // Completes the future with `x` where it is not complete yet, and answers whether it did.
-    tryComplete(x: T) -> bool = cell.complete(x)
+  // Completes the future with `x` where it is not complete yet, and answers whether it did.
+  tryComplete(x: T) -> bool = cell.complete(x)
 
-    // Whether the future is complete.
-    isCompleted() -> bool = cell.peek().isDefined
+  // Whether the future is complete.
+  isCompleted() -> bool = cell.peek().isDefined
