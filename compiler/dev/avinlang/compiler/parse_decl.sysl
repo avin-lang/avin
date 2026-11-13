@@ -45,6 +45,7 @@ parse(src: Source) -> Parsed
             file.tests_only = true
             continue
         val hidden = p.accept("private")
+        skip_top_level_modifiers(&p)
         if hidden && export_ahead(&p)
             p.report.add(error(start.to(p.ended()), "an export is public: it presents a declaration as the module's own, which `private` would hide again"))
             p.expect("export")
@@ -139,6 +140,55 @@ required_name(p: *Parser) -> string
 /** Whether `lazy` begins a `lazy val` here: like `open` before `class`, `lazy` is a modifier only
  * before `val` or `var`, and elsewhere an ordinary name. */
 lazy_ahead(p: *Parser) -> bool = p.at("lazy") && (p.ahead(1) == "val" || p.ahead(1) == "var")
+
+/** Whether the word after a modifier begins a member or a function: a name that is not a keyword,
+ * or a word that opens a declaration. `open(…)` and `open = …` stay a call and an assignment. */
+private declaration_after_modifier(p: *Parser) -> bool
+    val next = p.toks.peek_at(1) match
+        Some(t) -> t
+        None -> return false
+    if next.value != Word then return false
+    val word = p.ahead(1)
+    !is_keyword(word) || word == "def" || word == "val" || word == "var" || word == "private" || word == "static" || word == "override" || word == "open" || word == "abstract"
+
+/** Reports and skips `open` and `abstract` written before a member of a class, object, trait or
+ * impl, where neither means anything: every public method of an `open` or `abstract` class, and
+ * every method of a trait, may be overridden already, and a method is abstract by having no body.
+ * Skipping the word lets the member parse as written, so the mistake is reported once. */
+private skip_member_modifiers(p: *Parser)
+    loop
+        if !(p.at("open") || p.at("abstract")) || !declaration_after_modifier(p) then return
+        val word = p.ahead(0)
+        var i = 1usize
+        while p.ahead(i) == "private" || p.ahead(i) == "static" || p.ahead(i) == "override" || p.ahead(i) == "def" || p.ahead(i) == "open" || p.ahead(i) == "abstract"
+            i += 1
+        val field = p.ahead(i) == "val" || p.ahead(i) == "var"
+        var message = "a method takes no `abstract`: one declared without a body, `name() -> T`, is abstract already, which only an `abstract` class or a trait allows; remove `abstract`"
+        if field && word == "open" then message = "a field cannot be overridden, so it takes no `open`: remove it"
+        elif field then message = "a field takes no `abstract`: one declared without a value, `val name: T`, is abstract already; remove `abstract`"
+        elif word == "open" then message = "a method takes no `open`: every public method of an `open` or `abstract` class, and every method of a trait, may be overridden already; remove `open`"
+        p.report.add(error(p.toks.here(), message))
+        p.toks.advance()
+
+/** Reports and skips `open`, `abstract` and `override` written before a top-level declaration they
+ * do not apply to: only a class is `open` or `abstract`, and only a method overrides. */
+private skip_top_level_modifiers(p: *Parser)
+    loop
+        if !(p.at("open") || p.at("abstract") || p.at("override")) then return
+        val word = p.ahead(0)
+        val next = p.ahead(1)
+        if next == "class" && word != "override" then return
+        var message = ""
+        if next == "trait" && word == "open" then message = "a trait may always be implemented and extended, so it takes no `open`: remove it"
+        elif next == "trait" && word == "abstract" then message = "a trait is abstract already, so it takes no `abstract`: remove it"
+        elif next == "data" then message = s"a data type has exactly the variants it declares and cannot be extended, so it takes no `$word`: remove it"
+        elif next == "object" then message = s"an object is the one value of its own class and cannot be extended, so it takes no `$word`: remove it"
+        elif next == "class" then message = "`override` marks a method that replaces an inherited one, and a class replaces nothing; remove `override`, and write `: Base` to extend a class"
+        elif declaration_after_modifier(p) && word == "override" then message = "`override` marks a method that replaces an inherited one, and a function at the top level replaces nothing: remove it"
+        elif declaration_after_modifier(p) then message = s"`$word` marks a class whose subclasses may extend it, and a function at the top level belongs to no class: remove `$word`"
+        if message == "" then return
+        p.report.add(error(p.toks.here(), message))
+        p.toks.advance()
 
 /** Whether `type` begins a type alias here: like `actor` and `machine`, `type` declares something
  * only before a name, and elsewhere is an ordinary name. */
@@ -1148,11 +1198,14 @@ parse_class_member(p: *Parser) -> ClassMember
     // checker decides which a method may have.
     val annotations = if p.at("@") then parse_annotations(p) else buf()
     val start = p.toks.here()
+    skip_member_modifiers(p)
     val hidden = p.accept("private")
+    skip_member_modifiers(p)
     // `override static` and `static override` are one member.
     var static_member = p.accept("static")
     val overrides = p.accept("override")
     if !static_member then static_member = p.accept("static")
+    skip_member_modifiers(p)
     // `def` follows the modifiers and begins a method, with or without a parameter list.
     if p.at("def") && accept_def(p) then return MethodMember(parse_def_function(p, annotations), !hidden, overrides, static_member)
     val lazy = lazy_ahead(p)
