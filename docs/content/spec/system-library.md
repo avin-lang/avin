@@ -1141,15 +1141,15 @@ same [cancellation](/spec/threads/#cancellation). A program that reaches none of
 links no OpenSSL.
 
 ```text
-import avin.net.tls.{TlsClient, TlsStream}
+import avin.io.IoError
+import avin.net.tls.{TlsError, TlsStream}
 
-main()
-    TlsStream.connect("example.com", 443) match
-        Ok(s) ->
-            s.writeText("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-            println(s.readLine())
-            s.close()
-        Err(e) -> eprintln(e.message)
+main() -> Result[unit, TlsError | IoError]
+    val s = TlsStream.connect("example.com", 443)?
+    defer s.close()
+    s.writeText("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")?
+    println(s.readLine()?.getOrElse(""))
+    Ok(())
 ```
 
 | Member | Meaning |
