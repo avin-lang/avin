@@ -1245,7 +1245,7 @@ Settled by the user on 2026-11-04:
   `partition` answers `(Vector[T], Vector[T])`, `groupBy` a `Map[K, Vector[T]]`, `zipWithIndex` a
   `Vector[(T, int)]`, so a set's or a map's partition keeps every element, equal results included,
   and a list's comes back indexed. A type's own method of the same signature still answers where the
-  type is known (`List.toList()` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
+  type is known (`List.toList` is the list itself). `Iterator` has lazy `map`, `filter`, `take`,
   `drop`, `takeWhile`, `dropWhile`, `zip` and `zipWithIndex` answering iterators; its
   `zipWithIndex` is the trait's own method and so is found before `Iterable`'s. To compile these, a
   method table holds a method at a position only for the types a call through that position can
@@ -1438,7 +1438,7 @@ Settled by the user on 2026-11-04:
   elapsed time is `monotonic() - start`. Makers: `now()`, `monotonic()`, `date(y, m, d)`,
   `time(h, m, s)`, `dateTime(…)`, `zone("America/Toronto")`, `localZone()`, and `utc`, a value
   rather than a call; `epochSeconds`, `epochMillis` and `epochMicros` to and from counts; the
-  durations `micros millis seconds minutes hours days weeks`, also as methods (`2.hours()`); the
+  durations `micros millis seconds minutes hours days weeks`, also as methods (`2.hours`); the
   periods `months` and `years`. The implementation binds with `@sysl` over Sysl 0.10.0's `sysl.time`
   (`Date`, `Time`, `DateTime`, `YearMonthDay`, `Offset`, `Weekday`, `Resolution`, `Zone` over
   `sysl.time.tzif` with `offset_at` and `resolve`, `Zoned`, `Period`), with the system clock and the
@@ -2050,7 +2050,7 @@ their words are reserved.
   failing with `Io(InvalidUtf8)`; the alternative is the failure, which would lose the whole output
   over one byte. **Review with the user**: the decoding.
 - Settled on the user's delegation 2026-11-06 (branch `command-clear-env`): **A command's environment: `clearEnv`, `withoutEnv`, `withEnvironment`** ([commands](/spec/system-library/#commands)).
-  A command keeps its environment changes as an ordered list (set, remove, clear), applied in the order called; on a joined command the command's list comes before each part's own. `clearEnv()` starts from an empty environment, `withoutEnv(name)` drops one inherited variable (an unset name is no error), `withEnvironment(map)` is `clearEnv()` then each entry. With only sets, the running program's environment is left to Sysl's `inherit_env`; once a list clears or removes, the whole environment is built from `environment()` and handed over with `inherit_env = false`. A bare program name after a clear is looked for on the `PATH` the command was given, or the system's default path where none, never the running program's: that is Sysl's `spawn` rule, kept so a command never finds a program through a variable it was told not to have. Variables whose name or value is not UTF-8 are not passed once a command removes or clears (`environment()` passes them over). WHY: a daemon must start jobs from the submitter's environment, not its own. ALTERNATIVES: a single `withEnvironment` only (cannot remove one variable cheaply); a settings pair of a base flag and a removed set (loses the order of calls, so `clearEnv().withEnv(x)` and `withEnv(x).clearEnv()` could not differ); looking the program up on the parent's `PATH` (a cleared command would still find programs by a variable it lacks). Review with the user: the `PATH` lookup rule.
+  A command keeps its environment changes as an ordered list (set, remove, clear), applied in the order called; on a joined command the command's list comes before each part's own. `clearEnv()` starts from an empty environment, `withoutEnv(name)` drops one inherited variable (an unset name is no error), `withEnvironment(map)` is `clearEnv()` then each entry. With only sets, the running program's environment is left to Sysl's `inherit_env`; once a list clears or removes, the whole environment is built from `environment()` and handed over with `inherit_env = false`. A bare program name after a clear is looked for on the `PATH` the command was given, or the system's default path where none, never the running program's: that is Sysl's `spawn` rule, kept so a command never finds a program through a variable it was told not to have. Variables whose name or value is not UTF-8 are not passed once a command removes or clears (`environment()` passes them over). WHY: a daemon must start jobs from the submitter's environment, not its own. ALTERNATIVES: a single `withEnvironment` only (cannot remove one variable cheaply); a settings pair of a base flag and a removed set (loses the order of calls, so `clearEnv().withEnv(x)` and `withEnv(x).clearEnv` could not differ); looking the program up on the parent's `PATH` (a cleared command would still find programs by a variable it lacks). Review with the user: the `PATH` lookup rule.
 - Settled on the user's delegation 2026-11-05 (built on branch `process-commands`), with one change: **`kill()` and a started sequence** ([commands](/spec/system-library/#commands)).
   Proposed: `Child.kill()` sends signal 15 to every program of the command still running and starts
   no part not yet started; `waitFor()` then answers `Signalled(15)` for a program it stopped. A
@@ -3473,7 +3473,7 @@ spelling is better, as each entry says.
   so `zoned + days(1)` keeps the wall clock, which contradicts the settled list. **Review with the
   user**: the two spellings answer differently across a daylight-saving change.
 - **Names where slate leaves them open, and where slate's are kept.** `t.atZone(z)`, `d.atTime(t)`,
-  `t.atDate(d)`, `d.atStartOfDay()`, `zt.toInstant()`, `plusYears`/`plusMonths`/`plusWeeks`/
+  `t.atDate(d)`, `d.atStartOfDay()`, `zt.toInstant`, `plusYears`/`plusMonths`/`plusWeeks`/
   `plusDays` (no `minus` forms: a negative count), `withYear`/`withMonth`/`withDay`/`withHour`…,
   `isBefore`/`isAfter`/`isSameInstant`, a duration's `toHours()` (whole) and `toHoursPart()`, a
   date's `daysUntil`/`monthsUntil`/`until`. Kept from slate as better: `weekday()` (shorter, and the
@@ -3482,7 +3482,7 @@ spelling is better, as each entry says.
   is spelt `atZone`/`atTime`/`atDate`, since one overloaded word hides which conversion is meant and
   `atZone` names what can fail. `startOf("month")` becomes `startOfMonth()` and its siblings, so a
   date's `startOfHour` is a compile error rather than a run-time one. *Alternatives*: slate's
-  `d.minutes()` for whole minutes (the same word makes and measures), `dayOfMonth`.
+  `d.minutes` for whole minutes (the same word makes and measures), `dayOfMonth`.
 - **Choosing an instant for a skipped or repeated reading.** `dt.atZone(z)` answers
   `Result[Zoned, ZoneTimeError]` (`Skipped`, `Repeated`), and `atZoneEarlier(z)`/`atZoneLater(z)`,
   Sysl's `at_earlier`/`at_later`, always answer: the earlier or later instant of a repeated hour, and
@@ -4461,19 +4461,19 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   (more machinery for a rare shape). Review with the user: whether `match` arms such as `Some(2)`
   beside `Some(big)` should also agree.
 
-- Settled on the user's delegation 2026-11-06 (branch `okor-command-message`): **`Option.okOr` / `okOrElse` and `CommandError.message()`**.
+- Settled on the user's delegation 2026-11-06 (branch `okor-command-message`): **`Option.okOr` / `okOrElse` and `CommandError.message`**.
   `Option[T]` gains `okOr[E](error: E) -> Result[T, E]` and `okOrElse[E](f: () -> E)`, the `Result`
-  counterparts of `toRight`; `Result.ok()` and `err()` already existed. `okOr` takes its argument
+  counterparts of `toRight`; `Result.ok` and `err()` already existed. `okOr` takes its argument
   by value and `okOrElse` a function called only for `None`. WHY: the two names say which form
   evaluates; the by-name form already exists as a lambda call, and a by-name `okOr` would leave
   `okOrElse` redundant. Alternatives: a by-name `okOr` only (as `toRight` is; one method, but an
   argument with effects reads as eager and is not), or `toRight`-style names (`toOk`). Review
   with the user if `okOr`'s eagerness should instead match `toRight`'s.
-  `CommandError.message() -> string` reads `exited with status N`, `killed by signal N (Name)`
+  `CommandError.message -> string` reads `exited with status N`, `killed by signal N (Name)`
   (`unknown` for a signal `avin.signal` has no name for), `timed out`, and an `Io` error's own
-  `IoError.message()`. WHY: one sentence per variant in `IoError.message`'s lower-case style, the
+  `IoError.message`. WHY: one sentence per variant in `IoError.message`'s lower-case style, the
   signal's name beside its number as `avin.signal` names them. Alternatives: the number alone;
-  `ExitStatus.message()` as well (not added: nothing needs it yet).
+  `ExitStatus.message` as well (not added: nothing needs it yet).
 
 - Settled on the user's delegation 2026-11-06 (branch `sysl-098`): **`Child.detach()`** ([commands](/spec/system-library/#commands)).
   `detach() -> long` lets go of every program of the command still running without stopping it
@@ -5665,7 +5665,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`startOfYear()`, `startOfMonth()` and `startOfWeek()` on a
   `DateTime` answer midnight** of that day, while `endOfMonth()` keeps the time of day, as the
   chapter says. *Why*: a start is the first moment of its span, as `startOfDay` is; keeping the
-  time would make `r.startOfMonth()` mean "the same time on the 1st", which `r.withDay(1)` already
+  time would make `r.startOfMonth` mean "the same time on the 1st", which `r.withDay(1)` already
   says. *Alternatives*: keep the time of day for all four (symmetric with `endOfMonth`, but two
   spellings of `withDay(1)`); make `endOfMonth` the last microsecond of the month too (a start/end
   pair, but the chapter decided "at the same time of day"). Review with the user whether
@@ -5682,7 +5682,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   integer overflow trap everywhere (shorter code, a less useful message); clamping to the bounds
   (silently wrong).
 - Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`withYear` takes a `long`**, the type `year()` answers, so
-  `d.withYear(d.year() + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
+  `d.withYear(d.year + 1)` needs no conversion; the other `with…` take an `int`. *Alternatives*:
   `int` like the makers (a conversion at every use of `year()`), or changing `year()` to `int`
   (every year of a `Date` fits, but a change to step 1's fields).
 - Settled on the user's delegation 2026-11-11 (built on branch `time-calendar`): **`with…` and `startOf…` on `Zoned` wait for step 3**, which
@@ -5871,7 +5871,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with `a + months(n) <= b` (answers 1 for 2026-01-31 to 2026-02-28, against the chapter); counting
   backward periods from `b` so the reverse is the negation (breaks `a + a.until(b) == b` for
   `a > b`).
-- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`p.toIsoString()` writes a period in ISO 8601's form**,
+- Settled on the user's delegation 2026-11-11 (built on branch `time-period`): **`p.toIsoString` writes a period in ISO 8601's form**,
   `P1Y2M3D`, the months split into years as the display splits them, `P0D` for the empty period,
   and a negative part with its own sign (`P-1Y-2M`, `P1M-3D`). *Why*: the display `1y 2mo 3d` is
   for people; exchange formats want ISO's, and a period's parts may differ in sign, which a single
@@ -6313,7 +6313,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `x.pow(0)` is `1` for every `x`, `0.pow(0)` included. `gcd` is never negative and traps only when
   its value is `MinValue`'s magnitude; `lcm` is `0` when either side is, otherwise positive. `sign`
   is an `int`, as are `bitCount`, `leadingZeros` and `trailingZeros`, which count at the width
-  (`(-1).bitCount()` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
+  (`(-1).bitCount` is `32`, zero has `width` leading and trailing zeros). `toRadix` writes lower
   case, a `-` and the magnitude, as `f"%x"` does, with no prefix, and takes `int` from 2 to 36 and
   traps outside it. Why: each is the usual meaning, the least surprising for a program moving
   between widths. Alternatives weighed: a `long` exponent (never needed; an `int` is enough for
@@ -6665,7 +6665,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   of the cell); keeping the expression (simpler, a space leak).
 - Settled on the user's delegation 2026-11-11 (built on branch `stdlib-lazy-list`): **`LazyList.cons(head, tail)` takes the head
   strictly and the tail by name, and the tail is evaluated when the list's second cell is first
-  read**, not when the first is: `xs.head()` never evaluates the tail expression. WHY: the first
+  read**, not when the first is: `xs.head` never evaluates the tail expression. WHY: the first
   cell is then exactly the head, and a function building a list recursively runs one step per cell
   read. ALTERNATIVES: a by-name head too (a cell would then be one more function for a value usually
   at hand); evaluating the tail with the first cell (one list fewer per cell, but `head()` runs the
@@ -6677,7 +6677,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Settled on the user's delegation 2026-11-11 (built on branch `lazy-cons-operator`): **A companion object may declare an operator
   ending in `:` with its right operand by name, and `x op: r` calls it where `r`'s type is the
   companion's type.** `object LazyList` declares `#::[T](head: T, tail: -> LazyList[T])`, so
-  `0 #:: 1 #:: fibs.zip(fibs.tail()).map((a, b) -> a + b)` evaluates its tail only when the cell
+  `0 #:: 1 #:: fibs.zip(fibs.tail).map((a, b) -> a + b)` evaluates its tail only when the cell
   after the head is first read. The right operand's type decides which `op:` is called, and that
   type is known only once the operand is checked, so wherever some companion declares `op:` this
   way, the right operand of every `x op: r` is checked as a delayed expression; a type whose `op:`
@@ -6789,7 +6789,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   where the collection-specific conversions need a method per pair. Alternatives weighed: a
   `to(factory)` conversion (needs higher-kinded types); a universal `into(builder)` (not added:
   `builder.addAll(xs)` already reads as well, and `from` covers the target-first reading);
-  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList()` is one call);
+  `List.iterate`/`ArraySeq.iterate` (not added; `Vector.iterate(...).toList` is one call);
   `Array.from` (left out as arrays are not in the item). `Iterator.from(start)` is the unrelated
   counting iterator and keeps its name.
 - Settled on the user's delegation 2026-11-11 (built on branch `union-tag-payload`): **The words of a union with a scalar member, and
@@ -6976,13 +6976,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 - Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`): **parentheses after a parameterless method
   call what it yields.** `t.adder(4)`, where `adder -> (int) -> int`, calls the function `adder`
-  yields, and `t.items(2)` indexes the sequence `items` yields; `c.head()`, where `head` yields
+  yields, and `t.items(2)` indexes the sequence `items` yields; `c.head`, where `head` yields
   neither (or a sequence given no index), is an error naming the fix, "`head` takes no parameter
   list, so it is called without parentheses: write `head`, not `head()`". The same holds inside the
   class by bare name and through `super`. WHY: `x.m(a)` must mean one thing, and the declaration says
   `m` takes no arguments, so the only call the parentheses can make is of the result; reporting
-  `x.head()` instead of reading it as a call keeps the rule visible at every wrong use. ALTERNATIVES:
-  accepting `x.head()` as a synonym of `x.head` (two spellings of one call, and it hides a callable
+  `x.head` instead of reading it as a call keeps the rule visible at every wrong use. ALTERNATIVES:
+  accepting `x.head` as a synonym of `x.head` (two spellings of one call, and it hides a callable
   result's call); refusing parentheses after a parameterless method altogether (then `t.adder(4)`
   would need `(t.adder)(4)`).
 - Settled on the user's delegation 2026-11-12 (built on branch `parameterless-methods`): **the parameter-list shape is part of a
@@ -7182,6 +7182,63 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   macros.
 
 ## Proposed
+
+- Proposed 2026-11-12 (branch `parameterless-wave2`): **the rest of the standard library's pure
+  accessors are parameterless.** The rule applied: a public method of no parameters is declared
+  without a parameter list when it answers from its receiver (or, static, from its type), changes
+  nothing, and hands out nothing to change or use up; the same rule wave 1 applied to collections,
+  where `reverse`, `distinct` and the immutable conversions count as accessors. Converted: Option's
+  `isDefined`, `isEmpty`, `nonEmpty`, `get`, `toList`, `toVector`, `toArraySeq`, `knownSize`,
+  `flatten`, `unzip`; Either's `isLeft`, `isRight`, `swap`, `toOption`, `toList`, `toVector`,
+  `merge`, `joinLeft`, `joinRight`; Result's `isOk`, `isErr`, `ok`, `err`, `toList`, `flatten`; a
+  pair's `swap`; string's `byteLength`, `charCount`, `isEmpty`, `nonEmpty`, `isBlank`, `head`,
+  `last`, `headOption`, `lastOption`, `tail`, `init`, `reverse`, `chars`, `bytes`, `lines`, `trim`,
+  `strip`, `stripLeading`, `stripTrailing`, `stripLineEnd`, `capitalize`, `toUpperCase`,
+  `toLowerCase`; char's `isDigit`, `isLetter`, `isLetterOrDigit`, `isSpaceChar`, `isWhitespace`,
+  `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower`, `asDigit`; the integers' `abs`, `sign`,
+  `bitCount`, `leadingZeros`, `trailingZeros`, `isPowerOfTwo`; real's `isNaN`, `isInfinite`,
+  `isFinite`; Enumerable's `values` (static), `ordinal`, `name`; StringWriter's `text`, `length`,
+  `isEmpty`; ByteView's `length`; `sorted`, `firstKey`, `lastKey`, `toTreeMap`, `toBitMask` and a
+  queue's `front`, `frontOption`, `dequeue`, `dequeueOption`, `toQueue`, which wave 1 missed;
+  regex's `pattern`, `regex`, `anchored`, `unanchored`, `groupCount`, `groupNames`, `matched`,
+  `start`, `end`, `before`, `after`, `subgroups`; time's int and long `micros` … `weeks`,
+  Duration's `toDays` … `toSecondsReal`, `isNegative`, `isZero`, `abs`, Instant's and Zoned's
+  `epochSeconds`/`epochMillis`/`epochMicros`, every Date, Time, DateTime and Zoned field reader
+  (`year`, `month`, `day`, `weekday`, `hour`, `startOfMonth`, `date`, `time`, `abbreviation`, …),
+  Period's `months`/`years` and readers, Weekday's `isoNumber`, Zone's `name` and `isFixed`; every
+  error type's `message`; Url's `portOrDefault` and `queryParams`, an HTTP response's and request's
+  `text`, a request's `queryParams`; ExitStatus's `isSuccess`, Command's `clearEnv` and
+  `inNewGroup`; Weighted's `size`; Json's `isNull`, `asBool` … `asMembers`, `keys`, `size`,
+  `render`, `renderAscii`. A trait's static member declared without a parameter list is now read
+  through a type parameter too, `T.values` (it was refused as "`T` is not defined"), and the
+  infix-postfix diagnostic names both spellings, `xs.size` and `xs.size()`.
+  **Kept with `()`, the borderline calls**: (1) string's `toInt()`, `toLong()`, `toIntOption()`,
+  `toLongOption()` have overloads taking a radix, and a parameterless method is the only one of its
+  name, so they keep `()`, and `toReal()`, `toRealOption()`, `toBool()`, `toBoolOption()` keep them
+  with them, one spelling for the family of parsers; `stripMargin()` likewise beside
+  `stripMargin(c)`. (2) The core traits' members every type implements or derives —
+  `toString()`, `hash()`, `zero()`, `one()`, `negate()`, `shape()`, Codec's `whenMissing()` and
+  `jsonKey()` — and so Duration's and Period's `zero()`/`negate()`, since changing these changes
+  every program's own impls and derives; **review with the user**, as a wave of its own. (3)
+  Reads of shared or outside state: a `Mutex`'s and a UI state's `get()`, a signal's `read()`,
+  a future's `isCompleted()`/`value()`/`peek()`, an executor's `isShutdown()`, an actor mailbox's
+  `isEmpty()`, and every method of a file, socket, listener, child process or command's handle
+  (`pid()`, `isAlive()`, `isClosed()`, `port()`), whose answer can change under the reader. (4)
+  Constructors and factories, `Vector.empty[T]()`, `BitSet.empty()`, `newBuilder()`, `copy()`,
+  `Random()`. (5) A UI view's modifiers `padded()` and `panel()`, beside `padding(n)` and
+  `pad(…)`, one spelling for the modifier chain. (6) Private helpers and binding classes.
+  **Borderline converted**: `opt.get` and `s.head` trap on None and on an empty string, as `xs.head`
+  does; `q.dequeue` reads like an action but answers a new queue and changes nothing; a regex
+  matcher's `matched`, `start` and `end` read the current match of a cursor that `findNext()`
+  moves, as a buffer's `size` reads a buffer that `push` changes. WHY: one rule across the library,
+  so a reader knows a call's spelling from what it does; the families above stay uniform.
+  ALTERNATIVES weighed: converting only the brief's types (Option, Either, Result, string) and
+  leaving char, integer, time and regex for later (two spellings for one kind of method, read side
+  by side in the same expression, `s.trim.toInt()` beside `c.isDigit()`); renaming the radix
+  overloads (`toIntRadix(16)`) so `toInt` could lose its `()` (a rename of a settled API for
+  spelling alone); converting `toString()` and `hash()` now (every class's impls change with them).
+  A trap to know: `opt.get()` where `opt: Option[() -> T]` now calls the function the option holds;
+  the library's one such site was rewritten to `opt.get`.
 
 ## Open
 

@@ -167,7 +167,7 @@ var slot0: Option[F0] = None                   // one slot per field, each at it
 var slot1: Option[F1] = None
 while b.next(VARIANT)? is Some(i)
     i match
-        0 -> if slot0.isDefined() then return Err(b.duplicate(FIELD_0))
+        0 -> if slot0.isDefined then return Err(b.duplicate(FIELD_0))
              else slot0 = Some(b.field[F0](FIELD_0)?)
         1 -> …
 val x0 = slot0 or else field 0's default or else b.missing[F0](FIELD_0)?
@@ -464,7 +464,7 @@ derive Display for T
         if spec.width > 0
             val text = StringWriter()
             display(text, FormatSpec())
-            out.writeField(text.text(), spec)
+            out.writeField(text.text, spec)
         else
             T.walk(self, DisplayFields(out))
 
@@ -513,8 +513,8 @@ data Color derives Enumerable
     Blue
 
 main()
-    for c in Color.values()
-        println(s"${c.ordinal()} ${c.name()}")   // 0 Red, 1 Green, 2 Blue
+    for c in Color.values
+        println(s"${c.ordinal} ${c.name}")   // 0 Red, 1 Green, 2 Blue
     println(Color.valueOf("Green"))              // Some(Green)
     println(Color.valueOf("green"))              // None
 ```
@@ -527,20 +527,20 @@ trait Enumerable
     static valueOf(name: string) -> Option[Self]
 
 derive Enumerable for T
-    static values() -> Vector[T] = Vector.tabulate(T.shape().variantCount, i -> T.build(ChooseVariant(i)).ok().get())
+    static values() -> Vector[T] = Vector.tabulate(T.shape().variantCount, i -> T.build(ChooseVariant(i)).ok.get)
     ordinal() -> int = T.variantOf(self).index
     name() -> string = T.variantOf(self).name
     static valueOf(name: string) -> Option[T] =
         for v in T.shape().variants
-            if v.name == name then return T.build(ChooseVariant(v.index)).ok()
+            if v.name == name then return T.build(ChooseVariant(v.index)).ok
         None
 ```
 
-- **`T.values()`** is every variant in declaration order, as a new `Vector` each call.
-- **`ordinal()`** is the variant's 0-based position in the declaration, an `int`; a derived `Ord`
-  orders variants the same way, so `a < b` exactly when `a.ordinal() < b.ordinal()`.
-- **`name()`** is the variant's name as declared. It is not its `Display`: an impl of `Display`
-  changes what the variant prints, never its name, so `T.valueOf(x.name())` is always `Some(x)`.
+- **`T.values`** is every variant in declaration order, as a new `Vector` each call.
+- **`ordinal`** is the variant's 0-based position in the declaration, an `int`; a derived `Ord`
+  orders variants the same way, so `a < b` exactly when `a.ordinal < b.ordinal`.
+- **`name`** is the variant's name as declared. It is not its `Display`: an impl of `Display`
+  changes what the variant prints, never its name, so `T.valueOf(x.name)` is always `Some(x)`.
 - **`T.valueOf(name)`** is the variant of exactly that name, compared byte for byte, so another
   case, surrounding white space and the empty string are `None`. It never traps.
 - `ChooseVariant` is the template's builder, which picks the variant at an index and supplies no

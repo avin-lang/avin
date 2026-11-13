@@ -29,7 +29,7 @@ An instant has no year until a zone is named; a date has no hour; a time of day 
 | Type | What it is | Representation | Made by |
 | --- | --- | --- | --- |
 | `Instant` | a point on the timeline, with no calendar | `data Instant(epochMicros: long)`, microseconds since 1970-01-01T00:00:00Z | `now()`, `epochSeconds(n)`, `epochMillis(n)`, `epochMicros(n)` |
-| `Duration` | an exact length of timeline, negative, zero or positive | `data Duration(micros: long)` | `micros(n)` … `weeks(n)`, `2.hours()`; `monotonic()` |
+| `Duration` | an exact length of timeline, negative, zero or positive | `data Duration(micros: long)` | `micros(n)` … `weeks(n)`, `2.hours`; `monotonic()` |
 | `Date` | a calendar date, with no time of day and no zone | `data Date(epochDay: int)`, days since 1970-01-01 | `date(y, m, d)` |
 | `Time` | a time of day, with no date and no zone | `data Time(microsOfDay: long)`, `0` to `86_399_999_999` | `time(h, m)`, `time(h, m, s)`, `time(h, m, s, us)` |
 | `DateTime` | a wall reading, a date and a time of day, with no zone | `data DateTime(date: Date, time: Time)` | `dateTime(…)`, `d.atTime(t)` |
@@ -69,18 +69,18 @@ it has no calendar, no zone and no text as a date. There is no conversion betwee
 
 `micros`, `millis`, `seconds`, `minutes`, `hours`, `days` and `weeks` each take a `long` count and
 answer the exact duration; a day is 24 hours and a week 7 days of timeline, whatever the clocks of a
-zone do. Each is also a method on `int` and `long`, so `2.hours() == hours(2)` and
-`90.seconds() == minutes(1) + seconds(30)`. `Duration(micros)` makes one from its count.
+zone do. Each is also a method on `int` and `long`, so `2.hours == hours(2)` and
+`90.seconds == minutes(1) + seconds(30)`. `Duration(micros)` makes one from its count.
 `Duration.Zero`, `Duration.Min` and `Duration.Max` are the zero, least and greatest durations.
 
 | Method | Meaning |
 | --- | --- |
 | `micros` | the count of microseconds (the field) |
-| `toDays()`, `toHours()`, `toMinutes()`, `toSeconds()`, `toMillis()` | how many whole units it holds, a fraction dropped toward zero: `(hours(1) + minutes(30)).toMinutes()` is `90`, `seconds(-90).toMinutes()` is `-1` |
-| `toHoursPart()`, `toMinutesPart()`, `toSecondsPart()`, `toMicrosPart()` | the part left in that unit below the next larger: `(hours(50) + minutes(7)).toHoursPart()` is `2`; negative for a negative duration |
-| `toSecondsReal() -> real` | the seconds with their fraction |
-| `isNegative()`, `isZero()` | its sign |
-| `abs()` | without its sign; `Duration.Min.abs()` traps |
+| `toDays`, `toHours`, `toMinutes`, `toSeconds`, `toMillis` | how many whole units it holds, a fraction dropped toward zero: `(hours(1) + minutes(30)).toMinutes` is `90`, `seconds(-90).toMinutes` is `-1` |
+| `toHoursPart`, `toMinutesPart`, `toSecondsPart`, `toMicrosPart` | the part left in that unit below the next larger: `(hours(50) + minutes(7)).toHoursPart` is `2`; negative for a negative duration |
+| `toSecondsReal -> real` | the seconds with their fraction |
+| `isNegative`, `isZero` | its sign |
+| `abs` | without its sign; `Duration.Min.abs` traps |
 
 **Arithmetic.** Durations add, subtract and negate (`Add`, `Sub`, `Neg`); `d * n` and `d / n`
 scale by a `long`, a remainder dropped toward zero, dividing by zero trapping; `d / e` between two
@@ -91,8 +91,8 @@ compile: the built-in types' operators cannot gain methods, so the duration is w
 
 `epochSeconds(n)`, `epochMillis(n)` and `epochMicros(n)` make the instant `n` units after
 1970-01-01T00:00:00Z (before it where `n` is negative), `epochSeconds` and `epochMillis` trapping
-where the count is too large; `t.epochSeconds()` and `t.epochMillis()` count back, rounding toward
-negative infinity, so `epochMillis(-1).epochSeconds()` is `-1`, and the field `t.epochMicros` is the
+where the count is too large; `t.epochSeconds` and `t.epochMillis` count back, rounding toward
+negative infinity, so `epochMillis(-1).epochSeconds` is `-1`, and the field `t.epochMicros` is the
 exact count. The unit is in every name because no default unit is safe. `Instant.Epoch` is the instant
 `epochMicros(0)`.
 
@@ -114,21 +114,21 @@ naming the field and its range. Text from outside the program is a `Result` ([pa
 
 | Method | On | Meaning |
 | --- | --- | --- |
-| `year()`, `month()`, `day()` | `Date`, `DateTime`, `Zoned` | the year, the month `1` to `12`, the day of the month `1` to `31` |
-| `weekday() -> Weekday` | the same | the day of the week |
-| `dayOfYear()` | the same | `1` to `366` |
-| `daysInMonth()`, `daysInYear()`, `isLeapYear()` | the same | of the date's month and year |
-| `monthName()` | the same | `January` … `December` |
-| `isoWeek()`, `isoWeekYear()` | the same | the ISO 8601 week (`1` to `53`, weeks starting on Monday, week 1 holding the year's first Thursday) and the year it belongs to: 2027-01-01 is in week 53 of 2026 |
-| `hour()`, `minute()`, `second()`, `microsecond()` | `Time`, `DateTime`, `Zoned` | `0`–`23`, `0`–`59`, `0`–`59`, `0`–`999_999` |
+| `year`, `month`, `day` | `Date`, `DateTime`, `Zoned` | the year, the month `1` to `12`, the day of the month `1` to `31` |
+| `weekday -> Weekday` | the same | the day of the week |
+| `dayOfYear` | the same | `1` to `366` |
+| `daysInMonth`, `daysInYear`, `isLeapYear` | the same | of the date's month and year |
+| `monthName` | the same | `January` … `December` |
+| `isoWeek`, `isoWeekYear` | the same | the ISO 8601 week (`1` to `53`, weeks starting on Monday, week 1 holding the year's first Thursday) and the year it belongs to: 2027-01-01 is in week 53 of 2026 |
+| `hour`, `minute`, `second`, `microsecond` | `Time`, `DateTime`, `Zoned` | `0`–`23`, `0`–`59`, `0`–`59`, `0`–`999_999` |
 | `date`, `time` | `DateTime` | the fields |
-| `date()`, `time()` | `Zoned` | its reading's parts |
+| `date`, `time` | `Zoned` | its reading's parts |
 | `epochDay`, `microsOfDay` | `Date`, `Time` | the fields: days since 1970-01-01, microseconds since midnight |
 
 `isLeapYear(year)` and `daysInMonth(year, month)` are module functions too; `daysInMonth` traps on a
 month outside `1` to `12`.
 
-**`Weekday`** is `Monday` … `Sunday`, ordered in that order, ISO 8601's. `w.isoNumber()` is `1`
+**`Weekday`** is `Monday` … `Sunday`, ordered in that order, ISO 8601's. `w.isoNumber` is `1`
 (Monday) to `7` (Sunday), `w.plus(n)` the day `n` days on (any `int`, negative included), and it
 displays as its name.
 
@@ -139,12 +139,12 @@ displays as its name.
 past the month's end, trap. On a `Zoned` the wall reading changes and the zone resolves it as
 [a period does](#zoned-arithmetic).
 
-**Starting points.** `startOfYear()`, `startOfMonth()` and `startOfWeek()` (the Monday) on `Date`,
-`DateTime` and `Zoned`, at midnight; `endOfMonth()` on the same, the month's last day at the same
-time of day; `startOfDay()`, `startOfHour()`, `startOfMinute()` and `startOfSecond()` on `DateTime`
+**Starting points.** `startOfYear`, `startOfMonth` and `startOfWeek` (the Monday) on `Date`,
+`DateTime` and `Zoned`, at midnight; `endOfMonth` on the same, the month's last day at the same
+time of day; `startOfDay`, `startOfHour`, `startOfMinute` and `startOfSecond` on `DateTime`
 and `Zoned` truncate the time of day. On a `Date` the date-only ones answer a `Date`; a `Date` has no
 `startOfHour`. A start or end that falls outside `Date.Min` to `Date.Max` traps naming the date
-(`Date.Max`, 11 July, has no `endOfMonth()`). `d.onOrAfter(w)` is the first date on or after `d` falling on weekday `w`, and
+(`Date.Max`, 11 July, has no `endOfMonth`). `d.onOrAfter(w)` is the first date on or after `d` falling on weekday `w`, and
 `d.onOrBefore(w)` the last on or before it: `date(2026, 8, 28).onOrAfter(Monday)` is 2026-08-31, and
 a Friday's `onOrAfter(Friday)` is itself.
 
@@ -153,15 +153,15 @@ a Friday's `onOrAfter(Friday)` is itself.
 A `Period` is a length of calendar: so many months and so many days. **Months and days never
 convert**: a month is 28 to 31 days and a day on a zone's clock 23 to 25 hours, so neither is
 some number of the other. `months(n)` and `years(n)` take an `int`, and are methods on `int` too
-(`3.months()`). `years(n)` is `12 * n` months, which is exact, so `years(1) ==
+(`3.months`). `years(n)` is `12 * n` months, which is exact, so `years(1) ==
 months(12)`; `months(1) != Period(0, 30)`. `Period.Zero` is the empty period.
 
 Periods add, subtract and negate part by part, never carrying days into months, and `p * n` scales
 both parts by an `int`; a part leaving `int` traps as an integer overflow does. `p.months` and
-`p.days` are the fields; `p.toYearsPart()` and `p.toMonthsPart()` split the months, each part
+`p.days` are the fields; `p.toYearsPart` and `p.toMonthsPart` split the months, each part
 carrying the months' sign (`months(14)` is 1 year and 2 months, `months(-14)` -1 and -2), and
-`p.isZero()` asks for the empty period. A period has no order: whether a month is longer than 30 days
-depends on the month. `p.toIsoString()` writes ISO 8601's form, `P1Y2M3D`: the years, the months
+`p.isZero` asks for the empty period. A period has no order: whether a month is longer than 30 days
+depends on the month. `p.toIsoString` writes ISO 8601's form, `P1Y2M3D`: the years, the months
 left over and the days, each where it is not zero, `P0D` for the empty period, and a negative part
 with its own sign (`P-1Y-2M`, `P1M-3D`), since the parts may differ in sign; `parsePeriod` reads it
 back ([Parsing](#parsing)).
@@ -239,7 +239,7 @@ where that is one of the two, and otherwise takes the earlier.
 `ZoneError` is `UnknownZone(name)` where the database has no such zone, `NotAZoneName(name)` where
 the text cannot be one — it is empty, starts with `/`, holds a `..` segment, or a character outside
 ASCII letters, digits and `/ _ + -` — which is decided before anything is read, and
-`Malformed(name)` where the database's file for it cannot be decoded. `e.message()` and its display
+`Malformed(name)` where the database's file for it cannot be decoded. `e.message` and its display
 name the zone: `no zone is named 'Mars/Olympus_Mons'`.
 
 The database is the host's (the directory `TZDIR` names, otherwise `/usr/share/zoneinfo`), kept
@@ -248,11 +248,11 @@ transition the host's table lists takes the table's last offset.
 
 | Method of `Zone` | Meaning |
 | --- | --- |
-| `name()` | `"America/Toronto"`, `"UTC"`, `"+05:30"` |
+| `name` | `"America/Toronto"`, `"UTC"`, `"+05:30"` |
 | `offsetAt(t: Instant) -> Duration` | how far its clocks are from UTC at `t`: `-4` hours in Toronto in July |
 | `isDaylightSavingAt(t)`, `abbreviationAt(t)` | whether `t` falls in daylight saving there, and the clocks' abbreviation then (`"EDT"`); a fixed zone is never in daylight saving and its abbreviation is its name |
 | `resolve(dt: DateTime) -> Resolution` | which of the three cases the wall reading is in this zone |
-| `isFixed()` | whether its offset never changes |
+| `isFixed` | whether its offset never changes |
 
 `Resolution` is `Unique(at: Zoned)`, `Repeated(earlier: Zoned, later: Zoned)` where the clocks show
 the reading twice, and `Skipped(before: Duration, after: Duration)` where they never show it, with
@@ -277,17 +277,17 @@ happens twice in America/Toronto, when the clocks go back; atZoneEarlier or atZo
 
 A `Zoned` holds its reading, the offset in force (a `Duration`, the one thing that tells the two
 readings of a repeated hour apart) and its zone, as the fields `dateTime`, `offset` and `zone`. Its
-other methods: `toInstant()`, `isDaylightSaving()` and `abbreviation()`, and every field and step
-above; `epochSeconds()`, `epochMillis()` and `epochMicros()` are its instant's counts.
+other methods: `toInstant`, `isDaylightSaving` and `abbreviation`, and every field and step
+above; `epochSeconds`, `epochMillis` and `epochMicros` are its instant's counts.
 
 ## Conversions
 
 | From | To | Spelling |
 | --- | --- | --- |
 | `long` count | `Instant` / `Duration` | `epochSeconds(n)`, `epochMillis(n)`, `epochMicros(n)` / `micros(n)` … `weeks(n)` |
-| `Instant` | count | `t.epochSeconds()`, `t.epochMillis()`, `t.epochMicros` |
-| `Instant` | `Zoned`, then any calendar value | `t.atZone(z)`, then `.dateTime`, `.date()`, `.time()` |
-| `Zoned` | `Instant`, `DateTime`, `Date`, `Time` | `toInstant()`, `dateTime`, `date()`, `time()` |
+| `Instant` | count | `t.epochSeconds`, `t.epochMillis`, `t.epochMicros` |
+| `Instant` | `Zoned`, then any calendar value | `t.atZone(z)`, then `.dateTime`, `.date`, `.time` |
+| `Zoned` | `Instant`, `DateTime`, `Date`, `Time` | `toInstant`, `dateTime`, `date`, `time` |
 | `DateTime` | `Zoned` | `atZone(z)` (a `Result`), `atZoneEarlier(z)`, `atZoneLater(z)` |
 | `DateTime` | `Date`, `Time` | `date`, `time` |
 | `Date` + `Time` | `DateTime` | `d.atTime(t)`, `t.atDate(d)`, `dateTime(d, t)` |
@@ -342,10 +342,10 @@ other type as its display.
 | `parseDateTime(text) -> Result[DateTime, TimeParseError]` | a date and a time joined by `T` or one space |
 | `parseTimestamp(text) -> Result[Instant, TimeParseError]` | a date-time and an offset: `Z`, `±hh:mm` or `±hhmm` |
 | `parseZoned(text) -> Result[Zoned, TimeParseError]` | a timestamp and, optionally, a zone name in brackets |
-| `parsePeriod(text) -> Result[Period, TimeParseError]` | `P`, then years `Y`, months `M` and days `D` in that order, at least one, each with its own `-` where negative: what `toIsoString()` writes |
+| `parsePeriod(text) -> Result[Period, TimeParseError]` | `P`, then years `Y`, months `M` and days `D` in that order, at least one, each with its own `-` where negative: what `toIsoString` writes |
 
 **Every display of `Instant`, `Date`, `Time`, `DateTime` and `Zoned` reads back** to an equal value,
-and so does every period's `toIsoString()`. A year of four digits has no sign; one written with a sign
+and so does every period's `toIsoString`. A year of four digits has no sign; one written with a sign
 has four digits or more (`+10000`, `-0001`, `+2026`). A fraction means what it says: `.5` is half a
 second. **A parse checks the calendar, not only the shape**: `2026-02-30` has the right shape and is
 refused, as are `24:00`, a second of `60`, a seventh digit of fraction (even a `0`), an offset beyond

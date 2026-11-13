@@ -587,8 +587,8 @@ main()
 `Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
 derived one ([Display and Debug](/spec/equality-and-memory/#display-and-debug)). A data type whose
-variants have no fields is an enumeration, and `derives Enumerable` gives it `values()`, `ordinal()`,
-`name()` and `valueOf(name)` ([Enumerations](/spec/derivation/#enumerations)).
+variants have no fields is an enumeration, and `derives Enumerable` gives it `values`, `ordinal`,
+`name` and `valueOf(name)` ([Enumerations](/spec/derivation/#enumerations)).
 
 ### Changing fields: `with`
 
@@ -739,7 +739,7 @@ val f = () -> c.head
   something else, the error names the lambda.
 - **Parentheses after one call what it yields.** `t.adder(4)`, where `adder -> (int) -> int`, calls
   the function `adder` yields, and `t.items(2)` indexes the sequence `items` yields. Where the
-  result is neither a function nor a sequence given an index, `c.head()` is an error naming the fix,
+  result is neither a function nor a sequence given an index, `c.head` is an error naming the fix,
   `head`.
 - **It is the only method of its name**: a class, a trait or the impls of a type cannot also have a
   method of that name with a parameter list, in the type itself or inherited, since `x.head` would
@@ -755,6 +755,21 @@ val f = () -> c.head
 - **A member is declared without a parameter list as it is; a function at the top level or in a
   block, with `def`** (below). A parameterless method takes no type parameters of its own,
   since `x.first[int]` would read as indexing its result; its class's type parameters it has.
+- **A static one is read on its type the same way**: `Color.values`, and through a type parameter
+  bounded by its trait, `T.values`, the type argument's own in each instance; `T.values()` is the
+  error naming the fix.
+- **The standard library declares every pure accessor without a parameter list**: a method of no
+  parameters that answers from its receiver, or a static one from its type, changing nothing and
+  handing out nothing to change or use up. `opt.isDefined`, `opt.get`, `r.isOk`, `e.swap`,
+  `s.trim`, `s.headOption`, `c.isDigit`, `n.abs`, `x.isNaN`, `d.toSeconds`, `date.year`,
+  `5.seconds`, `m.groupCount`, `err.message`, `json.keys`. What keeps `()` is what has an effect or
+  hands out a fresh mutable object or an iterator (`next()`, `iterator()`, `toBuffer()`,
+  `charIterator()`); what reaches a resource outside the program (a file, a socket, a child process,
+  a lock, a future, a signal); a constructor or factory (`Vector.empty[int]()`, `newBuilder()`); a
+  name that also has an overload with parameters (`s.toInt()` beside `s.toInt(16)`, and with it the
+  whole family `toLong()`, `toReal()`, `toBool()` and their `…Option()`; `stripMargin()` beside
+  `stripMargin('#')`); and the methods of the traits every type implements and derives produce,
+  `toString()`, `hash()`, `zero()`, `one()`, `negate()` and `shape()`.
 - **With `def`, the result type may be left to inference**: `def perimeter = 2.0 * (w + h)`. Without
   `def`, a name followed by `=` is an assignment.
 - It is not a field: `c.head = 3` is an error, and a class cannot declare a field and a method of
@@ -1702,7 +1717,7 @@ an `Err` fails the test with the error shown as the reason (`test answered Err: 
 reported at the test's name).
 
 ```text
-parse(text: string) -> Result[int, string] = if text == "" then Err("empty input") else Ok(text.length())
+parse(text: string) -> Result[int, string] = if text == "" then Err("empty input") else Ok(text.byteLength)
 
 @test("reads a word")
 readsAWord() -> Result[unit, string]

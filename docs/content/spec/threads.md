@@ -118,7 +118,7 @@ fetchAll(urls: Vector[string]) -> Result[Vector[string], string]
         for u in urls do s.spawn(() -> pages.send(fetch(u)))
         var got: Vector[string] = []
         var failure: Option[string] = None
-        while got.length < urls.length && failure.isEmpty()
+        while got.length < urls.length && failure.isEmpty
             pages.receive() match
                 Some(Ok(page)) -> got = got :+ page
                 Some(Err(e)) ->
@@ -430,7 +430,7 @@ main() -> int
     val counted = Future
         val words = load(path).split(" ")
         words.length
-    val both = for p in page, n in counted yield s"${p.charCount()} characters, $n words"
+    val both = for p in page, n in counted yield s"${p.charCount} characters, $n words"
     println(both.await())
     0
 ```
