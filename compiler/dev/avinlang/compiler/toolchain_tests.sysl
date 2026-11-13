@@ -132,3 +132,61 @@ version_in_step()
     val manifest = if exists(here + "/compiler/sysl.hocon") then here + "/compiler/sysl.hocon" else here + "/sysl.hocon"
     val text = read_text(manifest).unwrap()
     assert(text.contains("  version = \"" + Version + "\"\n"), "compiler/sysl.hocon names version " + Version)
+
+private stamped_toolchain(root: string, manifest: Option[string]) -> Toolchain
+    fake_toolchain(root)
+    if manifest is Some(text) then write_text(root + "/library/library.hocon", text).unwrap()
+    toolchain_in(root, root + "/cache").unwrap()
+
+private library_manifest(version: string) -> string = "package { name = \"avin-library\", version = \"" + version + "\" }\n"
+
+@test("a library stamped with the compiler's version passes the check")
+library_version_matches()
+    val dir = canonicalize(make_temp_dir("avin-libver").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    assert(library_version_error(stamped_toolchain(dir + "/a", Some(library_manifest(Version)))) is None)
+
+@test("a library of another version is refused with one error naming both versions and the library")
+library_version_mismatch()
+    val dir = canonicalize(make_temp_dir("avin-libver").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    for other in ["0.0.1", "99.0.0", "0.0.190", "0.1.0"]
+        val tc = stamped_toolchain(dir + "/" + other, Some(library_manifest(other)))
+        val message = library_version_error(tc).unwrap()
+        assert(message.contains("is version " + other + ", and this compiler is version " + Version), message)
+        assert(message.contains(tc.library_dir()), message)
+        assert(!message.contains("\n"), message)
+
+@test("a library with no version, no manifest or an unreadable manifest is refused")
+library_version_missing()
+    val dir = canonicalize(make_temp_dir("avin-libver").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val none = library_version_error(stamped_toolchain(dir + "/none", None)).unwrap()
+    assert(none.contains("carries no version"), none)
+    assert(none.contains(Version), none)
+    val bare = library_version_error(stamped_toolchain(dir + "/bare", Some("package { name = \"avin-library\" }\n"))).unwrap()
+    assert(bare.contains("has no `version`") && bare.contains("library.hocon"), bare)
+    val broken = library_version_error(stamped_toolchain(dir + "/broken", Some("sysl-dependencies = 3\n"))).unwrap()
+    assert(broken.contains("library.hocon"), broken)
+
+@test("check against a library of another version prints the one error and no library diagnostics, for every command that compiles")
+library_version_refused_before_compiling()
+    val dir = canonicalize(make_temp_dir("avin-libver").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = stamped_toolchain(dir + "/old", Some(library_manifest("0.0.1")))
+    write_text(tc.library_dir() + "/avin/prelude.avin", "this is not avin at all\n").unwrap()
+    write_text(dir + "/p.avin", "main() = 0\n").unwrap()
+    for command in ["check", "build", "run", "test"]
+        var noted = ""
+        val status = run_cli(["avin", command, dir + "/p.avin"], Some(tc), s -> (), s -> noted = noted + s + "\n")
+        assert_eq(status, 1)
+        assert(noted.starts_with("avin: the standard library at "), noted)
+        assert(noted.contains("is version 0.0.1"), noted)
+        assert_eq(noted.split("\n").len, 2)
+
+@test("the library's version and the compiler's agree in the checkout")
+library_version_in_step()
+    val here = current_dir().unwrap_or(".")
+    val manifest = if exists(here + "/library/library.hocon") then here + "/library/library.hocon" else here + "/../library/library.hocon"
+    val text = read_text(manifest).unwrap()
+    assert(text.contains("version = \"" + Version + "\" }"), "library/library.hocon names version " + Version)

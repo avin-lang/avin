@@ -22,7 +22,9 @@
 #      `--expect <sha>`); a rerun on a HEAD that is already the version stamp over that commit is
 #      accepted
 #   2. stamp `<version>` into `const Version` (`compiler/dev/avinlang/compiler/cli.sysl`) and
-#      `package.version` (`compiler/sysl.hocon`) -- a test holds the two in step -- and commit it
+#      `package.version` (`compiler/sysl.hocon`) -- a test holds the two in step -- and into the
+#      standard library's `package.version` (`library/library.hocon`), which the compiler checks
+#      against its own before it compiles anything; commit it
 #   3. build the compiler with the `sysl` on PATH, at `-O2` unless `-O<level>` says otherwise
 #   4. stage the prefix: `bin/avin`; `share/avin/library` and `share/avin/runtime`, the sources the
 #      compiler reads; `share/avin/editors`, the TextMate grammars of `.avin` and `.lavin`; and
@@ -154,6 +156,7 @@ base_commit=$(git -C $repo rev-parse ${expect:-origin/dev})
 
 version_file=$proj/dev/avinlang/compiler/cli.sysl
 manifest=$proj/sysl.hocon
+library_manifest=$repo/library/library.hocon
 
 stamp() {
     local text old new
@@ -168,6 +171,12 @@ stamp() {
     new="  version = \"$version\""
     [[ $old == $new ]] || print -r -- "${text/$old/$new}" > $manifest
 
+    text=$(< $library_manifest)
+    old=$(grep -m1 '^package { name = "avin-library", version = "' <<< $text) || { print "no package.version in $library_manifest"; return 1 }
+    new="package { name = \"avin-library\", version = \"$version\" }"
+    [[ $old == $new ]] || print -r -- "${text/$old/$new}" > $library_manifest
+
+    grep -qxF "package { name = \"avin-library\", version = \"$version\" }" $library_manifest || { print "the stamp did not take in $library_manifest"; return 1 }
     grep -qxF "const Version: string = \"$version\"" $version_file || { print "the stamp did not take in $version_file"; return 1 }
     grep -qxF "  version = \"$version\"" $manifest || { print "the stamp did not take in $manifest"; return 1 }
 
@@ -179,7 +188,7 @@ stamp() {
     git -C $repo diff --stat
     local changed
     changed=$(git -C $repo diff --name-only | sort | tr '\n' ' ')
-    [[ $changed == "compiler/dev/avinlang/compiler/cli.sysl compiler/sysl.hocon " ]] || { print "the stamp touched $changed"; return 1 }
+    [[ $changed == "compiler/dev/avinlang/compiler/cli.sysl compiler/sysl.hocon library/library.hocon " ]] || { print "the stamp touched $changed"; return 1 }
 
     git -C $repo commit -q -am "avin $version" || return 1
     git -C $repo log -1 --oneline
