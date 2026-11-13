@@ -361,6 +361,120 @@ language's, so sequencing is `andThen`, `orElse` and `followedBy`, and redirecti
 **Waiting is safe for the collector.** A thread waiting in `run`, `output` or `waitFor` holds
 nothing the collector waits on, as `await` does not.
 
+## `avin.cli`
+
+A program's command line, read against what the program takes. A `Parser` declares the flags, the
+options with a value and the positional arguments, each with a line of help; `parse` reads `main`'s
+`args` into `Args`, whose values are asked for by name and come back as the types they were
+declared with. The help and the usage line are written from the same declarations.
+
+```text
+import avin.cli
+
+val parser = cli.Parser("wc", "Count lines, words and characters.", version = "1.0")
+    .flag("lines", short = 'l', help = "count lines")
+    .flag("words", short = 'w', help = "count words")
+    .int("top", help = "list the N commonest words", value = "N")
+    .choice("format", ["text", "json"], default = "text")
+    .positionals("file", help = "the files to count", required = true)
+
+main(args: Vector[string]) -> int
+    val opts = parser.parseOrExit(args)
+    for f in opts.strings("file")
+        if opts.flag("lines") then println(s"$f: lines")
+    println(s"top ${opts.int("top")} as ${opts.string("format")}")
+    0
+```
+
+`wc -lw --top=3 a.txt b.txt` gives both flags, 3 and the two files; `wc --help` writes
+
+```text
+Usage: wc [options] <file>...
+
+Count lines, words and characters.
+
+Arguments:
+  <file>...                 the files to count
+
+Options:
+  -l, --lines               count lines
+  -w, --words               count words
+      --top <N>             list the N commonest words
+      --format <text|json>  (default: text)
+  -h, --help                show this help and exit
+      --version             show the version and exit
+```
+
+and `wc --top many a.txt` writes to standard error, and exits with 2:
+
+```text
+wc: `--top` needs an int, not `many`
+Usage: wc [options] <file>...
+Run `wc --help` for the options.
+```
+
+| Declaration on `Parser` | Declares |
+| --- | --- |
+| `Parser(name, about = "", version = "")` | A parser of no options and no arguments. `name` is the program's name in the usage line and the messages, `about` a sentence for the help; a `version` that is not empty gives the program `--version`. |
+| `flag(name, short, help)` | `--name`, given or not, any number of times. |
+| `string(name, short, help, default = "", required = false, repeated = false, value = "")` | `--name` with a text value. `value` names the value in the help (`--out <file>`), the option's name when empty. |
+| `int(…, default = 0, …)`, `real(…, default = 0.0, …)` | `--name` with an `int` or a `real` value, refused at parse time when it is not one. |
+| `choice(name, choices, short, help, default = "", required = false, repeated = false)` | `--name` whose value is one of `choices` exactly as written; the help shows them, `<text\|json>`. |
+| `positional(name, help = "", required = true)` | One positional argument, after those declared before it. |
+| `positionals(name, help = "", required = false)` | Every argument left, none or more, or one or more where `required`. It is the last declared. |
+
+Each declaration answers a new parser and leaves the one it was called on as it was, so a parser is
+an ordinary value: built once at the top of a module, or in a function.
+
+| Reading | Meaning |
+| --- | --- |
+| `parse(args) -> Result[Args, ArgsError]` | The arguments read, or why not. |
+| `parseOrExit(args) -> Args` | As `parse`, and where it gives no `Args` the program ends: the help or the version to standard output and status 0, a mistake to standard error, as the name and the reason, the usage line and where the help is, and status 2. |
+| `usage -> string`, `help -> string` | The usage line, and the whole help: usage, `about`, the arguments, then the options in the order declared, each with its help, its default where it has one, and whether it is required or may be repeated. |
+| `a.flag(name) -> bool`, `a.count(name) -> int` | Whether the flag was given, and how many times: 3 for `-vvv`. |
+| `a.string(name)`, `a.int(name)`, `a.real(name)` | The option's last value, else its default; the text of a choice or of a positional argument (empty where an optional one was left off). |
+| `a.strings(name)`, `a.ints(name)`, `a.reals(name)` | Every value of a repeated option in order, or its default alone where none was given and it has one; every argument a `positionals` took. |
+| `a.given(name) -> bool` | Whether the option or argument was on the command line, rather than taking its default. |
+
+**The arguments are read as a command line is.** An argument starting with `-` is an option, except
+`-` alone, which is positional, as is the empty argument. `--name=value` and `--name value` give a
+value alike. A single `-` starts one or more one-letter options, `-lw`, the last of which may take
+the rest of the argument or the next one as its value: `-n5`, `-n 5`, `-lwn5`. An option's value is
+the next argument whatever it starts with, so `--top -1` is −1 and `--out --verbose` writes to a
+file named `--verbose`. Every argument after `--` is positional. Options and positional arguments
+may come in any order.
+
+**A value given twice replaces the first,** so a later `--out` wins, unless the option is
+`repeated`, when each is kept. A flag may always be repeated, and `count` says how often.
+
+**Every parser has `--help` and `-h`,** unless the program declares an option named `help` or with
+the letter `h` itself, which then is the program's own; `--version` likewise, where the parser has
+a version. Each is acted on where it stands: `--help` after a mistake is never reached, and a
+mistake after `--help` is not looked at.
+
+**A mistake on the command line is an `ArgsError`, never a trap.** `ArgsError` is
+`HelpRequested(text)`, `VersionRequested(text)` or `Invalid(reason, usage)`, and an
+[`Error`](/spec/errors/), so a `main` answering a `Result` may pass it on with `?` and the program
+ends with `error: ` and the reason. The reasons name what the user wrote, as they wrote it:
+
+| Command line | Reason |
+| --- | --- |
+| `--x`, `-x` | ``unknown option `--x` ``, ``unknown option `-x` `` |
+| `--verbose=yes` | `` `--verbose` takes no value `` |
+| `--out` at the end | `` `--out` needs a value `` |
+| `--count abc`, `--count 2147483648` | `` `--count` needs an int, not `abc` `` |
+| `--scale fast` | `` `--scale` needs a number, not `fast` `` |
+| `--format xml` | `` `--format` must be one of `text`, `json`, not `xml` `` |
+| a required option left off | ``missing required option `--to` `` |
+| a required argument left off | ``missing argument `<file>` `` |
+| one argument more than declared | ``unexpected argument `extra` `` |
+
+**A mistake in the declarations, or in asking for a value, is the program's, and traps.** Two
+options of one name or one letter, a name written with its dashes, a choice with no choices or a
+default not among them, an argument after the one taking the rest or a required one after an
+optional one trap where they are declared; asking `Args` for a name never declared, or as another
+type than it was declared with (`a.int("out")` for a string option), traps where it is asked.
+
 ## `avin.signal`
 
 Signals the program watches for: a number another process, or the platform, sends to ask it to

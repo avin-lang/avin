@@ -7768,6 +7768,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   storing the name's span in the syntax tree (every `Member` match changes, for a span the source
   already determines).
 
+- **`avin.cli`: a declared parser read by name** (branch `argparse`). Proposed: the standard
+  library's argument parser is a `Parser` value built by chained declarations (`flag`, `string`,
+  `int`, `real`, `choice`, `positional`, `positionals`, each with named `short`, `help`, `default`,
+  `required`, `repeated`, `value`), and `parse(args)` answers `Result[Args, ArgsError]`; values are
+  asked for by name and type (`a.int("top")`, `a.strings("file")`), and asking for an undeclared
+  name or the wrong type traps. `parseOrExit` covers the usual `main`: help or version to standard
+  output and status 0, a mistake to standard error with the usage line and status 2. Why: it needs
+  no language feature, a program reads in the order its help does, and every mistake a user can
+  make is a value with a sentence naming what they wrote. Alternatives weighed: deriving a parser
+  from a `data` type's fields (`data Options(...) derives Args`), which checks names at compile time
+  but needs a derivation and a way to attach help, short letters and defaults to fields; a
+  getopt-style loop the program drives, which is what `wc` hand-rolled; one getter returning
+  `Option` for everything, which makes every read a `match`. Review with the user: whether a
+  derived form is wanted on top of this one.
+  The rules it settles, each the common command-line convention: `--name=value` and `--name value`
+  alike; bundled letters (`-lw`, `-n5`, `-lwn5`); an option's value is the next argument whatever
+  it starts with (`--top -1`); `-` alone and the empty argument are positional; `--` ends the
+  options; options and arguments interleave; a single option given twice keeps the last (so an
+  alias's option can be overridden), a `repeated` one keeps all, and a flag is counted (`-vvv`).
+  Every parser has `--help`/`-h`, and `--version` where it has a version, unless the program
+  declares that name or letter itself; each acts where it stands, left to right. An option with no
+  `default` reads as its type's zero (`""`, `0`, `0.0`) and `given(name)` tells whether it was on
+  the command line; the help shows a default only where it is not that zero, since a default
+  parameter cannot tell an explicit zero from an omitted one. Every option has a long name (the
+  name `Args` looks it up by); positional arguments are strings. The reasons read ``unknown option
+  `--x` ``, `` `--count` needs an int, not `abc` `` and `` `--scale` needs a number, not `x` ``
+  (a user of the program knows "number" better than "real"). Alternatives weighed: refusing an
+  option given twice (catches typos, breaks overriding an alias); refusing a value that starts with
+  `-` unless it is a number; typed positional arguments, left out until a program needs one;
+  `Option`-typed defaults (`default = Some(3)`), exact but noisy at every declaration.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
