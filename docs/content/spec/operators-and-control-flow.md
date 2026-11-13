@@ -24,7 +24,9 @@ a type implements its `compare(other: Self) -> int`, negative, zero or positive,
 four comparisons from it, implementing any of them as well where it can answer more directly. The
 built-in types implement the traits their operators have, so `int` is an `Add` and an `Ord`, and
 `string` is an `Add` (joining) and an `Ord`. Both operands of an operator reached through its trait
-are of one type. The wrapping, saturating and shift operators belong to the built-in types alone;
+are of one type, with one conversion: an integer beside a value of a type that implements
+`FromInteger`, such as `BigInt`, is converted to that type, on either side, so `big * i`, `1 + big`
+and `big < n` read as they would on integers ([types](/spec/types/#integers-meet-a-type-that-takes-them)). The wrapping, saturating and shift operators belong to the built-in types alone;
 `&`, `^` and `|` are the integers' and bytes' bitwise operators, and on any other type the
 [methods](#methods-named-by-symbols) of those names.
 

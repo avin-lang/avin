@@ -8039,6 +8039,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **Integers meet a type that takes them, through a core trait `FromInteger`** (2026-11-13, branch
+  `bigint-natural`; [types](/spec/types/#integers-meet-a-type-that-takes-them)). `trait FromInteger`
+  with one member, `static fromInteger[N: Integer](n: N) -> Self`; `BigInt` implements it. (1) An
+  integer literal where such a type is expected is `T.fromInteger(literal)`, the literal typed as a
+  `long` where it fits and otherwise at the narrowest width a multiple of 64 bits that holds it, so a
+  literal of any size and base is a `BigInt` (`val x: BigInt = 123456789012345678901234567890`). (2)
+  In `+ - * / %`, the comparisons and `==`/`!=`, an operand of an integer type (or a type parameter
+  bounded by `Integer`) beside an operand of such a type is converted with `fromInteger`, on either
+  side and in chains; a compound assignment converts only its value, so an integer target keeps its
+  type. (3) Where the type has an operator method of the name and no overload of it takes an
+  integer, its integer argument is converted, and a converted left operand calls it. (4) An integer
+  literal is refused as a pattern for such a type, since its value is a call. WHY: `f * i`,
+  `f == 0` and `val f: BigInt = 1` are what a reader writes, and `BigInt(i)` around every integer
+  hid the arithmetic. One trait serves both rules and any later number type (a decimal, a rational)
+  joins by an impl, with no type named in the checker; the conversion is lossless by the trait's
+  contract, which is why it is allowed where integer widths, which can lose, still need `long(x)`.
+  A literal too large for `long` reuses the arbitrary-width integers rather than a text form, so the
+  trait has one member. ALTERNATIVES: operator methods on `BigInt` taking `[N: Integer]` (covers
+  `big * i` only; `i * big` and `0 == big` still need a checker rule, so two mechanisms); a general
+  reversed-operand lookup on the right operand's type (larger, and it says nothing of literals or
+  `==`); implicit conversion of an integer to a `FromInteger` type at every expected type, arguments
+  included (wider than asked, and it makes overloads `f(BigInt)`/`f(long)` harder to read); a
+  `fromDigits(text)` member for literals past `long` (a second member every implementer writes, and
+  a parse at run time). Literal patterns for such a type (matching by `==`) were left out: a pattern
+  is a constant today, and coverage reasons about constants. **Review with the user**: whether the
+  conversion should reach plain arguments (`gcd(7)` already works for a literal; `gcd(i)` does not),
+  and whether `BigInt.zero()`/`one()` should lose their `()` with the core traits' wave.
+- **`BigInt(n)` with a literal past `long` stays an error** (2026-11-13, branch `bigint-natural`):
+  `apply(n: long)` and `apply[T: Integer](n: T)` give the literal no wider type, and the message says
+  it does not fit; `val x: BigInt = …` is the spelling. WHY: typing a literal at a free `Integer`
+  bound by its size would be a second literal rule for one call. ALTERNATIVE: an `apply` overload
+  the literal rule reaches.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
