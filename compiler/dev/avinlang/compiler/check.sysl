@@ -11301,6 +11301,13 @@ private rendering_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
 // most specific.
 private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: string, ms: Buf[usize], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
     if ms.len() == 1 || *receiver.ty is Nothing then return method_value(c, at, receiver, ms[0], explicit, expected)
+    // Methods declared without a parameter list are named to be called, so no expected function type
+    // chooses among them: an impl's for each receiver it is for, so here none is, and the first says
+    // which receiver it needs.
+    var all_parameterless = true
+    for m in ms
+        if !is_parameterless(c, m) then all_parameterless = false
+    if all_parameterless then return method_value(c, at, receiver, ms[0], explicit, expected)
     if refuse_trait_clash(c, at, receiver.ty, name, ms) then return TExpr(at, ErrorType, UnitConst)
     val unit = unit_of(c)
     var wanted: Option[Buf[&Type]] = None
@@ -11312,7 +11319,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
             // With an overload of no parameters among them, the likelier slip is a call missing its
             // parentheses, so the error names the call.
             for m in ms
-                if c.symbols[m].params.len() == 1
+                if c.symbols[m].params.len() == 1 && !is_parameterless(c, m)
                     empty_list_without_call(c, at, receiver, name)
                     return TExpr(at, ErrorType, UnitConst)
             c.note(unit, at, s"`$name` is overloaded, so as a value with no expected function type it is ambiguous: ${overload_list(c, ms)} could each be meant")
@@ -11512,6 +11519,14 @@ private inside_class(c: *Checker, k: usize) -> bool
         None -> return false
     here == k || c.classes[k].companion == Some(here)
 
+/** Whether class `k` has a field left unset by `field_unset`; outside the core library the intrinsic
+ * is already refused where it is declared, so a class there is reported once. */
+private has_unset_field(c: *Checker, k: usize) -> bool
+    if c.classes[k].module_name != CoreModule then return false
+    for f in c.classes[k].fields
+        if f.unset then return true
+    false
+
 // An abstract class has a constructor its subclasses' constructors run, but cannot be called to make
 // an object of its own; reports whether `id` is one.
 private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
@@ -11529,6 +11544,11 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
         return true
     if c_value_type(c.classes[k].decl) is Some(target)
         c.note(unit_of(c), at, s"`${c.classes[k].name}` is a copy of the C value `$target`, so only a C binding that answers one makes it")
+        return true
+    // An object made with a field left unset holds zero bytes there until the class's own code writes
+    // it, so only that code, the class's and its companion's, makes one: see `field_unset`.
+    if has_unset_field(c, k) && !inside_class(c, k)
+        c.note(unit_of(c), at, s"`${c.classes[k].name}` keeps fields its own code fills in, so only the class and its companion make one")
         return true
     if !is_abstract_class(c, k) then return false
     if is_trait(c, k) then c.note(unit_of(c), at, s"`${c.classes[k].name}` is a trait, so it cannot be instantiated; instantiate a class that conforms to it")
@@ -15534,6 +15554,9 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             views.push(substitute_all(s.params, s.owner, s.known))
             bindings.push(binding)
     var typed: Buf[Option[&TExpr]] = buf()
+    // Arguments that could not be checked before an overload is chosen, each tried against every
+    // candidate in turn.
+    var trials: Buf[usize] = buf()
     if bound.len() == 0
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${joined_labels(labels)}")
         return Choice(None, typed)
@@ -15548,7 +15571,15 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             if bound_signatures[k].type_params.len() > bound_signatures[k].known.len() || !same_type(p, shared) then agree = false
         if takes_parameter_type(value) || is_literal(value) then typed.push(None)
         elif delayed then typed.push(Some(delayed_unchosen(c, args[j], if agree then Some(strict(shared)) else None)))
-        else typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
+        elif agree || bound.len() < 2 then typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
+        else
+            // Checked by itself first; one that needs the parameter's type to be checked at all, a
+            // generic function named as a value, is tried against each candidate below.
+            muted_check(c, value, None) match
+                Some(t) -> typed.push(Some(t))
+                None ->
+                    typed.push(None)
+                    trials.push(j)
     var fitting: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
     // A candidate with a repeated parameter is chosen only where no candidate without one fits.
@@ -15565,13 +15596,38 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
     var considered: Buf[bool] = buf()
     for k in 0..<bound.len()
         considered.push(!(fixed_fits && bound_signatures[k].variadic) && !(direct_fits && untupling[k]) && fits_call(c, bound_signatures[k], bindings[k], args, typed, written))
+    // A lambda whose body never returns fits every candidate alike, so the first is chosen.
+    var never_returns = false
+    var opened: Buf[Option[&Type]] = buf()
     for j in 0..<args.len()
+        opened.push(None)
         if typed[j] is None
             if result_open_params(c, bound_signatures, views, bindings, args, j, considered) is Some(want)
-                typed[j] = Some(check_expr(c, argument_value(args[j]), Some(want)))
+                opened[j] = Some(want)
+                // A body whose branches join only at the result a candidate expects, `if … then
+                // aList else aVector` for an `Iterable[U]`, is tried against each candidate instead.
+                muted_check(c, argument_value(args[j]), Some(want)) match
+                    Some(t) ->
+                        if returns_nothing(c, t.ty) then never_returns = true
+                        else typed[j] = Some(t)
+                    None -> trials.push(j)
+    // Each argument tried against each candidate: where exactly one candidate takes it, that one is
+    // chosen; otherwise the argument is checked as it would have been, and reports what is wrong.
+    var only: Option[usize] = None
+    for j in trials
+        var survivors: Buf[usize] = buf()
+        for k in 0..<bound.len()
+            if considered[k] && argument_trial(c, bound_signatures[k], bindings[k], args, j, written) then survivors.push(k)
+        val value = argument_value(args[j])
+        if survivors.len() == 1 && (only is None || only == Some(survivors[0]))
+            only = Some(survivors[0])
+            if !takes_parameter_type(value) then typed[j] = Some(check_expr(c, value, Some(trial_expected(c, bound_signatures[survivors[0]], bindings[survivors[0]], args, j, written))))
+        elif takes_parameter_type(value) then typed[j] = Some(check_expr(c, value, opened[j]))
+        else typed[j] = Some(check_expr(c, value, None))
     for k in 0..<bound.len()
         if fixed_fits && bound_signatures[k].variadic then continue
         if direct_fits && untupling[k] then continue
+        if only is Some(o) && o != k then continue
         if !fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then continue
         fitting.push(bound[k])
         var params: Buf[&Type] = buf()
@@ -15609,6 +15665,7 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
                     for j in 0..<args.len()
                         if typed[j] is Some(x)
                             if takes_parameter_type(argument_value(args[j])) && yields_error(c, x.ty) then return Choice(Some(fitting[0]), typed)
+                    if never_returns then return Choice(Some(fitting[0]), typed)
                     c.note(unit, name_span, s"this call to `$name` is ambiguous: ${joined_labels(fitting_labels)} each accept it, and none is more specific than the others")
                     Choice(None, typed)
 
@@ -15795,6 +15852,49 @@ private result_open_params(c: *Checker, signatures: Buf[Signature], views: Buf[B
         count += 1
     if count < 2 || !results_differ then return None
     Some(Function(shared, fresh_var(c), sendable))
+
+/** `e` checked against `expected` with nothing reported: the checked expression where that reports
+ * nothing, or None, with the inference variables and the deferred sendability checks as they were. */
+private muted_check(c: *Checker, e: &Expr, expected: Option[&Type]) -> Option[&TExpr]
+    val saved = save_vars(c)
+    val sendables = c.late_sendables.len()
+    c.muted = c.muted + 1
+    val before = c.muted_notes
+    val t = check_expr(c, e, expected)
+    c.muted = c.muted - 1
+    if c.muted_notes == before then return Some(t)
+    restore_vars(c, saved)
+    while c.late_sendables.len() > sendables
+        c.late_sendables.pop()
+    None
+
+/** Whether `t` is a function whose result is `Nothing`: one that never returns. */
+private returns_nothing(c: *Checker, t: &Type) -> bool = *zonk(c, t) match
+    Function(_, result, _) -> *zonk(c, result) is Nothing
+    _ -> false
+
+/** The type candidate `s` gives argument `j`, its type arguments not written or known left as fresh
+ * inference variables. */
+private trial_expected(c: *Checker, s: Signature, binding: Binding, args: Buf[Argument], j: usize, written: Buf[&Type]) -> &Type
+    var type_args: Buf[&Type] = buf()
+    for i in 0..<s.type_params.len()
+        type_args.push(if i < s.known.len() then s.known[i] else fresh_var(c))
+    for i in 0..<written.len()
+        unify(c, type_args[s.known.len() + i], written[i])
+    strict(argument_type(c, s, substitute_all(s.params, s.owner, type_args), binding, args, j).unwrap())
+
+/** Whether argument `j` checks, with nothing reported, against the type candidate `s` gives it, and
+ * fits it; nothing it settles is kept. */
+private argument_trial(c: *Checker, s: Signature, binding: Binding, args: Buf[Argument], j: usize, written: Buf[&Type]) -> bool
+    val saved = save_vars(c)
+    val sendables = c.late_sendables.len()
+    val p = trial_expected(c, s, binding, args, j, written)
+    var ok = false
+    if muted_check(c, argument_value(args[j]), Some(p)) is Some(t) then ok = fits(c, strict(t.ty), p)
+    restore_vars(c, saved)
+    while c.late_sendables.len() > sendables
+        c.late_sendables.pop()
+    ok
 
 /** Whether `t` is the error type, or a function whose result is. */
 private yields_error(c: *Checker, t: &Type) -> bool = *zonk(c, t) match

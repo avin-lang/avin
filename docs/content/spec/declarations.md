@@ -158,6 +158,12 @@ their parameter types differ. A call chooses among them by its arguments:
   is an error. A default argument that makes two overloads accept the same call makes that call
   ambiguous.
 - A function used as a value takes its overload from the expected function type.
+- Where candidates differ only in what a function argument returns, `flatMap` taking `(T) ->
+  Iterable[U]` or `(T) -> Option[U]`, a lambda's body decides its result first. An argument that
+  cannot be checked that way, a lambda whose branches join only at the result a candidate expects
+  (`if … then aList else aVector`) or a generic function named as a value (`flatMap(identity)`), is
+  checked against each candidate in turn, and the one candidate that takes it is chosen. A lambda
+  that never returns fits every candidate alike, and the first declared is chosen.
 
 ```text
 describe(n: int) -> string = s"int $n"
