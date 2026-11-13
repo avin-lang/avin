@@ -1,0 +1,110 @@
+// expect: exit 0
+// The client's verbs against the library's own server over the loopback: `get`, `head`, `delete`,
+// `post`, `put` and `patch`, each with headers of its own and without, the `Content-Length` each
+// writes for an empty body, Unicode in bodies, headers and query parameters, headers sent by
+// `withHeaders` and by the constructor, query parameters added by `withQueryParam`, headers a handler
+// answers with `withHeader`, `Response.json`, and the errors of a URL that is not one and of a
+// refused connection.
+import avin.io.{IoError, ConnectionRefused}
+import avin.net.http
+import avin.net.http.{HttpError, Io, BadUrl, Request, Response, ServerRequest}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message)
+
+shownHeader(r: ServerRequest, name: string) -> string = r.header(name).getOrElse("-")
+
+// What the server was sent, answered with headers of its own.
+echo(r: ServerRequest) -> Response
+    if r.path == "/json" then return Response.json(201, s"{\"method\":\"${r.method}\",\"word\":\"café ✓\"}")
+    if r.path == "/json-empty" then return Response.json(200, "")
+    if r.path == "/q" then return Response.text(200, s"${r.queryParams}")
+    val sent = s"type=${shownHeader(r, "Content-Type")} length=${shownHeader(r, "Content-Length")}"
+    val own = s"note=${shownHeader(r, "X-Note")} other=${shownHeader(r, "X-Other")}"
+    val seen = s"${r.method} ${r.target} $sent $own body=[${string.fromUtf8Lossy(r.body)}]"
+    Response.text(200, seen).withHeader("X-Method", r.method).withHeader("X-Word", "naïve ✓").withHeader("X-Empty", "")
+
+describe(r: Result[Response, HttpError]) -> string = r match
+    Ok(res) -> s"${res.status} ${res.text}"
+    Err(e) -> s"error: ${e.message}"
+
+answered(r: Result[Response, HttpError]) -> string = r match
+    Ok(res) -> s"${res.status} ${res.header("x-method")} ${res.header("X-WORD")} ${res.header("X-Empty")} ${res.header("Content-Type")} ${res.body.length}"
+    Err(e) -> s"error: ${e.message}"
+
+main()
+    val server = ok(http.serve("127.0.0.1", 0, echo))
+    val base = s"http://127.0.0.1:${server.port()}"
+    val note = [("X-Note", "kept as written"), ("X-Other", "ünïcödé")]
+
+    // Each verb without headers of its own: the bodiless ones send no length, the others one even for
+    // an empty body.
+    println(describe(http.get(s"$base/a")))
+    println(describe(http.delete(s"$base/a")))
+    println(describe(http.post(s"$base/a", "", "text/plain")))
+    println(describe(http.put(s"$base/a", "", "text/plain")))
+    println(describe(http.patch(s"$base/a", "", "text/plain")))
+    http.head(s"$base/a") match
+        Ok(r) -> println(s"HEAD ${r.status} ${r.header("Content-Length")} ${r.header("X-Method")} ${r.body.length}")
+        Err(e) -> println(e)
+
+    // Each verb with headers, and Unicode bodies counted in bytes.
+    println(describe(http.get(s"$base/b", note)))
+    println(describe(http.delete(s"$base/b/é", note)))
+    println(describe(http.post(s"$base/b", "a=1", "application/x-www-form-urlencoded", note)))
+    println(describe(http.put(s"$base/b", "é ✓ 😀", "text/plain; charset=utf-8", note)))
+    println(describe(http.patch(s"$base/b", "{\"op\":\"replace\"}", "application/json-patch+json", note)))
+    http.head(s"$base/b", note) match
+        Ok(r) -> println(s"HEAD ${r.status} ${r.header("Content-Length")} ${r.body.length}")
+        Err(e) -> println(e)
+
+    // An empty vector of headers is the same as none.
+    println(describe(http.get(s"$base/c", [])))
+    // The verb's `Content-Type` comes first, so a header of that name given too is sent after it and
+    // the server, reading the first, sees the verb's.
+    println(describe(http.post(s"$base/c", "x", "text/plain", [("Content-Type", "application/other")])))
+
+    // Headers the handler answers with, read back on each verb.
+    println(answered(http.get(s"$base/d")))
+    println(answered(http.head(s"$base/d")))
+    println(answered(http.delete(s"$base/d")))
+    println(answered(http.post(s"$base/d", "z", "text/plain")))
+    println(answered(http.put(s"$base/d", "z", "text/plain")))
+    println(answered(http.patch(s"$base/d", "z", "text/plain")))
+
+    // `Response.json`: its status, type and body as given, empty too.
+    println(answered(http.get(s"$base/json")))
+    println(describe(http.patch(s"$base/json", "", "text/plain")))
+    println(answered(http.get(s"$base/json-empty")))
+    println(describe(http.get(s"$base/json-empty")))
+
+    // Query parameters, encoded, added to a URL without a query, with one, ending in `?` or `&`, and
+    // before a fragment.
+    val q = Request("GET", s"$base/q").withQueryParam("name", "Zoë & co").withQueryParam("a=b", "")
+    println(q.url.replace(base, "BASE"))
+    println(describe(http.send(q)))
+    println(Request("GET", "http://h/p?x=1").withQueryParam("y", "2").url)
+    println(Request("GET", "http://h/p?").withQueryParam("y", "2").url)
+    println(Request("GET", "http://h/p?x=1&").withQueryParam("y", "2").url)
+    println(Request("GET", "http://h/p#top").withQueryParam("y", "✓").url)
+    println(Request("GET", "http://h/p?x#top").withQueryParam("", "").url)
+
+    // Headers given by `withHeaders` and by the constructor, in order after the ones it had.
+    val built = Request("PUT", s"$base/e", [("X-Note", "first")]).withHeaders([("X-Other", "second"), ("X-Note", "third")]).withBody("ü")
+    println(built.headers)
+    println(describe(http.send(built)))
+    println(Request("GET", "http://h/").withHeaders([]).headers)
+
+    // Errors: a URL that is not one, for each verb, and a refused connection.
+    for r in [http.get("no scheme"), http.head("no scheme"), http.delete("/relative"), http.post("", "", "text/plain"),
+              http.put("::", "", "text/plain"), http.patch("no scheme", "x", "text/plain")]
+        r match
+            Err(BadUrl(_)) -> println("bad url")
+            other -> println(describe(other))
+    server.stop()
+    for r in [http.get(s"$base/a"), http.head(s"$base/a"), http.delete(s"$base/a"), http.post(s"$base/a", "x", "text/plain"),
+              http.put(s"$base/a", "x", "text/plain"), http.patch(s"$base/a", "x", "text/plain", note)]
+        r match
+            Err(Io(ConnectionRefused)) -> println("refused")
+            other -> println(describe(other))

@@ -1,6 +1,7 @@
 module avin.net.http
 
-// An HTTP/1.1 client over a TCP connection: `get`, `post`, and `send` for any request. One request
+// An HTTP/1.1 client over a TCP connection: `get`, `head`, `delete`, `post`, `put` and `patch`, each
+// taking headers to send, and `send` for any request. One request
 // goes on each connection, and a status is an answer rather than a failure, so a `404` is an `Ok`.
 // A `GET` or `HEAD` follows up to five redirects, each resolved against the URL that answered it.
 // An `https` URL is fetched over TLS, its certificate checked for the URL's host against the
@@ -39,18 +40,26 @@ impl Error for HttpError
 
 // A request: its method, its URL as text, the headers sent besides the ones the client writes, its
 // body, how long a read or write on its connection may wait, and the TLS settings an `https` URL is
-// fetched with, by redirect too. A method is a token, such as `GET`, and a header's name and value
-// hold no line break; either traps where it does not hold.
+// fetched with, by redirect too. A method is a token, such as `GET`, a header's name is a token and
+// its value holds no line break; a request where one does not hold traps as it is made, its headers
+// given to the constructor as much as those added by `withHeader`.
 class Request(val method: string, val url: string, val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
         val body: Array[byte] = Array.empty[byte](), val timeout: Option[Duration] = None, val tls: TlsClient = TlsClient())
     if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
+    for (name, value) in headers
+        checkHeader(name, value)
 
     // The request with a header added after the ones it has. `Host`, `Content-Length` and
     // `Connection`, given here, replace the ones the client would write.
-    withHeader(name: string, value: string) -> Request
-        if name.isEmpty || name.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$name` is not a header name")
-        if value.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the value of the header `$name` holds a line break")
-        Request(method, url, headers :+ (name, value), body, timeout, tls)
+    withHeader(name: string, value: string) -> Request = Request(method, url, headers :+ (name, value), body, timeout, tls)
+
+    // The request with the headers of `more` added after the ones it has, in order.
+    withHeaders(more: Vector[(string, string)]) -> Request = Request(method, url, headers ++ more, body, timeout, tls)
+
+    // The request with the query parameter `name=value` added after any its URL has, each encoded by
+    // `Url.encode`, and before the URL's fragment.
+    withQueryParam(name: string, value: string) -> Request =
+        Request(method, withParam(url, name, value), headers, body, timeout, tls)
 
     // The request with `text`, as UTF-8, for its body.
     withBody(text: string) -> Request = Request(method, url, headers, utf8(text), timeout, tls)
@@ -77,14 +86,18 @@ class Response(val status: int, val reason: string, val headers: Vector[(string,
     // The response with a header added after the ones it has. A header's name is a token and its
     // value holds no line break; either traps where it does not hold.
     withHeader(name: string, value: string) -> Response
-        if name.isEmpty || name.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$name` is not a header name")
-        if value.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the value of the header `$name` holds a line break")
+        checkHeader(name, value)
         Response(status, reason, headers :+ (name, value), body)
 
 object Response
     // A response of `status` whose body is `text` as UTF-8, of the type `text/plain; charset=utf-8`.
     text(status: int, text: string) -> Response =
         Response(status, reasonPhrase(status), Vector(("Content-Type", "text/plain; charset=utf-8")), utf8(text))
+
+    // A response of `status` whose body is `text`, JSON already written, as UTF-8, of the type
+    // `application/json`. The text is sent as it is given, not checked to be JSON.
+    json(status: int, text: string) -> Response =
+        Response(status, reasonPhrase(status), Vector(("Content-Type", "application/json")), utf8(text))
 
     // A response of `status` whose body is `body`, of the type `contentType`.
     bytes(status: int, body: Array[byte], contentType: string) -> Response =
@@ -139,12 +152,36 @@ reasonPhrase(504) = "Gateway Timeout"
 reasonPhrase(505) = "HTTP Version Not Supported"
 reasonPhrase(_) = ""
 
-// Fetches `url`.
-get(url: string) -> Result[Response, HttpError] = send(Request("GET", url))
+// Fetches `url`, sending `headers` besides the ones the client writes.
+get(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+    send(Request("GET", url, headers))
 
-// Sends `body` to `url` with the content type `contentType`, and answers the response.
-post(url: string, body: string, contentType: string) -> Result[Response, HttpError] =
-    send(Request("POST", url).withHeader("Content-Type", contentType).withBody(body))
+// Asks for `url`'s headers without its body.
+head(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+    send(Request("HEAD", url, headers))
+
+// Asks the server to delete `url`.
+delete(url: string, headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+    send(Request("DELETE", url, headers))
+
+// Sends `body`, as UTF-8, to `url` with the content type `contentType`, and answers the response.
+post(url: string, body: string, contentType: string,
+        headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+    send(withContent("POST", url, body, contentType, headers))
+
+// Stores `body`, as UTF-8, at `url` with the content type `contentType`.
+put(url: string, body: string, contentType: string,
+        headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+    send(withContent("PUT", url, body, contentType, headers))
+
+// Changes `url` by `body`, as UTF-8, of the content type `contentType`.
+patch(url: string, body: string, contentType: string,
+        headers: Vector[(string, string)] = Vector.empty[(string, string)]()) -> Result[Response, HttpError] =
+    send(withContent("PATCH", url, body, contentType, headers))
+
+// A request with a body: its `Content-Type` first, then `headers`.
+private withContent(method: string, url: string, body: string, contentType: string, headers: Vector[(string, string)]) -> Request =
+    Request(method, url, Vector(("Content-Type", contentType)) ++ headers, utf8(body))
 
 // Sends `request` and answers its response, following up to five redirects of a `GET` or `HEAD`.
 send(request: Request) -> Result[Response, HttpError]
@@ -200,7 +237,7 @@ private exchange(request: Request, url: Url) -> Result[Response, HttpError]
 
 // The request written on `stream` and its response read, the connection left for the caller to close.
 private over(stream: ByteStream, request: Request, url: Url, host: string) -> Result[Response, HttpError]
-    stream.write(utf8(head(request, url, host))).mapErr(e -> Io(e))?
+    stream.write(utf8(requestHead(request, url, host))).mapErr(e -> Io(e))?
     if request.body.length > 0 then stream.write(request.body).mapErr(e -> Io(e))?
     while true
         val response = readResponse(stream, request.method == "HEAD")?
@@ -209,13 +246,13 @@ private over(stream: ByteStream, request: Request, url: Url, host: string) -> Re
     fail("unreachable")
 
 // The request line and headers, ending in the empty line.
-private head(request: Request, url: Url, host: string) -> string
+private requestHead(request: Request, url: Url, host: string) -> string
     val out = StringWriter()
     val target = (if url.path.isEmpty then "/" else url.path) + url.query.map(q -> "?" + q).getOrElse("")
     out.write(s"${request.method} $target HTTP/1.1\r\n")
     if headerIn(request.headers, "Host").isEmpty
         out.write(s"Host: $host${url.port.map(p -> s":$p").getOrElse("")}\r\n")
-    val sendsLength = request.body.length > 0 || request.method == "POST" || request.method == "PUT"
+    val sendsLength = request.body.length > 0 || request.method == "POST" || request.method == "PUT" || request.method == "PATCH"
     if sendsLength && headerIn(request.headers, "Content-Length").isEmpty
         out.write(s"Content-Length: ${request.body.length}\r\n")
     if headerIn(request.headers, "Connection").isEmpty then out.write("Connection: close\r\n")
@@ -331,6 +368,19 @@ private addressOf(host: string) -> string =
 // A character a method or a header's name may hold: a letter, a digit, or one of RFC 9110's marks.
 private isTokenChar(c: char) -> bool =
     ('a' <= c <= 'z') || ('A' <= c <= 'Z') || ('0' <= c <= '9') || "!#$%&'*+-.^_`|~".indexOf(c) >= 0
+
+// Traps where `name` is not a header name, a token, or `value` holds a line break.
+private checkHeader(name: string, value: string)
+    if name.isEmpty || name.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$name` is not a header name")
+    if value.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(s"the value of the header `$name` holds a line break")
+
+// `url` with `name=value`, each encoded, added to its query, before its fragment.
+private withParam(url: string, name: string, value: string) -> string
+    val hash = url.indexOf('#')
+    val before = if hash >= 0 then url.slice(0, hash) else url
+    val after = if hash >= 0 then url.slice(hash, url.byteLength) else ""
+    val joiner = if before.indexOf('?') < 0 then "?" else if before.endsWith("?") || before.endsWith("&") then "" else "&"
+    s"$before$joiner${Url.encode(name)}=${Url.encode(value)}$after"
 
 // The UTF-8 bytes of `text`.
 private utf8(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))

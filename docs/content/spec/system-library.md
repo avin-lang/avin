@@ -1195,7 +1195,8 @@ them. A target is a path beginning with `/` or an absolute `http` URL; `ServerRe
 target)` traps on any other, so a handler can be tried without a connection.
 
 A `Response` is the client's: `Response.text(status, text)` (`text/plain; charset=utf-8`),
-`Response.bytes(status, body, contentType)`, `Response.empty(status)` and `withHeader(name, value)`,
+`Response.json(status, text)` (`application/json`, the text sent as given and not checked to be
+JSON), `Response.bytes(status, body, contentType)`, `Response.empty(status)` and `withHeader(name, value)`,
 which traps on a name that is not a token or a value holding a line break; `http.reasonPhrase(status)`
 is RFC 9110's phrase for a status, empty for one it does not name.
 
@@ -1280,9 +1281,19 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 
 | Function | Meaning |
 | --- | --- |
-| `http.get(url: string) -> Result[Response, HttpError]` | Fetches the URL. |
-| `http.post(url: string, body: string, contentType: string) -> Result[Response, HttpError]` | Sends `body` and answers the response. |
-| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url)` with `withHeader`, `withBody`, `withTimeout` and `withTls`. |
+| `http.get(url: string, headers = []) -> Result[Response, HttpError]` | Fetches the URL. |
+| `http.head(url: string, headers = [])` | Asks for the URL's headers; the response has no body. |
+| `http.delete(url: string, headers = [])` | Asks the server to delete the URL. |
+| `http.post(url: string, body: string, contentType: string, headers = []) -> Result[Response, HttpError]` | Sends `body`, as UTF-8, and answers the response. |
+| `http.put(url, body, contentType, headers = [])` | The same with `PUT`. |
+| `http.patch(url, body, contentType, headers = [])` | The same with `PATCH`. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout` and `withTls`. |
+
+Every verb answers a `Result[Response, HttpError]`, and `headers`, a `Vector[(string, string)]`, are
+sent after the ones the client writes, in order. `post`, `put` and `patch` send `Content-Type:
+contentType` first, so a `Content-Type` among `headers` follows it. `withQueryParam(name, value)`
+adds `name=value` to the request's URL, each encoded by `Url.encode`, after any query it has (with
+`?` where it has none, `&` otherwise, nothing after a trailing `?` or `&`) and before its fragment.
 
 A `Response` has its `status` and `reason`, its `headers` as a vector of name and value pairs,
 `header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text`
@@ -1293,11 +1304,13 @@ that could not be made, broke or timed out being `Io`, for `https` as for `http`
 client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
 the connection's end, and follows up to five redirects of a `GET` or `HEAD` (statuses 301, 302,
 303, 307 and 308), each `Location` resolved against the URL that answered by `Url.resolve`; the sixth
-is the answer. It writes `Host`, `Content-Length` (for a body, a `POST` and a `PUT`) and `Connection:
-close` unless the request gives them, then the request's own headers in order. `HEAD`, an interim
+is the answer. It writes `Host`, `Content-Length` (for a body, and for a `POST`, a `PUT` and a
+`PATCH` even when theirs is empty) and `Connection: close` unless the request gives them, then the
+request's own headers in order. `HEAD`, an interim
 `1xx` (which is skipped for the answer after it), `204` and `304` have no body. A method is a token
-and a header's name one too, and a header's value holds no line break; `Request` and `withHeader`
-trap where one does not. A request's timeout bounds each read and write on its connection.
+and a header's name one too, and a header's value holds no line break; a request where one does not
+traps as it is made, whether the header came to `Request`'s constructor, to a verb, or by
+`withHeader` or `withHeaders`, so nothing is sent. A request's timeout bounds each read and write on its connection.
 
 **An `https` URL just works**: the client makes the TCP connection to the URL's port, 443 where it
 gives none, sets the request's timeout on it, so the handshake's waits are bounded too, and speaks
