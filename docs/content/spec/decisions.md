@@ -7620,6 +7620,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `walk` needs the kind of an unreadable directory to report it. Alternatives weighed: keeping the
   opening check (a permission answer dressed as a kind).
 
+- Proposed (built on branch `text-papercuts`): **`sortedDescending` on every `Seq` of `Ord`
+  elements (a `List`'s answering a `List`), and `sortInPlaceDescending()` on arrays, buffers and
+  deques**, beside `Reverse`, which stays the way to sort descending by a key. This amends the
+  settled `Reverse` entry, which had chosen no `sortedDescending`. Why: the whole-element case is the
+  common one (top scores, largest files), `sortBy(x -> Reverse(x))` is a detour for it, and the
+  obvious spelling a program reaches for instead, `sorted.reverse`, is quietly wrong for elements
+  that compare equal but differ, since it turns their order round; a stable descending sort keeps
+  it. No `sortByDescending`: a key turned round is `Reverse(key)`, which also composes inside a
+  tuple key, so a second spelling would add nothing. Alternatives weighed: keep `Reverse` alone (the
+  settled choice; the gap audit's programs did not find it); `sortByDescending(key)` as well (two
+  ways to write one thing); a `descending` flag on `sorted` (a boolean argument reads poorly at the
+  call). **Review with the user**: it reverses a settled choice.
+- Proposed (built on branch `text-papercuts`): **the `,` format flag groups a decimal integer's
+  digits in threes with commas**, under `%d` and `%i` only; under every other conversion it is the
+  "has no effect" error. The zeros of a precision are grouped with the digits (`${5}%,.6d` is
+  `000,005`), but the zeros of the `0` flag are not: they fill the width before the grouped digits,
+  the commas and the sign counting in it, so the field is never wider than asked unless the number
+  is (`${1234}%0,8d` is `0001,234`, `${-1234}%0,8d` is `-001,234`). `FormatSpec` gains
+  `grouping: bool = false` as its last field, so code that builds one by position is unchanged.
+  Why: a width is a column's width, and a column that a comma can widen by one does not line up;
+  precision zeros are digits of the number, fill zeros are padding. Alternatives weighed: grouping
+  the fill zeros too, added until the field is full (`0,001,234` for width 8: one wider than asked);
+  `_` or a locale's
+  separator (no locale exists; a comma is the common reading); allowing `,` under `%f` (a real's
+  grouping is a separate item, not asked for yet). Always a comma, never locale-dependent.
+- Proposed (built on branch `text-papercuts`): **`string.utf8` answers a new `Array[byte]`**, a
+  parameterless member as `bytes` is, the array the caller's own on every call. Why: files, sockets
+  and request bodies take an `Array[byte]`, and `s.bytes.toArray()` built a vector only to copy it.
+  Alternatives weighed: `toUtf8()` with parentheses (it is a pure conversion, so the parameterless
+  rule writes it bare); answering a frozen, shared view (an `Array` is mutable, so sharing would let
+  one caller change another's bytes).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

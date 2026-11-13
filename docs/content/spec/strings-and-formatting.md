@@ -95,6 +95,15 @@ There is no `%%`.
   `0` pads with zeros after the sign and any prefix, and `#` asks for the alternate form: `0x`, `0X`
   or `0b` before a non-zero integer, a leading `0` in octal, and a decimal point that stays in a
   `real`, with `g`'s trailing zeros. `0` gives way to `-`, and for integers to a precision. `#` does nothing under `d` and `i`.
+- **`,` groups the digits** of an integer under `d` and `i`, three at a time from the right with a
+  comma between groups, for every width of integer and for `byte`: `${1234567}%,d` is `1,234,567`,
+  `${-2147483648}%,d` is `-2,147,483,648`, and a value under a thousand has no comma. The sign comes
+  before the first group, and a width and `-` pad the grouped text with spaces
+  (`${1234567}%,12d` is `   1,234,567`). The zeros a precision asks for are grouped with the
+  digits (`${5}%,.6d` is `000,005`). The zeros `0` fills a width with are not: they come before the
+  grouped digits, and the commas and the sign count in the width, so the field is exactly as wide as
+  asked unless the number is wider (`${1234}%0,8d` is `0001,234`, `${-1234}%0,8d` is `-001,234`).
+  Under any other conversion the flag has no effect, which is an error.
 - **The width** is the least number of characters the field takes; a value wider is written whole.
 - **The precision** is, for an integer, the least number of digits, so a precision of 0 writes zero as
   no digits; for `f`, `e` and `E` the number of decimals, and for `g` and `G` of significant digits;
@@ -116,6 +125,7 @@ is an integer.
 val n = 7
 println(f"${n}%s")       // format `%s` expects a string or another value that is not a number, but the value has type `int`
 println(f"${n}%#d")      // the flag `#` has no effect under `%d`
+println(f"${n}%,x")      // the flag `,`, which groups decimal digits, has no effect under `%x`
 println(f"${n}%u")       // `%u` is not a format conversion: integers are signed, so `%d` writes every one
 println(f"${n}%")        // this format specifier has no conversion: …
 println(f"${2.5}%.${2.5}f")  // a width or precision written as a hole is a count, so it has to be an integer, …
@@ -220,7 +230,7 @@ trait Writer
 
 data FormatSpec(width: int = 0, precision: int = -1, left: bool = false,
                 zeroPad: bool = false, plus: bool = false, space: bool = false,
-                alternate: bool = false, conversion: char = 's')
+                alternate: bool = false, conversion: char = 's', grouping: bool = false)
     withWidth[T: Integer](n: T) -> FormatSpec = …
     withPrecision[T: Integer](n: T) -> FormatSpec = …
 
@@ -245,8 +255,9 @@ writeDebugged[T: Debug](out: Writer, value: T, spec: FormatSpec)
   with no precision, the value is rendered with the whole spec, and whatever it writes is padded to
   the field, so a `display` that ignores its spec, or writes no text at all, still fills `%8s`, and
   one that fills the field itself is not padded twice. `zeroPad`, `plus`, `space` and
-  `alternate` are the flags `0`, `+`, space and `#`, and `conversion` the letter of the specifier,
-  `s` when none was written; a renderer reads the conversions its type takes and renders its own
+  `alternate` are the flags `0`, `+`, space and `#`, `conversion` the letter of the specifier,
+  `s` when none was written, and `grouping` the flag `,`, which the integers read under `d`, `i`
+  and `s`; a renderer reads the conversions its type takes and renders its own
   form under any other. `withWidth` and `withPrecision` set a count as a specifier's hole does.
   `writeField` writes a text in the field a spec describes, padded with spaces, which is how most
   `display` methods end.

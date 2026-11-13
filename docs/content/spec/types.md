@@ -166,6 +166,7 @@ most the largest `int` bytes.
 | `stripMargin()`, `stripMargin(c)` | Each line with its leading characters up to U+0020 and the margin character after them (a vertical bar, or `c`) removed; a line whose first other character is not the margin is unchanged, and the line terminators stay |
 | `chars` | The characters, in order, as a `Vector[char]` |
 | `bytes` | The bytes of the encoding, in order, as a `Vector[byte]` |
+| `utf8` | The bytes of the encoding in a new `Array[byte]`, `byteLength` of them, which the caller owns: each call makes another, so writing to one changes neither the string nor any other. It is what a file, a socket or a request body is written from, and `string.fromUtf8(s.utf8)` is `Ok(s)` |
 | `count(p)` | The number of characters satisfying `p` |
 | `split(sep)` | The pieces between the occurrences of `sep`, as a `Vector[string]`; empty pieces are kept (`",a,,b,".split(",")` has five pieces), and a string without `sep` is one piece. An empty `sep` traps |
 | `lines` | The lines as a `Vector[string]`, each ended by `\n` or `\r\n` and shown without it; a terminator at the very end starts no further line, so `"a\nb\n".lines` is two lines and `""` has none. A `\r` not before `\n` stays in its line |
@@ -203,6 +204,14 @@ println(word.slice(3, 5))                               // é
 println(word.slice(0, 4))                               // traps: offset 4 is inside `é`
 ```
 
+A string has no `length` or `size`, since its length is counted in characters or in bytes, and
+asking for one names both; nor does `*` repeat it, and the error names `repeat`:
+
+```text
+word.length    // string has no field `length`; a string counts its characters with `charCount` and its bytes with `byteLength`
+"-" * 3        // `*` needs two numbers of one type, not string and int; a string is repeated by `repeat`, as in `text.repeat(n)`
+```
+
 ### Strings from bytes
 
 Bytes become a string through two [static members](/spec/declarations/#static-members-of-built-in-types)
@@ -221,7 +230,7 @@ could make a character. Refused are a continuation byte that begins nothing, an 
 sequence begins with (`FF`), and a sequence cut short.
 
 ```text
-val bytes = "naïve".bytes.toArray()
+val bytes = "naïve".utf8
 println(string.fromUtf8(bytes))                          // Ok(naïve)
 val cut: Array[byte] = [0x61, 0xE2, 0x82]
 println(string.fromUtf8(cut))                            // Err(Utf8Error(1, true))
