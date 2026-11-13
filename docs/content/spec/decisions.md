@@ -7676,6 +7676,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `numeric-widths`): **numbers have `toInt`, `toLong` and `toReal` as
+  parameterless members, each exactly the conversion call of its type.** Every integer type has
+  `n.toInt` and `n.toLong` (`int(n)`, `long(n)`: a narrowing one traps when the value does not fit,
+  as the call does); `real` has `x.toInt` and `x.toLong` (`int(x)`, `long(x)`: truncation toward zero,
+  saturation at the bounds, NaN to zero); `toReal` was already `Numeric`'s. They are members of the
+  integer family's impl and of `real`'s, not of `Numeric`, so a number type of a program's own owes
+  only `toReal`. WHY: `string.toLong()` and `xs.sum.toReal` put conversions where a reader reaches for
+  them, and `n.toLong` answering ``int has no field `toLong` `` was the surprise; making the member the
+  call, rather than a second semantics, keeps one rule for what a conversion does. A narrowing
+  `toInt` traps, as `string.toInt()` traps on a number that does not fit and as `int(n)` does, so the
+  trap/`Option` split stays where it is (`toIntOption()` is for text, whose failure is the input's).
+  ALTERNATIVES: no members, only a hint naming `long(n)` (leaves `toReal` the odd one out); a
+  narrowing `toInt` answering `Option[int]` (differs from `int(n)` and from `string.toInt()`); no
+  narrowing members at all, `toLong` only (an `int` from a `long` is as common as the reverse); members
+  on `byte` too (a byte is not a number, and `int(b)` reads as what it is). Review with the user:
+  whether `real.toInt` should trap on NaN and out-of-range values instead of saturating, as
+  `string.toInt()` traps on text that is no number.
+- Proposed (branch `numeric-widths`): **mixed-width arithmetic stays an error, and its diagnostic
+  names the conversion**, pointing at the operand to convert: ``error: `*` needs two numbers of one
+  type, not long and int; write `long(n)` ``, the operand quoted as written (or, when it is longer
+  than 40 bytes or spans lines, ``convert the int with a call of `long` ``). The narrower integer
+  converts to the wider, an integer or a byte to `real`, a byte to an integer, an integer to a type
+  parameter bounded by `Integer` (`T(n)`), and a value of a `Numeric` parameter to `real` by
+  ``x.toReal``. Comparisons (`<`, `==`, …, each link of a chain) say the same. A compound
+  assignment's target keeps its type, so there the value converts to it, a narrowing call included
+  (`n -= total` suggests `int(total)`). A `char` beside a number gets no conversion hint: it is no
+  number, and `'-' * 3` meant `repeat`. WHY: the spec settles that integers are never widened
+  implicitly; the error was right and only lacked the fix. ALTERNATIVES: implicit widening (contrary
+  to the settled rule); pointing at the whole operation (the hint names one operand, so the caret
+  should too); suggesting a narrowing of the wider operand (loses values).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

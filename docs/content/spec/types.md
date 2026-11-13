@@ -27,7 +27,11 @@ All other types — user types, library types, collections — are PascalCase by
 ## Integers
 
 Arithmetic keeps the operand width: `i8 + i8` is `i8`. Mixed widths need an explicit conversion
-(`long(x)`); there is no implicit widening. Diagnostics name `i32` and `i64` by their aliases. A literal takes its width from context (an annotation,
+(`long(x)`); there is no implicit widening. Diagnostics name `i32` and `i64` by their aliases, and
+an operation or comparison on two number types names the conversion that joins them, pointing at
+the operand to convert: ``error: `*` needs two numbers of one type, not long and int; write
+`long(n)` `` (an integer converts to the wider integer or to `real`, a byte to the other side's
+type; a compound assignment's target keeps its type, so there the value converts to it). A literal takes its width from context (an annotation,
 a parameter, the other operand, the other branches of an `if` or elements of a collection literal) and defaults to `int`; a literal that does not fit is a compile error.
 Where a `real` is expected, an integer literal is that real (`x * 2`), provided it is exact: its
 magnitude is at most 2^53.
@@ -85,6 +89,8 @@ a result does not fit:
 | `leadingZeros`, `trailingZeros` | The zero bits above the highest one and below the lowest one, an `int`; the width for zero. `leadingZeros` is `0` for a negative number |
 | `isPowerOfTwo` | Whether the number is `1`, `2`, `4`, and so on; never for zero or a negative number |
 | `toRadix(r)` | The digits in radix `r` from 2 to 36, lower case, with a `-` for a negative number and no prefix, as `f"%x"` and `f"%b"` write them; any other radix traps |
+| `toInt`, `toLong` | The number as an `int` or a `long`, exactly `int(n)` and `long(n)`: trapping when it does not fit |
+| `toReal` | The number as a `real`, exactly `real(n)`; it is `Numeric`'s, so generic code has it too |
 
 The bitwise operators `&`, `|`, `^` and the shifts also work on a type parameter bounded by
 `Integer`, as the machine's operators at each width, with both operands of one type: `x >> T(1)`.
@@ -102,7 +108,9 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 
 `real` arithmetic follows IEEE 754, including NaN and signed zero; comparisons with NaN are false
 except `!=`. `x.isNaN`, `x.isInfinite` (either infinity) and `x.isFinite` (neither) classify a
-value, and each value is exactly one of NaN, infinite or finite. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
+value, and each value is exactly one of NaN, infinite or finite. `x.toInt` and `x.toLong` are
+`int(x)` and `long(x)`, truncating toward zero, saturating at the bounds and mapping NaN to zero;
+`x.toReal` is `x`. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
 the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
 `math.sqrt(x)`. `char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
