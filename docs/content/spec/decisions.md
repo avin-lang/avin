@@ -7142,6 +7142,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `field-shadow`): **A field may share its name with a trait's method
+  that takes a parameter list.** `x.name` and a bare `name` read the field; `x.name(args)` and a
+  bare `name(args)` call the method (a bare call is `self.name(args)`, which already put methods
+  first); through the trait or a type parameter it bounds only the method is seen. A method of no
+  trait, or of no parameter list, still may not share a field's name, and is reported at its own
+  declaration; what a derived impl lacks is reported at the `derives` entry, never in the library's
+  template. WHY: `display`, `debug`, `compare` and the rest are ordinary field names
+  (`data Config(host: string, debug: bool)`), and every data type derives `Display` and `Debug`
+  without asking, so refusing the pair made such a type unprintable with an error inside
+  `format.avin`; the read/call split is the rule member access and calls already followed, so no
+  program changes meaning. A field holding a function under such a name is called by reading it
+  first (`val f = x.name`). ALTERNATIVES: renaming the protocol methods to reserved spellings
+  (breaks every hand-written impl and still leaves a name a field can take); having the library and
+  templates call through a qualified trait form such as `Display.display(x, …)` (no such form exists,
+  and it would fix only the library's calls, not a program's own impl); refusing the field with a
+  better message (keeps `debug: bool` illegal). Review with the user: it widens what a type may
+  declare.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

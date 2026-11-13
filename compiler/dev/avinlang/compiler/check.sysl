@@ -2457,6 +2457,25 @@ private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
     None -> d.target.span
 
 /** Whether the trait `t` declares a method named `name`, or one of the traits it requires does. */
+/** Whether a trait class `id` conforms to declares a method `name`: one written after `:` by the
+ * class or a superclass, or one an impl of the class implements. Such a method with a parameter
+ * list may share its name with a field: `x.name` reads the field and `x.name(args)` calls it. */
+private class_trait_declares(c: *Checker, id: usize, name: string, depth: usize) -> bool
+    if depth > c.classes.len() then return false
+    for t in c.classes[id].traits
+        if *t is Class(r, _, _)
+            if trait_declares(c, r, name, 0) then return true
+    for block in c.impls
+        if *block.target is Class(k, _, _)
+            if k == id && block.trait_type is Some(tt)
+                if *tt is Class(r, _, _)
+                    if trait_declares(c, r, name, 0) then return true
+    c.classes[id].superclass match
+        Some(s) -> *s match
+            Class(p, _, _) -> class_trait_declares(c, p, name, depth + 1)
+            _ -> false
+        None -> false
+
 private trait_declares(c: *Checker, t: usize, name: string, depth: usize) -> bool
     if depth > c.classes.len() then return false
     for m in c.classes[t].decl.members
@@ -3428,7 +3447,7 @@ private declare_methods(c: *Checker, unit: usize)
             var clash: Option[usize] = None
             for i in 0..<k.fields.len()
                 if k.fields[i].name == f.name && (i >= k.inherited || k.fields[i].public) then clash = Some(i)
-            if clash is Some(i)
+            if clash is Some(i) && (f.parameterless || !class_trait_declares(c, id, f.name, 0))
                 c.note(file_unit, f.name_span, s"`${f.name}` is already a field of `${c.classes[k.fields[i].owner].name}`")
                 continue
             val bodyless = f.body is None && f.clauses.len() == 0
@@ -3621,11 +3640,17 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
         if language_static(target, f.name)
             c.note(unit, f.name_span, s"`$type_name_of.${f.name}` is the language's own, and no static member can redefine it")
             return
+    // A method implementing a trait's method with a parameter list may share its name with a field:
+    // `x.name` reads the field and `x.name(args)` calls the method, so a field of any name leaves
+    // the type its `Display`, `Debug`, `Eq`, `Ord` and every other trait's methods.
+    val implements_trait = trait_id match
+        Some(t) -> !f.parameterless && trait_declares(c, t, f.name, 0)
+        None -> false
     if *target is Data(id, _, _)
         var field = false
         for v in c.data[id].variants
             if contains_name(v.field_names, f.name) then field = true
-        if field
+        if field && !implements_trait
             c.note(unit, f.name_span, s"`${f.name}` is already a field of `$type_name_of`")
             return
     // The methods of this name the type's impls have added so far, which this one overloads.
@@ -4569,6 +4594,7 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
                                 slots[j] = field_getter(c, k.unit, k.module_name, k.name, k.fields[i].span, k.fields[i].name, own_class_type(k, id), class_owner(id), k.decl.type_params, Some(id))
                                 filled = true
                     if filled then continue
+                    if !is_parameterless(c, m) && is_trait(c, c.symbols[m].owner_class.unwrap()) then continue
                     if actor_own_method(k.name, owner) then c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is one of every actor's own methods, `${c.symbols[m].name}`; name the field something else")
                     else c.note(unit, k.fields[i].span, s"`${k.fields[i].name}` is already a method of `$owner`")
     var conformed: Buf[&Type] = buf()
@@ -4583,7 +4609,9 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
     for f in k.fields
         if f.owner == id && f.public
             if trait_method(c, id, f.name) is Some(m)
-                if !is_trait_field(c, m) && !field_may_implement(c, m) then c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
+                // A trait's method with a parameter list leaves the name to a field: `x.name` reads
+                // the field and `x.name(args)` calls the method.
+                if !is_trait_field(c, m) && !field_may_implement(c, m) && is_parameterless(c, m) then c.note(unit, f.span, s"`${f.name}` is already a method of `${c.classes[c.symbols[m].owner_class.unwrap()].name}`")
     val self_type = own_class_type(k, id)
     for i in 0..<k.methods.len()
         val m = k.methods[i]
@@ -4864,13 +4892,18 @@ private data_supplied_field(c: *Checker, id: usize, tm: usize) -> usize
 // A problem with data type `id`'s conformance to trait `t` is reported at the impl that brings the
 // trait in: the impl of `t` itself, or of a trait requiring it.
 private report_conformance(c: *Checker, id: usize, t: usize, message: string)
-    for block in c.impls
+    for i in 0..<c.impls.len()
+        val block = c.impls[i]
         if *block.target is Data(d, _, _)
             if d != id then continue
             if block.trait_type is Some(tt)
                 if *tt is Class(k, _, _)
                     if k == t || requires_trait(c, t, k, 0)
-                        c.note(block.unit, block.decl.target.span, message)
+                        // An impl a template made is the deriving type's: what it lacks is reported
+                        // at the type's `derives` entry, never inside the library's template.
+                        if derived_of_impl(c, i) is Some(x)
+                            c.note(c.derived[x].site.unit, c.derived[x].site.at, message)
+                        else c.note(block.unit, block.decl.target.span, message)
                         return
     c.note(c.data[id].unit, c.data[id].decl.span, message)
 
@@ -10432,6 +10465,14 @@ private is_trait_self(t: &Type) -> bool = *t is TypeVar(_, _, _) && !is_integer_
 
 /** `self`, the instance the enclosing constructor or method works on. A static member works on no
  * instance, so there the receiver's members are an error. */
+/** Whether `self`'s type has a method `name`, beside the field of that name a bare `name` reads. */
+private self_has_method(c: *Checker, at: Span, name: string) -> bool
+    if in_static(c) then return false
+    val me = binding_ref(c, at, "self") match
+        Some(t) -> t
+        None -> return false
+    methods_of(c, me.ty, name).len() > 0
+
 private self_ref(c: *Checker, at: Span) -> &TExpr
     if refuse_static_self(c, at, " and cannot use the members of a value") then return TExpr(at, ErrorType, UnitConst)
     binding_ref(c, at, "self").unwrap()
@@ -15141,8 +15182,14 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
             var ms = bare_methods(c, name)
             if ms.len() == 0 then ms.push(m)
             return call_method(c, at, named.span, receiver, name, ms, args, explicit, expected, false)
-        Some(FieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
-        Some(DataFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
+        // `name(args)` is `self.name(args)`: where the type has a method of the name as well as a
+        // field, which a trait's method may, the call is the method's.
+        Some(FieldOf(_)) ->
+            if self_has_method(c, named.span, name) then return member_call(c, at, callee, named.span, Expr(named.span, Name("self")), name, args, explicit, expected, false)
+            if explicit is None then return value_call(c, at, callee, args)
+        Some(DataFieldOf(_)) ->
+            if self_has_method(c, named.span, name) then return member_call(c, at, callee, named.span, Expr(named.span, Name("self")), name, args, explicit, expected, false)
+            if explicit is None then return value_call(c, at, callee, args)
         Some(TraitFieldOf(_)) -> if explicit is None then return value_call(c, at, callee, args)
         None -> ()
     // A module-level value is called as a value; a class's name in call position is its
