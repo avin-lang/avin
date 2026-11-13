@@ -158,7 +158,7 @@ most the largest `int` bytes.
 | `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
 | `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
-| `toUpperCase`, `toLowerCase` | Each character's simple case mapping, one character for one: `"straße".toUpperCase` is `STRAßE` |
+| `toUpper`, `toLower` | Each character's simple case mapping, one character for one, as `char`'s methods of the same names map it: `"straße".toUpper` is `STRAßE` |
 | `strip`, `stripLeading`, `stripTrailing` | Without the Unicode `White_Space` characters at both ends, the start, the end |
 | `trim` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
@@ -217,6 +217,7 @@ asking for one names both; nor does `*` repeat it, and the error names `repeat`:
 
 ```text
 word.length    // string has no field `length`; a string counts its characters with `charCount` and its bytes with `byteLength`
+word.toUpperCase  // string has no field `toUpperCase`; a string maps its case with `toUpper` and `toLower`, as a `char` does
 "-" * 3        // `*` needs two numbers of one type, not string and int; a string is repeated by `repeat`, as in `text.repeat(n)`
 ```
 
@@ -254,7 +255,9 @@ returns `unit`.
 ## Tuples
 
 `(A, B, …)` is a tuple type of any arity, written and matched with parentheses: `(1, "one")`,
-`(n, name) -> …`. Elements are read with `t.0`, `t.1`. Tuples are values with no identity and derive
+`(n, name) -> …`. Elements are read with `t.0`, `t.1`, numbered from 0; asked for `t._1` or
+`t._2`, the error names the part to write (``(string, int) has no field `_2`; a tuple's parts are
+numbered from 0, so write `.1` ``). Tuples are values with no identity and derive
 `Eq`, `Hash`, `Ord`, `Display` and `Debug` when their elements do. A pair has `swap`, the pair
 with its parts the other way round: `(1, "one").swap` is `("one", 1)`. A program adds methods to
 tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from its parameters,

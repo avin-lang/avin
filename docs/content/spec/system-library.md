@@ -109,7 +109,9 @@ doubt, so the program stops at once, running no more hooks.
 by an argument of its own, which the test does not see: in a test, `args()` is empty.
 
 `avin run <program> -- ARGS` passes everything after `--` to the program unchanged, flags and a
-second `--` included.
+second `--` included. Everything before the `--` is avin's, and its options may come before or
+after the program: `avin run -O2 main.avin`, `avin run main.avin -O2` and `avin -O2 main.avin` are
+one command.
 
 ### The environment and the platform
 

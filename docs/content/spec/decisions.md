@@ -208,7 +208,8 @@ a decision changes, this page and the chapter change together.
   by the type pattern `s: string` like any other type.
 - Settled 2026-11-03: the library's [string methods](/spec/types/#string) are `byteLength`,
   `charCount`, `isEmpty`, `nonEmpty`, `startsWith`, `endsWith`, `contains`, `slice`,
-  `toUpperCase`, `toLowerCase`, `trim`, `strip`, `stripLeading`, `stripTrailing`, `repeat`,
+  `toUpper`, `toLower` (named `toUpperCase` and `toLowerCase` until the Proposed entry on one
+  family of case names), `trim`, `strip`, `stripLeading`, `stripTrailing`, `repeat`,
   `replace` and `padTo` beside `padStart` and `padEnd`, with the reference library's names (user,
   2026-11-04), and, with the reference's names and behaviour (user, 2026-11-04), `stripPrefix`,
   `stripSuffix`, `capitalize` (only a lower-case first character changes), `stripMargin` with the
@@ -6278,7 +6279,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     dropping trailing empty pieces; a negative limit trapping.
   - **`stripLineEnd` removes one terminator, `\n` or `\r\n`, never a lone `\r`**, agreeing with
     `lines()`, which does not end a line at a `\r` either. *Alternative:* also a lone `\r`.
-  - **`compareIgnoreCase` compares the two after `toLowerCase`**, as `equalsIgnoreCase` equates
+  - **`compareIgnoreCase` compares the two after `toLower`**, as `equalsIgnoreCase` equates
     them, so its sign is `compare` of the lower-cased strings. *Alternative:* comparing character by
     character after upper-casing.
   - **`charIterator()` is a lazy `Iterator[char]` reading the string by offset**, with `next()` on
@@ -7238,8 +7239,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `merge`, `joinLeft`, `joinRight`; Result's `isOk`, `isErr`, `ok`, `err`, `toList`, `flatten`; a
   pair's `swap`; string's `byteLength`, `charCount`, `isEmpty`, `nonEmpty`, `isBlank`, `head`,
   `last`, `headOption`, `lastOption`, `tail`, `init`, `reverse`, `chars`, `bytes`, `lines`, `trim`,
-  `strip`, `stripLeading`, `stripTrailing`, `stripLineEnd`, `capitalize`, `toUpperCase`,
-  `toLowerCase`; char's `isDigit`, `isLetter`, `isLetterOrDigit`, `isSpaceChar`, `isWhitespace`,
+  `strip`, `stripLeading`, `stripTrailing`, `stripLineEnd`, `capitalize`, `toUpper`,
+  `toLower`; char's `isDigit`, `isLetter`, `isLetterOrDigit`, `isSpaceChar`, `isWhitespace`,
   `isUpper`, `isLower`, `isControl`, `toUpper`, `toLower`, `asDigit`; the integers' `abs`, `sign`,
   `bitCount`, `leadingZeros`, `trailingZeros`, `isPowerOfTwo`; real's `isNaN`, `isInfinite`,
   `isFinite`; Enumerable's `values` (static), `ordinal`, `name`; StringWriter's `text`, `length`,
@@ -7798,6 +7799,44 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   option given twice (catches typos, breaks overriding an alias); refusing a value that starts with
   `-` unless it is a number; typed positional arguments, left out until a program needs one;
   `Option`-typed defaults (`default = Some(3)`), exact but noisy at every declaration.
+
+- **Proposed (branch `small-papercuts`): one family of case names, `toUpper` and `toLower`, for
+  `char` and `string` alike.** `string.toUpperCase` and `toLowerCase` are renamed to `toUpper` and
+  `toLower`, the names `char` already had, across the library, its tests, the corpus, the scripts
+  and the spec; `"a".toUpperCase` is refused with ``string has no field `toUpperCase`; a string
+  maps its case with `toUpper` and `toLower`, as a `char` does``. WHY: one name for one operation
+  on both types, and the shorter one, which conflicts with nothing on either type. There is no
+  deprecation mechanism to keep the old names as aliases, so the old names are gone and the error
+  names the new ones. ALTERNATIVES: rename `char`'s to `toUpperCase` (longer, and `isUpper`/`isLower`
+  on `char` would then disagree with it); keep both names on `string` as plain aliases (two names for
+  one method forever, with no way to retire one). Review with the user: it breaks source using the
+  old names (marshal, tui and typing-practice use them), so their call sites change in the release
+  that carries it.
+- **Proposed (branch `small-papercuts`): `avin` takes its options before or after the program.**
+  The program is the first argument that is neither an option nor an option's value, wherever it
+  stands before `run`'s `--`; for `avin test`, only an existing path is the program and any other
+  word is the filter, as before. `avin run -O2 main.avin`, `avin run main.avin -O2`,
+  `avin -O2 main.avin` and `avin build -o out -O0 main.avin` are all accepted, and only what follows
+  `--` reaches the program. A first argument that is any option (not only `-O0`, `-O2` or `--`) now
+  means `avin run`, which checks the options itself. WHY: the audit's `avin run -O2 file.avin`
+  printed the whole usage; the order of avin's own options carries no meaning, and `--` already
+  separates the program's arguments. ALTERNATIVES: options after the program only, with an error
+  saying so (keeps a rule nobody needs); treating words after the program as its arguments without
+  `--` (makes `avin run main.avin -O2` pass `-O2` to the program, which surprises in the other
+  direction).
+- **Proposed (branch `small-papercuts`): `Result.toOption` beside `ok`, and `StringWriter` is
+  `Display`.** `toOption` answers exactly what `ok` does, under the name `Either` and the
+  collections use; `ok` stays. `StringWriter` implements `Display` (its `text`, padded to a field's
+  width, as a string) and `toString()` returns its `text`. WHY: the names people reach for first,
+  and a writer that interpolates as what it holds. ALTERNATIVES: renaming `ok` to `toOption`
+  (breaks callers for no gain; `ok`/`err` read as a pair); a `StringWriter` with `toString()` only
+  (it would still show as its type's name in `s"$w"`).
+- **Proposed (branch `small-papercuts`): `t._1` on a tuple names the part to write.** A member
+  `_` followed by decimal digits asked of a tuple adds ``; a tuple's parts are numbered from 0, so
+  write `.n-1` `` when `1 <= n <=` its arity, and ``; a tuple's parts are numbered from 0 and read as
+  `.0` to `.k` `` otherwise (`_0`, a part beyond the arity, a number too large to read). WHY: the
+  `_1` spelling is what readers of other notations write first, and `_n` meaning part `n - 1` is the
+  likely intent. ALTERNATIVES: accepting `_1` as a second spelling (two ways to write one thing).
 
 ## Open
 
