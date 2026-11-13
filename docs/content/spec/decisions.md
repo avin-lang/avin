@@ -1509,8 +1509,8 @@ Settled by the user on 2026-11-04:
     `fallbackTo`), an `Executor` for pools of one's own (its execution context, chosen explicitly),
     `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
-  - **JSON** is a package of its own, not part of the system library (since proposed to be
-    `avin.json` in the standard library: see that Proposed entry).
+  - **JSON** is a package of its own, not part of the system library: the package
+    `dev.avinlang.json` (settled by the user 2026-11-13; see that entry).
 
 - Settled by the user 2026-11-04: Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
   decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
@@ -7419,7 +7419,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   error first); keeping the wrapped error's static type (`ContextError[E]`), which a chain of
   contexts would nest in its type.
 
-- Settled on the user's delegation 2026-11-12 (built on branch `json-stdlib`): **JSON is `avin.json` in the standard library**, moved
+- Settled by the user 2026-11-13: **JSON is the package `dev.avinlang.json`**, in its own repository
+  (`github.com/avin-lang/json`, version 0.0.1), not a module of the standard library; it supersedes
+  the 2026-11-12 entry below. The library's `library/avin/json` and its tests `library/tests/jsontests`
+  moved to the package, which `avin test` runs; the tests of the README's examples went with them.
+  `import avin.json` (whole, a declaration, a group, or under another name) is an error naming the
+  package: *JSON is the package `dev.avinlang.json`; add it to your dependencies*; so is `import json`
+  in a program with no module or declaration `json` and no dependency on the package. The corpus
+  programs that test the compiler or runtime with JSON (derivation's diagnostics, the collector's
+  stress, traps, threads and sockets) became manifest programs in `tests/programs/{run,reject}/json_*`
+  depending on the package by the path `../../../../../json`, the sibling checkout
+  `~/dev/avin-lang/json`, as the compiler reaches `~/dev/sysl-lang/parsing`. JSON derivation needed no
+  compiler change: its templates are ordinary `derive` templates found in the module a file imports
+  from. A single-file script that needs JSON declares the dependency in the script itself (a separate
+  item, `script-deps`).
+
+- (Superseded by the user's decision of 2026-11-13, **JSON is the package `dev.avinlang.json`**.)
+  Settled on the user's delegation 2026-11-12 (built on branch `json-stdlib`): **JSON is `avin.json` in the standard library**, moved
   from the package `packages/json` (module `json`); it supersedes the 2026-11-06 entry that made it
   a package, and the one that had the corpus gate `packages/json`'s tests. Its tests are
   `library/tests/json_*.avin`, run with the core library's own; its corpus programs are single files
@@ -7542,8 +7558,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Settled on the user's delegation 2026-11-12 (built on branch `http-verbs`): **`Response.json(status, text: string)` takes JSON already
   written** and sends it as `application/json` without checking it. Why: JSON lives in a package
   today (moving to the standard library as `avin.json`), and `avin.net.http` must not depend on a
-  package; a text overload needs nothing. Once `avin.json` is in the standard library,
-  `Response.json(status, value: Json)` can sit beside it as an overload. Alternatives weighed:
+  package; a text overload needs nothing. (JSON stays a package, `dev.avinlang.json`, by the user's
+  decision of 2026-11-13, so the text overload is the only one; a program passes `value.render`.)
+  Alternatives weighed:
   leaving `Response.json` out until then (every JSON handler spells the content type by hand);
   `charset=utf-8` in the type (RFC 8259 defines none for `application/json`). Review with the user:
   the `Json` overload once `avin.json` lands.
@@ -7675,6 +7692,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
+
+- Proposed 2026-11-13 (branch `json-package`): **the corpus programs that test the compiler with
+  JSON depend on the sibling checkout `~/dev/avin-lang/json` by path** (`../../../../../json` from
+  `tests/programs/{run,reject}/NAME/`). *Why*: the corpus loads packages without fetching, and a copy
+  of the package inside this repository would drift from the real one; the compiler already reaches
+  `~/dev/sysl-lang/parsing` the same way. *Alternatives*: a vendored copy under `tests/packages/json`
+  (self-contained, but two sources of one package); a git dependency (the corpus does not fetch).
+  Review with the user: it makes the avin gate need the json checkout beside it.
+- Proposed 2026-11-13 (branch `json-package`): **a trap inside a package is placed in the package's
+  source**, as before for any module that is not the core library: `j("absent")` now reports
+  `at json.avin:98:9` where, as `avin.json`, it reported the program's call. The corpus programs
+  `json_missing_key_trap` and `json_missing_index_trap` hide the package's line and column. *Why*: the
+  rule that a trap is placed where the program last called in is the core library's ([errors](/spec/errors/)),
+  and widening it to every dependency is a design change of its own. *Alternatives*: placing a trap
+  at the last call from the root package's own code (better for a package's users, worse for its
+  author debugging it); a per-package opt-in. Review with the user: a package's user would usually
+  rather see their own call.
 
 ## Open
 
