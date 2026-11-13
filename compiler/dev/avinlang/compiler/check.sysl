@@ -15533,6 +15533,13 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
         val apart = untuples_lambda(c, bound_signatures[k], views[k], bindings[k], args)
         untupling.push(apart)
         if !apart && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then direct_fits = true
+    var considered: Buf[bool] = buf()
+    for k in 0..<bound.len()
+        considered.push(!(fixed_fits && bound_signatures[k].variadic) && !(direct_fits && untupling[k]) && fits_call(c, bound_signatures[k], bindings[k], args, typed, written))
+    for j in 0..<args.len()
+        if typed[j] is None
+            if result_open_params(c, bound_signatures, views, bindings, args, j, considered) is Some(want)
+                typed[j] = Some(check_expr(c, argument_value(args[j]), Some(want)))
     for k in 0..<bound.len()
         if fixed_fits && bound_signatures[k].variadic then continue
         if direct_fits && untupling[k] then continue
@@ -15548,6 +15555,11 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
         for t in typed
             if t is Some(x)
                 if *zonk(c, x.ty) is Union(_) && hint == "" then hint = s"; `${type_name(zonk(c, x.ty))}` does not choose among overloads for its members, since its member is known only while running: take it apart with a `match` first"
+        // A lambda checked before choosing, by the parameters the candidates agree on, is named with
+        // the type its body gave it, which is what none of them accepts.
+        for j in 0..<args.len()
+            if typed[j] is Some(x)
+                if takes_parameter_type(argument_value(args[j])) && hint == "" then hint = s"; the function given is ${type_name(zonk(c, x.ty))}"
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${joined_labels(labels)}$hint")
         return Choice(None, typed)
     var owners: Buf[usize] = buf()
@@ -15563,6 +15575,11 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             literal_preferred(c, owners, counts, compared, args) match
                 Some(k) -> Choice(Some(fitting[k]), typed)
                 None ->
+                    // A lambda whose body was already reported fits every candidate alike; the call
+                    // goes on with the first rather than reporting the same error again as ambiguity.
+                    for j in 0..<args.len()
+                        if typed[j] is Some(x)
+                            if takes_parameter_type(argument_value(args[j])) && yields_error(c, x.ty) then return Choice(Some(fitting[0]), typed)
                     c.note(unit, name_span, s"this call to `$name` is ambiguous: ${joined_labels(fitting_labels)} each accept it, and none is more specific than the others")
                     Choice(None, typed)
 
@@ -15697,6 +15714,64 @@ private untuples_lambda(c: *Checker, s: Signature, params: Buf[&Type], binding: 
                         if ps.len() != written.len() then return true
                 None -> ()
     false
+
+// The function type a lambda argument `j` is checked against before an overload is chosen, where the
+// candidates still `considered` all give it the same parameter types, known without any candidate's
+// own type arguments, and differ in its result: those parameters, and a result left for its body to
+// decide. The lambda is then checked once, and its result chooses among the candidates as any
+// argument's type does, so `m.map((k, v) -> Summary(k, v))` reaches the overload whose function may
+// answer anything where another needs a pair, and `xs.flatMap(x -> Some(x))` on an option keeps the
+// option's own. None where the candidates agree on the result too, or differ in the parameters.
+private result_open_params(c: *Checker, signatures: Buf[Signature], views: Buf[Buf[&Type]], bindings: Buf[Binding], args: Buf[Argument], j: usize, considered: Buf[bool]) -> Option[&Type]
+    val value = argument_value(args[j])
+    val written = value.kind match
+        Lambda(ps, _) -> ps.len()
+        MatchFunction(_) -> 1usize
+        _ -> return None
+    var shared: Buf[&Type] = buf()
+    var first_result: &Type = ErrorType
+    var sendable = false
+    var count = 0usize
+    var results_differ = false
+    for k in 0..<signatures.len()
+        if !considered[k] then continue
+        val p = argument_type(c, signatures[k], views[k], bindings[k], args, j) match
+            Some(t) -> zonk(c, strict(t))
+            None -> return None
+        val ps = *p match
+            Function(params, _, _) -> params
+            _ -> return None
+        val r = *p match
+            Function(_, result, _) -> result
+            _ -> return None
+        val s = is_sendable_function(p)
+        // A lambda taking a tuple apart sees the same elements from every candidate giving it that
+        // tuple, so its body decides the result alike.
+        val apart = ps.len() == 1 && written >= 2 && tuple_elements(zonk(c, ps[0])).len() == written
+        if ps.len() != written && !apart then return None
+        val sig = signatures[k]
+        for i in sig.known.len()..<sig.type_params.len()
+            if any_names_param(ps, sig.owner, i) then return None
+        for q in ps
+            if has_unknowns(q) then return None
+        if count == 0
+            shared = ps
+            first_result = r
+            sendable = s
+        else
+            if s != sendable || ps.len() != shared.len() then return None
+            for i in 0..<ps.len()
+                if !same_type(ps[i], shared[i]) then return None
+            if !same_type(r, first_result) then results_differ = true
+        count += 1
+    if count < 2 || !results_differ then return None
+    Some(Function(shared, fresh_var(c), sendable))
+
+/** Whether `t` is the error type, or a function whose result is. */
+private yields_error(c: *Checker, t: &Type) -> bool = *zonk(c, t) match
+    ErrorType -> true
+    Function(_, result, _) -> *zonk(c, result) is ErrorType
+    _ -> false
 
 // Whether a literal or a lambda, which takes its type from its parameter, can be given one of type
 // `p`.

@@ -770,9 +770,10 @@ Settled by the user on 2026-11-03:
   generator and no guards.
 - A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
   of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
-  the library's collections takes any `Iterable` from its function; a `Range` maps to a `Vector`;
+  the library's collections takes any `Iterable` from its function, or an `Option` (see the
+  Proposed entry on `flatMap` with options, branch `map-flatmap`); a `Range` maps to a `Vector`;
   a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
-  a function of one pair, and yield a `Map`.
+  a function of one pair, and yield a `Map` where they yield pairs, a collection otherwise.
 - A generator's pattern must match every element, as in a `for` loop, rather than filtering out the
   elements it does not match. `return`, `break`, `continue` and `?` cannot leave a comprehension's
   guards or yielded value.
@@ -1928,9 +1929,57 @@ their words are reserved.
   concrete collection back at run time; that would make every collection's `map` an `override`,
   rule out the bounded versions (`TreeSet.map[B: Ord]` cannot override an unbounded `map[B]`),
   and dispatch every call. The chapter's earlier claim that generic code gets the concrete
-  collection back is withdrawn. **Review with the user**: a `Map` receiver still offers only its
-  pair-making `map`, so `m.map(e -> e.0)` is rejected rather than answering an `Iterable`; making
-  it fall back needs overload resolution that checks a lambda's body against each candidate.
+  collection back is withdrawn. The review this entry carried, a `Map` receiver offering only its
+  pair-making `map`, is superseded by the Proposed entry on a map's `map` to other results (branch
+  `map-flatmap`).
+- **Proposed** (branch `map-flatmap`): **a map's `map` and `flatMap` to anything other than pairs
+  answer a collection** ([collections](/spec/collections/#operations-without-higher-kinded-types)),
+  on the user's direction that Avin adopt the conveniences of a rich collections library that add
+  no complexity. `m.map((k, v) -> Summary(k, v))`, `m.map(e -> e.0)`, a `match` function or a
+  method value making non-pairs, and a comprehension over a map yielding non-pairs, guarded or
+  not, answer `Iterable[B]` (a `Vector` underneath) in the map's iteration order; a pair still
+  makes a map of the receiver's kind (`HashMap` through `Map`, `TreeMap`, the mutable ones). Every
+  map has a `map[B](f: (K, V) -> B) -> Iterable[B]` overload beside its pair-making one, and the
+  filtered views a comprehension's guard makes have `map[B]` and `flatMap[B]` of one pair; a
+  function of the entry as one pair reaches `Iterable`'s own. To choose by the lambda's body,
+  overload resolution gains one rule ([declarations](/spec/declarations/#default-and-named-arguments)):
+  where the candidates left all give a lambda (or a `match` function) the same parameter types,
+  known without the candidates' own type arguments, and differ only in the result, the lambda is
+  checked once with those parameters and an open result, and then fits as any typed argument does;
+  of two that fit, the pair-making one is the more specific. WHY: one check of the body, with no
+  speculative re-checking or rollback, settles the common shape exactly, and the rule is
+  invisible where the overloads already agree. ALTERNATIVES: checking the lambda's body against
+  each candidate in turn and discarding the failures (general, but every check would have to be
+  undone, captures and nested lambdas included); answering a `Vector` rather than an `Iterable`
+  (handier to index, but `Iterable`'s own `map`, which a one-pair function reaches, answers
+  `Iterable`, and the two shapes of function should agree); a diagnostic suggesting `.toVector`
+  first (the audit's stopgap). Not done: a sorted collection's `map` to an element or key that is
+  not `Ord` is still refused naming the bound, rather than falling back to an unsorted result,
+  since the sorted overload hides `Iterable`'s of the same parameter types and the candidates are
+  not held to their bounds while choosing. Review with the user: whether that fallback is wanted
+  too, and `Iterable` versus `Vector` as the result.
+- **Proposed** (branch `map-flatmap`): **`flatMap` takes an option-making function on every
+  collection**, by an overload `flatMap[U](f: (T) -> Option[U])` beside each collection's own
+  `flatMap` of a collection-making function, answering the same kind: `Iterable` (a `Vector`),
+  every `Seq`, `Vector`, `List`, `ArraySeq`, `Array`, `Buffer`, `Deque`, `Queue`, `LazyList` (lazily),
+  `Iterator` (lazily), `Set`, `TreeSet`, the mutable sets and bit set, and every filtered view a
+  comprehension's guard makes. A map's takes `((K, V)) -> Option[(L, W)]` into a map of its kind,
+  and any other option into a collection (through `Iterable`'s, or the filtered view's own).
+  `Iterable[Option[T]]` has `flatten` into a `Vector`, `Iterator[Option[T]]` into a lazy iterator.
+  `Option` gains `flatMap[U](f: (T) -> Iterable[U]) -> Vector[U]`, so a comprehension drawing from
+  an option and then a collection yields a vector; one drawing from a collection and then options
+  yields the collection's kind. The lambda's body chooses between the two `flatMap`s by the rule of
+  the entry above. WHY: the overload is a library addition that every call path sees, generic code
+  through `Iterable` included, and leaves options' representation alone. ALTERNATIVES: making
+  `Option` an `Iterable` of at most one element (`impl[T] Iterable[T] for Option[T]`), which was
+  built and works, `++`, `concat` and `Iterable` parameters taking options included, but the
+  library's `Iterator[Iterable[T]]` impl then views a type parameter through a trait `Option`
+  conforms to, so the representation plan keeps every option of every program as an object rather
+  than a bare pointer (an allocation per `Some`, and `None` read through `Any` changes); a
+  conversion at the call (a mechanism Avin does not have). Not done: `xs ++ maybe`, `concat` and
+  an option given for an `Iterable` parameter, which need the conformance; `toList` covers them.
+  Review with the user: whether options as iterables are worth reworking the representation plan
+  for, and the `Vector` from an option's `flatMap` of a collection.
 - Settled on the user's delegation 2026-11-05: **`rest*` binds what `drop(n)` answers**
   ([collections](/spec/collections/#sequence-patterns)), branch `coll-followups`. One rule for every `n`,
   `n = 0` included: `[rest*]` binds `drop(0)`, the list itself on a list and a `Vector` on a range,
