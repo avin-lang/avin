@@ -686,7 +686,11 @@ class Savings(owner: string, balance: int, rate: real): Account(owner, balance),
 - After `:` comes at most one superclass, with its constructor arguments, followed by any number of
   traits.
 - Classes are **final unless declared `open` or `abstract`**. Overriding requires `override`.
-  An `abstract class` may leave members without bodies and cannot be instantiated.
+  An `abstract class` may leave members without bodies and cannot be instantiated. `open` and
+  `abstract` mark a class only: a method takes neither, since every public method of such a class
+  may be overridden and one without a body is abstract already; nor does a trait, a data type, an
+  object or a top-level function. `override` marks a method alone. Each misplaced
+  word is an error that says to remove it.
 - Instances are heap objects with identity. Unless the class implements or derives `Eq`, `==` and
   the hash are by identity, like `===`; `class Point(x: int, y: int) derives Eq, Hash, Display`
   compares and hashes by its fields, which for `derives` are its constructor parameters. Display

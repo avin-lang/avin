@@ -7866,6 +7866,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   rename-published entries need none). Review with the user: whether a cache of a deleted project
   should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
 
+- Proposed (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
+  tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
+  `match` arm, `Status.Shipped` qualified, `Some(Shipped)` nested and `f(Shipped) = …` in a clause
+  all mean `Shipped(_, _)`, with the variant's own number of `_`; coverage and unreachable arms
+  treat it as that pattern. `Shipped()`, written with parentheses, is still matched against the
+  fields by number and refused for a variant that has some. Why: the commonest test of a variant
+  asks only which one it is, and counting `_`s to say so is noise that changes whenever a field is
+  added; the previous error suggested `Shipped(fields)`, which is not Avin, and the bare name could
+  mean nothing else, since a variant in scope is never a binding. One rule for every place a
+  pattern goes, because `x is P` takes exactly the patterns a `match` arm takes. Alternatives: only
+  in `is` (two pattern languages, and a `match` arm refactored from an `if … is` would break);
+  keeping the error and suggesting `Shipped(_, _)` with the right number of `_` (valid, but the
+  test still has to change with the fields). Review with the user: a reader may take `Shipped`
+  for a variant without fields.
+
+- Proposed (built on branch `variant-test-open`): **`open`, `abstract` and `override` where they
+  mean nothing are one error each, and the declaration then parses as written.** Before a method:
+  "a method takes no `open`: every public method of an `open` or `abstract` class, and every
+  method of a trait, may be overridden already; remove `open`", and for `abstract` that a method
+  declared without a body is abstract already; before a field, that a field cannot be overridden
+  or is abstract by having no value; before a top-level function, that it belongs to no class or
+  overrides nothing; before `trait`, `data` and `object`, why each takes none; `override class`,
+  that a class replaces nothing and extends with `: Base`. Why: the words were read as names, so
+  `open sound() -> string` reported `open` and `string` as undefined and then every override of
+  `sound` as overriding nothing. The spec settles that every public method of an open class may be
+  overridden, so methods have no `open` to accept. Alternatives: accepting `open` on a method as a
+  harmless no-op (two spellings of one meaning); a method-level `open` with classes' methods
+  final by default (a language change the settled rules do not ask for). `open(…)`, `open = …`
+  and a method named `open` keep their meaning: the word is a modifier only before a name or a
+  declaration keyword.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

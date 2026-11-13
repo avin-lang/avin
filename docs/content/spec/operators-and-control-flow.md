@@ -552,6 +552,9 @@ expression, checked for exhaustiveness. Patterns include:
 - `n + k`, where `k` is a positive integer literal: it matches an integer of at least `k` and binds
   `n` to the value minus `k`, which never overflows;
 - constructors with nested patterns, tuples and `()`;
+- a variant with fields named alone, bare or qualified (`Shipped`, `Status.Shipped`), which tests
+  for the variant and binds none of its fields, as `Shipped(_, _)` does with one `_` per field;
+  `Shipped()`, with parentheses, is matched against the fields by number;
 - [extractor patterns](#extractor-patterns), `Name(p1, p2)` where `Name` is a value with
   `unapply` or `unapplySeq`;
 - list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
@@ -718,7 +721,8 @@ this way tests its patterns and guards once each time it is called, lifted or gi
 ## is
 
 `x is P` tests a value against any pattern a `match` arm takes and yields a `bool`; `x is not P` is
-its negation. `not` is a keyword only there, directly after `is`, where it always negates: `x is
+its negation. `order.status is Shipped` asks only which variant it is, whatever fields `Shipped`
+has. `not` is a keyword only there, directly after `is`, where it always negates: `x is
 not(y)` tests the pattern `(y)`. Everywhere else `not` is an ordinary name, so a function, method,
 parameter or local may be called `not` and `not(p)` calls it. The names `P` binds are in scope only
 where the test is known to have matched:
