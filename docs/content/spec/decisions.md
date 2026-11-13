@@ -7371,32 +7371,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter of a private type (an extra field in every cell). Review with the user: it is a special
   case of private constructors, which may want to be the general feature.
 
-**Deferred**
-
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
-
-- Settled on the user's delegation 2026-11-12 (built on branch `library-version`): **the standard library carries the compiler's version, and
-  the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
-  stamped by `scripts/release.sh` in the same commit as `const Version` and `compiler/sysl.hocon`,
-  and a compiler checks it against its own before it compiles anything: `check`, `build`, `run`,
-  `test` and `lsp` print one error naming both versions and the library's path, and nothing else.
-  A library with no version, or a `library.hocon` that is missing or unreadable, is refused the
-  same way. The rule is an **exact match**. A compiler built between releases carries the last
-  release's version, and so does the library in its own checkout, so a development build matches
-  its own tree; only a library from another release, through `AVIN_ROOT` or an install, differs.
-  Why: a library of another version fails as dozens of errors inside `library/avin/*.avin`, which
-  points a reader at the library rather than at the mismatch. Alternatives weighed: a dev compiler
-  accepting a library from the same commit (needs a commit id stamped into both and a build step
-  that keeps them in step, to answer a case the exact rule already passes); "the library is newer
-  than the compiler" (a newer library declares what an older compiler cannot check, which is the
-  failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
-  library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
-
-
-## Proposed
-
-- Proposed (built on branch `io-errors`): **an `IoError` carries its kind, operation and subject:
+- Settled on the user's delegation 2026-11-12 (built on branch `io-errors`): **an `IoError` carries its kind, operation and subject:
   `data IoError(kind: ErrorKind, operation: string = "", subject: string = "")`**, the former
   variants becoming `ErrorKind`'s, each with a `description`. It shows as `cannot <operation>
   <subject>: <description>` (`cannot read nope.txt: no such file or directory`), leaving out what is
@@ -7410,11 +7385,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   repeats it eleven times; keeping the variants and adding the path only to the message, which
   leaves the value unable to say what it was about. **Review with the user**: matching moved from
   `Err(NotFound)` to `Err(IoError(NotFound, _, _))`, longer at every site that tells kinds apart.
-- Proposed (built on branch `io-errors`): **`CommandError.Failed(status, command)`** names the
+- Settled on the user's delegation 2026-11-12 (built on branch `io-errors`): **`CommandError.Failed(status, command)`** names the
   command's programs (`ls`, `ls | wc`, `make && ./app`, `a || b`, `a; b`), and its message is
   `false exited with status 1`; an empty `command` leaves it out. *Why*: a failed status must say
   which command failed. *Alternative*: the command only in the message, not matchable.
-- Proposed (built on branch `io-errors`): **the core trait `Error: Display`, with parameterless
+- Settled on the user's delegation 2026-11-12 (built on branch `io-errors`): **the core trait `Error: Display`, with parameterless
   `message -> string` and `cause -> Option[Error] = None`, and a default `display` that shows the
   message, then `: ` and the cause as it shows**, leaving out an empty message. *Why
   parameterless*: both read what the error holds, the parameterless rule's case, and a data field
@@ -7428,13 +7403,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   so it shows once. *Alternatives*: `message()` with parentheses, as before (against the
   parameterless rule); a `source` chain printed separately rather than in the display (a program
   would have to walk it to print anything useful).
-- Proposed (built on branch `io-errors`): **a data type implementing a core trait that gives
+- Settled on the user's delegation 2026-11-12 (built on branch `io-errors`): **a data type implementing a core trait that gives
   `display` (or `debug`) a body takes that method rather than the automatic one** made from its
   fields, as it does where its own impl declares the method. *Why*: `impl Error for ParseError`
   must show the sentence, not `ParseError(3)`. Only core-library traits are looked at, since the
   automatic derivation is decided before names resolve. *Alternative*: making each error type also
   write `impl Display`, which every program's error type would have to repeat.
-- Proposed (built on branch `io-errors`): **`Result[T, E].context(text: -> string) ->
+- Settled on the user's delegation 2026-11-12 (built on branch `io-errors`): **`Result[T, E].context(text: -> string) ->
   Result[T, ContextError]`, for `E: Error`, and `data ContextError(message: string, inner: Error)`
   in the prelude**, whose cause is `inner`. It works on a union of `Error` types and a type
   parameter bounded by `Error`, and `?` passes it, and every other error type, unchanged into
@@ -7444,7 +7419,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   error first); keeping the wrapped error's static type (`ContextError[E]`), which a chain of
   contexts would nest in its type.
 
-- Proposed (built on branch `json-stdlib`): **JSON is `avin.json` in the standard library**, moved
+- Settled on the user's delegation 2026-11-12 (built on branch `json-stdlib`): **JSON is `avin.json` in the standard library**, moved
   from the package `packages/json` (module `json`); it supersedes the 2026-11-06 entry that made it
   a package, and the one that had the corpus gate `packages/json`'s tests. Its tests are
   `library/tests/json_*.avin`, run with the core library's own; its corpus programs are single files
@@ -7465,7 +7440,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   standard library holds from "what talks to the operating system" to "the formats nearly every
   script reads".
 
-- Proposed 2026-11-12 (branch `defer-use`): **resource cleanup is a block-scoped `defer` statement,
+- Settled on the user's delegation 2026-11-12 (built on branch `defer-use`): **resource cleanup is a block-scoped `defer` statement,
   and the library's resources are each an `io.Close`**
   ([defer](/spec/operators-and-control-flow/#defer), [`Close`](/spec/system-library/#close)).
   - **`defer stmt`** (or `defer` and an indented block) runs the statement when control leaves the
@@ -7504,7 +7479,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     statements (it needs cancellation points compiled as exits); whether discarding a `close`'s
     `Result` in `defer` deserves a warning; whether `use x = e` sugar is wanted.
 
-- Proposed (built on branch `numeric`): **`Numeric`, the numbers' bound.** A core trait
+- Settled on the user's delegation 2026-11-12 (built on branch `numeric`): **`Numeric`, the numbers' bound.** A core trait
   `Numeric: Add, Sub, Mul, Div, Rem, Neg, Ord, Display, Debug` declaring `toReal -> real`; `Integer`
   now requires it (`trait Integer: Numeric`), so every width meets it through one
   `impl[T: Integer] Numeric for T`, and `real` has its own impl. Why: a mean, a clamp or a running
@@ -7517,12 +7492,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   identities and a conversion from integers is lossy at narrow widths; a separate `Fractional` for
   `real`, not needed while `real` is the one non-integer. **Review with the user**: whether `Div`
   and `Rem` belong in it.
-- Proposed (built on branch `numeric`): **`Numeric` is open.** Unlike `Integer`, a program's own
+- Settled on the user's delegation 2026-11-12 (built on branch `numeric`): **`Numeric` is open.** Unlike `Integer`, a program's own
   type that implements the required traits and `toReal` is a number (a rational type is the
   example in the tests). Why: a library number type (a decimal, a rational, a fixed-point) should
   reach every `[T: Numeric]` function. Alternative: closed like `Integer`, which would keep `toReal`
   meaningful only for built-ins at the cost of every user number.
-- Proposed (built on branch `numeric`): **`average` totals as `real` and traps when empty.**
+- Settled on the user's delegation 2026-11-12 (built on branch `numeric`): **`average` totals as `real` and traps when empty.**
   `average` on a collection of `Numeric` elements is a `real` mean summed through `toReal`, so
   integers whose sum overflows their type still average (beyond 2⁵³ the total rounds);
   `average` traps on an empty collection as `max` and `min` do, and `averageOption` answers
@@ -7530,14 +7505,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   where the mean is representable); NaN for an empty collection (silent, unlike `max`); only
   `averageOption`. `sum`, `product`, `min` and `max` were already generic over `Add`, `Mul` and `Ord`
   and are left as they were rather than duplicated on `Numeric`.
-- Proposed (built on branch `numeric`): **`real(x)` on a `Numeric` parameter is refused, naming
+- Settled on the user's delegation 2026-11-12 (built on branch `numeric`): **`real(x)` on a `Numeric` parameter is refused, naming
   `.toReal`.** A call converts only a type parameter bounded by `Integer`; a `T: Numeric` converts
   with its own method. Why: a conversion call on a type parameter is lowered per instance by the
   compiler for integers only, while `toReal` is an ordinary trait method a program's own number
   implements. Alternative: lower `real(x)` to `x.toReal` for a `Numeric` parameter, more uniform
   with the integers' `real(x)`, at the cost of a second meaning for a conversion call.
 
-- Proposed (branch `http-verbs`): **the HTTP client has a function per common verb, each taking
+- Settled on the user's delegation 2026-11-12 (built on branch `http-verbs`): **the HTTP client has a function per common verb, each taking
   its headers.** `http.get`, `head` and `delete(url, headers = [])`; `http.post`, `put` and
   `patch(url, body: string, contentType, headers = [])`, the content type sent first and the body
   as UTF-8. Headers are a `Vector[(string, string)]`, as `Request` and `Response` already hold
@@ -7547,7 +7522,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   order and repeated names, which HTTP allows); byte-body overloads of `post`/`put`/`patch` (left to
   `Request.withBody`, to keep one overload per verb).
 
-- Proposed (branch `http-verbs`): **a `Request`'s headers are checked as it is made, those given to
+- Settled on the user's delegation 2026-11-12 (built on branch `http-verbs`): **a `Request`'s headers are checked as it is made, those given to
   its constructor too.** The constructor traps on a header name that is not a token or a value
   holding a line break, as `withHeader` did; before, a header passed to the constructor was written
   unchecked, so a value holding `\r\n` could add a header of its own. Why: a verb's `headers`
@@ -7555,7 +7530,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   head is written (as the server does for a `Response`), which would trap later, away from the
   code that built the request. `withHeaders(more)` adds several in order.
 
-- Proposed (branch `http-verbs`): **query parameters are added one at a time by
+- Settled on the user's delegation 2026-11-12 (built on branch `http-verbs`): **query parameters are added one at a time by
   `Request.withQueryParam(name, value)`**, each encoded by `Url.encode` (so a space is `%20`, not
   `+`), joined with `?` or `&` and placed before any fragment, by text on the request's URL, which is
   parsed only when sent. Why: the cheapest form that reads well in a chain and needs no parse that
@@ -7564,7 +7539,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   request); form encoding with `+` (only `application/x-www-form-urlencoded` bodies need it).
   Review with the user: whether the verbs should also take a `query` vector.
 
-- Proposed (branch `http-verbs`): **`Response.json(status, text: string)` takes JSON already
+- Settled on the user's delegation 2026-11-12 (built on branch `http-verbs`): **`Response.json(status, text: string)` takes JSON already
   written** and sends it as `application/json` without checking it. Why: JSON lives in a package
   today (moving to the standard library as `avin.json`), and `avin.net.http` must not depend on a
   package; a text overload needs nothing. Once `avin.json` is in the standard library,
@@ -7573,7 +7548,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `charset=utf-8` in the type (RFC 8259 defines none for `application/json`). Review with the user:
   the `Json` overload once `avin.json` lands.
 
-- **Paths are strings, and the path functions live in `avin.fs`** (branch `path-helpers`, 2026-11-12).
+- Settled on the user's delegation 2026-11-12 (built on branch `path-helpers`): **Paths are strings, and the path functions live in `avin.fs`** (branch `path-helpers`, 2026-11-12).
   Proposed: no `Path` type; `fs.join`, `fs.parent`, `fs.fileName`, `fs.extension`, `fs.stem`,
   `fs.normalize`, `fs.relativeTo`, `fs.components`, `fs.isAbsolute`/`isRelative` take and answer
   `string`, bound to `sysl.path`, and sit in `avin.fs` beside the calls they feed. Why: every call
@@ -7584,7 +7559,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   well but splits the library in two; a separate `avin.path` module, which a program's own
   `path` variable shadows at once (`fs.join` cannot be shadowed by a local of that name). Review with
   the user: whether a `Path` type is wanted after all.
-- **`walk` answers a sorted vector, with an unreadable directory as an entry** (branch
+- Settled on the user's delegation 2026-11-12 (built on branch `path-helpers`): **`walk` answers a sorted vector, with an unreadable directory as an entry** (branch
   `path-helpers`). Proposed: `fs.walk(root) -> Result[Vector[Entry], IoError]`, depth first, a
   directory before its contents, each directory's names in code-point order (as `listDir`), the root
   itself left out; `Entry(path, relative, depth, isDir, isLink, error)`. A link is listed and never
@@ -7597,7 +7572,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   its own `?` and the order is the file system's); failing the whole walk at the first error; skipping
   unreadable directories silently; following links with cycle detection. Review with the user:
   whether a lazy walk with pruning is wanted for very large trees.
-- **Pattern matching is by character, and `glob` ignores what it cannot read** (branch
+- Settled on the user's delegation 2026-11-12 (built on branch `path-helpers`): **Pattern matching is by character, and `glob` ignores what it cannot read** (branch
   `path-helpers`). Proposed: `fs.matches(pattern, path)` is written in Avin rather than bound to
   `sysl.path.matches`: `?` and a class take one *character*, so `?.txt` fits `文.txt`. Pattern and path
   are compared component by component (doubled and trailing `/` do not matter, an absolute pattern fits
@@ -7614,14 +7589,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Result` (an error deep in a tree would lose the rest, as with `walk`, and a pattern has no single
   directory whose failure should be the answer). Review with the user: brace alternatives `{a,b}`,
   left out.
-- **`isDir` and `isFile` ask `stat`** (branch `path-helpers`). Proposed: `fs.isDir` was bound to
+- Settled on the user's delegation 2026-11-12 (built on branch `path-helpers`): **`isDir` and `isFile` ask `stat`** (branch `path-helpers`). Proposed: `fs.isDir` was bound to
   `sysl.fs.is_dir`, which opens the path as a directory, so a directory the program may not read
   answered `false` and `isFile` (`exists && !isDir`) answered `true` for it; both now read the same
   `stat` as `metadata`. Why: the chapter says `isDir` is whether the path names a directory, and
   `walk` needs the kind of an unreadable directory to report it. Alternatives weighed: keeping the
   opening check (a permission answer dressed as a kind).
 
-- Proposed (built on branch `text-papercuts`): **`sortedDescending` on every `Seq` of `Ord`
+- Settled on the user's delegation 2026-11-12 (built on branch `text-papercuts`): **`sortedDescending` on every `Seq` of `Ord`
   elements (a `List`'s answering a `List`), and `sortInPlaceDescending()` on arrays, buffers and
   deques**, beside `Reverse`, which stays the way to sort descending by a key. This amends the
   settled `Reverse` entry, which had chosen no `sortedDescending`. Why: the whole-element case is the
@@ -7633,7 +7608,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   settled choice; the gap audit's programs did not find it); `sortByDescending(key)` as well (two
   ways to write one thing); a `descending` flag on `sorted` (a boolean argument reads poorly at the
   call). **Review with the user**: it reverses a settled choice.
-- Proposed (built on branch `text-papercuts`): **the `,` format flag groups a decimal integer's
+- Settled on the user's delegation 2026-11-12 (built on branch `text-papercuts`): **the `,` format flag groups a decimal integer's
   digits in threes with commas**, under `%d` and `%i` only; under every other conversion it is the
   "has no effect" error. The zeros of a precision are grouped with the digits (`${5}%,.6d` is
   `000,005`), but the zeros of the `0` flag are not: they fill the width before the grouped digits,
@@ -7646,14 +7621,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `_` or a locale's
   separator (no locale exists; a comma is the common reading); allowing `,` under `%f` (a real's
   grouping is a separate item, not asked for yet). Always a comma, never locale-dependent.
-- Proposed (built on branch `text-papercuts`): **`string.utf8` answers a new `Array[byte]`**, a
+- Settled on the user's delegation 2026-11-12 (built on branch `text-papercuts`): **`string.utf8` answers a new `Array[byte]`**, a
   parameterless member as `bytes` is, the array the caller's own on every call. Why: files, sockets
   and request bodies take an `Array[byte]`, and `s.bytes.toArray()` built a vector only to copy it.
   Alternatives weighed: `toUtf8()` with parentheses (it is a pure conversion, so the parameterless
   rule writes it bare); answering a frozen, shared view (an `Array` is mutable, so sharing would let
   one caller change another's bytes).
 
-- Proposed (branch `dot-chain`): **a line that starts with a member's `.`, indented deeper than the
+- Settled on the user's delegation 2026-11-12 (built on branch `dot-chain`): **a line that starts with a member's `.`, indented deeper than the
   line its expression began on, continues that expression**, exactly as a line starting with a binary
   operator does: in the same places (a binding's value, an assignment, a `return` value, an infix
   call's argument, a `match` arm's or a lambda's body, a branch of a one-line `if`, an expression
@@ -7675,6 +7650,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   lines), which adds nothing the depth rule does not already say; a trailing `.` at the end of the
   line above, which hides the call being made. Review with the user whether `.` after an operator
   line should bind to the whole expression instead.
+
+**Deferred**
+
+- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
+  macros.
+
+- Settled on the user's delegation 2026-11-12 (built on branch `library-version`): **the standard library carries the compiler's version, and
+  the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
+  stamped by `scripts/release.sh` in the same commit as `const Version` and `compiler/sysl.hocon`,
+  and a compiler checks it against its own before it compiles anything: `check`, `build`, `run`,
+  `test` and `lsp` print one error naming both versions and the library's path, and nothing else.
+  A library with no version, or a `library.hocon` that is missing or unreadable, is refused the
+  same way. The rule is an **exact match**. A compiler built between releases carries the last
+  release's version, and so does the library in its own checkout, so a development build matches
+  its own tree; only a library from another release, through `AVIN_ROOT` or an install, differs.
+  Why: a library of another version fails as dozens of errors inside `library/avin/*.avin`, which
+  points a reader at the library rather than at the mismatch. Alternatives weighed: a dev compiler
+  accepting a library from the same commit (needs a commit id stamped into both and a build step
+  that keeps them in step, to answer a case the exact rule already passes); "the library is newer
+  than the compiler" (a newer library declares what an older compiler cannot check, which is the
+  failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
+  library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
+
+
+## Proposed
 
 ## Open
 
