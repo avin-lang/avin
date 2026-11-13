@@ -289,7 +289,6 @@ per line, each the function's name applied to a pattern per parameter:
 ```text
 classify(n: int) -> string
 classify(0) = "zero"
-
 classify(n)
   | n < 0 = "negative"
   | n < 10 = "small"
