@@ -1,0 +1,421 @@
+module avin
+
+// Decimal numbers of any size and any number of places. A `BigDecimal` is an integer, its unscaled
+// value, and a scale, the number of its digits after the point: `19.99` is `1999` at scale 2. It is
+// exact where a `real` rounds to the nearest binary fraction, so `0.1 + 0.2 == 0.3` holds, and it is
+// the number for money, rates and anything else written in decimal.
+//
+// `+`, `-`, `*` and unary `-` are exact: a sum has the larger scale of its operands and a product
+// their sum. `/` cannot always be: `1 / 3` never ends. It gives the quotient to 34 significant digits,
+// rounded half to even, and an exact quotient within that many digits exactly, with no zeros after
+// it beyond the dividend's scale less the divisor's. `div(o, scale = n, rounding = r)` gives the
+// quotient at `n` places, `divSignificant(o, n)` to `n` significant digits, and `exactDiv(o)` the
+// exact quotient, or None when it never ends. `%` is the remainder left by the quotient cut to a
+// whole number, with the dividend's sign, and `divRem(o)` gives both from one division.
+//
+// Two numbers are equal, ordered and hashed by value, whatever their scales: `2.0 == 2.00`, and both
+// are one key of a map. `scale` reads the scale and `stripTrailingZeros` drops the zeros a scale adds.
+//
+// A decimal literal where a `BigDecimal` is expected is that number, read from its digits:
+// `val price: BigDecimal = 19.99` holds exactly 19.99. An integer literal of any size is one too, and
+// an integer or a `BigInt` beside a `BigDecimal` under an operator or a comparison is converted to
+// one (`FromDecimal`). A `real` never is: `BigDecimal.fromRealExact(x)` is the binary fraction `x`
+// holds, every digit of it, and `BigDecimal.fromRealShortest(x)` the shortest decimal that reads back
+// as `x`. `toString` writes plain digits, never an exponent.
+
+// How a number is rounded to fewer digits: which of the two neighbours at the digits kept it becomes.
+// A number already at those digits is unchanged by every mode.
+data Rounding
+  // The nearer neighbour, a tie going to the one whose last digit is even: `2.5` to `2`, `3.5` to
+  // `4`. Its ties lean neither way, so it is the default wherever a rounding is taken.
+  HalfEven
+  // The nearer neighbour, a tie going away from zero: `2.5` to `3`, `-2.5` to `-3`.
+  HalfUp
+  // The nearer neighbour, a tie going toward zero: `2.5` to `2`, `-2.5` to `-2`.
+  HalfDown
+  // The neighbour away from zero: `2.1` to `3`, `-2.1` to `-3`.
+  Up
+  // The neighbour toward zero, the digits cut off: `2.9` to `2`, `-2.9` to `-2`.
+  Down
+  // The neighbour toward positive infinity: `2.1` to `3`, `-2.9` to `-2`.
+  Ceiling
+  // The neighbour toward negative infinity: `2.9` to `2`, `-2.1` to `-3`.
+  Floor
+
+// The number `unscaled` divided by 10 to the power `scale`. A negative scale traps: a number's places
+// are never fewer than none, and a whole number of any size is a scale of 0.
+class BigDecimal(val unscaled: BigInt, val scale: int)
+  if scale < 0 then fail(s"negative scale: $scale")
+
+  // Whether the number is zero, at any scale.
+  isZero -> bool = unscaled.isZero
+
+  // `-1`, `0` or `1` by whether the number is negative, zero or positive.
+  sign -> int = unscaled.sign
+
+  // The magnitude, at the same scale.
+  abs -> BigDecimal = if unscaled.sign < 0 then BigDecimal(unscaled.abs, scale) else self
+
+  // The number of digits of the unscaled value, and 1 for zero: `123.45` has 5, `0.001` has 1.
+  precision -> int = digitCount(unscaled)
+
+  // The same number at the least scale that holds it: `2.500` is `2.5` and `2.00` is `2`. A whole
+  // number keeps its zeros before the point, `1200` staying `1200`.
+  stripTrailingZeros -> BigDecimal
+    if unscaled.isZero then return if scale == 0 then self else BigDecimal(unscaled, 0)
+    var u = unscaled
+    var s = scale
+    while s > 0
+      val (q, r) = u.divRem(10)
+      if !r.isZero then break
+      u = q
+      s -= 1
+    if s == scale then self else BigDecimal(u, s)
+
+  // The number at scale `places`, its other digits rounded by `rounding`: for `2.345`, `round(2)`
+  // is `2.34` and `round(2, rounding = HalfUp)` is `2.35`. A number with fewer places gains zeros,
+  // `2.5` at two places being `2.50`. A negative `places` rounds to a multiple of 10 to its
+  // magnitude, written as a whole number: `1250` at `-2` places is `1200`.
+  round(places: int, rounding: Rounding = HalfEven) -> BigDecimal = rounded(unscaled, scale, places, rounding)
+
+  // The number rounded by `rounding` to at most `digits` significant digits, `digits` being at least
+  // 1: `123.456` to 4 is `123.5` and `0.0012345` to 2 is `0.0012`. A number with no more digits is
+  // unchanged, and the digits of a whole number past them are zeros, `12345` to 2 being `12000`.
+  roundSignificant(digits: int, rounding: Rounding = HalfEven) -> BigDecimal
+    if digits < 1 then fail(s"roundSignificant: digits must be at least 1, not $digits")
+    val drop = precision - digits
+    if drop <= 0 then return self
+    var places = scale - drop
+    val divisor = pow10(drop)
+    val (q, r) = unscaled.divRem(divisor)
+    var v = roundedQuotient(q, r, divisor, unscaled.sign < 0, rounding)
+    // A carry, as `9.99` to `10.0`, makes one digit more, a zero, which a place after the point drops.
+    if places > 0 && digitCount(v) > digits
+      v = v / 10
+      places -= 1
+    atScale(v, places)
+
+  // The quotient at scale `scale`, its other digits rounded by `rounding`: `BigDecimal(1).div(3,
+  // scale = 4)` is `0.3333`. A negative scale rounds to a multiple of 10 to its magnitude. A zero
+  // divisor traps.
+  div(other: BigDecimal, scale: int, rounding: Rounding = HalfEven) -> BigDecimal
+    val (q, r, divisor) = quotientAt(self, other, scale)
+    atScale(roundedQuotient(q, r, divisor, unscaled.sign != other.unscaled.sign, rounding), scale)
+
+  // The quotient rounded by `rounding` to at most `digits` significant digits, `digits` being at
+  // least 1, with no zeros after it beyond the dividend's scale less the divisor's: `/` is
+  // `divSignificant(other, 34)`. A zero divisor traps.
+  divSignificant(other: BigDecimal, digits: int, rounding: Rounding = HalfEven) -> BigDecimal
+    if digits < 1 then fail(s"divSignificant: digits must be at least 1, not $digits")
+    if other.unscaled.isZero then fail("division by zero")
+    val preferred = if self.scale > other.scale then self.scale - other.scale else 0
+    if unscaled.isZero then return BigDecimal(unscaled, preferred)
+    // The quotient's leading digit is at a power of ten `lead` or one below it, so at `places` places
+    // it has `digits` digits or one more, and one place fewer then gives exactly `digits`.
+    val lead = (precision - self.scale) - (other.precision - other.scale)
+    var places = digits - lead
+    var cut = quotientAt(self, other, places)
+    if digitCount(cut.0) > digits
+      places -= 1
+      cut = quotientAt(self, other, places)
+    var v = roundedQuotient(cut.0, cut.1, cut.2, unscaled.sign != other.unscaled.sign, rounding)
+    if digitCount(v) > digits
+      v = v / 10
+      places -= 1
+    while places > preferred
+      val (shorter, last) = v.divRem(10)
+      if !last.isZero then break
+      v = shorter
+      places -= 1
+    atScale(v, places)
+
+  // The exact quotient, or None when it never ends, as `1 / 3` does: 1 by 8 is `Some(0.125)`. It has no zeros after it beyond the dividend's scale less the divisor's, so it is
+  // what `/` gives wherever `/` is exact. A zero divisor traps.
+  exactDiv(other: BigDecimal) -> Option[BigDecimal]
+    if other.unscaled.isZero then fail("division by zero")
+    if unscaled.isZero
+      return Some(BigDecimal(unscaled, if self.scale > other.scale then self.scale - other.scale else 0))
+    // In lowest terms the quotient ends exactly when its denominator has no prime factor but 2 and 5.
+    val g = unscaled.gcd(other.unscaled)
+    var d = (other.unscaled / g).abs
+    var twos = 0
+    while (d % 2).isZero
+      d = d / 2
+      twos += 1
+    var fives = 0
+    while (d % 5).isZero
+      d = d / 5
+      fives += 1
+    if d != 1 then return None
+    val k = if twos > fives then twos else fives
+    var u = unscaled / g * BigInt(2).pow(k - twos) * BigInt(5).pow(k - fives)
+    if other.unscaled.sign < 0 then u = -u
+    Some(atScale(u, k + self.scale - other.scale))
+
+  // The quotient cut to a whole number and the remainder, from one division: 7.5 by 2 gives
+  // `(3, 1.5)`. The remainder has the dividend's sign and the larger scale. A zero divisor traps.
+  divRem(other: BigDecimal) -> (BigDecimal, BigDecimal)
+    val s = if self.scale > other.scale then self.scale else other.scale
+    val (q, r) = aligned(self, s).divRem(aligned(other, s))
+    (BigDecimal(q, 0), BigDecimal(r, s))
+
+  // The number raised to the power `n`, exactly, at `n` times its scale; a negative `n` traps.
+  // `x.pow(0)` is `1`.
+  pow(n: int) -> BigDecimal
+    if n < 0 then fail("pow: negative exponent")
+    BigDecimal(unscaled.pow(n), scale * n)
+
+  // The whole number toward zero from it: `-2.7` gives `-2`.
+  toBigInt -> BigInt = if scale == 0 then unscaled else unscaled / pow10(scale)
+
+  // The whole number toward zero from it as a `long`, or None when that does not fit one.
+  toLongOption -> Option[long] = toBigInt.toLongOption
+
+  // The whole number toward zero from it as an `int`, or None when that does not fit one.
+  toIntOption -> Option[int] = toBigInt.toIntOption
+
+  // The whole number toward zero from it as a `long`, trapping when that does not fit one.
+  toLong -> long = toBigInt.toLong
+
+  // The whole number toward zero from it as an `int`, trapping when that does not fit one.
+  toInt -> int = toBigInt.toInt
+
+// A `BigDecimal` is a number: the operators, the identities `BigDecimal.zero()` and
+// `BigDecimal.one()`, both at scale 0, and its value as a `real`, the nearest one, a tie going to the
+// even one, and an infinity of its sign beyond the greatest finite `real`.
+impl Numeric for BigDecimal
+  toReal -> real = s"${unscaled}e-$scale".toRealOption() match
+    Some(x) -> x
+    None -> if unscaled.sign < 0 then real.NegativeInfinity else real.PositiveInfinity
+
+// A sum is exact, at the larger scale of the two.
+impl Add for BigDecimal
+  add(other: BigDecimal) -> BigDecimal
+    if scale == other.scale then BigDecimal(unscaled + other.unscaled, scale)
+    elif scale < other.scale then BigDecimal(unscaled * pow10(other.scale - scale) + other.unscaled, other.scale)
+    else BigDecimal(unscaled + other.unscaled * pow10(scale - other.scale), scale)
+  static zero() -> BigDecimal = BigDecimal(BigInt.zero(), 0)
+
+impl Sub for BigDecimal
+  subtract(other: BigDecimal) -> BigDecimal = add(other.negate())
+
+// A product is exact, at the sum of the two scales.
+impl Mul for BigDecimal
+  multiply(other: BigDecimal) -> BigDecimal = BigDecimal(unscaled * other.unscaled, scale + other.scale)
+  static one() -> BigDecimal = BigDecimal(BigInt.one(), 0)
+
+// `/` is `divSignificant(other, 34)`, rounding half to even; a zero divisor traps.
+impl Div for BigDecimal
+  divide(other: BigDecimal) -> BigDecimal = divSignificant(other, 34)
+
+// `%` is what is left once the quotient cut to a whole number is taken away, with the dividend's sign,
+// at the larger scale; a zero divisor traps.
+impl Rem for BigDecimal
+  remainder(other: BigDecimal) -> BigDecimal
+    val s = if scale > other.scale then scale else other.scale
+    BigDecimal(aligned(self, s) % aligned(other, s), s)
+
+impl Neg for BigDecimal
+  negate() -> BigDecimal = if unscaled.isZero then self else BigDecimal(-unscaled, scale)
+
+// Every integer is a `BigDecimal` at scale 0, so an integer literal of any size is one where a
+// `BigDecimal` is expected, and an integer of any width meets one under an operator.
+impl FromInteger for BigDecimal
+  static fromInteger[N: Integer](n: N) -> BigDecimal = BigDecimal(BigInt(n), 0)
+
+// A decimal literal where a `BigDecimal` is expected is the number its digits write, and a `BigInt`
+// meets one under an operator at scale 0.
+impl FromDecimal for BigDecimal
+  static fromDecimal(text: string) -> BigDecimal = BigDecimal(text)
+  static fromBigInt(n: BigInt) -> BigDecimal = BigDecimal(n, 0)
+
+// Numbers order by value, whatever their scales.
+impl Ord for BigDecimal
+  compare(other: BigDecimal) -> int
+    if scale == other.scale then return unscaled.compare(other.unscaled)
+    if unscaled.sign != other.unscaled.sign then return if unscaled.sign < other.unscaled.sign then -1 else 1
+    if scale < other.scale then (unscaled * pow10(other.scale - scale)).compare(other.unscaled)
+    else unscaled.compare(other.unscaled * pow10(scale - other.scale))
+
+// Two `BigDecimal`s are equal when their values are: `2.0 == 2.00`.
+impl Eq for BigDecimal
+  equals(other: BigDecimal) -> bool = compare(other) == 0
+
+// Equal numbers hash alike, whatever their scales: the hash is the least-scale form's.
+impl Hash for BigDecimal
+  hash() -> long
+    val least = stripTrailingZeros
+    least.unscaled.hash() *% 31 +% long(least.scale)
+
+// A `BigDecimal` displays as its plain digits, with a `-` when negative and a point when its scale is
+// above 0, and never an exponent: `0.000001`, `1000000000000000000000.5`. Under `%f` it takes the
+// precision as its places, rounding half to even (`f"$x%.2f"`), and with none keeps its own; the flags
+// `+`, space, `0` and `#` act as they do on a `real`.
+impl Display for BigDecimal
+  display(out: Writer, spec: FormatSpec)
+    if spec.conversion == 'f' then out.writeField(fixedText(self, spec), spec)
+    else out.writeField(plainText(unscaled, scale), spec)
+  toString() -> string = plainText(unscaled, scale)
+
+// The diagnostic form is the display form, as it is for the other numbers.
+impl Debug for BigDecimal
+  debug(out: Writer, spec: FormatSpec) = display(out, spec)
+
+object BigDecimal
+  // The integer `n`, at scale 0; a literal argument takes this one, so it may be as large as a `long`.
+  apply(n: long) -> BigDecimal = BigDecimal(BigInt(n), 0)
+
+  // The integer `n`, of any width, at scale 0.
+  apply[T: Integer](n: T) -> BigDecimal = BigDecimal(BigInt(n), 0)
+
+  // The whole number `n`, at scale 0.
+  apply(n: BigInt) -> BigDecimal = BigDecimal(n, 0)
+
+  // The number `text` writes in decimal: an optional `-` or `+`, digits with an optional point among
+  // or around them, at least one digit, and an optional exponent, `e` or `E` with an optional sign and
+  // digits. Its scale is the digits after the point less the exponent, and 0 where that is below 0:
+  // `"1.50"` is scale 2, `"1.5e-3"` is `0.0015` and `"1.5e3"` is `1500`. Nothing else is read, no
+  // white space or separators, and any other text traps, as does a scale beyond an `int`.
+  apply(text: string) -> BigDecimal
+    if decimalParsed(text) is Some(d) then return d
+    notANumber(text)
+
+  // The number `BigDecimal(text)` reads, or None when the text is not one.
+  parse(text: string) -> Option[BigDecimal] = decimalParsed(text)
+
+  // Exactly the binary fraction `x` holds, at the least scale that holds it:
+  // `BigDecimal.fromRealExact(0.1)` is `0.1000000000000000055511151231257827021181583404541015625`.
+  // NaN and the infinities trap.
+  fromRealExact(x: real) -> BigDecimal
+    if !x.isFinite then fail(s"fromRealExact: $x is not a finite number")
+    BigDecimal(formatReal(x, 'f', 0, 0, 1074)).stripTrailingZeros
+
+  // The shortest decimal that reads back as `x`, at the least scale that holds it, as `x` prints:
+  // `BigDecimal.fromRealShortest(0.1)` is `0.1` and `fromRealShortest(2.0)` is `2`. NaN and the
+  // infinities trap.
+  fromRealShortest(x: real) -> BigDecimal
+    if !x.isFinite then fail(s"fromRealShortest: $x is not a finite number")
+    BigDecimal(renderReal(x)).stripTrailingZeros
+
+// 10 to the power `n`, `n` not negative.
+private pow10(n: int) -> BigInt
+  if n <= 18
+    var v: long = 1
+    var i = 0
+    while i < n
+      v *= 10
+      i += 1
+    return BigInt(v)
+  BigInt(10).pow(n)
+
+// The number of decimal digits of `u`'s magnitude, 1 for zero.
+private digitCount(u: BigInt) -> int = if u.isZero then 1 else u.abs.toString().byteLength
+
+// The number `u` at scale `places`, a negative `places` meaning `u` times 10 to its magnitude, at
+// scale 0.
+private atScale(u: BigInt, places: int) -> BigDecimal =
+  if places >= 0 then BigDecimal(u, places) else BigDecimal(u * pow10(-places), 0)
+
+// The unscaled value of `x` at scale `s`, which is not below its own.
+private aligned(x: BigDecimal, s: int) -> BigInt = if s == x.scale then x.unscaled else x.unscaled * pow10(s - x.scale)
+
+// The number `u` at scale `s`, rounded by `rounding` to scale `places`, as `round` describes.
+private rounded(u: BigInt, s: int, places: int, rounding: Rounding) -> BigDecimal
+  if places >= s then return BigDecimal(u * pow10(places - s), places)
+  val divisor = pow10(s - places)
+  val (q, r) = u.divRem(divisor)
+  atScale(roundedQuotient(q, r, divisor, u.sign < 0, rounding), places)
+
+// `a / b` at `places` places, cut toward zero: the quotient, the remainder and the divisor's
+// magnitude, which the remainder is a fraction of. A zero `b` traps.
+private quotientAt(a: BigDecimal, b: BigDecimal, places: int) -> (BigInt, BigInt, BigInt)
+  if b.unscaled.isZero then fail("division by zero")
+  // `a / b * 10^places` is `a.unscaled * 10^(places + b.scale - a.scale) / b.unscaled`.
+  val e = places + b.scale - a.scale
+  val num = if e > 0 then a.unscaled * pow10(e) else a.unscaled
+  val den = if e < 0 then b.unscaled * pow10(-e) else b.unscaled
+  val (q, r) = num.divRem(den)
+  (q, r, den.abs)
+
+// The quotient `q`, cut toward zero, rounded by `rounding` from the remainder `r` left over a divisor of
+// magnitude `divisor`; `negative` is the sign of the exact quotient, which a zero `q` has lost.
+private roundedQuotient(q: BigInt, r: BigInt, divisor: BigInt, negative: bool, rounding: Rounding) -> BigInt
+  if r.isZero then return q
+  if !roundsAway(rounding, negative, (r.abs * 2).compare(divisor), !(q % 2).isZero) then return q
+  if negative then q - 1 else q + 1
+
+// Whether a quotient cut toward zero, with something left over, moves one away from zero: `half` is
+// `-1`, `0` or `1` by whether what is left is less than, exactly or more than half a unit, and `odd`
+// whether the cut quotient's last digit is odd.
+private roundsAway(rounding: Rounding, negative: bool, half: int, odd: bool) -> bool
+roundsAway(HalfEven, _, half, odd) = half > 0 || half == 0 && odd
+roundsAway(HalfUp, _, half, _) = half >= 0
+roundsAway(HalfDown, _, half, _) = half > 0
+roundsAway(Up, _, _, _) = true
+roundsAway(Down, _, _, _) = false
+roundsAway(Ceiling, negative, _, _) = !negative
+roundsAway(Floor, negative, _, _) = negative
+
+// The plain digits of `u` at scale `s`: a `-` when negative, the whole part, at least `0`, and the
+// point and `s` digits after it when `s` is above 0.
+private plainText(u: BigInt, s: int) -> string
+  val digits = u.abs.toString()
+  val sign = if u.sign < 0 then "-" else ""
+  if s == 0 then return sign + digits
+  val n = digits.byteLength
+  if n > s then sign + digits.slice(0, n - s) + "." + digits.slice(n - s, n)
+  else sign + "0." + "0".repeat(s - n) + digits
+
+// `x` under `%f`: at the precision's places where one is given, with the sign the flags ask for, a
+// point after a whole number under `#`, and zeros after the sign out to the width under `0`.
+private fixedText(x: BigDecimal, spec: FormatSpec) -> string
+  val v = if spec.precision >= 0 then x.round(spec.precision) else x
+  var body = plainText(v.unscaled.abs, v.scale)
+  if spec.alternate && v.scale == 0 then body = body + "."
+  val sign = if v.sign < 0 then "-" elif spec.plus then "+" elif spec.space then " " else ""
+  val pad = spec.width - sign.byteLength - body.byteLength
+  if spec.zeroPad && !spec.left && pad > 0 then sign + "0".repeat(pad) + body else sign + body
+
+// The number `text` writes, as `BigDecimal(text)` reads it, or None where it is not one.
+private decimalParsed(text: string) -> Option[BigDecimal]
+  val n = text.byteLength
+  var i = 0
+  var negative = false
+  if n > 0
+    val first = char(int(text.byteAt(0)))
+    if first == '-' || first == '+'
+      negative = first == '-'
+      i = 1
+  val digits = StringWriter()
+  if negative then digits.writeChar('-')
+  var count = 0
+  var fraction = 0
+  while i < n && '0' <= char(int(text.byteAt(i))) <= '9'
+    digits.writeChar(char(int(text.byteAt(i))))
+    count += 1
+    i += 1
+  if i < n && char(int(text.byteAt(i))) == '.'
+    i += 1
+    while i < n && '0' <= char(int(text.byteAt(i))) <= '9'
+      digits.writeChar(char(int(text.byteAt(i))))
+      fraction += 1
+      i += 1
+  if count + fraction == 0 then return None
+  var exponent: long = 0
+  if i < n && (char(int(text.byteAt(i))) == 'e' || char(int(text.byteAt(i))) == 'E')
+    i += 1
+    var below = false
+    if i < n && (char(int(text.byteAt(i))) == '-' || char(int(text.byteAt(i))) == '+')
+      below = char(int(text.byteAt(i))) == '-'
+      i += 1
+    val start = i
+    while i < n && '0' <= char(int(text.byteAt(i))) <= '9'
+      // An exponent past any `int` scale is no number, and stops growing here.
+      if exponent < 10000000000 then exponent = exponent * 10 + long(int(char(int(text.byteAt(i)))) - int('0'))
+      i += 1
+    if i == start then return None
+    if below then exponent = -exponent
+  if i != n then return None
+  val s = long(fraction) - exponent
+  if !(-2147483647 <= s <= 2147483647) then return None
+  Some(atScale(BigInt(digits.text), int(s)))

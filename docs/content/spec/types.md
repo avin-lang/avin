@@ -183,6 +183,125 @@ trait FromInteger
   type, since its value is a call and not a constant: `b match 0 -> …` is an error that says to
   compare with `==`.
 
+## BigDecimal
+
+`BigDecimal`, a class of the core library beside `BigInt`, is a decimal number of any size and any
+number of places: an unscaled `BigInt` and a scale, the count of its digits after the point, so
+`19.99` is `1999` at scale 2. Where a `real` holds the nearest binary fraction, a `BigDecimal` holds
+the decimal exactly, which makes it the number for money and for anything else written in decimal.
+It is immutable, and a number, an ordered value and a key: it implements `Numeric`, `Eq` and `Hash`
+by value, `FromInteger` and [`FromDecimal`](#decimals-meet-a-type-that-takes-them).
+
+```text run
+main()
+  val price: BigDecimal = 19.99
+  println(price * 3)                          // 59.97
+  val tenth: BigDecimal = 0.1
+  println(tenth + 0.2 == 0.3)                 // true
+  val one: BigDecimal = 1
+  println(one / 3)                            // 0.3333333333333333333333333333333333
+  println(one.div(3, scale = 4))              // 0.3333
+  println(one.exactDiv(8))                    // Some(0.125)
+  println(one.exactDiv(3))                    // None
+  val x: BigDecimal = 2.345
+  println(x.round(2))                         // 2.34
+  println(x.round(2, rounding = HalfUp))      // 2.35
+  val two: BigDecimal = 2.0
+  println(two == 2.00)                        // true
+  println(BigDecimal.fromRealShortest(0.1))   // 0.1
+  println(f"$x%.1f")                          // 2.3
+```
+
+```text output
+59.97
+true
+0.3333333333333333333333333333333333
+0.3333
+Some(0.125)
+None
+2.34
+2.35
+true
+0.1
+2.3
+```
+
+- **Making one.** A decimal literal where a `BigDecimal` is expected is that number, read from its
+  digits, never through a `real`: `val price: BigDecimal = 19.99` holds exactly 19.99, and `1.5e-3`,
+  `1_000.25` and `-0.5` are read the same way. An integer literal of any size is one at scale 0, and
+  an integer or a `BigInt` beside one under an operator is converted to one. `BigDecimal(n)` takes an
+  integer of any width or a `BigInt`, and `BigDecimal(unscaled, scale)` names both parts; a negative
+  scale traps. `BigDecimal(text)` reads an optional `-` or `+`, digits with an optional point among or
+  around them, and an optional exponent (`e` or `E`, an optional sign, digits); the scale is the
+  digits after the point less the exponent, and 0 where that is below 0, so `"1.50"` is scale 2 and
+  `"1.5e3"` is `1500`. Nothing else is read, no white space or separators; other text traps, and
+  `BigDecimal.parse(text)` answers `None` instead, as it does for a scale beyond an `int`.
+- **From a `real`, only explicitly.** A `real` never converts on its own: `d + r` is an error that
+  names the two conversions. `BigDecimal.fromRealExact(x)` is the binary fraction `x` holds, every
+  digit of it (`0.1` gives `0.1000000000000000055511151231257827021181583404541015625`), and
+  `BigDecimal.fromRealShortest(x)` the shortest decimal that reads back as `x`, as `x` prints (`0.1`).
+  Both take the least scale that holds the value, and NaN and the infinities trap. `toReal` is the
+  nearest `real`, a tie going to the even one, and an infinity of the number's sign beyond the
+  greatest finite one.
+- **Rounding.** `Rounding` is a data type of seven variants: `HalfEven`, the nearer neighbour with a
+  tie to the even digit, the default wherever a rounding is taken; `HalfUp` and `HalfDown`, a tie away
+  from and toward zero; `Up` and `Down`, away from and toward zero; `Ceiling` and `Floor`, toward
+  positive and negative infinity. There is no mode that traps on an inexact result: an operation that
+  must be exact answers an `Option` instead. `x.round(places)` gives the number at that scale, its
+  other digits rounded, and a shorter one gains zeros (`2.5` at two places is `2.50`); a negative
+  `places` rounds to tens, hundreds and so on, written as a whole number. `x.roundSignificant(n)`
+  rounds to at most `n` significant digits. Each takes `rounding = …` by name.
+- **Arithmetic.** `+`, `-`, `*` and unary `-` are exact: a sum has the larger scale and a product the
+  sum of the scales. `/` gives the quotient to 34 significant digits, rounded half to even; where the
+  exact quotient has no more digits than that, it is exact, with no zeros after it beyond the
+  dividend's scale less the divisor's (`1 / 4` is `0.25`, `6.00 / 2` is `3.00`). `a.div(b, scale =
+  n, rounding = r)` gives the quotient at `n` places and `a.divSignificant(b, n, rounding = r)` to `n`
+  significant digits, `/` being `divSignificant(b, 34)`. `a.exactDiv(b)` answers the exact quotient,
+  or `None` where it never ends; where `/` is exact the two agree. `%` is what is left once the
+  quotient cut to a whole number is taken away, with the dividend's sign, and `divRem(b)` answers that
+  whole quotient and the remainder from one division. `pow(n)` is exact. A zero divisor traps with
+  `division by zero` under every one of them.
+- **Equality is by value.** `==`, the ordering and the hash look at the number, not its scale:
+  `2.0 == 2.00`, the two hash alike, and they are one key of a map and one member of a set. `scale`
+  tells them apart, and `stripTrailingZeros` gives the number at the least scale that holds it
+  (`2.500` is `2.5`; a whole number keeps its zeros before the point).
+- **Mixing.** An integer of any width and a `BigInt` meet a `BigDecimal` under the five operators,
+  the comparisons and `==`, on either side and in chains, and in a compound assignment to a
+  `BigDecimal`; a decimal literal beside one is one too (`price + 0.01`, `0 < price < 20.0`). A `real`
+  meets one nowhere. A decimal literal is no pattern for a `BigDecimal`; compare with `==`.
+- **Parts and conversions.** `unscaled`, `scale`, `precision` (the unscaled value's digits, 1 for
+  zero), `sign`, `isZero` and `abs`. `toBigInt`, `toLong` and `toInt` take the whole part, toward
+  zero; `toLong` and `toInt` trap with `value out of range for long` (or `int`) where it does not fit,
+  and `toLongOption` and `toIntOption` answer `None`.
+- **Text.** A `BigDecimal` is written in plain digits, never with an exponent: `0.000001`,
+  `1000000000000000000000`. Its `Debug` form is the same. Under `%f` the precision is its places,
+  rounded half to even, and with none it keeps its own; the flags `+`, space, `0` and `#` act as on a
+  `real`. Like every number it is refused under `%s`, and as one never written with an exponent it is
+  refused under `%e` and `%g`.
+- **Identities.** `BigDecimal.zero()` and `BigDecimal.one()`, at scale 0.
+
+### Decimals meet a type that takes them
+
+A type that implements the core trait `FromDecimal` takes every decimal number exactly, and with it
+every integer and every `BigInt`. `BigDecimal` is the library's one; a program's own type joins by
+implementing it beside `FromInteger`:
+
+```text
+trait FromDecimal: FromInteger
+  static fromDecimal(text: string) -> Self
+  static fromBigInt(n: BigInt) -> Self
+```
+
+- **A decimal literal where one is expected is its value**, wherever a type is expected, as an
+  integer literal is for `FromInteger`. It is `T.fromDecimal(text)`, the text the literal as written
+  with its sign and any exponent and without its separators (`-1_000.5e-3` passes `"-1000.5e-3"`),
+  so no digit is rounded through a `real`. A type parameter bounded by `FromDecimal` takes one the
+  same way.
+- **A `BigInt` operand beside one is converted to it**, as `T.fromBigInt(n)`, under the operators,
+  the comparisons and `==`, on either side, as an integer operand is for `FromInteger`. A type that
+  takes integers alone takes no `BigInt`.
+- **A `real` value is never converted**, and a decimal literal is no pattern for such a type.
+
 ## byte
 
 `byte` is an octet with a value from 0 to 255. It is the element of binary data — file contents,

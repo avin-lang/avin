@@ -8071,6 +8071,84 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   it does not fit; `val x: BigInt = …` is the spelling. WHY: typing a literal at a free `Integer`
   bound by its size would be a second literal rule for one call. ALTERNATIVE: an `apply` overload
   the literal rule reaches.
+- **`BigDecimal`: an immutable unscaled `BigInt` and a scale, rounding by a `Rounding` data type,
+  no context object** (2026-11-13, branch `bigdecimal`; [types](/spec/types/#bigdecimal)). The class
+  is `BigDecimal(val unscaled: BigInt, val scale: int)`; a negative scale traps in the constructor,
+  so a whole number is always scale 0 and a large one carries its zeros in `unscaled`. `Rounding`
+  has `HalfEven` (the default everywhere), `HalfUp`, `HalfDown`, `Up`, `Down`, `Ceiling` and
+  `Floor`, and no mode that traps on inexactness: the exact operation is `exactDiv`, answering an
+  `Option`. Every rounding operation takes its precision positionally and its mode by name:
+  `round(places, rounding = …)`, `roundSignificant(digits, rounding = …)`, `div(o, scale, rounding
+  = …)`, `divSignificant(o, digits, rounding = …)`. WHY: one value type with its precision stated at
+  each call reads plainly and has no hidden state; an `Option` says "may not be exact" in the type
+  where a trapping mode would say it at run time. ALTERNATIVES: a context object or a thread-wide
+  default (hidden state, the thing the user asked to leave out); an `Unnecessary` mode (a trap where
+  a type can say it); a visible negative scale (`1E+3` as unscaled 1, scale -3: compact, but a second
+  spelling of every whole number and a source of surprise in `scale`).
+- **`/` gives 34 significant digits, half to even, and an exact quotient within them at the
+  "preferred" scale** (branch `bigdecimal`). The quotient is rounded to 34 significant digits, then
+  zeros after the point are dropped down to the dividend's scale less the divisor's (never below 0):
+  `1 / 4` is `0.25`, `6.00 / 2` is `3.00`, `1 / 3` has 34 threes. So `/` agrees with `exactDiv`
+  wherever it is exact, and `divSignificant` keeps the same rule at its own digit count. WHY: 34 is
+  the precision of a 128-bit decimal, enough for money and rates; padding every quotient to 34 digits
+  (`0.2500000…`) would make `/` useless for display. ALTERNATIVES: a fixed scale for `/` (wrong for
+  large and small magnitudes alike); refusing `/` and requiring `div` (the user asked for a default);
+  no zero-stripping (the padded form above).
+- **Decimal literals reach a type through a core trait `FromDecimal: FromInteger`, with the
+  literal's text** (branch `bigdecimal`; [types](/spec/types/#decimals-meet-a-type-that-takes-them)).
+  `static fromDecimal(text: string) -> Self` takes the literal as written, sign and exponent kept and
+  separators dropped; `RealLit` now keeps its spelling for this. The parse happens at run time, each
+  time the literal is evaluated. WHY: the literal is exact only if no `real` is ever made of it, and
+  text is the one form every decimal type can read; the trait mirrors `FromInteger`, so a program's
+  own decimal type joins by an impl. ALTERNATIVES: emitting `BigDecimal(unscaledLiteral, scale)`
+  (exact and parse-free, but names one library type in the checker and serves no other); a
+  compile-time constant pool (later optimization, not a language question). **Review with the
+  user**: whether to hoist the parse once performance matters.
+- **A `BigInt` meets a type that takes decimals by `FromDecimal.fromBigInt`** (branch `bigdecimal`).
+  The trait's second member converts a `BigInt` operand beside a `FromDecimal` type under the five
+  operators, the comparisons and `==`, either side, chains and compound assignment included, as an
+  integer operand meets a `FromInteger` type. A type that takes only integers takes no `BigInt`.
+  WHY: `price * qty` with a `BigInt` count should read as written, and a type taking every decimal
+  takes every whole number losslessly. ALTERNATIVES: a `fromBigInt` member on `FromInteger` (every
+  integer-only type would have to write it, with nothing to build it from); converting through
+  `fromDecimal(n.toString())` (no extra member, but a text round trip on every operation); overloads
+  on `BigDecimal` and `BigInt` (covers one pair of types, and `BigInt` would have to know
+  `BigDecimal`).
+- **A real literal waits for the other operand only beside a value that is not a literal**
+  (branch `bigdecimal`). In `x + 0.5`, `0.5 + x` and `x < 0.5`, the literal takes `x`'s type, so a
+  `BigDecimal` `x` makes it one; among literals alone (`1 + 0.5`, `1 < 2.5`) everything is a `real`
+  as before. WHY: the operand order rule integer literals follow, extended without changing a
+  program that compiled.
+- **The `Rounding` variants are core names, seen everywhere** (branch `bigdecimal`). `HalfEven`,
+  `Up`, `Down`, `Ceiling`, `Floor` and the rest are variants of a prelude data type, so
+  `rounding = Floor` needs no import or qualifier. A program's own `Up` or `Down` hides them where
+  nothing expects a `Rounding`, and where one is expected the bare name is still `Rounding`'s, as for
+  `None` and `Some`; `Rounding.Up` is always available. WHY: the call reads `x.round(2, rounding =
+  HalfUp)`, as asked. ALTERNATIVES: a module `avin.math` for `BigDecimal` and `Rounding` (an import
+  for every program using money); prefixed names (`RoundHalfUp`). **Review with the user**: short
+  common words such as `Up` and `Down` in the prelude.
+- **`BigDecimal`'s smaller choices** (branch `bigdecimal`): (1) the sign accessor is `sign`, as on
+  `BigInt` and the integers, not `signum`; (2) `round(places)` always answers that scale, padding
+  with zeros where the number has fewer places, and a negative `places` rounds to tens, hundreds, …
+  answering scale 0; (3) `roundSignificant` drops one zero a carry adds after the point (`9.99` to 2
+  is `10`), while a whole number keeps the zeros it needs; (4) `%` and `divRem` use the quotient cut
+  toward zero, the remainder taking the dividend's sign, as on `BigInt`; no `floorDiv` yet; (5)
+  `toBigInt`, `toLong` and `toInt` take the whole part toward zero, as `real`'s do, trapping (or
+  `None`) only when it does not fit; (6) `fromRealExact` and `fromRealShortest` trap on NaN and the
+  infinities and answer the least scale that holds the value; `fromRealExact` writes the `real` with
+  1074 places through `%f`, which every finite `real` fits exactly; (7) `BigDecimal(text)` and
+  `parse` accept `.5`, `5.` and an exponent, refuse separators and white space, and answer `None`
+  for a resulting scale outside `int` (a large positive exponent within it, `1e100000000`, is read,
+  at the cost of its digits); (8) `%f` takes a `BigDecimal` with its precision as places, half to
+  even, and with none keeps its own scale; `%e`, `%g`, `%s`, `%d` and `,` are refused; (9) the hash
+  is the least-scale form's, so equal values hash alike; (10) `exactDiv` by zero traps, as every
+  division does, since `None` means "never ends"; (11) `BigDecimal.zero()` and `one()` are at scale
+  0; (12) mixing a `real` value with a `BigDecimal` is an error that names `fromRealShortest` and
+  `fromRealExact`. ALTERNATIVES weighed for each: `signum` (inconsistent with `BigInt`);
+  `round` never adding places (then `round(2)` cannot be used to show cents); floor division for
+  `%` (different from every other `%` in the language); traps for fractional `toLong` (the whole part
+  is what conversions take elsewhere); `Option` from the `real` conversions (NaN is a programming
+  error, not data); a `%f` default of 6 places (loses digits a decimal holds exactly).
 
 ## Open
 

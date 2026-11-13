@@ -7396,7 +7396,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "Display", "Debug", "Sendable", "Boundary"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "FromDecimal", "Display", "Debug", "Sendable", "Boundary"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -10691,10 +10691,10 @@ private union_hint(c: *Checker, e: &Expr, want: &Type) -> Option[Option[&Type]]
             if op is Negate
                 operand.kind match
                     IntLit(spelling) -> return literal_member(c, e.span, spelling, true, want)
-                    RealLit(_) -> return Some(only_member(members, Real))
+                    RealLit(_, _) -> return Some(only_member(members, Real))
                     _ -> ()
             Some(None)
-        RealLit(_) -> Some(only_member(members, Real))
+        RealLit(_, _) -> Some(only_member(members, Real))
         Lambda(_, _) -> one_of(c, e, "a lambda", want, function_members(c, members))
         MatchFunction(_) -> one_of(c, e, "a `match` function", want, function_members(c, members))
         // A variant among several members of its type is checked on its own, which decides it where
@@ -11014,7 +11014,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Unary(op, operand) -> unary_expr(c, e, op, operand, expected)
     BoolLit(value) -> TExpr(e.span, Bool, BoolConst(value))
     CharLit(value) -> TExpr(e.span, Char, CharConst(u32(value)))
-    RealLit(value) -> TExpr(e.span, Real, RealConst(value))
+    RealLit(value, spelling) -> real_literal(c, e.span, value, spelling, false, expected)
     StringLit(value) -> TExpr(e.span, Str, StrConst(value))
     Interpolate(prefix, chunks, parts, holes) -> interpolate_expr(c, e, prefix, chunks, parts, holes, expected)
     UnitLit -> TExpr(e.span, Unit, UnitConst)
@@ -13601,6 +13601,16 @@ private is_literal(e: &Expr) -> bool = e.kind match
     Unary(Negate, operand) -> operand.kind is IntLit(_)
     _ -> false
 
+// Whether `e` is a real literal, `1.5`, or a negated one, `-1.5`.
+private is_real_literal(e: &Expr) -> bool = e.kind match
+    RealLit(_, _) -> true
+    Unary(Negate, operand) -> operand.kind is RealLit(_, _)
+    _ -> false
+
+// Whether `e` is a number literal of either kind, which takes its type from the other operand of an
+// operator or a comparison.
+private is_number_literal(e: &Expr) -> bool = is_literal(e) || is_real_literal(e)
+
 private settled(t: &Type) -> bool = !(*t is ErrorType || *t is Nothing)
 
 private expect_bool(c: *Checker, t: &TExpr)
@@ -13620,7 +13630,7 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
     if op is Not then return check_condition(c, e).expr
     if op is Negate && operand.kind is IntLit(spelling)
         return integer_literal(c, e.span, spelling, true, expected)
-    if op is Negate && operand.kind is RealLit(value) then return TExpr(e.span, Real, RealConst(-value))
+    if op is Negate && operand.kind is RealLit(value, spelling) then return real_literal(c, e.span, value, spelling, true, expected)
     val x = check_expr(c, operand, expected)
     // On a data type, a class or a type parameter with a method `-` taking no argument, `-a` calls it.
     if op is Negate && has_operator_traits(zonk(c, x.ty)) && settled(zonk(c, x.ty))
@@ -13650,7 +13660,8 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
 private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Expr, op_span: Span, wanted: Option[&Type]) -> &TExpr
     if op is And || op is Or then return check_condition(c, e).expr
     val expected = operand_hint(c, wanted)
-    if is_literal(left) && !is_literal(right)
+    // A real literal waits for the other operand too, unless that is a literal: `1 + 0.5` is a real.
+    if (is_literal(left) && !is_literal(right)) || (is_real_literal(left) && !is_number_literal(right))
         val r = check_expr(c, right, expected)
         val l = check_expr(c, left, Some(r.ty))
         // A literal that became a value of a type with a method of the operator's name calls it.
@@ -13669,7 +13680,7 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
                 if ms.len() == 1 && c.symbols[ms[0]].params.len() >= 2
                     if same_type(zonk(c, c.symbols[ms[0]].params[1]), zonk(c, l.ty)) then hint = Some(zonk(c, l.ty))
                 val r = check_expr(c, right, hint)
-                val arg = if integer_type(c, zonk(c, r.ty)) then from_integer(c, r, zonk(c, l.ty)) else r
+                val arg = if integer_type(c, zonk(c, r.ty)) then from_integer(c, r, zonk(c, l.ty)) elif big_int_beside(c, r.ty, l.ty) then from_big_int(c, r, zonk(c, l.ty)) else r
                 return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, arg), expected)
         return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
     operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
@@ -13720,6 +13731,13 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
     // `big * i` and `i * big`. A compound assignment's target keeps its type, so only its value is
     // converted.
     if binary_operator_method(op) is Some(_)
+        // A `BigInt` meets a type that takes decimals, `BigDecimal` among them, the same way.
+        if big_int_beside(c, r.ty, l.ty)
+            return operate(c, at, op_at, op, spelling, l, from_big_int(c, r, zonk(c, l.ty)))
+        if !compound_spelling(spelling) && big_int_beside(c, l.ty, r.ty)
+            val converted = from_big_int(c, l, zonk(c, r.ty))
+            if operator_method(c, op, converted.ty) then return operator_method_call(c, at, op_at, checked_slot(c, converted), converted, spelling, checked_slot(c, r), None)
+            return operate(c, at, op_at, op, spelling, converted, r)
         if takes_integers(c, l.ty) && integer_type(c, zonk(c, r.ty))
             return operate(c, at, op_at, op, spelling, l, from_integer(c, r, zonk(c, l.ty)))
         if !compound_spelling(spelling) && integer_type(c, zonk(c, l.ty)) && takes_integers(c, r.ty)
@@ -13746,7 +13764,7 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
                 if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
                     c.note(unit_of(c), operand, s"$what; $hint")
                 else
-                    c.note(unit_of(c), at, what)
+                    c.note(unit_of(c), at, what + real_beside_decimal(c, l.ty, r.ty))
                 return TExpr(at, ErrorType, UnitConst)
             if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
             return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
@@ -13770,7 +13788,7 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
             c.note(unit_of(c), operand, s"$what; $hint")
         else
-            c.note(unit_of(c), at, what)
+            c.note(unit_of(c), at, what + real_beside_decimal(c, l.ty, r.ty))
         return TExpr(at, ErrorType, UnitConst)
     val bitwise = op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
     val arithmetic = op is Add || op is Subtract || op is Multiply || op is Divide || op is Remainder
@@ -13797,6 +13815,62 @@ private from_integer(c: *Checker, value: &TExpr, to: &Type) -> &TExpr
     var args: Buf[Argument] = buf()
     args.push(Argument(value.span, None, checked_slot(c, value), false))
     static_call(c, value.span, value.span, checked_slot(c, TExpr(value.span, to, TypeReceiver)), to, "fromInteger", args, None, Some(to), false)
+
+/** Whether decimals convert to `t`: `t` implements the core library's `FromDecimal`, or is a type
+ * parameter bounded by it. A real literal where a `t` is expected is a `t`, read from its digits
+ * exactly, and a `BigInt` operand beside a `t` is converted to one. */
+private takes_decimals(c: *Checker, t: &Type) -> bool
+    val k = zonk(c, t)
+    if !settled(k) || !has_operator_traits(k) || integer_type(c, k) then return false
+    core_trait_type(c, "FromDecimal") match
+        Some(b) -> conforms_to_bound(c, k, b)
+        None -> false
+
+// Whether `t` is the core library's `BigInt`.
+private big_int_type(c: *Checker, t: &Type) -> bool
+    if *zonk(c, t) is Class(k, _, _)
+        if c.class_types.get(qualified(CoreModule, "BigInt")) is Some(big) then return big == k
+    false
+
+// Whether `t` is the core library's `BigDecimal`.
+private big_decimal_type(c: *Checker, t: &Type) -> bool
+    if *zonk(c, t) is Class(k, _, _)
+        if c.class_types.get(qualified(CoreModule, "BigDecimal")) is Some(d) then return d == k
+    false
+
+// Whether a value of type `value`, a `BigInt`, meets one of type `other`, which takes decimals and is
+// not a `BigInt` itself, and so is converted to it.
+private big_int_beside(c: *Checker, value: &Type, other: &Type) -> bool =
+    big_int_type(c, value) && !big_int_type(c, other) && takes_decimals(c, other)
+
+/** `value`, a `BigInt`, as a value of `to`, a type that takes decimals: `to.fromBigInt(value)`. */
+private from_big_int(c: *Checker, value: &TExpr, to: &Type) -> &TExpr
+    var args: Buf[Argument] = buf()
+    args.push(Argument(value.span, None, checked_slot(c, value), false))
+    static_call(c, value.span, value.span, checked_slot(c, TExpr(value.span, to, TypeReceiver)), to, "fromBigInt", args, None, Some(to), false)
+
+/** A real literal, its value `value` and its spelling `spelling`, negated when `negative`: where a type
+ * that takes decimals is expected, that type's value read from the literal's digits,
+ * `to.fromDecimal("19.99")`, so nothing is rounded through a `real`; otherwise the `real`. */
+private real_literal(c: *Checker, at: Span, value: real, spelling: string, negative: bool, expected: Option[&Type]) -> &TExpr
+    if expected is Some(t)
+        if takes_decimals(c, t)
+            val to = zonk(c, t)
+            val digits = (if negative then "-" else "") + spelling.replace_all("_", "")
+            var args: Buf[Argument] = buf()
+            args.push(Argument(at, None, checked_slot(c, TExpr(at, Str, StrConst(digits))), false))
+            return static_call(c, at, at, checked_slot(c, TExpr(at, to, TypeReceiver)), to, "fromDecimal", args, None, Some(to), false)
+    TExpr(at, Real, RealConst(if negative then -value else value))
+
+// What an operator's error adds where a `real` meets a type that takes decimals: that it converts only
+// explicitly.
+private real_beside_decimal(c: *Checker, l: &Type, r: &Type) -> string
+    val x = zonk(c, l)
+    val y = zonk(c, r)
+    val other = if *x is Real then y elif *y is Real then x else return ""
+    if !takes_decimals(c, other) then return ""
+    if big_decimal_type(c, other) then return "; a `real` is converted to a `BigDecimal` only explicitly, by `BigDecimal.fromRealShortest(x)` or `BigDecimal.fromRealExact(x)`"
+    s"; a `real` is converted to `${type_name(other)}` only explicitly"
 
 // Whether an operator spelled `spelling` is a compound assignment's, as `+=` and `+:=` are, whose
 // target keeps its type.
@@ -13910,8 +13984,13 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
         first = Some(l)
     // A number or collection literal takes its type from another operand: `xs == [1, 2]` builds the
     // collection `xs` is. So does a variant's name several types share: `w == Normal`.
+    // A real literal waits for another operand's type where one is not a literal, as in `x < 0.5`
+    // with `x` a `BigDecimal`; among literals alone it is a real, and `1 < 2.5` compares reals.
+    var plain = false
     for o in operands
-        if is_literal(o) || is_collection_literal(o) || shared_variant_use(c, o) then early.push(None)
+        if !is_number_literal(o) then plain = true
+    for o in operands
+        if is_literal(o) || (plain && is_real_literal(o)) || is_collection_literal(o) || shared_variant_use(c, o) then early.push(None)
         else
             val t = if early.len() == 0 && first is Some(_) then first.unwrap() else check_expr(c, o, None)
             if anchor is None && settled(t.ty) then anchor = Some(t.ty)
@@ -13930,6 +14009,9 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
             if !(ops[i] is Same || ops[i] is NotSame)
                 if integer_type(c, zonk(c, typed[i].ty)) && takes_integers(c, typed[i + 1].ty) then typed[i] = from_integer(c, typed[i], zonk(c, typed[i + 1].ty))
                 elif takes_integers(c, typed[i].ty) && integer_type(c, zonk(c, typed[i + 1].ty)) then typed[i + 1] = from_integer(c, typed[i + 1], zonk(c, typed[i].ty))
+                // and a `BigInt` beside a type that takes decimals is converted to that type.
+                elif big_int_beside(c, typed[i].ty, typed[i + 1].ty) then typed[i] = from_big_int(c, typed[i], zonk(c, typed[i + 1].ty))
+                elif big_int_beside(c, typed[i + 1].ty, typed[i].ty) then typed[i + 1] = from_big_int(c, typed[i + 1], zonk(c, typed[i].ty))
     // `==` between an `Any` and a value of another type compares the value as an `Any`.
     if ops.len() == 1 && (ops[0] is Equal || ops[0] is NotEqual)
         val x = zonk(c, typed[0].ty)
@@ -14369,13 +14451,14 @@ private specified(c: *Checker, value: &TExpr, p: Specifier) -> Option[&Expr]
         zeros = true
         alternate = true
         wanted = "a real"
-        fits = *t is Real
+        // A `BigDecimal` takes `%f` alone: it is never written with an exponent.
+        fits = *t is Real || (letter == "f" && big_decimal_type(c, t))
     elif letter == "c"
         wanted = "a char"
         fits = *t is Char
     elif letter == "s"
         wanted = "a string or another value that is not a number"
-        fits = !(whole_number_type(c, t) || *t is Real)
+        fits = !(whole_number_type(c, t) || *t is Real || big_decimal_type(c, t))
     elif letter == "?"
         fits = true
     elif letter == "u"
@@ -17606,11 +17689,11 @@ private literal_default(c: *Checker, id: usize) -> Option[&Expr]
     val body = c.symbols[id].decl.body?
     body.kind match
         IntLit(_) -> Some(body)
-        RealLit(_) -> Some(body)
+        RealLit(_, _) -> Some(body)
         CharLit(_) -> Some(body)
         BoolLit(_) -> Some(body)
         StringLit(_) -> Some(body)
-        Unary(op, operand) -> if op is Negate && (operand.kind is IntLit(_) || operand.kind is RealLit(_)) then Some(body) else None
+        Unary(op, operand) -> if op is Negate && (operand.kind is IntLit(_) || operand.kind is RealLit(_, _)) then Some(body) else None
         _ -> None
 
 /** The type written argument `j` is checked against, of the parameter types `params` (with the
@@ -17903,7 +17986,7 @@ private min_tier(a: i32, b: i32) -> i32 = if a < b then a else b
  * of a lambda, a `match` function or a local function inside it. A form not listed counts as one. */
 private exits_lambda(e: &Expr) -> bool = e.kind match
     IntLit(_) -> false
-    RealLit(_) -> false
+    RealLit(_, _) -> false
     CharLit(_) -> false
     StringLit(_) -> false
     BoolLit(_) -> false
@@ -19681,9 +19764,9 @@ private constant_member(value: &Expr, t: &Type) -> bool = value.kind match
     IntLit(_) -> *t is Int(_) || *t is Byte
     Unary(_, operand) -> operand.kind match
         IntLit(_) -> *t is Int(_)
-        RealLit(_) -> *t is Real
+        RealLit(_, _) -> *t is Real
         _ -> false
-    RealLit(_) -> *t is Real
+    RealLit(_, _) -> *t is Real
     CharLit(_) -> *t is Char
     StringLit(_) -> *t is Str
     Interpolate(_, _, _, _) -> *t is Str
@@ -20009,6 +20092,10 @@ private pattern_constant(c: *Checker, value: &Expr, ty: &Type) -> &TExpr
     // is no pattern: such a value is compared with `==`.
     if is_literal(value) && takes_integers(c, ty)
         c.note(unit, value.span, s"an integer literal does not match a ${type_name(zonk(c, ty))} as a pattern; compare it with `==`, as in `if x == 0`")
+        return TExpr(value.span, ErrorType, UnitConst)
+    // So is a decimal literal where a type that takes decimals is expected.
+    if is_real_literal(value) && takes_decimals(c, ty)
+        c.note(unit, value.span, s"a decimal literal does not match a ${type_name(zonk(c, ty))} as a pattern; compare it with `==`, as in `if x == 0.5`")
         return TExpr(value.span, ErrorType, UnitConst)
     val t = check_expr(c, value, Some(ty))
     if !settled(t.ty) || !settled(ty) then return TExpr(t.span, ErrorType, UnitConst)
