@@ -1,0 +1,363 @@
+module jsontests
+
+// The streaming reader: events in order, every way a source can cut the text into pieces, the
+// grammar's faults found at the same places `parse` finds them, the numbers at the edges of each
+// kind, nesting to the limit and past it, and the calls a decoder makes.
+import avin.json
+import avin.json.Json
+import avin.json.JsonEvent
+import avin.json.JsonReader
+import avin.io.IoError
+import avin.io.Reader
+
+// A source giving `bytes` at most `size` at a time.
+class Pieces(private val bytes: Array[byte], private val size: int): Reader
+    private var at = 0
+
+    override read(max: int) -> Result[Array[byte], IoError]
+        val n = if size < max then size else max
+        val end = if bytes.length - at < n then bytes.length else at + n
+        val piece = bytes.slice(at, end)
+        at = end
+        Ok(piece)
+
+// A source that gives `bytes`, when there are any, and then fails to read.
+class Failing(private val bytes: Array[byte]): Reader
+    private var given = false
+
+    override read(max: int) -> Result[Array[byte], IoError]
+        if given || bytes.length == 0 then return Err(IoError.TimedOut)
+        given = true
+        Ok(bytes)
+
+utf8(text: string) -> Array[byte] = text.bytes.toArray()
+
+// A reader of `bytes` a piece of `size` at a time; 0 hands over the whole text at once.
+readerOf(bytes: Array[byte], size: int, maxDepth: int = json.defaultMaxDepth) -> JsonReader =
+    if size == 0 then JsonReader.fromBytes(bytes, maxDepth) else JsonReader.fromReader(Pieces(bytes, size), maxDepth)
+
+// An event in a few characters: brackets, `name:` for a member's name, `L` and `R` before numbers.
+eventText(e: JsonEvent) -> string = e match
+    JsonEvent.StartObject -> "{"
+    JsonEvent.EndObject -> "}"
+    JsonEvent.StartArray -> "["
+    JsonEvent.EndArray -> "]"
+    JsonEvent.MemberName(k) -> s"$k:"
+    JsonEvent.StringValue(s) -> Json.Str(s).render
+    JsonEvent.LongValue(n) -> s"L$n"
+    JsonEvent.RealValue(x) -> s"R${Json.Real(x).render}"
+    JsonEvent.BoolValue(b) -> s"$b"
+    JsonEvent.NullValue -> "null"
+    JsonEvent.EndOfText -> "$"
+
+placed(e: json.JsonError) -> string = s"$e, offset ${e.offset}"
+
+// Every event the reader gives, to the end of the text or to its first fault.
+events(r: JsonReader) -> string
+    val out = Buffer[string]()
+    loop
+        r.next() match
+            Ok(JsonEvent.EndOfText) ->
+                out.addOne("$")
+                return out.mkString(" ")
+            Ok(e) -> out.addOne(eventText(e))
+            Err(e) ->
+                out.addOne(s"! ${placed(e)}")
+                return out.mkString(" ")
+
+// What reading a document gives: its compact text, or its error and place.
+outcome(r: Result[Json, json.JsonError]) -> string = r match
+    Ok(j) -> j.render
+    Err(e) -> s"error: ${placed(e)}"
+
+// Where the streaming reader, given the text whole or cut into pieces of every small size, reads
+// the document differently from `parse`.
+disagreements(text: string, maxDepth: int = json.defaultMaxDepth) -> Vector[string] =
+    bytesDisagreements(utf8(text), outcome(json.parse(text, maxDepth)), maxDepth)
+
+bytesDisagreements(bytes: Array[byte], expected: string, maxDepth: int = json.defaultMaxDepth) -> Vector[string]
+    val wrong = Buffer[string]()
+    for size in [0, 1, 2, 3, 4, 5, 7, 64]
+        val actual = outcome(readerOf(bytes, size, maxDepth).readDocument())
+        if actual != expected then wrong.addOne(s"${string.fromUtf8Lossy(bytes)} in pieces of $size: expected $expected, found $actual")
+    wrong.toVector
+
+@test("every kind of event, in the order the text gives them, and the end of the text after the value")
+everyEvent()
+    val text = "{\"a\": [1, -2.5, \"s\", true, false, null, {}, []], \"b\": {\"c\": 9223372036854775807}}"
+    assertEq(events(JsonReader.fromString(text)), "{ a: [ L1 R-2.5 \"s\" true false null { } [ ] ] b: { c: L9223372036854775807 } } $")
+    assertEq(events(JsonReader.fromString("  7  ")), "L7 $")
+    assertEq(events(JsonReader.fromString("\"\"")), "\"\" $")
+    assertEq(events(JsonReader.fromString("[]")), "[ ] $")
+
+@test("the end of the text is given again on every call after it")
+endRepeats()
+    val r = JsonReader.fromString("null")
+    assertEq(r.next(), Ok(JsonEvent.NullValue))
+    assertEq(r.next(), Ok(JsonEvent.EndOfText))
+    assertEq(r.next(), Ok(JsonEvent.EndOfText))
+    assertEq(r.peek(), Ok(JsonEvent.EndOfText))
+
+@test("peek gives the coming event without moving past it, and depth counts the containers open")
+peeking()
+    val r = JsonReader.fromString("[{\"k\": [true]}]")
+    assertEq(r.depth(), 0)
+    assertEq(r.peek(), Ok(JsonEvent.StartArray))
+    assertEq(r.peek(), Ok(JsonEvent.StartArray))
+    assertEq(r.depth(), 1)
+    assertEq(r.next(), Ok(JsonEvent.StartArray))
+    assertEq(r.next(), Ok(JsonEvent.StartObject))
+    assertEq(r.depth(), 2)
+    assertEq(r.peek(), Ok(JsonEvent.MemberName("k")))
+    assertEq(r.next(), Ok(JsonEvent.MemberName("k")))
+    assertEq(r.next(), Ok(JsonEvent.StartArray))
+    assertEq(r.depth(), 3)
+    assertEq(r.next(), Ok(JsonEvent.BoolValue(true)))
+    assertEq(r.next(), Ok(JsonEvent.EndArray))
+    assertEq(r.next(), Ok(JsonEvent.EndObject))
+    assertEq(r.next(), Ok(JsonEvent.EndArray))
+    assertEq(r.depth(), 0)
+    assertEq(r.next(), Ok(JsonEvent.EndOfText))
+
+// A document with something of everything the reader takes apart byte by byte: escapes, a
+// surrogate pair, text of every UTF-8 length, numbers of each kind and every word.
+val varied: string = "{\"k\\u00e9y\": [\"a\\n\\\"b\\\\\", \"\\uD83D\\uDE00x\", \"é€😀\", -0, 12.5e-3, 1E+2, 18446744073709551616],\r\n\t\"w\": [true, false, null], \"\": {\"x\": {}}}"
+
+@test("a source cut at every byte, in pieces of every size, gives the same events as the text whole")
+everySplit()
+    val bytes = utf8(varied)
+    val whole = events(JsonReader.fromString(varied))
+    assertEq(whole, "{ ké\u{79}: [ \"a\\n\\\"b\\\\\" \"😀x\" \"é€😀\" L0 R0.0125 R100.0 R18446744073709552000.0 ] w: [ true false null ] : { x: { } } } $")
+    val wrong = Buffer[string]()
+    for size in 1..bytes.length
+        val actual = events(readerOf(bytes, size))
+        if actual != whole then wrong.addOne(s"pieces of $size: $actual")
+    assertEq(wrong.toVector, Vector.empty[string]())
+
+@test("a character of every UTF-8 length is read whole wherever a piece ends inside it")
+utf8AcrossPieces()
+    for pad in 0..<4
+        for c in ["é", "€", "😀"]
+            val text = "[\"" + "a".repeat(pad) + c + "\", \"" + c + "\"]"
+            val expected = s"[ \"${"a".repeat(pad)}$c\" \"$c\" ] $$"
+            for size in 1..5
+                assertEq(events(readerOf(utf8(text), size)), expected)
+
+@test("text beyond ASCII where a value belongs is named in the error, whatever the pieces")
+unexpectedBeyondAscii()
+    for size in [0, 1, 2]
+        assertEq(outcome(readerOf(utf8("[😀]"), size).readDocument()), "error: unexpected '😀' where a value was expected at line 1, column 2, offset 1")
+        assertEq(outcome(readerOf(utf8("1 €"), size).readDocument()), "error: unexpected '€' after the value at line 1, column 3, offset 2")
+
+// The bytes of `text` with `bad` put in place of each `#`.
+withBytes(text: string, bad: Vector[int]) -> Array[byte]
+    val out = Buffer[byte]()
+    for b in text.bytes
+        if b == byte(0x23)
+            for x in bad do out.addOne(byte(x))
+        else
+            out.addOne(b)
+    out.toArray()
+
+@test("bytes that are not UTF-8 are an error at the first of them, as parse places it, in a string and out of one")
+invalidUtf8()
+    val sequences = [[0x80], [0xbf], [0xc0, 0x80], [0xc1, 0xbf], [0xe0, 0x80, 0x80], [0xe0, 0x9f, 0xbf], [0xed, 0xa0, 0x80],
+        [0xed, 0xbf, 0xbf], [0xf0, 0x80, 0x80, 0x80], [0xf0, 0x8f, 0xbf, 0xbf], [0xf4, 0x90, 0x80, 0x80], [0xf5, 0x80, 0x80, 0x80],
+        [0xff], [0xfe], [0xc3], [0xe2, 0x82], [0xf0, 0x9f, 0x98], [0xc3, 0x41], [0xe2, 0x41, 0x82]]
+    val wrong = Buffer[string]()
+    for bad in sequences
+        for shape in ["[\"ab#\"]", "[\"#\"]", "\n  \"é#x\"", "[#]", "1 #", "{\"a\":#}"]
+            val bytes = withBytes(shape, bad)
+            val expected = outcome(json.parse(bytes))
+            assert(expected.startsWith("error: bytes that are not UTF-8"))
+            wrong.addAll(bytesDisagreements(bytes, expected))
+    // A sequence cut off by the end of the text.
+    for bad in [[0xc3], [0xe2, 0x82], [0xf0, 0x9f, 0x98]]
+        val bytes = withBytes("\"#", bad)
+        wrong.addAll(bytesDisagreements(bytes, outcome(json.parse(bytes))))
+    assertEq(wrong.toVector, Vector.empty[string]())
+    assertEq(outcome(JsonReader.fromBytes(withBytes("[\"a\",\n \"#\"]", [0xff])).readDocument()), "error: bytes that are not UTF-8 at line 2, column 3, offset 8")
+
+@test("surrogate escapes pair into one character, and a lone or mismatched one is refused where parse refuses it")
+surrogates()
+    val wrong = Buffer[string]()
+    for text in ["\"\\uD83D\\uDE00\"", "\"\\ud800\\udc00\"", "\"\\uDBFF\\uDFFF\"", "\"x\\uD834\\uDD1Ey\"", "\"\\uDE00\"", "\"\\uD83D\"",
+            "\"\\uD83Dx\"", "\"\\uD83D\\n\"", "\"\\uD83D\\u0041\"", "\"\\uD83D\\uD83D\"", "\"\\uD83D\\", "\"\\uD83D\\u", "\"\\uD83D\\uDE",
+            "\"\\u12\"", "\"\\u12G4\"", "\"\\u\"", "\"\\", "\"\\x\""]
+        wrong.addAll(disagreements(text))
+    assertEq(wrong.toVector, Vector.empty[string]())
+    assertEq(JsonReader.fromString("\"\\uD83D\\uDE00\"").readString(), Ok("😀"))
+
+@test("numbers at the edges of an int, a long and a real read as parse reads them, as each kind of value")
+numberEdges()
+    val wrong = Buffer[string]()
+    for text in ["2147483647", "-2147483648", "2147483648", "-2147483649", "9223372036854775807", "-9223372036854775808",
+            "9223372036854775808", "-9223372036854775809", "-0", "0", "-0.0", "1.7976931348623157e308", "1.7976931348623158e308",
+            "1e309", "-1e400", "5e-324", "2e-324", "1e-400", "-1e-400", "123456789012345678901234567890", "0.1", "1E0", "1e+0",
+            "01", "-01", "-", "1.", "1.e5", ".5", "1e", "1e+", "-a", "+1", "0x10", "1.5e3.2"]
+        wrong.addAll(disagreements(text))
+        wrong.addAll(disagreements(s"[$text]"))
+        wrong.addAll(disagreements(s"{\"n\":$text}"))
+    assertEq(wrong.toVector, Vector.empty[string]())
+    assertEq(JsonReader.fromString("2147483647").readInt(), Ok(2147483647))
+    assertEq(JsonReader.fromString("-2147483648").readInt(), Ok(-2147483648))
+    assertEq(s"${JsonReader.fromString("2147483648").readInt().err.get}", "the number 2147483648 is not a whole number within an int's range at line 1, column 1")
+    assertEq(s"${JsonReader.fromString("2.5").readInt().err.get}", "the number 2.5 is not a whole number within an int's range at line 1, column 1")
+    assertEq(JsonReader.fromString("-9223372036854775808").readLong(), Ok(long(-9223372036854775807) - 1))
+    assertEq(JsonReader.fromString("3.0").readLong(), Ok(long(3)))
+    assertEq(JsonReader.fromString("1e3").readInt(), Ok(1000))
+    assertEq(s"${JsonReader.fromString("1.5").readLong().err.get}", "the number 1.5 is not a whole number within a long's range at line 1, column 1")
+    assertEq(s"${JsonReader.fromString("9223372036854775808").readLong().err.get}", "the number 9223372036854776000.0 is not a whole number within a long's range at line 1, column 1")
+    assertEq(JsonReader.fromString("7").readReal(), Ok(7.0))
+    assertEq(JsonReader.fromString("-0.0").readReal().map(x -> 1.0 / x), Ok(-1.0 / 0.0))
+    assertEq(s"${JsonReader.fromString("\"7\"").readReal().err.get}", "expected a number, found a string at line 1, column 1")
+
+@test("arrays and objects nest to the limit, and the bracket one deeper is the error, as in parse")
+nesting()
+    val wrong = Buffer[string]()
+    wrong.addAll(disagreements(nest(512, "1")))
+    wrong.addAll(disagreements(nest(513, "1")))
+    wrong.addAll(disagreements("{\"a\":".repeat(512) + "1" + "}".repeat(512)))
+    wrong.addAll(disagreements("{\"a\":".repeat(513) + "1" + "}".repeat(513)))
+    wrong.addAll(disagreements("[1]", 1))
+    wrong.addAll(disagreements("[[1]]", 1))
+    wrong.addAll(disagreements("1", 0))
+    wrong.addAll(disagreements("[]", 0))
+    assertEq(wrong.toVector, Vector.empty[string]())
+    assertEq(outcome(JsonReader.fromString(nest(513, "")).readDocument()), "error: arrays and objects nested more than 512 deep at line 1, column 513, offset 512")
+
+@test("a reader keeps no call stack per level, so a limit far beyond the default is read and skipped")
+deepStream()
+    val depth = 200000
+    val text = nest(depth, "\"deep\"")
+    var r = JsonReader.fromString(text, depth)
+    var most = 0
+    loop
+        val e = r.next().ok.get
+        if r.depth() > most then most = r.depth()
+        if e == JsonEvent.EndOfText then break
+    assertEq(most, depth)
+    r = JsonReader.fromString("[" + text + ", 5]", depth + 1)
+    r.beginArray().ok.get
+    assert(r.nextElement().ok.get)
+    r.skipValue().ok.get
+    assert(r.nextElement().ok.get)
+    assertEq(r.readInt(), Ok(5))
+    assertEq(r.nextElement(), Ok(false))
+    assertEq(r.finish(), Ok(()))
+    assertEq(r.depth(), 0)
+    assert(JsonReader.fromString(text, depth - 1).skipValue().isErr)
+
+@test("a mebibyte document read as a stream, whole, a byte at a time and in pieces, is the value parse reads")
+largeStream()
+    val doc = mebibyte()
+    for text in [doc.render, doc.pretty()]
+        val bytes = utf8(text)
+        for size in [0, 1, 4096, 100000]
+            assertEq(readerOf(bytes, size).readDocument().ok.get, doc)
+
+@test("every cut-short prefix of a document is an error, the same one parse gives")
+truncated()
+    val bytes = utf8(varied)
+    val wrong = Buffer[string]()
+    for end in 0..<bytes.length
+        val prefix = bytes.slice(0, end)
+        if string.fromUtf8(prefix) is Ok(text)
+            val expected = outcome(json.parse(text))
+            assert(expected.startsWith("error: "))
+            wrong.addAll(bytesDisagreements(prefix, expected))
+    assertEq(wrong.toVector, Vector.empty[string]())
+
+@test("only white space may follow the value, and a fault, once met, is met again on every call")
+trailing()
+    val wrong = Buffer[string]()
+    for text in ["1 x", "1 2", "{} {}", "[]]", "[]}", "\"a\"\"b\"", "null,", "true false", "0 \u{0}", "{}\n\n  @", "[1]\t\r\n "]
+        wrong.addAll(disagreements(text))
+    assertEq(wrong.toVector, Vector.empty[string]())
+    val r = JsonReader.fromString("[1] x")
+    assertEq(events(r), "[ L1 ] ! unexpected 'x' after the value at line 1, column 5, offset 4")
+    assertEq(r.next().err.get.offset, long(4))
+    assertEq(r.peek().err.get.offset, long(4))
+    assert(r.readValue().isErr)
+
+@test("every fault parse finds in the grammar, the streaming reader finds at the same place")
+grammarFaults()
+    val wrong = Buffer[string]()
+    for text in ["", "   ", "\n\n", "[1,]", "[1, ]", "{\"a\":1,}", "[1 2]", "{\"a\":1 \"b\":2}", "[,]", "[1,,2]", "{,}", "[", "[1", "[1,",
+            "{", "{\"a\"", "{\"a\":", "{\"a\":1", "{\"a\" 1}", "{1:2}", "{\"a\":1,,}", "tru", "truex", "nul", "nulll", "False", "NaN",
+            "Infinity", "[true,fals]", "\"a\u{1}b\"", "\"\t\"", "\"\\a\"", "\u{c}1", "\u{a0}1", "[1]\u{b}", "\"abc", "'a'", "{\"a\":1}x",
+            "[\"é\", x]", "{\"é\":\n  ]}"]
+        wrong.addAll(disagreements(text))
+    assertEq(wrong.toVector, Vector.empty[string]())
+
+@test("the decoder's calls: arrays and objects entered, elements and keys walked, values of a kind read")
+decoding()
+    val r = JsonReader.fromString("{\"name\": \"Ada\", \"age\": 36, \"home\": null, \"tags\": [\"x\", \"y\"], \"extra\": {\"deep\": [1, {\"a\": 2}]}, \"ok\": true, \"pi\": 3.5}")
+    r.beginObject().ok.get
+    assertEq(r.nextKey(), Ok(Some("name")))
+    assertEq(r.readString(), Ok("Ada"))
+    assertEq(r.nextKey(), Ok(Some("age")))
+    assert(!r.takeNull())
+    assertEq(r.readInt(), Ok(36))
+    assertEq(r.nextKey(), Ok(Some("home")))
+    assert(r.takeNull())
+    assertEq(r.nextKey(), Ok(Some("tags")))
+    r.beginArray().ok.get
+    val tags = Buffer[string]()
+    while r.nextElement().ok.get
+        tags.addOne(r.readString().ok.get)
+    assertEq(tags.toVector, ["x", "y"])
+    assertEq(r.nextKey(), Ok(Some("extra")))
+    r.skipValue().ok.get
+    assertEq(r.nextKey(), Ok(Some("ok")))
+    assertEq(r.readBool(), Ok(true))
+    assertEq(r.nextKey(), Ok(Some("pi")))
+    assertEq(r.readReal(), Ok(3.5))
+    assertEq(r.nextKey(), Ok(None))
+    assertEq(r.finish(), Ok(()))
+
+@test("a value of the wrong kind is an error at that value, naming what was expected and what was found")
+wrongKinds()
+    assertEq(s"${JsonReader.fromString("[1]").beginObject().err.get}", "expected an object, found an array at line 1, column 1")
+    assertEq(s"${JsonReader.fromString(" {}").beginArray().err.get}", "expected an array, found an object at line 1, column 2")
+    assertEq(s"${JsonReader.fromString("\n 1").readString().err.get}", "expected a string, found a number at line 2, column 2")
+    assertEq(s"${JsonReader.fromString("null").readBool().err.get}", "expected a boolean, found null at line 1, column 1")
+    assertEq(s"${JsonReader.fromString("false").readLong().err.get}", "expected a number, found a boolean at line 1, column 1")
+    assertEq(s"${JsonReader.fromString("true").readInt().err.get}", "expected a number, found a boolean at line 1, column 1")
+    val r = JsonReader.fromString("[1, 2]")
+    r.beginArray().ok.get
+    assertEq(r.readInt(), Ok(1))
+    assertEq(s"${r.readString().err.get}", "expected a string, found a number at line 1, column 5")
+    assertEq(s"${r.error("a custom fault")}", "a custom fault at line 1, column 5")
+    val e = JsonReader.fromString("[]")
+    e.beginArray().ok.get
+    assertEq(s"${e.skipValue().err.get}", "expected a value, found the end of an array at line 1, column 2")
+    assertEq(s"${JsonReader.fromString("").skipValue().err.get}", "unexpected end of text where a value was expected at line 1, column 1")
+    assertEq(s"${JsonReader.fromString("[1 2]").readValue().err.get}", "unexpected '2' in an array, where ',' or ']' was expected at line 1, column 4")
+    val o = JsonReader.fromString("{\"a\": 1}")
+    o.beginObject().ok.get
+    assertEq(s"${o.finish().err.get}", "expected the end of the text, found a member's name at line 1, column 2")
+    val done = JsonReader.fromString("1")
+    assertEq(done.readInt(), Ok(1))
+    assertEq(s"${done.readValue().err.get}", "expected a value, found the end of the text at line 1, column 2")
+
+@test("readValue builds one value whole, leaving the reader just after it")
+partialValues()
+    val r = JsonReader.fromString("[{\"a\": [1, 2.5]}, \"s\", {\"a\":1,\"a\":2}]")
+    r.beginArray().ok.get
+    assert(r.nextElement().ok.get)
+    assertEq(r.readValue().ok.get.render, "{\"a\":[1,2.5]}")
+    assert(r.nextElement().ok.get)
+    assertEq(r.readValue(), Ok(Json.Str("s")))
+    assert(r.nextElement().ok.get)
+    assertEq(r.readValue().ok.get.render, "{\"a\":1,\"a\":2}")
+    assertEq(r.nextElement(), Ok(false))
+    assertEq(r.finish(), Ok(()))
+
+@test("a source that fails to read ends the reading with its failure, placed where the reading stopped")
+readFailure()
+    val r = JsonReader.fromReader(Failing(utf8("[1,\n 2")))
+    // The 2 might go on in the next piece, so the failure ends it unread.
+    assertEq(events(r), "[ L1 ! the text could not be read: timed out at line 2, column 3, offset 6")
+    assertEq(r.next().err.get.message, "the text could not be read: timed out")
+    assertEq(outcome(JsonReader.fromReader(Failing(utf8(""))).readDocument()), "error: the text could not be read: timed out at line 1, column 1, offset 0")

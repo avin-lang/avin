@@ -481,7 +481,7 @@ source checkout. Its version is the compiler's. It is never a dependency: no man
   error at the import, listing the modules under the deepest prefix that exists:
 
 ```text
-error: the standard library has no module `avin.jsn`; the modules under `avin` are `avin.actors`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.threads`, `avin.time`
+error: the standard library has no module `avin.jsn`; the modules under `avin` are `avin.actors`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.json`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.threads`, `avin.time`
  --> app/main.avin:1:8
 ```
 
@@ -492,8 +492,17 @@ error: the standard library has no module `avin.jsn`; the modules under `avin` a
   a program reaches it.
 - **What belongs in it** is what every program's types are built from (the core traits, collections,
   strings, formatting) and what talks to the operating system (`avin.io`, `avin.fs`, `avin.process`,
-  `avin.time`, `avin.threads`). A library for one domain is a package of its own, fetched like any
-  other.
+  `avin.time`, `avin.threads`), and the formats nearly every script reads and writes (`avin.json`),
+  so a script of one file with no manifest has them. A library for one domain is a package of its
+  own, fetched like any other.
+- **An import that leaves out `avin.`** is an error that writes out the import meant, where the
+  library has a module of that name and the program has no module or declaration of its own by it:
+
+```text
+error: there is no module `json`; the standard library's is `avin.json`, imported as `import avin.json`
+ --> script.avin:1:8
+```
+
 - **It has no features.** A standard module is either imported or not, which already costs a program
   nothing it does not use.
 

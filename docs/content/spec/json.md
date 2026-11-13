@@ -1,22 +1,18 @@
 ---
 title: JSON
-summary: "The json package — `Json` values, reading text with the line and column of any error, writing compact, indented or ASCII text, and the accessors that take a value apart."
+summary: "avin.json — `Json` values, reading text with the line and column of any error, writing compact, indented or ASCII text, and the accessors that take a value apart."
 weight: 29
 ---
 
-A program reads and writes JSON through the **`json` package**, written in Avin. It lives in this
-repository at `packages/json`, its module is `json`, and a program names it as a dependency, by path
-from a checkout or by the repository's coordinate and the package's directory:
-
-```hocon
-dependencies {
-  json { path = "../avin/packages/json" }
-}
-```
+A program reads and writes JSON through **`avin.json`**, a module of the standard library written in
+Avin. It ships with the compiler, so a script of one file with no manifest imports it as it imports
+`avin.fs`; the import binds `json`. An import that leaves out `avin.`, `import json`, is an error
+that writes out the import meant, unless the program has a module or a declaration of its own named
+`json`.
 
 ```avin
-import json
-import json.Json
+import avin.json
+import avin.json.Json
 
 main()
     val event = json.parse("{\"id\": 7, \"cmd\": \"make\", \"tags\": [\"a\", \"b\"]}") match
@@ -113,8 +109,8 @@ its limit allows, reads in a bounded amount of it: a hundred megabytes of record
 twelve mebibytes of resident memory, the program included.
 
 ```avin
-import json
-import json.JsonReader
+import avin.json
+import avin.json.JsonReader
 import avin.fs
 
 // The sum of every record's "bytes", read from a log far larger than memory.
@@ -242,8 +238,8 @@ templates in [derivation](/spec/derivation/#a-json-library). There is one reader
 in hand and text arriving from a file or a connection the same way.
 
 ```avin
-import json
-import json.{JsonEncoder, JsonDecoder, JsonKey, JsonTag}
+import avin.json
+import avin.json.{JsonEncoder, JsonDecoder, JsonKey, JsonTag}
 
 data Address(street: string, city: string) derives JsonEncoder, JsonDecoder
 

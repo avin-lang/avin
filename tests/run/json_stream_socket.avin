@@ -1,0 +1,88 @@
+// expect: exit 0
+// JSON read as a stream from connections and files through `Reader`: sixteen lightweight threads
+// each read a document a peer writes a few bytes at a time over TCP, parked between pieces, while
+// the writers run on threads of their own; a Unix connection, a file, and a connection the writer
+// closes in the middle of a document, which is an error at the end of the text read so far.
+import avin.json
+import avin.json.JsonReader
+import avin.fs
+import avin.io.IoError
+import avin.io.Reader
+import avin.net.{TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+    Ok(v) -> v
+    Err(e) -> fail(e.message)
+
+bytesOf(text: string) -> Array[byte] = text.bytes.toArray()
+
+// The document thread `t` sends: records with names beyond ASCII and escapes, nested values.
+document(t: int) -> string =
+    "[" + (0..<40).map(i -> s"{\"t\": $t, \"i\": $i, \"name\": \"é\\u00e9😀 $i\", \"xs\": [$i.5, null, true, {\"deep\": [[$t]]}]}").mkString(",\n ") + "]"
+
+// Writes `text` in pieces of `size` bytes, each its own write.
+sendInPieces(out: TcpStream, text: string, size: int)
+    val bytes = bytesOf(text)
+    var at = 0
+    while at < bytes.length
+        val end = if bytes.length - at > size then at + size else bytes.length
+        ok(out.write(bytes.slice(at, end)))
+        at = end
+
+// The sum of every record's `i` and `t`, read from `source` a value at a time.
+total(source: Reader) -> Result[long, json.JsonError]
+    val r = JsonReader.fromReader(source)
+    var sum: long = 0
+    r.beginArray()?
+    while r.nextElement()?
+        r.beginObject()?
+        loop
+            r.nextKey()? match
+                None -> break
+                Some("i") | Some("t") -> sum += r.readLong()?
+                Some("name") ->
+                    if !r.readString()?.startsWith("éé😀 ") then return Err(r.error("a name read wrong"))
+                Some(_) -> r.skipValue()?
+    r.finish()?
+    Ok(sum)
+
+main()
+    val l = ok(TcpListener.bind("127.0.0.1", 0))
+    val port = l.port()
+    val writers = (0..<16).map(t -> spawn(() ->
+        val c = ok(TcpStream.connect("127.0.0.1", port))
+        sendInPieces(c, document(t), 1 + t * 3)
+        c.close()
+        t)).toVector
+    // Each connection is handed to the thread that reads it.
+    val readers = (0..<16).map(t ->
+        val conn = ok(l.accept())
+        spawn(() -> total(conn))).toVector
+    for w in writers do w.join()
+    val sums = readers.map(r -> r.join().ok.get)
+    println(sums.foldLeft(long(0), (a, b) -> a + b))
+    l.close()
+
+    val dir = ok(fs.createTempDir("json-stream"))
+    val path = s"$dir/s.sock"
+    val ul = ok(UnixListener.bind(path))
+    val served = spawn(() -> total(ok(ul.accept())))
+    val uc = ok(UnixStream.connect(path))
+    ok(uc.write(bytesOf(document(3))))
+    uc.close()
+    println(served.join())
+    ul.close()
+
+    ok(fs.writeText(s"$dir/doc.json", document(5)))
+    println(total(ok(fs.open(s"$dir/doc.json"))))
+
+    val cut = ok(TcpListener.bind("127.0.0.1", 0))
+    val cutPort = cut.port()
+    val cutReader = spawn(() -> total(ok(cut.accept())))
+    val half = ok(TcpStream.connect("127.0.0.1", cutPort))
+    ok(half.write(bytesOf("[{\"i\": 1}, {\"i\": 2, \"name\": \"unfinished")))
+    half.close()
+    println(cutReader.join().err.get)
+    cut.close()
+    ok(fs.removeDirAll(dir))

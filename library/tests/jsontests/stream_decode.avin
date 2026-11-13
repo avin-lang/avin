@@ -1,0 +1,140 @@
+module jsontests
+
+// A program's own types decoded through the streaming reader: the same value and the same errors
+// whether the text is in hand or arrives a piece at a time, however small the pieces, with an
+// error's path from the decoder and its line, column and offset from the stream.
+import avin.json
+import avin.json.Json
+import avin.json.JsonDecoder
+import avin.json.JsonEncoder
+import avin.json.JsonError
+import avin.json.JsonKey
+import avin.json.JsonReader
+import avin.json.JsonTag
+import avin.io.IoError
+
+data Part(name: string, qty: int, tags: Vector[string], note: Option[string]) derives JsonEncoder, JsonDecoder
+
+@JsonTag("kind")
+data Mark derives JsonEncoder, JsonDecoder
+    Dot
+    @JsonKey("line") Stroke(length: real)
+
+data Order(id: long, items: Vector[Part], byCode: TreeMap[int, string], mark: Mark, extra: Json) derives JsonEncoder, JsonDecoder
+
+// An order whose text crosses lines and holds characters of one to four bytes and escapes.
+val orderText: string = [
+    "{",
+    "  \"id\": 9007199254740993,",
+    "  \"items\": [",
+    "    {\"name\": \"é日😀\", \"qty\": 2, \"tags\": [\"a\\u00e9\", \"\\ud83d\\ude00\"], \"note\": null},",
+    "    {\"name\": \"b\", \"qty\": -2147483648, \"tags\": [], \"note\": \"n\"},",
+    "    {\"qty\": 3.0, \"skipped\": {\"deep\": [[1, {\"x\": null}]]}, \"name\": \"c\", \"tags\": [\"\"]}",
+    "  ],",
+    "  \"byCode\": {\"7\": \"seven\", \"-1\": \"minus\"},",
+    "  \"mark\": {\"kind\": \"line\", \"length\": 1.5e2},",
+    "  \"extra\": [true, {\"k\": -0.5}]",
+    "}",
+    ""].mkString("\n")
+
+val order: Order = Order(
+    9007199254740993,
+    [Part("é日😀", 2, ["aé", "😀"], None), Part("b", -2147483648, [], Some("n")), Part("c", 3, [""], None)],
+    TreeMap((7, "seven"), (-1, "minus")),
+    Mark.Stroke(150.0),
+    Json.arr(Json.Bool(true), Json.obj(("k", Json.num(-0.5)))))
+
+// `text` decoded as an `A` from a source giving `size` bytes at a time.
+inPieces[A: JsonDecoder](text: string, size: int, maxDepth: int = json.defaultMaxDepth) -> Result[A, JsonError] =
+    json.decode[A](Pieces(utf8(text), size), maxDepth)
+
+shown[A: Display](r: Result[A, JsonError]) -> string = r match
+    Ok(a) -> s"decoded $a"
+    Err(e) -> s"$e, offset ${e.offset}, path ${e.pathText()}"
+
+// Where decoding `text` from a source cut into pieces of each size from 1 to 9 disagrees with
+// decoding it whole.
+pieceDisagreements[A: JsonDecoder + Display](text: string) -> Vector[string]
+    val whole = shown(json.decode[A](text))
+    val wrong = Buffer[string]()
+    for size in 1..9
+        val got = shown(inPieces[A](text, size))
+        if got != whole then wrong.addOne(s"pieces of $size: $got, not $whole")
+    wrong.toVector
+
+@test("a derived type decoded from a source giving one byte at a time is the value decoded from the text whole")
+oneBytePieces()
+    assertEq(json.decode[Order](orderText), Ok(order))
+    assertEq(inPieces[Order](orderText, 1), Ok(order))
+    assertEq(pieceDisagreements[Order](orderText), Vector.empty[string]())
+    assertEq(inPieces[Order](json.encode(order), 1), Ok(order))
+    assertEq(inPieces[Vector[Part]]("[]", 1), Ok(Vector.empty[Part]()))
+    assertEq(inPieces[Mark](" {\"kind\":\"Dot\"} ", 1), Ok(Mark.Dot))
+    assertEq(inPieces[Option[int]]("null", 1), Ok(None))
+    assertEq(inPieces[string]("\"😀\"", 1), Ok("😀"))
+    assertEq(inPieces[long]("-9223372036854775808", 1), Ok(long(-9223372036854775807) - 1))
+
+@test("an error's path comes from the decoder and its line, column and offset from the stream, alike in pieces of any size")
+pathAtStreamPlace()
+    val text = "{\"id\": 1,\n \"items\": [\n  {\"name\": \"a\", \"qty\": 1, \"tags\": []},\n  {\"name\": \"b\", \"qty\": 2, \"tags\": []},\n  {\"name\": 3, \"qty\": 3, \"tags\": []}\n ]}"
+    val e = inPieces[Order](text, 1).err.get
+    assertEq(e.pathText(), "items[2].name")
+    assertEq(e.path, [json.PathStep.Key("items"), json.PathStep.Index(2), json.PathStep.Key("name")])
+    assertEq((e.line, e.column, e.offset), (long(5), long(12), long(111)))
+    assertEq(s"$e", "items[2].name: expected a string, found a number at line 5, column 12")
+    assertEq(pieceDisagreements[Order](text), Vector.empty[string]())
+
+@test("a fault in the text, a wrong kind, a missing field and a value past the limit are each found alike in any pieces")
+faultsInPieces()
+    val faults = [
+        "{\"id\": 1, \"items\": [{\"name\": \"a\" \"qty\": 1}]}",
+        "{\"id\": 1, \"items\": [{\"name\": \"a\", \"qty\": 1, \"tags\": []} {}]}",
+        "{\"id\": 1, \"items\": [{\"name\": \"a\", \"qty\": 2.5, \"tags\": []}]}",
+        "{\"id\": 1, \"items\": [{\"name\": \"a\", \"tags\": []}]}",
+        "{\"id\": 1, \"items\": [], \"byCode\": {\"x\": \"y\"}}",
+        "{\"id\": 1, \"items\": [], \"byCode\": {}, \"mark\": {\"kind\": \"square\"}}",
+        "{\"id\": 1, \"items\": [{\"name\": \"\\ud800\"}]}",
+        "{\"id\": 1, \"items\": [], \"byCode\": {}, \"mark\": {\"kind\": \"Dot\"}, \"extra\": tru}",
+        "{\"id\": 1} x",
+        ""]
+    for text in faults
+        assert(json.decode[Order](text).isErr)
+        assertEq(pieceDisagreements[Order](text), Vector.empty[string]())
+
+@test("a grammar fault met while decoding is worded as parse words it, under the path of the value being read")
+grammarFaultPath()
+    assertEq(shown(inPieces[Order]("{\"id\": 1, \"items\": [{\"name\": \"a\" \"qty\": 1}]}", 1)), "items[0]: unexpected '\"' in an object, where ',' or '}' was expected at line 1, column 34, offset 33, path items[0]")
+    assertEq(shown(inPieces[Order]("{\"id\": 1, \"items\": [{\"name\": \"a\", \"qty\": 1, \"tags\": []} {}]}", 1)), "items: unexpected '{' in an array, where ',' or ']' was expected at line 1, column 57, offset 56, path items")
+    assertEq(shown(inPieces[bool]("tru", 1)), "unexpected word 'tru' where a value was expected at line 1, column 1, offset 0, path ")
+
+@test("a failure of the source to read is an error at the place reading stopped, with the path of the value being read")
+decodeReadFailure()
+    val e = json.decode[Order](Failing(utf8("{\"id\": 1, \"items\": [{\"name\": \"ab")), json.defaultMaxDepth).err.get
+    assertEq(e.message, "the text could not be read: timed out")
+    assertEq(e.pathText(), "items[0].name")
+    assertEq(json.decode[int](Failing(utf8("")), json.defaultMaxDepth).err.get.message, "the text could not be read: timed out")
+
+@test("decoding from a source refuses anything but white space after the value, and the nesting limit holds")
+endAndDepth()
+    assertEq(shown(inPieces[int](" 7 \n\t", 1)), "decoded 7")
+    assertEq(shown(inPieces[int]("7 8", 1)), "unexpected '8' after the value at line 1, column 3, offset 2, path ")
+    assertEq(shown(inPieces[int]("", 1)), "unexpected end of text where a value was expected at line 1, column 1, offset 0, path ")
+    val deep = "{\"id\": 1, \"items\": [], \"byCode\": {}, \"mark\": {\"kind\": \"Dot\"}, \"extra\": [[[]]]}"
+    assert(inPieces[Order](deep, 1, 4).isOk)
+    assertEq(inPieces[Order](deep, 1, 3).err.get.message, "arrays and objects nested more than 3 deep")
+    assertEq(json.decode[Order](deep, 3).err.get.message, "arrays and objects nested more than 3 deep")
+
+@test("a long document of derived records decodes from small pieces as from the whole text")
+manyRecords()
+    val parts = (0..<2000).map(i -> Part(s"p$i é", i, [s"$i"], if i % 3 == 0 then Some("n") else None)).toVector
+    val text = json.encode(parts)
+    assertEq(inPieces[Vector[Part]](text, 7), Ok(parts))
+    assertEq(inPieces[Vector[Part]](text, 1).map(v -> v.length), Ok(2000))
+
+@test("a JsonError made by hand takes int places, which widen to the long fields")
+handMadeError()
+    val e = JsonError("m", 2, 3, 9)
+    assertEq((e.line, e.column, e.offset), (long(2), long(3), long(9)))
+    assertEq(s"${e.atIndex(4).inField("k")}", "k[4]: m at line 2, column 3")
+    val far = JsonError("far", 1, 3000000000, 5000000000)
+    assertEq(s"$far", "far at line 1, column 3000000000")

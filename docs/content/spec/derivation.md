@@ -277,7 +277,7 @@ that never encodes a `Person` compiles none of the encoder.
 ## A JSON library
 
 The core of a `json` library written with templates. `JsonWriter` writes text and places the
-commas; `JsonReader` is the json package's [streaming reader](/spec/json/#reading-a-stream), which
+commas; `JsonReader` is `avin.json`'s [streaming reader](/spec/json/#reading-a-stream), which
 reads events from text in hand or from any `Reader`, one at a time.
 
 ```text

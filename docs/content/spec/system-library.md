@@ -515,7 +515,7 @@ trait Reader
 source is still going, and an empty array once it has ended. `fs.File` is a reader by its own
 `read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
-[json package](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
+[`avin.json`](/spec/json/#reading-a-stream)'s `JsonReader` reads JSON from any reader.
 
 ### `Source`
 
@@ -1259,6 +1259,5 @@ with futures reaches for is there, under these names:
 
 ## JSON
 
-JSON is not part of the system library: reading and writing it is a package of its own, which a
-program adds as a dependency. It is the [`json` package](/spec/json/), in `packages/json` of this
-repository.
+JSON is part of the standard library: [`avin.json`](/spec/json/), in `library/avin/json`, which a
+script of one file imports with no manifest, `import avin.json`.

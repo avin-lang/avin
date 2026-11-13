@@ -1,0 +1,256 @@
+module avin.json
+
+// Encoding and decoding a program's own types. `derives JsonEncoder` and `derives JsonDecoder` give a
+// data type or a class an encoder and a decoder written for its own fields: a value is an object of
+// its fields, by name, and a value of a type of several variants also carries its variant's name
+// under a discriminator key written first.
+
+import avin.io.Reader
+
+// A value that writes itself as JSON.
+trait JsonEncoder
+    encode(out: JsonWriter)
+
+// A value read from JSON. `whenMissing` is the value of a field absent from the input, where the type
+// has one: `None` for an `Option`, and nothing for any other type, whose absence is an error.
+trait JsonDecoder
+    static decode(r: JsonReader) -> Result[Self, JsonError]
+    static whenMissing() -> Option[Self]
+
+// A field's or a variant's name in JSON, in place of its name in the program.
+data JsonKey(name: string)
+impl Annotation for JsonKey
+
+// The discriminator key of a type of several variants, in place of `"type"`.
+data JsonTag(key: string)
+impl Annotation for JsonTag
+
+// A field never written, and skipped where the input has it: a decoded value takes the field's
+// default.
+object JsonOmit: Annotation
+
+// `value` as compact JSON text.
+encode[A: JsonEncoder](value: A) -> string
+    val text = StringWriter()
+    value.encode(JsonWriter(text))
+    text.text
+
+// The value of type `A` that `text` writes, with nothing but white space around it, or the first
+// thing wrong with it, its path naming where in the document the value at fault is.
+decode[A: JsonDecoder](text: string, maxDepth: int = defaultMaxDepth) -> Result[A, JsonError] =
+    decodeAll[A](JsonReader.fromString(text, maxDepth))
+
+// The value of type `A` that the text `source` gives holds, read as it arrives: from a file, a
+// connection or any other `Reader`, a piece at a time, so no copy of the whole text is made. A failure
+// to read the source is an error at the place reading stopped.
+decode[A: JsonDecoder](source: Reader, maxDepth: int = defaultMaxDepth) -> Result[A, JsonError] =
+    decodeAll[A](JsonReader.fromReader(source, maxDepth))
+
+private decodeAll[A: JsonDecoder](r: JsonReader) -> Result[A, JsonError]
+    val value = A.decode(r)?
+    r.finish()?
+    Ok(value)
+
+private keyOf(f: FieldShape) -> string = f.annotation[JsonKey]().map(k -> k.name).getOrElse(f.name)
+
+private nameOf(v: VariantShape) -> string = v.annotation[JsonKey]().map(k -> k.name).getOrElse(v.name)
+
+private tagOf(t: TypeShape) -> string = t.annotation[JsonTag]().map(tag -> tag.key).getOrElse("type")
+
+// The built-in types: a `bool` as `true` or `false`, the integers and `real` as numbers, a string as a
+// string, a `Json` as itself.
+
+impl JsonEncoder for bool
+    encode(out: JsonWriter) = out.bool(self)
+
+impl JsonDecoder for bool
+    static decode(r: JsonReader) -> Result[bool, JsonError] = r.readBool()
+    static whenMissing() -> Option[bool] = None
+
+impl JsonEncoder for int
+    encode(out: JsonWriter) = out.long(long(self))
+
+impl JsonDecoder for int
+    static decode(r: JsonReader) -> Result[int, JsonError] = r.readInt()
+    static whenMissing() -> Option[int] = None
+
+impl JsonEncoder for long
+    encode(out: JsonWriter) = out.long(self)
+
+impl JsonDecoder for long
+    static decode(r: JsonReader) -> Result[long, JsonError] = r.readLong()
+    static whenMissing() -> Option[long] = None
+
+// A NaN or an infinity, which JSON cannot write, is written `null`, and does not read back as a `real`.
+impl JsonEncoder for real
+    encode(out: JsonWriter) = out.real(self)
+
+impl JsonDecoder for real
+    static decode(r: JsonReader) -> Result[real, JsonError] = r.readReal()
+    static whenMissing() -> Option[real] = None
+
+impl JsonEncoder for string
+    encode(out: JsonWriter) = out.string(self)
+
+impl JsonDecoder for string
+    static decode(r: JsonReader) -> Result[string, JsonError] = r.readString()
+    static whenMissing() -> Option[string] = None
+
+impl JsonEncoder for Json
+    encode(out: JsonWriter) = out.json(self)
+
+impl JsonDecoder for Json
+    static decode(r: JsonReader) -> Result[Json, JsonError] = r.readValue()
+    static whenMissing() -> Option[Json] = None
+
+// An `Option` is `null` when it is `None`, and its value otherwise; a field of an `Option` type absent
+// from the input is `None`.
+impl[A: JsonEncoder] JsonEncoder for Option[A]
+    encode(out: JsonWriter) = self match
+        Some(a) -> a.encode(out)
+        None -> out.writeNull()
+
+impl[A: JsonDecoder] JsonDecoder for Option[A]
+    static decode(r: JsonReader) -> Result[Option[A], JsonError] =
+        if r.takeNull() then Ok(None) else A.decode(r).map(a -> Some(a))
+    static whenMissing() -> Option[Option[A]] = Some(None)
+
+// A vector and a list are arrays, the path of an error in an element naming its index.
+impl[A: JsonEncoder] JsonEncoder for Vector[A]
+    encode(out: JsonWriter)
+        out.beginArray()
+        for a in self
+            a.encode(out)
+        out.endArray()
+
+impl[A: JsonDecoder] JsonDecoder for Vector[A]
+    static decode(r: JsonReader) -> Result[Vector[A], JsonError] = decodeElements[A](r)
+    static whenMissing() -> Option[Vector[A]] = None
+
+private decodeElements[A: JsonDecoder](r: JsonReader) -> Result[Vector[A], JsonError]
+    r.beginArray()?
+    val items = Buffer[A]()
+    while r.nextElement()?
+        items.addOne(A.decode(r).mapErr(e -> e.atIndex(items.length))?)
+    Ok(items.toVector)
+
+impl[A: JsonEncoder] JsonEncoder for List[A]
+    encode(out: JsonWriter)
+        out.beginArray()
+        for a in self
+            a.encode(out)
+        out.endArray()
+
+impl[A: JsonDecoder] JsonDecoder for List[A]
+    static decode(r: JsonReader) -> Result[List[A], JsonError] = decodeElements[A](r).map(items -> items.toList)
+    static whenMissing() -> Option[List[A]] = None
+
+// A type whose values are an object's keys: a string as itself, and an `int` or a `long` as its
+// decimal digits, read back only from exactly what `toLongOption` reads.
+trait JsonMapKey
+    jsonKey() -> string
+    static fromJsonKey(key: string) -> Option[Self]
+
+impl JsonMapKey for string
+    jsonKey() -> string = self
+    static fromJsonKey(key: string) -> Option[string] = Some(key)
+
+impl JsonMapKey for int
+    jsonKey() -> string = s"$self"
+    static fromJsonKey(key: string) -> Option[int] = key.toIntOption()
+
+impl JsonMapKey for long
+    jsonKey() -> string = s"$self"
+    static fromJsonKey(key: string) -> Option[long] = key.toLongOption()
+
+// A map, a `HashMap` or a `TreeMap`, whose keys are a `JsonMapKey`, is an object of its entries in
+// the map's own order; a key written twice in the input keeps its last value.
+impl[K: JsonMapKey, A: JsonEncoder] JsonEncoder for HashMap[K, A]
+    encode(out: JsonWriter) = encodeEntries(out, self.iterator())
+
+impl[K: JsonMapKey, A: JsonDecoder] JsonDecoder for HashMap[K, A]
+    static decode(r: JsonReader) -> Result[HashMap[K, A], JsonError] = decodeEntries(r, HashMap.newBuilder[K, A]())
+    static whenMissing() -> Option[HashMap[K, A]] = None
+
+impl[K: JsonMapKey, A: JsonEncoder] JsonEncoder for TreeMap[K, A]
+    encode(out: JsonWriter) = encodeEntries(out, self.iterator())
+
+impl[K: JsonMapKey, A: JsonDecoder] JsonDecoder for TreeMap[K, A]
+    static decode(r: JsonReader) -> Result[TreeMap[K, A], JsonError] = decodeEntries(r, TreeMap.newBuilder[K, A]())
+    static whenMissing() -> Option[TreeMap[K, A]] = None
+
+private encodeEntries[K: JsonMapKey, A: JsonEncoder](out: JsonWriter, entries: Iterator[(K, A)])
+    out.beginObject()
+    for (k, a) in entries
+        out.key(k.jsonKey())
+        a.encode(out)
+    out.endObject()
+
+private decodeEntries[K: JsonMapKey, A: JsonDecoder, M](r: JsonReader, entries: Builder[(K, A), M]) -> Result[M, JsonError]
+    r.beginObject()?
+    while r.nextKey()? is Some(name)
+        val k = K.fromJsonKey(name) match
+            Some(k) -> k
+            None -> return Err(r.error(s"the key \"$name\" is not a key of this map's type").inField(name))
+        entries.addOne((k, A.decode(r).mapErr(e -> e.inField(name))?))
+    Ok(entries.result())
+
+// The derived encoder: an object of the value's fields, by name, each written by its own type's
+// encoder. A type of several variants writes its variant's name first, under its discriminator key.
+derive JsonEncoder for T
+    encode(out: JsonWriter)
+        T.walk(self, FieldWriter(out, T.shape()))
+        out.endObject()
+
+private data FieldWriter(out: JsonWriter, shape: TypeShape)
+
+impl ShapeVisitor for FieldWriter
+    variant(v: VariantShape) -> FieldWriter
+        out.beginObject()
+        if shape.variantCount > 1
+            out.key(tagOf(shape))
+            out.string(nameOf(v))
+        self
+
+impl FieldWriter
+    field[F: JsonEncoder](f: FieldShape, value: F) -> FieldWriter
+        if !f.has(JsonOmit)
+            out.key(keyOf(f))
+            value.encode(out)
+        self
+
+// The derived decoder reads as the text comes: the discriminator first, where the type has several
+// variants, then each key, decoding its value at that field's type. A key no field has is skipped, a
+// key written twice is an error, and a field absent from the input takes its default, or its type's
+// `whenMissing`, or is an error naming it.
+derive JsonDecoder for T
+    static decode(r: JsonReader) -> Result[T, JsonError] = T.build(FieldReader(r))
+    static whenMissing() -> Option[T] = None
+
+private data FieldReader(r: JsonReader)
+
+impl ShapeBuilder[JsonError] for FieldReader
+    variant(t: TypeShape) -> Result[int, JsonError]
+        r.beginObject()?
+        if t.variantCount == 1 then return Ok(0)
+        val tag = tagOf(t)
+        if r.nextKey()? != Some(tag) then return Err(r.error(s"expected \"$tag\" first, naming the variant"))
+        val name = r.readString().mapErr(e -> e.inField(tag))?
+        t.variants.find(v -> nameOf(v) == name) match
+            Some(v) -> Ok(v.index)
+            None -> Err(r.error(s"unknown variant \"$name\"").inField(tag))
+
+    next(v: VariantShape) -> Result[Option[int], JsonError]
+        while r.nextKey()? is Some(key)
+            if v.fields.find(f -> !f.has(JsonOmit) && keyOf(f) == key) is Some(f) then return Ok(Some(f.index))
+            r.skipValue()?
+        Ok(None)
+
+    duplicate(f: FieldShape) -> JsonError = r.error(s"duplicate field \"${keyOf(f)}\"")
+
+impl FieldReader
+    field[F: JsonDecoder](f: FieldShape) -> Result[F, JsonError] = F.decode(r).mapErr(e -> e.inField(keyOf(f)))
+
+    missing[F: JsonDecoder](f: FieldShape) -> Result[F, JsonError] = F.whenMissing() match
+        Some(value) -> Ok(value)
+        None -> Err(r.error(s"missing field \"${keyOf(f)}\""))

@@ -1509,7 +1509,8 @@ Settled by the user on 2026-11-04:
     `fallbackTo`), an `Executor` for pools of one's own (its execution context, chosen explicitly),
     `threads.blocking(body)` and `threads.sleep(d)`. There is no `failed` or `filter`, since a future
     carries no failure. Bindings: none beyond a runtime timed wait for `sleep`. Not blocked.
-  - **JSON** is a package of its own, not part of the system library.
+  - **JSON** is a package of its own, not part of the system library (since proposed to be
+    `avin.json` in the standard library: see that Proposed entry).
 
 - Settled by the user 2026-11-04: Lower bounds and the expected type ([generics](/spec/generics/#lower-bounds)): the expected type
   decides a lower-bounded type argument only where it admits the bound; otherwise the argument is
@@ -4314,7 +4315,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   not either, and a regular file's read does not wait for a peer. ALTERNATIVES: bind them
   `blocking` (needed only for files on a stalled network mount).
 
-- Settled on the user's delegation 2026-11-06 (branch `json`): **JSON is the package `json`, in `packages/json` of this repository,
+- (Superseded by the Proposed entry **JSON is `avin.json` in the standard library**.) Settled on the user's delegation 2026-11-06 (branch `json`): **JSON is the package `json`, in `packages/json` of this repository,
   module `json`, rather than `avin.json` in the standard library** ([JSON](/spec/json/)). Why: the
   system library chapter already says JSON is a package of its own; the package mechanism reads a
   path dependency and a git dependency on a directory of a repository (`//packages/json`), as the
@@ -4365,7 +4366,7 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   knows is there, as a map's is; a producer writing `3.0` for a count is common. Alternatives
   weighed: a missing member answering `Null` (confuses absent with null); a cursor type with its
   own errors (a later layer, which the derivation's `JsonReader` covers).
-- Settled on the user's delegation 2026-11-06 (branch `json`): **the corpus runs every package under `packages/` that has a `tests`
+- (JSON's tests have since moved to `library/tests`; see the Proposed entry **JSON is `avin.json` in the standard library**. The rule stands for any later package with tests.) Settled on the user's delegation 2026-11-06 (branch `json`): **the corpus runs every package under `packages/` that has a `tests`
   directory, with `avin test` at `-O0` and `-O2`.** Why: a package's tests are what `avin test`
   runs in it, and the repository's own packages must be gated like the core library is. A package
   whose behaviour needs a window (`ui`) has no such directory.
@@ -7367,6 +7368,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
+
+- Proposed (built on branch `json-stdlib`): **JSON is `avin.json` in the standard library**, moved
+  from the package `packages/json` (module `json`); it supersedes the 2026-11-06 entry that made it
+  a package, and the one that had the corpus gate `packages/json`'s tests. Its tests are
+  `library/tests/json_*.avin`, run with the core library's own; its corpus programs are single files
+  in `tests/run/json_*.avin` and `tests/reject/json_*.avin` with no manifest. An import that leaves
+  out `avin.`, `import json` or `import fs.readText`, is an error naming the import meant (it reads: there is
+  no module `json`; the standard library's is `avin.json`, imported as `import avin.json`), unless
+  the program has a module or a top-level declaration of that name. *Why*: reading JSON is the first
+  thing many scripts do, and a script of one file has no manifest to name a dependency in; marshal
+  and most services need it; and the library is read only where imported, so a program that does not
+  import it pays nothing. The hint is general rather than a list of package names because the one
+  well-known package name a script reached for is now a library module, and a list in the compiler
+  would go stale. *Alternatives*: a package the compiler makes available by default without a
+  manifest (a second, implicit dependency mechanism with its own versioning); keeping the package and
+  only improving the diagnostic (still no JSON for a lone script); the module name
+  `dev.avinlang.json` for the package (the prefix packages take, but still a package). Programs
+  outside this repository change `import json` to `import avin.json` and drop the `json` dependency
+  from their manifests. Review with the user: it reverses a settled decision, and it widens what the
+  standard library holds from "what talks to the operating system" to "the formats nearly every
+  script reads".
 
 ## Open
 
