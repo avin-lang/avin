@@ -7676,6 +7676,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **A function whose result is `Nothing` converts to one of another result where it is written, as a
+  lambda calling it, and not inside another type** ([types](/spec/types/#any-and-nothing); branch
+  `nothing-conversion`). The subtyping rules already made `(A) -> Nothing` a subtype of every
+  `(A) -> R`, but no function value of it was accepted where one was expected (only a lambda whose
+  body never finishes, checked against the expected type), while an inferred type argument let one
+  through with no conversion, and the call through the wider type then called code yielding no value
+  as code yielding one. A call of a `Nothing` function yields no value at all, and one of an
+  `(A) -> R` yields an `R`, so the two are laid out differently and one is not the other as it
+  stands. The choice: at a declared type, an argument (after inference too), a result, a field, and
+  the branches of an `if`/`match` or elements of a collection literal, the value is evaluated once
+  into a local and made a lambda of the expected type calling it (a named function is called by name
+  and nothing is captured, so it may be `@sendable`); nested results (`() -> () -> Nothing`) convert
+  one level at a time. Parameters keep their variance; a `Vector[(int) -> Nothing]` is no
+  `Vector[(int) -> int]`, as a `Vector[int]` is no `Vector[Any]`. Why: it gives the subtyping rule
+  its meaning with no change to how functions are called, and matches how a value of a value type
+  becomes an `Any` or a trait (at the site, never inside a container). Alternatives weighed: a view
+  with no conversion, the closure's entry for a `Nothing` result answering every result's layout
+  (impossible in one entry: an `int`, a `real`, a reference and no value are returned differently);
+  a dedicated adapter node in lowering (the same conversion, built by hand rather than as a checked
+  lambda); refusing the conversion and keeping only lambdas (contradicts the subtyping rule, and the
+  inferred case had to be closed anyway). Review with the user: whether a function held inside a
+  collection should convert too, which needs a copy of the collection.
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

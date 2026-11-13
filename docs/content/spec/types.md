@@ -520,6 +520,24 @@ never returns. It is a subtype of every type, and an expression of type `Nothing
 value. An empty collection literal or `None` does **not** have a `Nothing` type argument; its type
 comes from context (see [inference](/spec/generics/#inference)).
 
+A function's result is a covariant position, so a function whose result is `Nothing` is a function
+of every result type: a named function, a lambda, a method value or any other value of type
+`(A) -> Nothing` may be used where an `(A) -> R` is expected, and so may a `() -> () -> Nothing` where
+a `() -> () -> R` is. It converts where it is written, in a declared type, an argument (also one
+whose parameter type the other arguments decide), a result, a field, and the branches of an `if` or
+`match` or the elements of a collection literal, which agree on the other function type; the value
+is evaluated once, there. Its parameters still vary as a function's do: an `(Animal) -> Nothing` is a
+`(Dog) -> string`, and a `(Dog) -> Nothing` is no `(Animal) -> string`. Inside another type it is
+not converted, as a value of a value type is not: a `Vector[(int) -> Nothing]` is no
+`Vector[(int) -> int]` ([proposed](/spec/decisions/#proposed)).
+
+```text
+refuse(x: int) -> Nothing = fail(s"refused $x")
+
+val f: (int) -> Option[int] = refuse
+val g = if strict then refuse else (x: int) -> Some(x)    // (int) -> Option[int]
+```
+
 ## Union types
 
 `A | B` is a value of `A` or of `B`, written in annotations and never inferred, made at a single
