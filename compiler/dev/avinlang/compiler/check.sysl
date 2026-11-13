@@ -13654,7 +13654,11 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
     if !numeric && has_operator_traits(zonk(c, l.ty))
         if binary_operator_method(op) is Some(om)
             if !same_type(zonk(c, l.ty), zonk(c, r.ty))
-                c.note(unit_of(c), at, s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+                val what = s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+                if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
+                    c.note(unit_of(c), operand, s"$what; $hint")
+                else
+                    c.note(unit_of(c), at, what)
                 return TExpr(at, ErrorType, UnitConst)
             if !operator_conforms(c, at, spelling, zonk(c, l.ty), om.trait_name) then return TExpr(at, ErrorType, UnitConst)
             return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
@@ -13664,13 +13668,21 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight || wrapping_or_saturating(op)
             if integer_type(c, zonk(c, l.ty))
                 if !same_type(zonk(c, l.ty), zonk(c, r.ty))
-                    c.note(unit_of(c), at, s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+                    val what = s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+                    if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
+                        c.note(unit_of(c), operand, s"$what; $hint")
+                    else
+                        c.note(unit_of(c), at, what)
                     return TExpr(at, ErrorType, UnitConst)
                 return TExpr(at, zonk(c, l.ty), Arith(op, l, r, op_at))
             c.note(unit_of(c), at, s"`${type_name(zonk(c, l.ty))}` has no method `$spelling`")
             return TExpr(at, ErrorType, UnitConst)
     if !numeric || !same_type(l.ty, r.ty)
-        c.note(unit_of(c), at, s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}")
+        val what = s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+        if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
+            c.note(unit_of(c), operand, s"$what; $hint")
+        else
+            c.note(unit_of(c), at, what)
         return TExpr(at, ErrorType, UnitConst)
     val bitwise = op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
     val arithmetic = op is Add || op is Subtract || op is Multiply || op is Divide || op is Remainder
@@ -13681,6 +13693,76 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         c.note(unit_of(c), at, s"`$spelling` is not defined on real")
         return TExpr(at, ErrorType, UnitConst)
     TExpr(at, l.ty, Arith(op, l, r, op_at))
+
+// Whether an operator spelled `spelling` is a compound assignment's, as `+=` and `+:=` are, whose
+// target keeps its type.
+private compound_spelling(spelling: string) -> bool = spelling.ends_with("=")
+
+/** The conversion that makes two numbers of different types one type, as the span of the operand to
+ * convert and the hint that says how. An integer converts to a wider integer, to `real` and to a type
+ * parameter bounded by `Integer` (`T(n)`), a `byte` to an integer or `real`, and a value of a type parameter bounded by `Numeric` to `real` by `toReal`. Where `fixed`, the left
+ * operand is a compound assignment's target, whose type cannot change, so the right one converts to
+ * it by any conversion there is, a narrowing one included. `None` where no conversion joins the two. */
+private width_conversion(c: *Checker, l: &TExpr, r: &TExpr, fixed: bool) -> Option[(Span, string)]
+    val x = zonk(c, l.ty)
+    val y = zonk(c, r.ty)
+    if fixed
+        if converts_to(c, y, x) then return Some((r.span, conversion_hint(c, r, x)))
+        return None
+    if widens_to(c, x, y) then return Some((l.span, conversion_hint(c, l, y)))
+    if widens_to(c, y, x) then return Some((r.span, conversion_hint(c, r, x)))
+    None
+
+// Whether a value of type `from` converts to `to` without losing its meaning: the direction a mixed
+// operation is joined in.
+private widens_to(c: *Checker, from: &Type, to: &Type) -> bool = *from match
+    Int(a) -> *to match
+        Int(b) -> a < b
+        Real -> true
+        TypeVar(_, _, _) -> integer_type(c, to)
+        _ -> false
+    Byte -> *to is Int(_) || *to is Real
+    TypeVar(_, _, _) -> *to is Real && numeric_param(c, from)
+    _ -> false
+
+// Whether a value of type `from` converts to the number type `to` by a call of `to`, or by `toReal`,
+// narrowing or not. A `byte` is no target: it has no arithmetic for the converted value to meet.
+private converts_to(c: *Checker, from: &Type, to: &Type) -> bool = *from match
+    Int(_) -> *to is Int(_) || *to is Real || (*to is TypeVar(_, _, _) && integer_type(c, to))
+    Real -> *to is Int(_)
+    Byte -> *to is Int(_) || *to is Real
+    TypeVar(_, _, _) -> (*to is Real && numeric_param(c, from)) || (*to is Int(_) && integer_type(c, from))
+    _ -> false
+
+// Whether `t` is a type parameter bounded by `Numeric`, whose values have `toReal`.
+private numeric_param(c: *Checker, t: &Type) -> bool
+    if !(*t is TypeVar(_, _, _)) then return false
+    core_trait(c, "Numeric") match
+        Some(numeric) -> conforms_to_bound(c, t, numeric)
+        None -> false
+
+/** How to write `operand` as a value of type `to`: `write `long(n)``, with the operand as written, or
+ * `write `n.toReal`` for a value of a type parameter becoming a `real`. An operand longer than a line
+ * of a message, or written over several lines, is named by its type instead. */
+private conversion_hint(c: *Checker, operand: &TExpr, to: &Type) -> string
+    val src = c.units[unit_of(c)].src
+    val text = from_utf8_unchecked(src.text(operand.span))
+    val short = text.bytes.len <= 40 && src.locate(operand.span.start).line == src.locate(operand.span.end).line
+    val from = zonk(c, operand.ty)
+    if *from is TypeVar(_, _, _) && *to is Real
+        if !short then return s"convert the ${type_name(from)} with `toReal`"
+        if simple_operand(text) then return s"write `$text.toReal`"
+        return s"write `($text).toReal`"
+    if !short then return s"convert the ${type_name(from)} with a call of `${type_name(to)}`"
+    s"write `${type_name(to)}($text)`"
+
+// Whether `text` is an operand a member can follow without parentheses: a name, a member, a call or
+// an index, with no operator or space at its top.
+private simple_operand(text: string) -> bool
+    for b in chars_of(text.bytes)
+        if !(('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9') || b == '_' || b == '.' || b == '(' || b == ')' || b == '[' || b == ']')
+            return false
+    true
 
 private wrapping_or_saturating(op: BinaryOp) -> bool = op match
     AddWrapping -> true
@@ -13807,6 +13889,11 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
     val at = a.span.to(b.span)
     val spelling = compare_spelling(op)
     val identity = op is Same || op is NotSame
+    // Two numbers of different types compare once one is converted, which the diagnostic says how.
+    if !identity && !same_type(zonk(c, a.ty), zonk(c, b.ty)) && !fits(c, zonk(c, a.ty), zonk(c, b.ty)) && !fits(c, zonk(c, b.ty), zonk(c, a.ty))
+        if width_conversion(c, a, b, false) is Some((operand, hint))
+            c.note(unit_of(c), operand, s"`$spelling` cannot compare ${type_name(zonk(c, a.ty))} with ${type_name(zonk(c, b.ty))}; $hint")
+            return
     if op is Equal || op is NotEqual then return equality_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     if !identity then return ordering_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     val x = zonk(c, a.ty)
