@@ -293,6 +293,10 @@ private resolved(c: *Checker, t: &Type) -> &Type = *t match
     Var(id) -> c.vars[id] match
         Some(bound) -> resolved(c, bound)
         None -> t
+    // An application whose constructor is known is the type it makes.
+    Applied(head, args) -> *resolved(c, head) match
+        Constructor(body, _) -> resolved(c, substitute(body, hole_owner(), args))
+        _ -> t
     _ -> t
 
 /** The indices of the type parameters of `owner` that `t` names. */
@@ -320,13 +324,27 @@ private params_in(c: *Checker, t: &Type, owner: usize, out: *Buf[usize])
         Opaque(_, _, args, _) ->
             for x in args
                 params_in(c, x, owner, out)
+        Constructor(body, _) -> params_in(c, body, owner, out)
+        Applied(head, args) ->
+            params_in(c, head, owner, out)
+            for x in args
+                params_in(c, x, owner, out)
         _ -> ()
 
 /** How deep in `t` its deepest mention of type parameter `i` of `owner` is: 0 for the parameter
- * itself, one more for each type around it; -1 where `t` does not name it. */
+ * itself, one more for each type around it; -1 where `t` does not name it. A constructor is as deep
+ * as the type it makes, so a constructor parameter passed bare, `F`, is at 0, and `Wrap[F, _]` at 1;
+ * the head of an application `F[A]` is at the application's own depth, its arguments one deeper. */
 private depth_of(c: *Checker, t: &Type, owner: usize, i: usize) -> i64
     val parts: Buf[&Type] = *resolved(c, t) match
         TypeVar(o, j, _) -> return if o == owner && j == i then 0 else -1
+        Constructor(body, _) -> return depth_of(c, body, owner, i)
+        Applied(head, args) ->
+            var deepest = depth_of(c, head, owner, i)
+            for x in args
+                val d = depth_of(c, x, owner, i)
+                if d >= 0 && d + 1 > deepest then deepest = d + 1
+            return deepest
         Tuple(items) -> items
         Function(params, result, _) ->
             var all: Buf[&Type] = buf()
@@ -402,6 +420,10 @@ private mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type)
         ByName(inner) -> mention(c, f, site, span, inner)
         // An opaque type's code is its representation's.
         Opaque(_, _, _, repr) -> mention(c, f, site, span, repr)
+        Constructor(body, _) -> mention(c, f, site, span, body)
+        Applied(_, args) ->
+            for x in args
+                mention(c, f, site, span, x)
         _ -> ()
 
 /** A direct call or function value of `id`. A local function or lambda with no type parameters of
@@ -508,6 +530,9 @@ private walk(c: *Checker, f: *Flow, site: Site, e: &TExpr)
         LazyGlobal(_, initialize, _) -> walk(c, f, site, initialize)
         LazyField(object, _, initialize, _) ->
             walk(c, f, site, object)
+            walk(c, f, site, initialize)
+        LazyLocal(cell, initialize, _, _) ->
+            walk(c, f, site, cell)
             walk(c, f, site, initialize)
         StoreGlobal(_, value, _) -> walk(c, f, site, value)
         Block(items) -> walk_all(c, f, site, items)
@@ -870,7 +895,7 @@ private all_any(c: *Checker, items: Buf[&Type]) -> Buf[&Type]
 // The guarded edges are connected here too, from the outermost types that reach them, and each
 // step can bring another a new one, so the steps repeat until none adds a node or an edge.
 private connect_bounds(c: *Checker, f: *Flow)
-    val conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers)
+    val conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers, None)
     var size = 0usize
     while f.edges.len() + f.keys.len() != size
         size = f.edges.len() + f.keys.len()

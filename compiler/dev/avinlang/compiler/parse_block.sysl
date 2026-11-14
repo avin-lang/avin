@@ -134,6 +134,28 @@ parse_binding(p: *Parser, at: Span, mutable: bool) -> &Expr
     if p.accept(":") then declared = Some(parse_type(p))
     binding_value(p, at, mutable, pattern, name, declared)
 
+// `lazy val x = value` in a block, after `lazy`: one name, computed on its first read.
+parse_lazy_binding(p: *Parser, at: Span) -> &Expr
+    val mutable = p.at("var")
+    p.toks.advance()
+    reject_lazy_var(p, at, mutable)
+    var binding: &Expr = Expr(at, Invalid)
+    if !p.at("(") && p.ahead(1) == ":"
+        val name = declared_name(p, "a value")
+        p.expect(":")
+        val declared = parse_type(p)
+        if p.at_line_end()
+            p.report.add(error(at.to(declared.span), "a `lazy val` is computed from its initializer, so it needs one"))
+            return Expr(at.to(declared.span), Invalid)
+        binding = binding_value(p, at, false, None, name, Some(declared))
+    else binding = parse_binding(p, at, false)
+    binding.kind match
+        Binding(name, declared, value, _) -> Expr(binding.span, LazyBinding(name, declared, value))
+        Destructure(_, _, _, _) ->
+            p.report.add(error(binding.span, "a `lazy val` names one value; take the value apart where it is read"))
+            Expr(binding.span, Invalid)
+        _ -> binding
+
 // The rest of a binding, from its `=`: `pattern` or `name` and the type `declared` are parsed.
 binding_value(p: *Parser, at: Span, mutable: bool, pattern: Option[&Pattern], name: string, declared: Option[&TypeExpr]) -> &Expr
     p.expect("=")
@@ -199,7 +221,8 @@ parse_for(p: *Parser, at: Span) -> &Expr
     val generators = grouped(p, clauses)
     if p.accept("yield")
         val indented = p.at_kind(Indent)
-        val body = parse_line_body(p, false)
+        // Inside brackets whose commas separate items a comma ends a one-line `yield` value.
+        val body = if p.in_list && !indented then expression(p, 0) else parse_line_body(p, false)
         optional_end(p, "for", indented)
         if generators.len() == 0 then return Expr(at.to(p.ended()), Invalid)
         return Expr(at.to(p.ended()), ForYield(generators, body))
@@ -380,9 +403,42 @@ private match_arms(p: *Parser) -> Buf[Arm]
             p.report.add(error(p.toks.here(), "a leading `|` needs a pattern, not `else`"))
         arms.push(match_arm(p, fallback, false))
         if p.toks.position == before then break
+        if p.in_list && p.at(",")
+            // The comma ends the arm, the `match` and the item it stands in; the block's Dedent
+            // comes before the closing bracket.
+            if next_line_is_arm(p)
+                p.report.add(error(p.toks.here(), "a comma inside brackets ends the `match`, so this arm's body is one value; write a tuple in parentheses, `(a, b)`"))
+            p.owed_dedents += 1
+            p.open_lines = lines
+            return arms
     p.open_lines = lines
     optional_end(p, "match", true)
     arms
+
+// Whether, after the comma the parser is at, the items on the arm's line run on to a line at the
+// arms' own depth that reads as another arm: one starting with `else` or holding an `->` outside
+// brackets. Such a comma was meant to make a tuple of a middle arm's body.
+private next_line_is_arm(p: *Parser) -> bool
+    var depth = 0
+    var i = 1usize
+    var next_line = false
+    loop
+        val t = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if depth == 0 && (t.value == Dedent || t.value == Indent) then return false
+        if depth == 0 && t.value == Newline
+            if next_line then return false
+            next_line = true
+            if p.ahead(i + 1) == "else" then return true
+        else
+            val word = p.spelling(t)
+            if word == "(" || word == "[" || word == "{" then depth += 1
+            elif word == ")" || word == "]" || word == "}"
+                if depth == 0 then return false
+                depth -= 1
+            elif next_line && depth == 0 && word == "->" then return true
+        i += 1
 
 // One arm: a pattern, an optional `if` guard, `->` and the body. An `else` arm, already consumed when
 // `fallback` is set, has no pattern and no arrow. `alone` marks the one arm on a `match` function's
@@ -396,6 +452,7 @@ match_arm(p: *Parser, fallback: bool, alone: bool) -> Arm
         guard = Some(expression(p, 0))
         p.lambda_boundary = previous
     if !fallback then p.expect("->")
-    // In an argument list a comma ends a one-line arm's body, as it ends the argument.
-    val body = if alone && p.in_list && !p.at_kind(Indent) then expression(p, 0) else parse_line_body(p, false)
+    // Inside brackets whose commas separate items a comma ends a one-line arm's body, as it ends the
+    // item, so a tuple there is written in parentheses.
+    val body = if p.in_list && !p.at_kind(Indent) then expression(p, 0) else parse_line_body(p, false)
     Arm(pattern, guard, body)

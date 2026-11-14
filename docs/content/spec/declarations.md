@@ -1601,6 +1601,9 @@ representation is.
   `F[_]`, whose instances are each an object, and an opaque type takes no constructor parameter of
   its own, which would leave its layout undecided. It is a type argument of a constructor
   parameter's application like any type: `F[UserId]` at `Vector` is a `Vector[UserId]`.
+- A refined variant's result does not name an opaque type, alone or inside another type
+  (`Newest -> Query[UserId]` is refused); its fields may be of opaque types, and a type with refined
+  variants takes one as its type argument like any type.
 - A union of an opaque type and its representation keeps its members apart; only a union naming
   one type twice, the opaque type or the representation, collapses to it.
 - An opaque type has no supertype (`opaque type X <: Y` is refused), no annotations and no
@@ -1798,7 +1801,8 @@ server reads it the same way.
 ### Positions are the document's
 
 Every line of program text stays where it was written, so every position the compiler reports, in
-a diagnostic, a trap's report, a failed test or the language server, is the line and column of the
+a diagnostic, a trap's report, a failed test, the language server or the debug information a
+debugger reads, is the line and column of the
 document the reader has open, the four columns included:
 
 ```text
@@ -2061,17 +2065,35 @@ passed by name, a method value), and it traps at that read rather than read what
 
 - **`lazy val name = expr`** (its type optional, as for `val`) is computed on its first read instead,
   exactly once, and every later read gives the value kept. One that is never read is never
-  computed. It is declared at module level or in a class or object body, where each instance has
-  its own; `lazy` is a modifier only before `val`, and elsewhere an ordinary name. A `lazy var` is
-  an error, since the value is never assigned, and so is `lazy` on a parameter, a class parameter, a
-  data field or a local, each of which is given its value where it is made.
+  computed. It is declared at module level, in a class or object body, where each instance has its
+  own, or in a block, as a local; `lazy` is a modifier only before `val`, and elsewhere an ordinary
+  name. A `lazy var` is an error, since the value is never assigned, and so is one without an
+  initializer, and `lazy` on a parameter, a class parameter or a data field, each of which is given
+  its value where it is made.
 
   ```avin
   lazy val table: Vector[string] = loadTable() // read the file when something first needs it
 
   class Report(title: string)
     lazy val heading = s"== $title ==" // per instance, on the instance's first read
+
+  summary(rows: Vector[Row], verbose: bool) -> string
+    lazy val detail = rows.map(describe).mkString("\n") // only if the branch below reads it
+    if verbose then detail else s"${rows.length} rows"
   ```
+
+  **A local `lazy val`** names one value (a pattern that takes a value apart is an error) and is in
+  scope from its declaration to the end of its block, its own initializer included. Each time the
+  declaration runs it makes a new value not yet computed, so one in a loop body is a fresh one on
+  every pass. Its initializer sees the locals around it as they are when it runs, on the first
+  read, not where it is declared, and its type is its declared one or its initializer's, which must
+  be known where it is declared. It is never assigned: an assignment, a compound one or a step is
+  refused. A closure that reads it captures it and shares it with the code around it: whichever
+  reads it first computes it, and every other read, in the closure or outside it, gives the value
+  kept, even after the block that declared it has finished. A closure carried to another thread
+  carries the initializer with it, so a `@sendable` closure may capture a local `lazy val` only
+  where its type is [sendable](threads.md) and what its initializer captures and reaches is what
+  such a closure itself may capture and reach, through every lazy value it reads in turn.
 
   A module-level `lazy val` takes no place in the initialization order: its initializer runs where
   it is first read, and an eager value that reads it depends on what that initializer reads. Its
@@ -2100,6 +2122,9 @@ passed by name, a method value), and it traps at that read rather than read what
       Some(n) -> n.depth + 1
       None -> 0
   ```
+
+  A local `lazy val` is held to the same rule, its initializer's own code being the block's code
+  that it runs and the functions that code calls.
 
   Code the initializer makes and hands on without running it itself (a lambda, an argument passed by
   name, a method value) may read the value: that is how a value refers to itself, as a lazy list

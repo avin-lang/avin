@@ -329,6 +329,47 @@ every program's warm build is compared with its clean one; the warm build is the
 test` of the library's and the packages' tests runs in `verify` mode the same way. Unset, the gate
 builds the corpus once, with no cache.
 
+## Debug information
+
+`avin build -g` and `avin emit-llvm -g` build a program a debugger can read in its Avin source
+(`debug_info.sysl`). Nothing else changes: the code is the code the same build makes without `-g`,
+and a build without it carries no debug information at all.
+
+- **Lowering places the code.** In a program built with `-g`, every function the source declares is
+  lowered with a `Locate` instruction before each run of instructions that comes from one place:
+  the line and column, counted from 1, where the innermost expression being lowered begins. The
+  places are the document's, so a literate program's are the lines of its `.lavin` file, the code
+  margin included ([positions are the document's](/spec/declarations/#positions-are-the-documents)).
+  A `Locate` never comes between a call and the words of its result. The code before the body's first
+  expression, which takes the parameters in, is placed nowhere, so a debugger that stops at a
+  function's first line finds its parameters already there. A `Variable` instruction names each
+  parameter and each local that lives in a slot of its own, with its Avin type; a local a closure
+  shares lives in a box and is left out, as is one the compiler made. Neither instruction makes code,
+  and neither counts toward the size that decides inlining. A function inlined into another takes
+  the place of the call, since the inlined body's own places are in another function and maybe
+  another file.
+- **Emission writes LLVM's debug metadata.** One compile unit; a file for each source file, by its
+  full path; a subprogram for each function the source declares, named as Avin spells it (`fact`,
+  `twice[int]`, `main.lambda#1`, and a library function by its module, `avin.…`) with its symbol as the linkage name
+  and the line of its name; a location on every instruction from the body's first expression on, and
+  on every call; and a local variable for each `Variable`: a parameter with its place among the
+  parameters, a scalar of a basic type (`int`, `long` and the other integers signed, `byte`
+  unsigned, `char` a UTF-32 code point, `bool`, `real`), and a reference as a pointer to a structure
+  named by its type, which the debugger shows as an address. A parameter is copied to a slot of its
+  own at the entry so it can be read wherever the function stops; a local in a root of the frame is
+  found in the frame. A function lowering makes, which no source declares, has no subprogram.
+- **On macOS the build gathers the DWARF.** The linker leaves it in the objects, which a build
+  removes, so `avin build -g` runs `dsymutil` on the executable once it is published, writing
+  `<executable>.dSYM` beside it, where lldb looks. Elsewhere the executable carries it.
+- **Builds and caches.** A function's text is never taken from the instance cache in a `-g` build,
+  nor kept in it, since its locations follow lines its key does not cover; its lowered code is, in a
+  directory of its own (`program-O2-g`), each `Locate` kept counted from the start of the
+  declaration it is in, as a trap site is, and placed again where the declaration is now when it is
+  read back. Codegen units carry every metadata line, as they carry every other module-level line,
+  and a function declared in a unit that does not define it carries no subprogram. Both `-O0` and
+  `-O2` keep the information valid: clang's verifier, which drops debug information it finds
+  invalid with a warning, accepts every unit.
+
 ## Sysl bindings and the shim cache
 
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its

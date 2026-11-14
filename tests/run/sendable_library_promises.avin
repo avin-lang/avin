@@ -1,0 +1,96 @@
+// expect: exit 0
+// The standard library's promises to be `Sendable` are checked against the structure as a
+// program's are, and the few types safe for a reason the structure cannot show are marked
+// `@trusted_sendable`. Every one of those is still sendable, as are the types built of them, and a
+// map with a default is sendable with a `@sendable` default or a sendable default value: each is
+// used from several threads at once here.
+import avin.actors.{ActorRef, Isolated, isolate}
+import avin.net.{TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.net.tls.TlsStream
+import avin.process.Child
+import avin.regex.Regex
+import avin.threads.{Atomic, Channel, Condition, Executor, Future, Mutex, Once, Promise, Thread, spawn}
+
+needs[T: Sendable](x: T) -> int = 1
+
+// Each compiles only where its parameter's type is sendable; none is called.
+channelOf(c: Channel[string]) -> int = needs(c)
+threadOf(t: Thread[Vector[int]]) -> int = needs(t)
+futureOf(f: Future[Option[string]]) -> int = needs(f)
+promiseOf(p: Promise[int]) -> int = needs(p)
+conditionOf(c: Condition) -> int = needs(c)
+executorOf(e: Executor) -> int = needs(e)
+isolatedOf(i: Isolated[Buffer[int]]) -> int = needs(i)
+actorOf(r: ActorRef[string]) -> int = needs(r)
+tcpOf(s: TcpStream, l: TcpListener) -> int = needs(s) + needs(l)
+unixOf(s: UnixStream, l: UnixListener) -> int = needs(s) + needs(l)
+tlsOf(s: TlsStream) -> int = needs(s)
+childOf(c: Child) -> int = needs(c)
+
+// A map with a default, of any sendable key and value types.
+counted[K: Sendable, V: Sendable](m: Map[K, V], fallback: V) -> Map[K, V] = m.withDefault(k -> fallback)
+
+main()
+  // a mutex of a mutable value, an atomic and a once, shared by four threads
+  val total = Mutex(Buffer[int]())
+  val hits = Atomic(0)
+  val once = Once()
+  val workers = Vector.tabulate(4, w -> spawn(() ->
+    once.run(() -> hits.add(1000))
+    for i in 0 ..< 1000
+      total.with(b -> b.append(i))
+      _ = hits.add(1)
+    w))
+  println(workers.map(t -> t.join()), total.with(b -> b.length), hits.load(), once.isDone())
+
+  // a channel and a promise across threads
+  val ch = Channel[int]()
+  val done = Promise[int]()
+  val sender = spawn(() ->
+    for i in 1 ..< 101 do ch.send(i)
+    ch.close()
+    done.complete(7))
+  var sum = 0
+  for x in ch do sum += x
+  println(sum, done.future.await(), sender.join())
+
+  // a future made on an executor of its own, mapped on another thread
+  val pool = Executor.fixed(2)
+  val f = pool.future(21).map(x -> x * 2)
+  println(spawn(() -> f.await()).join())
+
+  // an isolated buffer taken by another thread
+  val chunk = isolate
+    val b = Buffer[int]()
+    for i in 0 ..< 10 do b.append(i)
+    b
+  println(spawn(() -> chunk.take().length).join())
+
+  // a map with a computed default, which uses only sendable values, read by four threads at once
+  val names = Vector("zero", "one", "two")
+  val misses = Atomic(0)
+  val words: Map[int, string] = Map((1, "uno")).withDefault(k ->
+    _ = misses.add(1)
+    if 0 <= k < names.length then names(k) else "many")
+  val readers = Vector.tabulate(4, w -> spawn(() ->
+    var s = ""
+    for k in 0 ..< 4 do s += words(k) + " "
+    s))
+  println(readers.map(t -> t.join()), misses.load())
+
+  // a default value that is sendable, an update keeping it, and a default of a default
+  val zeros = HashMap(("a", 1)).withDefaultValue(0).updated("b", 2)
+  val nested = zeros.withDefault(k -> k.byteLength)
+  println(spawn(() -> (zeros("a"), zeros("b"), zeros("zzz"), nested("zzz"), nested.size)).join())
+
+  // a generic instance, and an empty map whose every key is the default
+  val tree = counted(TreeMap(("x", 1.5)), -1.0)
+  val empty = counted(Map.empty[(int, int), Vector[string]](), Vector("none"))
+  println(spawn(() -> (tree("x"), tree("y"), empty((1, 2)), empty.isEmpty)).join())
+
+  // the Unicode property tables, module-level values every pattern naming a property reads, read by
+  // four threads at once
+  val greek = Vector.tabulate(4, w -> spawn(() -> Regex.compile(raw"\p{IsAlphabetic}+") match
+    Ok(r) -> r.findAllIn("Ἀθῆναι, Σπάρτη ٣ 東京").toList.length
+    Err(_) -> -1))
+  println(greek.map(t -> t.join()))

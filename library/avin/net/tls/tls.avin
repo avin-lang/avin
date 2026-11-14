@@ -111,6 +111,17 @@ private class ClientContext
 @sysl("sh.sysl.openssl.Server", named: "TlsServer")
 private class ServerContext
 
+// Who a `TlsStream` belongs to: a Sysl handle holding nothing else, which moves between threads with
+// the stream, so the code that handed the stream over traps at its next use. Its traps name the
+// `TlsStream`.
+@sysl("avin.rt.Token", named: "TlsStream")
+private class Owner
+  // Does nothing: calling it checks the stream belongs to the code running.
+  held() -> unit
+
+@sysl("avin.rt.token")
+private newOwner() -> Owner
+
 // One end of a TLS connection, between the plaintext and the ciphertext buffers.
 @sysl("sh.sysl.openssl.Stream", named: "TlsStream")
 private class Engine
@@ -199,6 +210,7 @@ private serverContext(server: TlsServer) -> Result[ServerContext, TlsError] =
 // failure of TLS itself after the handshake is an `IoError` of kind `Other` beginning `TLS:`, naming the peer. The connection
 // ends where the peer closes TLS or the TCP connection beneath. It may be handed to another thread
 // or actor, which takes it over, as a `TcpStream` is.
+@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps")
 class TlsStream(
     private val tcp: TcpStream,
     private val engine: Engine,
@@ -207,25 +219,33 @@ class TlsStream(
     private var closed: bool,
     private val peer: string
 ): Sendable, ByteStream
+  // Who the connection belongs to, checked before every operation, one served from the bytes read
+  // ahead included: handed over, the connection moves with it.
+  private val owner = newOwner()
+
   // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
   // sending. `max` is at least one.
   override read(max: int) -> Result[Array[byte], IoError]
+    owner.held()
     if closed then return Err(closedError("read from", peer))
     buffered.read(max, received)
 
   // The next line, without its terminator, or `None` once the other end has finished sending and
   // every line has been read, as a `TcpStream` reads one.
   override readLine() -> Result[Option[string], IoError]
+    owner.held()
     if closed then return Err(closedError("read from", peer))
     buffered.readLine(received)
 
   // Everything the other end sends until it finishes, after what earlier reads left.
   override readAll() -> Result[Array[byte], IoError]
+    owner.held()
     if closed then return Err(closedError("read from", peer))
     buffered.readAll(received)
 
   // Sends all of `bytes`.
   override write(bytes: Array[byte]) -> Result[unit, IoError]
+    owner.held()
     if closed then return Err(closedError("write to", peer))
     var at = 0
     while at < bytes.length
@@ -246,12 +266,14 @@ class TlsStream(
   // A wait on the connection beneath longer than `d` fails with `TimedOut` from now on, as a
   // `TcpStream`'s does; zero or less takes the limit away.
   override setTimeout(d: Duration) -> Result[unit, IoError]
+    owner.held()
     if closed then return Err(closedError("set the timeout of", peer))
     tcp.setTimeout(d)
 
   // Tells the other end nothing more will be sent, closing TLS and then the TCP connection's
   // sending side; reading goes on.
   override shutdownOutput() -> Result[unit, IoError]
+    owner.held()
     if closed then return Err(closedError("shut down", peer))
     engine.notifyClose()
     flush()?
@@ -261,6 +283,7 @@ class TlsStream(
   // does nothing. A read or write afterwards answers an error. The `Err` is a failure to send the
   // peer the notice that TLS is closing; the connection is closed either way.
   override close() -> Result[unit, IoError]
+    owner.held()
     if closed then return Ok(())
     closed = true
     engine.notifyClose()
