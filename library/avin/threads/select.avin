@@ -28,6 +28,18 @@ private selectReset(wait: Any)
 @intrinsic("select_withdraw")
 private selectWithdraw(wait: Any)
 
+// Opens the select, every arm of whose round has been tried and enlisted, to claims by threads that
+// complete an arm on a channel of capacity zero themselves.
+@intrinsic("select_open")
+private selectOpen(wait: Any)
+
+// Ends the select's wait through arm `index`, for a thread completing that arm under its channel's
+// lock: 1 where this ended it; 0 where the select is still trying its arms; -1 where its wait has
+// already ended. With `poke` 1, ends a wait still trying its arms too, so that the select tries the
+// arm again once its round is over.
+@intrinsic("select_claim")
+private selectClaim(wait: Any, index: long, poke: long) -> long
+
 // Waits until a channel an arm is enlisted on is notified, or until `deadline` where it is positive:
 // the arm notified, or -1 where the time ran out. A cancellation point.
 @intrinsic("select_park")
@@ -46,6 +58,9 @@ private val ReceiveClosed: int = 2
 // The wait of one select of `arms` arms, which only this module makes, so only its code tries an arm.
 private class Selecting(arms: int)
   val handle = selectNew(long(arms))
+  // Whether the select is trying again the arm it was woken through, so that an arm on a channel of
+  // capacity zero waits out another select still trying its arms there rather than missing it.
+  var retrying = false
 
 // One channel arm of a `select` block.
 trait SelectArm
@@ -60,19 +75,44 @@ trait SelectArm
   // microseconds: the time a channel `after` or a `Ticker` made next falls due; 0 for never.
   wakeAt(wait: Selecting) -> long = 0
 
+  // Takes what stands for the arm off its channel, once the select has ended or before it begins
+  // another round: only an arm on a channel of capacity zero leaves anything there.
+  withdraw() = ()
+
 // A receive arm, `channel.receive() as pattern`, wanting what `wants` says: 0 a value or the channel
 // closed, 1 a value, 2 the channel closed and drained.
 class SelectReceive[T](private val channel: Channel[T], private val wants: int): SelectArm
   private var got: Option[T] = None
+  // On a channel of capacity zero, what stands for the arm there in this round, which a sender
+  // completes.
+  private var party: Option[Party[T]] = None
 
-  override offer(wait: Selecting, index: int, enlist: bool) -> bool =
-    channel.offerReceive(wants, wait, index, enlist) match
-      Some(r) ->
-        got = r
+  override offer(wait: Selecting, index: int, enlist: bool) -> bool
+    val r =
+      if channel.handsOver()
+        channel.offerTake(wants, wait, index, enlist, partyFor(wait, index, enlist))
+      else channel.offerReceive(wants, wait, index, enlist)
+    r match
+      Some(x) ->
+        got = x
         true
       None -> false
 
   override passOn(wait: Selecting) = channel.passOn(wait, false)
+
+  override withdraw()
+    if party is Some(p)
+      channel.withdrawParty(p)
+      party = None
+
+  // The party of this round: a new one where the round begins, which `enlist` says, or where there is
+  // none yet.
+  private partyFor(wait: Selecting, index: int, enlist: bool) -> Party[T]
+    if !enlist
+      if party is Some(p) then return p
+    val p = Party[T](None, Some(wait), index, ReceiveWait)
+    party = Some(p)
+    p
 
   override wakeAt(wait: Selecting) -> long = channel.wakeAt(wait)
 
@@ -86,9 +126,28 @@ class SelectReceive[T](private val channel: Channel[T], private val wants: int):
 
 // A send arm, `channel.send(x)`, its value evaluated once, before the select tries any arm.
 class SelectSend[T](private val channel: Channel[T], private val x: T): SelectArm
-  override offer(wait: Selecting, index: int, enlist: bool) -> bool = channel.offerSend(x, wait, index, enlist)
+  // On a channel of capacity zero, what stands for the arm there in this round, which a receiver
+  // completes.
+  private var party: Option[Party[T]] = None
+
+  override offer(wait: Selecting, index: int, enlist: bool) -> bool
+    if !channel.handsOver() then return channel.offerSend(x, wait, index, enlist)
+    channel.offerGive(x, wait, index, enlist, partyFor(wait, index, enlist))
 
   override passOn(wait: Selecting) = channel.passOn(wait, true)
+
+  override withdraw()
+    if party is Some(p)
+      channel.withdrawParty(p)
+      party = None
+
+  // The party of this round, as a receive arm's is.
+  private partyFor(wait: Selecting, index: int, enlist: bool) -> Party[T]
+    if !enlist
+      if party is Some(p) then return p
+    val p = Party[T](Some(x), Some(wait), index, SendWait)
+    party = Some(p)
+    p
 
 // A select with no `else` and no `after`: waits until one of `arms` runs, and answers which.
 selectWaiting(arms: SelectArm*) -> int = chosen(arms, 0, false)
@@ -117,13 +176,22 @@ private chosen(arms: Vector[SelectArm], deadline: long, timed: bool) -> int
     // Woken through an arm, the select tries that arm first and, where the arm cannot complete,
     // passes the notification on to the next thread waiting on its channel, which may be able to
     // use it.
+    // A thread that claimed the select through an arm on a channel of capacity zero has completed
+    // that arm already, and the arm's offer finds it so.
     if woken >= 0
-      if arms(woken).offer(wait, woken, false) then return woken
+      wait.retrying = true
+      val done = arms(woken).offer(wait, woken, false)
+      wait.retrying = false
+      if done
+        withdrawn(arms)
+        return woken
       arms(woken).passOn(wait)
+    withdrawn(arms)
     selectReset(wait.handle)
     for i in drawnOrder(arms.length)
       if arms(i).offer(wait, i, true)
         selectWithdraw(wait.handle)
+        withdrawn(arms)
         return i
     // An arm on a channel `after` or a `Ticker` made is notified by nothing, so the select also wakes
     // when the soonest of their clocks falls due, and tries the arms again.
@@ -131,12 +199,19 @@ private chosen(arms: Vector[SelectArm], deadline: long, timed: bool) -> int
     for arm in arms
       val at = arm.wakeAt(wait)
       if at > 0 && (limit <= 0 || at < limit) then limit = at
+    // Only now, with every arm tried, may another thread complete one of them and end the wait.
+    selectOpen(wait.handle)
     val ended = selectPark(wait.handle, limit)
     if ended >= 0
       woken = int(ended)
     elif timed && limit == deadline
+      withdrawn(arms)
       return arms.length
     else woken = -1
+
+// Takes what every arm of a select left on its channel off it.
+private withdrawn(arms: Vector[SelectArm])
+  for arm in arms do arm.withdraw()
 
 // The draws of every select, each a step of a sequence no two draws share.
 private val draws = Atomic(long(0))
