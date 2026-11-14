@@ -609,8 +609,10 @@ impl Monad for Option
   result is the trait's or conforms to it, and which has no bound the trait's method lacks. So
   `List`'s `flatMap(f: (T) -> Iterable[U]) -> List[U]` meets `flatMap[B](f: (A) -> List[B]) ->
   List[B]`, and `impl Monad for List` gives only `pure`. A method of that name that does not meet it
-  is an error naming what it lacks (`TreeSet`'s `map` bounds `B` by `Ord`); a method the type does
-  not have is written in the impl, and is then the type's own (`Option` gains `foldLeft`).
+  is an error naming what it lacks (`TreeSet`'s `map` bounds `B` by `Ord`), and so are two
+  overloads that both meet it; a method the type does not have is written in the impl, and is then
+  the type's own (`Option` gains `foldLeft`). The methods that meet are the type's own, never a
+  superclass's.
 - **A call through the bound calls the meeting method directly** in each instance, at the type
   arguments the meeting decided.
 

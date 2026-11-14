@@ -127,6 +127,9 @@ struct ClassSymbol
     /** For a class, the trait fields it stores itself, in the order it initializes them: they
      * follow its parameters in `fields`, from `inherited` plus the parameters' count on. */
     mixed: Buf[MixedField]
+    /** For a trait, whether it is a constructor trait: each instance of its methods knows the
+     * constructor implementing it, which `Self` stands for. */
+    constructor_trait: bool
 
 /** A field a trait declares with a value. The trait reads it through `getter`, the `val` the field
  * is to every type conforming to it, and assigns a `var` one through `setter`; `init` computes its
@@ -702,6 +705,9 @@ struct Checker
     /** While a derivation holds the fields of a type with refined variants to its trait, the own
      * parameters the trait holds of. */
     own_bounded: Option[OwnBounds]
+    /** What each method meeting a constructor trait's method is given by a call through the bound:
+     * see `TProgram.meetings`. */
+    meetings: Map[string, Buf[&Type]]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1112,7 +1118,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None)
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None, map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1146,6 +1152,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     for id in 0..<c.classes.len()
         inherit_fields(&c, id)
     refuse_stateful_impls(&c)
+    refuse_constructor_conformances(&c)
     for u in 0..<c.units.len()
         declare_unit(&c, u)
         declare_methods(&c, u)
@@ -1294,7 +1301,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), c.meetings)), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1739,7 +1746,7 @@ private declare_types(c: *Checker, unit: usize)
             check_handle_declaration(c, unit, d)
             check_c_handle_declaration(c, unit, d)
             c.class_types.put(key, c.classes.len())
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None, buf(), buf()))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, None, None, buf(), buf(), 0, None, buf(), None, buf(), buf(), false))
 
 // An object is a class with one instance. Named after a class or a data type of its module, in any of
 // the module's files, it is that type's companion and its type has no name of its own; otherwise its
@@ -1773,7 +1780,7 @@ private declare_objects(c: *Checker, unit: usize)
             else
                 c.class_types.put(key, id)
                 if file.private_items[i] then c.private_names.put(key, true)
-            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data, buf(), None, buf(), buf()))
+            c.classes.push(ClassSymbol(unit, file.module_name, d.name, d, buf(), buf(), 0, 0, None, 0, 0, buf(), buf(), 0, companion, None, buf(), buf(), 0, companion_data, buf(), None, buf(), buf(), false))
 
 // Each type alias of a file, named once every data type, class and object is, so a clash with any of
 // them is reported at the alias. An alias is another name for a type, so its parameters take no
@@ -1901,7 +1908,65 @@ private is_template_type(t: &Type) -> bool = *t match
     TypeVar(owner, _, _) -> is_template_owner(owner)
     _ -> false
 
-private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl) -> ImplSymbol
+// An impl of a constructor trait whose trait arguments are all the type's parameters, in order, may
+// leave both off, `impl Monad for Option`: it is the impl written out, `impl[T] Monad[T] for
+// Option[T]`, the parameters named as the type's declaration names them. Any other impl is as written.
+private constructor_impl_written_out(c: *Checker, unit: usize, d: &ImplDecl) -> &ImplDecl
+    if d.type_params.len() > 0 || d.template || d.derived is Some(_) then return d
+    val written_trait = d.trait_name match
+        Some(t) -> t
+        None -> return d
+    val trait_path = written_trait.kind match
+        Named(p, args) -> if args.len() == 0 then p else return d
+        _ -> return d
+    val path = d.target.kind match
+        Named(p, args) -> if args.len() == 0 then p else return d
+        _ -> return d
+    val k = c.class_types.get(resolve_name(c, unit, trait_path)) match
+        Some(k) -> k
+        None -> return d
+    if !is_constructor_trait(c, k) then return d
+    val key = resolve_name(c, unit, path)
+    var declared: Buf[TypeParam] = buf()
+    if c.types.get(key) is Some(id) then declared = c.data[id].decl.type_params
+    elif c.class_types.get(key) is Some(id) then declared = c.classes[id].decl.type_params
+    elif builtin_type(path) is None then return d
+    var params: Buf[TypeParam] = buf()
+    var args: Buf[&TypeExpr] = buf()
+    for i in 0..<declared.len()
+        val tp = declared[i]
+        params.push(TypeParam(d.target.span, tp.name, Invariant, buf(), s"${c.units[unit].src.name}:${d.span.start}/$i", None, buf()))
+        args.push(TypeExpr(d.target.span, Named(tp.name, buf())))
+    val target = TypeExpr(d.target.span, Named(path, args))
+    val arity = c.classes[k].decl.type_params.len()
+    // Left off, the trait's arguments are all the type's parameters; where their numbers differ, the
+    // impl says which are the holes.
+    if declared.len() != arity
+        if declared.len() > 0
+            var names: Buf[string] = buf()
+            var holes = ""
+            for i in 0..<declared.len()
+                names.push(declared[i].name)
+                if i >= declared.len() - arity
+                    if holes != "" then holes = holes + ", "
+                    holes = holes + declared[i].name
+            val list = join_names(names)
+            c.note(unit, d.target.span, s"`$path` takes ${arguments_word(declared.len())} and `${c.classes[k].name}` ${arguments_word(arity)}; name the ones left open, as in `impl[$list] ${c.classes[k].name}[$holes] for $path[$list]`")
+        else c.note(unit, d.target.span, s"`$path` takes no type arguments, so it is no constructor, and only a constructor implements the constructor trait `${c.classes[k].name}`")
+        return ImplDecl(d.span, params, Some(TypeExpr(written_trait.span, InvalidType)), target, d.members, d.template, d.derived)
+    val trait_expr = TypeExpr(written_trait.span, Named(trait_path, args))
+    ImplDecl(d.span, params, Some(trait_expr), target, d.members, d.template, d.derived)
+
+/** Names joined with commas: `A, B`. */
+private join_names(names: Buf[string]) -> string
+    var out = ""
+    for n in names
+        if out != "" then out = out + ", "
+        out = out + n
+    out
+
+private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl: &ImplDecl) -> ImplSymbol
+    val d = constructor_impl_written_out(c, unit, written_decl)
     val invalid = ImplSymbol(unit, module_name, d, ErrorType, 0, None, buf())
     // An impl's parameters are its type's, bounded where the type declares them. A bound of the
     // impl's own makes the conformance hold only for the type arguments that meet it.
@@ -2592,6 +2657,8 @@ private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
 /** The error for a conformance of type `who` to `t` stated again. */
 private restated(c: *Checker, who: string, t: &Type) -> string
     if *t is Class(k, _, _)
+        if is_constructor_trait(c, k)
+            return s"`$who` already implements `${c.classes[k].name}`; a type implements a constructor trait once, at one choice of holes"
         if is_trait(c, k) && c.classes[k].decl.type_params.len() > 0 && !implemented_several_times(c, k)
             return s"`$who` already conforms to `${c.classes[k].name}`; a type implements a trait at several type arguments only where the trait's members are all static"
     s"`$who` already conforms to `${type_name(t)}`; a conformance is stated once"
@@ -3343,6 +3410,228 @@ private refuse_stateful_impls(c: *Checker)
         c.builtins = builtins
         c.impls[i].target = ErrorType
 
+// A constructor trait's parameters are holes, so they take no variance, and it requires only
+// constructor traits, each at its own parameters in order. A conformance to one leaves open distinct
+// parameters of the type, which the impl does not bound and whose bounds in the type the trait's
+// parameters promise; and a type conforms to a constructor trait at one choice of holes. A refused
+// conformance is withdrawn, so nothing more is reported of it.
+private refuse_constructor_conformances(c: *Checker)
+    for k in 0..<c.classes.len()
+        if !is_constructor_trait(c, k) then continue
+        c.classes[k].constructor_trait = true
+        val d = c.classes[k].decl
+        val unit = c.classes[k].unit
+        for tp in d.type_params
+            if !(tp.variance is Invariant)
+                c.note(unit, tp.span, s"`${d.name}` is a constructor trait, whose parameters are the holes of the constructors implementing it, so they take no variance; a constructor parameter states one on its hole, as in `F[+_]`")
+        // A static member is called on a constructor, which names no type for the trait's
+        // parameters.
+        for member in d.members
+            val (f, static_member) = member match
+                MethodMember(f, _, _, s) -> (f, s)
+                _ -> continue
+            if static_member
+                for tp in d.type_params
+                    var shadowed = false
+                    for own in f.type_params
+                        if own.name == tp.name then shadowed = true
+                    if !shadowed && function_names_type(f, tp.name)
+                        c.note(unit, f.name_span, s"`${f.name}` is a static member of the constructor trait `${d.name}`, so it names no parameter of the trait, and it names `${tp.name}`: a call of it names only the constructor, as in `F.${f.name}(…)`; give it a type parameter of its own")
+                        break
+        for parent in c.classes[k].traits
+            val (p, xs) = *parent match
+                Class(p, _, xs) -> (p, xs)
+                _ -> continue
+            if !is_constructor_trait(c, p)
+                c.note(unit, d.name_span, s"`${d.name}` is a constructor trait, so it requires only constructor traits, and `${c.classes[p].name}` is a trait for types")
+                continue
+            var in_order = xs.len() == d.type_params.len()
+            for j in 0..<xs.len()
+                *xs[j] match
+                    TypeVar(o, i, _) -> if o != class_owner(k) || i != j then in_order = false
+                    _ -> in_order = false
+            if !in_order
+                c.note(unit, d.name_span, s"`${d.name}` requires `${c.classes[p].name}` at its own parameters, in order, as in `trait ${d.name}[${param_names(d.type_params)}]: ${c.classes[p].name}[${param_names(d.type_params)}]`")
+    for i in 0..<c.impls.len()
+        val block = c.impls[i]
+        val t = block.trait_type match
+            Some(x) -> x
+            None -> continue
+        val k = *t match
+            Class(k, _, _) -> k
+            _ -> continue
+        if !is_constructor_trait(c, k) then continue
+        val (owner, declared, name) = *block.target match
+            Data(id, _, _) -> (data_owner(id), c.data[id].decl.type_params, c.data[id].name)
+            // A class's conformances, its impls' among them, are checked with the class.
+            Class(_, _, _) -> continue
+            ErrorType -> continue
+            _ ->
+                c.note(block.unit, written_trait_span(block.decl), s"`${c.classes[k].name}` is a constructor trait, implemented by a generic data type or class, and ${type_name(block.target)} is a built-in type")
+                withdraw_conformance(c, i, t)
+                continue
+        if constructor_conformance_refusal(c, block.decl.type_params, owner, declared, name, t) is Some(text)
+            c.note(block.unit, written_trait_span(block.decl), text)
+            withdraw_conformance(c, i, t)
+    for id in 0..<c.classes.len()
+        if is_trait(c, id) then continue
+        for t in c.classes[id].traits
+            val k = *t match
+                Class(k, _, _) -> k
+                _ -> continue
+            if !is_constructor_trait(c, k) then continue
+            val block = impl_stating(c, c.classes[id].decl.name_span, id, t)
+            val params = block match
+                Some(b) -> c.impls[b].decl.type_params
+                None -> buf()
+            if constructor_conformance_refusal(c, params, class_owner(id), c.classes[id].decl.type_params, c.classes[id].name, t) is Some(text)
+                block match
+                    Some(b) ->
+                        c.note(c.impls[b].unit, written_trait_span(c.impls[b].decl), text)
+                        withdraw_conformance(c, b, t)
+                    None ->
+                        c.note(c.classes[id].unit, c.classes[id].decl.name_span, text)
+                        withdraw_class_conformance(c, id, t)
+    for id in 0..<c.data.len()
+        refuse_second_holes(c, own_type(c.data[id], id), c.data[id].traits, c.data[id].unit, c.data[id].decl.span)
+    for id in 0..<c.classes.len()
+        if !is_trait(c, id) then refuse_second_holes(c, own_class_type(c.classes[id], id), c.classes[id].traits, c.classes[id].unit, c.classes[id].decl.name_span)
+
+/** Whether function `f`'s parameters or result name the type `name`. */
+private function_names_type(f: &Function, name: string) -> bool
+    for p in f.params
+        if writes_name(p.ty, name) then return true
+    if f.result is Some(r) then return writes_name(r, name)
+    false
+
+/** Whether a type written names the type `name`, alone or among the arguments of another. */
+private writes_name(t: &TypeExpr, name: string) -> bool
+    t.kind match
+        Named(path, args) ->
+            if path == name then return true
+            for a in args
+                if writes_name(a, name) then return true
+        Tuple(items) ->
+            for item in items
+                if writes_name(item, name) then return true
+        Function(params, result, _) ->
+            for p in params
+                if writes_name(p.ty, name) then return true
+            return writes_name(result, name)
+        Union(members) ->
+            for m in members
+                if writes_name(m, name) then return true
+        _ -> ()
+    false
+
+/** The parameters' names, joined: `A, B`. */
+private param_names(params: Buf[TypeParam]) -> string
+    var names: Buf[string] = buf()
+    for tp in params
+        names.push(tp.name)
+    join_names(names)
+
+/** Why the conformance `t`, to a constructor trait, of a type named `name` whose parameters are
+ * `declared`, owned by `owner`, is refused, where it is; `impl_params` are the impl's, empty for a
+ * conformance a class's header states. */
+private constructor_conformance_refusal(c: *Checker, impl_params: Buf[TypeParam], owner: usize, declared: Buf[TypeParam], name: string, t: &Type) -> Option[string]
+    val (k, xs) = *t match
+        Class(k, _, xs) -> (k, xs)
+        _ -> return None
+    val trait_name = c.classes[k].name
+    val trait_params = c.classes[k].decl.type_params
+    var seen: Buf[usize] = buf()
+    for j in 0..<xs.len()
+        val p = *xs[j] match
+            TypeVar(o, p, _) -> if o == owner && p < declared.len() then p else return Some(left_open_message(trait_name, name, xs[j]))
+            _ -> return Some(left_open_message(trait_name, name, xs[j]))
+        val shown = if p < impl_params.len() then impl_params[p].name else declared[p].name
+        if contains_id(seen, p) then return Some(s"`$shown` is named twice among `${type_name(t)}`'s arguments; each hole is a different parameter of `$name`")
+        seen.push(p)
+        if p < impl_params.len() && impl_params[p].bounds.len() > 0
+            return Some(s"`${impl_params[p].name}` is a hole of `${type_name(t)}`, and a hole takes no bounds: the constructor conforms at every type it is applied to; bound only the parameters written out")
+        if j >= trait_params.len() then continue
+        val given = c.bounds.get(bound_key(class_owner(k), j, trait_params[j])).unwrap_or(buf())
+        for wanted in c.bounds.get(bound_key(owner, p, declared[p])).unwrap_or(buf())
+            if !bound_implied(c, given, wanted)
+                return Some(s"`$name`'s parameter `${declared[p].name}` is bounded by `${type_name(wanted)}`, and `$trait_name`'s parameter `${trait_params[j].name}` is not, so `$name` is no constructor for it: what is `$trait_name` applies its constructor to any type")
+    None
+
+private left_open_message(trait_name: string, name: string, arg: &Type) -> string =
+    s"each of `$trait_name`'s arguments is a parameter of `$name` left open, a hole, and ${type_name(arg)} is none; a constructor trait's argument names the parameter, as in `impl[T, E] $trait_name[T] for Result[T, E]`"
+
+/** The impl among the impls stating conformance `t` for class `id`, if an impl states it. */
+private impl_stating(c: *Checker, at: Span, id: usize, t: &Type) -> Option[usize]
+    for i in 0..<c.impls.len()
+        if c.impls[i].trait_type is Some(x)
+            if *c.impls[i].target is Class(target, _, _)
+                if target == id && same_type(x, t) then return Some(i)
+    None
+
+/** Withdraws the conformance impl `i` states, `t`, from its type. */
+private withdraw_conformance(c: *Checker, i: usize, t: &Type)
+    *c.impls[i].target match
+        Data(d, _, _) ->
+            var kept: Buf[&Type] = buf()
+            for x in c.data[d].traits
+                if !same_type(x, t) then kept.push(x)
+            c.data[d].traits = kept
+        Class(id, _, _) -> withdraw_class_conformance(c, id, t)
+        _ -> ()
+    c.impls[i].target = ErrorType
+
+private withdraw_class_conformance(c: *Checker, id: usize, t: &Type)
+    var kept: Buf[&Type] = buf()
+    for x in c.classes[id].traits
+        if !same_type(x, t) then kept.push(x)
+    c.classes[id].traits = kept
+
+// A type conforms to a constructor trait at one choice of holes: two conformances reaching one
+// constructor trait leave the same parameters open.
+private refuse_second_holes(c: *Checker, own: &Type, traits: Buf[&Type], unit: usize, at: Span)
+    for b in 1..<traits.len()
+        for a in 0..<b
+            for k in 0..<c.classes.len()
+                if !is_constructor_trait(c, k) then continue
+                val first = ancestor_type(c.classes, c.data, traits[a], k) match
+                    Some(x) -> x
+                    None -> continue
+                val second = ancestor_type(c.classes, c.data, traits[b], k) match
+                    Some(x) -> x
+                    None -> continue
+                if same_type(first, second) then continue
+                val name = type_name(own)
+                val shown = if *own is Data(_, n, _) then n elif *own is Class(_, n, _) then n else name
+                var where_at = at
+                var where_unit = unit
+                for i in 0..<c.impls.len()
+                    if c.impls[i].trait_type is Some(x)
+                        if same_type(x, traits[b]) && impl_targets(c.impls[i].target, own)
+                            where_at = written_trait_span(c.impls[i].decl)
+                            where_unit = c.impls[i].unit
+                c.note(where_unit, where_at, s"`$shown` already implements `${c.classes[k].name}` leaving ${open_names(first)} open; a type implements a constructor trait once, at one choice of holes, and this leaves ${open_names(second)} open")
+                return
+
+/** The parameters a constructor trait's conformance leaves open, as a diagnostic names them. */
+private open_names(t: &Type) -> string
+    val xs = *t match
+        Class(_, _, xs) -> xs
+        _ -> return ""
+    var names: Buf[string] = buf()
+    for x in xs
+        names.push(s"`${type_name(x)}`")
+    spoken_list(names)
+
+/** Whether an impl's resolved target is type `own`'s declaration. */
+private impl_targets(target: &Type, own: &Type) -> bool = *target match
+    Data(d, _, _) -> *own match
+        Data(e, _, _) -> d == e
+        _ -> false
+    Class(d, _, _) -> *own match
+        Class(e, _, _) -> d == e
+        _ -> false
+    _ -> false
+
 /** Adds trait `t` to `order` after the traits it requires, unless it is there already or the
  * superclass `sup` conforms to it, so that its fields are the superclass's. */
 private mixing_order(c: *Checker, sup: Option[&Type], t: &Type, order: *Buf[&Type], visiting: *Buf[usize])
@@ -3883,7 +4172,14 @@ private declare_methods(c: *Checker, unit: usize)
             // so the trait's methods can pass it where their parameters take one.
             var receiver_types: Buf[&Type] = buf()
             var receiver_names: Buf[string] = buf()
-            if is_trait(c, id) && mentions_self(c, id, 0) then receiver_types.push(TypeVar(self_owner(id), 0, "Self"))
+            // In a constructor trait it is a `Self[A]`, the constructor applied to the trait's own
+            // parameters.
+            if is_trait(c, id) && is_constructor_trait(c, id)
+                var own: Buf[&Type] = buf()
+                for i in 0..<d.type_params.len()
+                    own.push(TypeVar(class_owner(id), i, d.type_params[i].name))
+                receiver_types.push(Applied(TypeVar(self_owner(id), 0, "Self"), own))
+            elif is_trait(c, id) && mentions_self(c, id, 0) then receiver_types.push(TypeVar(self_owner(id), 0, "Self"))
             else receiver_types.push(self_type)
             receiver_names.push("self")
             for t in symbol.params
@@ -5027,10 +5323,17 @@ private link_methods(c: *Checker, id: usize, linked: *Buf[bool])
         if sid is Some(s) then inherited = inherited_matching(c, s, self_type, m)
         // Every method of the traits the class conforms to that the method implements.
         var implemented: Buf[usize] = buf()
+        // A constructor trait's methods are met by the class's own methods of their names, which
+        // implement them as they are, with no `override`.
+        var meets = false
         for t in conformed
             if *t is Class(tid, _, _)
+                if is_constructor_trait(c, tid)
+                    if trait_declares(c, tid, name, 0) then meets = true
+                    continue
                 if own_matching(c, tid, self_type, m) is Some(tm)
                     if !contains_id(implemented, tm) then implemented.push(tm)
+        if meets && implemented.len() == 0 && inherited is None && (symbol.static_member || k.overriding[i]) then continue
         // A static member implements a trait's static member, and a method a trait's method.
         var mismatched = false
         for tm in implemented
@@ -5183,6 +5486,328 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
                     c.note(c.builtins[at].unit, c.builtins[at].span, s"`$name_of` does not implement ${c.classes[t].name}'s $what")
     c.builtins[b].table = table
 
+/** The owner of the type parameters of a method being met with a constructor trait's, while the
+ * meeting decides them. */
+private meeting_owner() -> usize = hole_owner() + 1
+
+/** What meeting a constructor trait's method found among a type's methods of its name: the method
+ * and the type arguments of its own the meeting decided, or why the one of its name does not meet
+ * it, or none of the name. */
+enum Meeting
+    Met(m: usize, args: Buf[&Type])
+    Unmet(m: usize, why: string)
+    /** Two overloads of the name that both meet it. */
+    Ambiguous(first: usize, second: usize)
+    NoneNamed
+
+/** How a constructor trait's method `tm` is met by the methods `candidates` of the type `own`, an
+ * instance of a data type or class with its own parameters as arguments: one of its name whose
+ * parameters take `tm`'s parameter types with no conversion, at type arguments of its own the call
+ * decides (a lower bound by its bound), whose result is `tm`'s or seen as it with no conversion, and
+ * which bounds nothing `tm` leaves unbounded. `conditions` are the bounds the conformance's impl
+ * gives the type's parameters. */
+private meet_method(c: *Checker, own: &Type, tm: usize, candidates: Buf[usize], conditions: Buf[Buf[&Type]]) -> Meeting
+    val trait_member = c.symbols[tm]
+    val k = trait_member.owner_class.unwrap()
+    val positions = constructor_holes(c, own, k) match
+        Some(p) -> p
+        None -> return NoneNamed
+    val own_args = *own match
+        Data(_, _, xs) -> xs
+        Class(_, _, xs) -> xs
+        _ -> return NoneNamed
+    // The trait's method as the type sees it: `Self` the type's constructor, the trait's parameters
+    // the holes, and its own type parameters left as they are, each a type no call knows more of.
+    var self_args: Buf[&Type] = buf()
+    self_args.push(Constructor(open_at(own, positions), positions.len()))
+    var trait_args: Buf[&Type] = buf()
+    for p in positions
+        trait_args.push(own_args[p])
+    val tm_own = trait_member.decl.type_params.len()
+    val tm_outer = trait_member.type_params.len() - tm_own
+    for j in 0..<tm_own
+        trait_args.push(TypeVar(method_params_owner(), j, trait_member.decl.type_params[j].name))
+    var wanted_params: Buf[&Type] = buf()
+    for i in 1..<trait_member.params.len()
+        wanted_params.push(substitute(substitute(trait_member.params[i], self_owner(k), self_args), class_owner(k), trait_args))
+    val wanted_result = substitute(substitute(trait_member.result.unwrap_or(ErrorType), self_owner(k), self_args), class_owner(k), trait_args)
+    var named: Option[usize] = None
+    var why = ""
+    var met: Buf[usize] = buf()
+    var met_args: Buf[Buf[&Type]] = buf()
+    for m in candidates
+        val symbol = c.symbols[m]
+        if symbol.decl.name != trait_member.decl.name || symbol.static_member != trait_member.static_member then continue
+        if named is None then named = Some(m)
+        val reason = meeting_refusal(c, own_args, m, tm, tm_outer, wanted_params, wanted_result, conditions, positions)
+        reason match
+            Ok(args) ->
+                met.push(m)
+                met_args.push(args)
+            Err(text) -> if why == "" then why = text
+    // Two overloads that both meet it leave a call through the trait with no one method to call.
+    if met.len() > 1 then return Ambiguous(met[0], met[1])
+    if met.len() == 1 then return Met(met[0], met_args[0])
+    named match
+        Some(m) -> Unmet(m, why)
+        None -> NoneNamed
+
+/** The type arguments of its own method `m` takes in meeting trait method `tm`, whose parameters and
+ * result the type sees as `wanted_params` and `wanted_result`, or why it does not meet it. */
+private meeting_refusal(c: *Checker, own_args: Buf[&Type], m: usize, tm: usize, tm_outer: usize, wanted_params: Buf[&Type], wanted_result: &Type, conditions: Buf[Buf[&Type]], positions: Buf[usize]) -> Result[Buf[&Type], string]
+    val symbol = c.symbols[m]
+    val own = symbol.decl.type_params.len()
+    val outer = symbol.type_params.len() - own
+    if symbol.params.len() != wanted_params.len() + 1
+        return Err(s"which takes ${count(symbol.params.len() - 1, "parameter")}, and `${c.symbols[tm].name}` ${count(wanted_params.len(), "parameter")}")
+    // The method's own parameters are what the meeting decides.
+    var view_args: Buf[&Type] = buf()
+    for i in 0..<outer
+        view_args.push(if i < own_args.len() then own_args[i] else ErrorType)
+    for q in 0..<own
+        view_args.push(TypeVar(meeting_owner(), q, symbol.decl.type_params[q].name))
+    var params: Buf[&Type] = buf()
+    for i in 1..<symbol.params.len()
+        params.push(substitute(symbol.params[i], symbol.type_owner, view_args))
+    val result = substitute(symbol.result.unwrap_or(ErrorType), symbol.type_owner, view_args)
+    var decided: Buf[Option[&Type]] = buf()
+    for _ in 0..<own
+        decided.push(None)
+    for i in 0..<params.len()
+        decide_meeting(c, params[i], wanted_params[i], false, &decided)
+    decide_meeting(c, result, wanted_result, true, &decided)
+    var args: Buf[&Type] = buf()
+    for q in 0..<own
+        val tp = symbol.type_params[outer + q]
+        decided[q] match
+            Some(t) -> args.push(t)
+            None ->
+                // A lower bound decides a parameter nothing else does, as its least type.
+                lower_at(c, symbol.type_owner, symbol.type_params, outer + q) match
+                    Some(l) -> args.push(substitute(l, symbol.type_owner, view_args))
+                    None -> return Err(s"whose type parameter `${tp.name}` a call of `${c.symbols[tm].name}` does not decide")
+    // Every parameter's own lower bound is still met by what decides it.
+    for q in 0..<own
+        if lower_at(c, symbol.type_owner, symbol.type_params, outer + q) is Some(l)
+            val lower = substitute(substitute(l, symbol.type_owner, view_args), meeting_owner(), args)
+            if !seen_without_conversion(c, lower, args[q])
+                return Err(s"whose type parameter `${symbol.type_params[outer + q].name}` is bounded below by ${type_name(lower)}, which ${type_name(args[q])} is not above")
+    for i in 0..<params.len()
+        val have = substitute(params[i], meeting_owner(), args)
+        if !seen_without_conversion(c, wanted_params[i], have)
+            return Err(s"whose parameter `${symbol.param_names[i + 1]}` takes ${type_name(have)}, and ${type_name(wanted_params[i])} is not one without a conversion")
+    val yields = substitute(result, meeting_owner(), args)
+    if !seen_without_conversion(c, yields, wanted_result)
+        return Err(s"which yields ${type_name(yields)}, and ${type_name(wanted_result)} is wanted, which it is not without a conversion")
+    // A bound the trait's method does not give is one a call through the trait cannot promise.
+    val trait_member = c.symbols[tm]
+    for q in 0..<own
+        val tp = symbol.type_params[outer + q]
+        for b in c.bounds.get(bound_key(symbol.type_owner, outer + q, tp)).unwrap_or(buf())
+            val wanted = substitute(substitute(b, symbol.type_owner, view_args), meeting_owner(), args)
+            var given: Buf[&Type] = buf()
+            *args[q] match
+                TypeVar(o, j, _) ->
+                    if o == method_params_owner()
+                        for g in c.bounds.get(bound_key(trait_member.type_owner, tm_outer + j, trait_member.type_params[tm_outer + j])).unwrap_or(buf())
+                            given.push(g)
+                _ -> ()
+            if !bound_implied(c, given, wanted) && !meets_bound(meeting_conformances(c), args[q], wanted)
+                return Err(s"whose type parameter `${tp.name}` is bounded by ${type_name(wanted)}, which `${c.symbols[tm].name}` does not promise")
+    // A method of an impl with bounds of its own exists only where they are met.
+    for i in 0..<outer
+        val extra = c.bounds.get(bound_key(symbol.type_owner, i, symbol.type_params[i])).unwrap_or(buf())
+        if extra.len() == 0 || i >= own_args.len() then continue
+        if declared_site(c, symbol.type_owner, i) == symbol.type_params[i].site then continue
+        var given: Buf[&Type] = buf()
+        var hole_index: Option[usize] = None
+        for j in 0..<positions.len()
+            if positions[j] == i then hole_index = Some(j)
+        hole_index match
+            Some(j) ->
+                val k = trait_member.owner_class.unwrap()
+                val tps = c.classes[k].decl.type_params
+                if j < tps.len()
+                    for g in c.bounds.get(bound_key(class_owner(k), j, tps[j])).unwrap_or(buf())
+                        given.push(g)
+            None ->
+                if i < conditions.len()
+                    for g in conditions[i]
+                        given.push(g)
+        for b in extra
+            if !bound_implied(c, given, b)
+                return Err(s"which needs `${symbol.type_params[i].name}: ${type_name(b)}`, which the conformance does not promise")
+    var converted: Buf[&Type] = buf()
+    for a in args
+        converted.push(meeting_arg(a, trait_member.type_owner, tm_outer))
+    Ok(converted)
+
+/** A type argument the meeting decided, in the trait method's own type parameters as a call through
+ * the bound gives them, after the trait's, and the type's own. */
+private meeting_arg(t: &Type, owner: usize, outer: usize) -> &Type = *t match
+    TypeVar(o, j, name) -> if o == method_params_owner() then TypeVar(owner, outer + j, name) else t
+    Tuple(items) -> Tuple(meeting_args(items, owner, outer))
+    Function(ps, r, s) -> Function(meeting_args(ps, owner, outer), meeting_arg(r, owner, outer), s)
+    ByName(inner) -> ByName(meeting_arg(inner, owner, outer))
+    Data(id, name, xs) -> Data(id, name, meeting_args(xs, owner, outer))
+    Class(id, name, xs) -> Class(id, name, meeting_args(xs, owner, outer))
+    Union(ms) -> Union(meeting_args(ms, owner, outer))
+    Applied(h, xs) -> Applied(meeting_arg(h, owner, outer), meeting_args(xs, owner, outer))
+    Constructor(b, n) -> Constructor(meeting_arg(b, owner, outer), n)
+    _ -> t
+
+private meeting_args(ts: Buf[&Type], owner: usize, outer: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for t in ts
+        out.push(meeting_arg(t, owner, outer))
+    out
+
+/** The site of type parameter `index` as the data type or class owning it declares it. */
+private declared_site(c: *Checker, owner: usize, index: usize) -> string
+    if owner >= class_owner(0) && owner < self_owner(0)
+        val k = owner - class_owner(0)
+        if k < c.classes.len() && index < c.classes[k].decl.type_params.len() then return c.classes[k].decl.type_params[index].site
+    elif owner >= data_owner(0)
+        val d = owner - data_owner(0)
+        if d < c.data.len() && index < c.data[d].decl.type_params.len() then return c.data[d].decl.type_params[index].site
+    ""
+
+/** The conformances as a meeting asks of them: of types alone, with no generic scope. */
+private meeting_conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers)
+
+/** Whether a value of type `x` is one of type `to` with no conversion: the same type, or a reference
+ * seen as a supertype of it, as a covariant part is. */
+private seen_without_conversion(c: *Checker, x: &Type, to: &Type) -> bool
+    if conforms(x, to) then return true
+    val f = meeting_conformances(c)
+    conforms(view_part(f, x, to), to)
+
+/** Decides the parameters of the method being met, `meeting_owner()`'s, that `pattern`, its type,
+ * names, from `given`, the trait's: `covariant` where the method's type is to be seen as the
+ * trait's, otherwise the trait's as the method's. The first place a parameter is met decides it;
+ * whether the rest agree is checked once all are decided. */
+private decide_meeting(c: *Checker, pattern: &Type, given: &Type, covariant: bool, decided: *Buf[Option[&Type]])
+    *pattern match
+        TypeVar(o, q, _) ->
+            if o == meeting_owner() && q < decided.len()
+                if decided[q] is None then decided[q] = Some(given)
+        Tuple(ps) -> *given match
+            Tuple(gs) ->
+                if ps.len() == gs.len()
+                    for i in 0..<ps.len()
+                        decide_meeting(c, ps[i], gs[i], covariant, decided)
+            _ -> ()
+        Function(ps, r, _) -> *given match
+            Function(gs, s, _) ->
+                if ps.len() == gs.len()
+                    for i in 0..<ps.len()
+                        decide_meeting(c, ps[i], gs[i], !covariant, decided)
+                decide_meeting(c, r, s, covariant, decided)
+            _ -> ()
+        ByName(p) -> *given match
+            ByName(g) -> decide_meeting(c, p, g, covariant, decided)
+            _ -> decide_meeting(c, p, given, covariant, decided)
+        Data(id, _, ps) -> *given match
+            Data(gid, _, gs) ->
+                if id == gid && ps.len() == gs.len()
+                    for i in 0..<ps.len()
+                        decide_meeting(c, ps[i], gs[i], vary(c.data[id].decl.type_params, i, covariant), decided)
+            // The method's data type seen as a trait the trait's method names.
+            Class(gid, _, _) ->
+                if covariant
+                    if ancestor_type(c.classes, c.data, pattern, gid) is Some(up) then decide_meeting(c, up, given, covariant, decided)
+            _ -> ()
+        Class(id, _, ps) ->
+            // The trait's type is seen as the method's class through its ancestors where the
+            // method's is the wider; the method's is seen as the trait's where the trait's is.
+            var other = given
+            if covariant
+                if *given is Class(gid, _, _)
+                    if gid != id
+                        if ancestor_type(c.classes, c.data, pattern, gid) is Some(up)
+                            decide_meeting(c, up, given, covariant, decided)
+                        return
+            elif ancestor_type(c.classes, c.data, given, id) is Some(up) then other = up
+            *other match
+                Class(gid, _, gs) ->
+                    if id == gid && ps.len() == gs.len()
+                        for i in 0..<ps.len()
+                            decide_meeting(c, ps[i], gs[i], vary(c.classes[id].decl.type_params, i, covariant), decided)
+                _ -> ()
+        Union(ps) -> *given match
+            Union(gs) ->
+                if ps.len() == gs.len()
+                    for i in 0..<ps.len()
+                        decide_meeting(c, ps[i], gs[i], covariant, decided)
+            _ -> ()
+        _ -> ()
+
+/** The method among `candidates`, the methods of type `own`, that meets method `tm` of constructor
+ * trait `t`, which `own` conforms to, recording what a call through the bound gives it; a method of
+ * the name that does not meet it is reported, once for `key`. */
+private met_in_table(c: *Checker, own: &Type, t: usize, tm: usize, candidates: Buf[usize], key: string, reported: *Buf[string]) -> Option[usize]
+    val site = conformance_impl(c, own, t)
+    val conditions = site match
+        Some(i) -> c.impls[i].conditions
+        None -> buf()
+    meet_method(c, own, tm, candidates, conditions) match
+        Met(m, args) ->
+            c.meetings.put(meeting_key(m, tm), args)
+            Some(m)
+        Unmet(m, why) ->
+            if !contains_name(*reported, key)
+                reported.push(key)
+                val name_of = type_name(own)
+                val shown = *own match
+                    Data(_, n, _) -> n
+                    Class(_, n, _) -> n
+                    _ -> name_of
+                val text = s"`${c.symbols[m].name}` does not implement `${c.symbols[tm].name}` for `$shown`, $why"
+                // A method the impl declares is shown where it is; any other at the impl.
+                var at_method = true
+                if site is Some(i)
+                    val d = c.impls[i].decl
+                    val s = c.symbols[m].decl.name_span
+                    at_method = c.symbols[m].unit == c.impls[i].unit && d.span.start <= s.start && s.end <= d.span.end
+                    if !at_method then c.note(c.impls[i].unit, written_trait_span(d), text)
+                if at_method then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, text)
+            None
+        Ambiguous(a, b) ->
+            if !contains_name(*reported, key)
+                reported.push(key)
+                val shown = *own match
+                    Data(_, n, _) -> n
+                    Class(_, n, _) -> n
+                    _ -> type_name(own)
+                val text = s"two overloads of `${c.symbols[a].decl.name}` both meet `${c.symbols[tm].name}` for `$shown`, so a call through the trait would have two methods to call; exactly one of the name meets it"
+                site match
+                    Some(i) -> c.note(c.impls[i].unit, written_trait_span(c.impls[i].decl), text)
+                    None -> c.note(c.symbols[b].unit, c.symbols[b].decl.name_span, text)
+            None
+        NoneNamed -> None
+
+/** Whether `methods` holds one named `name`, static or not as `static_member` says. */
+private has_method_named(c: *Checker, methods: Buf[usize], name: string, static_member: bool) -> bool
+    for m in methods
+        if c.symbols[m].decl.name == name && c.symbols[m].static_member == static_member then return true
+    false
+
+/** The impl stating type `own`'s conformance to `t`, or to a trait requiring it, if an impl does. */
+private conformance_impl(c: *Checker, own: &Type, t: usize) -> Option[usize]
+    for i in 0..<c.impls.len()
+        if c.impls[i].trait_type is Some(x)
+            if impl_targets(c.impls[i].target, own) && ancestor_type(c.classes, c.data, x, t) is Some(_) then return Some(i)
+    None
+
+/** The direction a type argument at parameter `i` is compared in, inside a type compared in
+ * `covariant`'s: kept at a covariant parameter, flipped at a contravariant one; an invariant one is
+ * decided either way. */
+private vary(params: Buf[TypeParam], i: usize, covariant: bool) -> bool
+    if i >= params.len() then return covariant
+    params[i].variance match
+        Contravariant -> !covariant
+        _ -> covariant
+
 // A data type's method table: at each position of a trait it conforms to, the type's own method of
 // that name, which an impl of a trait declares, or else the trait's default body. Two different
 // default bodies under one name must be replaced by the type's own; every abstract method must be.
@@ -5206,6 +5831,13 @@ private build_data_table(c: *Checker, id: usize, conformed: Buf[usize])
             val name = c.symbols[methods[j]].decl.name
             val key = method_key(c, self_type, methods[j])
             var chosen = methods[j]
+            // A constructor trait's method is met by the type's own method of its name, wherever
+            // it is declared; with none of the name, the trait's default body serves.
+            if is_constructor_trait(c, t)
+                if met_in_table(c, self_type, t, methods[j], c.data[id].methods, key, &reported) is Some(m)
+                    table[c.classes[t].base + j] = Some(m)
+                    continue
+                if has_method_named(c, c.data[id].methods, name, c.symbols[methods[j]].static_member) then continue
             var own: Option[usize] = None
             val mine = c.data[id].methods
             if is_trait_field(c, methods[j])
@@ -5388,6 +6020,19 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
                 reported.push(key)
                 c.note(k.unit, k.decl.name_span, s"`${k.name}` inherits two implementations of `$name`, `${c.symbols[bodies[0]].name}` and `${c.symbols[bodies[1]].name}`; override it")
         if chosen is Some(m) then table[i] = Some(m)
+    // A constructor trait the class conforms to itself is met by the class's own methods of each
+    // name; with none of the name, the trait's default body serves.
+    if !is_trait(c, id)
+        for t in conformed[id]
+            if !is_constructor_trait(c, t) || constructor_holes(c, self_type, t) is None then continue
+            val methods = c.classes[t].methods
+            for j in 0..<methods.len()
+                if is_trait_override(c, methods[j]) then continue
+                val key = method_key(c, self_type, methods[j])
+                if met_in_table(c, self_type, t, methods[j], k.methods, key, &reported) is Some(m)
+                    table[c.classes[t].base + j] = Some(m)
+                elif has_method_named(c, k.methods, c.symbols[methods[j]].decl.name, c.symbols[methods[j]].static_member)
+                    table[c.classes[t].base + j] = None
     c.classes[id].table = table
     // A static member belongs to the type, so an abstract class implements its traits' too.
     val abstract_class = is_abstract_class(c, id)
@@ -5581,8 +6226,10 @@ private check_class_variance(c: *Checker, id: usize)
     val owner = class_owner(id)
     val at = k.decl.name_span
     if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
+    // A constructor trait's arguments are holes, which no value's type fills, so they are no
+    // position of a variance.
     for t in k.traits
-        variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+        if !names_constructor_trait(c, t) then variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
     for f in k.functions
         variance_in(c, k.unit, params, owner, f, 1, at, s"the function type ${type_name(f)}")
     for i in k.inherited..<k.fields.len()
@@ -5653,7 +6300,7 @@ private check_data_variance(c: *Checker, id: usize)
             val name = if i < v.field_names.len() then v.field_names[i] else "_"
             variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
     for t in d.traits
-        variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+        if !names_constructor_trait(c, t) then variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
     for f in d.functions
         variance_in(c, d.unit, params, owner, f, 1, d.decl.span, s"the function type ${type_name(f)}")
 
@@ -5747,6 +6394,7 @@ private check_override_results(c: *Checker, id: usize)
                 if sup_table[position] is Some(sm)
                     if !is_abstract_method(c.symbols[sm]) && c.symbols[sm].decl.name == c.symbols[base].decl.name then base = sm
             if m == base then continue
+            if c.meetings.get(meeting_key(m, base)) is Some(_) then continue
             // A method made from a template is the template's, which is checked against the trait.
             c.derived_context = c.derived_symbols.get(s"$m")
             if contains_id(c.field_getters, m)
@@ -5794,10 +6442,7 @@ private seen_from(c: *Checker, self_type: &Type, m: usize, t: &Type) -> &Type
         None -> buf()
     // A trait's `Self` is the type the method is seen from.
     var selfless = renamed
-    if is_trait(c, owner)
-        var implementer: Buf[&Type] = buf()
-        implementer.push(self_type)
-        selfless = substitute(renamed, self_owner(owner), implementer)
+    if is_trait(c, owner) then selfless = substitute(renamed, self_owner(owner), self_for(c, self_type, owner))
     substitute(selfless, class_owner(owner), args)
 
 /** How many type parameters of its own method `m` declares. */
@@ -5984,6 +6629,8 @@ private check_data_implementations(c: *Checker, id: usize)
                 None -> continue
             val base = methods[j]
             if m == base then continue
+            // A method meeting a constructor trait's was checked by the meeting.
+            if c.meetings.get(meeting_key(m, base)) is Some(_) then continue
             if contains_id(c.field_getters, m)
                 if field_mismatch(c, self_type, m, base) is Some(text) then report_conformance(c, id, t, text)
                 continue
@@ -6610,7 +7257,7 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
     for i in from..<params.len()
         val tp = params[i]
         if tp.holes.len() > 0
-            declare_constructor_param(c, unit, tp)
+            declare_constructor_param(c, unit, owner, i, tp)
             continue
         if tp.lower is Some(l)
             if i < own then c.note(unit, l.span, s"a lower bound is written on a function's or a method's own type parameter, not on `${tp.name}`")
@@ -6621,6 +7268,11 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
         if tp.bounds.len() == 0 then continue
         var bounds: Buf[&Type] = buf()
         for b in tp.bounds
+            // A constructor trait bounds a constructor, never a type.
+            if written_constructor_trait(c, unit, b) is Some(k)
+                val n = c.classes[k].decl.type_params.len()
+                c.note(unit, b.span, s"`${c.classes[k].name}` is a bound for a constructor of ${arguments_word(n)}; declare `${tp.name}[${hole_marks(n)}]`")
+                continue
             val t = resolve_bound(c, unit, b)
             *t match
                 Class(k, _, _) ->
@@ -6639,15 +7291,37 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
 // A constructor parameter, `F[_]`, stands for a type constructor, so what bounds a type bounds none
 // of it: a trait for types (`Ord`) is refused, and so is a lower bound, which compares types. The
 // parameter itself is invariant; a variance is written on its holes, as a demand on the constructor.
-private declare_constructor_param(c: *Checker, unit: usize, tp: TypeParam)
+private declare_constructor_param(c: *Checker, unit: usize, owner: usize, index: usize, tp: TypeParam)
     if !(tp.variance is Invariant)
         val sign = if tp.variance is Covariant then "+" else "-"
         c.note(unit, tp.span, s"a constructor parameter is invariant; a variance is written on its holes, as in `${tp.name}[${sign}_]`, as a demand on the constructor passed")
     if tp.lower is Some(l) then c.note(unit, l.span, s"`${tp.name}` is a constructor, which takes no lower bound; a lower bound is a type's")
+    // A constructor parameter is bounded by constructor traits of its arity, named bare.
+    var bounds: Buf[&Type] = buf()
     for b in tp.bounds
+        if written_constructor_trait(c, unit, b) is Some(k)
+            val arity = c.classes[k].decl.type_params.len()
+            val name = c.classes[k].name
+            val written_args = b.kind match
+                Named(_, args) -> args.len()
+                _ -> 0
+            if written_args > 0
+                c.note(unit, b.span, s"`$name` is a constructor trait, which bounds a constructor parameter named without arguments, as in `${tp.name}[${hole_marks(tp.holes.len())}]: $name`")
+                continue
+            if arity != tp.holes.len()
+                c.note(unit, b.span, s"`$name` is a bound for a constructor of ${arguments_word(arity)}, and `${tp.name}` takes ${arguments_word(tp.holes.len())}")
+                continue
+            index_class(c, unit, Span(b.span.start, b.span.start + name.bytes.len), k)
+            val t = constructor_bound(c, k)
+            if contains_type(bounds, t)
+                c.note(unit, b.span, s"`$name` is already a bound of `${tp.name}`")
+                continue
+            bounds.push(t)
+            continue
         val t = resolve_bound(c, unit, b)
         if *t is ErrorType then continue
         c.note(unit, b.span, s"`${type_name(t)}` is a bound for a type, and `${tp.name}` is a constructor")
+    if bounds.len() > 0 then c.bounds.put(bound_key(owner, index, tp), bounds)
     // A hole's bounds are a type's, `F[_: Ord]`: every type the hole is filled with meets them.
     for k in 0..<tp.holes.len()
         var bounds: Buf[&Type] = buf()
@@ -6663,6 +7337,44 @@ private declare_constructor_param(c: *Checker, unit: usize, tp: TypeParam)
                 ErrorType -> ()
                 _ -> c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
         c.bounds.put(hole_bound_key(tp, k), bounds)
+    // A constructor trait's bounded parameter is the bound of the hole it stands for, which must
+    // promise it: `SendableMonad[A: Sendable]` bounds an `F[_: Sendable]`.
+    for b in bounds
+        if *b is Class(k, _, _)
+            val params = c.classes[k].decl.type_params
+            for j in 0..<params.len()
+                if j >= tp.holes.len() then break
+                for wanted in c.bounds.get(bound_key(class_owner(k), j, params[j])).unwrap_or(buf())
+                    if !bound_implied(c, hole_bounds(c, tp, j), wanted)
+                        c.note(unit, tp.span, s"`${c.classes[k].name}`'s parameter `${params[j].name}` is bounded by `${type_name(wanted)}`, so the hole it stands for is too, as in `${tp.name}[${bounded_hole_marks(tp.holes.len(), j, type_name(wanted))}]`")
+
+/** `n` holes as a constructor parameter writes them: `_, _`. */
+private hole_marks(n: usize) -> string
+    var out = ""
+    for i in 0..<n
+        if i > 0 then out = out + ", "
+        out = out + "_"
+    out
+
+/** `n` holes with hole `j` bounded by `bound`: `_, _: Sendable`. */
+private bounded_hole_marks(n: usize, j: usize, bound: string) -> string
+    var out = ""
+    for i in 0..<n
+        if i > 0 then out = out + ", "
+        out = out + (if i == j then s"_: $bound" else "_")
+    out
+
+/** The constructor trait a bound names, if it names one: written as a name, with or without type
+ * arguments. */
+private written_constructor_trait(c: *Checker, unit: usize, b: &TypeExpr) -> Option[usize]
+    val path = b.kind match
+        Named(p, _) -> p
+        _ -> return None
+    if c.generic is Some(scope)
+        for tp in scope.params
+            if tp.name == path then return None
+    val k = c.class_types.get(resolve_name(c, unit, path))?
+    if is_constructor_trait(c, k) then Some(k) else None
 
 /** Where the bounds of hole `k` of constructor parameter `tp` are kept in `bounds`. */
 private hole_bound_key(tp: TypeParam, k: usize) -> string = s"hole/${tp.site}/$k"
@@ -6785,6 +7497,20 @@ private type_var_bounds(f: Conformances, t: &Type) -> Buf[&Type]
             if f.generic is Some(scope)
                 if scope.owner == owner then params = scope.params
             scope_bounds(f, owner, params, index)
+        // An application `F[X]` of a constructor parameter bounded by constructor traits has
+        // their members at `X`: its bounds are the traits with `X` in place of their holes. Inside a
+        // constructor trait, `Self[X]` is the trait at `X`.
+        Applied(head, args) -> *head match
+            TypeVar(owner, _, _) ->
+                var out: Buf[&Type] = buf()
+                if is_self_owner(owner)
+                    val k = owner - self_owner(0)
+                    out.push(Class(k, f.classes[k].name, args))
+                    return out
+                for b in type_var_bounds(f, head)
+                    out.push(substitute(b, hole_owner(), args))
+                out
+            _ -> buf()
         _ -> buf()
 
 /** The lower bound of type parameter `t` as the code being checked names it, if it has one. */
@@ -8305,6 +9031,10 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
         if is_hole(args[i]) then continue
         if params[i].holes.len() > 0
             hold_constructor(c, unit, at, owner, params, i, args)
+            for b in bounds_at(c, owner, params, i)
+                if *b is Class(k, _, _)
+                    if constructor_refusal_for_trait(c, zonk(c, args[i]), k) is Some(why)
+                        c.note(unit, at, s"`${type_name(zonk(c, args[i]))}` does not implement `${c.classes[k].name}`, the bound of `${params[i].name}` in $what$why")
             continue
         for b in bounds_at(c, owner, params, i)
             val bound = substitute(b, owner, args)
@@ -8337,6 +9067,80 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
             if conforms(lower, arg) || conforms(view_part(conformances(c), lower, arg), arg)
                 if !same_type(lower, arg) then c.views.push(TypeView(one_part(lower), one_part(arg)))
             else c.note(unit, at, s"`${type_name(arg)}` is not a supertype of `${type_name(lower)}`, the lower bound of `${params[i].name}` in $what")
+
+/** Why constructor `given` does not implement constructor trait `k`, said after the message that it
+ * does not (empty for no more to say), or `None` where it does. A data type or class conforms by its
+ * own declaration or impls, never a superclass's, at the holes its conformance leaves open, and with
+ * the arguments written out meeting the conformance's bounds; a constructor parameter conforms
+ * through its bounds. */
+private constructor_refusal_for_trait(c: *Checker, given: &Type, k: usize) -> Option[string]
+    val body = *given match
+        Constructor(b, _) -> b
+        ErrorType -> return None
+        _ -> return Some("")
+    val trait_name = c.classes[k].name
+    *body match
+        Applied(head, xs) ->
+            for j in 0..<xs.len()
+                if !same_type(xs[j], hole(j)) then return Some("; a constructor parameter conforms to its bounds only with all its arguments open")
+            *head match
+                TypeVar(owner, _, _) ->
+                    if is_self_owner(owner)
+                        if ancestor_type(c.classes, c.data, own_class_type(c.classes[owner - self_owner(0)], owner - self_owner(0)), k) is Some(_) then return None
+                        return Some("")
+                    for b in bounds_of(c, head)
+                        if ancestor_type(c.classes, c.data, b, k) is Some(_) then return None
+                    Some(s"; bound it, as in `${type_name(head)}[${hole_marks(xs.len())}]: $trait_name`")
+                _ -> Some("")
+        Data(id, name, xs) -> conformance_refusal_at(c, own_type(c.data[id], id), name, xs, k)
+        Class(id, name, xs) -> conformance_refusal_at(c, own_class_type(c.classes[id], id), name, xs, k)
+        _ -> Some("")
+
+/** Why the constructor that is type `own` at the arguments `xs`, its holes among them, does not
+ * implement constructor trait `k`, or `None` where it does. */
+private conformance_refusal_at(c: *Checker, own: &Type, name: string, xs: Buf[&Type], k: usize) -> Option[string]
+    val trait_name = c.classes[k].name
+    val positions = constructor_holes(c, own, k) match
+        Some(p) -> p
+        None ->
+            // A superclass's conformance is not the subclass's: its methods answer the superclass.
+            if *own is Class(id, _, _)
+                var sup = c.classes[id].superclass
+                loop
+                    val s = sup match
+                        Some(s) -> s
+                        None -> break
+                    if *s is Class(sid, sname, _)
+                        if constructor_holes(c, own_class_type(c.classes[sid], sid), k) is Some(_)
+                            return Some(s": its superclass `$sname` does, and a constructor trait's conformance is a type's own, which a subclass does not inherit; implement it for `$name` too")
+                        sup = c.classes[sid].superclass
+                    else break
+            return Some(s"; a type is a `$trait_name` only where an impl says so, as in `impl $trait_name for $name`")
+    var open_ok = true
+    for p in 0..<xs.len()
+        var hole_at: Option[usize] = None
+        for j in 0..<positions.len()
+            if positions[j] == p then hole_at = Some(j)
+        hole_at match
+            Some(j) -> if !same_type(xs[p], hole(j)) then open_ok = false
+            None -> if is_hole(xs[p]) then open_ok = false
+    if !open_ok
+        val shown = type_name(Constructor(open_at(own, positions), positions.len()))
+        return Some(s": `$name` implements `$trait_name` as `$shown`, leaving those arguments open")
+    // The arguments written out meet the bounds the conformance's impl gives them.
+    if conformance_impl(c, own, k) is Some(i)
+        val conditions = c.impls[i].conditions
+        val owner = *own match
+            Data(id, _, _) -> data_owner(id)
+            Class(id, _, _) -> class_owner(id)
+            _ -> 0
+        for p in 0..<xs.len()
+            if p >= conditions.len() || is_hole(xs[p]) then continue
+            for b in conditions[p]
+                val bound = substitute(b, owner, xs)
+                if !conforms_to_bound(c, xs[p], bound)
+                    return Some(s": its impl holds only where `${c.impls[i].decl.type_params[p].name}` conforms to `${type_name(bound)}`, and `${type_name(xs[p])}` does not")
+    None
 
 // The constructor given to constructor parameter `params[i]`, written or inferred, held to what the
 // parameter's holes demand of it: at each hole, the parameter of the type there is covariant where
@@ -8567,6 +9371,131 @@ private mentions_self(c: *Checker, k: usize, depth: usize) -> bool
         if parent_trait(c, c.classes[k].unit, parent) is Some(t)
             if mentions_self(c, t, depth + 1) then return true
     false
+
+/** Whether `k` is a constructor trait: a trait whose members write `Self` with type arguments, or
+ * that requires a trait that does. What implements it is a constructor, `Self[B]` that constructor
+ * applied, and the trait's parameters are its holes. */
+is_constructor_trait(c: *Checker, k: usize) -> bool = constructor_trait_at(c, k, 0)
+
+private constructor_trait_at(c: *Checker, k: usize, depth: usize) -> bool
+    if depth > c.classes.len() || !is_trait(c, k) then return false
+    for m in c.classes[k].decl.members
+        m match
+            MethodMember(f, _, _, _) ->
+                for p in f.params
+                    if applies_self(p.ty) then return true
+                if f.result is Some(r)
+                    if applies_self(r) then return true
+            AbstractFieldMember(f) -> if applies_self(f.declared) then return true
+            FieldMember(f) ->
+                if f.declared is Some(t)
+                    if applies_self(t) then return true
+            _ -> ()
+    for parent in c.classes[k].decl.parents
+        if parent_trait(c, c.classes[k].unit, parent) is Some(t)
+            if constructor_trait_at(c, t, depth + 1) then return true
+    false
+
+/** Whether a type written names `Self` with type arguments, `Self[B]`. */
+private applies_self(t: &TypeExpr) -> bool
+    t.kind match
+        Named(path, args) ->
+            if path == "Self" && args.len() > 0 then return true
+            for a in args
+                if applies_self(a) then return true
+        Tuple(items) ->
+            for item in items
+                if applies_self(item) then return true
+        Function(params, result, _) ->
+            for p in params
+                if applies_self(p.ty) then return true
+            return applies_self(result)
+        Union(members) ->
+            for m in members
+                if applies_self(m) then return true
+        _ -> ()
+    false
+
+/** Whether `t` is a constructor trait at some arguments. */
+private names_constructor_trait(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> is_constructor_trait(c, k)
+    _ -> false
+
+/** A constructor trait's bound as a constructor parameter has it, its parameters the holes:
+ * `Functor[_]` for `F[_]: Functor`. */
+private constructor_bound(c: *Checker, k: usize) -> &Type
+    var holes: Buf[&Type] = buf()
+    for i in 0..<c.classes[k].decl.type_params.len()
+        holes.push(hole(i))
+    Class(k, c.classes[k].name, holes)
+
+/** Which of a data type's or class's parameters are the holes of its conformance to constructor
+ * trait `k`, in the order of the trait's parameters: the conformance its own declaration or impls
+ * state, never one a superclass has. `None` where it has none. */
+private constructor_holes(c: *Checker, t: &Type, k: usize) -> Option[Buf[usize]] = holes_of_conformance(c.classes, c.data, t, k)
+
+/** `constructor_holes`, from the types alone. */
+holes_of_conformance(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, k: usize) -> Option[Buf[usize]]
+    val (traits, owner) = *t match
+        Data(id, _, _) -> (data[id].traits, data_owner(id))
+        Class(id, _, _) -> (classes[id].traits, class_owner(id))
+        _ -> return None
+    for written in traits
+        if ancestor_type(classes, data, written, k) is Some(up)
+            if *up is Class(_, _, xs)
+                var positions: Buf[usize] = buf()
+                for x in xs
+                    *x match
+                        TypeVar(o, p, _) -> if o == owner then positions.push(p) else return None
+                        _ -> return None
+                return Some(positions)
+    None
+
+/** The constructor a value of type `t` is an application of, as constructor trait `k` sees it: the
+ * head of an application of a constructor parameter, or `t`'s own type with the holes of its
+ * conformance to `k` left open, `Result[_, E]` for a `Result[T, E]`. `None` where `t` has no such
+ * conformance. */
+private self_constructor(c: *Checker, t: &Type, k: usize) -> Option[&Type]
+    *t match
+        Applied(head, _) -> return Some(head)
+        TypeVar(owner, _, _) -> if is_self_owner(owner) then return Some(t)
+        _ -> ()
+    val positions = constructor_holes(c, t, k)?
+    Some(Constructor(open_at(t, positions), positions.len()))
+
+/** The constructor a value of data type or class `t` is an application of, as constructor trait `k`
+ * sees it, from the types alone: what an instance of `k`'s methods takes as `Self`. */
+constructor_of_value(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, k: usize) -> Option[&Type]
+    val positions = holes_of_conformance(classes, data, t, k)?
+    Some(Constructor(open_at(t, positions), positions.len()))
+
+/** Data type or class type `t` with its arguments at `positions` replaced by holes, the `j`th
+ * position by hole `j`. */
+open_at(t: &Type, positions: Buf[usize]) -> &Type
+    val args = *t match
+        Data(_, _, xs) -> xs
+        Class(_, _, xs) -> xs
+        _ -> return t
+    var open: Buf[&Type] = buf()
+    for a in args
+        open.push(a)
+    for j in 0..<positions.len()
+        if positions[j] < open.len() then open[positions[j]] = hole(j)
+    *t match
+        Data(id, name, _) -> Data(id, name, open)
+        Class(id, name, _) -> Class(id, name, open)
+        _ -> t
+
+/** What `Self` stands for in trait `k`'s methods as a value of type `t` sees them: `t` itself, or
+ * for a constructor trait the constructor `t` is an application of. */
+private self_for(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    if is_constructor_trait(c, k)
+        if self_constructor(c, t, k) is Some(f)
+            out.push(f)
+            return out
+    out.push(t)
+    out
 
 /** Whether `k` is a trait whose methods, and those of every trait it requires, take `Self` only as
  * their receiver, with no static member: the traits a union conforms to where its members do. */
@@ -10546,6 +11475,20 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     check_hole_args(c, unit, t.span, scope.params[i], items)
                     return Applied(TypeVar(scope.owner, i, path), items)
         if path == "Self"
+            // In a constructor trait `Self` is the constructor implementing it, a type only applied
+            // to as many arguments as the trait has parameters.
+            if c.self_trait is Some(k)
+                if is_constructor_trait(c, k)
+                    val arity = c.classes[k].decl.type_params.len()
+                    if args.len() != arity
+                        val name = c.classes[k].name
+                        if args.len() == 0 then c.note(unit, t.span, s"`$name` is a constructor trait, so `Self` in it is a constructor, a type only with its ${count(arity, "type argument")}, as in `Self[${sample_args(arity)}]`")
+                        else c.note(unit, t.span, s"`Self` in `$name` takes ${count(arity, "type argument")}, as `$name` has ${count(arity, "parameter")}, not ${args.len()}")
+                        return ErrorType
+                    var items: Buf[&Type] = buf()
+                    for a in args
+                        items.push(resolve_type(c, unit, a))
+                    return Applied(TypeVar(self_owner(k), 0, "Self"), items)
             if args.len() > 0 then c.note(unit, t.span, "`Self` takes no type arguments")
             if c.self_trait is Some(k) then return TypeVar(self_owner(k), 0, "Self")
             c.note(unit, t.span, "`Self` is the type implementing a trait, so it is written only in a trait's methods")
@@ -10589,6 +11532,10 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 return ErrorType
             if !as_bound && is_class_named(c, id, qualified(CoreModule, "Boundary"))
                 c.note(unit, t.span, "`Boundary` is a bound, as in `[T: Boundary]`, and not a type")
+                return ErrorType
+            if !as_bound && is_trait(c, id) && is_constructor_trait(c, id)
+                val n = k.decl.type_params.len()
+                c.note(unit, t.span, s"`$path` is a constructor trait, so it is a bound of a constructor, as in `[F[${hole_marks(n)}]: $path]`, and not a type")
                 return ErrorType
             if !as_bound && is_trait(c, id) && mentions_self(c, id, 0)
                 c.note(unit, t.span, s"`$path` mentions `Self`, so it is a bound, as in `[T: $path]`, and not a type")
@@ -12695,7 +13642,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
  * list of parameter types. */
 methods_of(c: *Checker, t: &Type, name: string) -> Buf[usize]
     val known = zonk(c, t)
-    if *known is TypeVar(_, _, _) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
+    if bounded_receiver(known) then return with_trait_methods(c, known, name, bound_methods(c, known, name))
     if *known is Union(_) then return union_rendering_methods(c, known, name)
     val found = if *known is Class(k, _, _) then with_trait_methods(c, known, name, methods_named(c, k, name)) else in_scope_on_context(c, known, with_trait_methods(c, known, name, visible_methods(c, receiver_methods(c, known, name))))
     if found.len() > 0 then found else rendering_methods(c, known, name)
@@ -12714,6 +13661,13 @@ private in_scope_on_context(c: *Checker, t: &Type, ms: Buf[usize]) -> Buf[usize]
         val home = c.symbols[m].module_name
         if home == CoreModule || sees_module(c, unit_of(c), home) then out.push(m)
     out
+
+/** Whether a value of type `t` has exactly the members its bounds give it: a type parameter, or an
+ * application of a constructor parameter, `F[X]`, or of a constructor trait's `Self`. */
+bounded_receiver(t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    Applied(head, _) -> *head is TypeVar(_, _, _)
+    _ -> false
 
 /** The methods of `name` a value of type parameter `t` has: those of its bounds, each once. */
 bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
@@ -13089,6 +14043,7 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
             c.note(unit, e.span, s"`${type_name(ty)}` has no field `$name`")
         Class(k, _, _) -> return class_member_value(c, e.span, value, k, name, expected)
         TypeVar(_, _, _) -> return bound_member_value(c, e.span, value, ty, name, expected)
+        Applied(_, _) -> if bounded_receiver(ty) then return bound_member_value(c, e.span, value, ty, name, expected)
         ErrorType -> ()
         Nothing -> return value
         Union(_) -> c.note(unit, e.span, union_no_member(ty, name))
@@ -18266,7 +19221,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
         return TExpr(at, ErrorType, UnitConst)
     // A value of a type parameter has the methods of its bounds, and no others but the `equals` and
     // `hash` every value has.
-    if *zonk(c, object.ty) is TypeVar(_, _, _)
+    if bounded_receiver(zonk(c, object.ty))
         val ty = zonk(c, object.ty)
         val ms = with_trait_methods(c, ty, name, bound_methods(c, ty, name))
         if ms.len() > 0
@@ -18567,9 +19522,7 @@ private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Typ
         Some(k) -> k
         None -> return t
     if !is_trait(c, k) then return t
-    var implementer: Buf[&Type] = buf()
-    implementer.push(zonk(c, receiver_type))
-    substitute(t, self_owner(k), implementer)
+    substitute(t, self_owner(k), self_for(c, zonk(c, receiver_type), k))
 
 // Reports a call of method `m` on a receiver of type `receiver_type` that has the method only through
 // a conformance that does not hold at its type arguments: a method of an impl with bounds of its own
@@ -18716,8 +19669,9 @@ private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&
     // One of an impl for every tuple of an arity takes the receiver's parts as its parameters.
     if is_tuple_owner(c.symbols[m].type_owner)
         if *t is Tuple(parts) then return parts
-    // A type parameter has the methods of its bounds, as an instance of them.
-    if *t is TypeVar(_, _, _)
+    // A type parameter has the methods of its bounds, as an instance of them, and so does an
+    // application of a constructor parameter, at its arguments.
+    if bounded_receiver(t)
         if c.symbols[m].owner_class is Some(k)
             for b in bounds_of(c, t)
                 if ancestor_type(c.classes, c.data, b, k) is Some(up)
@@ -18762,7 +19716,7 @@ private method_call_kind(c: *Checker, receiver_type: &Type, m: usize, args: Buf[
     // `equals` and `hash` are decided by the receiver's type in every instance: its own, or by value
     // or identity.
     if is_universal(c, m) then return BoundCall(m, Some(trait_slot(c, m)), args, type_args)
-    if *zonk(c, receiver_type) is TypeVar(_, _, _) then return BoundCall(m, bound_slot(c, m), args, type_args)
+    if bounded_receiver(zonk(c, receiver_type)) then return BoundCall(m, bound_slot(c, m), args, type_args)
     dispatch_slot(c, receiver_type, m) match
         Some(s) -> Dispatch(m, s, args, type_args)
         None -> Call(m, args, type_args)

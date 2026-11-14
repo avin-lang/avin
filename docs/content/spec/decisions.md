@@ -9297,6 +9297,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
   it may not fill among them).
 
+**Higher-kinded types, constructor traits and their impls** (build plan step 3, branch `hkt-3`)
+
+- Proposed: **a constructor trait's default bodies are compiled once per implementing constructor
+  already in step 3**, not from step 5: each instance of a constructor trait's method takes the
+  constructor after its type arguments, and `Self` stands for it there. Why: a body shared by
+  every conforming type sees `Self` as an object, but a `Self[B]` may be an option or another value
+  laid out as no object is, and a shared `mapTwice` built that way crashed at run time; the
+  per-constructor copy is what the spec's design says in the end, so no later step removes it.
+  Step 5 keeps `Self.pure` and `F.pure`. Alternatives: refusing default bodies in constructor
+  traits until step 5 (a temporary refusal step 5 would remove).
+- Proposed: **the methods that meet a constructor trait's are the type's own: those its
+  declaration and its impls declare, never a superclass's.** Why: the spec's rule names "the
+  type's own methods", and a superclass's method answers the superclass's type, the reason a
+  subclass inherits no conformance. Alternatives: also meeting with inherited methods whose
+  results happen to fit (a `foldLeft` would; a `map` never does). Review with the user if a class
+  hierarchy wants an inherited `foldLeft` to meet `Foldable`.
+- Proposed: **two overloads that both meet one trait method are an error at the impl**, naming
+  the method. Why: a call through the bound would have two methods to call, and choosing the
+  more specific is a second overload resolution no call site shows. Alternatives: the more
+  specific overload, as a written call would pick (more code, and a choice the reader cannot
+  see); the first declared (arbitrary).
+- Proposed: **the meeting decides a method's own type parameters from where they first appear in
+  its parameter types, against the trait's, then in its result; one still undecided takes its
+  lower bound, and one with none is an error naming it.** Every parameter and the result are then
+  checked with what was decided, each seen as the other's with no conversion (a reference seen as
+  a supertype, as a covariant part is; never a box). Why: the spec's "whose own type parameters
+  that call decides (a lower bound by its bound)"; the order makes `List`'s `flatMap(f: (T) ->
+  Iterable[U])` take `U` from the trait's `List[B]` seen as an `Iterable`. Alternatives: full
+  inference by the call checker (heavier, and its tiers of defaults would decide what the trait's
+  call does not).
+- Proposed: **a constructor trait requires only constructor traits**, each at its own parameters
+  in order; `trait Shown[A]: Functor[A], Display` is an error. Why: a trait for types bounds what
+  a value is, and the constructor trait's `Self` is no value's type, so what the requirement would
+  promise is unclear. Alternatives: reading it as a bound on every application `Self[A]` (a
+  constraint on applications, which impls over constructor parameters, step 6, are the place for).
+- Proposed: **a constructor trait's arguments are no position of a variance** for the conforming
+  type: `List[+T]` and `Result[+T, +E]` conform to `Monad[T]`, an invariant parameter. Why: no
+  value has the trait as its type, so `Monad[Dog]` and `Monad[Animal]` are never compared; the
+  subtyping of `F[Dog]` is the hole's (`F[+_]`). Alternatives: none that let a covariant type
+  conform.
+- Proposed: **a class may state a conformance to a constructor trait in its header**, `class
+  Crate[A]: Functor[A]`, held as an impl's is; the form leaving the trait's arguments off is an
+  impl's only. A class's methods meeting the trait's need no `override`, and may write it. Why:
+  a header conformance is one an impl could state, and the meeting methods are the class's own,
+  which override nothing. Alternatives: requiring an impl for constructor traits (no reason a
+  header could not say the same).
+- Proposed: **the conformance's errors are reported at the impl, a meeting's at the method where
+  the impl declares it and at the impl otherwise**: a library type's method that does not meet is
+  reported where the program's impl names the trait. Why: the impl is what the program wrote; the
+  library's method is not the mistake.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per
