@@ -522,7 +522,9 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     for i in 0..<program.symbols.len()
         var inside_generic_local = false
         if program.symbols[i].root is Some(r) then inside_generic_local = generic_locals[r]
-        if !inside_generic_local && !program.symbols[i].lambda && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] then instance(&l, i, buf())
+        // A local function written in an arm on a variant hiding types is compiled for each pack,
+        // through the calls and function values the arm's copies make.
+        if !inside_generic_local && !program.symbols[i].lambda && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] && !in_pack_scope(&l, i) then instance(&l, i, buf())
     val entry: Option[usize] = program.entry match
         Some(id) -> Some(instance(&l, id, buf()))
         None -> None
@@ -3234,9 +3236,11 @@ private function_refinements(l: *Lowering, symbol: usize) -> Buf[Refinement]
         if rf.symbol != symbol then continue
         // A pattern on a variant hiding types reads them from the pack of the arm that made the
         // function value, which its copy's type arguments end with (`pack_args`).
-        var tail = l.subst.len()
+        var width = 0usize
         for k in rf.sites
-            tail -= hidden_site_width(l, k)
+            width += hidden_site_width(l, k)
+        if width > l.subst.len() then panic("a function value's copy lacks its packs' type arguments")
+        var tail = l.subst.len() - width
         for k in rf.sites
             val site = l.program.refine_sites[k]
             val width = hidden_site_width(l, k)
@@ -3265,15 +3269,20 @@ private own_pack_width(l: *Lowering) -> usize
         break
     if width > l.subst.len() then 0 else width
 
+/** Whether function `symbol` is written inside a pattern on a variant hiding types. */
+private in_pack_scope(l: *Lowering, symbol: usize) -> bool
+    for rf in l.program.refined_functions
+        if rf.symbol != symbol then continue
+        for k in rf.sites
+            if hidden_site_width(l, k) > 0 then return true
+    false
+
 /** How many type arguments a function value made inside refining pattern `k`'s scope carries for
  * it: its variant's parameters where the variant hides some, and none otherwise. */
 private hidden_site_width(l: *Lowering, k: usize) -> usize
     val site = l.program.refine_sites[k]
-    val id = *concrete(l, site.matched) match
-        Data(id, _, _) -> id
-        _ -> return 0
-    if !hides(l, id, site.variant) then return 0
-    l.program.data[id].variants[site.variant].params.len()
+    if !hides(l, site.data, site.variant) then return 0
+    l.program.data[site.data].variants[site.variant].params.len()
 
 /** The type arguments a copy of lambda or local function `function`, made in the code being lowered,
  * carries for the packs of the hidden variant patterns whose scope it is written in: each such
@@ -3283,16 +3292,21 @@ private pack_args(l: *Lowering, function: usize, base: Buf[&Type]) -> Buf[&Type]
     for rf in l.program.refined_functions
         if rf.symbol != function then continue
         for k in rf.sites
-            if hidden_site_width(l, k) == 0 then continue
+            val width = hidden_site_width(l, k)
+            if width == 0 then continue
+            // Exactly the variant's parameters for each such pattern, so the copy reads them back
+            // where it expects them; a pattern no arm here stands for gives nothing it can name.
+            var args: Buf[&Type] = buf()
             for r in l.refined
-                if r.owner == pattern_owner(k)
-                    var copied: Buf[&Type] = buf()
-                    for x in out
-                        copied.push(x)
-                    for a in r.args
-                        copied.push(concrete(l, a))
-                    out = copied
+                if r.owner == pattern_owner(k) && r.args.len() == width
+                    args = r.args
                     break
+            var copied: Buf[&Type] = buf()
+            for x in out
+                copied.push(x)
+            for i in 0..<width
+                copied.push(if i < args.len() then concrete(l, args[i]) else Nothing)
+            out = copied
         break
     out
 
