@@ -53,12 +53,18 @@ match_covers(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> bool
 /** The cases a type enumerates for coverage, or none for a type with too many values. */
 private enum Case
     BoolCase(value: bool)
-    /** A variant, with the types of its fields in the matched type. */
-    VariantCase(index: usize, fields: Buf[&Type])
+    /** A variant, with the types of its fields in the matched type, and what a refined variant's
+     * equalities with the matched type say of the type parameters the other columns may name. */
+    VariantCase(index: usize, fields: Buf[&Type], binds: Buf[Equality])
     /** A member of a union: a union is covered when each of its members is. */
     MemberCase(member: &Type)
 
-private cases_of(t: &Type, data: Buf[DataSymbol]) -> Buf[Case]
+// The cases of a column of type `t`, the other columns being `rest`. A data type with refined
+// variants has only the variants possible at its instance: those whose result's equalities with it
+// have a solution, each variant's parameters given types of their own (`coverage_owner`). The
+// solution holds of every value in the case, so it carries to the fields and to the other columns,
+// where it may leave other variants impossible: the equalities of a row travel along it.
+private cases_of(t: &Type, rest: Buf[&Type], data: Buf[DataSymbol]) -> Buf[Case]
     var out: Buf[Case] = buf()
     *t match
         Union(members) ->
@@ -69,12 +75,156 @@ private cases_of(t: &Type, data: Buf[DataSymbol]) -> Buf[Case]
             out.push(BoolCase(false))
         Data(id, _, args) ->
             val d = data[id]
+            if !has_refined_variants(t, data)
+                for i in 0..<d.variants.len()
+                    out.push(VariantCase(i, variant_fields(d, id, i, args), buf()))
+                return out
+            var columns: Buf[&Type] = buf()
+            columns.push(t)
+            for r in rest
+                columns.push(r)
+            val owner = coverage_owner(fresh_after(columns))
             for i in 0..<d.variants.len()
-                out.push(VariantCase(i, variant_fields(d, id, i, args)))
+                if possible_case(d, id, i, args, owner) is Some(case) then out.push(case)
         // A tuple has one shape, whose parts become columns.
-        Tuple(items) -> out.push(VariantCase(0, items))
+        Tuple(items) -> out.push(VariantCase(0, items, buf()))
         _ -> ()
     out
+
+// Variant `index` of data type `id` as a case of the instance `Data(id, _, args)`, or `None` where
+// its result's equalities with the instance contradict, so it makes no value of it.
+private possible_case(d: DataSymbol, id: usize, index: usize, args: Buf[&Type], owner: usize) -> Option[Case]
+    val shape = d.variants[index]
+    var fresh: Buf[&Type] = buf()
+    for j in 0..<shape.params.len()
+        fresh.push(TypeVar(owner, j, shape.params[j].name))
+    var s = Unifying(buf(), owner, false)
+    shape.result match
+        Some(r) -> *substitute(r, data_owner(id), fresh) match
+            Data(_, _, rs) ->
+                if rs.len() != args.len() then return None
+                for i in 0..<args.len()
+                    unify(&s, args[i], rs[i])
+            _ -> return None
+        None ->
+            for i in 0..<args.len()
+                if i < fresh.len() then unify(&s, args[i], fresh[i])
+    if s.contradiction then return None
+    var fields: Buf[&Type] = buf()
+    for f in shape.fields
+        fields.push(apply_equalities(substitute(f, data_owner(id), fresh), s.found, s.found.len() + 1))
+    var binds: Buf[Equality] = buf()
+    for q in s.found
+        if q.owner != owner then binds.push(q)
+    Some(VariantCase(index, fields, binds))
+
+// The equalities found while a case's are solved; types of `owner` are the variant's own.
+private struct Unifying
+    found: Buf[Equality]
+    owner: usize
+    contradiction: bool
+
+// Takes `a = b` apart as the checker does for a refining pattern: the variant's own types first, then
+// any other type parameter; a union or a type constructor naming a type parameter, or a type not yet
+// known, teaches nothing; two other different types, or a type parameter equal to a type containing
+// it, are a contradiction.
+private unify(s: *Unifying, a: &Type, b: &Type)
+    if s.contradiction then return
+    val x = apply_equalities(a, s.found, s.found.len() + 1)
+    val y = apply_equalities(b, s.found, s.found.len() + 1)
+    if same_type(x, y) || *x is ErrorType || *y is ErrorType then return
+    if *y is TypeVar(o, _, _)
+        if o == s.owner
+            bind_case(s, y, x)
+            return
+    if *x is TypeVar(o, _, _)
+        if o == s.owner
+            bind_case(s, x, y)
+            return
+    if *x is Var(_) || *y is Var(_) then return
+    if *x is TypeVar(_, _, _)
+        bind_case(s, x, y)
+        return
+    if *y is TypeVar(_, _, _)
+        bind_case(s, y, x)
+        return
+    if opaque_part(x) || opaque_part(y) then return
+    *x match
+        Tuple(xs) -> *y match
+            Tuple(ys) -> unify_all(s, xs, ys)
+            _ -> s.contradiction = true
+        Function(xs, r, m) -> *y match
+            Function(ys, q, n) ->
+                if m != n then s.contradiction = true
+                else
+                    unify_all(s, xs, ys)
+                    unify(s, r, q)
+            _ -> s.contradiction = true
+        ByName(r) -> *y match
+            ByName(q) -> unify(s, r, q)
+            _ -> s.contradiction = true
+        Data(i, _, xs) -> *y match
+            Data(j, _, ys) -> if i == j then unify_all(s, xs, ys) else s.contradiction = true
+            _ -> s.contradiction = true
+        Class(i, _, xs) -> *y match
+            Class(j, _, ys) -> if i == j then unify_all(s, xs, ys) else s.contradiction = true
+            _ -> s.contradiction = true
+        _ -> s.contradiction = true
+
+private unify_all(s: *Unifying, xs: Buf[&Type], ys: Buf[&Type])
+    if xs.len() != ys.len()
+        s.contradiction = true
+        return
+    for i in 0..<xs.len()
+        unify(s, xs[i], ys[i])
+
+private bind_case(s: *Unifying, v: &Type, t: &Type)
+    val (o, i) = *v match
+        TypeVar(o, i, _) -> (o, i)
+        _ -> return
+    if names_type_var(t, o, i)
+        s.contradiction = true
+        return
+    s.found.push(Equality(0, o, i, t))
+
+// One more than the highest `coverage_owner` the types name, so a case's own types are new.
+private fresh_after(types: Buf[&Type]) -> usize
+    var next = 0usize
+    for t in types
+        val n = coverage_types_in(t)
+        if n > next then next = n
+    next
+
+private coverage_types_in(t: &Type) -> usize = *t match
+    TypeVar(o, _, _) -> if is_coverage_owner(o) then o - coverage_owner(0) + 1 else 0
+    Tuple(items) -> fresh_after(items)
+    Function(params, result, _) ->
+        val n = fresh_after(params)
+        val m = coverage_types_in(result)
+        if n > m then n else m
+    ByName(inner) -> coverage_types_in(inner)
+    Data(_, _, args) -> fresh_after(args)
+    Class(_, _, args) -> fresh_after(args)
+    Union(members) -> fresh_after(members)
+    _ -> 0
+
+// Whether `t` is an instance of a data type with refined variants.
+private has_refined_variants(t: &Type, data: Buf[DataSymbol]) -> bool
+    val id = *t match
+        Data(id, _, _) -> id
+        _ -> return false
+    val d = data[id]
+    for i in 0..<d.variants.len()
+        if refines_type(d, i) then return true
+    false
+
+// Whether a column of type `t` with `cases` holds no value: an instance of a data type at which none
+// of its variants is possible.
+private empty_column(t: &Type, cases: Buf[Case], data: Buf[DataSymbol]) -> bool
+    if cases.len() > 0 then return false
+    *t match
+        Data(id, _, _) -> data[id].variants.len() > 0
+        _ -> false
 
 // A pattern that matches every value of its type: a wildcard, a binding, a type pattern naming a
 // type the value's type already conforms to, `()` for unit, and any pattern that already failed to
@@ -94,7 +244,7 @@ private matches_case(p: &TPattern, case: Case) -> bool = case match
             BoolConst(b) -> b == value
             _ -> false
         _ -> false
-    VariantCase(index, _) -> p.kind match
+    VariantCase(index, _, _) -> p.kind match
         PVariant(i, _, _) -> i == index
         _ -> false
     MemberCase(member) -> member_part(p, member) is Some(_)
@@ -114,7 +264,7 @@ private specialize(row: Row, case: Case) -> Row
     val head = row.items[0]
     case match
         MemberCase(member) -> items.push(member_part(head, member).unwrap_or(TPattern(Span(0, 0), member, PWildcard)))
-        VariantCase(_, fields) -> head.kind match
+        VariantCase(_, fields, _) -> head.kind match
             PVariant(_, inner, _) ->
                 for p in inner
                     items.push(p)
@@ -354,6 +504,8 @@ private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol], views:
     if rows.len() == 0
         var all: Buf[string] = buf()
         for t in types
+            // A column no value has leaves nothing out.
+            if has_refined_variants(t, data) && empty_column(t, cases_of(t, types, data), data) then return None
             all.push("_")
         return Some(all)
     if types.len() == 0 then return None
@@ -385,19 +537,15 @@ private witness(rows: Buf[Row], types: Buf[&Type], data: Buf[DataSymbol], views:
     if defaults.len() < rows.len()
         val domain = domain_of(types[0])
         if domain.len() > 0 then return witness_ordered(rows, domain, types[0], rest, data, views)
-    val cases = cases_of(types[0], data)
+    val cases = cases_of(types[0], rest, data)
+    if empty_column(types[0], cases, data) then return None
     if defaults.len() == rows.len() || cases.len() == 0 then return in_front("_", witness(defaults, rest, data, views))
     for case in cases
         var specialized: Buf[Row] = buf()
         for row in rows
             val head = row.items[0]
             if unconstrained(head, views) || matches_case(head, case) then specialized.push(specialize(row, case))
-        var columns: Buf[&Type] = buf()
-        for t in case_fields(case)
-            columns.push(t)
-        for t in rest
-            columns.push(t)
-        if witness(specialized, columns, data, views) is Some(parts) then return Some(spell_case(types[0], case, parts, data))
+        if witness(specialized, case_columns(case, rest), data, views) is Some(parts) then return Some(spell_case(types[0], case, parts, data))
     None
 
 // A column of a sequence other than a list, split on its length. With `longest` the most elements
@@ -472,7 +620,7 @@ private in_front(head: string, found: Option[Buf[string]]) -> Option[Buf[string]
 // `Rect(_, _)`, `(1, _)`, `true`, and a list's cases as `[]` and `_ :: _`.
 private spell_case(t: &Type, case: Case, parts: Buf[string], data: Buf[DataSymbol]) -> Buf[string]
     var k = 0usize
-    if case is VariantCase(_, fields) then k = fields.len()
+    if case is VariantCase(_, fields, _) then k = fields.len()
     if case is MemberCase(_) then k = 1
     var inner = ""
     for i in 0..<k
@@ -482,7 +630,7 @@ private spell_case(t: &Type, case: Case, parts: Buf[string], data: Buf[DataSymbo
         BoolCase(value) -> if value then "true" else "false"
         // A member none of whose values is matched is named by a type pattern.
         MemberCase(member) -> if parts[0] == "_" then s"_: ${spell_member(member)}" else parts[0]
-        VariantCase(index, _) -> *t match
+        VariantCase(index, _, _) -> *t match
             Data(id, _, _) ->
                 val d = data[id]
                 val name = d.variants[index].name
@@ -520,7 +668,7 @@ missing_cases(arms: Buf[TArm], ty: &Type, data: Buf[DataSymbol]) -> Buf[MissingC
         if arm.guard is Some(_) then guarded.push(Row(items)) else rows.push(Row(items))
     rows = expand_heads(rows)
     guarded = expand_heads(guarded)
-    val cases = cases_of(ty, data)
+    val cases = cases_of(ty, buf(), data)
     if cases.len() == 0 || *ty is Tuple(_)
         missing_case(arms, ty, data, true) match
             Some(case) -> out.push(MissingCase(case, guarded.len() > 0))
@@ -678,7 +826,8 @@ private useful(rows: Buf[Row], q: Row, types: Buf[&Type], data: Buf[DataSymbol])
         for row in expanded
             if interval_of(row.items[0], least, greatest) is Some(_) then ordered = true
         if ordered then return useful_ordered(expanded, q, domain, rest, data)
-    val cases = cases_of(t, data)
+    val cases = cases_of(t, rest, data)
+    if empty_column(t, cases, data) then return false
     val anything = unconstrained(head, false) || head.kind is PType(_, _, _) || head.kind is PView(_, _, _)
     // A pattern on a union is useful where it is for one of the members it applies to.
     if head.kind is PUnion(_)
@@ -714,18 +863,22 @@ private specialize_rows(rows: Buf[Row], case: Case) -> Buf[Row]
         if unconstrained(head, false) || matches_case(head, case) then out.push(specialize(row, case))
     out
 
-// The columns a case's fields become, in front of the remaining ones.
+// The columns a case's fields become, in front of the remaining ones, which are seen under what the
+// case's equalities say of the type parameters they name.
 private case_columns(case: Case, rest: Buf[&Type]) -> Buf[&Type]
     var columns = case_fields(case)
+    val binds: Buf[Equality] = case match
+        VariantCase(_, _, binds) -> binds
+        _ -> buf()
     for t in rest
-        columns.push(t)
+        columns.push(if binds.len() == 0 then t else apply_equalities(t, binds, binds.len() + 1))
     columns
 
 // The columns a case's own values make: a variant's fields, or a union's member.
 private case_fields(case: Case) -> Buf[&Type]
     var columns: Buf[&Type] = buf()
     case match
-        VariantCase(_, fields) ->
+        VariantCase(_, fields, _) ->
             for t in fields
                 columns.push(t)
         MemberCase(member) -> columns.push(member)

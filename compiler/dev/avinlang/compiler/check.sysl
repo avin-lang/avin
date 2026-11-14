@@ -401,6 +401,14 @@ struct CheckedSite
     marker: usize
     vars_mark: usize
 
+/** The patterns that match one value together, an arm's, a clause's arguments', an `is` test's or a
+ * binding's: their equalities hold together, so one pattern contradicting another's is reported as
+ * a contradiction within the row. `start` is where the row's equalities begin among the body's;
+ * `kind` names the row in a diagnostic: "arm", "clause", or "pattern" for a test or a binding. */
+struct PatternRow
+    start: usize
+    kind: string
+
 /** A function passed to a binding's `@threaded` parameter `param` of `binding`. */
 struct ThreadedArgument
     unit: usize
@@ -735,6 +743,9 @@ struct Checker
     sites: Buf[CheckedSite]
     /** The lambdas and local functions checked where refining patterns' equalities hold. */
     refined_functions: Buf[RefinedFunction]
+    /** The row of patterns being checked, whose refining patterns' equalities hold together: see
+     * `PatternRow`. */
+    pattern_row: PatternRow
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1145,7 +1156,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None, map(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"))
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -2912,7 +2923,7 @@ private hidden_match_refused(c: *Checker, unit: usize, at: Span, v: VariantRef) 
     true
 
 /** Whether variant `index` of `d` is refined: it declares a result or parameters of its own. */
-private refines_type(d: DataSymbol, index: usize) -> bool =
+refines_type(d: DataSymbol, index: usize) -> bool =
     d.variants[index].result is Some(_) || d.variants[index].params.len() > d.decl.type_params.len()
 
 /** The type parameters of variant `v` of data type `id`: the type's, then the variant's own, each of
@@ -12138,6 +12149,8 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         val outer_start = c.body.block_start
         c.body.block_start = mark
         var patterns: Buf[&TPattern] = buf()
+        val outer_row = c.pattern_row
+        c.pattern_row = PatternRow(c.body.equalities.len(), "clause")
         for i in 0..<clause.patterns.len()
             val reported = c.reported_count
             val pattern = check_pattern(c, clause.patterns[i], params[i], "")
@@ -12146,6 +12159,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
             if pattern.kind is PType(target, _, _)
                 if same_type(target, params[i]) then c.note(unit, pattern.span, "a clause's arguments are patterns; their types are in the signature")
             patterns.push(pattern)
+        c.pattern_row = outer_row
         var bodies: Buf[TGuarded] = buf()
         for b in clause.bodies
             var guard: Option[&TExpr] = None
@@ -12157,7 +12171,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
             symbol.result match
                 Some(declared) ->
                     if !fits(c,body.ty, declared) && !(*declared is Unit)
-                        c.note(unit, b.body.span, s"${described(c, symbol)} yields ${type_name(body.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, body.ty)}")
+                        c.note(unit, b.body.span, s"${described(c, symbol)} yields ${apart_not(c, body.ty, declared)}${sendable_hint(c, declared, body.ty)}")
                     // A clause whose patterns refine yields the declared type, which its body was
                     // checked against under the equalities.
                     body = held_to_expected(c, body, symbol.result, mark)
@@ -12186,7 +12200,11 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     var settled_params = true
     for t in params
         if !settled(t) then settled_params = false
-    if settled_params && typed.len() == decl.clauses.len() && !clauses_cover(typed, params, c.data)
+    // Coverage counts the variants possible at each parameter's type as the equalities in scope see it.
+    var seen_params: Buf[&Type] = buf()
+    for t in params
+        seen_params.push(refined_type(c, t))
+    if settled_params && typed.len() == decl.clauses.len() && !clauses_cover(typed, seen_params, c.data)
         var blanks = ""
         for i in 0..<params.len()
             blanks = blanks + (if i == 0 then "_" else ", _")
@@ -12195,14 +12213,14 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
         for t in params
             if *zonk(c, t) is Union(_) then unions = true
         if unions
-            if missing_arguments(typed, params, c.data) is Some(parts)
+            if missing_arguments(typed, seen_params, c.data) is Some(parts)
                 if parts.len() == params.len()
                     blanks = ""
                     for i in 0..<parts.len()
                         blanks = blanks + (if i == 0 then parts[i] else ", " + parts[i])
         c.note(unit, decl.name_span, s"the clauses of `${decl.name}` do not cover every argument; add a clause for the rest, such as `${decl.name}($blanks)`")
     if settled_params && typed.len() == decl.clauses.len() && !pattern_errors
-        for u in unreached_clauses(typed, params, c.data)
+        for u in unreached_clauses(typed, seen_params, c.data)
             val at = decl.clauses[u.index].span
             u.by match
                 Some(j) ->
@@ -12237,7 +12255,7 @@ private check_body(c: *Checker, id: usize, body: &Expr, hint: Option[&Type])
     symbol.result match
         Some(declared) ->
             if !fits(c,typed.ty, declared) && !(*declared is Unit)
-                c.note(symbol.unit, body.span, s"${described(c, symbol)} yields ${type_name(typed.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, typed.ty)}")
+                c.note(symbol.unit, body.span, s"${described(c, symbol)} yields ${apart_not(c, typed.ty, declared)}${sendable_hint(c, declared, typed.ty)}")
             // A body of a function that yields unit drops its value, as a statement does: a lambda
             // passed where a `(T) -> unit` is wanted, most of all.
             if *declared is Unit then report_discarded(c, yielding(body), typed)
@@ -12340,7 +12358,7 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
                 if declared is None then settle_unknowns(c, mark)
                 declared match
                     Some(want) ->
-                        if !fits(c,typed.ty, want) then c.note(unit, f.value.span, s"expected ${type_name(want)}, found ${type_name(typed.ty)}${sendable_hint(c, want, typed.ty)}")
+                        if !fits(c,typed.ty, want) then c.note(unit, f.value.span, expected_found(c, want, typed.ty))
                     None ->
                         val inferred = zonk(c, typed.ty)
                         if has_unknowns(inferred)
@@ -14120,7 +14138,7 @@ private refined_field(c: *Checker, e: &Expr, value: &TExpr, id: usize, index: us
     var fresh: Buf[&Type] = buf()
     for j in 0..<variant.params.len()
         fresh.push(TypeVar(owner, j, variant.params[j].name))
-    var s = Solving(active_equalities(c), buf(), owner, false, false)
+    var s = Solving(active_equalities(c), buf(), owner, false, false, None)
     val ty = refined_type(c, value.ty)
     if variant.result is Some(r)
         if *substitute(r, data_owner(id), fresh) is Data(_, _, rs)
@@ -14287,7 +14305,7 @@ private with_expr(c: *Checker, e: &Expr, base: &Expr, changes: Buf[FieldChange])
                 c.note(unit, change.span, s"`$spelled` is changed whole and `${written[k]}` inside it in one `with`: change one or the other")
                 clash = true
         val value = check_expr(c, change.value, Some(leaf))
-        if !fits(c, value.ty, leaf) then c.note(unit, change.value.span, s"expected ${type_name(leaf)}, found ${type_name(value.ty)}${sendable_hint(c, leaf, value.ty)}")
+        if !fits(c, value.ty, leaf) then c.note(unit, change.value.span, expected_found(c, leaf, value.ty))
         if *value.ty is Nothing then finishes = false
         if clash
             failed = true
@@ -14518,7 +14536,7 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     val typed = check_expr(c, value, want)
     var ty = typed.ty
     if want is Some(w)
-        if !fits(c,typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}${sendable_hint(c, w, typed.ty)}")
+        if !fits(c,typed.ty, w) then c.note(unit, value.span, expected_found(c, w, typed.ty))
         ty = w
     // `val Refl = proof`, naming a variant of the value's type with refined variants, takes the value
     // apart, as a pattern does, and its equalities hold for the rest of the block.
@@ -14848,7 +14866,7 @@ private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp],
         None ->
             val typed = check_expr(c, value, Some(place.ty))
             if !fits(c,typed.ty, place.ty)
-                c.note(unit_of(c), value.span, s"expected ${type_name(place.ty)}, found ${type_name(typed.ty)}${sendable_hint(c, place.ty, typed.ty)}")
+                c.note(unit_of(c), value.span, expected_found(c, place.ty, typed.ty))
             typed
     place.wrap(e.span, place_store(c, place, e.span, stored, yields))
 
@@ -15182,7 +15200,7 @@ private assign_global(c: *Checker, e: &Expr, target: &Expr, g: usize, op: Option
         None ->
             val typed = check_expr(c, value, Some(ty))
             if !conforms(typed.ty, ty)
-                c.note(unit_of(c), value.span, s"expected ${type_name(ty)}, found ${type_name(typed.ty)}${sendable_hint(c, ty, typed.ty)}")
+                c.note(unit_of(c), value.span, expected_found(c, ty, typed.ty))
             typed
     val result: &Type = if *stored.ty is Nothing then Nothing elif yields then ty else Unit
     TExpr(e.span, result, StoreGlobal(g, stored, yields))
@@ -15442,7 +15460,7 @@ private assign_place(c: *Checker, e: &Expr, written: &Expr, op: Option[BinaryOp]
         None ->
             val typed = check_expr(c, value, Some(local.ty))
             if !fits(c,typed.ty, local.ty)
-                c.note(unit, value.span, s"expected ${type_name(local.ty)}, found ${type_name(typed.ty)}${sendable_hint(c, local.ty, typed.ty)}")
+                c.note(unit, value.span, expected_found(c, local.ty, typed.ty))
             typed
     val ty: &Type = if *stored.ty is Nothing then Nothing elif yields then local.ty else Unit
     TExpr(e.span, ty, Store(index, stored, yields))
@@ -15921,7 +15939,7 @@ private destructure_expr(c: *Checker, e: &Expr, pattern: &Pattern, declared: Opt
     val typed = check_expr(c, value, want)
     var ty = typed.ty
     if want is Some(w)
-        if !fits(c,typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}${sendable_hint(c, w, typed.ty)}")
+        if !fits(c,typed.ty, w) then c.note(unit, value.span, expected_found(c, w, typed.ty))
         ty = w
     destructured(c, e, pattern, ty, typed, mutable)
 
@@ -15930,12 +15948,15 @@ private destructured(c: *Checker, e: &Expr, pattern: &Pattern, ty: &Type, typed:
     val unit = unit_of(c)
     val outer = c.binds_var
     c.binds_var = mutable
+    val outer_row = c.pattern_row
+    c.pattern_row = PatternRow(c.body.equalities.len(), "pattern")
     val shape = check_pattern(c, pattern, ty, "")
+    c.pattern_row = outer_row
     c.binds_var = outer
     if settled(ty) && settled(shape.ty)
         var arms: Buf[TArm] = buf()
         arms.push(TArm(shape, None, TExpr(e.span, Unit, UnitConst)))
-        if !match_covers(arms, ty, c.data)
+        if !match_covers(arms, refined_type(c, ty), c.data)
             c.note(unit, pattern.span, s"a binding's pattern must match every ${type_name(ty)} value; take the value apart with `match`")
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, LetPattern(shape, typed))
 
@@ -16066,7 +16087,7 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
                         val old = TExpr(targets[i].span, ty, Local(olds[i].unwrap()))
                         result = operate(c, targets[i].span, op_span, o, binary_spelling(o) + "=", old, part)
                     None ->
-                        if !fits(c,part.ty, ty) then c.note(unit, part.span, s"expected ${type_name(ty)}, found ${type_name(part.ty)}${sendable_hint(c, ty, part.ty)}")
+                        if !fits(c,part.ty, ty) then c.note(unit, part.span, expected_found(c, ty, part.ty))
             None -> ()
         stored.push(result)
         stored_types.push(result.ty)
@@ -16265,7 +16286,7 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
     if !numeric && has_operator_traits(zonk(c, l.ty))
         if binary_operator_method(op) is Some(om)
             if !same_type(zonk(c, l.ty), zonk(c, r.ty))
-                val what = s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+                val what = s"`$spelling` needs two values of one type, not ${apart_and(c, l.ty, r.ty)}"
                 if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
                     c.note(unit_of(c), operand, s"$what; $hint")
                 else
@@ -16279,7 +16300,7 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
         if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight || wrapping_or_saturating(op)
             if integer_type(c, zonk(c, l.ty))
                 if !same_type(zonk(c, l.ty), zonk(c, r.ty))
-                    val what = s"`$spelling` needs two values of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+                    val what = s"`$spelling` needs two values of one type, not ${apart_and(c, l.ty, r.ty)}"
                     if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
                         c.note(unit_of(c), operand, s"$what; $hint")
                     else
@@ -16289,7 +16310,7 @@ private operate(c: *Checker, at: Span, op_at: Span, op: BinaryOp, spelling: stri
             c.note(unit_of(c), at, s"`${type_name(zonk(c, l.ty))}` has no method `$spelling`")
             return TExpr(at, ErrorType, UnitConst)
     if !numeric || !same_type(l.ty, r.ty)
-        val what = s"`$spelling` needs two numbers of one type, not ${type_name(l.ty)} and ${type_name(r.ty)}"
+        val what = s"`$spelling` needs two numbers of one type, not ${apart_and(c, l.ty, r.ty)}"
         if width_conversion(c, l, r, compound_spelling(spelling)) is Some((operand, hint))
             c.note(unit_of(c), operand, s"$what; $hint")
         else
@@ -16592,7 +16613,7 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
     // Two numbers of different types compare once one is converted, which the diagnostic says how.
     if !identity && !same_type(zonk(c, a.ty), zonk(c, b.ty)) && !fits(c, zonk(c, a.ty), zonk(c, b.ty)) && !fits(c, zonk(c, b.ty), zonk(c, a.ty))
         if width_conversion(c, a, b, false) is Some((operand, hint))
-            c.note(unit_of(c), operand, s"`$spelling` cannot compare ${type_name(zonk(c, a.ty))} with ${type_name(zonk(c, b.ty))}; $hint")
+            c.note(unit_of(c), operand, s"`$spelling` cannot compare ${apart_with(c, zonk(c, a.ty), zonk(c, b.ty))}; $hint")
             return
     if op is Equal || op is NotEqual then return equality_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
     if !identity then return ordering_link(c, at, spelling, zonk(c, a.ty), zonk(c, b.ty))
@@ -16605,7 +16626,7 @@ private compare_link(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr)
     // represents the other side's values.
     if xr || yr
         if identity_comparable(c, x, y, xr, yr) then return
-        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${apart_with(c, x, y)}")
         return
     // Two sides that may each hold a value type: whether two equal values are one object is the
     // compiler's choice, so the answer would be arbitrary.
@@ -16666,19 +16687,19 @@ private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
     // option's `T` with a `T1 >: T`.
     if *x is TypeVar(_, _, _) || *y is TypeVar(_, _, _)
         if !same_type(x, y) && !fits(c, x, y) && !fits(c, y, x)
-            c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+            c.note(unit_of(c), at, s"`$spelling` cannot compare ${apart_with(c, x, y)}")
             return
         operator_conforms(c, at, spelling, x, "Eq")
         return
     if *x is AnyType || *y is AnyType
-        c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)} in a chain; compare them on their own")
+        c.note(unit_of(c), at, s"`$spelling` cannot compare ${apart_with(c, x, y)} in a chain; compare them on their own")
         return
     if same_type(x, y) || fits(c, x, y) || fits(c, y, x) then return
     // Two sequences of one element type compare by their elements, whichever kinds they are.
     if seq_element(c, x) is Some(a)
         if seq_element(c, y) is Some(b)
             if same_type(zonk(c, a), zonk(c, b)) then return
-    c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+    c.note(unit_of(c), at, s"`$spelling` cannot compare ${apart_with(c, x, y)}")
 
 // `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes and strings have them, and a type
 // parameter, a data type or a class through `Ord`.
@@ -16690,7 +16711,7 @@ private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
     // A use settles what is still unknown: `Some(1) < None` compares two `Option[int]`s.
     if !same_type(x, y)
         if !((has_unknowns(x) || has_unknowns(y)) && unify(c, x, y))
-            c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(x)} with ${type_name(y)}")
+            c.note(unit_of(c), at, s"`$spelling` cannot compare ${apart_with(c, x, y)}")
             return
     val t = zonk(c, x)
     *t match
@@ -21423,7 +21444,7 @@ private type_argument_union_hint(c: *Checker, a: &Type, b: &Type) -> string
 /** "expected T, found U", and why two classes that share several traits do not join to one. */
 private mismatch(c: *Checker, wanted: &Type, found: &Type) -> string
     if constructor_mismatch(c, zonk(c, wanted), zonk(c, found)) is Some(why) then return why
-    val text =s"expected ${type_name(wanted)}, found ${type_name(found)}${sendable_hint(c, wanted, found)}"
+    val text = expected_found(c, wanted, found)
     val traits = shared_traits(c, wanted, zonk(c, found))
     if traits.len() < 2 then return text
     var names = ""
@@ -21454,6 +21475,62 @@ private scalar_union_inside(c: *Checker, wanted: &Type, found: &Type) -> Option[
         val u = zonk(c, a[i])
         if *u is Union(_) && !is_reference(u) && !same_type(u, zonk(c, b[i])) && fits(c, zonk(c, b[i]), u) then return Some(u)
     None
+
+/** "expected `wanted`, found `found`", the two named apart where they read the same. */
+private expected_found(c: *Checker, wanted: &Type, found: &Type) -> string
+    val (w, f) = names_apart(c, wanted, found)
+    s"expected $w, found $f${sendable_hint(c, wanted, found)}"
+
+/** The names of two types for a message that sets them side by side. Where they differ and read the
+ * same, each type a refining pattern takes from the value it matches is named with its pattern, so
+ * two patterns' `A`s read as `A of `Pair` on line 4` and `A of `Pair` on line 6`. */
+private names_apart(c: *Checker, a: &Type, b: &Type) -> (string, string)
+    val x = type_name(a)
+    val y = type_name(b)
+    if x != y || same_type(zonk(c, a), zonk(c, b)) then return (x, y)
+    val by_line = (type_name(with_sites_named(c, zonk(c, a), false)), type_name(with_sites_named(c, zonk(c, b), false)))
+    if by_line.0 != by_line.1 then return by_line
+    // Two patterns on one line are told apart by their columns too.
+    (type_name(with_sites_named(c, zonk(c, a), true)), type_name(with_sites_named(c, zonk(c, b), true)))
+
+// `t` with each refining pattern's fresh type renamed for its pattern.
+private with_sites_named(c: *Checker, t: &Type, column: bool) -> &Type = *t match
+    TypeVar(o, i, name) ->
+        if !is_pattern_owner(o) then return t
+        val k = o - pattern_owner(0)
+        if k >= c.sites.len() then return t
+        val site = c.sites[k]
+        val at = c.units[site.unit].src.locate(site.span.start)
+        val place = if column then s"line ${at.line}, column ${at.col}" else s"line ${at.line}"
+        TypeVar(o, i, s"$name of `${site_variant_name(c, k)}` on $place")
+    Tuple(items) -> Tuple(all_sites_named(c, column, items))
+    Function(params, result, sendable) -> Function(all_sites_named(c, column, params), with_sites_named(c, result, column), sendable)
+    ByName(inner) -> ByName(with_sites_named(c, inner, column))
+    Data(id, name, args) -> Data(id, name, all_sites_named(c, column, args))
+    Class(id, name, args) -> Class(id, name, all_sites_named(c, column, args))
+    Union(members) -> union_of(all_sites_named(c, column, members))
+    _ -> t
+
+private all_sites_named(c: *Checker, column: bool, items: Buf[&Type]) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for item in items
+        out.push(with_sites_named(c, item, column))
+    out
+
+/** "`a` and `b`", named apart where they read the same. */
+private apart_and(c: *Checker, a: &Type, b: &Type) -> string
+    val (x, y) = names_apart(c, a, b)
+    s"$x and $y"
+
+/** "`a` with `b`", named apart where they read the same. */
+private apart_with(c: *Checker, a: &Type, b: &Type) -> string
+    val (x, y) = names_apart(c, a, b)
+    s"$x with $y"
+
+/** "`a`, not `b`", named apart where they read the same. */
+private apart_not(c: *Checker, a: &Type, b: &Type) -> string
+    val (x, y) = names_apart(c, a, b)
+    s"$x, not $y"
 
 private sendable_hint(c: *Checker, wanted: &Type, found: &Type) -> string
     val w = zonk(c, wanted)
@@ -21742,7 +21819,7 @@ private delayed_argument(c: *Checker, arg: Argument, param: &Type, inner: &Type)
         if binding_ref(c, arg.value.span, n) is Some(t)
             if *t.ty is ByName(_)
                 if !unify(c, param, t.ty)
-                    c.note(unit, arg.value.span, s"expected ${type_name(zonk(c, param))}, found ${type_name(t.ty)}${sendable_hint(c, zonk(c, param), t.ty)}")
+                    c.note(unit, arg.value.span, expected_found(c, zonk(c, param), t.ty))
                 return t
     val expected: &Type = Function(buf(), inner, false)
     val delayed = lambda_expr(c, arg.value, buf(), arg.value, Some(expected), true)
@@ -22010,7 +22087,10 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         val outer_start = c.body.block_start
         c.body.block_start = mark
         val reported = c.reported_count
+        val outer_row = c.pattern_row
+        c.pattern_row = PatternRow(c.body.equalities.len(), "arm")
         val pattern = check_pattern(c, arm.pattern, s.ty, "")
+        c.pattern_row = outer_row
         if c.reported_count > reported then pattern_errors = true
         var guard: Option[&TExpr] = None
         if arm.guard is Some(g)
@@ -22093,26 +22173,43 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
         for i in 0..<typed.len()
             typed[i] = TArm(typed[i].pattern, typed[i].guard, inject(c, typed[i].body, zonk(c, ty)))
     if settled(s.ty)
+        // Coverage counts the variants possible at the type matched as the equalities in scope see it.
+        val seen = refined_type(c, s.ty)
+        val empty = !pattern_errors && empty_instance_matched(c, unit, s.span, seen)
         if machine_site(c, unit, e.span) is Some(site)
-            val missing = missing_cases(typed, s.ty, c.data)
+            val missing = missing_cases(typed, seen, c.data)
             if missing.len() > 0
                 c.note(unit, e.span, s"state `${site.state}` of `${site.machine}` does not handle ${case_list(missing)}")
         elif actor_receiving(c, unit, e.span) is Some(site)
-            val missing = missing_cases(typed, s.ty, c.data)
+            val missing = missing_cases(typed, seen, c.data)
             if missing.len() > 0
                 c.note(unit, e.span, s"actor `${site.name}` does not handle ${case_list(missing)}; a message it ignores is handled by an arm that does nothing, as `_ -> ()`")
-        elif missing_case(typed, s.ty, c.data, false) is Some(_)
-            val subject = s"this `match` does not cover every ${type_name(s.ty)} value"
+        elif !empty && missing_case(typed, seen, c.data, false) is Some(_)
+            val subject = s"this `match` does not cover every ${type_name(seen)} value"
             // A value is named only when no arm can match it whatever the extractors answer, and
             // when there is more to say of it than `_`.
-            missing_case(typed, s.ty, c.data, true) match
+            missing_case(typed, seen, c.data, true) match
                 Some(case) ->
-                    if *zonk(c, s.ty) is Union(_) then c.note(unit, e.span, s"this `match` does not cover every `${type_name(s.ty)}` value, such as `$case`")
+                    if *seen is Union(_) then c.note(unit, e.span, s"this `match` does not cover every `${type_name(seen)}` value, such as `$case`")
                     elif case == "_" then c.note(unit, e.span, s"$subject; add an arm for the rest, such as `_`")
                     else c.note(unit, e.span, s"$subject, such as `$case`; add an arm for it, or `_` for the rest")
                 None -> c.note(unit, e.span, s"$subject, since an extractor may answer that it does not match; add an arm for the rest, such as `_`")
-        if !pattern_errors then report_match_unreached(c, unit, e.span, typed, s.ty)
+        if !pattern_errors && !empty then report_match_unreached(c, unit, e.span, typed, seen)
     TExpr(e.span, ty, Match(s, typed))
+
+// A `match` on an instance of a data type that none of its variants makes has no value to match,
+// which is an error, reported at the value matched.
+private empty_instance_matched(c: *Checker, unit: usize, at: Span, ty: &Type) -> bool
+    val id = *ty match
+        Data(id, _, _) -> id
+        _ -> return false
+    val d = c.data[id]
+    var refined = false
+    for i in 0..<d.variants.len()
+        if refines_type(d, i) then refined = true
+    if !refined || !instance_empty(c, id, ty, buf(), pattern_owner(c.sites.len())) then return false
+    c.note(unit, at, s"`${type_name(ty)}` has no values: no variant of `${d.name}` makes one")
+    true
 
 // The arms of a match no value reaches, each an error.
 private report_match_unreached(c: *Checker, unit: usize, at: Span, typed: Buf[TArm], ty: &Type)
@@ -22272,7 +22369,10 @@ private condition_parts(c: *Checker, e: &Expr) -> Condition
     val mark = c.body.visible.len()
     if e.kind is Is(value, pattern, negated)
         val v = check_expr(c, value, None)
+        val outer_row = c.pattern_row
+        c.pattern_row = PatternRow(c.body.equalities.len(), "pattern")
         val p = check_pattern(c, pattern, v.ty, "")
+        c.pattern_row = outer_row
         var bound: Buf[usize] = buf()
         for i in mark..<c.body.visible.len()
             bound.push(c.body.visible[i])
@@ -22401,7 +22501,12 @@ private check_pattern_kind(c: *Checker, p: &Pattern, given: &Type, no_bind: stri
                 return TPattern(p.span, ErrorType, PWildcard)
             var typed: Buf[&TPattern] = buf()
             for o in options
+                // Each alternative matches a value on its own, so what one learns holds neither in
+                // the next nor in the arm, which runs whichever matched.
+                val sites_before = c.sites.len()
                 typed.push(check_pattern(c, o, ty, if no_bind == "" then "alternatives bind no names; write `_` for a value that is not used" else no_bind))
+                for k in sites_before..<c.sites.len()
+                    out_of_scope(c, c.sites[k].marker)
             TPattern(p.span, ty, PAlternatives(typed))
         Constructor(path, args, parens) ->
             val (chosen, is_variant) = choose_variant(c, p.span, path, Some(ty))
@@ -22771,7 +22876,7 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
         Data(id, _, type_args) ->
             if id != v.data then ok = false
             elif refines
-                refine_variant(c, p, v, ty) match
+                refine_variant(c, p, v, ty, no_bind != "") match
                     Some((k, typed_fields)) ->
                         site = Some(k)
                         fields = typed_fields
@@ -22808,31 +22913,17 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
 /** Solves the equalities of variant `v` matched against a value of type `ty`, an instance of `v`'s
  * type: records the pattern's site, declares its marker and its equalities, and answers the site and
  * the variant's field types, in its fresh types as far as the equalities leave them. `None`, reported,
- * where the type matched is not known well enough to say what the variant fixes. A contradiction
- * gives no equalities: no value reaches the arm. */
-private refine_variant(c: *Checker, p: &Pattern, v: VariantRef, ty: &Type) -> Option[(usize, Buf[&Type])]
+ * where the type matched is not known well enough to say what the variant fixes, and where the
+ * equalities contradict, so no value reaches the pattern; `alternative` where the pattern is one of
+ * a set of alternatives. */
+private refine_variant(c: *Checker, p: &Pattern, v: VariantRef, ty: &Type, alternative: bool) -> Option[(usize, Buf[&Type])]
     val unit = unit_of(c)
     val d = c.data[v.data]
     val variant = d.variants[v.index]
     val k = c.sites.len()
     val owner = pattern_owner(k)
-    var fresh: Buf[&Type] = buf()
-    for j in 0..<variant.params.len()
-        fresh.push(TypeVar(owner, j, variant.params[j].name))
-    var plain: Buf[&Type] = buf()
-    for j in 0..<d.decl.type_params.len()
-        plain.push(fresh[j])
-    val result: &Type = variant.result match
-        Some(r) -> substitute(r, data_owner(v.data), fresh)
-        None -> Data(v.data, d.name, plain)
-    var s = Solving(active_equalities(c), buf(), owner, false, false)
-    *refined_type(c, ty) match
-        Data(_, _, xs) -> *result match
-            Data(_, _, rs) ->
-                for i in 0..<xs.len()
-                    if i < rs.len() then solve_pair(c, &s, xs[i], rs[i])
-            _ -> ()
-        _ -> ()
+    val fresh = fresh_types(variant, owner)
+    var s = solve_variant(c, v, ty, active_equalities(c), owner)
     // An enclosing type parameter equated with a type still unknown would settle it here, inside the
     // arm, which only the code that declared the value may do.
     for q in s.found
@@ -22840,27 +22931,177 @@ private refine_variant(c: *Checker, p: &Pattern, v: VariantRef, ty: &Type) -> Op
     if s.unknown && !s.contradiction
         unknown_matched(c, unit, p.span, variant.name)
         return None
+    if s.contradiction
+        report_contradiction(c, unit, p.span, v, ty, owner, alternative)
+        return None
     val marker = c.body.locals.len()
     c.body.locals.push(TLocal(s"refinement $k", Unit, false, c.current))
     c.body.visible.push(marker)
     c.sites.push(CheckedSite(unit, p.span, v.data, v.index, ty, marker, c.vars.len()))
     var own: Buf[Equality] = buf()
-    if !s.contradiction
-        for q in s.found
-            c.body.equalities.push(Equality(marker, q.owner, q.index, q.ty))
-            if q.owner == owner then own.push(q)
+    for q in s.found
+        c.body.equalities.push(Equality(marker, q.owner, q.index, q.ty))
+        if q.owner == owner then own.push(q)
     var fields: Buf[&Type] = buf()
     for f in variant.fields
         fields.push(apply_equalities(substitute(f, data_owner(v.data), fresh), own, own.len() + 1))
     Some((k, fields))
 
-/** The equalities found so far while a pattern's are solved, with those already in scope. */
+/** The parameters of `variant`, as fresh types of `owner`. */
+private fresh_types(variant: VariantSymbol, owner: usize) -> Buf[&Type]
+    var fresh: Buf[&Type] = buf()
+    for j in 0..<variant.params.len()
+        fresh.push(TypeVar(owner, j, variant.params[j].name))
+    fresh
+
+/** The equalities of variant `v`, its parameters given fresh types of `owner`, matched against a
+ * value of type `ty` where the equalities `all` hold. */
+private solve_variant(c: *Checker, v: VariantRef, ty: &Type, all: Buf[Equality], owner: usize) -> Solving
+    val d = c.data[v.data]
+    val variant = d.variants[v.index]
+    val fresh = fresh_types(variant, owner)
+    var plain: Buf[&Type] = buf()
+    for j in 0..<d.decl.type_params.len()
+        plain.push(fresh[j])
+    val result: &Type = variant.result match
+        Some(r) -> substitute(r, data_owner(v.data), fresh)
+        None -> Data(v.data, d.name, plain)
+    // The solving adds to its own copy of `all`, which the caller may solve against again.
+    var held: Buf[Equality] = buf()
+    for q in all
+        held.push(q)
+    var s = Solving(held, buf(), owner, false, false, None)
+    *zonk(c, apply_equalities(zonk(c, ty), all, all.len() + 1)) match
+        Data(_, _, xs) -> *result match
+            Data(_, _, rs) ->
+                for i in 0..<xs.len()
+                    if i < rs.len() then solve_pair(c, &s, xs[i], rs[i])
+            _ -> ()
+        _ -> ()
+    s
+
+/** Whether no variant of data type `id` makes a value of type `ty` where the equalities `all` hold. */
+private instance_empty(c: *Checker, id: usize, ty: &Type, all: Buf[Equality], owner: usize) -> bool
+    val d = c.data[id]
+    if d.variants.len() == 0 then return false
+    for i in 0..<d.variants.len()
+        if !solve_variant(c, VariantRef(id, i), ty, all, owner).contradiction then return false
+    true
+
+// Reports a pattern on variant `v`, matching a value of type `ty`, whose equalities contradict, so no
+// value reaches it, saying which equality fails: the variant makes another instance than the one
+// matched, as the equalities in scope before its row see it; it needs a type to contain itself; or
+// it needs a type to be other than an earlier pattern of its row needs it to be.
+private report_contradiction(c: *Checker, unit: usize, at: Span, v: VariantRef, ty: &Type, owner: usize, alternative: bool)
+    val d = c.data[v.data]
+    val variant = d.variants[v.index]
+    val row = c.pattern_row
+    val lead = if alternative || row.kind == "pattern" then "this pattern never matches" else s"this ${row.kind} is never reached"
+    var outer: Buf[Equality] = buf()
+    var mine: Buf[Equality] = buf()
+    val active = active_equalities(c)
+    for q in active
+        if equality_from_row(c, q, row.start) then mine.push(q) else outer.push(q)
+    val alone = solve_variant(c, v, ty, outer, owner)
+    if alone.contradiction
+        if alone.cycle is Some((x, t))
+            c.note(unit, at, s"$lead: `${variant.name}` needs `${type_name(x)}` to be `${type_name(zonk(c, t))}`, which no type is")
+            return
+        val seen = zonk(c, apply_equalities(zonk(c, ty), outer, outer.len() + 1))
+        if instance_empty(c, v.data, ty, outer, owner)
+            c.note(unit, at, s"`${type_name(seen)}` has no values: no variant of `${d.name}` makes one")
+            return
+        val made: &Type = variant.result match
+            Some(r) -> r
+            None -> own_type(d, v.data)
+        c.note(unit, at, s"$lead: `${variant.name}` makes ${type_article_quoted(made)}, and the value matched is ${type_article_quoted(seen)}")
+        return
+    // The first equality of the row that, with those before it, leaves the pattern none.
+    var held: Buf[Equality] = buf()
+    for q in outer
+        held.push(q)
+    for q in mine
+        held.push(q)
+        val s = solve_variant(c, v, ty, held, owner)
+        if !s.contradiction then continue
+        if s.cycle is Some((x, t))
+            c.note(unit, at, s"$lead: `${variant.name}` needs `${type_name(x)}` to be `${type_name(zonk(c, t))}`, which no type is")
+            return
+        val other = site_of_marker(c, q.marker)
+        val where = if row.kind == "clause" then "clause" else "pattern"
+        val name = type_var_name(c, q.owner, q.index, ty, other)
+        var needed: Option[&Type] = None
+        for f in alone.found
+            if f.owner == q.owner && f.index == q.index then needed = Some(zonk(c, apply_equalities(f.ty, alone.all, alone.all.len() + 1)))
+        if name is Some(n) && needed is Some(want) && other is Some(o)
+            val there = zonk(c, apply_equalities(q.ty, held, held.len() + 1))
+            c.note(unit, at, s"$lead: `${site_variant_name(c, o)}` needs `$n` to be `${type_name(there)}`, and `${variant.name}` in the same $where needs it to be `${type_name(want)}`")
+            return
+        if other is Some(o)
+            c.note(unit, at, s"$lead: `${variant.name}` makes no value `${site_variant_name(c, o)}` in the same $where allows")
+            return
+        break
+    c.note(unit, at, s"$lead: `${variant.name}` makes no value the patterns around it allow")
+
+/** Whether equality `q` was learned in the row whose equalities begin at `start`. */
+private equality_from_row(c: *Checker, q: Equality, start: usize) -> bool
+    for i in start..<c.body.equalities.len()
+        val r = c.body.equalities[i]
+        if r.marker == q.marker && r.owner == q.owner && r.index == q.index then return true
+    false
+
+/** The refining pattern whose marker local, in the body being checked, is `marker`. Markers are
+ * numbered within their bodies, so the marker's name says which pattern it is. */
+private site_of_marker(c: *Checker, marker: usize) -> Option[usize]
+    if marker >= c.body.locals.len() then return None
+    val name = c.body.locals[marker].name
+    var k = c.sites.len()
+    while k > 0
+        k -= 1
+        if c.sites[k].marker == marker && name == s"refinement $k" then return Some(k)
+    None
+
+private site_variant_name(c: *Checker, k: usize) -> string = c.data[c.sites[k].data].variants[c.sites[k].variant].name
+
+/** The name of type parameter `index` of `owner`: a refining pattern's fresh type is named by its
+ * variant's parameter; any other is found where the types matched name it. */
+private type_var_name(c: *Checker, owner: usize, index: usize, ty: &Type, site: Option[usize]) -> Option[string]
+    if is_pattern_owner(owner)
+        val k = owner - pattern_owner(0)
+        if k < c.sites.len()
+            val variant = c.data[c.sites[k].data].variants[c.sites[k].variant]
+            if index < variant.params.len() then return Some(variant.params[index].name)
+    if type_var_named(zonk(c, ty), owner, index) is Some(n) then return Some(n)
+    if site is Some(k) then return type_var_named(zonk(c, c.sites[k].matched), owner, index)
+    None
+
+/** The name `t` gives type parameter `index` of `owner`, where it names it. */
+private type_var_named(t: &Type, owner: usize, index: usize) -> Option[string] = *t match
+    TypeVar(o, i, name) -> if o == owner && i == index then Some(name) else None
+    Tuple(items) -> type_var_named_in(items, owner, index)
+    Function(params, result, _) ->
+        if type_var_named_in(params, owner, index) is Some(n) then return Some(n)
+        type_var_named(result, owner, index)
+    ByName(inner) -> type_var_named(inner, owner, index)
+    Data(_, _, args) -> type_var_named_in(args, owner, index)
+    Class(_, _, args) -> type_var_named_in(args, owner, index)
+    Union(members) -> type_var_named_in(members, owner, index)
+    _ -> None
+
+private type_var_named_in(items: Buf[&Type], owner: usize, index: usize) -> Option[string]
+    for item in items
+        if type_var_named(item, owner, index) is Some(n) then return Some(n)
+    None
+
+/** The equalities found so far while a pattern's are solved, with those already in scope, and the
+ * type parameter and type of a cyclic one, where one was met. */
 private struct Solving
     all: Buf[Equality]
     found: Buf[Equality]
     owner: usize
     contradiction: bool
     unknown: bool
+    cycle: Option[(&Type, &Type)]
 
 // Takes `a = b` apart into equalities of type parameters. The pattern's fresh types are solved first,
 // so a field reads as the types around the arm where it can; an enclosing type parameter is solved
@@ -22922,7 +23163,7 @@ private solve_pairs(c: *Checker, s: *Solving, xs: Buf[&Type], ys: Buf[&Type])
 
 // A part of a type that equalities do not take apart: a union, or a type constructor, that names a
 // type parameter or an unknown, so more than one solution, or none, may make it equal to another.
-private opaque_part(t: &Type) -> bool = *t match
+opaque_part(t: &Type) -> bool = *t match
     Union(_) -> has_type_params(t) || has_unknowns(t)
     Constructor(_, _) -> true
     Applied(_, _) -> true
@@ -22936,6 +23177,7 @@ private bind_equal(s: *Solving, v: &Type, t: &Type)
         _ -> return
     if names_type_var(t, o, i)
         s.contradiction = true
+        s.cycle = Some((v, t))
         return
     s.found.push(Equality(0, o, i, t))
     s.all.push(Equality(0, o, i, t))
@@ -22947,7 +23189,7 @@ private unknown_matched(c: *Checker, unit: usize, at: Span, variant: string)
 
 /** `t` with each type parameter an equality of `eqs` fixes replaced by what it is, through at most
  * `depth` equalities in a row. */
-private apply_equalities(t: &Type, eqs: Buf[Equality], depth: usize) -> &Type
+apply_equalities(t: &Type, eqs: Buf[Equality], depth: usize) -> &Type
     if eqs.len() == 0 then return t
     *t match
         TypeVar(o, i, _) ->
@@ -22968,6 +23210,13 @@ private apply_all_equalities(items: Buf[&Type], eqs: Buf[Equality], depth: usize
     for item in items
         out.push(apply_equalities(item, eqs, depth))
     out
+
+/** Takes local `x` out of scope. */
+private out_of_scope(c: *Checker, x: usize)
+    var kept: Buf[usize] = buf()
+    for v in c.body.visible
+        if v != x then kept.push(v)
+    c.body.visible = kept
 
 /** Whether local `x` is in scope. */
 private in_scope(c: *Checker, x: usize) -> bool
