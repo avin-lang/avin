@@ -8196,7 +8196,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `x.` placeholder (it names a variable the program does not have). The opposite message, for
   `x.m()` on a parameterless `m`, is unchanged: it already reads well inside lambdas, placeholders
   and chains.
-- Proposed (built on branch `fmt-two-space`, decided by the director on the user's delegation):
+- Settled on the user's delegation 2026-11-13 (built on branch `fmt-two-space`):
   **`avin fmt` keeps a function's clauses together.** No blank line goes between a function's
   signature and its first clause or between two of its clauses, at the top level, in a class, an
   object, a trait or a block alike, and blank lines the source wrote there are dropped, around
