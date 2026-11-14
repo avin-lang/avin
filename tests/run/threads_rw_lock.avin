@@ -1,0 +1,55 @@
+// expect: exit 0
+// A read-write lock lets readers in together and a writer in alone: readers overlap, a writer never
+// overlaps a reader or another writer, and every read after a write sees it. A mutable value is
+// changed in place by a write body; a sendable one is read with `get` and replaced with `set` and
+// `update`, which gives back the new value.
+import avin.threads.{Atomic, RwLock, Semaphore, scope, sleep, spawn}
+import avin.time
+
+main()
+  // Readers overlap: four readers each wait inside for all four to have arrived.
+  val shared = RwLock(Buffer[int]())
+  val arrived = Atomic(0)
+  val overlapped = scope(s ->
+    val ts = (0 ..< 4).map(_ -> s.spawn(() -> shared.read(b ->
+      arrived.add(1)
+      while arrived.load() < 4 do sleep(time.micros(10))
+      arrived.load() == 4))).toVector
+    ts.count(t -> t.join()))
+  println(s"readers together $overlapped")
+
+  // Writers exclude everyone: a counter in a buffer, incremented by many writers, read by many
+  // readers who check no write is half done.
+  val state = RwLock(Buffer[int]())
+  state.write(b -> b.appendAll([0, 0]))
+  val torn = Atomic(0)
+  val writing = Atomic(0)
+  val overlap = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 16
+      s.spawn(() ->
+        for _ in 0 ..< 200
+          state.write(b ->
+            if writing.add(1) != 1 then overlap.add(1)
+            b(0) = b(0) + 1
+            b(1) = b(1) + 1
+            writing.sub(1)))
+    for _ in 0 ..< 16
+      s.spawn(() ->
+        for _ in 0 ..< 200
+          state.read(b ->
+            if writing.load() != 0 then overlap.add(1)
+            if b(0) != b(1) then torn.add(1))))
+  println(s"count ${state.read(b -> b(0))} torn ${torn.load()} overlap ${overlap.load()}")
+
+  // A sendable value: get, set and update, and update's result.
+  val word = RwLock("a")
+  println(s"get ${word.get()} update ${word.update(w -> w + "b")}")
+  word.set("z")
+  println(s"set ${word.get()}")
+  println(s"result ${state.write(b -> b.length)} ${state.read(b -> b.length * 10)}")
+
+  // A write from another thread is seen by the next read.
+  val n = RwLock(0)
+  spawn(() -> n.set(41)).join()
+  println(s"seen ${n.update(v -> v + 1)}")

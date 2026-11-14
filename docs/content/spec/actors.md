@@ -1,6 +1,6 @@
 ---
 title: Actors and state machines
-summary: "`actor` and `machine` declarations: typed messages, what may be sent and how the compiler checks it, `tell` and `ask`, supervision of a trap, lifecycle and watching, scheduling on a pool, and states with transitions."
+summary: "`actor` and `machine` declarations: typed messages, what may be sent and how the compiler checks it, `tell` and `ask`, supervision of a trap, lifecycle and watching, scheduling on a pool, routers and topics, and states with transitions and stashed messages."
 weight: 27
 ---
 
@@ -164,7 +164,7 @@ so the check is made once, where the type is named, and never at a send:
 | a class with no `var` field, whose fields are all sendable, and which is not `open` or `abstract`; an `object` likewise | deeply immutable: no code can change it, and a subclass cannot add a `var` |
 | a trait declared `: Sendable` | every type implementing it is checked to be sendable, at its `impl` or declaration |
 | `ActorRef[M]`, `Behaviour[M]`, `Future[T]` and `Promise[T]` of a sendable `T` | made to be handed between threads |
-| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` of any `T`, a mutex's `Condition`, `Once` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
+| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` and `RwLock[T]` of any `T`, a mutex's `Condition`, `Once`, `WaitGroup`, `Semaphore`, `Barrier` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
 | `Thread[T]` of a sendable `T`, an `Executor` | joining a thread and giving an executor work are synchronized |
 | a [Sysl handle](/spec/sysl-bindings/#handles) | sent by handing over its ownership, checked when it is used (below) |
 | `Isolated[T]` | an object graph nothing else reaches (below) |
@@ -229,7 +229,8 @@ connection, and a large buffer filled by one actor goes to the next.
   **nothing it calls, however indirectly, reaches module-level mutable state** (a module-level
   `var`, or a module-level value or `object` whose type is not sendable, a `lazy val` among them).
   Avin compiles the whole program, so the second is known for every function, in every module,
-  through every trait method a call may reach and every function value made inside the body. Every
+  through every trait method a call may reach, every function value made inside the body and the
+  initializer of every `lazy val` field it reads. Every
   mutable object the body leaves reachable from its result was therefore made inside it, and
   nothing outside holds one. The body may read a `var` of the code around it whose type is
   sendable, since it runs at once, and module-level values that are immutable and sendable; an
@@ -268,7 +269,8 @@ doubt, and the runtime can contain it:
   is. The actor's `Failed` reason is the trap's reason, without its place: `Failed(integer
   overflow)`.
 - **Where the trap leaves shared state in doubt, the program stops instead**, as it would for a
-  thread: a trap while the actor holds a `Mutex`, runs a `Once` body or initializes a `lazy val`
+  thread: a trap while the actor holds a `Mutex`, reads or writes a `RwLock`, holds a semaphore's
+  permit in `withPermit`, runs a barrier's action, runs a `Once` body or initializes a `lazy val`
   (each of which other threads may be waiting on), or inside a Sysl call: an Avin function Sysl
   called back, or a value a binding cannot take. The report still names the actor. A stack that
   runs out stops the program too, with the same `avin: trap: stack overflow` a thread's does, since
@@ -409,6 +411,109 @@ for a fixed pipeline of threads, and an actor that receives from a channel parks
 handles nothing else while it waits, so between actors, messages are the channel. Locks remain for the state that genuinely
 must be shared; a `Mutex` is sendable for that reason.
 
+## Routers
+
+A **router** is one reference that spreads its messages over a pool of actors started from one
+behaviour, its **routees**, so work that one actor would handle in turn is handled by several at once:
+
+```avin run
+import avin.actors.{ActorRef, Router, RoundRobin}
+import avin.time
+
+data Job
+  Square(n: int, replyTo: ActorRef[string])
+
+actor Squarer receives Job
+  receive
+    Square(n, replyTo) -> replyTo.tell(s"$self: ${n * n}")
+
+main()
+  val pool = Router.pool(3, Squarer(), RoundRobin)
+  for n in 1 .. 4
+    println(pool.ask(r -> Square(n, r), timeout = time.seconds(5)).await())
+```
+
+```text output
+Ok(Squarer#2: 1)
+Ok(Squarer#3: 4)
+Ok(Squarer#4: 9)
+Ok(Squarer#2: 16)
+```
+
+- **`Router.pool[M: Sendable](size: int, behaviour: Behaviour[M], routing: Routing[M] = RoundRobin,
+  onFailure: Supervision = Escalate, executor: Executor = Executor.shared()) -> ActorRef[M]`**
+  starts a router and `size` routees of `behaviour`, the router's children, and gives back the
+  router's reference at once. The router is a child of the code that calls `pool`, as `spawn`'s
+  actor is, and its reference is shown as `Router#n`, the router numbered before its routees. A
+  size less than one, and a `Restart` that `spawn` would refuse, trap in the calling code.
+- **Each message sent to the router goes to one routee**, chosen by the `Routing`:
+  - **`RoundRobin`**, the default: each routee in turn.
+  - **`AtRandom`**: any routee, each equally likely.
+  - **`SmallestMailbox`**: the routee with the fewest messages waiting in its mailbox, the next in
+    turn among equals, so a free routee takes work that round robin would queue behind a busy one.
+    The message a routee is handling does not count as waiting.
+  - **`ByKey(key: @sendable (M) -> long)`**: by the key `key` gives the message, so every message
+    with one key goes to one routee for as long as that routee lives; the keys spread over the pool,
+    and a routee that ends moves only its own keys to the others.
+- **Order.** Two messages one sender sends that go to one routee arrive in the order they were sent,
+  so with `ByKey`, each key's messages from one sender are handled in order.
+- **An ask through a router** is answered by the routee that takes the question; the reply goes to
+  the asker's reply reference as any reply does. An ask of a router that has ended answers `Ended`.
+- **Supervision as a group.** Each routee is supervised by `onFailure` and runs on `executor`. A
+  routee that restarts keeps its place in the pool and its mailbox; one that ends, whether it
+  stopped itself or failed under `Stop`, leaves the pool, a message the router finds it no longer
+  accepts going to another routee; and the router stops once no routee is left. A routee's failure
+  under `Escalate` fails the router, which escalates in turn: a top-level router stops the program.
+- **Lifecycle.** The router ends as any actor does: stopped by its parent with `stop(router)`, or with
+  its parent, and a router that ends stops its routees first, so its end is known once theirs are.
+
+## Topics
+
+A **topic** carries events from any number of publishers to every actor subscribed:
+
+```avin run
+import avin.actors.{Topic, spawn}
+import avin.threads.Channel
+
+actor Log(out: Channel[string]) receives string
+  receive
+    line -> out.send(s"$self: $line")
+
+main()
+  val news = Topic[string]()
+  val out = Channel[string]()
+  news.subscribe(spawn(Log(out)))
+  news.publish("one")
+  news.publish("two")
+  println(out.receive().get)
+  println(out.receive().get)
+  println(news.subscribers)
+```
+
+```text output
+Log#1: one
+Log#1: two
+[Log#1]
+```
+
+- **`Topic[E: Sendable]()`** makes one. A topic is not an actor; it is a sendable object any thread
+  may use, sent to actors in messages as any sendable value is.
+- **`subscribe(subscriber: ActorRef[E])`** subscribes an actor from now on; an actor of another
+  protocol subscribes an [adapter](#starting-telling-and-asking). An actor is subscribed once,
+  however many of its references are given: subscribing it again keeps its first place and the
+  reference given last. **`unsubscribe(subscriber: ActorRef[Nothing])`** stops telling it; an actor
+  not subscribed is left as it is.
+- **`publish(event: E)`** tells the event to every actor subscribed, in the order they subscribed,
+  and returns at once; with nobody subscribed it does nothing. **A subscriber is told one
+  publisher's events in the order published**; the events of different publishers interleave in any
+  order. An event holding a Sysl handle goes with the first subscriber's copy, as a [handle sent
+  twice](#handing-over-ownership) does.
+- **A subscriber that ends leaves the topic of itself**: its end is watched from the moment it
+  subscribes, so a topic keeps no ended actor for longer than it takes to hear of the end, and an
+  actor that had ended already when it subscribed is not kept.
+- **`subscribers -> Vector[ActorRef[E]]`** is the actors subscribed now, in the order they
+  subscribed.
+
 ## State machines
 
 **`machine`** declares a type whose objects move between declared **states**, driven by **events**:
@@ -531,6 +636,74 @@ actor's state or a machine's: an arm's result is the actor's own state, an arm's
 type's, and a bare name nothing decides is refused, naming the qualified forms (`Ev.Idle`,
 `Connection.State.Idle`). An actor without `state` blocks is one whose arms all `stay`, which is why
 its arms yield nothing.
+
+### Setting messages aside
+
+A message an actor cannot handle in its present state is set aside in a **`Stash`** and given back
+once the state changes, which is what `Connection` above does by hand with `pending`:
+
+```avin run
+import avin.actors.{ActorRef, Stash, spawn}
+import avin.time
+
+data Msg
+  Write(text: string)
+  Ready
+  Show(replyTo: ActorRef[string])
+
+actor Writer receives Msg
+  val waiting = Stash(self, 100)
+  val written = Buffer[string]()
+
+  state Starting
+    Write(text) ->
+      waiting.add(Write(text))
+      stay
+    Ready -> Running
+
+  state Running
+    enter
+      waiting.unstashAll()
+    Write(text) ->
+      written.append(text)
+      stay
+
+  receive
+    Show(replyTo) ->
+      replyTo.tell(s"$written")
+      stay
+    _ -> stay
+
+main()
+  val w = spawn(Writer())
+  w.tell(Write("a"))
+  w.tell(Write("b"))
+  w.tell(Ready)
+  w.tell(Write("c"))
+  println(w.ask(r -> Show(r), timeout = time.seconds(5)).await())
+```
+
+```text output
+Ok([a, b, c])
+```
+
+- **`Stash[M: Sendable](owner: ActorRef[M], capacity: int)`** is made by the actor's own code from its
+  own reference, `self` in a declaration or the reference a behaviour's start is given; made by any
+  other code it traps, as an `ActorContext` does. A capacity less than one traps.
+- **`add(message: M)`** sets a message aside. **Adding to a full stash traps**, failing the actor,
+  whose supervision decides what follows; an actor that would rather drop or answer the message
+  reads **`isFull`** first. **`length`** and **`isEmpty`** say what it holds, and `capacity` how much
+  it may.
+- **`unstashAll()`** gives back every message held, in the order they were added, **in front of every
+  message waiting in the mailbox**, so the actor handles them next and the messages that arrived
+  meanwhile after them, and leaves the stash empty. Messages given back while others given back
+  earlier still wait go in front of those. A message given back that the actor still cannot handle
+  is added again, behind the ones added since. Given back from a state's `enter`, they are handled by
+  that state, the usual place.
+- **`clear()`** drops what the stash holds.
+- **A stash is the actor's state.** Its messages are lost where the actor ends or restarts, as its
+  fields are, and a question among them times out; messages already given back are in the mailbox,
+  which a restart keeps, so the fresh state handles them.
 
 ## Keywords
 

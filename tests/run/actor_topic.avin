@@ -1,0 +1,109 @@
+// expect: exit 0
+// A topic tells each event it is given to every actor subscribed, in the order they subscribed, and
+// each subscriber the events of one publisher in the order published. An actor subscribed twice, by
+// its own reference or by an adapter, is subscribed once, by the reference given last; one that
+// unsubscribes is told nothing more; publishing with nobody subscribed does nothing. A subscriber
+// that ends leaves the topic of itself. A topic is sendable, so actors subscribe themselves to one
+// they are sent.
+import avin.actors.{ActorContext, ActorRef, Behaviour, Topic, spawn}
+import avin.threads.Channel
+import avin.threads as threads
+import avin.time
+
+data Price
+  Quote(symbol: string, cents: int)
+
+data Watch
+  Got(price: Price)
+  Join(topic: Topic[Price], replyTo: ActorRef[string])
+  JoinAdapted(topic: Topic[Price], replyTo: ActorRef[string])
+  Leave(topic: Topic[Price], replyTo: ActorRef[string])
+  Quit
+
+actor Watcher(name: string, out: Channel[string]) receives Watch
+  receive
+    Got(Quote(symbol, cents)) -> out.send(s"$name: $symbol $cents")
+    Join(topic, replyTo) ->
+      topic.subscribe(adapter(p -> Got(p)))
+      replyTo.tell("joined")
+    JoinAdapted(topic, replyTo) ->
+      topic.subscribe(adapter(p -> Got(adapted(p))))
+      replyTo.tell("joined again")
+    Leave(topic, replyTo) ->
+      topic.unsubscribe(self)
+      replyTo.tell("left")
+    Quit -> stop()
+
+adapted(p: Price) -> Price = p match
+  Quote(symbol, cents) -> Quote(s"$symbol (adapted)", cents)
+
+actor Printer(out: Channel[string]) receives Price
+  receive
+    Quote(symbol, cents) -> out.send(s"printer: $symbol $cents")
+
+call(a: ActorRef[Watch], make: (ActorRef[string]) -> Watch) -> string =
+  a.ask(make, timeout = time.seconds(5)).await().ok.getOrElse("none")
+
+main()
+  val prices = Topic[Price]()
+  // Nobody subscribed: published and dropped.
+  prices.publish(Quote("NONE", 0))
+  println(prices.subscribers)
+
+  val out = Channel[string]()
+  val printer = spawn(Printer(out))
+  prices.subscribe(printer)
+  val a = spawn(Watcher("a", out))
+  println(call(a, r -> Join(prices, r)))
+  println(prices.subscribers)
+  prices.publish(Quote("ACME", 1200))
+  prices.publish(Quote("ACME", 1250))
+  // Each subscriber hears both, in order; the two subscribers interleave in any order.
+  val heard = Buffer[string]()
+  for _ in 0 ..< 4 do heard.append(out.receive().get)
+  println(heard.filter(s -> s.startsWith("printer")))
+  println(heard.filter(s -> s.startsWith("a:")))
+
+  // Subscribing the same actor again, by an adapter, keeps one subscription, by the later reference.
+  println(call(a, r -> JoinAdapted(prices, r)))
+  println(prices.subscribers.length)
+  // Subscribing the first again keeps it first.
+  prices.subscribe(printer)
+  println(prices.subscribers)
+  prices.publish(Quote("ZED", 1))
+  heard.clear()
+  for _ in 0 ..< 2 do heard.append(out.receive().get)
+  println(heard.sorted)
+
+  // Unsubscribed: told nothing more, and unsubscribing an actor not subscribed changes nothing.
+  println(call(a, r -> Leave(prices, r)))
+  println(call(a, r -> Leave(prices, r)))
+  println(prices.subscribers)
+  prices.publish(Quote("ONLY", 7))
+  println(out.receive().get)
+  println(out.tryReceive())
+
+  // A subscriber that ends leaves the topic of itself.
+  println(call(a, r -> Join(prices, r)))
+  println(prices.subscribers.length)
+  a.tell(Quit)
+  a.ended().await()
+  settle(prices, 1)
+  println(prices.subscribers)
+  // Subscribing an actor that has ended already keeps nothing.
+  val gone = spawn(Behaviour[Price]("Gone", me ->
+    ActorContext(me).stop()
+    _ -> ()))
+  gone.ended().await()
+  prices.subscribe(gone)
+  settle(prices, 1)
+  println(prices.subscribers)
+  prices.publish(Quote("LAST", 9))
+  println(out.receive().get)
+
+// Waits, a while at most, for the topic to hold `n` subscribers, its ended ones gone.
+settle(topic: Topic[Price], n: int)
+  var waited = 0
+  while topic.subscribers.length > n && waited < 5000
+    threads.sleep(time.millis(1))
+    waited += 1
