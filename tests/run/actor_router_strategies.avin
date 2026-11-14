@@ -11,14 +11,14 @@ import avin.time
 
 data Job
   Who(key: long, replyTo: ActorRef[string])
-  Hold(started: Promise[string], release: Future[unit])
+  Hold(started: Promise[ActorRef[Job]], release: Future[unit])
   Quit(replyTo: ActorRef[ActorRef[Job]])
 
 actor Worker receives Job
   receive
     Who(_, replyTo) -> replyTo.tell(s"$self")
     Hold(started, release) ->
-      started.complete(s"$self")
+      started.complete(self)
       release.await()
     Quit(replyTo) ->
       replyTo.tell(self)
@@ -45,20 +45,26 @@ main()
   // Smallest mailbox, with every routee free: equal, so each in turn.
   val smallest = Router.pool(4, Worker(), SmallestMailbox)
   println((0 ..< 6).map(i -> who(smallest, long(i))).toVector)
-  // Every routee held in an arm: messages told now wait in the mailboxes, spread evenly.
+  // Every routee held in an arm, each with two messages waiting. They are told to each routee
+  // directly, so every count is in place before the routing below, with no race against the router
+  // passing messages on.
   val releases = Vector.fill(4, Promise[unit]())
-  val holders = Buffer[string]()
+  val holders = Buffer[ActorRef[Job]]()
   for p in releases
-    val started = Promise[string]()
+    val started = Promise[ActorRef[Job]]()
     smallest.tell(Hold(started, p.future))
     holders.append(started.future.await())
   println(holders)
   val sink = spawn(Behaviour[string]("Sink", me -> _ -> ()))
-  for i in 0 ..< 6 do smallest.tell(Who(long(i), sink))
-  // The third routee held is let go: it handles its waiting message and has none. Round robin would
-  // send the next asks to each routee in turn, behind the held ones; the smallest mailbox sends
-  // every one to the routee that has none waiting.
+  for (h, i) in holders.zipWithIndex
+    if i != 2 then for k in 0 ..< 2 do h.tell(Who(long(k), sink))
+  // The third routee held is let go once its two waiting messages are in its mailbox, and is known
+  // to have handled both, so it has none waiting while the others have two. Round robin would send
+  // the next asks to each routee in turn, behind the held ones; the smallest mailbox sends every one
+  // to the routee with none waiting.
+  val drained = (0 ..< 2).map(k -> holders(2).ask(r -> Who(long(k), r), timeout = time.seconds(10))).toVector
   releases(2).complete(())
+  for d in drained do _ = d.await()
   println(who(smallest, 0))
   println(who(smallest, 0))
   println(who(smallest, 0))
