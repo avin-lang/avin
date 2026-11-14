@@ -74,9 +74,10 @@ private struct Expectation
     reason: string
     numbers_vary: bool
     places_hidden: Buf[string]
+    times_vary: bool
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false, buf())
+    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false, buf(), false)
     for line in text.split("\n")
         if line == "// ignore" || line.starts_with("// ignore:")
             e.ignored = true
@@ -84,6 +85,7 @@ private expectation(text: string) -> Expectation
         elif line.starts_with("// expect: exit ") then e.exit = parse_int(line["// expect: exit ".bytes.len..])
         elif line == "// expect: trap" then e.trap = true
         elif line == "// stderr: actor numbers vary" then e.numbers_vary = true
+        elif line == "// stderr: times vary" then e.times_vary = true
         elif line.starts_with("// stderr: places hidden in ") then e.places_hidden.push(line["// stderr: places hidden in ".bytes.len..].trim())
         elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
         elif line.starts_with("// env: ")
@@ -315,6 +317,7 @@ private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, 
         if run.text != stdout then failures = failures + s"$path $level: standard output was:\n${run.text}\n"
         var err = if want.numbers_vary then without_actor_numbers(run.err.unwrap_or("")) else run.err.unwrap_or("")
         for name in want.places_hidden do err = without_places_in(err, name)
+        if want.times_vary then err = without_times(err)
         if err != stderr then failures = failures + s"$path $level: standard error was:\n$err\n"
     failures
 
@@ -330,6 +333,30 @@ without_actor_numbers(text: string) -> string
             i += 1
             while i < text.bytes.len && u8('0') <= text.bytes[i] <= u8('9') do i += 1
         else i += 1
+    from_utf8_unchecked(out.view())
+
+/** `text` with the number before every ` ms` shown as `n`, so `sleeping, 12 ms` reads `sleeping, n ms`:
+ * the standard error of a program that writes a thread dump, whose waits last as long as the machine
+ * makes them. */
+without_times(text: string) -> string
+    val n = text.bytes.len
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+    while i < n
+        var j = i
+        while j < n && u8('0') <= text.bytes[j] <= u8('9') do j += 1
+        val unit = j + 3 <= n && text.bytes[j] == u8(' ') && text.bytes[j + 1] == u8('m') && text.bytes[j + 2] == u8('s')
+        val ends = j + 3 == n || (j + 3 < n && !(u8('a') <= text.bytes[j + 3] <= u8('z')))
+        if j > i && unit && ends
+            out.push(u8('n'))
+            i = j
+        elif j > i
+            while i < j
+                out.push(text.bytes[i])
+                i += 1
+        else
+            out.push(text.bytes[i])
+            i += 1
     from_utf8_unchecked(out.view())
 
 /** `text` with the line and column dropped from every place in the file `name`, so
@@ -745,6 +772,18 @@ corpus_actor_numbers_vary()
     assert(without_actor_numbers("# #x end#") == "# #x end#")
     assert(without_actor_numbers("") == "")
     assert(without_actor_numbers("é#9é") == "é#né")
+
+@test("a stderr line lets a program's times in milliseconds vary, each shown as n and nothing else changed")
+corpus_times_vary()
+    assert(expectation("// stderr: times vary\nmain() = 0\n").times_vary)
+    assert(!expectation("main() = 0\n").times_vary)
+    assert(without_times("  thread 2: sleeping, 1234 ms\n") == "  thread 2: sleeping, n ms\n")
+    assert(without_times("0 ms 7 ms") == "n ms n ms")
+    assert(without_times("12 ms") == "n ms")
+    assert(without_times("12 msg 12ms 12 m 12 s 12") == "12 msg 12ms 12 m 12 s 12")
+    assert(without_times("thread 12: x, 3 ms.") == "thread 12: x, n ms.")
+    assert(without_times("") == "")
+    assert(without_times("é9 msé") == "én msé")
 
 @test("a stderr line hides the line and column of every place in the files it names, and nothing else")
 corpus_places_hidden()

@@ -345,6 +345,28 @@ error: `shapes.server` exists only while the feature `server` is on, and `shapes
 Because the check is made against the manifest and not against one build's selection, a package that
 checks with every feature on also builds with any set of them off.
 
+**The package's tests may import any of its modules, whatever its gate, and any of its optional
+dependencies.** `avin test` turns every feature on, so a test of `shapes.server` can sit in `tests`
+beside the rest. A test module is read only while every module it imports is: one importing a module
+that is off, or importing a test module that is not read, is passed over by that build as a gated
+module is, so the package still builds, checks and tests with any set of features off, running the
+tests that remain. The module is still the unit: a file of `tests` importing `shapes.server` takes
+the whole of `tests` with it when `server` is off, so tests that should run without a feature go in a
+module of their own, `tests/plain/`, which nothing gated reaches.
+
+```avin
+module tests
+
+import shapes.server.{serve, port}
+
+@test
+servesOnItsPort()
+  assertEq(serve() + port(), 284)
+```
+
+An import refused for the module it names is refused once for the whole import, however many names
+it brings in: `import shapes.server.{serve, port}` in an ungated module is one error.
+
 **A feature only adds.** It adds modules and dependencies; it cannot remove or change a declaration,
 because nothing in a file depends on which features are on. A gated module's conformances are about
 its own types and traits, and its extensions are seen only by the modules that import it, which are
