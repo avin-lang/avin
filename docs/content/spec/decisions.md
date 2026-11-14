@@ -9308,6 +9308,49 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Decided by the user 2026-11-14: **a built-in type's name in a pattern is a type pattern**:
+  `x is int` tests the type and an arm `int ->` matches an int, for every name in the table of
+  built-in types, the sized integers `iN` included; generic forms stay `_: Vector[int]`; a name
+  with a binding is `n: int`. Built on branch `is-type-name`, where `x is int` had bound a new
+  `int` and was always true (`tests/run/operands_for_traits.avin` tested nothing). Proposed with it:
+  - **Such a name never names a value**: a local (`val`, `var`), a function's, a lambda's or a
+    class's parameter, a data field, and a pattern binding it (`int: T`, `int @ p`, `int + 1`, a
+    comparison pattern, `int*`) are errors, `` `int` is a built-in type, so it cannot name a value
+    `` and `` …, so a pattern cannot bind it: alone it tests for the type, and `n: int` binds the
+    value as one ``. Why: with the names type patterns, `val (a, int) = p` would test where `val int
+    = 3` binds, and `int(x)` in an expression would mean the conversion or the local by context;
+    refusing them everywhere keeps one meaning per name. It also settles the hiding rule for built-in
+    statics: `val string = …; string.byteLength` no longer arises. The library and tests renamed
+    their locals (`unit` → `identity`/`scale`, the vector tree's `i1`–`i6` → `d1`–`d6`, `long`,
+    `real`, `int` locals in tests). Alternatives: allowing them as `val`/parameter names and
+    refusing them only in patterns (two meanings for one name, and destructuring differs from a
+    plain binding); allowing only the eight word names and leaving `iN` free (the user listed the
+    sized integers). Review with the user: `i1`, `i2`, … are common index names, and they are
+    refused too.
+  - **Every type's name in a pattern is its type pattern** (the same decision, extended by the
+    director 2026-11-14 after `a is Cell` was found binding too): a bare or dotted name with no
+    parentheses that is no variant but resolves to a class, trait, `object`, `data` type, alias,
+    `Any`, `Nothing` or type parameter is `_: T`. A variant wins where both exist, so
+    `data Cell(value: int)`'s `Cell` stays the variant's pattern and every variant pattern is
+    unchanged. A local, a parameter (of a function, local function or lambda) or a pattern binding
+    named after a type in scope is refused: `` `Cell` is a type, so it cannot name a value: in a
+    pattern it tests for the type, and `x: Cell` binds a value of it ``. Fields named after a user
+    type are not refused (they are reached as members, and a data field's pattern is positional).
+    Why: one meaning per name in a pattern; a capitalised name quietly binding was the same defect.
+    Alternatives: only refusing capitalised bindings that shadow a type (keeps the always-true test
+    as an error rather than a feature); including field names (more renames for no pattern
+    ambiguity).
+  - **A generic type's name alone in a pattern is refused**, `` `Box` is a generic type, and a type
+    pattern names its type arguments, as in `_: Box[int]` ``. Why: a type pattern compares type
+    arguments exactly, and the run-time test of "a `Box` at any arguments" would be a new kind of
+    test with no sound meaning for variance and value-type arguments yet. Alternatives: testing the
+    class at any arguments (needs a class-only run-time test and a binding type, `Box[?]`, Avin
+    lacks); inferring the arguments from the matched type (works only where they are known, and
+    reads differently by context). Review with the user if a "any instance of `Box`" test is wanted.
+  - A type alias in a constructor pattern, `P(a, b)`, stays refused as before.
+  - **Functions and methods may still be named so** (`cli`'s `int(name)` and `string(name)`
+    options): a function is called, never matched, so no pattern can mean it. A missing-member
+    witness still reads `_: string`, which is the same pattern.
 - Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
   against the structure, except where `@trusted_sendable("why")` marks a class**
   ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
@@ -9579,6 +9622,41 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the impl declares it and at the impl otherwise**: a library type's method that does not meet is
   reported where the program's impl names the trait. Why: the impl is what the program wrote; the
   library's method is not the mistake.
+
+**Higher-kinded types, inferring a constructor through its bound** (build plan step 4, branch
+`hkt-4`)
+
+- Proposed: **the spec's third place to look, "the one trait among those it conforms to that has
+  one", is left out, since no type can reach it.** An impl is never for a trait, and a trait that
+  requires a constructor trait is itself one, so a type conforming to it conforms to what it
+  requires at the same holes, as its own; a type conforming to it at fixed arguments
+  (`class Digits: Bag[int]`) is refused at the declaration. A type is therefore matched as itself,
+  then as its superclasses nearest first, and a type with no conformance there is an error naming
+  the bound and the type. Why: code for a case no program can write would be untested. Review
+  with the user: it returns, with its "several such traits" error, if traits come to implement
+  constructor traits by impls (`impl Monad for Seq`), which the spec's `pairUp[Seq, …]` example
+  presumes and the library step will want.
+- Proposed: **with several constructor-trait bounds, each conformance the type (or the superclass
+  matched) has decides; two that leave different arguments open are an error naming both**
+  (`Pair` implements `Mappable` as `Pair[int, _]` and `Lefty` as `Pair[_, int]`), and a bound the
+  type lacks is reported as for a written constructor. Why: the bounds are one demand on one
+  constructor, so the nearest type with any of them is the answer the others are checked against.
+  Alternatives: the first bound written decides (order-dependent); the nearest type with all of
+  them (skips a subclass's own conformance for a superclass's, which the spec's no-inheritance rule
+  forbids).
+- Proposed: **an argument written out of a constructor joins only where the type's parameter is
+  covariant and the argument a reference type known at that argument; the expected type, checked
+  first, fixes it.** `second(dogs, cats)` makes `F` `Result[_, Animal]`; with
+  `val r: Result[int, Dog] = second(dogs, cats)` the expected type has made `F` `Result[_, Dog]` and
+  the cats are refused. Why: the expected type decides type arguments before the arguments do for
+  every generic call. An argument the first argument leaves unknown (`Ok(1)`'s error type) is
+  decided by the next, as an invariant one is.
+- Proposed: **inference sees a subclass as its superclass, or a type as a trait, only where a value
+  is read out** (a fix found in step 4, which matching through a superclass's conformance meets):
+  at an invariant argument or a function's parameter, inference held a `Box[TallShelf[int]]` to be
+  a `Box[Shelf[A]]`, and a `(Dog) -> int` an `(Animal) -> B`, so generic code could store a `Shelf`
+  in the box or pass a cat to the function, reading memory that was never a `TallShelf`'s or a
+  `Dog`'s. Both are now refused; a type that is the class itself is still taken there.
 
 ## Open
 

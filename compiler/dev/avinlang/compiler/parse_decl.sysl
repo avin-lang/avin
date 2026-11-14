@@ -260,7 +260,13 @@ declared_name(p: *Parser, what: string) -> string
         p.toks.advance()
         reject_keyword(p, at, word, what)
         return word
+    if what == "a value" || what == "a field" || what == "a parameter" then refuse_builtin_name(p, at, word, what)
     required_name(p)
+
+/** A built-in type's name where a value is named: a local, a field or a parameter. It is refused,
+ * since in a pattern the name tests for its type, and in an expression it converts to it. */
+refuse_builtin_name(p: *Parser, at: Span, word: string, what: string)
+    if builtin_type_name(word) then p.report.add(error(at, s"`$word` is a built-in type, so it cannot name $what"))
 
 // A method's name that is a run of operator characters. Most of the language's own operators are not
 // method names: a type has `==` through `Eq`, and the logical, wrapping and saturating operators not
@@ -465,11 +471,14 @@ private parse_bound_pattern(p: *Parser, typed: bool) -> &Pattern
     if typed && p.at(":") && binder(inner)
         p.toks.advance()
         val ty = parse_pattern_type(p)
-        return Pattern(inner.span.to(ty.span), Typed(inner, ty))
+        return Pattern(inner.span.to(ty.span), Typed(bound_builtin(p, inner), ty))
     if !p.at("@") then return inner
     val at = p.toks.here()
     p.toks.advance()
     val nested = parse_named_pattern(p, typed)
+    if builtin_name_pattern(inner) is Some(_)
+        bound_builtin(p, inner)
+        return nested
     inner.kind match
         Name(name) -> Pattern(inner.span.to(nested.span), Named(name, nested))
         _ ->
@@ -494,7 +503,19 @@ private bound_of(p: *Parser, pattern: &Pattern, message: string) -> &Expr = patt
         p.report.add(error(pattern.span, message))
         Expr(pattern.span, Invalid)
 
-private binder(pattern: &Pattern) -> bool = pattern.kind is Name(_) || pattern.kind is Wildcard
+// A built-in type's name counts as one, so that binding it is reported by `bound_builtin` rather than
+// read as some other mistake.
+private binder(pattern: &Pattern) -> bool = pattern.kind is Name(_) || pattern.kind is Wildcard || builtin_name_pattern(pattern) is Some(_)
+
+// A built-in type's name where a pattern binds one, as in `int: T`, `int @ p`, `int + 1`, `int < 3`
+// or `int*`: reported, and read as `_`.
+private bound_builtin(p: *Parser, pattern: &Pattern) -> &Pattern = builtin_name_pattern(pattern) match
+    Some(name) ->
+        p.report.add(error(pattern.span, builtin_bound(name)))
+        Pattern(pattern.span, Wildcard)
+    None -> pattern
+
+builtin_bound(name: string) -> string = s"`$name` is a built-in type, so a pattern cannot bind it: alone it tests for the type, and `n: $name` binds the value as one"
 
 // `n + k` and the comparison patterns: `n < k`, `n <= k`, `n > k`, `n >= k`, and a bound before
 // the name, `lo <= n` or `lo <= n < hi`, with `<` or `<=` on either side. The name may be `_`.
@@ -504,7 +525,7 @@ private parse_comparison_pattern(p: *Parser) -> &Pattern
         p.toks.advance()
         val amount = parse_pattern_atom(p)
         val k = bound_of(p, amount, "the amount in `n + k` is a positive integer literal")
-        return Pattern(first.span.to(amount.span), Successor(first, k))
+        return Pattern(first.span.to(amount.span), Successor(bound_builtin(p, first), k))
     if !at_comparison(p) then return first
     val at = p.toks.here()
     val op = p.ahead(0)
@@ -518,12 +539,13 @@ private parse_comparison_pattern(p: *Parser) -> &Pattern
             p.report.add(error(p.toks.here(), "a comparison pattern with two bounds puts the name between them, as in `0 <= n < 10`"))
             p.toks.advance()
             parse_pattern_atom(p)
-        if op == "<" || op == "<=" then return Pattern(span, Bounded(first, None, Some(bound)))
-        return Pattern(span, Bounded(first, Some(bound), None))
+        val named = bound_builtin(p, first)
+        if op == "<" || op == "<=" then return Pattern(span, Bounded(named, None, Some(bound)))
+        return Pattern(span, Bounded(named, Some(bound), None))
     val low = bound_of(p, first, "a comparison pattern compares a name with a literal")
     if op != "<" && op != "<="
         p.report.add(error(at, "a comparison pattern that starts with its bound uses `<` or `<=`, as in `0 <= n < 10`"))
-    val name = parse_pattern_atom(p)
+    val name = bound_builtin(p, parse_pattern_atom(p))
     if !binder(name) then p.report.add(error(name.span, "a comparison pattern binds a name or `_` between its bounds"))
     val lower = Some(PatternBound(low, op == "<="))
     if !p.at("<") && !p.at("<=") then return Pattern(first.span.to(name.span), Bounded(name, lower, None))
@@ -602,7 +624,10 @@ private parse_pattern_atom(p: *Parser) -> &Pattern
         p.report.add(error(start.to(p.ended()), s"a pattern takes its type arguments from the value it matches; write `$path`"))
     if !p.accept("(")
         if path.contains(".") then return Pattern(start.to(p.ended()), Constructor(path, buf(), false))
-        return Pattern(start.to(p.ended()), Name(path))
+        // A built-in type's name is a type pattern, `int` for `_: int`, and never a binding.
+        val span = start.to(p.ended())
+        if !written && builtin_type_name(path) then return Pattern(span, Typed(Pattern(span, Wildcard), TypeExpr(span, Named(path, buf()))))
+        return Pattern(span, Name(path))
     var args: Buf[&Pattern] = buf()
     if !p.at(")")
         loop
@@ -622,7 +647,7 @@ private parse_sequence_item(p: *Parser) -> &Pattern
     if !binder(item)
         p.report.add(error(star, "only a name or `_` stands for the rest of a sequence, as in `rest*`"))
         return item
-    Pattern(item.span.to(p.ended()), Rest(item))
+    Pattern(item.span.to(p.ended()), Rest(bound_builtin(p, item)))
 
 // A function parameter is `pattern: type`, optionally by-name (`: -> T`), repeated (`T*`), or
 // defaulted (`= value`). Data fields allow only plain and defaulted fields.
@@ -649,7 +674,11 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
                 p.report.add(error(start, what))
                 p.toks.advance()
                 if p.at("val") || p.at("var") then p.toks.advance()
-            val pattern = parse_untyped_pattern(p)
+            var pattern = parse_untyped_pattern(p)
+            if builtin_name_pattern(pattern) is Some(name)
+                // Reported here, and read on as the name, so the one mistake is reported once.
+                refuse_builtin_name(p, pattern.span, name, if function then "a parameter" else "a field")
+                pattern = Pattern(pattern.span, Name(name))
             val named = pattern.kind is Name(_)
             p.expect(":")
             val by_name = p.accept("->")
