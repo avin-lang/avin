@@ -293,6 +293,10 @@ private struct Lowering
     /** The deferred statements reached in the blocks enclosing the code being lowered, innermost
      * last: each is lowered again at every edge that leaves its block. */
     defers: Buf[&TExpr]
+    /** In an instance of a constructor trait's method, the owner of the trait's `Self`, and the
+     * constructor it stands for in `self_args`; 0 in any other instance. */
+    self_owner: usize
+    self_args: Buf[&Type]
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -418,7 +422,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     val ordinals = local_ordinals(program)
     var constant_globals: Buf[bool] = buf()
     val keyer = key_maker(program, ordinals, constant_globals, world)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), 0, buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -2600,6 +2604,11 @@ private struct DispatchAnswer
 // type, which is not passed.
 private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
     val callee = l.program.symbols[function]
+    // A constructor trait's method is compiled for each constructor implementing it, which follows
+    // its type arguments, so its `Self` is the value's own type.
+    if constructor_trait_method(l, callee) && args.len() > 0
+        val operands = call_operands(l, callee, args, false)?
+        return call_resolved(l, e, function, callee, args, operands, with_constructor(l, function, args[0].ty, type_args))
     // A trait's default body is compiled once for every conforming type, its `Self` an object: an
     // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
     val default_body = is_trait_method(l, callee)
@@ -2608,6 +2617,11 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
         val object = call_resolved(l, e, function, callee, args, operands, type_args)?
         return Some(option_pointer(l, e.ty, object))
     call_resolved(l, e, function, callee, args, operands, type_args)
+
+/** Whether `symbol` is a method a constructor trait declares. */
+private constructor_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool = symbol.owner_class match
+    Some(k) -> l.program.classes[k].constructor_trait
+    None -> false
 
 // The arguments of a direct call of `callee`, lowered, those with no runtime value and a static
 // member's type receiver left out; `None` where one never finishes, which ends the code there, since
@@ -2751,6 +2765,20 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
     var concrete_args: Buf[&Type] = buf()
     for a in implementation_args(l, receiver, m)
         concrete_args.push(a)
+    // A method meeting a constructor trait's takes the type arguments of its own the meeting
+    // decided, in the trait method's and the type's.
+    if l.program.meetings.get(meeting_key(m, function)) is Some(decided)
+        var trait_args: Buf[&Type] = buf()
+        for t in type_args
+            trait_args.push(concrete(l, t))
+        var outer: Buf[&Type] = buf()
+        for a in concrete_args
+            outer.push(a)
+        while outer.len() < l.program.symbols[m].type_params.len()
+            outer.push(ErrorType)
+        for d in decided
+            concrete_args.push(concrete(l, substitute(substitute(d, l.program.symbols[m].type_owner, outer), l.program.symbols[function].type_owner, trait_args)))
+        return direct_call(l, e, m, args, concrete_args)
     val own = l.program.symbols[function].decl.type_params.len()
     for i in type_args.len() - own..<type_args.len()
         concrete_args.push(concrete(l, type_args[i]))
@@ -2851,10 +2879,47 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
 /** A type of the code being lowered, with the instance's type arguments substituted. A union of
  * references is laid out as an `Any` holding its member, so lowering sees it as `Any`; a union with
  * a scalar member is kept, since it has a layout of its own (see `make_cell`). */
-private concrete(l: *Lowering, t: &Type) -> &Type = erase_reference_unions(substitute(solve(l.program.vars, t), l.subst_owner, l.subst))
+private concrete(l: *Lowering, t: &Type) -> &Type = erase_reference_unions(written_concrete(l, t))
 
 /** `t` in the instance being lowered, with its unions kept: what a type pattern naming a union tests. */
-private written_concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
+private written_concrete(l: *Lowering, t: &Type) -> &Type
+    val known = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
+    if l.self_owner == 0 then known else substitute(known, l.self_owner, l.self_args)
+
+// An instance of a constructor trait's method is given the constructor implementing the trait after
+// the method's type arguments, which `Self` stands for in it.
+private set_self(l: *Lowering, function: usize)
+    l.self_owner = 0
+    val symbol = l.program.symbols[function]
+    val k = symbol.owner_class match
+        Some(k) -> k
+        None -> return
+    if !l.program.classes[k].constructor_trait || l.subst.len() <= symbol.type_params.len() then return
+    l.self_owner = self_owner(k)
+    var args: Buf[&Type] = buf()
+    args.push(l.subst[symbol.type_params.len()])
+    l.self_args = args
+
+/** The type arguments of a call of constructor trait method `function` on a receiver of type
+ * `receiver`, with the constructor implementing the trait after them. */
+private with_constructor(l: *Lowering, function: usize, receiver: &Type, type_args: Buf[&Type]) -> Buf[&Type]
+    val symbol = l.program.symbols[function]
+    val k = symbol.owner_class match
+        Some(k) -> k
+        None -> return type_args
+    if !l.program.classes[k].constructor_trait || type_args.len() != symbol.type_params.len() then return type_args
+    val r = concrete(l, receiver)
+    val made = *r match
+        Applied(head, _) -> Some(head)
+        _ -> constructor_of_value(l.program.classes, l.program.data, r, k)
+    val f = made match
+        Some(f) -> f
+        None -> return type_args
+    var out: Buf[&Type] = buf()
+    for t in type_args
+        out.push(t)
+    out.push(f)
+    out
 
 private machine(l: *Lowering, t: &Type) -> Option[MirType] = mir_type(concrete(l, t))
 
@@ -2963,6 +3028,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
     l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
+    set_self(l, symbol.root.unwrap_or(inst.function))
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -7222,6 +7288,7 @@ private own_rendering(l: *Lowering, t: &Type, m: usize) -> Option[usize]
 private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     l.subst = buf()
     l.subst_owner = 0
+    l.self_owner = 0
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -7291,6 +7358,7 @@ private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
     val symbol = l.program.symbols[inst.function]
     l.subst = inst.type_args
     l.subst_owner = symbol.type_owner
+    set_self(l, inst.function)
     val boxed = value_boxed(l, shape.option)
     val signature = signature_of(l, l.program.functions[inst.function])
     var params: Buf[MirType] = buf()
@@ -7592,6 +7660,7 @@ private enter_instance(l: *Lowering, k: usize)
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
     l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
+    set_self(l, symbol.root.unwrap_or(inst.function))
     l.unit = symbol.unit
     l.library = library_instance(l, k)
     l.here = symbol.decl.name_span
