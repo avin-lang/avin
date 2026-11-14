@@ -588,6 +588,9 @@ bucket(n: int) -> string = n match
 
 Guards do not count, since a guard may fail.
 
+An arm on a [refined variant](/spec/refined-variants/#refinement-in-a-match) learns the type
+equalities its result gives, and coverage counts only the variants possible at the type matched.
+
 A **type pattern**, `x: T`, matches a value whose type at run time is `T` and binds it to `x` as a
 `T`; `_: T` tests without binding. For a class or a trait it matches an instance of any subclass or
 conforming class, and for a generic type it compares the type arguments exactly (`Box[int]` is not a

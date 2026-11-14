@@ -233,7 +233,71 @@ carry the chapter's exact messages, at most five per file.
   `[T: A | B]` (and `[T >: A | B]` accepted), a union in an `@sysl` and an `@c` parameter, result and
   mirror field, calling or constructing a union, each with its message.
 
-### Incremental builds: build plan
+### Refined variants: build plan
+
+[Refined variants](/spec/refined-variants/) are designed, their choices proposed in
+[decisions](/spec/decisions/#proposed); none is built. Each step is one item, gated on its own
+targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
+`-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
+messages, at most five per file. A step that meets a missing piece of the checker it builds on
+reports it rather than routing around it.
+
+1. **Declaration.** `Variant[params](fields) -> Type[args]` and `Name -> Type[args]` in a `data`
+   body: `syntax.sysl` (`Variant` gains `type_params` and `result: Option[&TypeExpr]`),
+   `parse_decl.sysl`, `formatter.sysl` (round trip, `avin fmt`-clean), `syntax_show.sysl`,
+   `lsp_symbols.sysl`; in `check.sysl`'s `declare_variants`, `VariantSymbol` gains its parameters and
+   its result in them, and the six declaration checks run. *Tests:* each check's reject (a result of
+   another type, a fixed `+T` and `-T`, a union naming a parameter beside a closed union accepted,
+   an unused parameter, a reused name, `Lift[A](x: Expr[Vector[A]])` refused beside
+   `First[A, B](pair: Expr[(A, B)])` accepted); parse and formatter cases for a fieldless variant with a
+   result, a multi-line field list, annotations and defaults on a refined variant's fields.
+2. **Making values and layouts.** `variant_signature` generic over the variant's parameters; inference
+   from fields and the expected type; explicit arguments on the variant and on the type; the bare and
+   qualified names; in `lower.sysl`, `DataLayout` holding only the variants possible at the
+   instance, tags kept as declared; derived `Eq`, `Hash`, `Display`, `Debug` per instance; a type
+   pattern on an `Any` holding one. No hidden parameters yet (refused with a "not yet built"
+   message, removed by step 5). *Tests:* run: values of every `Expr` variant printed and compared,
+   `Expr[int]` and `Expr[bool]` in one `Vector[Any]` taken apart by type pattern, a refined value
+   in a class field, a closure capturing one, a `Map` keyed by one; reject: a variant at the wrong
+   expected instance, a field of the wrong instance, a shared variant name decided by a refined
+   result.
+3. **Refinement.** In `check.sysl`, a scoped substitution of the type parameters in scope, pushed
+   by each arm, clause, `is` scope and destructuring binding whose pattern holds a refined variant
+   (solved by decomposition with an occurs check), consulted wherever two types are compared or a
+   member is found; arm results checked against the expected type under it; inference variables
+   settled as written; in `lower.sysl`, an arm whose equalities fail at the copy is not lowered.
+   *Tests:* run: `eval` over `IntLit`, `BoolLit`, `Add`, `Eq`, `If`, `Pair` (as clauses, as a
+   `match`, as a match function, through `is` with an early return, in a class's generic method,
+   in a local generic function); nested refinement (`If(BoolLit(b), x, y)`); a lambda made in an arm
+   and called after it; a `var` declared outside stored in an arm; `Same`/`cast`; reject: an arm
+   result of the wrong type, arms joining with no expected type, an inference variable settled in an
+   arm and used outside, a refined name used outside its `is` scope, an unknown matched type.
+4. **Coverage.** In `coverage.sysl`, `cases_of` keeps the variants possible at the instance and the
+   witness search carries each row's equalities; impossible arms and empty instances are errors with
+   the chapter's messages. *Tests:* run: `total` on `Expr[int]` with no `BoolLit` arm, a pair of
+   `Expr[T]`s whose contradictory row is left out, a nested `match` inside a refined arm; reject: an
+   `Eq` arm on `Expr[int]`, a contradiction in one row, a cyclic equality, a `Same[int, string]`
+   matched, a missing case naming a possible variant, an arm unreachable after the possible variants
+   are covered.
+5. **Hidden parameters.** Fresh rigid types in an arm; the escape check; packs: one descriptor per
+   variant and list of hidden types the program makes, fields laid out at the pack's types; an arm
+   on such a variant lowered once per pack as a function of the hidden types and called through the
+   descriptor, reusing the dispatch `lower.sysl` and `devirt.sysl` build for generic trait methods;
+   equality comparing descriptors first; the polymorphic-recursion check extended to cycles that make
+   packs. *Tests:* run: `First` in `eval`; a hidden value-type field (`int`, `real`, a tuple) beside
+   a reference one; two packs of one variant compared unequal and hashed apart; the `Plan` example
+   driving a `Door` machine; reject: a hidden type leaving its arm as a result, through a local
+   settled in the arm, one value's hidden type used with another's; a growing pack cycle.
+6. **Bounds on variant parameters.** Checked where a value is made; held in the arm; gained by an
+   enclosing type parameter equated with a bounded one; a copy at a type without the bound leaves the
+   arm out. `Sendable` decided per pack. *Tests:* run: `Sorted[A: Ord]` and `smallest`; the
+   `Account` protocol of the chapter end to end (`request` at `long`, `string`, `unit`); reject:
+   making `Ask` with an unsendable reply type, a method of a bound the variant does not give.
+7. **Tooling and pages.** Hover and completion show a refined variant's signature (`lsp.sysl`,
+   `completion.sysl`); the IntelliJ plugin's grammar takes the result (in `avin-intellij`, its own
+   item); the chapter's examples become `run` fences with their `output` fences, so the docs test
+   compiles them.
+
 
 Stage 10's incremental builds are designed in the [pipeline](/compiler/#incremental-builds), their
 choices proposed in [decisions](/spec/decisions/#proposed). The plan follows a measurement.

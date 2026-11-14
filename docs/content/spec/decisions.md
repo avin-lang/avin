@@ -8218,6 +8218,68 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+**Refined variants** ([chapter](/spec/refined-variants/), branch `gadt-design`; designed, not built)
+
+- **Spelling: a variant's result after `->`, its own type parameters after its name.**
+  `IntLit(value: int) -> Expr[int]`, `Balance -> Query[long]`, `Pair[A, B](…) -> Expr[(A, B)]`; the
+  data type's parameter names are every variant's parameters, so a variant with no result keeps
+  meaning `-> D[T…]`. Why: a variant is a constructor, and `(fields) -> Type` is exactly how Avin
+  writes a function's signature, so the line reads as the constructor it declares; nothing else is
+  written after a variant's fields. Alternatives weighed: `IntLit(value: int): Expr[int]` (`:` already
+  types each field on the same line and begins an inheritance list, which a variant is not); a
+  `where T = int` clause (names the equality instead of the instance, and needs a second syntax for
+  hidden parameters); a separate keyword per refined variant (a second kind of variant where there
+  is one with an optional result).
+- **A variant fixes only invariant parameters.** Where the type's parameter is `+T` or `-T`, a
+  variant's result has `T` there. Why: an invariant argument is exact, so the equality an arm learns
+  is true; a covariant one is an upper bound, and taking it as an equality is unsound (the chapter's
+  `asDog` makes a cat a `Dog`). Alternatives weighed: refining a covariant place by a bound
+  (`Dog <: T`) and a contravariant one by the opposite bound (sound, but it gives one-directional
+  facts that are hard to read in an error, and no motivating example needs it); forbidding variance
+  on any type with a refined variant (needlessly strict: unfixed places keep their variance soundly).
+  Review with the user: whether bound refinement at variance places is wanted later.
+- **Hidden type parameters are allowed, and compiled per pack.** A variant parameter its result does
+  not name is a fresh type in each arm, never leaving it; each list of hidden types the program makes
+  a variant with has its own descriptor, and an arm on it is compiled once per pack and selected by
+  the descriptor. Why: a typed protocol (a request and its reply address agreeing on a type the
+  message type does not mention) and a chained plan (`Then[Mid]`) need one, and the whole-program
+  compiler already knows every pack, as it knows every implementer of a trait for dynamic generic
+  methods, so nothing is boxed and the value-type fields stay unboxed. Alternatives weighed: refusing
+  hidden parameters (the protocol could then only erase `R` behind a trait, losing the type the
+  design exists to keep); boxing a hidden field behind `Any` (a run-time test where none is needed).
+  Review with the user: code size, since an arm is copied per pack.
+- **Equalities hold exactly where the pattern's names are in scope, and nowhere outside.** An arm's
+  result is checked against the expected type under them; with none expected, arms yield their types
+  as written; an inference variable settled in an arm settles to the type as written; a hidden type
+  in an arm's result is an error. Why: a fact true only in the arm cannot leak to code that runs
+  without it, and "as written" is the one reading that does not guess whether an `int` was meant as
+  `T`. Alternatives weighed: mapping an arm's type back through its equalities (ambiguous: `int` and
+  `T` are one type there and two outside); inferring the result type of a refining `match` (needs a
+  search the local inference does not do).
+- **Only variants refine.** Extractors and type patterns learn no equalities. Why: an extractor's
+  answer type is its signature's; a type pattern's could refine an invariant generic's arguments by
+  the same header argument, but it widens the feature to every generic type and every type test.
+  Alternative weighed: refining by type patterns on invariant instances (sound; deferred). Review
+  with the user.
+- **A union in a result names no variant parameter**, since a value would not say which member a
+  parameter is; closed unions (`-> Expr[int | string]`) are allowed. Alternative weighed: deciding the
+  parameter by normal-form order (arbitrary, and wrong for a value made at another member).
+- **An arm no value can reach because its equalities contradict is an error**, as every unreachable
+  arm is, and coverage counts only the variants possible at the matched type, carrying each row's
+  equalities; a `match` on an instance with no possible variant is an error. Alternatives weighed: a
+  warning for an impossible arm (Avin has no warnings for unreachable code); pruning per column
+  without carrying equalities along a row (simpler, but demands arms for combinations no value has).
+- **Bounds on a variant's parameters** are checked where a value is made and held in the arm, and an
+  enclosing type parameter equated with a bounded one gains the bound there; a copy at a type
+  without the bound compiles no such arm. Why: it is what makes a hidden type useful (`Sendable` for
+  a reply, `Ord` for a sorted payload), and it costs one more test when an arm is decided at a copy.
+  Alternative weighed: no bounds on variant parameters (the protocol could not name `ActorRef[R]`,
+  whose parameter is bounded by `Sendable`).
+- **The nested-data-type rule is measured against the variant's result**, and a larger part made of
+  a hidden parameter is allowed, since its instances exist only where the program makes a pack.
+  Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
+  Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
