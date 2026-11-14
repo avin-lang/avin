@@ -588,6 +588,10 @@ struct Checker
      * receiver, while the expression's own span, the one its traps and code are placed at, stays
      * whole. */
     shown: Buf[(Span, Span)]
+    /** The `flatMap` calls of the `for` with `yield` being checked, outermost first: what each
+     * generator's source takes from the rest of the comprehension, so the generator after it names
+     * itself when what it gives is not that. */
+    yield_frames: Buf[YieldFrame]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -989,7 +993,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -15139,7 +15143,74 @@ private for_yield_expr(c: *Checker, e: &Expr, generators: Buf[Generator], body: 
         val d = g.definitions[i]
         definitions.push(element_binding(d.pattern, d.value))
     val name = if generators.len() > 1 then "flatMap" else "map"
-    comprehension_call(c, e.span, g.source.span, source, name, element_function(pattern, item, definitions, rest), expected)
+    val frames = c.yield_frames.len()
+    if generators.len() > 1 then push_yield_frame(c, source, generators[1].span.start)
+    val result = comprehension_call(c, e.span, g.source.span, source, name, element_function(pattern, item, definitions, rest), expected)
+    c.yield_frames.truncate(frames)
+    taken_by_frame(c, e.span, g, result)
+
+/** What the `flatMap` of one generator's source takes from the rest of a `for` with `yield`: the
+ * result types of the functions its overloads take, `next` being where the generator after it
+ * starts. */
+struct YieldFrame
+    next: usize
+    source: &Type
+    takes: Buf[&Type]
+
+/** Records what the `flatMap` of `source` takes from the generator starting at `next`, when every
+ * overload of it takes a function. */
+private push_yield_frame(c: *Checker, source: &TExpr, next: usize)
+    val ty = zonk(c, source.ty)
+    if !settled(ty) then return
+    var takes: Buf[&Type] = buf()
+    for m in methods_of(c, ty, "flatMap")
+        val params = c.symbols[m].params
+        if params.len() == 0 then return
+        *params[params.len() - 1] match
+            Function(_, result, _) -> takes.push(result)
+            _ -> return
+    if takes.len() > 0 then c.yield_frames.push(YieldFrame(next, ty, takes))
+
+/** `result`, what the generator `g` and the rest of its comprehension make, unless the `flatMap` of
+ * the generator before it takes none of what it makes: then the generator is named, at its source,
+ * as the one that does not fit. */
+private taken_by_frame(c: *Checker, at: Span, g: Generator, result: &TExpr) -> &TExpr
+    val made = zonk(c, result.ty)
+    if !settled(made) || *made is Var(_) then return result
+    var k = c.yield_frames.len()
+    while k > 0
+        k = k - 1
+        val frame = c.yield_frames[k]
+        if frame.next != g.span.start then continue
+        for t in frame.takes
+            if head_fits(c, made, t) then return result
+        var answers = ""
+        for i in 0 ..< frame.takes.len()
+            if i > 0 then answers = answers + " or "
+            answers = answers + s"`${type_name(frame.takes[i])}`"
+        val which = g.pattern.kind match
+            Name(n) -> s"the generator of `$n`"
+            _ -> "this generator"
+        c.note(unit_of(c), g.source.span, s"$which makes `${type_name(made)}`, which the generator before it cannot go on with: the `flatMap` of `${type_name(frame.source)}` takes a function answering $answers")
+        return TExpr(at, ErrorType, UnitConst)
+    result
+
+/** Whether `given` conforms to the type `declared` names, whatever its type arguments. */
+private head_fits(c: *Checker, given: &Type, declared: &Type) -> bool
+    val count = *declared match
+        Class(_, _, xs) -> xs.len()
+        Data(_, _, xs) -> xs.len()
+        _ -> return true
+    val saved = save_vars(c)
+    var args: Buf[&Type] = buf()
+    for i in 0 ..< count do args.push(fresh_var(c))
+    val shape: &Type = *declared match
+        Class(k, n, _) -> Class(k, n, args)
+        Data(k, n, _) -> Data(k, n, args)
+        _ -> declared
+    val ok = fits(c, given, shape)
+    restore_vars(c, saved)
+    ok
 
 /** The name of the parameter of a function a `for` with `yield` makes: `yield KIND START`, then
  * the name the generator's pattern binds when it is one name, so a diagnostic can say it. */
@@ -15165,12 +15236,19 @@ private comprehension_call(c: *Checker, at: Span, source_span: Span, receiver: &
     if !settled(ty) then return receiver
     var args: Buf[Argument] = buf()
     args.push(Argument(f.span, None, f, false))
-    val ms = comprehension_methods(c, ty, name)
+    var called = name
+    var ms = comprehension_methods(c, ty, name)
+    // A guard calls `filter` on a source that has no `withFilter`.
+    if ms.len() == 0 && name == "withFilter"
+        called = "filter"
+        ms = comprehension_methods(c, ty, called)
     if ms.len() == 0
-        val role = if name == "withFilter" then "a guard of a `for` with `yield`" else "a `for` with `yield`"
-        c.note(unit_of(c), source_span, s"`${type_name(ty)}` has no method `$name`, which $role calls on its source")
+        if name == "withFilter"
+            c.note(unit_of(c), source_span, s"`${type_name(ty)}` has no method `withFilter` or `filter`, which a guard of a `for` with `yield` calls on its source")
+        else
+            c.note(unit_of(c), source_span, s"`${type_name(ty)}` has no method `$name`, which a `for` with `yield` calls on its source")
         return TExpr(at, ErrorType, UnitConst)
-    call_method(c, at, source_span, receiver, name, ms, args, None, expected, false)
+    call_method(c, at, source_span, receiver, called, ms, args, None, expected, false)
 
 /** The methods of `name` a call on a value of type `t` chooses among, as a call written out sees them. */
 private comprehension_methods(c: *Checker, t: &Type, name: string) -> Buf[usize] = methods_of(c, t, name)

@@ -1,0 +1,115 @@
+// expect: exit 0
+// A `for` with `yield` works over any source whose type has the methods it calls: `map` for the last
+// generator, `flatMap` for each earlier one, and `withFilter`, or `filter` where there is no
+// `withFilter`, for a guard. So it reads the same over results, eithers, options, iterators, lazy
+// lists and types of the program's own as over collections.
+
+// A type with only `map` and `flatMap`: comprehensions without guards work over it.
+class Box[T](val v: T)
+  map[U](f: (T) -> U) -> Box[U] = Box(f(v))
+  flatMap[U](f: (T) -> Box[U]) -> Box[U] = f(v)
+  show -> string = s"Box(${v})"
+
+// A type with `filter` and no `withFilter`: its guards call `filter`.
+class Maybe(val v: int, val here: bool)
+  map(f: (int) -> int) -> Maybe = if here then Maybe(f(v), true) else self
+  flatMap(f: (int) -> Maybe) -> Maybe = if here then f(v) else self
+  filter(p: (int) -> bool) -> Maybe =
+    println(s"  filter $v")
+    if here && p(v) then self else Maybe(v, false)
+  show -> string = if here then s"Maybe($v)" else "Nope"
+
+// A type with both: a guard calls `withFilter`.
+class Both(val v: int)
+  map(f: (int) -> int) -> Both = Both(f(v))
+  withFilter(p: (int) -> bool) -> Both =
+    println(s"  withFilter $v ${p(v)}")
+    self
+  filter(p: (int) -> bool) -> Both =
+    println("  filter")
+    self
+
+data Pt(x: int, y: int)
+
+step(tag: string, r: Result[int, string]) -> Result[int, string] =
+  println(s"  source $tag")
+  r
+
+opt(tag: string, o: Option[int]) -> Option[int] =
+  println(s"  source $tag")
+  o
+
+main()
+  // Results: each position short-circuits, and the sources after an error are not evaluated.
+  println(for a in step("a", Ok(1)), b in step("b", Ok(2)), c in step("c", Ok(3)) yield a + b + c)
+  println(for a in step("a", Err("first")), b in step("b", Ok(2)), c in step("c", Ok(3)) yield a + b + c)
+  println(for a in step("a", Ok(1)), b in step("b", Err("second")), c in step("c", Ok(3)) yield a + b + c)
+  println(for a in step("a", Ok(1)), b in step("b", Ok(2)), c in step("c", Err("third")) yield a + b + c)
+  // A later source may use an earlier value, and value definitions sit between them.
+  val chained = for
+    a in step("a", Ok(10))
+    half = a / 2
+    b in step("b", if half > 4 then Ok(half) else Err("small"))
+    total = a + b
+  yield total * 2
+  println(chained)
+  // A single generator is `map`, so a result's error passes through unchanged.
+  val single: Result[string, string] = for n in step("one", Err("kept")) yield s"$n"
+  println(single)
+
+  // Options: each position short-circuits.
+  println(for a in opt("a", Some(1)), b in opt("b", Some(2)) if a < b yield a * 10 + b)
+  println(for a in opt("a", None), b in opt("b", Some(2)) yield a + b)
+  println(for a in opt("a", Some(1)), b in opt("b", None) yield a + b)
+  println(for a in opt("a", Some(5)) if a > 9, b in opt("b", Some(2)) yield a + b)
+  println(for a in opt("a", Some(5)), b in opt("b", Some(2)) if a < b yield a + b)
+
+  // Eithers are right-biased.
+  val r: Either[string, int] = Right(3)
+  val l: Either[string, int] = Left("left")
+  println(for x in r, y in r, z = x * y yield z + 1)
+  println(for x in r, y in l yield x + y)
+  println(for x in l, y in r yield x + y)
+
+  // An iterator's `flatMap`, `map` and `withFilter` are lazy: nothing runs until it is read.
+  val it = for x in [1, 2, 3, 4].iterator() if x % 2 == 0, y in [x, x * 100] yield y
+  println(it.toList)
+  val empty = for x in Vector[int]().iterator() yield x
+  println(empty.hasNext())
+
+  // A lazy list has `filter` and no `withFilter`, so its guards stay lazy: an infinite one is fine.
+  val odds = for n in LazyList.from(1) if n % 2 == 1 yield n * n
+  println(odds.take(4).toList)
+  val small = [1, 2].toLazyList()
+  println((for x in small, y in small yield (x, y)).toList)
+
+  // A type of the program's own with only `map` and `flatMap`.
+  println((for x in Box(2), y in Box(3), z in Box(x * y) yield z + 1).show)
+  println((for (a, b) in Box((1, "one")) yield s"$a=$b").show)
+  println((for Pt(x, y) in Box(Pt(3, 4)), d = x * x + y * y yield d).show)
+  println((for s in Box("é"), n in Box(s.charCount) yield s"$s$n").show)
+  // One generic class at two instances in one comprehension: `Box[string]` then `Box[int]`.
+  println((for s in Box("ab"), n in Box(s.charCount) yield n).show)
+
+  // Guards on a type with `filter` only, at each place a guard can stand.
+  println((for x in Maybe(4, true) if x > 1, y in Maybe(5, true) if y > x yield x + y).show)
+  println((for x in Maybe(4, true) if x > 9, y in Maybe(5, true) yield x + y).show)
+  println((for x in Maybe(4, true), y = x * 2 if y > 9 yield y).show)
+  // `withFilter` is chosen over `filter` where a type has both.
+  println((for x in Both(7) if x > 0 yield x).v)
+
+  // A closure made in the yielded value keeps the element it saw.
+  val fs = for x in Some(4), y in Some(5) yield () -> x * y
+  println(fs.map(f -> f()))
+
+  // Nested: a comprehension as a source, and one in the yielded value.
+  val nested = for a in (for x in Some(2) yield x + 1), b in Some(10) yield for c in [a, b] yield c * a
+  println(nested)
+  val inner = for x in Box(1) yield (for y in Some(x) yield y + 1)
+  println(inner.v)
+
+  // Mixed kinds follow the first source's `flatMap`: an option then a collection is a vector, a
+  // collection then an option keeps the collection's kind.
+  val xs: List[int] = [1, 2, 3]
+  println(for a in Some(1), b in xs yield a + b)
+  println(for a in xs, b in (if a == 2 then None else Some(a * 10)) yield b)
