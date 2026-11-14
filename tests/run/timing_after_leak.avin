@@ -1,0 +1,65 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// An `after` nobody receives from leaves nothing behind: no timer, no thread, and no memory once it is
+// collected. Three hundred thousand hour-long `after`s are made and dropped, and a hundred thousand
+// tickers, never stopped; ten thousand selects each wait
+// on a fresh hour-long `after` and are won by another arm, and as many are given up by a select's own
+// `after` arm; a thousand threads park in a receive with a timeout on an `after` that is not due, and
+// are cancelled. Afterwards the runtime holds no more timers than before, and the
+// memory the program holds has grown by a bounded amount. So many allocations under a collection at
+// each would take minutes, so this program runs with the collector as it ordinarily is;
+// `timing_after_gc.avin` runs the same shapes under the stressed collector.
+import avin.process.{pid, residentBytes}
+import avin.threads.{Channel, Ticker, after, scope, sleep}
+import avin.time.{hours, micros, millis}
+
+@sysl("avin.rt.scheduler_timers")
+timers() -> long
+
+residentMegabytes() -> long = residentBytes(pid()).getOrElse(0) / 1000000
+
+main() -> int
+  val timersBefore = timers()
+  // A warm-up, so the heap has grown to its working size before it is measured.
+  for _ in 0 ..< 20000 do after(hours(1)).tryReceive()
+  val before = residentMegabytes()
+
+  // Made and dropped: kept, three hundred thousand would hold about 160 MB.
+  var made = 0
+  for _ in 0 ..< 300000
+    val a = after(hours(1))
+    if a.tryReceive().isEmpty then made++
+  println("made:", made, "timers:", timers() - timersBefore)
+
+  // Tickers dropped without `stop`, some after a tick.
+  var ticked = 0
+  for i in 0 ..< 100000
+    val t = Ticker(if i % 1000 == 0 then micros(1) else hours(1))
+    if i % 1000 == 0 && t.ticks.receive().isDefined then ticked++
+  println("ticked:", ticked, "timers:", timers() - timersBefore)
+
+  // A select's arm, lost to a channel that has a value.
+  val ready = Channel[int]()
+  var won = 0
+  for i in 0 ..< 10000
+    ready.send(i)
+    select
+      ready.receive() as Some(_) -> won++
+      after(hours(1)).receive() -> ()
+  // And lost to the select's own `after`.
+  var gaveUp = 0
+  for _ in 0 ..< 10000
+    select
+      after(hours(1)).receive() -> ()
+      after micros(1) -> gaveUp++
+  println("won:", won, "gave up:", gaveUp, "timers:", timers() - timersBefore)
+
+  // Parked on an `after` that is not due, then cancelled.
+  val results = scope(s ->
+    val ts = (0 ..< 1000).map(_ -> s.spawn(() -> after(hours(1)).receive(hours(2)))).toVector
+    sleep(millis(50))
+    s.cancel()
+    ts)
+  println("cancelled:", results.forall(t -> t.result().isEmpty), "timers:", timers() - timersBefore)
+  println("bounded memory:", residentMegabytes() - before < 60)
+  0

@@ -1,0 +1,66 @@
+// expect: exit 0
+// `after` and `Ticker` under the collector run at every allocation: `after`s dropped unreceived, lost
+// in selects to another arm or to the select's own `after`, waited on by threads that are cancelled,
+// and waited on by a thread or a select as the only thing that still reaches them, which the collector
+// must keep until they deliver. Ticks are received while the collector runs between them. No timer is
+// left behind by any of it.
+import avin.threads.{Atomic, Channel, Ticker, after, scope, sleep, spawn}
+import avin.time.{hours, micros, millis}
+
+@sysl("avin.rt.scheduler_timers")
+timers() -> long
+
+main() -> int
+  val timersBefore = timers()
+
+  var made = 0
+  for _ in 0 ..< 2000
+    if after(hours(1)).tryReceive().isEmpty then made++
+
+  val ready = Channel[string]()
+  var won = 0
+  var gaveUp = 0
+  for i in 0 ..< 300
+    ready.send(s"value $i")
+    select
+      ready.receive() as Some(_) -> won++
+      after(hours(1)).receive() -> ()
+    select
+      after(hours(1)).receive() -> ()
+      after micros(1) -> gaveUp++
+  println(made, won, gaveUp, timers() - timersBefore)
+
+  // Reached only by the threads waiting on them.
+  val delivered = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 50
+      s.spawn(() ->
+        if after(millis(long(5 + i % 10))).receive().isDefined then delivered.add(1))
+    for i in 0 ..< 50
+      s.spawn(() ->
+        val junk = Channel[int]()
+        select
+          junk.receive() -> 0
+          after(millis(long(5 + i % 10))).receive() as Some(_) -> delivered.add(1)))
+  println(delivered.load())
+
+  // Waiting threads cancelled.
+  val results = scope(s ->
+    val ts = (0 ..< 100).map(i -> s.spawn(() ->
+      if i % 2 == 0 then after(hours(1)).receive(hours(2)) else after(hours(1)).receive())).toVector
+    sleep(millis(20))
+    s.cancel()
+    ts)
+  println(results.forall(t -> t.result().isEmpty), timers() - timersBefore)
+
+  // Ticks, the collector running between them.
+  val t = Ticker(millis(2))
+  var ticks = 0
+  var garbage: List[string] = []
+  for at in t.ticks
+    garbage = s"tick $ticks" :: garbage
+    ticks++
+    if ticks == 20 then break
+  t.stop()
+  println(ticks, garbage.length, timers() - timersBefore)
+  0
