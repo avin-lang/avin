@@ -52,8 +52,8 @@ main()
   T)` and `def class -> int` at the top level declare functions; and `impl` begins an impl before a
   type, before type parameters and a type (`impl[A, B] (A, B)`), or before a function type with
   `for`. The words of actors and machines are keywords only where they [begin their
-  forms](/spec/actors/#keywords), as `select` is only where it ends its line to open a [select
-  block](/spec/threads/#select).
+  forms](/spec/actors/#keywords), as
+  `select` is only where it ends its line to open a [select block](/spec/threads/#select).
 - **Capitalized** means the first character is an uppercase or titlecase letter (Unicode `Lu` or
   `Lt`): `Ärger`, `Δelta` and `ǅemal` are capitalized. A letter with no case, as in Chinese,
   Japanese or Arabic, is not, so such a name is written where a lowercase one is. Types and
