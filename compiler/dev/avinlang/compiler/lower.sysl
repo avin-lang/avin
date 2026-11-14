@@ -313,6 +313,10 @@ private struct Lowering
      * this copy: the rest of the enclosing block holds that pattern's equalities, false here, and
      * is not compiled. */
     dead: bool
+    /** Set where the condition just lowered is a constant an `is` test's pattern decided at this
+     * copy, so the code holding its equalities can be left out; any other constant condition is
+     * compiled as written. */
+    refuted: bool
 
 /** The code of the current block from instruction `at` on comes from the source at `span`, until
  * the next mark. */
@@ -446,7 +450,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     val ordinals = local_ordinals(program)
     var constant_globals: Buf[bool] = buf()
     val keyer = key_maker(program, ordinals, constant_globals, world)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), debug, false, buf(), false)
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), debug, false, buf(), false, false)
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -3024,6 +3028,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
     l.refined = function_refinements(l, f.symbol)
     l.dead = false
+    l.refuted = false
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -6273,8 +6278,11 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         if !is_machine_scalar(t) then return operator_call(l, t, "negate", [x], machine(l, t))
         Some(negate_value(l, t, x, e.span))
     Not(operand) ->
+        l.refuted = false
         val x = lower_expr(l, operand)?
-        if x is ConstBool(known) then return Some(ConstBool(!known))
+        if l.refuted
+            if x is ConstBool(known) then return Some(ConstBool(!known))
+        l.refuted = false
         Some(binary(l, MBool, OpXor, x, ConstBool(true)))
     Complement(operand) ->
         val x = lower_expr(l, operand)?
@@ -6547,11 +6555,14 @@ max_digits(bits: u32) -> string
     head + char(last).to_string()
 
 private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr, tail: bool) -> Option[Operand]
+    l.refuted = false
     val a = lower_expr(l, left)?
-    // A left operand known at this copy decides the whole where it can, and the right one, which may
-    // be checked under equalities false here, is not compiled.
-    if a is ConstBool(known)
-        if known != and then return Some(a)
+    // A left operand an `is` test decided at this copy decides the whole where it can, and the right
+    // one, which may be checked under equalities false here, is not compiled.
+    if l.refuted
+        if a is ConstBool(known)
+            if known != and then return Some(a)
+    l.refuted = false
     val slot = new_slot(l, Bool)
     store(l, slot, Some(a))
     val rest = new_block(l)
@@ -6559,6 +6570,7 @@ private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr, tail: bool) 
     finish_into(l, if and then Branch(a, rest, done) else Branch(a, done, rest), rest)
     store(l, slot, lower_at(l, right, tail))
     l.dead = false
+    l.refuted = false
     finish_into(l, Jump(done), done)
     load(l, slot)
 
@@ -6689,19 +6701,23 @@ private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) 
     load(l, slot)
 
 private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr], tail: bool) -> Option[Operand]
+    l.refuted = false
     val c = lower_expr(l, condition)?
-    // A condition known at this copy compiles only the branch it takes: the other may be checked
-    // under equalities false here. A taken branch that never finishes, as `if e is not V(x) then
-    // return` at a copy no `V` reaches, leaves the rest of its block uncompiled too (`dead`).
-    if c is ConstBool(known)
-        val slot = new_slot(l, e.ty)
-        if known
-            store(l, slot, lower_at(l, yes, tail))
-            if *yes.ty is Nothing then l.dead = true
-        elif no is Some(n)
-            store(l, slot, lower_at(l, n, tail))
-            if *n.ty is Nothing then l.dead = true
-        return load(l, slot)
+    val decided = l.refuted
+    l.refuted = false
+    // A condition an `is` test decided at this copy compiles only the branch it takes: the other may
+    // be checked under equalities false here. A taken branch that never finishes, as `if e is not
+    // V(x) then return` at a copy no `V` reaches, leaves the rest of its block uncompiled too (`dead`).
+    if decided
+        if c is ConstBool(known)
+            val slot = new_slot(l, e.ty)
+            if known
+                store(l, slot, lower_at(l, yes, tail))
+                if *yes.ty is Nothing then l.dead = true
+            elif no is Some(n)
+                store(l, slot, lower_at(l, n, tail))
+                if *n.ty is Nothing then l.dead = true
+            return load(l, slot)
     val slot = new_slot(l, e.ty)
     val then_block = new_block(l)
     val join = new_block(l)
@@ -6723,13 +6739,18 @@ private lower_while(l: *Lowering, e: &TExpr, label: usize, condition: &TExpr, bo
     val head = new_block(l)
     val exit = new_block(l)
     finish_into(l, Jump(head), head)
+    l.refuted = false
     val c = lower_expr(l, condition)?
-    // A condition false at this copy runs no body, which may be checked under equalities false here.
-    if c is ConstBool(false)
-        if otherwise is Some(o)
-            store(l, slot, lower_expr(l, o))
-        finish_into(l, Jump(exit), exit)
-        return load(l, slot)
+    val decided = l.refuted
+    l.refuted = false
+    // A condition an `is` test made false at this copy runs no body, which may be checked under
+    // equalities false here.
+    if decided
+        if c is ConstBool(false)
+            if otherwise is Some(o)
+                store(l, slot, lower_expr(l, o))
+            finish_into(l, Jump(exit), exit)
+            return load(l, slot)
     val body_block = new_block(l)
     val else_block = if otherwise is Some(_) then new_block(l) else exit
     finish_into(l, Branch(c, body_block, else_block), body_block)
@@ -6851,7 +6872,9 @@ private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool)
     if v is None && machine(l, value.ty) is Some(_) then return None
     // A pattern no value of the instance can match fails at this copy, and the code that holds its
     // equalities is not compiled (`lower_if`, `logic`).
-    if !keep_refinements(l, pattern) then return Some(ConstBool(negated))
+    if !keep_refinements(l, pattern)
+        l.refuted = true
+        return Some(ConstBool(negated))
     val slot = new_slot(l, Bool)
     val fail = new_block(l)
     val join = new_block(l)
