@@ -277,8 +277,20 @@ private qualified_name(p: *Parser) -> string
 // Types: a name with optional arguments, a tuple `(A, B)`, or a function type. `A -> B` and
 // `(A, B) -> C` are function types and associate to the right; `-> T` in a function type's
 // parameter list is a by-name parameter. `@sendable` before a function type marks it as one whose
-// values may run on any thread.
+// values may run on any thread. `A & B` is no type: an intersection of traits is written only as a
+// type parameter's bounds, so where a type is written it is an error that says so.
 parse_type(p: *Parser) -> &TypeExpr
+    val t = parse_type_operand(p)
+    if !p.at("&") then return t
+    var last = t.span
+    while p.accept("&")
+        last = parse_type_operand(p).span
+    val shown = from_utf8_unchecked(p.src.text(t.span.to(last)))
+    p.report.add(error(t.span.to(last), s"`$shown` is not a type: an intersection is written only as a type parameter's bounds, as in `[T: $shown](x: T)`"))
+    TypeExpr(t.span.to(last), InvalidType)
+
+/** One type, stopping before a `&`: an operand of a type parameter's bounds, or a whole type. */
+private parse_type_operand(p: *Parser) -> &TypeExpr
     val start = p.toks.here()
     if p.at("@") && p.ahead(1) == "sendable"
         p.toks.advance()
@@ -313,7 +325,7 @@ parse_type(p: *Parser) -> &TypeExpr
         p.toks.advance()
         return TypeExpr(start, InvalidType)
     type_tail(p, start, if p.at("[") then slice_type(p, start) else named_type(p, start))
-end parse_type
+end parse_type_operand
 
 // What may follow a type's first operand: more members of a union, `A | B`, which binds more
 // tightly than `->`, and then `->` and a result, making a function taking the type so far.
@@ -359,7 +371,12 @@ private named_type(p: *Parser, start: Span) -> &TypeExpr
     var args: Buf[&TypeExpr] = buf()
     if p.accept("[")
         loop
-            args.push(parse_type(p))
+            // `_` alone as an argument leaves it open, making a constructor: `Result[_, E]`.
+            val hole = p.toks.here()
+            if p.at("_") && (p.ahead(1) == "," || p.ahead(1) == "]")
+                p.toks.advance()
+                args.push(TypeExpr(hole, Hole))
+            else args.push(parse_type(p))
             if !p.accept(",") || p.at("]") then break
         p.expect("]")
     TypeExpr(start.to(p.ended()), Named(path, args))
@@ -630,7 +647,7 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
     p.expect(")")
     params
 
-// `[T, U: Ord + Hash]`, on a type `[+T, -U]`, and on a function `[W >: T]` or `[W >: T: Display]`
+// `[T, U: Ord & Hash]`, on a type `[+T, -U]`, and on a function `[W >: T]` or `[W >: T: Display]`
 parse_type_params(p: *Parser) -> Buf[TypeParam]
     var params: Buf[TypeParam] = buf()
     if !p.accept("[") then return params
@@ -642,22 +659,61 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
             if p.accept("+") then variance = Covariant
             elif p.accept("-") then variance = Contravariant
             val name = declared_name(p, "a type parameter")
+            val holes = parse_type_holes(p)
             var lower: Option[&TypeExpr] = None
             if p.accept(">:") then lower = Some(parse_type(p))
             var bounds: Buf[&TypeExpr] = buf()
             if p.accept(":")
                 loop
-                    bounds.push(parse_type(p))
-                    if !p.accept("+") then break
+                    bounds.push(parse_type_operand(p))
+                    if p.at("+")
+                        p.report.add(error(p.toks.here(), "a type parameter's bounds are joined with `&`, as in `[T: Ord & Display]`"))
+                        p.toks.advance()
+                        continue
+                    if !p.accept("&") then break
             if p.at(">:")
                 p.report.add(error(p.toks.here(), "a lower bound comes before the bounds, as in `[W >: T: Display]`"))
                 p.toks.advance()
                 val late = parse_type(p)
                 if lower is None then lower = Some(late)
-            params.push(TypeParam(start.to(p.ended()), name, variance, bounds, s"${p.src.name}:${start.start}", lower))
+            params.push(TypeParam(start.to(p.ended()), name, variance, bounds, s"${p.src.name}:${start.start}", lower, holes))
             if !p.accept(",") || p.at("]") then break
     p.expect("]")
     params
+
+// The holes of a constructor parameter, `F[_, +_]`, after its name; none for a parameter that stands
+// for a type. A hole is a type argument, so it takes no holes of its own: `F[_[_]]` is refused.
+private parse_type_holes(p: *Parser) -> Buf[TypeHole]
+    var holes: Buf[TypeHole] = buf()
+    if !p.accept("[") then return holes
+    loop
+        val at = p.toks.here()
+        var variance = Invariant
+        if p.accept("+") then variance = Covariant
+        elif p.accept("-") then variance = Contravariant
+        if p.at("_")
+            p.toks.advance()
+        else
+            p.report.add(error(p.toks.here(), "a constructor parameter's arguments are written `_`, one for each argument it takes, as in `F[_]` or `F[_, _]`"))
+            if !p.at("]") && !p.at(",") then p.toks.advance()
+        holes.push(TypeHole(at.to(p.ended()), variance))
+        if p.at("[")
+            val nested = p.toks.here()
+            skip_brackets(p)
+            p.report.add(error(nested.to(p.ended()), "a constructor parameter's arguments are types, never constructors, so a hole takes no arguments: write `F[_]`"))
+        if !p.accept(",") || p.at("]") then break
+    p.expect("]")
+    holes
+
+// Past a bracketed group and every group nested in it, the parser at its `[`.
+private skip_brackets(p: *Parser)
+    var depth = 0
+    loop
+        if p.at("[") then depth += 1
+        elif p.at("]") then depth -= 1
+        elif p.toks.peek() is None then return
+        p.toks.advance()
+        if depth == 0 then return
 
 /** A function: `name[T](params) -> Result = body`, an indented body, the clauses on the lines after
  * a signature with no body, or neither (a declaration completed by an annotation such as
@@ -897,7 +953,9 @@ local_function_ahead(p: *Parser) -> bool
             params = true
         elif params && text == "{" then braces += 1
         elif params && text == "}" then braces -= 1
-        elif text == ":" && params && depth == 1 && braces == 0 then typed = true
+        // A parameter is typed as `name: T`; `f(1: long)` is a call with an ascribed argument.
+        elif text == ":" && params && depth == 1 && braces == 0
+            if p.toks.peek_at(i - 1).unwrap().value == Word then typed = true
         elif text == ")"
             depth -= 1
             if params && depth == 0
@@ -906,13 +964,35 @@ local_function_ahead(p: *Parser) -> bool
                     None -> return false
                 val word = p.spelling(after)
                 // A signature with no result type is followed by its clauses.
-                if after.value == Newline then return typed && p.ahead(i + 2) == p.ahead(0) && p.ahead(i + 3) == "("
+                if after.value == Newline then return typed && p.ahead(i + 2) == p.ahead(0) && p.ahead(i + 3) == "(" && clause_follows(p, i + 3)
                 // `xs(i) = v` assigns an element, and `retry(3)` before an indented block passes the
                 // block as its last argument: a declaration's parameters are typed.
                 return (word == "=" || after.value == Indent) && (typed || empty) || word == "->" || word == "|"
-        elif !params && text != "[" && token.value != Word && text != "]" && text != "," && text != ":" && text != "+" && text != ">:" then return false
+        elif !params && text != "[" && token.value != Word && text != "]" && text != "," && text != ":" && text != "&" && text != "+" && text != ">:" then return false
         i += 1
     false
+
+// Whether the line whose argument list opens `open` tokens ahead is a clause: its arguments are
+// followed by `=`, a guard's `|` or an indented block of guards. Two calls with ascribed arguments,
+// `show(n: long)` on two lines, are no signature and its clause.
+private clause_follows(p: *Parser, open: usize) -> bool
+    var depth = 0
+    var i = open
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Dedent then return false
+        val text = p.spelling(token)
+        if text == "(" then depth += 1
+        elif text == ")"
+            depth -= 1
+            if depth == 0
+                val after = p.toks.peek_at(i + 1) match
+                    Some(t) -> t
+                    None -> return false
+                return p.spelling(after) == "=" || p.spelling(after) == "|" || after.value == Indent
+        i += 1
 
 private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &DataDecl
     val name = declared_name(p, "a type")
@@ -922,7 +1002,7 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
     val one_line = p.at("(")
     if one_line
         val fields = parse_params(p, false)
-        variants.push(Variant(start.to(p.ended()), name, fields, buf()))
+        variants.push(Variant(start.to(p.ended()), name, fields, buf(), buf(), None))
     var derives: Buf[&TypeExpr] = buf()
     if p.accept("derives")
         loop
@@ -939,9 +1019,14 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         // An annotation may stand on the line before its variant.
         if variant_annotations.len() > 0 then p.accept_kind(Newline)
         val variant = declared_name(p, "a variant")
+        // A refined variant's own type parameters follow its name, and the instance it makes follows
+        // its fields: `Pair[A, B](first: Expr[A], second: Expr[B]) -> Expr[(A, B)]`.
+        val variant_params = parse_type_params(p)
         var fields: Buf[Param] = buf()
         if p.at("(") then fields = parse_params(p, false)
-        variants.push(Variant(at.to(p.ended()), variant, fields, variant_annotations))
+        var result: Option[&TypeExpr] = None
+        if p.accept("->") then result = Some(parse_type(p))
+        variants.push(Variant(at.to(p.ended()), variant, fields, variant_annotations, variant_params, result))
         if p.toks.position == before then p.toks.advance()
     DataDecl(annotations, start.to(p.ended()), name, type_params, variants, derives)
 
@@ -1083,7 +1168,7 @@ private parse_derive(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &
     val name_at = p.toks.here()
     val name = declared_name(p, "the type a template is written for")
     var type_params: Buf[TypeParam] = buf()
-    type_params.push(TypeParam(name_at.to(p.ended()), name, Invariant, buf(), s"${p.src.name}:${name_at.start}", None))
+    type_params.push(TypeParam(name_at.to(p.ended()), name, Invariant, buf(), s"${p.src.name}:${name_at.start}", None, buf()))
     val members = parse_class_body(p, name)
     ImplDecl(start.to(p.ended()), type_params, Some(trait_name), TypeExpr(name_at.to(name_at), Named(name, buf())), members, true, None)
 

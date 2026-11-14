@@ -106,7 +106,7 @@ function yielding errors of `F`:
   its own. So `load(path) -> Result[Config, IoError | ParseError]` may `?` a `Result[_, IoError]` and a
   `Result[_, ParseError]`. The full rule is in [union types](/spec/unions/#errors-and).
 - **A type parameter converts through its bounds**: in
-  `load[F: From[IoError] + From[ParseError]](path: string) -> Result[Doc, F]`, both errors convert,
+  `load[F: From[IoError] & From[ParseError]](path: string) -> Result[Doc, F]`, both errors convert,
   and each instance calls its type argument's `from`.
 
 An `Option` `?` cannot exit a function returning `Result`, and the enclosing function's result type

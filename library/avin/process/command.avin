@@ -435,6 +435,14 @@ class Child(private val job: Job, private val owner: Owner, private val track: T
     if p == 0 || track.ended.load() then return Err(IoError(io.NotFound, "read the memory of", s"process $p"))
     residentBytesOf(p)
 
+  // The CPU time the command's programs used: each program's own and that of every descendant it
+  // reaped in turn, a pipeline's stages and a sequence's parts added together. Once `waitFor` has
+  // answered it is the whole command's; before then it is what the programs seen to have ended used,
+  // and a program still running, or let go of by `detach`, counts nothing.
+  cpuTime() -> CpuTime
+    owner.held()
+    job.cpu()
+
   // Checks the child belongs to the code running and is still its to wait for.
   private held()
     owner.held()
@@ -710,6 +718,8 @@ private abstract class Job
   stop() -> unit
   // Lets go of every program still running without stopping it, and starts no part not yet started.
   release() -> unit
+  // The CPU time of its programs reaped so far, each with the descendants it reaped in turn.
+  cpu() -> CpuTime
 
 // A part that ended before it began: its time ran out first.
 private class Ended(private val result: Result[ExitStatus, IoError]): Job
@@ -719,14 +729,21 @@ private class Ended(private val result: Result[ExitStatus, IoError]): Job
   override outcome() -> Result[ExitStatus, IoError] = result
   override stop() = ()
   override release() = ()
+  override cpu() -> CpuTime = CpuTime.Zero
 
-// One running program.
+// How long a program past its deadline is given to stop once asked, before it is made to.
+private val StopGraceMillis: long = 200
+
+// One running program. It is reaped here, with its CPU time, rather than by its `Spawned`, which is
+// let go of once it has been: so its deadline is kept here too, as the `Spawned` would have kept it,
+// the program asked to stop, given a short grace, then made to.
 private class Process(
     private val child: Spawned,
     private val deadline: Option[Duration],
     private val program: string
 ): Job
   private var result: Option[Result[ExitStatus, IoError]] = None
+  private var used: CpuTime = CpuTime.Zero
 
   override sequenced() -> bool = false
 
@@ -739,14 +756,21 @@ private class Process(
     if late
       finish()
       return true
-    child.tryWait() match
-      Ok(Some(status)) -> ended(Ok(status))
-      Ok(None) -> return false
-      Err(e) -> ended(Err(ioError(e, "wait for", program)))
-    true
+    reapedNow()
 
   override finish()
-    if result.isEmpty then ended(child.wait().mapErr(failed("wait for", program)))
+    if result.isDefined then return
+    deadline match
+      None -> reapedWithCpu(child.pid()) match
+        Ok(r) -> reaped(r, false)
+        Err(e) -> ended(Err(ioError(e, "wait for", program)))
+      Some(d) ->
+        var pause: long = 1
+        while !reapedNow()
+          val left = d - time.monotonic()
+          if left.micros <= 0 then return outstayed()
+          threads.sleep(if left < time.millis(pause) then left else time.millis(pause))
+          if pause < 16 then pause = pause * 2
 
   override outcome() -> Result[ExitStatus, IoError] = result.get
 
@@ -758,8 +782,41 @@ private class Process(
   override release()
     if result.isEmpty then child.detach()
 
+  override cpu() -> CpuTime = used
+
+  // Reaps the program if it has ended, without waiting, and says whether it has.
+  private reapedNow() -> bool
+    polledWithCpu(child.pid()) match
+      Ok(r) ->
+        if !r.ended() then return false
+        reaped(r, false)
+      Err(e) -> ended(Err(ioError(e, "wait for", program)))
+    true
+
+  // The program ran past its deadline: asked to stop, made to after the grace, and reaped, its
+  // status `TimedOut` and its CPU time counted.
+  private outstayed()
+    _ = child.kill(15)
+    val grace = time.monotonic() + time.millis(StopGraceMillis)
+    while time.monotonic() < grace
+      polledWithCpu(child.pid()) match
+        Ok(r) -> if r.ended() then return reaped(r, true)
+        Err(e) -> return ended(Err(ioError(e, "wait for", program)))
+      threads.sleep(time.millis(2))
+    _ = child.kill(9)
+    reapedWithCpu(child.pid()) match
+      Ok(r) -> reaped(r, true)
+      Err(e) -> ended(Err(ioError(e, "wait for", program)))
+
+  private reaped(r: Reaped, late: bool)
+    used = cpuOfReaped(r)
+    ended(Ok(if late then TimedOut else r.status()))
+
+  // The program is reaped, or cannot be waited for any more, so its `Spawned` is let go of: there is
+  // nothing left for it to stop, and its process id may already be another program's.
   private ended(r: Result[ExitStatus, IoError])
     result = Some(r)
+    child.detach()
     child.close()
 
 // Two parts run at once, the first's standard output the second's input.
@@ -795,6 +852,8 @@ private class Pipeline(private val from: Job, private val into: Job): Job
     from.release()
     into.release()
 
+  override cpu() -> CpuTime = from.cpu() + into.cpu()
+
 // Two parts one after the other, the second started by `second` when the first ends, if `joint` says
 // so. The streams are both parts', closed when the sequence ends.
 private class Sequence(
@@ -806,8 +865,11 @@ private class Sequence(
   private var started = false
   private var stopped = false
   private var result: Option[Result[ExitStatus, IoError]] = None
+  private var earlier: CpuTime = CpuTime.Zero
 
   override sequenced() -> bool = result.isEmpty
+
+  override cpu() -> CpuTime = earlier + current.cpu()
 
   override poll() -> bool
     while result.isEmpty
@@ -841,7 +903,9 @@ private class Sequence(
     if started || stopped || !goesOn(o) then return ended(o)
     started = true
     second() match
-      Ok(job) -> current = job
+      Ok(job) ->
+        earlier = earlier + current.cpu()
+        current = job
       Err(e) -> ended(Err(e))
 
   private goesOn(o: Result[ExitStatus, IoError]) -> bool = o match

@@ -11,7 +11,7 @@ module avin.net.http
 import avin.io.IoError
 import avin.net.{ByteStream, TcpStream, Url, UrlError}
 import avin.net.tls.{TlsClient, TlsError, TlsStream, Transport}
-import avin.time.Duration
+import avin.time.{Duration, seconds}
 
 // Why a request has no response.
 data HttpError
@@ -88,8 +88,16 @@ class Request(
   // authorities and those `client` adds.
   withTls(client: TlsClient) -> Request = Request(method, url, headers, body, timeout, client)
 
-// A response: its status and reason, its headers as they came, name and value, and its body.
-class Response(val status: int, val reason: string, val headers: Vector[(string, string)], val body: Array[byte])
+// A response: its status and reason, its headers as they came, name and value, and its body. A
+// response a server writes may instead be `streamed`, its body written as the handler makes it,
+// and its `body` is then empty.
+class Response(
+    val status: int,
+    val reason: string,
+    val headers: Vector[(string, string)],
+    val body: Array[byte],
+    val streamed: Option[StreamedBody] = None
+)
   // The value of the first header of `name`, compared without regard to case.
   header(name: string) -> Option[string] = headerIn(headers, name)
 
@@ -100,9 +108,48 @@ class Response(val status: int, val reason: string, val headers: Vector[(string,
   // value holds no line break; either traps where it does not hold.
   withHeader(name: string, value: string) -> Response
     checkHeader(name, value)
-    Response(status, reason, headers :+ (name, value), body)
+    Response(status, reason, headers :+ (name, value), body, streamed)
+
+// How a streamed response's body is written: by `write`, given a writer onto the connection, in
+// `length` bytes where that is known beforehand.
+class StreamedBody(val length: Option[long], val write: (BodyWriter) -> unit)
 
 object Response
+  // A response of `status` whose body `write` writes as it goes, of the type `contentType`, through
+  // the `BodyWriter` it is given, in chunks, each write sent at once.
+  stream(status: int, contentType: string, write: (BodyWriter) -> unit) -> Response =
+    streamedOf(status, contentType, None, write)
+
+  // As `stream(status, contentType, write)`, the body being exactly `length` bytes, said beforehand
+  // in its `Content-Length`. A negative length traps.
+  stream(status: int, contentType: string, length: long, write: (BodyWriter) -> unit) -> Response
+    if length < 0 then fail(s"a streamed body of $length bytes: its length is at least zero")
+    streamedOf(status, contentType, Some(length), write)
+
+  // A stream of server-sent events, `200` of the type `text/event-stream`, which `write` sends
+  // through the `EventWriter` it is given. While it waits through the writer's `untilStopped`, a
+  // comment is sent every fifteen seconds, so a client that has gone is noticed and one still there
+  // keeps the stream open.
+  events(write: (EventWriter) -> unit) -> Response = events(seconds(15), write)
+
+  // As `events(write)`, sending a comment every `keepAlive` while it waits, none for zero.
+  events(keepAlive: Duration, write: (EventWriter) -> unit) -> Response = Response(
+    200,
+    reasonPhrase(200),
+    Vector(("Content-Type", "text/event-stream"), ("Cache-Control", "no-cache")),
+    Array.empty[byte](),
+    Some(StreamedBody(None, w -> write(EventWriter(w, keepAlive))))
+  )
+
+  private streamedOf(status: int, contentType: string, length: Option[long], write: (BodyWriter) -> unit) -> Response =
+    Response(
+      status,
+      reasonPhrase(status),
+      Vector(("Content-Type", contentType)),
+      Array.empty[byte](),
+      Some(StreamedBody(length, write))
+    )
+
   // A response of `status` whose body is `text` as UTF-8, of the type `text/plain; charset=utf-8`.
   text(status: int, text: string) -> Response =
     Response(status, reasonPhrase(status), Vector(("Content-Type", "text/plain; charset=utf-8")), utf8(text))
