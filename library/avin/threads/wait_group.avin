@@ -1,0 +1,65 @@
+module avin.threads
+
+import avin.time.Duration
+
+// A count of work under way, which threads wait to see fall to zero. `add(n)` counts `n` more pieces,
+// `done()` counts one finished, and `wait()` sleeps until none is left. It counts work, not threads:
+// the threads that do the work may be started anywhere, by a scope, an executor or an actor, or may
+// be no new threads at all, and any of them may call `done`, since a wait group is sendable. Threads a
+// body starts and waits for itself are a `scope`'s to count.
+//
+//     val pending = WaitGroup()
+//     pending.add(jobs.length)
+//     for j in jobs do pool.submit(() -> run(j, pending))
+//     pending.wait()
+//
+// Every `done` (and every `add`) happens before each `wait` it lets return. A count taken below zero
+// traps, since it means a piece of work was finished twice or never counted.
+@keeps_owners
+class WaitGroup(): Sendable
+  private val lock = Lock()
+  private val idle = Condition(lock)
+  private var count = 0
+
+  // Counts `n` more pieces of work, or `-n` finished where `n` is negative; traps where the count
+  // would fall below zero, and wakes every waiting thread where it reaches zero.
+  add(n: int)
+    lock.acquire()
+    if count + n < 0
+      lock.release()
+      fail("a wait group's count falls below zero")
+    count += n
+    if count == 0 then idle.notifyAll()
+    lock.release()
+
+  // Counts one piece of work finished.
+  done() = add(-1)
+
+  // Sleeps until the count is zero; returns at once where it is.
+  wait()
+    lock.acquire()
+    while count > 0 do idle.wait()
+    lock.release()
+
+  // `wait` for at most `timeoutMillis` milliseconds, answering whether the count reached zero; a
+  // time that is not positive only asks.
+  waitFor(timeoutMillis: long) -> bool
+    lock.acquire()
+    val deadline = monotonicMillis() +| timeoutMillis
+    var left = timeoutMillis
+    while count > 0 && left > 0
+      idle.waitFor(left)
+      left = deadline - monotonicMillis()
+    val zero = count == 0
+    lock.release()
+    zero
+
+  // `waitFor` with the time as a `Duration`, a part of a millisecond waited for as a whole one.
+  waitFor(timeout: Duration) -> bool = waitFor(waitMillis(timeout))
+
+  // The count now, which other threads may change at once.
+  pending() -> int
+    lock.acquire()
+    val n = count
+    lock.release()
+    n
