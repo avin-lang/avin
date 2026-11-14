@@ -123,7 +123,9 @@ a decision changes, this page and the chapter change together.
 - A generic impl of a trait writes the type's parameters, in order, as its own:
   `impl[T] Show for Box[T]`. An impl without `for` may also name a type built from its parameters
   (settled 2026-11-04, below).
-- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
+- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A & B]`
+  (spelled `+` until the intersection-bounds entry under [Proposed](#proposed) made `&` the one
+  spelling).
   A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
   each bound's type; type arguments are held to their bounds where written and where inferred, and
   a bound's own type arguments are inferred from the argument. A call through a bound is direct in
@@ -790,7 +792,7 @@ Settled by the user on 2026-11-04:
   otherwise through `F.from`: at `From[E]`, or else at the one conformance `From[X]` with `E` an `X`
   that is more specific than every other such. Neither is an error naming `From[E]`; several equally
   specific ones are an error naming them. On a type parameter the conformances are its bounds',
-  `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
+  `F: From[IoError] & From[ParseError]`. See [errors](/spec/errors/) and
   [declarations](/spec/declarations/#impl).
 - **One formatting style, applied by `avin fmt [--check] [<path>...]` and the language server's
   `textDocument/formatting`.** Each block level is indented two spaces; a literate file keeps its
@@ -3859,7 +3861,7 @@ spelling is better, as each entry says.
   derivation declares it. Each call's type arguments are held to it as to any bound, a generic
   function passes its own type parameter on only where that one is bounded by it too, and every
   instantiation gets a shim of its own that Sysl checks, so a Sysl bound the instance does not meet is
-  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary + Ord]`) is Avin's to
+  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary & Ord]`) is Avin's to
   check, with no mapping between Sysl's traits and Avin's. A generic handle class,
   `@sysl("m.Signal") class Signal[T: Boundary]`, names the generic type without arguments, its type
   parameters invariant and the Sysl type's in order; each instance the program uses is a handle of its
@@ -7507,7 +7509,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Integer` excludes `real`); taking every operator the integers and `real` share (`Div` and `Rem`
   included, though their meaning differs: integer division truncates and traps on zero) gives the
   most generic code, and `zero`/`one` are already `Add`'s and `Mul`'s. Alternatives: only
-  `Add + Sub + Mul + Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
+  `Add & Sub & Mul & Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
   `Numeric` that also offered `fromInt`/`T(n)` construction, left out since `zero`/`one` cover the
   identities and a conversion from integers is lossy at narrow widths; a separate `Fractional` for
   `real`, not needed while `real` is the one non-integer. **Review with the user**: whether `Div`
@@ -8217,6 +8219,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 
 ## Proposed
+
+- Proposed (built on branch `intersection-bounds`): **several bounds on one type parameter are
+  joined with `&`, the one spelling, and an intersection is a bound only, never a type.**
+  `[T: Ord & Display]` replaces `[T: Ord + Display]` everywhere type parameters are declared
+  (functions, methods, classes, data types, traits, actors, impl headers, after a lower bound);
+  `+` between bounds is a parse error that says to write `&`, and the library, tests and docs are
+  rewritten. Each operand is a trait or a class, **at most one a class** (a second class is an
+  error naming both, a subclass of the first included), and **each written once** (the same trait
+  at the same type arguments twice is an error; `Make[int] & Make[long]` are two). **Name clashes**:
+  methods of one name from two bounds are overloads, resolved by parameter types; two of the same
+  parameter types are not an error to declare, only a call both accept is, as the existing
+  ambiguous-call error at the generic definition. **`A & B` is not a type**: written as a
+  parameter's, a field's, a `val`'s, a result's, a type argument's or a lower bound's type it is a
+  parse error that shows `[T: A & B](x: T)` instead. Why: `&` reads as "and", which is what
+  conformance to every bound means, and makes the bound read as the intersection it is, where `+`
+  reads as arithmetic and was the only use of `+` in a type; one spelling, since two ways to write
+  one thing is the kind of choice the language avoids. Bounds only, because a type parameter
+  already gives a value of two traits everything an intersection type would, with each instance
+  calling its type argument's methods directly; an intersection *type* would need a new value
+  representation (a pair of method tables, or a table per combination), subtyping rules against
+  unions and variance, and reification for `is` — a large addition the language's programs have
+  not asked for, and a nominal type system with declared traits covers it by declaring a trait
+  that requires both (`trait Shown: Named, Sized`). At most one class, because a class extends one
+  superclass, so two unrelated classes can never both be met and a subclass already implies its
+  superclass. Alternatives weighed: keeping `+` (the existing spelling, no source change, but reads
+  as addition, and the user asked for `&`); accepting both (two spellings of one thing);
+  intersection types in annotations, with `A & B <: A`, commutativity, distribution over unions and
+  a dual-table layout (left out for the reasons above; this decision leaves room to add it, since
+  `A & B` in a type position is an error today, not something else); allowing redundant bounds
+  silently (a repeated bound is always a slip). Review with the user: whether `A & B` should become
+  a type in annotations later, and whether to keep the `+` diagnostic once existing code has moved
+  (it costs nothing and helps code written before the change). Packages outside this repository
+  that still write `+` (the `json` package's tests) move to `&` with the release that carries this.
 
 ## Open
 

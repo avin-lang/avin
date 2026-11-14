@@ -20,8 +20,8 @@ data Result[+T, +E]
 
 ## Bounds
 
-`[T: Bound]` requires `T` to conform to `Bound`, which may be a trait or a class; `[T: A + B]` requires
-both. A bound declared on a type applies everywhere that type's parameters appear. An unbounded `T`
+`[T: Bound]` requires `T` to conform to `Bound`, which may be a trait or a class; `[T: A & B]` requires
+both, and `[T: A & B & C]` all three. A bound declared on a type applies everywhere that type's parameters appear. An unbounded `T`
 may be stored, passed and returned; using an operator, a method or a field on it needs the bound that
 provides it. Errors are reported at the generic definition, not at an instantiation.
 
@@ -51,6 +51,27 @@ class SortedPair[T: Ordered](first: T, second: T)
   `drain[S: Source[A], A](s: S)` is from the source passed.
 - **A bound is a trait or a class**, and may name the declaration's other parameters. A trait whose
   methods mention `Self` is named only here, and in an impl's header.
+- **Several bounds are joined with `&`**, the one spelling, wherever type parameters are declared:
+  on functions, methods, classes, data types, traits, actors and impl headers
+  (`impl[T: Ord & Display] Display for Box[T]`), after a lower bound too (`[W >: T: Display & Ord]`).
+  `+` between bounds is an error that says to write `&`. Each operand is a trait or a class, an
+  instance of a generic trait among them (`[S: Source[A] & Named, A]`); **at most one is a class**,
+  the others traits, since a class extends one superclass, so a second class is an error naming
+  both, even a subclass of the first, whose bound alone says the same. **Each is written once**: the
+  same trait at the same type arguments twice is an error, and `Make[int] & Make[long]` are two
+  bounds. The order of the operands means nothing: `[T: A & B]` and `[T: B & A]` admit the same
+  arguments and give `T` the same members.
+- **The members of every operand are the parameter's**, as if each were its only bound. Methods of
+  one name from two bounds are overloads of each other, chosen by parameter types as any overloads
+  are: with `say(n: int)` from one and `say(s: string)` from the other, `x.say(1)` and `x.say("a")`
+  each call one. Two of the same parameter types make a call that both accept ambiguous, an error
+  at the generic definition naming both methods; it is not an error to write the bounds, only to
+  make the call. A type argument meets every operand, and the error for one that misses names the
+  bound it misses.
+- **`A & B` is not a type**: an intersection is written only as a type parameter's bounds, so a
+  parameter, a field, a `val`, a result, a type argument or a lower bound written `Named & Sized` is
+  an error, which shows the form to write instead, `[T: Named & Sized](x: T)`. A value that is both
+  is reached through such a parameter, whose instances call each type's methods directly.
 - **An impl's parameters are its type's**, and have the bounds the type declares. **An impl of a
   trait may bound them further**, making the type conform only for the type arguments that meet the
   bounds: with `impl[T: Ord] Ord for Box[T]`, a `Box[int]` is an `Ord` and a `Box[Plain]` is not. Each
@@ -445,7 +466,9 @@ leading prefix with the rest inferred.
 
 The type system stays small: generics with bounds, subtyping with declaration-site variance, and
 traits implemented through `impl`, and [union types](/spec/unions/) written in annotations. It has
-no higher-kinded types, type members, inferred unions, intersection types, implicit parameters,
-implicit conversions or macros. The
+no higher-kinded types, type members, inferred unions, implicit parameters, implicit conversions
+or macros. Intersections exist only as [bounds](#bounds), `[T: A & B]`: there is no intersection
+type to annotate a value with, so a value of two traits at once is always a bounded parameter's,
+monomorphized at its type argument. The
 [collections chapter](/spec/collections/) shows how the library gets precise result types with
 these tools alone.
