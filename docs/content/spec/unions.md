@@ -330,6 +330,13 @@ A `match` in generic code is checked once, where it is written, against the unio
 come together (`T = int`), each value is matched by the first arm whose pattern it fits, so the arm
 for `T` takes every `int` and the arm for `int` is never reached at that instance, which is no error.
 
+At such an instance the union is its one member's type, with that type's layout and nothing of a
+union's: `build[T](x: T) -> Vector[T | int] = [x, 7]` at `T = int` makes a `Vector[int]` of plain
+`int`s, `T | real` at `T = real` is returned as a `real`, and `T | string` at `T = string` is a
+string. A value of it is the same value seen as an `Any`, so `build[int](3)` as an `Any` matches
+`Vector[int]`. A union that keeps more than one member at the instance (`T | int | string` at
+`T = int`, which is `int | string`) keeps a union's layout, of those members.
+
 ## What a union value can do
 
 **Equality and hashing.** Every union compares with `==` and hashes, since every type does
