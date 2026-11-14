@@ -1597,6 +1597,12 @@ representation is.
   representation names hold each type argument to their own bounds where the opaque type is used,
   as an alias's do. A parameter the representation does not name is allowed, and tells values apart
   by type alone: `Id[User]` and `Id[Order]` are both a `long`.
+- An opaque type is no type constructor. A generic one is not passed for a constructor parameter
+  `F[_]`, whose instances are each an object, and an opaque type takes no constructor parameter of
+  its own, which would leave its layout undecided. It is a type argument of a constructor
+  parameter's application like any type: `F[UserId]` at `Vector` is a `Vector[UserId]`.
+- A union of an opaque type and its representation keeps its members apart; only a union naming
+  one type twice, the opaque type or the representation, collapses to it.
 - An opaque type has no supertype (`opaque type X <: Y` is refused), no annotations and no
   `derives` clause.
 - Its name is a type's, under the rules for an alias's name; it is public unless marked `private`,

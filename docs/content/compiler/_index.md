@@ -1258,9 +1258,23 @@ which take and give back one spin lock every such operation shares. `add`, `sub`
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
 anything is stored.
 
-**Locks and conditions.** The synchronization library reaches eight intrinsics, each a runtime
-entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_wait`,
-`condition_wait_for`, `condition_notify` and `condition_notify_all`. A lock is an object on the
+**Locks and conditions.** The synchronization library reaches eleven intrinsics, each a runtime
+entry: `lock_new`, `lock_acquire`, `lock_release`, `lock_release_holding`, `condition_new`,
+`condition_new_kind` (a condition whose waiters the thread dump and the deadlock report name as a
+channel's receive or send, a future or an executor's work), `condition_wait`, `condition_wait_for`,
+`condition_wait_settling`, `condition_notify` and `condition_notify_all`.
+`condition_wait_settling` is the wait of a waiter with state of its own (a read-write lock's
+waiting writers, a barrier's arrivals): it takes a limit in milliseconds or none, and answers
+woken, out of time, or cancelled, a cancellation ending it with the lock held again instead of
+stopping the thread, so the library takes the waiter's mark back, lets the lock go and reaches
+`cancel_point`, which stops it. A share others wait for (a read-write lock's read or write, a
+semaphore's permit in `withPermit`) is taken under the library's lock, which `lock_release_holding`
+lets go while staying in the region in doubt taking it entered; `cancel_guarded_held` then runs the
+body and the closure giving the share back, and leaves the region. Nothing can stop the thread
+between taking the share and giving it back, and a trap there stops the program; where the body
+is cancellable (a read, a permit's body), it runs at a cancellation point of its own inside the
+region, so a cancellation returns to it, the share is given back, and the cancellation goes on. A
+lock is an object on the
 collected heap holding whether a thread holds it and a queue of the threads waiting for it, and a
 condition one holding a queue alone; neither holds a reference, and the collector never moves
 either, so a waiter may be linked from one. Each queue has a guard, a futex lock held for a few
