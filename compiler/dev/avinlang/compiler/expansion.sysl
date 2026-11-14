@@ -379,11 +379,23 @@ private deepest_param(c: *Checker, t: &Type, owner: usize) -> i64
 /** Edges from the code at `site` to the type parameters from `offset` on of the code or type whose
  * parameter 0 has key `target`, given `args`; and the edges of the types `args` name. */
 private flow_into(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type], target: usize, offset: usize)
-    if !site.generic then return
     for j in 0..<args.len()
         if offset + j >= 256 then break
+        val hiding = fresh_edges(c, f, site, span, args[j], target + offset + j)
+        if !site.generic then continue
         var params: Buf[usize] = buf()
         params_in(c, args[j], site.owner, &params)
+        // A type argument holding a type a value hides is needed only for the packs the program makes:
+        // at a copy, the arm it is written in runs at an instance its matched value says, so where
+        // that instance names a parameter, the parameter's growth here is the growth of the values
+        // the program makes, which their own edges count.
+        var shown: Buf[usize] = buf()
+        for i in params
+            var kept = true
+            for k in hiding
+                if names_type_var(c.sites[k].matched, site.owner, i) then kept = false
+            if kept then shown.push(i)
+        params = shown
         val head: usize = *resolved(c, args[j]) match
             Data(id, _, _) -> data_base(id)
             Class(id, _, _) -> class_base(id)
@@ -396,6 +408,62 @@ private flow_into(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type
         if params.len() > 0 && head != 0 then add_head(f, target + offset + j, head)
         mention(c, f, site, span, args[j])
 
+// The fresh types of refining patterns a type argument `t` names are nodes of their variant's own,
+// one for each of the variant's parameters, which every pattern on the variant shares: the fresh type
+// stands for what a value of the variant holds there. Each reaches the target `to` with the depth it
+// has in `t`, and the type a pattern matches reaches its variant's parameters (`refined_edges`) from
+// the code it is matched in. The result is the patterns whose hidden types `t` names.
+private fresh_edges(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type, to: usize) -> Buf[usize]
+    var hiding: Buf[usize] = buf()
+    var keys: Buf[usize] = buf()
+    fresh_in(c, t, &keys)
+    for key in keys
+        val k = key / 256
+        val i = key % 256
+        val s = c.sites[k]
+        connect(f, variant_base(s.data, s.variant) + i, to, depth_of(c, t, pattern_owner(k), i), site.unit, span, t)
+        mention(c, f, site, span, s.matched)
+        for h in hidden_positions(c.data[s.data], s.data, s.variant)
+            if h == i
+                var known = false
+                for x in hiding
+                    if x == k then known = true
+                if !known then hiding.push(k)
+    hiding
+
+/** The fresh types of refining patterns `t` names, each as its pattern's site times 256 plus its
+ * index among the variant's parameters. */
+private fresh_in(c: *Checker, t: &Type, out: *Buf[usize])
+    *resolved(c, t) match
+        TypeVar(o, i, _) ->
+            if !is_pattern_owner(o) || i >= 256 then return
+            val key = (o - pattern_owner(0)) * 256 + i
+            for x in *out
+                if x == key then return
+            out.push(key)
+        Tuple(items) ->
+            for x in items
+                fresh_in(c, x, out)
+        Function(params, result, _) ->
+            for x in params
+                fresh_in(c, x, out)
+            fresh_in(c, result, out)
+        ByName(inner) -> fresh_in(c, inner, out)
+        Data(_, _, args) ->
+            for x in args
+                fresh_in(c, x, out)
+        Class(_, _, args) ->
+            for x in args
+                fresh_in(c, x, out)
+        Opaque(_, _, args, _) ->
+            for x in args
+                fresh_in(c, x, out)
+        Applied(head, args) ->
+            fresh_in(c, head, out)
+            for x in args
+                fresh_in(c, x, out)
+        _ -> ()
+
 private add_head(f: *Flow, key: usize, head: usize) -> bool
     var heads = f.heads.get(key).unwrap_or(buf())
     for h in heads
@@ -406,7 +474,6 @@ private add_head(f: *Flow, key: usize, head: usize) -> bool
 
 /** The edges of the data types and classes `t` names, from the code at `site`. */
 private mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type)
-    if !site.generic then return
     *resolved(c, t) match
         Data(id, _, args) -> flow_into(c, f, site, span, args, data_base(id), 0)
         Class(id, _, args) -> flow_into(c, f, site, span, args, class_base(id), 0)
@@ -516,7 +583,17 @@ private walk(c: *Checker, f: *Flow, site: Site, e: &TExpr)
             else call_edges(c, f, site, e.span, id, type_args)
             walk_all(c, f, site, args)
         FunctionValue(id, type_args) -> call_edges(c, f, site, e.span, id, type_args)
-        Construct(_, args) -> walk_all(c, f, site, args)
+        Construct(variant, args, hidden) ->
+            // A value of a variant hiding types makes a pack: the types reach the variant's own.
+            if hidden.len() > 0
+                if *resolved(c, e.ty) is Data(id, _, _)
+                    val positions = hidden_positions(c.data[id], id, variant)
+                    for i in 0..<hidden.len()
+                        if i < positions.len()
+                            var one: Buf[&Type] = buf()
+                            one.push(hidden[i])
+                            flow_into(c, f, site, e.span, one, variant_base(id, variant), positions[i])
+            walk_all(c, f, site, args)
         Collection(elements, built) ->
             walk_all(c, f, site, elements)
             walk(c, f, site, built)

@@ -252,7 +252,7 @@ request[R: Sendable](account: ActorRef[AccountMsg], q: Query[R]) -> Future[Resul
 
 main()
   val account = spawn(Account("ada"))
-  request(account, Deposit(40)).await()
+  _ = request(account, Deposit(40)).await()
   println(request(account, Balance).await()) // Ok(40)
   println(request(account, Owner).await()) // Ok(ada)
 ```
@@ -260,7 +260,7 @@ main()
 `request(account, Balance)` is a `Future[Result[long, AskError]]`, and a reply of any other type is
 an error in `Account`, not a surprise in its caller: in the `Ask` arm `R` is a fresh type, the same
 for `query` and `replyTo`, so `replyTo.tell(answer(query))` is well typed and `replyTo.tell(balance)`
-is not (`` `balance` is a `long`, and `replyTo` takes an `R` ``).
+is not (`expected R, found long`).
 
 - **In the arm a hidden parameter is a fresh type**, with the bounds its declaration gives it and no
   other knowledge, distinct from every other type; nested patterns may refine it, as `answer`'s
@@ -269,7 +269,17 @@ is not (`` `balance` is a `long`, and `replyTo` takes an `R` ``).
   must not need it; with no expected type, an arm whose type names it is an error. A local declared
   outside the arm cannot be settled to a type naming it.
 - **Making a value** chooses the hidden parameter at the call, inferred or written
-  (`Ask[long](Balance, r)`).
+  (`Ask[long](Balance, r)`), and its bounds are checked there, as a call's are.
+- **A trait the type derives holds of a hidden parameter only by its bounds**, `Sendable` included:
+  each value may hold another type there. `Ask`'s `R: Sendable` is what makes `AccountMsg` an
+  actor's message type; `data Box` with `Hold[A](value: A)` has no automatic `Display`, and with
+  `Hold[A: Display](value: A)` it has one. A parameter of the type that a refined variant hides,
+  as `T` in `Hide(value: T) -> Tagged[int]`, is the value's own, not the instance's, and is held
+  the same way.
+- **An `is` test or a binding takes apart no field of a hidden type**: the code its names reach is
+  not one arm. `if m is Ask(_, _)` tests the variant, and a field whose type every value of the
+  variant shares may be matched and bound; `if m is Ask(q, _)` is an error, which says to take the
+  value apart with `match`.
 
 ### Why it is sound
 
@@ -371,9 +381,9 @@ when the copy is made.
   compiled whole, so the packs are known, as the types implementing a trait are for
   [generic trait methods](/spec/generics/#reification). A field of a hidden type is laid out at the
   pack's type, unboxed where it is a value type. An arm on such a variant is compiled once per pack
-  reaching it, as a function of the hidden types, and the `match` calls the one the value's
+  reaching it, at the hidden types, and the `match` runs the one whose pack the value's
   descriptor names. Equality compares the descriptors before the fields: two values of one variant
-  in different packs are unequal.
+  in different packs are unequal, and they hash apart.
 - **A cycle that makes packs from ever larger hidden types** is
   [polymorphic recursion](/spec/generics/#polymorphic-recursion) and is reported as one; recursion
   through an arm that passes a part of the value matched, as `eval(a)` passes `Expr[A]` taken from
@@ -476,3 +486,6 @@ well typed because the clause learns `A = B`.
 | A field the instance does not determine | `` the field `items` of `Hold` has a type a `Holder[T]` does not determine; take the value apart with `match` `` |
 | A missing case | the usual message, naming a possible variant: `` this `match` does not cover every Expr[int] value, such as `If(_, _, _)` `` |
 | Growing packs | the [polymorphic recursion](/spec/generics/#polymorphic-recursion) error, naming the variant whose hidden type grows |
+| A hidden field in a test | `` `Hold` hides `A`, and its field `value` names it: an `is` test or a binding takes apart no field of a hidden type; take the value apart with `match`, whose arm is compiled for each type the value hides `` |
+| A trait a hidden parameter lacks | `` `Tagged` has no `Display` because its field `Hide.value` names `T`, which the variant hides and a value may hold at any type; bound it, as in `[T: Display]` ``; with `derives`, `` `Loud` cannot derive `Display`: its variant `Yell` hides `A` in its field `value`, which a value may hold at any type; bound the parameter, as in `[A: Display]` `` |
+| Sending a hidden type | `` its variant `Keep` hides `A`, which a value may hold at any type; bound it, as in `[A: Sendable]` `` |

@@ -248,7 +248,28 @@ variant_fields(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type]) -> Bu
  * variant makes no value of that instance: its result is another instance, or one of its parameters
  * is hidden, named by its fields and not by its result. A parameter named by neither is `Nothing`.
  * The arguments may have their reference unions erased, as a layout's are. */
-variant_args(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type]) -> Option[Buf[&Type]]
+variant_args(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type]) -> Option[Buf[&Type]] = packed_variant_args(d, id, variant, args, None)
+
+/** The positions among variant `variant`'s parameters (its type's, then its own) that are hidden:
+ * named by a field and not by the variant's result. A plain variant's result names its type's own
+ * parameters. The types a value holds there are its **pack**, in this order. */
+hidden_positions(d: DataSymbol, id: usize, variant: usize) -> Buf[usize]
+    val v = d.variants[variant]
+    val owner = data_owner(id)
+    var out: Buf[usize] = buf()
+    for j in 0..<v.params.len()
+        val in_result = v.result match
+            Some(r) -> names_type_var(r, owner, j)
+            None -> j < d.decl.type_params.len()
+        if in_result then continue
+        for f in v.fields
+            if names_type_var(f, owner, j)
+                out.push(j)
+                break
+    out
+
+/** `variant_args`, with the types of a value's pack, `pack`, at the variant's hidden positions. */
+packed_variant_args(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type], pack: Option[Buf[&Type]]) -> Option[Buf[&Type]]
     val v = d.variants[variant]
     val owner = data_owner(id)
     var found: Buf[Option[&Type]] = buf()
@@ -266,19 +287,32 @@ variant_args(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type]) -> Opti
                 continue
             if !reads_back(made[i], args[i], owner, &found) then return None
     var out: Buf[&Type] = buf()
+    var packed = 0usize
     for j in 0..<v.params.len()
         found[j] match
             Some(t) -> out.push(t)
             None ->
+                var named = false
                 for f in v.fields
-                    if names_type_var(f, owner, j) then return None
-                out.push(Nothing)
+                    if names_type_var(f, owner, j) then named = true
+                if !named
+                    out.push(Nothing)
+                    continue
+                val types = pack?
+                if packed >= types.len() then return None
+                out.push(types[packed])
+                packed += 1
     Some(out)
 
 /** The fields of variant `variant` in a value of the concrete type `Data(id, _, args)`, or `None`
  * where the variant makes no value of it (`variant_args`). */
 variant_fields_at(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type]) -> Option[Buf[&Type]]
     val full = variant_args(d, id, variant, args)?
+    Some(substitute_all(d.variants[variant].fields, data_owner(id), full))
+
+/** `variant_fields_at` for a value of pack `pack` (`packed_variant_args`). */
+packed_fields_at(d: DataSymbol, id: usize, variant: usize, args: Buf[&Type], pack: Buf[&Type]) -> Option[Buf[&Type]]
+    val full = packed_variant_args(d, id, variant, args, Some(pack))?
     Some(substitute_all(d.variants[variant].fields, data_owner(id), full))
 
 // Whether `actual` is an instance of `pattern`, a part of a refined variant's result: each parameter
@@ -1355,7 +1389,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         opaques.push(qualified(a.module_name, a.decl.name))
     var sites: Buf[RefineSite] = buf()
     for s in c.sites
-        sites.push(RefineSite(s.matched, s.variant))
+        sites.push(RefineSite(s.matched, s.data, s.variant))
     Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), c.meetings, opaques, sites, c.refined_functions)), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
@@ -3080,19 +3114,24 @@ refined_data(d: &DataDecl) -> bool
         if refined_variant(d, v) then return true
     false
 
-// A pattern on a variant with hidden type parameters is not taken apart yet: its arm is compiled
-// once per list of hidden types the program makes the variant with, and no value of one is made yet.
-// The code derived for the type matches its every variant at its own parameters, and each copy of
-// it is compiled for the variants possible at the copy's instance.
-private hidden_match_refused(c: *Checker, unit: usize, at: Span, v: VariantRef) -> bool
-    if c.derived_context is Some(_) then return false
-    val hidden = hidden_params(c, v)
+// A pattern on a variant with hidden type parameters takes its value apart in an arm or a clause,
+// which is compiled once for each list of hidden types the program makes the variant with and
+// chosen by the value's descriptor. An `is` test or a binding is not an arm: the code its names
+// reach is compiled once, so it binds no field whose type names a hidden parameter, and tests only
+// what every pack's value has the same type for.
+private hidden_match_refused(c: *Checker, unit: usize, at: Span, v: VariantRef, args: Buf[&Pattern]) -> bool
+    if c.derived_context is Some(_) || c.pattern_row.kind != "pattern" then return false
+    val d = c.data[v.data]
+    val hidden = hidden_positions(d, v.data, v.index)
     if hidden.len() == 0 then return false
-    var names: Buf[string] = buf()
-    for h in hidden
-        names.push(s"`$h`")
-    c.note(unit, at, s"`${c.data[v.data].variants[v.index].name}` hides ${spoken_list(names)}, named by its fields and not by its result: a pattern cannot take apart a value of a variant with hidden type parameters yet")
-    true
+    val variant = d.variants[v.index]
+    for i in 0..<args.len()
+        if i >= variant.fields.len() || args[i].kind is Wildcard then continue
+        for j in hidden
+            if names_type_var(variant.fields[i], data_owner(v.data), j)
+                c.note(unit, args[i].span, s"`${variant.name}` hides `${variant.params[j].name}`, and its field `${variant.field_names[i]}` names it: an `is` test or a binding takes apart no field of a hidden type; take the value apart with `match`, whose arm is compiled for each type the value hides")
+                return true
+    false
 
 /** Whether variant `index` of `d` is refined: it declares a result or parameters of its own. */
 refines_type(d: DataSymbol, index: usize) -> bool =
@@ -7551,6 +7590,9 @@ private string_intrinsic(name: string) -> Option[&Type]
 // share an owner and positions.
 private bound_key(owner: usize, index: usize, tp: TypeParam) -> string = s"$owner/$index/${tp.site}"
 
+/** The key of the bounds of fresh type `index` of a refining pattern's `owner`. */
+private fresh_bound_key(owner: usize, index: usize) -> string = s"$owner/$index/fresh"
+
 // Resolves the bounds of `params` from position `from` on, in the scope that declares them, and
 // records them. A bound is a trait or a class. It may name the parameters, and a trait that
 // mentions `Self`, which is a bound and never a type. A lower bound is any type; only a function's
@@ -7762,6 +7804,9 @@ private scope_bounds(f: Conformances, owner: usize, params: Buf[TypeParam], inde
         if f.core.trait_named("Integer") is Some(k) then family.push(own_class_type(f.classes[k], k))
         return family
     if owner >= method_params_owner() then return buf()
+    // A fresh type a refining pattern gives a variant's parameter has the bounds the variant
+    // declares for it.
+    if is_pattern_owner(owner) then return f.bounds.get(fresh_bound_key(owner, index)).unwrap_or(buf())
     var declared = params
     if owner >= class_owner(0)
         val k = owner - class_owner(0)
@@ -7868,6 +7913,16 @@ struct OwnBounds
     indices: Buf[usize]
     bound: &Type
 
+/** Whether the hidden parameter `j` of variant `v` of data type `id` has `bound` by its declared
+ * bounds: every value of the variant holds there a type meeting them. */
+private hidden_has(c: *Checker, id: usize, v: usize, j: usize, bound: &Type) -> bool
+    val variant = c.data[id].variants[v]
+    if j >= variant.params.len() then return false
+    val bounds = c.bounds.get(bound_key(data_owner(id), j, variant.params[j])).unwrap_or(buf())
+    for b in bounds
+        if conforms_to_bound(c, b, bound) then return true
+    false
+
 /** The own parameters bounded in the code being checked: a derivation's, or the derived impl's. */
 private own_bounds_in_scope(c: *Checker) -> Option[OwnBounds]
     if c.own_bounded is Some(o) then return Some(o)
@@ -7878,28 +7933,37 @@ private own_bounds_in_scope(c: *Checker) -> Option[OwnBounds]
 // The own parameters of data type `id`'s refined variants that `bound`, a trait derived for it, holds
 // of wherever the type's instance has it: one that a variant's result places where the trait on the
 // result implies it on the parameter, as in `Pair[A, B](…) -> Expr[(A, B)]`, where a tuple has the
-// trait only where its parts do; and one hidden, named only by fields, which no value made yet holds.
-// A position is kept only where every variant with an own parameter there gives it the trait.
+// trait only where its parts do; and one hidden, named only by fields, where its declared bounds give
+// it the trait, since a value may hold any type meeting them there. A position is kept only where
+// every variant with an own parameter there gives it the trait.
 private implied_own(c: *Checker, id: usize, bound: &Type) -> Buf[usize]
     val d = c.data[id]
     val owner = data_owner(id)
     val n = d.decl.type_params.len()
     var out: Buf[usize] = buf()
-    if n == 0 then return out
     // The type's own first parameter, bounded by the trait in its derived impl: a type that has it.
-    val witness = TypeVar(owner, 0, d.decl.type_params[0].name)
-    if !conforms_to_bound(c, witness, bound) then return out
+    // A type with no parameters of its own implies nothing by its instance, and its hidden
+    // parameters have the trait by their bounds alone.
+    val witness: &Type = if n > 0 then TypeVar(owner, 0, d.decl.type_params[0].name) else ErrorType
+    val implying = n > 0 && conforms_to_bound(c, witness, bound)
     var widest = n
     for v in d.variants
         if v.params.len() > widest then widest = v.params.len()
     for j in n..<widest
         var holds = true
-        for v in d.variants
+        for vi in 0..<d.variants.len()
+            val v = d.variants[vi]
             if j >= v.params.len() then continue
+            if contains_index(hidden_positions(d, id, vi), j)
+                if !hidden_has(c, id, vi, j, bound) then holds = false
+                continue
             val r = v.result match
                 Some(r) -> r
                 None -> continue
             if !names_type_var(r, owner, j) then continue
+            if !implying
+                holds = false
+                continue
             var implied = false
             if *r is Data(_, _, args)
                 for a in args
@@ -8196,6 +8260,15 @@ sendable_params(f: Conformances, x: &Type, k: usize) -> Buf[bool]
                     if bk == k && i < count then out[i] = true
     out
 
+/** Whether hidden parameter `j` of variant `v` of data type `id` is bounded by `Sendable`, trait `k`,
+ * or a trait that promises it. */
+private hidden_sendable(f: Conformances, id: usize, v: usize, j: usize, k: usize) -> bool
+    val tp = f.data[id].variants[v].params[j]
+    for b in f.bounds.get(bound_key(data_owner(id), j, tp)).unwrap_or(buf())
+        if *b is Class(bk, _, _)
+            if bk == k || ancestor_type(f.classes, f.data, b, k) is Some(_) then return true
+    false
+
 /** Whether `x`, a data type or a class, is sendable by its structure, whatever it promises. `top`
  * says that it is the type a declaration promising `Sendable` is checked for, where an `open` or
  * `abstract` class may promise it: each subclass is checked in turn. */
@@ -8205,7 +8278,19 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
         Data(id, _, args) ->
             val d = f.data[id]
             for v in 0..<d.variants.len()
-                val types = variant_fields(d, id, v, args)
+                // A hidden parameter holds whatever type each value was made with, which is
+                // sendable only where the variant bounds it so; a sendable one is then as `unit` is.
+                val hidden = hidden_positions(d, id, v)
+                var full: Buf[&Type] = buf()
+                for j in 0..<d.variants[v].params.len()
+                    if contains_index(hidden, j)
+                        if !hidden_sendable(f, id, v, j, k)
+                            val name = d.variants[v].params[j].name
+                            return CannotSend(s"its variant `${d.variants[v].name}` hides `$name`, which a value may hold at any type; bound it, as in `[$name: Sendable]`")
+                        full.push(Unit)
+                    elif j < args.len() then full.push(args[j])
+                    else full.push(TypeVar(data_owner(id), j, d.variants[v].params[j].name))
+                val types = substitute_all(d.variants[v].fields, data_owner(id), full)
                 for i in 0..<types.len()
                     type_sendability(f, types[i], k, a, seen, depth + 1) match
                         CannotSend(why) ->
@@ -8730,7 +8815,7 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
         Call(_, args, _) -> push_all(&out, args)
         Dispatch(_, _, args, _) -> push_all(&out, args)
         BoundCall(_, _, args, _) -> push_all(&out, args)
-        Construct(_, args) -> push_all(&out, args)
+        Construct(_, args, _) -> push_all(&out, args)
         Collection(_, built) -> out.push(built)
         CallValue(callee, args) ->
             out.push(callee)
@@ -9200,7 +9285,32 @@ private check_derivation(c: *Checker, dv: Derivation) -> bool
             for x in 0..<c.derived.len()
                 if made_for(c.impls[c.derived[x].impl_index].decl, dv) then c.derived[x].own = Some(own)
     var failed = false
+    // A parameter of the type that a refined variant hides holds whatever type each value was made
+    // with, not the instance's: the trait holds of it only by its declared bounds.
+    if data_id is Some(id)
+        val d = c.data[id]
+        for vi in 0..<d.variants.len()
+            if failed then break
+            val v = d.variants[vi]
+            for j in hidden_positions(d, id, vi)
+                if failed then break
+                if hidden_has(c, id, vi, j, bound) then continue
+                // A parameter of the type passes the field check by the impl's bound, which is the
+                // instance's; a variant's own one fails it where the field needs the trait of it.
+                var field = ""
+                for i in 0..<v.fields.len()
+                    if field != "" || !names_type_var(v.fields[i], data_owner(id), j) then continue
+                    if j < d.decl.type_params.len() || !conforms_to_bound(c, v.fields[i], bound) then field = v.field_names[i]
+                if field == "" then continue
+                failed = true
+                if dv.automatic
+                    c.underived.push(Underived(id, dv.trait_name, s"${v.name}.$field", s"hidden ${v.params[j].name}"))
+                    break
+                c.note(dv.unit, dv.span, s"`${dv.type_name}` cannot derive `${dv.trait_name}`: its variant `${v.name}` hides `${v.params[j].name}` in its field `$field`, which a value may hold at any type; bound the parameter, as in `[${v.params[j].name}: ${dv.trait_name}]`")
+                break
+    val hidden_failed = failed
     for i in 0..<types.len()
+        if hidden_failed then break
         if conforms_to_bound(c, types[i], bound) then continue
         failed = true
         val shown = type_name(zonk(c, types[i]))
@@ -9297,6 +9407,11 @@ private underived_reason(c: *Checker, t: &Type, trait_name: string) -> string
         _ -> return ""
     for u in c.underived
         if u.data == id && u.trait_name == trait_name
+            // A field naming a hidden parameter: the type the variant hides there has no bound
+            // giving the trait.
+            if u.field_type.starts_with("hidden ")
+                val name = u.field_type[7..]
+                return s"; `${c.data[id].name}` has no `$trait_name` because its field `${u.field}` names `$name`, which the variant hides and a value may hold at any type; bound it, as in `[$name: $trait_name]`"
             return s"; `${c.data[id].name}` has no `$trait_name` because its field `${u.field}` has type `${u.field_type}`, which does not implement `$trait_name`"
     ""
 
@@ -14795,7 +14910,7 @@ private rebuilt_value(c: *Checker, at: Span, ty: &Type, held: usize, base_ty: &T
             var read: &TExpr = TExpr(at, base_ty, Local(held))
             for i in path do read = data_field_read(c, at, read, i)
             made.push(read)
-    TExpr(at, ty, Construct(0, made))
+    TExpr(at, ty, Construct(0, made, buf()))
 
 /** Whether two field paths are the same. */
 private same_indices(a: Buf[usize], b: Buf[usize]) -> bool
@@ -16214,7 +16329,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             val never = *typed_keys[i].ty is Nothing || *typed_values[i].ty is Nothing
             var given: Buf[Option[&TExpr]] = buf()
             if never && !failed then given.push(Some(never_made(span, typed_parts)))
-            else given.push(Some(TExpr(span, if failed then ErrorType else pair, Construct(0, typed_parts))))
+            else given.push(Some(TExpr(span, if failed then ErrorType else pair, Construct(0, typed_parts, buf()))))
             steps.push(method_call(c, span, span, receiver, adds[0], args, None, None, false, given))
     elif *element is Var(_)
         // No element type is expected, so the elements decide it. A number literal or an empty
@@ -16307,7 +16422,7 @@ private tuple_expr(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[&T
         typed.push(t)
         types.push(t.ty)
     if never && !failed then return never_made(e.span, typed)
-    TExpr(e.span, if failed then ErrorType else Tuple(types), Construct(0, typed))
+    TExpr(e.span, if failed then ErrorType else Tuple(types), Construct(0, typed, buf()))
 
 // A value that is never made, since one of its parts never finishes: the parts are evaluated in
 // order up to that one, and nothing after it is reached.
@@ -16491,7 +16606,7 @@ private multi_assign_expr(c: *Checker, e: &Expr, targets: Buf[&Expr], op: Option
             None -> ()
         stored.push(result)
         stored_types.push(result.ty)
-    block.push(TExpr(e.span, Unit, MultiStore(locals, TExpr(value.span, Tuple(stored_types), Construct(0, stored)))))
+    block.push(TExpr(e.span, Unit, MultiStore(locals, TExpr(value.span, Tuple(stored_types), Construct(0, stored, buf())))))
     for i in 0..<fields.len()
         if fields[i] is Some(place)
             val held = TExpr(targets[i].span, place.ty, Local(locals[i].unwrap()))
@@ -18454,7 +18569,7 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     var arms: Buf[TArm] = buf()
     if is_option
         arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Some"), success, None)), None, TExpr(e.span, args[0], Local(held))))
-        val none = TExpr(e.span, declared, Construct(variant_index(c, d, "None"), buf()))
+        val none = TExpr(e.span, declared, Construct(variant_index(c, d, "None"), buf(), buf()))
         arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "None"), buf(), None)), None, TExpr(e.span, Nothing, Return(Some(none)))))
         return TExpr(e.span, args[0], Match(s, arms))
     val error = zonk(c, args[1])
@@ -18468,7 +18583,7 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     val converted = passed_error(c, e, value, read, passed, symbol)
     if *converted.ty is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
     fields.push(converted)
-    val err = TExpr(e.span, declared, Construct(variant_index(c, d, "Err"), fields))
+    val err = TExpr(e.span, declared, Construct(variant_index(c, d, "Err"), fields, buf()))
     arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Ok"), success, None)), None, TExpr(e.span, args[0], Local(held))))
     arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Err"), failed, None)), None, TExpr(e.span, Nothing, Return(Some(err)))))
     TExpr(e.span, args[0], Match(s, arms))
@@ -20478,7 +20593,12 @@ private construct_checked(c: *Checker, at: Span, name_span: Span, v: VariantRef,
             c.refined_fields.push(RefinedField(args[j].value.span, field, made_by.name))
     val applied = apply(c, at, name_span, variant_signature(c, v), args, explicit, expected, typed)
     c.refined_fields.truncate(outer_fields)
-    val made = applied.wrap(at, Construct(v.index, applied.args))
+    // The types a value of a variant with hidden parameters holds there, which its descriptor
+    // records.
+    var hidden: Buf[&Type] = buf()
+    for j in hidden_positions(c.data[v.data], v.data, v.index)
+        hidden.push(if j < applied.type_args.len() then applied.type_args[j] else ErrorType)
+    val made = applied.wrap(at, Construct(v.index, applied.args, hidden))
     if refined_instance_refused(c, unit, at, v, made.ty, expected) then return TExpr(at, ErrorType, UnitConst)
     made
 
@@ -20514,35 +20634,24 @@ struct RefinedField
  * variant's own parameters included for a variant that makes its type's own instance. */
 private hidden_params(c: *Checker, v: VariantRef) -> Buf[string]
     val variant = c.data[v.data].variants[v.index]
-    val owner = data_owner(v.data)
-    val n = c.data[v.data].decl.type_params.len()
     var out: Buf[string] = buf()
-    for j in 0..<variant.params.len()
-        var in_result = j < n
-        if variant.result is Some(r) then in_result = names_type_var(r, owner, j)
-        if in_result then continue
-        for f in variant.fields
-            if names_type_var(f, owner, j)
-                out.push(variant.params[j].name)
-                break
+    for j in hidden_positions(c.data[v.data], v.data, v.index)
+        out.push(variant.params[j].name)
     out
 
-// A value of a variant with hidden type parameters, or with bounds on its own parameters, is not
-// made yet: its descriptor holds the types it hides, and an arm on it learns its bounds.
+// A value of a variant bounding one of its own parameters that its result names is not made yet: an
+// arm on it learns the bound for the enclosing code's type parameters. A hidden parameter's bounds
+// are checked where the value is made and held by the fresh type an arm gives it.
 private refined_value_refused(c: *Checker, unit: usize, at: Span, v: VariantRef) -> bool
     val variant = c.data[v.data].variants[v.index]
-    val hidden = hidden_params(c, v)
-    if hidden.len() > 0
-        var names: Buf[string] = buf()
-        for h in hidden
-            names.push(s"`$h`")
-        c.note(unit, at, s"`${variant.name}` hides ${spoken_list(names)}, named by its fields and not by its result: a value of a variant with hidden type parameters cannot be made yet")
-        return true
+    val hidden = hidden_positions(c.data[v.data], v.data, v.index)
     val decl = c.data[v.data].decl
+    val n = decl.type_params.len()
     for k in 0..<decl.variants.len()
         if decl.variants[k].name != variant.name then continue
-        for tp in decl.variants[k].type_params
-            if tp.bounds.len() > 0
+        for i in 0..<decl.variants[k].type_params.len()
+            val tp = decl.variants[k].type_params[i]
+            if tp.bounds.len() > 0 && !contains_index(hidden, n + i)
                 c.note(unit, at, s"`${variant.name}` bounds its own parameter `${tp.name}`: a value of a variant whose own parameters have bounds cannot be made yet")
                 return true
     false
@@ -23505,7 +23614,7 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
     val variant = d.variants[v.index]
     var fields: Buf[&Type] = buf()
     var ok = true
-    if hidden_match_refused(c, unit, p.span, v)
+    if hidden_match_refused(c, unit, p.span, v, args)
         // The fields still bind their names, so the arm reports nothing more.
         for a in args
             check_pattern(c, a, ErrorType, no_bind)
@@ -23565,6 +23674,14 @@ private refine_variant(c: *Checker, p: &Pattern, v: VariantRef, ty: &Type, alter
     val k = c.sites.len()
     val owner = pattern_owner(k)
     val fresh = fresh_types(variant, owner)
+    // Each fresh type has the bounds the variant declares for its parameter: a value is made only
+    // at types meeting them.
+    for j in 0..<variant.params.len()
+        if c.bounds.get(bound_key(data_owner(v.data), j, variant.params[j])) is Some(bounds)
+            var held: Buf[&Type] = buf()
+            for b in bounds
+                held.push(substitute(b, data_owner(v.data), fresh))
+            c.bounds.put(fresh_bound_key(owner, j), held)
     var s = solve_variant(c, v, ty, active_equalities(c), owner)
     // An enclosing type parameter equated with a type still unknown would settle it here, inside the
     // arm, which only the code that declared the value may do.
@@ -23972,12 +24089,23 @@ private escape_checked(c: *Checker, typed: &TExpr, what: string) -> &TExpr
     val (k, fresh) = escaped_type(c, typed.ty) match
         Some(found) -> found
         None -> return typed
-    c.note(unit_of(c), typed.span, s"$what is ${type_article_quoted(zonk(c, typed.ty))}, and ${escaped_reason(c, k, fresh)}")
+    val shown = type_article_quoted(zonk(c, typed.ty))
+    if hidden_fresh(c, k, fresh) && same_type(zonk(c, typed.ty), fresh)
+        c.note(unit_of(c), typed.span, s"$what is $shown, a type `${c.data[c.sites[k].data].variants[c.sites[k].variant].name}` hides in the value matched, which is not known outside the arm")
+    else c.note(unit_of(c), typed.span, s"$what is $shown, and ${escaped_reason(c, k, fresh)}")
     TExpr(typed.span, ErrorType, typed.kind)
 
 private escaped_reason(c: *Checker, k: usize, fresh: &Type) -> string
     val site = c.sites[k]
-    s"`${type_name(fresh)}` is a type `${c.data[site.data].variants[site.variant].name}` takes from the value it matches, which is not known outside its arm"
+    val variant = c.data[site.data].variants[site.variant].name
+    if hidden_fresh(c, k, fresh) then return s"`${type_name(fresh)}` is a type `$variant` hides in the value matched, which is not known outside the arm"
+    s"`${type_name(fresh)}` is a type `$variant` takes from the value it matches, which is not known outside its arm"
+
+/** Whether `fresh`, a type of refining pattern `k`, stands for a parameter its variant hides. */
+private hidden_fresh(c: *Checker, k: usize, fresh: &Type) -> bool
+    val site = c.sites[k]
+    if *fresh is TypeVar(_, i, _) then return contains_index(hidden_positions(c.data[site.data], site.data, site.variant), i)
+    false
 /** The element type of `t` as a `Seq`, when it is one. */
 private seq_element(c: *Checker, t: &Type) -> Option[&Type]
     if !(*t is Class(_, _, _) || *t is Data(_, _, _)) then return None
@@ -24716,7 +24844,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
                 if c.symbols[f].delayed && c.bodies[f] is Some(body) then return scan_init(c, s, body, unsafe)
             val ok = scan_init(c, s, callee, unsafe)
             scan_init_all(c, s, args, unsafe) && ok
-        Construct(_, args) -> scan_init_all(c, s, args, unsafe)
+        Construct(_, args, _) -> scan_init_all(c, s, args, unsafe)
         Collection(_, built) -> scan_init(c, s, built, unsafe)
         Block(items) ->
             if method_value_of_self(c, s, items) is Some(name)
