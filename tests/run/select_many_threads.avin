@@ -1,0 +1,50 @@
+// expect: exit 0
+// Thousands of threads each run a `select` in a loop over channels they all share: a pool of 2000
+// workers takes jobs from one channel and stops when told to through another, sending each result
+// on a bounded channel that is often full. Every job is done exactly once, every worker stops, and
+// none waits for ever: a notification taken by a select that could not use it is passed on, and a
+// select's registrations on the channels it did not take from are withdrawn. Plain `receive`s wait
+// on the same channel as the selects and get their share. Its smaller twins, `select_pass_on` and
+// `select_fair`, run the same paths under the collector's stress.
+// env: AVIN_GC_STRESS=0
+import avin.threads.{Atomic, Channel, scope}
+
+main() -> int
+  val workers = 2000
+  val jobs = Channel[int]()
+  val stop = Channel[unit]()
+  val results = Channel[long](64)
+  val count = 20000
+  val done = Atomic(0)
+  val plainTaken = Atomic(0)
+  var total: long = 0
+  scope(s ->
+    for w in 0 ..< workers
+      s.spawn(() ->
+        var going = true
+        while going
+          select
+            jobs.receive() as Some(j) ->
+              select
+                results.send(long(j)) -> done.add(1)
+            stop.receive() as None -> going = false
+            jobs.receive() as None -> going = false)
+    // A few plain receivers wait on the jobs channel beside the selects.
+    for p in 0 ..< 4
+      s.spawn(() ->
+        var going = true
+        while going
+          jobs.receive() match
+            Some(j) ->
+              plainTaken.add(1)
+              results.send(long(j))
+            None -> going = false)
+    s.spawn(() ->
+      for j in 0 ..< count do jobs.send(j)
+      jobs.close())
+    for r in 0 ..< count
+      total += results.receive().get
+    stop.close())
+  val expected = long(count) * long(count - 1) / 2
+  println(total == expected, done.load() + plainTaken.load(), results.tryReceive())
+  0

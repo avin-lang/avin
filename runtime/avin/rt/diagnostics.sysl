@@ -43,8 +43,18 @@ const WaitsOnSend: u32 = 7
 const WaitsOnFuture: u32 = 8
 /** An executor's condition that work has arrived: the worker is idle. */
 const WaitsForWork: u32 = 9
+/** A select, waiting on the channels of its arms (`select.sysl`); `select_waits` adds how many. */
+const WaitsOnSelect: u32 = 10
 /** Added to a kind for a wait with a time limit. */
 const WaitTimed: u32 = 256
+/** Where a select's wait keeps how many channels it waits on: the bits from here up. */
+const WaitCountShift: u32 = 16
+
+/** What a select waiting on `channels` channels waits on. */
+select_waits(channels: usize) -> u32 = WaitsOnSelect + (u32(channels) << WaitCountShift)
+
+/** The kind of a wait, without its time limit or a select's channel count. */
+wait_kind(waits: u32) -> u32 = waits & (WaitTimed - 1)
 
 /** The kinds the library may give a condition it makes (`avin_rt_condition_new_kind`). */
 condition_kind(kind: i32) -> u32
@@ -65,9 +75,13 @@ end_waiting(ctx: *Context)
 
 /** What a thread waiting on `waits` is doing, in words. */
 private waiting_text(waits: u32) -> string
-    val kind = waits & ~WaitTimed
-    val what = kind_text(kind)
+    val kind = wait_kind(waits)
+    val what = if kind == WaitsOnSelect then select_text(waits >> WaitCountShift) else kind_text(kind)
     if (waits & WaitTimed) != 0 && kind != WaitsOnSleep then what + " with a time limit" else what
+
+// A select's wait on `channels` channels, in words.
+private select_text(channels: u32) -> string =
+    "waiting in a select on " + channels.to_string() + (if channels == 1 then " channel" else " channels")
 
 // A wait kind, in words.
 private kind_text(kind: u32) -> string
@@ -102,7 +116,9 @@ poke_main()
 
 /** Whether the program is deadlocked, asked by the main thread while it waits without a limit as
  * `w`. A wake of `w` before the first look is seen in its state, read after the others; one after it
- * moves the count, since every waker counts a wake before it makes it. */
+ * moves the count, since a waker of a thread that is not lightweight counts the wake before it makes
+ * it. A lightweight thread's wake is counted under `sched` as the thread is put on the ready queue, so
+ * the look at the scheduler sees it ready or the count has moved by the last read. */
 all_waiting(w: *Waiter) -> bool
     if stopping_now() then return false
     val before = wakes.load()
@@ -150,7 +166,7 @@ waits_line(waits: u32, since: long, now: long, timed: bool) -> string
     what + ", " + ms.to_string() + " ms"
 
 /** Whether a thread waiting on `waits` is an idle worker, which the deadlock report leaves out. */
-idle_worker(waits: u32) -> bool = (waits & ~WaitTimed) == WaitsForWork
+idle_worker(waits: u32) -> bool = wait_kind(waits) == WaitsForWork
 
 // The quit signal's thread dump. A handler written in C (`__posix__/thread_dump.c`) wakes a thread of
 // its own, which calls `avin_rt_thread_dump`; the program goes on as it was.

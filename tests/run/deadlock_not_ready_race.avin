@@ -1,0 +1,54 @@
+// expect: exit 0
+// A thread on its way to the ready queue is never taken for a deadlock: its wake is counted as it is
+// put on the queue, so the main thread's look sees it ready or sees the count move. The runtime is
+// made to pause just before a thread is put on the queue, and `main` waits, without a limit, on
+// threads made ready by each way there is: a sleep's timer firing, a send to a channel a thread waits
+// on, and a value reaching a thread parked in a `select`. The collector's stress is off: it is the
+// scheduler's timing being tested, and a collection at every allocation spreads the threads' steps
+// too far apart for them to meet the pause.
+// env: AVIN_GC_STRESS=0
+import avin.threads.{Channel, sleep, spawn}
+import avin.time.micros
+
+@sysl("avin.rt.set_ready_pause")
+readyPause(on: bool) -> unit
+
+main()
+  val rounds = 1500
+  readyPause(true)
+  // A timer: `main` sends to a full channel that a sleeping thread makes room in.
+  val full = Channel[int](1)
+  var sent = 0
+  for i in 0 ..< rounds
+    full.send(-1)
+    val receiver = spawn(() ->
+      sleep(micros(long(i % 4) * 100))
+      full.receive())
+    full.send(i)
+    sent++
+    receiver.join()
+    while full.tryReceive() is Some(_) do ()
+  println(sent)
+
+  // A channel: `main` joins a thread parked on a receive, which a second thread's send wakes.
+  val c = Channel[int]()
+  var got = 0
+  for i in 0 ..< rounds
+    val waiting = spawn(() -> c.receive().getOrElse(0))
+    spawn(() -> c.send(1))
+    got += waiting.join()
+  println(got)
+
+  // A select: `main` joins a thread parked in a select, which a second thread's send wakes.
+  val a = Channel[int]()
+  val b = Channel[int]()
+  var chosen = 0
+  for i in 0 ..< rounds
+    val selecting = spawn(() ->
+      select
+        a.receive() as Some(x) -> x
+        b.receive() as Some(x) -> x)
+    spawn(() -> if i % 2 == 0 then a.send(1) else b.send(2))
+    chosen += selecting.join()
+  println(chosen)
+  readyPause(false)

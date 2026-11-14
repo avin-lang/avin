@@ -1,0 +1,89 @@
+// expect: exit 0
+// A `select`'s `else` runs where no arm is ready now, and never waits; one whose arm is ready runs
+// the arm. A select of `else` alone runs it. `after d` runs where no arm became ready within `d`,
+// waiting no longer than that, and a ready arm runs at once instead; a duration of zero or less tries
+// the arms once, as `else` does. A select of `after` alone waits the duration and runs it. Each is an
+// arm of the select's value. The `after`'s duration is evaluated once, in its place among the arms.
+import avin.threads.{Channel, spawn, sleep}
+import avin.time.{Duration, millis, monotonic, seconds}
+
+var order = ""
+
+noted[T](what: string, x: T) -> T
+  order = order + what
+  x
+
+main() -> int
+  val c = Channel[int]()
+  val none = select
+    c.receive() as Some(x) -> s"got $x"
+    else "nothing ready"
+  println(none)
+  c.send(5)
+  val some = select
+    c.receive() as Some(x) -> s"got $x"
+    else "nothing ready"
+  println(some)
+  val alone = select
+    else "else alone"
+  println(alone)
+  // `else` with a send: a full channel takes the `else`, a channel with room the send.
+  val full = Channel[int](1)
+  full.send(0)
+  val sendElse = select
+    full.send(1) -> "sent"
+    else "full"
+  println(sendElse, full.tryReceive(), full.tryReceive())
+
+  // `after` runs once the time is up, and not before.
+  val t0 = monotonic()
+  val timedOut = select
+    c.receive() as Some(x) -> s"got $x"
+    after 30.millis -> "timed out"
+  val waited = monotonic() - t0
+  println(timedOut, waited >= 30.millis, waited < 10.seconds)
+
+  // A ready arm runs at once, however long the `after`.
+  c.send(6)
+  val t1 = monotonic()
+  val quick = select
+    c.receive() as Some(x) -> s"got $x"
+    after 10.seconds -> "timed out"
+  println(quick, monotonic() - t1 < 5.seconds)
+
+  // An arm that becomes ready during the wait runs, before the time is up.
+  val sender = spawn(() ->
+    sleep(10.millis)
+    c.send(7))
+  val t2 = monotonic()
+  val during = select
+    c.receive() as Some(x) -> s"got $x"
+    after 10.seconds -> "timed out"
+  println(during, monotonic() - t2 < 5.seconds)
+  sender.join()
+
+  // A duration of zero or less tries the arms once.
+  for d in [0.millis, -5.millis, Duration(0)]
+    val r = select
+      c.receive() as Some(x) -> s"got $x"
+      after d -> "at once"
+    println(r)
+  c.send(8)
+  println(select
+    c.receive() as Some(x) -> s"got $x"
+    after 0.millis -> "at once")
+
+  // `after` alone waits its duration.
+  val t3 = monotonic()
+  select
+    after 20.millis -> println("slept")
+  println(monotonic() - t3 >= 20.millis)
+
+  // The duration is evaluated once, in its place among the arms' operands.
+  order = ""
+  select
+    noted("a", c).receive() -> ()
+    after noted("b", 1.millis) -> ()
+    noted("c", c).receive() as None -> ()
+  println(order)
+  0

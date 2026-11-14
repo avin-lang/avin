@@ -208,17 +208,34 @@ private forget_lwt(p: *Lwt)
     p.all_next = null
 
 /** Puts `p`, a parked or new lightweight thread, at the back of the ready queue, and has a worker
- * take it: an idle one, or a new one while fewer than the target are counted. */
+ * take it: an idle one, or a new one while fewer than the target are counted. The wake is counted
+ * under `sched`, with the thread put on the queue: the main thread's look for a deadlock reads the
+ * count, then whether anything is running or ready, under `sched`, so it sees the thread ready or a
+ * count that has moved, never a quiet scheduler and an unmoved count while the thread is on its way. */
 make_ready(p: *Lwt)
-    _ = wakes.add(1)
+    if ready_pause.load() != 0 then pause_micros(300)
     p.phase.store(PhaseReady)
     sched.lock_raw()
+    _ = wakes.add(1)
     p.next = null
     if ready_tail == null then ready_head = p else ready_tail.next = p
     ready_tail = p
     val start = more_hands()
     sched.unlock_raw()
     if start then start_worker()
+
+/** For the runtime's own tests: 1 has `make_ready` pause before it takes `sched`, which widens the
+ * moment in which a wake counted outside `sched` would have been missed by a look for a deadlock. */
+var ready_pause: Atomic[u32] = Atomic(0)
+
+/** For the runtime's own tests: has `make_ready` pause, or no longer pause, before it takes `sched`. */
+set_ready_pause(on: bool)
+    ready_pause.store(if on then 1 else 0)
+
+// Spins for `us` microseconds, holding no lock.
+private pause_micros(us: long)
+    val until = now_micros() + us
+    while now_micros() < until do ()
 
 // Under `sched`, with a thread ready: wakes an idle worker, or counts one more toward the target,
 // waking a spare or answering `true` for the caller to start a new worker once it has let `sched` go.
@@ -459,6 +476,9 @@ struct Waiter
     order: u64
     /** One more than its place among the timers, or 0 while it has no timer; under `timer_lock`. */
     slot: usize
+    /** Where the waiter is a `select`'s link on one of the queues it waits on (`select.sysl`), the
+     * link, whose select's own waiter is the one woken; null for a thread's waiter. */
+    link: *SelectLink
 
 /** A waiter still waiting. */
 const WaitPending: u32 = 0
@@ -471,7 +491,7 @@ const WaitCancelled: u32 = 3
 
 private waiter_at(at: usize) -> *Waiter = ptr_cast(at)
 
-new_waiter() -> Waiter = Waiter(null, null, null, Atomic(WaitPending), false, 0, 0, 0)
+new_waiter() -> Waiter = Waiter(null, null, null, Atomic(WaitPending), false, 0, 0, 0, null)
 
 /** The waiter of `ctx`'s thread, made ready for a new wait. A thread waits on one thing at a time, so
  * its context holds the one waiter it needs. The context outlives every wait of its thread, and a
@@ -487,6 +507,7 @@ waiter_of(ctx: *Context) -> *Waiter
     w.at = 0
     w.order = 0
     w.slot = 0
+    w.link = null
     w
 
 /** The threads waiting on one thing, oldest first, and the guard over them and over the thing's own
@@ -541,8 +562,9 @@ wake_all(q: *WaitQueue)
 
 // Wakes `w`, which is off its queue, where it is still waiting. Its thread is parked, since the guard
 // the caller holds was let go only after it had switched away; once its state changes it may run, so
-// nothing of `w` is read after.
+// nothing of `w` is read after. A select's link wakes its select, where nothing has ended its wait yet.
 wake_waiter(w: *Waiter) -> bool
+    if w.link != null then return wake_select(w.link)
     val l = w.lwt
     // A thread that is not lightweight is counted before it is woken, as `make_ready` counts a
     // lightweight one, so the main thread's look for a deadlock sees its own wake.
@@ -629,10 +651,11 @@ private park_until(ctx: *Context, deadline: long, cancellable: bool) -> bool
 private var blocked_lock: Mutex[unit] = Mutex.new(())
 private var blocked_woken: Condvar = Condvar.new()
 
-// Blocks the operating system thread of `ctx` until `w` is woken or `deadline` passes. The main
-// thread, waiting without a limit, looks for a deadlock as it begins and each time a worker pokes it:
-// a poke that comes between its look and its wait is seen, since the count it read has moved.
-private block_until_woken(ctx: *Context, w: *Waiter, deadline: long)
+/** Blocks the operating system thread of `ctx` until `w` is woken or `deadline` passes. The main
+ * thread, waiting without a limit, looks for a deadlock as it begins and each time a worker pokes it:
+ * a poke that comes between its look and its wait is seen, since the count it read has moved. A
+ * select waits here too (`select.sysl`). */
+block_until_woken(ctx: *Context, w: *Waiter, deadline: long)
     val watched = deadline <= 0 && ctx == &main_context
     if watched then main_watching.store(1)
     blocked_lock.lock_raw()
