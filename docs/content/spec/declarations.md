@@ -1104,7 +1104,9 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
 - **In a trait a static member has no body**: a trait's default bodies are shared by every
   conforming type, and a static member is each type's own. `Self` in its signature is the
   implementing type, as in a method's. A trait never overrides a static member, and its default
-  bodies cannot call one on `Self`, which there is no one type.
+  bodies cannot call one on `Self`, which there is no one type; a
+  [constructor trait](/spec/generics/#constructor-traits)'s defaults, compiled for each implementing
+  constructor, can.
 - **Every implementation gives it, with a body**, marked `static` as the trait's member is: an impl,
   and a class's body with `override static`. An abstract class gives it too, since it belongs to the
   type and not to a subclass's objects. A static member is static exactly where the trait's member
@@ -1214,6 +1216,9 @@ built-in type implements every method of the trait, defaults included.
   of a trait always does: a conformance holds for every instance of a type, so an impl of a trait
   for particular type arguments (`impl Show for Box[int]`) or for a type built from its parameters
   (`impl[T] Show for Box[List[T]]`) is an error, and no two conformances of one type can overlap.
+  An impl of a [constructor trait](/spec/generics/#implementing-a-constructor-trait) names them too,
+  and gives the trait the ones it leaves open (`impl[T, E] Monad[T] for Result[T, E]`), or leaves
+  both off where they are all open, in order (`impl Monad for Option`).
 - **An impl without `for` may add methods to any type built from its parameters**:
   `impl[T] Option[Option[T]]`, `impl[A, B] Pair[A, List[B]]`, and, adding to a trait,
   `impl[T] Seq[Seq[T]]` and `impl[K, V] Iterable[(K, V)]`. Each of its parameters is part of that

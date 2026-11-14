@@ -1,13 +1,14 @@
 ---
 title: Collections
-summary: A rich collection library without higher-kinded types, where Iterator is Iterable and arrays are ordinary collections.
+summary: A rich collection library with precise result types from first-order generics, where Iterator is Iterable and arrays are ordinary collections.
 weight: 18
 ---
 
 The standard library's collections are a rich, immutable-by-default family with shared operation
 families, written in Avin. Each transformation returns the most precise collection type the caller
-can know, and the structure below achieves that without higher-kinded types, which Avin does not
-have.
+can know, and the structure below achieves that with first-order generics alone. The collections
+also implement the [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse)
+through their own methods, so code generic over any `Monad` takes them unchanged.
 
 ## Hierarchy
 
@@ -1319,8 +1320,9 @@ r.contains(3000000000)   // true
 ## for comprehensions
 
 A `for` with `yield` is sugar over collection methods: generators become `flatMap`/`map` and guards
-become lazy filters, so any type with those methods works in it. Scope and the order of evaluation
-follow the source. A `for` without `yield` is a loop over the source's `iterator()`, described next.
+become lazy filters. A source is admitted by what it is, nominally: an `Iterable`, or a type
+implementing the [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse)
+(below). Scope and the order of evaluation follow the source. A `for` without `yield` is a loop over the source's `iterator()`, described next.
 
 `for pattern in xs` followed by an indented body, or `for pattern in xs do body` on one line, runs the
 body once per element, binding each by the pattern: a name, `_`, a tuple or a variant pattern that
@@ -1404,9 +1406,37 @@ other `Seq`, a sequence of the program's own among them, a `Vector`, through the
 yields pairs and makes a `Map`. Over a mutable `Set` or `Map` the result is a new mutable set or map,
 as over an `Array`, a `Buffer` or a `Deque` it is a new one of those, and the source is unchanged. `flatMap` on the library's collections takes any `Iterable` from its
 function, so a later generator may draw from another kind of collection than the first; an
-`Option`'s `flatMap` takes an `Option`. A type of the program's own works in a comprehension by
-having the methods it calls: `map` for one generator, `flatMap` for more, and `withFilter` for a
-guard. A source without the method it is asked for is an error at that source.
+`Option`'s `flatMap` takes an `Option`.
+
+**Which sources a comprehension takes is decided by conformance, never by the methods a type
+happens to have.** Each source is checked for the role the desugaring gives it, then its calls are
+checked as written out:
+
+- **The last generator's source** is an `Iterable`, or its type's constructor implements `Functor`
+  or `SendableFunctor`.
+- **A generator followed by another**, or by a definition a guard follows, is an `Iterable`, a
+  `Monad` or a `SendableMonad`, so a comprehension over futures is a future, as before.
+- **A guard** filters an `Iterable` through `withFilter`, lazily as below, and any other source
+  through `Filter`'s `filter`. The views `withFilter` makes are `Iterable`s themselves, so the calls
+  after a guard are on an `Iterable` too.
+- **In generic code** the bounds decide: `fa: F[A]` with `F[_]: Monad + Filter` takes every role,
+  and with `F[_]: Functor` alone only the last generator's.
+
+So `Option`, `Result[_, E]` and `Either[L, _]` draw in a comprehension as the collections do, and so
+does a type of the program's own that implements `Monad` (and `Filter`, for guards). A type with a
+`map` and a `flatMap` and no such impl is no source:
+
+```text
+for x in box, y in other yield x + y
+// error: `box` is a `Box[int]`, which is neither an `Iterable` nor a `Monad`, and a generator
+// followed by another draws only from those: declare `impl Monad for Box`
+```
+
+A source admitted for its role whose call still fails is reported at the generator that caused it:
+in `for p in parser, n in maybeInt yield …` where `parser` is a `Parser[int]`, the error names the
+second generator, an `Option[int]` where `Parser`'s `flatMap` takes a function yielding a `Parser`.
+A guard on a source that is neither an `Iterable` nor a `Filter` names the guard and the bound it
+needs.
 
 `withFilter` is lazy. It returns a view of the collection that tests each element just before
 `map`, `flatMap` or `foreach` uses it, and another `withFilter` on the view combines the tests. So
