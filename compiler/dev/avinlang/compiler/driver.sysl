@@ -1,6 +1,7 @@
 module dev.avinlang.compiler
 
-import sh.sysl.parsing.{Source, Span, error, source_of, report}
+import sh.sysl.parsing.{Report, Source, Span, error, source_of, report}
+import sysl.{MacOS, os}
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.env.get
@@ -245,20 +246,21 @@ compile_files(tc: Toolchain, files: Buf[ProgramFile]) -> Compilation = compile_p
 //
 // With the instance cache open (`open_incremental`), the build reads and writes it; in its `verify`
 // mode the program is then built again without it, and the two texts must be the same.
-compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary]) -> Compilation
+compile_program(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary], debug: bool = false) -> Compilation
     val mode = incremental_now()
-    if mode != IncrementalVerify then return compile_with(tc, files, testing, sysl, c, mode == IncrementalOn)
-    val cached = compile_with(tc, files, testing, sysl, c, true)
+    if mode != IncrementalVerify then return compile_with(tc, files, testing, sysl, c, mode == IncrementalOn, debug)
+    val cached = compile_with(tc, files, testing, sysl, c, true, debug)
     if cached.diagnostics != "" then return cached
-    val clean = compile_with(tc, files, testing, sysl, c, false)
+    val clean = compile_with(tc, files, testing, sysl, c, false, debug)
     if clean.diagnostics != "" then return clean
     val differs = first_difference(cached.llvm.unwrap_or(""), clean.llvm.unwrap_or(""))
     if differs != "" then return Compilation(differs, None, None, buf(), buf())
     cached
 
-/** `compile_program` reading and writing the instance cache, with `caching`, or neither. */
-private compile_with(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary], caching: bool) -> Compilation
-    val lowered = lower_units(tc, files, testing, c, caching) match
+/** `compile_program` reading and writing the instance cache, with `caching`, or neither; with
+ * `debug`, into a program with debug information (`debug_info.sysl`). */
+private compile_with(tc: Toolchain, files: Buf[ProgramFile], testing: bool, sysl: Buf[SyslPackage], c: Buf[CLibrary], caching: bool, debug: bool) -> Compilation
+    val lowered = lower_units(tc, files, testing, c, caching, debug) match
         Ok(l) -> l
         Err(diagnostics) -> return Compilation(diagnostics, None, None, buf(), buf())
     var archive: Option[string] = None
@@ -304,10 +306,10 @@ struct CachedLowering
 
 /** A program lowered and emitted as a build with the instance cache in `dir` makes it, reading and
  * writing the cache, for the compiler's tests. */
-cached_lowering(tc: Toolchain, files: Buf[ProgramFile], dir: string) -> Result[CachedLowering, string]
+cached_lowering(tc: Toolchain, files: Buf[ProgramFile], dir: string, debug: bool = false) -> Result[CachedLowering, string]
     open_incremental(dir, IncrementalOn)
     defer close_incremental()
-    val lowered = lower_units(tc, files, false, buf(), true)?
+    val lowered = lower_units(tc, files, false, buf(), true, debug)?
     val emitted = emit_llvm_cached(lowered.program, lowered.store.texts, true)
     _ = store_entries(lowered, emitted)
     Ok(CachedLowering(lowered.program, emitted.text, emitted.reused))
@@ -426,18 +428,16 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
         units.push(u)
     for k in 0..<units.len()
         var report = units[k].report
+        var said: Buf[string] = buf()
         for i in units[k].file.imports
             if whole_library then break
             if k >= library_units && package_module_meant(i.path, units) is Some(message)
-                report.add(error(import_path_span(i), message))
-                broken = true
+                if refuse_import_once(&report, &said, i, message) then broken = true
             elif missing_library_module(i.path, modules, units) is Some(message)
-                report.add(error(import_path_span(i), message))
-                broken = true
+                if refuse_import_once(&report, &said, i, message) then broken = true
             elif k >= library_units
                 if library_module_meant(i.path, modules, units) is Some(message)
-                    report.add(error(import_path_span(i), message))
-                    broken = true
+                    if refuse_import_once(&report, &said, i, message) then broken = true
         units[k].report = report
     // An import a feature's gate does not allow is refused whichever features are on, so a module that
     // is off is told about by name rather than as missing.
@@ -446,14 +446,25 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
         if fences.len() == 0 then continue
         val k = library_units + j
         var report = units[k].report
+        var said: Buf[string] = buf()
         for i in units[k].file.imports
             for fence in fences
                 if i.path == fence.prefix || i.path.starts_with(fence.prefix + ".")
-                    report.add(error(import_path_span(i), fence.message))
-                    broken = true
+                    if refuse_import_once(&report, &said, i, fence.message) then broken = true
                     break
         units[k].report = report
     Ok(LoadedUnits(units, library_units, root_module, broken))
+
+// Refuses the import `i` with `message`, once for the declaration it is part of: the names of
+// `import a.b.{c, d}` are one import each and share the path written, `said` holding each declaration
+// and message refused so far. Answers whether it was refused now.
+private refuse_import_once(into: *Report, said: *Buf[string], i: Import, message: string) -> bool
+    val key = s"${i.module_span.start} ${i.module_span.end} $message"
+    for s in *said
+        if s == key then return false
+    said.push(key)
+    into.add(error(import_path_span(i), message))
+    true
 
 // The place of the path an import names, without its alias.
 private import_path_span(i: Import) -> Span = i.module_span.to(i.name_span)
@@ -604,7 +615,7 @@ private modules_under(modules: Map[string, bool], prefix: string) -> string
 // The library's modules a compilation reads are the prelude and those imported, and every module in
 // it is the core library's, `avin` or under it; the program's own modules may not be. A program's
 // C unit is built between checking and lowering, which converts at the widths it measured.
-private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary], caching: bool) -> Result[Lowered, string]
+private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary], caching: bool, debug: bool = false) -> Result[Lowered, string]
     val front = check_units(tc, files, testing)?
     var program = front.program
     val loaded = front.loaded
@@ -624,7 +635,7 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Bu
         c_link.push(flag)
     val store = if caching then read_instance_store(incremental_directory()) else instance_store_at("")
     if caching then began = phase_done("cache", began, s"files=${store.files} damaged=${store.damaged} lowered=${store.lowered.len()} texts=${store.texts.len()}")
-    var mir = lower_program_cached(program, store.lowered, caching)
+    var mir = lower_program_cached(program, store.lowered, caching, debug)
     var reused = 0usize
     for r in mir.reused
         if r then reused += 1
@@ -758,7 +769,7 @@ runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + ru
  * unless `keep_units` is false: a program built once, as a test corpus builds each of its programs,
  * gains nothing from keeping them. The executable is written under a temporary name and
  * published by rename, so a failed link leaves any previous output in place. */
-link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string, c_link: Buf[string], units: int = 0, keep_units: bool = true) -> Result[unit, string]
+link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string, c_link: Buf[string], units: int = 0, keep_units: bool = true, debug: bool = false) -> Result[unit, string]
     var libraries: Buf[string] = buf()
     val archive = shims match
         Some(a) ->
@@ -803,4 +814,16 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
         return Err("clang failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
     publish_file(pending, output).map_err(e -> e.to_string())?
     _ = phase_done("link", began)
+    // On macOS the linker leaves the debug information in the objects, which are gone once the
+    // build is; `dsymutil` gathers it into `<output>.dSYM` beside the executable, where the debugger
+    // finds it.
+    if debug && os() == MacOS
+        began = phase_start()
+        val gathered = capture(DsymUtil, [output, "-o", output + ".dSYM"], stderr = true, timeout = 120000).map_err(e -> s"cannot run `$DsymUtil` (${e.to_string()}); it comes with Xcode's command-line tools, which `xcode-select --install` installs")?
+        if !gathered.status.ok()
+            return Err("dsymutil failed: " + gathered.status.to_string() + "\n" + gathered.err.unwrap_or("") + gathered.text)
+        _ = phase_done("dsym", began)
     Ok(())
+
+/** The tool that gathers an executable's debug information on macOS. */
+const DsymUtil: string = "dsymutil"

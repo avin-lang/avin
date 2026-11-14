@@ -545,7 +545,14 @@ body's scope has ended. A `do` that starts a line always opens this form; the `d
 ## match
 
 `subject match` is followed by indented `pattern -> body` arms and an optional `else`. It is an
-expression, checked for exhaustiveness. Patterns include:
+expression, checked for exhaustiveness. An arm's body written on its own line fills that line, so a
+comma list there is a tuple without parentheses (`_ -> 0, 1`). Inside brackets whose commas
+separate items (call arguments, tuple and collection literals, a `with` change) a comma after a
+one-line arm's body ends the arm, the `match` and the item, as it ends a `return` value: in
+`f(x match` … `_ -> 0, "a")` the `match` is the first argument and `"a"` the second, which may also
+stand on the line after the arms. A tuple body there is written in parentheses, `_ -> (0, 1)`; a
+comma after an arm that more arms follow is an error that says so. An arm's indented body is a
+block and starts a line again. Patterns include:
 
 - literals, including negative numbers;
 - inclusive and exclusive literal ranges (`'a'..'z'`, `0..<10`);

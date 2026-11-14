@@ -15,6 +15,10 @@ struct Parser
      * collection literals): a `return` or `break` value stops at the comma there, instead of making a
      * tuple. An indented block starts a new line context and clears it. */
     in_list: bool
+    /** The blocks of `match` arms, inside the current brackets, that a comma after an arm's body ended
+     * before their lines did: `f(x match` … `_ -> 0, "a")`. Each still closes with a Dedent before
+     * the closing bracket, which the list steps over. */
+    owed_dedents: usize
     /** The spans of the expressions written in parentheses of their own, which the rule against
      * mixing left- and right-grouping infix calls lets through. */
     grouped: Buf[Span]
@@ -127,7 +131,7 @@ impl TokenStream for Parser
 
 parser_for(src: Source) -> Parser
     val lexed = lex(src)
-    Parser(src, lexed.items, lexed.report, None, false, buf(), false, 0, 0)
+    Parser(src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0)
 
 private after_dedent(p: Parser) -> bool = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
 
@@ -373,7 +377,7 @@ private hole(p: *Parser, span: Span) -> &Expr
         p.report.add(error(span, "an interpolation hole needs an expression"))
         return Expr(span, Invalid)
     val lexed = lex_hole(p.src, span)
-    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf(), false, 0, 0)
+    var inner = Parser(p.src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0)
     val e = expression(&inner, 0)
     saw_tuple(p, inner.widest_tuple)
     if !inner.toks.at_end() then inner.report.add(error(inner.toks.here(), "unexpected input after the expression in this hole"))
@@ -472,6 +476,13 @@ private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
     if is_keyword(text) then return Expr(t.span, Name(text))
     bare_call(p, Expr(t.span, Name(text)))
 
+/** Steps over the line breaks and Dedents of the arm blocks a comma ended in the current brackets,
+ * so the items after them read on as the list's own. */
+settle(p: *Parser)
+    while p.owed_dedents > 0
+        if p.accept_kind(Dedent) then p.owed_dedents -= 1
+        elif !p.accept_kind(Newline) then return
+
 /** A value that fills the rest of a line: an expression, or several separated by commas, which
  * make a tuple without parentheses. */
 line_value(p: *Parser) -> &Expr
@@ -522,25 +533,32 @@ private parenthesized(p: *Parser, start: Span) -> &Expr
     if p.accept(")") then return Expr(start.to(p.ended()), UnitLit)
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     var reported = p.report.len()
-    val first = expression(p, 0)
+    val first = ascribed(p, expression(p, 0))
     if !p.at(",")
         if !p.at(")") && !p.toks.at_end() then misread_item(p, None, first, reported)
         p.in_list = outer
+        p.owed_dedents = owed
         p.expect(")")
         p.grouped.push(first.span)
         return first
     var items: Buf[&Expr] = buf()
     items.push(first)
     while p.accept(",")
+        settle(p)
         if p.at(")") then break
         reported = p.report.len()
-        val item = expression(p, 0)
+        val item = ascribed(p, expression(p, 0))
         items.push(item)
+        settle(p)
         if !p.at(",") && !p.at(")") && !p.toks.at_end()
             misread_item(p, None, item, reported)
             break
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     val end = p.toks.here()
     p.expect(")")
     saw_tuple(p, items.len())
@@ -678,6 +696,8 @@ private with_update(left: &Expr, p: *Parser) -> &Expr
     var changes: Buf[FieldChange] = buf()
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     var written = false
     loop
         if p.at("}") || p.toks.at_end() then break
@@ -718,7 +738,10 @@ private with_update(left: &Expr, p: *Parser) -> &Expr
         val value = expression(p, 0)
         changes.push(FieldChange(first.span.to(value.span), path, spans, value))
         if !p.accept(",") then break
+        settle(p)
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     val end = p.toks.here()
     if !written && p.at("}") then p.report.add(error(open.span.to(end), "`with` changes at least one field: name it, as in `with { x = 1 }`"))
     p.expect("}")
@@ -740,7 +763,12 @@ private type_application(left: &Expr, p: *Parser) -> &Expr
     if p.at("]") then p.report.add(error(p.toks.here(), "expected at least one type argument"))
     else
         loop
-            args.push(parse_type(p))
+            // `_` alone is read as a hole so that the checker can say what an argument there takes.
+            val hole = p.toks.here()
+            if p.at("_") && (p.ahead(1) == "," || p.ahead(1) == "]")
+                p.toks.advance()
+                args.push(TypeExpr(hole, Hole))
+            else args.push(parse_type(p))
             if !p.accept(",") || p.at("]") then break
     // Without its `]` the application ends at its last argument, so the token the bracket was
     // expected at stays outside it, as the next expression's part.
@@ -752,6 +780,8 @@ private call(left: &Expr, p: *Parser) -> &Expr
     var args: Buf[Argument] = buf()
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     if !p.at(")")
         loop
             val start = p.toks.here()
@@ -761,13 +791,18 @@ private call(left: &Expr, p: *Parser) -> &Expr
                 name = Some(p.spelling(p.toks.advance().unwrap()))
                 p.toks.advance()
             val reported = p.report.len()
-            val value = placeholder_scope(p, expression(p, 0))
+            val value = placeholder_scope(p, ascribed(p, expression(p, 0)))
             args.push(Argument(start.to(value.span), name, value, false))
+            settle(p)
             if !p.at(",") && !p.at(")") && !p.toks.at_end()
                 misread_item(p, Some(callee_name(left)), value, reported)
                 break
-            if !p.accept(",") || p.at(")") then break
+            if !p.accept(",") then break
+            settle(p)
+            if p.at(")") then break
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     var end = p.toks.here()
     p.expect(")")
     trailing_block(p, true) match
@@ -797,18 +832,6 @@ private misread_item(p: *Parser, callee: Option[string], value: &Expr, reported:
         val last = p.toks.peek_at(arrow - 1).unwrap().span
         val shown = from_utf8_unchecked(p.src.text(first.to(last)))
         if p.report.len() == reported then p.report.add(error(at.to(last), s"a lambda's parameter with a type is written in parentheses: `($item: $shown) -> …`"))
-    elif p.at(":")
-        p.toks.advance()
-        val written = parse_type(p)
-        val item = from_utf8_unchecked(p.src.text(value.span))
-        val shown = from_utf8_unchecked(p.src.text(written.span))
-        val rest = if p.at(",") then ", …" else ""
-        val message = callee match
-            Some(name) ->
-                if name == "" then s"an argument is not given a type: give the type argument of the function it is passed to, `[$shown]`"
-                else s"an argument is not given a type: give the type argument instead, as in `$name[$shown]($item$rest)`"
-            None -> s"an expression is not given a type: declare the value with it, as in `val x: $shown = $item`"
-        if p.report.len() == reported then p.report.add(error(at.to(written.span), message))
     else p.report.add(expected(at, "`)`", found_at(p.src, at)))
     var depth = 0
     loop
@@ -818,6 +841,33 @@ private misread_item(p: *Parser, callee: Option[string], value: &Expr, reported:
         if word == "(" || word == "[" || word == "{" then depth += 1
         if word == ")" || word == "]" || word == "}" then depth -= 1
         p.toks.advance()
+
+/** An item of a parenthesized list, `value`, given a type by a `:` after it: `(n: long)`,
+ * `f(None: Option[string])`, `(a: real, b)`. A name followed by `: int -> body`, whose rest is no
+ * type, is a lambda whose typed parameter lacks its parentheses, which `misread_item` reports, so
+ * `value` is left as it is; `(f: int -> int)` gives `f` a function type. */
+private ascribed(p: *Parser, value: &Expr) -> &Expr
+    if !p.at(":") then return value
+    if value.kind is Name(_) && lambda_arrow_ahead(p) is Some(_) && !type_follows(p) then return value
+    p.toks.advance()
+    val ty = parse_type(p)
+    Expr(value.span.to(ty.span), Ascribe(value, ty))
+
+// Whether every token after the `:` the parser is at, up to the `,` or `)` that ends the item, can
+// be part of a type: names, brackets, `->`, `|`, `.` and `@`, with `,` only inside brackets.
+private type_follows(p: *Parser) -> bool
+    var depth = 0
+    var i = 1usize
+    loop
+        val t = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        val word = p.spelling(t)
+        if depth == 0 && (word == "," || word == ")") then return i > 1
+        if word == "(" || word == "[" then depth += 1
+        elif word == ")" || word == "]" then depth -= 1
+        elif !(t.value == Word || word == "->" || word == "|" || word == "." || word == "@" || word == ",") then return false
+        i += 1
 
 // How many tokens ahead of the `:` the parser is at stands the `->` (or `=>`) of a lambda whose
 // typed parameter was written without parentheses, `x: int -> body`: an arrow at the list's own
@@ -912,6 +962,11 @@ private with_placeholders(e: &Expr, params: *Buf[LambdaParam]) -> &Expr
         Member(target, name) -> Expr(e.span, Member(with_placeholders(target, params), name))
         TupleIndex(target, index) -> Expr(e.span, TupleIndex(with_placeholders(target, params), index))
         TypeApply(target, args) -> Expr(e.span, TypeApply(with_placeholders(target, params), args))
+        // `(_: long)` is a parameter of that type.
+        Ascribe(value, ty) ->
+            val inner = with_placeholders(value, params)
+            if value.kind is Name("_") then params[params.len() - 1] = LambdaParam(value.span, params[params.len() - 1].name, Some(ty))
+            Expr(e.span, Ascribe(inner, ty))
         With(base, changes) -> Expr(e.span, With(with_placeholders(base, params), changes))
         Tuple(items) ->
             var parts: Buf[&Expr] = buf()
@@ -1069,6 +1124,8 @@ private collection(p: *Parser, start: Span, braces: bool) -> &Expr
     var map = false
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     if !p.at(close)
         loop
             val before = p.toks.position
@@ -1079,8 +1136,12 @@ private collection(p: *Parser, start: Span, braces: bool) -> &Expr
             keys.push(key)
             if entry then values.push(expression(p, 0))
             if p.toks.position == before then break
-            if !p.accept(",") || p.at(close) then break
+            if !p.accept(",") then break
+            settle(p)
+            if p.at(close) then break
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     val end = p.toks.here()
     p.expect(close)
     val span = start.to(end)

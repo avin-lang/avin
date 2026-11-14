@@ -931,7 +931,8 @@ Settled by the user on 2026-11-04:
 - Details of [synchronization](/spec/threads/#synchronization): `Mutex[T].with` hands its body the
   value itself, and an immutable value is read with `get`, replaced with `set` and changed with
   `update(f)` under the lock. A mutex is not reentrant, and a thread taking one it already holds
-  traps rather than waiting for ever; no other deadlock is detected. A `Condition` is made by its
+  traps rather than waiting for ever; otherwise only a deadlock of the whole program is detected
+  ([diagnostics](/spec/threads/#deadlock)). A `Condition` is made by its
   mutex's `condition()`, so it is waited for with that mutex only, and `wait()` from a thread not
   holding it traps. `Atomic[T]` holds any type: a value of one word lock-free, an integer wider
   than 64 bits under one runtime lock; `compareAndSet` compares identity for a reference and the
@@ -4432,12 +4433,25 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   the same literal to a reader. Two limits, chosen as the smallest rule: of two arguments that
   both hold literals, the first written decides for the second (`same((1, x), (x, 2))` for
   `x: long` is an error, where a part-by-part solution would type it); and choosing an overload
-  checks a nested literal once at its own type where the candidates' parameters differ (`kind(Some(1))`
-  beside `kind(o: Option[long])` and `kind(o: Option[string])` fits neither), as only a bare literal
-  is tried against each candidate. Alternatives: leaving each literal unknown until its use settles
-  it, as a type argument is (solves both limits, but makes every literal an inference variable);
-  trying each candidate's parameter on a nested literal by its structure (collection, tuple and
-  constructor shapes). Review with the user: whether either limit is worth lifting.
+  checked a nested literal once at its own type where the candidates' parameters differ. Review
+  with the user: whether the first limit is worth lifting.
+
+  **Proposed (branch `fix-literal-expected`, 2026-11-14): the second limit is lifted.** Choosing an
+  overload checks a value built around number literals by itself first, as before; where that
+  leaves no candidate fitting (or it does not check by itself, as `[5_000_000_000]` does not), it is
+  checked against each candidate's parameter instead, with the type arguments the receiver, the
+  lower bounds and the other arguments decide, as a bare literal is. So `kind(Some(1))` beside
+  `kind(o: Option[long])` and `kind(o: Option[string])` is the `long` one, and `longs ++ [400]`,
+  which met two overloads of `++` (`Vector[W]` and `Iterable[W]` with `W >: long`), is a
+  `Vector[long]` (found writing marshal). Where the literal fits candidates at its own type, the
+  choice is unchanged, so `own([1])` beside `Vector[int]` and `Vector[long]` stays the `int` one.
+  With it, a reference type that takes integers or decimals (`BigInt`, `BigDecimal`, a type
+  implementing `FromInteger`) is kept in the expected type a literal argument gets, as a number is,
+  so `pair(cents, [3])` for `pair[T](a: Vector[T], b: Vector[T])` builds `Cents` where it had built
+  an `int`. Why: a literal one level down is the same literal to a reader, and an operator method
+  on a collection is the commonest place it meets overloads. Alternatives: checking against each
+  candidate first (would change which overload `own([1])` picks, and is ambiguous where both
+  take it); trying candidates by the literal's structure only (more code, same result).
 
 - Settled on the user's delegation 2026-11-06 (branch `stdout-flush-isnan`): **standard output gets an explicit `flush()`; reading flushes it; `real` gets `isNaN`, `isInfinite` and `isFinite`.** `flush()` is a prelude function and a method on `StandardOutput` and `StandardError` (a no-op beyond flushing output, as error keeps no buffer); a read of standard input that must wait flushes output first. The classifiers are methods on `real` in `avin`, written in Avin (`self != self`; comparison with the infinities; `self - self == 0.0`); `real.NaN`, `real.PositiveInfinity` and `real.NegativeInfinity` already existed, and `real` is the only floating type. WHY: a drawing program must push a frame without a newline, and a prompt must be seen before the wait; the methods read as `char`'s do, where the `avin.math` functions are not methods. ALTERNATIVES: a `Writer.flush` on the trait (every writer would need a meaning); flushing only on `print` (defeats buffering); `math.isNaN(x)` functions (the spec keeps `avin.math` for elementary functions). Review with the user if a `Writer`-level `flush` is wanted.
 
@@ -7734,15 +7748,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   argument list or parenthesized group meeting a token other than `,` or `)` reports it once and
   skips to its `)`. `->` there says "write a map as `{"a": 1}`" when the callee's name ends in `Map`
   and "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{"a": 1}`" otherwise;
-  `x: T` says "give the type argument instead, as in `f[T](x, …)`" (Avin has no expression
-  ascription: a value takes its type from where it is used, or from a declared `val`'s type), "a
-  lambda's parameter with a type is written in parentheses" when `->` follows the type, and "declare
-  the value with it, as in `val x: T = …`" in a group. WHY: one mistake made five to ten errors,
+  and "a lambda's parameter with a type is written in parentheses" when `: T ->` follows a name.
+  WHY: one mistake made five to ten errors,
   each naming a token rather than the mistake, and the token shows exactly which mistake it is.
   ALTERNATIVES: suppressing every error after the first in a statement (panic mode), which also
   hides a genuinely separate mistake on the same line; accepting `k -> v` as a pair (a second
-  spelling of a tuple, and `x -> body` is a lambda); accepting `x: T` as an ascription (a second way
-  to state a type the language deliberately gives through declarations and type arguments).
+  spelling of a tuple, and `x -> body` is a lambda). The hints this entry first gave for `x: T` in
+  an argument or a group ("give the type argument instead", "declare the value with it") are gone:
+  `x: T` there is now a [type ascription](#proposed) (the user approved ascription 2026-11-13).
 - Settled on the user's delegation 2026-11-13 (built on branch `diag-spans-recovery`): **A member's mistake is shown at the member** (branch `diag-spans-recovery`). The checker reports
   a missing or private member, an argument-count mistake and `()` on a parameterless member at the
   member's name and argument list; the call's own span, used for a type mismatch and for traps,
@@ -8221,10 +8234,191 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatter is meant to settle exactly this); a blank line between clauses only around a
   multi-line one (it still splits one function in two); a blank line between every clause
   (it spreads a short definition over twice its lines).
+- Proposed (built on branch `http-stream`): **A streamed response is a `Response` whose body a
+  function writes through a `BodyWriter`** (`Response.stream(status, contentType, write)`, with a
+  `length` overload, and `Response.events` for server-sent events through an `EventWriter`). The
+  head says `Transfer-Encoding: chunked`, or `Content-Length` where the length is given, or to an
+  HTTP/1.0 client neither, the body ending with the connection. Each write answers `Result[unit,
+  IoError]`, `Err` once the client has gone or the server is stopping and for every later write;
+  a write past a given length traps; a handler trapping once the head is sent has its connection
+  closed with no `500`. Why: one `Response` type keeps routers, middleware and error pages working
+  on streamed answers unchanged, and a `Result` per write makes the end of a stream the program's
+  ordinary control flow. Alternatives weighed: a separate `StreamedResponse` type beside `Response`
+  (every handler type and middleware doubled); a handler handed the connection (the server loses
+  its framing and keep-alive); writes that trap when the client has gone (a client leaving is not a
+  bug). Review with the user: whether `Response.events`'s fifteen-second keep-alive default suits.
+- Proposed (built on branch `http-stream`): **Typed parameters through a `FromParam` trait of
+  static methods**, `paramAs[T]`, `queryAs[T]` (with a default overload) and `queryOption[T]`
+  answering `Result[_, ParamError]`, `Missing` or `Invalid`; `string`, `int`, `long`, `real` and
+  `bool` implement it. Why: a static `parse` makes a program's own type a parameter type by one
+  `impl`, and a `Result` lets `?` answer the client `400`. Alternatives weighed: separate
+  `queryInt`/`queryLong` methods (closed to a program's own types); trapping on bad input (a client
+  error is not a server bug).
+- Proposed (built on branch `http-stream`): **Handlers that fail answer `Result[Response,
+  ToResponse]`**: `ToResponse` is a trait with `toResponse()`, implemented by `Response` itself and
+  `ParamError`, `fromResult` turns such a function into a `Handler`, and each `Route.get` … `patch`
+  has an overload taking one. Why: `?` then ends a handler with any failure the program's own error
+  types can render, and a plain `Response` handler is untouched. Alternatives weighed: one
+  `Result`-only handler type (every simple handler would wrap in `Ok`); an `Error`-bounded error
+  rendered as `500` (hides the status the program meant). Making the overloads work needed two
+  compiler fixes: a lambda tried against several overloads is compiled only for the one chosen, and
+  an argument checked before the overload was chosen is made `@sendable` where the chosen one's
+  parameter is (tests `overload_lambda_return`, `overload_sendable`, `overload_sendable_capture`).
+- Proposed (built on branch `http-stream`): **Route groups and middleware are plain functions**:
+  `type Handler`, a middleware `(Handler) -> Handler`, `Route.wrap`, `Route.under` and
+  `Route.group(prefix, routes, middleware)` answering a `Vector[Route]`, nesting with the inner
+  middleware inside the outer. A prefix must begin with `/` and not end with one, else it traps.
+  Why: groups flatten into the router's one ordered list, so matching, `405` and `HEAD` stay as they
+  were. Alternatives weighed: a nested router type (two matching rules); a prefix tolerating a
+  trailing `/` (two spellings of one path, and `//` after joining).
+- Proposed (built on branch `http-stream`): **Error pages are an `ErrorPage = @sendable (int) ->
+  Response`**, given to `Router` (its `404` and `405`) and `http.serve` (every status it answers
+  itself), defaulting to `plainError`, the reason phrase as text; the status sent is always the one
+  given, and a `405` keeps its `Allow`. Why: one function covers JSON or HTML pages without a
+  table of statuses. Alternatives weighed: a `Map[int, Response]` (every status listed by hand, and
+  none computed); letting the page change the status (a `404` page answering `200` misleads clients).
+- Proposed (built on branch `http-stream`): **`isStopping()` and `untilStopped(wait)` on a
+  `ServerRequest`, `BodyWriter` and `EventWriter`**, `untilStopped` running `wait` on its own thread
+  through `TcpServer.idle`, so stopping cancels it and the handler gets `None`. Why: a long poll or
+  an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
+  cancellation token passed to every handler (every handler signature changes); leaving shutdown
+  to the write timeout (a quiet stream would hold it for `writeTimeout`).
+
+- Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
+  `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
+  starts threads and waits for them structurally, so a spawning wait group would be a second way to
+  do what `scope` does; what a wait group adds is counting work finished by threads started
+  elsewhere (an executor, an actor, another scope) or by no thread at all. Alternatives weighed:
+  `wg.spawn(body)` starting and counting a thread (duplicates `Scope.spawn`, and an unscoped spawn
+  escapes cancellation); answering a negative count by clamping at zero (hides a double `done`).
+- Proposed (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
+  traps.** `Semaphore(permits, capacity = permits)`; negative permits, a capacity below one or more
+  permits than the capacity trap too. Permits belong to no thread, and waiters are not queued (one
+  arriving as a permit comes back may take it first). Why: an over-release is the same bug as a
+  wait group's double `done`, a permit given back that nobody took, and a trap finds it where it
+  happens; the separate capacity keeps the signalling use (`Semaphore(0, capacity = 1)`) that an
+  "at most the initial permits" rule would forbid. Alternatives weighed: an unbounded count (a
+  silent over-release grows the limit for good); permits owned by the thread that took them (rules
+  out a permit taken by one thread and given back by another, which hand-offs need); a FIFO queue
+  of waiters (a cancelled waiter would have to take its place back, for a fairness the condition's
+  oldest-first wake mostly gives already). Review with the user: trap or ignore an over-release.
+- Proposed (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
+  hold when a cancellation stops their body; a `RwLock`'s write runs to its end; a trap in any of
+  them stops the program.** The share is taken under the library's lock and held in a region in
+  doubt from that moment until it is given back (the runtime's new `lock_release_holding` and
+  `cancel_guarded_held`), so no cancellation can come between taking it and the body. A read body
+  or a permit's body runs at a cancellation point of its own inside that region, so a cancelled scope stops
+  a long download inside `withPermit` at once and the permit goes back, while a trap there, even in
+  an actor, stops the program as one under a lock does, since recovering the actor's turn would
+  leave the share held for ever. A write body is also uncancellable, as a `Mutex`'s body is, since
+  stopping it could leave the value half changed. Why: a semaphore guards no value, and a reader
+  changes nothing, so nothing is left in doubt by stopping them; a writer does change the value.
+  Alternatives weighed: every body uncancellable, as a mutex's (a scope's cancellation would wait
+  for every permit holder's whole body); every body cancellable (a write could leave the value
+  torn); a trap in an actor's body failing only the actor (needs a give-back chain run by the
+  actor's recovery, which the runtime does not have).
+- Proposed (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
+  a write kept waiting before the next writer.** A reader that arrives while a writer waits waits
+  behind it; when a write ends, every reader then waiting is admitted ahead of the writers waiting.
+  Why: writers do not starve under overlapping readers, and readers do not starve under back-to-back
+  writers, with no tuning. Alternatives weighed: pure writer preference (readers starve while
+  writers keep coming); reader preference (writers starve); a strict FIFO of both (serialises
+  readers that could share). Review with the user: a read body is trusted only to read; nothing
+  stops it changing a mutable value other readers share, which races with them (a race is not
+  undefined behaviour in Avin, but the type system does not rule it out here as it does elsewhere).
+  A read-only view of a value would close it and is a language feature, not a library one.
+- Proposed (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
+  cancelled while waiting withdraws.** The last arrival runs the action holding the barrier's lock,
+  so the action is uncancellable and one that waits on its own barrier traps as a lock taken twice
+  does; `wait` answers whether the caller arrived last. A cancelled waiter takes its arrival back
+  (it is not counted for the round), through the runtime's settling condition wait, which answers a
+  cancellation with the lock held again rather than stopping at once. Why: a scope cancelled
+  mid-round leaves the barrier as if the stopped parties had never come, ready for new ones.
+  Alternatives weighed: a cancelled party staying counted (the round could trip with a party
+  missing); "breaking" the barrier for every party (a state each `wait` would have to answer);
+  running the action outside the lock (waiting on its own barrier would then deadlock instead of
+  trapping).
 
 
 ## Proposed
 
+- Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+  take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
+  the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
+  live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
+  was. Alternatives: `-O0` implying `-g` (the usual "debug build"; costs every `-O0` corpus and test
+  build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
+  user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
+
+- Proposed (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+  (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
+  the program's own module prefix left off the readable name; lldb shows the linkage name. The
+  compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
+  `char32_t`). `char` is a UTF-32 code point, `byte` unsigned, `bool` a byte; a reference is a
+  pointer to an opaque structure named by its Avin type. A local a lambda shares (boxed) is not
+  described, nor is a local the compiler made. DWARF version 4. Why: each is the smallest choice that
+  makes `b`, `bt` and `frame variable` work with no lldb plugin. Alternatives: a vendor language code
+  (lldb then treats frames as unknown language), describing objects' fields as DWARF structures
+  (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
+  data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
+
+- Proposed (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+  function's first line lands after the parameters are stored where their variables are read (a
+  lambda's parameter otherwise read a stale slot). A call there still gets the function's own
+  location, which LLVM's verifier asks of every call in a function with debug information.
+  Alternative: placing that code at the function's name, as it was first built: lldb then stopped
+  before the stores and showed the slot's previous value.
+
+- Proposed (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+  cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
+  counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
+  and locations follow lines no function key covers, so cached text would carry stale lines; the
+  lowered code is still reused, and `AVIN_INCREMENTAL=verify` matches a clean build. Alternatives:
+  per-function metadata numbering with a renumbering pass (the text cache would then work under
+  `-g`), or a key over absolute positions (every edit above a function would relower it).
+
+- Proposed (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+  other module-level line, so any line moved anywhere changes every unit's text and recompiles every
+  unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
+  each unit's definitions through the metadata lines and renders only the nodes reached (plus the
+  compile unit and the flags), which also shrinks each unit.
+
+- Proposed (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+  its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
+  build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
+  program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
+  and `avin` (or a user with `atos -o prog.dSYM -l <image> <pc>`) turns it into `file:line` after the
+  process has stopped; a table of function start addresses with their names, emitted as a constant,
+  would let the handler name the function itself, without lines, at any `-g` level. Neither is
+  built: the first needs a runtime change and a symbolizing step, the second a table the emitter does
+  not make yet.
+- **A package's tests import its gated modules; a test module is read only while every module it
+  imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
+  The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
+  that module, and a `tests` file importing it was refused even under `avin test`, which turns every
+  feature on. Now `tests` and the modules under it have no fences: they may import every module of
+  the package and its optional dependencies. A build with a feature off passes over each test module
+  importing a module that is off, and, repeated to the end, each test module importing one passed
+  over; the rest are read and run. The module stays the unit, so a file of `tests` importing a gated
+  module takes all of `tests` with it when that feature is off. *Why*: the spec already says
+  `avin test` has every feature on, so the tests see the whole package; and the package's own
+  `tests` are compiled by `build` and `run` too, so a selection-independent refusal was the only
+  thing keeping a build with features off working; deriving each test module's gate from its imports
+  keeps that guarantee with no annotation to write. *Alternatives*: allowing `tests` to import gated
+  modules only under `avin test` (a build or `avin test --no-default-features` would then fail at
+  the import, so the minimal configuration could not be tested); letting a feature list
+  `tests.server` explicitly (works, but repeats in the manifest what the imports already say);
+  skipping single files rather than modules (finer, but a file of `tests` could then lose a helper
+  another file of it uses, breaking only the build with the feature off). Not covered: a test
+  importing an optional dependency's module directly while that dependency is not taken is reported
+  as an unknown module, since a dependency not taken is not read and its modules are unknown; such a
+  test reaches the dependency through the package's gated module. Review with the user: whether a
+  test module passed over should be named in `avin test`'s output rather than silently absent.
+- **An import refused for its module is one error per import declaration**, not one per name it
+  imports (branch `gated-tests`): `import a.b.{c, d}` refused as gated, as an optional dependency's,
+  or as a standard-library module that does not exist, is reported once, at the first name;
+  two import lines are two errors. *Why*: the error is about the module, which the declaration names
+  once. *Alternatives*: one per module per file (hides the second line's error).
 - Proposed (built on branch `intersection-bounds`): **several bounds on one type parameter are
   joined with `&`, the one spelling, and an intersection is a bound only, never a type.**
   `[T: Ord & Display]` replaces `[T: Ord + Display]` everywhere type parameters are declared
@@ -8276,6 +8470,81 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   offset itself for an empty needle, as before (a result that traps when sliced at).
 
 **Initialization** ([declarations](/spec/declarations/#initialization), branch `init-design`)
+
+
+- Proposed (built on branch `deadlock-dump`): **A deadlock of the whole program is a trap; a partial
+  one is not found** ([diagnostics](/spec/threads/#deadlock)). The main thread checks when it begins
+  a wait with no limit, and again each time a worker finds no lightweight thread running or ready
+  while it waits: the program is deadlocked where no lightweight thread is running or ready, no
+  timer is set, no thread waits on a socket, no thread the program did not start is attached and no
+  `@threaded` callback is held. Every wake goes through one counter, so a check whose count did not
+  move between its first look and its last saw one moment of the program and cannot report a
+  thread that ran meanwhile. The report is `avin: trap: deadlock: all threads are waiting` and a line
+  per thread, the trap's exit status, and the exit hooks run after it as after any trap. Why: it is
+  the case a program can never leave, it costs nothing until `main` waits (one counter increment
+  per wake, one clock read per wait for the dump), and a check made only from `main`'s own wait
+  needs no thread of its own. Alternatives weighed: a monitor that looks periodically (a thread or a
+  tick for every program, and latency); finding cycles of lock holders (catches partial deadlocks,
+  but needs owner tracking on every lock and misses channels and conditions, which have no owner);
+  reporting a held `@threaded` callback or an attached foreign thread as deadlocked too (a C thread
+  may call back at any time, so that would be a false report). Review with the user: whether a
+  partial deadlock, found by cycles among lock holders and joins, is wanted later.
+- Proposed (branch `deadlock-dump`): **What a thread waits on is named by the runtime's own queue**:
+  a lock, a condition, a join, a sleep, a socket; a condition the library makes for a channel's
+  receive or send, a future or an executor's work says so, through the intrinsic
+  `condition_new_kind`, which `Condition`'s constructor reaches with a second parameter the library
+  alone can pass (a `Condition` needs the library's private `Lock`). A channel's own lock is "a
+  lock". Threads are numbered from 1 in the order they started, not by their identity. A pool's
+  idle workers are left out of the deadlock report, whose length would otherwise follow the
+  machine's processors, and listed in the dump. Alternatives weighed: a label set around each wait
+  by the library (a call on every wait); naming waits only by the runtime primitive ("a condition"
+  for every channel and future, which says little).
+- Proposed (branch `deadlock-dump`): **The quit signal writes a thread dump and the program goes
+  on.** A handler in C writes a byte to a pipe; a thread started with the program, with every signal
+  blocked, reads it and writes the dump, since a handler may not take the scheduler's locks. A
+  program that watches the signal hears it instead; one started with it ignored keeps it ignored.
+  Why: the program under inspection keeps running, which is what a dump is for. Alternatives
+  weighed: writing the dump from the handler (not safe there); starting the thread only on first
+  use (a handler cannot start one); ending the program after the dump (loses the program being
+  looked at). Cost: one thread and one pipe for every program.
+- Proposed (branch `deadlock-dump`): **A thread dump names no functions.** A frame of the shadow
+  stack holds its previous frame and its count of slots, nothing naming its function, and walking
+  the native stack would need a table from code addresses to Avin names, which the compiler does
+  not emit (the stack-overflow trap has no place for the same reason). Alternatives weighed: a
+  function's descriptor stored in each frame (a store on every call); emitting an address table
+  and unwinding the native stack (a table per program and an unwinder for each platform). Review
+  with the user: which of the two, if a stack in the dump is wanted.
+- Proposed (branch `deadlock-dump`): **A corpus program's `// stderr: times vary` shows every number
+  before ` ms` in its standard error as `n`**, so a thread dump's durations do not make the test
+  depend on the machine. Alternative: a dump without durations (loses what a dump is for).
+
+- **CPU time is read from the kernel's accounting: `getrusage` and `wait4`** (branch `cpu-time`,
+  [CPU time](/spec/system-library/#cpu-time)). `CpuTime(user: Duration, system: Duration)` with
+  `total` and `Add`; `process.cpuTime()` and `process.childrenCpuTime()` (`RUSAGE_SELF`,
+  `RUSAGE_CHILDREN`) answer it plainly, not in a `Result`, since `getrusage` fails only for a `who`
+  it does not know; `waitPidCpu` / `tryWaitPidCpu` beside `waitPid` / `tryWaitPid`; and
+  `Child.cpuTime()`, a pipeline's stages and a sequence's parts added. Why: a job manager that
+  samples its jobs with `ps` cannot see the CPU of sub-processes that have already exited, and the
+  kernel folds each reaped process's time into its parent's, so a wait that reads it gives a whole
+  tree's. Alternatives weighed: changing `waitPid` to answer the pair (breaks every caller; a
+  return type cannot be overloaded); a `ProcessUsage` record with the other `rusage` counters (peak
+  memory, faults, context switches — memory is in different units per platform, and nothing asks
+  for them yet, so they can join later without breaking `CpuTime`); `Child.cpuTime()` as an
+  `Option` empty before the wait (a running command's reaped parts would then be invisible, and
+  "nothing reaped yet" is already `Zero`). Review with the user: the names `waitPidCpu` /
+  `tryWaitPidCpu`.
+
+- **A started program is reaped by the library with `wait4`, not by its Sysl `Spawned`** (branch
+  `cpu-time`). Sysl's `Spawned.wait` and `try_wait` reap with `waitpid` and drop the usage, so the
+  runtime (`runtime/avin/rt/cpu.sysl`) reaps the program itself and the `Spawned` is then let go of
+  with `detach`. A time limit is kept by the library in consequence, as Sysl kept it: polled with a
+  backoff to 16 ms up to the deadline, then signal 15, a 200 ms grace, signal 9, and a final wait,
+  the status `TimedOut` with the CPU time it used. Why: the alternative that keeps Sysl as the
+  reaper, reading `RUSAGE_CHILDREN` before and after a wait, is wrong whenever two threads reap at
+  once, which a job manager's do. Alternatives weighed: asking Sysl for a `wait` that answers usage
+  (the better home; reported to the sysl session as a gap, and this binding moves to it when it
+  exists); reaping through Sysl and leaving `cpuTime()` empty for commands (no answer to the item).
+  Review with the user: two reapers of one kind in the stack until Sysl grows the call.
 
 - **Initialization is proved at compile time, by order and by withholding `self`** (branch
   `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
@@ -8452,6 +8721,144 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a hidden parameter is allowed, since its instances exist only where the program makes a pack.
   Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
   Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+- Proposed (branch `gadt-1`, the declaration step): **a refined variant's parameters, the type's
+  included, are the variant's own in the expansion check.** An instance reaches them through the
+  result (`Expr[X]` holding a `Pair` has `X = (A, B)`, so `A` and `B` lie one level down), and a type
+  argument of a field that names a hidden parameter adds no edge, since its instances are the packs
+  the program makes, which step 5's check of growing packs counts. A growing cycle through a refined
+  variant names the field and the result it is measured against. Why: it is rule 6 exactly, and it
+  reuses the one polymorphic-recursion check rather than a second one for variants. Alternatives
+  weighed: a separate syntactic comparison of each field with the result (misses growth through a
+  second type, which the flow check already follows).
+- Proposed (branch `gadt-1`): **a variant's own type parameter takes bounds and no variance and no
+  lower bound**, and a name reused from the type's parameters or twice among the variant's own is an
+  error. Why: a variant is a constructor, a generic function, whose parameters take no variance; a
+  lower bound asks of a call's argument something a `match` could not hand back. Alternatives
+  weighed: allowing `>:` (sound at the call, but it gives the arm a one-directional fact, the kind
+  [Variance](/spec/refined-variants/#variance) declines).
+- Proposed (branch `gadt-1`): **a result written as the type at its own parameters, `If(…) ->
+  Expr[T]`, with no parameters of the variant's own, is a plain variant**, the same declaration as
+  one with no result. A data parameter a refined variant's result does not name is hidden there like
+  any other (`IntLit(value: T) -> Expr[int]` hides `T`). Why: the chapter says the type's names are
+  every variant's parameters, and a written-out plain result changes nothing a value carries.
+  Alternative weighed: treating any written result as refined (a type would lose its plain uses for
+  a redundant spelling).
+- Proposed (branch `gadt-1`), **until step 2 makes values: a type with a refined variant is
+  declared and checked, and refused wherever a program names it, makes a value of it or matches one**,
+  its plain variants included, with ``"`Expr` has refined variants: they are declared and checked,
+  but no value of the type can be made, matched or named yet"``; the fields and results of refined
+  variants may name such types. Step 2 removes the refusal. Why: lowering lays out every variant at
+  every instance and would meet a variant's own parameters it cannot substitute, and a value matched
+  without the refinement of step 3 would be read at the wrong types; refusing the type keeps the
+  declaration step sound with no partial path. Alternatives weighed: refusing only refined variants'
+  calls and patterns (a value of a plain variant of the type, or a type pattern on `Any`, would still
+  reach a layout holding them).
+- Proposed (branch `gadt-1`), **for constructor parameters ([higher-kinded
+  types](/spec/generics/#higher-kinded-types)), the conservative reading until a design says more: a
+  variant fixes no constructor parameter of its type, its own type parameters are no constructor
+  parameters, and a result's argument never applies a constructor parameter** (`-> D[F, F[A]]` is
+  refused, since `F[A]` against a known instance cannot be taken apart where `F` is itself a
+  parameter of the code matching). The declaration step enforces the last two through one rule: a
+  result's arguments are built of data types, classes, tuples, function types and the variant's
+  parameters, and any other form, a constructor or its application among them, is refused with
+  ``"`F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are
+  built of data types, classes, tuples and function types"``; a constructor parameter among a
+  variant's own (`V[G[_]]`) is to be refused where the two branches meet, since this branch has no
+  holes to read. Fields name constructor applications freely, as any variant's do. Why: refinement
+  solves equalities by decomposition, which needs every parameter under a constructor that the
+  instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
+  X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
+  among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
+
+- Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
+  **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
+  (1) *Where it parses*: a group, a tuple's part or a call's argument (a named one's value
+  included), never a bare `value: T` elsewhere. WHY: inside parentheses `:` has no other meaning
+  (named arguments use `=`, a map literal's `:` is inside braces, a field's or parameter's type is
+  in a declaration), so the grammar stays unambiguous with no new token; at a statement's level
+  `x: T` would read as half of a declaration. ALTERNATIVES: bare `value: T` anywhere (collides with
+  `val x: T`, clause signatures and a match arm's type pattern `n: int -> …`); a keyword
+  (`value as T`, a word read as a conversion, which this is not); parentheses only for a group, not
+  for arguments (`f((None: Option[string]))` doubles every bracket).
+  (2) *What it accepts*: exactly what `val x: T = value` accepts — literals taking `T`, `None`,
+  empty collections and lambdas typed by `T`, a subtype's value, a union's member — and the
+  expression is of type `T`. WHY: one rule a reader already knows, and no conversion hides in a
+  form that looks like a type. ALTERNATIVES: also converting numbers (`(n: long)` of an `int`),
+  which is the implicit widening the spec refuses; accepting narrowing as a checked downcast, which
+  is a `match`'s job.
+  (3) *The refusal* says what to write: `long(n)` for a numeric conversion, `BigInt(k)` /
+  `T.fromInteger(k)` for an integer variable to a type that takes integers, the explicit
+  `BigDecimal.fromReal…` for a `real`, and `is`/`match` for a narrowing.
+  (4) *Ambiguities settled*: `(n: long) -> …` stays a lambda; `x: int -> body` whose rest is not
+  type-shaped keeps its hint "a lambda's parameter with a type is written in parentheses", while
+  `(f: int -> int)` is an ascription to a function type; at the start of a block's line
+  `name(x: T)` followed by `=`, `->`, an indented block or a clause line still declares a local
+  function, and a clause signature now needs its next line to be a clause (followed by `=`, `|` or
+  guards), so two `show(n: long)` calls on consecutive lines are calls; a parameter counts as typed
+  only when a name precedes its `:`, so `show(1: long)` is never a declaration.
+  (5) `(_: T)` in a placeholder lambda is a parameter of type `T`. WHY: it is the one place a
+  placeholder's type can be written. ALTERNATIVES: leaving `_` untyped inside an ascription (the
+  ascription would still constrain it, but a mismatch would read as the ascription's error rather
+  than the parameter's). Review with the user: (1)'s rule that a statement-level `retry(n: long)`
+  followed by an indented block is a declaration (write `retry((n: long))` to call it).
+
+**Actor patterns** ([actors](/spec/actors/#routers), branch `actor-patterns`)
+
+- Proposed 2026-11-13 (branch `actor-patterns`): **Routers are `Router.pool(size, behaviour,
+  routing, onFailure, executor)`, giving back a plain `ActorRef[M]`.** The router is an actor of its
+  own, the routees its children, so the lifecycle and supervision of actors cover it with nothing
+  new: `stop(router)` ends the routees first, a routee's `onFailure` is the router's argument, a
+  routee that ends leaves the pool and the router stops with the last one, and a routee's
+  escalation fails the router, which always escalates (the router's own supervision is not a
+  parameter). The routings are the `data Routing[M]`: `RoundRobin` (the default), `AtRandom`,
+  `SmallestMailbox`, `ByKey(key: @sendable (M) -> long)`. *Why*: one reference that accepts the
+  routees' own messages is what a caller wants, and asks through it work unchanged; a hop through
+  the router keeps one sender's order per routee and keeps the pool's state in one actor's turns,
+  with no lock. *Alternatives*: a reference whose `tell` picks a routee in the sender's thread (no
+  hop, but the pool's changing membership shared between threads); a `Router[M]` object with its
+  own `stop` (a second lifecycle beside the actor's); a supervision parameter for the router itself
+  (rarely wanted: it holds no state worth restarting). `Random` was not taken as a variant name since
+  `avin.random.Random` is a common import; `Router` shares its name with `avin.net.http.Router`, in
+  a different module. **Review with the user:** the names (`AtRandom`, `ByKey`) and the router's
+  fixed `Escalate`.
+- Proposed 2026-11-13 (branch `actor-patterns`): **`SmallestMailbox` counts the messages waiting,
+  and `ByKey` hashes by highest weight.** A routee's mailbox alone keeps a count (an atomic add on
+  each send and take; other actors' mailboxes pay nothing), the message being handled not counted,
+  ties going to the next in turn. `ByKey` weighs each routee against the key by mixing the key with
+  the routee's number and takes the heaviest, so a key keeps its routee while it lives and a routee
+  that ends moves only its own keys. *Why*: the count is exact and cheap where it is needed; the
+  weighting needs no ring and stays consistent as the pool shrinks. *Alternatives*: counting every
+  mailbox (a cost to every actor); counting a message until its handling ends (a second atomic per
+  message); the key modulo the pool's size (every key moves when one routee leaves); a hash ring
+  (more state for pools that are small).
+- Proposed 2026-11-13 (branch `actor-patterns`): **A message a router finds refused goes to another
+  routee.** A routee that has begun to end refuses a message, and the router chooses again among the
+  rest, before it has heard of the end; a message a routee accepted and then dropped as it stopped
+  is lost, as with any actor that stops. *Why*: the window between a routee ending and the router
+  hearing of it would otherwise lose messages for no reason. *Alternative*: dropping them.
+- Proposed 2026-11-13 (branch `actor-patterns`): **A `Stash` is a bounded object of the actor's state,
+  `Stash(self, capacity)`, and adding to a full one traps.** `unstashAll` puts its messages in front of
+  every message waiting, in the order added, in a queue the actor's turn reads before its mailbox, so
+  a restart keeps them as it keeps the mailbox, while what is still stashed is lost with the state.
+  *Why*: the actor's own state is where an actor's choices live, and a stash made from the actor's
+  own reference cannot be given another actor's messages; a full stash means the actor's design did
+  not foresee the load, which is a bug for supervision to handle, and an actor that wants another
+  policy checks `isFull` first. *Alternatives* for overflow: dropping the newest or the oldest
+  silently (a lost question looks like a timeout with no report), `add` answering a `bool` (easily
+  ignored); for the shape: `stash(message)` and `unstashAll()` on `ActorContext` with a capacity
+  given to `spawn` (state outside the actor's fields, and a parameter every actor carries);
+  unstashed messages put at the back of the mailbox (behind messages that arrived later, losing
+  order). **Review with the user:** trapping on overflow.
+- Proposed 2026-11-13 (branch `actor-patterns`): **A `Topic[E]` is a sendable object, not an actor.**
+  `publish` tells each subscriber in the publisher's own thread, so one publisher's events reach
+  each subscriber in order with no hop; subscriptions live in one atomic value; a subscriber's end
+  is watched through its `ended()` future from its first subscription, which drops it. An actor is
+  subscribed once, by its number, the later reference (an adapter, say) replacing the earlier in
+  its place. *Why*: any thread may publish, nothing needs stopping, and no actor's mailbox sits
+  between publisher and subscriber. *Alternatives*: a topic actor that subscribers and publishers
+  message, watching subscribers with `watch` (an extra hop per event, a lifecycle to manage, and a
+  count that is only known by asking); topics named in a global registry (shared mutable state by
+  name).
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 
@@ -8611,6 +9018,131 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **Functions and methods may still be named so** (`cli`'s `int(name)` and `string(name)`
     options): a function is called, never matched, so no pattern can mean it. A missing-member
     witness still reads `_: string`, which is the same pattern.
+- Proposed: **a marked parameter survives a function becoming a value only through its type**
+  (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
+  `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
+  type, which for a function is a `@sendable` function type; with no function type expected, the
+  value takes that form of each marked function parameter (`val sp = spawn[int]` is a
+  `(@sendable () -> int, long) -> Thread[int]`). A type that is a function (a class naming it, or an
+  impl of it for a data type) has an `apply` that marks a parameter only where its function type
+  makes that parameter sendable, and a `@sendable` parameter matches a `@sendable` function type's.
+  Why: function types carry no parameter marks, so `val sp: (() -> unit, long) -> Thread[unit] =
+  spawn` ran a buffer-capturing closure on four threads, and `Isolated`/`Mutex` as values kept an
+  object the caller still used. Alternatives: marks in function types (`(@sendable f: () -> unit) ->
+  unit`; a second way to say what `@sendable () -> unit` says for functions, and for a non-function
+  `@isolating` value a new kind of type); refusing every such function as a value, as a `@threaded`
+  one is (also sound, but `spawn` and `onExit` could never be held or passed). A by-name marked
+  parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
+  function parameter takes the `@sendable` form, which asks a little more than the mark (no
+  captured `var`). Method values keep their own wording, from the call inside the closure they are.
+- Proposed: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+  `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
+  an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
+  "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
+  at the comma the same way. A comma after an arm when the next line at the arms' depth reads as
+  another arm (it starts with `else` or holds an `->` outside brackets) is reported as a tuple that
+  needs parentheses. Why: the indented arms were read as lines of a block, so the last arm's body
+  swallowed the following arguments as a tuple, a type error far from the cause; a `return` value,
+  a lambda's and a one-line `if`'s bodies already stop at the comma. Alternatives: keep the arms a
+  line context (the spec's "an indented block starts a line again"), which makes `_ -> 0, "a")` a
+  tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
+  line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
+  lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
+  writes. An indented arm body stays a block, where a comma list is a tuple.
+
+**Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
+
+- Proposed: **a type with a constructor parameter derives nothing through a template, and has no
+  automatic `Display` or `Debug`**: `derives Eq` on a class, `Hash`, `Ord` or a library trait is
+  refused with the parameter named, and a value is shown by its type, as a value of no `Display`
+  is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
+  type's parameters by the trait, a bound for types that no constructor parameter takes, and what
+  displays an `F[A]` is unknown where `F` is any constructor. Reviewed once step 2 landed (branch
+  `hkt-2`) and kept: a hole's bounds (`F[_: Eq]`) say what `F` is applied to, never what an
+  `F[A]` meets, so they give a derivation nothing to call. Alternatives: deriving through a bounded
+  hole (unsound for the reason above: `F[_: Eq]` admits a constructor whose values have no `Eq`
+  of their own beyond identity); requiring `F[A]: Display` per field (a constraint on
+  applications, which impls over constructor parameters, step 6, are the place for). Review with
+  the user once step 6 lands.
+- Proposed: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
+  is written the same way everywhere else, and a contravariant hole is the dual demand
+  (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
+- Proposed: **a type whose parameter is bounded is a constructor only for a hole whose bounds imply
+  that bound** (step 2, branch `hkt-2`, replacing step 1's refusal of every such type at any hole):
+  a hole's bound implies a parameter's where it is the same trait or class, or one that is an
+  instance of it (a trait requiring it, a subclass), as `Ord` implies `Eq`; `Eq` and `Hash` need
+  no hole bound, since every Avin type has them (which is what lets `Map[_, V]` and `Set` be
+  constructors for a plain `_`); a parameter's bound that names the parameter itself is implied by
+  no hole bound. A constructor parameter passed for another is held the same way by its own holes'
+  bounds. The check is made where the type arguments are held to their bounds, so a constructor
+  written and one inferred are refused alike, with one message. Why: an `F[_]` may be applied to
+  any type, so a constructor with a bounded parameter could otherwise be instantiated at a type its
+  bound refuses; implication is the least the hole must promise. Alternatives: checking each
+  application at instantiation (an instance could then fail, against the design); entailment
+  through impls with bounds of their own (no case needs it yet).
+- Proposed: **every `F[X]` a declaration writes is held to the bounds of `F`'s holes where it is
+  written**, once per application, with the message "`X` does not conform to `B`, the bound of
+  `F`'s argument in `F[_: B]`": a signature naming `F[A]` twice for an `A` without the bound reports
+  both. Why: the spec's rule is "checked wherever the declaration writes `F[X]`"; each place is a
+  separate mistake to fix. Alternatives: one report per declaration (hides the second place).
+- Proposed: **a hole's variance is what makes `F[A]` variant** (step 2, replacing step 1's
+  invariance of every applied argument): inside the declaration an argument of `F[A]` is at the
+  position its hole gives it, kept at `+_`, flipped at `-_`, invariant at `_`, so `+A` in a field
+  `F[A]` is accepted for `F[+_]` and refused for `F[_]`; `F[Dog]` is an `F[Animal]` only at `+_`
+  (and `F[Animal]` an `F[Dog]` at `-_`), where the arguments are references, as for any type. At
+  each constructor passed, written or inferred, the type's parameter at a `+_` hole must be
+  covariant and at a `-_` hole contravariant; a constructor parameter passed must declare that
+  variance on its own hole. Why: the subtyping assumed inside the declaration is then exactly what
+  each instance grants. Alternatives: none sound that keep `F[+_]` useful.
+- Proposed: **a constructor parameter has no `Nothing` default**: one that is neither written nor
+  inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
+  Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
+  of `Nothing` (meaningless as a constructor).
+- Proposed: **with overloads, the first candidate's type parameters decide which written argument
+  is resolved as a constructor**, before a candidate is chosen. Why: written type arguments are
+  resolved once, before overload resolution, and overloads differing in the kinds of their type
+  parameters are rare; resolving per candidate would need resolution repeated per overload.
+  Alternatives: resolving the arguments once per candidate (correct for mixed kinds, more work in
+  the hottest path); refusing overloads whose type parameters differ in kind. Review with the user
+  if overloads of mixed kinds turn up.
+- Proposed: **`_` alone as a written argument at a call is read as a hole**, so that the checker
+  says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
+  instead of `unknown type`.
+
+- Proposed: **a `for` loop admits its source by conformance to `Iterable`** (branch
+  `nominal-for-in`): besides a range written in place, a `Range` and an array, the source's type
+  conforms to `Iterable` at some element type through its class's or data type's parents and impls,
+  a type parameter's bounds, a built-in type's impls, or, for a union, every member's. A type with
+  an `iterator()` method and no conformance is refused, the error naming the type and the impl to
+  declare; `Option` and `Either`, which have `iterator()` but are not `Iterable`s, are refused too,
+  an option pointed at `toList`. Why: the user's rule that Avin is nominal, and collections.md
+  already said a class is iterable by conforming; the structural check admitted any type with a
+  method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
+  anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
+  conforms, and the loop's `iterator()` call is answered by every member).
+
+**Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
+2, branch `hkt-2`)
+
+- Proposed: **an unbounded constructor parameter is inferred from the type an argument or the
+  expected type gives `F[X]`, named bare**: a data type, class or trait with exactly as many type
+  parameters as `F` has holes, a subclass by its own name (`Crate[A]` passed as `F[A]` is `Crate`,
+  not its superclass), or another constructor parameter in scope applied to as many arguments.
+  Once `F` is known, the rest of the argument is held to the type it makes with that type's own
+  variance, so a covariant argument still widens (`both(Some(dog), Some(cat))` for
+  `both[F[_], A](x: F[A], y: F[A])` takes `A` as `Animal`, since `Option` is covariant). A type
+  of more parameters, of fewer, a type whose parameter takes a constructor, or one that is no
+  data type, class or trait decides nothing and is reported as "cannot infer `F` from `T`: …;
+  write it, as in `f[…](arguments)`", the example leaving open the arguments that match the
+  application's own known ones (`Either[string, _]` for an `F[int]` given an
+  `Either[string, int]`), else the first ones. Why: the spec's rule ("a type of more is an error
+  asking for `F` to be written"); the example is the likeliest constructor meant. Alternatives:
+  always leaving the first arguments open in the example (wrong for `Either[string, int]`);
+  holding the arguments invariantly once `F` is decided (refuses calls every instance accepts).
+- Proposed: **a function's or method's type arguments taken as a value (`k.pick[Dog]`) are held
+  to their bounds, as at a call** (a fix found in step 2: a method value checked no bound at all,
+  so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
+  it may not fill among them).
 
 ## Open
 

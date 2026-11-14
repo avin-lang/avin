@@ -477,7 +477,8 @@ tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from i
 Where a value fills the rest of a line, a tuple needs no parentheses: after `=` in a function, clause
 or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
 last. Inside brackets and in the body of a one-line `if` or `while`, a comma separates other things,
-so a tuple there is parenthesized.
+so a tuple there is parenthesized, a `match` arm's one-line body inside brackets
+[included](/spec/operators-and-control-flow/#match).
 
 ```text
 divmod(a: int, b: int) -> (int, int) = a / b, a % b
@@ -772,6 +773,53 @@ chapter, [union types](/spec/unions/).
 describe(x: int | string) -> string = x match
   n: int -> s"number $n"
   s: string -> s"text $s"
+```
+
+## Type ascription
+
+`(value: T)` gives a value the type `T` where it is written, with no conversion and no `val` to
+hold it. It is checked exactly as the value of `val x: T = value` is, and the expression is of type
+`T`:
+
+- **A literal takes `T`**: `(3_000_000_000: long)`, `(255: byte)`, `(2.5: real)`, `(1: real)`, and
+  any integer literal of any size for a type that
+  [takes integers](#integers-meet-a-type-that-takes-them) (`(123456789012345678901234567890:
+  BigInt)`, `(7: Cents)`) and any decimal literal for one that
+  [takes decimals](#decimals-meet-a-type-that-takes-them) (`(0.1: BigDecimal)`). In an operation
+  the ascribed operand decides the other's type: `(1: long) + 2147483647` is a `long`.
+- **A value whose type its context decides is decided by `T`**: `(None: Option[string])`,
+  `([]: List[int])`, `({}: Map[string, int])`, `(Ok(3): Result[int, string])`, and a lambda,
+  `((x -> x * 2): int -> int)`, whose parameters take `T`'s.
+- **A value of a subtype stands as one of `T`**: `(dog: Animal)`, `(Square(3): Shape)`,
+  `([1, 2]: Iterable[int])`, `(Some(dog): Option[Animal])`, and a member of a union as the union,
+  `(n: int | string)` ([union types](/spec/unions/)). `(x: Any)` is the value as an `Any`.
+- **Nothing else is accepted.** An ascription never narrows (`(animal: Dog)`, `(u: int)` of an
+  `int | string`: test the value with `is` or `match`) and never converts: `(n: long)` of an `int`
+  `n` is an error that says to write `long(n)`, `(k: BigInt)` of an integer variable says
+  `BigInt(k)`, a `real` is no `BigDecimal`, and a value of an unrelated type is refused. A literal
+  that does not fit is refused as it is in a declaration: `(300: byte)`.
+
+It is written as an item of a parenthesized list, so the `:` never meets another meaning: a group,
+`(n: long)`; a tuple's part, `(1: long, "a")`; a call's argument, `f(None: Option[string], x)`, the
+value of a named one included, `f(k = 1: long)`. The value before `:` is a whole expression and the
+type after it a whole type, a function type included: `(a + b: long)`, `(f: int -> int)`. A
+parenthesized list followed by `->` is a lambda's parameters, `(n: long) -> n`. A name followed by
+`: int -> body` whose rest is no type is a lambda whose typed parameter lacks its parentheses, and
+is reported so. At the start of a block's line, `name(x: T)` followed by `=`, `->`, an indented
+block or a line of clauses declares a local function, as it always has; a call there with a name
+ascribed is written with the ascription grouped, `retry((n: long))`, and a call followed by nothing
+is a call, so `show(n: long)` on two lines calls `show` twice.
+
+In a [placeholder lambda](#placeholder-lambdas), `(_: T)` is a parameter of type `T`:
+`twice((_: long) * 3, 1)` passes `(x: long) -> x * 3`.
+
+```text
+val big = (123456789012345678901234567890: BigInt) * 2
+val none = (None: Option[string])
+println(total(([1, 2, 3]: Iterable[int])))
+println(describe((7: int | string)))
+val n = 3
+val m = (n: long)        // error: an ascription converts nothing; write `long(n)`
 ```
 
 ## Reference types and value types

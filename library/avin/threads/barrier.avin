@@ -1,0 +1,59 @@
+module avin.threads
+
+// A meeting point for a fixed number of threads: each that calls `wait` sleeps until `parties` of them
+// have, then all go on together, and the barrier is ready for the next round. Before they go on, the
+// last to arrive runs `action`, once a round, with every other party still waiting:
+//
+//     val step = Barrier(workers, () -> grid.swap())
+//     for w in 0 ..< workers
+//       s.spawn(() ->
+//         for _ in 0 ..< steps
+//           compute(w)
+//           step.wait())
+//
+// `wait` answers `true` to the one thread that arrived last, which ran the action, and `false` to the
+// others. Every party's work before its `wait` happens before the action, and the action happens before
+// every `wait` of that round returns. The action runs to its end once begun, a cancellation of its
+// thread stopping it only after; an action that waits on its own barrier traps, since it would wait for
+// ever. A party whose thread is cancelled while it waits takes its arrival back, so the round goes on
+// waiting for as many parties as before. A barrier is sendable.
+@keeps_owners
+class Barrier(val parties: int, @sendable private val action: () -> unit = () -> ()): Sendable
+  private val count = partiesOf(parties)
+  private val lock = Lock()
+  private val tripped = conditionNew()
+  // The parties waiting in this round, and the rounds that have ended.
+  private var arrived = 0
+  private var rounds: long = 0
+
+  // Sleeps until every party of this round has arrived; the last to arrive runs the action and wakes
+  // the others. Answers whether the calling thread arrived last.
+  wait() -> bool
+    lock.acquire()
+    val round = rounds
+    arrived += 1
+    if arrived == count
+      action()
+      arrived = 0
+      rounds += 1
+      conditionNotifyAll(tripped)
+      lock.release()
+      return true
+    while rounds == round
+      if lock.awaitSettling(tripped, -1) == waitCancelled
+        if rounds == round then arrived -= 1
+        lock.releaseCancelled()
+    lock.release()
+    false
+
+  // How many parties are waiting in this round now, which other threads may change at once.
+  waiting() -> int
+    lock.acquire()
+    val n = arrived
+    lock.release()
+    n
+
+// A barrier's parties, at least one.
+private partiesOf(parties: int) -> int
+  if parties < 1 then fail("a barrier has at least one party")
+  parties

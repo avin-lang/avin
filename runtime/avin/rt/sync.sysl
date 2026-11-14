@@ -45,7 +45,7 @@ struct Holding
 lock_new(ctx: *Context) -> *u8
     val p = allocate(ctx, &lock_descriptor)
     val l: *ParkLock = ptr_cast(p)
-    *l = ParkLock(new_wait_queue(), false)
+    *l = ParkLock(new_wait_queue_for(WaitsOnLock), false)
     published(p)
 
 /** Takes the lock `p`, waiting, safe for the collector, while another thread holds it. */
@@ -76,6 +76,14 @@ lock_release(ctx: *Context, p: *u8)
     leave_doubt(ctx)
     let_lock_go(p)
 
+/** Lets the lock `p` go, which the calling thread holds, staying in the region in doubt taking it
+ * entered: for a thread that took, under the lock, a share of what it guards (a read-write lock's
+ * share, a semaphore's permit), and holds that share until `cancel_guarded_held` gives it back and
+ * leaves the region. Nothing can stop the thread between the two. */
+@export("avin_rt_lock_release_holding")
+lock_release_holding(ctx: *Context, p: *u8)
+    let_lock_go(p)
+
 // Lets the lock `p` go: to the oldest thread waiting for it, which then holds it, or free.
 private let_lock_go(p: *u8)
     val l: *ParkLock = ptr_cast(p)
@@ -85,10 +93,18 @@ private let_lock_go(p: *u8)
 
 /** A new condition, with no thread waiting on it. */
 @export("avin_rt_condition_new")
-condition_new(ctx: *Context) -> *u8
+condition_new(ctx: *Context) -> *u8 = condition_made(ctx, WaitsOnCondition)
+
+/** A new condition, with no thread waiting on it, which a thread waiting on it waits on as `kind`: a
+ * channel's receive (6) or send (7), a future (8), an executor's work (9), or a plain condition (any
+ * other), as the thread dump and the deadlock report name it. */
+@export("avin_rt_condition_new_kind")
+condition_new_kind(ctx: *Context, kind: i32) -> *u8 = condition_made(ctx, condition_kind(kind))
+
+private condition_made(ctx: *Context, kind: u32) -> *u8
     val p = allocate(ctx, &condition_descriptor)
     val c: *ParkCondition = ptr_cast(p)
-    *c = ParkCondition(new_wait_queue())
+    *c = ParkCondition(new_wait_queue_for(kind))
     published(p)
 
 /** Lets the lock `lock` go, which the calling thread holds, waits until the condition `p` is notified,
@@ -120,6 +136,29 @@ condition_wait_for_cancellable(ctx: *Context, p: *u8, lock: *u8, millis: long) -
     val ended = wait_notified(ctx, p, lock, deadline_after(millis), may_cancel(ctx, 1))
     if ended == WaitCancelled then unwind_cancelled(ctx)
     ended == WaitWoken
+
+/** How `condition_wait_settling` answers: notified (or woken with nothing changed), out of time, or
+ * cancelled. */
+const WaitEndedWoken: i32 = 0
+const WaitEndedTimedOut: i32 = 1
+const WaitEndedCancelled: i32 = 2
+
+/** A cancellable wait on the condition `p` for a waiter that has state of its own to put right before
+ * its thread stops: where the thread's cancellation ends the wait, it takes the lock again and answers
+ * `WaitEndedCancelled` instead of stopping, and the caller puts its state right, lets the lock go and
+ * reaches a cancellation point, which stops it. Otherwise it waits as `condition_wait_for_cancellable`
+ * does, for at most `millis` milliseconds, or with no limit where `millis` is negative; a limit of zero
+ * answers `WaitEndedTimedOut` at once, holding the lock throughout. The lock is held when it answers,
+ * however the wait ended. */
+@export("avin_rt_condition_wait_settling")
+condition_wait_settling(ctx: *Context, p: *u8, lock: *u8, millis: long) -> i32
+    if millis == 0 then return WaitEndedTimedOut
+    val deadline = if millis < 0 then 0 else deadline_after(millis)
+    val ended = wait_notified(ctx, p, lock, deadline, may_cancel(ctx, 1))
+    if ended == WaitCancelled
+        take_lock(ctx, lock)
+        return WaitEndedCancelled
+    if ended == WaitWoken then WaitEndedWoken else WaitEndedTimedOut
 
 // Waits on the condition `p` with the lock `lock` let go, until notified or, where `deadline` is
 // positive, until then; takes the lock again and answers how the wait ended. Where `cancellable`, the
