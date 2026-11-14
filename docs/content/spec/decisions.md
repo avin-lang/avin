@@ -968,9 +968,10 @@ Settled by the user on 2026-11-04:
   `await` inside a body is allowed. The pool is a module's `lazy val`, so a program that makes no
   future never makes it.
 - [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
-  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  (each instance its own), and in blocks (each declaration's run its own, see the entry for branch
+  `lazy-local`), is computed on its first read, exactly once, and kept; never read, never
   computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
-  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
   reads; an initializer that needs its own value, directly or through other lazy values, traps at
   that read, naming the value. A field's initializer may use every field and method; the class
@@ -1875,7 +1876,9 @@ their words are reserved.
   - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
     trait's header, or in an impl for a data type. The promise is checked against the structure,
     outside the standard library, and an `open` or `abstract` class that promises it is sendable,
-    each subclass being checked. The standard library's promises are taken as made, since they are
+    each subclass being checked. (Replaced by the Proposed `@trusted_sendable` entry, branch
+    `fix-core-promises`: the library's promises are checked too, but for the classes it marks.)
+    The standard library's promises are taken as made, since they are
     for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
     sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
     and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
@@ -7862,7 +7865,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
   then fetches again over the network); a lock around a program's cache (the content-addressed,
   rename-published entries need none). Review with the user: whether a cache of a deleted project
-  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+  should ever be trimmed on its own (answered by the cache's limit: least recently used first, see
+  the Proposed entries of branch `cache-trim`).
 
 - Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
   tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
@@ -8283,6 +8287,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
   cancellation token passed to every handler (every handler signature changes); leaving shutdown
   to the write timeout (a quiet stream would hold it for `writeTimeout`).
+- Proposed (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
+  cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
+  state word and the closure computing it, so a read is that cell's lazy field read: once on the
+  first read, under the same protocol as a field's between threads, with the same trap for a read
+  made while it is being computed. The choices the request left open:
+  - *Closures share it.* A closure capturing the name captures the cell, so a first read inside
+    the closure computes it for the enclosing scope too, and the reverse; it outlives its block. A
+    declaration in a loop body makes a new cell on every pass. *Alternatives*: copying the value
+    into the closure at capture (would force it where the closure is made, defeating the point);
+    one cell per declaration site (wrong for loops and recursion).
+  - *The initializer sees the locals as they are at the first read*, a captured `var` included,
+    since it is a lambda run then; fields see their object at the first read in the same way.
+    *Alternative*: snapshotting the locals at the declaration (would need a copy of every captured
+    `var`, and differs from what a lambda written in the same place does).
+  - *Across threads, sendable where its type is and its initializer would be.* A `@sendable`
+    closure (a thread's body, a future's) may capture a local `lazy val` only where the value's
+    type is sendable and every local and parameter the initializer captures passes the rules that
+    closure is held to, a `var` refused, through each lazy value the initializer reads in turn; what
+    the initializer reaches is held to the module-level state rule too. *Why*: the initializer may
+    run on whichever thread reads first, so it is code the closure carries; a field's initializer
+    captures only its object, which the object's own sendability covers. *Alternatives*: refusing
+    every capture of a lazy local by a `@sendable` closure (simpler, but refuses the plain case of
+    a sendable value computed from sendable `val`s); checking the value's type alone (unsound: an
+    initializer capturing a `Buffer` or a `var` would run on another thread).
+  - *A self-read follows the other lazy values*: today it traps at run time, ``avin: trap: `x` is
+    read while it is being initialized``, as a field's and a module-level value's do, and a lazy
+    list may refer to itself through its cells. The sound-initialization design (`### lazy val` in
+    declarations) makes a read the initializer's own code reaches a compile error; a local is held
+    to it in the same way when that is built, and its run tests `lazy_local_self_direct` (a direct
+    read, which becomes a reject test) and `lazy_local_self` (a read through a closure the
+    initializer calls, which stays a trap) say which side each falls on. A trap in the initializer
+    stops the program as any trap does.
+  - *The type must be known where it is declared*: an initializer whose type is not settled there
+    (one reading only its own value) is refused with "cannot infer the type of `x`", as a field's
+    is, rather than settled by later uses as a plain `val`'s may be. An initializer that never
+    finishes gives the type `Nothing`. A mismatch with a declared type is reported as "the
+    initializer of `x` yields …".
+  - *One name per declaration*: `lazy val (a, b) = …` and `lazy val a, b = …` are refused ("take
+    the value apart where it is read"), as is a `lazy val` without an initializer; an assignment, a
+    compound assignment and a step are refused as for a module-level `lazy val`.
+  - *Cost*: a declaration allocates the cell and the initializer's closure, both kept until the cell
+    is unreachable. *Alternative weighed*: storing the value, state and closure in boxed locals
+    without an object (saves one allocation but needs a layout of its own in the lowering and a
+    separate sendability rule); clearing the closure after the first read (frees its captures early,
+    but fields keep theirs, and a race-free clear needs another store on the hot path).
+  Review with the user: the cross-thread rule (the more permissive of the two sound choices).
 
 - Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
   `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
@@ -9090,6 +9140,101 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
+  against the structure, except where `@trusted_sendable("why")` marks a class**
+  ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
+  standard library's promises are taken as made", under which `Map.withDefault(f)` answered a
+  sendable map holding a plain function and a thread raced on what it captured. The mark is a
+  class annotation (it trusts the class whether its header or an impl makes the promise), takes one
+  non-empty string saying why the class is safe, is refused outside the standard library, and is
+  an error on a class that promises nothing. Seventeen classes carry it: `Lock`, `Condition`,
+  `Mutex`, `Atomic`, `Channel`, `Thread`, and the futures' `Cell`, `Pool` and `Registry`
+  (synchronization the runtime does); the running `Actor` (its turns are serial) and `Isolated`
+  (an atomic state arbitrates its objects); `TcpStream`, `TcpListener`, `UnixStream`,
+  `UnixListener`, `TlsStream` and `Child` (one owner at a time, checked by every operation).
+  `Future`, `Promise`, `Executor` and `Once` became sendable by their structure, `Cell` gained an
+  `impl[T: Sendable] Sendable` and `Lock` a `: Sendable` for it. Why: the trust is greppable and
+  each entry says its reason; trusting the innermost synchronized class rather than each composite
+  keeps the list short and checks the rest. Alternatives weighed: a list of names in the compiler
+  (invisible at the type, drifts from the library); trusting every class of `avin.threads` (too
+  wide: it hid nothing here, but would hide the next `DefaultMap`); marking the composites
+  (`Future`, `Promise`) instead of `Cell` (more entries, fewer types checked).
+- Proposed (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
+  `DefaultMap` holds its default as a private `MapDefault` data value, `Fixed(v)` or
+  `Computed(f)`, so `withDefaultValue(v)` takes any value and the wrapper is sendable wherever the
+  map and `v` are. Why: `Map` promises `Sendable` and every map is one, so the default must be
+  sendable for the wrapper to keep the promise; most defaults (`k -> 0`, `k -> k.length`) capture
+  nothing mutable and are unchanged. Alternatives weighed: `Map` not promising `Sendable` (every
+  immutable map would stop being sendable); `DefaultMap` alone not being a `Map` (breaks
+  `val m: Map[K, V] = ….withDefault(f)`); keeping a plain function and making the wrapper not
+  sendable (a trait's implementers cannot opt out). Review with the user: a default that mutated a
+  captured local (a call counter) now uses an `Atomic`.
+- Proposed (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
+  through a token handle as `Child` does, so a stream handed to another thread traps its previous
+  owner at a read served from the bytes read ahead; before, only a read that reached the socket
+  checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
+  sound.
+
+- Proposed (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
+  used first, with no index**: an entry is a program's build directory (`build/`, `test-builds/`) or
+  one object or archive (`units/`, `runtime/`, `shims/`, `cunit/`), and its modification time is its
+  last use, touched by every build that takes it from the cache (a program's directory when its
+  build starts and before each test `avin test` runs). Every command that builds sweeps the cache at
+  most once in ten minutes, a stamp file in the cache shared by every process, and evicts the
+  oldest entries until the cache is within `AVIN_CACHE_LIMIT` (a size with `K`/`M`/`G`/`T`, `off`
+  for none, default 5G; a value that is neither is an error from every command). Why: builds run in
+  many worktrees and sessions at once, so a shared index would need a lock Sysl's library does not
+  offer, while a touch is one system call and the existing unit-object trim already worked by
+  modification time. Alternatives: an index file of use times (a lock, and a writer killed halfway
+  through it); access times (`noatime` mounts, and macOS updates them lazily); a sweep after every
+  build (the size walk on every build); an hourly sweep (24G had grown within hours). Review with
+  the user: the 5G default and the ten-minute interval.
+- Proposed (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
+  aside, looked at again and put back if a build touched it in between**, before it is removed.
+  Why: no build reading or writing an entry loses it, without a lock; a cache whose fresh entries
+  alone pass the limit stays past it until they age. Alternatives: lease files naming the process
+  (Sysl's library has no way to ask whether a process is alive); `flock` (not in Sysl's library);
+  no grace (a sweep could take the executable `avin test` starts once per test). A shim archive and
+  the record of the libraries it needs beside it are one entry, the archive evicted first and a
+  record newer than the sweep's choice kept, so no build finds the record without its archive.
+- Proposed (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
+  error**: every object and archive a build takes from the cache is touched first, and one missing
+  (or a shim archive without its record) is built again; the link looks again at everything it takes
+  from the cache before clang runs and after clang fails, answers an entry gone in between as such
+  rather than as clang's error, and the build then compiles again, which builds the entry anew, and
+  links once more. Why: a cache emptied by hand, or by a disk being cleared, while builds ran made two
+  gates fail to link a shim archive that had been there when the program compiled (2026-11-13).
+  Alternatives: holding the entries open across the link (clang opens them by name); copying them
+  out of the cache first (the copying costs every build).
+- Proposed (branch `cache-trim`): **another version's cache is removed three days after its last
+  use**, judged by the newest time on it, its kinds and their entries, and only beside the default
+  cache (never beside a directory `AVIN_CACHE` names), and only for a name that is a version's. Why:
+  no compiler of this version can read it, and three days spares a user switching back. Alternatives:
+  removing every other version at once (an older installed compiler still in use would rebuild each
+  time); never (the unreachable caches are what filled the disk).
+- Proposed (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
+  sweep**; a sweep removes only the debris of interrupted fetches, and `avin cache clean --packages`
+  removes packages (with `--older-than`, those no build has read for that long; a build touches the
+  package it reads). Why: a package is source pinned by `avin.sum`, small beside a build, and
+  fetching it again needs the network and a tag that may since have been removed, so evicting one
+  could break an offline or archived build. Alternatives: counting packages in the limit (evicted
+  first, being rarely touched, for a few hundred kilobytes saved).
+- Proposed (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
+  `.pending-` (a write that was never renamed into place) that nothing has written to for an hour,
+  and in the temporary directory the directories a build works in (`avin-link`, `avin-shims`,
+  `avin-c-unit` and the six characters `make_temp_dir` adds) that nothing has written to for a day,
+  and the `avin-test-builds` ones the compiler's tests left before their builds moved into the
+  cache's `test-builds/`. Why: a killed or out-of-space build leaves these behind, and on this
+  machine its tests had left 8,673 such directories. A program's own temporary directories are never
+  touched, whatever they are called. Alternatives: every `avin-` directory (a program may name its
+  own so); none (the debris is unbounded).
+- Proposed (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
+  limit, each kind's entries and size, the total with its oldest and newest use, debris, fetched
+  packages and other versions' caches; `trim` sweeps now; `clean` removes every entry, the debris and
+  other versions' caches, `--older-than <n>m|h|d` only what no build has used for that long, and
+  `--packages` the fetched packages too. `avin clean` keeps its meaning (one program's builds, or
+  `--all` every program's). Why: the user sees what the cache holds and can empty it without
+  knowing its layout. Alternatives: folding these into `avin clean` (whose argument is a program).
 - Proposed: **a marked parameter survives a function becoming a value only through its type**
   (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
   `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
@@ -9215,6 +9360,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   to their bounds, as at a call** (a fix found in step 2: a method value checked no bound at all,
   so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
   it may not fill among them).
+
+**Higher-kinded types, constructor traits and their impls** (build plan step 3, branch `hkt-3`)
+
+- Proposed: **a constructor trait's default bodies are compiled once per implementing constructor
+  already in step 3**, not from step 5: each instance of a constructor trait's method takes the
+  constructor after its type arguments, and `Self` stands for it there. Why: a body shared by
+  every conforming type sees `Self` as an object, but a `Self[B]` may be an option or another value
+  laid out as no object is, and a shared `mapTwice` built that way crashed at run time; the
+  per-constructor copy is what the spec's design says in the end, so no later step removes it.
+  Step 5 keeps `Self.pure` and `F.pure`. Alternatives: refusing default bodies in constructor
+  traits until step 5 (a temporary refusal step 5 would remove).
+- Proposed: **the methods that meet a constructor trait's are the type's own: those its
+  declaration and its impls declare, never a superclass's.** Why: the spec's rule names "the
+  type's own methods", and a superclass's method answers the superclass's type, the reason a
+  subclass inherits no conformance. Alternatives: also meeting with inherited methods whose
+  results happen to fit (a `foldLeft` would; a `map` never does). Review with the user if a class
+  hierarchy wants an inherited `foldLeft` to meet `Foldable`.
+- Proposed: **two overloads that both meet one trait method are an error at the impl**, naming
+  the method. Why: a call through the bound would have two methods to call, and choosing the
+  more specific is a second overload resolution no call site shows. Alternatives: the more
+  specific overload, as a written call would pick (more code, and a choice the reader cannot
+  see); the first declared (arbitrary).
+- Proposed: **the meeting decides a method's own type parameters from where they first appear in
+  its parameter types, against the trait's, then in its result; one still undecided takes its
+  lower bound, and one with none is an error naming it.** Every parameter and the result are then
+  checked with what was decided, each seen as the other's with no conversion (a reference seen as
+  a supertype, as a covariant part is; never a box). Why: the spec's "whose own type parameters
+  that call decides (a lower bound by its bound)"; the order makes `List`'s `flatMap(f: (T) ->
+  Iterable[U])` take `U` from the trait's `List[B]` seen as an `Iterable`. Alternatives: full
+  inference by the call checker (heavier, and its tiers of defaults would decide what the trait's
+  call does not).
+- Proposed: **a constructor trait requires only constructor traits**, each at its own parameters
+  in order; `trait Shown[A]: Functor[A], Display` is an error. Why: a trait for types bounds what
+  a value is, and the constructor trait's `Self` is no value's type, so what the requirement would
+  promise is unclear. Alternatives: reading it as a bound on every application `Self[A]` (a
+  constraint on applications, which impls over constructor parameters, step 6, are the place for).
+- Proposed: **a constructor trait's arguments are no position of a variance** for the conforming
+  type: `List[+T]` and `Result[+T, +E]` conform to `Monad[T]`, an invariant parameter. Why: no
+  value has the trait as its type, so `Monad[Dog]` and `Monad[Animal]` are never compared; the
+  subtyping of `F[Dog]` is the hole's (`F[+_]`). Alternatives: none that let a covariant type
+  conform.
+- Proposed: **a class may state a conformance to a constructor trait in its header**, `class
+  Crate[A]: Functor[A]`, held as an impl's is; the form leaving the trait's arguments off is an
+  impl's only. A class's methods meeting the trait's need no `override`, and may write it. Why:
+  a header conformance is one an impl could state, and the meeting methods are the class's own,
+  which override nothing. Alternatives: requiring an impl for constructor traits (no reason a
+  header could not say the same).
+- Proposed: **the conformance's errors are reported at the impl, a meeting's at the method where
+  the impl declares it and at the impl otherwise**: a library type's method that does not meet is
+  reported where the program's impl names the trait. Why: the impl is what the program wrote; the
+  library's method is not the mistake.
 
 ## Open
 
