@@ -1,0 +1,97 @@
+// expect: exit 0
+// How each routing spreads its messages. `AtRandom` gives every routee about an equal share.
+// `SmallestMailbox` sends each message to the routee with the fewest messages waiting, the next in
+// turn among equals, so a routee that is free takes the work that round robin would queue behind a
+// busy one. `ByKey` sends every message with one key to one routee, spreads the keys over the pool,
+// and, where a routee leaves, moves only that routee's keys.
+import avin.actors.{ActorRef, Behaviour, Router, AtRandom, SmallestMailbox, ByKey, spawn}
+import avin.collections.mutable.{Map as MutableMap}
+import avin.threads.{Future, Promise}
+import avin.time
+
+data Job
+  Who(key: long, replyTo: ActorRef[string])
+  Hold(started: Promise[string], release: Future[unit])
+  Quit(replyTo: ActorRef[ActorRef[Job]])
+
+actor Worker receives Job
+  receive
+    Who(_, replyTo) -> replyTo.tell(s"$self")
+    Hold(started, release) ->
+      started.complete(s"$self")
+      release.await()
+    Quit(replyTo) ->
+      replyTo.tell(self)
+      stop()
+
+who(router: ActorRef[Job], key: long) -> string =
+  router.ask(r -> Who(key, r), timeout = time.seconds(10)).await().ok.getOrElse("timed out")
+
+tally(router: ActorRef[Job], n: int) -> Vector[int]
+  val counts = MutableMap[string, int]()
+  for i in 0 ..< n
+    val w = who(router, long(i))
+    counts(w) = counts.get(w).getOrElse(0) + 1
+  counts.values.toVector.sorted
+
+main()
+  // At random: 400 messages over 4 routees, about 100 each.
+  val random = Router.pool(4, Worker(), AtRandom)
+  val shares = tally(random, 400)
+  println(shares.length)
+  println(shares.sum)
+  println(shares.forall(c -> 50 <= c <= 150))
+
+  // Smallest mailbox, with every routee free: equal, so each in turn.
+  val smallest = Router.pool(4, Worker(), SmallestMailbox)
+  println((0 ..< 6).map(i -> who(smallest, long(i))).toVector)
+  // Every routee held in an arm: messages told now wait in the mailboxes, spread evenly.
+  val releases = Vector.fill(4, Promise[unit]())
+  val holders = Buffer[string]()
+  for p in releases
+    val started = Promise[string]()
+    smallest.tell(Hold(started, p.future))
+    holders.append(started.future.await())
+  println(holders)
+  val sink = spawn(Behaviour[string]("Sink", me -> _ -> ()))
+  for i in 0 ..< 6 do smallest.tell(Who(long(i), sink))
+  // The third routee held is let go: it handles its waiting message and has none. Round robin would
+  // send the next asks to each routee in turn, behind the held ones; the smallest mailbox sends
+  // every one to the routee that has none waiting.
+  releases(2).complete(())
+  println(who(smallest, 0))
+  println(who(smallest, 0))
+  println(who(smallest, 0))
+  for p in releases do p.tryComplete(())
+
+  // By key: one key, one routee, every time.
+  val keyed = Router.pool(4, Worker(), ByKey(m -> m match
+    Who(key, _) -> key
+    _ -> 0))
+  val home = MutableMap[long, string]()
+  for k in 0 ..< 40 do home(long(k)) = who(keyed, long(k))
+  var steady = true
+  for _ in 0 ..< 3
+    for k in 0 ..< 40
+      if who(keyed, long(k)) != home(long(k)) then steady = false
+  println(steady)
+  // Forty keys reach every routee.
+  println(home.values.toVector.distinct.length)
+  // A routee leaving moves its own keys and no other. Once it has ended, a message for it that the
+  // router sends before it has learnt of the end is refused and sent on to another.
+  val leaving = keyed.ask(r -> Quit(r), timeout = time.seconds(10)).await().ok.get
+  leaving.ended().await()
+  val gone = s"$leaving"
+  var kept = true
+  var moved = true
+  for k in 0 ..< 40
+    val now = who(keyed, long(k))
+    if home(long(k)) == gone
+      if now == gone then moved = false
+    elif now != home(long(k)) then kept = false
+  println(kept)
+  println(moved)
+  // The key of a message the key function maps to the same number is one key, negative numbers
+  // and the extremes among them.
+  val extremes: Vector[long] = [-9223372036854775808, 9223372036854775807, -1, 0]
+  println(extremes.forall(k -> who(keyed, k) == who(keyed, k)))

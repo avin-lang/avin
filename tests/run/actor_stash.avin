@@ -1,0 +1,76 @@
+// expect: exit 0
+// A stash sets aside the messages an actor cannot handle in its present state and gives them back
+// on a change of state: `unstashAll` puts them in front of every message waiting in the mailbox, in
+// the order they were added, so the actor handles them next, and the messages that arrived
+// meanwhile after them. Called from a state's `enter`, it gives them back on every entry into that
+// state. A message given back that the actor still cannot handle may be stashed again.
+import avin.actors.{ActorRef, Stash, spawn}
+import avin.threads.{Channel, Future, Promise}
+import avin.time
+
+data Msg
+  Open(release: Future[unit])
+  Close
+  Item(n: int)
+  Done(replyTo: ActorRef[string])
+
+// Takes items only while open: while closed, they are stashed and the order kept.
+actor Gate(out: Channel[string]) receives Msg
+  val waiting = Stash(self, 100)
+  val seen = Buffer[int]()
+
+  state Closed
+    enter
+      out.send(s"closed with ${waiting.length} stashed")
+    Open(release) ->
+      // Held until released, so the messages sent meanwhile are queued behind the stash.
+      release.await()
+      Opened
+    Item(n) ->
+      waiting.add(Item(n))
+      stay
+    Done(replyTo) ->
+      waiting.add(Done(replyTo))
+      stay
+
+  state Opened
+    enter
+      out.send(s"opened, giving back ${waiting.length}")
+      waiting.unstashAll()
+    Item(n) ->
+      seen.append(n)
+      stay
+    Close -> Closed
+    Done(replyTo) ->
+      replyTo.tell(s"$seen")
+      stay
+
+  receive
+    _ -> stay
+
+main()
+  val out = Channel[string]()
+  val gate = spawn(Gate(out))
+  println(out.receive().get)
+  for i in 1 .. 5 do gate.tell(Item(i))
+  val release = Promise[unit]()
+  gate.tell(Open(release.future))
+  // Queued while the gate holds in `Open`: handled after the five given back.
+  for i in 6 .. 8 do gate.tell(Item(i))
+  release.complete(())
+  println(out.receive().get)
+  println(gate.ask(r -> Done(r), timeout = time.seconds(5)).await())
+
+  // Closed again: items and a question are stashed, and given back in order on the next opening,
+  // the question answered after the items that came before it.
+  gate.tell(Close)
+  println(out.receive().get)
+  gate.tell(Item(9))
+  val answer = gate.ask(r -> Done(r), timeout = time.seconds(5))
+  gate.tell(Item(10))
+  val again = Promise[unit]()
+  again.complete(())
+  gate.tell(Open(again.future))
+  println(out.receive().get)
+  println(answer.await())
+  println(gate.ask(r -> Done(r), timeout = time.seconds(5)).await())

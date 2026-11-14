@@ -1,0 +1,58 @@
+// expect: exit 0
+// Many senders through one router under every routing: each message is handled exactly once, by one
+// routee; the messages one sender sends with one key arrive in the order sent; and the strings the
+// messages carry, made on many threads, survive the collector on their way.
+import avin.actors.{ActorRef, Router, Routing, RoundRobin, AtRandom, SmallestMailbox, ByKey}
+import avin.threads.{Atomic, Promise}
+import avin.threads as threads
+import avin.time
+
+data Job
+  Item(sender: int, seq: int, text: string)
+  Check(key: int, replyTo: ActorRef[string])
+
+actor Sink(handled: Atomic[int], bytes: Atomic[long]) receives Job
+  // The last sequence number seen from each sender.
+  val last = Buffer[int]()
+  var inOrder = true
+  for _ in 0 ..< 8 do last.append(-1)
+
+  receive
+    Item(sender, seq, text) ->
+      if seq <= last(sender) then inOrder = false
+      last(sender) = seq
+      handled.add(1)
+      bytes.add(long(text.byteLength))
+    Check(_, replyTo) -> replyTo.tell(if inOrder then "in order" else "out of order")
+
+run(routing: Routing[Job])
+  val handled = Atomic[int](0)
+  val bytes = Atomic[long](0)
+  val router = Router.pool(4, Sink(handled, bytes), routing)
+  val senders = 8
+  val each = 150
+  val done = Vector.fill(senders, Promise[unit]())
+  for s in 0 ..< senders
+    val finished = done(s)
+    threads.spawn(() ->
+      for i in 0 ..< each do router.tell(Item(s, i, s"message $i from sender $s"))
+      finished.complete(()))
+  for p in done do p.future.await()
+  while handled.load() < senders * each do threads.sleep(time.millis(1))
+  threads.sleep(time.millis(20))
+  println(handled.load())
+  println(bytes.load() > long(senders * each * 10))
+  // The router passes each sender's messages on in the order sent, so every routee sees each
+  // sender's share in order, and keyed by sender, all of one sender's messages reach one routee.
+  val answers = Buffer[string]()
+  for i in 0 ..< 4
+    answers.append(router.ask(r -> Check(i, r), timeout = time.seconds(10)).await().ok.getOrElse("none"))
+  println(answers.distinct)
+
+main()
+  run(RoundRobin)
+  run(AtRandom)
+  run(SmallestMailbox)
+  run(ByKey(m -> m match
+    Item(sender, _, _) -> long(sender)
+    Check(key, _) -> long(key)))
