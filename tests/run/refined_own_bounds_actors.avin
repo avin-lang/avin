@@ -1,0 +1,58 @@
+// expect: exit 0
+// Values of refined variants bounding their own parameters, carried between actors. Whether a
+// refined type is sendable is decided at its instance: a variant's own parameters are what the
+// instance's arguments say, so `Coll[string]` is sendable though `Sorted`'s `A` is bounded by `Ord`
+// alone, and `Msg[int]` is though `Log`, which makes only a `Msg[string]`, holds a `Buffer`. A
+// hidden parameter bounded by `Ord & Sendable` carries a collection whose `Sorted` arm, in the
+// actor, takes the least element at the pack's type.
+import avin.actors.{ActorRef, AskError, spawn}
+import avin.threads.Future
+import avin.time
+
+data Coll[T]
+  Plain(items: Vector[T])
+  Sorted[A: Ord](items: Vector[A]) -> Coll[A]
+
+data Msg[T]
+  Num(n: int) -> Msg[int]
+  Log(lines: Buffer[string]) -> Msg[string]
+
+data Job
+  Least[R: Ord & Sendable](coll: Coll[R], replyTo: ActorRef[Option[R]])
+
+data KeeperMsg
+  Put(coll: Coll[string], done: ActorRef[string])
+  Count(msg: Msg[int], done: ActorRef[string])
+
+smallest[T](c: Coll[T]) -> Option[T] = c match
+  Plain(_) -> None
+  Sorted(items) -> items.minOption
+
+actor Ranker() receives Job
+  receive
+    Least(coll, replyTo) -> replyTo.tell(smallest(coll))
+
+actor Keeper() receives KeeperMsg
+  var seen = 0
+  receive
+    Put(Sorted(items), done) ->
+      seen += 1
+      done.tell(s"sorted ${items.minOption} $seen")
+    Put(Plain(items), done) -> done.tell(s"plain ${items.length}")
+    Count(Num(n), done) -> done.tell(s"num $n")
+
+least[R: Ord & Sendable](r: ActorRef[Job], c: Coll[R]) -> Future[Result[Option[R], AskError]] =
+  r.ask(t -> Least(c, t), timeout = time.seconds(1))
+
+main()
+  val r = spawn(Ranker())
+  println(least(r, Sorted([4, 2, 9])).await())
+  println(least(r, Sorted(["q", "b"])).await())
+  println(least(r, Coll[long].Plain([long(1)])).await())
+  println(least(r, Sorted([int.MinValue, int.MaxValue])).await())
+  val k = spawn(Keeper())
+  val t = time.seconds(1)
+  println(k.ask(s -> Put(Sorted(["z", "é", "m"]), s), timeout = t).await())
+  println(k.ask(s -> Put(Plain([]), s), timeout = t).await())
+  println(k.ask(s -> Put(Sorted([""]), s), timeout = t).await())
+  println(k.ask(s -> Count(Num(int.MaxValue), s), timeout = t).await())

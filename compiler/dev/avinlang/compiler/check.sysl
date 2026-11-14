@@ -5980,7 +5980,7 @@ private declared_site(c: *Checker, owner: usize, index: usize) -> string
     ""
 
 /** The conformances as a meeting asks of them: of types alone, with no generic scope. */
-private meeting_conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers, None)
+private meeting_conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers, None, buf())
 
 /** Whether a value of type `x` is one of type `to` with no conversion: the same type, or a reference
  * seen as a supertype of it, as a covariant part is. */
@@ -7588,7 +7588,7 @@ private string_intrinsic(name: string) -> Option[&Type]
 // The bounds of the type parameter at `index` of `owner` are recorded under this key: the
 // parameter's declaration tells apart a type's own parameters and those of each impl of it, which
 // share an owner and positions.
-private bound_key(owner: usize, index: usize, tp: TypeParam) -> string = s"$owner/$index/${tp.site}"
+bound_key(owner: usize, index: usize, tp: TypeParam) -> string = s"$owner/$index/${tp.site}"
 
 /** The key of the bounds of fresh type `index` of a refining pattern's `owner`. */
 private fresh_bound_key(owner: usize, index: usize) -> string = s"$owner/$index/fresh"
@@ -7793,6 +7793,13 @@ private resolve_bound(c: *Checker, unit: usize, t: &TypeExpr) -> &Type
 private bounds_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type] = scope_bounds(conformances(c), owner, params, index)
 
 private scope_bounds(f: Conformances, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type]
+    var out = declared_scope_bounds(f, owner, params, index)
+    for g in f.gained
+        if g.owner == owner && g.index == index then out.push(g.bound)
+    out
+
+// The bounds of a type parameter as declared, without what an equality in scope gives it.
+private declared_scope_bounds(f: Conformances, owner: usize, params: Buf[TypeParam], index: usize) -> Buf[&Type]
     if is_self_owner(owner)
         val k = owner - self_owner(0)
         var own: Buf[&Type] = buf()
@@ -7905,6 +7912,16 @@ struct Conformances
     /** In the impl a `derives` entry made for a type with refined variants, the variants' own
      * parameters the derived trait holds of: those the trait on the type's instance implies. */
     own: Option[OwnBounds]
+    /** In an arm of a refined variant, the bounds a type parameter of the enclosing code gains by
+     * being equated with a bounded parameter of the variant. */
+    gained: Buf[GainedBound]
+
+/** A bound type parameter `index` of `owner` has where an equality in scope equates it with a
+ * variant parameter declaring it. */
+struct GainedBound
+    owner: usize
+    index: usize
+    bound: &Type
 
 /** The own parameters of a data type's refined variants, by position, that a trait derived for the
  * type holds of in its impl: a variant's fields are held to the trait at them. */
@@ -8002,7 +8019,28 @@ private rebuilt(t: &Type, parts: Buf[&Type]) -> &Type = *t match
     _ -> t
 
 /** The conformances as the code being checked sees them. */
-private conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, c.generic, c.lowers, own_bounds_in_scope(c))
+private conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, c.generic, c.lowers, own_bounds_in_scope(c), gained_bounds(c))
+
+// In an arm of a refined variant, a type parameter of the enclosing code that an equality in scope
+// equates with a bounded parameter of the variant has that parameter's bounds there: the value was
+// made only at types meeting them. Only a parameter equated as a whole gains them; one equated with
+// a part of a larger type, as `U` with `Vector[U]`, gains nothing.
+private gained_bounds(c: *Checker) -> Buf[GainedBound]
+    var out: Buf[GainedBound] = buf()
+    if c.body.equalities.len() == 0 then return out
+    val eqs = active_equalities(c)
+    for q in eqs
+        val held = c.bounds.get(fresh_bound_key(q.owner, q.index)) match
+            Some(b) -> b
+            None -> continue
+        if held.len() == 0 then continue
+        *zonk(c, apply_equalities(q.ty, eqs, eqs.len() + 1)) match
+            TypeVar(o, i, _) ->
+                if o == q.owner && i == q.index then continue
+                for b in held
+                    out.push(GainedBound(o, i, zonk(c, apply_equalities(b, eqs, eqs.len() + 1))))
+            _ -> ()
+    out
 
 /** Whether a value of type `t` conforms to `bound`, a trait or a class: a type parameter does through
  * its own bounds. */
@@ -8281,15 +8319,25 @@ private structural_sendability(f: Conformances, x: &Type, k: usize, a: SendAssum
                 // A hidden parameter holds whatever type each value was made with, which is
                 // sendable only where the variant bounds it so; a sendable one is then as `unit` is.
                 val hidden = hidden_positions(d, id, v)
+                var pack: Buf[&Type] = buf()
+                for j in hidden
+                    if !hidden_sendable(f, id, v, j, k)
+                        val name = d.variants[v].params[j].name
+                        return CannotSend(s"its variant `${d.variants[v].name}` hides `$name`, which a value may hold at any type; bound it, as in `[$name: Sendable]`")
+                    pack.push(Unit)
+                // A refined variant's own parameters are what the instance's arguments say they are;
+                // a concrete instance the variant makes no value of holds none of its fields. Where
+                // the arguments do not say, a parameter bounded by `Sendable` is sendable, as a
+                // hidden one is, and any other may be any type.
                 var full: Buf[&Type] = buf()
-                for j in 0..<d.variants[v].params.len()
-                    if contains_index(hidden, j)
-                        if !hidden_sendable(f, id, v, j, k)
-                            val name = d.variants[v].params[j].name
-                            return CannotSend(s"its variant `${d.variants[v].name}` hides `$name`, which a value may hold at any type; bound it, as in `[$name: Sendable]`")
-                        full.push(Unit)
-                    elif j < args.len() then full.push(args[j])
-                    else full.push(TypeVar(data_owner(id), j, d.variants[v].params[j].name))
+                packed_variant_args(d, id, v, args, Some(pack)) match
+                    Some(read) -> full = read
+                    None ->
+                        if !any_type_params(args) then continue
+                        for j in 0..<d.variants[v].params.len()
+                            if contains_index(hidden, j) || hidden_sendable(f, id, v, j, k) then full.push(Unit)
+                            elif j < args.len() && d.variants[v].result is None then full.push(args[j])
+                            else full.push(TypeVar(data_owner(id), j, d.variants[v].params[j].name))
                 val types = substitute_all(d.variants[v].fields, data_owner(id), full)
                 for i in 0..<types.len()
                     type_sendability(f, types[i], k, a, seen, depth + 1) match
@@ -13011,7 +13059,7 @@ private check_threaded_arguments(c: *Checker)
             _ -> c.note(t.unit, t.value.span, s"$what, is not a lambda, a method value, a function named here, a value of a `@sendable` function type or a parameter marked `@sendable`: a plain function value's type does not say what it captures")
     c.body.threaded = buf()
 
-private contains_index(items: Buf[usize], x: usize) -> bool
+contains_index(items: Buf[usize], x: usize) -> bool
     for i in items
         if i == x then return true
     false
@@ -20577,10 +20625,6 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
 // A variant made by a call, with `typed` holding the arguments already checked, if any.
 private construct_checked(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], typed: Buf[Option[&TExpr]]) -> &TExpr
     val unit = unit_of(c)
-    if refined_value_refused(c, unit, name_span, v)
-        for a in args
-            check_ignored(c, a.value)
-        return TExpr(at, ErrorType, UnitConst)
     val made_by = c.data[v.data].variants[v.index]
     // A refined variant's fields, each with the argument it is given, so that a refined value given
     // to one at the wrong instance is reported as the field's.
@@ -20638,23 +20682,6 @@ private hidden_params(c: *Checker, v: VariantRef) -> Buf[string]
     for j in hidden_positions(c.data[v.data], v.data, v.index)
         out.push(variant.params[j].name)
     out
-
-// A value of a variant bounding one of its own parameters that its result names is not made yet: an
-// arm on it learns the bound for the enclosing code's type parameters. A hidden parameter's bounds
-// are checked where the value is made and held by the fresh type an arm gives it.
-private refined_value_refused(c: *Checker, unit: usize, at: Span, v: VariantRef) -> bool
-    val variant = c.data[v.data].variants[v.index]
-    val hidden = hidden_positions(c.data[v.data], v.data, v.index)
-    val decl = c.data[v.data].decl
-    val n = decl.type_params.len()
-    for k in 0..<decl.variants.len()
-        if decl.variants[k].name != variant.name then continue
-        for i in 0..<decl.variants[k].type_params.len()
-            val tp = decl.variants[k].type_params[i]
-            if tp.bounds.len() > 0 && !contains_index(hidden, n + i)
-                c.note(unit, at, s"`${variant.name}` bounds its own parameter `${tp.name}`: a value of a variant whose own parameters have bounds cannot be made yet")
-                return true
-    false
 
 /** What a call of variant `v` is checked against: its fields, in its type parameters, and the
  * instance it makes. A refined variant is a generic function of its parameters, the type's and then
