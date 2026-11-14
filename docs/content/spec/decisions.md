@@ -8643,6 +8643,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
   function parameter takes the `@sendable` form, which asks a little more than the mark (no
   captured `var`). Method values keep their own wording, from the call inside the closure they are.
+- Proposed: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+  `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
+  an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
+  "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
+  at the comma the same way. A comma after an arm when the next line at the arms' depth reads as
+  another arm (it starts with `else` or holds an `->` outside brackets) is reported as a tuple that
+  needs parentheses. Why: the indented arms were read as lines of a block, so the last arm's body
+  swallowed the following arguments as a tuple, a type error far from the cause; a `return` value,
+  a lambda's and a one-line `if`'s bodies already stop at the comma. Alternatives: keep the arms a
+  line context (the spec's "an indented block starts a line again"), which makes `_ -> 0, "a")` a
+  tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
+  line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
+  lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
+  writes. An indented arm body stays a block, where a comma list is a tuple.
 
 ## Open
 

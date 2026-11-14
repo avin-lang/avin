@@ -15,6 +15,10 @@ struct Parser
      * collection literals): a `return` or `break` value stops at the comma there, instead of making a
      * tuple. An indented block starts a new line context and clears it. */
     in_list: bool
+    /** The blocks of `match` arms, inside the current brackets, that a comma after an arm's body ended
+     * before their lines did: `f(x match` … `_ -> 0, "a")`. Each still closes with a Dedent before
+     * the closing bracket, which the list steps over. */
+    owed_dedents: usize
     /** The spans of the expressions written in parentheses of their own, which the rule against
      * mixing left- and right-grouping infix calls lets through. */
     grouped: Buf[Span]
@@ -127,7 +131,7 @@ impl TokenStream for Parser
 
 parser_for(src: Source) -> Parser
     val lexed = lex(src)
-    Parser(src, lexed.items, lexed.report, None, false, buf(), false, 0, 0)
+    Parser(src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0)
 
 private after_dedent(p: Parser) -> bool = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
 
@@ -373,7 +377,7 @@ private hole(p: *Parser, span: Span) -> &Expr
         p.report.add(error(span, "an interpolation hole needs an expression"))
         return Expr(span, Invalid)
     val lexed = lex_hole(p.src, span)
-    var inner = Parser(p.src, lexed.items, lexed.report, None, false, buf(), false, 0, 0)
+    var inner = Parser(p.src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0)
     val e = expression(&inner, 0)
     saw_tuple(p, inner.widest_tuple)
     if !inner.toks.at_end() then inner.report.add(error(inner.toks.here(), "unexpected input after the expression in this hole"))
@@ -471,6 +475,13 @@ private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
     if is_keyword(text) then return Expr(t.span, Name(text))
     bare_call(p, Expr(t.span, Name(text)))
 
+/** Steps over the line breaks and Dedents of the arm blocks a comma ended in the current brackets,
+ * so the items after them read on as the list's own. */
+settle(p: *Parser)
+    while p.owed_dedents > 0
+        if p.accept_kind(Dedent) then p.owed_dedents -= 1
+        elif !p.accept_kind(Newline) then return
+
 /** A value that fills the rest of a line: an expression, or several separated by commas, which
  * make a tuple without parentheses. */
 line_value(p: *Parser) -> &Expr
@@ -521,25 +532,32 @@ private parenthesized(p: *Parser, start: Span) -> &Expr
     if p.accept(")") then return Expr(start.to(p.ended()), UnitLit)
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     var reported = p.report.len()
     val first = ascribed(p, expression(p, 0))
     if !p.at(",")
         if !p.at(")") && !p.toks.at_end() then misread_item(p, None, first, reported)
         p.in_list = outer
+        p.owed_dedents = owed
         p.expect(")")
         p.grouped.push(first.span)
         return first
     var items: Buf[&Expr] = buf()
     items.push(first)
     while p.accept(",")
+        settle(p)
         if p.at(")") then break
         reported = p.report.len()
         val item = ascribed(p, expression(p, 0))
         items.push(item)
+        settle(p)
         if !p.at(",") && !p.at(")") && !p.toks.at_end()
             misread_item(p, None, item, reported)
             break
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     val end = p.toks.here()
     p.expect(")")
     saw_tuple(p, items.len())
@@ -677,6 +695,8 @@ private with_update(left: &Expr, p: *Parser) -> &Expr
     var changes: Buf[FieldChange] = buf()
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     var written = false
     loop
         if p.at("}") || p.toks.at_end() then break
@@ -717,7 +737,10 @@ private with_update(left: &Expr, p: *Parser) -> &Expr
         val value = expression(p, 0)
         changes.push(FieldChange(first.span.to(value.span), path, spans, value))
         if !p.accept(",") then break
+        settle(p)
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     val end = p.toks.here()
     if !written && p.at("}") then p.report.add(error(open.span.to(end), "`with` changes at least one field: name it, as in `with { x = 1 }`"))
     p.expect("}")
@@ -751,6 +774,8 @@ private call(left: &Expr, p: *Parser) -> &Expr
     var args: Buf[Argument] = buf()
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     if !p.at(")")
         loop
             val start = p.toks.here()
@@ -762,11 +787,16 @@ private call(left: &Expr, p: *Parser) -> &Expr
             val reported = p.report.len()
             val value = placeholder_scope(p, ascribed(p, expression(p, 0)))
             args.push(Argument(start.to(value.span), name, value, false))
+            settle(p)
             if !p.at(",") && !p.at(")") && !p.toks.at_end()
                 misread_item(p, Some(callee_name(left)), value, reported)
                 break
-            if !p.accept(",") || p.at(")") then break
+            if !p.accept(",") then break
+            settle(p)
+            if p.at(")") then break
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     var end = p.toks.here()
     p.expect(")")
     trailing_block(p, true) match
@@ -1087,6 +1117,8 @@ private collection(p: *Parser, start: Span, braces: bool) -> &Expr
     var map = false
     val outer = p.in_list
     p.in_list = true
+    val owed = p.owed_dedents
+    p.owed_dedents = 0
     if !p.at(close)
         loop
             val before = p.toks.position
@@ -1097,8 +1129,12 @@ private collection(p: *Parser, start: Span, braces: bool) -> &Expr
             keys.push(key)
             if entry then values.push(expression(p, 0))
             if p.toks.position == before then break
-            if !p.accept(",") || p.at(close) then break
+            if !p.accept(",") then break
+            settle(p)
+            if p.at(close) then break
+    settle(p)
     p.in_list = outer
+    p.owed_dedents = owed
     val end = p.toks.here()
     p.expect(close)
     val span = start.to(end)

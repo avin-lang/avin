@@ -475,7 +475,8 @@ tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from i
 Where a value fills the rest of a line, a tuple needs no parentheses: after `=` in a function, clause
 or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
 last. Inside brackets and in the body of a one-line `if` or `while`, a comma separates other things,
-so a tuple there is parenthesized.
+so a tuple there is parenthesized, a `match` arm's one-line body inside brackets
+[included](/spec/operators-and-control-flow/#match).
 
 ```text
 divmod(a: int, b: int) -> (int, int) = a / b, a % b
