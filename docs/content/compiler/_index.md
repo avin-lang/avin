@@ -1258,9 +1258,11 @@ which take and give back one spin lock every such operation shares. `add`, `sub`
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
 anything is stored.
 
-**Locks and conditions.** The synchronization library reaches eight intrinsics, each a runtime
-entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_wait`,
-`condition_wait_for`, `condition_notify` and `condition_notify_all`. A lock is an object on the
+**Locks and conditions.** The synchronization library reaches nine intrinsics, each a runtime
+entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_new_kind` (a
+condition whose waiters the thread dump and the deadlock report name as a channel's receive or
+send, a future or an executor's work), `condition_wait`, `condition_wait_for`, `condition_notify`
+and `condition_notify_all`. A lock is an object on the
 collected heap holding whether a thread holds it and a queue of the threads waiting for it, and a
 condition one holding a queue alone; neither holds a reference, and the collector never moves
 either, so a waiter may be linked from one. Each queue has a guard, a futex lock held for a few

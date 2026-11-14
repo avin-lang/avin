@@ -931,7 +931,8 @@ Settled by the user on 2026-11-04:
 - Details of [synchronization](/spec/threads/#synchronization): `Mutex[T].with` hands its body the
   value itself, and an immutable value is read with `get`, replaced with `set` and changed with
   `update(f)` under the lock. A mutex is not reentrant, and a thread taking one it already holds
-  traps rather than waiting for ever; no other deadlock is detected. A `Condition` is made by its
+  traps rather than waiting for ever; otherwise only a deadlock of the whole program is detected
+  ([diagnostics](/spec/threads/#deadlock)). A `Condition` is made by its
   mutex's `condition()`, so it is waited for with that mutex only, and `wait()` from a thread not
   holding it traps. `Atomic[T]` holds any type: a value of one word lock-free, an integer wider
   than 64 bits under one runtime lock; `compareAndSet` compares identity for a reference and the
@@ -8316,6 +8317,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Initialization** ([declarations](/spec/declarations/#initialization), branch `init-design`)
 
+
+- Proposed (built on branch `deadlock-dump`): **A deadlock of the whole program is a trap; a partial
+  one is not found** ([diagnostics](/spec/threads/#deadlock)). The main thread checks when it begins
+  a wait with no limit, and again each time a worker finds no lightweight thread running or ready
+  while it waits: the program is deadlocked where no lightweight thread is running or ready, no
+  timer is set, no thread waits on a socket, no thread the program did not start is attached and no
+  `@threaded` callback is held. Every wake goes through one counter, so a check whose count did not
+  move between its first look and its last saw one moment of the program and cannot report a
+  thread that ran meanwhile. The report is `avin: trap: deadlock: all threads are waiting` and a line
+  per thread, the trap's exit status, and the exit hooks run after it as after any trap. Why: it is
+  the case a program can never leave, it costs nothing until `main` waits (one counter increment
+  per wake, one clock read per wait for the dump), and a check made only from `main`'s own wait
+  needs no thread of its own. Alternatives weighed: a monitor that looks periodically (a thread or a
+  tick for every program, and latency); finding cycles of lock holders (catches partial deadlocks,
+  but needs owner tracking on every lock and misses channels and conditions, which have no owner);
+  reporting a held `@threaded` callback or an attached foreign thread as deadlocked too (a C thread
+  may call back at any time, so that would be a false report). Review with the user: whether a
+  partial deadlock, found by cycles among lock holders and joins, is wanted later.
+- Proposed (branch `deadlock-dump`): **What a thread waits on is named by the runtime's own queue**:
+  a lock, a condition, a join, a sleep, a socket; a condition the library makes for a channel's
+  receive or send, a future or an executor's work says so, through the intrinsic
+  `condition_new_kind`, which `Condition`'s constructor reaches with a second parameter the library
+  alone can pass (a `Condition` needs the library's private `Lock`). A channel's own lock is "a
+  lock". Threads are numbered from 1 in the order they started, not by their identity. A pool's
+  idle workers are left out of the deadlock report, whose length would otherwise follow the
+  machine's processors, and listed in the dump. Alternatives weighed: a label set around each wait
+  by the library (a call on every wait); naming waits only by the runtime primitive ("a condition"
+  for every channel and future, which says little).
+- Proposed (branch `deadlock-dump`): **The quit signal writes a thread dump and the program goes
+  on.** A handler in C writes a byte to a pipe; a thread started with the program, with every signal
+  blocked, reads it and writes the dump, since a handler may not take the scheduler's locks. A
+  program that watches the signal hears it instead; one started with it ignored keeps it ignored.
+  Why: the program under inspection keeps running, which is what a dump is for. Alternatives
+  weighed: writing the dump from the handler (not safe there); starting the thread only on first
+  use (a handler cannot start one); ending the program after the dump (loses the program being
+  looked at). Cost: one thread and one pipe for every program.
+- Proposed (branch `deadlock-dump`): **A thread dump names no functions.** A frame of the shadow
+  stack holds its previous frame and its count of slots, nothing naming its function, and walking
+  the native stack would need a table from code addresses to Avin names, which the compiler does
+  not emit (the stack-overflow trap has no place for the same reason). Alternatives weighed: a
+  function's descriptor stored in each frame (a store on every call); emitting an address table
+  and unwinding the native stack (a table per program and an unwinder for each platform). Review
+  with the user: which of the two, if a stack in the dump is wanted.
+- Proposed (branch `deadlock-dump`): **A corpus program's `// stderr: times vary` shows every number
+  before ` ms` in its standard error as `n`**, so a thread dump's durations do not make the test
+  depend on the machine. Alternative: a dump without durations (loses what a dump is for).
 - **Initialization is proved at compile time, by order and by withholding `self`** (branch
   `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
   value or `lazy val` is read before it is set: an object's fields are set in the order written and
