@@ -529,7 +529,9 @@ and the default is never stored. Everything else sees only the real entries: `ge
 those of the wrapped map. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` answer a map
 with the same default, and `transform` and `mapValues` the wrapped map's own, with none. The wrapper
 is equal to the map it wraps, and to every map of the same entries whatever its default, and hashes
-and displays as it does. A default of a supertype of the values makes a map of that type. A
+and displays as it does. A default of a supertype of the values makes a map of that type. The
+wrapper is sendable where the map it wraps and `v` are, so the function `f` is `@sendable`, using
+only sendable values from around it: a default that counts its calls does so through an `Atomic`. A
 counter reads `val counts = HashMap.empty[string, int]().withDefaultValue(0)` and then
 `counts.updated(w, counts(w) + 1)`.
 
@@ -885,7 +887,7 @@ initialized (without a lock, since only one thread reaches it), and a cell whose
 `lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read:
 ``avin: trap: a LazyList cell is read while it is being evaluated``.
 
-A list that refers to itself is a `lazy val`, at module level or in a class: a module-level `val`
+A list that refers to itself is a `lazy val`, at module level, in a class or in a block: a module-level `val`
 initializes before `main` and may not need its own value at all, even inside a delayed expression,
 so `val fibs = 0 #:: fibs` is an error naming `fibs` as needed by its own initializer.
 
