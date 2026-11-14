@@ -765,7 +765,10 @@ private layout_made(l: *Lowering, t: &Type) -> DataLayout
             // A refined variant that makes no value of this instance has no descriptor in it; the
             // others keep their declared positions as their tags.
             for v in 0..<d.variants.len()
-                variant_fields_at(d, id, v, args) match
+                var fields_at = variant_fields_at(d, id, v, args)
+                if variant_args(d, id, v, args) is Some(full)
+                    if !meets_own_bounds(l, id, v, full) then fields_at = None
+                fields_at match
                     Some(fields) -> variants.push(variant_layout(l, key + "." + d.variants[v].name, v, fields, true, true, methods, record, call))
                     None -> variants.push(VariantLayout(AbsentVariant, buf()))
         Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, true, method_table(l, t), record, None))
@@ -1182,7 +1185,29 @@ private fill_used_slots(l: *Lowering) -> bool
 /** The lowering's view of conformances: of concrete types only, so with no type parameters in scope,
  * and the bounds of the impls for tuples, which a tuple's parts must meet. */
 private lowering_conformances(l: *Lowering) -> Conformances =
-    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.core, l.program.bounds, None, map(), None)
+    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.core, l.program.bounds, None, map(), None, buf())
+
+// Whether variant `v` of data type `id`, at its arguments `full` (its type's, then its own), meets
+// the bounds it declares on its own parameters that its result names. A value is made only at
+// arguments meeting them, so an instance where they fail holds no value of the variant: its layout
+// has no descriptor for it, and an arm on it is not compiled there. A hidden parameter's bounds hold
+// of every pack the program makes, since each was checked where its value was made.
+private meets_own_bounds(l: *Lowering, id: usize, v: usize, full: Buf[&Type]) -> bool
+    val d = l.program.data[id]
+    val variant = d.variants[v]
+    val n = d.decl.type_params.len()
+    if variant.params.len() <= n then return true
+    val hidden = hidden_positions(d, id, v)
+    val owner = data_owner(id)
+    for j in n..<variant.params.len()
+        if j >= full.len() then break
+        if contains_index(hidden, j) then continue
+        val bounds = l.program.bounds.get(bound_key(owner, j, variant.params[j])) match
+            Some(b) -> b
+            None -> continue
+        for b in bounds
+            if !meets_bound(lowering_conformances(l), full[j], substitute(b, owner, full)) then return false
+    true
 
 // For each position of `t`'s method table, whether it belongs to a trait `t` does not conform to at
 // its type arguments, though an impl with bounds of its own places the trait in every instance's
@@ -7265,6 +7290,7 @@ private refine_one(l: *Lowering, p: &TPattern, variant: usize, site: Option[usiz
             val full = packed_variant_args(d, id, variant, args, pack) match
                 Some(full) -> full
                 None -> return false
+            if !meets_own_bounds(l, id, variant, full) then return false
             l.refined.push(Refinement(data_owner(id), full))
             if site is Some(k) then l.refined.push(Refinement(pattern_owner(k), full))
     true
