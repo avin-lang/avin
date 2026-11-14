@@ -474,17 +474,32 @@ A type parameter may stand for a **type constructor**: a generic type not yet gi
 `F` is in scope. Bounded by one of the [standard traits](#functor-applicative-monad-traverse), one
 function serves options, results, sequences and a program's own types alike:
 
-```text
+```text run
 pairUp[F[_]: Monad, A, B](fa: F[A], fb: F[B]) -> F[(A, B)] =
   for a in fa, b in fb yield (a, b)
 
-pairUp(Some(1), Some("one"))      // Some((1, "one"))
-pairUp([1, 2], ["a", "b"])        // [(1, "a"), (1, "b"), (2, "a"), (2, "b")]
-pairUp(age(x), age(y))            // a Result[(int, int), AgeError]
+data AgeError(text: string)
+
+age(text: string) -> Result[int, AgeError] = text.toIntOption() match
+  Some(n) -> Ok(n)
+  None -> Err(AgeError(text))
+
+main()
+  println(pairUp(Some(1), Some("one")))
+  println(pairUp([1, 2], ["a", "b"]))
+  println(pairUp(age("30"), age("41")))
+  println(pairUp(age("30"), age("old")))
 ```
 
-where `age(text: string) -> Result[int, AgeError]`. Each call compiles its own copy, at `Option`,
-at `Vector` and at `Result[_, AgeError]`, as any generic call does.
+```text output
+Some((1, one))
+[(1, a), (1, b), (2, a), (2, b)]
+Ok((30, 41))
+Err(AgeError(old))
+```
+
+Each call compiles its own copy, at `Option`, at `Vector` and at `Result[_, AgeError]`, as any
+generic call does.
 
 ### Constructor parameters
 
@@ -558,9 +573,22 @@ is a `Self[A]`, `self` among them.
   methods mention `Self`, it is a bound and never a type.
 - **A bound on one of its parameters is the bound of that hole**: `trait SendableMonad[A: Sendable]`
   is the bound of an `F[_: Sendable]`, and is implemented by constructors whose parameter there is
-  bounded by no more than `Sendable`.
+  bounded by no more than `Sendable`, an unbounded one among them (`Future[T]`): the trait applies
+  the constructor only to types meeting the bound, so the conformance asks nothing of the type's
+  parameter. A trait requiring it bounds its own parameter as it does.
 - **A trait requiring a constructor trait is one**, and names it at its own parameters, in order:
-  `trait Monad[A]: Applicative[A]`.
+  `trait Monad[A]: Applicative[A]`. It may require a trait for types that bounds constructors, the
+  same way: `trait Traverse[A]: Functor[A], Foldable[A]`.
+- **A trait for types whose members never name `Self` beyond the receiver bounds constructors
+  too**, where it has parameters, no static member, and requires only such traits: `Foldable[A]`
+  is one. A constructor conforms to it where each of its applications does with the trait's
+  parameters at the holes, so `impl Foldable for Option`, or any conformance stating
+  `Foldable[T]` for an `Option[T]`, makes `Option` a constructor for `[F[_]: Foldable]`, and a
+  value of `F[X]` there has its members with `X` for the trait's parameters. It stays a trait for
+  types in every other place, so a `Foldable[int]` is a type, and a type conforming to it at no
+  parameter of its own (`impl Foldable[int] for Ints`) is no constructor of it. A trait naming
+  `Self` otherwise (`same(other: Self)`) or declaring a static member bounds types only, and one
+  writing `Self[X]` is a constructor trait and bounds constructors only.
 - **A static member names no parameter of the trait**, since a call of it names only the
   constructor: `static pure[X](value: X) -> Self[X]`. It is called on a constructor, a bounded
   parameter (`F.pure(1)`), a type named bare (`Option.pure(1)`) or a partial application
@@ -623,7 +651,7 @@ impl Monad for Option
 A program's own type implements the family by giving `pure` and `flatMap`; `map` and `map2` come
 from `Monad`'s defaults:
 
-```text
+```text run
 data Parser[A](run: (string) -> Option[(A, string)])
 
 impl Monad for Parser
@@ -632,9 +660,23 @@ impl Monad for Parser
   flatMap[B](f: (A) -> Parser[B]) -> Parser[B] =
     Parser(s -> run(s).flatMap(match (a, rest) -> f(a).run(rest)))
 
+pairUp[F[_]: Monad, A, B](fa: F[A], fb: F[B]) -> F[(A, B)] =
+  for a in fa, b in fb yield (a, b)
+
 val digit = Parser(s -> s.headOption.filter(c -> '0' <= c <= '9').map(c -> (int(c) - int('0'), s.drop(1))))
 
 val twoDigits = pairUp(digit, digit).map(match (a, b) -> a * 10 + b)
+
+main()
+  println(twoDigits.run("42!"))
+  println(twoDigits.run("4x"))
+  println(Parser.pure(7).run("rest"))
+```
+
+```text output
+Some((42, !))
+None
+Some((7, rest))
 ```
 
 ### Inferring a constructor
@@ -661,7 +703,8 @@ val twoDigits = pairUp(digit, digit).map(match (a, b) -> a * 10 + b)
   parameter the first decides. An expected type decides them first, as it decides any type
   argument. The type named must agree: an `Option` and a `List` for
   one `F` is an error naming both, never a join to a trait they share, which a written argument
-  (`pairUp[Seq, …]`) asks for.
+  asks for where that trait conforms to the bound: `both[Seq]([1, 2], List(3))` for a
+  `both[F[_]: Foldable](a: F[int], b: F[int])`.
 - **The expected type decides `F` as an argument does**: with
   `wrap[F[_]: Applicative, A](a: A) -> F[A] = F.pure(a)`, `val o: Option[int] = wrap(3)` takes
   `F` as `Option`; with nothing expected and no argument naming `F`, the call is an error asking for
@@ -741,6 +784,11 @@ check left for run time and no unchecked conversion anywhere:
 - **Static members and defaults per constructor.** A static member is reached only through a
   constructor that is known in each instance, and a default body is compiled once per implementing
   constructor, so `Self.pure` always names one implementation.
+- **Traits for types at holes.** A trait for types that bounds constructors names no `Self` beyond
+  the receiver and has no static member, so its members read the same from every application, and
+  a constructor conforms to it only where a conformance states the trait's parameters as the
+  type's own. Every `F[X]` an instance makes is then a `Foldable[X]` by an ordinary conformance, and
+  a call through the bound is the ordinary call on that type.
 - **A bound, never a type.** No value has a constructor trait as its type, so there is no object
   whose `Self` is unknown, no dynamic dispatch over constructors and no existential to open. Each
   instance is monomorphized, its values reified at their exact types, and a downcast stays a
@@ -748,13 +796,14 @@ check left for run time and no unchecked conversion anywhere:
 
 ## Functor, Applicative, Monad, Traverse
 
-The core library declares the standard constructor traits, in module `avin`:
+The core library declares the standard constructor traits, in module `avin`, and `Foldable`, a
+trait for types that bounds constructors as well, since its method never writes `Self`:
 
 ```text
 trait Functor[A]
   map[B](f: (A) -> B) -> Self[B]
 
-trait Foldable[A]
+trait Foldable[+A]
   foldLeft[B](initial: B, f: (B, A) -> B) -> B
 
 trait Applicative[A]: Functor[A]
@@ -793,36 +842,75 @@ trait SendableMonad[A: Sendable]: SendableFunctor[A]
 `impl SendableMonad for Future` gives only `pure` (`Future.successful`); `Future`'s own `map` and
 `flatMap` meet the rest.
 
+The impls are for concrete types only, one per row; code generic over sequences takes an
+`F[_]: Monad` (or the trait it needs) rather than a `Seq`, which as a trait for types has no impl of
+a constructor trait:
+
 | Constructor | `Functor` | `Foldable` | `Applicative`, `Monad` | `Filter` | `Traverse` |
 | --- | --- | --- | --- | --- | --- |
 | `Option` | yes | yes | yes (`pure` is `Some`) | yes | yes |
 | `Result[_, E]` | yes | yes | yes (`Ok`) | no: no error to give | yes |
 | `Either[L, _]` | yes | yes | yes (`Right`) | no | yes |
-| `List`, `Vector`, `ArraySeq`, `Queue`, `Seq` | yes | yes | yes (one element) | yes | yes |
+| `List`, `Vector`, `ArraySeq`, `Queue` | yes | yes | yes (one element) | yes | yes |
 | `LazyList` | yes | yes | yes | yes | no: an infinite list never finishes |
 | `Array`, `Buffer`, `Deque` | yes | yes | no: mutable | yes | no |
-| `Set` | yes | yes | no | yes | no |
+| `HashSet`, `OrderedSet`, `TreeSet` | no: `map` makes a `Set` | yes | no | no | no |
 
 - **The traits are nominal.** A type is a `Functor` because an impl says so, and only then: a type
   with a `map` of the right shape and no `impl Functor` is no `Functor`, cannot be passed for an
   `F[_]: Functor`, and is no source of a [`for` comprehension](/spec/collections/#for-comprehensions)
   unless it is an `Iterable`.
+- **Every `Iterable[A]` is a `Foldable[A]`**: `Iterable` requires it and gives `foldLeft`, so every
+  collection of one parameter is a constructor for `[F[_]: Foldable]` with no impl of its own, the
+  sets and the sorted collections too, where the hole promises their bound (`TreeSet` for an
+  `F[_: Ord]`). `Option`, `Result` and `Either` gain `foldLeft` in their impls of `Traverse`.
 - **The traits add no method a collection already has and change none.** `List`'s own `map`,
   `flatMap` and `foldLeft` implement them, so `xs.map(f)` on a `List` is the call it always was, with
-  the result it always had; the impls write only what the types lack: `pure`, `map2` on the
-  sequences, `traverse`, and `foldLeft` on `Option`, `Result` and `Either`. `sequence` is added to
-  every traversable of applicatives.
+  the result it always had; the impls write only what the types lack: `pure`, `traverse`, and
+  `foldLeft` on `Option`, `Result` and `Either`. `map2` is `Monad`'s, from `flatMap`, and `sequence`
+  is added to every traversable of applicatives.
 - **A sequence's `map2` and `flatMap` pair every element with every element**, as a two-generator
   `for` does; `zip` still pairs them by position, and is no trait's.
-- `traverse` and `sequence` stop at the first `None`, `Err` or `Left`:
-  `["1", "2"].traverse(_.toIntOption())` is `Some([1, 2])`, `[Some(1), None].sequence()` is `None`,
-  and `lines.traverse(parseLine)` is a `Result[Vector[Line], ParseError]`, where `flatten` keeps the
-  values that are present and drops the rest.
+- **`traverse` and `sequence` answer the first `None`, `Err` or `Left`** where there is one, and
+  otherwise the applicative of all the results. A sequence's `traverse` gathers through `map2`, so
+  `f` is applied to every element, in order, and the first failure decides the result; it is the
+  result that stops at the first failure, never the evaluation. `flatten` keeps the values that are
+  present and drops the rest:
+
+```text run
+data Line(name: string, size: int)
+
+data ParseError(line: string)
+
+parseLine(text: string) -> Result[Line, ParseError] = text.split(" ") match
+  [name, size] -> size.toIntOption().map(n -> Line(name, n)).okOr(ParseError(text))
+  _ -> Err(ParseError(text))
+
+main()
+  println(["1", "2"].traverse(_.toIntOption()))
+  println(["1", "two", "x"].traverse(_.toIntOption()))
+  println([Some(1), None].sequence())
+  println([Some(1), None].flatten)
+  println(["a 1", "b 2"].traverse(parseLine))
+  println(["a 1", "b", "c x"].traverse(parseLine))
+```
+
+```text output
+Some([1, 2])
+None
+None
+[1]
+Ok([Line(a, 1), Line(b, 2)])
+Err(ParseError(b))
+```
+
 - Not implemented, each for a reason a reader can see in its signature: `Map` (its `map` takes the
-  entries), `TreeSet` and the sorted collections (their `map` needs `Ord`), `Iterator` (single-pass),
-  `Range` (its `map` makes a `Vector`, not a range) and `Future` (its `map` needs a `Sendable`
-  result and a `@sendable` function, so it is a `SendableMonad` instead); `Future.traverse`, a
-  static member taking a collection, is unrelated and stays.
+  entries, so it folds them as an `Iterable[(K, V)]` and is no constructor), the sets and the sorted
+  collections as functors (their `map` makes a `Set` and needs `Eq & Hash` or `Ord` of its result),
+  `Iterator` as a functor (single-pass), `Range` (its `map` makes a `Vector`, not a range), `Seq`
+  and `Set` (traits for types, which no impl of a constructor trait is for) and `Future` (its `map`
+  needs a `Sendable` result and a `@sendable` function, so it is a `SendableMonad` instead);
+  `Future.traverse`, a static member taking a collection, is unrelated and stays.
 - **Each implementation keeps the laws**, which the library's tests check for every type in the
   table: `map(x -> x)` is the value, `map(f).map(g)` is `map(x -> g(f(x)))`; `pure(a).flatMap(f)` is
   `f(a)`, `m.flatMap(Self.pure)` is `m`, and `flatMap` is associative.

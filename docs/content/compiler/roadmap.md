@@ -656,8 +656,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 6 are
-done; steps 7 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 7 are
+done; steps 8 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -738,14 +738,23 @@ and emission see only the types they see today; `type_key` names a constructor
    (an extension module adding to every `Pointed`, seen only where imported),
    `tests/reject/constructor_param_impl_{calls,decls}.avin`,
    `tests/programs/reject/constructor_param_extension_{unseen,clash}`.
-7. **The library.** `library/avin/functor.avin`: `Functor`, `Foldable`, `Applicative`, `Monad`,
-   `Filter`, `Traverse`, `sequence`, `SendableFunctor`, `SendableMonad`; the impls of the spec's
-   table, each giving only what the type lacks (`pure`, `map2`, `traverse`, `foldLeft` on `Option`,
-   `Result`, `Either`). Tests: `library/tests/functors.avin` checking the functor and monad laws for
-   every type in the table, `traverse`/`sequence` stopping at the first failure, cartesian `map2` on
-   sequences beside positional `zip`; a `tests/run` program proving `List.map` and the other own
-   methods answer exactly what they did (their result types by a type pattern). The spec's examples
-   (`pairUp`, `Parser`, `traverse`) become `run` fences.
+7. **The library.** *Done.* `library/avin/functor.avin`: `Functor`, `Foldable`, `Applicative`,
+   `Monad`, `Filter`, `Traverse`, `sequence`, `SendableFunctor`, `SendableMonad`; the impls of the
+   spec's table, for concrete types only, each giving only what the type lacks (`pure`,
+   `traverse`, `foldLeft` on `Option`, `Result`, `Either`), and `impl SendableMonad for Future`.
+   `Foldable` is a trait for types that bounds constructors at its holes (`bounds_constructors`
+   in `check.sysl`: bounds, a constructor trait's requirements, impls over constructor
+   parameters, inference), and `Iterable` requires it, so every collection folds through
+   `[F[_]: Foldable]`; a constructor trait's parameter bounds no longer demand anything of the
+   conforming type's parameters (`conforming_type_param`). Tests: `library/tests/functors.avin`
+   (the functor and monad laws through the bounds for every type in the table, `traverse` and
+   `sequence` answering the first failure with every element given to `f`, cartesian `map2`
+   beside `zip`, `Future`'s `pure`), `tests/run/functor_own_methods.avin` (own methods' result
+   types by type patterns), `tests/run/foldable_constructor_bounds{,_gc}.avin`,
+   `tests/run/sendable_monad_conformance.avin`,
+   `tests/reject/foldable_constructor_bound_{refusals,inference}.avin`,
+   `tests/reject/sendable_monad_conformance.avin`; the spec's `pairUp`, `Parser` and `traverse`
+   examples are `run` fences.
 8. **Comprehensions by conformance.** `for_yield_expr` (`check.sysl`) admits each source by its
    role (`Iterable`, or `Functor`/`Monad`/`Filter` or the sendable pair, through bounds in generic
    code) before checking its calls as today; the guard on a non-`Iterable` source calls `filter`;

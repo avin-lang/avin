@@ -136,13 +136,15 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
 ## Methods every Iterable has
 
 `Iterable` itself gives `head`, `last` and their `Option` forms, which a sequence and a sorted
-collection override to reach the end at once. Impls add the rest to `Iterable`, each written once
+collection override to reach the end at once, and `foldLeft`, by which every `Iterable[A]` is a
+[`Foldable[A]`](/spec/generics/#functor-applicative-monad-traverse) and a list or a vector, overriding
+it, walks itself. Impls add the rest to `Iterable`, each written once
 over `iterator()`, so every collection has them:
 lists, vectors, arrays, buffers, deques, ranges, sets, maps (whose elements are their entries, as
 `(key, value)` pairs), the mutable sets and maps, iterators, and a class of the program's own that
 conforms to `Iterable`. They visit the elements in iteration order. On an iterator they consume it.
 A type with a faster way to answer one keeps its own method of the same name and parameter types,
-which is found first wherever the type is known: a list walks itself for `foldLeft`, `find` and the
+which is found first wherever the type is known: a list walks itself for `find` and the
 rest, a set and a range know at once whether they are empty, a vector is its own `toVector`.
 Collections they make are vectors, maps and sets; n is the number of elements.
 

@@ -2019,12 +2019,15 @@ private constructor_impl_written_out(c: *Checker, unit: usize, d: &ImplDecl) -> 
     val k = c.class_types.get(resolve_name(c, unit, trait_path)) match
         Some(k) -> k
         None -> return d
-    if !is_constructor_trait(c, k) then return d
+    if !bounds_constructors(c, k) then return d
     val key = resolve_name(c, unit, path)
     var declared: Buf[TypeParam] = buf()
     if c.types.get(key) is Some(id) then declared = c.data[id].decl.type_params
     elif c.class_types.get(key) is Some(id) then declared = c.classes[id].decl.type_params
     elif builtin_type(path) is None then return d
+    // A trait for types that bounds constructors at its holes is written out the same way where the
+    // numbers agree, and otherwise is the impl as written.
+    if !is_constructor_trait(c, k) && declared.len() != c.classes[k].decl.type_params.len() then return d
     var params: Buf[TypeParam] = buf()
     var args: Buf[&TypeExpr] = buf()
     for i in 0..<declared.len()
@@ -2610,7 +2613,7 @@ private constructor_traits_at(c: *Checker, owner: usize, index: usize) -> Buf[us
     var out: Buf[usize] = buf()
     for b in bounds_at(c, owner, c.symbols[owner].type_params, index)
         if *b is Class(k, _, _)
-            if is_constructor_trait(c, k) && !contains_index(out, k) then out.push(k)
+            if bounds_constructors(c, k) && !contains_index(out, k) then out.push(k)
     out
 
 /** Whether `t`, an application of a constructor parameter in scope, is one of each of `traits`, by
@@ -3707,8 +3710,8 @@ private refuse_constructor_conformances(c: *Checker)
             val (p, xs) = *parent match
                 Class(p, _, xs) -> (p, xs)
                 _ -> continue
-            if !is_constructor_trait(c, p)
-                c.note(unit, d.name_span, s"`${d.name}` is a constructor trait, so it requires only constructor traits, and `${c.classes[p].name}` is a trait for types")
+            if !bounds_constructors(c, p)
+                c.note(unit, d.name_span, s"`${d.name}` is a constructor trait, so it requires only traits that bound constructors, and `${c.classes[p].name}` is a trait for types")
                 continue
             var in_order = xs.len() == d.type_params.len()
             for j in 0..<xs.len()
@@ -7633,7 +7636,7 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
         var bounds: Buf[&Type] = buf()
         for b in tp.bounds
             // A constructor trait bounds a constructor, never a type.
-            if written_constructor_trait(c, unit, b) is Some(k)
+            if written_constructor_trait(c, unit, b, false) is Some(k)
                 val n = c.classes[k].decl.type_params.len()
                 c.note(unit, b.span, s"`${c.classes[k].name}` is a bound for a constructor of ${arguments_word(n)}; declare `${tp.name}[${hole_marks(n)}]`")
                 continue
@@ -7663,7 +7666,7 @@ private declare_constructor_param(c: *Checker, unit: usize, owner: usize, index:
     // A constructor parameter is bounded by constructor traits of its arity, named bare.
     var bounds: Buf[&Type] = buf()
     for b in tp.bounds
-        if written_constructor_trait(c, unit, b) is Some(k)
+        if written_constructor_trait(c, unit, b, true) is Some(k)
             val arity = c.classes[k].decl.type_params.len()
             val name = c.classes[k].name
             val written_args = b.kind match
@@ -7681,6 +7684,11 @@ private declare_constructor_param(c: *Checker, unit: usize, owner: usize, index:
                 c.note(unit, b.span, s"`$name` is already a bound of `${tp.name}`")
                 continue
             bounds.push(t)
+            continue
+        // A trait for types bounds a constructor at its holes only where its members never name
+        // `Self` beyond the receiver and it has no static member.
+        if written_trait_for_types(c, unit, b) is Some(k)
+            c.note(unit, b.span, s"`${c.classes[k].name}` names `Self` beyond the receiver or has a static member, or requires a trait that does, so it bounds types and not constructors, and `${tp.name}` is a constructor")
             continue
         val t = resolve_bound(c, unit, b)
         if *t is ErrorType then continue
@@ -7729,8 +7737,8 @@ private bounded_hole_marks(n: usize, j: usize, bound: string) -> string
     out
 
 /** The constructor trait a bound names, if it names one: written as a name, with or without type
- * arguments. */
-private written_constructor_trait(c: *Checker, unit: usize, b: &TypeExpr) -> Option[usize]
+ * arguments. With `at_holes`, a trait that bounds constructors at its holes counts too. */
+private written_constructor_trait(c: *Checker, unit: usize, b: &TypeExpr, at_holes: bool) -> Option[usize]
     val path = b.kind match
         Named(p, _) -> p
         _ -> return None
@@ -7738,7 +7746,18 @@ private written_constructor_trait(c: *Checker, unit: usize, b: &TypeExpr) -> Opt
         for tp in scope.params
             if tp.name == path then return None
     val k = c.class_types.get(resolve_name(c, unit, path))?
-    if is_constructor_trait(c, k) then Some(k) else None
+    if is_constructor_trait(c, k) || (at_holes && bounds_constructors(c, k)) then Some(k) else None
+
+/** The trait of parameters a bound names bare, where it is one that bounds types only. */
+private written_trait_for_types(c: *Checker, unit: usize, b: &TypeExpr) -> Option[usize]
+    val path = b.kind match
+        Named(p, args) -> if args.len() == 0 then p else return None
+        _ -> return None
+    if c.generic is Some(scope)
+        for tp in scope.params
+            if tp.name == path then return None
+    val k = c.class_types.get(resolve_name(c, unit, path))?
+    if is_trait(c, k) && c.classes[k].decl.type_params.len() > 0 && !bounds_constructors(c, k) then Some(k) else None
 
 /** Where the bounds of hole `k` of constructor parameter `tp` are kept in `bounds`. */
 private hole_bound_key(tp: TypeParam, k: usize) -> string = s"hole/${tp.site}/$k"
@@ -9458,6 +9477,19 @@ private check_type_args(c: *Checker, unit: usize, at: Span, what: string, owner:
         return
     hold_to_bounds(c, unit, at, what, owner, params, args, 0)
 
+/** Whether `owner` owns the type parameters of a constructor trait. */
+private constructor_trait_owner(c: *Checker, owner: usize) -> bool =
+    owner >= class_owner(0) && owner < class_owner(c.classes.len()) && is_constructor_trait(c, owner - class_owner(0))
+
+/** Whether `t` is a parameter of a data type or of a class that is no trait: what a conformance's
+ * holes are, and never a trait's parameter, which a trait requiring another passes on. */
+private conforming_type_param(c: *Checker, t: &Type) -> bool = *t match
+    TypeVar(o, _, _) ->
+        if o >= data_owner(0) && o < data_owner(c.data.len()) then true
+        elif o >= class_owner(0) && o < class_owner(c.classes.len()) then !is_trait(c, o - class_owner(0))
+        else false
+    _ -> false
+
 // Reports each of `args`, from position `from` on, that does not conform to a bound of its
 // parameter, the bound seen with these type arguments.
 private hold_to_bounds(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type], from: usize) =
@@ -9471,6 +9503,10 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
         // An argument a constructor leaves open is held by the constructor's own rules
         // (`constructor_refusal`), never to the type's bounds.
         if is_hole(args[i]) then continue
+        // A constructor trait's arguments, in a conformance, are the holes of the type: its
+        // parameters' bounds are the holes' promise to the type, held against the type's own
+        // bounds (`constructor_conformance_refusal`), never demanded of the type's parameters.
+        if constructor_trait_owner(c, owner) && conforming_type_param(c, zonk(c, args[i])) then continue
         if params[i].holes.len() > 0
             hold_constructor(c, unit, at, owner, params, i, args)
             for b in bounds_at(c, owner, params, i)
@@ -9664,7 +9700,7 @@ private note_constructor_vars(c: *Checker, callee: string, called: bool, owner: 
             var traits: Buf[usize] = buf()
             for b in bounds_at(c, owner, params, i)
                 if *b is Class(k, _, _)
-                    if is_constructor_trait(c, k) && !contains_index(traits, k) then traits.push(k)
+                    if bounds_constructors(c, k) && !contains_index(traits, k) then traits.push(k)
             c.constructor_vars.put(v, ConstructorVar(params[i], callee, before, called, traits))
 
 /** Why `found` decides no constructor for the unknown constructor parameter `wanted` is applied
@@ -9867,6 +9903,13 @@ private applies_self(t: &TypeExpr) -> bool
                 if applies_self(m) then return true
         _ -> ()
     false
+
+/** Whether `k` can bound a constructor: a constructor trait, or a trait of parameters whose members
+ * never name `Self` beyond the receiver, have no static member, and require only such traits, as
+ * `Foldable[A]` does. A constructor conforms to the latter where each of its applications conforms
+ * as a type with the trait's parameters at the holes: `impl Foldable for Option` makes `Option` one. */
+bounds_constructors(c: *Checker, k: usize) -> bool =
+    is_constructor_trait(c, k) || (is_trait(c, k) && c.classes[k].decl.type_params.len() > 0 && self_only_as_receiver(c.classes, k, 0))
 
 /** Whether `t` is a constructor trait at some arguments. */
 private names_constructor_trait(c: *Checker, t: &Type) -> bool = *t match
@@ -24599,6 +24642,11 @@ private bound_constructor(c: *Checker, t: &Type, traits: Buf[usize], arity: usiz
         if i > 0 then bound_names = bound_names + (if i + 1 == traits.len() then " and " else ", ")
         bound_names = bound_names + s"`${c.classes[traits[i]].name}`"
     val name = type_head_name(t)
+    // A trait for types the type conforms to at arguments that are not its own parameters makes no
+    // constructor of it.
+    for k in traits
+        if ancestor_type(c.classes, c.data, t, k) is Some(up)
+            return ConstructorChoice(None, s"`$name` implements `${c.classes[k].name}` as `${type_name(up)}`, at no parameters of its own, so it is no constructor implementing it; a constructor implements it at its parameters, as in `impl[T] ${c.classes[k].name}[T] for Box[T]`", "")
     val subject = if superclass_of_type(c, t) is Some(_) then s"neither `$name` nor a superclass of it implements" else s"`$name` does not implement"
     ConstructorChoice(None, s"$subject $bound_names, the bound of the constructor; a type is one only where its declaration or an impl says so", "")
 

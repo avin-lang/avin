@@ -1,0 +1,155 @@
+module avin
+
+// The standard constructor traits. Each is implemented by a type constructor rather than a type, so
+// a function bounded by one, `[F[_]: Monad]`, serves options, results, sequences and a program's own
+// types alike. The traits add no method a type already has and change none: a type's own `map`,
+// `flatMap`, `filter` and `foldLeft` implement them, and the impls below give only what a type lacks.
+
+// A constructor whose values can be mapped: `map(x -> x)` is the value, and `map(f).map(g)` is
+// `map(x -> g(f(x)))`.
+trait Functor[A]
+  map[B](f: (A) -> B) -> Self[B]
+
+// A type whose elements can be folded, first to last. Its methods never write `Self`, so it is a
+// trait for types and bounds constructors too: `impl Foldable for Option` makes each `Option[T]` a
+// `Foldable[T]`, and `[F[_]: Foldable]` asks that of every application of `F`. Every `Iterable` is
+// one, at its element type.
+trait Foldable[+A]
+  foldLeft[B](initial: B, f: (B, A) -> B) -> B
+
+// A functor that can lift a value, `pure`, and combine two of its values, `map2`.
+trait Applicative[A]: Functor[A]
+  static pure[X](value: X) -> Self[X]
+  map2[B, C](other: Self[B], f: (A, B) -> C) -> Self[C]
+
+// An applicative whose values chain: `pure(a).flatMap(f)` is `f(a)`, `m.flatMap(Self.pure)` is `m`,
+// and `flatMap` is associative. A constructor giving `pure` and `flatMap` has `map` and `map2` from
+// them; a sequence's `map2` so pairs every element with every element.
+trait Monad[A]: Applicative[A]
+  flatMap[B](f: (A) -> Self[B]) -> Self[B]
+  override map[B](f: (A) -> B) -> Self[B] = flatMap(a -> Self.pure(f(a)))
+  override map2[B, C](other: Self[B], f: (A, B) -> C) -> Self[C] =
+    flatMap(a -> other.map(b -> f(a, b)))
+
+// A functor that can keep only the elements meeting a predicate.
+trait Filter[A]: Functor[A]
+  filter(p: (A) -> bool) -> Self[A]
+
+// A functor whose elements can each be turned into an applicative's value, and the values gathered:
+// `traverse` answers the applicative of all the results, or the first failure among them. Every
+// element is given to `f`; the first failure decides the result.
+trait Traverse[A]: Functor[A], Foldable[A]
+  traverse[G[_]: Applicative, B](f: (A) -> G[B]) -> G[Self[B]]
+
+// Every traversable of applicatives turns inside out: `[Some(1), Some(2)].sequence()` is
+// `Some([1, 2])`, and `[Some(1), None].sequence()` is `None`.
+impl[F[_]: Traverse, G[_]: Applicative, A] F[G[A]]
+  sequence() -> G[F[A]] = traverse(x -> x)
+
+// A functor whose functions run on another thread: its holes carry `Sendable` and its functions are
+// `@sendable`.
+trait SendableFunctor[A: Sendable]
+  map[B: Sendable](@sendable f: (A) -> B) -> Self[B]
+
+// The monad of the sendable pair, `Future`'s.
+trait SendableMonad[A: Sendable]: SendableFunctor[A]
+  static pure[X: Sendable](value: X) -> Self[X]
+  flatMap[B: Sendable](@sendable f: (A) -> Self[B]) -> Self[B]
+
+// The results of `f` on the elements folded by `fold`, gathered in the applicative `G` as a list in
+// reverse order, which each sequence's `traverse` turns into its own type.
+private gatheredReversed[G[_]: Applicative, A, B](fold: Foldable[A], f: (A) -> G[B]) -> G[List[B]] =
+  fold.foldLeft(G.pure(List.empty[B]()), (acc, a) -> acc.map2(f(a), (bs, b) -> b :: bs))
+
+// `Option`: its own `map`, `flatMap` and `filter` meet the traits.
+impl Monad for Option
+  static pure[X](value: X) -> Option[X] = Some(value)
+
+impl Filter for Option
+
+impl Traverse for Option
+  foldLeft[B](initial: B, f: (B, T) -> B) -> B = self match
+    Some(v) -> f(initial, v)
+    None -> initial
+
+  traverse[G[_]: Applicative, B](f: (T) -> G[B]) -> G[Option[B]] = self match
+    Some(v) -> f(v).map(b -> Some(b))
+    None -> G.pure(None)
+
+// `Result[_, E]`, on its `Ok` values: its own `map` and `flatMap` meet the traits.
+impl[T, E] Monad[T] for Result[T, E]
+  static pure[X](value: X) -> Result[X, E] = Ok(value)
+
+impl[T, E] Traverse[T] for Result[T, E]
+  foldLeft[B](initial: B, f: (B, T) -> B) -> B = self match
+    Ok(v) -> f(initial, v)
+    Err(_) -> initial
+
+  traverse[G[_]: Applicative, B](f: (T) -> G[B]) -> G[Result[B, E]] = self match
+    Ok(v) -> f(v).map(b -> Ok(b))
+    Err(e) -> G.pure(Err(e))
+
+// `Either[L, _]`, on its `Right` values: its own `map` and `flatMap` meet the traits.
+impl[L, R] Monad[R] for Either[L, R]
+  static pure[X](value: X) -> Either[L, X] = Right(value)
+
+impl[L, R] Traverse[R] for Either[L, R]
+  foldLeft[B](initial: B, f: (B, R) -> B) -> B = self match
+    Right(v) -> f(initial, v)
+    Left(_) -> initial
+
+  traverse[G[_]: Applicative, B](f: (R) -> G[B]) -> G[Either[L, B]] = self match
+    Right(v) -> f(v).map(b -> Right(b))
+    Left(l) -> G.pure(Left(l))
+
+// The immutable sequences: their own `map`, `flatMap`, `filter` and `foldLeft` meet the traits, and
+// `pure` is the sequence of one element.
+impl Monad for List
+  static pure[X](value: X) -> List[X] = List(value)
+
+impl Filter for List
+
+impl Traverse for List
+  traverse[G[_]: Applicative, B](f: (T) -> G[B]) -> G[List[B]] = gatheredReversed(self, f).map(bs -> bs.reverse)
+
+impl Monad for Vector
+  static pure[X](value: X) -> Vector[X] = Vector(value)
+
+impl Filter for Vector
+
+impl Traverse for Vector
+  traverse[G[_]: Applicative, B](f: (T) -> G[B]) -> G[Vector[B]] =
+    gatheredReversed(self, f).map(bs -> bs.reverse.toVector)
+
+impl Monad for ArraySeq
+  static pure[X](value: X) -> ArraySeq[X] = ArraySeq.fill(1, value)
+
+impl Filter for ArraySeq
+
+impl Traverse for ArraySeq
+  traverse[G[_]: Applicative, B](f: (T) -> G[B]) -> G[ArraySeq[B]] =
+    gatheredReversed(self, f).map(bs -> bs.reverse.toArraySeq)
+
+impl Monad for Queue
+  static pure[X](value: X) -> Queue[X] = Queue(value)
+
+impl Filter for Queue
+
+impl Traverse for Queue
+  traverse[G[_]: Applicative, B](f: (T) -> G[B]) -> G[Queue[B]] =
+    gatheredReversed(self, f).map(bs -> Queue.from(bs.reverse))
+
+// `LazyList`: a monad and a filter, read lazily as its own methods read it; never traversed, since an
+// infinite list never finishes.
+impl Monad for LazyList
+  static pure[X](value: X) -> LazyList[X] = LazyList.cons(value, LazyList.empty[X]())
+
+impl Filter for LazyList
+
+// The mutable sequences: each `map` and `filter` makes a new one; no `pure`, since a mutable sequence
+// of one element is no value to share.
+impl Filter for Array
+
+impl Filter for Buffer
+
+impl Filter for Deque

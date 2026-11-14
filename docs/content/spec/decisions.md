@@ -8417,6 +8417,65 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   settled 2026-11-14 that `private`, `static` and `override` stay reserved: a modifier used as a
   variable name would read strangely.
 
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **a trait for types whose
+  members never write `Self` bounds constructors too**
+  ([generics](/spec/generics/#constructor-traits)). A trait with parameters, no static member, no
+  member naming `Self` beyond the receiver, and requiring only such traits (`Foldable[A]`, any
+  `Countable[A]` of a program's own) is a trait for types everywhere it is one, and also a bound of
+  a constructor parameter of its arity: `impl Foldable for Option` makes each `Option[T]` a
+  `Foldable[T]`, so `Option` is a constructor for `[F[_]: Foldable]`, and a constructor trait may
+  require it at its own parameters (`trait Traverse[A]: Functor[A], Foldable[A]`). A type conforms
+  as a constructor only where a conformance states the trait's parameters as its own parameters,
+  so `impl Foldable[int] for Ints` makes no constructor; a type whose parameter is bounded is one
+  only for a hole promising that bound (`TreeSet` for `F[_: Ord]`), as for a constructor trait; a
+  trait naming `Self` otherwise or declaring a static member bounds types only, and one writing
+  `Self[X]` stays a constructor trait, never a type. Why: `Foldable`'s method mentions no `Self`,
+  so what it promises of an `F[X]` is exactly what the type conformance promises of that type; one
+  trait serves both uses, generic code over constructors reads the conformances the collections
+  already have, and nothing new is needed at run time (each instance's call is the ordinary call on
+  its type). Alternatives weighed: a constructor trait requiring a trait for types at its holes (a
+  constraint on every application `Self[A]`, a second notion with its own rules, where the dual
+  reading needs none); giving `Foldable` a method that writes `Self` (an artificial member, and it
+  would stop `Foldable[int]` being a type). This supersedes the Proposed "a constructor trait
+  requires only constructor traits" (branch `hkt-3`) for traits that bound constructors.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **every `Iterable[A]` is a
+  `Foldable[A]`.** `Iterable` requires `Foldable` and gives `foldLeft` as its default, moved from the
+  impl adding methods to every `Iterable`; `List` gives its own walk in its impl of `Seq` and
+  `Vector` overrides it, so every collection of one parameter is a constructor for `[F[_]:
+  Foldable]` with no impl of its own, and `Option`, `Result` and `Either` gain `foldLeft` in their
+  impls of `Traverse`. A class of a program's own conforming to `Iterable` that declares its own
+  `foldLeft` now marks it `override`. Why: the fold is what every collection already has, and the
+  nominal rule needs a conformance; one in `Iterable` gives it to all of them at once. Alternatives
+  weighed: `impl Foldable for` each collection (an impl per type, each restating `foldLeft`, since
+  a method an impl adds to a trait does not implement another trait's); leaving the collections
+  out of `Foldable` (generic folds would not take a `Vector`).
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **`Seq` and `Set` leave
+  the table of the standard constructor traits; the impls are for concrete types only**
+  ([generics](/spec/generics/#functor-applicative-monad-traverse)): `List`, `Vector`, `ArraySeq`,
+  `Queue`, `LazyList`, `Array`, `Buffer`, `Deque`, `Option`, `Result`, `Either`, and the sets and
+  sorted collections as `Foldable` only, since their `map` answers a `Set` and needs `Eq & Hash` or
+  `Ord` of its result. Generic code over sequences takes an `F[_]: Monad` (or the trait it needs).
+  No impl is for a trait type. Why: an impl is for a type's own constructor, and a trait's `map`
+  answers the trait's type for every implementing class, so `Seq` could meet `Functor` only through
+  an impl for a trait, which the language does not have. Alternatives weighed: impls for trait
+  types, a future language feature, added only if a library need appears.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **`traverse` and
+  `sequence` through `Applicative.map2` apply `f` to every element and answer the first failure.**
+  The spec's "stops at the first failure" means the result, not evaluation: a sequence's
+  `traverse` folds through `map2`, which runs `f` on each element in order, and the first `None`,
+  `Err` or `Left` decides what is answered. Why: `traverse` is written once for every applicative,
+  and `map2` is all an applicative gives; stopping early would need a short-circuiting fold the
+  trait does not have. Alternatives weighed: a stopping `traverse` per constructor of the result
+  (`Option`'s, `Result`'s), which generic code at a program's own applicative would not have.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **a constructor trait's
+  parameter bounds ask nothing of the conforming type's parameters**: `impl SendableMonad for
+  Future`, whose `T` has no bound, conforms, since the trait applies the constructor only to
+  types meeting `Sendable`; a type whose parameter is bounded by more than the trait's parameter
+  promises is still refused, and a trait requiring the trait bounds its own parameter as it does.
+  A conformance had held `T` to `Sendable` as an ordinary trait argument, against the spec's
+  "bounded by no more than `Sendable`". Alternatives: none that keep `Future` a `SendableMonad`
+  with its parameter unbounded.
+
 ## Proposed
 
 - Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
@@ -9748,7 +9807,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference by the call checker (heavier, and its tiers of defaults would decide what the trait's
   call does not).
 - Proposed: **a constructor trait requires only constructor traits**, each at its own parameters
-  in order; `trait Shown[A]: Functor[A], Display` is an error. Why: a trait for types bounds what
+  in order; `trait Shown[A]: Functor[A], Display` is an error. (Widened by the settled entry of
+  2026-11-14, branch `hkt-7`: it may also require a trait for types that bounds constructors.) Why: a trait for types bounds what
   a value is, and the constructor trait's `Self` is no value's type, so what the requirement would
   promise is unclear. Alternatives: reading it as a bound on every application `Self[A]` (a
   constraint on applications, which impls over constructor parameters, step 6, are the place for).
