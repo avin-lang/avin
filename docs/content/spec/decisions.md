@@ -8218,6 +8218,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+**The security primitives an API server needs** (branch `security`; [`avin.encoding`](/spec/system-library/#avinencoding), [`avin.crypto`](/spec/system-library/#avincrypto), [`avin.random`](/spec/system-library/#avinrandom))
+
+- Proposed: **a new module `avin.encoding` holds hexadecimal, base64 and base64url** (`toHex`,
+  `fromHex`, `toBase64`, `fromBase64`, `toBase64Url`, `fromBase64Url`, `DecodeError`), and
+  `toHex` moved there from `avin.crypto`, which keeps offering it with `export avin.encoding.toHex`,
+  so `import avin.crypto.toHex` still works. Why: base64 is not cryptography (data URLs, Basic
+  authentication, binary in JSON all use it), and hexadecimal in one module and its decoder in
+  another would split one encoding. Alternatives weighed: everything in `avin.crypto` (one import for
+  a server, but a module named for secrets would hold plain encodings); `fromHex` beside `toHex` in
+  `avin.crypto` and base64 alone in `avin.encoding` (hexadecimal split across two modules).
+- Proposed: **decoding is strict, one function per alphabet**: `fromBase64` takes only the standard
+  alphabet with its `=` padding, `fromBase64Url` only the URL-safe one with no `=`; whitespace and
+  line breaks are refused, and so is a last digit whose unused bits are not zero (RFC 4648 §3.5
+  allows a decoder to refuse it). Each byte sequence then has exactly one spelling, so a token or a
+  signature cannot be sent in a second form that compares unequal as text but decodes equal.
+  `fromHex` takes either case (a digit's case carries no bits). Errors are checked in order:
+  characters, then padding, then length, then unused bits, so the first offset named is the first
+  character wrong. Why: the module exists for an API server reading untrusted text, where
+  malleability is a defect. Alternatives weighed: Sysl's forgiving decoder (either alphabet, optional
+  padding, unused bits ignored), which is friendlier to sloppy writers but accepts many spellings of
+  one value; a `lenient` flag (two behaviours to test and document for no current need). Review with
+  the user: a reader of MIME-wrapped base64 must strip its line breaks first.
+- Proposed: **`DecodeError` has four cases**, `BadCharacter(at)`, `BadPadding(at)`, `Truncated(at)`
+  (where `at` is the text's length) and `UnusedBits(at)`, all byte offsets, and is an `Error`. Why:
+  the cases are what a caller would report differently, as `UrlError`'s are; `Truncated` carries the
+  length so every case has a position. Alternative weighed: binding Sysl's `DecodeError`, whose
+  `BadLength` has no position and whose `Short` and `Utf8` cannot occur here.
+- Proposed: **the encoders are written in Avin**, while the digests stay bound to Sysl. Why:
+  Avin's decoder is stricter than Sysl's (above), and encoding is a few lines of byte arithmetic with
+  no platform behind it. Alternative weighed: binding `sysl.encoding`'s encoders and writing only the
+  checks in Avin (two passes over the text, and a second implementation of the alphabet anyway).
+- Proposed: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
+  (compared as UTF-8 bytes, so `"é"` and `"e\u{301}"` differ), bound to Sysl's `sysl.crypto.verify`,
+  which reads every byte and branches only on the lengths. Why: Sysl pins that function's
+  branch-free code with its own codegen tests, which an Avin loop would not have; different lengths
+  answering `false` at once leaks only a length, which a token's or a tag's is not secret. Alternatives
+  weighed: an Avin loop accumulating `xor`s (its constant time would rest on the optimizer); a method
+  on `Vector[byte]` (a security property should be found where the secrets are).
+- Proposed: **`SecureRandom`, an object in `avin.random`**, with `Random`'s drawing methods
+  (`nextBytes`, `nextInt`, `nextLong`, both bounded, `between` for `int` and `long`, `nextReal`,
+  `nextBoolean`, `alphanumeric`, `shuffle`, `choose`) and two token functions, `hexToken(byteCount
+  = 32)` and `urlToken(byteCount = 32)`. Every draw reads `getentropy` through Sysl's
+  `sysl.posix.rand.entropy_from_os`, which is on macOS, glibc Linux and the BSDs and loops past the
+  256-byte request limit. A refusal from the operating system traps. Why: one name beside `Random`
+  is found by whoever reads that module's warning; an object, not a class, because there is no seed
+  and no state; trapping because a program wanting key material has no safe fallback. 32 bytes is
+  256 bits, past any guessing. `nextGaussian`, `chooseWeighted` and `setSeed` are left out: no
+  secret is drawn from a normal or weighted distribution, and there is no seed. Alternatives
+  weighed: a class `SecureRandom()` sharing a trait with `Random` (an instance holds nothing, and the
+  trait would add a dispatch to every PCG draw); a buffered pool of entropy (fewer system calls, but
+  secret bytes kept in the heap and a lock); `secureBytes` and token functions in `avin.crypto`
+  (randomness split across two modules); `Result` instead of a trap (a caller of `nextInt` would
+  match on every draw).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
