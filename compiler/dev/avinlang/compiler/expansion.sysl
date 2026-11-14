@@ -213,6 +213,10 @@ private resolved(c: *Checker, t: &Type) -> &Type = *t match
     Var(id) -> c.vars[id] match
         Some(bound) -> resolved(c, bound)
         None -> t
+    // An application whose constructor is known is the type it makes.
+    Applied(head, args) -> *resolved(c, head) match
+        Constructor(body, _) -> resolved(c, substitute(body, hole_owner(), args))
+        _ -> t
     _ -> t
 
 /** The indices of the type parameters of `owner` that `t` names. */
@@ -237,13 +241,27 @@ private params_in(c: *Checker, t: &Type, owner: usize, out: *Buf[usize])
         Class(_, _, args) ->
             for x in args
                 params_in(c, x, owner, out)
+        Constructor(body, _) -> params_in(c, body, owner, out)
+        Applied(head, args) ->
+            params_in(c, head, owner, out)
+            for x in args
+                params_in(c, x, owner, out)
         _ -> ()
 
 /** How deep in `t` its deepest mention of type parameter `i` of `owner` is: 0 for the parameter
- * itself, one more for each type around it; -1 where `t` does not name it. */
+ * itself, one more for each type around it; -1 where `t` does not name it. A constructor is as deep
+ * as the type it makes, so a constructor parameter passed bare, `F`, is at 0, and `Wrap[F, _]` at 1;
+ * the head of an application `F[A]` is at the application's own depth, its arguments one deeper. */
 private depth_of(c: *Checker, t: &Type, owner: usize, i: usize) -> i64
     val parts: Buf[&Type] = *resolved(c, t) match
         TypeVar(o, j, _) -> return if o == owner && j == i then 0 else -1
+        Constructor(body, _) -> return depth_of(c, body, owner, i)
+        Applied(head, args) ->
+            var deepest = depth_of(c, head, owner, i)
+            for x in args
+                val d = depth_of(c, x, owner, i)
+                if d >= 0 && d + 1 > deepest then deepest = d + 1
+            return deepest
         Tuple(items) -> items
         Function(params, result, _) ->
             var all: Buf[&Type] = buf()
@@ -316,6 +334,10 @@ private mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type)
                 mention(c, f, site, span, x)
             mention(c, f, site, span, result)
         ByName(inner) -> mention(c, f, site, span, inner)
+        Constructor(body, _) -> mention(c, f, site, span, body)
+        Applied(_, args) ->
+            for x in args
+                mention(c, f, site, span, x)
         _ -> ()
 
 /** A direct call or function value of `id`. A local function or lambda with no type parameters of
