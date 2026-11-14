@@ -236,13 +236,24 @@ carry the chapter's exact messages, at most five per file.
 ### Refined variants: build plan
 
 [Refined variants](/spec/refined-variants/) are designed, their choices proposed in
-[decisions](/spec/decisions/#proposed); none is built. Each step is one item, gated on its own
+[decisions](/spec/decisions/#proposed); step 1 is built, steps 2 to 7 are still to come. Each step is one item, gated on its own
 targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
 `-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
 messages, at most five per file. A step that meets a missing piece of the checker it builds on
 reports it rather than routing around it.
 
-1. **Declaration.** `Variant[params](fields) -> Type[args]` and `Name -> Type[args]` in a `data`
+1. **Declaration.** *Done (branch `gadt-1`):* parsed, shown and formatted; `VariantSymbol` holds
+   `params` (the type's, then the variant's own) and `result`; the six checks run, rule 6 through
+   `expansion.sysl`'s flow graph with each refined variant's parameters as nodes of their own; tests
+   `tests/reject/refined_{result,parameters,variance,nested,bounds,defaults,not_yet_built,not_yet_built_types}`,
+   `tests/run/refined_declaration`, `tests/programs/reject/refined_across_modules`, and cases in
+   `parse_tests`, `formatter_tests` and `lsp_tests`. Until step 2, a type with a refined variant is
+   refused wherever it is named, made or matched (`refined_use_refused` in `check.sysl`), which step 2
+   removes. Where it meets [higher-kinded types](/spec/generics/#higher-kinded-types): a result
+   refuses any form but data types, classes, tuples, functions and parameters, so a constructor or an
+   applied constructor parameter is refused already; a constructor parameter among a variant's own
+   (`V[G[_]]`) is refused when the two branches are merged.
+   `Variant[params](fields) -> Type[args]` and `Name -> Type[args]` in a `data`
    body: `syntax.sysl` (`Variant` gains `type_params` and `result: Option[&TypeExpr]`),
    `parse_decl.sysl`, `formatter.sysl` (round trip, `avin fmt`-clean), `syntax_show.sysl`,
    `lsp_symbols.sysl`; in `check.sysl`'s `declare_variants`, `VariantSymbol` gains its parameters and
@@ -251,7 +262,8 @@ reports it rather than routing around it.
    an unused parameter, a reused name, `Lift[A](x: Expr[Vector[A]])` refused beside
    `First[A, B](pair: Expr[(A, B)])` accepted); parse and formatter cases for a fieldless variant with a
    result, a multi-line field list, annotations and defaults on a refined variant's fields.
-2. **Making values and layouts.** `variant_signature` generic over the variant's parameters; inference
+2. **Making values and layouts.** Removes step 1's `refined_use_refused` and its two reject tests
+   `refined_not_yet_built*`. `variant_signature` generic over the variant's parameters; inference
    from fields and the expected type; explicit arguments on the variant and on the type; the bare and
    qualified names; in `lower.sysl`, `DataLayout` holding only the variants possible at the
    instance, tags kept as declared; derived `Eq`, `Hash`, `Display`, `Debug` per instance; a type
