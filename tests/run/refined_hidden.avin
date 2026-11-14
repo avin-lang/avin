@@ -1,0 +1,142 @@
+// expect: exit 0
+// Hidden type parameters: a variant parameter its fields name and its result does not is chosen by
+// each value where it is made, and an arm taking the value apart sees it as a fresh type, the same
+// for every field naming it. Each list of hidden types the program makes a variant with is a pack,
+// with its own layout, so a value-type field (`int`, `real`, a tuple) is kept unboxed beside a
+// reference one; an arm on the variant is compiled once per pack and chosen by the value's
+// descriptor. Two values of one variant in different packs are unequal and hash apart.
+
+data Expr[T]
+  IntLit(value: int) -> Expr[int]
+  BoolLit(value: bool) -> Expr[bool]
+  Add(a: Expr[int], b: Expr[int]) -> Expr[int]
+  Eq(a: Expr[int], b: Expr[int]) -> Expr[bool]
+  If(cond: Expr[bool], yes: Expr[T], no: Expr[T])
+  Pair[A, B](first: Expr[A], second: Expr[B]) -> Expr[(A, B)]
+  First[A, B](pair: Expr[(A, B)]) -> Expr[A]
+
+eval[T](e: Expr[T]) -> T
+eval(IntLit(n)) = n
+eval(BoolLit(b)) = b
+eval(Add(a, b)) = eval(a) + eval(b)
+eval(Eq(a, b)) = eval(a) == eval(b)
+eval(If(c, yes, no)) = if eval(c) then eval(yes) else eval(no)
+eval(Pair(a, b)) = (eval(a), eval(b))
+eval(First(p)) =
+  val (a, _) = eval(p)
+  a
+
+// One hidden parameter beside fields of fixed types, shown through the function its value carries.
+data Box
+  Hold[A](value: A, show: (A) -> string, tag: int)
+  Empty
+
+render(b: Box) -> string = b match
+  Hold(v, f, _) -> f(v)
+  Empty -> "empty"
+
+// A closure made in the arm captures the hidden value, and is called after the arm: its type names
+// no hidden type, so it leaves.
+later(b: Box) -> () -> string = b match
+  Hold(v, f, t) ->
+    val g = () -> s"${f(v)}#$t"
+    g
+  Empty -> () -> "none"
+
+// A local function and a `var` in the arm.
+twiceShown(b: Box) -> string = b match
+  Hold(v, f, _) ->
+    twice(x: string) -> string = x + x
+    var out = twice(f(v))
+    out = out + "!"
+    out
+  Empty -> ""
+
+// Patterns testing fields of fixed types, alternatives, and an `is` test, try every pack.
+kind(b: Box) -> string = b match
+  Hold(_, _, 0) | Empty -> "zero or empty"
+  Hold(_, _, _) -> "tagged"
+
+tag(b: Box) -> int = if b is Hold(_, _, t) then t else -1
+
+// Two values' hidden types are two types: each nested arm is compiled for each pair of packs.
+both(b: Box, c: Box) -> string = b match
+  Hold(v, f, _) -> c match
+    Hold(w, g, _) -> f(v) + "+" + g(w)
+    Empty -> f(v)
+  Empty -> "-"
+
+// Several hidden parameters in one pack.
+data Two
+  Both[A, B](a: A, b: B, join: (A, B) -> string)
+
+joined(t: Two) -> string = t match
+  Both(a, b, j) -> j(a, b)
+
+// A parameter of the type, hidden by a refined variant: the value's own, not the instance's.
+data Tagged[T]
+  Hide(value: T, show: (T) -> string) -> Tagged[int]
+  Plain(n: int) -> Tagged[int]
+
+tagged(t: Tagged[int]) -> string = t match
+  Hide(v, f) -> f(v)
+  Plain(n) -> n.toString()
+
+// Many values of three packs, made and taken apart while the collector runs: each keeps its fields
+// at its own pack's layout.
+churn(n: int) -> int
+  var all: Vector[Box] = []
+  for i in 0 ..< n
+    val b = i % 3 match
+      0 -> Hold(i, (x: int) -> x.toString(), i)
+      1 -> Hold(s"s$i", (s: string) -> s, i)
+      _ -> Hold([i, i], (v: Vector[int]) -> v.length.toString(), i)
+    all = all :+ b
+  var total = 0
+  for b in all
+    total += render(b).charCount + tag(b)
+  total
+
+// A field whose type every pack shares is read by name on the type's one variant.
+data One
+  Only[A](value: A, id: long)
+
+main()
+  val e = If(Eq(IntLit(2), Add(IntLit(1), IntLit(1))), Pair(IntLit(7), BoolLit(true)), Pair(IntLit(0), BoolLit(false)))
+  println(eval(e))
+  println(eval(First(e)) + 1)
+  println(eval(First(Pair(BoolLit(false), IntLit(3)))))
+  println(eval(First(First(Pair(Pair(IntLit(5), BoolLit(true)), IntLit(9))))))
+  val boxes = [
+    Hold(1, (x: int) -> s"int $x", 0),
+    Hold("é", (s: string) -> s"string $s", 2),
+    Hold(2.5, (r: real) -> s"real $r", 3),
+    Hold((1, "x"), (p: (int, string)) -> s"pair $p", 4),
+    Hold(Empty, (b: Box) -> s"box ${render(b)}", 5),
+    Empty
+  ]
+  for b in boxes
+    println(s"${render(b)} | ${later(b)()} | ${twiceShown(b)} | ${kind(b)} | ${tag(b)}")
+  println(both(boxes(0), boxes(1)))
+  println(both(boxes(2), boxes(5)))
+  println(both(boxes(5), boxes(0)))
+  println(render(Hold(2147483647, (x: int) -> s"max $x", 0)))
+  println(render(Hold(-2147483648, (x: int) -> s"min $x", 0)))
+  println(render(Hold("", (s: string) -> s"[$s]", 0)))
+  println(render(Hold((), (u: unit) -> s"unit $u", 0)))
+  println(joined(Both(1, "a", (x: int, y: string) -> s"$x$y")))
+  println(joined(Both(true, 'c', (x: bool, y: char) -> s"$x$y")))
+  println(joined(Both(Hold(1, (x: int) -> "in", 0), 1.5, (x: Box, y: real) -> s"${render(x)} $y")))
+  println(tagged(Hide("hidden", (s: string) -> s.charCount.toString())))
+  println(tagged(Hide(4.5, (r: real) -> (r * 2.0).toString())))
+  println(tagged(Plain(3)))
+  println(Only(1, long(5)).id + Only("s", long(6)).id)
+  println(First(e) == First(e))
+  println(First(e) == IntLit(7))
+  println(Only(1, long(5)) == Only(1, long(5)))
+  println(Only(1, long(5)) == Only(long(1), long(5)))
+  println(Only(1, long(5)) == Only(2, long(5)))
+  println(Only(1, long(5)).hash() == Only(1, long(5)).hash())
+  println(Only(1, long(5)).hash() == Only(long(1), long(5)).hash())
+  println(Only("a", long(0)).hash() == Only('a', long(0)).hash())
+  println(churn(3000))

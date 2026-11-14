@@ -8898,7 +8898,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   it is not implied (`Hold[A](x: A) -> Odd[Wrap[A]]`, with `Wrap` showing itself whatever `A` is),
   the field falls short and the type has no automatic `Display`, as any type with such a field. A
   hidden parameter is given the trait, since no value of its variant is made before step 5, **which
-  must decide it per pack. Review with the user**: whether a refined type's `Display` should rather
+  must decide it per pack** (step 5, branch `gadt-5`, decided it: by the parameter's bounds, the
+  entry below). **Review with the user**: whether a refined type's `Display` should rather
   be decided per instance, at the instance's own arguments. Why: a derived impl is checked once, over
   its type's parameters, and this is the most that check can know of a variant's own; it is sound,
   since the trait at an instance gives it to the parameter read back there. Alternatives weighed:
@@ -8990,7 +8991,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   on a variant bounding its own parameters is accepted, its arm without those bounds until step 6**.
   Why: an arm on a hidden parameter is compiled per pack, which step 5 builds; no value of either
   kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
-  arms would never be compiled, and a program would meet step 5's rules later as a change).
+  arms would never be compiled, and a program would meet step 5's rules later as a change). **Step
+  5 (branch `gadt-5`) lifted both refusals of hidden parameters**, values and patterns, leaving an
+  `is` test's (the `gadt-5` entries above).
 
 - Proposed (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
   type matched as the equalities in scope see it**, splitting a column on a refined type's variant
@@ -9035,6 +9038,70 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   two unrelated sets of fresh types with the variant's parameter names. Alternatives weighed:
   numbering the fresh types (`A1`, `A2`), which every message would show, even where nothing
   clashes.
+- Proposed (branch `gadt-5`, the hidden-parameters step): **a hidden parameter has exactly the
+  bounds its variant declares, and a trait derived for its type holds of it only by them**:
+  `Hold[A](value: A)` gives `Box` no automatic `Display`, `Debug`, `Eq`, `Hash` nor `Sendable`, and
+  `Hold[A: Display](value: A)` gives it `Display`. A parameter of the type that a refined variant
+  hides (`Hide(value: T) -> Tagged[int]`) is the value's own, so the impl's bound on the instance's
+  `T` does not give it the trait either. The reason a type has no automatic trait names the variant,
+  its field and the hidden parameter (`` `Tagged` has no `Display` because its field `Hide.value`
+  names `T`, which the variant hides and a value may hold at any type; bound it, as in `[T:
+  Display]` ``), and an explicit `derives` says the same. This settles step 2's "the trait for now"
+  per pack: the derived code's arm is compiled once per pack, and only the bounds hold at every
+  pack. `==` and the hash still compare and hash every value, a pack at a time. Consequence: the
+  chapter's `Expr`, whose `First` hides `B`, has no automatic `Display` unless `First` writes `[A,
+  B: Display & Debug]`. Why: a derived impl is checked once and must hold wherever any value is,
+  and a pack's types are known only where the value is made; deciding by bounds keeps the type's
+  traits a fact of its declaration. Alternatives weighed: giving the trait unconditionally (unsound:
+  a value of a pack without it reaches the derived code); requiring the trait of the hidden types
+  where each value is made, whenever the type derives it (every `Box` made of a class without
+  `Display` would be an error, though the program never shows one, and generic code could not know
+  whether its instance derives it); rendering a hidden field through its type record (`Display` and
+  `Debug` only, and a change to the derive templates). **Review with the user**: whether `Display`
+  and `Debug` should rather render a hidden field through its run-time type, so `Expr` prints
+  without the bound.
+- Proposed (branch `gadt-5`): **a bound on a hidden parameter is allowed now, `T: A & B` included;
+  a bound on a variant's own parameter that its result names stays refused until step 6**, even
+  beside a bounded hidden one. A hidden parameter's bounds are checked where a value is made, as a
+  call's are, and the fresh type an arm gives it has them. Why: the chapter states them for hidden
+  parameters in their own section ("a fresh type, with the bounds its declaration gives it"), and
+  the typed protocol needs `Ask[R: Sendable]`; what step 6 adds, an enclosing type parameter gaining
+  a bound by equality, does not arise for a hidden one. Alternatives weighed: leaving every bound to
+  step 6 (the protocol could not be written in step 5).
+- Proposed (branch `gadt-5`): **an `is` test or a binding takes apart no field of a hidden type**:
+  `if b is Hold(v, _)` with `value: A` hidden is refused with ``"`Hold` hides `A`, and its field
+  `value` names it: an `is` test or a binding takes apart no field of a hidden type; take the value
+  apart with `match`, whose arm is compiled for each type the value hides"``; `b is Hold(_, _, t)`,
+  testing or binding only fields whose type every pack shares, is accepted and tries each pack. A
+  `match` arm, a clause, a match function and an actor's or machine's arm take any field. Why: an
+  arm is one expression, compiled once per pack; an `is` test's equalities reach the rest of a block
+  after an early return or the right operand of `&&`, code that would have to be copied per pack
+  as far as the names reach. Alternatives weighed: copying the reached code per pack (a block's
+  rest, an `&&` chain and a `while` condition each need their own copying); refusing every hidden
+  pattern in a test (the tag test and the shared fields are sound and useful).
+- Proposed (branch `gadt-5`): **an arm on a variant with hidden parameters is compiled inline,
+  once per pack, and chosen by comparing the value's descriptor with each pack's**, not as a
+  function called through the descriptor's method table as the build plan said. Lowering finds the
+  packs as it reaches the code making them; an instance compiled for fewer packs than the program
+  has made by the end is lowered again, until none is stale, and such instances are not kept in the
+  instance cache. Why: an arm compiled inline keeps `return`, `break`, `continue`, a `var` of the
+  function and a tail call behaving as in any arm, which a separate function would have to pass
+  back across a call; the run-time cost is one compare per pack before the arm, against a call
+  through a table. Alternatives weighed: the plan's function per pack through the table (each arm
+  would need its locals captured and its exits returned as codes); boxing hidden fields behind `Any`
+  (the chapter's alternative, a run-time test where none is needed).
+- Proposed (branch `gadt-5`): **in the polymorphic-recursion check, a refining pattern's fresh types
+  are its variant's parameter nodes, a value made with hidden types reaches them, and a type
+  argument holding a hidden type grows no parameter of the code that the value matched holds**: so
+  `eval(First(p)) = … eval(p)` at `(T, B)` is ordinary, as the chapter says, while a pack built
+  from ever larger hidden types (`Hold(v) -> grow(Hold([v]))`), a generic function making a pack of
+  its parameter whose arm calls it larger, and a parameter grown beside a hidden type of a value not
+  holding it, are refused as polymorphic recursion naming the variant. Why: an instance at a hidden
+  type exists only for a pack, which a value made somewhere holds, and a matched value holding the
+  parameter can be of a larger pack only where the program made one; growth through the values made
+  is counted by the construction edges. Alternatives weighed: counting every type argument as
+  before (refuses the chapter's `eval`); dropping every edge of an argument naming a hidden type
+  (accepts `pairUp((x, y), b)`, which never ends).
 
 - Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).

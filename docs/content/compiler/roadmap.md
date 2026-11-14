@@ -236,7 +236,7 @@ carry the chapter's exact messages, at most five per file.
 ### Refined variants: build plan
 
 [Refined variants](/spec/refined-variants/) are designed, their choices proposed in
-[decisions](/spec/decisions/#proposed); steps 1 to 4 are built, steps 5 to 7 are still to come. Each step is one item, gated on its own
+[decisions](/spec/decisions/#proposed); steps 1 to 5 are built, steps 6 and 7 are still to come. Each step is one item, gated on its own
 targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
 `-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
 messages, at most five per file. A step that meets a missing piece of the checker it builds on
@@ -342,7 +342,30 @@ reports it rather than routing around it.
    `Eq` arm on `Expr[int]`, a contradiction in one row, a cyclic equality, a `Same[int, string]`
    matched, a missing case naming a possible variant, an arm unreachable after the possible variants
    are covered.
-5. **Hidden parameters.** Fresh rigid types in an arm; the escape check; packs: one descriptor per
+5. **Hidden parameters.** *Done (branch `gadt-5`):* steps 2 and 3's step-5 refusals are gone. A
+   value records the types it hides (`Construct`'s `hidden`, at `hidden_positions`); in `lower.sysl`
+   each list of them at an instance is a pack (`pack_layout`, `PackLayout`), a descriptor of the
+   variant's tag laying the fields out at the pack's types. An arm, a clause and the derived code are
+   compiled once per combination of packs their hidden variant patterns can stand for
+   (`arm_packs`), each tested by its descriptor (`test_packs`); an alternative, an `is` test and a
+   field read by name (`pack_field`) try each pack in turn. Packs are found as lowering reaches the
+   code making them, so an instance compiled for fewer than the program makes is lowered again
+   (`relower_stale`), and neither kind is kept in the instance cache. A lambda or local function in
+   such an arm carries its pack's arguments after its copy's (`pack_args`), and a local whose type a
+   pattern decides gets a slot of the copy's machine type where it is bound. Equality compares
+   descriptors first and hashes a pack's number. In `check.sysl`, a fresh type has the bounds its
+   variant declares (`fresh_bound_key`), so a hidden parameter's bounds, `T: A & B` included, are
+   checked at the call and held in the arm, while a bound on a variant's own parameter that its
+   result names stays refused (step 6); a derived trait, `Sendable` included, holds of a hidden
+   parameter only by its bounds (`hidden_has`, `hidden_sendable`); a hidden type leaving its arm has
+   the chapter's message; an `is` test binds no field naming a hidden type. In `expansion.sysl` the
+   fresh types of patterns are their variant's parameter nodes, a value's hidden types reach them,
+   and a type argument holding a hidden type does not grow a parameter the matched value holds
+   (`fresh_edges`), so `eval(First(p))` is ordinary and a cycle making ever larger packs is refused.
+   *Tests:* run `refined_hidden`, `refined_hidden_plan`, `refined_hidden_protocol`, the program
+   `refined_hidden_across_modules`; reject `refined_hidden_escapes`, `refined_hidden_tests`,
+   `refined_hidden_growing`, `refined_hidden_bounds`, `refined_later_steps` (now step 6's alone) and
+   `refined_later_steps_reads`. The plan as written: fresh rigid types in an arm; the escape check; packs: one descriptor per
    variant and list of hidden types the program makes, fields laid out at the pack's types; an arm
    on such a variant lowered once per pack as a function of the hidden types and called through the
    descriptor, reusing the dispatch `lower.sysl` and `devirt.sysl` build for generic trait methods;
@@ -351,11 +374,14 @@ reports it rather than routing around it.
    a reference one; two packs of one variant compared unequal and hashed apart; the `Plan` example
    driving a `Door` machine; reject: a hidden type leaving its arm as a result, through a local
    settled in the arm, one value's hidden type used with another's; a growing pack cycle.
-6. **Bounds on variant parameters.** Checked where a value is made; held in the arm; gained by an
+6. **Bounds on variant parameters.** Step 5 built them for hidden parameters (checked where a value
+   is made, held by the arm's fresh type, `Sendable` and the derived traits decided by them), with
+   the `Account` protocol end to end and the refusals of an unsendable reply type and of a method no
+   bound gives (`refined_hidden_protocol`, `refined_hidden_bounds`). Still to come, for a variant's
+   own parameter that its result names: checked where a value is made; held in the arm; gained by an
    enclosing type parameter equated with a bounded one; a copy at a type without the bound leaves the
-   arm out. `Sendable` decided per pack. *Tests:* run: `Sorted[A: Ord]` and `smallest`; the
-   `Account` protocol of the chapter end to end (`request` at `long`, `string`, `unit`); reject:
-   making `Ask` with an unsendable reply type, a method of a bound the variant does not give.
+   arm out; the refusal `refined_later_steps` holds lifted. *Tests:* run: `Sorted[A: Ord]` and
+   `smallest`; reject: a method of a bound the variant does not give, through the equated parameter.
 7. **Tooling and pages.** Hover and completion show a refined variant's signature (`lsp.sysl`,
    `completion.sysl`); the IntelliJ plugin's grammar takes the result (in `avin-intellij`, its own
    item); the chapter's examples become `run` fences with their `output` fences, so the docs test
