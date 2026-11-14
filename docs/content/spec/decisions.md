@@ -8223,6 +8223,66 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **Initialization is proved at compile time, by order and by withholding `self`** (branch
+  `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
+  value or `lazy val` is read before it is set: an object's fields are set in the order written and
+  `self` is withheld from everything that could read one later until the last is set; module values
+  are computed in the order their initializers' reach requires, a cycle an error; a `lazy val` is
+  the explicit opt-out, its own cycles an error where its code reaches them, a trap only through a
+  function it hands on. Why: it is sound with no annotation and no cost per read, it keeps the rules
+  Avin already enforces (every probe of them held), and each rule's proof is a short argument a
+  reader can check. Alternatives weighed: a checker of object states (an object cold, then warm,
+  then hot, a parameter or a method declared to accept a cold object) accepts more, such as passing
+  a half-made object to a helper that only stores it, but needs those annotations and a far larger
+  analysis, and the code it would admit is rare; a default value in every field before its
+  initializer (a wrong value read silently, and Avin has no value every type can hold); a check on
+  every field read (a cost on every read, and a trap where an error was possible); ordering
+  modules by their imports (an import cycle would be an error, or the order a guess); making every
+  module value lazy (a gate on every read, and cycles found only when they run).
+
+- **A superclass's arguments use nothing of the object, functions made there included** (branch
+  `init-design`). A lambda, an argument passed by name, a local function or a method value in them
+  that uses a field, a method or `self` is an error; class parameters and module values are read
+  freely. Why: avin 0.0.21 lets such a function through, and a superclass calling it in its body
+  reads a field before it is set: `0` for a number, a crash for a string, a vector or a generic
+  field (a soundness hole, the build plan's first item). Alternatives weighed: allowing a function
+  that reads only inherited fields of a class whose constructor finished before (it needs the
+  superclass chain's timing at each read, for code no library or example writes); a mark on a
+  parameter the constructor may call during construction (an annotation for a rare shape).
+
+- **An object's own name in its body is `self`** (branch `init-design`). `O.k` obeys the rule `k`
+  does; in a method, a lambda made after the last field or a lazy initializer, it makes the object
+  need nothing more. Why: today the name counts as the module value, so a lazy field or a late
+  lambda naming its own object is refused as a cycle while the bare name is accepted, a false error
+  with no unsoundness behind it. Alternatives weighed: keeping the refusal (sound, but the two
+  spellings of one read disagree); counting only code the body runs (the same result, reached by
+  the module order rather than by the object rules, which then speak of the name twice).
+
+- **A `lazy val` cycle its own code reaches is a compile error; a read through a handed-on function
+  traps** (branch `init-design`). The reach is the module order's (calls, every implementation a
+  dispatched call or an operator may reach, other lazy values' initializers), without the lambdas,
+  by-name arguments and method values the initializer makes; for a field, only reads of the same
+  object (bare name, `self.`, methods called on `self`) count. Why: a cycle the code always makes
+  is found where it is written rather than when it runs, while a value referring to itself through
+  a function it hands on (`lazy val ones = LazyList.cons(1, ones)`, a handler naming its button) is
+  the reason `lazy` exists and stays legal; a reach that followed handed-on functions would refuse
+  those, and one through another instance's field would refuse recursion over a structure (a
+  node's depth). Alternatives weighed: the trap alone (today's: a cycle anyone could see waits for
+  a run to reach it); following every function value to every lambda of its type in the program
+  (sound without a trap, but it refuses the knots and the handlers). **Review with the user:**
+  through dispatch the reach counts every override, so a lazy value calling a trait method one of
+  whose implementations reads the value is refused even where that implementation never runs, as
+  module values already are.
+
+- **A lazy initializer waiting for a thread that reads the same value is not detected** (branch
+  `init-design`). It waits for ever, as threads waiting for one another do
+  ([threads](/spec/threads/)). Why: Avin detects no deadlock but a lock taken twice, and a cycle
+  through two lazy values' own code is now a compile error, which leaves only a read through a
+  function handed to the other thread. Alternative weighed: the runtime following a waiting read
+  through the initializing thread's own wait (a `join`, another lazy value) and trapping when the
+  chain returns to the reader, cheap on the slow path. **Review with the user:** it is liveness, not
+  soundness, but it is the one way a lazy read can still hang.
+
 **Refined variants** ([chapter](/spec/refined-variants/), branch `gadt-design`; designed, not built)
 
 - **Spelling: a variant's result after `->`, its own type parameters after its name.**
