@@ -1313,6 +1313,9 @@ private constant_construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&T
             val v = values[i] match
                 Some(v) -> v
                 None -> return None
+            // Inside a function only an object named by its content is made at compile time (see
+            // `constant_object_made`).
+            if l.constant_owner == "" && constant_key(v).contains("?") then return None
             fields.push(ConstantField(slot.offset, slot.ty, v))
     Some(Constant(Some(constant_object(l, shape.descriptor, l.descriptors[shape.descriptor].size, fields, true))))
 
@@ -1357,8 +1360,9 @@ private core_class(l: *Lowering, name: string) -> Option[usize]
 /** A new constant object; with `shared`, the one already made with the same descriptor and fields,
  * if there is one. */
 private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
-    if begin_request(l, "B")
-        var w = entry_writer()
+    val outermost = begin_request(l, "B")
+    var w = entry_writer()
+    if outermost
         w.text(l.descriptors[descriptor].name)
         w.num(size)
         w.flag(shared)
@@ -1367,15 +1371,29 @@ private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Bu
             w.num(f.offset)
             write_machine(&w, f.ty)
             if !write_operand(l, &w, f.value) then l.unrecordable = true
-        l.requests.out.push(w.finish())
     l.depth -= 1
-    constant_object_made(l, descriptor, size, fields, shared)
+    val made = constant_object_made(l, descriptor, size, fields, shared)
+    // The name the object was given, which the instance's code reads it by: replaying the request
+    // must give it the same name, or the entry does not read back (see `replay_requests`).
+    if outermost
+        w.text(constant_name(l, made))
+        l.requests.out.push(w.finish())
+    made
+
+/** The name of the constant object `o`, "" for any other operand. */
+private constant_name(l: *Lowering, o: Operand) -> string = o match
+    ConstData(index, _) -> l.constants[index].name
+    _ -> ""
 
 private constant_object_made(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
     var key = s"$descriptor:$size"
     for f in fields
         key = key + s";${f.offset}=" + constant_key(f.value)
-    // A real's text need not tell two reals apart, so an object holding one is never shared.
+    // An object is named by its content, which no edit elsewhere in the program moves, unless it
+    // is not to be shared or holds a value its key cannot spell. Such an object is named by the
+    // module-level value it is made for and its place among that value's objects; one inside a
+    // function body would be numbered in the order lowering met the functions, which a function
+    // read back from the instance cache does not follow, so `constant_construct` never makes one.
     var name = ""
     if shared && !key.contains("?")
         if l.constant_index.get(key) is Some(index) then return ConstData(index, descriptor)
@@ -1385,6 +1403,7 @@ private constant_object_made(l: *Lowering, descriptor: usize, size: usize, field
             content = content + s"\n${f.offset}=" + stable_constant_key(l, f.value)
         name = "=" + content_key(content)
     else
+        if l.constant_owner == "" then panic("avin: a constant object outside a module-level value has no stable name")
         val place = l.place_counts.get(l.constant_owner).unwrap_or(0) + 1
         l.place_counts.put(l.constant_owner, place)
         name = s"${l.constant_owner}#$place"
@@ -1395,6 +1414,7 @@ private constant_object_made(l: *Lowering, descriptor: usize, size: usize, field
 private constant_key(o: Operand) -> string = o match
     ConstInt(bits, digits) -> s"i$bits:$digits"
     ConstBool(value) -> if value then "t" else "f"
+    ConstReal(value) -> s"r${value.bits()}"
     ConstStr(index) -> s"s$index"
     ConstObject(descriptor) -> s"o$descriptor"
     ConstData(index, _) -> s"d$index"
@@ -6051,7 +6071,10 @@ private trap_site_made(l: *Lowering, reason: string, at: Span) -> usize
     val key = if made == "" then s"${l.unit}:${at.start}:$reason" else s"${l.unit}:made $made:$reason"
     if l.trap_index.get(key) is Some(index) then return index
     val src = l.program.sources[l.unit]
-    val position = src.locate(at.start)
+    // A site the compiler made is placed where its function is declared: it is one site however
+    // many places it is asked for at, so where it is reported cannot depend on which came first.
+    val placed = if made != "" && l.function_index < l.instances.len() then instance_declaration(l, l.function_index).start else at.start
+    val position = src.locate(placed)
     val file = file_name(src.name).unwrap_or(src.name)
     val name = if made == "" then trap_name(l, reason, at, file) else s"$made+made:" + content_key(reason)[0..<12]
     l.traps.push(TrapSite(name, intern(l, reason), intern(l, file), position.line, position.col))
@@ -8099,7 +8122,8 @@ private replay_requests(l: *Lowering, r: *EntryReader, apply: bool) -> Option[un
                 val t = read_machine(r)?
                 val value = read_operand(l, r, apply)?
                 fields.push(ConstantField(offset, t, value))
-            if apply then _ = constant_object(l, descriptor_named(l, name)?, size, fields, shared)
+            val recorded = r.text()
+            if apply && constant_name(l, constant_object(l, descriptor_named(l, name)?, size, fields, shared)) != recorded then return None
         else return None
         if r.failed then return None
     if r.failed then None else Some(())
