@@ -329,6 +329,47 @@ every program's warm build is compared with its clean one; the warm build is the
 test` of the library's and the packages' tests runs in `verify` mode the same way. Unset, the gate
 builds the corpus once, with no cache.
 
+## Debug information
+
+`avin build -g` and `avin emit-llvm -g` build a program a debugger can read in its Avin source
+(`debug_info.sysl`). Nothing else changes: the code is the code the same build makes without `-g`,
+and a build without it carries no debug information at all.
+
+- **Lowering places the code.** In a program built with `-g`, every function the source declares is
+  lowered with a `Locate` instruction before each run of instructions that comes from one place:
+  the line and column, counted from 1, where the innermost expression being lowered begins. The
+  places are the document's, so a literate program's are the lines of its `.lavin` file, the code
+  margin included ([positions are the document's](/spec/declarations/#positions-are-the-documents)).
+  A `Locate` never comes between a call and the words of its result. The code before the body's first
+  expression, which takes the parameters in, is placed nowhere, so a debugger that stops at a
+  function's first line finds its parameters already there. A `Variable` instruction names each
+  parameter and each local that lives in a slot of its own, with its Avin type; a local a closure
+  shares lives in a box and is left out, as is one the compiler made. Neither instruction makes code,
+  and neither counts toward the size that decides inlining. A function inlined into another takes
+  the place of the call, since the inlined body's own places are in another function and maybe
+  another file.
+- **Emission writes LLVM's debug metadata.** One compile unit; a file for each source file, by its
+  full path; a subprogram for each function the source declares, named as Avin spells it (`fact`,
+  `twice[int]`, `main.lambda#1`, and a library function by its module, `avin.…`) with its symbol as the linkage name
+  and the line of its name; a location on every instruction from the body's first expression on, and
+  on every call; and a local variable for each `Variable`: a parameter with its place among the
+  parameters, a scalar of a basic type (`int`, `long` and the other integers signed, `byte`
+  unsigned, `char` a UTF-32 code point, `bool`, `real`), and a reference as a pointer to a structure
+  named by its type, which the debugger shows as an address. A parameter is copied to a slot of its
+  own at the entry so it can be read wherever the function stops; a local in a root of the frame is
+  found in the frame. A function lowering makes, which no source declares, has no subprogram.
+- **On macOS the build gathers the DWARF.** The linker leaves it in the objects, which a build
+  removes, so `avin build -g` runs `dsymutil` on the executable once it is published, writing
+  `<executable>.dSYM` beside it, where lldb looks. Elsewhere the executable carries it.
+- **Builds and caches.** A function's text is never taken from the instance cache in a `-g` build,
+  nor kept in it, since its locations follow lines its key does not cover; its lowered code is, in a
+  directory of its own (`program-O2-g`), each `Locate` kept counted from the start of the
+  declaration it is in, as a trap site is, and placed again where the declaration is now when it is
+  read back. Codegen units carry every metadata line, as they carry every other module-level line,
+  and a function declared in a unit that does not define it carries no subprogram. Both `-O0` and
+  `-O2` keep the information valid: clang's verifier, which drops debug information it finds
+  invalid with a warning, accepts every unit.
+
 ## Sysl bindings and the shim cache
 
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
@@ -1258,11 +1299,23 @@ which take and give back one spin lock every such operation shares. `add`, `sub`
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
 anything is stored.
 
-**Locks and conditions.** The synchronization library reaches nine intrinsics, each a runtime
-entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_new_kind` (a
-condition whose waiters the thread dump and the deadlock report name as a channel's receive or
-send, a future or an executor's work), `condition_wait`, `condition_wait_for`, `condition_notify`
-and `condition_notify_all`. A lock is an object on the
+**Locks and conditions.** The synchronization library reaches eleven intrinsics, each a runtime
+entry: `lock_new`, `lock_acquire`, `lock_release`, `lock_release_holding`, `condition_new`,
+`condition_new_kind` (a condition whose waiters the thread dump and the deadlock report name as a
+channel's receive or send, a future or an executor's work), `condition_wait`, `condition_wait_for`,
+`condition_wait_settling`, `condition_notify` and `condition_notify_all`.
+`condition_wait_settling` is the wait of a waiter with state of its own (a read-write lock's
+waiting writers, a barrier's arrivals): it takes a limit in milliseconds or none, and answers
+woken, out of time, or cancelled, a cancellation ending it with the lock held again instead of
+stopping the thread, so the library takes the waiter's mark back, lets the lock go and reaches
+`cancel_point`, which stops it. A share others wait for (a read-write lock's read or write, a
+semaphore's permit in `withPermit`) is taken under the library's lock, which `lock_release_holding`
+lets go while staying in the region in doubt taking it entered; `cancel_guarded_held` then runs the
+body and the closure giving the share back, and leaves the region. Nothing can stop the thread
+between taking the share and giving it back, and a trap there stops the program; where the body
+is cancellable (a read, a permit's body), it runs at a cancellation point of its own inside the
+region, so a cancellation returns to it, the share is given back, and the cancellation goes on. A
+lock is an object on the
 collected heap holding whether a thread holds it and a queue of the threads waiting for it, and a
 condition one holding a queue alone; neither holds a reference, and the collector never moves
 either, so a waiter may be linked from one. Each queue has a guard, a futex lock held for a few

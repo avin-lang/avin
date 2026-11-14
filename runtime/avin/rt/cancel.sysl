@@ -79,6 +79,31 @@ cancel_guarded(ctx: *Context, run: *u8, runner: *u8) -> bool
         return false
     guarded_run(ctx, run, entry)
 
+/** Runs `run` and then `give_back`, closures that take nothing and return nothing, for a caller that
+ * holds a share of something other threads wait for (a share of a read-write lock, a semaphore's
+ * permit), taken in a region in doubt it entered with `lock_release_holding`: `give_back` gives the
+ * share back, and this leaves the region once it has. The share is held from the moment it is taken
+ * until it is given back with nothing able to stop the thread in between, and a trap inside `run`
+ * stops the program, as one under a lock does, rather than returning to an actor's turn, which would
+ * leave the share held for ever. Where `cancellable`, and the thread could be stopped but for this
+ * region, a cancellation may stop `run`, returning here: `give_back` still runs, and this answers
+ * `true`, leaving the thread as one returning to `cancel_guarded` is, not to be stopped again until
+ * it calls `cancel_resume`. Otherwise `run` runs to its end. */
+@export("avin_rt_cancel_guarded_held")
+cancel_guarded_held(ctx: *Context, run: *u8, give_back: *u8, cancellable: bool, runner: *u8) -> bool
+    val entry: *extern(@lets_out *Context, *u8) -> unit = ptr_cast(runner)
+    var stopped = false
+    if cancellable && may_cancel(ctx, 1)
+        // The point is set inside the region, so the waits and polls in `run` may stop it; a return
+        // from a cancellation leaves the context one region deeper than the point.
+        stopped = guarded_run(ctx, run, entry)
+        if stopped then leave_doubt(ctx)
+    else
+        entry(ctx, run)
+    entry(ctx, give_back)
+    if !stopped then leave_doubt(ctx)
+    stopped
+
 /** The cancellation point a lightweight thread runs its closure at. */
 run_cancellable(ctx: *Context, run: *u8, runner: *u8) -> bool
     val entry: *extern(@lets_out *Context, *u8) -> unit = ptr_cast(runner)

@@ -3,6 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.fs.canonicalize
 import sysl.path.file_name
 import sysl.text.from_utf8_unchecked
 
@@ -293,10 +294,24 @@ private struct Lowering
     /** The deferred statements reached in the blocks enclosing the code being lowered, innermost
      * last: each is lowered again at every edge that leaves its block. */
     defers: Buf[&TExpr]
+    /** Whether the program is built with debug information, which the functions declared in the
+     * source carry as `Locate` and `Variable` instructions. */
+    debug: bool
+    /** Whether the function being lowered is placed in the source: one the source declares, in a
+     * program built with debug information. */
+    locating: bool
+    /** The places the current block's code comes from, by where in it each begins: see `mark`. */
+    marks: Buf[Mark]
     /** In an instance of a constructor trait's method, the owner of the trait's `Self`, and the
      * constructor it stands for in `self_args`; 0 in any other instance. */
     self_owner: usize
     self_args: Buf[&Type]
+
+/** The code of the current block from instruction `at` on comes from the source at `span`, until
+ * the next mark. */
+private struct Mark
+    at: usize
+    span: Span
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -396,8 +411,10 @@ lower_program(program: TProgram) -> MirProgram = lower_program_cached(program, m
 
 /** `lower_program` with the instance cache's lowered entries `cached`: with `caching`, an instance
  * whose own key has an entry there is read back rather than lowered, and every instance lowered that
- * an entry can hold gets one, in the program's `key_inputs`. */
-lower_program_cached(program: TProgram, cached: Map[string, string], caching: bool) -> MirProgram
+ * an entry can hold gets one, in the program's `key_inputs`. With `debug`, every function the source
+ * declares carries where its code comes from and its variables, and the program each function's
+ * `FunctionDebug`. */
+lower_program_cached(program: TProgram, cached: Map[string, string], caching: bool, debug: bool = false) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in 0..<program.globals.len()
         // A union with a scalar member keeps its tag and bits here, and its reference word apart.
@@ -422,7 +439,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     val ordinals = local_ordinals(program)
     var constant_globals: Buf[bool] = buf()
     val keyer = key_maker(program, ordinals, constant_globals, world)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), 0, buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), debug, false, buf(), 0, buf())
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -550,7 +567,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
         l.stored.push("")
         l.reused.push(false)
     val inputs = KeyInputs(keyed, l.local_ordinals, l.instance_facts, devirt_facts, scalar_facts, constant_globals, world, l.own_keys, bodies_fingerprinted(l.keyer))
-    var mir = MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, entry_answer, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf(), l.stored, l.reused)
+    var mir = MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, entry_answer, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf(), l.stored, l.reused, if debug then functions_debug(&l) else buf())
     mir
 
 /** Each string's name: the first 16 hexadecimal digits of the SHA-256 of its bytes. Two different
@@ -3023,6 +3040,8 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.tail_calls = false
     l.param_slots = buf()
     l.result_words = buf()
+    l.marks = buf()
+    l.locating = false
     if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
@@ -3042,6 +3061,9 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.locals = f.locals
     l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
     if inst.entry then return lower_entry(l, inst)
+    // The code before the body's first expression, which takes the parameters in, is placed
+    // nowhere, so a debugger stopping at the function's first line sees them taken.
+    l.locating = l.debug
     var signature = signature_of(l, f)
     var name = function_symbol(l, f.symbol, inst.type_args)
     if inst.words
@@ -3077,6 +3099,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     f.body match
         Some(body) ->
             if loops_on_itself(l, symbol, body) then start_loop(l, symbol)
+            if l.locating then declare_variables(l, symbol, f.symbol, f.locals)
             l.tail_calls = !is_class_constructor(l.program, f.symbol)
             val result = lower_at(l, body, true)
             l.tail_calls = false
@@ -3123,6 +3146,66 @@ private start_loop(l: *Lowering, symbol: FunctionSymbol)
     val head = new_block(l)
     finish_into(l, Jump(head), head)
     l.tail_head = Some(head)
+
+/** A `Variable` for each parameter and local of the function being lowered that lives in a slot of
+ * its own or is a parameter's value: a local a closure shares lives in a box, and is left out, as
+ * is one the compiler made, whose name no program can spell. A top-level function compiled as a
+ * loop keeps its parameters in slots, which are then where they live. */
+private declare_variables(l: *Lowering, symbol: FunctionSymbol, function: usize, locals: Buf[TLocal])
+    var args: Map[usize, usize] = map()
+    if symbol.root is None
+        for i in 0..<symbol.params.len()
+            if i >= symbol.param_names.len() || !spelled_name(symbol.param_names[i]) then continue
+            val ty = type_name(concrete(l, symbol.params[i]))
+            if i < l.param_slots.len() && l.param_slots[i] is Some(p)
+                l.insts.push(Variable(symbol.param_names[i], ty, p.address, i + 1))
+            elif i < l.param_values.len() && l.param_values[i] is Some(v)
+                l.insts.push(Variable(symbol.param_names[i], ty, Value(v), i + 1))
+    else
+        for i in 0..<symbol.param_locals.len()
+            args.put(symbol.param_locals[i], i + 1)
+    for x in 0..<locals.len()
+        val local = locals[x]
+        if local.owner != function || l.boxed[x] || !spelled_name(local.name) then continue
+        if l.local_slots[x] is Some(p)
+            if p.address is SlotAddress(_)
+                l.insts.push(Variable(local.name, type_name(concrete(l, local.ty)), p.address, args.get(x).unwrap_or(0)))
+
+/** Whether `name` is one a program can write: a local the compiler makes is named otherwise. */
+private spelled_name(name: string) -> bool
+    if name.len == 0 then return false
+    val c = name.bytes[0]
+    u8('a') <= c <= u8('z') || u8('A') <= c <= u8('Z') || c == u8('_')
+
+/** What the debugger is told of each function of the program, by instance: a function the source
+ * declares is named as Avin spells it, its symbol without the prefix of the program's own module,
+ * and placed at its name in the file it is declared in, by that file's full path. */
+private functions_debug(l: *Lowering) -> Buf[FunctionDebug]
+    var out: Buf[FunctionDebug] = buf()
+    var paths: Map[usize, string] = map()
+    for k in 0..<l.instances.len()
+        val inst = l.instances[k]
+        if inst.generated != Written || inst.entry
+            out.push(FunctionDebug("", "", 0, 0, false))
+            continue
+        val f = l.program.functions[inst.function]
+        val symbol = l.program.symbols[f.symbol]
+        val src = l.program.sources[symbol.unit]
+        val file = paths.get(symbol.unit) match
+            Some(p) -> p
+            None ->
+                val p = canonicalize(src.name).unwrap_or(src.name)
+                paths.put(symbol.unit, p)
+                p
+        val at = src.locate(symbol.decl.name_span.start)
+        var name = function_symbol(l, f.symbol, inst.type_args)
+        if inst.words then name = name + "#words"
+        if name.starts_with(ProgramModulePrefix) then name = name[ProgramModulePrefix.len..]
+        out.push(FunctionDebug(name, file, at.line, at.col, true))
+    out
+
+/** How the symbol of a function of the program's own module begins. */
+private const ProgramModulePrefix: string = "<program>."
 
 /** The value of parameter `x` of the top-level function, where the code being lowered can reach it. */
 private param_operand(l: *Lowering, x: usize) -> Option[Operand]
@@ -5596,8 +5679,9 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
             params.push(t)
     // The runtime runs a started thread's closure, an actor's guarded code and the exit hooks
     // through the program's closure runner, since it calls with the C convention and the closure's
-    // entry has the program's own; a scope's body run so that a cancellation returns to it, too.
-    if name == "thread_start" || name == "actor_guarded" || name == "exit_hooks" || name == "cancel_guarded"
+    // entry has the program's own; a scope's body run so that a cancellation returns to it, too, and
+    // a body holding what other threads wait for.
+    if name == "thread_start" || name == "actor_guarded" || name == "exit_hooks" || name == "cancel_guarded" || name == "cancel_guarded_held"
         args.push(ClosureRunner)
         params.push(MPtr)
     val result = machine(l, found.2)
@@ -5753,9 +5837,12 @@ private new_block(l: *Lowering) -> usize
 
 /** Ends the current block with `term`. */
 private finish(l: *Lowering, term: Terminator)
-    l.blocks[l.current].insts = l.insts
+    l.blocks[l.current].insts = if l.locating then located(l) else l.insts
     l.blocks[l.current].term = term
     l.insts = buf()
+    if l.locating
+        l.marks = buf()
+        mark(l, l.here)
 
 /** Ends the current block and continues in `block`. */
 private finish_into(l: *Lowering, term: Terminator, block: usize)
@@ -6041,9 +6128,46 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = lower_at(l, e, 
 private lower_at(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand]
     val outer = l.here
     l.here = e.span
+    if l.locating then mark(l, e.span)
     val value = lower_kind(l, e, tail)
     l.here = outer
+    if l.locating then mark(l, outer)
     value
+
+/** Places the code lowering makes from here on at `span`, in a function built with debug
+ * information; a span of code the compiler wrote, which is empty, leaves the place as it was. */
+private mark(l: *Lowering, span: Span)
+    if span.start == span.end then return
+    val at = l.insts.len()
+    val n = l.marks.len()
+    if n > 0 && l.marks[n - 1].at == at
+        l.marks[n - 1] = Mark(at, span)
+    else l.marks.push(Mark(at, span))
+
+/** The current block's instructions with a `Locate` before each run that comes from one place. The
+ * block begins at the place lowering was at when it began, and no `Locate` comes between a call
+ * and the words of its result, or among the words a return gives, which belong together. */
+private located(l: *Lowering) -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+    val src = l.program.sources[l.unit]
+    var j = 0usize
+    var pending: Option[Span] = None
+    var line = 0usize
+    var col = 0usize
+    for i in 0..<l.insts.len()
+        while j < l.marks.len() && l.marks[j].at <= i
+            pending = Some(l.marks[j].span)
+            j += 1
+        val inst = l.insts[i]
+        if pending is Some(span) && !(inst is CallWord(_, _, _) || inst is ReturnWord(_, _))
+            val p = src.locate(span.start)
+            if p.line != line || p.col != col
+                out.push(Locate(span.start, p.line, p.col))
+                line = p.line
+                col = p.col
+            pending = None
+        out.push(inst)
+    out
 
 private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.kind match
     IntConst(digits) -> Some(ConstInt(int_bits(e.ty), digits))
@@ -8065,6 +8189,20 @@ private write_inst(l: *Lowering, w: *EntryWriter, inst: Inst) -> bool
             w.num(dest)
             w.text(l.descriptors[d].name)
         Publish -> w.word("pu")
+        Locate(at, _, _) ->
+            // Kept counted from the start of the declaration the instance belongs to, as a trap
+            // site is, so the place is found again where the declaration is now.
+            val base = instance_declaration(l, l.function_index)
+            val inside = base.start <= at && at <= base.end
+            w.word("lo")
+            w.flag(inside)
+            w.num(if inside then at - base.start else at)
+        Variable(name, type_name, address, arg) ->
+            w.word("va")
+            w.text(name)
+            w.text(type_name)
+            w.num(arg)
+            return write_operand(l, w, address)
         AtomicLoad(dest, address) ->
             w.word("aL")
             w.num(dest)
@@ -8137,6 +8275,17 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
             callee = Some(CFunction(symbol, params, result))
         return Some(Call(dest, callee?, read_operands(l, r)?))
     if tag == "pu" then return Some(Publish)
+    if tag == "lo"
+        val inside = r.flag()
+        val offset = r.num()
+        val at = if inside then instance_declaration(l, l.function_index).start + offset else offset
+        val p = l.program.sources[l.unit].locate(at)
+        return Some(Locate(at, p.line, p.col))
+    if tag == "va"
+        val name = r.text()
+        val type_name = r.text()
+        val arg = r.num()
+        return Some(Variable(name, type_name, read_operand(l, r, true)?, arg))
     val dest = r.num()
     if tag == "bi"
         val op = op_of(r.num())?

@@ -8284,9 +8284,114 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   cancellation token passed to every handler (every handler signature changes); leaving shutdown
   to the write timeout (a quiet stream would hold it for `writeTimeout`).
 
+- Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
+  `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
+  starts threads and waits for them structurally, so a spawning wait group would be a second way to
+  do what `scope` does; what a wait group adds is counting work finished by threads started
+  elsewhere (an executor, an actor, another scope) or by no thread at all. Alternatives weighed:
+  `wg.spawn(body)` starting and counting a thread (duplicates `Scope.spawn`, and an unscoped spawn
+  escapes cancellation); answering a negative count by clamping at zero (hides a double `done`).
+- Proposed (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
+  traps.** `Semaphore(permits, capacity = permits)`; negative permits, a capacity below one or more
+  permits than the capacity trap too. Permits belong to no thread, and waiters are not queued (one
+  arriving as a permit comes back may take it first). Why: an over-release is the same bug as a
+  wait group's double `done`, a permit given back that nobody took, and a trap finds it where it
+  happens; the separate capacity keeps the signalling use (`Semaphore(0, capacity = 1)`) that an
+  "at most the initial permits" rule would forbid. Alternatives weighed: an unbounded count (a
+  silent over-release grows the limit for good); permits owned by the thread that took them (rules
+  out a permit taken by one thread and given back by another, which hand-offs need); a FIFO queue
+  of waiters (a cancelled waiter would have to take its place back, for a fairness the condition's
+  oldest-first wake mostly gives already). Review with the user: trap or ignore an over-release.
+- Proposed (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
+  hold when a cancellation stops their body; a `RwLock`'s write runs to its end; a trap in any of
+  them stops the program.** The share is taken under the library's lock and held in a region in
+  doubt from that moment until it is given back (the runtime's new `lock_release_holding` and
+  `cancel_guarded_held`), so no cancellation can come between taking it and the body. A read body
+  or a permit's body runs at a cancellation point of its own inside that region, so a cancelled scope stops
+  a long download inside `withPermit` at once and the permit goes back, while a trap there, even in
+  an actor, stops the program as one under a lock does, since recovering the actor's turn would
+  leave the share held for ever. A write body is also uncancellable, as a `Mutex`'s body is, since
+  stopping it could leave the value half changed. Why: a semaphore guards no value, and a reader
+  changes nothing, so nothing is left in doubt by stopping them; a writer does change the value.
+  Alternatives weighed: every body uncancellable, as a mutex's (a scope's cancellation would wait
+  for every permit holder's whole body); every body cancellable (a write could leave the value
+  torn); a trap in an actor's body failing only the actor (needs a give-back chain run by the
+  actor's recovery, which the runtime does not have).
+- Proposed (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
+  a write kept waiting before the next writer.** A reader that arrives while a writer waits waits
+  behind it; when a write ends, every reader then waiting is admitted ahead of the writers waiting.
+  Why: writers do not starve under overlapping readers, and readers do not starve under back-to-back
+  writers, with no tuning. Alternatives weighed: pure writer preference (readers starve while
+  writers keep coming); reader preference (writers starve); a strict FIFO of both (serialises
+  readers that could share). Review with the user: a read body is trusted only to read; nothing
+  stops it changing a mutable value other readers share, which races with them (a race is not
+  undefined behaviour in Avin, but the type system does not rule it out here as it does elsewhere).
+  A read-only view of a value would close it and is a language feature, not a library one.
+- Proposed (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
+  cancelled while waiting withdraws.** The last arrival runs the action holding the barrier's lock,
+  so the action is uncancellable and one that waits on its own barrier traps as a lock taken twice
+  does; `wait` answers whether the caller arrived last. A cancelled waiter takes its arrival back
+  (it is not counted for the round), through the runtime's settling condition wait, which answers a
+  cancellation with the lock held again rather than stopping at once. Why: a scope cancelled
+  mid-round leaves the barrier as if the stopped parties had never come, ready for new ones.
+  Alternatives weighed: a cancelled party staying counted (the round could trip with a party
+  missing); "breaking" the barrier for every party (a state each `wait` would have to answer);
+  running the action outside the lock (waiting on its own barrier would then deadlock instead of
+  trapping).
+
 
 ## Proposed
 
+- Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+  take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
+  the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
+  live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
+  was. Alternatives: `-O0` implying `-g` (the usual "debug build"; costs every `-O0` corpus and test
+  build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
+  user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
+
+- Proposed (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+  (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
+  the program's own module prefix left off the readable name; lldb shows the linkage name. The
+  compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
+  `char32_t`). `char` is a UTF-32 code point, `byte` unsigned, `bool` a byte; a reference is a
+  pointer to an opaque structure named by its Avin type. A local a lambda shares (boxed) is not
+  described, nor is a local the compiler made. DWARF version 4. Why: each is the smallest choice that
+  makes `b`, `bt` and `frame variable` work with no lldb plugin. Alternatives: a vendor language code
+  (lldb then treats frames as unknown language), describing objects' fields as DWARF structures
+  (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
+  data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
+
+- Proposed (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+  function's first line lands after the parameters are stored where their variables are read (a
+  lambda's parameter otherwise read a stale slot). A call there still gets the function's own
+  location, which LLVM's verifier asks of every call in a function with debug information.
+  Alternative: placing that code at the function's name, as it was first built: lldb then stopped
+  before the stores and showed the slot's previous value.
+
+- Proposed (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+  cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
+  counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
+  and locations follow lines no function key covers, so cached text would carry stale lines; the
+  lowered code is still reused, and `AVIN_INCREMENTAL=verify` matches a clean build. Alternatives:
+  per-function metadata numbering with a renumbering pass (the text cache would then work under
+  `-g`), or a key over absolute positions (every edit above a function would relower it).
+
+- Proposed (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+  other module-level line, so any line moved anywhere changes every unit's text and recompiles every
+  unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
+  each unit's definitions through the metadata lines and renders only the nodes reached (plus the
+  compile unit and the flags), which also shrinks each unit.
+
+- Proposed (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+  its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
+  build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
+  program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
+  and `avin` (or a user with `atos -o prog.dSYM -l <image> <pc>`) turns it into `file:line` after the
+  process has stopped; a table of function start addresses with their names, emitted as a constant,
+  would let the handler name the function itself, without lines, at any `-g` level. Neither is
+  built: the first needs a runtime change and a symbolizing step, the second a table the emitter does
+  not make yet.
 - **A package's tests import its gated modules; a test module is read only while every module it
   imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
   The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
