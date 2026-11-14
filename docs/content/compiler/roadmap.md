@@ -402,6 +402,92 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    rebuild, a design for checked interfaces per module (today one checker holds the whole program by
    index, so this is a rewrite of how symbols are numbered, not a cache).
 
+### Higher-kinded types: build plan
+
+[Higher-kinded types](/spec/generics/#higher-kinded-types) and the
+[standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Not started. Each step
+is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
+no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
+test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
+`corpus_tests.sysl` then builds and runs.
+
+**Representation.** `TypeParam` (`syntax.sysl`) gains its holes, each a variance and bounds;
+`TypeExprKind` gains `Hole` for a `_` argument. `Type` (`types.sysl`) gains `Constructor(body,
+arity)`, whose body is a data type, class or trait with `Hole(i)` among its direct arguments (the
+normal form, so `same_type` on constructors is structural), and `Applied(head, args)`, an application
+of a constructor parameter. `substitute` reduces `Applied(Constructor …)` to the body with the
+holes filled, so after monomorphization no `Applied` or `Constructor` is left, and lowering, layout
+and emission see only the types they see today; `type_key` names a constructor
+(`Result[_,ParseError]`) so instance keys and the incremental store keep one copy per constructor.
+
+1. **Kinds and constructor parameters, written.** Parse `F[_]`, `F[_, _]`, `F[+_]` in every type
+   parameter list and `_` in type arguments (`parse_decl.sysl`, `formatter.sysl`); the two `Type`
+   forms, `substitute`, `solve`, `same_type`, `type_key`; kind checking wherever a type is resolved
+   (`check.sysl`'s type resolution); constructor arguments written at calls and in types: a bare
+   generic type, a partial application, an alias that is a constructor, another constructor
+   parameter; instance keys (`lower.sysl` `instance_key`, `keys.sysl`). Tests: `tests/run/`
+   constructor parameters on a function, a method, a data type and a class, at one and two holes,
+   with value-type arguments (`F[int]` unboxed at `Vector`), `-O0`/`-O2`, under GC stress;
+   `Parsed` and `Result[_, E]` one instance (a counter in a module value); `tests/reject/` one file
+   per kind error the spec names (constructor as a type, type as a constructor, wrong arity, nested
+   `_`, `F[_[_]]`, an alias that is no constructor); `parse_tests.sysl` and `formatter_tests.sysl`
+   for the forms.
+2. **Inference without bounds, hole variance and hole bounds.** `F` inferred from a type of as many
+   parameters as it takes holes, and the error asking for it otherwise; `F[+_]` subtyping inside the
+   declaration and the check on the constructor passed; `F[_: B]` checked at every `F[X]` written
+   and against the constructor's own bounds. Tests: inference from arguments and from the expected
+   type; `F[+_]` accepting `Option` and refusing `Array`; `F[_: Ord]` taking `TreeSet` and plain
+   `_` refusing it; `F[X]` at an `X` missing the hole's bound reported at the definition;
+   polymorphic recursion through a growing constructor (`expansion.sysl`) rejected and a
+   non-growing one accepted.
+3. **Constructor traits and their impls.** `Self[X]` in a trait's methods, its arity and the
+   requirement chain; impls naming the holes and the bare form; coherence (once per type, the
+   module rule, no inherited conformance); the meeting rule, recording per trait method the type's
+   method and the type arguments the meeting decided (`TraitImpl`/`TraitMethod` in `check.sysl`),
+   so a call through the bound lowers to a direct call of it; a value of `F[X]` has the bound's
+   members; constructor arguments written explicitly at calls. Tests: a trait and impls for a data
+   type, a class, a two-parameter type at each hole; `List`'s overloaded `flatMap` and `Result`'s
+   lower-bounded one meeting; one reject file per refusal (two holes for one type, a bounded hole in
+   an impl, a meeting that needs a conversion, a method with an extra bound, bare `Self`, the trait
+   as a type, `[T: Functor]`, `[F[_]: Ord]`).
+4. **Inferring a constructor through its bound.** Matching `F[X]` through the conformance, the
+   nearest superclass and the one trait; the written-out arguments joined by variance (`Ok(1)` with
+   a `Result[int, E]`), the head required to agree; the expected type; a lambda's result deciding
+   `G`. Tests: each bullet of the spec's inference section as a run test and each of its errors as a
+   reject test; a private `Vector` subclass passed as `Vector`; literals beside a constructor.
+5. **Static members on constructors and per-constructor defaults.** `F.pure`, `Option.pure`,
+   `Result[_, E].pure`; default bodies compiled per implementing constructor, calling `Self.pure`;
+   overriding a required trait's method with a default (`Monad`'s `map`). Tests: a trait whose only
+   implementation of `map` is the default, at three constructors; a static member as a function
+   value; the error for a static called on a value of `F[X]`.
+6. **Impls over constructor parameters.** `impl[F[_]: B, A] F[A]` and `F[G[A]]`: receiver matching
+   through the conformance, the own-methods-first rule, extensions seen by import, two matching
+   impls an error. Tests in `tests/programs/run/` (an extension module adding to every `Monad`, seen
+   only where imported) and `tests/programs/reject/`.
+7. **The library.** `library/avin/functor.avin`: `Functor`, `Foldable`, `Applicative`, `Monad`,
+   `Filter`, `Traverse`, `sequence`, `SendableFunctor`, `SendableMonad`; the impls of the spec's
+   table, each giving only what the type lacks (`pure`, `map2`, `traverse`, `foldLeft` on `Option`,
+   `Result`, `Either`). Tests: `library/tests/functors.avin` checking the functor and monad laws for
+   every type in the table, `traverse`/`sequence` stopping at the first failure, cartesian `map2` on
+   sequences beside positional `zip`; a `tests/run` program proving `List.map` and the other own
+   methods answer exactly what they did (their result types by a type pattern). The spec's examples
+   (`pairUp`, `Parser`, `traverse`) become `run` fences.
+8. **Comprehensions by conformance.** `for_yield_expr` (`check.sysl`) admits each source by its
+   role (`Iterable`, or `Functor`/`Monad`/`Filter` or the sendable pair, through bounds in generic
+   code) before checking its calls as today; the guard on a non-`Iterable` source calls `filter`;
+   the library's `withFilter` views conform to `Iterable`. The generator-mismatch diagnostic naming
+   the later generator is taken from the parked branch `monadic-for` (6824d3bb), not merged whole.
+   Migration: `tests/run/for_yield_forms.avin`'s `Maybe` gains `impl Monad`/`impl Filter`;
+   `tests/run/futures_for_yield.avin` stays as it is, through `SendableMonad`; every other
+   comprehension over a type of a program's own in the corpus, the examples and the packages
+   (grep `yield` beside a `class` or `data`) gains its impl in the same commit. Tests: every role
+   accepted and refused, at a concrete type and through a bound; the order of evaluation unchanged
+   (the interleaving test); one reject file per new diagnostic.
+9. **Tooling.** Hover and completion of a constructor's members (`lsp.sysl`, `completion.sysl`),
+   the IntelliJ plugin's grammar for `F[_]` and `_` arguments (`avin-lang/avin-intellij`, shipped
+   with the release that carries step 1), and `avin fmt` of every form.
+
 ## Releases
 
 Releases are cut from `dev` at any stage, as the language stands, by `scripts/release.sh`
