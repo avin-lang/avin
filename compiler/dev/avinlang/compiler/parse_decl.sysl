@@ -222,8 +222,20 @@ private parse_alias(p: *Parser, start: Span, annotations: Buf[Annotation], opaqu
     val name = declared_name(p, "a type")
     val name_span = name_start.to(p.ended())
     val type_params = parse_type_params(p)
+    if opaque && p.at("<:")
+        val at = p.toks.here()
+        p.toks.advance()
+        val parent = parse_type(p)
+        p.report.add(error(at.to(parent.span), "an opaque type has no supertype: it is a type of its own, and an `impl` makes it conform to a trait"))
     p.expect("=")
     val body = parse_type(p)
+    if opaque && p.at("derives")
+        val at = p.toks.here()
+        var last = at
+        while !p.at_line_end() && !p.toks.at_end()
+            last = p.toks.here()
+            p.toks.advance()
+        p.report.add(error(at.to(last), "an opaque type derives nothing: an `impl` gives it a trait, written in its module against its representation"))
     AliasDecl(start.to(p.ended()), name_span, name, type_params, body, opaque)
 
 /** Reports `lazy var`: a lazy value is computed once and never assigned. */
@@ -910,7 +922,7 @@ local_function_ahead(p: *Parser) -> bool
             params = true
         elif params && text == "{" then braces += 1
         elif params && text == "}" then braces -= 1
-        elif text == ":" && params && depth == 1 && braces == 0 then typed = true
+        elif text == ":" && params && depth == 1 && braces == 0 && parameter_colon(p, i) then typed = true
         elif text == ")"
             depth -= 1
             if params && depth == 0
@@ -1294,9 +1306,24 @@ local_parameterless_ahead(p: *Parser) -> bool
         i += 1
     false
 
+// Whether the `:` `i` tokens ahead types a parameter: it follows the parameter's name, which begins
+// its item of the list. A call's argument has a `:` only inside an expression, as in `f(x is _: T)`,
+// where something other than the list's `(` or `,` comes before the name.
+private parameter_colon(p: *Parser, i: usize) -> bool
+    if i < 2 then return false
+    val name = p.toks.peek_at(i - 1) match
+        Some(t) -> t
+        None -> return false
+    if name.value != Word then return false
+    val before = p.toks.peek_at(i - 2) match
+        Some(t) -> t
+        None -> return false
+    val text = p.spelling(before)
+    text == "(" || text == "[" || text == "," || text == "val" || text == "var" || before.value == Word && !is_keyword(text)
+
 // A member that is a name, type parameters perhaps, and a parameter list with a typed parameter,
-// ending its line, is the signature of an abstract method yielding `unit`: a call never has a `:`
-// among its arguments.
+// ending its line, is the signature of an abstract method yielding `unit`: a call has a `:` among its
+// arguments only inside an expression.
 private signature_ahead(p: *Parser) -> bool
     if !p.at_kind(Word) then return false
     val next = p.ahead(1)
@@ -1311,7 +1338,7 @@ private signature_ahead(p: *Parser) -> bool
         if token.value == Newline || token.value == Dedent then return false
         val text = p.spelling(token)
         if text == "(" || text == "[" then depth += 1
-        elif text == ":" && depth == 1 then typed = true
+        elif text == ":" && depth == 1 && parameter_colon(p, i) then typed = true
         elif text == ")" || text == "]"
             depth -= 1
             if text == ")" && depth == 0
