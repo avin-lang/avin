@@ -1,0 +1,63 @@
+// expect: exit 0
+// Waiting for a child by its pid with its CPU time. A shell whose sub-processes burn CPU and exit
+// answers their time as its own, since it reaped them; a child that only sleeps answers next to none.
+// `tryWaitPidCpu` is `None` while the child runs and its status and time once it has ended. The
+// status is what `waitPid` would answer: an exit code, or the signal that ended it. A pid that is not
+// this program's child, zero, a negative one, one past the largest process id, and a child already
+// reaped are each `Err(NotFound)`, from both. Threads waiting at once each get their own child's time.
+import avin.fs
+import avin.io.{ErrorKind, IoError}
+import avin.process
+import avin.process.{Command, CpuTime, ExitStatus}
+import avin.threads
+import avin.time
+
+private val Burn = "i=0; while [ $i -lt 3 ]; do sh -c 'j=0; while [ $j -lt 40000 ]; do j=$((j+1)); done'; i=$((i+1)); done"
+
+kinds[T](r: Result[T, IoError]) -> Result[T, ErrorKind] = r.mapErr(e -> e.kind)
+
+detached(script: string) -> long = Command("/bin/sh", "-c", script).start().ok.get.detach()
+
+// The status, and whether the time is at least `least` milliseconds and below `most`.
+within(r: Result[(ExitStatus, CpuTime), IoError], least: long, most: long) -> string = r match
+  Ok((status, cpu)) -> s"$status ${least <= cpu.total.toMillis < most} ${cpu.total == cpu.user + cpu.system}"
+  Err(e) -> e.message
+
+main()
+  val strangers: Vector[long] = [process.pid(), 1, 0, -1, long(int.MaxValue) + 1, long.MaxValue, long.MinValue]
+  for pid in strangers
+    println(s"${kinds(process.waitPidCpu(pid))} ${kinds(process.tryWaitPidCpu(pid))}")
+  // The burning shell's sub-processes have all exited and been reaped by it.
+  val burner = detached(Burn)
+  println(within(process.waitPidCpu(burner), 150, 100000))
+  println(kinds(process.waitPidCpu(burner)))
+  println(kinds(process.tryWaitPidCpu(burner)))
+  println(process.waitPidCpu(burner).err.get.message == s"cannot wait for process $burner: no such file or directory")
+  // A sleeper used next to nothing.
+  println(within(process.waitPidCpu(detached("sleep 0.2")), 0, 100))
+  // A child running, then ended.
+  val dir = fs.createTempDir("avin-wait-pid-cpu").ok.get
+  val flag = dir + "/go"
+  val waiting = detached(s"while [ ! -e '$flag' ]; do sleep 0.01; done; exit 4")
+  println(process.tryWaitPidCpu(waiting))
+  _ = fs.writeText(flag, "")
+  var polled: Option[(ExitStatus, CpuTime)] = None
+  while polled.isEmpty
+    polled = process.tryWaitPidCpu(waiting).ok.get
+    if polled.isEmpty then threads.sleep(time.millis(5))
+  println(polled.get.0)
+  println(kinds(process.tryWaitPidCpu(waiting)))
+  // A signal ends it.
+  println(within(process.waitPidCpu(detached("kill -9 $$")), 0, 100))
+  val term = detached("sleep 5")
+  _ = process.signal(term, 15)
+  println(within(process.waitPidCpu(term), 0, 100))
+  // Several threads waiting at once.
+  val jobs: Vector[(long, long, long)] = [
+    (detached(Burn), 150, 100000),
+    (detached("sleep 0.1"), 0, 100),
+    (detached(Burn), 150, 100000)
+  ]
+  val waits = jobs.map(j -> threads.spawn(() -> within(process.waitPidCpu(j.0), j.1, j.2)))
+  for w in waits do println(w.join())
+  _ = fs.removeDirAll(dir)

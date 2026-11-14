@@ -8363,6 +8363,35 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Proposed (branch `deadlock-dump`): **A corpus program's `// stderr: times vary` shows every number
   before ` ms` in its standard error as `n`**, so a thread dump's durations do not make the test
   depend on the machine. Alternative: a dump without durations (loses what a dump is for).
+
+- **CPU time is read from the kernel's accounting: `getrusage` and `wait4`** (branch `cpu-time`,
+  [CPU time](/spec/system-library/#cpu-time)). `CpuTime(user: Duration, system: Duration)` with
+  `total` and `Add`; `process.cpuTime()` and `process.childrenCpuTime()` (`RUSAGE_SELF`,
+  `RUSAGE_CHILDREN`) answer it plainly, not in a `Result`, since `getrusage` fails only for a `who`
+  it does not know; `waitPidCpu` / `tryWaitPidCpu` beside `waitPid` / `tryWaitPid`; and
+  `Child.cpuTime()`, a pipeline's stages and a sequence's parts added. Why: a job manager that
+  samples its jobs with `ps` cannot see the CPU of sub-processes that have already exited, and the
+  kernel folds each reaped process's time into its parent's, so a wait that reads it gives a whole
+  tree's. Alternatives weighed: changing `waitPid` to answer the pair (breaks every caller; a
+  return type cannot be overloaded); a `ProcessUsage` record with the other `rusage` counters (peak
+  memory, faults, context switches — memory is in different units per platform, and nothing asks
+  for them yet, so they can join later without breaking `CpuTime`); `Child.cpuTime()` as an
+  `Option` empty before the wait (a running command's reaped parts would then be invisible, and
+  "nothing reaped yet" is already `Zero`). Review with the user: the names `waitPidCpu` /
+  `tryWaitPidCpu`.
+
+- **A started program is reaped by the library with `wait4`, not by its Sysl `Spawned`** (branch
+  `cpu-time`). Sysl's `Spawned.wait` and `try_wait` reap with `waitpid` and drop the usage, so the
+  runtime (`runtime/avin/rt/cpu.sysl`) reaps the program itself and the `Spawned` is then let go of
+  with `detach`. A time limit is kept by the library in consequence, as Sysl kept it: polled with a
+  backoff to 16 ms up to the deadline, then signal 15, a 200 ms grace, signal 9, and a final wait,
+  the status `TimedOut` with the CPU time it used. Why: the alternative that keeps Sysl as the
+  reaper, reading `RUSAGE_CHILDREN` before and after a wait, is wrong whenever two threads reap at
+  once, which a job manager's do. Alternatives weighed: asking Sysl for a `wait` that answers usage
+  (the better home; reported to the sysl session as a gap, and this binding moves to it when it
+  exists); reaping through Sysl and leaving `cpuTime()` empty for commands (no answer to the item).
+  Review with the user: two reapers of one kind in the stack until Sysl grows the call.
+
 - **Initialization is proved at compile time, by order and by withholding `self`** (branch
   `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
   value or `lazy val` is read before it is set: an object's fields are set in the order written and
