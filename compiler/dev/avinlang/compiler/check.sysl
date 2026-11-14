@@ -370,12 +370,23 @@ struct PendingHoles
     scope: Option[GenericScope]
 
 /** A constructor parameter of a call being inferred: `tp`, of the function `callee`, whose type
- * parameters before it are written `before` in an example (`A, `), called when `called`. */
+ * parameters before it are written `before` in an example (`A, `), called when `called`. `traits`
+ * are the constructor traits bounding it, by index, whose conformances say which arguments of a type
+ * are its holes. */
 struct ConstructorVar
     tp: TypeParam
     callee: string
     before: string
     called: bool
+    traits: Buf[usize]
+
+/** What a bounded constructor parameter's argument decides for it: the constructor `made`, or `why`
+ * none is, said after "cannot infer `F` from `T`: ", with `example` a constructor the diagnostic
+ * suggests writing (empty for none). */
+struct ConstructorChoice
+    made: Option[&Type]
+    why: string
+    example: string
 
 /** An `impl` block, resolved. `target` is the type it adds to, with the impl's type parameters as its
  * arguments, which are the type's own: `owner` owns them, `data_owner` or `class_owner` of the type.
@@ -8964,14 +8975,18 @@ private hold_constructor(c: *Checker, unit: usize, at: Span, owner: usize, param
 
 /** Records each of a call's unknowns that stands for a constructor parameter, so a type it cannot be
  * decided from is reported by what it is. */
-private note_constructor_vars(c: *Checker, callee: string, called: bool, params: Buf[TypeParam], from: usize, args: Buf[&Type])
+private note_constructor_vars(c: *Checker, callee: string, called: bool, owner: usize, params: Buf[TypeParam], from: usize, args: Buf[&Type])
     for i in from..<params.len()
         if params[i].holes.len() == 0 || i >= args.len() then continue
         if *args[i] is Var(v)
             var before = ""
             for j in from..<i
                 before = before + params[j].name + ", "
-            c.constructor_vars.put(v, ConstructorVar(params[i], callee, before, called))
+            var traits: Buf[usize] = buf()
+            for b in bounds_at(c, owner, params, i)
+                if *b is Class(k, _, _)
+                    if is_constructor_trait(c, k) && !contains_index(traits, k) then traits.push(k)
+            c.constructor_vars.put(v, ConstructorVar(params[i], callee, before, called, traits))
 
 /** Why `found` decides no constructor for the unknown constructor parameter `wanted` is applied
  * with, where that is the trouble: a type of more parameters than the parameter has holes, which
@@ -8996,6 +9011,12 @@ private constructor_mismatch(c: *Checker, wanted: &Type, found: &Type) -> Option
     val tp = info.tp
     val subject = s"cannot infer `${tp.name}` from `${type_name(found)}`"
     val call = if info.called then "(arguments)" else ""
+    // Bounded, the conformances decide, and say why they do not.
+    if info.traits.len() > 0
+        val choice = bound_constructor(c, found, info.traits, arity)
+        if choice.why != ""
+            val hint = if choice.example == "" then "" else s"; write it, as in `${info.callee}[${info.before}${choice.example}]$call`"
+            return Some(s"$subject: ${choice.why}$hint")
     var args: Buf[&Type] = buf()
     var declared: Buf[TypeParam] = buf()
     var name = ""
@@ -19620,7 +19641,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     var type_args: Buf[&Type] = buf()
     for i in 0..<type_params.len()
         type_args.push(if i < known.len() then known[i] else fresh_var(c))
-    note_constructor_vars(c, name, called, type_params, known.len(), type_args)
+    note_constructor_vars(c, name, called, owner, type_params, known.len(), type_args)
     // Written type arguments may be a leading prefix, with the rest inferred. Too many are reported,
     // and the ones that fit are still taken, so the count is the only error the call reports.
     if explicit is Some(types)
@@ -20907,8 +20928,11 @@ private loosen_for(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool, li
     Data(d, name, args) -> Data(d, name, loosen_args(c, c.data[d].decl.type_params, args, open, covariant, literals))
     Class(k, name, args) -> Class(k, name, loosen_args(c, c.classes[k].decl.type_params, args, open, covariant, literals))
     // `F[A]` with `F` decided is the type the constructor makes, loosened as that type is.
-    Applied(head, args) -> *zonk(c, head) match
+    // With `F` still open where a value is read out, the argument is checked for itself, so that
+    // `F` is decided by `constrain`, which lets later arguments widen what the constructor writes out.
+    Applied(head, args) -> *head_of(c, head) match
         Constructor(body, _) -> loosen_for(c, substitute(body, hole_owner(), args), open, covariant, literals)
+        Var(i) -> if covariant && open_index(open, i) is Some(_) then fresh_var(c) else zonk(c, t)
         _ -> zonk(c, t)
     _ -> zonk(c, t)
 
@@ -20982,7 +21006,7 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
     // subtype of what the parameter yields, `-> Option[Dog]` given for `-> Option[Animal]`.
     if *zonk(c, p) is ByName(pi)
         if *zonk(c, actual) is ByName(ai) then return constrain(c, Function(buf(), pi, false), Function(buf(), ai, false), open, covariant)
-    if !mentions_open(p, open) then return unify(c, p, upcast(c, actual, p))
+    if !mentions_open(p, open) then return unify(c, p, held_as(c, actual, p, covariant))
     val v = zonk(c, actual)
     *p match
         Var(i) -> return lower_bound(c, i, v, open, covariant)
@@ -21003,16 +21027,19 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
         Data(d, _, xs) -> *v match
             Data(e, _, ys) -> if d == e then return constrain_args(c, c.data[d].decl.type_params, xs, ys, open, covariant)
             _ -> ()
+        // A subclass, or a type conforming to the trait, is an instance of it only where a value is
+        // read out; elsewhere the class or trait itself is held.
         Class(k, _, xs) ->
-            if ancestor_type(c.classes, c.data, v, k) is Some(up)
-                if *up is Class(_, _, ys) then return constrain_args(c, c.classes[k].decl.type_params, xs, ys, open, covariant)
+            if covariant || nominal_head(v) == s"c$k"
+                if ancestor_type(c.classes, c.data, v, k) is Some(up)
+                    if *up is Class(_, _, ys) then return constrain_args(c, c.classes[k].decl.type_params, xs, ys, open, covariant)
         // `F[A]`: once `F` is known, or decided by this argument, the parameter is the type the
         // constructor makes, held to the argument as that type is, its own variance and all. An `F`
         // in scope is held argument by argument, as its holes' variance allows.
         Applied(h, xs) ->
-            val head = zonk(c, h)
+            val head = head_of(c, h)
             if *head is Constructor(body, _) then return constrain(c, substitute(body, hole_owner(), xs), actual, open, covariant)
-            if decide_constructor(c, head, xs.len(), v) then return constrain(c, p, actual, open, covariant)
+            if decide_constructor(c, head, xs.len(), v, open) then return constrain(c, p, actual, open, covariant)
             if *head is TypeVar(_, _, _) && *v is Applied(g, ys)
                 if same_type(head, zonk(c, g)) && xs.len() == ys.len()
                     for k in 0..<xs.len()
@@ -21021,7 +21048,25 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
                         if !constrain(c, xs[k], ys[k], open, reads) then return false
                     return true
         _ -> ()
-    unify(c, p, upcast(c, actual, p))
+    unify(c, p, held_as(c, actual, p, covariant))
+
+/** `actual` as `constrain` holds it to `p`: seen as `p` by subtyping where a value is read out. Anywhere
+ * else, at an invariant argument or a function's parameter, a value of a subclass or of a type
+ * conforming to a trait is no instance of `p`, since generic code may store an instance of `p` there
+ * or pass one to it, so a data type, class or trait is held as itself. */
+private held_as(c: *Checker, actual: &Type, p: &Type, covariant: bool) -> &Type
+    if !covariant
+        val a = zonk(c, actual)
+        val head = nominal_head(a)
+        if head != "" && head != nominal_head(zonk(c, p)) && nominal_head(zonk(c, p)) != "" then return a
+    upcast(c, actual, p)
+
+/** The data type, class or trait `t` is an instance of, as a key (`d3`, `c7`), or empty for any other
+ * type. */
+private nominal_head(t: &Type) -> string = *t match
+    Data(d, _, _) -> s"d$d"
+    Class(k, _, _) -> s"c$k"
+    _ -> ""
 
 private constrain_args(c: *Checker, params: Buf[TypeParam], xs: Buf[&Type], ys: Buf[&Type], open: *Buf[usize], covariant: bool) -> bool
     if xs.len() != ys.len() || xs.len() != params.len() then return false
@@ -22423,22 +22468,147 @@ private unify_applied(c: *Checker, head: &Type, args: Buf[&Type], other: &Type) 
         if *h is Var(_) && *k is TypeVar(_, _, _) then return unify(c, h, parameter_constructor(k, ys.len())) && unify_all(c, args, ys)
         if *k is Var(_) && *h is TypeVar(_, _, _) then return unify(c, k, parameter_constructor(h, args.len())) && unify_all(c, args, ys)
         return unify(c, h, k) && unify_all(c, args, ys)
-    if decide_constructor(c, h, args.len(), other) then return unify(c, Applied(h, args), other)
+    // Made equal, the arguments written out are decided as `other` has them, never joined.
+    var fixed: Buf[usize] = buf()
+    if decide_constructor(c, h, args.len(), other, &fixed) then return unify(c, Applied(h, args), other)
     false
 
-/** Where `head` is an unknown constructor applied to `arity` arguments, decides it as the constructor
- * of `actual`, a type of exactly that many parameters, named bare: `Option` for an `Option[int]`. A
- * type of more parameters, or of fewer, decides nothing, since nothing says which of its arguments
- * are left open; nor does a type that is no data type, class or trait. */
-private decide_constructor(c: *Checker, head: &Type, arity: usize, actual: &Type) -> bool
+/** Where `head` is an unknown constructor applied to `arity` arguments, decides it from `actual`, the
+ * type given for that application. Bounded by constructor traits, it is the constructor the
+ * conformance names (`bound_constructor`): `Result[_, AgeError]` for a `Result[int, AgeError]`. Each
+ * argument it writes out where the type's parameter is covariant and `actual` has a reference type
+ * becomes an unknown in `open`, bounded below by that type, so later arguments join with it as they
+ * would with any type argument read out. Unbounded, it is the constructor of a type of exactly that
+ * many parameters, named bare: `Option` for an `Option[int]`; a type of more parameters, or of fewer,
+ * decides nothing, since nothing says which of its arguments are left open; nor does a type that is
+ * no data type, class or trait. */
+private decide_constructor(c: *Checker, head: &Type, arity: usize, actual: &Type, open: *Buf[usize]) -> bool
     val v = *zonk(c, head) match
         Var(v) -> v
         _ -> return false
-    val made = constructor_of(c, zonk(c, actual), arity) match
+    val given = zonk(c, actual)
+    var traits: Buf[usize] = buf()
+    if c.constructor_vars.get(v) is Some(info) then traits = info.traits
+    if traits.len() == 0
+        val made = constructor_of(c, given, arity) match
+            Some(t) -> t
+            None -> return false
+        c.vars[v] = Some(made)
+        return true
+    val made = bound_constructor(c, given, traits, arity).made match
         Some(t) -> t
         None -> return false
-    c.vars[v] = Some(made)
+    c.vars[v] = Some(widened_constructor(c, made, open))
     true
+
+/** `t` with the chain of variables it is solved as followed to its end, but nothing inside the type
+ * found solved: a constructor decided with unknowns among the arguments it writes out keeps them, so
+ * a later argument can still widen them. */
+private head_of(c: *Checker, t: &Type) -> &Type
+    var now = t
+    loop
+        val i = *now match
+            Var(i) -> i
+            _ -> return now
+        now = c.vars[i] match
+            Some(s) -> s
+            None -> return now
+
+/** Constructor `made`, decided from an argument, with each argument it writes out at a covariant
+ * parameter of its type replaced by an unknown in `open` that has that argument as a lower bound, so
+ * `Result[_, Dog]` decided from one argument is `Result[_, Animal]` once a `Result[int, Cat]` joins
+ * it. An argument still unknown, or of a value type, is kept: it is decided as an invariant one is. */
+private widened_constructor(c: *Checker, made: &Type, open: *Buf[usize]) -> &Type
+    val (body, arity) = *made match
+        Constructor(b, n) -> (b, n)
+        _ -> return made
+    val (params, xs) = *body match
+        Data(id, _, xs) -> (c.data[id].decl.type_params, xs)
+        Class(id, _, xs) -> (c.classes[id].decl.type_params, xs)
+        _ -> return made
+    var items: Buf[&Type] = buf()
+    var changed = false
+    for i in 0..<xs.len()
+        val x = xs[i]
+        if !is_hole(x) && i < params.len() && params[i].variance is Covariant && is_reference(x) && !has_unknowns(x)
+            val w = fresh_var(c)
+            if *w is Var(id)
+                open.push(id)
+                c.vars[id] = Some(x)
+            items.push(w)
+            changed = true
+        else items.push(x)
+    if !changed then return made
+    val widened: &Type = *body match
+        Data(id, name, _) -> Data(id, name, items)
+        Class(id, name, _) -> Class(id, name, items)
+        _ -> return made
+    Constructor(widened, arity)
+
+/** The constructor a value of type `t` gives a constructor parameter of `arity` holes bounded by the
+ * constructor traits `traits`, each conformance saying which arguments are the holes: `t`'s own, where
+ * it has one, and otherwise that of the nearest superclass with one, `t` then passed as that
+ * superclass. An application of a constructor parameter in scope gives that parameter. Otherwise no
+ * constructor, with the reason (empty where `t` is no data type or class, which the caller words). */
+private bound_constructor(c: *Checker, t: &Type, traits: Buf[usize], arity: usize) -> ConstructorChoice
+    *t match
+        Applied(g, xs) ->
+            val k = zonk(c, g)
+            if xs.len() == arity && *k is TypeVar(_, _, _) then return ConstructorChoice(Some(parameter_constructor(k, arity)), "", "")
+            return ConstructorChoice(None, "", "")
+        Data(_, _, _) -> ()
+        Class(_, _, _) -> ()
+        _ -> return ConstructorChoice(None, "", "")
+    // The type itself, then its superclasses, nearest first.
+    var at: Option[&Type] = Some(t)
+    loop
+        val here = at match
+            Some(h) -> h
+            None -> break
+        val own = own_constructor(c, here, traits)
+        if own.made is Some(_) || own.why != "" then return own
+        at = superclass_of_type(c, here)
+    // A trait is never one with a conformance a type does not have of its own: an impl is never for
+    // a trait, and a trait requiring a constructor trait is one, so a type conforming to it conforms
+    // to what it requires at the same holes.
+    var bound_names = ""
+    for i in 0..<traits.len()
+        if i > 0 then bound_names = bound_names + (if i + 1 == traits.len() then " and " else ", ")
+        bound_names = bound_names + s"`${c.classes[traits[i]].name}`"
+    val name = type_head_name(t)
+    val subject = if superclass_of_type(c, t) is Some(_) then s"neither `$name` nor a superclass of it implements" else s"`$name` does not implement"
+    ConstructorChoice(None, s"$subject $bound_names, the bound of the constructor; a type is one only where its declaration or an impl says so", "")
+
+/** The constructor that data type, class or trait `t`'s own conformance to one of the constructor
+ * traits `traits` makes of it: `t` with that conformance's holes left open. Where two of the traits
+ * leave different arguments open, no one constructor is both, and the reason says so. */
+private own_constructor(c: *Checker, t: &Type, traits: Buf[usize]) -> ConstructorChoice
+    var found: Option[&Type] = None
+    var found_trait = 0usize
+    for k in traits
+        val positions = constructor_holes(c, t, k) match
+            Some(p) -> p
+            None -> continue
+        val made: &Type = Constructor(open_at(t, positions), positions.len())
+        found match
+            Some(other) ->
+                if !same_type(other, made)
+                    return ConstructorChoice(None, s"`${type_head_name(t)}` implements `${c.classes[found_trait].name}` as `${type_name(other)}` and `${c.classes[k].name}` as `${type_name(made)}`, so no one constructor is both", type_name(other))
+            None ->
+                found = Some(made)
+                found_trait = k
+    ConstructorChoice(found, "", "")
+
+/** The superclass of class `t`, in `t`'s type arguments; `None` for any other type. */
+private superclass_of_type(c: *Checker, t: &Type) -> Option[&Type] = *t match
+    Class(k, _, xs) -> Some(substitute(c.classes[k].superclass?, class_owner(k), xs))
+    _ -> None
+
+/** The name of the data type, class or trait `t` is an instance of, as a diagnostic writes it. */
+private type_head_name(t: &Type) -> string = *t match
+    Data(_, name, _) -> name
+    Class(_, name, _) -> name
+    _ -> type_name(t)
 
 /** The constructor of `t` named bare, where `t` has exactly `arity` type arguments: its data type,
  * class or trait with every argument left open, or the constructor parameter it applies. */
