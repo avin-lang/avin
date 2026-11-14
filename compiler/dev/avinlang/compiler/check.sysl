@@ -357,6 +357,23 @@ struct PendingBound
     args: Buf[&Type]
     scope: Option[GenericScope]
 
+/** An application `F[X]` of constructor parameter `param`, written before every conformance is
+ * known: its arguments `args`, each held to its hole's bounds once they are. */
+struct PendingHoles
+    unit: usize
+    at: Span
+    param: TypeParam
+    args: Buf[&Type]
+    scope: Option[GenericScope]
+
+/** A constructor parameter of a call being inferred: `tp`, of the function `callee`, whose type
+ * parameters before it are written `before` in an example (`A, `), called when `called`. */
+struct ConstructorVar
+    tp: TypeParam
+    callee: string
+    before: string
+    called: bool
+
 /** An `impl` block, resolved. `target` is the type it adds to, with the impl's type parameters as its
  * arguments, which are the type's own: `owner` owns them, `data_owner` or `class_owner` of the type.
  * `trait` is the trait it makes the type conform to. An impl found invalid has the error type as its
@@ -596,6 +613,12 @@ struct Checker
     shown: Buf[(Span, Span)]
     /** The function each `lazy val` field's initializer is checked as, which a read of it may run. */
     lazy_initializers: Buf[LazyInitializer]
+    /** Applications `F[X]` written before every conformance is known, each argument held to the
+     * bounds of its hole once they are. */
+    pending_holes: Buf[PendingHoles]
+    /** The unknown standing for each constructor parameter of a call being inferred, by its
+     * variable: what an error that cannot decide it names. */
+    constructor_vars: Map[usize, ConstructorVar]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1004,7 +1027,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1067,6 +1090,12 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         hold_to_bounds(&c, p.unit, p.at, p.what, p.owner, p.params, p.args, 0)
         c.generic = outer_generic
     c.pending = buf()
+    for p in c.pending_holes
+        val outer_generic = c.generic
+        c.generic = p.scope
+        hold_to_holes(&c, p.unit, p.at, p.param, p.args)
+        c.generic = outer_generic
+    c.pending_holes = buf()
     for b in c.late_bindings
         val outer_generic = c.generic
         c.generic = b.scope
@@ -3365,7 +3394,34 @@ private view_as_type(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
         _ -> x
     // A type parameter with a lower bound is a supertype of the bound.
     TypeVar(_, _, _) -> if below_lower(f, x, to) then to else x
+    // `F[Dog]` is an `F[Animal]` where `F`'s hole is `+_`, which only a constructor covariant there
+    // is accepted for; at a plain `_` the arguments must be the same.
+    Applied(h, ys) -> *x match
+        Applied(g, xs) ->
+            if !same_type(h, g) || xs.len() != ys.len() then return x
+            var out: Buf[&Type] = buf()
+            for i in 0..<xs.len()
+                val v = hole_variance(f, h, i)
+                if v is Covariant && *xs[i] is Nothing && !(*ys[i] is Var(_)) then out.push(ys[i])
+                elif v is Covariant then out.push(view_part(f, xs[i], ys[i]))
+                elif v is Contravariant then out.push(view_contra(f, xs[i], ys[i]))
+                else out.push(xs[i])
+            Applied(h, out)
+        _ -> x
     _ -> x
+
+/** The variance hole `k` of constructor parameter `head` demands, as the code being checked declares
+ * it; invariant where the parameter is not in scope. */
+private hole_variance(f: Conformances, head: &Type, k: usize) -> Variance
+    val (owner, index) = *head match
+        TypeVar(o, i, _) -> (o, i)
+        _ -> return Invariant
+    val scope = f.generic match
+        Some(s) -> s
+        None -> return Invariant
+    if scope.owner != owner || index >= scope.params.len() then return Invariant
+    val holes = scope.params[index].holes
+    if k < holes.len() then holes[k].variance else Invariant
 
 // A value of class or data type `x` seen as the function type `to`, through the function type `x` is
 // a subtype of; `x` itself where it is none.
@@ -5518,12 +5574,19 @@ private variance_in(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usi
         ByName(inner) -> variance_in(c, unit, params, owner, inner, polarity, at, place)
         Data(d, _, args) -> variance_args(c, unit, params, owner, c.data[d].decl.type_params, args, polarity, at, place)
         Class(k, _, args) -> variance_args(c, unit, params, owner, c.classes[k].decl.type_params, args, polarity, at, place)
-        // Nothing is known of the constructor a parameter `F[_]` stands for, so each of its
-        // arguments is in an invariant position.
+        // An argument of `F[A]` is where `F`'s hole puts it: kept at `+_`, flipped at `-_`, and
+        // invariant at a plain `_`, where nothing is known of the constructor passed.
         Applied(head, args) ->
             if !variance_in(c, unit, params, owner, head, 0, at, place) then return false
-            for a in args
-                if !variance_in(c, unit, params, owner, a, 0, at, place) then return false
+            for k in 0..<args.len()
+                var hole_sign = 0
+                if *head is TypeVar(o, i, _)
+                    if o == owner && i < params.len() && k < params[i].holes.len()
+                        hole_sign = params[i].holes[k].variance match
+                            Covariant -> 1
+                            Contravariant -> -1
+                            Invariant -> 0
+                if !variance_in(c, unit, params, owner, args[k], polarity * hole_sign, at, place) then return false
             true
         Constructor(body, _) -> variance_in(c, unit, params, owner, body, polarity, at, place)
         _ -> true
@@ -6316,6 +6379,17 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         var none: Buf[&Type] = buf()
         params.push(Function(none, Unit, false))
         result = Bool
+    elif name == "cancel_guarded_held"
+        // A body run holding a share other threads wait for, and the closure giving it back, which
+        // runs however the body ended; whether the body may be stopped by a cancellation, and whether
+        // it was.
+        entry = "avin_rt_cancel_guarded_held"
+        var none: Buf[&Type] = buf()
+        params.push(Function(none, Unit, false))
+        var none_back: Buf[&Type] = buf()
+        params.push(Function(none_back, Unit, false))
+        params.push(Bool)
+        result = Bool
     elif name == "cancel_resume"
         entry = "avin_rt_cancel_resume"
         result = Nothing
@@ -6351,6 +6425,9 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
     elif name == "lock_release"
         entry = "avin_rt_lock_release"
         params.push(AnyType)
+    elif name == "lock_release_holding"
+        entry = "avin_rt_lock_release_holding"
+        params.push(AnyType)
     elif name == "condition_new"
         entry = "avin_rt_condition_new"
         result = AnyType
@@ -6372,6 +6449,14 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         params.push(AnyType)
         params.push(Int(64))
         result = Bool
+    elif name == "condition_wait_settling"
+        // The condition, the lock its waiter holds, and the most milliseconds to wait (negative for no
+        // limit); how the wait ended: notified, out of time, or cancelled with the lock held again.
+        entry = "avin_rt_condition_wait_settling"
+        params.push(AnyType)
+        params.push(AnyType)
+        params.push(Int(64))
+        result = Int(32)
     elif name == "condition_notify"
         entry = "avin_rt_condition_notify"
         params.push(AnyType)
@@ -6442,19 +6527,6 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
                 _ -> c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
         c.bounds.put(bound_key(owner, i, tp), bounds)
 
-// The bound among `bounds` that is a class rather than a trait, if one is.
-private class_bound(c: *Checker, bounds: Buf[&Type]) -> Option[&Type]
-    for e in bounds
-        if *e is Class(k, _, _)
-            if !is_trait(c, k) then return Some(e)
-    None
-
-// Whether `t` is one of `types`.
-private contains_type(types: Buf[&Type], t: &Type) -> bool
-    for e in types
-        if same_type(e, t) then return true
-    false
-
 // A constructor parameter, `F[_]`, stands for a type constructor, so what bounds a type bounds none
 // of it: a trait for types (`Ord`) is refused, and so is a lower bound, which compares types. The
 // parameter itself is invariant; a variance is written on its holes, as a demand on the constructor.
@@ -6467,6 +6539,65 @@ private declare_constructor_param(c: *Checker, unit: usize, tp: TypeParam)
         val t = resolve_bound(c, unit, b)
         if *t is ErrorType then continue
         c.note(unit, b.span, s"`${type_name(t)}` is a bound for a type, and `${tp.name}` is a constructor")
+    // A hole's bounds are a type's, `F[_: Ord]`: every type the hole is filled with meets them.
+    for k in 0..<tp.holes.len()
+        var bounds: Buf[&Type] = buf()
+        for b in tp.holes[k].bounds
+            val t = resolve_bound(c, unit, b)
+            *t match
+                Class(id, _, _) ->
+                    if c.classes[id].decl.object then c.note(unit, b.span, s"`${type_name(t)}` is an object, which has one value; a bound is a trait or a class")
+                    elif contains_type(bounds, t) then c.note(unit, b.span, s"`${type_name(t)}` is already a bound of `${tp.name}`'s argument")
+                    elif !is_trait(c, id) && class_bound(c, bounds) is Some(other)
+                        c.note(unit, b.span, s"`${tp.name}`'s argument has one class among its bounds, and `${type_name(other)}` and `${type_name(t)}` are both classes; the others are traits")
+                    else bounds.push(t)
+                ErrorType -> ()
+                _ -> c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
+        c.bounds.put(hole_bound_key(tp, k), bounds)
+
+/** Where the bounds of hole `k` of constructor parameter `tp` are kept in `bounds`. */
+private hole_bound_key(tp: TypeParam, k: usize) -> string = s"hole/${tp.site}/$k"
+
+/** The bounds of hole `k` of constructor parameter `tp`, resolved where it is declared. */
+private hole_bounds(c: *Checker, tp: TypeParam, k: usize) -> Buf[&Type] = c.bounds.get(hole_bound_key(tp, k)).unwrap_or(buf())
+
+/** Holds each argument of an application `F[X]` of constructor parameter `tp` to its hole's bounds,
+ * where the application is written, so a generic definition's errors are reported at the
+ * definition; before every conformance is known, the check waits in `pending_holes`. */
+private check_hole_args(c: *Checker, unit: usize, at: Span, tp: TypeParam, args: Buf[&Type])
+    var any = false
+    for h in tp.holes
+        if h.bounds.len() > 0 then any = true
+    if !any then return
+    if !c.conformances_known
+        c.pending_holes.push(PendingHoles(unit, at, tp, args, c.generic))
+        return
+    hold_to_holes(c, unit, at, tp, args)
+
+private hold_to_holes(c: *Checker, unit: usize, at: Span, tp: TypeParam, args: Buf[&Type])
+    for k in 0..<args.len()
+        if k >= tp.holes.len() then break
+        val arg = zonk(c, args[k])
+        if *arg is ErrorType || is_hole(arg) || has_unknowns(arg) then continue
+        for b in hole_bounds(c, tp, k)
+            if sendable_trait_of(c, b) is Some(s)
+                hold_to_sendable(c, unit, at, s"the bound of `${tp.name}`'s argument in `${written_param(tp)}`", arg, s)
+                continue
+            if !conforms_to_bound(c, arg, b)
+                c.note(unit, at, s"`${type_name(arg)}` does not conform to `${type_name(b)}`, the bound of `${tp.name}`'s argument in `${written_param(tp)}`${underived_reason(c, arg, type_name(b))}")
+
+// The bound among `bounds` that is a class rather than a trait, if one is.
+private class_bound(c: *Checker, bounds: Buf[&Type]) -> Option[&Type]
+    for e in bounds
+        if *e is Class(k, _, _)
+            if !is_trait(c, k) then return Some(e)
+    None
+
+// Whether `t` is one of `types`.
+private contains_type(types: Buf[&Type], t: &Type) -> bool
+    for e in types
+        if same_type(e, t) then return true
+    false
 
 // Whether `t`, given as the lower bound of parameter `i` of `owner`, is that parameter, or another of
 // the same declaration whose lower bounds lead back to it.
@@ -7924,6 +8055,9 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
         // An argument a constructor leaves open is held by the constructor's own rules
         // (`constructor_refusal`), never to the type's bounds.
         if is_hole(args[i]) then continue
+        if params[i].holes.len() > 0
+            hold_constructor(c, unit, at, owner, params, i, args)
+            continue
         for b in bounds_at(c, owner, params, i)
             val bound = substitute(b, owner, args)
             if sendable_trait_of(c, bound) is Some(k)
@@ -7955,6 +8089,199 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
             if conforms(lower, arg) || conforms(view_part(conformances(c), lower, arg), arg)
                 if !same_type(lower, arg) then c.views.push(TypeView(one_part(lower), one_part(arg)))
             else c.note(unit, at, s"`${type_name(arg)}` is not a supertype of `${type_name(lower)}`, the lower bound of `${params[i].name}` in $what")
+
+// The constructor given to constructor parameter `params[i]`, written or inferred, held to what the
+// parameter's holes demand of it: at each hole, the parameter of the type there is covariant where
+// the hole is `+_` and contravariant where it is `-_`, and each of its bounds is implied by the
+// hole's, `Eq` and `Hash` aside, which every type meets. A constructor parameter given is held the
+// same way by its own holes. So generic code, which assumes only what its holes say, is correct at
+// every constructor it is instantiated with.
+private hold_constructor(c: *Checker, unit: usize, at: Span, owner: usize, params: Buf[TypeParam], i: usize, args: Buf[&Type])
+    val tp = params[i]
+    val given = zonk(c, args[i])
+    val body = *given match
+        Constructor(b, _) -> b
+        _ -> return
+    var items: Buf[&Type] = buf()
+    var declared: Buf[TypeParam] = buf()
+    var type_owner = 0usize
+    var name = ""
+    // The constructor parameter given, where it is one: its declaration in scope.
+    var other: Option[TypeParam] = None
+    *body match
+        Data(id, n, xs) ->
+            items = xs
+            declared = c.data[id].decl.type_params
+            type_owner = data_owner(id)
+            name = n
+        Class(id, n, xs) ->
+            items = xs
+            declared = c.classes[id].decl.type_params
+            type_owner = class_owner(id)
+            name = n
+        Applied(h, xs) ->
+            items = xs
+            other = scope_param(c, h)
+            name = type_name(h)
+            if other is None then return
+        _ -> return
+    val shown = type_name(given)
+    for k in 0..<tp.holes.len()
+        var place: Option[usize] = None
+        for j in 0..<items.len()
+            if same_type(items[j], hole(k)) then place = Some(j)
+        val j = place match
+            Some(j) -> j
+            None -> continue
+        val demand = tp.holes[k].variance
+        val promised = substitute_all(hole_bounds(c, tp, k), owner, args)
+        other match
+            Some(g) ->
+                if j >= g.holes.len() then continue
+                val offered = g.holes[j].variance
+                if !variance_meets(offered, demand)
+                    c.note(unit, at, s"`$name` is ${variance_word(offered)} at that argument, as `${written_param(g)}` is declared, and `${written_param(tp)}` takes only a constructor ${variance_word(demand)} there")
+                    continue
+                for b in hole_bounds(c, g, j)
+                    if every_type_meets(c, b) || implied_bound(c, promised, b) then continue
+                    c.note(unit, at, bound_refusal(c, s"`${written_param(g)}` bounds its argument by `${type_name(b)}`", name, tp, promised))
+                    break
+            None ->
+                if j >= declared.len() then continue
+                val p = declared[j]
+                if !variance_meets(p.variance, demand)
+                    c.note(unit, at, s"`$shown` is ${variance_word(p.variance)} in its parameter `${p.name}`, and `${written_param(tp)}` takes only a constructor ${variance_word(demand)} there")
+                    continue
+                for b in bounds_at(c, type_owner, declared, j)
+                    val needed = substitute(b, type_owner, items)
+                    if every_type_meets(c, needed) || implied_bound(c, promised, needed) then continue
+                    c.note(unit, at, bound_refusal(c, s"`$name` bounds its parameter `${p.name}` by `${type_name(needed)}`", name, tp, promised))
+                    break
+
+/** Records each of a call's unknowns that stands for a constructor parameter, so a type it cannot be
+ * decided from is reported by what it is. */
+private note_constructor_vars(c: *Checker, callee: string, called: bool, params: Buf[TypeParam], from: usize, args: Buf[&Type])
+    for i in from..<params.len()
+        if params[i].holes.len() == 0 || i >= args.len() then continue
+        if *args[i] is Var(v)
+            var before = ""
+            for j in from..<i
+                before = before + params[j].name + ", "
+            c.constructor_vars.put(v, ConstructorVar(params[i], callee, before, called))
+
+/** Why `found` decides no constructor for the unknown constructor parameter `wanted` is applied
+ * with, where that is the trouble: a type of more parameters than the parameter has holes, which
+ * says nothing of which are left open, one of fewer, or one that is no generic type at all. */
+private constructor_mismatch(c: *Checker, wanted: &Type, found: &Type) -> Option[string]
+    val (head, arity) = *wanted match
+        Applied(h, xs) -> (zonk(c, h), xs.len())
+        _ -> return None
+    val v = *head match
+        Var(v) -> v
+        _ -> return None
+    val info = c.constructor_vars.get(v)?
+    var applied: Buf[&Type] = buf()
+    if *wanted is Applied(_, xs)
+        for x in xs
+            applied.push(zonk(c, x))
+    // The constructor is reported here, so it and the arguments it is applied to are settled as
+    // failed, and not reported again as unknowns nothing decided.
+    c.vars[v] = Some(ErrorType)
+    for x in applied
+        poison(c, x)
+    val tp = info.tp
+    val subject = s"cannot infer `${tp.name}` from `${type_name(found)}`"
+    val call = if info.called then "(arguments)" else ""
+    var args: Buf[&Type] = buf()
+    var declared: Buf[TypeParam] = buf()
+    var name = ""
+    *found match
+        Data(id, n, xs) ->
+            args = xs
+            declared = c.data[id].decl.type_params
+            name = n
+        Class(id, n, xs) ->
+            args = xs
+            declared = c.classes[id].decl.type_params
+            name = n
+        Applied(g, xs) ->
+            args = xs
+            name = type_name(zonk(c, g))
+        _ -> return Some(s"$subject: ${takes_constructor(tp)}, and `${type_name(found)}` is no data type, class or trait; write it, as in `${info.callee}[${info.before}${sample_type_arg(tp)}]$call`")
+    if takes_constructors(declared)
+        return Some(s"$subject: `$name` has a parameter that takes a constructor, which a hole cannot leave open; write `${tp.name}`, as in `${info.callee}[${info.before}${sample_type_arg(tp)}]$call`")
+    if args.len() > arity
+        // The example leaves open the arguments the application's own known arguments match, then
+        // the first ones left, and writes out the others as `found` has them.
+        var open: Buf[bool] = buf()
+        for _ in args
+            open.push(false)
+        var left = arity
+        for a in applied
+            if has_unknowns(a) || *a is ErrorType then continue
+            for j in 0..<args.len()
+                if !open[j] && same_type(args[j], a)
+                    open[j] = true
+                    left -= 1
+                    break
+        for j in 0..<args.len()
+            if left == 0 then break
+            if !open[j]
+                open[j] = true
+                left -= 1
+        var example = name + "["
+        for j in 0..<args.len()
+            if j > 0 then example = example + ", "
+            example = example + (if open[j] then "_" else type_name(args[j]))
+        example = example + "]"
+        return Some(s"$subject: `$name` takes ${arguments_word(args.len())} and `${tp.name}` ${number_word(arity)}, and nothing says which ${if arity == 1 then "is" else "are"} left open; write it, as in `${info.callee}[${info.before}$example]$call`")
+    if args.len() < arity
+        val has = if args.len() == 0 then "no type arguments" else arguments_word(args.len())
+        return Some(s"$subject: ${takes_constructor(tp)}, and `$name` takes $has")
+    None
+
+// Why a constructor whose parameter at a hole is bounded is no constructor for `tp`, whose hole
+// promises only `promised` of the types it is filled with.
+private bound_refusal(c: *Checker, bounding: string, name: string, tp: TypeParam, promised: Buf[&Type]) -> string =
+    if promised.len() == 0 then s"$bounding, and `${tp.name}` may be applied to any type, so `$name` is no constructor for `${written_param(tp)}`"
+    else s"$bounding, which `${written_param(tp)}` does not promise of the types `${tp.name}` is applied to, so `$name` is no constructor for it"
+
+/** Whether a constructor of variance `offered` at an argument meets a hole demanding `demand`. */
+private variance_meets(offered: Variance, demand: Variance) -> bool = demand match
+    Invariant -> true
+    Covariant -> offered is Covariant
+    Contravariant -> offered is Contravariant
+
+private variance_word(v: Variance) -> string = v match
+    Invariant -> "invariant"
+    Covariant -> "covariant"
+    Contravariant -> "contravariant"
+
+/** Whether `bound` is `Eq` or `Hash`, which every type meets. */
+private every_type_meets(c: *Checker, bound: &Type) -> bool = *bound match
+    Class(k, _, _) -> is_class_named(c, k, qualified(CoreModule, "Eq")) || is_class_named(c, k, qualified(CoreModule, "Hash"))
+    _ -> false
+
+/** Whether a type meeting every bound of `promised` meets `needed`: one of them is it, or a trait or
+ * class that is one of it, as `Ord` is an `Eq`. */
+private implied_bound(c: *Checker, promised: Buf[&Type], needed: &Type) -> bool
+    val k = *needed match
+        Class(k, _, _) -> k
+        _ -> return false
+    for b in promised
+        if same_type(b, needed) then return true
+        if ancestor_type(c.classes, c.data, b, k) is Some(up)
+            if same_type(up, needed) then return true
+    false
+
+/** The declaration of type parameter `t` in the scope being checked, where `t` is one of its
+ * parameters. */
+private scope_param(c: *Checker, t: &Type) -> Option[TypeParam]
+    val (owner, index) = *t match
+        TypeVar(o, i, _) -> (o, i)
+        _ -> return None
+    val scope = c.generic?
+    if scope.owner != owner || index >= scope.params.len() then None else Some(scope.params[index])
 
 /** Whether each of `args` decided so far, from position `from` on, is a supertype of its parameter's
  * lower bound as `hold_to_bounds` requires; one not yet known, or whose bound is not, passes. */
@@ -9968,6 +10295,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                     var items: Buf[&Type] = buf()
                     for a in args
                         items.push(resolve_type(c, unit, a))
+                    check_hole_args(c, unit, t.span, scope.params[i], items)
                     return Applied(TypeVar(scope.owner, i, path), items)
         if path == "Self"
             if args.len() > 0 then c.note(unit, t.span, "`Self` takes no type arguments")
@@ -10093,6 +10421,8 @@ private written_param(tp: TypeParam) -> string
             Invariant -> "_"
             Covariant -> "+_"
             Contravariant -> "-_")
+        for k in 0..<tp.holes[i].bounds.len()
+            out = out + (if k == 0 then ": " else " & ") + show_type(tp.holes[i].bounds[k])
     out + "]"
 
 // What a diagnostic says a constructor parameter takes: `F[_]` takes a constructor of one argument,
@@ -10190,6 +10520,7 @@ private resolve_named_constructor(c: *Checker, unit: usize, t: &TypeExpr, path: 
                     items.push(hole(k))
                     k += 1
                 else items.push(resolve_type(c, unit, a))
+            check_hole_args(c, unit, t.span, q, items)
             return Constructor(Applied(head, items), arity)
     if path == "Self"
         val r = resolve_type(c, unit, t)
@@ -10272,21 +10603,20 @@ private open_count_message(t: &TypeExpr, open: usize, tp: TypeParam) -> string =
 
 // Why `body`, the type named with its holes in place, is no constructor for `tp`, if it is not: it
 // must be a data type, class or trait with each hole as one of its own arguments exactly once, and
-// none deeper, and no hole where the type bounds its parameter or takes a constructor.
+// none deeper, and no hole where the type's parameter takes a constructor. Whether the type's
+// variance and bounds at each hole are what `tp`'s holes demand is held where the type arguments are
+// (`hold_constructor`), written or inferred alike.
 private constructor_refusal(c: *Checker, path: string, body: &Type, shown: string, arity: usize, tp: TypeParam) -> Option[string]
     var items: Buf[&Type] = buf()
-    var owner = 0usize
     var params: Buf[TypeParam] = buf()
     var name = ""
     *body match
         Data(id, n, xs) ->
             items = xs
-            owner = data_owner(id)
             params = c.data[id].decl.type_params
             name = n
         Class(id, n, xs) ->
             items = xs
-            owner = class_owner(id)
             params = c.classes[id].decl.type_params
             name = n
         _ -> return Some(s"`$path` stands for $shown, which is no constructor: a constructor leaves open arguments of a data type, a class or a trait")
@@ -10303,7 +10633,6 @@ private constructor_refusal(c: *Checker, path: string, body: &Type, shown: strin
                 if i < params.len()
                     val p = params[i]
                     if p.holes.len() > 0 then return Some(s"`$name`'s parameter `${p.name}` takes a constructor, so it cannot be left open: a hole stands for a type")
-                    if bounded_beyond_equality(c, owner, i, p) then return Some(s"`$name` bounds its parameter `${p.name}`, and `${tp.name}` may be applied to any type, so `$name` is no constructor for `${written_param(tp)}`")
                 continue
         if names_hole(item) then return Some(alias_shape_refusal(path, shown))
     if seen.len() != arity then return Some(alias_shape_refusal(path, shown))
@@ -10328,27 +10657,6 @@ private any_names_hole(items: Buf[&Type]) -> bool
     for item in items
         if names_hole(item) then return true
     false
-
-// Whether a type's parameter `i` has a bound other than `Eq` and `Hash`, which every type meets, so
-// generic code applying a constructor to any type could break it.
-private bounded_beyond_equality(c: *Checker, owner: usize, i: usize, p: TypeParam) -> bool
-    if p.bounds.len() == 0 then return false
-    c.bounds.get(bound_key(owner, i, p)) match
-        Some(bs) ->
-            for b in bs
-                *b match
-                    Class(k, _, _) ->
-                        if !is_class_named(c, k, qualified(CoreModule, "Eq")) && !is_class_named(c, k, qualified(CoreModule, "Hash")) then return true
-                    _ -> return true
-            false
-        // Not declared yet: read as written.
-        None ->
-            for b in p.bounds
-                val written = b.kind match
-                    Named(n, _) -> n
-                    _ -> ""
-                if !(written == "Eq" || written == "Hash" || written.ends_with(".Eq") || written.ends_with(".Hash")) then return true
-            false
 
 // A union written out, in normal form. A member written by hand that another absorbs (a duplicate,
 // one that converts to another member, `Any`, `Nothing`) is a mistake, reported with the type to
@@ -12250,6 +12558,9 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
                 failed = true
         solved.push(zonk(c, t))
     if failed then return TExpr(at, ErrorType, UnitConst)
+    // The type arguments written or inferred conform to their parameters' bounds, as at a call; those
+    // the receiver gives were held where its type was made.
+    hold_to_bounds(c, unit, at, s"`$name`", target.type_owner, type_params, solved, known.len())
     val ty = zonk(c, declared)
     var lambda_params: Buf[&Type] = buf()
     var lambda_result: &Type = ErrorType
@@ -18355,6 +18666,7 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     var type_args: Buf[&Type] = buf()
     for i in 0..<type_params.len()
         type_args.push(if i < known.len() then known[i] else fresh_var(c))
+    note_constructor_vars(c, name, called, type_params, known.len(), type_args)
     // Written type arguments may be a leading prefix, with the rest inferred. Too many are reported,
     // and the ones that fit are still taken, so the count is the only error the call reports.
     if explicit is Some(types)
@@ -19545,7 +19857,8 @@ private type_argument_union_hint(c: *Checker, a: &Type, b: &Type) -> string
 
 /** "expected T, found U", and why two classes that share several traits do not join to one. */
 private mismatch(c: *Checker, wanted: &Type, found: &Type) -> string
-    val text = s"expected ${type_name(wanted)}, found ${type_name(found)}${sendable_hint(c, wanted, found)}"
+    if constructor_mismatch(c, zonk(c, wanted), zonk(c, found)) is Some(why) then return why
+    val text =s"expected ${type_name(wanted)}, found ${type_name(found)}${sendable_hint(c, wanted, found)}"
     val traits = shared_traits(c, wanted, zonk(c, found))
     if traits.len() < 2 then return text
     var names = ""
@@ -19639,6 +19952,10 @@ private loosen_for(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool, li
         Function(solved, loosen_for(c, result, open, covariant, literals), sendable)
     Data(d, name, args) -> Data(d, name, loosen_args(c, c.data[d].decl.type_params, args, open, covariant, literals))
     Class(k, name, args) -> Class(k, name, loosen_args(c, c.classes[k].decl.type_params, args, open, covariant, literals))
+    // `F[A]` with `F` decided is the type the constructor makes, loosened as that type is.
+    Applied(head, args) -> *zonk(c, head) match
+        Constructor(body, _) -> loosen_for(c, substitute(body, hole_owner(), args), open, covariant, literals)
+        _ -> zonk(c, t)
     _ -> zonk(c, t)
 
 /** The expected type of an argument that holds a number literal (`Some(1)`, `[1, 2]`, `(1, 2)`), where
@@ -19691,6 +20008,7 @@ private mentions_open(t: &Type, open: *Buf[usize]) -> bool = *t match
     ByName(inner) -> mentions_open(inner, open)
     Data(_, _, args) -> any_open(args, open)
     Class(_, _, args) -> any_open(args, open)
+    Applied(head, args) -> mentions_open(head, open) || any_open(args, open)
     _ -> false
 
 private any_open(types: Buf[&Type], open: *Buf[usize]) -> bool
@@ -19734,6 +20052,20 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
         Class(k, _, xs) ->
             if ancestor_type(c.classes, c.data, v, k) is Some(up)
                 if *up is Class(_, _, ys) then return constrain_args(c, c.classes[k].decl.type_params, xs, ys, open, covariant)
+        // `F[A]`: once `F` is known, or decided by this argument, the parameter is the type the
+        // constructor makes, held to the argument as that type is, its own variance and all. An `F`
+        // in scope is held argument by argument, as its holes' variance allows.
+        Applied(h, xs) ->
+            val head = zonk(c, h)
+            if *head is Constructor(body, _) then return constrain(c, substitute(body, hole_owner(), xs), actual, open, covariant)
+            if decide_constructor(c, head, xs.len(), v) then return constrain(c, p, actual, open, covariant)
+            if *head is TypeVar(_, _, _) && *v is Applied(g, ys)
+                if same_type(head, zonk(c, g)) && xs.len() == ys.len()
+                    for k in 0..<xs.len()
+                        val y = zonk(c, ys[k])
+                        val reads = covariant && hole_variance(conformances(c), head, k) is Covariant && is_reference(y)
+                        if !constrain(c, xs[k], ys[k], open, reads) then return false
+                    return true
         _ -> ()
     unify(c, p, upcast(c, actual, p))
 
@@ -20992,6 +21324,10 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
     if *y is Var(j)
         c.vars[j] = Some(x)
         return true
+    // An application of a constructor parameter, `F[A]` meeting `Option[int]`: an unknown `F` is
+    // decided as the other type's constructor, then the arguments are unified.
+    if *x is Applied(h, xs) then return unify_applied(c, h, xs, y)
+    if *y is Applied(h, ys) then return unify_applied(c, h, ys, x)
     *x match
         Tuple(xs) -> *y match
             Tuple(ys) -> unify_all(c, xs, ys)
@@ -21071,6 +21407,11 @@ private occurrence(c: *Checker, t: &Type, v: usize, covariant: bool) -> i32 = *z
     ByName(inner) -> occurrence(c, inner, v, covariant)
     Data(d, _, args) -> occurrence_args(c, c.data[d].decl.type_params, args, v, covariant)
     Class(k, _, args) -> occurrence_args(c, c.classes[k].decl.type_params, args, v, covariant)
+    // An argument of a constructor not yet known is at no known variance.
+    Applied(head, args) ->
+        val o = occurrence(c, head, v, false)
+        val a = occurrences(c, args, v, false)
+        if o > a then o else a
     _ -> 0
 
 private occurrences(c: *Checker, types: Buf[&Type], v: usize, covariant: bool) -> i32
@@ -21106,6 +21447,10 @@ private poison(c: *Checker, t: &Type)
         Class(_, _, args) ->
             for a in args
                 poison(c, a)
+        Applied(head, args) ->
+            poison(c, head)
+            for a in args
+                poison(c, a)
         _ -> ()
 
 private unify_all(c: *Checker, xs: Buf[&Type], ys: Buf[&Type]) -> bool
@@ -21113,6 +21458,53 @@ private unify_all(c: *Checker, xs: Buf[&Type], ys: Buf[&Type]) -> bool
     for i in 0..<xs.len()
         if !unify(c, xs[i], ys[i]) then return false
     true
+
+// Unifies `head[args]`, solved as far as it goes, with `other`: two applications of one constructor
+// parameter agree argument by argument, and an unknown head takes `other`'s constructor.
+private unify_applied(c: *Checker, head: &Type, args: Buf[&Type], other: &Type) -> bool
+    val h = zonk(c, head)
+    if *other is Applied(g, ys)
+        if args.len() != ys.len() then return false
+        val k = zonk(c, g)
+        if *h is Var(_) && *k is TypeVar(_, _, _) then return unify(c, h, parameter_constructor(k, ys.len())) && unify_all(c, args, ys)
+        if *k is Var(_) && *h is TypeVar(_, _, _) then return unify(c, k, parameter_constructor(h, args.len())) && unify_all(c, args, ys)
+        return unify(c, h, k) && unify_all(c, args, ys)
+    if decide_constructor(c, h, args.len(), other) then return unify(c, Applied(h, args), other)
+    false
+
+/** Where `head` is an unknown constructor applied to `arity` arguments, decides it as the constructor
+ * of `actual`, a type of exactly that many parameters, named bare: `Option` for an `Option[int]`. A
+ * type of more parameters, or of fewer, decides nothing, since nothing says which of its arguments
+ * are left open; nor does a type that is no data type, class or trait. */
+private decide_constructor(c: *Checker, head: &Type, arity: usize, actual: &Type) -> bool
+    val v = *zonk(c, head) match
+        Var(v) -> v
+        _ -> return false
+    val made = constructor_of(c, zonk(c, actual), arity) match
+        Some(t) -> t
+        None -> return false
+    c.vars[v] = Some(made)
+    true
+
+/** The constructor of `t` named bare, where `t` has exactly `arity` type arguments: its data type,
+ * class or trait with every argument left open, or the constructor parameter it applies. */
+private constructor_of(c: *Checker, t: &Type, arity: usize) -> Option[&Type]
+    var holes: Buf[&Type] = buf()
+    for i in 0..<arity
+        holes.push(hole(i))
+    // A parameter that takes a constructor is never left open: a hole stands for a type.
+    *t match
+        Data(id, name, xs) -> if xs.len() == arity && arity > 0 && !takes_constructors(c.data[id].decl.type_params) then Some(Constructor(Data(id, name, holes), arity)) else None
+        Class(id, name, xs) -> if xs.len() == arity && arity > 0 && !takes_constructors(c.classes[id].decl.type_params) then Some(Constructor(Class(id, name, holes), arity)) else None
+        Applied(g, xs) ->
+            val k = zonk(c, g)
+            if xs.len() == arity && *k is TypeVar(_, _, _) then Some(parameter_constructor(k, arity)) else None
+        _ -> None
+
+private takes_constructors(params: Buf[TypeParam]) -> bool
+    for tp in params
+        if tp.holes.len() > 0 then return true
+    false
 
 // Initialization: no field of an object is observed before the class body sets it. Until a class
 // body has initialized its last field, `self` may only read a field already initialized and assign
