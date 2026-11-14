@@ -968,9 +968,10 @@ Settled by the user on 2026-11-04:
   `await` inside a body is allowed. The pool is a module's `lazy val`, so a program that makes no
   future never makes it.
 - [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
-  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  (each instance its own), and in blocks (each declaration's run its own, see the entry for branch
+  `lazy-local`), is computed on its first read, exactly once, and kept; never read, never
   computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
-  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
   reads; an initializer that needs its own value, directly or through other lazy values, traps at
   that read, naming the value. A field's initializer may use every field and method; the class
@@ -1875,7 +1876,9 @@ their words are reserved.
   - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
     trait's header, or in an impl for a data type. The promise is checked against the structure,
     outside the standard library, and an `open` or `abstract` class that promises it is sendable,
-    each subclass being checked. The standard library's promises are taken as made, since they are
+    each subclass being checked. (Replaced by the Proposed `@trusted_sendable` entry, branch
+    `fix-core-promises`: the library's promises are checked too, but for the classes it marks.)
+    The standard library's promises are taken as made, since they are
     for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
     sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
     and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
@@ -8283,6 +8286,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
   cancellation token passed to every handler (every handler signature changes); leaving shutdown
   to the write timeout (a quiet stream would hold it for `writeTimeout`).
+- Proposed (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
+  cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
+  state word and the closure computing it, so a read is that cell's lazy field read: once on the
+  first read, under the same protocol as a field's between threads, with the same trap for a read
+  made while it is being computed. The choices the request left open:
+  - *Closures share it.* A closure capturing the name captures the cell, so a first read inside
+    the closure computes it for the enclosing scope too, and the reverse; it outlives its block. A
+    declaration in a loop body makes a new cell on every pass. *Alternatives*: copying the value
+    into the closure at capture (would force it where the closure is made, defeating the point);
+    one cell per declaration site (wrong for loops and recursion).
+  - *The initializer sees the locals as they are at the first read*, a captured `var` included,
+    since it is a lambda run then; fields see their object at the first read in the same way.
+    *Alternative*: snapshotting the locals at the declaration (would need a copy of every captured
+    `var`, and differs from what a lambda written in the same place does).
+  - *Across threads, sendable where its type is and its initializer would be.* A `@sendable`
+    closure (a thread's body, a future's) may capture a local `lazy val` only where the value's
+    type is sendable and every local and parameter the initializer captures passes the rules that
+    closure is held to, a `var` refused, through each lazy value the initializer reads in turn; what
+    the initializer reaches is held to the module-level state rule too. *Why*: the initializer may
+    run on whichever thread reads first, so it is code the closure carries; a field's initializer
+    captures only its object, which the object's own sendability covers. *Alternatives*: refusing
+    every capture of a lazy local by a `@sendable` closure (simpler, but refuses the plain case of
+    a sendable value computed from sendable `val`s); checking the value's type alone (unsound: an
+    initializer capturing a `Buffer` or a `var` would run on another thread).
+  - *A self-read follows the other lazy values*: today it traps at run time, ``avin: trap: `x` is
+    read while it is being initialized``, as a field's and a module-level value's do, and a lazy
+    list may refer to itself through its cells. The sound-initialization design (`### lazy val` in
+    declarations) makes a read the initializer's own code reaches a compile error; a local is held
+    to it in the same way when that is built, and its run tests `lazy_local_self_direct` (a direct
+    read, which becomes a reject test) and `lazy_local_self` (a read through a closure the
+    initializer calls, which stays a trap) say which side each falls on. A trap in the initializer
+    stops the program as any trap does.
+  - *The type must be known where it is declared*: an initializer whose type is not settled there
+    (one reading only its own value) is refused with "cannot infer the type of `x`", as a field's
+    is, rather than settled by later uses as a plain `val`'s may be. An initializer that never
+    finishes gives the type `Nothing`. A mismatch with a declared type is reported as "the
+    initializer of `x` yields …".
+  - *One name per declaration*: `lazy val (a, b) = …` and `lazy val a, b = …` are refused ("take
+    the value apart where it is read"), as is a `lazy val` without an initializer; an assignment, a
+    compound assignment and a step are refused as for a module-level `lazy val`.
+  - *Cost*: a declaration allocates the cell and the initializer's closure, both kept until the cell
+    is unreachable. *Alternative weighed*: storing the value, state and closure in boxed locals
+    without an object (saves one allocation but needs a layout of its own in the lowering and a
+    separate sendability rule); clearing the closure after the first read (frees its captures early,
+    but fields keep theirs, and a race-free clear needs another store on the hot path).
+  Review with the user: the cross-thread rule (the more permissive of the two sound choices).
 
 - Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
   `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
@@ -8752,7 +8801,58 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   without the refinement of step 3 would be read at the wrong types; refusing the type keeps the
   declaration step sound with no partial path. Alternatives weighed: refusing only refined variants'
   calls and patterns (a value of a plain variant of the type, or a type pattern on `Any`, would still
-  reach a layout holding them).
+  reach a layout holding them). **Step 2 (branch `gadt-2`) lifted it**, and what it leaves refused
+  is the next entry's.
+- Proposed (branch `gadt-2`, the values-and-layouts step): **until the steps that build them, four
+  uses stay refused, each with a "yet" message**: a variant pattern of a type with refined variants,
+  its plain variants included, in code the program writes (step 3: ``"`IntLit` is a variant of
+  `Expr`, which has refined variants: a pattern cannot take one of its values apart yet"``); a field
+  read by name on such a type's one variant (step 3: ``"`One[int]` has refined variants: a field of
+  one is not read by name yet"``); a value of a variant with a hidden parameter, the type's or its
+  own (step 5: ``"`First` hides `B`, named by its fields and not by its result: a value of a variant
+  with hidden type parameters cannot be made yet"``); and a value of a variant bounding its own
+  parameter (step 6). The code the derived templates write for the type (`Display`, `Debug`, `Ord`,
+  any `walk`) matches every variant and is accepted, its copies compiled only for the variants
+  possible at each instance, each arm at the arguments it reads back from the instance. Why: each
+  refused use needs what a later step builds (an arm's equalities, packs, bounds held in the arm),
+  and a plain variant's pattern needs coverage over the possible variants, which is step 4's; the
+  derived code is the plan's "derived per instance", and needs only what lowering knows at a copy.
+  Alternatives weighed: accepting patterns on plain variants now (coverage would demand arms for
+  impossible variants that step 4 then makes errors).
+- Proposed (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
+  its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
+  is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
+  of `Done -> Plan[From, From]` writes `From`, and `IntLit[int](1)` takes no type argument. On the
+  type, `Expr[(int, bool)].Pair(…)` names the instance the value makes: the variant's parameters are
+  inferred from it and the value is held to it. Why: the chapter says a variant is called as a
+  generic function, and such a parameter is no parameter of that function; leaving it to inference
+  would make every call of `IntLit` an unsolvable "cannot infer `T`". Alternatives weighed: dropping
+  the parameter from the variant's list (its field defaults are functions of the whole list);
+  reading `T[A].V` as written arguments of `V` (they are the type's, and need not match `V`'s own in
+  number or meaning).
+- Proposed (branch `gadt-2`): **a derived trait holds of a refined variant's own parameter where the
+  trait on the instance implies it**: the parameter sits in the result under constructors whose
+  trait needs their argument's (a tuple's, `Vector`'s), tested by whether the constructor at the
+  parameter has the trait where every other argument does and the parameter alone has none. Where
+  it is not implied (`Hold[A](x: A) -> Odd[Wrap[A]]`, with `Wrap` showing itself whatever `A` is),
+  the field falls short and the type has no automatic `Display`, as any type with such a field. A
+  hidden parameter is given the trait, since no value of its variant is made before step 5, **which
+  must decide it per pack. Review with the user**: whether a refined type's `Display` should rather
+  be decided per instance, at the instance's own arguments. Why: a derived impl is checked once, over
+  its type's parameters, and this is the most that check can know of a variant's own; it is sound,
+  since the trait at an instance gives it to the parameter read back there. Alternatives weighed:
+  no trait for own parameters (every type with `Pair` would lose `Display`); the trait
+  unconditionally (unsound for `Odd`).
+- Proposed (branch `gadt-2`, where refined variants meet higher-kinded types): **a variant's own
+  type parameters are types, and a constructor parameter of the type keeps its place in a result**:
+  `V[G[_]](…)` is refused with ``"a variant's own type parameters stand for types, not type
+  constructors: `G` of `V` takes type arguments; declare a constructor parameter on the type, as in
+  `data D[G[_]]`"``, and `W(…) -> D[Vector, T]` with ``"a variant fixes no constructor parameter: `W`
+  makes `D[Vector, T]`, and `F` of `D` is a constructor parameter, so its place holds `F`"``, while
+  `Y(x: F[int]) -> D[F, int]`, keeping `F` and fixing `T`, is accepted (step 1 refused it as "no type
+  a `match` can take apart", which was a mistake). Why: the `gadt-1` entry below settles that no
+  constructor parameter is fixed, and keeping one in its place fixes nothing. Alternatives weighed: refusing any
+  refined variant of a type with a constructor parameter (needlessly narrow).
 - Proposed (branch `gadt-1`), **for constructor parameters ([higher-kinded
   types](/spec/generics/#higher-kinded-types)), the conservative reading until a design says more: a
   variant fixes no constructor parameter of its type, its own type parameters are no constructor
@@ -8763,8 +8863,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameters, and any other form, a constructor or its application among them, is refused with
   ``"`F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are
   built of data types, classes, tuples and function types"``; a constructor parameter among a
-  variant's own (`V[G[_]]`) is to be refused where the two branches meet, since this branch has no
-  holes to read. Fields name constructor applications freely, as any variant's do. Why: refinement
+  variant's own (`V[G[_]]`) is refused since the two branches met (branch `gadt-2`, the entry
+  above). Fields name constructor applications freely, as any variant's do. Why: refinement
   solves equalities by decomposition, which needs every parameter under a constructor that the
   instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
   X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
@@ -8975,6 +9075,40 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
+  against the structure, except where `@trusted_sendable("why")` marks a class**
+  ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
+  standard library's promises are taken as made", under which `Map.withDefault(f)` answered a
+  sendable map holding a plain function and a thread raced on what it captured. The mark is a
+  class annotation (it trusts the class whether its header or an impl makes the promise), takes one
+  non-empty string saying why the class is safe, is refused outside the standard library, and is
+  an error on a class that promises nothing. Seventeen classes carry it: `Lock`, `Condition`,
+  `Mutex`, `Atomic`, `Channel`, `Thread`, and the futures' `Cell`, `Pool` and `Registry`
+  (synchronization the runtime does); the running `Actor` (its turns are serial) and `Isolated`
+  (an atomic state arbitrates its objects); `TcpStream`, `TcpListener`, `UnixStream`,
+  `UnixListener`, `TlsStream` and `Child` (one owner at a time, checked by every operation).
+  `Future`, `Promise`, `Executor` and `Once` became sendable by their structure, `Cell` gained an
+  `impl[T: Sendable] Sendable` and `Lock` a `: Sendable` for it. Why: the trust is greppable and
+  each entry says its reason; trusting the innermost synchronized class rather than each composite
+  keeps the list short and checks the rest. Alternatives weighed: a list of names in the compiler
+  (invisible at the type, drifts from the library); trusting every class of `avin.threads` (too
+  wide: it hid nothing here, but would hide the next `DefaultMap`); marking the composites
+  (`Future`, `Promise`) instead of `Cell` (more entries, fewer types checked).
+- Proposed (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
+  `DefaultMap` holds its default as a private `MapDefault` data value, `Fixed(v)` or
+  `Computed(f)`, so `withDefaultValue(v)` takes any value and the wrapper is sendable wherever the
+  map and `v` are. Why: `Map` promises `Sendable` and every map is one, so the default must be
+  sendable for the wrapper to keep the promise; most defaults (`k -> 0`, `k -> k.length`) capture
+  nothing mutable and are unchanged. Alternatives weighed: `Map` not promising `Sendable` (every
+  immutable map would stop being sendable); `DefaultMap` alone not being a `Map` (breaks
+  `val m: Map[K, V] = ….withDefault(f)`); keeping a plain function and making the wrapper not
+  sendable (a trait's implementers cannot opt out). Review with the user: a default that mutated a
+  captured local (a call counter) now uses an `Atomic`.
+- Proposed (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
+  through a token handle as `Child` does, so a stream handed to another thread traps its previous
+  owner at a read served from the bytes read ahead; before, only a read that reached the socket
+  checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
+  sound.
 - Proposed: **a marked parameter survives a function becoming a value only through its type**
   (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
   `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
@@ -8992,6 +9126,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
   function parameter takes the `@sendable` form, which asks a little more than the mark (no
   captured `var`). Method values keep their own wording, from the call inside the closure they are.
+- Proposed: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+  `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
+  an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
+  "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
+  at the comma the same way. A comma after an arm when the next line at the arms' depth reads as
+  another arm (it starts with `else` or holds an `->` outside brackets) is reported as a tuple that
+  needs parentheses. Why: the indented arms were read as lines of a block, so the last arm's body
+  swallowed the following arguments as a tuple, a type error far from the cause; a `return` value,
+  a lambda's and a one-line `if`'s bodies already stop at the comma. Alternatives: keep the arms a
+  line context (the spec's "an indented block starts a line again"), which makes `_ -> 0, "a")` a
+  tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
+  line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
+  lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
+  writes. An indented arm body stays a block, where a comma list is a tuple.
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
