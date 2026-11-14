@@ -1,0 +1,94 @@
+module avin.threads
+
+import avin.time.Duration
+
+// A count of permits, which threads take before they go on and give back after: at most as many
+// threads as there are permits hold one at once. `withPermit(body)` is the usual way, taking a permit
+// for the body and giving it back when the body returns:
+//
+//     val downloads = Semaphore(4)
+//     for u in urls do s.spawn(() -> downloads.withPermit(() -> fetch(u)))
+//
+// `acquire` and `release` take and give back a permit apart, for a permit one thread takes and another
+// gives back. A semaphore holds at most `capacity` permits, `permits` of them to begin with, so
+// `Semaphore(0, capacity = 1)` starts empty and signals: a `release` lets one `acquire` through. A
+// release that would hold more than the capacity traps, since it gives back a permit nobody took.
+// A semaphore is sendable. Each release happens before the acquire that takes the permit it gave back.
+// A thread waiting for a permit takes no place in a queue: one that asks just as a permit comes back
+// may take it before a thread that has waited longer.
+@keeps_owners
+class Semaphore(permits: int, capacity: int = permits): Sendable
+  private val most = capacityOf(permits, capacity)
+  private val lock = Lock()
+  private val freed = Condition(lock)
+  private var available = permits
+
+  // Takes a permit, sleeping while there is none.
+  acquire()
+    take()
+    lock.release()
+
+  // Takes a permit, sleeping while there is none, and holds the lock after.
+  private take()
+    lock.acquire()
+    while available == 0 do freed.wait()
+    available -= 1
+
+  // Takes a permit where one is free now, and answers whether it did.
+  tryAcquire() -> bool
+    lock.acquire()
+    val took = available > 0
+    if took then available -= 1
+    lock.release()
+    took
+
+  // `acquire` for at most `timeoutMillis` milliseconds, answering whether it took a permit; a time
+  // that is not positive takes one only where one is free now.
+  acquireFor(timeoutMillis: long) -> bool
+    lock.acquire()
+    val deadline = monotonicMillis() +| timeoutMillis
+    var left = timeoutMillis
+    while available == 0 && left > 0
+      freed.waitFor(left)
+      left = deadline - monotonicMillis()
+    val took = available > 0
+    if took then available -= 1
+    lock.release()
+    took
+
+  // `acquireFor` with the time as a `Duration`, a part of a millisecond waited for as a whole one.
+  acquireFor(timeout: Duration) -> bool = acquireFor(waitMillis(timeout))
+
+  // Gives a permit back, waking a thread waiting for one; traps where the semaphore holds its
+  // capacity already.
+  release()
+    lock.acquire()
+    if available == most
+      lock.release()
+      fail("a semaphore is released beyond its capacity")
+    available += 1
+    freed.notify()
+    lock.release()
+
+  // Runs `body` holding a permit, and gives back what it returns; the permit goes back when the body
+  // returns. A cancellation that stops the thread inside the body gives the permit back too; a trap
+  // inside it stops the program, even in an actor, since the permit would otherwise never come back.
+  withPermit[R](body: () -> R) -> R
+    take()
+    lock.releaseHolding()
+    holding(body, () -> release(), true)
+
+  // The permits free now, which other threads may change at once.
+  availablePermits() -> int
+    lock.acquire()
+    val n = available
+    lock.release()
+    n
+
+// A semaphore's capacity, at least one and no fewer than the permits it starts with, none of them
+// negative.
+private capacityOf(permits: int, capacity: int) -> int
+  if permits < 0 then fail("a semaphore's permits are not negative")
+  if capacity < 1 then fail("a semaphore's capacity is at least one")
+  if permits > capacity then fail("a semaphore starts with no more permits than its capacity")
+  capacity
