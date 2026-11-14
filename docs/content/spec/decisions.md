@@ -7734,15 +7734,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   argument list or parenthesized group meeting a token other than `,` or `)` reports it once and
   skips to its `)`. `->` there says "write a map as `{"a": 1}`" when the callee's name ends in `Map`
   and "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{"a": 1}`" otherwise;
-  `x: T` says "give the type argument instead, as in `f[T](x, …)`" (Avin has no expression
-  ascription: a value takes its type from where it is used, or from a declared `val`'s type), "a
-  lambda's parameter with a type is written in parentheses" when `->` follows the type, and "declare
-  the value with it, as in `val x: T = …`" in a group. WHY: one mistake made five to ten errors,
+  and "a lambda's parameter with a type is written in parentheses" when `: T ->` follows a name.
+  WHY: one mistake made five to ten errors,
   each naming a token rather than the mistake, and the token shows exactly which mistake it is.
   ALTERNATIVES: suppressing every error after the first in a statement (panic mode), which also
   hides a genuinely separate mistake on the same line; accepting `k -> v` as a pair (a second
-  spelling of a tuple, and `x -> body` is a lambda); accepting `x: T` as an ascription (a second way
-  to state a type the language deliberately gives through declarations and type arguments).
+  spelling of a tuple, and `x -> body` is a lambda). The hints this entry first gave for `x: T` in
+  an argument or a group ("give the type argument instead", "declare the value with it") are gone:
+  `x: T` there is now a [type ascription](#proposed) (the user approved ascription 2026-11-13).
 - Settled on the user's delegation 2026-11-13 (built on branch `diag-spans-recovery`): **A member's mistake is shown at the member** (branch `diag-spans-recovery`). The checker reports
   a missing or private member, an argument-count mistake and `()` on a parameterless member at the
   member's name and argument list; the call's own span, used for a type mismatch and for traps,
@@ -8225,6 +8224,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **A package's tests import its gated modules; a test module is read only while every module it
+  imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
+  The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
+  that module, and a `tests` file importing it was refused even under `avin test`, which turns every
+  feature on. Now `tests` and the modules under it have no fences: they may import every module of
+  the package and its optional dependencies. A build with a feature off passes over each test module
+  importing a module that is off, and, repeated to the end, each test module importing one passed
+  over; the rest are read and run. The module stays the unit, so a file of `tests` importing a gated
+  module takes all of `tests` with it when that feature is off. *Why*: the spec already says
+  `avin test` has every feature on, so the tests see the whole package; and the package's own
+  `tests` are compiled by `build` and `run` too, so a selection-independent refusal was the only
+  thing keeping a build with features off working; deriving each test module's gate from its imports
+  keeps that guarantee with no annotation to write. *Alternatives*: allowing `tests` to import gated
+  modules only under `avin test` (a build or `avin test --no-default-features` would then fail at
+  the import, so the minimal configuration could not be tested); letting a feature list
+  `tests.server` explicitly (works, but repeats in the manifest what the imports already say);
+  skipping single files rather than modules (finer, but a file of `tests` could then lose a helper
+  another file of it uses, breaking only the build with the feature off). Not covered: a test
+  importing an optional dependency's module directly while that dependency is not taken is reported
+  as an unknown module, since a dependency not taken is not read and its modules are unknown; such a
+  test reaches the dependency through the package's gated module. Review with the user: whether a
+  test module passed over should be named in `avin test`'s output rather than silently absent.
+- **An import refused for its module is one error per import declaration**, not one per name it
+  imports (branch `gated-tests`): `import a.b.{c, d}` refused as gated, as an optional dependency's,
+  or as a standard-library module that does not exist, is reported once, at the first name;
+  two import lines are two errors. *Why*: the error is about the module, which the declaration names
+  once. *Alternatives*: one per module per file (hides the second line's error).
 - Proposed (built on branch `intersection-bounds`): **several bounds on one type parameter are
   joined with `&`, the one spelling, and an intersection is a bound only, never a type.**
   `[T: Ord & Display]` replaces `[T: Ord + Display]` everywhere type parameters are declared
@@ -8452,6 +8478,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a hidden parameter is allowed, since its instances exist only where the program makes a pack.
   Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
   Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+
+- Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
+  **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
+  (1) *Where it parses*: a group, a tuple's part or a call's argument (a named one's value
+  included), never a bare `value: T` elsewhere. WHY: inside parentheses `:` has no other meaning
+  (named arguments use `=`, a map literal's `:` is inside braces, a field's or parameter's type is
+  in a declaration), so the grammar stays unambiguous with no new token; at a statement's level
+  `x: T` would read as half of a declaration. ALTERNATIVES: bare `value: T` anywhere (collides with
+  `val x: T`, clause signatures and a match arm's type pattern `n: int -> …`); a keyword
+  (`value as T`, a word read as a conversion, which this is not); parentheses only for a group, not
+  for arguments (`f((None: Option[string]))` doubles every bracket).
+  (2) *What it accepts*: exactly what `val x: T = value` accepts — literals taking `T`, `None`,
+  empty collections and lambdas typed by `T`, a subtype's value, a union's member — and the
+  expression is of type `T`. WHY: one rule a reader already knows, and no conversion hides in a
+  form that looks like a type. ALTERNATIVES: also converting numbers (`(n: long)` of an `int`),
+  which is the implicit widening the spec refuses; accepting narrowing as a checked downcast, which
+  is a `match`'s job.
+  (3) *The refusal* says what to write: `long(n)` for a numeric conversion, `BigInt(k)` /
+  `T.fromInteger(k)` for an integer variable to a type that takes integers, the explicit
+  `BigDecimal.fromReal…` for a `real`, and `is`/`match` for a narrowing.
+  (4) *Ambiguities settled*: `(n: long) -> …` stays a lambda; `x: int -> body` whose rest is not
+  type-shaped keeps its hint "a lambda's parameter with a type is written in parentheses", while
+  `(f: int -> int)` is an ascription to a function type; at the start of a block's line
+  `name(x: T)` followed by `=`, `->`, an indented block or a clause line still declares a local
+  function, and a clause signature now needs its next line to be a clause (followed by `=`, `|` or
+  guards), so two `show(n: long)` calls on consecutive lines are calls; a parameter counts as typed
+  only when a name precedes its `:`, so `show(1: long)` is never a declaration.
+  (5) `(_: T)` in a placeholder lambda is a parameter of type `T`. WHY: it is the one place a
+  placeholder's type can be written. ALTERNATIVES: leaving `_` untyped inside an ascription (the
+  ascription would still constrain it, but a mismatch would read as the ascription's error rather
+  than the parameter's). Review with the user: (1)'s rule that a statement-level `retry(n: long)`
+  followed by an indented block is a declaration (write `retry((n: long))` to call it).
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 
@@ -8686,6 +8744,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   un-cancellable `main`, and a cancellation that must tell its own timeout from an outer cancel).
   Review with the user: the body running on another thread is visible to code that asks which
   thread it is on.
+- Proposed: **a marked parameter survives a function becoming a value only through its type**
+  (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
+  `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
+  type, which for a function is a `@sendable` function type; with no function type expected, the
+  value takes that form of each marked function parameter (`val sp = spawn[int]` is a
+  `(@sendable () -> int, long) -> Thread[int]`). A type that is a function (a class naming it, or an
+  impl of it for a data type) has an `apply` that marks a parameter only where its function type
+  makes that parameter sendable, and a `@sendable` parameter matches a `@sendable` function type's.
+  Why: function types carry no parameter marks, so `val sp: (() -> unit, long) -> Thread[unit] =
+  spawn` ran a buffer-capturing closure on four threads, and `Isolated`/`Mutex` as values kept an
+  object the caller still used. Alternatives: marks in function types (`(@sendable f: () -> unit) ->
+  unit`; a second way to say what `@sendable () -> unit` says for functions, and for a non-function
+  `@isolating` value a new kind of type); refusing every such function as a value, as a `@threaded`
+  one is (also sound, but `spawn` and `onExit` could never be held or passed). A by-name marked
+  parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
+  function parameter takes the `@sendable` form, which asks a little more than the mark (no
+  captured `var`). Method values keep their own wording, from the call inside the closure they are.
 
 ## Open
 

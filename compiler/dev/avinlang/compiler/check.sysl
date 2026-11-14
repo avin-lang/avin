@@ -5528,14 +5528,16 @@ private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) ->
 private check_function_types(c: *Checker)
     for k in 0..<c.classes.len()
         val self_type = own_class_type(c.classes[k], k)
-        c.classes[k].call = function_call(c, c.classes[k].unit, c.classes[k].decl.name_span, self_type, c.classes[k].name, methods_named(c, k, "apply"))
+        c.classes[k].call = function_call(c, c.classes[k].unit, c.classes[k].decl.name_span, self_type, c.classes[k].name, methods_named(c, k, "apply"), c.classes[k].functions.len() > 0)
     for d in 0..<c.data.len()
         val self_type = own_type(c.data[d], d)
-        c.data[d].call = function_call(c, c.data[d].unit, c.data[d].decl.span, self_type, c.data[d].name, receiver_methods(c, self_type, "apply"))
+        c.data[d].call = function_call(c, c.data[d].unit, c.data[d].decl.span, self_type, c.data[d].name, receiver_methods(c, self_type, "apply"), c.data[d].functions.len() > 0)
 
 // The `apply`, among `applies`, that implements the function type `self_type` is a subtype of; `None`
-// where it is no function, or reported where it is two or lacks that `apply`.
-private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name: string, applies: Buf[usize]) -> Option[usize]
+// where it is no function, or reported where it is two or lacks that `apply`. Where the type names
+// its function type itself (`direct`), its `apply` is held to the marks that type allows; one
+// inherited through a trait declares the `apply` it overrides, which holds it to them.
+private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name: string, applies: Buf[usize], direct: bool) -> Option[usize]
     var found: Buf[&Type] = buf()
     function_ancestors(c.classes, c.data, self_type, &found, 0)
     if found.len() == 0 then return None
@@ -5555,10 +5557,15 @@ private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name
         if have.len() != params.len() + 1 || own_type_params(c, m) > 0 then continue
         var same = true
         for i in 0..<params.len()
-            if !same_type(seen_from(c, self_type, m, have[i + 1]), params[i]) then same = false
+            // A parameter marked `@sendable` holds a `@sendable` function, so it takes that type's.
+            var mine = seen_from(c, self_type, m, have[i + 1])
+            if param_mark(c, m, i + 1) == SendableMark && is_sendable_function(params[i]) then mine = as_sendable(mine)
+            if !same_type(mine, params[i]) then same = false
         if !same then continue
         val yields = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
-        if alike_or_error(yields, result) || *yields is Nothing || same_type(view_as(conformances(c), yields, result), result) then return Some(m)
+        if alike_or_error(yields, result) || *yields is Nothing || same_type(view_as(conformances(c), yields, result), result)
+            if direct then unchecked_apply_mark(c, unit, at, name, f, m, params)
+            return Some(m)
         c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, so its `apply` yields ${type_name(result)}, not ${type_name(yields)}")
         return None
     var written = ""
@@ -5567,6 +5574,20 @@ private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name
         written = written + type_name(params[i])
     c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, so it has `apply($written) -> ${type_name(result)}`")
     None
+
+// A value of a type that is a function is called through its function type, whose parameters carry
+// no marks, so its `apply` marks a parameter only where the function type gives that parameter a
+// sendable type, which every value passed for it meets.
+private unchecked_apply_mark(c: *Checker, unit: usize, at: Span, name: string, f: &Type, m: usize, params: Buf[&Type])
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for i in 0..<params.len()
+        val mark = param_mark(c, m, i + 1)
+        if mark == NotMarked then continue
+        if sendability(conformances(c), zonk(c, params[i]), k) is CannotSend(why)
+            c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, but its `apply` marks its parameter `${c.symbols[m].param_names[i + 1]}` `${mark_name(mark)}`, which a call through ${type_name(f)} would not check; the function type gives it ${type_name_quoted(zonk(c, params[i]))}, which is not sendable: $why")
+            return
 
 // The methods in a data type's table implement its traits' methods with their parameters and yield
 // their results, or types conforming to them, as the data type sees both; compared once every body
@@ -6718,7 +6739,7 @@ private hold_to_sendable(c: *Checker, unit: usize, at: Span, context: string, t:
     val arg = zonk(c, t)
     sendability(conformances(c), arg, k) match
         CannotSend(why) -> c.note(unit, at, s"${type_name_quoted(arg)} does not conform to `Sendable`, $context: $why")
-        NotYetKnown -> c.late_sendables.push(LateSendable(unit, at, context, arg, c.generic))
+        NotYetKnown -> c.late_sendables.push(LateSendable(unit, at, context, arg, c.generic, ""))
         CanSend -> ()
 
 private type_name_quoted(t: &Type) -> string = s"`${type_name(t)}`"
@@ -6730,6 +6751,9 @@ struct LateSendable
     context: string
     ty: &Type
     scope: Option[GenericScope]
+    /** Where it is not empty, what the report begins with in place of the type: the type is then the
+     * one a function value gives a marked parameter (`hold_marked_params`). */
+    marked: string
 
 // Holds again each type whose sendability waited for a field's type, now that every body is checked:
 // a field still unknown is one whose initializer failed, already reported.
@@ -6741,7 +6765,12 @@ private check_late_sendables(c: *Checker)
         val outer_generic = c.generic
         c.generic = late.scope
         if sendability(conformances(c), zonk(c, late.ty), k) is CannotSend(why)
-            c.note(late.unit, late.at, s"${type_name_quoted(zonk(c, late.ty))} does not conform to `Sendable`, ${late.context}: $why")
+            val t = zonk(c, late.ty)
+            if late.marked == ""
+                c.note(late.unit, late.at, s"${type_name_quoted(t)} does not conform to `Sendable`, ${late.context}: $why")
+            else
+                val hint = if *t is Function(_, _, false) then s"; give that parameter a `@sendable` function type, as in ${type_name_quoted(as_sendable(t))}" else ""
+                c.note(late.unit, late.at, s"${late.marked} ${type_name_quoted(t)}, which is not sendable: $why$hint")
         c.generic = outer_generic
     c.late_sendables = buf()
 
@@ -6790,6 +6819,42 @@ private sendable_mark_added(c: *Checker, m: usize, base: usize) -> Option[string
         if mark > param_mark(c, base, i)
             return Some(s"which marks its parameter `${c.symbols[m].param_names[i]}` `${mark_name(mark)}` where the method it overrides does not; a call through that method would not check what is passed for it")
     None
+
+// A function, a constructor or a method used as a value is called through a function type, whose
+// parameters carry no marks, so nothing checks what such a call passes for a marked parameter. The
+// value's type therefore gives each marked parameter a type whose every value meets the mark: a
+// sendable type, which for a parameter taking a function is a `@sendable` function type. Where no
+// function type is expected, or the one expected makes that parameter `@sendable`, the value takes
+// the `@sendable` form of a parameter's function type; any other type must be sendable itself.
+
+/** `params`, the parameter types of function `f` as a value, counted from parameter `from` of `f`,
+ * with each marked one taking a function given its `@sendable` form, where `expected` asks no
+ * other. */
+private marked_value_params(c: *Checker, f: usize, from: usize, params: Buf[&Type], expected: Option[&Type]) -> Buf[&Type]
+    var wanted: Option[Buf[&Type]] = None
+    if expected is Some(t)
+        if *zonk(c, t) is Function(ps, _, _) then wanted = Some(ps)
+    var out: Buf[&Type] = buf()
+    for i in 0..<params.len()
+        val p = params[i]
+        var sendable = param_mark(c, f, from + i) != NotMarked && *p is Function(_, _, false)
+        if sendable
+            if wanted is Some(ps)
+                sendable = i < ps.len() && is_sendable_function(zonk(c, ps[i]))
+        out.push(if sendable then as_sendable(p) else p)
+    out
+
+/** Holds each parameter of `value`, function `f` as a value counted from parameter `from` of `f`, that
+ * `f` marks to `Sendable`, once every body is checked and its type is known. */
+private hold_marked_params(c: *Checker, unit: usize, at: Span, f: usize, from: usize, value: &Type)
+    val ps = *value match
+        Function(ps, _, _) -> ps
+        _ -> return
+    for i in 0..<ps.len()
+        val mark = param_mark(c, f, from + i)
+        if mark == NotMarked then continue
+        val name = c.symbols[f].param_names[from + i]
+        c.late_sendables.push(LateSendable(unit, at, "", ps[i], c.generic, s"`${c.symbols[f].name}` cannot be a value of this function type: it marks its parameter `$name` `${mark_name(mark)}`, which a call through a function value does not check, and the type gives that parameter"))
 
 /** A local with no name that holds an argument, evaluated before the call as its parameters' defaults
  * need, and the expression it holds. */
@@ -11109,6 +11174,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     TypeParent(_) ->
         c.note(unit_of(c), e.span, "a type is not a value")
         TExpr(e.span, ErrorType, UnitConst)
+    Ascribe(value, ty) -> ascribe_expr(c, e, value, ty)
     Checked(slot) -> c.checked_slots[slot]
     Member(target, name) ->
         // The rewritten use is judged as this one is, by the caller, so it is checked as used.
@@ -11628,7 +11694,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     for i in 1..<target.params.len()
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
-    val declared: &Type = Function(substitute_all(params, target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args), sendable_wanted(c, expected))
+    val declared: &Type = Function(substitute_all(marked_value_params(c, m, 1, params, expected), target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args), sendable_wanted(c, expected))
     if expected is Some(want) then unify(c, declared, want)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
@@ -12271,6 +12337,33 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     val index = declare_local(c, e.span, name, ty, mutable)
     // A binding whose value never finishes does not finish either.
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** `(value: ty)`: `value` checked as a declared `val`'s value of type `ty` is, so a literal, `None`,
+ * a lambda, an empty collection and a union's member take `ty`, and a value of a subtype stands as
+ * one of `ty`. Anything else is refused, a value a conversion would take included: an ascription
+ * states a type and converts nothing. The expression is of type `ty`. */
+private ascribe_expr(c: *Checker, e: &Expr, value: &Expr, ty: &TypeExpr) -> &TExpr
+    val want = resolve_type(c, unit_of(c), ty)
+    val typed = check_expr(c, value, Some(want))
+    if !fits(c, typed.ty, want)
+        val found = zonk(c, typed.ty)
+        val w = zonk(c, want)
+        val text = from_utf8_unchecked(c.units[unit_of(c)].src.text(value.span))
+        val hint = if converts_to(c, found, w) then s": an ascription converts nothing; ${conversion_hint(c, typed, w)}"
+        elif *found is Int(_) && takes_integers(c, w)
+            val call = if big_int_type(c, w) || big_decimal_type(c, w) then s"${type_name(w)}($text)" else s"${type_name(w)}.fromInteger($text)"
+            s": an ascription converts nothing; write `$call`"
+        elif real_beside_decimal(c, found, w) != "" then real_beside_decimal(c, found, w)
+        elif fits(c, w, found) then s": an ascription only widens, and `${type_name(w)}` is narrower; test the value with `is` or `match`"
+        else sendable_hint(c, want, found)
+        c.note(unit_of(c), value.span, s"cannot give this `${type_name(found)}` the type `${type_name(w)}`${hint}")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if same_type(zonk(c, typed.ty), zonk(c, want)) then return typed
+    // A value of a subtype is kept as it is and seen as `ty`, as an `if` sees its branches as the
+    // type they agree on.
+    var items: Buf[&TExpr] = buf()
+    items.push(typed)
+    TExpr(e.span, want, Block(items))
 
 /** Brings a new local into scope; a name may be declared once per block. */
 private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize
@@ -18153,6 +18246,7 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
             if exits_lambda(change.value) then return true
         false
     TypeApply(target, _) -> exits_lambda(target)
+    Ascribe(value, _) -> exits_lambda(value)
     _ -> true
 
 private any_exits_lambda(items: Buf[&Expr]) -> bool
@@ -18374,9 +18468,10 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
         else
             for i in 0..<types.len()
                 unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
-    val declared: &Type = Function(target.params, result, sendable_wanted(c, expected))
+    val declared: &Type = Function(marked_value_params(c, id, 0, target.params, expected), result, sendable_wanted(c, expected))
     val ty = substitute(declared, target.type_owner, type_args)
     if expected is Some(want) then unify(c, ty, want)
+    hold_marked_params(c, unit, at, id, 0, ty)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
@@ -18493,7 +18588,8 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                         local = Some(ty)
                         ty = zonk(c, wanted[i])
                     elif !unify(c, wanted[i], ty)
-                        c.note(unit, p.span, s"`${p.name}` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
+                        val shown = if p.name.starts_with("_$") then "_" else p.name
+                        c.note(unit, p.span, s"`$shown` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
                         ty = ErrorType
             None ->
                 val known: &Type = if i < wanted.len() then zonk(c, wanted[i]) else Var(0)
