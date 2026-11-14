@@ -85,12 +85,60 @@ class Channel[T](capacity: int = 0): Iterable[T]
   // Whether a bounded channel holds as many values as it may; under the lock.
   private full() -> bool = bound > 0 && items.length >= bound
 
-  // The value at the front, taken off, waking a sender waiting for room; under the lock.
+  // The value at the front, taken off, waking a sender waiting for room; under the lock. Taking the
+  // last value of a closed channel also wakes every `select` waiting for it to be drained.
   private taken() -> Option[T]
     if items.isEmpty then return None
     val x = items.removeHead()
     writable.notify()
+    if closed && items.isEmpty then readable.notifyAll()
     Some(x)
+
+// What a `select` block's arms do with a channel (`select.avin`). Only the module makes a
+// `Selecting`, so only its code calls these. Each tries its operation under the channel's lock and,
+// where it cannot complete and the select is to wait, enlists the arm on the condition it waits for
+// before letting the lock go, so no change made after it looked goes unseen.
+impl[T] Channel[T]
+  // A receive by arm `index` of the select waiting as `wait`: the value taken, or `None` from a
+  // closed and drained channel, where the channel is ready for what the arm `wants` (`ReceiveValue`,
+  // `ReceiveClosed` or `ReceiveEither`), and otherwise `None`, the arm enlisted where `enlist`.
+  offerReceive(wants: int, wait: Selecting, index: int, enlist: bool) -> Option[Option[T]]
+    lock.acquire()
+    val ready =
+      if wants == ReceiveValue then !items.isEmpty
+      elif wants == ReceiveClosed then items.isEmpty && closed
+      else !items.isEmpty || closed
+    if ready
+      val got = taken()
+      lock.release()
+      return Some(got)
+    if enlist then readable.enlist(wait, index) else lock.release()
+    None
+
+  // A send of `x` by arm `index` of the select `wait`: whether there was room for it, the arm
+  // enlisted where there was not and `enlist`; traps where the channel is closed, as `send` does.
+  offerSend(x: T, wait: Selecting, index: int, enlist: bool) -> bool
+    lock.acquire()
+    if closed
+      lock.release()
+      fail("a send to a closed channel")
+    if !full()
+      items.append(x)
+      readable.notify()
+      lock.release()
+      return true
+    if enlist then writable.enlist(wait, index) else lock.release()
+    false
+
+  // Passes on a notification a select took and did not use: wakes the next thread waiting to
+  // receive where a value is waiting, or to send, where `sending`, where there is room. Where another
+  // thread has already taken what the notification was for, there is nothing to pass on.
+  passOn(wait: Selecting, sending: bool)
+    lock.acquire()
+    if sending
+      if !closed && !full() then writable.notify()
+    elif !items.isEmpty then readable.notify()
+    lock.release()
 
 // A channel's capacity, which is not negative.
 private boundOf(capacity: int) -> int

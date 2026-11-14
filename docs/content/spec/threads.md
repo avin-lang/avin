@@ -414,6 +414,69 @@ A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does 
 waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. **A deadlock is not detected**, apart from a thread
 taking a lock it already holds: threads that each wait for another sleep for ever.
 
+## select
+
+A `select` block waits on several channels at once and runs exactly one of its arms: the first
+whose channel operation can complete. `select` ending its line opens the block of its arms, written
+as a match's are; elsewhere `select` is an ordinary name.
+
+```avin
+import avin.threads.Channel
+import avin.time.millis
+
+step(jobs: Channel[int], results: Channel[int], r: int) -> string = select
+  jobs.receive() as Some(j) -> s"job $j"
+  jobs.receive() as None -> "no more jobs"
+  results.send(r) -> "sent"
+  after 100.millis -> "idle"
+```
+
+What a program can rely on:
+
+- **The arms.** `ch.receive()` receives, with an optional `as` pattern: `Some(p)` runs for a value
+  and binds it by `p`, any pattern a `val` takes; `None` runs once the channel is closed and every
+  value sent before is received; a name runs for either and binds the `Option` received; `_`, or no
+  pattern, runs for either and binds nothing. `ch.send(x)` sends, and binds nothing. `after d` runs
+  where no other arm became ready within the [`Duration`](/spec/time/) `d`; `else` runs where no
+  arm is ready now, and is written as a match's `else` is, with no arrow. A select has at most one
+  `after` and one `else`, and not both, since a select with `else` never waits. Any other arm, a
+  guard among them, is an error.
+- **Evaluation.** Every channel, every value sent and the `after`'s duration are evaluated once, in
+  the order the arms are written, before any arm is tried. Only the arm that runs receives or sends:
+  every other channel keeps its values, and a value meant for an arm that does not run is never sent.
+- **Choosing.** Of several arms ready at once, each is as likely to run as any other: the arms are
+  tried in an order drawn at random each time. Where none is ready, a select with `else` runs it, and
+  one without waits, parking only its thread, until an arm can complete and runs it, or until its
+  `after`'s time runs out. An `after` of zero or less tries the arms once, as `else` does. A select of
+  `after` alone waits its duration; one of `else` alone runs it.
+- **Closed channels behave as `receive` and `send` do.** The values sent before a close are received
+  first; then a `None` arm, a name and `_` run, every time after. `Some(p)` is never ready on a
+  closed and drained channel, so a select whose only arms want values from closed channels waits for
+  its `after`, runs its `else`, or waits for ever. A send arm on a closed channel traps when it is
+  tried, as `send` does.
+- **Its value.** A select is an expression whose value is the arm that ran, the arms' types unified as
+  a match's are. Its bodies are code of the function it is in: `return`, `break` and `continue` leave
+  an arm as they leave a match's, and a select may be nested in another's arm. `end select` may close
+  one.
+- **Waiting.** A select that waits is a wait like a channel's own: safe for the collector, and a
+  cancellation point, so a scope's `cancel` stops a thread parked in it at once. Nothing of a
+  select that has ended, by an arm, its time or a cancellation, is left on the channels it waited on,
+  and a notification a select was woken by and could not use is passed on to the next thread
+  waiting on that channel, so no other waiter, a plain `receive` or another select, misses it.
+
+```avin
+import avin.threads.Channel
+
+// Workers take jobs until told to stop; each result is sent where there is room for it.
+work(jobs: Channel[int], stop: Channel[unit], results: Channel[int])
+  var going = true
+  while going
+    select
+      jobs.receive() as Some(j) -> results.send(j * j)
+      jobs.receive() as None -> going = false
+      stop.receive() as None -> going = false
+```
+
 ## Futures
 
 A `Future[T]` is a value some thread is computing. `Future(body)` runs `body` on a shared pool of

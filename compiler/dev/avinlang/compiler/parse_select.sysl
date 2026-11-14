@@ -1,0 +1,263 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A `select` block: `select` ending its line, and an indented block of arms, each run when its
+// channel operation completes, of which exactly one runs.
+//
+//     select
+//       jobs.receive() as Some(j) -> run(j)
+//       jobs.receive() as None -> done = true
+//       results.send(r) -> sent++
+//       after 100.millis -> idle()
+//       else nothing()
+//
+// It is read into the code it means, a block of:
+//
+// - an arm object for each channel arm, in the order written, `val select$<at>$<i> =
+//   avin.threads.SelectReceive(jobs, wants)` or `avin.threads.SelectSend(results, r)`, so each
+//   channel and each value sent is evaluated once, before any arm is tried, and an `after`'s
+//   duration bound where it is written, `val select$<at>$after = 100.millis`;
+// - the choice, `val select$<at> = avin.threads.selectWaiting(arms)`, or `selectOrElse(arms)` with
+//   an `else`, or `selectWithin(duration, arms)` with an `after`, answering the number of the arm
+//   that ran: a channel arm's place, then the `after`, then the `else`;
+// - a match of that number whose arms are the select's bodies, so the select's value is the body's
+//   and their types are unified as a match's arms' are. A receive arm's pattern binds in its body:
+//   `Some(p)` the value received (`val p = arm.value()`), a name the received `Option` (`val o =
+//   arm.received()`); `None` and `_` bind nothing.
+//
+// `<at>` is the select's place in its file, so a select nested in another's body has names of its
+// own. No name a program writes holds a `$`.
+
+/** What a receive arm waits for, as `avin.threads` numbers it: a value or the channel closed, a
+ * value, or the channel closed and drained. */
+const ReceiveEither: string = "0"
+const ReceiveValue: string = "1"
+const ReceiveClosed: string = "2"
+
+/** Whether a `select` block starts here: `select` ending its line, before its indented arms.
+ * Elsewhere `select` is an ordinary name. */
+select_ahead(p: *Parser) -> bool = p.at_kind(Indent)
+
+// One arm as written: a channel arm's operation, the `after`'s duration, or the `else`.
+private enum SelectArmKind
+    ReceiveArm(channel: &Expr, wants: string, binding: Option[&Pattern])
+    SendArm(channel: &Expr, value: &Expr)
+    AfterArm(duration: &Expr)
+    ElseArm
+    /** An arm already reported, which makes no code. */
+    MalformedArm
+
+private struct WrittenArm
+    span: Span
+    kind: SelectArmKind
+    body: &Expr
+
+parse_select(p: *Parser, at: Span) -> &Expr
+    p.expect_kind(Indent, "expected indented arms after `select`")
+    val number = p.selects
+    p.selects += 1
+    var arms: Buf[WrittenArm] = buf()
+    val lines = p.open_lines
+    p.open_lines = 0
+    loop
+        if p.toks.at_end() || p.accept_kind(Dedent) then break
+        if p.accept_kind(Newline) then continue
+        val before = p.toks.position
+        arms.push(select_arm(p))
+        if p.toks.position == before then break
+    p.open_lines = lines
+    optional_end(p, "select", true)
+    val span = at.to(p.ended())
+    checked_arms(p, at, arms)
+    select_code(span, at, number, arms)
+
+// One arm: `else` and its body, `after` a duration, or a channel's `receive()`, with an optional
+// `as` pattern, or `send(x)`, then `->` and the body.
+private select_arm(p: *Parser) -> WrittenArm
+    val start = p.toks.here()
+    if p.accept("else")
+        val body = parse_line_body(p, false)
+        return WrittenArm(start.to(p.ended()), ElseArm, body)
+    if p.at("if")
+        p.report.add(error(start, "a select arm is a channel's `receive()` or `send(x)`, `after` a duration, or `else`; it takes no guard"))
+        skip_line(p)
+        return WrittenArm(start, MalformedArm, Expr(start, UnitLit))
+    val previous = p.lambda_boundary
+    p.lambda_boundary = match_guard_boundary(p)
+    var kind: SelectArmKind = MalformedArm
+    if p.at("after") && p.ahead(1) != "." && p.ahead(1) != "("
+        p.toks.advance()
+        kind = AfterArm(expression(p, 0))
+    else
+        val op = expression(p, 0)
+        var pattern: Option[&Pattern] = None
+        if p.accept("as") then pattern = Some(parse_pattern(p))
+        kind = channel_arm(p, op, pattern)
+    p.lambda_boundary = previous
+    p.expect("->")
+    val body = parse_line_body(p, false)
+    WrittenArm(start.to(p.ended()), kind, body)
+
+// The arm a channel operation and its pattern make: `ch.receive()` or `ch.send(x)`.
+private channel_arm(p: *Parser, op: &Expr, pattern: Option[&Pattern]) -> SelectArmKind
+    val malformed = "a select arm is a channel's `receive()` or `send(x)`, `after` a duration, or `else`"
+    op.kind match
+        Call(callee, args) -> callee.kind match
+            Member(target, name) ->
+                if name == "receive" && args.len() == 0
+                    return receive_arm(p, target, pattern)
+                if name == "send" && args.len() == 1 && args[0].name is None && !args[0].block
+                    if pattern is Some(pt) then p.report.add(error(pt.span, "a send arm binds nothing, so it has no `as` pattern"))
+                    return SendArm(target, args[0].value)
+            _ -> ()
+        _ -> ()
+    if !(op.kind is Invalid) then p.report.add(error(op.span, malformed))
+    MalformedArm
+
+// A receive arm: what its pattern makes it wait for, and the pattern its body binds.
+private receive_arm(p: *Parser, channel: &Expr, pattern: Option[&Pattern]) -> SelectArmKind
+    val pt = pattern match
+        Some(x) -> x
+        None -> return ReceiveArm(channel, ReceiveEither, None)
+    pt.kind match
+        Constructor(path, args, _) ->
+            if path == "Some" && args.len() == 1 then return ReceiveArm(channel, ReceiveValue, Some(args[0]))
+            if path == "None" && args.len() == 0 then return ReceiveArm(channel, ReceiveClosed, None)
+        Name(n) ->
+            if n == "None" then return ReceiveArm(channel, ReceiveClosed, None)
+            return ReceiveArm(channel, ReceiveEither, Some(pt))
+        Wildcard -> return ReceiveArm(channel, ReceiveEither, None)
+        InvalidPattern -> return ReceiveArm(channel, ReceiveEither, None)
+        _ -> ()
+    p.report.add(error(pt.span, "a receive arm's pattern is `Some(p)` for a value, `None` for the channel closed and drained, or a name for either"))
+    ReceiveArm(channel, ReceiveEither, None)
+
+// The rules on a select's arms as a whole: at most one `after` and one `else`, and not both. A
+// select has at least one arm, since `select` opens a block only where an indented line follows.
+private checked_arms(p: *Parser, at: Span, arms: Buf[WrittenArm])
+    var after: Option[Span] = None
+    var otherwise: Option[Span] = None
+    for arm in arms
+        arm.kind match
+            AfterArm(_) ->
+                if after is Some(_) then p.report.add(error(arm.span, "a select has at most one `after`"))
+                else after = Some(arm.span)
+            ElseArm ->
+                if otherwise is Some(_) then p.report.add(error(arm.span, "a select has at most one `else`"))
+                else otherwise = Some(arm.span)
+            _ -> ()
+    if after is Some(a) && otherwise is Some(_)
+        p.report.add(error(a, "a select with `else` never waits, so it has no `after`"))
+
+// The hidden name of the select numbered `number` in its file, or, with an arm's suffix, of one of
+// its arm objects. The number, rather than the select's position, makes the name: reformatting a
+// file moves its selects and must leave what it means as it was.
+private select_name(number: usize, suffix: string) -> string = "select$" + s"$number" + suffix
+
+// The suffix of arm `i`'s object.
+private arm_suffix(i: usize) -> string = "$" + s"$i"
+
+private select_ref(at: Span, name: string) -> &Expr = Expr(at, Name(name))
+
+private int_literal(at: Span, n: usize) -> &Expr = Expr(at, IntLit(s"$n"))
+
+private call_of(at: Span, callee: &Expr, values: Buf[&Expr]) -> &Expr
+    var args: Buf[Argument] = buf()
+    for v in values
+        args.push(Argument(v.span, None, v, false))
+    Expr(at, Call(callee, args))
+
+// The block a select is read into.
+private select_code(span: Span, at: Span, number: usize, arms: Buf[WrittenArm]) -> &Expr
+    var items: Buf[&Expr] = buf()
+    var channel_arms: Buf[&Expr] = buf()
+    var duration: Option[&Expr] = None
+    var otherwise = false
+    // The arm objects, and the `after`'s duration, in the order written.
+    for i in 0..<arms.len()
+        val arm = arms[i]
+        val name = select_name(number, arm_suffix(i))
+        arm.kind match
+            ReceiveArm(channel, wants, _) ->
+                var values: Buf[&Expr] = buf()
+                values.push(channel)
+                values.push(Expr(channel.span, IntLit(wants)))
+                val made = call_of(channel.span, select_ref(channel.span, core_path("threads.SelectReceive")), values)
+                items.push(Expr(arm.span, Binding(name, None, made, false)))
+                channel_arms.push(select_ref(channel.span, name))
+            SendArm(channel, value) ->
+                var values: Buf[&Expr] = buf()
+                values.push(channel)
+                values.push(value)
+                val made = call_of(channel.span, select_ref(channel.span, core_path("threads.SelectSend")), values)
+                items.push(Expr(arm.span, Binding(name, None, made, false)))
+                channel_arms.push(select_ref(channel.span, name))
+            AfterArm(d) ->
+                if duration is None
+                    items.push(Expr(d.span, Binding(name, None, d, false)))
+                    duration = Some(select_ref(d.span, name))
+            ElseArm -> otherwise = true
+            MalformedArm -> ()
+    // The choice.
+    var values: Buf[&Expr] = buf()
+    var chooser = "threads.selectWaiting"
+    if duration is Some(d) && !otherwise
+        chooser = "threads.selectWithin"
+        values.push(d)
+    elif otherwise then chooser = "threads.selectOrElse"
+    for a in channel_arms
+        values.push(a)
+    val chosen = select_name(number, "")
+    items.push(Expr(at, Binding(chosen, None, call_of(at, select_ref(at, core_path(chooser)), values), false)))
+    // The bodies, by the number of the arm that ran: the channel arms', then the `after`'s, then the
+    // `else`'s, the last of them taking every other number.
+    var bodies: Buf[Arm] = buf()
+    var after_body: Option[&Expr] = None
+    var else_body: Option[&Expr] = None
+    var n = 0usize
+    for i in 0..<arms.len()
+        val arm = arms[i]
+        val name = select_name(number, arm_suffix(i))
+        arm.kind match
+            ReceiveArm(_, wants, binding) ->
+                bodies.push(number_arm(arm.span, n, received_body(arm, name, wants, binding)))
+                n += 1
+            SendArm(_, _) ->
+                bodies.push(number_arm(arm.span, n, arm.body))
+                n += 1
+            AfterArm(_) -> if after_body is None then after_body = Some(arm.body)
+            ElseArm -> if else_body is None then else_body = Some(arm.body)
+            MalformedArm -> ()
+    // `after` and `else` together are reported already; the `else` runs where both are written.
+    if after_body is Some(b) && !otherwise
+        bodies.push(number_arm(b.span, n, b))
+        n += 1
+    if else_body is Some(b)
+        bodies.push(number_arm(b.span, n, b))
+        n += 1
+    if bodies.len() > 0
+        val last = bodies[bodies.len() - 1]
+        bodies[bodies.len() - 1] = Arm(Pattern(last.pattern.span, Wildcard), None, last.body)
+    items.push(Expr(at, Match(select_ref(at, chosen), bodies)))
+    Expr(span, Block(items, false))
+
+private number_arm(at: Span, n: usize, body: &Expr) -> Arm = Arm(Pattern(at, Literal(int_literal(at, n))), None, body)
+
+// A receive arm's body, after the binding its pattern makes.
+private received_body(arm: WrittenArm, name: string, wants: string, binding: Option[&Pattern]) -> &Expr
+    val pt = binding match
+        Some(x) -> x
+        None -> return arm.body
+    val at = pt.span
+    val method = if wants == ReceiveValue then "value" else "received"
+    val read = Expr(at, Call(Expr(at, Member(select_ref(at, name), method)), buf()))
+    val bound: Option[&Expr] = pt.kind match
+        Wildcard -> None
+        Name(n) -> Some(Expr(at, Binding(n, None, read, false)))
+        _ -> Some(Expr(at, Destructure(pt, None, read, false)))
+    var items: Buf[&Expr] = buf()
+    if bound is Some(b) then items.push(b)
+    items.push(arm.body)
+    Expr(arm.body.span, Block(items, false))

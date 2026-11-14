@@ -1,0 +1,69 @@
+// expect: exit 0
+// A notification a `select` is woken by but cannot use is passed on, so no other thread waiting on
+// the channel misses it. A select waiting only for a channel's close is first in line when a value is
+// sent: it wakes, cannot take the value, and wakes the plain `receive` waiting behind it, which gets
+// the value. A select woken for room on a bounded channel that another sender fills first passes
+// nothing on, since nothing is left to pass, and waits again. Each wait here ends within the test's
+// `after`, which would report a missed notification rather than hang.
+import avin.threads.{Channel, spawn, sleep}
+import avin.time.{millis, seconds}
+
+main() -> int
+  val c = Channel[int]()
+  val closer = spawn(() ->
+    select
+      c.receive() as None -> "closed"
+      after 10.seconds -> "missed")
+  sleep(10.millis)
+  val taker = spawn(() ->
+    select
+      c.receive() as Some(x) -> s"took $x"
+      after 10.seconds -> "missed")
+  sleep(10.millis)
+  c.send(1)
+  println(taker.join())
+  c.close()
+  println(closer.join())
+
+  // The same with a plain receive behind the select.
+  val d = Channel[int]()
+  val dCloser = spawn(() ->
+    select
+      d.receive() as None -> "closed"
+      after 10.seconds -> "missed")
+  sleep(10.millis)
+  val plainGot = Channel[Option[int]]()
+  spawn(() -> plainGot.send(d.receive()))
+  sleep(10.millis)
+  d.send(2)
+  println(select
+    plainGot.receive() as Some(got) -> s"plain $got"
+    after 10.seconds -> "missed")
+  d.close()
+  println(dCloser.join())
+  // The plain receive, if it missed the value, ends now with the close.
+  plainGot.tryReceive()
+
+  // Many selects waiting for the close in front of many takers: every value reaches a taker.
+  val e = Channel[int]()
+  var closers: List[avin.threads.Thread[string]] = []
+  for i in 0 ..< 50
+    closers = spawn(() ->
+      select
+        e.receive() as None -> "closed"
+        after 10.seconds -> "missed") :: closers
+  sleep(10.millis)
+  var takers: List[avin.threads.Thread[int]] = []
+  for i in 0 ..< 50
+    takers = spawn(() ->
+      select
+        e.receive() as Some(x) -> x
+        after 10.seconds -> -1000) :: takers
+  sleep(10.millis)
+  for i in 0 ..< 50 do e.send(i)
+  var sum = 0
+  for t in takers do sum += t.join()
+  println(sum)
+  e.close()
+  println(closers.forall(t -> t.join() == "closed"))
+  0

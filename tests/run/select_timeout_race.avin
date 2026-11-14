@@ -1,0 +1,63 @@
+// expect: exit 0
+// A select's `after` racing a send: a sender sends after about as long as the select waits, so
+// either may come first, many times over. Exactly one arm runs each time, and no value is lost or
+// received twice: a value the select timed out before is still in the channel for the next one. The
+// same holds for a send arm racing a receiver that makes room, and for many racing pairs at once.
+import avin.threads.{Atomic, Channel, scope, sleep, spawn}
+import avin.time.{micros, millis}
+
+main() -> int
+  val rounds = 300
+  val c = Channel[int]()
+  var received = 0
+  var timeouts = 0
+  var sum = 0
+  for i in 0 ..< rounds
+    val sender = spawn(() ->
+      sleep(micros(long(i % 5) * 200))
+      c.send(i))
+    select
+      c.receive() as Some(x) ->
+        received++
+        sum += x
+      after micros(500) -> timeouts++
+    sender.join()
+  // What the selects timed out before is still waiting.
+  var leftovers = 0
+  while c.tryReceive() is Some(x)
+    leftovers++
+    sum += x
+  println(received + timeouts == rounds, received + leftovers == rounds, sum == rounds * (rounds - 1) / 2)
+
+  // A send arm racing a receiver that makes room.
+  val full = Channel[int](1)
+  var sent = 0
+  var gaveUp = 0
+  var taken = 0
+  for i in 0 ..< rounds
+    full.send(-1)
+    val receiver = spawn(() ->
+      sleep(micros(long(i % 5) * 200))
+      full.receive())
+    select
+      full.send(i) -> sent++
+      after micros(500) -> gaveUp++
+    receiver.join()
+    while full.tryReceive() is Some(_) do taken++
+  println(sent + gaveUp == rounds, taken == sent)
+
+  // Many racing pairs at once, every select on a lightweight thread.
+  val shared = Channel[int]()
+  val got = Atomic(0)
+  val missed = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 1000
+      s.spawn(() ->
+        select
+          shared.receive() as Some(_) -> got.add(1)
+          after micros(long(i % 7) * 100 + 1) -> missed.add(1))
+    for i in 0 ..< 1000 do s.spawn(() -> shared.send(i)))
+  var rest = 0
+  while shared.tryReceive() is Some(_) do rest++
+  println(got.load() + missed.load() == 1000, got.load() + rest == 1000)
+  0

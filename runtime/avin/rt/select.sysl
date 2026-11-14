@@ -1,0 +1,165 @@
+module avin.rt
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+import sysl.threads.SleepLock
+
+// The wait of a `select` block: one thread waiting on the conditions of several channels at once,
+// until the first of them is notified, its time runs out or its thread is cancelled. The library
+// (`library/avin/threads/select.avin`) makes one for each `select` it runs, an object on the
+// collected heap holding a waiter of its own, the one token whose state says how the wait ended, and
+// a link for each arm. Arm by arm, under the arm's channel lock, the library tries the arm and, where
+// it cannot complete, enlists the arm's link on the queue of the condition it waits for, before it
+// lets the lock go; so a change of the channel made after it looked is notified to a queue the link
+// is on. Then it parks once, as the select's own waiter.
+//
+// A notification that reaches a link wakes the select only where it is the first thing to end its
+// wait: it changes the token's state from pending, as every wait's ending does, so a wait ends once
+// whichever of a notification, a timer and a cancellation comes first, and a link whose select has
+// already ended is passed over, the condition waking the next thread on its queue instead. A
+// notification may come before the thread has parked, while it enlists its later arms: the select's
+// guard, held while it parks until its worker has switched away, decides whether the waker makes the
+// thread ready or the thread finds its wait already ended and does not park.
+//
+// Once the wait has ended, every link is taken off the queue it is on, the losers' and the winner's
+// alike, each under its queue's guard, which also waits out a waker still inside `wake_select` for
+// a link on that queue: after it, nothing of the object is reached by any other thread, and the
+// library's reference to it is the only one. The library keeps the object, and the channels whose
+// conditions it is enlisted on, alive until then.
+
+/** The payload of a select's wait, followed in its object by `count` links. */
+struct SelectWait
+    guard: SleepLock
+    /** The token: the waiter the thread parks as, whose state says how the wait ended. */
+    primary: Waiter
+    /** Whether the thread has parked, or is parking, on the token; under `guard`. */
+    parked: bool
+    /** The arm whose link a notification ended the wait through, or -1; under `guard`. */
+    woken_by: i64
+    count: usize
+
+/** A select's link on a condition's queue: a waiter of the queue that stands for the select, the
+ * select it belongs to, its arm, and the queue it is enlisted on, or null. The waiter is first, so a
+ * queue's `*Waiter` is the link. */
+struct SelectLink
+    waiter: Waiter
+    wait: *SelectWait
+    index: i64
+    queue: *WaitQueue
+
+@assert(offsetof(SelectLink, waiter) == 0, "a link's waiter is the start of the link")
+
+/** The descriptor of a select's wait, holding no reference and naming no type record; the object is
+ * sized for its links. */
+var select_descriptor: Descriptor = descriptor(0, sizeof(SelectWait), 0)
+
+private link_at(s: *SelectWait, i: usize) -> *SelectLink =
+    ptr_cast(usize(s) + sizeof(SelectWait) + i * sizeof(SelectLink))
+
+/** A new select's wait for `arms` arms, its links on no queue and its token not yet waiting. */
+@export("avin_rt_select_new")
+select_new(ctx: *Context, arms: long) -> *u8
+    val n: usize = if arms < 0 then 0 else usize(arms)
+    val p = allocate_sized(ctx, &select_descriptor, sizeof(SelectWait) + n * sizeof(SelectLink))
+    val s: *SelectWait = ptr_cast(p)
+    *s = SelectWait(SleepLock.new(), new_waiter(), false, -1, n)
+    for i in 0..<n
+        val l = link_at(s, i)
+        *l = SelectLink(new_waiter(), s, i64(i), null)
+        l.waiter.link = l
+    published(p)
+
+/** Makes the select `p` ready for a round of its arms: its token waiting, held by the calling thread,
+ * and no arm having woken it. Every link is off its queue, since the last round withdrew them. */
+@export("avin_rt_select_reset")
+select_reset(ctx: *Context, p: *u8)
+    val s: *SelectWait = ptr_cast(p)
+    s.guard.lock()
+    s.primary.state.store(WaitPending)
+    s.primary.lwt = if runs_lightweight(ctx) then ptr_cast(ctx) else null
+    s.parked = false
+    s.woken_by = -1
+    s.guard.unlock()
+
+/** Enlists arm `index` of the select `p` on the queue of the condition `condition`, then lets the lock
+ * `lock` go, which the calling thread holds and under which it found the arm could not complete: a
+ * notification of the condition made under the lock after this reaches the link. */
+@export("avin_rt_select_enlist")
+select_enlist(ctx: *Context, p: *u8, index: long, condition: *u8, lock: *u8)
+    val s: *SelectWait = ptr_cast(p)
+    val c: *ParkCondition = ptr_cast(condition)
+    if 0 <= index && usize(index) < s.count
+        val l = link_at(s, usize(index))
+        if l.queue == null
+            c.waiting.guard.lock()
+            enqueue(&c.waiting, &l.waiter)
+            c.waiting.guard.unlock()
+            l.queue = &c.waiting
+    lock_release(ctx, lock)
+
+/** Takes every link of the select `p` off the queue it was enlisted on. */
+@export("avin_rt_select_withdraw")
+select_withdraw(ctx: *Context, p: *u8)
+    withdraw(ptr_cast(p))
+
+private withdraw(s: *SelectWait)
+    for i in 0..<s.count
+        val l = link_at(s, i)
+        val q = l.queue
+        if q == null then continue
+        // Taken even where a waker has already unlinked it: a waker still in `wake_select` for this
+        // link holds the guard, so after it no other thread reaches the select.
+        q.guard.lock()
+        unlink_waiter(q, &l.waiter)
+        q.guard.unlock()
+        l.queue = null
+
+/** Waits as the select `p`'s token until a notification reaches one of its links or, where
+ * `deadline` is positive, until that time on the monotonic clock in microseconds: answers the arm
+ * whose link was notified, or -1 where the time ran out. Every link is off its queue when it answers.
+ * A wait already ended by a notification while the arms were enlisted answers at once. A lightweight
+ * thread parks, and its cancellation ends the wait as any wait's does: the thread stops here, with
+ * nothing of the select left on any queue. */
+@export("avin_rt_select_park")
+select_park(ctx: *Context, p: *u8, deadline: long) -> long
+    val s: *SelectWait = ptr_cast(p)
+    val w = &s.primary
+    s.guard.lock()
+    if w.state.load() == WaitPending
+        s.parked = true
+        if runs_lightweight(ctx)
+            park_as(ctx, &s.guard, if deadline > 0 then w else null, deadline, if may_cancel(ctx, 0) then w else null)
+            if deadline > 0 then cancel_timer(w)
+        else
+            s.guard.unlock()
+            enter_safe(ctx)
+            block_until_woken(w, deadline)
+            leave_safe(ctx)
+    else s.guard.unlock()
+    withdraw(s)
+    val ended = w.state.load()
+    if ended == WaitCancelled then unwind_cancelled(ctx)
+    if ended == WaitWoken then s.woken_by else -1
+
+/** The time `micros` microseconds from now on the monotonic clock, for a select's deadline: at
+ * least one microsecond from the clock's start, so a deadline is always positive. */
+@export("avin_rt_select_deadline")
+select_deadline(ctx: *Context, micros: long) -> long
+    val at = deadline_in(if micros < 0 then 0 else micros)
+    if at < 1 then 1 else at
+
+/** Under the guard of the queue `l` was on, which has just taken it off: ends the wait of `l`'s
+ * select where nothing has ended it yet, answering whether this did. A select that has parked is made
+ * ready; one still enlisting its arms finds its wait ended and does not park. */
+wake_select(l: *SelectLink) -> bool
+    val s = l.wait
+    s.guard.lock()
+    val w = &s.primary
+    val first = w.state.cas(WaitPending, WaitWoken) == WaitPending
+    if first
+        s.woken_by = l.index
+        val t = w.lwt
+        if t == null then wake_blocked()
+        elif s.parked then make_ready(t)
+    s.guard.unlock()
+    first

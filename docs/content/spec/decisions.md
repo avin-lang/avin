@@ -8218,6 +8218,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `select`): **A `select` block's syntax** ([Threads](/spec/threads/#select)).
+  `select` ending its line opens a block of arms written as a match's: `ch.receive() as P -> body`,
+  `ch.send(x) -> body`, `after d -> body`, and `else body` with no arrow; `end select` may close it.
+  `select` is a contextual word, a name anywhere else, as `actor` and `export` are. Why: the arms
+  read as the match arms they are compiled into, `->` is Avin's one arrow (`=>` is rejected
+  everywhere), and `else` is spelled as a match's is. Alternatives weighed: `=>` arms as in the
+  item's sketch (refused by the lexer and by the settled rule on arrows); a reserved keyword (breaks
+  every program naming something `select`, and the library's own prose); a library function taking
+  lambdas (no binding by pattern, no `return`/`break` from an arm, every arm a closure).
+- Proposed (built on branch `select`): **What a receive arm's pattern means.** `Some(p)` waits for
+  a value and binds it by `p`, any irrefutable pattern a `val` takes; `None` waits for the channel
+  closed and drained; a name waits for either and binds the `Option`; `_` or no pattern waits for
+  either. Any other pattern (a literal, a tuple, alternatives, a type pattern) is an error. So
+  `Some(p)` alone is never ready on a closed, drained channel: a select whose only arms want values
+  from closed channels takes its `after` or `else`, or waits for ever, as a select over a channel no
+  one sends to does. Why: the pattern says what the arm waits for, so an arm never takes a value it
+  then cannot match, and the common loop (`Some(j)` and `None` arms) reads as a match on what
+  `receive` returns. Alternatives weighed: trapping where a closed channel's `None` matches no arm
+  (turns a finished producer into a crash), any pattern with an unmatched receive dropped (loses
+  values). **Review with the user**: whether `Some(p)` alone on a closed channel should wait or trap.
+- Proposed (built on branch `select`): **Choosing and evaluating.** Every channel, value sent and
+  `after` duration is evaluated once, in the order written, before any arm is tried; the arms are
+  tried in an order drawn at random each select (a Fisher–Yates shuffle from one shared
+  split-mix sequence), so of several ready arms each is equally likely. `after` and `else` together
+  are an error (a select with `else` never waits); two of either is an error. An `after` of zero or
+  less tries the arms once, as `else` does. A send arm on a closed channel traps when it is tried,
+  as `send` does. Why: the order of evaluation is the order of reading; a random order is the only
+  fair one that needs no state per select site. Alternatives weighed: round-robin per select site
+  (needs a hidden mutable per site, shared between threads); trying in written order (starves the
+  later arms); a send arm on a closed channel never ready (hides the program's mistake).
+- Proposed (built on branch `select`): **How a select waits.** It waits on the very conditions a
+  channel's `receive` and `send` wait on: in one pass, each arm is tried under its channel's lock and,
+  where it cannot complete, a link of the select is enlisted on that condition's queue before the
+  lock goes; the thread then parks once. The runtime wakes a link as it wakes any waiter, and the
+  select's one token decides, by compare-and-set, whether a notification, the timer or a
+  cancellation ended the wait; a notification reaching an ended select's link is passed by to the
+  next waiter. Woken through an arm, the select tries that arm first and, where it cannot complete
+  while the channel still holds a value (or room), notifies the next waiter, so no notification is
+  lost to a select that could not use it; every link is withdrawn when the wait ends. Why: a
+  channel's own operations are unchanged, a select costs one park, and a plain `receive` and a select
+  share one queue in arrival order. Alternatives weighed: a list of selects on each channel woken on
+  every change (wakes every waiting select for each value, a herd of thousands where workers share a
+  channel); passing every unused notification on whatever the channel holds (idle selects hand one
+  notification round for ever: two thousand workers ran forty times slower); a select polling with
+  sleeps (latency and wasted work).
+- Proposed (built on branch `select`): **The library names a select is read into are public**:
+  `avin.threads.SelectArm`, `SelectReceive`, `SelectSend`, `selectWaiting`, `selectOrElse`,
+  `selectWithin`, and `Channel`'s `offerReceive`, `offerSend` and `passOn`. Their wait parameter is
+  of a type private to `avin.threads`, so no program can call an arm's operations. Why: the code a
+  `select` is read into is checked in the program's file, so what it names is public, as the
+  actor's `ActorContext` is; members have no module-wide visibility. Alternatives weighed: a member
+  visibility private to the module (a language change of its own); intrinsics the compiler calls
+  directly (the arms are generic, and the channel logic belongs in Avin).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -1,0 +1,61 @@
+// expect: exit 0
+// A `select` waiting is a cancellation point like every other wait: a scope's `cancel` wakes a thread
+// parked in a select with no `after`, in one with an hour's `after`, and in one with a send arm
+// waiting for room, and nothing after the select runs; a thread looping over a select with `else`
+// stops at its loop's poll. Nothing of a cancelled select stays on its channels: a value sent to
+// them afterwards goes to the next thread waiting, a plain receive or another select, rather than
+// to the select that was cancelled.
+import avin.threads.{Atomic, Channel, scope, sleep, spawn}
+import avin.time.{hours, millis}
+
+main() -> int
+  val started = Atomic(0)
+  val after = Atomic(0)
+  val a = Channel[int]()
+  val b = Channel[int]()
+  val full = Channel[int](1)
+  full.send(0)
+  val results = scope(s ->
+    val receiving = s.spawn(() ->
+      started.add(1)
+      select
+        a.receive() as Some(x) -> println(x)
+        b.receive() as None -> println("closed")
+      after.add(1))
+    val timed = s.spawn(() ->
+      started.add(1)
+      select
+        a.receive() as Some(x) -> println(x)
+        after hours(1) -> println("an hour")
+      after.add(1))
+    val sending = s.spawn(() ->
+      started.add(1)
+      select
+        full.send(1) -> println("sent")
+        b.receive() -> println("b")
+      after.add(1))
+    val polling = s.spawn(() ->
+      started.add(1)
+      var spins = 0
+      while spins >= 0
+        select
+          a.receive() as Some(x) -> println(x)
+          else spins++
+      after.add(1))
+    while started.load() < 4 do sleep(1.millis)
+    sleep(20.millis)
+    s.cancel()
+    [receiving, timed, sending, polling])
+  println(results.map(t -> t.result()), after.load())
+
+  // The channels work on: values sent now go to the threads waiting now.
+  val plain = spawn(() -> a.receive())
+  val selecting = spawn(() ->
+    select
+      b.receive() as Some(x) -> x * 10)
+  sleep(10.millis)
+  a.send(1)
+  b.send(2)
+  println(plain.join(), selecting.join())
+  println(full.receive(), full.tryReceive())
+  0
