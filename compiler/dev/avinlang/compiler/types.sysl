@@ -46,7 +46,37 @@ enum Type
      * written, flattened, each named once, never `Nothing` or `Any`, and at least two (`union_of`
      * keeps that form); two unions with the same members are one type, whatever their order. */
     Union(members: Buf[&Type])
+    /** A type constructor of `arity` arguments, what a constructor parameter `F[_]` stands for: a
+     * data type, class or trait with `hole(i)` among its direct arguments for the `i`th argument left
+     * open (`Result[_, ParseError]` is `Result[hole(0), ParseError]`), or a constructor parameter
+     * applied to holes. That is the one form a constructor has, so two are one exactly when they are
+     * structurally the same type. A constructor is never the type of a value. */
+    Constructor(body: &Type, arity: usize)
+    /** `F[A]`: a constructor parameter, or what it was replaced by, applied to types. Substituting a
+     * `Constructor` for the head fills its holes, so no instance keeps one. */
+    Applied(head: &Type, args: Buf[&Type])
 end Type
+
+/** The owner of the holes of a `Constructor`'s body. */
+hole_owner() -> usize = 1usize << 44
+
+/** The `index`th argument a constructor leaves open. */
+hole(index: usize) -> &Type = TypeVar(hole_owner(), index, "_")
+
+/** `head` applied to `args`: a constructor's body with its holes filled in order, or an `Applied`
+ * while the head is still a constructor parameter. */
+apply_constructor(head: &Type, args: Buf[&Type]) -> &Type = *head match
+    Constructor(body, _) -> substitute(body, hole_owner(), args)
+    ErrorType -> head
+    _ -> Applied(head, args)
+
+/** The constructor a constructor parameter `p` of `arity` holes is when passed bare: `p` applied to
+ * its holes. */
+parameter_constructor(p: &Type, arity: usize) -> &Type
+    var holes: Buf[&Type] = buf()
+    for i in 0..<arity
+        holes.push(hole(i))
+    Constructor(Applied(p, holes), arity)
 
 /** The union of `members` in normal form, as far as it needs no knowledge of declarations: nested
  * unions flattened, a member named twice kept once, `Nothing` dropped, a union with `Any` among its
@@ -170,6 +200,8 @@ has_union(t: &Type) -> bool = *t match
     ByName(inner) -> has_union(inner)
     Data(_, _, args) -> any_union(args)
     Class(_, _, args) -> any_union(args)
+    Constructor(body, _) -> has_union(body)
+    Applied(head, args) -> has_union(head) || any_union(args)
     _ -> false
 
 private any_union(items: Buf[&Type]) -> bool
@@ -224,6 +256,8 @@ names_alias_param(t: &Type) -> bool = *t match
     Data(_, _, args) -> any_alias_param(args)
     Class(_, _, args) -> any_alias_param(args)
     Union(members) -> any_alias_param(members)
+    Constructor(body, _) -> names_alias_param(body)
+    Applied(head, args) -> names_alias_param(head) || any_alias_param(args)
     _ -> false
 
 /** Whether `t` names type parameter `index` of `owner`. */
@@ -235,6 +269,8 @@ names_type_var(t: &Type, owner: usize, index: usize) -> bool = *t match
     Data(_, _, args) -> any_names_type_var(args, owner, index)
     Class(_, _, args) -> any_names_type_var(args, owner, index)
     Union(members) -> any_names_type_var(members, owner, index)
+    Constructor(body, _) -> names_type_var(body, owner, index)
+    Applied(head, args) -> names_type_var(head, owner, index) || any_names_type_var(args, owner, index)
     _ -> false
 
 private any_names_type_var(items: Buf[&Type], owner: usize, index: usize) -> bool
@@ -340,6 +376,12 @@ same_type(a: &Type, b: &Type) -> bool = *a match
     Union(xs) -> *b match
         Union(ys) -> same_members(xs, ys)
         _ -> false
+    Constructor(x, n) -> *b match
+        Constructor(y, m) -> n == m && same_type(x, y)
+        _ -> false
+    Applied(h, xs) -> *b match
+        Applied(g, ys) -> same_type(h, g) && same_types(xs, ys)
+        _ -> false
 
 /** Whether two unions have the same members, in whatever order. */
 private same_members(xs: Buf[&Type], ys: Buf[&Type]) -> bool
@@ -399,6 +441,12 @@ private alike(a: &Type, b: &Type) -> bool
         Union(xs) -> *b match
             Union(ys) -> members_alike(xs, ys)
             _ -> false
+        Constructor(x, n) -> *b match
+            Constructor(y, m) -> n == m && alike(x, y)
+            _ -> false
+        Applied(h, xs) -> *b match
+            Applied(g, ys) -> alike(h, g) && all_alike(xs, ys)
+            _ -> false
         _ -> same_type(a, b)
 
 private members_alike(xs: Buf[&Type], ys: Buf[&Type]) -> bool
@@ -436,6 +484,28 @@ type_name(t: &Type) -> string = *t match
     TypeVar(_, _, name) -> name
     Var(_) -> "_"
     Union(members) -> union_name(members)
+    Constructor(body, arity) -> if leaves_all_open(body, arity) then constructor_head_name(body) else type_name(body)
+    Applied(head, args) -> type_name(head) + "[" + type_list(args) + "]"
+
+/** Whether a constructor's body leaves every argument open, in order, so the constructor is written
+ * as its type's bare name: `Option`, not `Option[_]`. */
+private leaves_all_open(body: &Type, arity: usize) -> bool
+    var args: Buf[&Type] = buf()
+    *body match
+        Data(_, _, xs) -> args = xs
+        Class(_, _, xs) -> args = xs
+        Applied(_, xs) -> args = xs
+        _ -> return false
+    if args.len() != arity then return false
+    for i in 0..<args.len()
+        if !same_type(args[i], hole(i)) then return false
+    true
+
+private constructor_head_name(body: &Type) -> string = *body match
+    Data(_, name, _) -> name
+    Class(_, name, _) -> name
+    Applied(head, _) -> type_name(head)
+    _ -> type_name(body)
 
 // A union's members in the order written, a function type among them in parentheses.
 private union_name(members: Buf[&Type]) -> string
@@ -477,6 +547,10 @@ type_key(t: &Type) -> string = *t match
             if i > 0 then out = out + " | "
             out = out + keys[i]
         out + ")"
+    // A constructor by its body, its holes spelled `_`: `#4[_, #9[]]` for `Result[_, ParseError]`,
+    // which `Parsed` is too, so the two are one instance.
+    Constructor(body, _) -> type_key(body)
+    Applied(head, args) -> type_key(head) + "[" + key_list(args) + "]"
     _ -> type_name(t)
 
 private key_list(items: Buf[&Type]) -> string
@@ -528,6 +602,8 @@ has_unknowns(t: &Type) -> bool = *t match
     Data(_, _, args) -> any_unknowns(args)
     Class(_, _, args) -> any_unknowns(args)
     Union(members) -> any_unknowns(members)
+    Constructor(body, _) -> has_unknowns(body)
+    Applied(head, args) -> has_unknowns(head) || any_unknowns(args)
     _ -> false
 
 private any_unknowns(items: Buf[&Type]) -> bool
@@ -544,6 +620,9 @@ substitute(t: &Type, owner: usize, args: Buf[&Type]) -> &Type = *t match
     Data(id, name, items) -> Data(id, name, substitute_all(items, owner, args))
     Class(id, name, items) -> Class(id, name, substitute_all(items, owner, args))
     Union(members) -> union_of(substitute_all(members, owner, args))
+    // A constructor's holes are its own, so filling an outer constructor's leaves them alone.
+    Constructor(body, arity) -> if owner == hole_owner() then t else Constructor(substitute(body, owner, args), arity)
+    Applied(head, items) -> apply_constructor(substitute(head, owner, args), substitute_all(items, owner, args))
     _ -> t
 
 substitute_all(items: Buf[&Type], owner: usize, args: Buf[&Type]) -> Buf[&Type]
@@ -563,6 +642,8 @@ solve(vars: Buf[Option[&Type]], t: &Type) -> &Type = *t match
     Data(id, name, args) -> Data(id, name, solve_all(vars, args))
     Class(id, name, args) -> Class(id, name, solve_all(vars, args))
     Union(members) -> union_of(solve_all(vars, members))
+    Constructor(body, arity) -> Constructor(solve(vars, body), arity)
+    Applied(head, args) -> apply_constructor(solve(vars, head), solve_all(vars, args))
     _ -> t
 
 private solve_all(vars: Buf[Option[&Type]], items: Buf[&Type]) -> Buf[&Type]

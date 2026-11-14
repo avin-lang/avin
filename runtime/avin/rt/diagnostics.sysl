@@ -1,0 +1,184 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.sync.*
+
+// What the runtime says about the program's threads: the deadlock report, when every thread waits for
+// something no thread or event outside the program can end, and the thread dump the quit signal asks
+// for (Ctrl-\ at a terminal), which the program survives.
+//
+// A program is deadlocked when its main thread waits, without a limit, on a lock, a condition, a join
+// or anything built on them, and at that moment no lightweight thread is running or ready, so every one
+// of them is parked, and nothing outside the threads can make one ready: no timer is set (a sleep, a
+// timed wait, a signal watch's wait, an actor's timer), no thread waits on a socket, no thread the
+// program did not start is attached, and no callback that such a thread may call is held. A thread in
+// a blocking call is running, so a program with one is never deadlocked. The main thread checks when
+// it begins such a wait and again each time a worker finds no thread running or ready while it waits;
+// it reports and stops the program as a trap does. Every way a parked thread becomes ready goes through
+// `make_ready`, and every wake of a thread that is not lightweight through `wake_waiter`, and both
+// count it in `wakes`, so a check whose count did not move saw one moment of the program: nothing ran
+// and nothing was woken between its first look and its last.
+//
+// A program some of whose threads are deadlocked while others still run is not found: the check is
+// for the whole program only.
+
+// What a thread waits on, in its context's `waits` (`heap.sysl`), with `WaitTimed` added for a wait
+// with a time limit.
+/** A lock. */
+const WaitsOnLock: u32 = 1
+/** A condition. */
+const WaitsOnCondition: u32 = 2
+/** A join: another thread to end. */
+const WaitsOnJoin: u32 = 3
+/** A sleep. */
+const WaitsOnSleep: u32 = 4
+/** A socket. */
+const WaitsOnSocket: u32 = 5
+/** A channel's condition that a value has arrived. */
+const WaitsOnReceive: u32 = 6
+/** A channel's condition that there is room. */
+const WaitsOnSend: u32 = 7
+/** A future's condition that it is complete. */
+const WaitsOnFuture: u32 = 8
+/** An executor's condition that work has arrived: the worker is idle. */
+const WaitsForWork: u32 = 9
+/** A select, waiting on the channels of its arms (`select.sysl`); `select_waits` adds how many. */
+const WaitsOnSelect: u32 = 10
+/** Added to a kind for a wait with a time limit. */
+const WaitTimed: u32 = 256
+/** Where a select's wait keeps how many channels it waits on: the bits from here up. */
+const WaitCountShift: u32 = 16
+
+/** What a select waiting on `channels` channels waits on. */
+select_waits(channels: usize) -> u32 = WaitsOnSelect + (u32(channels) << WaitCountShift)
+
+/** The kind of a wait, without its time limit or a select's channel count. */
+wait_kind(waits: u32) -> u32 = waits & (WaitTimed - 1)
+
+/** The kinds the library may give a condition it makes (`avin_rt_condition_new_kind`). */
+condition_kind(kind: i32) -> u32
+    if kind == 6 then return WaitsOnReceive
+    if kind == 7 then return WaitsOnSend
+    if kind == 8 then return WaitsOnFuture
+    if kind == 9 then return WaitsForWork
+    WaitsOnCondition
+
+/** Marks the thread of `ctx` as waiting on `kind` from now, timed where `timed`. */
+begin_waiting(ctx: *Context, kind: u32, timed: bool)
+    ctx.waits_since.store(now_micros())
+    ctx.waits.store(if timed then kind + WaitTimed else kind)
+
+/** Marks the thread of `ctx` as no longer waiting. */
+end_waiting(ctx: *Context)
+    ctx.waits.store(0)
+
+/** What a thread waiting on `waits` is doing, in words. */
+private waiting_text(waits: u32) -> string
+    val kind = wait_kind(waits)
+    val what = if kind == WaitsOnSelect then select_text(waits >> WaitCountShift) else kind_text(kind)
+    if (waits & WaitTimed) != 0 && kind != WaitsOnSleep then what + " with a time limit" else what
+
+// A select's wait on `channels` channels, in words.
+private select_text(channels: u32) -> string =
+    "waiting in a select on " + channels.to_string() + (if channels == 1 then " channel" else " channels")
+
+// A wait kind, in words.
+private kind_text(kind: u32) -> string
+    if kind == WaitsOnLock then return "waiting for a lock"
+    if kind == WaitsOnCondition then return "waiting on a condition"
+    if kind == WaitsOnJoin then return "waiting for a thread to end"
+    if kind == WaitsOnSleep then return "sleeping"
+    if kind == WaitsOnSocket then return "waiting on a socket"
+    if kind == WaitsOnReceive then return "waiting to receive from a channel"
+    if kind == WaitsOnSend then return "waiting to send to a full channel"
+    if kind == WaitsOnFuture then return "waiting for a future"
+    if kind == WaitsForWork then return "idle, waiting for work"
+    "waiting"
+
+/** How many threads the program did not start are attached now, running Avin code for a callback. */
+var foreign_attached: Atomic[u64] = Atomic(0)
+
+/** How many times a parked lightweight thread, or a new one, has been made ready. */
+var wakes: Atomic[u64] = Atomic(0)
+
+/** 1 while the main thread waits without a limit and checks for a deadlock, which a worker that finds
+ * nothing running or ready pokes it to do again. */
+var main_watching: Atomic[u32] = Atomic(0)
+
+/** How many times a worker has poked the main thread to look for a deadlock again. */
+var pokes: Atomic[u64] = Atomic(0)
+
+/** Has the main thread, waiting without a limit, look for a deadlock again. */
+poke_main()
+    _ = pokes.add(1)
+    wake_blocked()
+
+/** Whether the program is deadlocked, asked by the main thread while it waits without a limit as
+ * `w`. A wake of `w` before the first look is seen in its state, read after the others; one after it
+ * moves the count, since every waker counts a wake before it makes it. */
+all_waiting(w: *Waiter) -> bool
+    if stopping_now() then return false
+    val before = wakes.load()
+    if !scheduler_quiet() then return false
+    if timers_pending() != 0 then return false
+    if socket_waiters() != 0 then return false
+    if foreign_attached.load() != 0 then return false
+    if threaded_callbacks_held() != 0 then return false
+    if w.state.load() != WaitPending then return false
+    wakes.load() == before
+
+/** Stops the program from the main thread, `ctx`, which waits on something no thread can end, listing
+ * every thread and what it waits on, as a trap does. */
+deadlocked(ctx: *Context) -> never
+    val listing = threads_text(false)
+    leave_safe(ctx)
+    begin_stop(ctx)
+    flush()
+    eprints(trap_prefix(ctx) + "deadlock: all threads are waiting\n" + listing)
+    end_trapped(ctx)
+
+/** One line for each thread: the main thread first, then the lightweight threads in the order they
+ * started, each with what it is doing and, `timed`, for how long it has waited. The deadlock report
+ * leaves out idle workers, which wait for work by design and are as many as the machine's processors. */
+threads_text(timed: bool) -> string
+    val now = now_micros()
+    var out = "  main: " + main_text(now, timed) + "\n"
+    val lines = lightweight_lines(now, timed)
+    for line in lines do out = out + line
+    out
+
+// What the main thread is doing.
+private main_text(now: long, timed: bool) -> string
+    val waits = main_context.waits.load()
+    if waits != 0 then return waits_line(waits, main_context.waits_since.load(), now, timed)
+    val k = main_context.carrier
+    if k != null && k.blocked.load() != 0 then "running, in a blocking call" else "running"
+
+/** What a thread waiting on `waits` since `since` is doing, with how long it has waited where
+ * `timed`. */
+waits_line(waits: u32, since: long, now: long, timed: bool) -> string
+    val what = waiting_text(waits)
+    if !timed then return what
+    val ms = if now > since then (now - since) / 1000 else 0
+    what + ", " + ms.to_string() + " ms"
+
+/** Whether a thread waiting on `waits` is an idle worker, which the deadlock report leaves out. */
+idle_worker(waits: u32) -> bool = wait_kind(waits) == WaitsForWork
+
+// The quit signal's thread dump. A handler written in C (`__posix__/thread_dump.c`) wakes a thread of
+// its own, which calls `avin_rt_thread_dump`; the program goes on as it was.
+extern "avin_rt_thread_dump_install" install_thread_dump() -> unit
+
+/** How many thread dumps have been written, for a program that waits for one. */
+var dumps: Atomic[u64] = Atomic(0)
+
+/** How many thread dumps the quit signal has had written. */
+thread_dumps() -> long = long(dumps.load())
+
+/** Writes the thread dump to standard error: every thread, what it is doing, and how long it has
+ * waited. Called on the dump's own thread, which runs no Avin code. */
+@export("avin_rt_thread_dump")
+thread_dump()
+    eprints("avin: thread dump\n" + threads_text(true))
+    _ = dumps.add(1)

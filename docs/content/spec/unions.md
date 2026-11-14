@@ -128,7 +128,12 @@ val x = if ok then 1 else "none"
 
 val y: int | string = if ok then 1 else "none" // each branch becomes the union
 val zs: Vector[int | string] = [1, "two", 3] // each element too
+val w = (1: int | string)                      // an ascription writes it in place
 ```
+
+An [ascription](/spec/types/#type-ascription) writes the union where the value stands, as a
+declared type does: `(n: int | string)` is the member `n` as the union, and `(u: int)` of a union
+`u` is refused, since an ascription never narrows.
 
 The same holds for collection literals, generic calls and lambdas: `[1, "two"]` is an error, and
 `pair[T](a: T, b: T)` called as `pair(1, "one")` is an error, not a `pair[int | string]`.
@@ -329,6 +334,13 @@ A `match` in generic code is checked once, where it is written, against the unio
 `T | int` is two members there, and an arm for each is required. At an instance where the members
 come together (`T = int`), each value is matched by the first arm whose pattern it fits, so the arm
 for `T` takes every `int` and the arm for `int` is never reached at that instance, which is no error.
+
+At such an instance the union is its one member's type, with that type's layout and nothing of a
+union's: `build[T](x: T) -> Vector[T | int] = [x, 7]` at `T = int` makes a `Vector[int]` of plain
+`int`s, `T | real` at `T = real` is returned as a `real`, and `T | string` at `T = string` is a
+string. A value of it is the same value seen as an `Any`, so `build[int](3)` as an `Any` matches
+`Vector[int]`. A union that keeps more than one member at the instance (`T | int | string` at
+`T = int`, which is `int | string`) keeps a union's layout, of those members.
 
 ## What a union value can do
 

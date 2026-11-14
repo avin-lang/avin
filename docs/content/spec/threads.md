@@ -233,6 +233,15 @@ Inside the function, a parameter so marked that holds a function may be passed o
 with the same mark or a weaker one; an unmarked one may not, and the error says to mark it. A
 method that overrides or implements another marks no parameter more strongly than the method it
 overrides does, since a call through that method would not check what is passed.
+A function type carries no marks either, so a function, a constructor or a method whose parameter
+is marked is a value only where the value's type gives that parameter a sendable type, a `@sendable`
+function type for one that takes a function: `spawn` is a `(@sendable () -> T, long) -> Thread[T]`,
+and as a `(() -> unit, long) -> Thread[unit]` it is refused, as `Mutex` as an `(Array[int]) ->
+Mutex[Array[int]]` is. Where no function type is expected, the value takes the `@sendable` form of
+each marked parameter that takes a function, so `val sp = spawn[int]` holds it and what is passed
+through `sp` is checked where it is written. A by-name parameter so marked has no such type, so
+`isolate` is not a value. A class or a data type that is a function has an `apply` that marks a
+parameter only where its function type makes that parameter sendable likewise.
 
 **A parameter marked `@sendable` is sendable inside its function, whatever its type**, since what
 is passed for it was checked where it was passed: a `@sendable` lambda captures it, and it is passed
@@ -299,7 +308,9 @@ So what is passed for a `@sendable` parameter, directly or through every functio
 read and write no module-level `var`, and may read no module-level `val`, `lazy val` or `object`
 whose type is not sendable. Avin compiles the whole program, so every function a body can reach is
 known: the one a call names, every implementation a call through a trait method or an operator may
-reach, every closure made on the way, and an extractor a pattern calls. A module-level `val` of an
+reach, every closure made on the way, an extractor a pattern calls, and the initializer of every
+`lazy val`, module-level or a field, that it reads, since its first read runs the initializer on
+whichever thread makes it. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
 `lazy val` of a sendable type is initialized once whichever threads read it. The error names the
 module-level item and the functions it is reached through:
@@ -412,8 +423,10 @@ main() -> int
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
 parked on a lock, a condition, a channel or a join, or blocked on input, never holds up a collection.
 A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A thread
-waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. **A deadlock is not detected**, apart from a thread
-taking a lock it already holds: threads that each wait for another sleep for ever.
+waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. A thread
+taking a lock it already holds traps at once. A program whose threads, `main` among them, all wait for
+each other stops with a [deadlock report](#deadlock); threads that wait for each other while another
+still runs sleep for ever.
 
 ## select
 
@@ -639,3 +652,74 @@ handles one message at a time, so its own state needs no lock; its mailbox is a 
 heap, and a message is a reference to a heap value. A message holds only values no other actor can
 change, or hands over the ownership of what it carries, and the compiler checks every message type
 for it ([what may be sent](/spec/actors/#what-may-be-sent)).
+
+## Diagnostics
+
+The runtime says what a program's threads are doing in two cases: when every one of them waits for
+something nothing can end, and when the program is asked for a thread dump.
+
+### Deadlock
+
+A program whose threads all wait for each other stops, as a trap does, with a list of its threads
+and what each waits on:
+
+```
+avin: trap: deadlock: all threads are waiting
+  main: waiting for a thread to end
+  thread 1: waiting for a lock
+  thread 2: waiting for a lock
+```
+
+The program is deadlocked when `main` waits without a limit (for a lock, a condition, a join, a
+channel, a future, a [`select`](#select) with no `after`, or anything built on them) and at that
+moment
+
+- no lightweight thread is running or ready, so every one waits too, and
+- nothing outside the threads can end a wait: no timer is set (a sleep, a wait with a limit, an
+  `ask`'s limit, an actor's timer, a signal watch's `wait`), no thread waits on a socket, no thread
+  the program did not start is attached, and no callback that such a thread may call
+  ([`@threaded`](/spec/sysl-bindings/#callbacks)) is held.
+
+A thread in a blocking call (a [`blocking`](/spec/sysl-bindings/#calls-that-wait) binding, reading
+input, waiting for a command to end) is running, so a program with one is never deadlocked, and
+neither is a `main` that runs its own work, a window's frame loop among it. An `ask` that nobody
+answers is not a deadlock either: its limit ends it with `TimedOut`. An actor waiting for mail
+nobody can send has no thread at all, so `main` awaiting its end is deadlocked once everything else
+waits.
+
+The report lists `main` first, then each lightweight thread still there in the order the threads
+started, numbered from 1 by that order; a thread that has ended is not listed. A pool's idle workers,
+which wait for work by design and are as many as the machine has processors, are left out. What a
+thread waits on is one of: a lock (a mutex's), a condition, a thread to end (a join), receiving from
+a channel, sending to a full channel, a future, or a select, `waiting in a select on 2 channels`,
+which counts its arms that name a channel. A select with an `after` is a wait with a limit, whose
+timer can always end it, so it is never part of a deadlock. The report goes to standard error after what the
+program had printed is flushed, the exit hooks run after it, and the program ends as a trap ends it.
+
+**Only a deadlock of the whole program is found.** Threads that wait for each other while another
+thread still runs, or while `main` computes or sleeps, are not reported: the program goes on, and
+ends when `main` returns.
+
+### Thread dump
+
+The quit signal (Ctrl-\ at a terminal, `kill -QUIT`) writes every thread's state to standard error,
+and the program goes on as it was:
+
+```
+avin: thread dump
+  main: running
+  thread 1: waiting to receive from a channel, 250 ms
+  thread 2: sleeping, 1200 ms
+  thread 3: waiting on a condition with a time limit, 3 ms
+  thread 4: running
+  thread 5: idle, waiting for work, 40 ms
+```
+
+Each thread is `running` (`running, in a blocking call` while it is in one), `ready` for a worker,
+`ending`, or waiting, with what it waits on as in the deadlock report, `sleeping`, `waiting on a
+socket`, or, for a pool's worker with no work, `idle, waiting for work`; a wait with a limit says so,
+and every wait says how long it has lasted, in milliseconds. Idle workers are listed here. A dump
+names no functions: a thread's frames do not record which function they belong to.
+
+A program that [watches](/spec/system-library/#avinsignal) the quit signal hears of it instead, and no
+dump is written while the watch lasts. A program started with the signal ignored keeps it ignored.

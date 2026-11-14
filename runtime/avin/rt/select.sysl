@@ -127,14 +127,18 @@ select_park(ctx: *Context, p: *u8, deadline: long) -> long
     s.guard.lock()
     if w.state.load() == WaitPending
         s.parked = true
+        // A select with no `after` waits without a limit, so it is a wait the deadlock check counts;
+        // one with an `after` has a timer, which can always end it.
+        begin_waiting(ctx, select_waits(s.count), deadline > 0)
         if runs_lightweight(ctx)
             park_as(ctx, &s.guard, if deadline > 0 then w else null, deadline, if may_cancel(ctx, 0) then w else null)
             if deadline > 0 then cancel_timer(w)
         else
             s.guard.unlock()
             enter_safe(ctx)
-            block_until_woken(w, deadline)
+            block_until_woken(ctx, w, deadline)
             leave_safe(ctx)
+        end_waiting(ctx)
     else s.guard.unlock()
     withdraw(s)
     val ended = w.state.load()
@@ -155,10 +159,14 @@ wake_select(l: *SelectLink) -> bool
     val s = l.wait
     s.guard.lock()
     val w = &s.primary
+    val t = w.lwt
+    // A select on a thread that is not lightweight is counted before it is woken, as `wake_waiter`
+    // counts one, so the main thread's look for a deadlock sees the wake; `make_ready` counts a
+    // lightweight one.
+    if t == null then _ = wakes.add(1)
     val first = w.state.cas(WaitPending, WaitWoken) == WaitPending
     if first
         s.woken_by = l.index
-        val t = w.lwt
         if t == null then wake_blocked()
         elif s.parked then make_ready(t)
     s.guard.unlock()

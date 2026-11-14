@@ -139,7 +139,7 @@ check_features(dir: string, features: Buf[Feature], dependencies: Buf[Dependency
             val span = f.module_spans[i]
             if name == "" || name.ends_with(".") || !valid_module_name(name)
                 return Err(error(span, s"`$name` is not a module's name: a module is named by its directory's path from the package's root, `shapes.server`"))
-            if name == "tests" || name.starts_with("tests.")
+            if is_tests_module(name)
                 return Err(error(span, s"`$name` is the package's tests, which no feature lists: the tests are compiled whenever the package is tested"))
             if !is_dir(dir + "/" + name.replace_all(".", "/"))
                 return Err(error(span, s"`$name` is not a module of this package: it has no directory `${name.replace_all(".", "/")}`"))
@@ -313,6 +313,56 @@ gated_off(features: Buf[Feature], on: Buf[string]) -> Buf[string]
             out.push(m)
     out
 
+/** Whether `module_name` is the package's tests, its `tests` module or one under it. */
+is_tests_module(module_name: string) -> bool = module_name == "tests" || module_name.starts_with("tests.")
+
+/** The package's own `files` without the test modules that are not read while the modules `off` names
+ * are off: a test module importing one of them or a module under it, or importing a test module that is
+ * not read. A test module is read only while every module it imports is, so the package's tests build
+ * with any set of its features off. */
+without_unread_tests(files: Buf[ProgramFile], off: Buf[string]) -> Buf[ProgramFile]
+    if off.len() == 0 then return files
+    var owners: Buf[string] = buf()
+    var imported: Buf[Buf[string]] = buf()
+    for f in files
+        val m = f.module_name.unwrap_or("")
+        if !is_tests_module(m) then continue
+        var paths: Buf[string] = buf()
+        for i in parse(f.src).file.imports
+            paths.push(i.path)
+        owners.push(m)
+        imported.push(paths)
+    var unread: Buf[string] = buf()
+    var grew = true
+    while grew
+        grew = false
+        for k in 0..<owners.len()
+            if has_name(unread, owners[k]) then continue
+            if imports_unread(imported[k], off, unread, owners)
+                unread.push(owners[k])
+                grew = true
+    if unread.len() == 0 then return files
+    var out: Buf[ProgramFile] = buf()
+    for f in files
+        if !has_name(unread, f.module_name.unwrap_or("")) then out.push(f)
+    out
+
+// Whether one of the import paths `paths` names a module `off` lists, or one under it, or names a test
+// module `unread` lists, itself or a declaration of it; `modules` are the test modules there are, so
+// `tests.helpers` is the module of that name where there is one, and otherwise a declaration of `tests`.
+private imports_unread(paths: Buf[string], off: Buf[string], unread: Buf[string], modules: Buf[string]) -> bool
+    for p in paths
+        for m in off
+            if p == m || p.starts_with(m + ".") then return true
+        val owner = if has_name(modules, p) then p else module_part(p)
+        if has_name(unread, owner) then return true
+    false
+
+// The path `p` without its last name.
+private module_part(p: string) -> string = p.last_index_of(".") match
+    Some(at) -> p[0..<at]
+    None -> ""
+
 // The features the module `module_name` exists only while they are on: every one listing it or a
 // module it is under.
 private gate_of(features: Buf[Feature], module_name: string) -> Buf[string]
@@ -325,10 +375,12 @@ private gate_of(features: Buf[Feature], module_name: string) -> Buf[string]
 /** The imports a file of the module `module_name`, in a package declaring `features` whose optional
  * dependencies taken are `optional` with the modules of each in `optional_modules`, may not make:
  * every gated module its own gate does not imply, and every module of an optional dependency its gate
- * does not turn on. A gate implies another when the features its `enables` reach include it. */
+ * does not turn on. A gate implies another when the features its `enables` reach include it. The
+ * package's tests may import every module of it, whatever its gate: they are not read while a module
+ * they import is off (`without_unread_tests`). */
 fences_of(features: Buf[Feature], module_name: string, optional: Buf[string], optional_modules: Buf[Buf[string]]) -> Buf[Fence]
     var out: Buf[Fence] = buf()
-    if features.len() == 0 then return out
+    if features.len() == 0 || is_tests_module(module_name) then return out
     val own = gate_of(features, module_name)
     val implied = feature_closure(features, own)
     val importer = if module_name == "" then "the package's root module" else s"`$module_name`"
@@ -346,8 +398,7 @@ fences_of(features: Buf[Feature], module_name: string, optional: Buf[string], op
 
 // The second half of a fence's message: what the importing module is compiled with, and what to do.
 private gated_importer(importer: string, module_name: string, own: Buf[string], needed: string) -> string
-    val unlistable = module_name == "" || module_name == "tests" || module_name.starts_with("tests.")
-    if own.len() == 0 && unlistable
+    if own.len() == 0 && module_name == ""
         return s"$importer is always compiled: import it from a module listed under a feature that enables `$needed`"
     if own.len() == 0
         return s"$importer is always compiled: list $importer under a feature that enables `$needed`, or import it from a module that is"
