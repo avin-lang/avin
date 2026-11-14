@@ -5282,7 +5282,11 @@ methods_named(c: *Checker, id: usize, name: string) -> Buf[usize]
         k = *sup match
             Class(s, _, _) -> s
             _ -> break
-    trait_methods_named(c, id, self_type, name, &out, 0)
+    // The class's own methods of the name are its constructor traits' as it implements them, so a
+    // call of one is the call it always was; the traits' own declarations are found only where the
+    // class has none of the name.
+    val owned = out.len() > 0
+    trait_methods_named(c, id, self_type, name, &out, 0, owned)
     // A trait's `val`, and the method a field supplies it with, are read as a field, not called.
     var callable: Buf[usize] = buf()
     for m in out
@@ -5290,15 +5294,16 @@ methods_named(c: *Checker, id: usize, name: string) -> Buf[usize]
     callable
 
 /** Adds to `out` the methods of `name` of the traits class or trait `id` conforms to or requires. */
-private trait_methods_named(c: *Checker, id: usize, self_type: &Type, name: string, out: *Buf[usize], depth: usize)
+private trait_methods_named(c: *Checker, id: usize, self_type: &Type, name: string, out: *Buf[usize], depth: usize, owned: bool)
     if depth > c.classes.len() then return
     for required in c.classes[id].traits
         if *required is Class(t, _, _)
-            for m in c.classes[t].methods
-                if c.symbols[m].decl.name == name then add_method(c, self_type, out, m)
-            trait_methods_named(c, t, self_type, name, out, depth + 1)
+            if !(owned && is_constructor_trait(c, t))
+                for m in c.classes[t].methods
+                    if c.symbols[m].decl.name == name then add_method(c, self_type, out, m)
+            trait_methods_named(c, t, self_type, name, out, depth + 1, owned)
     if c.classes[id].superclass is Some(sup)
-        if *sup is Class(s, _, _) then trait_methods_named(c, s, self_type, name, out, depth + 1)
+        if *sup is Class(s, _, _) then trait_methods_named(c, s, self_type, name, out, depth + 1, owned)
 
 /** The method of a trait that trait `id` requires, directly or not, that is the same method as `m`. */
 private required_matching(c: *Checker, id: usize, self_type: &Type, m: usize, depth: usize) -> Option[usize]
@@ -6047,6 +6052,15 @@ private decide_meeting(c: *Checker, pattern: &Type, given: &Type, covariant: boo
                     for i in 0..<ps.len()
                         decide_meeting(c, ps[i], gs[i], covariant, decided)
             _ -> ()
+        // A constructor parameter of the method's, applied, is decided by the trait's applied
+        // where the trait's method writes one: `G[B]` against `G[B]` decides `G` as the trait's `G`.
+        Applied(h, ps) -> *given match
+            Applied(g, gs) ->
+                if ps.len() == gs.len()
+                    decide_meeting(c, h, g, covariant, decided)
+                    for i in 0..<ps.len()
+                        decide_meeting(c, ps[i], gs[i], covariant, decided)
+            _ -> ()
         _ -> ()
 
 /** The method among `candidates`, the methods of type `own`, that meets method `tm` of constructor
@@ -6286,10 +6300,14 @@ private build_table(c: *Checker, id: usize, conformed: Buf[Buf[usize]])
         // At the position of a trait the superclass already implements, the method is the
         // superclass's implementation: its `Self` is the superclass, the type that conforms, so an
         // override matches it rather than the trait's method seen with this class as `Self`.
+        // A constructor trait's conformance is the superclass's own and never this class's, so there
+        // the superclass's method is held even where it is abstract: the class overrides that method,
+        // and the trait's, whose `Self` is the superclass's constructor, is never seen from the class.
         var held = listed
         if i >= k.slots.len() && i < sup_table.len()
             if sup_table[i] is Some(sm)
-                if !is_abstract_method(c.symbols[sm]) && c.symbols[sm].decl.name == c.symbols[listed].decl.name then held = sm
+                val by_constructor = is_constructor_trait(c, c.symbols[listed].owner_class.unwrap())
+                if (by_constructor || !is_abstract_method(c.symbols[sm])) && c.symbols[sm].decl.name == c.symbols[listed].decl.name then held = sm
         val name = c.symbols[held].decl.name
         val key = method_key(c, self_type, held)
         if is_trait_field(c, held)
@@ -6700,8 +6718,10 @@ private check_override_results(c: *Checker, id: usize)
             // implementation, which was checked against the trait with the superclass as `Self`.
             var base = methods[j]
             if position < sup_table.len() && (!redeclaring || contains_id(sup_traits, t))
+                // A constructor trait's conformance is never the class's own, so there the
+                // superclass's method is the base even where it is abstract.
                 if sup_table[position] is Some(sm)
-                    if !is_abstract_method(c.symbols[sm]) && c.symbols[sm].decl.name == c.symbols[base].decl.name then base = sm
+                    if (is_constructor_trait(c, t) || !is_abstract_method(c.symbols[sm])) && c.symbols[sm].decl.name == c.symbols[base].decl.name then base = sm
             if m == base then continue
             if c.meetings.get(meeting_key(m, base)) is Some(_) then continue
             // A method made from a template is the template's, which is checked against the trait.
@@ -9904,10 +9924,15 @@ private self_constructor(c: *Checker, t: &Type, k: usize) -> Option[&Type]
     Some(Constructor(open_at(t, positions), positions.len()))
 
 /** The constructor a value of data type or class `t` is an application of, as constructor trait `k`
- * sees it, from the types alone: what an instance of `k`'s methods takes as `Self`. */
+ * sees it, from the types alone: what an instance of `k`'s methods takes as `Self`. A subclass with
+ * no conformance of its own is the nearest superclass that has one, whose table it inherits. */
 constructor_of_value(classes: Buf[ClassSymbol], data: Buf[DataSymbol], t: &Type, k: usize) -> Option[&Type]
-    val positions = holes_of_conformance(classes, data, t, k)?
-    Some(Constructor(open_at(t, positions), positions.len()))
+    if holes_of_conformance(classes, data, t, k) is Some(positions) then return Some(Constructor(open_at(t, positions), positions.len()))
+    if *t is Class(id, _, _)
+        if classes[id].superclass is Some(s)
+            if *s is Class(sid, _, _)
+                if ancestor_type(classes, data, t, sid) is Some(up) then return constructor_of_value(classes, data, up, k)
+    None
 
 /** Data type or class type `t` with its arguments at `positions` replaced by holes, the `j`th
  * position by hole `j`. */
