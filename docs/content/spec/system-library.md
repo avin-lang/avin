@@ -1086,12 +1086,39 @@ reference implementation's stream 54, seeded as the reference seeds it, so a see
 against the published algorithm: `Random(42).nextInt()` is its first published output, `0xa15c02b7`,
 which as an `int` is `-1587805513`. A `long` is two draws, the first the high half. A bound is reached without bias, by rejection rather
 than a remainder. **None of this is fit for secrets**: anyone who sees a few outputs can compute the
-rest, so a key, a token or a password is never taken from it.
+rest, so a key, a token or a password is never taken from it. Those come from `SecureRandom`.
+
+### `SecureRandom`
+
+```text
+import avin.random.SecureRandom
+
+main()
+  val session = SecureRandom.urlToken()
+  val key = SecureRandom.nextBytes(32)
+  println(SecureRandom.between(0, 10000))
+```
+
+**`SecureRandom` is random numbers fit for secrets.** Every draw is read from the operating system's
+cryptographic generator (`getentropy`, on macOS, Linux and the BSDs), so no number of outputs says
+anything about the next. It is an object, not a class: there is no seed, nothing to replay, and no
+state, so any thread may call it at once. Where the operating system gives no bytes, the draw traps,
+since nothing could stand in for them.
+
+| Function | Meaning |
+| --- | --- |
+| `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes, any count, past the system's 256-byte request limit included; a negative `n` traps. |
+| `hexToken(byteCount: int = 32) -> string` | `byteCount` random bytes as lower-case hexadecimal, two digits a byte: 64 characters by default. |
+| `urlToken(byteCount: int = 32) -> string` | `byteCount` random bytes as unpadded base64url, which a URL, a header, a cookie and a file name carry as it is: 43 characters by default. |
+| `nextInt()`, `nextLong()`, `nextInt(bound)`, `nextLong(bound)`, `between(min, max)` for `int` and `long`, `nextReal()`, `nextBoolean()`, `alphanumeric()`, `shuffle(xs)`, `choose(items)` | As `Random`'s, with the same bounds, the same traps and no bias. |
+
+32 bytes is 256 bits, beyond any guessing. `SecureRandom` has no `nextGaussian`, `chooseWeighted` or
+`setSeed`: no secret is drawn from those distributions, and there is no seed to set.
 
 ## `avin.crypto`
 
-Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two, and
-hexadecimal text for any digest.
+Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two,
+comparison of secrets in constant time, and hexadecimal text for any digest.
 
 ```text
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
@@ -1113,7 +1140,8 @@ or a cache, and is written as text only on request. Text is hashed as its UTF-8 
 | `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
 | `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
 | `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
-| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte. |
+| `constantTimeEquals(a, b) -> bool` | Whether `a` and `b`, both `Vector[byte]` or both `string` (compared as UTF-8 bytes), are the same, taking as long wherever they first differ. Different lengths answer `false` at once. |
+| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte: [`avin.encoding`](#avinencoding)'s, which this module offers too. |
 
 **A hasher takes its input in pieces**, for data too large to hold whole, such as a file read in
 chunks. `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
@@ -1124,10 +1152,67 @@ one-shot digest. A hasher belongs to the thread that made it, as a handle does.
 **`sha1` and `md5` are for formats that already use them**: a checksum in a listing, a cache key
 nobody attacks. Two different inputs with the same digest can be made for both, so neither signs,
 authenticates or names untrusted content; use `sha256` or `sha512` for those. HMAC does not rest on
-collision resistance, but only the SHA-2 variants are offered. Comparing a received tag with a
-computed one is a comparison of two `Vector[byte]`, which is not constant-time.
+collision resistance, but only the SHA-2 variants are offered.
 
-The digests are bound to Sysl's `sysl.crypto`, so they are the same code Sysl programs use.
+**A secret someone sent is compared with `constantTimeEquals`, never with `==`.** `==` stops at the
+first byte that differs, so how long a rejection takes tells a patient attacker how much of a guessed
+MAC tag, bearer token or password digest was right, and lets the guess be built a byte at a time.
+`constantTimeEquals` reads every byte and decides once, at the end. A length is not the secret, so
+different lengths answer at once. For two digests of public data, `==` is fine.
+
+```text
+val expected = hmacSha256(key, body)
+val ok = fromBase64(header) match
+  Ok(sent) -> constantTimeEquals(sent, expected)
+  Err(_) -> false
+```
+
+The digests and the comparison are bound to Sysl's `sysl.crypto`, so they are the same code Sysl
+programs use.
+
+## `avin.encoding`
+
+Bytes written as text and read back, as RFC 4648 defines them: hexadecimal, base64 with its `=`
+padding, and base64url, the URL- and filename-safe alphabet written without padding.
+
+```text
+import avin.encoding.{toBase64, fromBase64, toBase64Url, fromHex}
+
+main()
+  println(toBase64("hello"))
+  println(toBase64Url("hello"))
+  println(fromBase64("aGVsbG8="))
+  println(fromHex("68656c6c6f"))
+```
+
+| Function | Meaning |
+| --- | --- |
+| `toHex(x) -> string` | `x`, a `Vector[byte]` or the UTF-8 bytes of a `string`, as lower-case hexadecimal, two digits a byte. |
+| `fromHex(text) -> Result[Vector[byte], DecodeError]` | The bytes the digits spell, two a byte, upper or lower case. |
+| `toBase64(x) -> string` | `x` in base64: `A`–`Z`, `a`–`z`, `0`–`9`, `+` and `/`, padded with `=` to a multiple of four characters. |
+| `fromBase64(text) -> Result[Vector[byte], DecodeError]` | The bytes padded, standard base64 spells. |
+| `toBase64Url(x) -> string` | `x` in base64url: `-` and `_` in place of `+` and `/`, and no padding. |
+| `fromBase64Url(text) -> Result[Vector[byte], DecodeError]` | The bytes unpadded base64url spells. |
+
+Encoding never fails, and the empty input encodes as the empty text and decodes back from it.
+
+**Decoding is strict, so each byte sequence has exactly one spelling.** A decoder refuses whitespace
+and line breaks, the other alphabet's characters, a missing, extra or misplaced `=`, any `=` in
+base64url, and a last digit with bits set below the last whole byte, which an encoder always leaves
+zero (`Zh==` is refused; `Zg==` is `f`). Two different texts therefore never decode to the same
+bytes, which matters for a token or a signature carried as text. Text wrapped across lines has its
+line breaks taken out before it is decoded.
+
+**A refusal is a `DecodeError`**, an `Error` whose `at` is a byte offset in the text. The checks run
+in order, the characters first, then the padding, the length and the unused bits, so the offset
+named is of the first thing wrong.
+
+| Case | Meaning |
+| --- | --- |
+| `BadCharacter(at)` | A character the encoding does not use. |
+| `BadPadding(at)` | An `=` where padding cannot stand: before the last two characters, followed by a character that is not `=`, more than two of them, or any in base64url. |
+| `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one. `at` is the text's length. |
+| `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
 
 ## `avin.net`
 

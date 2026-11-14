@@ -1,0 +1,171 @@
+module avin.encoding
+
+// Bytes written as text and text read back as bytes, as RFC 4648 defines them: hexadecimal, base64
+// with its `=` padding, and base64url, the URL- and filename-safe alphabet written without padding.
+//
+//     println(toBase64("hello"))
+//     println(fromBase64("aGVsbG8="))
+//
+// Text is encoded as its UTF-8 bytes. Encoding never fails. Decoding answers the bytes, or a
+// `DecodeError` naming the byte offset in the text of what is wrong, and it is strict: whitespace,
+// line breaks, the other alphabet's characters, a missing or misplaced `=`, and a last character
+// with bits set that no bytes would set are all refused. So each byte sequence has exactly one
+// encoding, and two different texts never decode to the same bytes.
+
+// Why text is not the encoding of any bytes. `at` is a byte offset in the text.
+data DecodeError
+  // A character the encoding does not use, at `at`: a space, a line break, a character of the other
+  // base64 alphabet, or one beyond ASCII.
+  BadCharacter(at: int)
+  // An `=` where padding cannot stand, at `at`: before the last two characters, followed by a
+  // character that is not `=`, or anywhere in base64url, which is written without it.
+  BadPadding(at: int)
+  // The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a
+  // multiple of four, or base64url one character past a multiple of four. `at` is the text's length,
+  // where the missing characters would begin.
+  Truncated(at: int)
+  // The last character of the data, at `at`, sets bits below the last whole byte, which an encoder
+  // always leaves zero.
+  UnusedBits(at: int)
+
+impl Error for DecodeError
+  // A sentence saying what is wrong and where, for a message to a person.
+  message -> string = self match
+    BadCharacter(at) -> s"not a character of the encoding at index $at"
+    BadPadding(at) -> s"padding not allowed at index $at"
+    Truncated(at) -> s"the text ends inside a unit at index $at"
+    UnusedBits(at) -> s"unused bits set at index $at"
+
+// The lower-case hexadecimal digit of `n`, from 0 to 15, as its code.
+private hexDigit(n: int) -> byte
+hexDigit(n < 10) = byte(int('0') + n)
+hexDigit(n) = byte(int('a') + n - 10)
+
+// The value of the hexadecimal digit whose code is `c`, either case, or -1 for any other character.
+private hexValue(c: int) -> int
+hexValue(c)
+  | int('0') <= c <= int('9') = c - int('0')
+  | int('a') <= c <= int('f') = c - int('a') + 10
+  | int('A') <= c <= int('F') = c - int('A') + 10
+  | _ = -1
+
+// ASCII codes as a string. Every byte an encoder writes is ASCII, so they are always UTF-8.
+private ascii(codes: Array[byte]) -> string = string.fromUtf8Lossy(codes)
+
+// `bytes` as lower-case hexadecimal text, two digits for each byte.
+toHex(bytes: Vector[byte]) -> string = hexOf(bytes.toArray())
+
+// The UTF-8 bytes of `text` as lower-case hexadecimal text.
+toHex(text: string) -> string = hexOf(text.utf8)
+
+private hexOf(bytes: Array[byte]) -> string
+  val out = Array.fill(bytes.length * 2, byte(0))
+  for i in 0 ..< bytes.length
+    val v = int(bytes(i))
+    out(2 * i) = hexDigit(v >> 4)
+    out(2 * i + 1) = hexDigit(v & 15)
+  ascii(out)
+
+// The bytes hexadecimal `text` spells, two digits a byte, upper or lower case; an empty text is no
+// bytes.
+fromHex(text: string) -> Result[Vector[byte], DecodeError]
+  val codes = text.utf8
+  val n = codes.length
+  for i in 0 ..< n
+    if hexValue(int(codes(i))) < 0 then return Err(BadCharacter(i))
+  if n % 2 != 0 then return Err(Truncated(n))
+  Ok(Vector.tabulate(n / 2, i -> byte(hexValue(int(codes(2 * i))) * 16 + hexValue(int(codes(2 * i + 1))))))
+
+// The code of the base64 digit of the six-bit value `v`, in the standard alphabet or, for `url`, the
+// URL-safe one; they differ only in the last two.
+private digit(v: int, url: bool) -> byte
+digit(v < 26, _) = byte(int('A') + v)
+digit(v < 52, _) = byte(int('a') + v - 26)
+digit(v < 62, _) = byte(int('0') + v - 52)
+digit(62, url) = byte(int(if url then '-' else '+'))
+digit(_, url) = byte(int(if url then '_' else '/'))
+
+// The six-bit value of the base64 digit whose code is `c`, in the standard alphabet or, for `url`,
+// the URL-safe one; -1 for a character the alphabet does not have.
+private sextet(c: int, url: bool) -> int
+sextet(c, url)
+  | int('A') <= c <= int('Z') = c - int('A')
+  | int('a') <= c <= int('z') = c - int('a') + 26
+  | int('0') <= c <= int('9') = c - int('0') + 52
+  | c == int(if url then '-' else '+') = 62
+  | c == int(if url then '_' else '/') = 63
+  | _ = -1
+
+// `bytes` in base64: each three bytes four digits, and a last one or two bytes two or three digits,
+// padded with `=` to four unless `url`.
+private encode64(bytes: Array[byte], url: bool) -> string
+  val n = bytes.length
+  val rest = n % 3
+  val tail = if rest == 0 then 0 else if url then rest + 1 else 4
+  val out = Array.fill(n / 3 * 4 + tail, byte(int('=')))
+  var i = 0
+  var o = 0
+  while i + 3 <= n
+    val v = (int(bytes(i)) << 16) | (int(bytes(i + 1)) << 8) | int(bytes(i + 2))
+    out(o) = digit(v >> 18, url)
+    out(o + 1) = digit((v >> 12) & 63, url)
+    out(o + 2) = digit((v >> 6) & 63, url)
+    out(o + 3) = digit(v & 63, url)
+    i += 3
+    o += 4
+  if rest > 0
+    val v = (int(bytes(i)) << 16) | (if rest == 2 then int(bytes(i + 1)) << 8 else 0)
+    out(o) = digit(v >> 18, url)
+    out(o + 1) = digit((v >> 12) & 63, url)
+    if rest == 2 then out(o + 2) = digit((v >> 6) & 63, url)
+  ascii(out)
+
+// The bytes base64 `codes` spell: the standard alphabet with its padding, or for `url` the URL-safe
+// one with none. The characters are checked first, in order, then the padding, then the length, then
+// the last digit's unused bits.
+private decode64(codes: Array[byte], url: bool) -> Result[Vector[byte], DecodeError]
+  val n = codes.length
+  var end = n
+  for i in 0 ..< n
+    val c = int(codes(i))
+    if c == int('=')
+      if url then return Err(BadPadding(i))
+      if end == n then end = i
+    elif sextet(c, url) < 0 then return Err(BadCharacter(i))
+    elif end < n then return Err(BadPadding(end))
+  if n - end > 2 then return Err(BadPadding(end))
+  if !url && n % 4 != 0 then return Err(Truncated(n))
+  if end % 4 == 1 then return Err(Truncated(n))
+  val out = Array.fill(end / 4 * 3 + end % 4 * 3 / 4, byte(0))
+  var acc = 0
+  var bits = 0
+  var w = 0
+  for i in 0 ..< end
+    acc = ((acc << 6) | sextet(int(codes(i)), url)) & 0xFFFF
+    bits += 6
+    if bits >= 8
+      bits -= 8
+      out(w) = byte((acc >> bits) & 255)
+      w += 1
+  if (acc & ((1 << bits) - 1)) != 0 then return Err(UnusedBits(end - 1))
+  Ok(out.toVector)
+
+// `bytes` in base64 with the standard alphabet (`A`–`Z`, `a`–`z`, `0`–`9`, `+`, `/`), padded with `=`
+// to a multiple of four characters.
+toBase64(bytes: Vector[byte]) -> string = encode64(bytes.toArray(), false)
+
+// The UTF-8 bytes of `text` in base64.
+toBase64(text: string) -> string = encode64(text.utf8, false)
+
+// The bytes padded, standard base64 `text` spells; an empty text is no bytes.
+fromBase64(text: string) -> Result[Vector[byte], DecodeError] = decode64(text.utf8, false)
+
+// `bytes` in base64url: the URL- and filename-safe alphabet (`-` and `_` in place of `+` and `/`),
+// with no padding.
+toBase64Url(bytes: Vector[byte]) -> string = encode64(bytes.toArray(), true)
+
+// The UTF-8 bytes of `text` in base64url.
+toBase64Url(text: string) -> string = encode64(text.utf8, true)
+
+// The bytes unpadded base64url `text` spells; an empty text is no bytes.
+fromBase64Url(text: string) -> Result[Vector[byte], DecodeError] = decode64(text.utf8, true)
