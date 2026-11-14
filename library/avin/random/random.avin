@@ -2,8 +2,11 @@ module avin.random
 
 // Pseudo-random numbers from PCG32 (PCG-XSH-RR: 64 bits of state, 32 bits of output). A generator made
 // with a seed gives the same numbers on every platform and in every release; one made without is
-// seeded by the platform. None of it is fit for secrets: a few outputs give away the rest.
+// seeded by the platform. None of it is fit for secrets: a few outputs give away the rest. A key, a
+// token, a salt or a nonce comes from `SecureRandom`, which reads the operating system's
+// cryptographic generator for every draw.
 
+import avin.encoding.{toBase64Url, toHex}
 import avin.math.{log, sqrt}
 import avin.threads.Mutex
 
@@ -174,12 +177,15 @@ class Random(seed: long)
 
 // The positions Fisher-Yates takes from `rng` to shuffle `n` elements: for each position from the
 // last down to the second, one at or before it.
-private fisherYatesDraws(rng: Random, n: int) -> Vector[int]
+private fisherYatesDraws(rng: Random, n: int) -> Vector[int] = fisherYatesDraws(bound -> rng.nextInt(bound), n)
+
+// The same positions, each drawn by `below`, which gives a number from 0 up to its bound.
+private fisherYatesDraws(below: (int) -> int, n: int) -> Vector[int]
   val b = Vector.newBuilder[int]()
   var i = n
   while i > 1
     i -= 1
-    b.addOne(rng.nextInt(i + 1))
+    b.addOne(below(i + 1))
   b.result()
 
 // The elements of `a` in the order `draws`, from `fisherYatesDraws`, puts them: each position from
@@ -292,3 +298,93 @@ object Random
   // Starts the shared generator again as `Random(seed)` would, so the companion's numbers replay.
   setSeed(seed: long)
     shared.with(g -> g.setSeed(seed))
+
+// `into` filled from the operating system's cryptographic generator, or `false` where it gave none.
+@sysl("sysl.posix.rand.entropy_from_os")
+private osEntropy(into: Array[byte]) -> bool
+
+// `n` bytes from the operating system's cryptographic generator. A refusal traps: nothing could stand
+// in for them.
+private entropy(n: int) -> Array[byte]
+  val out = Array.fill(n, byte(0))
+  if !osEntropy(out) then fail("SecureRandom: the operating system gave no random bytes")
+  out
+
+// The first `count` bytes of `b` as one number, the first the highest.
+private joined(b: Array[byte], count: int) -> long
+  var v: long = 0
+  for i in 0 ..< count do v = (v << 8) | long(int(b(i)))
+  v
+
+// Random numbers fit for secrets: every draw is read from the operating system's cryptographic
+// generator (`getentropy`), so no number of outputs tells anything about the next. It has no seed and
+// nothing to replay, and is safe to call from any thread. The methods are `Random`'s, drawing alike,
+// with tokens beside them.
+//
+//     val session = SecureRandom.urlToken()
+//     val pin = SecureRandom.between(0, 10000)
+object SecureRandom
+  // A new array of `n` bytes; a negative `n` traps.
+  nextBytes(n: int) -> Array[byte]
+    if n < 0 then fail(s"SecureRandom.nextBytes: count must not be negative, was ${n}")
+    entropy(n)
+
+  // `byteCount` random bytes, 32 unless asked, as lower-case hexadecimal text, two digits a byte.
+  hexToken(byteCount: int = 32) -> string = toHex(nextBytes(byteCount).toVector)
+
+  // `byteCount` random bytes, 32 unless asked, as base64url text, which a URL, a header, a cookie and
+  // a file name all carry as it is.
+  urlToken(byteCount: int = 32) -> string = toBase64Url(nextBytes(byteCount).toVector)
+
+  // Any `int`, each equally likely.
+  nextInt() -> int = int.wrap(joined(entropy(4), 4))
+
+  // Any `long`, each equally likely.
+  nextLong() -> long = joined(entropy(8), 8)
+
+  // From `0` up to `bound`, not including it, each equally likely; a bound that is not positive traps.
+  nextInt(bound: int) -> int
+    if bound <= 0 then fail(s"SecureRandom.nextInt: bound must be positive, was ${bound}")
+    int(below(i128(bound)))
+
+  // From `0` up to `bound`, not including it, each equally likely; a bound that is not positive traps.
+  nextLong(bound: long) -> long
+    if bound <= 0 then fail(s"SecureRandom.nextLong: bound must be positive, was ${bound}")
+    long(below(i128(bound)))
+
+  // From `0` up to `n`, not including it, for `n` from 1 to 2^64: a 64-bit draw, the draws below
+  // `2^64 % n` rejected so that every value is equally likely.
+  private below(n: i128) -> i128
+    val threshold = TwoTo64 % n
+    var r = i128(nextLong()) & (TwoTo64 - 1)
+    while r < threshold do r = i128(nextLong()) & (TwoTo64 - 1)
+    r % n
+
+  // From `min` up to `max`, not including it, each equally likely; `min >= max` traps.
+  between(min: int, max: int) -> int
+    if min >= max then fail(s"SecureRandom.between: min must be less than max, was ${min} and ${max}")
+    int(i128(min) + below(i128(max) - i128(min)))
+
+  // From `min` up to `max`, not including it, each equally likely; `min >= max` traps.
+  between(min: long, max: long) -> long
+    if min >= max then fail(s"SecureRandom.between: min must be less than max, was ${min} and ${max}")
+    long(i128(min) + below(i128(max) - i128(min)))
+
+  // From `0.0` up to `1.0`, not including it, every multiple of 2^-53 equally likely.
+  nextReal() -> real = real(shiftRight(nextLong(), 11)) / 9007199254740992.0
+
+  // `true` or `false`, equally likely.
+  nextBoolean() -> bool = nextInt() < 0
+
+  // An endless run of characters from `A`–`Z`, `a`–`z` and `0`–`9`, equally likely.
+  alphanumeric() -> Iterator[char] = Alphanumeric(() -> nextInt(62))
+
+  // The elements in a new order, every order equally likely.
+  shuffle[T](xs: Iterable[T]) -> Vector[T]
+    val a = xs.toArray()
+    swapped(a, fisherYatesDraws(bound -> nextInt(bound), a.length))
+
+  // One of the items, each equally likely; an empty sequence traps.
+  choose[T](items: Seq[T]) -> T
+    if items.isEmpty then fail("SecureRandom.choose: no items to choose from")
+    items(nextInt(items.length))
