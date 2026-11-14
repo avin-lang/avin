@@ -1092,7 +1092,8 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   `Pair[int, string].zero()`) or a type parameter whose bounds have it (`T.zero()` with `T: Add`).
   Through a bound each instance calls its type argument's own directly, an open class's included,
   since no object is involved. Calling one on a value is an error, and so is calling a value's method
-  on a type. A local, a parameter, a member or a module value of the name hides the type. A
+  on a type. A local, a parameter, a member or a module value of the name hides the type; a built-in
+  type's name [names no value](/spec/operators-and-control-flow/#match), so its type is never hidden. A
   companion object does not: `BigInt.zero()` calls the type's static member beside
   `object BigInt`'s `apply`, unless the companion declares a member of that name itself, which
   `Name.member` then means.
