@@ -8877,7 +8877,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and a plain variant's pattern needs coverage over the possible variants, which is step 4's; the
   derived code is the plan's "derived per instance", and needs only what lowering knows at a copy.
   Alternatives weighed: accepting patterns on plain variants now (coverage would demand arms for
-  impossible variants that step 4 then makes errors).
+  impossible variants that step 4 then makes errors). **Step 3 (branch `gadt-3`) lifted the first
+  two**; a pattern on a variant with hidden parameters is refused in their place (the `gadt-3` entry
+  below).
 - Proposed (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
   its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
   is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
@@ -8928,6 +8930,68 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
   X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
   among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
+- Proposed (branch `gadt-3`, the refinement step): **each pattern on a refined variant gives the
+  variant's parameters fresh types of its own**, so two `Pair` patterns, nested or one after the
+  other, give two unrelated sets, and **the equalities are solved with those fresh types first, then
+  the enclosing code's type parameters**: `Vector[A] = Vector[T]` makes `A` the `T` around the arm,
+  so a field reads as a type the code can name, and `T = (A, B)` keeps `T` as the pair of the fresh
+  types. A union or a type constructor that names a type parameter is not taken apart and teaches
+  nothing (`T | string = int | string` has two solutions); any other two different types, and a
+  cyclic `T = Vector[T]`, are a contradiction, and **until step 4 makes such an arm an error, a
+  contradictory arm is checked with no equalities** (sound: it knows less), and is not compiled at
+  any copy. The equalities hold where a marker local the pattern declares beside its names is in
+  scope, which carries them exactly where the names go: an arm, a clause, an `is` test's branch,
+  the right operand of `&&` and `||`, the rest of a block after an early return or a binding. At a
+  copy where a pattern is impossible, lowering leaves out what holds its equalities: the arm, the
+  branch an `is` test then cannot take, the right operand of `&&` and `||`, a `while` body, and the
+  rest of a block whose taken branch never finishes. Why: the chapter's "fresh types known only by
+  these equalities", and a substitution the arm's code can read. Alternatives weighed: naming the
+  fresh types by the data type's own parameters (two nested patterns would share them); stopping
+  with an error at an equality not taken apart (refuses sound programs).
+- Proposed (branch `gadt-3`): **a variant's own parameter that the equalities leave a fresh type
+  never leaves its arm**, as a hidden one does not (the chapter states it for hidden parameters
+  only): with no type expected, an arm, a clause, an `is` branch or a block whose result names one is
+  refused with ``"this arm's result is an `Expr[A]`, and `A` is a type `Pair` takes from the value it
+  matches, which is not known outside its arm"``, and an inference variable made before the pattern
+  settled to one with ``"a type declared outside this arm cannot be settled to an `Expr[A]`: …"``,
+  reported at the pattern. Why: such a type is known only through the value matched, so no copy can
+  compile code outside the arm that names it. Alternatives weighed: settling the escaped type as
+  `Nothing` (lays out a value at the wrong type); allowing it (no copy could compile it).
+- Proposed (branch `gadt-3`): **inside an arm a value of a type an equality fixes is used at what
+  it is there** for operators, members and comparisons (`x + n` with `x: T` and `T = int` is an
+  `int`), the type expected of an expression is the one under the equalities (a literal where a `T`
+  that is an `int` is expected is an `int`, a value where a `T` that is `Any` is expected is boxed),
+  while **an inference variable still settles to the type as written** where it meets one. An arm
+  that refines, with a type expected, is checked against it under its equalities and **yields the
+  expected type itself**; one that does not fit it is refused with ``"this arm yields int, not the T
+  expected of the `match`"``. Clauses with no declared result that agree on no type are reported as
+  the chapter reports arms: ``"the clauses of `f` agree on no type: `IntLit`'s yields an `int`, which
+  is `T` only inside that clause; declare the result type"``. Why: the chapter's "a type and
+  anything it equals are one type" and its "as written" rule for inference variables, each where it
+  can apply. Alternatives weighed: rewriting every type in the arm to its refined form (would settle
+  variables outside the arm to refined types, against the chapter).
+- Proposed (branch `gadt-3`): **`val V = x`, where `V` is a variant of `x`'s type and that type has
+  refined variants, takes the value apart** as the chapter's `val Refl = proof` does; anywhere else
+  `val Name = x` binds a name, as before. **Review with the user**: whether `val V = x` should take
+  apart a value whenever `V` is a variant in scope, as a bare name in a pattern does. Why: the
+  chapter's example, with no change for any program written before refined variants. Alternatives
+  weighed: requiring `val V() = x` (not the chapter's spelling); the general rule (changes what
+  existing bindings mean).
+- Proposed (branch `gadt-3`): **a field of a refined type's one variant is read by name where the
+  instance says the field's type**: `o.value` on `One[T]` with `Mk(value: int) -> One[int]` is an
+  `int`; an instance the variant cannot make is refused with ``"`One[bool]` has no values: no
+  variant of `One` makes one"``, and a field whose type keeps a parameter the instance does not say
+  with ``"the field `items` of `Hold` has a type a `Holder[T]` does not determine; take the value
+  apart with `match`"``. Why: every value of the instance is the variant's, so the read is the arm
+  of a one-arm `match`, and only its result type must be one known outside. Alternatives weighed:
+  refusing every such read (the chapter's single-variant types would lose field access).
+- Proposed (branch `gadt-3`): **until step 5, a pattern on a variant with hidden parameters is
+  refused** (``"`First` hides `B`, named by its fields and not by its result: a pattern cannot take
+  apart a value of a variant with hidden type parameters yet"``), as a value of one is; **a pattern
+  on a variant bounding its own parameters is accepted, its arm without those bounds until step 6**.
+  Why: an arm on a hidden parameter is compiled per pack, which step 5 builds; no value of either
+  kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
+  arms would never be compiled, and a program would meet step 5's rules later as a change).
 
 - Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).

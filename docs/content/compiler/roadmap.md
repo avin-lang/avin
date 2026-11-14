@@ -236,7 +236,7 @@ carry the chapter's exact messages, at most five per file.
 ### Refined variants: build plan
 
 [Refined variants](/spec/refined-variants/) are designed, their choices proposed in
-[decisions](/spec/decisions/#proposed); steps 1 and 2 are built, steps 3 to 7 are still to come. Each step is one item, gated on its own
+[decisions](/spec/decisions/#proposed); steps 1 to 3 are built, steps 4 to 7 are still to come. Each step is one item, gated on its own
 targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
 `-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
 messages, at most five per file. A step that meets a missing piece of the checker it builds on
@@ -289,7 +289,27 @@ reports it rather than routing around it.
    in a class field, a closure capturing one, a `Map` keyed by one; reject: a variant at the wrong
    expected instance, a field of the wrong instance, a shared variant name decided by a refined
    result.
-3. **Refinement.** In `check.sysl`, a scoped substitution of the type parameters in scope, pushed
+3. **Refinement.** *Done (branch `gadt-3`):* step 2's two step-3 refusals are gone. Each refining
+   pattern is a site (`Checker.sites`, `TProgram.refine_sites`) whose fresh types have the owner
+   `pattern_owner(site)`; `refine_variant` solves the equalities (`solve_pair`: fresh types first, an
+   occurs check, unions and constructors naming parameters taken apart not at all, a contradiction
+   giving none) and declares a marker local beside the pattern's names, so `BodyState.equalities`
+   hold exactly where those names are in scope. `refined_type` applies them in `fits`, `unify`,
+   `joined`, bounds, the expected type of `check_value`, patterns on a type parameter, and operands
+   of operators and members (`refined_operand`); a refining arm, clause, `is` branch and block yield
+   the expected type (`held_to_expected`), and a fresh type leaving its scope is refused
+   (`escape_checked`, `settle_var`). `val V = x` takes the value apart where `V` is a variant of a
+   refined type; a field of a refined one-variant type is read at what the instance says. In
+   `lower.sysl`, `refine_pattern` reads each site's arguments back; `is`, `&&`, `||`, `!`, `if` and
+   `while` fold a test impossible at the copy and leave out what holds its equalities, a block's
+   rest included (`Lowering.dead`); a lambda or local function written in a site's scope is compiled
+   at what its sites read (`TProgram.refined_functions`); a field read of an instance with no values
+   traps. Still refused, for the steps that own them: a pattern on, and a value of, a variant with a
+   hidden parameter (step 5); a value of a variant bounding its own parameter (step 6). *Tests:* run
+   `refined_eval`, `refined_scopes`, `refined_closures`, `refined_impossible`, the cross-module
+   program; reject `refined_arm_results`, `refined_escapes`, `refined_contradictions`,
+   `refined_attacks`, `refined_later_steps`, `refined_later_steps_reads`. The plan as written: in
+   `check.sysl`, a scoped substitution of the type parameters in scope, pushed
    by each arm, clause, `is` scope and destructuring binding whose pattern holds a refined variant
    (solved by decomposition with an occurs check), consulted wherever two types are compared or a
    member is found; arm results checked against the expected type under it; inference variables

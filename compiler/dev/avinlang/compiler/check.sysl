@@ -375,8 +375,31 @@ struct BodyState
     /** Above zero while an expression is checked only to report its own errors, after the form
      * around it already failed: a value it drops is not reported as discarded (`check_ignored`). */
     quiet_discards: usize
+    /** The local type equalities refining patterns have given, each held where its pattern's
+     * marker local is in scope. */
+    equalities: Buf[Equality]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0)
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf())
+
+/** A local type equality: type parameter `index` of `owner` is `ty` wherever local `marker`, which a
+ * refining pattern declares beside the names it binds, is in scope. */
+struct Equality
+    marker: usize
+    owner: usize
+    index: usize
+    ty: &Type
+
+/** A pattern on a refined variant: where it is, the variant, the static type of the value it
+ * matches, the marker local its equalities hold beside, and how many inference variables there were
+ * before it, which are outside its scope. */
+struct CheckedSite
+    unit: usize
+    span: Span
+    data: usize
+    variant: usize
+    matched: &Type
+    marker: usize
+    vars_mark: usize
 
 /** A function passed to a binding's `@threaded` parameter `param` of `binding`. */
 struct ThreadedArgument
@@ -708,6 +731,10 @@ struct Checker
     /** What each method meeting a constructor trait's method is given by a call through the bound:
      * see `TProgram.meetings`. */
     meetings: Map[string, Buf[&Type]]
+    /** Every pattern on a refined variant outside derived code, by site: see `pattern_owner`. */
+    sites: Buf[CheckedSite]
+    /** The lambdas and local functions checked where refining patterns' equalities hold. */
+    refined_functions: Buf[RefinedFunction]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1118,7 +1145,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None, map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None, map(), buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1304,7 +1331,10 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     var opaques: Buf[string] = buf()
     for a in c.aliases
         opaques.push(qualified(a.module_name, a.decl.name))
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), c.meetings, opaques)), references, overrides, completions)
+    var sites: Buf[RefineSite] = buf()
+    for s in c.sites
+        sites.push(RefineSite(s.matched, s.variant))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), c.meetings, opaques, sites, c.refined_functions)), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -2885,15 +2915,23 @@ refined_data(d: &DataDecl) -> bool
         if refined_variant(d, v) then return true
     false
 
-// A variant pattern of a type with refined variants is taken apart only where the arm learns what
-// the variant fixes, which a `match` written in the program does not do yet: such a pattern is
-// refused. The code written for the type's derived `Display`, `Debug` and the other templates
-// matches its every variant at its own parameters, and each copy of it is compiled for the
-// variants possible at the copy's instance.
-private refined_match_refused(c: *Checker, unit: usize, at: Span, v: VariantRef) -> bool
-    if !refined_data(c.data[v.data].decl) || c.derived_context is Some(_) then return false
-    c.note(unit, at, s"`${c.data[v.data].variants[v.index].name}` is a variant of `${c.data[v.data].name}`, which has refined variants: a pattern cannot take one of its values apart yet")
+// A pattern on a variant with hidden type parameters is not taken apart yet: its arm is compiled
+// once per list of hidden types the program makes the variant with, and no value of one is made yet.
+// The code derived for the type matches its every variant at its own parameters, and each copy of
+// it is compiled for the variants possible at the copy's instance.
+private hidden_match_refused(c: *Checker, unit: usize, at: Span, v: VariantRef) -> bool
+    if c.derived_context is Some(_) then return false
+    val hidden = hidden_params(c, v)
+    if hidden.len() == 0 then return false
+    var names: Buf[string] = buf()
+    for h in hidden
+        names.push(s"`$h`")
+    c.note(unit, at, s"`${c.data[v.data].variants[v.index].name}` hides ${spoken_list(names)}, named by its fields and not by its result: a pattern cannot take apart a value of a variant with hidden type parameters yet")
     true
+
+/** Whether variant `index` of `d` is refined: it declares a result or parameters of its own. */
+private refines_type(d: DataSymbol, index: usize) -> bool =
+    d.variants[index].result is Some(_) || d.variants[index].params.len() > d.decl.type_params.len()
 
 /** The type parameters of variant `v` of data type `id`: the type's, then the variant's own, each of
  * which is checked: it takes no variance, it is no parameter of the type again, and it is declared
@@ -7684,7 +7722,7 @@ private conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.da
 
 /** Whether a value of type `t` conforms to `bound`, a trait or a class: a type parameter does through
  * its own bounds. */
-private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool = meets_bound(conformances(c), zonk(c, t), zonk(c, bound))
+private conforms_to_bound(c: *Checker, t: &Type, bound: &Type) -> bool = meets_bound(conformances(c), refined_type(c, t), refined_type(c, bound))
 
 /** Whether a value of type `x` conforms to `bound`, a trait or a class, where both are solved: a
  * type parameter through its bounds, a built-in type through its impls, and a class or data type
@@ -8447,7 +8485,7 @@ private pattern_binds(p: &TPattern, bound: *Buf[usize])
         PNamed(l, inner) ->
             bound.push(l)
             pattern_binds(inner, bound)
-        PVariant(_, fields) ->
+        PVariant(_, fields, _) ->
             for f in fields
                 pattern_binds(f, bound)
         PType(_, l, _) ->
@@ -12230,6 +12268,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     var pattern_errors = false
     var ty: &Type = Nothing
     var agreed = true
+    var refined_clauses: Buf[RefinedArm] = buf()
     for clause in decl.clauses
         if clause.patterns.len() != params.len()
             c.note(unit, clause.span, s"`${decl.name}` takes ${count(params.len(), "argument")}, but this clause matches ${clause.patterns.len()}")
@@ -12253,21 +12292,34 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
                 val t = check_expr(c, g, Some(Bool))
                 expect_bool(c, t)
                 guard = Some(t)
-            val body = check_expr(c, b.body, symbol.result)
+            var body = check_expr(c, b.body, symbol.result)
             symbol.result match
                 Some(declared) ->
                     if !fits(c,body.ty, declared) && !(*declared is Unit)
                         c.note(unit, b.body.span, s"${described(c, symbol)} yields ${type_name(body.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, body.ty)}")
+                    // A clause whose patterns refine yields the declared type, which its body was
+                    // checked against under the equalities.
+                    body = held_to_expected(c, body, symbol.result, mark)
                 None ->
+                    if holds_equalities_from(c, mark)
+                        refined_clauses.push(RefinedArm(typed.len(), first_clause_variant(c, patterns), body.ty, active_equalities(c)))
                     if agreed
                         join(c, ty, body.ty) match
                             Some(t) -> ty = t
                             None ->
-                                c.note(unit, b.body.span, s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
+                                val written = s"this clause yields ${type_name(body.ty)}, but the clauses before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}"
+                                c.note(unit, b.body.span, disagreement(c, refined_clauses, typed.len(), body.ty, ty, s"clauses of `${decl.name}`", "clause").unwrap_or(written))
                                 agreed = false
             bodies.push(TGuarded(guard, body))
         c.body.visible.truncate(mark)
         c.body.block_start = outer_start
+        // With no result declared, a clause's type must be one known outside it.
+        if symbol.result is None
+            for j in 0..<bodies.len()
+                val held = escape_checked(c, bodies[j].body, "this clause's result")
+                if *held.ty is ErrorType && !(*bodies[j].body.ty is ErrorType)
+                    agreed = false
+                    bodies[j] = TGuarded(bodies[j].guard, held)
         typed.push(TClause(patterns, bodies))
     if symbol.result is None then c.symbols[id].result = Some(if agreed then ty else ErrorType)
     var settled_params = true
@@ -12882,6 +12934,7 @@ private check_local_symbol(c: *Checker, id: usize)
     for i in 0..<symbol.params.len()
         param_locals.push(declare_local(c, decl.span, symbol.param_names[i], symbol.params[i], false))
     c.symbols[id].param_locals = param_locals
+    note_refined_function(c, id)
     var subjects: Buf[&TExpr] = buf()
     for i in 0..<param_locals.len()
         subjects.push(TExpr(decl.name_span, symbol.params[i], Local(param_locals[i])))
@@ -12932,7 +12985,14 @@ private check_ignored(c: *Checker, e: &Expr) -> &TExpr
 // A value expected as `Any` converts to it where it is written. Only the forms that yield one of
 // their parts (a block, `if`, `match`, a loop) pass `Any` on to those parts, so each converts its
 // own; for any other the expected `Any` says nothing about how to check it.
-private check_value(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
+private check_value(c: *Checker, e: &Expr, wanted: Option[&Type], used: bool) -> &TExpr
+    // Under the equalities in scope the expected type is what it is there: a literal where a `T` that
+    // is an `int` is expected is an `int`.
+    var expected = wanted
+    if c.body.equalities.len() > 0
+        if wanted is Some(w)
+            val now = refined_type(c, w)
+            if !same_type(now, zonk(c, w)) then expected = Some(now)
     val want = expected match
         Some(w) -> w
         None -> return check_form(c, e, None, used)
@@ -14153,8 +14213,10 @@ private member_expr(c: *Checker, e: &Expr, target: &Expr, name: string, expected
     c.shown.pop()
     read
 
-private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
+private member_of(c: *Checker, e: &Expr, given: &TExpr, name: string, expected: Option[&Type]) -> &TExpr
     val unit = unit_of(c)
+    // A member is found on the type the value is under the equalities in scope.
+    val value = refined_operand(c, given)
     val ty = zonk(c, value.ty)
     // A member of a union is read through the members' join or a trait the union conforms to, as
     // for a call.
@@ -14192,11 +14254,7 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
                 val names = d.variants[0].field_names
                 for i in 0..<names.len()
                     if names[i] == name
-                        // A refined variant's field is read only where the instance is known to be
-                        // one the variant makes, as an arm on it knows.
-                        if refined_data(d.decl)
-                            c.note(unit, e.span, s"`${type_name(ty)}` has refined variants: a field of one is not read by name yet")
-                            return TExpr(e.span, ErrorType, UnitConst)
+                        if refines_type(d, 0) && c.derived_context is None then return refined_field(c, e, value, id, i)
                         return TExpr(e.span, variant_fields(d, id, 0, args)[i], Field(value, i))
             c.note(unit, e.span, s"`${type_name(ty)}` has no field `$name`")
         Class(k, _, _) -> return class_member_value(c, e.span, value, k, name, expected)
@@ -14207,6 +14265,58 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
         Union(_) -> c.note(unit, e.span, union_no_member(ty, name))
         _ -> c.note(unit, e.span, s"${type_name(ty)} has no field `$name`${string_length_hint(ty, name)}${tuple_part_hint(ty, name)}")
     TExpr(e.span, ErrorType, UnitConst)
+
+// A field of a refined type's one variant, read by name: every value of the instance is the
+// variant's, so the field has its type at what the instance says the variant's parameters are. An
+// instance the variant cannot make has no values, and a field whose type names a parameter the
+// instance does not say is read only through a `match`, whose arm knows it.
+private refined_field(c: *Checker, e: &Expr, value: &TExpr, id: usize, index: usize) -> &TExpr
+    val unit = unit_of(c)
+    val d = c.data[id]
+    val variant = d.variants[0]
+    val owner = pattern_owner(c.sites.len())
+    var fresh: Buf[&Type] = buf()
+    for j in 0..<variant.params.len()
+        fresh.push(TypeVar(owner, j, variant.params[j].name))
+    var s = Solving(active_equalities(c), buf(), owner, false, false)
+    val ty = refined_type(c, value.ty)
+    if variant.result is Some(r)
+        if *substitute(r, data_owner(id), fresh) is Data(_, _, rs)
+            if *ty is Data(_, _, xs)
+                for i in 0..<xs.len()
+                    if i < rs.len() then solve_pair(c, &s, xs[i], rs[i])
+    for q in s.found
+        if q.owner != owner && has_unknowns(zonk(c, q.ty)) then s.unknown = true
+    if s.contradiction
+        c.note(unit, e.span, s"`${type_name(ty)}` has no values: no variant of `${d.name}` makes one")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if s.unknown
+        unknown_matched(c, unit, e.span, variant.name)
+        return TExpr(e.span, ErrorType, UnitConst)
+    var own: Buf[Equality] = buf()
+    for q in s.found
+        if q.owner == owner then own.push(q)
+    val field = apply_equalities(substitute(variant.fields[index], data_owner(id), fresh), own, own.len() + 1)
+    if names_type_var_of(field, owner)
+        c.note(unit, e.span, s"the field `${variant.field_names[index]}` of `${variant.name}` has a type ${type_article_quoted(ty)} does not determine; take the value apart with `match`")
+        return TExpr(e.span, ErrorType, UnitConst)
+    TExpr(e.span, field, Field(value, index))
+
+/** Whether `t` names a type parameter of `owner`. */
+private names_type_var_of(t: &Type, owner: usize) -> bool = *t match
+    TypeVar(o, _, _) -> o == owner
+    Tuple(items) -> any_type_var_of(items, owner)
+    Function(params, result, _) -> any_type_var_of(params, owner) || names_type_var_of(result, owner)
+    ByName(inner) -> names_type_var_of(inner, owner)
+    Data(_, _, args) -> any_type_var_of(args, owner)
+    Class(_, _, args) -> any_type_var_of(args, owner)
+    Union(members) -> any_type_var_of(members, owner)
+    _ -> false
+
+private any_type_var_of(items: Buf[&Type], owner: usize) -> bool
+    for item in items
+        if names_type_var_of(item, owner) then return true
+    false
 
 // What a tuple offers where a program asks it for `_1`, `_2` and so on: its parts are read by
 // position from 0, `.0`, `.1`, so `_n` names the part `.(n - 1)`; empty for any other member.
@@ -14523,11 +14633,18 @@ private block_expr(c: *Checker, e: &Expr, items: Buf[&Expr], discard: bool, expe
         report_clashes_with_functions(c, item.span, before, function_mark)
         if *t.ty is Nothing then finishes = false
         typed.push(t)
+    // A block whose bindings or `is` tests give equalities for the rest of it yields the type
+    // expected, which its last item was checked against under them; with none expected, its type
+    // must be one known outside it.
+    if typed.len() > 0 && !discard
+        typed[typed.len() - 1] = held_to_expected(c, typed[typed.len() - 1], expected, mark)
     c.body.visible.truncate(mark)
     c.body.functions.truncate(function_mark)
     c.body.function_starts.truncate(function_mark)
     c.body.function_marks.truncate(function_mark)
     c.body.block_start = outer_start
+    if typed.len() > 0 && !discard && used
+        typed[typed.len() - 1] = escape_checked(c, typed[typed.len() - 1], "this block's value")
     var ty: &Type = Unit
     if !finishes then ty = Nothing
     elif !discard && typed.len() > 0 then ty = typed[typed.len() - 1].ty
@@ -14546,9 +14663,11 @@ private branch(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &T
 private tested_branch(c: *Checker, e: &Expr, names: Buf[usize], expected: Option[&Type], used: bool) -> &TExpr
     val mark = c.body.visible.len()
     for x in names do c.body.visible.push(x)
-    val t = check_value(c, e, expected, used)
+    // A branch under an `is` test's equalities yields the type expected, which it was checked against
+    // under them; with none expected its type must be one known outside the branch.
+    val t = held_to_expected(c, check_value(c, e, expected, used), expected, mark)
     c.body.visible.truncate(mark)
-    t
+    if used then escape_checked(c, t, "this branch's value") else t
 
 private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&TypeExpr], value: &Expr, mutable: bool) -> &TExpr
     val unit = unit_of(c)
@@ -14559,9 +14678,21 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     if want is Some(w)
         if !fits(c,typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}${sendable_hint(c, w, typed.ty)}")
         ty = w
+    // `val Refl = proof`, naming a variant of the value's type with refined variants, takes the value
+    // apart, as a pattern does, and its equalities hold for the rest of the block.
+    if names_refined_variant(c, refined_type(c, ty), name)
+        return destructured(c, e, Pattern(e.span, Name(name)), ty, typed, mutable)
     val index = declare_local(c, e.span, name, ty, mutable)
     // A binding whose value never finishes does not finish either.
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** Whether `name` is a variant of `ty`, a data type with refined variants. */
+private names_refined_variant(c: *Checker, ty: &Type, name: string) -> bool
+    if *ty is Data(id, _, _)
+        if refined_data(c.data[id].decl)
+            for v in c.data[id].variants
+                if v.name == name then return true
+    false
 
 // A local `lazy val`: the local holds a cell, the core library's `LazyCell`, made where the value is
 // declared, whose initializer slot then takes the lambda computing the value. A read of the name is
@@ -15950,6 +16081,11 @@ private destructure_expr(c: *Checker, e: &Expr, pattern: &Pattern, declared: Opt
     if want is Some(w)
         if !fits(c,typed.ty, w) then c.note(unit, value.span, s"expected ${type_name(w)}, found ${type_name(typed.ty)}${sendable_hint(c, w, typed.ty)}")
         ty = w
+    destructured(c, e, pattern, ty, typed, mutable)
+
+// A binding's pattern, `pattern`, checked against its value, `typed`, of type `ty`.
+private destructured(c: *Checker, e: &Expr, pattern: &Pattern, ty: &Type, typed: &TExpr, mutable: bool) -> &TExpr
+    val unit = unit_of(c)
     val outer = c.binds_var
     c.binds_var = mutable
     val shape = check_pattern(c, pattern, ty, "")
@@ -16158,7 +16294,7 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
     if op is Negate && operand.kind is IntLit(spelling)
         return integer_literal(c, e.span, spelling, true, expected)
     if op is Negate && operand.kind is RealLit(value, spelling) then return real_literal(c, e.span, value, spelling, true, expected)
-    val x = check_expr(c, operand, expected)
+    val x = refined_operand(c, check_expr(c, operand, expected))
     // On a data type, a class or a type parameter with a method `-` taking no argument, `-a` calls it.
     if op is Negate && has_operator_traits(zonk(c, x.ty)) && settled(zonk(c, x.ty))
         val ms = methods_of(c, zonk(c, x.ty), "-")
@@ -16189,12 +16325,12 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
     val expected = operand_hint(c, wanted)
     // A real literal waits for the other operand too, unless that is a literal: `1 + 0.5` is a real.
     if (is_literal(left) && !is_literal(right)) || (is_real_literal(left) && !is_number_literal(right))
-        val r = check_expr(c, right, expected)
+        val r = refined_operand(c, check_expr(c, right, expected))
         val l = check_expr(c, left, Some(r.ty))
         // A literal that became a value of a type with a method of the operator's name calls it.
         if operator_method(c, op, l.ty) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, r), expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), l, r)
-    val l = check_expr(c, left, expected)
+    val l = refined_operand(c, check_expr(c, left, expected))
     if operator_method(c, op, l.ty)
         // An integer argument of a method on a type that takes integers is converted to that type,
         // as an operand of the core trait's operator is, unless an overload takes an integer itself.
@@ -16210,7 +16346,7 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
                 val arg = if integer_type(c, zonk(c, r.ty)) then from_integer(c, r, zonk(c, l.ty)) elif big_int_beside(c, r.ty, l.ty) then from_big_int(c, r, zonk(c, l.ty)) else r
                 return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, arg), expected)
         return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
-    operate(c, e.span, op_span, op, binary_spelling(op), l, check_expr(c, right, Some(l.ty)))
+    operate(c, e.span, op_span, op, binary_spelling(op), l, refined_operand(c, check_expr(c, right, Some(l.ty))))
 
 // Whether one of the methods `ms` takes an integer as its first argument.
 private takes_an_integer(c: *Checker, ms: Buf[usize]) -> bool
@@ -16506,7 +16642,7 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     // `a < b` alone, on a type with a method `<` taking one argument, calls it, whatever it yields.
     var first: Option[&TExpr] = None
     if ops.len() == 1 && ordering_op(ops[0]) && !is_literal(operands[0]) && !is_collection_literal(operands[0])
-        val l = check_expr(c, operands[0], None)
+        val l = refined_operand(c, check_expr(c, operands[0], None))
         if ordering_method(c, ops[0], l.ty) then return operator_method_call(c, e.span, e.span, operands[0], l, compare_spelling(ops[0]), operands[1], None)
         first = Some(l)
     // A number or collection literal takes its type from another operand: `xs == [1, 2]` builds the
@@ -16519,14 +16655,14 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     for o in operands
         if is_literal(o) || (plain && is_real_literal(o)) || is_collection_literal(o) || shared_variant_use(c, o) then early.push(None)
         else
-            val t = if early.len() == 0 && first is Some(_) then first.unwrap() else check_expr(c, o, None)
+            val t = if early.len() == 0 && first is Some(_) then first.unwrap() else refined_operand(c, check_expr(c, o, None))
             if anchor is None && settled(t.ty) then anchor = Some(t.ty)
             early.push(Some(t))
     var typed: Buf[&TExpr] = buf()
     for i in 0..<operands.len()
         early[i] match
             Some(t) -> typed.push(t)
-            None -> typed.push(check_expr(c, operands[i], anchor))
+            None -> typed.push(refined_operand(c, check_expr(c, operands[i], anchor)))
     // An integer compared with a value of a type that takes integers is converted to that type, so
     // `big < n` and `n == big` compare two numbers. A chain converts each integer beside one, the
     // pass back reaching an integer whose neighbour was converted on the way forward.
@@ -17131,6 +17267,9 @@ private joined(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if *a is Nothing || *a is ErrorType then return Some(b)
     if *b is Nothing || *b is ErrorType then return Some(a)
     if same_type(a, b) then return Some(a)
+    // Under the equalities in scope a type and what it equals agree on it.
+    if c.body.equalities.len() > 0
+        if same_type(refined_type(c, a), refined_type(c, b)) then return Some(a)
     var current = zonk(c, a)
     // An unknown branch, such as a `None` whose type argument is still open, takes the other's type.
     if *current is Var(_) || *zonk(c, b) is Var(_)
@@ -17311,6 +17450,14 @@ private viewed(c: *Checker, x: &Type, to: &Type) -> &Type
  * instance of its superclass, and an instance of a generic type one of another instance as its
  * parameters' variance allows, also inside a tuple or a function type. */
 private fits(c: *Checker, from: &Type, to: &Type) -> bool
+    // Under the equalities in scope a type and what it equals are one type.
+    if c.body.equalities.len() > 0
+        val x = refined_type(c, from)
+        val y = refined_type(c, to)
+        if !same_type(x, zonk(c, from)) || !same_type(y, zonk(c, to)) then return fits_as_written(c, x, y)
+    fits_as_written(c, from, to)
+
+private fits_as_written(c: *Checker, from: &Type, to: &Type) -> bool
     val up = upcast(c, from, to)
     if conforms(up, zonk(c, to)) then return true
     // A use settles what is still unknown: an `Option[_]` stored where an `Option[int]` is
@@ -18043,9 +18190,9 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     success.push(TPattern(e.span, args[0], PBind(held)))
     var arms: Buf[TArm] = buf()
     if is_option
-        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Some"), success)), None, TExpr(e.span, args[0], Local(held))))
+        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Some"), success, None)), None, TExpr(e.span, args[0], Local(held))))
         val none = TExpr(e.span, declared, Construct(variant_index(c, d, "None"), buf()))
-        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "None"), buf())), None, TExpr(e.span, Nothing, Return(Some(none)))))
+        arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "None"), buf(), None)), None, TExpr(e.span, Nothing, Return(Some(none)))))
         return TExpr(e.span, args[0], Match(s, arms))
     val error = zonk(c, args[1])
     val passed = zonk(c, failure[1])
@@ -18059,8 +18206,8 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     if *converted.ty is ErrorType then return TExpr(e.span, ErrorType, UnitConst)
     fields.push(converted)
     val err = TExpr(e.span, declared, Construct(variant_index(c, d, "Err"), fields))
-    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Ok"), success)), None, TExpr(e.span, args[0], Local(held))))
-    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Err"), failed)), None, TExpr(e.span, Nothing, Return(Some(err)))))
+    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Ok"), success, None)), None, TExpr(e.span, args[0], Local(held))))
+    arms.push(TArm(TPattern(e.span, ty, PVariant(variant_index(c, d, "Err"), failed, None)), None, TExpr(e.span, Nothing, Return(Some(err)))))
     TExpr(e.span, args[0], Match(s, arms))
 
 // The error `read` that `?` passes on, as an error of `passed`, the type the enclosing function
@@ -19359,7 +19506,7 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             if static_receiver(c, target, name) is Some(ty) then return static_call(c, at, name_span, target, ty, name, args, explicit, expected, false)
     var object = named_value match
         Some(v) -> v
-        None -> check_expr(c, target, None)
+        None -> refined_operand(c, check_expr(c, target, None))
     // A union's member is called through the members' join or a trait the union conforms to: a
     // union of references seen as that type with no conversion, as an `Any` holding its member, and
     // one with a scalar member converted to it; a name more than one of those has is not chosen
@@ -21176,6 +21323,7 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     for i in 0..<params.len()
         param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
     c.symbols[id].param_locals = param_locals
+    note_refined_function(c, id)
     check_body(c, id, body, hint)
     // One the body left open is reported here, and its unknowns are made errors, so the call does
     // not report the same gap a second time.
@@ -21721,7 +21869,40 @@ private settle(c: *Checker, i: usize, t: &Type)
             if *s is Var(j)
                 k = j
                 following = true
-    if !same_type(t, Var(k)) then c.vars[k] = Some(t)
+    if !same_type(t, Var(k)) then settle_var(c, k, t)
+
+/** Solves inference variable `i` as `t`. A variable made outside a refining pattern's scope is not
+ * settled to a type naming the pattern's fresh types, which are not known outside it: that is
+ * reported at the pattern, and the variable is settled as the error type. */
+private settle_var(c: *Checker, i: usize, t: &Type)
+    if c.sites.len() > 0 && names_pattern_type(t)
+        if outside_fresh(c, i, zonk(c, t)) is Some((k, fresh))
+            val site = c.sites[k]
+            c.note(site.unit, site.span, s"a type declared outside this arm cannot be settled to ${type_article_quoted(zonk(c, t))}: ${escaped_reason(c, k, fresh)}")
+            c.vars[i] = Some(ErrorType)
+            return
+    c.vars[i] = Some(t)
+
+// The fresh type in `t` of a refining pattern that variable `i` was made before, and the pattern.
+private outside_fresh(c: *Checker, i: usize, t: &Type) -> Option[(usize, &Type)] = *t match
+    TypeVar(o, j, name) ->
+        if !is_pattern_owner(o) then return None
+        val k = o - pattern_owner(0)
+        if k < c.sites.len() && i < c.sites[k].vars_mark then Some((k, TypeVar(o, j, name))) else None
+    Tuple(items) -> outside_fresh_in(c, i, items)
+    Function(params, result, _) ->
+        if outside_fresh_in(c, i, params) is Some(found) then return Some(found)
+        outside_fresh(c, i, result)
+    ByName(inner) -> outside_fresh(c, i, inner)
+    Data(_, _, args) -> outside_fresh_in(c, i, args)
+    Class(_, _, args) -> outside_fresh_in(c, i, args)
+    Union(members) -> outside_fresh_in(c, i, members)
+    _ -> None
+
+private outside_fresh_in(c: *Checker, i: usize, items: Buf[&Type]) -> Option[(usize, &Type)]
+    for item in items
+        if outside_fresh(c, i, zonk(c, item)) is Some(found) then return Some(found)
+    None
 
 // An argument to a by-name parameter is not evaluated at the call. It is checked as a lambda with
 // no parameters, which the callee evaluates at each read. A by-name parameter passed on to another
@@ -21938,6 +22119,44 @@ private waits_for_arms(e: &Expr) -> bool = empty_literal(e) || literal_expressio
 // Each arm's pattern names are scoped to that arm, and may shadow names outside it. The arms'
 // values must agree when the match's value is used, and together the unguarded arms must cover
 // every value of the subject's type.
+/** An arm or clause whose patterns refine: its place, the refined variant its pattern names first,
+ * the type its body yields as written, and the equalities that held in it. */
+struct RefinedArm
+    index: usize
+    variant: string
+    ty: &Type
+    equalities: Buf[Equality]
+
+/** The first refined variant a clause's patterns name, for a message. */
+private first_clause_variant(c: *Checker, patterns: Buf[&TPattern]) -> string
+    for p in patterns
+        val name = first_variant(c, p)
+        if name != "" then return name
+    ""
+
+/** The first refined variant `p` names, for a message. */
+private first_variant(c: *Checker, p: &TPattern) -> string = p.kind match
+    PVariant(_, fields, site) ->
+        if site is Some(k) then return c.data[c.sites[k].data].variants[c.sites[k].variant].name
+        for f in fields
+            val name = first_variant(c, f)
+            if name != "" then return name
+        ""
+    PNamed(_, inner) -> first_variant(c, inner)
+    _ -> ""
+
+// Where arms that yield different types as written yield one under an arm's equalities, the
+// message says so, and that the result is to be declared: the arm at `index` yields `ty`, the arms
+// before it `before`.
+private disagreement(c: *Checker, arms: Buf[RefinedArm], index: usize, ty: &Type, before: &Type, which: string, one: string) -> Option[string]
+    for a in arms
+        val other = if a.index == index then before else ty
+        val mine = if a.index == index then ty else a.ty
+        if a.variant == "" || *zonk(c, other) is Nothing then continue
+        if same_type(zonk(c, apply_equalities(zonk(c, mine), a.equalities, a.equalities.len() + 1)), zonk(c, apply_equalities(zonk(c, other), a.equalities, a.equalities.len() + 1)))
+            return Some(s"the $which agree on no type: `${a.variant}`'s yields ${type_article_quoted(zonk(c, mine))}, which is `${type_name(zonk(c, other))}` only inside that $one; declare the result type")
+    None
+
 private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expected: Option[&Type], used: bool) -> &TExpr
     val unit = unit_of(c)
     val s = check_expr(c, subject, None)
@@ -21960,6 +22179,7 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
     // A pattern that failed to check is not judged for reachability, nor are the ones after it.
     var pattern_errors = false
     var deferred: Buf[usize] = buf()
+    var refined_arms: Buf[RefinedArm] = buf()
     for arm in arms
         val mark = c.body.visible.len()
         val outer_start = c.body.block_start
@@ -21979,8 +22199,21 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
             typed.push(TArm(pattern, guard, TExpr(arm.body.span, Nothing, UnitConst)))
             continue
         var body = check_value(c, arm.body, wanted, used)
+        // An arm whose pattern refines is checked against the type expected under its equalities,
+        // and yields that type; with none expected it yields its own type as written.
+        val refined_here = holds_equalities_from(c, mark)
+        if refined_here && used
+            if wanted is Some(w)
+                if !(*body.ty is Nothing) && !(*body.ty is ErrorType) && !fits(c, body.ty, w)
+                    c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, not the ${type_name(w)} expected of the `match`")
+                    body = TExpr(body.span, ErrorType, body.kind)
+        body = held_to_expected(c, body, wanted, mark)
+        val inside: Buf[Equality] = if refined_here then active_equalities(c) else buf()
         c.body.visible.truncate(mark)
         c.body.block_start = outer_start
+        if used then body = escape_checked(c, body, "this arm's result")
+        if refined_here
+            refined_arms.push(RefinedArm(typed.len(), first_variant(c, pattern), body.ty, inside))
         if !(*body.ty is Nothing) then never = false
         if used && agreed
             // An arm that is an `Option[Nothing]` converts to the other arms' option, and the arms
@@ -22004,7 +22237,8 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                 None -> union_join(c, ty, body.ty) match
                     Some(t) -> ty = t
                     None ->
-                        c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
+                        val written = s"this arm yields ${type_name(body.ty)}, but the arms before it yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}"
+                        c.note(unit, arm.body.span, disagreement(c, refined_arms, typed.len(), body.ty, ty, "arms of this `match`", "arm").unwrap_or(written))
                         agreed = false
         typed.push(TArm(pattern, guard, body))
     for k in deferred
@@ -22119,7 +22353,7 @@ private capitalized_binders(c: *Checker, p: &TPattern) -> string = p.kind match
         val name = c.body.locals[local].name
         if name.len > 0 && name.bytes[0] >= u8('A') && name.bytes[0] <= u8('Z') then s"; `$name` binds a new value there, since no variant `$name` is in scope" else ""
     PNamed(_, inner) -> capitalized_binders(c, inner)
-    PVariant(_, fields) ->
+    PVariant(_, fields, _) ->
         var out = ""
         for f in fields
             out = out + capitalized_binders(c, f)
@@ -22268,8 +22502,11 @@ private check_pattern(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &
     if c.index is Some(_) then index_pattern(c, p, t)
     t
 
-private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string) -> &TPattern
+private check_pattern_kind(c: *Checker, p: &Pattern, given: &Type, no_bind: string) -> &TPattern
     val unit = unit_of(c)
+    // A value of a type parameter an equality in scope fixes is matched as the type it is there.
+    var ty = given
+    if *zonk(c, given) is TypeVar(_, _, _) then ty = refined_type(c, given)
     if *zonk(c, ty) is Union(members)
         if applies_to_members(c, p) then return union_pattern(c, p, zonk(c, ty), members, no_bind)
     p.kind match
@@ -22392,7 +22629,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, ty: &Type, no_bind: string)
             for i in 0..<items.len()
                 typed.push(check_pattern(c, items[i], if ok then parts[i] else ErrorType, no_bind))
             if !ok then return TPattern(p.span, ErrorType, PWildcard)
-            TPattern(p.span, ty, PVariant(0, typed))
+            TPattern(p.span, ty, PVariant(0, typed, None))
         Typed(binder, written) ->
             val target = resolve_type(c, unit, written)
             val local = binder_local(c, binder, target, no_bind)
@@ -22700,18 +22937,35 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
     val variant = d.variants[v.index]
     var fields: Buf[&Type] = buf()
     var ok = true
-    if refined_match_refused(c, unit, p.span, v)
+    if hidden_match_refused(c, unit, p.span, v)
         // The fields still bind their names, so the arm reports nothing more.
         for a in args
             check_pattern(c, a, ErrorType, no_bind)
         return TPattern(p.span, ErrorType, PWildcard)
-    *ty match
+    // A refined variant, outside the code derived for its type, gives its arm local type equalities.
+    val refines = c.derived_context is None && refines_type(d, v.index)
+    var site: Option[usize] = None
+    var reported = false
+    *zonk(c, ty) match
         Data(id, _, type_args) ->
-            if id == v.data then fields = variant_fields(d, id, v.index, type_args)
-            else ok = false
+            if id != v.data then ok = false
+            elif refines
+                refine_variant(c, p, v, ty) match
+                    Some((k, typed_fields)) ->
+                        site = Some(k)
+                        fields = typed_fields
+                    None ->
+                        ok = false
+                        reported = true
+            else fields = variant_fields(d, id, v.index, type_args)
         ErrorType -> ()
+        Var(_) ->
+            ok = false
+            if refines
+                unknown_matched(c, unit, p.span, variant.name)
+                reported = true
         _ -> ok = false
-    if !ok then c.note(unit, p.span, s"`${variant.name}` is a variant of `${d.name}`, but the value it matches is ${type_name(ty)}")
+    if !ok && !reported then c.note(unit, p.span, s"`${variant.name}` is a variant of `${d.name}`, but the value it matches is ${type_name(ty)}")
     if args.len() != variant.fields.len()
         c.note(unit, p.span, s"`${variant.name}` has ${count(variant.fields.len(), "field")}, not ${args.len()}")
         ok = false
@@ -22720,8 +22974,298 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
         val field: &Type = if ok && i < fields.len() then fields[i] else ErrorType
         typed.push(check_pattern(c, args[i], field, no_bind))
     if !ok || *ty is ErrorType then return TPattern(p.span, ErrorType, PWildcard)
-    TPattern(p.span, ty, PVariant(v.index, typed))
+    TPattern(p.span, ty, PVariant(v.index, typed, site))
 
+// Refinement. A pattern on a refined variant gives the variant's parameters fresh types of its own,
+// `pattern_owner` of the pattern's site, and gives its arm local type equalities: the value matched,
+// of type `D[X1, …, Xn]`, was made by the variant, so its type is the variant's result `D[R1, …, Rn]`
+// at some arguments, and each `Xi` is `Ri`. The equalities are solved at once by taking both sides
+// apart, into a most general substitution of the type parameters in scope. It holds where the
+// marker local the pattern declares beside the names it binds is in scope, so an arm, a clause, an
+// `is` test and a binding each hold it exactly where those names are.
+
+/** Solves the equalities of variant `v` matched against a value of type `ty`, an instance of `v`'s
+ * type: records the pattern's site, declares its marker and its equalities, and answers the site and
+ * the variant's field types, in its fresh types as far as the equalities leave them. `None`, reported,
+ * where the type matched is not known well enough to say what the variant fixes. A contradiction
+ * gives no equalities: no value reaches the arm. */
+private refine_variant(c: *Checker, p: &Pattern, v: VariantRef, ty: &Type) -> Option[(usize, Buf[&Type])]
+    val unit = unit_of(c)
+    val d = c.data[v.data]
+    val variant = d.variants[v.index]
+    val k = c.sites.len()
+    val owner = pattern_owner(k)
+    var fresh: Buf[&Type] = buf()
+    for j in 0..<variant.params.len()
+        fresh.push(TypeVar(owner, j, variant.params[j].name))
+    var plain: Buf[&Type] = buf()
+    for j in 0..<d.decl.type_params.len()
+        plain.push(fresh[j])
+    val result: &Type = variant.result match
+        Some(r) -> substitute(r, data_owner(v.data), fresh)
+        None -> Data(v.data, d.name, plain)
+    var s = Solving(active_equalities(c), buf(), owner, false, false)
+    *refined_type(c, ty) match
+        Data(_, _, xs) -> *result match
+            Data(_, _, rs) ->
+                for i in 0..<xs.len()
+                    if i < rs.len() then solve_pair(c, &s, xs[i], rs[i])
+            _ -> ()
+        _ -> ()
+    // An enclosing type parameter equated with a type still unknown would settle it here, inside the
+    // arm, which only the code that declared the value may do.
+    for q in s.found
+        if q.owner != owner && has_unknowns(zonk(c, q.ty)) then s.unknown = true
+    if s.unknown && !s.contradiction
+        unknown_matched(c, unit, p.span, variant.name)
+        return None
+    val marker = c.body.locals.len()
+    c.body.locals.push(TLocal(s"refinement $k", Unit, false, c.current))
+    c.body.visible.push(marker)
+    c.sites.push(CheckedSite(unit, p.span, v.data, v.index, ty, marker, c.vars.len()))
+    var own: Buf[Equality] = buf()
+    if !s.contradiction
+        for q in s.found
+            c.body.equalities.push(Equality(marker, q.owner, q.index, q.ty))
+            if q.owner == owner then own.push(q)
+    var fields: Buf[&Type] = buf()
+    for f in variant.fields
+        fields.push(apply_equalities(substitute(f, data_owner(v.data), fresh), own, own.len() + 1))
+    Some((k, fields))
+
+/** The equalities found so far while a pattern's are solved, with those already in scope. */
+private struct Solving
+    all: Buf[Equality]
+    found: Buf[Equality]
+    owner: usize
+    contradiction: bool
+    unknown: bool
+
+// Takes `a = b` apart into equalities of type parameters. The pattern's fresh types are solved first,
+// so a field reads as the types around the arm where it can; an enclosing type parameter is solved
+// next. A union, a type constructor or an applied one naming a type parameter is not taken apart,
+// and nothing is learned from it; any other two types that differ are a contradiction.
+private solve_pair(c: *Checker, s: *Solving, a: &Type, b: &Type)
+    if s.contradiction || s.unknown then return
+    val x = solved_now(c, s, a)
+    val y = solved_now(c, s, b)
+    if same_type(x, y) || *x is ErrorType || *y is ErrorType then return
+    if is_fresh(y, s.owner)
+        bind_equal(s, y, x)
+        return
+    if is_fresh(x, s.owner)
+        bind_equal(s, x, y)
+        return
+    if *x is Var(_) || *y is Var(_)
+        s.unknown = true
+        return
+    if *x is TypeVar(_, _, _)
+        bind_equal(s, x, y)
+        return
+    if *y is TypeVar(_, _, _)
+        bind_equal(s, y, x)
+        return
+    if opaque_part(x) || opaque_part(y) then return
+    *x match
+        Tuple(xs) -> *y match
+            Tuple(ys) -> solve_pairs(c, s, xs, ys)
+            _ -> s.contradiction = true
+        Function(xs, r, m) -> *y match
+            Function(ys, q, n) ->
+                if m != n then s.contradiction = true
+                else
+                    solve_pairs(c, s, xs, ys)
+                    solve_pair(c, s, r, q)
+            _ -> s.contradiction = true
+        ByName(r) -> *y match
+            ByName(q) -> solve_pair(c, s, r, q)
+            _ -> s.contradiction = true
+        Data(i, _, xs) -> *y match
+            Data(j, _, ys) -> if i == j then solve_pairs(c, s, xs, ys) else s.contradiction = true
+            _ -> s.contradiction = true
+        Class(i, _, xs) -> *y match
+            Class(j, _, ys) -> if i == j then solve_pairs(c, s, xs, ys) else s.contradiction = true
+            _ -> s.contradiction = true
+        _ -> s.contradiction = true
+
+private is_fresh(t: &Type, owner: usize) -> bool = *t match
+    TypeVar(o, _, _) -> o == owner
+    _ -> false
+
+private solve_pairs(c: *Checker, s: *Solving, xs: Buf[&Type], ys: Buf[&Type])
+    if xs.len() != ys.len()
+        s.contradiction = true
+        return
+    for i in 0..<xs.len()
+        solve_pair(c, s, xs[i], ys[i])
+
+// A part of a type that equalities do not take apart: a union, or a type constructor, that names a
+// type parameter or an unknown, so more than one solution, or none, may make it equal to another.
+private opaque_part(t: &Type) -> bool = *t match
+    Union(_) -> has_type_params(t) || has_unknowns(t)
+    Constructor(_, _) -> true
+    Applied(_, _) -> true
+    _ -> false
+
+// Records that type parameter `v` is `t`; a `t` that contains `v` makes the equality cyclic, which no
+// type satisfies.
+private bind_equal(s: *Solving, v: &Type, t: &Type)
+    val (o, i) = *v match
+        TypeVar(o, i, _) -> (o, i)
+        _ -> return
+    if names_type_var(t, o, i)
+        s.contradiction = true
+        return
+    s.found.push(Equality(0, o, i, t))
+    s.all.push(Equality(0, o, i, t))
+
+private solved_now(c: *Checker, s: *Solving, t: &Type) -> &Type = zonk(c, apply_equalities(zonk(c, t), s.all, s.all.len() + 1))
+
+private unknown_matched(c: *Checker, unit: usize, at: Span, variant: string)
+    c.note(unit, at, s"the type of the value matched must be known to match `$variant`, which fixes the type's argument; write the type where the value is declared")
+
+/** `t` with each type parameter an equality of `eqs` fixes replaced by what it is, through at most
+ * `depth` equalities in a row. */
+private apply_equalities(t: &Type, eqs: Buf[Equality], depth: usize) -> &Type
+    if eqs.len() == 0 then return t
+    *t match
+        TypeVar(o, i, _) ->
+            for q in eqs
+                if q.owner == o && q.index == i
+                    return if depth == 0 then t else apply_equalities(q.ty, eqs, depth - 1)
+            t
+        Tuple(items) -> Tuple(apply_all_equalities(items, eqs, depth))
+        Function(params, result, sendable) -> Function(apply_all_equalities(params, eqs, depth), apply_equalities(result, eqs, depth), sendable)
+        ByName(inner) -> ByName(apply_equalities(inner, eqs, depth))
+        Data(id, name, args) -> Data(id, name, apply_all_equalities(args, eqs, depth))
+        Class(id, name, args) -> Class(id, name, apply_all_equalities(args, eqs, depth))
+        Union(members) -> union_of(apply_all_equalities(members, eqs, depth))
+        _ -> t
+
+private apply_all_equalities(items: Buf[&Type], eqs: Buf[Equality], depth: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for item in items
+        out.push(apply_equalities(item, eqs, depth))
+    out
+
+/** Whether local `x` is in scope. */
+private in_scope(c: *Checker, x: usize) -> bool
+    var i = c.body.visible.len()
+    while i > 0
+        i -= 1
+        if c.body.visible[i] == x then return true
+    false
+
+/** The equalities that hold where the code being checked is: those whose patterns' names are in
+ * scope. */
+private active_equalities(c: *Checker) -> Buf[Equality]
+    var out: Buf[Equality] = buf()
+    var marker = 0usize
+    var held = false
+    for i in 0..<c.body.equalities.len()
+        val q = c.body.equalities[i]
+        if i == 0 || q.marker != marker
+            marker = q.marker
+            held = in_scope(c, marker)
+        if held then out.push(q)
+    out
+
+/** `t` as the code being checked sees it: its unknowns solved, and each type parameter an equality in
+ * scope fixes replaced by what it is there. */
+private refined_type(c: *Checker, t: &Type) -> &Type
+    val z = zonk(c, t)
+    if c.body.equalities.len() == 0 then return z
+    val eqs = active_equalities(c)
+    if eqs.len() == 0 then return z
+    zonk(c, apply_equalities(z, eqs, eqs.len() + 1))
+
+/** Records the refining patterns whose names are in scope where lambda or local function `id` is
+ * checked, outermost first: each copy of it is compiled at what they read back. */
+private note_refined_function(c: *Checker, id: usize)
+    if c.sites.len() == 0 then return
+    var held: Buf[usize] = buf()
+    for k in 0..<c.sites.len()
+        if site_in_scope(c, k) then held.push(k)
+    if held.len() > 0 then c.refined_functions.push(RefinedFunction(id, held))
+
+/** Whether refining pattern `k`'s names are in scope in the body being checked. */
+private site_in_scope(c: *Checker, k: usize) -> bool
+    val marker = c.sites[k].marker
+    marker < c.body.locals.len() && c.body.locals[marker].name == s"refinement $k" && in_scope(c, marker)
+
+/** Whether an equality is in scope here. */
+private refining(c: *Checker) -> bool
+    if c.body.equalities.len() == 0 then return false
+    active_equalities(c).len() > 0
+
+/** `typed` seen at its type under the equalities in scope, where they change it: a `T` that is an
+ * `int` in the arm takes `int`'s operators and methods there. */
+private refined_operand(c: *Checker, typed: &TExpr) -> &TExpr
+    if c.body.equalities.len() == 0 then return typed
+    val now = refined_type(c, typed.ty)
+    if same_type(now, zonk(c, typed.ty)) then return typed
+    TExpr(typed.span, now, typed.kind)
+
+/** Whether a refining pattern's marker at or after position `mark` of the locals in scope gives
+ * equalities there: a scope beginning at `mark` holds them. */
+private holds_equalities_from(c: *Checker, mark: usize) -> bool
+    if c.body.equalities.len() == 0 then return false
+    for i in mark..<c.body.visible.len()
+        val x = c.body.visible[i]
+        for q in c.body.equalities
+            if q.marker == x then return true
+    false
+
+/** A scope's value, checked against `expected` under the equalities its patterns give (those of
+ * markers from position `mark` on), yields `expected` itself, so its type is one the code outside
+ * the scope relies on without them. Checked before the scope's names leave it. */
+private held_to_expected(c: *Checker, typed: &TExpr, expected: Option[&Type], mark: usize) -> &TExpr
+    val want = expected match
+        Some(w) -> w
+        None -> return typed
+    if *typed.ty is Nothing || *typed.ty is ErrorType || *zonk(c, want) is Unit then return typed
+    if !holds_equalities_from(c, mark) then return typed
+    if same_type(zonk(c, typed.ty), zonk(c, want)) || !fits(c, typed.ty, want) then return typed
+    var items: Buf[&TExpr] = buf()
+    items.push(typed)
+    TExpr(typed.span, want, Block(items))
+
+/** The site of a refining pattern whose fresh type `t` names, where that pattern's names are out of
+ * scope here, and the type: a type that left its arm. */
+private escaped_type(c: *Checker, t: &Type) -> Option[(usize, &Type)]
+    *zonk(c, t) match
+        TypeVar(o, i, name) ->
+            if !is_pattern_owner(o) then return None
+            val k = o - pattern_owner(0)
+            if k < c.sites.len() && !site_in_scope(c, k) then Some((k, TypeVar(o, i, name))) else None
+        Tuple(items) -> escaped_in(c, items)
+        Function(params, result, _) ->
+            if escaped_in(c, params) is Some(found) then return Some(found)
+            escaped_type(c, result)
+        ByName(inner) -> escaped_type(c, inner)
+        Data(_, _, args) -> escaped_in(c, args)
+        Class(_, _, args) -> escaped_in(c, args)
+        Union(members) -> escaped_in(c, members)
+        _ -> None
+
+private escaped_in(c: *Checker, items: Buf[&Type]) -> Option[(usize, &Type)]
+    for item in items
+        if escaped_type(c, item) is Some(found) then return Some(found)
+    None
+
+/** A scope's value after its names left it: reported, as the error type, where its type names a
+ * fresh type of a pattern of the scope, which is not known outside it. */
+private escape_checked(c: *Checker, typed: &TExpr, what: string) -> &TExpr
+    if c.sites.len() == 0 || !names_pattern_type(zonk(c, typed.ty)) then return typed
+    val (k, fresh) = escaped_type(c, typed.ty) match
+        Some(found) -> found
+        None -> return typed
+    c.note(unit_of(c), typed.span, s"$what is ${type_article_quoted(zonk(c, typed.ty))}, and ${escaped_reason(c, k, fresh)}")
+    TExpr(typed.span, ErrorType, typed.kind)
+
+private escaped_reason(c: *Checker, k: usize, fresh: &Type) -> string
+    val site = c.sites[k]
+    s"`${type_name(fresh)}` is a type `${c.data[site.data].variants[site.variant].name}` takes from the value it matches, which is not known outside its arm"
 /** The element type of `t` as a `Seq`, when it is one. */
 private seq_element(c: *Checker, t: &Type) -> Option[&Type]
     if !(*t is Class(_, _, _) || *t is Data(_, _, _)) then return None
@@ -22906,6 +23450,16 @@ zonk(c: *Checker, t: &Type) -> &Type = solve(c.vars, t)
 // Makes two types equal by solving variables, and reports whether they can be. A value that never
 // finishes, or one whose type already failed, fits anything without deciding a variable.
 private unify(c: *Checker, a: &Type, b: &Type) -> bool
+    if unify_as_written(c, a, b) then return true
+    // Under the equalities in scope a type and what it equals are one type; an unknown still settles
+    // to the type as written where it meets one.
+    if c.body.equalities.len() == 0 then return false
+    val x = refined_type(c, a)
+    val y = refined_type(c, b)
+    if same_type(x, zonk(c, a)) && same_type(y, zonk(c, b)) then return false
+    unify_as_written(c, x, y)
+
+private unify_as_written(c: *Checker, a: &Type, b: &Type) -> bool
     val x = zonk(c, a)
     val y = zonk(c, b)
     // An unknown meeting a type that already failed takes that type, so it is not reported again as
@@ -22915,10 +23469,10 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
         poison(c, y)
         return true
     if *x is Var(i)
-        if !same_type(x, y) then c.vars[i] = Some(y)
+        if !same_type(x, y) then settle_var(c, i, y)
         return true
     if *y is Var(j)
-        c.vars[j] = Some(x)
+        settle_var(c, j, x)
         return true
     // An application of a constructor parameter, `F[A]` meeting `Option[int]`: an unknown `F` is
     // decided as the other type's constructor, then the arguments are unified.
