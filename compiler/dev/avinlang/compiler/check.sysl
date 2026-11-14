@@ -16055,6 +16055,9 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
     // Arguments that could not be checked before an overload is chosen, each tried against every
     // candidate in turn.
     var trials: Buf[usize] = buf()
+    // Arguments built around number literals (`[400]`, `List(400)`) that were checked by themselves,
+    // whose literals took their own types there.
+    var built: Buf[usize] = buf()
     if bound.len() == 0
         c.note(unit, name_span, s"no overload of `$name` accepts these arguments; the overloads are ${joined_labels(labels)}")
         return Choice(None, typed)
@@ -16069,15 +16072,20 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
             if bound_signatures[k].type_params.len() > bound_signatures[k].known.len() || !same_type(p, shared) then agree = false
         if takes_parameter_type(value) || is_literal(value) then typed.push(None)
         elif delayed then typed.push(Some(delayed_unchosen(c, args[j], if agree then Some(strict(shared)) else None)))
-        elif agree || bound.len() < 2 then typed.push(Some(check_expr(c, value, if agree then Some(shared) else None)))
+        elif agree then typed.push(Some(check_expr(c, value, Some(shared))))
+        elif bound.len() < 2 && !holds_literal(value) then typed.push(Some(check_expr(c, value, None)))
         else
             // Checked by itself first; one that needs the parameter's type to be checked at all, a
-            // generic function named as a value, is tried against each candidate below.
+            // generic function named as a value, is tried against each candidate below. One built
+            // around number literals that does not check by itself, `[5_000_000_000]`, takes them
+            // from each candidate's parameter.
             muted_check(c, value, None) match
-                Some(t) -> typed.push(Some(t))
+                Some(t) ->
+                    typed.push(Some(t))
+                    if holds_literal(value) then built.push(j)
                 None ->
                     typed.push(None)
-                    trials.push(j)
+                    if !holds_literal(value) then trials.push(j)
     var fitting: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
     // A candidate with a repeated parameter is chosen only where no candidate without one fits.
@@ -16091,6 +16099,17 @@ private choose_among(c: *Checker, at: Span, name_span: Span, name: string, signa
         val apart = untuples_lambda(c, bound_signatures[k], views[k], bindings[k], args)
         untupling.push(apart)
         if !apart && fits_call(c, bound_signatures[k], bindings[k], args, typed, written) then direct_fits = true
+    // Where no candidate takes them so, those arguments take their literals' types from each
+    // candidate's parameter instead, as a bare literal does: `longs ++ [400]` is a `Vector[long]`.
+    if built.len() > 0 && !any_fits(c, bound_signatures, bindings, args, typed, written)
+        for j in built
+            typed[j] = None
+        fixed_fits = false
+        direct_fits = false
+        for k in 0..<bound.len()
+            val fit = fits_call(c, bound_signatures[k], bindings[k], args, typed, written)
+            if !bound_signatures[k].variadic && fit then fixed_fits = true
+            if !untupling[k] && fit then direct_fits = true
     var considered: Buf[bool] = buf()
     for k in 0..<bound.len()
         considered.push(!(fixed_fits && bound_signatures[k].variadic) && !(direct_fits && untupling[k]) && fits_call(c, bound_signatures[k], bindings[k], args, typed, written))
@@ -16276,14 +16295,33 @@ private fits_call(c: *Checker, s: Signature, binding: Binding, args: Buf[Argumen
                 // An argument of a subtype, or of a covariant instance, fits as it would the call.
                 val agrees = if converts_none(c, t.ty, p) then true elif mentions_open(p, &open) || spliced then constrain(c, p, strict(t.ty), &open, true) else fits(c, strict(t.ty), p) || boxes_to(c, strict(t.ty), p)
                 if !agrees then ok = false
+    val sendables = c.late_sendables.len()
     for j in 0..<args.len()
         if ok && typed[j] is None
-            val p = zonk(c, strict(argument_type(c, s, params, binding, args, j).unwrap()))
+            val declared = strict(argument_type(c, s, params, binding, args, j).unwrap())
+            val p = zonk(c, declared)
             val value = argument_value(args[j])
-            val boxed = is_literal(value) && boxes_to(c, literal_own_type(value), p)
-            if !boxed && !open_argument_fits(value, p) then ok = false
+            if !is_literal(value) && !takes_parameter_type(value) && holds_literal(value)
+                // A value built around number literals fits where it checks against the parameter,
+                // its literals taking the numbers the parameter decides.
+                muted_check(c, value, Some(loosen_for(c, declared, &open, true, true))) match
+                    Some(t) ->
+                        val q = strict(t.ty)
+                        if !(if mentions_open(declared, &open) then constrain(c, declared, q, &open, true) else fits(c, q, p)) then ok = false
+                    None -> ok = false
+            else
+                val boxed = is_literal(value) && boxes_to(c, literal_own_type(value), p)
+                if !boxed && !open_argument_fits(value, p) then ok = false
+    while c.late_sendables.len() > sendables
+        c.late_sendables.pop()
     restore_vars(c, saved)
     ok
+
+/** Whether any of the candidates `signatures` fits the call as its arguments are `typed` so far. */
+private any_fits(c: *Checker, signatures: Buf[Signature], bindings: Buf[Binding], args: Buf[Argument], typed: Buf[Option[&TExpr]], written: Buf[&Type]) -> bool
+    for k in 0..<signatures.len()
+        if fits_call(c, signatures[k], bindings[k], args, typed, written) then return true
+    false
 
 /** Whether candidate `s` has a lambda among `args` take a tuple apart: a lambda whose parameters are
  * not as many as those of the function it is given as. */
@@ -18851,9 +18889,12 @@ private loosen_for(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool, li
  * its parameter's type is decided as `t` so far: `t`'s shape, with every number and other value type
  * in it kept, so the literals take them, and every other leaf left unknown, so a later argument may
  * still widen it. With `Vector[long]` decided, `[1, 2]` is a `Vector[long]`; with `Vector[Dog]`,
- * `[Cat(1)]` still joins to a `Vector[Animal]`. */
+ * `[Cat(1)]` still joins to a `Vector[Animal]`. A reference type that takes integers or decimals,
+ * `BigInt` or a type of the program's own, is kept as a number is, so `[2]` beside a `Vector[Cents]`
+ * is one. */
 private literal_hint(c: *Checker, t: &Type) -> &Type
     val now = zonk(c, t)
+    if takes_integers(c, now) || takes_decimals(c, now) then return now
     *now match
         Var(_) -> now
         Tuple(items) ->
