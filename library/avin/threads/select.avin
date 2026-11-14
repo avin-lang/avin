@@ -1,0 +1,154 @@
+module avin.threads
+
+// What a `select` block is read into: an arm object for each of its channel arms, made in the order
+// written, and a call of `selectWaiting`, `selectOrElse` or `selectWithin` with them, which answers
+// the arm that ran, its body then chosen by that number. A program writes `select` rather than calling
+// these.
+//
+// A select tries its arms in an order drawn at random each time, so of several arms ready at once
+// each is as likely to run as any other. Where none is ready, the select waits on all of their
+// channels at once: in one pass, each arm is tried under its channel's lock and, where it cannot
+// complete, enlisted on the condition of the channel it waits for before the lock goes, and then the
+// thread parks once, until the first of those conditions is notified, the select's time runs out or
+// its thread is cancelled (`runtime/avin/rt/select.sysl`). Woken through an arm, it tries that arm
+// first; where another thread got there first, it passes the notification on to the next thread
+// waiting on that channel, so a notification a select took is never lost, and then begins again.
+
+import avin.time.Duration
+
+// A new wait for a select of `arms` arms.
+@intrinsic("select_new")
+private selectNew(arms: long) -> Any
+
+// Begins a round of the select's arms, its wait ended by nothing yet.
+@intrinsic("select_reset")
+private selectReset(wait: Any)
+
+// Takes every arm of the select off the channel it was enlisted on.
+@intrinsic("select_withdraw")
+private selectWithdraw(wait: Any)
+
+// Waits until a channel an arm is enlisted on is notified, or until `deadline` where it is positive:
+// the arm notified, or -1 where the time ran out. A cancellation point.
+@intrinsic("select_park")
+private selectPark(wait: Any, deadline: long) -> long
+
+// The deadline `micros` microseconds from now.
+@intrinsic("select_deadline")
+private selectDeadline(micros: long) -> long
+
+// What a receive arm waits for: a value (`Some(x)`), the channel closed and drained (`None`), or
+// either.
+private val ReceiveEither: int = 0
+private val ReceiveValue: int = 1
+private val ReceiveClosed: int = 2
+
+// The wait of one select of `arms` arms, which only this module makes, so only its code tries an arm.
+private class Selecting(arms: int)
+  val handle = selectNew(long(arms))
+
+// One channel arm of a `select` block.
+trait SelectArm
+  // Tries the arm as arm `index` of the select waiting as `wait`: completes it and answers `true`
+  // where its channel is ready for it, and otherwise, where `enlist`, enlists it on the channel.
+  offer(wait: Selecting, index: int, enlist: bool) -> bool
+
+  // Passes on a notification the arm was woken by and did not use.
+  passOn(wait: Selecting) -> unit
+
+// A receive arm, `channel.receive() as pattern`, wanting what `wants` says: 0 a value or the channel
+// closed, 1 a value, 2 the channel closed and drained.
+class SelectReceive[T](private val channel: Channel[T], private val wants: int): SelectArm
+  private var got: Option[T] = None
+
+  override offer(wait: Selecting, index: int, enlist: bool) -> bool =
+    channel.offerReceive(wants, wait, index, enlist) match
+      Some(r) ->
+        got = r
+        true
+      None -> false
+
+  override passOn(wait: Selecting) = channel.passOn(wait, false)
+
+  // What the arm received: the value, or `None` from a closed and drained channel.
+  received() -> Option[T] = got
+
+  // The value the arm received, which an arm wanting a value has once it has run.
+  value() -> T = got match
+    Some(x) -> x
+    None -> fail("a select's receive arm holds no value")
+
+// A send arm, `channel.send(x)`, its value evaluated once, before the select tries any arm.
+class SelectSend[T](private val channel: Channel[T], private val x: T): SelectArm
+  override offer(wait: Selecting, index: int, enlist: bool) -> bool = channel.offerSend(x, wait, index, enlist)
+
+  override passOn(wait: Selecting) = channel.passOn(wait, true)
+
+// A select with no `else` and no `after`: waits until one of `arms` runs, and answers which.
+selectWaiting(arms: SelectArm*) -> int = chosen(arms, 0, false)
+
+// A select with `else`: runs one of `arms` that is ready now and answers which, or answers the number
+// of arms, the `else`, where none is.
+selectOrElse(arms: SelectArm*) -> int
+  val wait = Selecting(0)
+  for i in drawnOrder(arms.length)
+    if arms(i).offer(wait, i, false) then return i
+  arms.length
+
+// A select with `after timeout`: runs one of `arms`, waiting at most `timeout` for one to be ready,
+// and answers which, or the number of arms, the `after`, where the time ran out first. A timeout of
+// zero or less tries the arms once, as `else` does.
+selectWithin(timeout: Duration, arms: SelectArm*) -> int
+  if timeout.micros <= 0 then return selectOrElse(arms*)
+  chosen(arms, selectDeadline(timeout.micros), true)
+
+// Runs one of `arms`, waiting until `deadline` where `timed`: the arm, or the number of arms where
+// the time ran out.
+private chosen(arms: Vector[SelectArm], deadline: long, timed: bool) -> int
+  val wait = Selecting(arms.length)
+  var woken = -1
+  loop
+    // Woken through an arm, the select tries that arm first and, where the arm cannot complete,
+    // passes the notification on to the next thread waiting on its channel, which may be able to
+    // use it.
+    if woken >= 0
+      if arms(woken).offer(wait, woken, false) then return woken
+      arms(woken).passOn(wait)
+    selectReset(wait.handle)
+    for i in drawnOrder(arms.length)
+      if arms(i).offer(wait, i, true)
+        selectWithdraw(wait.handle)
+        return i
+    val ended = selectPark(wait.handle, if timed then deadline else 0)
+    if ended < 0 then return arms.length
+    woken = int(ended)
+
+// The draws of every select, each a step of a sequence no two draws share.
+private val draws = Atomic(long(0))
+
+// A random order of `0 ..< n`, each order as likely as any other.
+private drawnOrder(n: int) -> Array[int]
+  val order = Array.tabulate(n, i -> i)
+  if n < 2 then return order
+  var bits = mixed(draws.update(s -> s +% -7046029254386353131))
+  var i = n - 1
+  while i > 0
+    val j = int(unsigned(bits) % long(i + 1))
+    val t = order(i)
+    order(i) = order(j)
+    order(j) = t
+    bits = mixed(bits +% -7046029254386353131)
+    i -= 1
+  order
+
+// A 64-bit value whose bits each depend on every bit of `z`.
+private mixed(z: long) -> long
+  var x = (z ^ logicalShift(z, 30)) *% -4658895280553007687
+  x = (x ^ logicalShift(x, 27)) *% -7723592293110705685
+  x ^ logicalShift(x, 31)
+
+// `x` shifted right by `k`, with zeros shifted in.
+private logicalShift(x: long, k: long) -> long = (x >> k) & ((long(1) << (64 - k)) -% 1)
+
+// `x` with its sign bit cleared, so it is not negative.
+private unsigned(x: long) -> long = x & 9223372036854775807

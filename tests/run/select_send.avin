@@ -1,0 +1,61 @@
+// expect: exit 0
+// A `select`'s send arms. Every channel and every value sent is evaluated once, in the order the arms
+// are written, before any arm is tried, and only the arm that runs sends. A send to an unbounded
+// channel is always ready; to a full bounded channel it waits, parking only its thread, until a
+// receiver makes room, and then sends the value evaluated before the wait. Send and receive arms mix.
+import avin.threads.{Atomic, Channel, spawn}
+
+var order = ""
+
+noted[T](what: string, x: T) -> T
+  order = order + what
+  x
+
+main() -> int
+  val open = Channel[int]()
+  val full = Channel[int](1)
+  full.send(0)
+  // `full` has no room, so the send to `open` runs, and the value meant for `full` is never sent.
+  val ran = select
+    noted("a", full).send(noted("b", 10)) -> "full"
+    noted("c", open).send(noted("d", 20)) -> "open"
+  println(ran, order, open.tryReceive(), full.tryReceive(), full.tryReceive())
+
+  // A send waiting for room: the value is evaluated once, before the wait, and sent once room is
+  // made by a receiver on a lightweight thread.
+  val evaluated = Atomic(0)
+  full.send(1)
+  val receiver = spawn(() ->
+    val first = full.receive()
+    val second = full.receive()
+    (first, second))
+  select
+    full.send(noted("e", evaluated.add(1) * 100)) -> println("sent after waiting")
+  println(receiver.join(), evaluated.load(), order)
+
+  // A send arm on a lightweight thread, waiting on the main thread's receive.
+  val one = Channel[string](1)
+  one.send("x")
+  val sender = spawn(() ->
+    select
+      one.send("y") -> "sent y")
+  println(one.receive(), one.receive(), sender.join())
+
+  // A send and a receive in one select: the receive is ready, the send is not.
+  val inbox = Channel[int]()
+  inbox.send(7)
+  full.send(2)
+  val mixed = select
+    full.send(3) -> "sent"
+    inbox.receive() as Some(x) -> s"received $x"
+  println(mixed, full.tryReceive(), full.tryReceive())
+
+  // A send of a reference: the receiver gets the very object.
+  val boxes = Channel[Atomic[int]]()
+  val box = Atomic(41)
+  select
+    boxes.send(box) -> ()
+  val got = boxes.receive().get
+  got.add(1)
+  println(box.load(), got === box)
+  0

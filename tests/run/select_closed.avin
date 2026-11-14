@@ -1,0 +1,81 @@
+// expect: exit 0
+// A `select` over closed channels behaves as `receive` does: the values sent before the close are
+// received first, and only then does a `None` arm run, every time after too. An arm wanting a value,
+// `Some(p)`, is never ready on a closed and drained channel, so a select with only such arms takes
+// its `else` or its `after`, and one with another channel waits for that one. A select parked on a
+// `None` arm is woken by the close, and by the last value of a closed channel being taken by another
+// thread. An arm binding the `Option` gets `None`.
+import avin.threads.{Channel, spawn, sleep}
+import avin.time.millis
+
+main() -> int
+  val c = Channel[int]()
+  c.send(1)
+  c.send(2)
+  c.close()
+  for i in 0 ..< 4
+    select
+      c.receive() as Some(x) -> println(s"value $x")
+      c.receive() as None -> println("closed")
+
+  // `Some` alone on a closed and drained channel is never ready.
+  val v = select
+    c.receive() as Some(x) -> x
+    else -1
+  println(v)
+  val w = select
+    c.receive() as Some(x) -> x
+    after 5.millis -> -2
+  println(w)
+  val live = Channel[int]()
+  val feeder = spawn(() ->
+    sleep(5.millis)
+    live.send(3))
+  val u = select
+    c.receive() as Some(x) -> x
+    live.receive() as Some(x) -> x * 10
+  println(u)
+  feeder.join()
+
+  // `None` alone on a channel with values left is not ready until they are taken.
+  val left = Channel[string]()
+  left.send("last")
+  left.close()
+  val early = select
+    left.receive() as None -> "closed"
+    else "values left"
+  println(early)
+
+  // A select parked on `None` wakes once another thread takes the last value of the closed channel.
+  val waiter = spawn(() ->
+    select
+      left.receive() as None -> "drained")
+  sleep(5.millis)
+  println(left.receive())
+  println(waiter.join())
+
+  // A select parked on `None` wakes at the close; so does one parked on either.
+  val quiet = Channel[int]()
+  val onNone = spawn(() ->
+    select
+      quiet.receive() as None -> "closed")
+  val onEither = spawn(() ->
+    select
+      quiet.receive() as o -> s"either $o")
+  sleep(5.millis)
+  quiet.close()
+  println(onNone.join(), onEither.join())
+
+  // A bounded channel closed while full: its values still come first.
+  val bounded = Channel[int](2)
+  bounded.send(8)
+  bounded.send(9)
+  bounded.close()
+  var got: List[string] = []
+  for i in 0 ..< 3
+    val s = select
+      bounded.receive() as Some(x) -> s"$x"
+      bounded.receive() as None -> "end"
+    got = got :+ s
+  println(got)
+  0

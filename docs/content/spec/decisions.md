@@ -8389,6 +8389,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   running the action outside the lock (waiting on its own barrier would then deadlock instead of
   trapping).
 
+- Settled by the user 2026-11-14 (built on branch `contextual-keywords`, from the user's decision of 2026-11-14 that
+  `data` keeps its spelling and becomes contextual): **the words that begin a top-level declaration
+  are keywords only there, before the name they declare, and ordinary names everywhere else**:
+  `data`, `class`, `object`, `trait`, `impl`, `import` and `module` join `type`, `opaque`, `export`,
+  `derive`, `actor` and `machine`, and `open` and `abstract` are keywords only before `class`. So
+  `val data = readFile(p)`, a field `class`, a method `object()`, a parameter `import`, a named
+  argument `module = 2`, a type parameter, a variant, a module named `data` and `r.type` are all
+  legal, and `data(x: int)` at the top level declares a function called `data`. **The reserved
+  words stay**: `as`, `is`, `match`, `then`, `else`, `elif`, `do`, `yield` and `derives`, because each
+  follows a complete operand on its line (`x as T`, `if c then a`, `Base(x) derives Eq`), where a
+  name is an infix call; `if`, `while`, `for`, `loop`, `defer`, `return`, `break`, `continue`, `val`,
+  `var` and `def`, because each begins a statement or a declaration inside a block, where a line may
+  equally be an expression starting with a name (`loop` and an indented block would read as a call
+  of `loop` with a trailing block; `return (x)` as a call); `private`, `static` and `override`,
+  because they begin a member of a class body, where a line may be a statement, and `private + (o:
+  T)` would be both a method named by a symbol and an expression on a value; `true`, `false`,
+  `self` and `super`, which are values. `end` keeps its rule (a keyword only before a name), and
+  `not` and `with` theirs. Why: the test is whether the keyword's every position can be told from a
+  name's by the next token alone. A top-level line holds only declarations, never a statement, so a
+  declaration word followed by a name can mean nothing else, and none of these words begins
+  anything inside a block or a class body. Alternatives weighed: renaming `data` (the user kept the
+  spelling); making every word contextual by look-ahead over whole lines (`loop`, `return` and the
+  modifiers would each need a rule of their own that a reader cannot see at a glance); keeping
+  `class` and `object` reserved as the most declaration-like (they are common field names, and
+  nothing about them is less decidable than `data`). The user
+  settled 2026-11-14 that `private`, `static` and `override` stay reserved: a modifier used as a
+  variable name would read strangely.
 
 ## Proposed
 
@@ -9548,6 +9575,59 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
   anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
   conforms, and the loop's `iterator()` call is answered by every member).
+- Proposed (built on branch `select`): **A `select` block's syntax** ([Threads](/spec/threads/#select)).
+  `select` ending its line opens a block of arms written as a match's: `ch.receive() as P -> body`,
+  `ch.send(x) -> body`, `after d -> body`, and `else body` with no arrow; `end select` may close it.
+  `select` is a contextual word, a name anywhere else, as `actor` and `export` are. Why: the arms
+  read as the match arms they are compiled into, `->` is Avin's one arrow (`=>` is rejected
+  everywhere), and `else` is spelled as a match's is. Alternatives weighed: `=>` arms as in the
+  item's sketch (refused by the lexer and by the settled rule on arrows); a reserved keyword (breaks
+  every program naming something `select`, and the library's own prose); a library function taking
+  lambdas (no binding by pattern, no `return`/`break` from an arm, every arm a closure).
+- Proposed (built on branch `select`): **What a receive arm's pattern means.** `Some(p)` waits for
+  a value and binds it by `p`, any irrefutable pattern a `val` takes; `None` waits for the channel
+  closed and drained; a name waits for either and binds the `Option`; `_` or no pattern waits for
+  either. Any other pattern (a literal, a tuple, alternatives, a type pattern) is an error. So
+  `Some(p)` alone is never ready on a closed, drained channel: a select whose only arms want values
+  from closed channels takes its `after` or `else`, or waits for ever, as a select over a channel no
+  one sends to does. Why: the pattern says what the arm waits for, so an arm never takes a value it
+  then cannot match, and the common loop (`Some(j)` and `None` arms) reads as a match on what
+  `receive` returns. Alternatives weighed: trapping where a closed channel's `None` matches no arm
+  (turns a finished producer into a crash), any pattern with an unmatched receive dropped (loses
+  values). **Review with the user**: whether `Some(p)` alone on a closed channel should wait or trap.
+- Proposed (built on branch `select`): **Choosing and evaluating.** Every channel, value sent and
+  `after` duration is evaluated once, in the order written, before any arm is tried; the arms are
+  tried in an order drawn at random each select (a Fisher–Yates shuffle from one shared
+  split-mix sequence), so of several ready arms each is equally likely. `after` and `else` together
+  are an error (a select with `else` never waits); two of either is an error. An `after` of zero or
+  less tries the arms once, as `else` does. A send arm on a closed channel traps when it is tried,
+  as `send` does. Why: the order of evaluation is the order of reading; a random order is the only
+  fair one that needs no state per select site. Alternatives weighed: round-robin per select site
+  (needs a hidden mutable per site, shared between threads); trying in written order (starves the
+  later arms); a send arm on a closed channel never ready (hides the program's mistake).
+- Proposed (built on branch `select`): **How a select waits.** It waits on the very conditions a
+  channel's `receive` and `send` wait on: in one pass, each arm is tried under its channel's lock and,
+  where it cannot complete, a link of the select is enlisted on that condition's queue before the
+  lock goes; the thread then parks once. The runtime wakes a link as it wakes any waiter, and the
+  select's one token decides, by compare-and-set, whether a notification, the timer or a
+  cancellation ended the wait; a notification reaching an ended select's link is passed by to the
+  next waiter. Woken through an arm, the select tries that arm first and, where it cannot complete
+  while the channel still holds a value (or room), notifies the next waiter, so no notification is
+  lost to a select that could not use it; every link is withdrawn when the wait ends. Why: a
+  channel's own operations are unchanged, a select costs one park, and a plain `receive` and a select
+  share one queue in arrival order. Alternatives weighed: a list of selects on each channel woken on
+  every change (wakes every waiting select for each value, a herd of thousands where workers share a
+  channel); passing every unused notification on whatever the channel holds (idle selects hand one
+  notification round for ever: two thousand workers ran forty times slower); a select polling with
+  sleeps (latency and wasted work).
+- Proposed (built on branch `select`): **The library names a select is read into are public**:
+  `avin.threads.SelectArm`, `SelectReceive`, `SelectSend`, `selectWaiting`, `selectOrElse`,
+  `selectWithin`, and `Channel`'s `offerReceive`, `offerSend` and `passOn`. Their wait parameter is
+  of a type private to `avin.threads`, so no program can call an arm's operations. Why: the code a
+  `select` is read into is checked in the program's file, so what it names is public, as the
+  actor's `ActorContext` is; members have no module-wide visibility. Alternatives weighed: a member
+  visibility private to the module (a language change of its own); intrinsics the compiler calls
+  directly (the arms are generic, and the channel logic belongs in Avin).
 
 **Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
 2, branch `hkt-2`)
@@ -9657,6 +9737,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a `Box[Shelf[A]]`, and a `(Dog) -> int` an `(Animal) -> B`, so generic code could store a `Shelf`
   in the box or pass a cat to the function, reading memory that was never a `TallShelf`'s or a
   `Dog`'s. Both are now refused; a type that is the class itself is still taken there.
+
+**Higher-kinded types, static members on constructors** (build plan step 5, branch `hkt-5`)
+
+- Proposed: **a constructor named bare, or with `_` for the arguments it leaves open, has as its
+  static members those of the constructor traits it implements at exactly those holes**, each
+  conformance held as a constructor argument's is (the holes the impl leaves open, the arguments
+  written out meeting the impl's bounds): `Option.pure`, `Result[_, E].pure`, `Parsed.pure` for an
+  alias that is a constructor, and `Box[_].pure`, the same as `Box`. `Result[int, _].pure` is an
+  error saying `Result` implements the trait as `Result[_, E]`. Why: a static member of a
+  constructor trait names no parameter of the trait, so the constructor is all a call needs, and
+  the conformance says which constructor it is. Alternatives: look the member up on the type at
+  any arguments (would let `Result[int, _]` reach a member of the conformance at the other hole).
+- Proposed: **a static member of a type's own conformance to an ordinary trait is not reached on
+  the type named bare**: `Box.make()` for `impl[T] Make for Box[T]` is an error asking for the type
+  arguments (`Box[A].make(…)`), as before. Why: that member's types name the type's parameters,
+  which a bare name leaves unknown. Alternative weighed: inferring them from the call as a generic
+  function's are (a separate feature, not part of constructors).
+- Proposed: **a constructor trait's static member still takes no default body**, as every trait's
+  static member does: defaults that call `Self.pure` are its methods'. Why: the rule for static
+  members is one rule for every trait; the per-constructor compilation would allow it, so it can be
+  added later without changing anything written now. Review with the user if the library wants a
+  derived static member (a `Monad.unit` from `pure`).
+- Proposed: **two bounds that each declare a static member of one name and parameter types make a
+  call of it on the parameter ambiguous**, by the ordinary overloading rule, rather than one bound
+  being preferred. Why: nothing says which constructor's member is meant beyond the bounds.
+- Proposed: **a static member called on a value of `F[X]` is an error pointing at `F.pure(…)`**;
+  on a value of a known type, `Some(1).pure(2)`, the existing message names the type. Why: the
+  member is the constructor's, and the constructor is what the call writes.
+- In each instance a static member called on a constructor is compiled once per constructor: the
+  type's own member at `Nothing` for the holes, which it never names, so `Option.pure` and
+  `F.pure` at `Option` are one instance.
 
 ## Open
 
