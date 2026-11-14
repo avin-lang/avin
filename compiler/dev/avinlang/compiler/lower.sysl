@@ -24,6 +24,8 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Tuple(_) -> Some(MRef)
     Function(_, _, _) -> Some(MRef)
     ByName(_) -> Some(MRef)
+    // An opaque type's values are its representation's, with no box.
+    Opaque(_, _, _, repr) -> mir_type(repr)
     // A trait's `Self` is left in the code of the trait's default bodies, which every conforming
     // type shares: each such type is an object, reached by reference.
     TypeVar(owner, _, _) -> if is_self_owner(owner) then Some(MRef) else None
@@ -793,7 +795,7 @@ private table_entry(l: *Lowering, t: &Type, m: usize, type_args: Buf[&Type], pos
 
 /** Whether a value of type `t` is kept in a box when it is an `Any` or a trait's value: a built-in
  * value that is no reference. */
-private value_boxed(l: *Lowering, t: &Type) -> bool = is_builtin(t) && !(machine(l, t) is Some(MRef))
+private value_boxed(l: *Lowering, t: &Type) -> bool = (is_builtin(t) && !(machine(l, t) is Some(MRef))) || *concrete(l, t) is Opaque(_, _, _, _)
 
 /** The method a trait `t` conforms to declares at checker position `position`, named `name`. */
 private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -> Option[usize]
@@ -803,6 +805,8 @@ private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -
         val m = c.methods[position - c.base]
         if l.program.symbols[m].decl.name != name then continue
         if ancestor_type(l.program.classes, l.program.data, t, k) is Some(_) then return Some(m)
+        // An opaque type conforms through impls, which its boxed value's default bodies reach.
+        if *t is Opaque(_, _, _, _) && meets_bound(lowering_conformances(l), t, Class(k, c.decl.name, buf())) then return Some(m)
     None
 
 /** The function a call of a value of class or data type `t` as a function value runs: the type's
@@ -824,6 +828,7 @@ private names_type_parameter(t: &Type) -> bool = *t match
     ByName(inner) -> names_type_parameter(inner)
     Data(_, _, args) -> any_names_type_parameter(args)
     Class(_, _, args) -> any_names_type_parameter(args)
+    Opaque(_, _, args, _) -> any_names_type_parameter(args)
     _ -> false
 
 private any_names_type_parameter(items: Buf[&Type]) -> bool
@@ -876,7 +881,7 @@ private fill_used_slots(l: *Lowering) -> bool
     val before = l.instances.len()
     for i in 0..<l.descriptors.len()
         val t = l.record_types[l.descriptors[i].record]
-        if !(*t is Data(_, _, _) || *t is Class(_, _, _) || *t is Tuple(_) || is_builtin(t)) then continue
+        if !(*t is Data(_, _, _) || *t is Class(_, _, _) || *t is Tuple(_) || is_builtin_or_opaque(t)) then continue
         if l.descriptors[i].call is None
             if call_entry(l, t) is Some(f) then l.descriptors[i].call = Some(f)
         val old = l.descriptors[i].methods
@@ -1624,6 +1629,7 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             for item in items
                 if holds_handles(l, item, seen) then return true
             false
+        Opaque(_, _, _, repr) -> holds_handles(l, repr, seen)
         Data(id, _, args) ->
             val key = type_key(t)
             for s in *seen
@@ -1736,7 +1742,10 @@ private value_box_made(l: *Lowering, t: &Type) -> usize
     val record = object_record(l, t)
     val methods = method_table(l, t)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + stable_type_key(l.program, t), 0, size, buf(), size == 0, methods, record, Fields, None))
+    // A box of an opaque type may hold a reference, its representation's object.
+    var refs: Buf[usize] = buf()
+    if machine(l, t) is Some(m) then push_reference_words(&refs, m, 0)
+    l.descriptors.push(Descriptor("box of " + stable_type_key(l.program, t), 0, size, refs, size == 0, methods, record, Fields, None))
     l.boxes.put(key, d)
     // A built-in type's impls may add methods with type parameters of their own, which a call
     // through a trait reaches at a slot of their own type arguments, as an object's does.
@@ -1752,7 +1761,9 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
     if is_scalar_union(t) then return Some(cell_as_any(l, t, v))
     val m = machine(l, t)?
     if pointer_option(l, t) then return Some(option_object(l, t, v))
-    if m is MRef then return Some(v)
+    // A value of an opaque type is boxed whatever its representation, so the box names the opaque
+    // type and a type pattern never finds the representation's object in its place.
+    if m is MRef && !(*t is Opaque(_, _, _, _)) then return Some(v)
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, value_box(l, t)))
     l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, m)), v))
@@ -1814,7 +1825,8 @@ private scalar_bits(l: *Lowering, m: &Type, value: Option[Operand]) -> Operand
     val v = value match
         Some(v) -> v
         None -> return ConstInt(64, "0")
-    *m match
+    // An opaque member is kept as its representation is.
+    *representation(m) match
         Int(bits) -> resize(l, v, bits, 64, true)
         Byte -> resize(l, v, 8, 64, false)
         Char -> resize(l, v, 32, 64, false)
@@ -1823,7 +1835,7 @@ private scalar_bits(l: *Lowering, m: &Type, value: Option[Operand]) -> Operand
         _ -> ConstInt(64, "0")
 
 /** The value of the scalar type `m` that the bits `bits` of a union's cell keep. */
-private scalar_of_bits(l: *Lowering, m: &Type, bits: Operand) -> Option[Operand] = *m match
+private scalar_of_bits(l: *Lowering, m: &Type, bits: Operand) -> Option[Operand] = *representation(m) match
     Int(width) -> Some(resize(l, bits, 64, width, true))
     Byte -> Some(resize(l, bits, 64, 8, false))
     Char -> Some(resize(l, bits, 64, 32, false))
@@ -2116,7 +2128,7 @@ private seen_as(l: *Lowering, from: KnownType, target: KnownType) -> bool
     if always_is_known(l, from, target) then return true
     // For a reference that is not boxed to be seen as a trait, `always_is` has already looked
     // through `view_as`, and its no stands.
-    val boxed = (is_builtin(from.ty) || *from.ty is Tuple(_)) && *to is Class(_, _, _)
+    val boxed = (is_builtin_or_opaque(from.ty) || *from.ty is Tuple(_)) && *to is Class(_, _, _)
     if is_reference(from.ty) && !boxed then return false
     same_type(view_as(lowering_conformances(l), from.ty, to), to)
 
@@ -2127,7 +2139,7 @@ private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand]
     val c = concrete(l, t)
     if is_scalar_union(c) then return Some(any_as_cell(l, c, object))
     machine(l, t) match
-        Some(MRef) -> Some(object)
+        Some(MRef) -> if *c is Opaque(_, _, _, _) then Some(load_field(l, object, FieldSlot(0, MRef))) else Some(object)
         Some(m) -> Some(load_field(l, object, FieldSlot(0, m)))
         None -> None
 
@@ -2192,7 +2204,7 @@ private always_is(l: *Lowering, from: &Type, to: &Type) -> bool = value_always_i
 value_always_is(f: Conformances, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
     // A built-in value or a tuple is a value of each trait it conforms to, once boxed as one.
-    if (is_builtin(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(f, from, to)
+    if (is_builtin_or_opaque(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(f, from, to)
     if !is_reference(from) then return false
     same_type(view_as(f, from, to), to)
 
@@ -2501,7 +2513,7 @@ private never_reaches(f: Conformances, head: usize, up: &Type, receiver: &Type) 
     false
 
 /** Whether `t` is a number, a `char`, a `bool` or `unit`: a built-in type held as its value. */
-private is_plain_value(t: &Type) -> bool = is_builtin(t) && !(*t is Str)
+private is_plain_value(t: &Type) -> bool = (is_builtin(t) && !(*t is Str)) || *t is Opaque(_, _, _, _)
 
 // What the finished program shows of each call through a method table on a receiver of known static
 // type. Every object such a call can reach has a descriptor of a type that conforms to the receiver's
@@ -2602,6 +2614,10 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
         val object = call_resolved(l, e, function, callee, args, operands, type_args)?
         return Some(option_pointer(l, e.ty, object))
+    // A value of an opaque type goes in boxed, and comes out of its box again.
+    if default_body && is_self_type(callee.result.unwrap_or(Unit)) && *concrete(l, e.ty) is Opaque(_, _, _, _)
+        val object = call_resolved(l, e, function, callee, args, operands, type_args)?
+        return unbox(l, e.ty, object)
     call_resolved(l, e, function, callee, args, operands, type_args)
 
 // The arguments of a direct call of `callee`, lowered, those with no runtime value and a static
@@ -2620,6 +2636,7 @@ private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], d
                 Some(v) ->
                     val self_typed = i == 0 || (i < callee.params.len() && is_self_type(callee.params[i]))
                     if default_body && self_typed && pointer_option(l, a.ty) then operands.push(option_object(l, a.ty, v))
+                    elif default_body && self_typed && *concrete(l, a.ty) is Opaque(_, _, _, _) then operands.push(box_value(l, concrete(l, a.ty), Some(v)).unwrap())
                     else operands.push(v)
                 None -> return None
     Some(operands)
@@ -2923,6 +2940,7 @@ stable_type_key(program: TProgram, t: &Type) -> string = *t match
         val k = program.classes[id]
         val kind = if k.decl.object then "object " else "class "
         s"$kind${module_prefix(k.module_name)}.${k.name}[" + stable_key_list(program, args) + "]"
+    Opaque(id, _, args, _) -> s"opaque ${program.opaques[id]}[" + stable_key_list(program, args) + "]"
     // The members' keys in sorted order, so a union is one key whatever order it was written in.
     Union(members) ->
         var keys: Buf[string] = buf()
@@ -6118,6 +6136,8 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         if v is None && machine(l, value.ty) is Some(_) then return None
         if pointer_option(l, e.ty) then Some(NullAddress)
         else Some(ConstObject(layout(l, concrete(l, e.ty)).variants[none_variant(l)].descriptor))
+    // An opaque type and its representation are laid out alike, so the value is itself.
+    Reveal(value) -> lower_expr(l, value)
     Logic(and, left, right) -> logic(l, and, left, right, tail)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no, tail)
@@ -6906,6 +6926,9 @@ private operator_values(l: *Lowering, t: &Type, name: string, values: Buf[Operan
             // goes in as the object it stands for.
             if pointer_option(l, t) && implemented_by_trait(l, t, m)
                 for i in 0..<values.len() do values[i] = option_object(l, t, values[i])
+            // And a value of an opaque type goes in boxed.
+            elif *concrete(l, t) is Opaque(_, _, _, _) && implemented_by_trait(l, t, m)
+                for i in 0..<values.len() do values[i] = box_value(l, concrete(l, t), Some(values[i])).unwrap()
             call_instance(l, index, values, result)
         None ->
             // An instance the checker never lets run: a conditional impl's method at type
@@ -6994,6 +7017,8 @@ private equals_values(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
     Function(_, _, _) -> compare(l, CmpEq, a, b)
     ByName(_) -> compare(l, CmpEq, a, b)
     Union(_) -> if is_scalar_union(t) then union_equals(l, t, a, b) else call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
+    // An opaque type's values are equal as their representations are.
+    Opaque(_, _, _, repr) -> equals_values(l, repr, a, b)
     _ ->
         if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqEquals", e), two(a, b), Some(MBool)).unwrap()
         elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
@@ -7023,6 +7048,7 @@ private hash_value(l: *Lowering, t: &Type, a: Operand) -> Operand = *t match
     Function(_, _, _) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     ByName(_) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     Union(_) -> if is_scalar_union(t) then union_hash(l, t, a) else call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
+    Opaque(_, _, _, repr) -> hash_value(l, repr, a)
     _ ->
         if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqHash", e), one(a), Some(MInt(64))).unwrap()
         elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
@@ -7204,7 +7230,7 @@ private record_rendering(l: *Lowering, t: &Type, name: string) -> MirFunction
 /** The instance of type `t`'s own implementation of the rendering method `m`, where `t` conforms to
  * the trait declaring it. */
 private own_rendering(l: *Lowering, t: &Type, m: usize) -> Option[usize]
-    if !(*t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) || is_builtin(t)) then return None
+    if !(*t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) || is_builtin_or_opaque(t)) then return None
     val k = l.program.symbols[m].owner_class?
     if !meets_bound(lowering_conformances(l), t, Class(k, l.program.classes[k].decl.name, buf())) then return None
     explicit_implementation(l, t, m)

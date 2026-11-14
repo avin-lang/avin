@@ -46,7 +46,18 @@ enum Type
      * written, flattened, each named once, never `Nothing` or `Any`, and at least two (`union_of`
      * keeps that form); two unions with the same members are one type, whatever their order. */
     Union(members: Buf[&Type])
+    /** An opaque type, `opaque type Name = Repr`: a nominal type of its own, by its index in the
+     * checker's table of type declarations, with its name for diagnostics and its type arguments.
+     * `repr` is its representation with those arguments in place, which only its defining module
+     * sees through; a value of it is laid out as a value of `repr` is, and it is otherwise a type
+     * apart from every other. */
+    Opaque(id: usize, name: string, args: Buf[&Type], repr: &Type)
 end Type
+
+/** The representation of `t`, through every opaque type it is: what its values are laid out as. */
+representation(t: &Type) -> &Type = *t match
+    Opaque(_, _, _, repr) -> representation(repr)
+    _ -> t
 
 /** The union of `members` in normal form, as far as it needs no knowledge of declarations: nested
  * unions flattened, a member named twice kept once, `Nothing` dropped, a union with `Any` among its
@@ -90,6 +101,7 @@ erase_unions(t: &Type) -> &Type = *t match
     ByName(inner) -> ByName(erase_unions(inner))
     Data(id, name, args) -> Data(id, name, erase_all(args))
     Class(id, name, args) -> Class(id, name, erase_all(args))
+    Opaque(id, name, args, repr) -> Opaque(id, name, erase_all(args), erase_unions(repr))
     _ -> t
 
 private erase_all(items: Buf[&Type]) -> Buf[&Type]
@@ -113,6 +125,7 @@ erase_reference_unions(t: &Type) -> &Type = *t match
     ByName(inner) -> ByName(erase_reference_unions(inner))
     Data(id, name, args) -> Data(id, name, erase_reference_all(args))
     Class(id, name, args) -> Class(id, name, erase_reference_all(args))
+    Opaque(id, name, args, repr) -> Opaque(id, name, erase_reference_all(args), erase_reference_unions(repr))
     _ -> t
 
 private erase_reference_all(items: Buf[&Type]) -> Buf[&Type]
@@ -170,6 +183,7 @@ has_union(t: &Type) -> bool = *t match
     ByName(inner) -> has_union(inner)
     Data(_, _, args) -> any_union(args)
     Class(_, _, args) -> any_union(args)
+    Opaque(_, _, args, _) -> any_union(args)
     _ -> false
 
 private any_union(items: Buf[&Type]) -> bool
@@ -223,6 +237,7 @@ names_alias_param(t: &Type) -> bool = *t match
     ByName(inner) -> names_alias_param(inner)
     Data(_, _, args) -> any_alias_param(args)
     Class(_, _, args) -> any_alias_param(args)
+    Opaque(_, _, args, _) -> any_alias_param(args)
     Union(members) -> any_alias_param(members)
     _ -> false
 
@@ -234,6 +249,7 @@ names_type_var(t: &Type, owner: usize, index: usize) -> bool = *t match
     ByName(inner) -> names_type_var(inner, owner, index)
     Data(_, _, args) -> any_names_type_var(args, owner, index)
     Class(_, _, args) -> any_names_type_var(args, owner, index)
+    Opaque(_, _, args, _) -> any_names_type_var(args, owner, index)
     Union(members) -> any_names_type_var(members, owner, index)
     _ -> false
 
@@ -290,7 +306,19 @@ is_tuple_family(t: &Type) -> bool
  * parts where it was stated for a tuple family. Whether `t`'s parts meet the family impl's bounds is
  * the caller's to ask. */
 builtin_covers(stated: &Type, t: &Type) -> bool =
-    same_type(stated, t) || (is_integer_family(stated) && *t is Int(_)) || covers_tuple(stated, t)
+    same_type(stated, t) || (is_integer_family(stated) && *t is Int(_)) || covers_tuple(stated, t) || covers_opaque(stated, t)
+
+// An impl of a generic opaque type is stated at its own parameters, in order, and so holds at every
+// instance of the type.
+private covers_opaque(stated: &Type, t: &Type) -> bool = *stated match
+    Opaque(x, _, params, _) -> *t match
+        Opaque(y, _, _, _) ->
+            if x != y || params.len() == 0 then return false
+            for p in params
+                if !(*p is TypeVar(_, _, _)) then return false
+            true
+        _ -> false
+    _ -> false
 
 private covers_tuple(stated: &Type, t: &Type) -> bool
     if !is_tuple_family(stated) then return false
@@ -330,6 +358,9 @@ same_type(a: &Type, b: &Type) -> bool = *a match
         _ -> false
     Class(x, _, xs) -> *b match
         Class(y, _, ys) -> x == y && same_types(xs, ys)
+        _ -> false
+    Opaque(x, _, xs, _) -> *b match
+        Opaque(y, _, ys, _) -> x == y && same_types(xs, ys)
         _ -> false
     TypeVar(owner, index, _) -> *b match
         TypeVar(o, i, _) -> owner == o && index == i
@@ -396,6 +427,9 @@ private alike(a: &Type, b: &Type) -> bool
         Class(x, _, xs) -> *b match
             Class(y, _, ys) -> x == y && all_alike(xs, ys)
             _ -> false
+        Opaque(x, _, xs, _) -> *b match
+            Opaque(y, _, ys, _) -> x == y && all_alike(xs, ys)
+            _ -> false
         Union(xs) -> *b match
             Union(ys) -> members_alike(xs, ys)
             _ -> false
@@ -433,6 +467,7 @@ type_name(t: &Type) -> string = *t match
     ByName(inner) -> "-> " + type_name(inner)
     Data(_, name, args) -> if args.len() == 0 then name else name + "[" + type_list(args) + "]"
     Class(_, name, args) -> if args.len() == 0 then name else name + "[" + type_list(args) + "]"
+    Opaque(_, name, args, _) -> if args.len() == 0 then name else name + "[" + type_list(args) + "]"
     TypeVar(_, _, name) -> name
     Var(_) -> "_"
     Union(members) -> union_name(members)
@@ -463,6 +498,7 @@ type_key(t: &Type) -> string = *t match
     ByName(inner) -> "-> " + type_key(inner)
     Data(id, _, args) -> s"#$id[" + key_list(args) + "]"
     Class(id, _, args) -> s"class #$id[" + key_list(args) + "]"
+    Opaque(id, _, args, _) -> s"opaque #$id[" + key_list(args) + "]"
     // The members' keys in sorted order, so a union is one key whatever order it was written in.
     Union(members) ->
         var keys: Buf[string] = buf()
@@ -498,6 +534,11 @@ is_builtin(t: &Type) -> bool = *t match
     Int(_) -> true
     _ -> false
 
+/** Whether `t` is a built-in value type or an opaque type: a type whose conformances and methods
+ * impls state apart from any declaration of its layout, and whose values are put in a box where they
+ * become an `Any` or a trait's value. */
+is_builtin_or_opaque(t: &Type) -> bool = is_builtin(t) || *t is Opaque(_, _, _, _)
+
 /** The built-in type a name denotes: `Any`, `int`, `long`, `bool`, `byte`, `iN` and the rest. */
 builtin_type(name: string) -> Option[&Type]
     if name == "Any" then return Some(AnyType)
@@ -527,6 +568,7 @@ has_unknowns(t: &Type) -> bool = *t match
     ByName(inner) -> has_unknowns(inner)
     Data(_, _, args) -> any_unknowns(args)
     Class(_, _, args) -> any_unknowns(args)
+    Opaque(_, _, args, _) -> any_unknowns(args)
     Union(members) -> any_unknowns(members)
     _ -> false
 
@@ -543,6 +585,7 @@ substitute(t: &Type, owner: usize, args: Buf[&Type]) -> &Type = *t match
     ByName(inner) -> ByName(substitute(inner, owner, args))
     Data(id, name, items) -> Data(id, name, substitute_all(items, owner, args))
     Class(id, name, items) -> Class(id, name, substitute_all(items, owner, args))
+    Opaque(id, name, items, repr) -> Opaque(id, name, substitute_all(items, owner, args), substitute(repr, owner, args))
     Union(members) -> union_of(substitute_all(members, owner, args))
     _ -> t
 
@@ -562,6 +605,7 @@ solve(vars: Buf[Option[&Type]], t: &Type) -> &Type = *t match
     ByName(inner) -> ByName(solve(vars, inner))
     Data(id, name, args) -> Data(id, name, solve_all(vars, args))
     Class(id, name, args) -> Class(id, name, solve_all(vars, args))
+    Opaque(id, name, args, repr) -> Opaque(id, name, solve_all(vars, args), solve(vars, repr))
     Union(members) -> union_of(solve_all(vars, members))
     _ -> t
 

@@ -1165,7 +1165,10 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         sources.push(u.src)
     val views = solved_views(c.vars, c.views)
     val type_tests = solved_views(c.vars, c.type_tests)
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map())), references, overrides, completions)
+    var opaques: Buf[string] = buf()
+    for a in c.aliases
+        opaques.push(qualified(a.module_name, a.decl.name))
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), opaques)), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -1669,8 +1672,12 @@ private declare_aliases(c: *Checker, unit: usize)
                 continue
             for j in 0..<d.type_params.len()
                 val tp = d.type_params[j]
-                if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a data type or a class, not of a type alias, which is its expansion")
-                if tp.bounds.len() > 0 then c.note(unit, tp.span, s"a type alias's parameter takes no bounds: the types its body names hold `${tp.name}` to theirs wherever the alias is used")
+                if d.opaque
+                    if !(tp.variance is Invariant) then c.note(unit, tp.span, "an opaque type's parameters are invariant: whether its values could be seen at another type argument is its representation's, which only its module sees")
+                    if tp.bounds.len() > 0 then c.note(unit, tp.span, s"an opaque type's parameter takes no bounds: the types its representation names hold `${tp.name}` to theirs wherever the opaque type is used")
+                else
+                    if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a data type or a class, not of a type alias, which is its expansion")
+                    if tp.bounds.len() > 0 then c.note(unit, tp.span, s"a type alias's parameter takes no bounds: the types its body names hold `${tp.name}` to theirs wherever the alias is used")
                 if tp.lower is Some(l) then c.note(unit, l.span, s"a lower bound is written on a function's or a method's own type parameter, not on `${tp.name}`")
                 for k in 0..<j
                     if d.type_params[k].name == tp.name then c.note(unit, tp.span, s"the type parameter `${tp.name}` is declared more than once")
@@ -1827,6 +1834,10 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl
         owner = class_owner(id)
         home = c.classes[id].module_name
     elif builtin_type(path) is Some(_) then home = CoreModule
+    elif c.alias_names.get(key) is Some(a) && c.aliases[a].decl.opaque
+        // An opaque type's impls are stated as a built-in type's are, at its own parameters.
+        owner = alias_owner(a)
+        home = c.aliases[a].module_name
     elif c.alias_names.get(key) is Some(a)
         c.note(unit, d.target.span, s"`$path` is a type alias, for ${alias_shown(c, a)}; an impl names the type itself")
         return invalid
@@ -1967,6 +1978,7 @@ private names_param(t: &Type, owner: usize, index: usize) -> bool = *t match
     ByName(inner) -> names_param(inner, owner, index)
     Data(_, _, args) -> any_names_param(args, owner, index)
     Class(_, _, args) -> any_names_param(args, owner, index)
+    Opaque(_, _, args, _) -> any_names_param(args, owner, index)
     _ -> false
 
 private any_names_param(items: Buf[&Type], owner: usize, index: usize) -> bool
@@ -2109,6 +2121,7 @@ private in_order_target(target: &Type, owner: usize, count: usize) -> bool
     val args = *target match
         Data(_, _, a) -> a
         Class(_, _, a) -> a
+        Opaque(_, _, a, _) -> a
         _ -> return count == 0
     if args.len() != count then return false
     for j in 0..<count
@@ -2195,6 +2208,9 @@ private match_target(c: *Checker, pattern: &Type, t: &Type, owner: usize, binds:
         Data(d, _, ps) -> *x match
             Data(e, _, xs) -> d == e && match_args(c, c.data[d].decl.type_params, ps, xs, owner, binds, covariant)
             _ -> false
+        Opaque(d, _, ps, _) -> *x match
+            Opaque(e, _, xs, _) -> d == e && match_args(c, c.aliases[d].decl.type_params, ps, xs, owner, binds, false)
+            _ -> false
         Class(k, _, ps) ->
             var seen: Option[&Type] = None
             val same_class = *x match
@@ -2257,6 +2273,7 @@ private target_phrase(t: &Type) -> string
             return if params.len() == 1 then s"$kind of 1 parameter" else s"$kind of ${params.len()} parameters"
         Data(_, _, args) -> args
         Class(_, _, args) -> args
+        Opaque(_, _, args, _) -> args
         _ -> return s"`${type_name(t)}`"
     val name = head_name(t)
     var built: Option[&Type] = None
@@ -3131,7 +3148,7 @@ private into_member(f: Conformances, m: &Type, y: &Type) -> bool
     if *m is Var(_) || *y is Var(_) then return false
     if same_type(m, y) || *y is AnyType || *m is Nothing then return true
     if conforms(view_as(f, m, y), y) then return true
-    (is_builtin(m) || *m is Tuple(_)) && is_trait_class(f, y) && meets_bound(f, m, y)
+    (is_builtin_or_opaque(m) || *m is Tuple(_)) && is_trait_class(f, y) && meets_bound(f, m, y)
 
 private is_trait_class(f: Conformances, t: &Type) -> bool = *t match
     Class(k, _, _) -> f.classes[k].decl.modifier == "trait"
@@ -3718,7 +3735,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     // A data type's methods share its type parameters, then have their own, and so do the integer
     // family's and a tuple family's; a built-in type has none, so its methods' type parameters are
     // their own.
-    val owner = if *target is Data(_, _, _) || family || is_tuple_family(target) || is_template_type(target) then block.owner else id
+    val owner = if *target is Data(_, _, _) || *target is Opaque(_, _, _, _) || family || is_tuple_family(target) || is_template_type(target) then block.owner else id
     var type_params: Buf[TypeParam] = buf()
     for tp in block.decl.type_params
         type_params.push(tp)
@@ -3796,7 +3813,8 @@ private receiver_method(c: *Checker, t: &Type, name: string) -> Option[usize]
         _ ->
             for m in c.builtin_methods
                 if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name && method_holds(c, m, t) then return Some(m)
-            None
+            val defaults = opaque_defaults(c, t, name)
+            if defaults.len() > 0 then Some(defaults[0]) else None
 
 /** Whether built-in method `m` is one a value of type `t` has: for a method of an impl for a tuple
  * family, where `t`'s parts meet the impl's bounds. */
@@ -3826,6 +3844,20 @@ receiver_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
         _ ->
             for m in c.builtin_methods
                 if builtin_covers(c.symbols[m].receiver.unwrap(), t) && c.symbols[m].decl.name == name && method_holds(c, m, t) then out.push(m)
+            for m in opaque_defaults(c, t, name)
+                if !contains_id(out, m) then out.push(m)
+    out
+
+/** The default bodies of the traits opaque type `t` conforms to, named `name`, that its impls take
+ * rather than implement. */
+private opaque_defaults(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    if !(*t is Opaque(_, _, _, _)) then return out
+    for b in c.builtins
+        if !builtin_covers(b.ty, t) then continue
+        for entry in b.table
+            if entry is Some(m)
+                if c.symbols[m].decl.name == name && c.symbols[m].owner_class is Some(_) && !contains_id(out, m) then out.push(m)
     out
 
 /** `t` as an instance of trait `k`, where it conforms to it at its type arguments; a type parameter
@@ -4475,7 +4507,7 @@ private table_position(c: *Checker, k: usize, target: usize) -> Option[usize]
  * its superclass's, each as an instance of `t` sees it. A trait conformed to with two different type
  * argument lists appears twice. */
 private collect_traits(c: *Checker, t: &Type, out: *Buf[&Type])
-    if is_builtin(t) || is_integer_family(t) || *t is Tuple(_)
+    if is_builtin_or_opaque(t) || is_integer_family(t) || *t is Tuple(_)
         for r in builtin_traits(c, t)
             var seen = false
             for i in 0..<out.len()
@@ -4805,6 +4837,10 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
                 val receiver = c.symbols[m].receiver.unwrap()
                 if own is None && builtin_covers(receiver, ty) && (if several then c.symbols[m].decl.name == name && c.symbols[m].static_member else same_method(c, receiver, m, methods[j])) then own = Some(m)
             if several && own is None then continue
+            // An opaque type takes the trait's default bodies, which run on its value boxed.
+            if own is None && *ty is Opaque(_, _, _, _) && !is_abstract_method(c.symbols[methods[j]]) && !is_trait_field(c, methods[j])
+                table[c.classes[t].base + j] = Some(methods[j])
+                continue
             own match
                 Some(m) ->
                     if !several
@@ -5321,6 +5357,8 @@ private variance_in(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usi
         ByName(inner) -> variance_in(c, unit, params, owner, inner, polarity, at, place)
         Data(d, _, args) -> variance_args(c, unit, params, owner, c.data[d].decl.type_params, args, polarity, at, place)
         Class(k, _, args) -> variance_args(c, unit, params, owner, c.classes[k].decl.type_params, args, polarity, at, place)
+        // An opaque type's parameters are invariant.
+        Opaque(d, _, args, _) -> variance_args(c, unit, params, owner, c.aliases[d].decl.type_params, args, polarity, at, place)
         _ -> true
 
 private variance_args(c: *Checker, unit: usize, params: Buf[TypeParam], owner: usize, declared: Buf[TypeParam], args: Buf[&Type], polarity: i32, at: Span, place: string) -> bool
@@ -6358,7 +6396,7 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
             false
         _ ->
             if names_core_trait(f.core, k, "Eq") || names_core_trait(f.core, k, "Hash") then return true
-            if is_builtin(x) || *x is Tuple(_)
+            if is_builtin_or_opaque(x) || *x is Tuple(_)
                 // Every integer is a member of `Integer`, and has what it requires.
                 if *x is Int(_)
                     if f.core.trait_named("Integer") is Some(integer)
@@ -6466,6 +6504,10 @@ private type_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed, se
                     NotYetKnown -> undecided = true
                     CanSend -> ()
             if undecided then NotYetKnown else CanSend
+        // An opaque type's values are its representation's, so it is sendable where that is.
+        Opaque(_, _, _, repr) -> type_sendability(f, repr, k, a, seen, depth + 1) match
+            CannotSend(why) -> CannotSend(s"its representation is ${quoted_type(repr)}, ${nested_reason(why)}")
+            other -> other
         TypeVar(owner, index, name) ->
             if owner == a.owner && index < a.params.len() && a.params[index] then return CanSend
             for b in type_var_bounds(f, x)
@@ -7063,6 +7105,7 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
         Convert(x, _) -> out.push(x)
         Box(x) -> out.push(x)
         NoneAs(x) -> out.push(x)
+        Reveal(x) -> out.push(x)
         Arith(_, a, b, _) ->
             out.push(a)
             out.push(b)
@@ -7830,6 +7873,7 @@ private names_type_parameter(t: &Type) -> bool = *t match
     TypeVar(_, _, _) -> true
     Data(_, _, args) -> any_names_type_parameter(args)
     Class(_, _, args) -> any_names_type_parameter(args)
+    Opaque(_, _, args, _) -> any_names_type_parameter(args)
     Tuple(items) -> any_names_type_parameter(items)
     Function(ps, r, _) -> any_names_type_parameter(ps) || names_type_parameter(r)
     _ -> false
@@ -9530,12 +9574,17 @@ private expand_alias(c: *Checker, unit: usize, at: Span, path: string, id: usize
         else c.note(unit, at, s"`$path` takes ${count(params.len(), "type argument")}, not ${resolved.len()}")
         return ErrorType
     if c.aliases[id].state == 1
-        c.note(unit, at, s"the type alias `$path` is defined in terms of itself; an alias is another name for a type, so its expansion cannot contain it, and a recursive type is declared with `data`")
+        if c.aliases[id].decl.opaque then c.note(unit, at, s"the opaque type `$path` is laid out as its representation, so the representation cannot name it; a recursive type is declared with `data`")
+        else c.note(unit, at, s"the type alias `$path` is defined in terms of itself; an alias is another name for a type, so its expansion cannot contain it, and a recursive type is declared with `data`")
         return ErrorType
     val body = alias_body(c, id)
     if *body is ErrorType then return ErrorType
     for r in resolved
         if *r is ErrorType then return ErrorType
+    // An opaque type is a type of its own, which remembers its representation for its layout.
+    if c.aliases[id].decl.opaque
+        if params.len() > 0 then hold_alias_body(c, unit, at, body, alias_owner(id), resolved)
+        return Opaque(id, c.aliases[id].decl.name, resolved, substitute(body, alias_owner(id), resolved))
     if params.len() == 0 then return body
     hold_alias_body(c, unit, at, body, alias_owner(id), resolved)
     substitute(body, alias_owner(id), resolved)
@@ -9560,8 +9609,14 @@ private alias_body(c: *Checker, id: usize) -> &Type
     c.bound_context = outer_bound
     c.aliases[id].body = body
     c.aliases[id].state = 2
-    // A parameter the body never names would make `A[int]` and `A[string]` one type.
-    if !(*body is ErrorType)
+    if a.decl.opaque && opaque_repr_refused(body) is Some(why)
+        c.note(a.unit, a.decl.body.span, s"an opaque type is laid out as its representation, which may not be $why")
+        c.aliases[id].body = ErrorType
+        return ErrorType
+    // A parameter the body never names would make `A[int]` and `A[string]` one type. An opaque type
+    // is a type of its own at each argument, so a parameter its representation does not name tells
+    // its values apart by type alone: `Id[User]` and `Id[Order]`.
+    if !(*body is ErrorType) && !a.decl.opaque
         for i in 0..<a.decl.type_params.len()
             val tp = a.decl.type_params[i]
             // A second parameter of one name was reported where it is declared.
@@ -9572,6 +9627,70 @@ private alias_body(c: *Checker, id: usize) -> &Type
                 c.note(a.unit, tp.span, s"the type alias `${a.decl.name}` does not use its type parameter `${tp.name}`, so every type argument given for it would make the same type")
     body
 
+/** Why `body` cannot be an opaque type's representation, where it cannot: a type with no values or
+ * one value (`Nothing`, `unit`), whose values have no layout to share, or a union, whose layout is a
+ * tag over its members, which a union naming the opaque type beside them would need apart. */
+private opaque_repr_refused(body: &Type) -> Option[string] = *representation(body) match
+    Nothing -> Some("`Nothing`, which has no values")
+    Unit -> Some("`unit`, which has one value and nothing to lay out")
+    Union(_) -> Some(s"a union, `${type_name(body)}`: declare a `data` type with a variant for each member")
+    TypeVar(_, _, name) -> Some(s"its type parameter `$name` alone, which could be `unit` or a union; give the parameter a place inside a type, as in `Vector[$name]`")
+    _ -> None
+
+/** Opaque type `id` at the type arguments `args`, its representation with them in place. */
+private opaque_at(c: *Checker, id: usize, args: Buf[&Type]) -> &Type =
+    Opaque(id, c.aliases[id].decl.name, args, substitute(alias_body(c, id), alias_owner(id), args))
+
+/** The opaque type `name` names in `unit`, where it names one. */
+private opaque_named(c: *Checker, unit: usize, name: string) -> Option[usize]
+    val id = c.alias_names.get(resolve_name(c, unit, name))?
+    if c.aliases[id].decl.opaque then Some(id) else None
+
+/** Whether the code being checked is in the module that declares opaque type `id`, which alone sees
+ * its representation. */
+private inside_opaque(c: *Checker, id: usize) -> bool = c.units[unit_of(c)].file.module_name == c.aliases[id].module_name
+
+/** What code outside its module is told where it reaches for opaque type `id`'s representation. */
+private opaque_hidden(c: *Checker, id: usize) -> string
+    val a = c.aliases[id]
+    val home = if a.module_name == "" then "the program's root module" else s"its module `${a.module_name}`"
+    s"`${a.decl.name}` is an opaque type: its representation is seen only in $home, which makes and takes apart its values"
+
+/** Opaque type `id`'s own type: at its own type parameters, with its representation in them. */
+private opaque_own_type(c: *Checker, id: usize) -> &Type
+    val params = c.aliases[id].decl.type_params
+    var args: Buf[&Type] = buf()
+    for i in 0..<params.len()
+        args.push(TypeVar(alias_owner(id), i, params[i].name))
+    Opaque(id, c.aliases[id].decl.name, args, alias_body(c, id))
+
+// `Name(value)` for opaque type `Name`, inside its module: the representation `value` as a value of
+// the opaque type, which changes nothing at run time. Its type arguments are written or inferred as a
+// function's are, from the representation.
+private opaque_wrap(c: *Checker, at: Span, name_span: Span, id: usize, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    if !inside_opaque(c, id)
+        c.note(unit, name_span, opaque_hidden(c, id))
+        for a in args
+            check_ignored(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    val body = alias_body(c, id)
+    if *body is ErrorType
+        for a in args
+            check_ignored(c, a.value)
+        return TExpr(at, ErrorType, UnitConst)
+    val d = c.aliases[id].decl
+    var params: Buf[&Type] = buf()
+    params.push(body)
+    var names: Buf[string] = buf()
+    names.push("repr")
+    var defaults: Buf[Option[usize]] = buf()
+    defaults.push(None)
+    val signature = Signature(d.name, true, d.type_params, alias_owner(id), params, names, defaults, opaque_own_type(c, id), buf(), None, false, buf())
+    val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
+    if applied.cut || applied.args.len() != 1 then return applied.wrap(at, UnitConst)
+    applied.wrap(at, Reveal(applied.args[0]))
+
 /** Alias `id`'s expansion as a diagnostic shows it, its parameters by their names. */
 private alias_shown(c: *Checker, id: usize) -> string = "`" + type_name(c.aliases[id].body) + "`"
 
@@ -9581,6 +9700,9 @@ private alias_not_value(c: *Checker, unit: usize, name: string) -> Option[string
     val id = c.alias_names.get(resolve_name(c, unit, name)) match
         Some(id) -> id
         None -> return None
+    if c.aliases[id].decl.opaque
+        if !inside_opaque(c, id) then return Some(opaque_hidden(c, id))
+        return Some(s"`$name` is an opaque type: `$name(r)` makes one of its representation `r`, and `x.repr` is the representation of one; it is not a value or a pattern")
     val hint = *c.aliases[id].body match
         Data(d, n, _) -> if has_variant_named(c.data[d].decl, n) then s"; `$n` makes and matches its values" else ""
         Class(k, n, _) -> if c.classes[k].decl.object || is_trait(c, k) || is_abstract_class(c, k) || c.classes[k].module_name == CoreModule then "" else s"; `$n` makes its values"
@@ -9604,6 +9726,10 @@ private hold_alias_body(c: *Checker, unit: usize, at: Span, t: &Type, owner: usi
                 hold_alias_body(c, unit, at, item, owner, args)
         Class(id, name, items) ->
             if any_alias_param(items) then check_type_args(c, unit, at, s"`$name`", class_owner(id), c.classes[id].decl.type_params, substitute_all(items, owner, args))
+            for item in items
+                hold_alias_body(c, unit, at, item, owner, args)
+        // An opaque type's parameters have no bounds, so only what its arguments name is held.
+        Opaque(_, _, items, _) ->
             for item in items
                 hold_alias_body(c, unit, at, item, owner, args)
         Tuple(items) ->
@@ -9768,6 +9894,7 @@ private first_union(t: &Type) -> &Type
         ByName(inner) -> return first_union(inner)
         Data(_, _, args) -> args
         Class(_, _, args) -> args
+        Opaque(_, _, args, _) -> args
         _ -> return t
     for p in parts
         if has_union(p) then return first_union(p)
@@ -10989,7 +11116,7 @@ private is_option_data(c: *Checker, d: usize) -> bool = core_data(c, "Option") m
 private to_trait(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
     if !is_trait_type(c, want) then return typed
     val t = zonk(c, typed.ty)
-    if !(is_builtin(t) || *t is Tuple(_) || *t is Union(_) && !is_reference(t)) then return typed
+    if !(is_builtin_or_opaque(t) || *t is Tuple(_) || *t is Union(_) && !is_reference(t)) then return typed
     if !conforms_to_bound(c, t, want) then return typed
     TExpr(typed.span, want, Box(typed))
 
@@ -10997,7 +11124,7 @@ private to_trait(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
 private boxes_to(c: *Checker, t: &Type, want: &Type) -> bool
     val x = zonk(c, t)
     val w = zonk(c, want)
-    is_trait_type(c, w) && (is_builtin(x) || *x is Tuple(_)) && conforms_to_bound(c, x, w)
+    is_trait_type(c, w) && (is_builtin_or_opaque(x) || *x is Tuple(_)) && conforms_to_bound(c, x, w)
 
 private check_form(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -> &TExpr
     if completing_expr(c, e) then return TExpr(e.span, ErrorType, UnitConst)
@@ -11225,6 +11352,10 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     if name == "self" && in_actor(c) then return name_expr(c, at, ActorSelf, expected)
     if name == "self" && refuse_static_self(c, at, "") then return TExpr(at, ErrorType, UnitConst)
     if binding_ref(c, at, name) is Some(t) then return evaluated(t)
+    // In a method an impl adds to an opaque type in its module, `repr` is `self.repr`.
+    if name == "repr" && !in_static(c)
+        if c.symbols[c.body.root].receiver is Some(r)
+            if *r is Opaque(id, _, _, repr) && inside_opaque(c, id) && class_member(c, name) is None then return TExpr(at, repr, Reveal(self_ref(c, at)))
     val symbol = c.symbols[c.current]
     if name == "super" && enclosing_class(c) is Some(_)
         c.note(symbol.unit, at, "`super` calls a superclass's method, as in `super.describe()`")
@@ -11833,6 +11964,12 @@ private member_of(c: *Checker, e: &Expr, value: &TExpr, name: string, expected: 
             c.note(unit, e.span, union_clash(ty, name, found.owners))
             return TExpr(e.span, ErrorType, UnitConst)
         if found.owners.len() == 1 then return member_of(c, e, union_as_owner(c, value, found.owners[0]), name, expected)
+    // An opaque type's `repr` is its representation, seen only in the module that declares it.
+    if *ty is Opaque(id, _, _, repr) && name == "repr"
+        if inside_opaque(c, id) then return TExpr(e.span, repr, Reveal(value))
+        if methods_of(c, ty, name).len() == 0
+            c.note(unit, e.span, opaque_hidden(c, id))
+            return TExpr(e.span, ErrorType, UnitConst)
     // A field of a data type with one variant comes before a method of the same name.
     if !(*ty is Class(_, _, _)) && !one_variant_field(c, ty, name)
         val ms = methods_of(c, ty, name)
@@ -14256,6 +14393,7 @@ private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
         Data(_, _, _) -> operator_conforms(c, at, spelling, t, "Ord")
         Class(_, _, _) -> operator_conforms(c, at, spelling, t, "Ord")
         Tuple(_) -> operator_conforms(c, at, spelling, t, "Ord")
+        Opaque(_, _, _, _) -> operator_conforms(c, at, spelling, t, "Ord")
         _ -> c.note(unit_of(c), at, s"`$spelling` cannot compare ${type_name(t)} values")
 
 // Whether a value of type `t` has an operator through the core trait `trait_name`: its type conforms
@@ -14723,6 +14861,9 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
         Class(k, _, xs) -> *b match
             Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return None
             _ -> return None
+        Opaque(k, _, xs, _) -> *b match
+            Opaque(j, _, ys, _) -> if k == j then (c.aliases[k].decl.type_params, xs, ys) else return None
+            _ -> return None
         _ -> return None
     if xs.len() != ys.len() || xs.len() != params.len() then return None
     var args: Buf[&Type] = buf()
@@ -14752,6 +14893,7 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     *a match
         Data(d, name, _) -> Some(Data(d, name, args))
         Class(k, name, _) -> Some(Class(k, name, args))
+        Opaque(k, _, _, _) -> Some(opaque_at(c, k, args))
         _ -> None
 
 // The tuple two tuples of as many parts agree on: each part where they agree on it, as a tuple's parts
@@ -14804,6 +14946,9 @@ private through_lowers(c: *Checker, x: &Type, up: &Type) -> bool
             _ -> false
         Class(k, _, ys) -> *x match
             Class(j, _, xs) -> k == j && all_through_lowers(c, xs, ys)
+            _ -> false
+        Opaque(k, _, ys, _) -> *x match
+            Opaque(j, _, xs, _) -> k == j && all_through_lowers(c, xs, ys)
             _ -> false
         Tuple(ys) -> *x match
             Tuple(xs) -> all_through_lowers(c, xs, ys)
@@ -15714,7 +15859,7 @@ private from_sources(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
             for up in holding_ancestors(f, b, k)
                 out.push(up)
         return out
-    if is_builtin(t) || *t is Tuple(_)
+    if is_builtin_or_opaque(t) || *t is Tuple(_)
         for b in c.builtins
             if builtin_covers(b.ty, t) && tuple_parts_hold(f, b.owner, b.params, t)
                 if ancestor_type(c.classes, c.data, b.trait_type, k) is Some(up) then out.push(up)
@@ -15830,6 +15975,7 @@ private call_expr(c: *Checker, at: Span, callee: &Expr, args: Buf[Argument], exp
                     for a in args
                         check_ignored(c, a.value)
                     return TExpr(at, ErrorType, UnitConst)
+        if opaque_named(c, unit, name) is Some(id) then return opaque_wrap(c, at, named.span, id, args, explicit, expected)
         c.note(unit, named.span, alias_not_value(c, unit, name).unwrap_or(s"`$name` is not defined"))
         return TExpr(at, ErrorType, UnitConst)
     if ids.len() == 1 then return call_function(c, at, named.span, ids[0], args, explicit, expected, buf())
@@ -17293,6 +17439,7 @@ private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&
             _ -> buf()
         None -> *t match
             Data(_, _, a) -> a
+            Opaque(_, _, a, _) -> a
             _ -> buf()
 
 // A method a subclass may override is called through the object's method table, unless the
@@ -17827,6 +17974,7 @@ private gives_var(c: *Checker, t: &Type, v: usize, covariant: bool) -> bool = *t
     ByName(inner) -> gives_var(c, inner, v, covariant)
     Data(_, _, args) -> any_gives_var(c, args, v, true) || any_gives_var(c, args, v, false)
     Class(_, _, args) -> any_gives_var(c, args, v, true) || any_gives_var(c, args, v, false)
+    Opaque(_, _, args, _) -> any_gives_var(c, args, v, true) || any_gives_var(c, args, v, false)
     _ -> false
 
 private any_gives_var(c: *Checker, types: Buf[&Type], v: usize, covariant: bool) -> bool
@@ -18519,6 +18667,7 @@ private give_up_unknowns(c: *Checker, t: &Type)
         ByName(inner) -> give_up_unknowns(c, inner)
         Data(_, _, args) -> for a in args do give_up_unknowns(c, a)
         Class(_, _, args) -> for a in args do give_up_unknowns(c, a)
+        Opaque(_, _, args, _) -> for a in args do give_up_unknowns(c, a)
         _ -> ()
 
 /** The elements of `t` where it is a tuple, and none otherwise. */
@@ -18845,6 +18994,7 @@ private loosen_for(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool, li
         Function(solved, loosen_for(c, result, open, covariant, literals), sendable)
     Data(d, name, args) -> Data(d, name, loosen_args(c, c.data[d].decl.type_params, args, open, covariant, literals))
     Class(k, name, args) -> Class(k, name, loosen_args(c, c.classes[k].decl.type_params, args, open, covariant, literals))
+    Opaque(k, _, args, _) -> opaque_at(c, k, loosen_args(c, c.aliases[k].decl.type_params, args, open, covariant, literals))
     _ -> zonk(c, t)
 
 /** The expected type of an argument that holds a number literal (`Some(1)`, `[1, 2]`, `(1, 2)`), where
@@ -18894,6 +19044,7 @@ private mentions_open(t: &Type, open: *Buf[usize]) -> bool = *t match
     ByName(inner) -> mentions_open(inner, open)
     Data(_, _, args) -> any_open(args, open)
     Class(_, _, args) -> any_open(args, open)
+    Opaque(_, _, args, _) -> any_open(args, open)
     _ -> false
 
 private any_open(types: Buf[&Type], open: *Buf[usize]) -> bool
@@ -18933,6 +19084,9 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
             _ -> ()
         Data(d, _, xs) -> *v match
             Data(e, _, ys) -> if d == e then return constrain_args(c, c.data[d].decl.type_params, xs, ys, open, covariant)
+            _ -> ()
+        Opaque(d, _, xs, _) -> *v match
+            Opaque(e, _, ys, _) -> if d == e then return constrain_args(c, c.aliases[d].decl.type_params, xs, ys, open, covariant)
             _ -> ()
         Class(k, _, xs) ->
             if ancestor_type(c.classes, c.data, v, k) is Some(up)
@@ -19860,6 +20014,7 @@ private has_type_params(t: &Type) -> bool = *t match
     Function(params, result, _) -> any_type_params(params) || has_type_params(result)
     Data(_, _, args) -> any_type_params(args)
     Class(_, _, args) -> any_type_params(args)
+    Opaque(_, _, args, _) -> any_type_params(args)
     Union(members) -> any_type_params(members)
     _ -> false
 
@@ -19903,7 +20058,7 @@ private may_match(c: *Checker, from: &Type, to: &Type) -> bool
     if *x is Function(_, _, _) && *y is Class(j, _, _) then return is_open(c, j)
     if *y is Function(_, _, _) && *x is Class(k, _, _) then return is_open(c, k)
     // A trait's value may be a built-in value or a tuple that implements it.
-    if is_trait_type(c, x) && (is_builtin(y) || *y is Tuple(_)) then return conforms_to_bound(c, y, x)
+    if is_trait_type(c, x) && (is_builtin_or_opaque(y) || *y is Tuple(_)) then return conforms_to_bound(c, y, x)
     *x match
         Class(k, _, _) -> *y match
             Class(j, _, _) ->
@@ -19938,6 +20093,9 @@ private variant_instances(c: *Checker, x: &Type, y: &Type) -> bool
             _ -> return false
         Class(k, _, xs) -> *y match
             Class(j, _, ys) -> if k == j then (c.classes[k].decl.type_params, xs, ys) else return false
+            _ -> return false
+        Opaque(k, _, xs, _) -> *y match
+            Opaque(j, _, ys, _) -> if k == j then (c.aliases[k].decl.type_params, xs, ys) else return false
             _ -> return false
         _ -> return false
     if xs.len() != ys.len() || xs.len() != params.len() then return false
@@ -20206,6 +20364,9 @@ private unify(c: *Checker, a: &Type, b: &Type) -> bool
         Class(i, _, xs) -> *y match
             Class(j, _, ys) -> i == j && unify_all(c, xs, ys)
             _ -> false
+        Opaque(i, _, xs, _) -> *y match
+            Opaque(j, _, ys, _) -> i == j && unify_all(c, xs, ys)
+            _ -> false
         _ -> same_type(x, y)
 
 /** Unifies a call's declared result with the type expected of it, except at a contravariant argument
@@ -20269,6 +20430,7 @@ private occurrence(c: *Checker, t: &Type, v: usize, covariant: bool) -> i32 = *z
     ByName(inner) -> occurrence(c, inner, v, covariant)
     Data(d, _, args) -> occurrence_args(c, c.data[d].decl.type_params, args, v, covariant)
     Class(k, _, args) -> occurrence_args(c, c.classes[k].decl.type_params, args, v, covariant)
+    Opaque(k, _, args, _) -> occurrence_args(c, c.aliases[k].decl.type_params, args, v, covariant)
     _ -> 0
 
 private occurrences(c: *Checker, types: Buf[&Type], v: usize, covariant: bool) -> i32
@@ -20302,6 +20464,9 @@ private poison(c: *Checker, t: &Type)
             for a in args
                 poison(c, a)
         Class(_, _, args) ->
+            for a in args
+                poison(c, a)
+        Opaque(_, _, args, _) ->
             for a in args
                 poison(c, a)
         _ -> ()
@@ -20521,6 +20686,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Convert(x, _) -> scan_init(c, s, x, unsafe)
         Box(x) -> scan_init(c, s, x, unsafe)
         NoneAs(x) -> scan_init(c, s, x, unsafe)
+        Reveal(x) -> scan_init(c, s, x, unsafe)
         Arith(_, a, b, _) ->
             val ok = scan_init(c, s, a, unsafe)
             scan_init(c, s, b, unsafe) && ok
