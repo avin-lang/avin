@@ -24,6 +24,8 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Tuple(_) -> Some(MRef)
     Function(_, _, _) -> Some(MRef)
     ByName(_) -> Some(MRef)
+    // A constructor applied is a data type, a class or a trait in every instance.
+    Applied(_, _) -> Some(MRef)
     // A trait's `Self` is left in the code of the trait's default bodies, which every conforming
     // type shares: each such type is an object, reached by reference.
     TypeVar(owner, _, _) -> if is_self_owner(owner) then Some(MRef) else None
@@ -449,10 +451,13 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     for s in program.symbols
         if s.root is Some(r)
             if s.decl.type_params.len() > 0 then generic_locals[r] = true
+    // A lambda is compiled only through the function values that make it: checking an argument
+    // against several overloads makes a lambda for each try, and only the one the call keeps is ever
+    // reached.
     for i in 0..<program.symbols.len()
         var inside_generic_local = false
         if program.symbols[i].root is Some(r) then inside_generic_local = generic_locals[r]
-        if !inside_generic_local && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] then instance(&l, i, buf())
+        if !inside_generic_local && !program.symbols[i].lambda && !is_generic(program, i) && !never_compiled(program, i) && !in_core_library(program, i) && !implementing[i] then instance(&l, i, buf())
     val entry: Option[usize] = program.entry match
         Some(id) -> Some(instance(&l, id, buf()))
         None -> None
@@ -6110,10 +6115,14 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         val v = lower_expr(l, value)
         if v is None && machine(l, value.ty) is Some(_) then return None
         val to = concrete(l, e.ty)
+        val from = concrete(l, value.ty)
+        // A union whose members are one type in this instance, as `T | int` is at `T = int`, is
+        // that type, laid out as it is: a value of it is already one, and is not boxed.
+        if same_type(from, to) then return v
         // A value injected into a union with a scalar member becomes its cell; into anything else
         // it is seen as an `Any`.
-        if is_scalar_union(to) then inject_cell(l, concrete(l, value.ty), to, v)
-        else box_value(l, concrete(l, value.ty), v)
+        if is_scalar_union(to) then inject_cell(l, from, to, v)
+        else box_value(l, from, v)
     NoneAs(value) ->
         // The value is always `None`, so it is the other option's own `None`: null where that option
         // is kept as a pointer, and its one constant object where it is an object, so that as an `Any`

@@ -975,7 +975,12 @@ each literal a `byte`), and otherwise from the elements themselves, which agree 
 branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A number
 literal among them takes the type the others decide, wherever it is written
 ([generics](/spec/generics/#inference)): `[long(1), 2]` and `[2, long(1)]` are `Vector[long]`, and
-`[1.5, 2]` is a `Vector[real]`. A map
+`[1.5, 2]` is a `Vector[real]`. So does a number literal in a literal given as an argument, from
+what the receiver and the other arguments decide of its parameter, an overloaded method's included:
+with `v: Vector[long]`, `v ++ [400]` and `v ++ [5_000_000_000]` are `Vector[long]`, `l ++ List(400)`
+on a `List[long]` is a `List[long]`, and beside a `Vector[BigInt]` or a `Vector` of a type that
+[takes integers](/spec/types/#integers-meet-a-type-that-takes-them) the literal's numbers are that
+type's values; `v ++ ["a"]` is still an error. A map
 literal's keys agree on one type and its values on another, so `{a: dog, b: cat}` is a
 `Map[string, Animal]`. A literal in braces is all elements or all entries; `{1, b: 2}` is an
 error. Set and map literals nest inside one another and inside sequence literals, and like them may
@@ -1328,10 +1333,15 @@ implementing the [standard constructor traits](/spec/generics/#functor-applicati
 body once per element, binding each by the pattern: a name, `_`, a tuple or a variant pattern that
 every element matches. Each element is a new binding, so a closure made in the body keeps the
 element it saw. `break` and `continue` work as in `while`. A range written in place (`0..<n`, of any
-integer type) is counted without making a `Range`, and an array is indexed; anything else is
-traversed through its `iterator()`, which is what `foreach` does for the library's collections, and
-lets `break`, `continue` and `return` leave the body directly. A source with no iterator, such as an
-`int`, is an error.
+integer type) is counted without making a `Range`, and an array is indexed; anything else must
+conform to `Iterable` and is traversed through its `iterator()`, which is what `foreach` does for
+the library's collections, and lets `break`, `continue` and `return` leave the body directly.
+Conformance is by name, as everywhere: a class or data type declaring `Iterable[A]` among its
+parents or given it by an impl, an `Iterator`, a type parameter bounded by `Iterable` or by a trait
+requiring it, or a union whose every member is one. A type that merely has an `iterator()` method is
+not a source until it conforms, and neither is an `Option` or an `Either`, which have `iterator()`
+but are not `Iterable`s (`toList` makes one of an option's value). Any other source, such as an
+`int`, is an error that names its type.
 
 ```text
 for i in 0 ..< n do total += i
@@ -1419,7 +1429,7 @@ checked as written out:
 - **A guard** filters an `Iterable` through `withFilter`, lazily as below, and any other source
   through `Filter`'s `filter`. The views `withFilter` makes are `Iterable`s themselves, so the calls
   after a guard are on an `Iterable` too.
-- **In generic code** the bounds decide: `fa: F[A]` with `F[_]: Monad + Filter` takes every role,
+- **In generic code** the bounds decide: `fa: F[A]` with `F[_]: Monad & Filter` takes every role,
   and with `F[_]: Functor` alone only the last generator's.
 
 So `Option`, `Result[_, E]` and `Either[L, _]` draw in a comprehension as the collections do, and so

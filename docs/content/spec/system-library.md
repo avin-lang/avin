@@ -137,6 +137,10 @@ knows is asked for by name, and a program's own settings are its own values.
 | `exec(program: string, args: Vector[string], environment: Map[string, string]) -> Result[Nothing, IoError]` | The same, with `environment` as the whole of the new program's environment. |
 | `waitPid(pid: long) -> Result[ExitStatus, IoError]` | Waits for this program's child `pid` to end and answers how it ended, reaping it; see [becoming another program](#becoming-another-program). |
 | `tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]` | Whether the child `pid` has ended, without waiting: `None` while it runs, its status (reaping it) once it has. |
+| `waitPidCpu(pid: long) -> Result[(ExitStatus, CpuTime), IoError]` | `waitPid`, answering with the status the [CPU time](#cpu-time) the child used, its reaped descendants' included. |
+| `tryWaitPidCpu(pid: long) -> Result[Option[(ExitStatus, CpuTime)], IoError]` | `tryWaitPid`, answering with the status the child's CPU time. |
+| `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the program has used so far, every thread's together. |
+| `childrenCpuTime() -> CpuTime` | The CPU time of the program's children that have ended and been reaped, each with the children it reaped in turn. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
 
 Listing a group replaces a `pgrep -g` subprocess, for instance to signal or count everything a
@@ -199,6 +203,32 @@ program's own pid, and a pid of zero or less or past the largest process id are 
 `Err(NotFound)`. A thread waiting in `waitPid` leaves its worker to the program's other threads, as
 every [blocking](/spec/threads/#lightweight-threads) wait does. A child a `Child` still holds is
 its `Child`'s to wait for: one reaped by `waitPid` first is no longer there for `waitFor`.
+
+### CPU time
+
+`CpuTime(user: Duration, system: Duration)` is how long a processor ran a process's own code and
+the kernel's code on its behalf, each in whole microseconds as the kernel accounts for them; `total`
+is the two added, and `CpuTime` is `Add`, with `CpuTime.Zero` its zero. The kernel keeps the count
+per process, and **a process's count is handed to its parent when the parent reaps it**, folded into
+the parent's own children's count. So the CPU of a whole tree reaches the program through the one
+child it started, once every process in the tree was reaped by its own parent: a shell running a
+loop of programs that each exit has their time as well as its own.
+
+```avin
+match Command("/bin/sh", "-c", "make -j4").start()
+  Ok(job) ->
+    _ = job.waitFor()
+    println(s"${job.cpuTime().total.toSecondsReal} s of CPU")   // make, the compilers it ran, theirs
+  Err(e) -> eprint(e.message)
+```
+
+**Only what was reaped counts.** A program still running counts nothing, and so does one that has
+ended and not been waited for, and a grandchild that outlives its parent, or that its parent never
+waited for, never reaches it. `cpuTime()` is the program's own, every thread's, and only grows;
+`childrenCpuTime()` is every reaped child's added. `waitPidCpu` and `tryWaitPidCpu` answer one
+child's, as `waitPid` and `tryWaitPid` answer its status, with the same errors; a `Child`'s
+`cpuTime()` answers its command's. A program that only slept used next to none: what starting it
+took.
 
 ### Commands
 
@@ -270,6 +300,7 @@ it.
 | `signalGroup(sig: int) -> Result[unit, IoError]` | Sends `sig` to every process in the command's group, the programs those programs started that stayed in it among them, however the command ended; an empty group is `Err(Other("No such process"))`, also while its last member has ended but is not yet waited for, and a command not started `inNewGroup` `Err(Other("the command has no group of its own"))`. |
 | `detach() -> long` | Lets go of the command without stopping it, so it outlives its `Child` and the program, and answers `pid()`. |
 | `residentBytes() -> Result[long, IoError]` | The memory the program `pid()` names holds in RAM now, as `process.residentBytes(pid())` answers it; a command seen to have ended, or with no program started, is `Err(NotFound)`. |
+| `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the command's programs used, each with its reaped descendants', a pipeline's stages and a sequence's parts added. After `waitFor` it is the whole command's; before, what the programs seen to have ended used. A detached program counts nothing. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
@@ -1086,12 +1117,39 @@ reference implementation's stream 54, seeded as the reference seeds it, so a see
 against the published algorithm: `Random(42).nextInt()` is its first published output, `0xa15c02b7`,
 which as an `int` is `-1587805513`. A `long` is two draws, the first the high half. A bound is reached without bias, by rejection rather
 than a remainder. **None of this is fit for secrets**: anyone who sees a few outputs can compute the
-rest, so a key, a token or a password is never taken from it.
+rest, so a key, a token or a password is never taken from it. Those come from `SecureRandom`.
+
+### `SecureRandom`
+
+```text
+import avin.random.SecureRandom
+
+main()
+  val session = SecureRandom.urlToken()
+  val key = SecureRandom.nextBytes(32)
+  println(SecureRandom.between(0, 10000))
+```
+
+**`SecureRandom` is random numbers fit for secrets.** Every draw is read from the operating system's
+cryptographic generator (`getentropy`, on macOS, Linux and the BSDs), so no number of outputs says
+anything about the next. It is an object, not a class: there is no seed, nothing to replay, and no
+state, so any thread may call it at once. Where the operating system gives no bytes, the draw traps,
+since nothing could stand in for them.
+
+| Function | Meaning |
+| --- | --- |
+| `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes, any count, past the system's 256-byte request limit included; a negative `n` traps. |
+| `hexToken(byteCount: int = 32) -> string` | `byteCount` random bytes as lower-case hexadecimal, two digits a byte: 64 characters by default. |
+| `urlToken(byteCount: int = 32) -> string` | `byteCount` random bytes as unpadded base64url, which a URL, a header, a cookie and a file name carry as it is: 43 characters by default. |
+| `nextInt()`, `nextLong()`, `nextInt(bound)`, `nextLong(bound)`, `between(min, max)` for `int` and `long`, `nextReal()`, `nextBoolean()`, `alphanumeric()`, `shuffle(xs)`, `choose(items)` | As `Random`'s, with the same bounds, the same traps and no bias. |
+
+32 bytes is 256 bits, beyond any guessing. `SecureRandom` has no `nextGaussian`, `chooseWeighted` or
+`setSeed`: no secret is drawn from those distributions, and there is no seed to set.
 
 ## `avin.crypto`
 
-Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two, and
-hexadecimal text for any digest.
+Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two,
+comparison of secrets in constant time, and hexadecimal text for any digest.
 
 ```text
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
@@ -1113,7 +1171,8 @@ or a cache, and is written as text only on request. Text is hashed as its UTF-8 
 | `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
 | `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
 | `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
-| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte. |
+| `constantTimeEquals(a, b) -> bool` | Whether `a` and `b`, both `Vector[byte]` or both `string` (compared as UTF-8 bytes), are the same, taking as long wherever they first differ. Different lengths answer `false` at once. |
+| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte: [`avin.encoding`](#avinencoding)'s, which this module offers too. |
 
 **A hasher takes its input in pieces**, for data too large to hold whole, such as a file read in
 chunks. `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
@@ -1124,10 +1183,67 @@ one-shot digest. A hasher belongs to the thread that made it, as a handle does.
 **`sha1` and `md5` are for formats that already use them**: a checksum in a listing, a cache key
 nobody attacks. Two different inputs with the same digest can be made for both, so neither signs,
 authenticates or names untrusted content; use `sha256` or `sha512` for those. HMAC does not rest on
-collision resistance, but only the SHA-2 variants are offered. Comparing a received tag with a
-computed one is a comparison of two `Vector[byte]`, which is not constant-time.
+collision resistance, but only the SHA-2 variants are offered.
 
-The digests are bound to Sysl's `sysl.crypto`, so they are the same code Sysl programs use.
+**A secret someone sent is compared with `constantTimeEquals`, never with `==`.** `==` stops at the
+first byte that differs, so how long a rejection takes tells a patient attacker how much of a guessed
+MAC tag, bearer token or password digest was right, and lets the guess be built a byte at a time.
+`constantTimeEquals` reads every byte and decides once, at the end. A length is not the secret, so
+different lengths answer at once. For two digests of public data, `==` is fine.
+
+```text
+val expected = hmacSha256(key, body)
+val ok = fromBase64(header) match
+  Ok(sent) -> constantTimeEquals(sent, expected)
+  Err(_) -> false
+```
+
+The digests and the comparison are bound to Sysl's `sysl.crypto`, so they are the same code Sysl
+programs use.
+
+## `avin.encoding`
+
+Bytes written as text and read back, as RFC 4648 defines them: hexadecimal, base64 with its `=`
+padding, and base64url, the URL- and filename-safe alphabet written without padding.
+
+```text
+import avin.encoding.{toBase64, fromBase64, toBase64Url, fromHex}
+
+main()
+  println(toBase64("hello"))
+  println(toBase64Url("hello"))
+  println(fromBase64("aGVsbG8="))
+  println(fromHex("68656c6c6f"))
+```
+
+| Function | Meaning |
+| --- | --- |
+| `toHex(x) -> string` | `x`, a `Vector[byte]` or the UTF-8 bytes of a `string`, as lower-case hexadecimal, two digits a byte. |
+| `fromHex(text) -> Result[Vector[byte], DecodeError]` | The bytes the digits spell, two a byte, upper or lower case. |
+| `toBase64(x) -> string` | `x` in base64: `A`–`Z`, `a`–`z`, `0`–`9`, `+` and `/`, padded with `=` to a multiple of four characters. |
+| `fromBase64(text) -> Result[Vector[byte], DecodeError]` | The bytes padded, standard base64 spells. |
+| `toBase64Url(x) -> string` | `x` in base64url: `-` and `_` in place of `+` and `/`, and no padding. |
+| `fromBase64Url(text) -> Result[Vector[byte], DecodeError]` | The bytes unpadded base64url spells. |
+
+Encoding never fails, and the empty input encodes as the empty text and decodes back from it.
+
+**Decoding is strict, so each byte sequence has exactly one spelling.** A decoder refuses whitespace
+and line breaks, the other alphabet's characters, a missing, extra or misplaced `=`, any `=` in
+base64url, and a last digit with bits set below the last whole byte, which an encoder always leaves
+zero (`Zh==` is refused; `Zg==` is `f`). Two different texts therefore never decode to the same
+bytes, which matters for a token or a signature carried as text. Text wrapped across lines has its
+line breaks taken out before it is decoded.
+
+**A refusal is a `DecodeError`**, an `Error` whose `at` is a byte offset in the text. The checks run
+in order, the characters first, then the padding, the length and the unused bits, so the offset
+named is of the first thing wrong.
+
+| Case | Meaning |
+| --- | --- |
+| `BadCharacter(at)` | A character the encoding does not use. |
+| `BadPadding(at)` | An `=` where padding cannot stand: before the last two characters, followed by a character that is not `=`, more than two of them, or any in base64url. |
+| `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one. `at` is the text's length. |
+| `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
 
 ## `avin.net`
 
@@ -1382,9 +1498,11 @@ main()
   http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
 ```
 
-`http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,
+`type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
+`http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError) ->
+Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
 `writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
 takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The
@@ -1423,6 +1541,73 @@ route whether escaped or not. A `GET` route answers `HEAD` too where no `HEAD` r
 no route matches is answered `404`, and one that routes match for other methods only `405`, with
 `Allow` naming those methods, `HEAD` beside `GET`.
 
+**Typed parameters.** `paramAs[T](name)` reads a route parameter as a `T` and `queryAs[T](name)` a
+query parameter, its first where it is given more than once, each answering `Result[T,
+ParamError]`: `Missing(place, name)` where the query has none of that name, `Invalid(place, name,
+text, kind)` where its text does not read as a `T` (`paramAs` traps on a name the route lacks, as
+`param` does). `queryAs(name, default)` answers `default` for a missing one and `queryOption[T](name)`
+`None`. A `T` is any `FromParam`, a trait of two static methods, `parse(text) -> Option[Self]` and
+`kind()`, the words naming it in an error ("an int"); `string`, `int`, `long`, `real` and `bool`
+implement it, and a program's own type may. A `ParamError`'s `message` is the sentence for the
+client, as in ``the query parameter `n` is `x`, which is not an int``.
+
+**Handlers that fail.** `ToResponse` is a failure a handler can answer with, its `toResponse()` the
+response telling the client. `Response` implements it as itself and `ParamError` as a `400` with its
+message; a program's own error type may too. `fromResult(answer)` makes a `Handler` of a function
+answering `Result[Response, ToResponse]`, an `Err` answered with its failure's response, and each of
+`Route.get`, `post`, `put`, `delete` and `patch` has an overload taking such a function, so `?` ends a
+handler early:
+
+```text
+half(r: ServerRequest) -> Result[Response, ToResponse]
+  val n = r.paramAs[int]("n")?
+  if n % 2 != 0 then return Err(Response.text(422, "odd\n"))
+  Ok(Response.text(200, s"${n / 2}\n"))
+
+val route = Route.get("/half/:n", half)
+```
+
+**Groups and middleware.** `type Handler = @sendable (ServerRequest) -> Response`; a middleware is a
+`(Handler) -> Handler`. `route.wrap(middleware)` passes a route's handler through one, wrapping again
+putting the newer outside, so it runs first; `route.under(prefix)` puts a route's pattern after
+`prefix`, a pattern of `/` becoming the prefix itself. `Route.group(prefix, routes, middleware = h ->
+h)` answers each of `routes` under `prefix` and wrapped by `middleware`, and groups nest, an inner
+group's middleware running inside the outer's. A prefix begins with `/`, does not end with one and
+may bind parameters as a pattern does; one that does not hold traps.
+
+**Error pages.** `type ErrorPage = @sendable (int) -> Response` renders the responses a router and a
+server make themselves for an error status: `Router(routes, errors)` its `404` and `405`, and
+`http.serve(…, errors)` every status of the table below. The status sent is the one given, whatever
+the page answered, and a `405` still carries its `Allow` header. `http.plainError`, the default, answers the
+status's reason phrase as plain text.
+
+**Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
+`write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
+once; its `body` is empty. Its head says `Transfer-Encoding: chunked` and each write is a chunk, the
+body ended by the empty one once `write` returns; to an HTTP/1.0 client it says neither, and the
+body ends with the connection. `Response.stream(status, contentType, length, write)` says
+`Content-Length: length` beforehand instead: a write past it traps, a negative length traps, and a
+body ending short closes the connection. `BodyWriter.write(bytes)` and `write(text)` answer
+`Result[unit, IoError]`: `Err` once the client has gone or the server is stopping, and for every
+write after one that failed, so the code writing a stream ends there; a failed write closes the
+connection. No body is written for `HEAD`, `204` or `304`, and `write` is not run.
+
+`Response.events(write)` is a stream of server-sent events, `200` of the type `text/event-stream`,
+written through an `EventWriter`: `send(text, event = None, id = None)` sends an event, each line of
+`text` (split at `\r\n`, `\r` or `\n`) a `data:` line after its `event:` and `id:` lines, a type or an
+id holding a line break trapping; `comment(text)` sends a comment, which a client passes over; and
+`retry(delay)` tells the client how long to wait before reconnecting. `Response.events(keepAlive,
+write)` sets how often a comment is sent while `untilStopped` waits, fifteen seconds by default and
+none for zero, so a client that has gone is noticed and one still there keeps the stream open.
+
+**Waiting in a handler.** `request.isStopping()` says whether the server that read the request is
+stopping, and `request.untilStopped(wait)` runs `wait`, a `@sendable () -> T`, on a thread of its own
+and answers `Some` of its result, or `None` where the server stops first, cancelling `wait` wherever
+it waits as `TcpServer.idle` does: a long poll answers at once rather than holding the shutdown. Where
+the server is already stopping `wait` is not run. `BodyWriter` and `EventWriter` have both too, the
+`EventWriter`'s sending its keep-alive comments while it waits and answering `None` once one cannot
+be sent. A request made without a server never stops, and `wait` is then run as it is.
+
 **The connection.** Requests are read one after another, so several are kept alive on one
 connection and pipelined ones are answered in order: in HTTP/1.1 unless either side says
 `Connection: close`, in HTTP/1.0 only on `Connection: keep-alive`, which the response then repeats.
@@ -1430,8 +1615,8 @@ Empty lines before a request line are passed over, and a line may end in a bare 
 by `Content-Length` or chunked (extensions and trailers passed over); an `Expect: 100-continue` is
 answered `100 Continue` once the body is known to fit. The server writes `Content-Length` and
 `Connection` itself, in place of any the handler gave, every response as `HTTP/1.1`, and no body for
-`HEAD`, `204` and `304`. A handler's status outside 200 to 599, or a header the response cannot
-carry, traps.
+`HEAD`, `204` and `304`; a streamed response's framing is its own, as above. A handler's status
+outside 200 to 599, or a header the response cannot carry, traps.
 
 **A request the server cannot take is answered and the connection closed**, gently: its side is shut
 and what the client still sends read and dropped for a moment, so the answer is not lost to a reset.
@@ -1444,7 +1629,7 @@ and what the client still sends read and dropped for a moment, so the answer is 
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
 | `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
-| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS the connection is closed unanswered) |
+| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS, or once a streamed response's head is sent, the connection is closed unanswered) |
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
 | `505` | A version other than 1.0 and 1.1 |

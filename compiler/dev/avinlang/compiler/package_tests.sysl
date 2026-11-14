@@ -1914,9 +1914,103 @@ feature_gates_imports()
     // A gate whose `enables` reach the other feature implies it.
     put(shapes + "/avin.hocon", manifest("shapes", "features {\n  server {\n    default = true\n    modules = [shapes.server]\n    enables = [http]\n  }\n  desktop = [webview]\n  fancy { modules = [shapes.fancy], enables = [server, desktop] }\n}\ndependencies {\n  http { path = \"../http\", optional = true }\n  webview { path = \"../webview\", optional = true }\n}\n"))
     assert_eq(avin(dir, ["avin", "check", shapes]).noted, "")
-    // The tests and the root module are always compiled, and are never listed.
-    put(shapes + "/tests/shapes_tests.avin", "module tests\n\nimport shapes.server.serve\n\n@test\nserves()\n    assertEq(serve(), 204)\n")
-    assert(avin(dir, ["avin", "check", shapes]).noted.contains("`shapes.server` exists only while the feature `server` is on, and `tests` is always compiled: import it from a module listed under a feature that enables `server`"))
+    // The package's tests may import any of its modules, whatever its gate.
+    put(shapes + "/tests/shapes_tests.avin", "module tests\n\nimport shapes.server.serve\nimport shapes.fancy.fancy\nimport webview.open\n\n@test\nserves()\n    assertEq(serve() + fancy() + open(), 219)\n")
+    assert_eq(avin(dir, ["avin", "check", shapes]).noted, "")
+    // The root module is always compiled, and is never listed.
+    put(shapes + "/main.avin", "import shapes.server.serve\n\nmain()\n    println(serve())\n")
+    assert(avin(dir, ["avin", "check", shapes]).noted.contains("`shapes.server` exists only while the feature `server` is on, and the package's root module is always compiled: import it from a module listed under a feature that enables `server`"))
+
+// The number of times `part` is in `text`.
+private times(text: string, part: string) -> usize = text.split(part).len - 1
+
+@test("the package's tests import its gated modules, and a test module is read only while every module it imports is")
+tests_import_gated_modules()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    featured(dir, "")
+    val shapes = dir + "/shapes"
+    put(shapes + "/shapes/server/server.avin", "module shapes.server\n\nimport http.get\nimport shapes.area\n\nserve() -> int = get() + area()\nport() -> int = 80\n")
+    // One file of `tests` imports a gated module with several names; another file of it is a helper.
+    put(shapes + "/tests/server_tests.avin", "module tests\n\nimport shapes.server.{serve, port}\n\n@test\nservesOnItsPort()\n    assertEq(serve() + port(), 284)\n")
+    put(shapes + "/tests/helpers.avin", "module tests\n\ntwice(n: int) -> int = n * 2\n")
+    // A test module importing a declaration of `tests` is read only while `tests` is.
+    put(shapes + "/tests/uses/uses.avin", "module tests.uses\n\nimport tests.twice\n\n@test\ndoublesTwo()\n    assertEq(twice(2), 4)\n")
+    // A test module importing from `tests.plain`, a module of its own, does not depend on `tests`.
+    put(shapes + "/tests/plain/plain.avin", "module tests.plain\n\nimport shapes.area\n\nthree() -> int = area() - 1\n\n@test\nareaIsStillFour()\n    assertEq(area(), 4)\n")
+    put(shapes + "/tests/other/other.avin", "module tests.other\n\nimport tests.plain.three\n\n@test\nthreeIsThree()\n    assertEq(three(), 3)\n")
+    put(shapes + "/tests/whole/whole.avin", "module tests.whole\n\nimport tests.plain\n\n@test\nthreeThroughItsModule()\n    assertEq(plain.three(), 3)\n")
+    // A test module under a gated module's feature that is off, through a module under it.
+    put(shapes + "/tests/admin/admin.avin", "module tests.admin\n\nimport shapes.server.admin.admin\n\n@test\nadminIsOneMore()\n    assertEq(admin(), 205)\n")
+    val all = avin(dir, ["avin", "test", shapes, "-O0"])
+    assert_eq(all.noted, "")
+    assert_eq(all.status, 0)
+    for name in ["servesOnItsPort", "doublesTwo", "areaIsStillFour", "threeIsThree", "threeThroughItsModule", "adminIsOneMore", "areaIsFour"]
+        assert(all.said.contains(name), name)
+    // With `server` off, the test modules needing it are not read, and the rest still run.
+    val without = avin(dir, ["avin", "test", shapes, "-O0", "--no-default-features"])
+    assert_eq(without.noted, "")
+    assert_eq(without.status, 0)
+    for name in ["servesOnItsPort", "doublesTwo", "adminIsOneMore", "areaIsFour"]
+        assert(!without.said.contains(name), name)
+    assert(without.said.contains("areaIsStillFour"))
+    assert(without.said.contains("threeIsThree"))
+    assert(without.said.contains("threeThroughItsModule"))
+    // A check and a build with the feature off pass over them too, so the package builds with any set off.
+    assert_eq(avin(dir, ["avin", "check", shapes, "--no-default-features"]).noted, "")
+    put(shapes + "/main.avin", "import shapes.area\n\nmain()\n    println(area())\n")
+    val run = avin(dir, ["avin", "run", shapes, "--no-default-features"])
+    assert_eq(run.noted, "")
+    assert_eq(run.out, "4\n")
+    // Another feature off leaves the tests that need only `server` alone.
+    assert(avin(dir, ["avin", "test", shapes, "-O0", "--features", "server"]).said.contains("servesOnItsPort"))
+    // An error in a test module that is not read is not reported, and one in a test module that is, is.
+    put(shapes + "/tests/admin/admin.avin", "module tests.admin\n\nimport shapes.server.admin.admin\n\nbroken() -> int = \"no\"\n")
+    assert_eq(avin(dir, ["avin", "check", shapes, "--no-default-features"]).status, 0)
+    assert_eq(avin(dir, ["avin", "check", shapes]).status, 1)
+
+@test("an import refused for its module is refused once, however many names it imports")
+refused_imports_are_reported_once()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    featured(dir, "")
+    val shapes = dir + "/shapes"
+    put(shapes + "/shapes/server/server.avin", "module shapes.server\n\nimport http.get\nimport shapes.area\n\nserve() -> int = get() + area()\nport() -> int = 80\nhost() -> int = 1\npath() -> int = 2\nquery() -> int = 3\n")
+    val gated = "`shapes.server` exists only while the feature `server` is on"
+    // One import of five names from a gated module, from an ungated module: one error.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server.{serve, port, host, path, query}\n\narea() -> int = 4\n")
+    val five = avin(dir, ["avin", "check", shapes]).noted
+    assert_eq(times(five, gated), 1)
+    assert(five.contains("shapes/shapes/shapes.avin:3:8"))
+    // A name imported twice in one import: one error.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server.{serve, serve}\n\narea() -> int = 4\n")
+    assert_eq(times(avin(dir, ["avin", "check", shapes]).noted, gated), 1)
+    // Two imports from one gated module: an error at each.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server.serve\nimport shapes.server.{port, host}\n\narea() -> int = 4\n")
+    val two = avin(dir, ["avin", "check", shapes]).noted
+    assert_eq(times(two, gated), 2)
+    assert(two.contains("shapes/shapes/shapes.avin:3:8"))
+    assert(two.contains("shapes/shapes/shapes.avin:4:8"))
+    // The whole module imported, and a name of it, in one file: an error at each.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server\nimport shapes.server.serve\n\narea() -> int = 4\n")
+    assert_eq(times(avin(dir, ["avin", "check", shapes]).noted, gated), 2)
+    // From a module gated by another feature: one error for one import.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\narea() -> int = 4\n")
+    put(shapes + "/shapes/fancy/fancy.avin", "module shapes.fancy\n\nimport shapes.server.{serve, port, host}\n\nfancy() -> int = serve()\n")
+    val fancy = avin(dir, ["avin", "check", shapes]).noted
+    assert_eq(times(fancy, gated), 1)
+    assert(fancy.contains("and `shapes.fancy` exists only while `fancy` is on"))
+    // An optional dependency's module imported with several names: one error.
+    put(shapes + "/shapes/fancy/fancy.avin", "module shapes.fancy\n\nfancy() -> int = 1\n")
+    put(dir + "/http/http/http.avin", "module http\n\nget() -> int = 200\npost() -> int = 201\n")
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport http.{get, post}\n\narea() -> int = 4\n")
+    assert_eq(times(avin(dir, ["avin", "check", shapes]).noted, "`http` is a module of the optional dependency `http`"), 1)
+    // A module of the standard library that does not exist, imported with several names: one error.
+    put(dir + "/loose/main.avin", "import avin.nosuch.{a, b, c}\nimport avin.nosuch.d\n\nmain()\n    println(1)\n")
+    val missing = avin(dir, ["avin", "check", dir + "/loose/main.avin"]).noted
+    assert_eq(times(missing, "the standard library has no module `avin.nosuch`"), 2)
+    assert(missing.contains("main.avin:1:8"))
+    assert(missing.contains("main.avin:2:8"))
 
 @test("avin test and avin check turn every feature on unless a flag says otherwise, and build and run take the defaults and the flags")
 feature_flags()

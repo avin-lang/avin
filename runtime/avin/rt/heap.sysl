@@ -88,6 +88,11 @@ struct Context
     /** How many regions the thread is inside that its cancellation may not stop it in though no lock
      * is held: running what waits for a future it completed. */
     uncancellable: u32
+    /** What the thread waits on while it waits, a wait kind (`diagnostics.sysl`), or 0 while it does
+     * not; and when that wait began, in microseconds of the monotonic clock. Written by the thread
+     * itself, read by the thread dump and the deadlock report. */
+    waits: Atomic[u32]
+    waits_since: Atomic[long]
 
 @assert(offsetof(Context, caller) == 24, "the compiler writes a context's caller site at 24")
 @assert(offsetof(Context, owner) == OwnerOffset, "the compiler reads a context's owner at 32")
@@ -99,7 +104,7 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0)
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0))
 
 /** One operating system thread's state: the chunk of the heap that the contexts running on the thread
  * allocate from with no lock, and, on a worker of the scheduler, what the scheduler keeps about the
@@ -459,6 +464,7 @@ thread_attach() -> *Context
     t.me = Some(t)
     val c: *Context = ptr_cast(&*t)
     // Attached safe, then running once no collection is in progress.
+    _ = foreign_attached.add(1)
     attach(c)
     leave_safe(c)
     current_context = c
@@ -469,6 +475,7 @@ thread_attach() -> *Context
 @export("avin_rt_thread_detach")
 thread_detach(c: *Context)
     detach(c)
+    _ = foreign_attached.sub(1)
     val t: *ThreadContext = ptr_cast(c)
     t.me = None
 
@@ -512,6 +519,7 @@ collect(c: *Context)
 start(argc: i32, argv: **u8) -> *Context
     keep_arguments(argc, argv)
     install_stack_guard()
+    install_thread_dump()
     main_context.owner = fresh_owner()
     if poll_stress then _ = requested.or(Poll)
     attach(&main_context)

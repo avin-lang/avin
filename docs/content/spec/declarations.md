@@ -1183,7 +1183,7 @@ implemented by one type at several type arguments**, once at each: `impl From[Io
 AppError` beside `impl From[ParseError] for AppError`, or `class Note : Make[int], Make[string]`.
 No value of such a trait exists, so each call names a type, and the member called is the one taking
 the arguments' types: `AppError.from(e)` as any overloaded method, and on a type parameter bounded
-by several instances, `T: Make[int] + Make[string]`, the instance whose member the arguments fit.
+by several instances, `T: Make[int] & Make[string]`, the instance whose member the arguments fit.
 Each conformance gives every member of the trait at its own type arguments. Any other trait is
 implemented once, at one list of type arguments.
 

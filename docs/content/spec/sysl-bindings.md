@@ -759,7 +759,7 @@ refuses is reported at the binding, in Sysl's words:
 error: the Sysl binding `largest` does not match `avintest.digits.larger`: 'digits.avintest.digits.larger' requires its type parameter 'T' to implement 'PartialOrd', but digits.avintest.digits.Spot does not
 ```
 
-An Avin bound beside `Boundary`, `[T: Boundary + Ord]`, is checked by Avin at the call as any bound
+An Avin bound beside `Boundary`, `[T: Boundary & Ord]`, is checked by Avin at the call as any bound
 is; the two are not related, and the Sysl function's bounds are Sysl's to check. A collection, which
 crosses as a copy whose Sysl type differs by direction, a [handle](#handles), which goes into Sysl
 only by itself, and every other class, data type and function are not `Boundary`, and are refused at

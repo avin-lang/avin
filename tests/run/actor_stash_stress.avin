@@ -1,0 +1,49 @@
+// expect: exit 0
+// Many rounds of stashing and giving back, the messages strings made as they are sent from several
+// threads: every message comes back once, each sender's in the order it sent them, and the strings
+// survive the collector while they wait in the stash.
+import avin.actors.{ActorRef, Stash, spawn}
+import avin.threads.{Atomic, Promise}
+import avin.threads as threads
+import avin.time
+
+data Msg
+  Line(sender: int, seq: int, text: string)
+  Flip
+  Check(replyTo: ActorRef[string])
+
+actor Flipper receives Msg
+  val stash = Stash(self, 1000)
+  val last = Buffer[int]()
+  for _ in 0 ..< 4 do last.append(-1)
+  var open = false
+  var seen = 0
+  var inOrder = true
+
+  receive
+    Line(sender, seq, text) ->
+      if !open then stash.add(Line(sender, seq, text))
+      else
+        if seq <= last(sender) || text != s"line $seq of $sender" then inOrder = false
+        last(sender) = seq
+        seen += 1
+    Flip ->
+      open = !open
+      if open then stash.unstashAll()
+    Check(replyTo) -> replyTo.tell(s"$seen seen, in order $inOrder, ${stash.length} held")
+
+main()
+  val f = spawn(Flipper())
+  val done = Vector.fill(4, Promise[unit]())
+  for s in 0 ..< 4
+    val finished = done(s)
+    threads.spawn(() ->
+      for i in 0 ..< 100 do f.tell(Line(s, i, s"line $i of $s"))
+      finished.complete(()))
+  for _ in 0 ..< 60
+    f.tell(Flip)
+    threads.sleep(time.micros(200))
+  for p in done do p.future.await()
+  // Even flips leave it closed: open it once more to give back the rest.
+  f.tell(Flip)
+  println(f.ask(r -> Check(r), timeout = time.seconds(10)).await())
