@@ -8392,6 +8392,64 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
+  Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
+  opaque type reads as the alias it resembles, with one word saying the difference, and the parser
+  and formatter treat it as an alias. Alternatives weighed: `newtype Name = Repr` (a new keyword for
+  a small feature); `data Name(value: Repr)` with an annotation (a data value is an object, and the
+  layout is the point); `type Name = new Repr` (a modifier inside the body reads as part of the
+  type).
+- Proposed (built on branch `opaque-types`): **the representation is seen only in the declaring
+  module, through `Name(r)` and `x.repr` (and bare `repr` in its impls), with no implicit
+  conversion either way even inside the module.** Why: an explicit wrap and unwrap keep every
+  crossing between the type and its representation visible in the source, which is what the type
+  exists for, and one rule holds everywhere; `repr` is one short name that cannot be confused with
+  a field of the representation. Alternatives weighed: the type transparent inside its module (the
+  module's own code could mix `UserId` and `long` unnoticed, and the type checker would need two
+  views of every type); a `.value` accessor (a common field name of representations, so it would
+  shadow or be shadowed); an unwrapping pattern `Name(n)` (it reads as a constructor pattern of a
+  data type, which an opaque type is not, and `x.repr` covers it). Review with the user: whether the
+  module that declares the type should see it as its representation.
+- Proposed (built on branch `opaque-types`): **an opaque type is nominal, `Type.Opaque(id, name,
+  args, repr)`, a value type that is boxed only where it becomes an `Any` or a trait's value, and
+  its box names the opaque type over a reference too.** Its parameters are invariant and take no
+  bounds; a phantom parameter is allowed. The representation may not be `Nothing`, `unit`, a union,
+  a bare type parameter or name the type. Why: laid out as its representation, a `Vector[UserId]`
+  holds the `long`s themselves and the type costs nothing; a box naming the opaque type is what lets
+  `x: Any` be matched as `UserId` and never as `long` or `string`, so the abstraction holds through
+  `Any`. Variance would expose the representation's own variance, which only the module sees;
+  bounds have nothing to bound, since the representation's types hold their own. `Nothing`, `unit`,
+  unions and a bare parameter have no single layout to share. Alternatives weighed: reusing the
+  representation's box for a reference representation (cheaper, but `x is _: string` would find an
+  `Email`); covariant parameters (unsound for a mutable representation); refusing phantom
+  parameters as an alias does (they are a main use: typed identifiers).
+- Proposed (built on branch `opaque-types`): **an opaque type is no type constructor**: a generic
+  one is refused for a constructor parameter `F[_]`, and an opaque type declares no constructor
+  parameter of its own; it is an ordinary type argument of `F[A]`. Why: every instance of a
+  constructor parameter's application is laid out as an object, which an opaque type over `long`
+  is not, and a representation `F[int]` would leave the opaque type's layout to each use. Refusing
+  both is the sound position that can be loosened later. Alternatives weighed: accepting an opaque
+  type over a reference type as a constructor (sound for the layout, but it would make the rule
+  depend on the representation, which outside code should not see); accepting `opaque type W[F[_]]`
+  (the layout question is only deferred, to every use).
+- Proposed (built on branch `opaque-types`): **a refined variant's result does not name an opaque
+  type** (`Newest -> Query[UserId]`, `Query[Id[User]]`, `Query[Vector[UserId]]` are refused); a
+  variant's fields may be of opaque types and the type's own argument may be one. Why: a `match`
+  on a refined variant will learn type equalities from the result, and whether one learning
+  `R = UserId` should see the representation inside the opaque type's module is not decided; keeping
+  opaque types out of results is sound and can be loosened once matching on refined variants is
+  built. Alternatives weighed: accepting them as nominal types now (sound for values and layouts,
+  but it fixes the answer to the open question before the matching it affects exists).
+- Proposed (built on branch `opaque-types`): **equality and hashing are the representation's;
+  every other trait comes from an impl, which takes the trait's default bodies; an opaque type
+  derives nothing and has no supertype.** Why: every Avin type has `==` and a hash, so an opaque
+  type is a `Map` key and a `Set` element without ceremony, while order and printing are choices the
+  module makes for its type (an `Email` may print as `<…>`, a `UserId` may have no order). Default
+  bodies run on the boxed value, so `compare` gives `<`, `less`, `max` and sorting. Alternatives
+  weighed: `derives Ord, Display` forwarding to the representation (convenient, but it would show
+  the representation's text and order outside the module by default); inheriting every trait of the
+  representation (the opaque type would leak its representation's whole interface).
+
 - Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
   take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
   the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
