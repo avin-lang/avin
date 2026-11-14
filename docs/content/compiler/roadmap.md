@@ -595,8 +595,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 4 are
-done; steps 5 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 5 are
+done; steps 6 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -654,12 +654,18 @@ and emission see only the types they see today; `type_key` names a constructor
    `tests/run/constructor_bound_inference{,_more,_gc}.avin`, `tests/run/inference_subtype_reads.avin`,
    `tests/reject/constructor_bound_infer_failures.avin`,
    `tests/reject/inference_no_subtype_off_read.avin`.
-5. **Static members on constructors and per-constructor defaults.** `F.pure`, `Option.pure`,
-   `Result[_, E].pure`; default bodies, already compiled per implementing constructor, calling
-   `Self.pure`;
-   overriding a required trait's method with a default (`Monad`'s `map`). Tests: a trait whose only
-   implementation of `map` is the default, at three constructors; a static member as a function
-   value; the error for a static called on a value of `F[X]`.
+5. **Static members on constructors and per-constructor defaults.** *Done.* `F.pure` and a
+   constructor trait's `Self.pure` in its default bodies (the parameter itself as the receiver, its
+   bounds' static members); `Option.pure`, `Result[_, E].pure`, `Box[_].pure` and an alias that is
+   a constructor (`constructor_receiver`, `constructor_statics` in `check.sysl`: the static members
+   of the constructor traits it implements at exactly its holes); each a `BoundCall` that lowering
+   (`bound_call`) makes a direct call of the constructor's own member, at `Nothing` for the holes,
+   so one instance per constructor; function values of both; a default overriding a required
+   trait's method (`Monad`'s `map`), its `Self` seen from the trait itself. Tests:
+   `tests/run/constructor_statics{,_defaults,_gc}.avin` (`F.pure` at data types, a class,
+   partial applications and an alias, through two bounds, in closures and a generic class; the default `map`
+   at four constructors and the types' own meeting `map` still called; GC stress),
+   `tests/reject/constructor_static_{refusals,receivers,bounds}.avin`.
 6. **Impls over constructor parameters.** `impl[F[_]: B, A] F[A]` and `F[G[A]]`: receiver matching
    through the conformance, the own-methods-first rule, extensions seen by import, two matching
    impls an error. Tests in `tests/programs/run/` (an extension module adding to every `Monad`, seen

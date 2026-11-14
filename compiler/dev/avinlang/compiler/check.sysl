@@ -9480,6 +9480,14 @@ private self_constructor(c: *Checker, t: &Type, k: usize) -> Option[&Type]
     *t match
         Applied(head, _) -> return Some(head)
         TypeVar(owner, _, _) -> if is_self_owner(owner) then return Some(t)
+        // The trait itself, as its own methods are seen from it where one overrides another's:
+        // every one of its parameters is a hole.
+        Class(id, _, xs) ->
+            if id == k
+                var all: Buf[usize] = buf()
+                for i in 0..<xs.len()
+                    all.push(i)
+                return Some(Constructor(open_at(t, all), xs.len()))
         _ -> ()
     val positions = constructor_holes(c, t, k)?
     Some(Constructor(open_at(t, positions), positions.len()))
@@ -18996,11 +19004,56 @@ static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
     if c.types.get(key) is Some(_) then names_type = true
     if c.class_types.get(key) is Some(k)
         if is_trait(c, k)
+            if is_constructor_trait(c, k)
+                c.note(unit, target.span, s"`$name` is a trait, which has no static members of its own: call one on a constructor implementing it, as in `F.$member(…)` with `F[${hole_marks(c.classes[k].decl.type_params.len())}]: $name`")
+                return Some(ErrorType)
             c.note(unit, target.span, s"`$name` is a trait, which has no static members of its own: call one on a type implementing it, as in `T.$member()` with `T: $name`")
             return Some(ErrorType)
         names_type = true
+    if constructor_receiver(c, unit, target.span, name, written, names_type) is Some(made) then return Some(made)
     if !names_type then return None
     Some(resolve_type(c, unit, TypeExpr(target.span, Named(name, written))))
+
+// The constructor `name[written]` names where it is the receiver of a static member: a constructor
+// parameter named bare, which is the parameter itself; a constructor trait's `Self` in its own
+// methods; or a generic type or alias named bare, or written with `_` for the arguments it leaves
+// open, as `Option` and `Result[_, E]`. `None` where the name written so is a type, or no type.
+private constructor_receiver(c: *Checker, unit: usize, at: Span, name: string, written: Buf[&TypeExpr], names_type: bool) -> Option[&Type]
+    var open = 0usize
+    for a in written
+        if a.kind is Hole then open += 1
+    if name == "Self"
+        val k = c.self_trait?
+        if !is_constructor_trait(c, k) || written.len() > 0 then return None
+        return Some(TypeVar(self_owner(k), 0, "Self"))
+    if c.generic is Some(scope)
+        for i in 0..<scope.params.len()
+            val q = scope.params[i]
+            if q.name != name then continue
+            if q.holes.len() == 0 then return None
+            if written.len() == 0
+                index_type_param(c, unit, Span(at.start, at.start + name.bytes.len), q)
+                return Some(TypeVar(scope.owner, i, name))
+            if open == 0 then return None
+            return Some(resolve_named_constructor(c, unit, TypeExpr(at, Named(name, written)), name, written, receiver_param(at, open)))
+    val key = resolve_name(c, unit, name)
+    var params: Buf[TypeParam] = buf()
+    if c.alias_names.get(key) is Some(id) then params = c.aliases[id].decl.type_params
+    elif !names_type then return None
+    elif c.types.get(key) is Some(id) then params = c.data[id].decl.type_params
+    elif c.class_types.get(key) is Some(id) then params = c.classes[id].decl.type_params
+    if params.len() == 0 then return None
+    if written.len() > 0 && open == 0 then return None
+    val arity = if written.len() == 0 then params.len() else open
+    Some(resolve_named_constructor(c, unit, TypeExpr(at, Named(name, written)), name, written, receiver_param(at, arity)))
+
+/** A constructor parameter of `arity` plain holes, as which a constructor written as a static
+ * member's receiver is resolved: it takes any constructor of that arity. */
+private receiver_param(at: Span, arity: usize) -> TypeParam
+    var holes: Buf[TypeHole] = buf()
+    for _ in 0..<arity
+        holes.push(TypeHole(at, Invariant, buf()))
+    TypeParam(at, "the receiver", Invariant, buf(), "", None, holes)
 
 // A call of the static member `name` of type `ty`: the type's own where the type is known, and its
 // type argument's in each instance where it is a type parameter.
@@ -19027,7 +19080,19 @@ private static_value(c: *Checker, at: Span, target: &Expr, name: string, expecte
         for m in bound_methods(c, t, name)
             if c.symbols[m].static_member then bound.push(m)
         if bound.len() == 1 && is_parameterless(c, bound[0]) then return Some(static_call(c, at, at, target, ty, name, buf(), None, expected, true))
+        // On a constructor parameter, `F.pure` is a function value of its bound's static member,
+        // which each instance makes of its constructor's.
+        if constructor_param_arity(c, t) > 0
+            if bound.len() == 1 then return Some(method_value(c, at, TExpr(target.span, t, TypeReceiver), bound[0], None, expected))
+            if bound.len() == 0 then no_constructor_static(c, at, t, name)
+            else c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant")
+            return Some(TExpr(at, ErrorType, UnitConst))
         return None
+    if *t is Constructor(_, _)
+        val found = constructor_statics(c, at, t, name)
+        if found.len() == 1 then return Some(method_value(c, at, TExpr(target.span, t, TypeReceiver), found[0], None, expected))
+        if found.len() > 1 then c.note(unit_of(c), at, s"`${type_name(t)}.$name` has several overloads, and nothing here says which is meant")
+        return Some(TExpr(at, ErrorType, UnitConst))
     if *t is ErrorType then return None
     var statics: Buf[usize] = buf()
     for m in members_of_type(c, t, name)
@@ -19063,11 +19128,19 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
         TypeVar(owner, _, _) ->
             // A trait's default body is shared by every type implementing it, so its `Self` is no
             // one type whose static member it could call.
+            // A constructor trait's default bodies are compiled for each constructor implementing
+            // it, so there `Self` is one constructor, whose static members are called.
             if c.self_trait is Some(k)
-                if owner == self_owner(k)
+                if owner == self_owner(k) && !is_constructor_trait(c, k)
                     c.note(unit, target.span, s"`Self.$name()` cannot be called in a trait's default body, which every type implementing the trait shares; a function bounded by the trait calls it, as `T.$name()`")
                     reported = true
             if !reported then ms = bound_methods(c, t, name)
+            if !reported && ms.len() == 0 && constructor_param_arity(c, t) > 0
+                no_constructor_static(c, name_span, t, name)
+                reported = true
+        Constructor(_, _) ->
+            ms = constructor_statics(c, name_span, t, name)
+            reported = ms.len() == 0
         _ -> ms = members_of_type(c, t, name)
     var statics: Buf[usize] = buf()
     for m in ms
@@ -19091,6 +19164,73 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
                 if instances.len() > 1 then return several_bound_call(c, at, name_span, TExpr(target.span, t, TypeReceiver), statics[0], instances, args)
     if bare && statics.len() == 1 then return method_call(c, at, name_span, TExpr(target.span, t, TypeReceiver), statics[0], buf(), None, expected, false, buf())
     call_method(c, at, name_span, TExpr(target.span, t, TypeReceiver), name, statics, args, explicit, expected, false)
+
+/** The number of arguments constructor parameter `t` takes, a constructor trait's `Self` among
+ * them; 0 where `t` is a parameter that stands for a type. */
+private constructor_param_arity(c: *Checker, t: &Type) -> usize
+    val (owner, index) = *t match
+        TypeVar(o, i, _) -> (o, i)
+        _ -> return 0
+    if is_self_owner(owner)
+        val k = owner - self_owner(0)
+        return if is_constructor_trait(c, k) then c.classes[k].decl.type_params.len() else 0
+    val scope = c.generic match
+        Some(s) -> s
+        None -> return 0
+    if scope.owner != owner || index >= scope.params.len() then return 0
+    scope.params[index].holes.len()
+
+// `F.name(…)` where no bound of constructor parameter `F` declares a static member `name`.
+private no_constructor_static(c: *Checker, at: Span, t: &Type, name: string)
+    val shown = type_name(t)
+    var traits = ""
+    for b in bounds_of(c, t)
+        if *b is Class(k, _, _)
+            if traits != "" then traits = traits + " & "
+            traits = traits + c.classes[k].name
+    if traits == "" then c.note(unit_of(c), at, s"`$shown` has no bound, so it has no static member `$name`; a constructor trait declaring it, as in `[$shown[${hole_marks(constructor_param_arity(c, t))}]: Trait]`, gives it one")
+    else c.note(unit_of(c), at, s"`$name` is not a static member of `$traits`, the bound of `$shown`")
+
+/** The static members `name` of the constructor traits constructor `t` implements, such as
+ * `pure` of `Option`, or of `Result[_, E]` where `Result` implements the trait with its first
+ * argument open. Reports, and gives none, where it implements none that declares one. */
+private constructor_statics(c: *Checker, at: Span, t: &Type, name: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    if *t is Constructor(body, arity)
+        var declaring: Option[usize] = None
+        var why = ""
+        for k in 0..<c.classes.len()
+            if !is_trait(c, k) || c.classes[k].decl.type_params.len() != arity || !is_constructor_trait(c, k) then continue
+            var found: Buf[usize] = buf()
+            for m in methods_named(c, k, name)
+                if c.symbols[m].static_member && !contains_id(out, m) then found.push(m)
+            if found.len() == 0 then continue
+            constructor_refusal_for_trait(c, t, k) match
+                Some(text) ->
+                    if declaring is None
+                        declaring = Some(k)
+                        why = text
+                None ->
+                    for m in found
+                        if !contains_id(out, m) then out.push(m)
+        if out.len() > 0 then return out
+        val shown = type_name(t)
+        declaring match
+            Some(k) -> c.note(unit_of(c), at, s"`$name` is a static member of `${c.classes[k].name}`, which `$shown` does not implement$why")
+            None ->
+                // A static member of the type itself, not of a constructor trait, is called on the
+                // type at its arguments.
+                val (head, written) = *body match
+                    Data(_, n, xs) -> (n, xs.len())
+                    Class(_, n, xs) -> (n, xs.len())
+                    _ -> ("", 0usize)
+                if head != ""
+                    for m in members_of_type(c, body, name)
+                        if c.symbols[m].static_member
+                            c.note(unit_of(c), at, s"`$shown` is a constructor, and `$name` is a static member of the type, not of a constructor trait it implements; give it its type arguments, as in `$head[${sample_args(written)}].$name(…)`")
+                            return out
+                c.note(unit_of(c), at, s"`$shown` has no static member `$name`: no constructor trait it implements declares one")
+    out
 
 // A static member of a trait a type parameter is bounded by at several type arguments,
 // `T: Make[int] + Make[string]`: the arguments decide which instance's member is called, the one
@@ -19145,6 +19285,11 @@ private refuse_static_on_value(c: *Checker, at: Span, receiver: &TExpr, m: usize
     if !target.static_member || receiver.kind is TypeReceiver then return false
     // A receiver already reported, as `self` in a static member's body is, names no type to show.
     if *zonk(c, receiver.ty) is ErrorType then return true
+    // A value of `F[X]` is an application of a constructor, whose static members are called on the
+    // constructor, `F.pure(…)`.
+    if *zonk(c, receiver.ty) is Applied(head, _)
+        c.note(unit_of(c), at, s"`${target.decl.name}` is static: it belongs to the constructor, so it is called on it, as in `${type_name(head)}.${target.decl.name}(…)`, not on a value")
+        return true
     val shown = type_name(zonk(c, receiver.ty))
     c.note(unit_of(c), at, s"`${target.decl.name}` is static: it belongs to the type, so it is called on the type, as in `$shown.${target.decl.name}()`, not on a value")
     true
@@ -19698,6 +19843,12 @@ private receiver_type_args(c: *Checker, receiver_type: &Type, m: usize) -> Buf[&
                 if ancestor_type(c.classes, c.data, b, k) is Some(up)
                     if *up is Class(_, _, a) then return a
         return buf()
+    // A constructor trait's static member called on a constructor names none of the trait's
+    // parameters, which are the constructor's holes, as they are through a bound.
+    if *t is Constructor(_, _)
+        if c.symbols[m].owner_class is Some(k)
+            if is_constructor_trait(c, k)
+                if *constructor_bound(c, k) is Class(_, _, holes) then return holes
     c.symbols[m].owner_class match
         Some(k) -> *ancestor_type(c.classes, c.data, t, k).unwrap_or(t) match
             Class(_, _, a) -> a
@@ -19733,6 +19884,8 @@ private method_call_kind(c: *Checker, receiver_type: &Type, m: usize, args: Buf[
     if direct || trait_method_of(c, m) is Some(_) then return Call(m, args, type_args)
     // A static member called on a type that is known is that type's own; on a type parameter, each
     // instance calls its type argument's.
+    // On a constructor, the constructor trait's member is called, as the constructor implements it.
+    if c.symbols[m].static_member && *zonk(c, receiver_type) is Constructor(_, _) then return BoundCall(m, bound_slot(c, m), args, type_args)
     if c.symbols[m].static_member && !(*zonk(c, receiver_type) is TypeVar(_, _, _)) then return Call(m, args, type_args)
     // `equals` and `hash` are decided by the receiver's type in every instance: its own, or by value
     // or identity.
