@@ -397,7 +397,8 @@ will own its handles across every message, whichever thread runs it.
   its initializer waits, safe for the collector, and the stored value is published with a release
   store that every read pairs with an acquire load, so no thread sees it half made. A read by the
   initializing thread itself traps, as a `Once` run again from its body does, and a trap in the
-  initializer stops the program.
+  initializer stops the program; a read that the initializer's own code reaches, not through a
+  function it hands on, is a compile error instead.
 
 ```avin
 import avin.threads.{Channel, scope}
