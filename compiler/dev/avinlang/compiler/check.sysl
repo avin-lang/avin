@@ -10667,11 +10667,26 @@ private sendable_wanted(c: *Checker, expected: Option[&Type]) -> bool = expected
     Some(want) -> is_sendable_function(zonk(c, want))
     None -> false
 
+/** `typed`, a function reference or a method value made as a plain function (checked before an
+ * overload was chosen, so with no type expected), as a `@sendable` one where `want` is: it is then
+ * held to the rules for one, as `made_sendable` finds it. Anything else is left as it is. */
 private to_sendable(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
-    if !is_sendable_function(zonk(c, want)) || !(typed.kind is FunctionValue(_, _)) then return typed
+    if !is_sendable_function(zonk(c, want)) then return typed
     val t = zonk(c, typed.ty)
     if !(*t is Function(_, _, false)) then return typed
-    TExpr(typed.span, as_sendable(t), typed.kind)
+    typed.kind match
+        FunctionValue(_, _) -> TExpr(typed.span, as_sendable(t), typed.kind)
+        // A method value: the receiver held in a local, then the closure capturing it.
+        Block(items) ->
+            if items.len() == 0 || items.len() > 2 then return typed
+            val last = items[items.len() - 1]
+            if !(last.kind is FunctionValue(_, _)) then return typed
+            var made: Buf[&TExpr] = buf()
+            for i in 0..<items.len() - 1
+                made.push(items[i])
+            made.push(TExpr(last.span, as_sendable(zonk(c, last.ty)), last.kind))
+            TExpr(typed.span, as_sendable(t), Block(made))
+        _ -> typed
 
 /** `typed` as an `Any`: put in a box where its type needs one. An unknown type is decided as
  * `Any`. */
@@ -16319,16 +16334,19 @@ private result_open_params(c: *Checker, signatures: Buf[Signature], views: Buf[B
     var results_differ = false
     for k in 0..<signatures.len()
         if !considered[k] then continue
-        val p = argument_type(c, signatures[k], views[k], bindings[k], args, j) match
-            Some(t) -> zonk(c, strict(t))
+        val given = argument_type(c, signatures[k], views[k], bindings[k], args, j) match
+            Some(t) -> t
             None -> return None
+        val p = zonk(c, strict(given))
         val ps = *p match
             Function(params, _, _) -> params
             _ -> return None
         val r = *p match
             Function(_, result, _) -> result
             _ -> return None
-        val s = is_sendable_function(p)
+        // `strict` drops `@sendable`, so whether the lambda is made as one is read from the type the
+        // candidate gives it.
+        val s = is_sendable_function(zonk(c, given))
         // A lambda taking a tuple apart sees the same elements from every candidate giving it that
         // tuple, so its body decides the result alike.
         val apart = ps.len() == 1 && written >= 2 && tuple_elements(zonk(c, ps[0])).len() == written
@@ -18145,6 +18163,10 @@ private check_arguments_after(c: *Checker, args: Buf[Argument], wanted: Buf[Opti
                         // once, at the call, by one that takes it strictly.
                         if param is Some(p)
                             if *given.ty is ByName(_) && !(*zonk(c, p) is ByName(_)) then t = evaluated(given)
+                            // A function named as a value, checked before an overload was chosen,
+                            // is made `@sendable` where the chosen one expects that, as it would
+                            // have been had it been checked against that parameter.
+                            t = to_sendable(c, t, p)
                             t = to_trait(c, t, zonk(c, p))
                             // A value given for a union parameter is injected where it is written.
                             if *zonk(c, p) is Union(_) then t = inject(c, t, zonk(c, p))

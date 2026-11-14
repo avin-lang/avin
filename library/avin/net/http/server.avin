@@ -12,19 +12,22 @@ module avin.net.http
 import avin.io.{IoError, TimedOut}
 import avin.net.{ByteStream, TcpServer, TcpStream, Url}
 import avin.net.tls.{TlsServer, TlsStream}
+import avin.threads.Mutex
 import avin.time.{Duration, millis, seconds}
 
 // A request as a server read it: its method, its target as the request line gave it, its headers in
 // order, its body, its version (`HTTP/1.1` or `HTTP/1.0`) and the parameters its route bound. A
 // target is a path beginning with `/`, with an optional query, or an absolute `http` URL; any other
-// traps where a request is made with it.
+// traps where a request is made with it. A request a server read knows its server, so a handler can
+// wait in a way the server's stopping ends; one made without a server never stops.
 class ServerRequest(
     val method: string,
     val target: string,
     val headers: Vector[(string, string)] = Vector.empty[(string, string)](),
     val body: Array[byte] = Array.empty[byte](),
     val version: string = "HTTP/1.1",
-    val params: Vector[(string, string)] = Vector.empty[(string, string)]()
+    val params: Vector[(string, string)] = Vector.empty[(string, string)](),
+    private val server: Option[TcpServer] = None
 )
   private val parts: Target = targetOf(target) match
     Some(t) -> t
@@ -55,6 +58,37 @@ class ServerRequest(
       if n == name then return v
     fail(s"the route has no parameter `$name`")
 
+  // The route's parameter `name` read as a `T`, or `Invalid` where its text is not one; traps where
+  // the route has no such parameter, as `param` does.
+  paramAs[T: FromParam](name: string) -> Result[T, ParamError] = parsed[T]("route parameter", name, param(name))
+
+  // The query parameter `name`, its first where it is given more than once, read as a `T`: `Missing`
+  // where the query has none of that name, and `Invalid` where its text is not a `T`.
+  queryAs[T: FromParam](name: string) -> Result[T, ParamError] = queryOption[T](name).flatMap(v -> v match
+    Some(x) -> Ok(x)
+    None -> Err(Missing("query parameter", name)))
+
+  // As `queryAs(name)`, answering `default` where the query has no parameter of that name.
+  queryAs[T: FromParam](name: string, default: T) -> Result[T, ParamError] =
+    queryOption[T](name).map(v -> v.getOrElse(default))
+
+  // As `queryAs(name)`, answering `None` where the query has no parameter of that name.
+  queryOption[T: FromParam](name: string) -> Result[Option[T], ParamError]
+    for (n, v) in queryParams
+      if n == name then return parsed[T]("query parameter", name, v).map(x -> Some(x))
+    Ok(None)
+
+  // Whether the server that read the request is stopping; false for a request made without one.
+  isStopping() -> bool = server.exists(s -> s.isStopping())
+
+  // Waits by `wait`, run on a thread of its own, and answers its result, or `None` where the server
+  // stops first: stopping cancels `wait` wherever it waits, as `TcpServer.idle` does, so a handler
+  // waiting for news, a long poll, answers at once rather than holding the shutdown. Where the
+  // server is already stopping, `wait` is not run; without a server, `wait` is run as it is.
+  untilStopped[T: Sendable](@sendable wait: () -> T) -> Option[T] = server match
+    Some(s) -> s.idle(wait)
+    None -> Some(wait())
+
   // The request with the parameters a route bound.
   withParams(bound: Vector[(string, string)]) -> ServerRequest = ServerRequest(
     method,
@@ -62,7 +96,8 @@ class ServerRequest(
     headers,
     body,
     version,
-    bound
+    bound,
+    server
   )
 
 // A target read: the URL it is part of, its path decoded, and the path's segments decoded.
@@ -88,9 +123,42 @@ private targetOf(target: string) -> Option[Target]
       Err(_) -> return None
   Some(Target(url, path, segments.toVector))
 
+// What answers a request: a route's handler, a router's `handle`, and what `serve` is given. A
+// middleware is a function from one handler to another, so handlers compose as functions do.
+type Handler = @sendable (ServerRequest) -> Response
+
+// What renders the response a router or a server makes itself for an error status: given the
+// status, it answers the headers and body to send, the status itself staying the one given.
+type ErrorPage = @sendable (int) -> Response
+
+// The error page a router and a server use unless given another: the status's reason phrase as
+// plain text.
+plainError(status: int) -> Response = Response.text(status, s"${reasonPhrase(status)}\n")
+
+// `page`'s rendering of `status`, carrying that status whatever `page` answered.
+private rendered(page: ErrorPage, status: int) -> Response
+  val r = page(status)
+  Response(status, reasonPhrase(status), r.headers, r.body, r.streamed)
+
+// A failure a handler can answer with: the response that tells the client about it. A handler
+// answering a `Result[Response, ToResponse]` passes any such error on by `?` as it is, so an error
+// type of the program's own implements it to end handlers early. A `Response` is one, itself, and
+// so is a `ParamError`.
+trait ToResponse
+  toResponse() -> Response
+
+impl ToResponse for Response
+  toResponse() -> Response = self
+
+// A handler of `answer`, which answers `Ok` with its response or `Err` with a failure, answered with
+// that failure's response.
+fromResult(@sendable answer: (ServerRequest) -> Result[Response, ToResponse]) -> Handler = r -> answer(r) match
+  Ok(response) -> response
+  Err(failure) -> failure.toResponse()
+
 // A route: `handler` for requests of `method` whose path matches `pattern`. The method is a token
 // and the pattern begins with `/`; either traps where it does not.
-class Route(val method: string, val pattern: string, val handler: @sendable (ServerRequest) -> Response): Sendable
+class Route(val method: string, val pattern: string, val handler: Handler): Sendable
   if method.isEmpty || method.indexWhere(c -> !isTokenChar(c)) >= 0 then fail(s"`$method` is not an HTTP method")
   if !pattern.startsWith("/") then fail(s"the route pattern `$pattern` does not begin with `/`")
 
@@ -100,28 +168,73 @@ class Route(val method: string, val pattern: string, val handler: @sendable (Ser
   // The parameters the pattern binds where it matches `segments`, `None` where it does not.
   matches(segments: Vector[string]) -> Option[Vector[(string, string)]] = bound(parts, segments)
 
+  // The route with its handler passed through `middleware`, which runs around it: wrapping again
+  // puts the newer middleware outside, so it runs first.
+  wrap(@sendable middleware: (Handler) -> Handler) -> Route = Route(method, pattern, middleware(handler))
+
+  // The route under `prefix`: its pattern `prefix` followed by its own, a pattern of `/` becoming
+  // `prefix` itself.
+  under(prefix: string) -> Route = Route(method, joined(prefix, pattern), handler)
+
 object Route
   // A route for `GET`, which answers `HEAD` too.
-  get(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("GET", pattern, handler)
+  get(pattern: string, handler: Handler) -> Route = Route("GET", pattern, handler)
+
+  // A route for `GET` whose handler answers a `Result`, as `fromResult` takes one.
+  get(pattern: string, handler: @sendable (ServerRequest) -> Result[Response, ToResponse]) -> Route =
+    Route("GET", pattern, fromResult(handler))
 
   // A route for `POST`.
-  post(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("POST", pattern, handler)
+  post(pattern: string, handler: Handler) -> Route = Route("POST", pattern, handler)
+
+  // A route for `POST` whose handler answers a `Result`.
+  post(pattern: string, handler: @sendable (ServerRequest) -> Result[Response, ToResponse]) -> Route =
+    Route("POST", pattern, fromResult(handler))
 
   // A route for `PUT`.
-  put(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("PUT", pattern, handler)
+  put(pattern: string, handler: Handler) -> Route = Route("PUT", pattern, handler)
+
+  // A route for `PUT` whose handler answers a `Result`.
+  put(pattern: string, handler: @sendable (ServerRequest) -> Result[Response, ToResponse]) -> Route =
+    Route("PUT", pattern, fromResult(handler))
 
   // A route for `DELETE`.
-  delete(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("DELETE", pattern, handler)
+  delete(pattern: string, handler: Handler) -> Route = Route("DELETE", pattern, handler)
+
+  // A route for `DELETE` whose handler answers a `Result`.
+  delete(pattern: string, handler: @sendable (ServerRequest) -> Result[Response, ToResponse]) -> Route =
+    Route("DELETE", pattern, fromResult(handler))
 
   // A route for `PATCH`.
-  patch(pattern: string, handler: @sendable (ServerRequest) -> Response) -> Route = Route("PATCH", pattern, handler)
+  patch(pattern: string, handler: Handler) -> Route = Route("PATCH", pattern, handler)
+
+  // A route for `PATCH` whose handler answers a `Result`.
+  patch(pattern: string, handler: @sendable (ServerRequest) -> Result[Response, ToResponse]) -> Route =
+    Route("PATCH", pattern, fromResult(handler))
+
+  // The routes of a group: each of `routes` under `prefix`, its handler passed through
+  // `middleware`. A prefix begins with `/` and does not end with one, and may bind parameters as a
+  // pattern does; one that does not hold traps. Groups nest, an inner group's middleware running
+  // inside the outer's.
+  group(
+      prefix: string,
+      routes: Vector[Route],
+      @sendable middleware: (Handler) -> Handler = h -> h
+  ) -> Vector[Route] = routes.map(r -> r.under(prefix).wrap(middleware))
+
+// `prefix` followed by `pattern`, a pattern of `/` giving the prefix itself.
+private joined(prefix: string, pattern: string) -> string
+  if !prefix.startsWith("/") then fail(s"the route prefix `$prefix` does not begin with `/`")
+  if prefix.endsWith("/") then fail(s"the route prefix `$prefix` ends with `/`")
+  if pattern == "/" then prefix else prefix + pattern
 
 // A handler that chooses another by a request's method and path, trying its routes in order. A
 // pattern is a path whose segments are matched one for one with the request's decoded segments, a
 // segment written `:name` matching any one that is not empty and binding it to `name`. A `GET` route
 // answers `HEAD` too, where no `HEAD` route matches. A path no route matches is answered `404`, and
-// one that routes match for other methods only `405`, with an `Allow` header naming them.
-class Router(private val routes: Vector[Route]): Sendable
+// one that routes match for other methods only `405`, with an `Allow` header naming them; `errors`
+// renders the two.
+class Router(private val routes: Vector[Route], private val errors: ErrorPage = plainError): Sendable
   // The response of the first route matching the request's method and path, its parameters bound.
   handle(request: ServerRequest) -> Response
     answer(request, request.method) match
@@ -134,9 +247,9 @@ class Router(private val routes: Vector[Route]): Sendable
     val allowed = Buffer[string]()
     for r in routes
       if r.matches(request.segments).isDefined && !allowed.contains(r.method) then allowed.addOne(r.method)
-    if allowed.isEmpty then return Response.text(404, "Not Found\n")
+    if allowed.isEmpty then return rendered(errors, 404)
     if allowed.contains("GET") && !allowed.contains("HEAD") then allowed.addOne("HEAD")
-    Response.text(405, "Method Not Allowed\n").withHeader("Allow", allowed.mkString(", "))
+    rendered(errors, 405).withHeader("Allow", allowed.mkString(", "))
 
   // The response of the first route for `method` whose pattern matches the request's path.
   private answer(request: ServerRequest, method: string) -> Option[Response]
@@ -169,29 +282,31 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // its certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
 // whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
 // answer, since the answer would have to go through the connection's TLS, which ended with the
-// handler.
+// handler; so does one that traps while it streams a response, whose head is already sent. The
+// answers the server makes itself for an error status are rendered by `errors`.
 serve(
     host: string,
     port: int,
-    handler: @sendable (ServerRequest) -> Response,
+    handler: Handler,
     maxConnections: int = 1024,
     readTimeout: Duration = seconds(30),
     writeTimeout: Duration = seconds(30),
     idleTimeout: Duration = seconds(5),
     maxHeaderBytes: int = 16384,
     maxBodyBytes: int = 1048576,
-    tls: Option[TlsServer] = None
+    tls: Option[TlsServer] = None,
+    errors: ErrorPage = plainError
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
-  val s = Settings(readTimeout, writeTimeout, idleTimeout, maxHeaderBytes, maxBodyBytes)
+  val s = Settings(readTimeout, writeTimeout, idleTimeout, maxHeaderBytes, maxBodyBytes, errors, Streaming())
   tls match
     None -> TcpServer.start(
       host,
       port,
       (stream, server) -> converse(stream, server, handler, s),
       maxConnections,
-      failed = stream -> refuse(stream, 500, s)
+      failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s)
     )
     Some(identity) -> TcpServer.start(
       host,
@@ -202,29 +317,51 @@ serve(
     )
 
 // A connection served over TLS: the handshake, then its requests as `converse` serves them.
-private secured(
-    tcp: TcpStream,
-    server: TcpServer,
-    handler: @sendable (ServerRequest) -> Response,
-    s: Settings,
-    identity: TlsServer
-)
+private secured(tcp: TcpStream, server: TcpServer, handler: Handler, s: Settings, identity: TlsServer)
   if tcp.setTimeout(s.readTimeout).isErr then return
   TlsStream.server(tcp, identity) match
     Ok(stream) ->
-      converse(stream, server, handler, s)
+      converse(stream, server, handler, s, false)
       // The conversation is over; a close notice the client never reads changes nothing.
       _ = stream.close()
     Err(_) -> ()
 
-// The limits a server was started with.
+// The limits a server was started with, the error page it renders its own answers by, and the
+// connections streaming a response.
 private data Settings(
     readTimeout: Duration,
     writeTimeout: Duration,
     idleTimeout: Duration,
     maxHeaderBytes: int,
-    maxBodyBytes: int
+    maxBodyBytes: int,
+    errors: ErrorPage,
+    streaming: Streaming
 )
+
+// The connections whose response's head has been sent while its body is streamed, so a handler that
+// traps there has its connection closed without a `500` written into the middle of the body. Each
+// is held by its identity's hash: two connections sharing one would only mean a trap on the second
+// is closed unanswered too.
+private class Streaming(): Sendable
+  private val held = Mutex(Held())
+
+  // Holds `stream` while its body is streamed.
+  hold(stream: ByteStream)
+    val key = stream.hash()
+    held.with(h -> h.counts = h.counts.updated(key, h.counts.getOrElse(key, 0) + 1))
+
+  // Lets `stream` go, and answers whether it was held.
+  release(stream: ByteStream) -> bool
+    val key = stream.hash()
+    held.with(h ->
+      h.counts.get(key) match
+        Some(n) ->
+          h.counts = if n > 1 then h.counts.updated(key, n - 1) else h.counts.removed(key)
+          true
+        None -> false)
+
+private class Held()
+  var counts = HashMap.empty[long, int]()
 
 // Why a request is not served: the connection is closed quietly, or answered with a status first.
 private data Refusal
@@ -232,13 +369,14 @@ private data Refusal
   Answer(status: int)
 
 // One connection's requests, read and answered in turn until it is not kept alive, its peer ends it,
-// or it waits for a request longer than its limit.
-private converse(stream: ByteStream, server: TcpServer, handler: @sendable (ServerRequest) -> Response, s: Settings)
+// or it waits for a request longer than its limit. Where `marks`, a connection streaming a response
+// is held in `s.streaming` while it does.
+private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, marks: bool = true)
   val input = Incoming(stream)
   var limit = s.readTimeout
   while input.awaits(limit, server)
     limit = s.idleTimeout
-    val request = readRequest(input, stream, s) match
+    val request = readRequest(input, stream, server, s) match
       Ok(r) -> r
       Err(Quietly) -> return
       Err(Answer(status)) ->
@@ -249,8 +387,15 @@ private converse(stream: ByteStream, server: TcpServer, handler: @sendable (Serv
       return
     val response = handler(request)
     val keep = keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
-    if !written(stream, request.method == "HEAD", response, keep, request.version, s.writeTimeout) then return
-    if !keep then return
+    val headOnly = request.method == "HEAD"
+    val kept = response.streamed match
+      None -> written(stream, headOnly, response, keep, request.version, s.writeTimeout) && keep
+      Some(body) ->
+        if marks then s.streaming.hold(stream)
+        val going = streamedOut(stream, server, headOnly, response, body, keep, request.version, s.writeTimeout)
+        if marks then _ = s.streaming.release(stream)
+        going
+    if !kept then return
 
 // Whether the client asks for its connection to stay open after this request: by default in
 // HTTP/1.1, unless `Connection: close`; in HTTP/1.0 only with `Connection: keep-alive`.
@@ -267,7 +412,7 @@ private connectionWords(headers: Vector[(string, string)]) -> Vector[string] =
 // Answers `status` and closes the connection gently: the server's side is shut, then what the client
 // still sends is read and dropped for a moment, so the answer is not lost to a reset.
 private refuse(stream: ByteStream, status: int, s: Settings)
-  if written(stream, false, Response.text(status, s"${reasonPhrase(status)}\n"), false, "HTTP/1.1", s.writeTimeout)
+  if written(stream, false, rendered(s.errors, status), false, "HTTP/1.1", s.writeTimeout)
     if stream.shutdownOutput().isErr then return
     if stream.setTimeout(millis(500)).isErr then return
     var left = 1 << 20
@@ -281,7 +426,7 @@ private refuse(stream: ByteStream, status: int, s: Settings)
 // Writes `response`, whether or not the connection stays open, and answers whether it was written.
 // The server writes `Content-Length` and `Connection` itself, in place of any the handler gave, and
 // no body for `HEAD` or for `204` and `304`. A status outside 200 to 599, or a header the response
-// cannot carry, traps.
+// cannot carry, traps. A streamed response is written by `streamedOut`; here its body is empty.
 private written(
     stream: ByteStream,
     headOnly: bool,
@@ -290,6 +435,48 @@ private written(
     version: string,
     limit: Duration
 ) -> bool
+  val bodiless = response.status == 204 || response.status == 304
+  val length = if bodiless then None else Some(s"Content-Length: ${response.body.length}")
+  val all = Buffer[byte]()
+  all.addAll(utf8(headOf(response, length, keep, version)))
+  if !headOnly && !bodiless then all.addAll(response.body)
+  stream.setTimeout(limit).isOk && stream.write(all.toArray()).isOk
+
+// Writes a streamed response and answers whether the connection may carry another request. Its head
+// is sent first, saying `Content-Length` where the length is known, else `Transfer-Encoding:
+// chunked`, or, to an HTTP/1.0 client, neither, the connection's end ending the body. Then `body`
+// writes the body through a `BodyWriter`, unless the request is `HEAD` or the status `204` or
+// `304`, which have none.
+private streamedOut(
+    stream: ByteStream,
+    server: TcpServer,
+    headOnly: bool,
+    response: Response,
+    body: StreamedBody,
+    keep: bool,
+    version: string,
+    limit: Duration
+) -> bool
+  val bodiless = response.status == 204 || response.status == 304
+  val framing = body.length match
+    Some(n) -> Sized(n)
+    None -> if version == "HTTP/1.0" then Closing else Chunked
+  val going = keep && framing != Closing
+  val line = if bodiless then None else framing match
+    Sized(n) -> Some(s"Content-Length: $n")
+    Chunked -> Some("Transfer-Encoding: chunked")
+    Closing -> None
+  if !(
+    stream.setTimeout(limit).isOk && stream.write(utf8(headOf(response, line, going, version))).isOk
+  ) then return false
+  if headOnly || bodiless then return going
+  val writer = BodyWriter(stream, Some(server), framing, limit)
+  body.write(writer)
+  writer.finish() && going
+
+// The status line and headers of `response`, with `framing`, the line saying how its body is framed,
+// where it has one, and the `Connection` header `keep` and `version` call for.
+private headOf(response: Response, framing: Option[string], keep: bool, version: string) -> string
   if !(200 <= response.status <= 599) then fail(
     s"a response of status ${response.status}: a handler answers 200 to 599"
   )
@@ -307,15 +494,11 @@ private written(
       "Transfer-Encoding"
     ) || name.equalsIgnoreCase("Connection")
     if !own then out.write(s"$name: $value\r\n")
-  val bodiless = response.status == 204 || response.status == 304
-  if !bodiless then out.write(s"Content-Length: ${response.body.length}\r\n")
+  if framing is Some(f) then out.write(s"$f\r\n")
   if !keep then out.write("Connection: close\r\n")
   else if version == "HTTP/1.0" then out.write("Connection: keep-alive\r\n")
   out.write("\r\n")
-  val all = Buffer[byte]()
-  all.addAll(utf8(out.text))
-  if !headOnly && !bodiless then all.addAll(response.body)
-  stream.setTimeout(limit).isOk && stream.write(all.toArray()).isOk
+  out.text
 
 // The bytes of a connection, read ahead in pieces and handed out as lines and counted runs.
 private class Incoming(private val stream: ByteStream)
@@ -379,7 +562,12 @@ private class Incoming(private val stream: ByteStream)
       Err(_) -> Err(Quietly)
 
 // One request: its request line, its headers and its body.
-private readRequest(input: Incoming, stream: ByteStream, s: Settings) -> Result[ServerRequest, Refusal]
+private readRequest(
+    input: Incoming,
+    stream: ByteStream,
+    server: TcpServer,
+    s: Settings
+) -> Result[ServerRequest, Refusal]
   var room = s.maxHeaderBytes
   var first = input.line(s.readTimeout, room, 414)?
   // Empty lines before a request line are passed over, counted against the limit.
@@ -414,7 +602,7 @@ private readRequest(input: Incoming, stream: ByteStream, s: Settings) -> Result[
   val hosts = all.count(h -> h.0.equalsIgnoreCase("Host"))
   if hosts > 1 || (version == "HTTP/1.1" && hosts == 0) then return Err(Answer(400))
   val body = readBody(input, stream, all, version, s)?
-  Ok(ServerRequest(method, target, all, body, version))
+  Ok(ServerRequest(method, target, all, body, version, server = Some(server)))
 
 // `HTTP/` and a digit, a dot and a digit.
 private isVersion(text: string) -> bool =

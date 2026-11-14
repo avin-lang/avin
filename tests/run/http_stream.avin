@@ -1,0 +1,247 @@
+// expect: exit 0
+// stderr: actor numbers vary
+// Streamed responses, read by a raw TCP client so their framing is seen byte for byte: a chunked
+// body whose empty write sends no chunk and whose end is the empty chunk, each write sent at once;
+// a body of a length given beforehand; one written short, and an HTTP/1.0 client's, after which the
+// connection is closed; `HEAD`, `204` and a body that writes nothing; a connection kept alive after
+// a streamed response. Server-sent events: their framing (type, id, lines of data, a comment, a
+// retry), each sent before the next is made, keep-alive comments while waiting, a client that goes
+// ending the stream, and a shutdown ending a stream at once with its last chunk. A handler that
+// traps, writes past its length or names an event's type or id with a line break while streaming has
+// its connection closed with no `500` written into the body, and the server goes on.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{BodyWriter, EventWriter, Response, Route, Router, ServerRequest}
+import avin.threads.{Atomic, Channel, Promise, sleep, spawn}
+import avin.time
+import avin.time.{Duration, millis, monotonic}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+shown(text: string) -> string = text.replace("\r\n", "|").replace("\n", "/")
+
+open(server: TcpServer) -> TcpStream
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  c
+
+// What arrives on `c` until the text read so far holds `marker`, or the connection ends.
+until(c: TcpStream, marker: string) -> string
+  val got = Buffer[byte]()
+  while !string.fromUtf8Lossy(got.toArray()).contains(marker)
+    val more = ok(c.read(4096))
+    if more.length == 0 then break
+    got.addAll(more)
+  string.fromUtf8Lossy(got.toArray())
+
+// The head of a response, its lines joined by `|`.
+head(c: TcpStream) -> string = shown(until(c, "\r\n\r\n"))
+
+// Everything until the connection ends.
+rest(c: TcpStream) -> string = shown(string.fromUtf8Lossy(ok(c.readAll())))
+
+get(path: string) -> string = s"GET $path HTTP/1.1\r\nHost: t\r\n\r\n"
+
+// Writes each of `parts` through `w`, answering whether all went through.
+each(w: BodyWriter, parts: Vector[string]) -> bool = parts.forall(p -> w.write(p).isOk)
+
+// Sends each event `gate` gives until the stream fails or stops, then says how many it sent.
+feed(es: EventWriter, gate: Channel[string], ended: Promise[string])
+  var sent = 0
+  while es.untilStopped(() -> gate.receive()) is Some(Some(e))
+    if es.send(e).isErr then break
+    sent += 1
+  _ = ended.tryComplete(s"feed ended after $sent, stopping: ${es.isStopping()}")
+
+main()
+  val gate = Channel[string]()
+  val ran = Atomic(0)
+  val ended = Promise[string]()
+  val router = Router(
+    [
+      Route.get("/chunks", _ -> Response.stream(200, "text/plain", w -> _ = each(w, ["hello", "", "world"]))),
+      Route.get("/nothing", _ -> Response.stream(200, "text/plain", _ -> ())),
+      Route.get("/sized", _ -> Response.stream(200, "text/plain", 10, w -> _ = each(w, ["01234", "56789"]))),
+      Route.get("/short", _ -> Response.stream(200, "text/plain", 10, w -> _ = w.write("abc"))),
+      Route.get("/past", _ -> Response.stream(200, "text/plain", 5, w -> _ = each(w, ["abc", "defg"]))),
+      Route.get("/empty", _ -> Response.stream(200, "text/plain", 0, _ -> ())),
+      Route.get("/badevent", _ -> Response.events(es -> _ = es.send("x", event = Some("a\nb")))),
+      Route.get("/badid", _ -> Response.events(es -> _ = es.send("x", id = Some("1\r2")))),
+      Route.get(
+        "/counted",
+        _ -> Response.stream(200, "text/plain", w ->
+          ran.add(1)
+          _ = w.write("x"))
+          ),
+          Route.get(
+          "/none",
+          _ -> Response.stream(204, "text/plain", _ ->
+            ran.add(1)
+            ())
+            ),
+            Route.get(
+            "/unicode",
+            _ -> Response.stream(200, "text/plain; charset=utf-8", w -> _ = each(w, ["日本", "語✓"]))
+            ),
+            Route.get(
+            "/trap",
+            _ -> Response.stream(200, "text/plain", w ->
+              _ = w.write("begun")
+              val zero = ran.load() - ran.load()
+              _ = w.write(s"${1 / zero}"))
+              ),
+              // Each write is sent at once: the second part is made only once the client has read the first.
+              Route.get(
+              "/paced",
+              _ -> Response.stream(200, "text/plain", w ->
+                _ = w.write("first")
+                val next = w.untilStopped(() -> gate.receive()).flatten.getOrElse("?")
+                _ = w.write(next))
+                ),
+                Route.get(
+                "/events",
+                _ -> Response.events(es ->
+                  _ = es.retry(millis(1500))
+                  _ = es.send("one")
+                  _ = es.send("two\nlines", event = Some("note"), id = Some("7"))
+                  _ = es.send("crlf\r\nand\rcr")
+                  _ = es.send("")
+                  _ = es.comment("a remark")
+                  _ = es.send("Grüße ✓", event = Some("ünïcode")))
+                  ),
+                  // Waits for events from `gate`, keep-alive comments going out every 40 ms meanwhile.
+                  Route.get("/feed", _ -> Response.events(millis(40), es -> feed(es, gate, ended))),
+                  Route.get(
+                  "/quiet",
+                  _ -> Response.events(Duration.Zero, es -> _ = es.send(es.untilStopped(() -> "at once").getOrElse("?")))
+                  )
+                  ]
+                  )
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+
+  // A chunked body: no chunk for the empty write, the empty chunk at the end, and the connection kept
+  // for the next request, which is answered too.
+  val c = open(server)
+  ok(c.writeText(get("/chunks")))
+  println(shown(until(c, "0\r\n\r\n")))
+  ok(c.writeText(get("/sized")))
+  println(shown(until(c, "56789")))
+  ok(c.writeText(get("/empty")))
+  println(shown(until(c, "Content-Length: 0\r\n\r\n")))
+  ok(c.writeText(get("/nothing")))
+  println(shown(until(c, "0\r\n\r\n")))
+  ok(c.writeText(get("/unicode")))
+  println(shown(until(c, "0\r\n\r\n")))
+  // A plain response after streamed ones on the same connection.
+  ok(c.writeText("GET /missing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(rest(c))
+  _ = c.close()
+
+  // A body written short of its length: the client sees what was written, and the connection closes.
+  val short = open(server)
+  ok(short.writeText(get("/short")))
+  println(rest(short))
+  _ = short.close()
+
+  // An HTTP/1.0 client: no chunks, the connection's end ending the body.
+  val old = open(server)
+  ok(old.writeText("GET /chunks HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"))
+  println(rest(old))
+  _ = old.close()
+
+  // `HEAD` and `204` send no body, and the code writing it does not run; the connection stays open.
+  val bare = open(server)
+  ok(bare.writeText("HEAD /counted HTTP/1.1\r\nHost: t\r\n\r\n"))
+  println(head(bare))
+  ok(bare.writeText(get("/none")))
+  println(head(bare))
+  ok(bare.writeText("GET /counted HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(rest(bare))
+  println(s"bodies written: ${ran.load()}")
+  _ = bare.close()
+
+  // A trap while streaming, and a write past the length: the connection is closed with nothing
+  // after what was written, and the server answers the next connection.
+  for path in ["/trap", "/past", "/badevent", "/badid"]
+    val t = open(server)
+    ok(t.writeText(get(path)))
+    println(rest(t))
+    _ = t.close()
+  val after = open(server)
+  ok(after.writeText("GET /chunks HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(rest(after))
+  _ = after.close()
+
+  // Each write goes out at once: the first part is read before the second is made.
+  val paced = open(server)
+  ok(paced.writeText(get("/paced")))
+  println(shown(until(paced, "first\r\n")))
+  gate.send("second")
+  println(shown(until(paced, "0\r\n\r\n")))
+  _ = paced.close()
+
+  // Server-sent events and their framing.
+  val ev = open(server)
+  ok(ev.writeText("GET /events HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(rest(ev))
+  _ = ev.close()
+  val quiet = open(server)
+  ok(quiet.writeText("GET /quiet HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  println(rest(quiet))
+  _ = quiet.close()
+
+  // A feed: an event arrives as it is sent, keep-alive comments flow while it waits, and a client
+  // that goes ends the stream within a few of them.
+  val feed = open(server)
+  ok(feed.writeText(get("/feed")))
+  println(head(feed))
+  gate.send("hello")
+  println(s"event as its own chunk: ${until(feed, "data: hello\n\n\r\n").contains("d\r\ndata: hello\n\n\r\n")}")
+  println(s"keep-alive while waiting: ${until(feed, "keep-alive\n\n\r\n").contains(": keep-alive")}")
+  _ = feed.close()
+  println(ended.future.await(time.seconds(10)).getOrElse("the feed did not end"))
+
+  // A shutdown ends a waiting feed at once, its last chunk sent, and `shutdown` returns promptly.
+  val ending = Promise[string]()
+  val ender = Router(
+    [
+      Route.get(
+        "/feed",
+        _ -> Response.events(es ->
+          val got = es.untilStopped(() -> Channel[string]().receive())
+          _ = ending.tryComplete(s"stopped feed got: $got, stopping: ${es.isStopping()}"))
+          ),
+          // A stream that never waits: once the server stops, its writes fail and it ends.
+          Route.get(
+          "/busy",
+          _ -> Response.stream(200, "text/plain", w ->
+            var n = 0
+            while w.write("x").isOk do n += 1
+            _ = w.write("never"))
+            )
+            ]
+            )
+  val stopping = ok(http.serve("127.0.0.1", 0, ender.handle))
+  val f = open(stopping)
+  ok(f.writeText(get("/feed")))
+  println(head(f))
+  val b = open(stopping)
+  ok(b.writeText(get("/busy")))
+  println(s"busy streaming: ${until(b, "1\r\nx\r\n").contains("Transfer-Encoding: chunked")}")
+  // The busy stream is read on a thread of its own, so its writes never wait for room.
+  val reader = spawn(() ->
+    val all = rest(b)
+    _ = b.close()
+    all)
+  val start = monotonic()
+  stopping.shutdown()
+  println(s"shutdown at once: ${monotonic() - start < time.seconds(5)}, held: ${stopping.connections()}")
+  println(ending.future.await(time.seconds(5)).getOrElse("the feed did not stop"))
+  println(rest(f))
+  val busy = reader.join()
+  println(s"busy ends with its last chunk: ${busy.endsWith("|0||") || busy == "0||"}")
+  _ = f.close()
+  server.shutdown()

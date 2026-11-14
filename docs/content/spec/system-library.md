@@ -1382,9 +1382,11 @@ main()
   http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
 ```
 
-`http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,
+`type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
+`http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError) ->
+Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
 `writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
 takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The
@@ -1423,6 +1425,73 @@ route whether escaped or not. A `GET` route answers `HEAD` too where no `HEAD` r
 no route matches is answered `404`, and one that routes match for other methods only `405`, with
 `Allow` naming those methods, `HEAD` beside `GET`.
 
+**Typed parameters.** `paramAs[T](name)` reads a route parameter as a `T` and `queryAs[T](name)` a
+query parameter, its first where it is given more than once, each answering `Result[T,
+ParamError]`: `Missing(place, name)` where the query has none of that name, `Invalid(place, name,
+text, kind)` where its text does not read as a `T` (`paramAs` traps on a name the route lacks, as
+`param` does). `queryAs(name, default)` answers `default` for a missing one and `queryOption[T](name)`
+`None`. A `T` is any `FromParam`, a trait of two static methods, `parse(text) -> Option[Self]` and
+`kind()`, the words naming it in an error ("an int"); `string`, `int`, `long`, `real` and `bool`
+implement it, and a program's own type may. A `ParamError`'s `message` is the sentence for the
+client, as in ``the query parameter `n` is `x`, which is not an int``.
+
+**Handlers that fail.** `ToResponse` is a failure a handler can answer with, its `toResponse()` the
+response telling the client. `Response` implements it as itself and `ParamError` as a `400` with its
+message; a program's own error type may too. `fromResult(answer)` makes a `Handler` of a function
+answering `Result[Response, ToResponse]`, an `Err` answered with its failure's response, and each of
+`Route.get`, `post`, `put`, `delete` and `patch` has an overload taking such a function, so `?` ends a
+handler early:
+
+```text
+half(r: ServerRequest) -> Result[Response, ToResponse]
+  val n = r.paramAs[int]("n")?
+  if n % 2 != 0 then return Err(Response.text(422, "odd\n"))
+  Ok(Response.text(200, s"${n / 2}\n"))
+
+val route = Route.get("/half/:n", half)
+```
+
+**Groups and middleware.** `type Handler = @sendable (ServerRequest) -> Response`; a middleware is a
+`(Handler) -> Handler`. `route.wrap(middleware)` passes a route's handler through one, wrapping again
+putting the newer outside, so it runs first; `route.under(prefix)` puts a route's pattern after
+`prefix`, a pattern of `/` becoming the prefix itself. `Route.group(prefix, routes, middleware = h ->
+h)` answers each of `routes` under `prefix` and wrapped by `middleware`, and groups nest, an inner
+group's middleware running inside the outer's. A prefix begins with `/`, does not end with one and
+may bind parameters as a pattern does; one that does not hold traps.
+
+**Error pages.** `type ErrorPage = @sendable (int) -> Response` renders the responses a router and a
+server make themselves for an error status: `Router(routes, errors)` its `404` and `405`, and
+`http.serve(…, errors)` every status of the table below. The status sent is the one given, whatever
+the page answered, and a `405` still carries its `Allow` header. `http.plainError`, the default, answers the
+status's reason phrase as plain text.
+
+**Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
+`write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
+once; its `body` is empty. Its head says `Transfer-Encoding: chunked` and each write is a chunk, the
+body ended by the empty one once `write` returns; to an HTTP/1.0 client it says neither, and the
+body ends with the connection. `Response.stream(status, contentType, length, write)` says
+`Content-Length: length` beforehand instead: a write past it traps, a negative length traps, and a
+body ending short closes the connection. `BodyWriter.write(bytes)` and `write(text)` answer
+`Result[unit, IoError]`: `Err` once the client has gone or the server is stopping, and for every
+write after one that failed, so the code writing a stream ends there; a failed write closes the
+connection. No body is written for `HEAD`, `204` or `304`, and `write` is not run.
+
+`Response.events(write)` is a stream of server-sent events, `200` of the type `text/event-stream`,
+written through an `EventWriter`: `send(text, event = None, id = None)` sends an event, each line of
+`text` (split at `\r\n`, `\r` or `\n`) a `data:` line after its `event:` and `id:` lines, a type or an
+id holding a line break trapping; `comment(text)` sends a comment, which a client passes over; and
+`retry(delay)` tells the client how long to wait before reconnecting. `Response.events(keepAlive,
+write)` sets how often a comment is sent while `untilStopped` waits, fifteen seconds by default and
+none for zero, so a client that has gone is noticed and one still there keeps the stream open.
+
+**Waiting in a handler.** `request.isStopping()` says whether the server that read the request is
+stopping, and `request.untilStopped(wait)` runs `wait`, a `@sendable () -> T`, on a thread of its own
+and answers `Some` of its result, or `None` where the server stops first, cancelling `wait` wherever
+it waits as `TcpServer.idle` does: a long poll answers at once rather than holding the shutdown. Where
+the server is already stopping `wait` is not run. `BodyWriter` and `EventWriter` have both too, the
+`EventWriter`'s sending its keep-alive comments while it waits and answering `None` once one cannot
+be sent. A request made without a server never stops, and `wait` is then run as it is.
+
 **The connection.** Requests are read one after another, so several are kept alive on one
 connection and pipelined ones are answered in order: in HTTP/1.1 unless either side says
 `Connection: close`, in HTTP/1.0 only on `Connection: keep-alive`, which the response then repeats.
@@ -1430,8 +1499,8 @@ Empty lines before a request line are passed over, and a line may end in a bare 
 by `Content-Length` or chunked (extensions and trailers passed over); an `Expect: 100-continue` is
 answered `100 Continue` once the body is known to fit. The server writes `Content-Length` and
 `Connection` itself, in place of any the handler gave, every response as `HTTP/1.1`, and no body for
-`HEAD`, `204` and `304`. A handler's status outside 200 to 599, or a header the response cannot
-carry, traps.
+`HEAD`, `204` and `304`; a streamed response's framing is its own, as above. A handler's status
+outside 200 to 599, or a header the response cannot carry, traps.
 
 **A request the server cannot take is answered and the connection closed**, gently: its side is shut
 and what the client still sends read and dropped for a moment, so the answer is not lost to a reset.
@@ -1444,7 +1513,7 @@ and what the client still sends read and dropped for a moment, so the answer is 
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
 | `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
-| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS the connection is closed unanswered) |
+| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS, or once a streamed response's head is sent, the connection is closed unanswered) |
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
 | `505` | A version other than 1.0 and 1.1 |

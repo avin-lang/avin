@@ -8214,6 +8214,55 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatter is meant to settle exactly this); a blank line between clauses only around a
   multi-line one (it still splits one function in two); a blank line between every clause
   (it spreads a short definition over twice its lines).
+- Proposed (built on branch `http-stream`): **A streamed response is a `Response` whose body a
+  function writes through a `BodyWriter`** (`Response.stream(status, contentType, write)`, with a
+  `length` overload, and `Response.events` for server-sent events through an `EventWriter`). The
+  head says `Transfer-Encoding: chunked`, or `Content-Length` where the length is given, or to an
+  HTTP/1.0 client neither, the body ending with the connection. Each write answers `Result[unit,
+  IoError]`, `Err` once the client has gone or the server is stopping and for every later write;
+  a write past a given length traps; a handler trapping once the head is sent has its connection
+  closed with no `500`. Why: one `Response` type keeps routers, middleware and error pages working
+  on streamed answers unchanged, and a `Result` per write makes the end of a stream the program's
+  ordinary control flow. Alternatives weighed: a separate `StreamedResponse` type beside `Response`
+  (every handler type and middleware doubled); a handler handed the connection (the server loses
+  its framing and keep-alive); writes that trap when the client has gone (a client leaving is not a
+  bug). Review with the user: whether `Response.events`'s fifteen-second keep-alive default suits.
+- Proposed (built on branch `http-stream`): **Typed parameters through a `FromParam` trait of
+  static methods**, `paramAs[T]`, `queryAs[T]` (with a default overload) and `queryOption[T]`
+  answering `Result[_, ParamError]`, `Missing` or `Invalid`; `string`, `int`, `long`, `real` and
+  `bool` implement it. Why: a static `parse` makes a program's own type a parameter type by one
+  `impl`, and a `Result` lets `?` answer the client `400`. Alternatives weighed: separate
+  `queryInt`/`queryLong` methods (closed to a program's own types); trapping on bad input (a client
+  error is not a server bug).
+- Proposed (built on branch `http-stream`): **Handlers that fail answer `Result[Response,
+  ToResponse]`**: `ToResponse` is a trait with `toResponse()`, implemented by `Response` itself and
+  `ParamError`, `fromResult` turns such a function into a `Handler`, and each `Route.get` … `patch`
+  has an overload taking one. Why: `?` then ends a handler with any failure the program's own error
+  types can render, and a plain `Response` handler is untouched. Alternatives weighed: one
+  `Result`-only handler type (every simple handler would wrap in `Ok`); an `Error`-bounded error
+  rendered as `500` (hides the status the program meant). Making the overloads work needed two
+  compiler fixes: a lambda tried against several overloads is compiled only for the one chosen, and
+  an argument checked before the overload was chosen is made `@sendable` where the chosen one's
+  parameter is (tests `overload_lambda_return`, `overload_sendable`, `overload_sendable_capture`).
+- Proposed (built on branch `http-stream`): **Route groups and middleware are plain functions**:
+  `type Handler`, a middleware `(Handler) -> Handler`, `Route.wrap`, `Route.under` and
+  `Route.group(prefix, routes, middleware)` answering a `Vector[Route]`, nesting with the inner
+  middleware inside the outer. A prefix must begin with `/` and not end with one, else it traps.
+  Why: groups flatten into the router's one ordered list, so matching, `405` and `HEAD` stay as they
+  were. Alternatives weighed: a nested router type (two matching rules); a prefix tolerating a
+  trailing `/` (two spellings of one path, and `//` after joining).
+- Proposed (built on branch `http-stream`): **Error pages are an `ErrorPage = @sendable (int) ->
+  Response`**, given to `Router` (its `404` and `405`) and `http.serve` (every status it answers
+  itself), defaulting to `plainError`, the reason phrase as text; the status sent is always the one
+  given, and a `405` keeps its `Allow`. Why: one function covers JSON or HTML pages without a
+  table of statuses. Alternatives weighed: a `Map[int, Response]` (every status listed by hand, and
+  none computed); letting the page change the status (a `404` page answering `200` misleads clients).
+- Proposed (built on branch `http-stream`): **`isStopping()` and `untilStopped(wait)` on a
+  `ServerRequest`, `BodyWriter` and `EventWriter`**, `untilStopped` running `wait` on its own thread
+  through `TcpServer.idle`, so stopping cancels it and the handler gets `None`. Why: a long poll or
+  an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
+  cancellation token passed to every handler (every handler signature changes); leaving shutdown
+  to the write timeout (a quiet stream would hold it for `writeTimeout`).
 
 
 ## Proposed
