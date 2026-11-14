@@ -8257,6 +8257,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a type in annotations later, and whether to keep the `+` diagnostic once existing code has moved
   (it costs nothing and helps code written before the change). Packages outside this repository
   that still write `+` (the `json` package's tests) move to `&` with the release that carries this.
+
+**Byte offsets inside a character** ([types](/spec/types/#string), branch `fix-charat-boundary`)
+
+- Proposed: **`charAt` at an offset inside a character's encoding traps, `charAt offset is not a
+  character boundary`, as slicing there does; the searches never trap on such an offset and never
+  answer one.** `indexOf(p, from)` and `indexWhere(f, from)` from inside a character start at the
+  next one, so `"café".indexOf("", 4)` is 5; `lastIndexOf(p, end)` and `lastIndexWhere(f, end)` from
+  inside one search back from the character it belongs to, so `"café".lastIndexOf("", 4)` is 3; and
+  `startsWith("", at)` is false inside a character, since the empty string occurs only where a
+  character begins or at the end. Why: `charAt` and `slice` read the text at the offset given, so an
+  offset that is not a place in the text is the caller's mistake, the trap the spec gives slicing;
+  a search is asked "where at or after (before) this", which has an exact answer from any offset,
+  and answering only offsets where a character begins means every result can be fed to `charAt` or
+  `slice` again. The cost on a character boundary is one comparison on a lead byte, none on ASCII.
+  Alternatives weighed: trapping in the searches too (a search from `i + 1` over text with
+  characters beyond ASCII would then trap where the same search over ASCII succeeds); answering the
+  offset itself for an empty needle, as before (a result that traps when sliced at).
+
+**Initialization** ([declarations](/spec/declarations/#initialization), branch `init-design`)
+
 - **Initialization is proved at compile time, by order and by withholding `self`** (branch
   `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
   value or `lazy val` is read before it is set: an object's fields are set in the order written and
