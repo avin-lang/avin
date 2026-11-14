@@ -8392,6 +8392,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `contextual-keywords`, from the user's decision of 2026-11-14 that
+  `data` keeps its spelling and becomes contextual): **the words that begin a top-level declaration
+  are keywords only there, before the name they declare, and ordinary names everywhere else**:
+  `data`, `class`, `object`, `trait`, `impl`, `import` and `module` join `type`, `opaque`, `export`,
+  `derive`, `actor` and `machine`, and `open` and `abstract` are keywords only before `class`. So
+  `val data = readFile(p)`, a field `class`, a method `object()`, a parameter `import`, a named
+  argument `module = 2`, a type parameter, a variant, a module named `data` and `r.type` are all
+  legal, and `data(x: int)` at the top level declares a function called `data`. **The reserved
+  words stay**: `as`, `is`, `match`, `then`, `else`, `elif`, `do`, `yield` and `derives`, because each
+  follows a complete operand on its line (`x as T`, `if c then a`, `Base(x) derives Eq`), where a
+  name is an infix call; `if`, `while`, `for`, `loop`, `defer`, `return`, `break`, `continue`, `val`,
+  `var` and `def`, because each begins a statement or a declaration inside a block, where a line may
+  equally be an expression starting with a name (`loop` and an indented block would read as a call
+  of `loop` with a trailing block; `return (x)` as a call); `private`, `static` and `override`,
+  because they begin a member of a class body, where a line may be a statement, and `private + (o:
+  T)` would be both a method named by a symbol and an expression on a value; `true`, `false`,
+  `self` and `super`, which are values. `end` keeps its rule (a keyword only before a name), and
+  `not` and `with` theirs. Why: the test is whether the keyword's every position can be told from a
+  name's by the next token alone. A top-level line holds only declarations, never a statement, so a
+  declaration word followed by a name can mean nothing else, and none of these words begins
+  anything inside a block or a class body. Alternatives weighed: renaming `data` (the user kept the
+  spelling); making every word contextual by look-ahead over whole lines (`loop`, `return` and the
+  modifiers would each need a rule of their own that a reader cannot see at a glance); keeping
+  `class` and `object` reserved as the most declaration-like (they are common field names, and
+  nothing about them is less decidable than `data`). Review with the user: whether `private`,
+  `static` and `override` should become contextual too, at the price of the symbol-method rule.
 - Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
   Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
   opaque type reads as the alias it resembles, with one word saying the difference, and the parser
