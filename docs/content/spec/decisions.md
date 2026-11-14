@@ -8218,6 +8218,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **A package's tests import its gated modules; a test module is read only while every module it
+  imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
+  The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
+  that module, and a `tests` file importing it was refused even under `avin test`, which turns every
+  feature on. Now `tests` and the modules under it have no fences: they may import every module of
+  the package and its optional dependencies. A build with a feature off passes over each test module
+  importing a module that is off, and, repeated to the end, each test module importing one passed
+  over; the rest are read and run. The module stays the unit, so a file of `tests` importing a gated
+  module takes all of `tests` with it when that feature is off. *Why*: the spec already says
+  `avin test` has every feature on, so the tests see the whole package; and the package's own
+  `tests` are compiled by `build` and `run` too, so a selection-independent refusal was the only
+  thing keeping a build with features off working; deriving each test module's gate from its imports
+  keeps that guarantee with no annotation to write. *Alternatives*: allowing `tests` to import gated
+  modules only under `avin test` (a build or `avin test --no-default-features` would then fail at
+  the import, so the minimal configuration could not be tested); letting a feature list
+  `tests.server` explicitly (works, but repeats in the manifest what the imports already say);
+  skipping single files rather than modules (finer, but a file of `tests` could then lose a helper
+  another file of it uses, breaking only the build with the feature off). Not covered: a test
+  importing an optional dependency's module directly while that dependency is not taken is reported
+  as an unknown module, since a dependency not taken is not read and its modules are unknown; such a
+  test reaches the dependency through the package's gated module. Review with the user: whether a
+  test module passed over should be named in `avin test`'s output rather than silently absent.
+- **An import refused for its module is one error per import declaration**, not one per name it
+  imports (branch `gated-tests`): `import a.b.{c, d}` refused as gated, as an optional dependency's,
+  or as a standard-library module that does not exist, is reported once, at the first name;
+  two import lines are two errors. *Why*: the error is about the module, which the declaration names
+  once. *Alternatives*: one per module per file (hides the second line's error).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
