@@ -975,7 +975,12 @@ each literal a `byte`), and otherwise from the elements themselves, which agree 
 branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A number
 literal among them takes the type the others decide, wherever it is written
 ([generics](/spec/generics/#inference)): `[long(1), 2]` and `[2, long(1)]` are `Vector[long]`, and
-`[1.5, 2]` is a `Vector[real]`. A map
+`[1.5, 2]` is a `Vector[real]`. So does a number literal in a literal given as an argument, from
+what the receiver and the other arguments decide of its parameter, an overloaded method's included:
+with `v: Vector[long]`, `v ++ [400]` and `v ++ [5_000_000_000]` are `Vector[long]`, `l ++ List(400)`
+on a `List[long]` is a `List[long]`, and beside a `Vector[BigInt]` or a `Vector` of a type that
+[takes integers](/spec/types/#integers-meet-a-type-that-takes-them) the literal's numbers are that
+type's values; `v ++ ["a"]` is still an error. A map
 literal's keys agree on one type and its values on another, so `{a: dog, b: cat}` is a
 `Map[string, Animal]`. A literal in braces is all elements or all entries; `{1, b: 2}` is an
 error. Set and map literals nest inside one another and inside sequence literals, and like them may
