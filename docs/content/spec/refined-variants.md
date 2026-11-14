@@ -154,6 +154,17 @@ operators and methods, and a `Vector[A]` is a `Vector[int]`. Outside it nothing 
   elsewhere is an error there.
 - **A variable declared outside the arm keeps its declared type**, and the arm may store into it any
   value of that type under the equalities: `var out: T` takes `n` in the `IntLit` arm.
+- **A fresh type the equalities leave unsolved never leaves its arm**: matching an `Expr[T]`,
+  `Pair`'s `A` and `B` are known only as the parts of `T`, so with no type expected an arm whose
+  result names `A`, and a local declared outside settled to a type naming it, are errors, as for a
+  [hidden parameter](#hidden-type-parameters). Matching an `Expr[(int, bool)]`, `A` is `int`, and
+  the fields read as `Expr[int]` and `Expr[bool]`.
+
+A binding names a variant of its value's type to take the value apart: `val Refl = proof`, where
+the type has refined variants, holds `Refl`'s equalities in the rest of the block. A field of a
+refined type's one variant is read by name, `o.value`, where the instance says the field's type:
+every value of the instance is that variant's. An instance the variant cannot make has no values,
+and a field whose type keeps a parameter the instance does not say is reached through a `match`.
 
 An arm learns equalities from variants only. An extractor pattern does not refine, since an
 `unapply`'s result type is its own signature's, and neither does a type pattern: `x: Expr[int]` on
@@ -448,5 +459,10 @@ well typed because the clause learns `A = B`.
 | An unknown type matched | `` the type of the value matched must be known to match `IntLit`, which fixes the type's argument; write the type where the value is declared `` |
 | A hidden type leaving its arm | `` this arm's result is an `R`, a type `Ask` hides in the value matched, which is not known outside the arm `` |
 | Arms needing an expected type | `` the arms of this `match` agree on no type: `IntLit`'s yields an `int`, which is `T` only inside that arm; declare the result type `` |
+| Clauses needing a declared result | `` the clauses of `f` agree on no type: `IntLit`'s yields an `int`, which is `T` only inside that clause; declare the result type `` |
+| An arm not the expected type | `` this arm yields int, not the T expected of the `match` `` |
+| A fresh type leaving its arm | `` this arm's result is an `Expr[A]`, and `A` is a type `Pair` takes from the value it matches, which is not known outside its arm `` |
+| A fresh type settling a type outside | `` a type declared outside this arm cannot be settled to an `Expr[A]`: `A` is a type `Pair` takes from the value it matches, which is not known outside its arm `` |
+| A field the instance does not determine | `` the field `items` of `Hold` has a type a `Holder[T]` does not determine; take the value apart with `match` `` |
 | A missing case | the usual message, naming a possible variant: `` this `match` does not cover every Expr[int] value, such as `If(_, _, _)` `` |
 | Growing packs | the [polymorphic recursion](/spec/generics/#polymorphic-recursion) error, naming the variant whose hidden type grows |

@@ -747,7 +747,8 @@ ensure_runtime(tc: Toolchain) -> Result[string, string]
     val shipped = tc.prebuilt_runtime(key)
     if exists(shipped) then return Ok(shipped)
     val archive = tc.runtime_cache() + "/libavinrt-" + key + ".a"
-    if exists(archive) then return Ok(archive)
+    // Found, it is touched, so a sweep of the cache sees it in use.
+    if touch_entry(archive) then return Ok(archive)
     make_dir_all(tc.runtime_cache()).map_err(e -> s"${tc.runtime_cache()}: ${e.to_string()}")?
     val pending = pending_name(archive)
     defer _ = remove_file(pending)
@@ -768,17 +769,31 @@ runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + ru
  * as `codegen_units` answers where `units` is 0, each unit's object kept in the toolchain's cache
  * unless `keep_units` is false: a program built once, as a test corpus builds each of its programs,
  * gains nothing from keeping them. The executable is written under a temporary name and
- * published by rename, so a failed link leaves any previous output in place. */
+ * published by rename, so a failed link leaves any previous output in place.
+ *
+ * What it links from the toolchain's cache is looked at before clang runs, and again if clang fails:
+ * an entry gone from under it (removed while the build ran, by a person or a disk being cleared) is
+ * answered as `VanishedEntry` and the entry's path, never as clang's error, so the caller compiles
+ * again, which builds the entry anew (`link_compiled`). A shim archive without the record of the
+ * libraries it needs beside it is not whole, and is answered the same way. */
 link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimization: string, c_link: Buf[string], units: int = 0, keep_units: bool = true, debug: bool = false) -> Result[unit, string]
     var libraries: Buf[string] = buf()
+    var cached: Buf[string] = buf()
     val archive = shims match
         Some(a) ->
             val needs = link_needs_file(a)
-            if exists(needs)
-                val listed = read_text(needs).map_err(e -> s"$needs: ${e.to_string()}")?
-                libraries = link_flags(listed)?
+            if !touch_entry(a) || !touch_entry(needs) then return Err(VanishedEntry + a)
+            cached.push(a)
+            cached.push(needs)
+            val listed = read_text(needs).map_err(e -> if exists(needs) then s"$needs: ${e.to_string()}" else VanishedEntry + needs)?
+            libraries = link_flags(listed)?
             a
         None -> ensure_runtime(tc)?
+    if archive.starts_with(tc.cache + "/") then cached.push(archive)
+    for flag in c_link
+        if flag.starts_with(tc.cache + "/")
+            if !touch_entry(flag) then return Err(VanishedEntry + flag)
+            cached.push(flag)
     val dir = make_temp_dir("avin-link").map_err(e -> e.to_string())?
     defer _ = remove_dir_all(dir)
     val pending = pending_name(output)
@@ -793,6 +808,7 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
             val compiled = compile_units(tc.clang, texts, dir, optimization, if keep_units then tc.unit_cache() else "")?
             for o in compiled.objects
                 args.push(o)
+                if o.starts_with(tc.cache + "/") then cached.push(o)
             began = phase_done("units", began, s"units=${compiled.objects.len()} compiled=${compiled.compiled} reused=${int(compiled.objects.len()) - compiled.compiled}")
         None ->
             began = phase_done("split", began, "units=1")
@@ -811,6 +827,8 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     began = phase_start()
     val result = capture(tc.clang, args.view(), stderr = true, timeout = 120000).map_err(e -> missing_tool(tc.clang, e.to_string()))?
     if !result.status.ok()
+        for p in cached
+            if !exists(p) then return Err(VanishedEntry + p)
         return Err("clang failed: " + result.status.to_string() + "\n" + result.err.unwrap_or("") + result.text)
     publish_file(pending, output).map_err(e -> e.to_string())?
     _ = phase_done("link", began)
@@ -824,6 +842,22 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
             return Err("dsymutil failed: " + gathered.status.to_string() + "\n" + gathered.err.unwrap_or("") + gathered.text)
         _ = phase_done("dsym", began)
     Ok(())
+
+/** How `link` begins its answer when an entry of the toolchain's cache it was to link is gone. */
+const VanishedEntry: string = "an entry of the build cache is gone: "
+
+/** Links `compiled` as `link` does, and where an entry of the cache it needed has vanished
+ * (`VanishedEntry`), compiles again with `recompile`, which builds that entry anew, and links that,
+ * once: a cache emptied under a build costs the build its time and not its result. */
+link_compiled(tc: Toolchain, compiled: Compilation, recompile: &Fn() -> Compilation, output: string, optimization: string, keep_units: bool = true, debug: bool = false) -> Result[unit, string]
+    val first = link(tc, compiled.llvm.unwrap_or(""), compiled.archive, output, optimization, compiled.c_link, keep_units = keep_units, debug = debug)
+    val message = first match
+        Ok(_) -> return Ok(())
+        Err(m) -> m
+    if !message.starts_with(VanishedEntry) then return Err(message)
+    val again = recompile()
+    if again.diagnostics != "" then return Err(again.diagnostics)
+    link(tc, again.llvm.unwrap_or(""), again.archive, output, optimization, again.c_link, keep_units = keep_units, debug = debug)
 
 /** The tool that gathers an executable's debug information on macOS. */
 const DsymUtil: string = "dsymutil"

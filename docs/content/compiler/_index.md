@@ -84,7 +84,30 @@ machine with no cache directory (no `HOME`, no `XDG_CACHE_HOME`, no `AVIN_CACHE`
 `.avin/build/` in the program's directory instead, or beside the file for a program of one file.
 `avin clean [<program>]` removes the program's cache, and the `.avin/build/` beside it if there is
 one; `avin clean --all` removes every program's cache this version keeps, and leaves the fetched
-packages, the runtime's archives and the shims. `avin build` is not a cache: it writes the
+packages, the runtime's archives and the shims.
+
+The cache keeps itself within a limit, with nothing for a person to do. Each program's directory
+under `build/` (and under `test-builds/`, where the compiler's own tests build) is an entry, and so
+is each object or archive under `units/`, `runtime/`, `shims/` and `cunit/`; an entry's modification
+time is its last use, since every build touches what it takes from the cache, a program's directory
+when its build starts and again before each test `avin test` runs. Every command that builds sweeps
+the cache at most once in ten minutes, whichever process does it (a `last-sweep` stamp in the
+cache): it evicts entries least recently used first until the cache is within `AVIN_CACHE_LIMIT`
+(`5G` unless it is set; `500M`, `20G`, a number of bytes, or `off` for no limit), never one used
+within the last hour, and renames an entry aside and looks at it again before removing it, putting
+it back if a build touched it in between, so nothing a running build uses goes; a shim archive and
+the record of what it links beside it are one entry. An entry gone from under a build anyway, the
+cache emptied by hand while it ran, is a miss: the link looks again at what it takes from the cache,
+and the build compiles once more, which builds the entry anew, rather than handing clang a path to
+nothing. The same sweep
+removes what interrupted builds left (anything whose name holds `.pending-`, an hour after the last
+write to it), the temporary directories a killed build worked in (`avin-link…`, `avin-shims…`,
+`avin-c-unit…` in `TMPDIR`, a day after the last write), and the caches of other versions of Avin
+three days after their last use. Fetched packages are not counted against the limit and a sweep
+never evicts one. `avin cache info` shows each kind's size, the limit, the oldest and newest use,
+debris, the packages and other versions' caches; `avin cache trim` sweeps now; `avin cache clean`
+removes all of it, `--older-than 30m`/`12h`/`7d` only what no build has used for that long, and
+`--packages` the fetched packages too. `avin build` is not a cache: it writes the
 executable where `-o` says, or in the working directory. Beside each
 executable, `<name>-O2` or `<name>-tests-O2`, a record holds the key it was built for: a hash over the
 compiler's version and its executable's modification time, the kind of build and its optimization,
