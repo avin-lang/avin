@@ -572,7 +572,8 @@ block and starts a line again. Patterns include:
 - [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
   `[a, b]` a sequence of exactly two elements;
 - type patterns (`d: Dog`, `_: Dog`), which also take a [union](/spec/unions/#match) apart, member
-  by member; a union in a type pattern is parenthesized, `x: (int | string)`;
+  by member; a union in a type pattern is parenthesized, `x: (int | string)`. A built-in type's name
+  alone, `int` or `string`, is the type pattern `_: int`;
 - alternatives (`1 | 2 | 3`), which bind no names and may continue across lines with a leading or
   trailing `|`;
 - named patterns (`whole @ Some(x)`);
@@ -624,7 +625,43 @@ that no tuple of that type could match is an error, as any such type pattern is.
 on its own by a tuple pattern with a type pattern inside it, `(d: Dog, n) -> …`, on a value of a tuple
 type; an `Any` is first matched by its tuple type, `p: (Animal, int)`.
 
-A type pattern that can never match, such as `s: string` on an `int`, is an error. A type pattern
+A type pattern that can never match, such as `s: string` on an `int`, is an error.
+
+### Type names in patterns
+
+**A type's name is a type pattern by itself.** Each name in the
+[table of built-in types](/spec/types/#built-in-types), `int`, `long`, `byte`, `real`, `char`,
+`bool`, `string`, `unit` and every sized integer `iN`, stands for `_: T` wherever a pattern does:
+`x is int` tests that `x` holds an int, and `x is not string` that it holds no string. So does the
+name of any other type in scope that is no variant: a class, a trait, an `object`, a `data` type, an
+alias, `Any` and a type parameter, so `a is Dog` tests for a `Dog`. A variant's name is still the
+variant, so `data Cell(value: int)` makes `Cell` the variant's pattern, and `Circle` matches the
+variant `Circle`. It keeps a type test short where one is wanted most:
+
+```text
+kind(x: Any) -> string = x match
+  int | long -> "an integer"
+  string -> "text"
+  _ -> "something else"
+
+size(v: int | string) -> int = v match
+  int -> 1
+  string -> 2
+```
+
+The name tests and binds nothing, so the value is bound beside its type as `n: int`, or whole as
+`n @ int`, and `_: int | string` and `_: Dog | Bird` are two such alternatives. A generic type's
+name alone is an error, since a type pattern compares the type arguments: `x is Box` asks for
+`_: Box[int]` or whichever arguments are meant, and `_: Vector[int]` and `v: Vector[int]` stay as
+they are.
+
+Because a type's name in a pattern always tests the type, it never names a value. A local, a
+parameter or a lambda's parameter named after a type in scope (`val Cell = 3`, `f(Dog: int)`) is an
+error, and so is a pattern binding it (`Dog: Animal`, `Count @ Some(_)`). A built-in type's name is
+refused as a field's name too, and in every binding position of a pattern (`int: T`, `int @ p`,
+`int + 1`, `0 <= int < 9`, `int*`). It reaches coverage and reachability as the type pattern it is:
+`int` covers the `int` member of a union, and an arm after `_`, after another `int` or after a
+supertype's name is never reached. A type pattern
 covers every value only when its type is one the matched value already has, so a `match` on an `Any`
 needs a `_` arm. A literal does not match an `Any`; match its type first (`n: int if n == 5`). In a
 function's clauses a type pattern takes an argument apart like any other (`size(s: string) = …`),
@@ -660,8 +697,9 @@ code(p: Phase) -> int = p match
   // `Live` is in scope
 ```
 
-A bare name that is not a variant in scope binds, so a variant's name misspelled or not imported
-matches everything; the message says so when the covering arm's name starts with a capital letter.
+A bare name that is neither a variant nor a [type](#type-names-in-patterns) in scope binds, so a
+variant's name misspelled or not imported matches everything; the message says so when the covering
+arm's name starts with a capital letter.
 
 ### Extractor patterns
 
@@ -737,7 +775,8 @@ this way tests its patterns and guards once each time it is called, lifted or gi
 
 `x is P` tests a value against any pattern a `match` arm takes and yields a `bool`; `x is not P` is
 its negation. `order.status is Shipped` asks only which variant it is, whatever fields `Shipped`
-has. `not` is a keyword only there, directly after `is`, where it always negates: `x is
+has, and `x is int` which type it holds, since a built-in type's name is a
+[type pattern](#match) by itself. `not` is a keyword only there, directly after `is`, where it always negates: `x is
 not(y)` tests the pattern `(y)`. Everywhere else `not` is an ordinary name, so a function, method,
 parameter or local may be called `not` and `not(p)` calls it. The names `P` binds are in scope only
 where the test is known to have matched:

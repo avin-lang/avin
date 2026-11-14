@@ -9198,6 +9198,49 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Decided by the user 2026-11-14: **a built-in type's name in a pattern is a type pattern**:
+  `x is int` tests the type and an arm `int ->` matches an int, for every name in the table of
+  built-in types, the sized integers `iN` included; generic forms stay `_: Vector[int]`; a name
+  with a binding is `n: int`. Built on branch `is-type-name`, where `x is int` had bound a new
+  `int` and was always true (`tests/run/operands_for_traits.avin` tested nothing). Proposed with it:
+  - **Such a name never names a value**: a local (`val`, `var`), a function's, a lambda's or a
+    class's parameter, a data field, and a pattern binding it (`int: T`, `int @ p`, `int + 1`, a
+    comparison pattern, `int*`) are errors, `` `int` is a built-in type, so it cannot name a value
+    `` and `` …, so a pattern cannot bind it: alone it tests for the type, and `n: int` binds the
+    value as one ``. Why: with the names type patterns, `val (a, int) = p` would test where `val int
+    = 3` binds, and `int(x)` in an expression would mean the conversion or the local by context;
+    refusing them everywhere keeps one meaning per name. It also settles the hiding rule for built-in
+    statics: `val string = …; string.byteLength` no longer arises. The library and tests renamed
+    their locals (`unit` → `identity`/`scale`, the vector tree's `i1`–`i6` → `d1`–`d6`, `long`,
+    `real`, `int` locals in tests). Alternatives: allowing them as `val`/parameter names and
+    refusing them only in patterns (two meanings for one name, and destructuring differs from a
+    plain binding); allowing only the eight word names and leaving `iN` free (the user listed the
+    sized integers). Review with the user: `i1`, `i2`, … are common index names, and they are
+    refused too.
+  - **Every type's name in a pattern is its type pattern** (the same decision, extended by the
+    director 2026-11-14 after `a is Cell` was found binding too): a bare or dotted name with no
+    parentheses that is no variant but resolves to a class, trait, `object`, `data` type, alias,
+    `Any`, `Nothing` or type parameter is `_: T`. A variant wins where both exist, so
+    `data Cell(value: int)`'s `Cell` stays the variant's pattern and every variant pattern is
+    unchanged. A local, a parameter (of a function, local function or lambda) or a pattern binding
+    named after a type in scope is refused: `` `Cell` is a type, so it cannot name a value: in a
+    pattern it tests for the type, and `x: Cell` binds a value of it ``. Fields named after a user
+    type are not refused (they are reached as members, and a data field's pattern is positional).
+    Why: one meaning per name in a pattern; a capitalised name quietly binding was the same defect.
+    Alternatives: only refusing capitalised bindings that shadow a type (keeps the always-true test
+    as an error rather than a feature); including field names (more renames for no pattern
+    ambiguity).
+  - **A generic type's name alone in a pattern is refused**, `` `Box` is a generic type, and a type
+    pattern names its type arguments, as in `_: Box[int]` ``. Why: a type pattern compares type
+    arguments exactly, and the run-time test of "a `Box` at any arguments" would be a new kind of
+    test with no sound meaning for variance and value-type arguments yet. Alternatives: testing the
+    class at any arguments (needs a class-only run-time test and a binding type, `Box[?]`, Avin
+    lacks); inferring the arguments from the matched type (works only where they are known, and
+    reads differently by context). Review with the user if a "any instance of `Box`" test is wanted.
+  - A type alias in a constructor pattern, `P(a, b)`, stays refused as before.
+  - **Functions and methods may still be named so** (`cli`'s `int(name)` and `string(name)`
+    options): a function is called, never matched, so no pattern can mean it. A missing-member
+    witness still reads `_: string`, which is the same pattern.
 - Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
   against the structure, except where `@trusted_sendable("why")` marks a class**
   ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the

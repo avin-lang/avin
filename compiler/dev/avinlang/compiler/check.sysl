@@ -6900,7 +6900,9 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         if !(tp.variance is Invariant) then c.note(unit, tp.span, "variance is written on the parameters of a type, not of a function")
     for p in f.params
         p.pattern.kind match
-            Name(n) -> names.push(n)
+            Name(n) ->
+                if !builtin_type_name(n) && names_a_type(c, unit, n) then c.note(unit, p.pattern.span, type_named_value(n))
+                names.push(n)
             Wildcard -> names.push("_")
             _ ->
                 c.note(unit, p.pattern.span, "parameter patterns are not implemented")
@@ -12932,7 +12934,7 @@ private check_local_symbol(c: *Checker, id: usize)
     if decl.type_params.len() > 0 && symbol.type_params.len() > 0 then c.generic = Some(GenericScope(symbol.type_owner, symbol.type_params))
     var param_locals: Buf[usize] = buf()
     for i in 0..<symbol.params.len()
-        param_locals.push(declare_local(c, decl.span, symbol.param_names[i], symbol.params[i], false))
+        param_locals.push(add_local(c, decl.span, symbol.param_names[i], symbol.params[i], false))
     c.symbols[id].param_locals = param_locals
     note_refined_function(c, id)
     var subjects: Buf[&TExpr] = buf()
@@ -14790,6 +14792,17 @@ private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: b
 /** `declare_local`, with the type the definition index shows for it, `shown`: a local `lazy val`'s
  * value type rather than its cell's. */
 private declare_local_shown(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool, shown: &Type) -> usize
+    // A built-in type's name is refused where it is parsed, and a function's parameter where its
+    // signature is read; any other type's name is refused here, since a pattern of that name tests
+    // for the type rather than meaning the value.
+    if name != "" && !builtin_type_name(name) && names_a_type(c, unit_of(c), name)
+        c.note(unit_of(c), at, type_named_value(name))
+    add_local_shown(c, at, name, ty, mutable, shown)
+
+// A local's declaration, its name judged a value's: once per block, and seen from here on.
+private add_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize = add_local_shown(c, at, name, ty, mutable, ty)
+
+private add_local_shown(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool, shown: &Type) -> usize
     if name == "self"
         if in_actor(c) then c.note(unit_of(c), at, "`self` names the actor's reference; it cannot be declared")
         else c.note(unit_of(c), at, "`self` names the instance a method works on; it cannot be declared")
@@ -22507,6 +22520,7 @@ private check_pattern_kind(c: *Checker, p: &Pattern, given: &Type, no_bind: stri
     // A value of a type parameter an equality in scope fixes is matched as the type it is there.
     var ty = given
     if *zonk(c, given) is TypeVar(_, _, _) then ty = refined_type(c, given)
+    if type_name_pattern(c, p) is Some(typed) then return check_pattern_kind(c, typed, ty, no_bind)
     if *zonk(c, ty) is Union(members)
         if applies_to_members(c, p) then return union_pattern(c, p, zonk(c, ty), members, no_bind)
     p.kind match
@@ -22641,6 +22655,46 @@ private check_pattern_kind(c: *Checker, p: &Pattern, given: &Type, no_bind: stri
             c.type_tests.push(TypeView(ty, target))
             TPattern(p.span, ty, PType(target, local, !fits(c, ty, target)))
 
+// A bare name, or a dotted one without parentheses, that is no variant but names a type: a class, a
+// trait, an object, a data type, an alias or a type parameter. It is the type pattern `_: T`. A
+// generic type's name alone is refused, since a type pattern compares the type arguments, and none
+// are written; the pattern answered is then one that matches nothing further.
+private type_name_pattern(c: *Checker, p: &Pattern) -> Option[&Pattern]
+    val name = p.kind match
+        Name(n) -> n
+        Constructor(n, args, parens) -> if parens || args.len() > 0 then return None else n
+        _ -> return None
+    if variants_named(c, name).len() > 0 then return None
+    val params = type_params_named(c, unit_of(c), name) match
+        Some(k) -> k
+        None -> return None
+    if params > 0
+        var written = name + "[int"
+        for i in 1..<params do written = written + ", int"
+        written = written + "]"
+        c.note(unit_of(c), p.span, s"`$name` is a generic type, and a type pattern names its type arguments, as in `_: $written`")
+        return Some(Pattern(p.span, InvalidPattern))
+    Some(Pattern(p.span, Typed(Pattern(p.span, Wildcard), TypeExpr(p.span, Named(name, buf())))))
+
+// How many type parameters the type a pattern's bare `name` resolves to takes, or `None` where the
+// name is no type in scope.
+private type_params_named(c: *Checker, unit: usize, name: string) -> Option[usize]
+    if builtin_type(name) is Some(_) || name == "Nothing" then return Some(0)
+    if c.generic is Some(scope)
+        for q in scope.params
+            if q.name == name then return Some(0)
+    if name == "Self" then return if c.self_trait is Some(_) then Some(0) else None
+    val key = resolve_name(c, unit, name)
+    if c.alias_names.get(key) is Some(id) then return Some(c.aliases[id].decl.type_params.len())
+    if c.types.get(key) is Some(id) then return Some(c.data[id].decl.type_params.len())
+    if c.class_types.get(key) is Some(id) then return Some(c.classes[id].decl.type_params.len())
+    None
+
+private type_named_value(name: string) -> string = s"`$name` is a type, so it cannot name a value: in a pattern it tests for the type, and `x: $name` binds a value of it"
+
+/** Whether a value's `name` would hide a type in scope, which a pattern of that name tests for. */
+private names_a_type(c: *Checker, unit: usize, name: string) -> bool = type_params_named(c, unit, name) is Some(_)
+
 // A type pattern followed by `|` and bare names that are no variants, `x: int | string`, which reads as
 // a union meant for the type: the parenthesized form to write, where the alternatives are that.
 private union_in_type_pattern(c: *Checker, options: Buf[&Pattern]) -> Option[string]
@@ -22649,12 +22703,21 @@ private union_in_type_pattern(c: *Checker, options: Buf[&Pattern]) -> Option[str
         _ -> return None
     var names = show_type(first)
     if first.kind is Function(_, _, _) then names = s"($names)"
+    // A type's name after the bar is a type pattern of its own, so `_: int | string` and `_: Dog |
+    // Cat` are alternatives that bind nothing, and only a binding or a name of no type makes the
+    // mistake.
+    var binds = binder.kind is Name(_)
     for i in 1..<options.len()
+        if builtin_name_pattern(options[i]) is Some(n)
+            names = names + " | " + n
+            continue
         options[i].kind match
             Name(n) ->
                 if variants_named(c, n).len() > 0 then return None
                 names = names + " | " + n
+                if !names_a_type(c, unit_of(c), n) then binds = true
             _ -> return None
+    if !binds then return None
     val bound = binder.kind match
         Name(n) -> n
         _ -> "_"
