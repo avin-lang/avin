@@ -236,7 +236,7 @@ carry the chapter's exact messages, at most five per file.
 ### Refined variants: build plan
 
 [Refined variants](/spec/refined-variants/) are designed, their choices proposed in
-[decisions](/spec/decisions/#proposed); step 1 is built, steps 2 to 7 are still to come. Each step is one item, gated on its own
+[decisions](/spec/decisions/#proposed); steps 1 and 2 are built, steps 3 to 7 are still to come. Each step is one item, gated on its own
 targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
 `-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
 messages, at most five per file. A step that meets a missing piece of the checker it builds on
@@ -245,14 +245,12 @@ reports it rather than routing around it.
 1. **Declaration.** *Done (branch `gadt-1`):* parsed, shown and formatted; `VariantSymbol` holds
    `params` (the type's, then the variant's own) and `result`; the six checks run, rule 6 through
    `expansion.sysl`'s flow graph with each refined variant's parameters as nodes of their own; tests
-   `tests/reject/refined_{result,parameters,variance,nested,bounds,defaults,not_yet_built,not_yet_built_types}`,
+   `tests/reject/refined_{result,parameters,variance,nested,bounds,defaults}`,
    `tests/run/refined_declaration`, `tests/programs/reject/refined_across_modules`, and cases in
-   `parse_tests`, `formatter_tests` and `lsp_tests`. Until step 2, a type with a refined variant is
-   refused wherever it is named, made or matched (`refined_use_refused` in `check.sysl`), which step 2
-   removes. Where it meets [higher-kinded types](/spec/generics/#higher-kinded-types): a result
-   refuses any form but data types, classes, tuples, functions and parameters, so a constructor or an
-   applied constructor parameter is refused already; a constructor parameter among a variant's own
-   (`V[G[_]]`) is refused when the two branches are merged.
+   `parse_tests`, `formatter_tests` and `lsp_tests`. Where it meets [higher-kinded
+   types](/spec/generics/#higher-kinded-types): a result refuses any form but data types, classes,
+   tuples, functions and parameters, so a constructor or an applied constructor parameter is refused;
+   step 2 adds the rest (below).
    `Variant[params](fields) -> Type[args]` and `Name -> Type[args]` in a `data`
    body: `syntax.sysl` (`Variant` gains `type_params` and `result: Option[&TypeExpr]`),
    `parse_decl.sysl`, `formatter.sysl` (round trip, `avin fmt`-clean), `syntax_show.sysl`,
@@ -262,7 +260,25 @@ reports it rather than routing around it.
    an unused parameter, a reused name, `Lift[A](x: Expr[Vector[A]])` refused beside
    `First[A, B](pair: Expr[(A, B)])` accepted); parse and formatter cases for a fieldless variant with a
    result, a multi-line field list, annotations and defaults on a refined variant's fields.
-2. **Making values and layouts.** Removes step 1's `refined_use_refused` and its two reject tests
+2. **Making values and layouts.** *Done (branch `gadt-2`):* step 1's refusal is gone; a variant's
+   signature is generic over its parameters, a parameter of the type it names nowhere fixed rather
+   than inferred or written (`Signature.fixed`); `T[A].V` holds the value to the instance written;
+   the chapter's two messages for a value at the wrong instance, the field's named where it is given
+   to one; `variant_args`/`variant_fields_at` read a variant's arguments back from a concrete instance,
+   and `lower.sysl` lays out only the possible variants (`AbsentVariant` for the rest), compiles an
+   arm on a variant its copy's instance cannot hold not at all, and an arm on a refined one at the
+   arguments read back (`Lowering.refined`), which the derived templates' code needs; a derivation
+   holds a refined variant's own parameter to the trait where the result implies it (`implied_own`).
+   Higher-kinded types: a variant's own constructor parameter is refused, a result fixing a
+   constructor parameter is refused, and one keeping it in its place is accepted. *Still refused, with
+   "not yet" messages, for the steps that own them:* a variant pattern of a type with refined
+   variants, plain variants included, outside derived code (step 3); a field read by name on a
+   refined type's one variant (step 3); a value of a variant with a hidden parameter (step 5); a
+   value of a variant bounding its own parameter (step 6). *Tests:* run `refined_values`,
+   `refined_layouts`, `refined_derived`, `tests/programs/run/refined_across_modules`; reject
+   `refined_making`, `refined_shared_names`, `refined_type_args`, `refined_later_steps`,
+   `refined_later_steps_reads`, `refined_constructor_params`, and the cross-module program. The plan
+   as written: removes step 1's `refined_use_refused` and its two reject tests
    `refined_not_yet_built*`. `variant_signature` generic over the variant's parameters; inference
    from fields and the expected type; explicit arguments on the variant and on the type; the bare and
    qualified names; in `lower.sysl`, `DataLayout` holding only the variants possible at the

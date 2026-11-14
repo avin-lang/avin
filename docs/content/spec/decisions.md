@@ -8801,7 +8801,58 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   without the refinement of step 3 would be read at the wrong types; refusing the type keeps the
   declaration step sound with no partial path. Alternatives weighed: refusing only refined variants'
   calls and patterns (a value of a plain variant of the type, or a type pattern on `Any`, would still
-  reach a layout holding them).
+  reach a layout holding them). **Step 2 (branch `gadt-2`) lifted it**, and what it leaves refused
+  is the next entry's.
+- Proposed (branch `gadt-2`, the values-and-layouts step): **until the steps that build them, four
+  uses stay refused, each with a "yet" message**: a variant pattern of a type with refined variants,
+  its plain variants included, in code the program writes (step 3: ``"`IntLit` is a variant of
+  `Expr`, which has refined variants: a pattern cannot take one of its values apart yet"``); a field
+  read by name on such a type's one variant (step 3: ``"`One[int]` has refined variants: a field of
+  one is not read by name yet"``); a value of a variant with a hidden parameter, the type's or its
+  own (step 5: ``"`First` hides `B`, named by its fields and not by its result: a value of a variant
+  with hidden type parameters cannot be made yet"``); and a value of a variant bounding its own
+  parameter (step 6). The code the derived templates write for the type (`Display`, `Debug`, `Ord`,
+  any `walk`) matches every variant and is accepted, its copies compiled only for the variants
+  possible at each instance, each arm at the arguments it reads back from the instance. Why: each
+  refused use needs what a later step builds (an arm's equalities, packs, bounds held in the arm),
+  and a plain variant's pattern needs coverage over the possible variants, which is step 4's; the
+  derived code is the plan's "derived per instance", and needs only what lowering knows at a copy.
+  Alternatives weighed: accepting patterns on plain variants now (coverage would demand arms for
+  impossible variants that step 4 then makes errors).
+- Proposed (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
+  its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
+  is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
+  of `Done -> Plan[From, From]` writes `From`, and `IntLit[int](1)` takes no type argument. On the
+  type, `Expr[(int, bool)].Pair(…)` names the instance the value makes: the variant's parameters are
+  inferred from it and the value is held to it. Why: the chapter says a variant is called as a
+  generic function, and such a parameter is no parameter of that function; leaving it to inference
+  would make every call of `IntLit` an unsolvable "cannot infer `T`". Alternatives weighed: dropping
+  the parameter from the variant's list (its field defaults are functions of the whole list);
+  reading `T[A].V` as written arguments of `V` (they are the type's, and need not match `V`'s own in
+  number or meaning).
+- Proposed (branch `gadt-2`): **a derived trait holds of a refined variant's own parameter where the
+  trait on the instance implies it**: the parameter sits in the result under constructors whose
+  trait needs their argument's (a tuple's, `Vector`'s), tested by whether the constructor at the
+  parameter has the trait where every other argument does and the parameter alone has none. Where
+  it is not implied (`Hold[A](x: A) -> Odd[Wrap[A]]`, with `Wrap` showing itself whatever `A` is),
+  the field falls short and the type has no automatic `Display`, as any type with such a field. A
+  hidden parameter is given the trait, since no value of its variant is made before step 5, **which
+  must decide it per pack. Review with the user**: whether a refined type's `Display` should rather
+  be decided per instance, at the instance's own arguments. Why: a derived impl is checked once, over
+  its type's parameters, and this is the most that check can know of a variant's own; it is sound,
+  since the trait at an instance gives it to the parameter read back there. Alternatives weighed:
+  no trait for own parameters (every type with `Pair` would lose `Display`); the trait
+  unconditionally (unsound for `Odd`).
+- Proposed (branch `gadt-2`, where refined variants meet higher-kinded types): **a variant's own
+  type parameters are types, and a constructor parameter of the type keeps its place in a result**:
+  `V[G[_]](…)` is refused with ``"a variant's own type parameters stand for types, not type
+  constructors: `G` of `V` takes type arguments; declare a constructor parameter on the type, as in
+  `data D[G[_]]`"``, and `W(…) -> D[Vector, T]` with ``"a variant fixes no constructor parameter: `W`
+  makes `D[Vector, T]`, and `F` of `D` is a constructor parameter, so its place holds `F`"``, while
+  `Y(x: F[int]) -> D[F, int]`, keeping `F` and fixing `T`, is accepted (step 1 refused it as "no type
+  a `match` can take apart", which was a mistake). Why: the `gadt-1` entry below settles that no
+  constructor parameter is fixed, and keeping one in its place fixes nothing. Alternatives weighed: refusing any
+  refined variant of a type with a constructor parameter (needlessly narrow).
 - Proposed (branch `gadt-1`), **for constructor parameters ([higher-kinded
   types](/spec/generics/#higher-kinded-types)), the conservative reading until a design says more: a
   variant fixes no constructor parameter of its type, its own type parameters are no constructor
@@ -8812,8 +8863,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameters, and any other form, a constructor or its application among them, is refused with
   ``"`F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are
   built of data types, classes, tuples and function types"``; a constructor parameter among a
-  variant's own (`V[G[_]]`) is to be refused where the two branches meet, since this branch has no
-  holes to read. Fields name constructor applications freely, as any variant's do. Why: refinement
+  variant's own (`V[G[_]]`) is refused since the two branches met (branch `gadt-2`, the entry
+  above). Fields name constructor applications freely, as any variant's do. Why: refinement
   solves equalities by decomposition, which needs every parameter under a constructor that the
   instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
   X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
