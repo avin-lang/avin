@@ -233,7 +233,71 @@ carry the chapter's exact messages, at most five per file.
   `[T: A | B]` (and `[T >: A | B]` accepted), a union in an `@sysl` and an `@c` parameter, result and
   mirror field, calling or constructing a union, each with its message.
 
-### Incremental builds: build plan
+### Refined variants: build plan
+
+[Refined variants](/spec/refined-variants/) are designed, their choices proposed in
+[decisions](/spec/decisions/#proposed); none is built. Each step is one item, gated on its own
+targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
+`-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
+messages, at most five per file. A step that meets a missing piece of the checker it builds on
+reports it rather than routing around it.
+
+1. **Declaration.** `Variant[params](fields) -> Type[args]` and `Name -> Type[args]` in a `data`
+   body: `syntax.sysl` (`Variant` gains `type_params` and `result: Option[&TypeExpr]`),
+   `parse_decl.sysl`, `formatter.sysl` (round trip, `avin fmt`-clean), `syntax_show.sysl`,
+   `lsp_symbols.sysl`; in `check.sysl`'s `declare_variants`, `VariantSymbol` gains its parameters and
+   its result in them, and the six declaration checks run. *Tests:* each check's reject (a result of
+   another type, a fixed `+T` and `-T`, a union naming a parameter beside a closed union accepted,
+   an unused parameter, a reused name, `Lift[A](x: Expr[Vector[A]])` refused beside
+   `First[A, B](pair: Expr[(A, B)])` accepted); parse and formatter cases for a fieldless variant with a
+   result, a multi-line field list, annotations and defaults on a refined variant's fields.
+2. **Making values and layouts.** `variant_signature` generic over the variant's parameters; inference
+   from fields and the expected type; explicit arguments on the variant and on the type; the bare and
+   qualified names; in `lower.sysl`, `DataLayout` holding only the variants possible at the
+   instance, tags kept as declared; derived `Eq`, `Hash`, `Display`, `Debug` per instance; a type
+   pattern on an `Any` holding one. No hidden parameters yet (refused with a "not yet built"
+   message, removed by step 5). *Tests:* run: values of every `Expr` variant printed and compared,
+   `Expr[int]` and `Expr[bool]` in one `Vector[Any]` taken apart by type pattern, a refined value
+   in a class field, a closure capturing one, a `Map` keyed by one; reject: a variant at the wrong
+   expected instance, a field of the wrong instance, a shared variant name decided by a refined
+   result.
+3. **Refinement.** In `check.sysl`, a scoped substitution of the type parameters in scope, pushed
+   by each arm, clause, `is` scope and destructuring binding whose pattern holds a refined variant
+   (solved by decomposition with an occurs check), consulted wherever two types are compared or a
+   member is found; arm results checked against the expected type under it; inference variables
+   settled as written; in `lower.sysl`, an arm whose equalities fail at the copy is not lowered.
+   *Tests:* run: `eval` over `IntLit`, `BoolLit`, `Add`, `Eq`, `If`, `Pair` (as clauses, as a
+   `match`, as a match function, through `is` with an early return, in a class's generic method,
+   in a local generic function); nested refinement (`If(BoolLit(b), x, y)`); a lambda made in an arm
+   and called after it; a `var` declared outside stored in an arm; `Same`/`cast`; reject: an arm
+   result of the wrong type, arms joining with no expected type, an inference variable settled in an
+   arm and used outside, a refined name used outside its `is` scope, an unknown matched type.
+4. **Coverage.** In `coverage.sysl`, `cases_of` keeps the variants possible at the instance and the
+   witness search carries each row's equalities; impossible arms and empty instances are errors with
+   the chapter's messages. *Tests:* run: `total` on `Expr[int]` with no `BoolLit` arm, a pair of
+   `Expr[T]`s whose contradictory row is left out, a nested `match` inside a refined arm; reject: an
+   `Eq` arm on `Expr[int]`, a contradiction in one row, a cyclic equality, a `Same[int, string]`
+   matched, a missing case naming a possible variant, an arm unreachable after the possible variants
+   are covered.
+5. **Hidden parameters.** Fresh rigid types in an arm; the escape check; packs: one descriptor per
+   variant and list of hidden types the program makes, fields laid out at the pack's types; an arm
+   on such a variant lowered once per pack as a function of the hidden types and called through the
+   descriptor, reusing the dispatch `lower.sysl` and `devirt.sysl` build for generic trait methods;
+   equality comparing descriptors first; the polymorphic-recursion check extended to cycles that make
+   packs. *Tests:* run: `First` in `eval`; a hidden value-type field (`int`, `real`, a tuple) beside
+   a reference one; two packs of one variant compared unequal and hashed apart; the `Plan` example
+   driving a `Door` machine; reject: a hidden type leaving its arm as a result, through a local
+   settled in the arm, one value's hidden type used with another's; a growing pack cycle.
+6. **Bounds on variant parameters.** Checked where a value is made; held in the arm; gained by an
+   enclosing type parameter equated with a bounded one; a copy at a type without the bound leaves the
+   arm out. `Sendable` decided per pack. *Tests:* run: `Sorted[A: Ord]` and `smallest`; the
+   `Account` protocol of the chapter end to end (`request` at `long`, `string`, `unit`); reject:
+   making `Ask` with an unsendable reply type, a method of a bound the variant does not give.
+7. **Tooling and pages.** Hover and completion show a refined variant's signature (`lsp.sysl`,
+   `completion.sysl`); the IntelliJ plugin's grammar takes the result (in `avin-intellij`, its own
+   item); the chapter's examples become `run` fences with their `output` fences, so the docs test
+   compiles them.
+
 
 Stage 10's incremental builds are designed in the [pipeline](/compiler/#incremental-builds), their
 choices proposed in [decisions](/spec/decisions/#proposed). The plan follows a measurement.
@@ -401,6 +465,95 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 8. **Only if measured after 7:** the front end. If checking becomes the larger part of an edit's
    rebuild, a design for checked interfaces per module (today one checker holds the whole program by
    index, so this is a rewrite of how symbols are numbered, not a cache).
+
+### Sound initialization: build plan
+
+Designed in [Initialization](/spec/declarations/#initialization), its choices proposed in
+[decisions](/spec/decisions/#proposed): no field, module-level value or `lazy val` is read before it
+is set, proved when the program is compiled.
+
+**What 0.0.21 does (probed 2026-11-13).** The class-body rule, the open-class rule, trait fields,
+the module order (within and across modules, through calls, dispatch, operators, iterators,
+default arguments and lambdas made) and locals are all checked at compile time, and every probe of
+them was refused with the error the chapter gives or ran correctly. What is not:
+
+| Probe | What happens | Kind |
+| --- | --- | --- |
+| A lambda in a superclass's arguments reading a field, `class Late: Base(() -> late)`, the superclass calling it in its body | a `long` field reads `0`; a `string`, `Vector` or generic field crashes (exit 139) | **hole** |
+| The same with a method value, `Base(name)` | crash (exit 139) | **hole** |
+| The same with an argument passed by name, `Base(pick(true, s * 2))` | reads `0` | **hole** |
+| The same for an inherited field, `Leaf: Mid(() -> m)` with `m` Mid's | reads `0` | **hole** |
+| The same from an `object` extending a class | reads `0` | **hole** |
+| `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | run-time check |
+| A lazy's initializer joining a thread that reads the same lazy | waits for ever | liveness |
+| `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | false error |
+
+The holes have one cause: `field_read` in `check.sysl` refuses a field read only when the
+constructor is the current function, and the superclass's arguments are never scanned by
+`check_class_initialization`, so a function made there (a lambda, a by-name thunk, a method value)
+reads the object unchecked. Nothing in `library/`, `examples/` or `packages/` passes such a
+function (grep of every class header with a superclass call for `->`: none), so closing it changes
+no code there. The `lazy` change turns `tests/run/lazy_cycle.avin` and
+`tests/run/lazy_threads_cycle.avin` into reject tests; the library's own self-referring lazy values
+(the `LazyList` knots in `lazy_list.avin`) read themselves by name inside an argument passed by
+name, which stays legal.
+
+**The items**, each one agent, gated on its own, in this order:
+
+1. **Superclass arguments use nothing of the object.** `check_class_initialization` scans the
+   superclass-initialization item with an `InitScan` for the superclass's arguments (no field
+   ready, inherited or own), so a lambda, a by-name argument, a local function or a method value
+   that uses `self`, a field or a method is an error with the chapter's wording; objects extending a
+   class go through the same path. Files: `compiler/dev/avinlang/compiler/check.sysl`
+   (`check_class_initialization`, `init_violation`'s wording, the method-value case near
+   `check.sysl:15773`). Tests: `tests/reject/initialization_super_args.avin` (a lambda reading an own
+   field, one reading an inherited field, a method value, a by-name argument, an object's
+   arguments) and `tests/reject/initialization_super_args_more.avin` (a generic superclass, a lambda
+   inside a lambda, a lambda calling a method, one in a tuple or a collection argument, a lambda
+   through two levels of superclass); `tests/run/initialization_super_args.avin`, the legal cases
+   (functions capturing class parameters, module values and another object, a by-name argument
+   reading a parameter, the superclass calling each in its body), at `-O0` and `-O2` under GC
+   stress. Every 2026-11-13 hole above is one of these cases.
+2. **An object's name is `self` in its own body.** The checker resolves the object's own name inside
+   its body, methods, lambdas and lazy initializers to `self`, so the object rules apply to it and
+   the module order counts only what the body runs while the object is made. File: `check.sysl`
+   (where a name resolves to a module-level object). Tests: `tests/run/initialization_object_self_name.avin`
+   (a lazy field reading `O.k`, a lambda made after the last field, a method, an object extending a
+   class), `tests/reject/initialization_object_self_name.avin` (`O.y` above `y`, `O` passed before
+   the last field, `O.m()` before the last field, `O` read in its superclass's arguments).
+3. **Module-level lazy cycles at compile time.** `Uses` (`globals.sysl`) keeps the functions a body
+   calls apart from those it makes (lambdas, by-name thunks, method values); the module order
+   follows both, as now, and a new reach follows only calls and the lazy values read. A module-level
+   `lazy val` that reaches itself is an error naming the chain of lazy values, reported from its
+   earliest-declared member as module cycles are. The run-time trap (`lower.sysl`, `trap_site` of
+   `is read while it is being initialized`) stays for reads through handed-on functions. Tests:
+   `tests/reject/lazy_cycles.avin` (itself, through another lazy, through a function, through a
+   trait's implementation, through an operator), `tests/programs/reject/lazy_cycle_modules/` (across
+   two modules), `tests/run/lazy_self_deferred.avin` (`ones`, the Fibonacci knot, a handler naming
+   its own value, a method value stored), `tests/run/lazy_deferred_trap.avin` (a lambda the
+   initializer makes and calls at once: still the trap, `.err`); `lazy_cycle.avin` becomes a reject
+   test.
+4. **Field lazy cycles at compile time.** A pass beside `check_initialization` (`check.sysl`) follows,
+   per class, the lazy fields read and the methods called on `self` (bare names, `self.`, the
+   overrides a call through a slot may reach in subclasses), from each lazy field's initializer; a
+   read of another instance is not followed. Tests: `tests/reject/lazy_field_cycles.avin` (direct,
+   through another lazy field, through a method, through `self.x`, through a subclass's override)
+   and its generic and object variants; `tests/run/lazy_field_other_instance.avin` (a node's depth, a
+   tree's size, a lazy reading the same lazy of another instance through a method, at `-O0` and
+   `-O2`); `lazy_threads_cycle.avin` becomes a reject test and a handed-on read on a second thread
+   keeps a run test with its trap.
+
+The test matrix every item fills, each cell a test that would fail if the rule were false:
+
+| Rule | Refused shapes | Accepted shapes | Neighbours |
+| --- | --- | --- | --- |
+| Class body | read below; method; `self` passed; lambda, by-name, local fn, method value | read above; after the last field anything | generic class, actor class, `with`-free data |
+| Open/abstract body | override reachable; trait `val` a subclass supplies; unsafe private | safe private method | trait default method |
+| Superclass arguments | every function using the object | parameters, module values | object extending a class, generic superclass |
+| Trait fields | method call; lambda; field below | fields above, parameters | two traits, required traits |
+| Object name | above its field; passed early | lazy, lambda after last field, method | object extending a class |
+| Module values | cycles in one module, across modules, through dispatch, operators, defaults, iterators | declaration order kept | object, `var` written by another initializer |
+| `lazy val` | self, chain, function, dispatch, field via `self` | other instance, handed-on read after return | threads, actors, generic class |
 
 ### Higher-kinded types: build plan
 

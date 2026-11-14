@@ -321,6 +321,9 @@ The checker verifies each declared parameter's positions:
 An error names the parameter, its variance and the position: a `+T` in the parameter `x` of `put`
 is reported as a covariant type parameter appearing in a contravariant position.
 
+A [refined variant](/spec/refined-variants/#variance) may fix only an invariant parameter of its
+type; a parameter it fixes or hides has no variance in its fields.
+
 Use-site variance (wildcards, existentials) is not part of Avin.
 
 ## Inference
@@ -779,8 +782,9 @@ trait SendableMonad[A: Sendable]: SendableFunctor[A]
 ## Scope of the type system
 
 The type system stays small: generics with bounds, constructor parameters bounded by constructor
-traits, subtyping with declaration-site variance, traits implemented through `impl`, and
-[union types](/spec/unions/) written in annotations. It has no type lambdas beyond the partial
+traits, subtyping with declaration-site variance, traits implemented through `impl`,
+[union types](/spec/unions/) written in annotations, and
+[refined variants](/spec/refined-variants/), whose `match` arms learn type equalities. It has no type lambdas beyond the partial
 application of one type's own arguments, no constructors of constructors, and no type members,
 inferred unions, intersection types, implicit parameters, implicit conversions or macros. The
 [collections chapter](/spec/collections/) shows how the library gets precise result types without
