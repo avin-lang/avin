@@ -1876,7 +1876,9 @@ their words are reserved.
   - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
     trait's header, or in an impl for a data type. The promise is checked against the structure,
     outside the standard library, and an `open` or `abstract` class that promises it is sendable,
-    each subclass being checked. The standard library's promises are taken as made, since they are
+    each subclass being checked. (Replaced by the Proposed `@trusted_sendable` entry, branch
+    `fix-core-promises`: the library's promises are checked too, but for the classes it marks.)
+    The standard library's promises are taken as made, since they are
     for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
     sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
     and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
@@ -9022,6 +9024,40 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
+  against the structure, except where `@trusted_sendable("why")` marks a class**
+  ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
+  standard library's promises are taken as made", under which `Map.withDefault(f)` answered a
+  sendable map holding a plain function and a thread raced on what it captured. The mark is a
+  class annotation (it trusts the class whether its header or an impl makes the promise), takes one
+  non-empty string saying why the class is safe, is refused outside the standard library, and is
+  an error on a class that promises nothing. Seventeen classes carry it: `Lock`, `Condition`,
+  `Mutex`, `Atomic`, `Channel`, `Thread`, and the futures' `Cell`, `Pool` and `Registry`
+  (synchronization the runtime does); the running `Actor` (its turns are serial) and `Isolated`
+  (an atomic state arbitrates its objects); `TcpStream`, `TcpListener`, `UnixStream`,
+  `UnixListener`, `TlsStream` and `Child` (one owner at a time, checked by every operation).
+  `Future`, `Promise`, `Executor` and `Once` became sendable by their structure, `Cell` gained an
+  `impl[T: Sendable] Sendable` and `Lock` a `: Sendable` for it. Why: the trust is greppable and
+  each entry says its reason; trusting the innermost synchronized class rather than each composite
+  keeps the list short and checks the rest. Alternatives weighed: a list of names in the compiler
+  (invisible at the type, drifts from the library); trusting every class of `avin.threads` (too
+  wide: it hid nothing here, but would hide the next `DefaultMap`); marking the composites
+  (`Future`, `Promise`) instead of `Cell` (more entries, fewer types checked).
+- Proposed (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
+  `DefaultMap` holds its default as a private `MapDefault` data value, `Fixed(v)` or
+  `Computed(f)`, so `withDefaultValue(v)` takes any value and the wrapper is sendable wherever the
+  map and `v` are. Why: `Map` promises `Sendable` and every map is one, so the default must be
+  sendable for the wrapper to keep the promise; most defaults (`k -> 0`, `k -> k.length`) capture
+  nothing mutable and are unchanged. Alternatives weighed: `Map` not promising `Sendable` (every
+  immutable map would stop being sendable); `DefaultMap` alone not being a `Map` (breaks
+  `val m: Map[K, V] = ….withDefault(f)`); keeping a plain function and making the wrapper not
+  sendable (a trait's implementers cannot opt out). Review with the user: a default that mutated a
+  captured local (a call counter) now uses an `Atomic`.
+- Proposed (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
+  through a token handle as `Child` does, so a stream handed to another thread traps its previous
+  owner at a read served from the bytes read ahead; before, only a read that reached the socket
+  checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
+  sound.
 - Proposed: **a marked parameter survives a function becoming a value only through its type**
   (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
   `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable

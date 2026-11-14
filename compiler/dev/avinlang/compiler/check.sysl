@@ -2918,10 +2918,16 @@ private declare_fields(c: *Checker, unit: usize)
         // `@sysl` and `@c` on a class are checked where the class is declared. `@keeps_owners` is
         // the standard library's mark on a class whose objects are shared between owners, so that
         // handing over a value that reaches one stops there (`TypeRecord.apart`).
+        // `@trusted_sendable("why")` is its mark on a class whose promise to be `Sendable` rests on
+        // synchronization its structure cannot show (`check_sendable_declarations`).
         for a in d.annotations
             if a.name == "keeps_owners" && !d.object
                 if !in_standard_library(k.module_name) then c.note(unit, a.span, "`@keeps_owners` is the standard library's mark on a type shared between owners, such as `ActorRef`, whose handles a send does not hand over")
                 elif a.args.len() > 0 then c.note(unit, a.span, "`@keeps_owners` takes no arguments")
+                continue
+            if a.name == "trusted_sendable" && !d.object && d.modifier != "trait"
+                if !in_standard_library(k.module_name) then c.note(unit, a.span, "`@trusted_sendable` is the standard library's mark on a type whose synchronization its structure cannot show, such as `Mutex`; a type outside it is checked to be sendable by its structure")
+                elif !trust_reason_given(a) then c.note(unit, a.span, "`@trusted_sendable` takes one string, why the type is safe to share between threads")
                 continue
             if (a.name != "sysl" && a.name != "c") || d.object
                 val what = if d.object then "an object" elif d.modifier == "trait" then "a trait" else "a class"
@@ -7734,10 +7740,11 @@ private module_state_problem(c: *Checker, g: usize, k: usize) -> Option[string]
             Some(s"`${global.name}`, a module-level value holding ${quoted_type(t)}, ${nested_reason(why)}")
         _ -> None
 
-// Holds each type that promises `Sendable`, outside the standard library, to the promise: a class
-// whose header, superclass or impl makes it, and a data type an impl makes it for. The standard
-// library's promises are its own, made where the structure cannot show them: a mutex or a future is
-// synchronized, and a vector is never written once made.
+// Holds each type that promises `Sendable` to the promise, the standard library's as much as any
+// other: a class whose header, superclass or impl makes it, and a data type an impl makes it for.
+// The one exception is a standard library class marked `@trusted_sendable("why")`, whose safety
+// comes from synchronization its structure cannot show: a mutex's guarded `var`, an atomic cell, a
+// channel's queue. The mark says why, so every type taken on trust is found by searching for it.
 private check_sendable_declarations(c: *Checker)
     val k = c.core.trait_named("Sendable") match
         Some(k) -> k
@@ -7750,16 +7757,36 @@ private check_sendable_declarations(c: *Checker)
             Some(t) -> t
             None -> continue
         if ancestor_type(c.classes, c.data, t, k) is None then continue
-        if in_standard_library(block.module_name) then continue
-        if *block.target is Class(id, _, _) then by_impl[id] = true
+        if *block.target is Class(id, _, _)
+            by_impl[id] = true
+            if trusted_sendable(c, id) then continue
         if *block.target is Data(_, _, _) || *block.target is Class(_, _, _)
             keep_send_promise(c, block.unit, written_trait_span(block.decl), block.target, k, Some(GenericScope(block.owner, block.decl.type_params)))
     for id in 0..<c.classes.len()
         val cls = c.classes[id]
-        if by_impl[id] || cls.decl.modifier == "trait" || in_standard_library(cls.module_name) then continue
+        if cls.decl.modifier == "trait" then continue
         val own = own_class_type(cls, id)
-        if ancestor_type(c.classes, c.data, own, k) is None then continue
+        val promised = ancestor_type(c.classes, c.data, own, k) is Some(_)
+        if trusted_sendable(c, id) && !promised
+            c.note(cls.unit, cls.decl.name_span, s"`${cls.name}` is marked `@trusted_sendable` but does not promise to be `Sendable`, so the mark trusts nothing; declare it `: Sendable`, or remove the mark")
+        if by_impl[id] || !promised || trusted_sendable(c, id) then continue
         keep_send_promise(c, cls.unit, cls.decl.name_span, own, k, Some(GenericScope(class_owner(id), cls.decl.type_params)))
+
+// Whether class `id` is a standard library class marked `@trusted_sendable`, whose promise to be
+// `Sendable` is taken without checking its structure. A mark outside the library trusts nothing.
+private trusted_sendable(c: *Checker, id: usize) -> bool
+    val cls = c.classes[id]
+    if !in_standard_library(cls.module_name) then return false
+    for a in cls.decl.annotations
+        if a.name == "trusted_sendable" then return true
+    false
+
+// Whether `@trusted_sendable` gives its one argument, a string saying why the type is safe.
+private trust_reason_given(a: &Annotation) -> bool
+    if a.args.len() != 1 || a.args[0].name is Some(_) then return false
+    a.args[0].value.kind match
+        StringLit(s) -> s.len > 0
+        _ -> false
 
 // `Boundary` is decided from a type's structure alone, so no impl and no trait or class declares it:
 // what a Sysl binding's shim converts does not change with what a type says of itself.
