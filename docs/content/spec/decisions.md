@@ -8389,10 +8389,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   running the action outside the lock (waiting on its own barrier would then deadlock instead of
   trapping).
 
-
-## Proposed
-
-- Proposed (built on branch `contextual-keywords`, from the user's decision of 2026-11-14 that
+- Settled by the user 2026-11-14 (built on branch `contextual-keywords`, from the user's decision of 2026-11-14 that
   `data` keeps its spelling and becomes contextual): **the words that begin a top-level declaration
   are keywords only there, before the name they declare, and ordinary names everywhere else**:
   `data`, `class`, `object`, `trait`, `impl`, `import` and `module` join `type`, `opaque`, `export`,
@@ -8416,8 +8413,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   spelling); making every word contextual by look-ahead over whole lines (`loop`, `return` and the
   modifiers would each need a rule of their own that a reader cannot see at a glance); keeping
   `class` and `object` reserved as the most declaration-like (they are common field names, and
-  nothing about them is less decidable than `data`). Review with the user: whether `private`,
-  `static` and `override` should become contextual too, at the price of the symbol-method rule.
+  nothing about them is less decidable than `data`). The user
+  settled 2026-11-14 that `private`, `static` and `override` stay reserved: a modifier used as a
+  variable name would read strangely.
+
+## Proposed
+
 - Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
   Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
   opaque type reads as the alias it resembles, with one word saying the difference, and the parser
