@@ -9591,6 +9591,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   in the box or pass a cat to the function, reading memory that was never a `TallShelf`'s or a
   `Dog`'s. Both are now refused; a type that is the class itself is still taken there.
 
+**Higher-kinded types, static members on constructors** (build plan step 5, branch `hkt-5`)
+
+- Proposed: **a constructor named bare, or with `_` for the arguments it leaves open, has as its
+  static members those of the constructor traits it implements at exactly those holes**, each
+  conformance held as a constructor argument's is (the holes the impl leaves open, the arguments
+  written out meeting the impl's bounds): `Option.pure`, `Result[_, E].pure`, `Parsed.pure` for an
+  alias that is a constructor, and `Box[_].pure`, the same as `Box`. `Result[int, _].pure` is an
+  error saying `Result` implements the trait as `Result[_, E]`. Why: a static member of a
+  constructor trait names no parameter of the trait, so the constructor is all a call needs, and
+  the conformance says which constructor it is. Alternatives: look the member up on the type at
+  any arguments (would let `Result[int, _]` reach a member of the conformance at the other hole).
+- Proposed: **a static member of a type's own conformance to an ordinary trait is not reached on
+  the type named bare**: `Box.make()` for `impl[T] Make for Box[T]` is an error asking for the type
+  arguments (`Box[A].make(…)`), as before. Why: that member's types name the type's parameters,
+  which a bare name leaves unknown. Alternative weighed: inferring them from the call as a generic
+  function's are (a separate feature, not part of constructors).
+- Proposed: **a constructor trait's static member still takes no default body**, as every trait's
+  static member does: defaults that call `Self.pure` are its methods'. Why: the rule for static
+  members is one rule for every trait; the per-constructor compilation would allow it, so it can be
+  added later without changing anything written now. Review with the user if the library wants a
+  derived static member (a `Monad.unit` from `pure`).
+- Proposed: **two bounds that each declare a static member of one name and parameter types make a
+  call of it on the parameter ambiguous**, by the ordinary overloading rule, rather than one bound
+  being preferred. Why: nothing says which constructor's member is meant beyond the bounds.
+- Proposed: **a static member called on a value of `F[X]` is an error pointing at `F.pure(…)`**;
+  on a value of a known type, `Some(1).pure(2)`, the existing message names the type. Why: the
+  member is the constructor's, and the constructor is what the call writes.
+- In each instance a static member called on a constructor is compiled once per constructor: the
+  type's own member at `Nothing` for the holes, which it never names, so `Option.pure` and
+  `F.pure` at `Option` are one instance.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per
