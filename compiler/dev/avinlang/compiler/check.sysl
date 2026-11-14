@@ -588,6 +588,8 @@ struct Checker
      * receiver, while the expression's own span, the one its traps and code are placed at, stays
      * whole. */
     shown: Buf[(Span, Span)]
+    /** The function each `lazy val` field's initializer is checked as, which a read of it may run. */
+    lazy_initializers: Buf[LazyInitializer]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -603,6 +605,13 @@ struct Checker
         self.reported_count = self.reported_count + 1
         self.units[unit].report.add(error(shown_at(self.shown, at), message))
 end Checker
+
+/** The `lazy val` field at `index` of class `owner`, which declares it, and the function its
+ * initializer is checked as. */
+struct LazyInitializer
+    owner: usize
+    index: usize
+    function: usize
 
 /** Where a diagnostic reported at `at` is shown: the place the nearest entry of `shown` for `at`
  * gives, or `at` itself. */
@@ -989,7 +998,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -7173,6 +7182,10 @@ private module_state_path(c: *Checker, arg: &TExpr, k: usize, direct: Buf[Option
     var through = ""
     for step in r.via
         val s = c.symbols[step]
+        // A `lazy val` field's initializer is named as the field its read names.
+        if lazy_field_named(c, step) is Some(field)
+            through = through + (if through == "" then "" else " → ") + s"`$field`"
+            continue
         // The functions an actor declaration is read into, which no program writes, are not named,
         // and an actor's own method is named as the actor's code calls it.
         if s.lambda || s.name == "" || s.name.starts_with("<") || s.name.contains("$") then continue
@@ -7188,6 +7201,16 @@ private module_state_path(c: *Checker, arg: &TExpr, k: usize, direct: Buf[Option
     val via = if through == "" then "" else s"through $through "
     val what = module_state_problem(c, r.global, k).unwrap_or("")
     Some(s"${via}it reaches $what")
+
+/** Where `f` is the initializer of a `lazy val` field, the field as code names it: `Box.v`, or
+ * only `v` for an actor's own field, which its code reads by its name alone. */
+private lazy_field_named(c: *Checker, f: usize) -> Option[string]
+    for init in c.lazy_initializers
+        if init.function == f
+            val owner = c.classes[init.owner]
+            val field = owner.fields[init.index].name
+            return Some(if owner.name.starts_with(ActorClassPrefix) then field else s"${owner.name}.$field")
+    None
 
 // The first module-level value the uses `start` reach that a thread's body may not, found breadth
 // first so that the path to it is a shortest one.
@@ -10194,6 +10217,7 @@ private lazy_field(c: *Checker, k: usize, made: *Construction, f: FieldDecl)
     val declared = c.classes[k].fields[index].ty
     val mark = c.unknowns.len()
     val typed = check_expr(c, Expr(f.value.span, Lambda(buf(), f.value)), lazy_initializer_type(declared))
+    if typed.kind is FunctionValue(fn_id, _) then c.lazy_initializers.push(LazyInitializer(k, index, fn_id))
     if declared is None
         settle_unknowns(c, mark)
         val result: &Type = *zonk(c, typed.ty) match
@@ -12822,6 +12846,18 @@ private with_implementations(c: *Checker, uses: Uses) -> Uses
                 add_named(c, &u, k.table, name)
             for d in c.data
                 add_named(c, &u, d.table, name)
+    // A `lazy val` field's read runs its initializer the first time, on whichever thread reads it,
+    // so the code reaches what the initializer reaches. The initializer is the one the class that
+    // declares the field made; where the object's class is not known, every field of that name.
+    for read in u.lazy_fields
+        val declaring: Option[usize] = *zonk(c, read.object) match
+            Class(id, _, _) -> if read.index < c.classes[id].fields.len() then Some(c.classes[id].fields[read.index].owner) else None
+            _ -> None
+        for init in c.lazy_initializers
+            val same = declaring match
+                Some(owner) -> init.owner == owner && init.index == read.index
+                None -> c.classes[init.owner].fields[init.index].name == read.name
+            if same then add_function(&u, init.function)
     u
 
 /** Records that the code may call each method of `table` named `name`. */

@@ -299,7 +299,9 @@ So what is passed for a `@sendable` parameter, directly or through every functio
 read and write no module-level `var`, and may read no module-level `val`, `lazy val` or `object`
 whose type is not sendable. Avin compiles the whole program, so every function a body can reach is
 known: the one a call names, every implementation a call through a trait method or an operator may
-reach, every closure made on the way, and an extractor a pattern calls. A module-level `val` of an
+reach, every closure made on the way, an extractor a pattern calls, and the initializer of every
+`lazy val`, module-level or a field, that it reads, since its first read runs the initializer on
+whichever thread makes it. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
 `lazy val` of a sendable type is initialized once whichever threads read it. The error names the
 module-level item and the functions it is reached through:

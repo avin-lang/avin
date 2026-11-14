@@ -229,7 +229,8 @@ connection, and a large buffer filled by one actor goes to the next.
   **nothing it calls, however indirectly, reaches module-level mutable state** (a module-level
   `var`, or a module-level value or `object` whose type is not sendable, a `lazy val` among them).
   Avin compiles the whole program, so the second is known for every function, in every module,
-  through every trait method a call may reach and every function value made inside the body. Every
+  through every trait method a call may reach, every function value made inside the body and the
+  initializer of every `lazy val` field it reads. Every
   mutable object the body leaves reachable from its result was therefore made inside it, and
   nothing outside holds one. The body may read a `var` of the code around it whose type is
   sendable, since it runs at once, and module-level values that are immutable and sendable; an
