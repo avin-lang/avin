@@ -8747,6 +8747,18 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
   instead of `unknown type`.
 
+- Proposed: **a `for` loop admits its source by conformance to `Iterable`** (branch
+  `nominal-for-in`): besides a range written in place, a `Range` and an array, the source's type
+  conforms to `Iterable` at some element type through its class's or data type's parents and impls,
+  a type parameter's bounds, a built-in type's impls, or, for a union, every member's. A type with
+  an `iterator()` method and no conformance is refused, the error naming the type and the impl to
+  declare; `Option` and `Either`, which have `iterator()` but are not `Iterable`s, are refused too,
+  an option pointed at `toList`. Why: the user's rule that Avin is nominal, and collections.md
+  already said a class is iterable by conforming; the structural check admitted any type with a
+  method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
+  anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
+  conforms, and the loop's `iterator()` call is answered by every member).
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

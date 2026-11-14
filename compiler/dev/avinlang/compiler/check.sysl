@@ -15673,7 +15673,8 @@ private range_expr(c: *Checker, e: &Expr, lower: &Expr, upper: &Expr, inclusive:
 //   `Range`; it never steps past its upper bound, so it never overflows;
 // - a `Range` value counts from its start by its step;
 // - an array is indexed from 0 to the length it has when the loop starts;
-// - any other `Iterable` is traversed by the iterator its `iterator()` hands out.
+// - any other `Iterable` is traversed by the iterator its `iterator()` hands out. The source conforms
+//   to `Iterable` by name: a type that has an `iterator()` method without conforming is not one.
 //
 // The values the loop keeps are locals named so that no source name can equal them; the source and
 // a range's bounds are evaluated once, before the loop, left to right.
@@ -15721,11 +15722,11 @@ private for_expr(c: *Checker, e: &Expr, pattern: &Pattern, source: &Expr, body: 
             elif is_range_type(c, ty)
                 hold(c, at, seq, ty, typed, &lets)
                 stepped_range(at, tag, pattern, body, &items)
-            elif iterator_methods(c, ty).len() > 0
+            elif iterable_source(c, ty)
                 hold(c, at, seq, ty, typed, &lets)
                 iterated(at, tag, pattern, body, &items)
             else
-                if settled(ty) then c.note(unit, source.span, s"`for` goes over a range, an array or an Iterable, and ${type_name(ty)} is none of them")
+                if settled(ty) then c.note(unit, source.span, not_iterable(c, ty))
                 else lets.push(typed)
                 hold(c, at, s"for item $tag", ErrorType, TExpr(at, ErrorType, UnitConst), &lets)
                 items.push(element_binding(pattern, name_at(at, s"for item $tag")))
@@ -15867,14 +15868,49 @@ private list_literal(c: *Checker, e: &Expr, items: Buf[&Expr], expected: Option[
     args.push(Argument(tail.span, None, tail, false))
     construct(c, e.span, items[0].span, list_variant(c, "Cons").unwrap(), args, None, expected)
 
-/** The `iterator` methods a value of type `t` has: those of its class, of its bounds for a type
- * parameter, or of its impls. */
-private iterator_methods(c: *Checker, t: &Type) -> Buf[usize] = *t match
-    Class(k, _, _) -> methods_named(c, k, "iterator")
-    TypeVar(_, _, _) -> bound_methods(c, t, "iterator")
-    ErrorType -> buf()
-    Nothing -> buf()
-    _ -> visible_methods(c, receiver_methods(c, t, "iterator"))
+/** Whether a value of type `t` may be the source of a `for` loop: whether it conforms to the core
+ * trait `Iterable` at some element type, through its class's or data type's conformances, a type
+ * parameter's bounds, or a built-in type's impls. A union is one where every member is. Having a
+ * method named `iterator` is not enough: conformance is by name. */
+private iterable_source(c: *Checker, t: &Type) -> bool
+    val k = c.class_types.get(qualified(CoreModule, "Iterable")) match
+        Some(k) -> k
+        None -> return false
+    iterable_at(conformances(c), t, k)
+
+private iterable_at(f: Conformances, x: &Type, k: usize) -> bool = *x match
+    ErrorType -> false
+    Nothing -> false
+    Var(_) -> false
+    Union(members) ->
+        for m in members
+            if !iterable_at(f, m, k) then return false
+        members.len() > 0
+    TypeVar(_, _, _) ->
+        for b in type_var_bounds(f, x)
+            if holding_ancestor(f, b, k) is Some(_) then return true
+        false
+    _ ->
+        if is_builtin(x) || *x is Tuple(_)
+            for b in f.builtins
+                if builtin_covers(b.ty, x) && tuple_parts_hold(f, b.owner, b.params, x)
+                    if ancestor_type(f.classes, f.data, b.trait_type, k) is Some(_) then return true
+            return false
+        holding_ancestors(f, x, k).len() > 0
+
+/** Why a `for` loop cannot go over a value of type `t`, which conforms to none of the sources. An
+ * option is pointed at the collection it makes, and any other class or data type is told how to
+ * become a source. */
+private not_iterable(c: *Checker, t: &Type) -> string
+    val name = type_name(t)
+    val refused = s"`for` goes over a range, an array or an Iterable, and $name is none of them"
+    val implement = s"$refused; to loop over it, $name must implement `Iterable` (`impl Iterable[…] for $name`)"
+    *t match
+        Class(_, _, _) -> implement
+        Data(d, _, _) ->
+            if c.data[d].module_name == CoreModule && c.data[d].name == "Option" then s"$refused; an option is not an Iterable, and `toList` makes one of its value"
+            else implement
+        _ -> refused
 
 private name_at(at: Span, name: string) -> &Expr = Expr(at, Name(name))
 

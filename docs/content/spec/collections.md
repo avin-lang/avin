@@ -1333,10 +1333,15 @@ implementing the [standard constructor traits](/spec/generics/#functor-applicati
 body once per element, binding each by the pattern: a name, `_`, a tuple or a variant pattern that
 every element matches. Each element is a new binding, so a closure made in the body keeps the
 element it saw. `break` and `continue` work as in `while`. A range written in place (`0..<n`, of any
-integer type) is counted without making a `Range`, and an array is indexed; anything else is
-traversed through its `iterator()`, which is what `foreach` does for the library's collections, and
-lets `break`, `continue` and `return` leave the body directly. A source with no iterator, such as an
-`int`, is an error.
+integer type) is counted without making a `Range`, and an array is indexed; anything else must
+conform to `Iterable` and is traversed through its `iterator()`, which is what `foreach` does for
+the library's collections, and lets `break`, `continue` and `return` leave the body directly.
+Conformance is by name, as everywhere: a class or data type declaring `Iterable[A]` among its
+parents or given it by an impl, an `Iterator`, a type parameter bounded by `Iterable` or by a trait
+requiring it, or a union whose every member is one. A type that merely has an `iterator()` method is
+not a source until it conforms, and neither is an `Option` or an `Either`, which have `iterator()`
+but are not `Iterable`s (`toList` makes one of an option's value). Any other source, such as an
+`int`, is an error that names its type.
 
 ```text
 for i in 0 ..< n do total += i
