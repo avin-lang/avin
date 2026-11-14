@@ -49,13 +49,20 @@ A variant's **result** follows its fields after `->`: `IntLit(value: int) -> Exp
 fields, `Balance -> Query[long]`. A variant may declare **type parameters of its own** after its
 name, `Pair[A, B](…)`, with bounds as any type parameter takes (`Ask[R: Sendable](…)`). In a variant,
 the data type's own parameter names are the variant's parameters too, so `If`'s `T`, and `T` in a
-result `-> Expr[T]`, need no declaring; a variant parameter may not reuse one of those names.
+result `-> Expr[T]`, need no declaring; a variant parameter may not reuse one of those names, and
+takes no variance and no lower bound, as a function's parameters take none. A result written as the
+type at its own parameters, `If(…) -> Expr[T]`, is the plain variant spelled out. In a refined
+variant the type's names are the variant's like any other: `IntLit(value: T) -> Expr[int]` hides
+`T`.
 
 The declaration is checked as follows.
 
 1. **The result is an instance of the type being declared.** `IntLit(value: int) -> Option[int]` in
    `data Expr[T]` is refused. Its arguments are any types built from the variant's parameters and
-   the program's types: `Expr[int]`, `Expr[(A, B)]`, `Expr[Vector[A]]`, `Expr[(A) -> B]`.
+   the program's types: `Expr[int]`, `Expr[(A, B)]`, `Expr[Vector[A]]`, `Expr[(A) -> B]`. They are
+   built of data types, classes, tuples and function types only: a constructor parameter applied in
+   a result (`-> D[F, F[A]]`) is refused, and a variant fixes no constructor parameter
+   ([higher-kinded types](/spec/generics/#higher-kinded-types)).
 2. **A parameter declared with a variance is never fixed.** Where the type's parameter is `+T` or
    `-T`, the result's argument in that place is `T` itself. A variant fixes only invariant
    parameters ([Variance](#variance)).
@@ -424,7 +431,9 @@ well typed because the clause learns `A = B`.
 | A union naming a parameter | `` `A` is inside a union in the result of `V`, so a value of the type does not say what `A` is `` |
 | An unused variant parameter | `` `A` is declared by `V` but named by none of its fields and not by its result `` |
 | A reused name | `` `T` is already a parameter of `Expr`, and stands for the same type in each of its variants `` |
-| A larger instance | the [nested data type](/spec/generics/#polymorphic-recursion) error, naming the field and the variant's result |
+| A variance on a variant's parameter | `` variance is written on the parameters of a type, not on a variant's own: write `A` in `V` `` |
+| A result no `match` takes apart | `` `F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are built of data types, classes, tuples and function types `` |
+| A larger instance | the [nested data type](/spec/generics/#polymorphic-recursion) error, naming the field and the variant's result: `` …: the field `x` of `Lift` has type `Expr[Vector[A]]`, and `Lift` makes `Expr[A]` `` |
 | Making a value | `` `IntLit(1)` is an `Expr[int]`, and an `Expr[bool]` is expected here `` |
 | An impossible arm | `` this arm is never reached: `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` `` |
 | A contradiction in a row | `` this arm is never reached: `IntLit` needs `T` to be `int`, and `BoolLit` in the same pattern needs it to be `bool` `` |

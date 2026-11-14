@@ -1,0 +1,78 @@
+// expect: exit 0
+// A router at its edges: routees of a generic actor and of a behaviour made from a start; a router's
+// reference sent to an actor, which asks through it from its own turn; routees on an executor of
+// their own; a routee failing under `Stop` leaves the pool while the others go on; and the
+// routing of each kind with a pool of one.
+import avin.actors.{ActorRef, Behaviour, Router, Routing, RoundRobin, AtRandom, SmallestMailbox, ByKey, Stop, spawn}
+import avin.threads.{Atomic, Executor}
+import avin.time
+
+data Echo[T: Sendable]
+  Say(value: T, replyTo: ActorRef[T])
+
+actor Echoer[T: Sendable] receives Echo[T]
+  receive
+    Say(value, replyTo) -> replyTo.tell(value)
+
+data Ask
+  Through(router: ActorRef[Echo[string]], text: string, replyTo: ActorRef[string])
+  Answered(text: string, replyTo: ActorRef[string])
+
+actor Client receives Ask
+  receive
+    Through(router, text, replyTo) ->
+      pipeToSelf(
+        router.ask(r -> Say(text, r), timeout = time.seconds(5)),
+        a -> Answered(a.ok.getOrElse("none"), replyTo)
+      )
+    Answered(text, replyTo) -> replyTo.tell(s"$self got $text")
+
+data Job
+  Run(n: int, replyTo: ActorRef[string])
+
+actor Fragile receives Job
+  receive
+    Run(n, replyTo) -> replyTo.tell(s"$self: ${100 / n}")
+
+run(router: ActorRef[Job], n: int) -> string =
+  router.ask(r -> Run(n, r), timeout = time.seconds(5)).await().ok.getOrElse("timed out")
+
+main()
+  // A generic actor's routees, at two type arguments.
+  val ints = Router.pool(3, Echoer[int]())
+  println(ints.ask(r -> Say(42, r), timeout = time.seconds(5)).await())
+  val strings = Router.pool(2, Echoer[string](), AtRandom)
+  println(strings.ask(r -> Say("héllo ✓", r), timeout = time.seconds(5)).await())
+
+  // Asked through from another actor's turn, which goes on with its messages meanwhile.
+  val client = spawn(Client())
+  println(client.ask(r -> Through(strings, "", r), timeout = time.seconds(5)).await())
+
+  // Routees made from a behaviour's start, each with state of its own, on an executor of one worker.
+  val served = Atomic[int](0)
+  val counting = Behaviour[Echo[int]]("Counting", me ->
+    var seen = 0
+    m -> m match
+      Say(v, replyTo) ->
+        seen += 1
+        served.add(1)
+        replyTo.tell(v * 1000 + seen))
+  val one = Executor.fixed(1)
+  val pooled = Router.pool(2, counting, RoundRobin, executor = one)
+  for i in 1 .. 4 do println(pooled.ask(r -> Say(i, r), timeout = time.seconds(5)).await())
+  println(served.load())
+
+  // Under `Stop` a routee that traps ends alone: the router routes to the others from then on.
+  val fragile = Router.pool(3, Fragile(), RoundRobin, onFailure = Stop)
+  println(run(fragile, 1))
+  println(run(fragile, 2))
+  println(run(fragile, 4))
+  // The message that trapped is dropped, so its ask times out.
+  println(fragile.ask(r -> Run(0, r), timeout = time.millis(500)).await())
+  for n in 1 .. 6 do println(run(fragile, n))
+  println(fragile.ended().isCompleted())
+
+  // A pool of one, under every routing.
+  for routing in Vector[Routing[Echo[int]]](RoundRobin, AtRandom, SmallestMailbox, ByKey(m -> 7))
+    val solo = Router.pool(1, Echoer[int](), routing)
+    println(solo.ask(r -> Say(1, r), timeout = time.seconds(5)).await())

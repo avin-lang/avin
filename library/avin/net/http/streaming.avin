@@ -1,0 +1,162 @@
+module avin.net.http
+
+// The writers a streamed response's body is written through. A `BodyWriter` sends each write to the
+// client at once, as a chunk of a chunked body, as part of a body of a length given beforehand, or,
+// to an HTTP/1.0 client with no length given, as the body the connection's end closes. An
+// `EventWriter` writes server-sent events through one. A write answers `Err` once the client has
+// gone or the server is stopping, and every write after it does too, so the code writing a stream
+// ends there.
+
+import avin.io.{IoError, Other}
+import avin.net.{ByteStream, TcpServer}
+import avin.threads.{Promise, scope}
+import avin.time.Duration
+
+// How a streamed body is framed on the connection.
+private data Framing
+  // Each write a chunk, the body ended by an empty one.
+  Chunked
+  // Exactly `length` bytes.
+  Sized(length: long)
+  // The bytes as they are, the body ended by closing the connection.
+  Closing
+
+// The writer of one streamed response's body, onto its connection. Its server, where it has one,
+// says when it is stopping.
+class BodyWriter(
+    private val stream: ByteStream,
+    private val server: Option[TcpServer],
+    private val framing: Framing,
+    private val limit: Duration
+)
+  // Whether a write failed, so the connection's framing can no longer be trusted.
+  private var broken = false
+  // Whether a write was refused because the server is stopping.
+  private var stopped = false
+  // The bytes of the body sent so far.
+  private var sent: long = 0
+
+  // Sends `bytes` to the client at once, nothing for none. Answers `Err` where the connection fails,
+  // the client having gone among the causes, or where the server is stopping, and for every write
+  // after one that did. Writing past a length given beforehand traps.
+  write(bytes: Array[byte]) -> Result[unit, IoError]
+    if broken then return Err(IoError(Other("the connection failed"), "write to", "a client"))
+    if stopped || server.exists(s -> s.isStopping())
+      stopped = true
+      return Err(IoError(Other("the server is stopping"), "write to", "a client"))
+    if bytes.length == 0 then return Ok(())
+    val out = framing match
+      Chunked ->
+        val all = Buffer[byte]()
+        all.addAll(utf8(s"${hexOf(long(bytes.length))}\r\n"))
+        all.addAll(bytes)
+        all.addAll(utf8("\r\n"))
+        all.toArray()
+      Sized(length) ->
+        if sent + long(bytes.length) > length then fail(
+          s"a write of ${bytes.length} bytes after $sent: the body is $length bytes long"
+        )
+        bytes
+      Closing -> bytes
+    sent += long(bytes.length)
+    val done = stream.setTimeout(limit).flatMap(_ -> stream.write(out))
+    if done.isErr then broken = true
+    done
+
+  // Sends `text` as UTF-8, as `write(bytes)` does.
+  write(text: string) -> Result[unit, IoError] = write(utf8(text))
+
+  // Whether the server is stopping, so the code writing the stream should end it.
+  isStopping() -> bool = stopped || server.exists(s -> s.isStopping())
+
+  // Waits by `wait`, run on a thread of its own, and answers its result, or `None` where the server
+  // stops first: stopping cancels `wait` wherever it waits, as `TcpServer.idle` does, so a stream
+  // waiting for its next piece ends at once. Without a server, `wait` is run as it is.
+  untilStopped[T: Sendable](@sendable wait: () -> T) -> Option[T] = server match
+    Some(s) -> s.idle(wait)
+    None -> Some(wait())
+
+  // Ends the body once the code writing it has returned, and answers whether the connection may
+  // carry another request: a chunked body is ended by its empty chunk unless a write failed, and
+  // the connection is kept only where every write went through, the server is not stopping and a
+  // sized body was sent in full.
+  finish() -> bool
+    if broken then return false
+    framing match
+      Chunked ->
+        if stream.setTimeout(limit).flatMap(_ -> stream.write(utf8("0\r\n\r\n"))).isErr then return false
+        !isStopping()
+      Sized(length) -> sent == length && !isStopping()
+      Closing -> false
+
+// A writer of server-sent events onto a streamed response: each event or comment is sent at once, in
+// one piece. While `untilStopped` waits, a comment is sent every `keepAlive`, none for zero.
+class EventWriter(private val body: BodyWriter, private val keepAlive: Duration)
+  // Sends an event whose data is `text`, each of its lines as a `data:` line, after an `event:` line
+  // naming its type and an `id:` line where they are given. A type or an id holding a line break
+  // traps.
+  send(text: string, event: Option[string] = None, id: Option[string] = None) -> Result[unit, IoError]
+    val out = StringWriter()
+    if event is Some(name)
+      oneLine("event type", name)
+      out.write(s"event: $name\n")
+    if id is Some(i)
+      oneLine("event id", i)
+      out.write(s"id: $i\n")
+    for line in linesOf(text) do out.write(s"data: $line\n")
+    out.write("\n")
+    body.write(out.text)
+
+  // Tells the client to wait `delay` before reconnecting once the stream ends.
+  retry(delay: Duration) -> Result[unit, IoError] = body.write(s"retry: ${delay.toMillis}\n\n")
+
+  // Sends a comment, which a client passes over: each line of `text` after a `:`.
+  comment(text: string) -> Result[unit, IoError]
+    val out = StringWriter()
+    for line in linesOf(text) do out.write(s": $line\n")
+    out.write("\n")
+    body.write(out.text)
+
+  // Whether the server is stopping, so the code writing the stream should end it.
+  isStopping() -> bool = body.isStopping()
+
+  // Waits by `wait`, run on a thread of its own, as `BodyWriter.untilStopped` does, sending a comment
+  // every `keepAlive` while it waits. Answers `None` where the server stops first or a comment cannot
+  // be sent, the client having gone, and `wait` is then cancelled wherever it waits.
+  untilStopped[T: Sendable](@sendable wait: () -> T) -> Option[T]
+    if keepAlive <= Duration.Zero then return body.untilStopped(wait)
+    val answer = Promise[T]()
+    val got = answer.future
+    val every = keepAlive
+    scope(s ->
+      s.spawn(() -> answer.complete(wait()))
+      var result: Option[T] = None
+      var waiting = true
+      while waiting
+        body.untilStopped(() -> got.await(every)) match
+          Some(Some(v)) ->
+            result = Some(v)
+            waiting = false
+          Some(None) -> waiting = comment("keep-alive").isOk
+          None -> waiting = false
+      if result.isEmpty then s.cancel()
+      result)
+
+// The lines of `text`, split at `\r\n`, `\r` or `\n`; an empty text is one empty line.
+private linesOf(text: string) -> Vector[string] = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+private oneLine(what: string, text: string)
+  if text.indexWhere(c -> c == '\r' || c == '\n') >= 0 then fail(
+    s"an $what holds a line break, which would end its line"
+  )
+
+// `n` in lower-case hexadecimal digits.
+private hexOf(n: long) -> string
+  if n == 0 then return "0"
+  val digits = "0123456789abcdef"
+  var out = ""
+  var left = n
+  while left > 0
+    out = digits.slice(int(left % 16), int(left % 16) + 1) + out
+    left = left / 16
+  out
