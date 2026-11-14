@@ -594,6 +594,10 @@ main()
   val none: Option[string] = Option.None
 ```
 
+A variant of a generic type may say which instance it makes, `IntLit(value: int) -> Expr[int]`, and
+take type parameters of its own; a `match` arm on it then knows that instance. These are
+[refined variants](/spec/refined-variants/).
+
 `data` values have no identity, derive
 `Eq`, `Hash`, `Display` and `Debug` when their fields do, without `derives`, and are matched
 exhaustively. Methods are added in an `impl` block; an impl of `Display` or `Debug` replaces the
@@ -1100,7 +1104,9 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
 - **In a trait a static member has no body**: a trait's default bodies are shared by every
   conforming type, and a static member is each type's own. `Self` in its signature is the
   implementing type, as in a method's. A trait never overrides a static member, and its default
-  bodies cannot call one on `Self`, which there is no one type.
+  bodies cannot call one on `Self`, which there is no one type; a
+  [constructor trait](/spec/generics/#constructor-traits)'s defaults, compiled for each implementing
+  constructor, can.
 - **Every implementation gives it, with a body**, marked `static` as the trait's member is: an impl,
   and a class's body with `override static`. An abstract class gives it too, since it belongs to the
   type and not to a subclass's objects. A static member is static exactly where the trait's member
@@ -1177,7 +1183,7 @@ implemented by one type at several type arguments**, once at each: `impl From[Io
 AppError` beside `impl From[ParseError] for AppError`, or `class Note : Make[int], Make[string]`.
 No value of such a trait exists, so each call names a type, and the member called is the one taking
 the arguments' types: `AppError.from(e)` as any overloaded method, and on a type parameter bounded
-by several instances, `T: Make[int] + Make[string]`, the instance whose member the arguments fit.
+by several instances, `T: Make[int] & Make[string]`, the instance whose member the arguments fit.
 Each conformance gives every member of the trait at its own type arguments. Any other trait is
 implemented once, at one list of type arguments.
 
@@ -1210,6 +1216,9 @@ built-in type implements every method of the trait, defaults included.
   of a trait always does: a conformance holds for every instance of a type, so an impl of a trait
   for particular type arguments (`impl Show for Box[int]`) or for a type built from its parameters
   (`impl[T] Show for Box[List[T]]`) is an error, and no two conformances of one type can overlap.
+  An impl of a [constructor trait](/spec/generics/#implementing-a-constructor-trait) names them too,
+  and gives the trait the ones it leaves open (`impl[T, E] Monad[T] for Result[T, E]`), or leaves
+  both off where they are all open, in order (`impl Monad for Option`).
 - **An impl without `for` may add methods to any type built from its parameters**:
   `impl[T] Option[Option[T]]`, `impl[A, B] Pair[A, List[B]]`, and, adding to a trait,
   `impl[T] Seq[Seq[T]]` and `impl[K, V] Iterable[(K, V)]`. Each of its parameters is part of that
@@ -1837,6 +1846,15 @@ test the core library or a dependency declares.
 
 ## Initialization
 
+**No field, module-level value or `lazy val` is ever read before it is set, and the compiler proves
+it.** Each rule below is checked when the program is compiled and costs nothing when it runs; Avin
+has no default value a field holds before its initializer, so a read the rules let through could
+only be a wrong value or a crash, and there is none. One check is left to run time, for a `lazy val`
+that reaches its own value through code it hands to something else to run (a lambda, an argument
+passed by name, a method value), and it traps at that read rather than read what is not there.
+
+### Objects under construction
+
 - Creating an instance runs the superclass's constructor first, then stores the class parameters,
   then runs the class body top to bottom. Until every field is assigned, `self` may not be passed,
   stored, captured, or used to call a method, and a body statement may not read a field declared
@@ -1859,12 +1877,70 @@ test the core library or a dependency declares.
   making a lambda, a by-name argument or a local function that uses a field or `self`, or a method
   value of `self` (`describe` named without a call), since each can read a field before it is set.
   An object's body follows the same rule.
+
+  *Why it is sound:* the body is straight-line code that sets the fields in the order written, so
+  "declared above" is "already set" at every point of it. Everything that could read a field later
+  than it is written (a method, a lambda, an argument passed by name, a local function, a method
+  value, another object holding `self`) needs `self` to do it, and none of those uses of `self` is
+  allowed until the last field is set, after which every read finds a value.
 - An `open` or `abstract` class's body runs before any subclass's fields are set, so the object is
   never complete while it runs: the limits above hold for the whole of it. After its own last field
   it may call only a method that cannot be overridden (a private one) and that is itself safe: one
   that uses `self` only to read and assign fields and to call other safe methods. A call that could
   reach an override, directly or through such a method, is an error, as is passing, storing or
-  capturing `self`, a method value of `self` included.
+  capturing `self`, a method value of `self` included. A trait's abstract `val` that the class
+  does not supply itself is a subclass's field, and is not read in the body either.
+
+  *Why it is sound:* a subclass's fields are set only after this body has returned, and the only
+  code that can read them is an override, a trait's `val` a subclass supplies, or code that holds
+  `self`. A safe method is one whose every path stays inside the class's own fields, decided over
+  the methods it calls until nothing changes, so calling one cannot reach an override.
+- **A superclass's arguments run before any field of the object is set**, the superclass's own
+  included, so they use nothing of the object: no field, no method and no `self`, and no lambda,
+  argument passed by name, local function or method value that uses one of them, since the
+  superclass's constructor may call such a function before the field it reads is set. A class
+  parameter's name in them reads the argument itself, so a function capturing a parameter is fine.
+  The same holds for the arguments an `object` passes to the class it extends.
+
+  ```text
+  open class Base(f: () -> int)
+    val got: int = f()
+
+  class Next(start: int): Base(() -> start + 1) // reads the argument `start`
+  class Late: Base(() -> late) // error: a lambda that captures `self` is made in a superclass's arguments, which run before the object is initialized
+    val late: int = 41
+  ```
+
+  The errors read ``a lambda that captures `self` is made in a superclass's arguments, which run
+  before the object is initialized``, ``an argument passed by name uses `self` in a superclass's
+  arguments, …``, ``a local function that uses `self` is made in a superclass's arguments, …``, and
+  for a method value ``` `name` is a method of the object, which a superclass's arguments cannot
+  use as a value: … ```.
+
+  *Why it is sound:* the arguments are evaluated before the superclass's constructor starts, and
+  that constructor may run any function it is given, at once or from its body; at that moment no
+  field of the object, inherited or its own, has been set. A parameter is a value the caller has
+  already computed, so it is the one thing of the new object's that a function made there can read.
+- **A trait's fields** are computed after the superclass's constructor and the class's parameters
+  and before the class body, by the rule in [Fields](#fields): each reads only the fields set
+  before it and uses `self` for nothing else, by the same reasoning as a body before its last field.
+- **In an `object`'s own body, the object's name is `self`.** `Config.port` in a statement before
+  the last field is a read of a field declared above it or an error, as `port` is; in a method, a
+  lambda or a `lazy val`'s initializer it is the object itself, and it makes the object need
+  nothing it does not need already, since that code runs only once the object is complete:
+
+  ```text
+  object Counter
+    val start: int = 1
+    lazy val next: int = Counter.start + 1 // runs once `Counter` is complete
+    register(() -> Counter.start) // after the last field: `self` may be captured
+  ```
+
+  *Why it is sound:* the name and `self` are the same object, so they obey the same rule; the
+  module order needs only what the body runs while the object is made.
+
+### Module-level values
+
 - Module-level `val`s, `var`s and `object`s initialize before `main`, in the order their
   initializers depend on one another. An initializer depends on every module value and object it
   reads, directly or through the functions it calls and the lambdas it makes; values that need
@@ -1876,6 +1952,22 @@ test the core library or a dependency declares.
   val b = readA() * 2 // error: module-level values need one another to initialize: `a` → `b` → `a`
   readA() -> int = a
   ```
+
+  The order is the program's, across modules as within one: modules may import one another in a
+  cycle, and only a cycle of values is an error. A call through a trait or an `open` class depends on
+  every implementation it may reach, and an operator on every method it may call. An object that
+  extends a class depends on what its superclass's arguments and constructor read.
+
+  *Why it is sound:* each value is computed after everything its initializer can read while it
+  runs, so every such read finds a value. The functions a call reaches are known, since the whole
+  program is compiled; where a call may reach several, all count. A function value is the one thing
+  the analysis does not follow to its target, and it need not: a function value exists only once the
+  initializer that made it has run, and that initializer depends on everything the function reads,
+  so it ran after all of them, and whatever calls the function later finds them set. The values
+  `main` and the code after it see are all set, since every one is computed before `main` starts.
+
+### lazy val
+
 - **`lazy val name = expr`** (its type optional, as for `val`) is computed on its first read instead,
   exactly once, and every later read gives the value kept. One that is never read is never
   computed. It is declared at module level or in a class or object body, where each instance has
@@ -1892,18 +1984,65 @@ test the core library or a dependency declares.
 
   A module-level `lazy val` takes no place in the initialization order: its initializer runs where
   it is first read, and an eager value that reads it depends on what that initializer reads. Its
-  initializer may read every other module-level value. One whose initializer needs its own value,
-  directly or through other lazy values, traps at the read made while it is being initialized:
-  ``avin: trap: `first` is read while it is being initialized``. A field's initializer may read every
-  field and call every method, since it runs once the object is complete; the class body reads the
-  field only where it could call a method, after its last field and not at all in an `open` or
-  `abstract` class. A trap inside an initializer stops the program as any trap does.
+  initializer may read every other module-level value. A field's initializer may read every field
+  and call every method, since it runs once the object is complete; the class body reads the field
+  only where it could call a method, after its last field and not at all in an `open` or `abstract`
+  class. A trap inside an initializer stops the program as any trap does.
+- **A `lazy val` whose initializer needs its own value is a compile error** when its own code reaches
+  the read: directly, through the functions and methods it calls (every implementation a call may
+  reach, as for module values), or through the initializers of other lazy values it reads. The
+  error names the chain of lazy values:
+
+  ```text
+  lazy val first: int = second + 1 // error: the `lazy val` `first` needs its own value to initialize: `first` → `second` → `first`
+  lazy val second: int = later()
+  later() -> int = first * 2
+  ```
+
+  A field's value is its object's, so for a field only a read of the same object counts: by bare
+  name, through `self`, or in a method called on `self`. A read of another instance's field is a
+  different value, and recursion through a structure is fine:
+
+  ```text
+  class Node(next: Option[Node])
+    lazy val depth: int = next match // each node's own depth
+      Some(n) -> n.depth + 1
+      None -> 0
+  ```
+
+  Code the initializer makes and hands on without running it itself (a lambda, an argument passed by
+  name, a method value) may read the value: that is how a value refers to itself, as a lazy list
+  whose tail is itself, `lazy val ones = LazyList.cons(1, ones)`, or a button whose handler names the
+  button, do. Such a read finds the value when it runs after the initializer has returned. If it runs
+  while the initializer is still running, on the thread running it, it traps there:
+  ``avin: trap: `first` is read while it is being initialized``. This is initialization's one check
+  at run time, and it is made only on the slow path of a first read.
+
+  *Why it is sound:* a lazy value is read only through its initializer's gate, which either finds the
+  value stored or runs the initializer, so it is never read unset; the one way it could be needed
+  before it is stored is a read made while its own initializer runs. Every such read the initializer's
+  own code can reach is found by the same reach the module order uses, and is an error; a read made
+  through a function the initializer handed on is one the compiler cannot place in time, since the
+  function may run at once or never, and the gate traps on it instead of waiting for itself.
 
   The first read is safe between threads: when several threads read the value first at once,
   exactly one runs the initializer and the others wait for it, [safe for the collector](threads.md),
   then all see the same, whole value. A read after the value is stored is one atomic load and a
   branch. A trap in the initializer stops the program while the others still wait, so none of them
   goes on without the value. The read that traps as needing its own value is one made by the thread
-  running the initializer, whichever thread that is; a read by any other thread waits.
+  running the initializer, whichever thread that is; a read by any other thread waits. So an
+  initializer that waits for another thread which reads the same value, through a lambda it handed
+  that thread, waits for ever, as any threads waiting for each other do ([threads](threads.md)).
+  Two lazy values whose initializers' own code needs each other, run on two threads, are a cycle the
+  compile-time rule reports, so they cannot wait for each other that way.
+
+### Locals
+
+- A local is in scope from its declaration on, and is given its value there: a lambda or a local
+  function above it cannot name it, its own initializer included
+  (`val f: () -> int = () -> f()` is an error that `f` is not defined).
 - Local helper functions may call one another in any order, but a call that would read a captured
   local before its initialization is rejected.
+
+  *Why it is sound:* a name that is not in scope cannot be read, and a local function's captures
+  are checked at each call against the locals set at that point.
