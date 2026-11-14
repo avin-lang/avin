@@ -1,0 +1,213 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.path.{file_name, parent}
+import sysl.text.{StrBuilder, str_builder}
+
+// **Debug information: what lets a debugger read an Avin program in Avin's terms.**
+//
+// A program built with `-g` is lowered with a `Locate` before each run of instructions that comes
+// from one place of the source and a `Variable` for each parameter and local (see `lower.sysl`), and
+// with a `FunctionDebug` for each function. Emission writes them as LLVM's debug metadata: one
+// compile unit, a file for each source file by its full path, a subprogram for each function the
+// source declares, named as Avin spells it with its symbol as the linkage name, a location on every
+// instruction of such a function, and a local variable for each `Variable`, of a basic type for a
+// scalar and a pointer to a structure named by its Avin type for a reference. LLVM turns them into
+// DWARF, and on macOS `dsymutil` gathers that into the executable's `.dSYM`.
+//
+// Each function's text is written first and its locations attached after, line by line: every
+// instruction line of the function gets the location of the last place marked at or before it. A
+// block that does not begin with a `Locate` (one a later pass made, or one that holds a trap)
+// continues from the place its first predecessor ends at. The code that takes the parameters in, before
+// the body's first expression, has no place, so a debugger stopping at the function's first line finds
+// them taken in; a call there, which the verifier asks to have a location in a function with debug
+// information, is placed at the function's name.
+
+/** Metadata `!0` is the branch weights of a poll, which emission always numbers so. */
+private const FirstNode: usize = 1
+
+/** The debug metadata of a module, as it is made: the text of every node so far, the next number,
+ * and the nodes made once and shared. */
+struct DebugMeta
+    nodes: StrBuilder
+    next: usize
+    unit: usize
+    unit_file: Option[usize]
+    files: Map[string, usize]
+    types: Map[string, usize]
+    subroutine: usize
+    /** The current function's locations, by line and column. */
+    locations: Map[string, usize]
+
+/** Where in a function's text a place begins, and its location node. */
+struct LocationMark
+    at: usize
+    node: usize
+
+debug_meta() -> DebugMeta
+    var m = DebugMeta(str_builder(), FirstNode, 0, None, map(), map(), 0, map())
+    m.unit = fresh_node(&m)
+    m.subroutine = fresh_node(&m)
+    val types = fresh_node(&m)
+    m.nodes.push(s"!${m.subroutine} = !DISubroutineType(types: !$types)\n")
+    m.nodes.push(s"!$types = !{null}\n")
+    m
+
+private fresh_node(m: *DebugMeta) -> usize
+    val n = m.next
+    m.next += 1
+    n
+
+/** The metadata a module with debug information ends with: its compile unit, named by the file of
+ * the program's entry or else the first file, and the flags that say which DWARF to write. Nothing
+ * where no function had any. */
+finish_debug_meta(out: *StrBuilder, m: *DebugMeta)
+    val file = m.unit_file match
+        Some(f) -> f
+        None -> return
+    out.push("\n")
+    out.push(m.nodes.finish())
+    val dwarf = fresh_node(m)
+    val version = fresh_node(m)
+    out.push(s"!${m.unit} = distinct !DICompileUnit(language: DW_LANG_C, file: !$file, producer: \"avin\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)\n")
+    out.push(s"!$dwarf = !{i32 7, !\"Dwarf Version\", i32 4}\n")
+    out.push(s"!$version = !{i32 2, !\"Debug Info Version\", i32 3}\n")
+    out.push(s"!llvm.dbg.cu = !{!${m.unit}}\n")
+    out.push(s"!llvm.module.flags = !{!$dwarf, !$version}\n")
+
+/** The file node of the source at `path`, made when first asked for. */
+debug_file(m: *DebugMeta, path: string) -> usize
+    if m.files.get(path) is Some(n) then return n
+    val n = fresh_node(m)
+    val name = file_name(path).unwrap_or(path)
+    val dir = parent(path).unwrap_or("")
+    m.nodes.push(s"!$n = !DIFile(filename: ${meta_text(name)}, directory: ${meta_text(dir)})\n")
+    m.files.put(path, n)
+    if m.unit_file is None then m.unit_file = Some(n)
+    n
+
+/** The subprogram of a function the source declares, whose symbol is `symbol`; starts the
+ * function's own locations. */
+debug_subprogram(m: *DebugMeta, d: FunctionDebug, symbol: string) -> usize
+    val file = debug_file(m, d.file)
+    val n = fresh_node(m)
+    m.nodes.push(s"!$n = distinct !DISubprogram(name: ${meta_text(d.name)}, linkageName: ${meta_text(symbol)}, scope: !$file, file: !$file, line: ${d.line}, type: !${m.subroutine}, scopeLine: ${d.line}, spFlags: DISPFlagDefinition, unit: !${m.unit})\n")
+    m.locations = map()
+    n
+
+/** The location of line `line`, column `col` in the subprogram `scope`, made once per function. */
+debug_location(m: *DebugMeta, line: usize, col: usize, scope: usize) -> usize
+    val key = s"$line:$col"
+    if m.locations.get(key) is Some(n) then return n
+    val n = fresh_node(m)
+    m.nodes.push(s"!$n = !DILocation(line: $line, column: $col, scope: !$scope)\n")
+    m.locations.put(key, n)
+    n
+
+/** The type node of a variable of the Avin type `name` held as `t`: a basic type for a scalar, a
+ * pointer to a structure named by the type for a reference; none for an address or a union's cell,
+ * which a debugger could not show. */
+debug_type(m: *DebugMeta, name: string, t: MirType) -> Option[usize]
+    val key = name + "\n" + (t match
+        MInt(bits) -> s"i$bits"
+        MBool -> "bool"
+        MReal -> "real"
+        MRef -> "ref"
+        _ -> return None)
+    if m.types.get(key) is Some(n) then return Some(n)
+    val n = fresh_node(m)
+    val node = t match
+        MInt(bits) ->
+            val encoding = if name == "char" then "DW_ATE_UTF" elif name == "byte" then "DW_ATE_unsigned" else "DW_ATE_signed"
+            s"!DIBasicType(name: ${meta_text(name)}, size: $bits, encoding: $encoding)"
+        MBool -> s"!DIBasicType(name: ${meta_text(name)}, size: 8, encoding: DW_ATE_boolean)"
+        MReal -> s"!DIBasicType(name: ${meta_text(name)}, size: 64, encoding: DW_ATE_float)"
+        _ ->
+            val object = fresh_node(m)
+            m.nodes.push(s"!$object = !DICompositeType(tag: DW_TAG_structure_type, name: ${meta_text(name)}, flags: DIFlagFwdDecl)\n")
+            s"!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !$object, size: 64)"
+    m.nodes.push(s"!$n = $node\n")
+    m.types.put(key, n)
+    Some(n)
+
+/** The local variable `name` of the subprogram `scope`, of type `ty`, the `arg`th parameter or, for
+ * 0, a local. */
+debug_variable(m: *DebugMeta, name: string, arg: usize, scope: usize, file: usize, line: usize, ty: usize) -> usize
+    val n = fresh_node(m)
+    val place = if arg > 0 then s"arg: $arg, " else ""
+    m.nodes.push(s"!$n = !DILocalVariable(name: ${meta_text(name)}, ${place}scope: !$scope, file: !$file, line: $line, type: !$ty)\n")
+    n
+
+/** `text` as a quoted metadata string: a quote, a backslash and every control character written as
+ * a backslash and two hexadecimal digits; every other byte, UTF-8 included, as it is. */
+meta_text(text: string) -> string
+    var out = str_builder()
+    out.push("\"")
+    val digits = "0123456789ABCDEF"
+    val b = text.bytes
+    var from = 0usize
+    for i in 0..<b.len
+        val c = b[i]
+        if c == u8('"') || c == u8('\\') || c < u8(' ') || c == u8(127)
+            out.push(text[from..<i])
+            val high = usize(c >> 4)
+            val low = usize(c & 15)
+            out.push("\\" + digits[high..<high + 1] + digits[low..<low + 1])
+            from = i + 1
+    out.push(text[from..])
+    out.push("\"")
+    out.finish()
+
+/** A function's text with its locations attached: each instruction line, indented and not a
+ * comment, ends with the location of the last mark at or before the line's start. A mark of node 0
+ * places what follows nowhere, which leaves an instruction without a location, but a call there,
+ * which the verifier asks to have one, is placed at the function's own `start`. */
+attach_locations(text: string, marks: Buf[LocationMark], start: usize) -> string
+    var out = str_builder()
+    val b = text.bytes
+    var at = 0usize
+    var j = 0usize
+    var current: Option[usize] = None
+    while at < b.len
+        var eol = at
+        while eol < b.len && b[eol] != u8('\n')
+            eol += 1
+        while j < marks.len() && marks[j].at <= at
+            current = if marks[j].node == 0 then None else Some(marks[j].node)
+            j += 1
+        val line = text[at..<eol]
+        out.push(line)
+        if line.starts_with("  ") && !line.starts_with("  ;")
+            if current is Some(n) then out.push(s", !dbg !$n")
+            elif line.contains("call ") then out.push(s", !dbg !$start")
+        if eol < b.len then out.push("\n")
+        at = eol + 1
+    out.finish()
+
+/** Where each block of `f` begins in the source, as a line and column: where the code before it
+ * ends, along the first path from the entry that reaches it. The entry begins nowhere, as the code
+ * taking the parameters in does, and so does a block no path reaches. */
+block_places(f: MirFunction) -> Buf[Option[(usize, usize)]]
+    var places: Buf[Option[(usize, usize)]] = buf()
+    var seen: Buf[bool] = buf()
+    for _ in 0..<f.blocks.len()
+        places.push(None)
+        seen.push(false)
+    if f.blocks.len() == 0 then return places
+    var queue: Buf[usize] = buf()
+    queue.push(0)
+    seen[0] = true
+    var next = 0usize
+    while next < queue.len()
+        val b = queue[next]
+        next += 1
+        var end = places[b]
+        for inst in f.blocks[b].insts
+            if inst is Locate(_, line, col) then end = Some((line, col))
+        for s in successors(f.blocks[b].term)
+            if !seen[s]
+                seen[s] = true
+                places[s] = end
+                queue.push(s)
+    places

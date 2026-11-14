@@ -1,0 +1,409 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.{MacOS, os}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{canonicalize, exists, is_dir, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Debug information: `avin build -g` and `avin emit-llvm -g`, and what lldb makes of the result.
+
+// Every kind of variable the debugger is told of, a generic function at two types, a lambda with a
+// parameter and a captured variable, and a recursive function to stop in. The lines are counted on
+// by the tests: `fact` is line 1, its recursive call line 3, `kinds` line 5, `main` line 10.
+private const Shapes: string = "fact(n: int) -> int =\n  if n <= 1 then 1\n  else n * fact(n - 1)\n\nkinds(i: int, l: long, b: bool, r: real, c: char, y: byte, s: string) -> int =\n  val total = i + 1\n  total\n\ntwice[T](x: T, f: T -> T) -> T = f(f(x))\nmain() =\n  var count = 3\n  val bump = (n: int) -> n + count\n  println(twice(1, bump))\n  println(twice(\"a\", (t: string) -> t + \"b\"))\n  println(kinds(1, long(2), true, 1.5, 'x', byte(7), \"s\"))\n  val x = fact(5)\n  println(x)\n"
+
+private const ShapesOutput: string = "7\nabb\n2\n120\n"
+
+private struct Cli
+    status: int
+    said: string
+    noted: string
+
+private avin_cli(args: []const string) -> Cli
+    var said = ""
+    var noted = ""
+    val status = run_cli(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n")
+    Cli(status, said, noted)
+
+// `text` written as `name` in `dir`, and the module `avin emit-llvm -g` makes of it, or without
+// debug information where `debug` is false.
+private emitted(dir: string, name: string, text: string, debug: bool) -> string
+    val file = dir + "/" + name
+    write_text(file, text).unwrap()
+    val out = dir + "/" + name + ".ll"
+    val ran = if debug then avin_cli(["avin", "emit-llvm", file, "-o", out, "-g"]) else avin_cli(["avin", "emit-llvm", file, "-o", out])
+    if ran.status != 0 then panic(ran.noted)
+    read_text(out).unwrap()
+
+// The metadata line defining the subprogram named `name`, or "".
+private subprogram(ll: string, name: string) -> string
+    for line in ll.split("\n")
+        if line.contains("!DISubprogram(name: \"" + name + "\",") then return line
+    ""
+
+// The number a metadata line defines: `!12 = ...` is 12, as text.
+private node_of(line: string) -> string = line[1..<line.index_of(" ").unwrap()]
+
+// The lines of the definition of the function whose symbol is `symbol`, from `define` to `}`.
+private definition(ll: string, symbol: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var inside = false
+    for line in ll.split("\n")
+        if line.starts_with("define ") && line.contains("@\"" + symbol + "\"(") then inside = true
+        if inside
+            out.push(line)
+            if line == "}" then return out
+    out
+
+// The variables of the subprogram numbered `scope`.
+private variables(ll: string, scope: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for line in ll.split("\n")
+        if line.contains("!DILocalVariable(") && line.contains("scope: !" + scope + ",") then out.push(line)
+    out
+
+// The metadata line defining node `n`.
+private node(ll: string, n: string) -> string
+    for line in ll.split("\n")
+        if line.starts_with("!" + n + " = ") then return line
+    ""
+
+// The type node of a variable line.
+private type_of(ll: string, variable: string) -> string
+    val at = variable.index_of("type: !").unwrap() + 7
+    var end = at
+    while end < variable.len && variable.bytes[end] != u8(')') do end += 1
+    node(ll, variable[at..<end])
+
+// The variable named `name` among `vars`, or "".
+private variable_named(vars: Buf[string], name: string) -> string
+    for v in vars
+        if v.contains("name: \"" + name + "\",") then return v
+    ""
+
+@test("-g: a module has one compile unit, a file for its source by its full path, and the DWARF flags")
+debug_module_shape()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    assert(ll.contains("!llvm.dbg.cu = !{!"))
+    assert(ll.contains("!llvm.module.flags = !{!"))
+    assert(ll.contains("!{i32 2, !\"Debug Info Version\", i32 3}"))
+    assert(ll.contains("!{i32 7, !\"Dwarf Version\", i32 4}"))
+    var units = 0
+    var files = 0
+    for line in ll.split("\n")
+        if line.contains("!DICompileUnit(") then units += 1
+        if line.contains(s"!DIFile(filename: \"shapes.avin\", directory: \"$dir\")") then files += 1
+    assert_eq(units, 1)
+    assert_eq(files, 1)
+    // The standard library's functions the program reaches are described too, in their own files.
+    assert(ll.contains("!DIFile(filename: \"core.avin\"") || ll.contains("/library/"))
+
+@test("-g: a function the source declares is a subprogram named as Avin spells it, its symbol the linkage name, at its line")
+debug_subprograms()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    val fact = subprogram(ll, "fact")
+    assert(fact.contains("linkageName: \"<program>.fact\""))
+    assert(fact.contains(" line: 1,") && fact.contains("scopeLine: 1,"))
+    assert(fact.starts_with("!") && fact.contains("= distinct !DISubprogram(") && fact.contains("spFlags: DISPFlagDefinition"))
+    assert(subprogram(ll, "main").contains(" line: 10,"))
+    assert(subprogram(ll, "kinds").contains(" line: 5,"))
+    // The definition carries its subprogram.
+    val code = definition(ll, "<program>.fact")
+    assert(code.len() > 3)
+    assert(code[0].ends_with(s") !dbg !${node_of(fact)} {"))
+
+@test("-g: every instruction from the body's first expression on, and every call, has a location in its own function")
+debug_locations_everywhere()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    for name in ["fact", "kinds", "main", "twice[int]", "twice[string]", "main.lambda#1"]
+        val sp = subprogram(ll, name)
+        assert(sp != "")
+        val scope = node_of(sp)
+        val symbol = "<program>." + name
+        var located = false
+        var lines = 0
+        for line in definition(ll, symbol)
+            if !line.starts_with("  ") then continue
+            lines += 1
+            // A variable's declaration, at the entry, is placed at the function's name.
+            if line.contains("call void @llvm.dbg.declare(")
+                assert(line.contains(", !dbg !"))
+                continue
+            if line.contains(", !dbg !")
+                located = true
+                // The location is one of this function's.
+                val n = line[line.index_of(", !dbg !").unwrap() + 8..]
+                assert(node(ll, n).contains(s"scope: !$scope)"))
+            else
+                // Only what takes the parameters in, before the first located line, has none, and
+                // never a call.
+                assert(!located)
+                assert(!line.contains("call "))
+        assert(lines > 0 && located)
+    // `fact`'s recursive call is at its line and column.
+    var found = false
+    for line in definition(ll, "<program>.fact")
+        if line.contains("call tailcc i32 @\"<program>.fact\"")
+            val n = line[line.index_of(", !dbg !").unwrap() + 8..]
+            assert(node(ll, n).contains("!DILocation(line: 3, column: 12,"))
+            found = true
+    assert(found)
+
+@test("-g: parameters and locals are variables of their Avin types, scalars as basic types and references as pointers")
+debug_variables()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    val vars = variables(ll, node_of(subprogram(ll, "kinds")))
+    // Seven parameters, in order, and the local.
+    assert_eq(vars.len(), 8)
+    var k = 0
+    for name in ["i", "l", "b", "r", "c", "y", "s"]
+        k += 1
+        assert(variable_named(vars, name).contains(s"arg: $k,"))
+    assert(!variable_named(vars, "total").contains("arg:"))
+    assert(type_of(ll, variable_named(vars, "i")).contains("!DIBasicType(name: \"int\", size: 32, encoding: DW_ATE_signed)"))
+    assert(type_of(ll, variable_named(vars, "total")).contains("!DIBasicType(name: \"int\", size: 32, encoding: DW_ATE_signed)"))
+    assert(type_of(ll, variable_named(vars, "l")).contains("!DIBasicType(name: \"long\", size: 64, encoding: DW_ATE_signed)"))
+    assert(type_of(ll, variable_named(vars, "b")).contains("!DIBasicType(name: \"bool\", size: 8, encoding: DW_ATE_boolean)"))
+    assert(type_of(ll, variable_named(vars, "r")).contains("!DIBasicType(name: \"real\", size: 64, encoding: DW_ATE_float)"))
+    assert(type_of(ll, variable_named(vars, "c")).contains("!DIBasicType(name: \"char\", size: 32, encoding: DW_ATE_UTF)"))
+    assert(type_of(ll, variable_named(vars, "y")).contains("!DIBasicType(name: \"byte\", size: 8, encoding: DW_ATE_unsigned)"))
+    val s = type_of(ll, variable_named(vars, "s"))
+    assert(s.contains("!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !") && s.contains("size: 64)"))
+    assert(ll.contains("!DICompositeType(tag: DW_TAG_structure_type, name: \"string\", flags: DIFlagFwdDecl)"))
+    // Each type is made once.
+    var ints = 0
+    for line in ll.split("\n")
+        if line.contains("!DIBasicType(name: \"int\",") then ints += 1
+    assert_eq(ints, 1)
+    // Each variable is declared where it lives, at the function's entry: a parameter spilled to a
+    // slot of its own.
+    val code = definition(ll, "<program>.kinds")
+    var declared = 0
+    for line in code
+        if line.contains("call void @llvm.dbg.declare(") then declared += 1
+    assert_eq(declared, 8)
+    assert(ll.contains("declare void @llvm.dbg.declare(metadata, metadata, metadata)"))
+    // `main`'s locals: the function value and the result; `count`, which the lambda shares, lives in
+    // a box and is left out.
+    val main_vars = variables(ll, node_of(subprogram(ll, "main")))
+    assert(variable_named(main_vars, "bump") != "")
+    assert(variable_named(main_vars, "x") != "")
+    assert(variable_named(main_vars, "count") == "")
+    assert(type_of(ll, variable_named(main_vars, "bump")).contains("pointer_type"))
+    assert(ll.contains("name: \"(int) -> int\", flags: DIFlagFwdDecl)"))
+
+@test("-g: each instance of a generic function is a subprogram of its own, its variables at the instance's types")
+debug_generic_instances()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    val ints = subprogram(ll, "twice[int]")
+    val strings = subprogram(ll, "twice[string]")
+    assert(ints.contains("linkageName: \"<program>.twice[int]\"") && ints.contains(" line: 9,"))
+    assert(strings.contains("linkageName: \"<program>.twice[string]\"") && strings.contains(" line: 9,"))
+    assert(node_of(ints) != node_of(strings))
+    val x_int = variable_named(variables(ll, node_of(ints)), "x")
+    val x_string = variable_named(variables(ll, node_of(strings)), "x")
+    assert(type_of(ll, x_int).contains("name: \"int\""))
+    assert(type_of(ll, x_string).contains("pointer_type"))
+    assert(variable_named(variables(ll, node_of(strings)), "f").contains("arg: 2,"))
+
+@test("-g: a lambda is a subprogram at its own line, its parameter its first argument")
+debug_lambdas()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    val first = subprogram(ll, "main.lambda#1")
+    val second = subprogram(ll, "main.lambda#2")
+    assert(first.contains(" line: 12,") && second.contains(" line: 14,"))
+    val n = variable_named(variables(ll, node_of(first)), "n")
+    assert(n.contains("arg: 1,"))
+    assert(type_of(ll, n).contains("name: \"int\""))
+    assert(variable_named(variables(ll, node_of(second)), "t").contains("arg: 1,"))
+
+@test("-g: a literate program's places are its document's lines, in the document's file")
+debug_literate()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val doc = "# Doubling\n\nSome prose.\n\n    double(n: int) -> int =\n      n * 2\n\nMore prose.\n\n    main() =\n      println(double(21))\n"
+    val ll = emitted(dir, "doc.lavin", doc, true)
+    assert(ll.contains(s"!DIFile(filename: \"doc.lavin\", directory: \"$dir\")"))
+    val double = subprogram(ll, "double")
+    assert(double.contains(" line: 5,"))
+    assert(subprogram(ll, "main").contains(" line: 10,"))
+    // The body is on the document's line 6, at its column there, the code margin included.
+    var found = false
+    for line in ll.split("\n")
+        if line.contains(s"!DILocation(line: 6, column: 7, scope: !${node_of(double)})") then found = true
+    assert(found)
+
+@test("-g: a union parameter, which crosses a call as its words, is left out, and the parameters after it are still described")
+debug_union_parameters()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val text = "show(x: int | string, n: int) -> string = x match\n  k: int -> s\"int ${k + n}\"\n  s: string -> s\"string $s $n\"\n\nkeep[T](x: T, n: int) -> T = x\n\nmain() =\n  println(show(1, 2))\n  println(show(\"a\", 3))\n  val u: int | string = keep(4, 5)\n  println(show(u, 6))\n"
+    val ll = emitted(dir, "unions.avin", text, true)
+    val show = variables(ll, node_of(subprogram(ll, "show")))
+    assert_eq(variable_named(show, "x"), "")
+    assert(variable_named(show, "n").contains("arg: 2,"))
+    val keep = subprogram(ll, "keep[union(int | string)]")
+    assert(keep != "")
+    assert(variable_named(variables(ll, node_of(keep)), "n").contains("arg: 2,"))
+    for level in ["-O0", "-O2"]
+        assert_eq(clang_says(dir, ll, level, "unions"), "")
+    val tc = repository_toolchain()
+    val compiled = compile_program(tc, single_file(source_of(dir + "/unions.avin", text)), false, buf(), buf(), true)
+    assert_eq(compiled.diagnostics, "")
+    link(tc, compiled.llvm.unwrap(), compiled.archive, dir + "/unions", "-O0", compiled.c_link, units = 4, keep_units = false, debug = true).unwrap()
+    val ran = capture(dir + "/unions", timeout = 20000).unwrap()
+    assert_eq(ran.text, "int 3\nstring a 3\nint 10\n")
+
+@test("-g: a build without -g has no debug information at all")
+debug_only_when_asked()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, false)
+    assert(!ll.contains("!dbg"))
+    assert(!ll.contains("llvm.dbg"))
+    assert(!ll.contains("!DI"))
+
+@test("-g: is taken by build and emit-llvm only; run, test and check refuse it")
+debug_flag_commands()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/seven.avin"
+    write_text(file, "main() = 7\n").unwrap()
+    for command in ["run", "test", "check"]
+        assert_eq(avin_cli(["avin", command, file, "-g"]).status, 2)
+    // Given twice, it is a mistake too.
+    assert_eq(avin_cli(["avin", "build", file, "-g", "-g", "-o", dir + "/seven"]).status, 2)
+
+// What clang said compiling the module `ll` at `level`: "" when it compiled cleanly, keeping all of
+// its debug information.
+private clang_says(dir: string, ll: string, level: string, name: string) -> string
+    val file = dir + "/" + name + ".ll"
+    write_text(file, ll).unwrap()
+    val ran = capture("clang", ["-x", "ir", level, "-Wno-override-module", "-c", file, "-o", dir + "/" + name + ".o"], stderr = true, timeout = 120000).unwrap()
+    val said = ran.err.unwrap_or("") + ran.text
+    if !ran.status.ok() then return "failed: " + said
+    if said.contains("invalid debug info") || said.contains("warning") then return said
+    ""
+
+@test("-g: the module verifies at -O0 and -O2, whole and cut into codegen units, and the program runs as it does without -g")
+debug_module_verifies()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val ll = emitted(dir, "shapes.avin", Shapes, true)
+    for level in ["-O0", "-O2"]
+        assert_eq(clang_says(dir, ll, level, "whole"), "")
+        for copies in [false, true]
+            val units = split_module(ll, 4, copies).unwrap()
+            assert(units.len() >= 2)
+            for k in 0..<units.len()
+                // A unit declares a function another defines without the definition's subprogram.
+                for line in units[k].split("\n")
+                    if line.starts_with("declare ") then assert(!line.contains("!dbg"))
+                assert_eq(clang_says(dir, units[k], level, s"unit$k"), "")
+    val tc = repository_toolchain()
+    val compiled = compile_program(tc, single_file(source_of(dir + "/shapes.avin", Shapes)), false, buf(), buf(), true)
+    assert_eq(compiled.diagnostics, "")
+    for level in ["-O0", "-O2"]
+        for n in [1, 4]
+            link(tc, compiled.llvm.unwrap(), compiled.archive, dir + "/shapes", level, compiled.c_link, units = n, keep_units = false, debug = true).unwrap()
+            val ran = capture(dir + "/shapes", timeout = 20000).unwrap()
+            assert(ran.status.ok())
+            assert_eq(ran.text, ShapesOutput)
+            if os() == MacOS then assert(is_dir(dir + "/shapes.dSYM"))
+
+@test("-g: a line added above a function moves its places, through the instance cache, as a clean build places them")
+debug_places_follow_edits()
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    val path = dir + "/shapes.avin"
+    val cache = dir + "/instances"
+    val first = cached_lowering(tc, single_file(source_of(path, Shapes)), cache, true).unwrap()
+    assert(subprogram(first.llvm, "fact").contains(" line: 1,"))
+    val edited = "// a line above\n\n" + Shapes
+    val second = cached_lowering(tc, single_file(source_of(path, edited)), cache, true).unwrap()
+    // The functions came from the cache, and their places are where the source now has them.
+    var reused = 0
+    for r in second.program.reused
+        if r then reused += 1
+    assert(reused > 0)
+    assert(subprogram(second.llvm, "fact").contains(" line: 3,"))
+    assert(subprogram(second.llvm, "main.lambda#1").contains(" line: 14,"))
+    var call = false
+    for line in definition(second.llvm, "<program>.fact")
+        if line.contains("call tailcc i32 @\"<program>.fact\"")
+            assert(node(second.llvm, line[line.index_of(", !dbg !").unwrap() + 8..]).contains("!DILocation(line: 5, column: 12,"))
+            call = true
+    assert(call)
+    val clean = compile_program(tc, single_file(source_of(path, edited)), false, buf(), buf(), true)
+    assert_eq(clean.diagnostics, "")
+    assert_eq(second.llvm, clean.llvm.unwrap())
+
+// What lldb printed running `exe` with `commands`, each one `-o`; None where there is no lldb.
+private lldb(exe: string, commands: []const string) -> Option[string]
+    var args: Buf[string] = buf()
+    args.push("-b")
+    for c in commands
+        args.push("-o")
+        args.push(c)
+    args.push(exe)
+    capture("lldb", args.view(), stderr = true, timeout = 120000) match
+        Ok(ran) -> Some(ran.text + ran.err.unwrap_or(""))
+        Err(_) -> None
+
+@test("-g: lldb stops at an Avin line, shows the Avin call stack and reads the variables")
+debug_lldb_session()
+    if capture("lldb", ["--version"], timeout = 20000) is Err(_) then return
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/shapes.avin"
+    write_text(file, Shapes).unwrap()
+    val exe = dir + "/shapes"
+    val built = avin_cli(["avin", "build", file, "-o", exe, "-g", "-O0"])
+    assert_eq(built.status, 0)
+    if os() == MacOS then assert(is_dir(exe + ".dSYM"))
+    // Line 12 stops first in `main`, which makes the lambda there, then in the lambda each time it
+    // runs.
+    val said = lldb(exe, ["b shapes.avin:3", "b shapes.avin:12", "b shapes.avin:6", "run", "c", "frame variable", "c", "frame variable", "c", "frame variable", "c", "bt", "c", "bt"]).unwrap()
+    assert(said.contains("<program>.main at shapes.avin:12"))
+    // The lambda: its parameter as it was given each time.
+    assert(said.contains("<program>.main.lambda#1(n=1) at shapes.avin:12"))
+    assert(said.contains("<program>.main.lambda#1(n=4) at shapes.avin:12"))
+    assert(said.contains("(int) n = 1"))
+    assert(said.contains("(int) n = 4"))
+    // `kinds`, every parameter read in its own type.
+    assert(said.contains("<program>.kinds(i=1, l=2, b=true, r=1.5, c=U+0078 U'x'"))
+    assert(said.contains("(char32_t) c = U+0078 U'x'"))
+    assert(said.contains("(string *) s = 0x"))
+    // `fact`, recursing: the stack is Avin's, each frame at its line.
+    assert(said.contains("<program>.fact(n=5) at shapes.avin:3"))
+    assert(said.contains("<program>.fact(n=4) at shapes.avin:3"))
+    assert(said.contains("<program>.main at shapes.avin:16"))
+
+@test("-g: lldb stops at a line of a literate program's document")
+debug_lldb_literate()
+    if capture("lldb", ["--version"], timeout = 20000) is Err(_) then return
+    val dir = canonicalize(make_temp_dir("avin-debug").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/doc.lavin"
+    write_text(file, "# Doubling\n\nSome prose.\n\n    double(n: int) -> int =\n      n * 2\n\nMore prose.\n\n    main() =\n      println(double(21))\n").unwrap()
+    val exe = dir + "/doc"
+    assert_eq(avin_cli(["avin", "build", file, "-o", exe, "-g"]).status, 0)
+    assert(exists(exe))
+    val said = lldb(exe, ["b doc.lavin:6", "run", "bt"]).unwrap()
+    assert(said.contains("<program>.double(n=21) at doc.lavin:6:7"))
+    assert(said.contains("<program>.main at doc.lavin:11"))
