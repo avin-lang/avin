@@ -8937,9 +8937,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   so a field reads as a type the code can name, and `T = (A, B)` keeps `T` as the pair of the fresh
   types. A union or a type constructor that names a type parameter is not taken apart and teaches
   nothing (`T | string = int | string` has two solutions); any other two different types, and a
-  cyclic `T = Vector[T]`, are a contradiction, and **until step 4 makes such an arm an error, a
-  contradictory arm is checked with no equalities** (sound: it knows less), and is not compiled at
-  any copy. The equalities hold where a marker local the pattern declares beside its names is in
+  cyclic `T = Vector[T]`, are a contradiction, which step 4 (branch `gadt-4`) makes an error at the
+  pattern; the arm's body is then checked with no equalities, and is not compiled at any copy. The equalities hold where a marker local the pattern declares beside its names is in
   scope, which carries them exactly where the names go: an arm, a clause, an `is` test's branch,
   the right operand of `&&` and `||`, the rest of a block after an early return or a binding. At a
   copy where a pattern is impossible, lowering leaves out what holds its equalities: the arm, the
@@ -8992,6 +8991,50 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Why: an arm on a hidden parameter is compiled per pack, which step 5 builds; no value of either
   kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
   arms would never be compiled, and a program would meet step 5's rules later as a change).
+
+- Proposed (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
+  type matched as the equalities in scope see it**, splitting a column on a refined type's variant
+  only where the variant's result has a solution with the column's instance, the variant's own
+  parameters given types of their own for that split; **the solution carries to the other columns**,
+  so a row's equalities travel along it, and an instance no variant makes is a column with no
+  values. Why: the chapter's Coverage, and the same solving the checker does for a pattern, so the
+  two agree on what is possible. Alternatives weighed: carrying the equalities as a substitution
+  beside the columns (the same, with every function of the coverage check threading it; applying
+  them to the columns at each split needs no more state).
+- Proposed (branch `gadt-4`): **an impossible pattern is reported at the pattern, by the checker,
+  with the chapter's three reasons**, chosen by re-solving: against the equalities in scope before
+  its row alone it fails (`` `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` ``,
+  or the empty-instance message where no variant is possible), a cyclic equality
+  (`` `Wrap` needs `T` to be `Vector[T]`, which no type is ``), or the first equality of an earlier
+  pattern of its row that leaves it none (`` `IntLit` needs `T` to be `int`, and `BoolLit` in the
+  same pattern needs it to be `bool` ``). A row is an arm's pattern, a clause's arguments (`in the
+  same clause`), an `is` test's pattern, a binding's pattern. **The lead says what never happens**:
+  `this arm is never reached`, `this clause is never reached`, and `this pattern never matches` for
+  an `is` test, a binding and one of a set of alternatives, which the chapter does not word. An
+  impossible pattern on the right of `&&`, under the left's equalities, is an error the same way.
+  **A `match` on an empty instance is an error at the value matched even when no arm names a
+  variant** (`_ -> 0` on a `Same[int, string]`). Why: the pattern is where the contradiction is,
+  and a test that can never succeed is dead code as an arm is. Alternatives weighed: reporting
+  impossible arms from the coverage check (it sees rows, not which equality failed, and would say
+  only "never reached"); leaving an impossible `is` test legal (it folds to `false` at every copy,
+  which hides a mistake). **Review with the user:** the wording for tests, bindings and alternatives.
+- Proposed (branch `gadt-4`): **each alternative of a pattern matches on its own: the equalities an
+  alternative learns hold neither in the alternatives after it nor in the arm**, and lowering tests
+  each alternative at what its own patterns read back from the value. A step-3 bug: an alternative's
+  equalities stayed in scope, so `IntLit(_) | BoolLit(_) -> 5` on an `Expr[T]` was checked as if
+  `T` were `int`, and its `bool` copy answered `false` for the `5`; and an alternative was compiled
+  without its patterns' arguments, so `Pair(IntLit(3), _) | …` never matched. Why: the arm runs for
+  whichever alternative matched, so only what all of them imply could hold, and alternatives bind
+  no names. Alternatives weighed: keeping the equalities every alternative implies (sound, but needs
+  a meet of substitutions the chapter does not describe; no program has needed it).
+- Proposed (branch `gadt-4`): **two types that read the same in a message are named apart by the
+  refining patterns that took them**: ``expected Expr[A of `Pair` on line 4], found Expr[A of `Pair`
+  on line 5]``, with the column too where both patterns are on one line, in the expected/found,
+  operator-operand, `cannot compare` and declared-result messages. Only where the two names would
+  otherwise be identical; every other message is unchanged. Why: two patterns on one variant give
+  two unrelated sets of fresh types with the variant's parameter names. Alternatives weighed:
+  numbering the fresh types (`A1`, `A2`), which every message would show, even where nothing
+  clashes.
 
 - Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).

@@ -236,7 +236,7 @@ carry the chapter's exact messages, at most five per file.
 ### Refined variants: build plan
 
 [Refined variants](/spec/refined-variants/) are designed, their choices proposed in
-[decisions](/spec/decisions/#proposed); steps 1 to 3 are built, steps 4 to 7 are still to come. Each step is one item, gated on its own
+[decisions](/spec/decisions/#proposed); steps 1 to 4 are built, steps 5 to 7 are still to come. Each step is one item, gated on its own
 targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
 `-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
 messages, at most five per file. A step that meets a missing piece of the checker it builds on
@@ -320,7 +320,22 @@ reports it rather than routing around it.
    and called after it; a `var` declared outside stored in an arm; `Same`/`cast`; reject: an arm
    result of the wrong type, arms joining with no expected type, an inference variable settled in an
    arm and used outside, a refined name used outside its `is` scope, an unknown matched type.
-4. **Coverage.** In `coverage.sysl`, `cases_of` keeps the variants possible at the instance and the
+4. **Coverage.** *Done (branch `gadt-4`):* `cases_of` in `coverage.sysl` keeps the variants whose
+   result's equalities with the column's instance have a solution (`possible_case`, its own variant
+   parameters given `coverage_owner` types), and each case carries what its equalities say of the
+   enclosing type parameters to the other columns (`case_columns`), so a row's equalities travel
+   along it; an instance with no possible variant is a column with no values. The checker hands
+   coverage each matched type under the equalities in scope (`refined_type`), so a nested `match`
+   in a refining arm counts the enclosing arm's. A pattern whose equalities contradict is an error
+   at the pattern (`report_contradiction`): the variant makes another instance, a cyclic equality,
+   or a contradiction with an earlier pattern of its row (`Checker.pattern_row`: an arm, a clause's
+   arguments, an `is` test, a binding); a `match` on an empty instance is an error at the value
+   matched. Alternatives no longer hold each other's equalities nor the arm's (a step-3 leak:
+   `IntLit(_) | BoolLit(_) -> 5` checked `5` as a `T` that is `int`). Two fresh types that read the
+   same are named apart by their patterns' lines (`names_apart`) in the expected/found, operand and
+   result messages; lowering tests each alternative at what its own patterns read back (`refine_pattern`), where it compiled one without them. *Tests:* run `refined_coverage`, `refined_alternatives`; reject `refined_coverage`,
+   `refined_coverage_rows`, `refined_coverage_more`, `refined_names_apart`, `refined_contradictions`
+   (now an error for the cyclic arm), `refined_alternatives`. The plan as written: in `coverage.sysl`, `cases_of` keeps the variants possible at the instance and the
    witness search carries each row's equalities; impossible arms and empty instances are errors with
    the chapter's messages. *Tests:* run: `total` on `Expr[int]` with no `BoolLit` arm, a pair of
    `Expr[T]`s whose contradictory row is left out, a nested `match` inside a refined arm; reject: an
