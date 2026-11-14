@@ -51,6 +51,8 @@ private path_key(full: string) -> string
  * error is the program's diagnostics, rendered, or a message saying why it could not be built. */
 cached_build(tc: Toolchain, program: string, files: Buf[ProgramFile], testing: bool, optimization: string, sysl: Buf[SyslPackage], c: Buf[CLibrary]) -> Result[Built, string]
     val cache = build_cache(tc.builds, program)
+    // Touched before anything in it is read, so a sweep of the cache sees it in use (`cache.sysl`).
+    _ = touch_entry(cache)
     val kind = if testing then "-tests" else ""
     // A program named `.` is named by the directory it is.
     val name = stem(canonicalize(program).unwrap_or(program)).unwrap_or("program")
@@ -65,7 +67,7 @@ cached_build(tc: Toolchain, program: string, files: Buf[ProgramFile], testing: b
     val compiled = compile_program(tc, files, testing, sysl, c)
     if compiled.diagnostics != "" then return Err(compiled.diagnostics)
     make_dir_all(cache).map_err(e -> s"avin: $cache: ${e.to_string()}")?
-    link(tc, compiled.llvm.unwrap_or(""), compiled.archive, binary, optimization, compiled.c_link).map_err(message -> "avin: " + message)?
+    link_compiled(tc, compiled, () -> compile_program(tc, files, testing, sysl, c), binary, optimization).map_err(message -> "avin: " + message)?
     write_text_atomic(record, write_record(key, compiled.tests)).map_err(e -> s"avin: $record: ${e.to_string()}")?
     Ok(Built(binary, compiled.tests, true))
 
@@ -221,6 +223,9 @@ run_tests(built: Built, root: string, filter: string, prefix: bool, say: string 
             out(s"  skip  $padded  ignored: $reason")
             continue
         val slot = live_begin(s"$shown  ${t.name}", PhaseRun)
+        // Each test starts the executable again, so its directory is kept in use for as long as the
+        // tests run, however long that is.
+        _ = touch_entry(parent(built.path).unwrap_or("."))
         if t.setup_all != "" && set_up.get(t.module_name) is None
             val ran = run_part(built, i, "a", TestTimeout)
             set_up.put(t.module_name, if ran.status == Exited(0) then "" else ran.reason)

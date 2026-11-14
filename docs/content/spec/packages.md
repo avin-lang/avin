@@ -605,6 +605,10 @@ names its dependencies.
   in the user's cache directory, a directory per package and keyed by where the package is, so two
   checkouts of it never share one ([running and testing](/compiler/#running-and-testing)).
   `avin clean --all` removes every program's builds this version of Avin keeps; fetched packages stay.
+- Fetched packages are not counted against the build cache's limit and a sweep of the cache never
+  evicts one ([running and testing](/compiler/#running-and-testing)); `avin cache clean --packages`
+  removes them, with `--older-than` only those no build has read for that long, and the next build
+  that needs one fetches it again.
 - `avin add <coordinate>[@<version>|@<rev>] [<package>]` adds a git dependency to the package's
   manifest: the version given, the commit given (written to the manifest as its full id), or the
   highest release the repository has tagged. It fetches the package, lists

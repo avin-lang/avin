@@ -75,6 +75,12 @@ edit makes again only what the edit can change ([incremental builds](/compiler/#
 `AVIN_INCREMENTAL=off` turns it off). `avin clean` removes the program's cache and `avin clean --all`
 every program's; either is always safe.
 
+The cache looks after its own size: builds keep it within 5G, removing what was used longest ago
+first, and clear away what interrupted builds and older versions of Avin left. `AVIN_CACHE_LIMIT`
+sets another limit (`20G`, `500M`, or `off` for none). `avin cache info` shows what it holds, `avin
+cache trim` trims it now, and `avin cache clean` empties it (`--older-than 7d` for only what has not
+been used for a week, `--packages` for the fetched packages too).
+
 A program is a source file or a directory: `avin run my-program` builds every `.avin` and `.lavin`
 file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by
 default.
