@@ -20,6 +20,7 @@ module avin.actors
 // state and the same mailbox (`Restart`).
 
 import avin.collections.mutable.{Map as MutableMap}
+import avin.random.Random
 import avin.threads.{Atomic, Condition, Executor, Future, Mutex, Promise}
 import avin.threads as threads
 import avin.time.Duration
@@ -143,10 +144,12 @@ private class Node[M](private var message: Option[M], private var make: Option[(
 // An unbounded queue many threads put messages in and the actor alone takes them from, without a
 // lock: a sender swaps its node in as the newest, then links the one it replaced to it, so two
 // messages one sender sends arrive in the order it sent them. The oldest node is always one whose
-// message was taken already; the next is the next message.
-private class Mailbox[M]()
+// message was taken already; the next is the next message. A counted mailbox, a router's routee's,
+// also keeps how many messages wait in it, which any thread may read.
+private class Mailbox[M](private val counted: bool)
   private var oldest = Node[M](None, None, None)
   private val newest = Atomic[Node[M]](oldest)
+  private val count = Atomic[long](0)
 
   // Puts `m` at the back, with the guard of the timer or watch that sends it; called by any thread.
   put(m: M, guard: Option[Guard]) = link(Node(Some(m), None, guard))
@@ -154,7 +157,9 @@ private class Mailbox[M]()
   // Puts at the back the message `make` makes when the actor takes it.
   putMade(make: () -> M, guard: Option[Guard]) = link(Node[M](None, Some(make), guard))
 
-  private link(n: Node[M]) = newest.swap(n).next.store(Some(n))
+  private link(n: Node[M])
+    if counted then count.add(1)
+    newest.swap(n).next.store(Some(n))
 
   // The node at the front, taken out, where one is there; called by the actor alone. A message
   // whose sender has swapped its node in but not yet linked it is not there yet, and its sender
@@ -162,8 +167,12 @@ private class Mailbox[M]()
   take() -> Option[Node[M]] = oldest.next.load() match
     Some(n) ->
       oldest = n
+      if counted then count.add(-1)
       Some(n)
     None -> None
+
+  // How many messages wait, in a counted mailbox; zero in any other.
+  waiting() -> long = count.load()
 
   // Drops every message there.
   clear()
@@ -211,14 +220,18 @@ private class Actor[M: Sendable](
     private val behaviour: Behaviour[M],
     private val executor: Executor,
     val parent: Option[Core],
-    private val supervision: Supervision
+    private val supervision: Supervision,
+    counted: bool
 ): Core
   val number: long = numbers.add(1)
   val owner: long = newOwner()
   // Whether each turn is a lightweight thread of its own, as on the shared executor.
   private val ownThreads = executor === Executor.shared()
   val end = Promise[Ending]()
-  private val mailbox = Mailbox[M]()
+  private val mailbox = Mailbox[M](counted)
+  // The messages a stash gave back, handled before the mailbox's, the first at the front; the
+  // actor's turns alone reach it.
+  private val unstashed = Deque[M]()
   // Set until `start`, which queues the first turn, so nothing queues one before it.
   private val scheduled = Atomic[bool](true)
   private val stopAsked = Atomic[bool](false)
@@ -345,7 +358,7 @@ private class Actor[M: Sendable](
     if phase.load() == Closing && children.load().isEmpty then ended()
     if phase.load() == Gone then mailbox.clear()
     runAs(worker)
-    if handled == throughput && phase.load() == Live && !restarting && !mailbox.isEmpty() then return schedule()
+    if handled == throughput && phase.load() == Live && !restarting && hasMessages() then return schedule()
     scheduled.store(false)
     if pending() && scheduled.compareAndSet(false, true) then schedule()
 
@@ -355,11 +368,24 @@ private class Actor[M: Sendable](
     val p = phase.load()
     if p == Live then return escalated.load().isDefined || (
       if restarting then children.load().isEmpty else stopAsked.load() || (
-        !halted && (handler.isEmpty || !mailbox.isEmpty())
+        !halted && (handler.isEmpty || hasMessages())
       )
     )
     if p == Closing then return children.load().isEmpty
     !mailbox.isEmpty()
+
+  // Whether a message waits, given back by a stash or in the mailbox.
+  private hasMessages() -> bool = !unstashed.isEmpty || !mailbox.isEmpty()
+
+  // How many messages wait in a counted mailbox.
+  waiting() -> long = mailbox.waiting()
+
+  // The actor's own reference, which accepts its messages.
+  typedRef() -> ActorRef[M] = reference.get
+
+  // Puts `messages` in front of every message waiting, in their order, so the actor handles them
+  // next; called by the actor's own code alone.
+  unstash(messages: Iterable[M]) = unstashed.prependAll(messages)
 
   // The start where it has not run, then the messages: the code a trap in fails the actor.
   private work()
@@ -378,6 +404,10 @@ private class Actor[M: Sendable](
   private handle(h: (M) -> unit) -> int
     var n = 0
     while n < throughput && !stopAsked.load()
+      if !unstashed.isEmpty
+        h(unstashed.removeHead())
+        n += 1
+        continue
       mailbox.take() match
         Some(node) ->
           if node.wanted()
@@ -403,6 +433,7 @@ private class Actor[M: Sendable](
     phase.store(Closing)
     cancelAll()
     mailbox.clear()
+    unstashed.clear()
     for c in children.load() do c.requestStop()
 
   // Cancels every timer and every watch.
@@ -478,6 +509,7 @@ private class Actor[M: Sendable](
     runStoppings()
     phase.store(Gone)
     mailbox.clear()
+    unstashed.clear()
     handler = None
     registry.leave(owner)
     end.complete(failure match
@@ -607,18 +639,32 @@ spawn[M: Sendable](
     behaviour: Behaviour[M],
     onFailure: Supervision = Escalate,
     executor: Executor = Executor.shared()
-) -> ActorRef[M]
-  if onFailure is Restart(limit, within)
-    if limit < 0 then fail(s"a restart limit of $limit is less than zero")
-    if within <= Duration.Zero then fail(s"restarts are counted within $within, which is not more than zero")
+) -> ActorRef[M] = launch(behaviour, onFailure, executor, false).typedRef()
+
+// Starts an actor as `spawn` does and gives back the actor itself; a counted one keeps how many
+// messages wait in its mailbox.
+private launch[M: Sendable](
+    behaviour: Behaviour[M],
+    onFailure: Supervision,
+    executor: Executor,
+    counted: bool
+) -> Actor[M]
+  checkSupervision(onFailure)
   val parent = registry.current()
-  val actor = Actor(behaviour, executor, parent, onFailure)
+  val actor = Actor(behaviour, executor, parent, onFailure, counted)
   handOver(behaviour, currentOwner(), actor.owner)
   val ref = ActorRef[M](m -> actor.offer(m, None), behaviour.name, actor.number, actor.end.future)
   registry.enrol(actor.owner, actor)
   if parent is Some(p) then p.adopt(actor)
   actor.start(ref)
-  ref
+  actor
+
+// Traps where `onFailure` is a `Restart` whose limit is less than zero or whose window is not more
+// than zero.
+private checkSupervision(onFailure: Supervision)
+  if onFailure is Restart(limit, within)
+    if limit < 0 then fail(s"a restart limit of $limit is less than zero")
+    if within <= Duration.Zero then fail(s"restarts are counted within $within, which is not more than zero")
 
 // A timer of an actor, which `after` and `every` give back: `cancel()` stops it, and a message it has
 // sent that the actor has not yet handled is dropped. An actor's timers are all cancelled when it
@@ -834,8 +880,247 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
     if !actorCell.running() then fail(s"`$what` of $actorRef is called from code other than the actor's own")
 
 // The actor `ref` refers to, whose code is running.
-private own[M: Sendable](ref: ActorRef[M]) -> Actor[M] = registry.current() match
+private own[M: Sendable](ref: ActorRef[M], what: string = "an `ActorContext`") -> Actor[M] = registry.current() match
   Some(a: Actor[M]) -> if a.number == ref.number then a else fail(
-    s"an `ActorContext` of $ref is made by code other than the actor's own"
+    s"$what of $ref is made by code other than the actor's own"
   )
-  _ -> fail(s"an `ActorContext` of $ref is made by code other than the actor's own")
+  _ -> fail(s"$what of $ref is made by code other than the actor's own")
+
+// Messages an actor sets aside because it cannot handle them in its present state, to handle them
+// once it can: `add` keeps one, and `unstashAll` gives them all back, in the order they were added,
+// in front of every message waiting in the mailbox, so the actor handles them next. A stash holds at
+// most `capacity` messages, and adding one to a full stash traps, failing the actor. A stash is part
+// of the actor's state, made by its own code from its own reference, so the messages it holds are
+// lost where the actor ends or restarts, as its fields are; messages already given back are in the
+// mailbox, which a restart keeps.
+//
+//     val waiting = Stash(self, 100)
+//     ...
+//     Send(bytes) ->
+//       waiting.add(Send(bytes))
+//       stay
+class Stash[M: Sendable](owner: ActorRef[M], val capacity: int)
+  private val cell: Actor[M] = own(owner, "a `Stash`")
+  private val held = Buffer[M]()
+  if capacity < 1 then fail(s"a stash of capacity $capacity, which is less than one")
+
+  // How many messages the stash holds.
+  length -> int = held.length
+
+  // Whether the stash holds no message.
+  isEmpty -> bool = held.isEmpty
+
+  // Whether the stash holds `capacity` messages, so that adding another traps.
+  isFull -> bool = held.length >= capacity
+
+  // Sets `message` aside; traps where the stash is full.
+  add(message: M)
+    check("add")
+    if held.length >= capacity then fail(s"the stash of $owner is full: it holds $capacity messages")
+    held.append(message)
+
+  // Gives back every message the stash holds, in the order they were added, in front of the
+  // messages waiting in the mailbox, and leaves the stash empty.
+  unstashAll()
+    check("unstashAll")
+    cell.unstash(held)
+    held.clear()
+
+  // Drops every message the stash holds.
+  clear()
+    check("clear")
+    held.clear()
+
+  private check(what: string)
+    if !cell.running() then fail(s"`$what` of a stash of $owner is called from code other than the actor's own")
+
+// How a router chooses the routee each message goes to: `RoundRobin` each in turn; `AtRandom` any,
+// each equally likely; `SmallestMailbox` the one with the fewest messages waiting, the next in turn
+// among equals; `ByKey` by the key `key` gives the message, so messages with one key go to one
+// routee for as long as it lives, and a routee that ends moves only its own keys to the others.
+data Routing[M]
+  RoundRobin
+  AtRandom
+  SmallestMailbox
+  ByKey(key: @sendable (M) -> long)
+
+// Routers: one reference that spreads its messages over a pool of actors.
+object Router
+  // Starts a router and `size` routees of `behaviour`, its children, and gives back the router's
+  // reference, which accepts the routees' messages: each message sent to it goes to one routee,
+  // chosen by `routing`. The router is a child of the code that calls this, as `spawn`'s actor is,
+  // and is shown as `Router#n`. Each routee is supervised by `onFailure` and runs on `executor`: a
+  // routee that restarts keeps its place, one that ends leaves the pool, and the router stops once
+  // none is left; a routee's escalated failure fails the router, which escalates it in turn. A
+  // router that ends stops its routees first. Two messages one sender sends that go to one routee
+  // arrive in the order they were sent. A size less than one traps, as does a `Restart` `spawn`
+  // would refuse.
+  //
+  //     val workers = Router.pool(4, Resizer(), SmallestMailbox, onFailure = Restart(3, time.seconds(1)))
+  //     workers tell Resize(image)
+  pool[M: Sendable](
+      size: int,
+      behaviour: Behaviour[M],
+      routing: Routing[M] = RoundRobin,
+      onFailure: Supervision = Escalate,
+      executor: Executor = Executor.shared()
+  ) -> ActorRef[M]
+    if size < 1 then fail(s"a pool of $size routees, which is fewer than one")
+    checkSupervision(onFailure)
+    val router = launch(
+      Behaviour[Routed[M]]("Router", routerStart(size, behaviour, routing, onFailure, executor)),
+      Escalate,
+      Executor.shared(),
+      false
+    )
+    ActorRef[M](m -> router.offer(Route(m), None), "Router", router.number, router.end.future)
+
+// What a router handles: a message to route, or the end of one of its routees.
+private data Routed[M]
+  Route(message: M)
+  RouteeEnded(number: long)
+
+// The start of a router: it starts its routees and watches each, then routes each message to the
+// routee `routing` chooses, choosing again where that one has ended meanwhile.
+private routerStart[M: Sendable](
+    size: int,
+    behaviour: Behaviour[M],
+    routing: Routing[M],
+    onFailure: Supervision,
+    executor: Executor
+) -> @sendable (ActorRef[Routed[M]]) -> (Routed[M]) -> unit = me ->
+  val ctx = ActorContext(me)
+  val routees = Buffer[Actor[M]]()
+  for _ in 0 ..< size
+    val r = launch(behaviour, onFailure, executor, true)
+    routees.append(r)
+    ctx.watch(r.ref(), RouteeEnded[M](r.number))
+  val chooser = Chooser(routing)
+  message -> message match
+    Route(m) ->
+      var sent = false
+      while !sent && !routees.isEmpty
+        val i = chooser.pick(routees, m)
+        sent = routees(i).offer(m, None)
+        if !sent then routees.remove(i)
+    RouteeEnded(number) ->
+      routees.filterInPlace(r -> r.number != number)
+      if routees.isEmpty then ctx.stop()
+
+// A router's choice of routee, which keeps where its turn has got to and its own generator.
+private class Chooser[M: Sendable](private val routing: Routing[M])
+  private var next = 0
+  private val dice = Random()
+
+  // The index in `routees`, which is not empty, of the routee that takes `m`.
+  pick(routees: Buffer[Actor[M]], m: M) -> int = routing match
+    RoundRobin -> turn(routees.length)
+    AtRandom -> dice.nextInt(routees.length)
+    SmallestMailbox -> fewestWaiting(routees)
+    ByKey(key) -> heaviest(routees, key(m))
+
+  // The next index in turn among `n`.
+  private turn(n: int) -> int
+    val i = next % n
+    next = (i + 1) % n
+    i
+
+  // The routee with the fewest messages waiting, the first in turn among equals.
+  private fewestWaiting(routees: Buffer[Actor[M]]) -> int
+    val n = routees.length
+    val start = next % n
+    var best = start
+    var fewest = routees(start).waiting()
+    for j in 1 ..< n
+      val i = (start + j) % n
+      val w = routees(i).waiting()
+      if w < fewest
+        best = i
+        fewest = w
+    next = (best + 1) % n
+    best
+
+  // The routee whose number weighs most with `key`: each key has its own order of the routees, so
+  // a key keeps its routee while that one lives, and the keys of one that ends spread over the rest.
+  private heaviest(routees: Buffer[Actor[M]], key: long) -> int
+    var best = 0
+    var most = weight(key, routees(0).number)
+    for i in 1 ..< routees.length
+      val w = weight(key, routees(i).number)
+      if w > most
+        best = i
+        most = w
+    best
+
+// How much the routee numbered `routee` weighs with `key`: the two mixed so that every bit of each
+// moves about half the bits of the result.
+private weight(key: long, routee: long) -> long = mix(mix(key) ^ routee)
+
+private mix(x: long) -> long
+  val a = x +% -7046029254386353131
+  val b = (a ^ (a >> 30)) *% -4658895280553007687
+  val c = (b ^ (b >> 27)) *% -7723592293110705685
+  c ^ (c >> 31)
+
+// Publishing and subscribing: each event `publish` is given goes to every actor subscribed, which any
+// thread may do. A subscriber is told the events of one publisher in the order they were published;
+// the events of different publishers interleave in any order. An actor that ends leaves the topic of
+// itself, its end being watched from the moment it subscribes, so a topic never keeps an ended actor.
+// An event holding a Sysl handle goes with the first subscriber's copy, as a handle sent twice does.
+//
+//     val prices = Topic[Price]()
+//     prices.subscribe(self)
+//     prices.publish(Price("ACME", 12))
+@keeps_owners
+class Topic[E: Sendable](): Sendable
+  private val held = Atomic[Subscribers[E]](Subscribers(Vector(), Vector()))
+
+  // Subscribes `subscriber`, which is told every event published from now on. An actor subscribed
+  // already, by this reference or another of its own such as an adapter, is subscribed once, by
+  // the reference given last, in its first place. An actor that has ended is not kept.
+  subscribe(subscriber: ActorRef[E])
+    var fresh = false
+    held.update(s ->
+      fresh = !s.watched.contains(subscriber.number)
+      s.adding(subscriber))
+    if fresh
+      val topic = self
+      val number = subscriber.number
+      subscriber.ended().onComplete(_ -> topic.drop(number))
+
+  // Stops telling the actor `subscriber` refers to the events published from now on; an actor not
+  // subscribed is left as it is.
+  unsubscribe(subscriber: ActorRef[Nothing])
+    val number = subscriber.number
+    held.update(s -> s.without(number, false))
+    ()
+
+  // Tells `event` to every actor subscribed, in the order they subscribed; returns at once.
+  publish(event: E)
+    for s in held.load().members do s.tell(event)
+
+  // The actors subscribed now, in the order they subscribed.
+  subscribers -> Vector[ActorRef[E]] = held.load().members
+
+  // Forgets the actor numbered `number`, which has ended.
+  private drop(number: long)
+    held.update(s -> s.without(number, true))
+    ()
+
+// The actors a topic tells, in the order they subscribed, and the numbers of those whose ends it
+// watches, which is every one subscribed and any that left without ending. Never changed: a topic
+// swaps in a new one.
+@keeps_owners
+private class Subscribers[E: Sendable](val members: Vector[ActorRef[E]], val watched: Vector[long]): Sendable
+  // With `r` subscribed, in place of another reference to its actor where there is one.
+  adding(r: ActorRef[E]) -> Subscribers[E]
+    val i = members.indexWhere(m -> m.number == r.number)
+    val ms = if i >= 0 then members.updated(i, r) else members :+ r
+    val ws = if watched.contains(r.number) then watched else watched :+ r.number
+    Subscribers(ms, ws)
+
+  // Without the actor numbered `number`, and forgetting its end where `ended`.
+  without(number: long, ended: bool) -> Subscribers[E] = Subscribers(
+    members.filter(m -> m.number != number),
+    if ended then watched.filter(w -> w != number) else watched
+  )

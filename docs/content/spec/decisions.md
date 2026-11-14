@@ -8218,6 +8218,62 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed 2026-11-13 (branch `actor-patterns`): **Routers are `Router.pool(size, behaviour,
+  routing, onFailure, executor)`, giving back a plain `ActorRef[M]`.** The router is an actor of its
+  own, the routees its children, so the lifecycle and supervision of actors cover it with nothing
+  new: `stop(router)` ends the routees first, a routee's `onFailure` is the router's argument, a
+  routee that ends leaves the pool and the router stops with the last one, and a routee's
+  escalation fails the router, which always escalates (the router's own supervision is not a
+  parameter). The routings are the `data Routing[M]`: `RoundRobin` (the default), `AtRandom`,
+  `SmallestMailbox`, `ByKey(key: @sendable (M) -> long)`. *Why*: one reference that accepts the
+  routees' own messages is what a caller wants, and asks through it work unchanged; a hop through
+  the router keeps one sender's order per routee and keeps the pool's state in one actor's turns,
+  with no lock. *Alternatives*: a reference whose `tell` picks a routee in the sender's thread (no
+  hop, but the pool's changing membership shared between threads); a `Router[M]` object with its
+  own `stop` (a second lifecycle beside the actor's); a supervision parameter for the router itself
+  (rarely wanted: it holds no state worth restarting). `Random` was not taken as a variant name since
+  `avin.random.Random` is a common import; `Router` shares its name with `avin.net.http.Router`, in
+  a different module. **Review with the user:** the names (`AtRandom`, `ByKey`) and the router's
+  fixed `Escalate`.
+- Proposed 2026-11-13 (branch `actor-patterns`): **`SmallestMailbox` counts the messages waiting,
+  and `ByKey` hashes by highest weight.** A routee's mailbox alone keeps a count (an atomic add on
+  each send and take; other actors' mailboxes pay nothing), the message being handled not counted,
+  ties going to the next in turn. `ByKey` weighs each routee against the key by mixing the key with
+  the routee's number and takes the heaviest, so a key keeps its routee while it lives and a routee
+  that ends moves only its own keys. *Why*: the count is exact and cheap where it is needed; the
+  weighting needs no ring and stays consistent as the pool shrinks. *Alternatives*: counting every
+  mailbox (a cost to every actor); counting a message until its handling ends (a second atomic per
+  message); the key modulo the pool's size (every key moves when one routee leaves); a hash ring
+  (more state for pools that are small).
+- Proposed 2026-11-13 (branch `actor-patterns`): **A message a router finds refused goes to another
+  routee.** A routee that has begun to end refuses a message, and the router chooses again among the
+  rest, before it has heard of the end; a message a routee accepted and then dropped as it stopped
+  is lost, as with any actor that stops. *Why*: the window between a routee ending and the router
+  hearing of it would otherwise lose messages for no reason. *Alternative*: dropping them.
+- Proposed 2026-11-13 (branch `actor-patterns`): **A `Stash` is a bounded object of the actor's state,
+  `Stash(self, capacity)`, and adding to a full one traps.** `unstashAll` puts its messages in front of
+  every message waiting, in the order added, in a queue the actor's turn reads before its mailbox, so
+  a restart keeps them as it keeps the mailbox, while what is still stashed is lost with the state.
+  *Why*: the actor's own state is where an actor's choices live, and a stash made from the actor's
+  own reference cannot be given another actor's messages; a full stash means the actor's design did
+  not foresee the load, which is a bug for supervision to handle, and an actor that wants another
+  policy checks `isFull` first. *Alternatives* for overflow: dropping the newest or the oldest
+  silently (a lost question looks like a timeout with no report), `add` answering a `bool` (easily
+  ignored); for the shape: `stash(message)` and `unstashAll()` on `ActorContext` with a capacity
+  given to `spawn` (state outside the actor's fields, and a parameter every actor carries);
+  unstashed messages put at the back of the mailbox (behind messages that arrived later, losing
+  order). **Review with the user:** trapping on overflow.
+- Proposed 2026-11-13 (branch `actor-patterns`): **A `Topic[E]` is a sendable object, not an actor.**
+  `publish` tells each subscriber in the publisher's own thread, so one publisher's events reach
+  each subscriber in order with no hop; subscriptions live in one atomic value; a subscriber's end
+  is watched through its `ended()` future from its first subscription, which drops it. An actor is
+  subscribed once, by its number, the later reference (an adapter, say) replacing the earlier in
+  its place. *Why*: any thread may publish, nothing needs stopping, and no actor's mailbox sits
+  between publisher and subscriber. *Alternatives*: a topic actor that subscribers and publishers
+  message, watching subscribers with `watch` (an extra hop per event, a lifecycle to manage, and a
+  count that is only known by asking); topics named in a global registry (shared mutable state by
+  name).
+
 ## Open
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the

@@ -1,0 +1,94 @@
+// expect: exit 0
+// A topic with many subscribers and many publishers: every subscriber hears every event once, the
+// events of each publisher in the order published, the strings made on the publishing threads
+// surviving the collector; subscribers ending as events are published leave the topic, every one
+// of them, and the topic tells the rest; and topics of a generic event type and sent to actors
+// in messages work the same.
+import avin.actors.{ActorRef, Topic, spawn}
+import avin.threads.{Atomic, Promise}
+import avin.threads as threads
+import avin.time
+
+data Event
+  Tick(publisher: int, seq: int, text: string)
+
+data Sub
+  Heard(e: Event)
+  Subscribe(topic: Topic[Event], replyTo: ActorRef[string])
+  Report(replyTo: ActorRef[string])
+  Quit
+
+actor Listener(publishers: int, heard: Atomic[int], lasts: Atomic[int]) receives Sub
+  val last = Buffer[int]()
+  for _ in 0 ..< publishers do last.append(-1)
+  var inOrder = true
+
+  receive
+    Heard(Tick(p, seq, text)) ->
+      if seq != last(p) + 1 || text != s"tick $seq from $p" then inOrder = false
+      last(p) = seq
+      heard.add(1)
+      if text.startsWith("last ") then lasts.add(1)
+    Subscribe(topic, replyTo) ->
+      topic.subscribe(adapter(e -> Heard(e)))
+      replyTo.tell("ok")
+    Report(replyTo) -> replyTo.tell(if inOrder then "in order" else "out of order")
+    Quit -> stop()
+
+settle(topic: Topic[Event], n: int)
+  var waited = 0
+  while topic.subscribers.length > n && waited < 10000
+    threads.sleep(time.millis(1))
+    waited += 1
+
+main()
+  val topic = Topic[Event]()
+  val heard = Atomic[int](0)
+  val lasts = Atomic[int](0)
+  val publishers = 4
+  val listeners = Buffer[ActorRef[Sub]]()
+  for _ in 0 ..< 200
+    val l = spawn(Listener(publishers, heard, lasts))
+    _ = l.ask(r -> Subscribe(topic, r), timeout = time.seconds(10)).await()
+    listeners.append(l)
+  println(topic.subscribers.length)
+
+  val each = 10
+  val done = Vector.fill(publishers, Promise[unit]())
+  for p in 0 ..< publishers
+    val finished = done(p)
+    threads.spawn(() ->
+      for i in 0 ..< each do topic.publish(Tick(p, i, s"tick $i from $p"))
+      finished.complete(()))
+  for d in done do d.future.await()
+  while heard.load() < 200 * publishers * each do threads.sleep(time.millis(1))
+  println(heard.load())
+  val reports = listeners.map(l -> l.ask(r -> Report(r), timeout = time.seconds(10)).await().ok.getOrElse("none"))
+  println(reports.distinct)
+
+  // Half the listeners end, while a publisher goes on: every one of them leaves the topic, and the
+  // others hear every event.
+  val busy = threads.spawn(() ->
+    for i in 0 ..< 20 do topic.publish(Tick(1, i, s"noise $i")))
+  for i in 0 ..< 100 do listeners(i).tell(Quit)
+  for i in 0 ..< 100 do listeners(i).ended().await()
+  busy.join()
+  settle(topic, 100)
+  println(topic.subscribers.length)
+  println(topic.subscribers.forall(s -> !s.ended().isCompleted()))
+  for i in 0 ..< 5 do topic.publish(Tick(2, i, s"last $i"))
+  while lasts.load() < 500 do threads.sleep(time.millis(1))
+  threads.sleep(time.millis(20))
+  println(lasts.load())
+
+  // A topic of a generic event type.
+  val numbers = Topic[Option[long]]()
+  val got = Promise[Option[long]]()
+  val one = spawn(Grab(got))
+  numbers.subscribe(one)
+  numbers.publish(Some(-9223372036854775808))
+  println(got.future.await())
+
+actor Grab(got: Promise[Option[long]]) receives Option[long]
+  receive
+    v -> got.tryComplete(v)
