@@ -8214,6 +8214,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatter is meant to settle exactly this); a blank line between clauses only around a
   multi-line one (it still splits one function in two); a blank line between every clause
   (it spreads a short definition over twice its lines).
+- Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
+  `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
+  starts threads and waits for them structurally, so a spawning wait group would be a second way to
+  do what `scope` does; what a wait group adds is counting work finished by threads started
+  elsewhere (an executor, an actor, another scope) or by no thread at all. Alternatives weighed:
+  `wg.spawn(body)` starting and counting a thread (duplicates `Scope.spawn`, and an unscoped spawn
+  escapes cancellation); answering a negative count by clamping at zero (hides a double `done`).
+- Proposed (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
+  traps.** `Semaphore(permits, capacity = permits)`; negative permits, a capacity below one or more
+  permits than the capacity trap too. Permits belong to no thread, and waiters are not queued (one
+  arriving as a permit comes back may take it first). Why: an over-release is the same bug as a
+  wait group's double `done`, a permit given back that nobody took, and a trap finds it where it
+  happens; the separate capacity keeps the signalling use (`Semaphore(0, capacity = 1)`) that an
+  "at most the initial permits" rule would forbid. Alternatives weighed: an unbounded count (a
+  silent over-release grows the limit for good); permits owned by the thread that took them (rules
+  out a permit taken by one thread and given back by another, which hand-offs need); a FIFO queue
+  of waiters (a cancelled waiter would have to take its place back, for a fairness the condition's
+  oldest-first wake mostly gives already). Review with the user: trap or ignore an over-release.
+- Proposed (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
+  hold when a cancellation stops their body; a `RwLock`'s write runs to its end; a trap in any of
+  them stops the program.** The share is taken under the library's lock and held in a region in
+  doubt from that moment until it is given back (the runtime's new `lock_release_holding` and
+  `cancel_guarded_held`), so no cancellation can come between taking it and the body. A read body
+  or a permit's body runs at a cancellation point of its own inside that region, so a cancelled scope stops
+  a long download inside `withPermit` at once and the permit goes back, while a trap there, even in
+  an actor, stops the program as one under a lock does, since recovering the actor's turn would
+  leave the share held for ever. A write body is also uncancellable, as a `Mutex`'s body is, since
+  stopping it could leave the value half changed. Why: a semaphore guards no value, and a reader
+  changes nothing, so nothing is left in doubt by stopping them; a writer does change the value.
+  Alternatives weighed: every body uncancellable, as a mutex's (a scope's cancellation would wait
+  for every permit holder's whole body); every body cancellable (a write could leave the value
+  torn); a trap in an actor's body failing only the actor (needs a give-back chain run by the
+  actor's recovery, which the runtime does not have).
+- Proposed (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
+  a write kept waiting before the next writer.** A reader that arrives while a writer waits waits
+  behind it; when a write ends, every reader then waiting is admitted ahead of the writers waiting.
+  Why: writers do not starve under overlapping readers, and readers do not starve under back-to-back
+  writers, with no tuning. Alternatives weighed: pure writer preference (readers starve while
+  writers keep coming); reader preference (writers starve); a strict FIFO of both (serialises
+  readers that could share). Review with the user: a read body is trusted only to read; nothing
+  stops it changing a mutable value other readers share, which races with them (a race is not
+  undefined behaviour in Avin, but the type system does not rule it out here as it does elsewhere).
+  A read-only view of a value would close it and is a language feature, not a library one.
+- Proposed (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
+  cancelled while waiting withdraws.** The last arrival runs the action holding the barrier's lock,
+  so the action is uncancellable and one that waits on its own barrier traps as a lock taken twice
+  does; `wait` answers whether the caller arrived last. A cancelled waiter takes its arrival back
+  (it is not counted for the round), through the runtime's settling condition wait, which answers a
+  cancellation with the lock held again rather than stopping at once. Why: a scope cancelled
+  mid-round leaves the barrier as if the stopped parties had never come, ready for new ones.
+  Alternatives weighed: a cancelled party staying counted (the round could trip with a party
+  missing); "breaking" the barrier for every party (a state each `wait` would have to answer);
+  running the action outside the lock (waiting on its own barrier would then deadlock instead of
+  trapping).
 
 
 ## Proposed

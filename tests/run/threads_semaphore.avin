@@ -1,0 +1,61 @@
+// expect: exit 0
+// A semaphore lets at most its permits' worth of threads through at once, `withPermit` giving the
+// permit back as its body returns; `tryAcquire` never waits, a timed acquire answers whether it took a
+// permit, and a semaphore made empty with room for one signals from one thread to another. Every
+// release happens before the acquire that takes its permit.
+import avin.threads.{Atomic, Semaphore, scope, sleep, spawn}
+import avin.time
+
+main()
+  // At most three threads inside at once, out of forty.
+  val three = Semaphore(3)
+  val inside = Atomic(0)
+  val most = Atomic(0)
+  val total = scope(s ->
+    val ts = (0 ..< 40).map(i -> s.spawn(() -> three.withPermit(() ->
+      val now = inside.add(1)
+      most.update(m -> if now > m then now else m)
+      sleep(time.millis(1))
+      inside.sub(1)
+      i))).toVector
+    ts.map(t -> t.join()).sum)
+  println(s"total $total within ${1 <= most.load() <= 3} free ${three.availablePermits()}")
+
+  // tryAcquire and timed acquires on an empty semaphore and a full one.
+  val one = Semaphore(1)
+  println(
+    s"try ${one.tryAcquire()} then ${one.tryAcquire()} timed ${one.acquireFor(time.millis(10))} now ${one.acquireFor(0)}"
+  )
+  one.release()
+  println(s"after release ${one.acquireFor(time.seconds(5))} negative ${one.acquireFor(-1)}")
+  one.release()
+
+  // A permit given back by another thread wakes the timed waiter before its time runs out.
+  val handoff = Semaphore(0, capacity = 1)
+  val waiter = spawn(() -> handoff.acquireFor(time.seconds(30)))
+  sleep(time.millis(10))
+  handoff.release()
+  println(s"handed off ${waiter.join()} left ${handoff.availablePermits()}")
+
+  // Signalling: each release lets exactly one acquire through, in a ping-pong of a hundred turns.
+  val ping = Semaphore(0, capacity = 1)
+  val pong = Semaphore(0, capacity = 1)
+  val seen = Atomic(0)
+  val player = spawn(() ->
+    for _ in 0 ..< 100
+      ping.acquire()
+      seen.add(1)
+      pong.release()
+    seen.load())
+  for _ in 0 ..< 100
+    ping.release()
+    pong.acquire()
+  println(s"turns ${player.join()}")
+
+  // A body's result comes back through withPermit, a permit taken apart is given back by another
+  // thread, and a semaphore of many permits starts with fewer.
+  val partial = Semaphore(2, capacity = 5)
+  println(s"partial ${partial.availablePermits()} ${partial.withPermit(() -> "body")}")
+  partial.acquire()
+  spawn(() -> partial.release()).join()
+  println(s"partial again ${partial.availablePermits()}")

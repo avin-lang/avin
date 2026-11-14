@@ -74,17 +74,24 @@ goes on running after the call. What a program can rely on:
   keeps its result, and `join` answers it as before. A thread started in a cancelled scope runs
   nothing.
 - **Every wait is a cancellation point**: a `sleep`, a join, a channel's `receive` or a full channel's
-  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed), a socket's
+  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed), a wait
+  group's `wait` (plain or timed), a semaphore's `acquire` (plain, timed or in `withPermit`), a
+  read-write lock's `read` and `write` waiting to go in, a barrier's `wait`, a socket's
   `accept`, `connect`, read or write that waits for its connection. A thread
   parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
   compiled code makes on every back edge of a loop and before every call that may recur, so a thread
   that computes without waiting stops too, within a loop's turn.
 - **A thread is never stopped where others may be waiting on what it is doing**: while it holds a
-  lock (inside a `Mutex`'s `with`, for one), while it initializes a `lazy val`, while it runs what
+  lock (inside a `Mutex`'s `with`, for one), while it writes a `RwLock`, while it runs a barrier's
+  action, while it initializes a `lazy val`, while it runs what
   waits for a future it completed. It goes on to the end of that region and stops at its first
   cancellation point after, so a cancelled thread never leaves a mutex held or a value half made. Waiting
   for a lock is not a cancellation point; waiting on a condition is, and a thread stopped there does
-  not take its mutex again.
+  not take its mutex again. A wait that left a mark on what it waits for takes it back as it stops:
+  a writer or a reader waiting for a `RwLock` no longer holds back those behind it, and a party
+  waiting at a `Barrier` withdraws its arrival. A thread stopped inside a `RwLock`'s read body or a
+  semaphore's `withPermit` body gives its share of the lock, or its permit, back as it stops; what
+  such a body was doing is its own, as any cancelled code's is.
 - **Cancellation reaches down through scopes.** A cancelled thread that is running a scope of its own,
   in that scope's body or waiting for its threads, stops first at that scope: the inner scope cancels
   its threads and waits for them to end, and only then does the thread go on stopping. So every
@@ -383,6 +390,49 @@ will own its handles across every message, whichever thread runs it.
   many at once: every other call waits until that body has returned, and returns without running its
   own. `isDone()` says whether it has run. A body that runs its own `Once` again traps, as a mutex
   taken twice does.
+- **`WaitGroup()`**, a count of work under way. `add(n)` counts `n` more pieces (or `-n` finished,
+  where `n` is negative), `done()` counts one finished, and `wait()` sleeps until the count is zero,
+  returning at once where it is. `waitFor(timeoutMillis: long) -> bool` and
+  `waitFor(timeout: Duration) -> bool` wait at most that long and answer whether the count reached
+  zero; a time that is not positive only asks. `pending()` reads the count. It counts work, not
+  threads, so the pieces may be finished by threads started anywhere (a scope, an executor, an
+  actor) or by no new thread at all; threads a body starts and waits for itself are a
+  [scope](#starting-and-joining)'s to count, so a wait group has no `spawn` of its own. A count taken
+  below zero traps, since a piece was finished twice or never added. A wait group is sendable.
+- **`Semaphore(permits: int, capacity: int = permits)`**, a count of permits. `acquire()` takes one,
+  sleeping while there is none; `tryAcquire() -> bool` takes one only where one is free now;
+  `acquireFor(timeoutMillis: long) -> bool` and `acquireFor(timeout: Duration) -> bool` wait at most
+  that long; `release()` gives one back, waking a waiter. `withPermit(body)` takes a permit for its
+  body and gives it back when the body returns, giving back what it returned; a cancellation that
+  stops the thread inside the body gives the permit back too, and a trap inside it stops the
+  program even in an [actor](/spec/actors/), since the permit would never come back. A semaphore holds at most `capacity`
+  permits, `permits` of them at first, so `Semaphore(0, capacity = 1)` starts empty and signals. A
+  release that would hold more than the capacity traps, since it gives back a permit nobody took, as
+  does a semaphore made with negative permits, a capacity below one, or more permits than its
+  capacity. Permits belong to no thread: one thread may take a permit another gives back. Waiters
+  take no place in a queue, so a thread that asks just as a permit comes back may take it before one
+  that has waited longer. A semaphore is sendable.
+- **`RwLock[T](value)`**, a value many threads may read at once and one at a time may write. It owns
+  its value as a `Mutex` does, made in the argument, and its bodies are `@isolating` and give back a
+  sendable value: `read[R: Sendable](@isolating body: (T) -> R) -> R` runs alongside any other
+  readers, `write[R: Sendable](@isolating body: (T) -> R) -> R` alone. A read body only reads; one
+  that changes a value other readers are reading races with them, which nothing checks. For a
+  sendable value `get()` reads, `set(v)` writes and `update(f)` replaces the value with `f` of it,
+  giving back the new value. **Writers come first**: once a writer waits, a thread that asks to read
+  waits behind it, so a stream of overlapping readers never keeps a writer out; and when a write
+  ends, every reader that was waiting goes in before the next writer, so a stream of writers never
+  keeps those readers out. A write body runs to its end once begun, as a mutex's does; a read body is
+  stopped by a cancellation like any other code, and its share of the lock is given back as it stops.
+  A trap inside either body stops the program, even in an actor, as one under a mutex does.
+  It is not reentrant: reading or writing inside one's own write traps, and writing inside one's own
+  read, or reading inside it while a writer waits, waits for ever. It is sendable whatever `T` is.
+- **`Barrier(parties: int, action: () -> unit = () -> ())`**, a meeting point for `parties` threads.
+  `wait() -> bool` sleeps until that many have called it, then all go on and the barrier is ready for
+  the next round; the last to arrive runs the `@sendable` `action` first, once a round, with the
+  others still waiting, and its `wait` answers `true`, every other `false`. The action runs to its
+  end once begun, and one that waits on its own barrier traps. A party whose thread is cancelled while
+  it waits takes its arrival back, so the round still waits for `parties` threads. `parties` reads the
+  number and `waiting()` how many wait now. A barrier has at least one party, and is sendable.
 - **`lazy val`s**, module-level and fields alike ([Initialization](declarations.md#initialization)),
   initialized by exactly one thread, as a `Once` is run: a thread that reads one while another runs
   its initializer waits, safe for the collector, and the stored value is published with a release
@@ -534,8 +584,12 @@ main() -> int
 Starting a thread happens before its body; its end happens before `join` returns; releasing a
 `Mutex` happens before the next thread takes it; a `send` happens before the `receive` that gets the
 value; an `Atomic` store happens before every load that reads it; and completing a future happens
-before every `await` that gives its value and before every combinator's function runs with it. A
-program whose shared
+before every `await` that gives its value and before every combinator's function runs with it.
+In the rest of the kit: a wait group's `add` and `done` happen before every `wait` they let return;
+a semaphore's `release` happens before the acquire that takes the permit it gave back; the end of a
+`RwLock`'s write happens before every read and write after it, and the end of a read before the
+write after it; and every party's arrival at a barrier happens before that round's action, which
+happens before every party's `wait` of the round returns. A program whose shared
 mutable state is reached only under those edges sees sequentially consistent behaviour.
 
 **A data race on a plain field or `var` is not undefined behaviour.** A racing read returns some
