@@ -466,6 +466,95 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    rebuild, a design for checked interfaces per module (today one checker holds the whole program by
    index, so this is a rewrite of how symbols are numbered, not a cache).
 
+### Sound initialization: build plan
+
+Designed in [Initialization](/spec/declarations/#initialization), its choices proposed in
+[decisions](/spec/decisions/#proposed): no field, module-level value or `lazy val` is read before it
+is set, proved when the program is compiled.
+
+**What 0.0.21 does (probed 2026-11-13).** The class-body rule, the open-class rule, trait fields,
+the module order (within and across modules, through calls, dispatch, operators, iterators,
+default arguments and lambdas made) and locals are all checked at compile time, and every probe of
+them was refused with the error the chapter gives or ran correctly. What is not:
+
+| Probe | What happens | Kind |
+| --- | --- | --- |
+| A lambda in a superclass's arguments reading a field, `class Late: Base(() -> late)`, the superclass calling it in its body | a `long` field reads `0`; a `string`, `Vector` or generic field crashes (exit 139) | **hole** |
+| The same with a method value, `Base(name)` | crash (exit 139) | **hole** |
+| The same with an argument passed by name, `Base(pick(true, s * 2))` | reads `0` | **hole** |
+| The same for an inherited field, `Leaf: Mid(() -> m)` with `m` Mid's | reads `0` | **hole** |
+| The same from an `object` extending a class | reads `0` | **hole** |
+| `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | run-time check |
+| A lazy's initializer joining a thread that reads the same lazy | waits for ever | liveness |
+| `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | false error |
+
+The holes have one cause: `field_read` in `check.sysl` refuses a field read only when the
+constructor is the current function, and the superclass's arguments are never scanned by
+`check_class_initialization`, so a function made there (a lambda, a by-name thunk, a method value)
+reads the object unchecked. Nothing in `library/`, `examples/` or `packages/` passes such a
+function (grep of every class header with a superclass call for `->`: none), so closing it changes
+no code there. The `lazy` change turns `tests/run/lazy_cycle.avin` and
+`tests/run/lazy_threads_cycle.avin` into reject tests; the library's own self-referring lazy values
+(the `LazyList` knots in `lazy_list.avin`) read themselves by name inside an argument passed by
+name, which stays legal.
+
+**The items**, each one agent, gated on its own, in this order:
+
+1. **Superclass arguments use nothing of the object.** `check_class_initialization` scans the
+   superclass-initialization item with an `InitScan` for the superclass's arguments (no field
+   ready, inherited or own), so a lambda, a by-name argument, a local function or a method value
+   that uses `self`, a field or a method is an error with the chapter's wording; objects extending a
+   class go through the same path. Files: `compiler/dev/avinlang/compiler/check.sysl`
+   (`check_class_initialization`, `init_violation`'s wording, the method-value case near
+   `check.sysl:15773`). Tests: `tests/reject/initialization_super_args.avin` (a lambda reading an own
+   field, one reading an inherited field, a method value, a by-name argument, an object's
+   arguments) and `tests/reject/initialization_super_args_more.avin` (a generic superclass, a lambda
+   inside a lambda, a lambda calling a method, one in a tuple or a collection argument, a lambda
+   through two levels of superclass); `tests/run/initialization_super_args.avin`, the legal cases
+   (functions capturing class parameters, module values and another object, a by-name argument
+   reading a parameter, the superclass calling each in its body), at `-O0` and `-O2` under GC
+   stress. Every 2026-11-13 hole above is one of these cases.
+2. **An object's name is `self` in its own body.** The checker resolves the object's own name inside
+   its body, methods, lambdas and lazy initializers to `self`, so the object rules apply to it and
+   the module order counts only what the body runs while the object is made. File: `check.sysl`
+   (where a name resolves to a module-level object). Tests: `tests/run/initialization_object_self_name.avin`
+   (a lazy field reading `O.k`, a lambda made after the last field, a method, an object extending a
+   class), `tests/reject/initialization_object_self_name.avin` (`O.y` above `y`, `O` passed before
+   the last field, `O.m()` before the last field, `O` read in its superclass's arguments).
+3. **Module-level lazy cycles at compile time.** `Uses` (`globals.sysl`) keeps the functions a body
+   calls apart from those it makes (lambdas, by-name thunks, method values); the module order
+   follows both, as now, and a new reach follows only calls and the lazy values read. A module-level
+   `lazy val` that reaches itself is an error naming the chain of lazy values, reported from its
+   earliest-declared member as module cycles are. The run-time trap (`lower.sysl`, `trap_site` of
+   `is read while it is being initialized`) stays for reads through handed-on functions. Tests:
+   `tests/reject/lazy_cycles.avin` (itself, through another lazy, through a function, through a
+   trait's implementation, through an operator), `tests/programs/reject/lazy_cycle_modules/` (across
+   two modules), `tests/run/lazy_self_deferred.avin` (`ones`, the Fibonacci knot, a handler naming
+   its own value, a method value stored), `tests/run/lazy_deferred_trap.avin` (a lambda the
+   initializer makes and calls at once: still the trap, `.err`); `lazy_cycle.avin` becomes a reject
+   test.
+4. **Field lazy cycles at compile time.** A pass beside `check_initialization` (`check.sysl`) follows,
+   per class, the lazy fields read and the methods called on `self` (bare names, `self.`, the
+   overrides a call through a slot may reach in subclasses), from each lazy field's initializer; a
+   read of another instance is not followed. Tests: `tests/reject/lazy_field_cycles.avin` (direct,
+   through another lazy field, through a method, through `self.x`, through a subclass's override)
+   and its generic and object variants; `tests/run/lazy_field_other_instance.avin` (a node's depth, a
+   tree's size, a lazy reading the same lazy of another instance through a method, at `-O0` and
+   `-O2`); `lazy_threads_cycle.avin` becomes a reject test and a handed-on read on a second thread
+   keeps a run test with its trap.
+
+The test matrix every item fills, each cell a test that would fail if the rule were false:
+
+| Rule | Refused shapes | Accepted shapes | Neighbours |
+| --- | --- | --- | --- |
+| Class body | read below; method; `self` passed; lambda, by-name, local fn, method value | read above; after the last field anything | generic class, actor class, `with`-free data |
+| Open/abstract body | override reachable; trait `val` a subclass supplies; unsafe private | safe private method | trait default method |
+| Superclass arguments | every function using the object | parameters, module values | object extending a class, generic superclass |
+| Trait fields | method call; lambda; field below | fields above, parameters | two traits, required traits |
+| Object name | above its field; passed early | lazy, lambda after last field, method | object extending a class |
+| Module values | cycles in one module, across modules, through dispatch, operators, defaults, iterators | declaration order kept | object, `var` written by another initializer |
+| `lazy val` | self, chain, function, dispatch, field via `self` | other instance, handed-on read after return | threads, actors, generic class |
+
 ### Higher-kinded types: build plan
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
