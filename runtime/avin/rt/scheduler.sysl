@@ -61,6 +61,13 @@ struct Lwt
     cancel_guard: SleepLock
     /** The waiter of the cancellable wait the thread is parked in, or null. */
     cancel_waiter: *Waiter
+    /** The thread's number, counted from 1 in the order threads start, and its place among every
+     * thread started and not yet ended; under `sched`. */
+    id: u64
+    all_prev: *Lwt
+    all_next: *Lwt
+    /** Whether the thread is ready, running, parked or ending, for the thread dump. */
+    phase: Atomic[u32]
 
 @assert(offsetof(Lwt, context) == 0, "a lightweight thread's context is the start of its storage")
 @assert(offsetof(Lwt, run) == offsetof(Lwt, root) + sizeof(Frame), "a frame's slots follow its header")
@@ -109,6 +116,23 @@ var workers_started: Atomic[u64] = Atomic(0)
 var releases: Atomic[u64] = Atomic(0)
 /** How many times a lightweight thread has yielded at a poll. */
 var yields: Atomic[u64] = Atomic(0)
+/** Every lightweight thread started and not yet given back, oldest first, and the last number given
+ * one. */
+private var first_lwt: *Lwt = null
+private var last_lwt: *Lwt = null
+private var lwts_started: u64 = 0
+/** How many workers have taken a thread to run and not yet come back for another. */
+private var running_now: usize = 0
+
+// A lightweight thread's phase, for the thread dump.
+/** In the ready queue. */
+const PhaseReady: u32 = 0
+/** Running on a worker. */
+const PhaseRunning: u32 = 1
+/** Parked, waiting. */
+const PhaseParked: u32 = 2
+/** Ended, its worker not yet done with it. */
+const PhaseEnding: u32 = 3
 
 /** How many workers have been started, for a program that looks at how its threads are carried. */
 scheduler_workers() -> long = long(workers_started.load())
@@ -125,11 +149,69 @@ runs_lightweight(ctx: *Context) -> bool = ctx.carrier != null && ctx.carrier.wor
 /** Starts a lightweight thread, `p`, which is attached and safe: puts it at the back of the ready
  * queue. */
 start_lightweight(p: *Lwt)
+    sched.lock_raw()
+    lwts_started += 1
+    p.id = lwts_started
+    p.all_prev = last_lwt
+    p.all_next = null
+    if last_lwt == null then first_lwt = p else last_lwt.all_next = p
+    last_lwt = p
+    sched.unlock_raw()
     make_ready(p)
+
+/** Whether no lightweight thread is running or ready: every one started is parked, or there is none. */
+scheduler_quiet() -> bool
+    sched.lock_raw()
+    val quiet = running_now == 0 && ready_head == null
+    sched.unlock_raw()
+    quiet
+
+/** A line for each lightweight thread started and not yet ended, oldest first, saying what it is
+ * doing: with how long it has waited where `timed`, and leaving idle workers out where not. */
+lightweight_lines(now: long, timed: bool) -> Buf[string]
+    var lines: Buf[string] = buf()
+    sched.lock_raw()
+    var p = first_lwt
+    while p != null
+        val phase = p.phase.load()
+        val waits = p.context.waits.load()
+        if timed || phase != PhaseParked || !idle_worker(waits)
+            lines.push("  thread " + p.id.to_string() + ": " + phase_text(p, phase, waits, now, timed) + "\n")
+        p = p.all_next
+    sched.unlock_raw()
+    lines
+
+/** How many lightweight threads are parked now, for a program that waits until its threads are. */
+lightweight_parked() -> long
+    sched.lock_raw()
+    var n: long = 0
+    var p = first_lwt
+    while p != null
+        if p.phase.load() == PhaseParked then n += 1
+        p = p.all_next
+    sched.unlock_raw()
+    n
+
+// What `p`, in `phase`, is doing.
+private phase_text(p: *Lwt, phase: u32, waits: u32, now: long, timed: bool) -> string
+    if phase == PhaseReady then return "ready"
+    if phase == PhaseEnding then return "ending"
+    if phase == PhaseParked then return waits_line(waits, p.context.waits_since.load(), now, timed)
+    val k = p.context.carrier
+    if k != null && k.blocked.load() != 0 then "running, in a blocking call" else "running"
+
+// Under `sched`: takes `p`, which has ended, out of the threads started.
+private forget_lwt(p: *Lwt)
+    if p.all_prev == null then first_lwt = p.all_next else p.all_prev.all_next = p.all_next
+    if p.all_next == null then last_lwt = p.all_prev else p.all_next.all_prev = p.all_prev
+    p.all_prev = null
+    p.all_next = null
 
 /** Puts `p`, a parked or new lightweight thread, at the back of the ready queue, and has a worker
  * take it: an idle one, or a new one while fewer than the target are counted. */
 make_ready(p: *Lwt)
+    _ = wakes.add(1)
+    p.phase.store(PhaseReady)
     sched.lock_raw()
     p.next = null
     if ready_tail == null then ready_head = p else ready_tail.next = p
@@ -187,14 +269,32 @@ private work_loop(started: *Atomic[u64]) -> unit
     workers = k
     sched.unlock_raw()
     _ = started.add(1)
+    var ended: *Lwt = null
+    var ran = false
     loop
-        val p = next_ready(k)
-        run_on(k, p)
+        val p = next_ready(k, ran, ended)
+        ran = true
+        ended = run_on(k, p)
 
 // The next thread for `k` to run, waiting while there is none. A worker the monitor released rejoins
-// the count here, or rests as a spare until it is called where the count is full.
-private next_ready(k: *Carrier) -> *Lwt
+// the count here, or rests as a spare until it is called where the count is full. Where `ran`, the
+// worker is back from running a thread, `ended` where that thread ended: it is given back here. A
+// worker that leaves no thread running or ready has the main thread look for a deadlock, where it
+// waits.
+private next_ready(k: *Carrier, ran: bool, ended: *Lwt) -> *Lwt
     sched.lock_raw()
+    if ended != null then forget_lwt(ended)
+    if ran
+        running_now -= 1
+        if running_now == 0 && ready_head == null && main_watching.load() != 0
+            sched.unlock_raw()
+            poke_main()
+            sched.lock_raw()
+    if ended != null
+        // Its storage goes once nothing can find it among the threads started.
+        sched.unlock_raw()
+        ended.me = None
+        sched.lock_raw()
     loop
         if k.released
             k.released = false
@@ -211,6 +311,7 @@ private next_ready(k: *Carrier) -> *Lwt
             ready_head = p.next
             if ready_head == null then ready_tail = null
             p.next = null
+            running_now += 1
             val start = if ready_head != null then more_hands() else false
             sched.unlock_raw()
             if start then start_worker()
@@ -219,10 +320,12 @@ private next_ready(k: *Carrier) -> *Lwt
         work.wait(&sched)
         idle -= 1
 
-// Runs `p` on `k` until it switches back, then does what it asked for. The worker's own code never
-// moves between threads, so it is where the thread-local context is set.
-private run_on(k: *Carrier, p: *Lwt)
+// Runs `p` on `k` until it switches back, then does what it asked for, and answers `p` where it ended,
+// for the worker to give back, or null. The worker's own code never moves between threads, so it is
+// where the thread-local context is set.
+private run_on(k: *Carrier, p: *Lwt) -> *Lwt
     p.context.carrier = k
+    p.phase.store(PhaseRunning)
     k.slice_start.store(now_micros())
     k.yield_wanted.store(0)
     k.busy.store(1)
@@ -251,7 +354,8 @@ private run_on(k: *Carrier, p: *Lwt)
         make_ready(p)
     elif after == AfterEnd
         give_stack(p)
-        p.me = None
+        return p
+    null
 
 @noinline
 private set_current(c: *Context)
@@ -279,6 +383,7 @@ private lwt_finish(p: *Lwt)
     joint_finished(p.joint)
     heap_lock.unlock()
     cancel_finished(p)
+    p.phase.store(PhaseEnding)
     val k = c.carrier
     k.after = AfterEnd
     fiber.switch(&p.fiber, &k.home)
@@ -295,6 +400,7 @@ park(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long)
 park_as(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long, cancel: *Waiter)
     mark_safe(ctx)
     val p: *Lwt = ptr_cast(ctx)
+    p.phase.store(PhaseParked)
     val k = ctx.carrier
     k.after = AfterPark
     k.after_guard = guard
@@ -390,8 +496,14 @@ struct WaitQueue
     guard: SleepLock
     head: *Waiter
     tail: *Waiter
+    /** What a thread waiting here waits on, a wait kind (`diagnostics.sysl`). */
+    kind: u32
 
-new_wait_queue() -> WaitQueue = WaitQueue(SleepLock.new(), null, null)
+/** A queue of threads waiting on a condition. */
+new_wait_queue() -> WaitQueue = new_wait_queue_for(WaitsOnCondition)
+
+/** A queue of threads waiting on `kind`. */
+new_wait_queue_for(kind: u32) -> WaitQueue = WaitQueue(SleepLock.new(), null, null, kind)
 
 /** Under `q`'s guard: puts `w` at the back of `q`. */
 enqueue(q: *WaitQueue, w: *Waiter)
@@ -446,6 +558,7 @@ wait_on(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long) -> bool = wait
  * `w`'s state `WaitCancelled` and `w` off `q`, and the caller goes on with the cancellation
  * (`cancel.sysl`). */
 wait_on_as(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long, cancellable: bool) -> bool
+    begin_waiting(ctx, q.kind, deadline > 0)
     if runs_lightweight(ctx)
         w.lwt = ptr_cast(ctx)
         park_as(ctx, &q.guard, if deadline > 0 then w else null, deadline, if cancellable then w else null)
@@ -453,8 +566,9 @@ wait_on_as(ctx: *Context, q: *WaitQueue, w: *Waiter, deadline: long, cancellable
     else
         q.guard.unlock()
         enter_safe(ctx)
-        block_until_woken(w, deadline)
+        block_until_woken(ctx, w, deadline)
         leave_safe(ctx)
+    end_waiting(ctx)
     if w.state.load() == WaitWoken then return true
     q.guard.lock()
     unlink_waiter(q, w)
@@ -483,11 +597,16 @@ sleep_for(ctx: *Context, us: long)
  * did, the caller to go on with the cancellation (`cancel.sysl`). */
 sleep_as(ctx: *Context, us: long, cancellable: bool) -> bool
     if us <= 0 then return false
-    if runs_lightweight(ctx) then return park_until(ctx, deadline_in(us), cancellable)
+    begin_waiting(ctx, WaitsOnSleep, true)
+    if runs_lightweight(ctx)
+        val cancelled = park_until(ctx, deadline_in(us), cancellable)
+        end_waiting(ctx)
+        return cancelled
     enter_safe(ctx)
     val w = waiter_of(ctx)
-    block_until_woken(w, deadline_in(us))
+    block_until_woken(ctx, w, deadline_in(us))
     leave_safe(ctx)
+    end_waiting(ctx)
     false
 
 // Parks the lightweight thread `ctx` belongs to until `deadline`. Its timer takes itself off the
@@ -507,10 +626,22 @@ private park_until(ctx: *Context, deadline: long, cancellable: bool) -> bool
 private var blocked_lock: Mutex[unit] = Mutex.new(())
 private var blocked_woken: Condvar = Condvar.new()
 
-private block_until_woken(w: *Waiter, deadline: long)
+// Blocks the operating system thread of `ctx` until `w` is woken or `deadline` passes. The main
+// thread, waiting without a limit, looks for a deadlock as it begins and each time a worker pokes it:
+// a poke that comes between its look and its wait is seen, since the count it read has moved.
+private block_until_woken(ctx: *Context, w: *Waiter, deadline: long)
+    val watched = deadline <= 0 && ctx == &main_context
+    if watched then main_watching.store(1)
     blocked_lock.lock_raw()
     while w.state.load() == WaitPending
         if deadline <= 0
+            if watched
+                val seen = pokes.load()
+                blocked_lock.unlock_raw()
+                if all_waiting() then deadlocked(ctx)
+                blocked_lock.lock_raw()
+                if w.state.load() != WaitPending then break
+                if pokes.load() != seen then continue
             blocked_woken.wait(&blocked_lock)
         else
             val left = deadline - now_micros()
@@ -519,8 +650,10 @@ private block_until_woken(w: *Waiter, deadline: long)
             else
                 _ = blocked_woken.wait_for(&blocked_lock, left * 1000)
     blocked_lock.unlock_raw()
+    if watched then main_watching.store(0)
 
-private wake_blocked()
+/** Wakes every operating system thread blocked in a wait, each to look at its own waiter. */
+wake_blocked()
     blocked_lock.lock_raw()
     blocked_woken.notify_all()
     blocked_lock.unlock_raw()
