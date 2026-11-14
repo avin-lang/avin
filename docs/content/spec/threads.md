@@ -74,7 +74,7 @@ goes on running after the call. What a program can rely on:
   keeps its result, and `join` answers it as before. A thread started in a cancelled scope runs
   nothing.
 - **Every wait is a cancellation point**: a `sleep`, a join, a channel's `receive` or a full channel's
-  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed), a socket's
+  `send`, timed or not, a `select`, a `withTimeout`'s wait for its body, a future's `await`, a promise's future, a condition's `wait` (plain or timed), a socket's
   `accept`, `connect`, read or write that waits for its connection. A thread
   parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
   compiled code makes on every back edge of a loop and before every call that may recur, so a thread
@@ -378,7 +378,8 @@ will own its handles across every message, whichever thread runs it.
   gives `Some` of it, or `None` once the channel is closed and every value sent before is received.
   `close()` wakes every waiting thread, and a send to a closed channel traps; closing twice does
   nothing. `trySend(x) -> bool` and `tryReceive() -> Option[T]` never wait, and `isClosed()` asks.
-  A channel is `Iterable`: `for x in ch` receives until it is closed and drained.
+  A channel is `Iterable`: `for x in ch` receives until it is closed and drained. The waits have
+  [timed forms](#timers-and-deadlines), `receive(timeout)` and `send(x, timeout)`.
 - **`Once`**, whose `run(body)` runs its body exactly once, whichever threads call it and however
   many at once: every other call waits until that body has returned, and returns without running its
   own. `isDone()` says whether it has run. A body that runs its own `Once` again traps, as a mutex
@@ -477,6 +478,82 @@ work(jobs: Channel[int], stop: Channel[unit], results: Channel[int])
       jobs.receive() as None -> going = false
       stop.receive() as None -> going = false
 ```
+
+## Timers and deadlines
+
+Time reaches threads as channels and as limits on their waits, all in `avin.threads`, each taking a
+[`Duration`](/spec/time/). Every one of them waits as the other waits do: parking its lightweight
+thread on the runtime's timers, holding no worker, safe for the collector, and a cancellation point.
+
+```avin
+import avin.threads.{Channel, Ticker, after}
+import avin.time.seconds
+
+// Reports progress every second, and gives up on a result after five.
+watch(results: Channel[int]) -> Option[int]
+  val progress = Ticker(seconds(1))
+  val deadline = after(seconds(5))
+  var got: Option[int] = None
+  var waiting = true
+  while waiting
+    select
+      results.receive() as r ->
+        got = r
+        waiting = false
+      progress.ticks.receive() -> println("still waiting")
+      deadline.receive() -> waiting = false
+  progress.stop()
+  got
+```
+
+What a program can rely on:
+
+- **`after(d) -> Channel[Instant]`** gives a channel that delivers one value once `d` has passed from
+  the call, at once for a duration of zero or less: the [`Instant`](/spec/time/) at which the time
+  fell due, however late it is received. It is never delivered sooner. Only that one value ever
+  comes; a receive after it waits for ever, as on any channel nobody sends to, unless the channel is
+  closed, which ends it: nothing is delivered after a close. Of several threads receiving from one,
+  one gets the value. It is an ordinary channel to receive from, alone, with a timeout, or as a
+  `select` arm (`after(d).receive() -> …`, beside the `after d` arm, which it does not replace).
+- **An `after` nobody receives from costs nothing but itself.** The channel holds the time its value
+  falls due, a number, and no timer, thread or registration anywhere: the value is delivered by the
+  first receive or select that looks once the time has come, and a thread waiting on the channel waits
+  on its condition until that time at the most, its timer going with its wait. So an `after` that is
+  dropped, lost in a select to another arm, or waited on by a thread that is cancelled leaves nothing
+  behind and is collected like any object once nothing reaches it, however long its duration.
+- **`Ticker(period)`** delivers a tick on its channel `ticks` every `period`, the first a period after
+  it is made, each tick the instant it fell due, so each later than the one before. The channel holds
+  one tick at the most: **a tick that falls due while one is waiting to be received is dropped**, so a
+  slow receiver gets the oldest tick it has not received and then the ticks from its next period on,
+  never a backlog to catch up on. `stop()` ends the ticks: none is received after it, not even one
+  that fell due before and was waiting; stopping twice is stopping once, and a thread waiting on
+  `ticks` goes on waiting. A ticker, like `after`, holds no timer or thread, so one dropped without
+  `stop` is collected as any object is. A period of zero or less traps. A `Ticker` is sendable.
+- **Nothing sends to these channels but their clocks.** A `send`, `trySend`, timed send or `select`
+  send arm on a channel `after` or a `Ticker` made traps.
+- **`receive(timeout: Duration) -> Option[T]`** waits at most `timeout` for a value: `Some` of one, as
+  soon as it comes, or `None` where the time ran out first or once the channel is closed and every
+  value sent before is received; `isClosed()` tells the two apart where it matters. **`send(x,
+  timeout: Duration) -> bool`** waits at most `timeout` for room in a bounded channel and answers
+  whether it sent `x`, at once on an unbounded one; a value whose time ran out is not sent. A send to
+  a closed channel traps, as `send` does, rather than answering `false`. A timeout of zero or less is
+  the `try` form, `tryReceive` or `trySend`. Neither waits less than its timeout where nothing comes,
+  a part of a millisecond waited for as a whole one.
+- **`withTimeout(timeout, s -> …) -> Option[T]`** runs its body with a new [scope](#starting-and-joining)
+  for at most `timeout`: `Some` of what the body returns where it returns in time, `None` where the time
+  runs out first. Then the body is cancelled where it is, waiting or computing, with every thread its
+  scope started and everything below them, as a scope's [`cancel`](#cancellation) cancels them, and
+  `withTimeout` answers once they have all ended. A body that has returned keeps its result, however
+  close to the time it did. A timeout of zero or less runs nothing and answers `None`. Timeouts nest:
+  an inner one ends at its own time or when an outer one's runs out, whichever is sooner, and a
+  `withTimeout` on a thread a scope cancels stops with that thread, its body first.
+- **The body of a `withTimeout` runs on a lightweight thread of its own**, so that it can be stopped
+  wherever it is, even when `withTimeout` is called from `main`, whose own thread no cancellation
+  reaches. The calling thread waits for it, so the body reads and assigns the caller's variables, uses
+  the Sysl handles the caller owns and those it makes are the caller's after it, as a closure the
+  caller ran itself would. What tells the threads apart still does: `isMainThread()` answers `false` in
+  the body, and a lock the caller holds is not the body's, so a body that takes it waits for ever, and
+  one that waits on a condition of it traps.
 
 ## Futures
 

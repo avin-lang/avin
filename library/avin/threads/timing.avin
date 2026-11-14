@@ -1,0 +1,55 @@
+module avin.threads
+
+// Time as channels: `after` gives a channel that delivers one instant once a duration has passed, and
+// a `Ticker` one that delivers an instant every period, each to be received from, alone or as an arm of
+// a `select`. Neither starts a thread or sets a timer of its own. The time a value falls due is held
+// in the channel (`channel.avin`), and the value is delivered by the first receive or select that
+// looks once the time has come; a thread waiting on the channel parks on the runtime's timers until
+// then at the most, as any timed wait does. So a channel nobody receives from holds nothing but its
+// own few words, and is collected once nothing reaches it.
+
+import avin.time.{Duration, Instant, epochMicros, monotonic, now}
+
+// A channel that delivers one value, the instant at which `d` had passed, once `d` has passed from
+// the call; at once for a duration of zero or less. Only that one value is ever delivered: a receive
+// after it waits for ever, unless the channel is closed. Nothing may be sent to it; a send traps.
+//
+//     select
+//       results.receive() as Some(r) -> use(r)
+//       after(millis(50)).receive() -> giveUp()
+after(d: Duration) -> Channel[Instant]
+  val ch = Channel[Instant](1)
+  ch.startClock(Clock(monotonic().micros +| (if d.micros > 0 then d.micros else 0), 0, instantAt))
+  ch
+
+// Delivers a tick on `ticks` every `period`, the instant each fell due, for as long as it runs; the
+// first comes one period after the ticker is made. The channel holds one tick at the most: a tick that
+// falls due while one is waiting to be received is dropped, so a slow receiver gets the oldest tick it
+// has not received and then the ticks from its next period on, never a backlog. `stop()` ends the
+// ticks: none is received after it, even one that fell due before. A period of zero or less traps.
+//
+//     val t = Ticker(seconds(1))
+//     for at in t.ticks do report(at)
+class Ticker(period: Duration): Sendable
+  private val clock = tickerClock(period)
+
+  // Where the ticks are received. Nothing may be sent to it; a send traps.
+  val ticks: Channel[Instant] = tickerChannel(clock)
+
+  // Ends the ticks, and drops one that fell due and is not yet received. Stopping twice is stopping
+  // once. A thread waiting on `ticks` goes on waiting, as on any channel nobody sends to.
+  stop() = ticks.stopClock(clock)
+
+// The clock of a ticker of `period`, its first tick a period from now.
+private tickerClock(period: Duration) -> Clock[Instant]
+  if period.micros <= 0 then fail("a ticker's period is positive")
+  Clock(monotonic().micros +| period.micros, period.micros, instantAt)
+
+// The channel a ticker's ticks come on, given its clock.
+private tickerChannel(k: Clock[Instant]) -> Channel[Instant]
+  val ch = Channel[Instant](1)
+  ch.startClock(k)
+  ch
+
+// The instant at the time `at` on the monotonic clock in microseconds, as the wall clock read it.
+private instantAt(at: long) -> Instant = epochMicros(now().epochMicros - (monotonic().micros - at))

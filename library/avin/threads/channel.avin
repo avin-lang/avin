@@ -1,5 +1,7 @@
 module avin.threads
 
+import avin.time.{Duration, micros, monotonic}
+
 // A channel of sendable values may be shared between threads: every send and receive is synchronized.
 impl[T: Sendable] Sendable for Channel[T]
 
@@ -12,6 +14,11 @@ impl[T: Sendable] Sendable for Channel[T]
 // collector while it waits. Iterating a channel receives from it until it is closed and drained:
 //
 //     for job in jobs do run(job)
+//
+// A channel `after` or a `Ticker` makes (`timing.avin`) holds a clock instead of a sender: the time
+// its next value falls due, a number in the channel, so it costs no timer and no thread while nobody
+// waits on it. The value is delivered by the first receive or select that looks once the time has
+// come, and a thread waiting on such a channel waits on its condition until that time at the most.
 @keeps_owners
 class Channel[T](capacity: int = 0): Iterable[T]
   private val bound = boundOf(capacity)
@@ -20,10 +27,15 @@ class Channel[T](capacity: int = 0): Iterable[T]
   private val readable = Condition(lock)
   private val writable = Condition(lock)
   private var closed = false
+  // Whether `after` or a `Ticker` made the channel, which nothing sends to; set before the channel
+  // is shared, and never changed after.
+  private var timed = false
+  private var clock: Option[Clock[T]] = None
 
   // Puts `x` at the back, waiting while a bounded channel is full; traps where the channel is
   // closed.
   send(x: T)
+    sendable()
     lock.acquire()
     while !closed && full() do writable.wait()
     if closed
@@ -33,9 +45,29 @@ class Channel[T](capacity: int = 0): Iterable[T]
     readable.notify()
     lock.release()
 
+  // Puts `x` at the back, waiting at most `timeout` while a bounded channel is full, and answers
+  // whether it did: `false` where the time ran out with the channel still full. A timeout of zero or
+  // less is `trySend`. Traps where the channel is closed, as `send` does.
+  send(x: T, timeout: Duration) -> bool
+    if timeout.micros <= 0 then return trySend(x)
+    sendable()
+    val deadline = monotonic().micros +| timeout.micros
+    lock.acquire()
+    while !closed && full() && monotonic().micros < deadline do waitOn(writable, deadline)
+    if closed
+      lock.release()
+      fail("a send to a closed channel")
+    val room = !full()
+    if room
+      items.append(x)
+      readable.notify()
+    lock.release()
+    room
+
   // Puts `x` at the back where there is room now, and answers whether it did; traps where the
   // channel is closed.
   trySend(x: T) -> bool
+    sendable()
     lock.acquire()
     if closed
       lock.release()
@@ -51,7 +83,25 @@ class Channel[T](capacity: int = 0): Iterable[T]
   // and every value sent before is received.
   receive() -> Option[T]
     lock.acquire()
-    while items.isEmpty && !closed do readable.wait()
+    ripen()
+    while items.isEmpty && !closed
+      waitOn(readable, 0)
+      ripen()
+    val got = taken()
+    lock.release()
+    got
+
+  // Takes the value at the front, waiting at most `timeout` while there is none: `None` where the
+  // time ran out first, or once the channel is closed and every value sent before is received. A
+  // timeout of zero or less is `tryReceive`.
+  receive(timeout: Duration) -> Option[T]
+    if timeout.micros <= 0 then return tryReceive()
+    val deadline = monotonic().micros +| timeout.micros
+    lock.acquire()
+    ripen()
+    while items.isEmpty && !closed && monotonic().micros < deadline
+      waitOn(readable, deadline)
+      ripen()
     val got = taken()
     lock.release()
     got
@@ -59,15 +109,18 @@ class Channel[T](capacity: int = 0): Iterable[T]
   // Takes the value at the front where there is one now; `None` where there is not.
   tryReceive() -> Option[T]
     lock.acquire()
+    ripen()
     val got = taken()
     lock.release()
     got
 
   // Ends the channel: no value is sent to it after, and every thread waiting on it wakes. Closing a
-  // closed channel does nothing.
+  // closed channel does nothing. A channel `after` or a `Ticker` made delivers nothing more once it
+  // is closed.
   close()
     lock.acquire()
     closed = true
+    clock = None
     readable.notifyAll()
     writable.notifyAll()
     lock.release()
@@ -84,6 +137,37 @@ class Channel[T](capacity: int = 0): Iterable[T]
 
   // Whether a bounded channel holds as many values as it may; under the lock.
   private full() -> bool = bound > 0 && items.length >= bound
+
+  // Traps where `after` or a `Ticker` made the channel: its values come from its clock alone.
+  private sendable()
+    if timed then fail("a send to a channel `after` or a `Ticker` made, which only its clock sends to")
+
+  // Delivers what the channel's clock has fallen due for, if anything; under the lock. A clock of one
+  // value delivers it and ends. A ticking one delivers a tick where the channel holds none, and moves
+  // on to its first time after now, so the ticks a slow receiver missed are dropped rather than kept.
+  private ripen()
+    if clock is Some(k)
+      val now = monotonic().micros
+      if now < k.due then return
+      if k.period <= 0
+        items.append(k.stamp(k.due))
+        clock = None
+      else
+        if items.isEmpty then items.append(k.stamp(k.due))
+        k.due = k.due +| ((now - k.due) / k.period + 1) *| k.period
+      readable.notify()
+
+  // Waits on `condition`, which goes with the channel's lock, until it is notified, the channel's
+  // clock falls due, or `deadline` on the monotonic clock in microseconds passes where it is
+  // positive; holds the lock again after. A wait may end with nothing having changed.
+  private waitOn(condition: Condition, deadline: long)
+    val due = if clock is Some(k) then k.due else 0
+    val until = if due > 0 && (deadline <= 0 || due < deadline) then due else deadline
+    if until <= 0
+      condition.wait()
+      return
+    val left = until - monotonic().micros
+    if left > 0 then condition.waitFor(micros(left))
 
   // The value at the front, taken off, waking a sender waiting for room; under the lock. Taking the
   // last value of a closed channel also wakes every `select` waiting for it to be drained.
@@ -104,6 +188,7 @@ impl[T] Channel[T]
   // `ReceiveClosed` or `ReceiveEither`), and otherwise `None`, the arm enlisted where `enlist`.
   offerReceive(wants: int, wait: Selecting, index: int, enlist: bool) -> Option[Option[T]]
     lock.acquire()
+    ripen()
     val ready =
       if wants == ReceiveValue then !items.isEmpty
       elif wants == ReceiveClosed then items.isEmpty && closed
@@ -118,6 +203,7 @@ impl[T] Channel[T]
   // A send of `x` by arm `index` of the select `wait`: whether there was room for it, the arm
   // enlisted where there was not and `enlist`; traps where the channel is closed, as `send` does.
   offerSend(x: T, wait: Selecting, index: int, enlist: bool) -> bool
+    sendable()
     lock.acquire()
     if closed
       lock.release()
@@ -139,6 +225,37 @@ impl[T] Channel[T]
       if !closed && !full() then writable.notify()
     elif !items.isEmpty then readable.notify()
     lock.release()
+
+  // When the select waiting as `wait` is to look at the channel again although nothing notifies it:
+  // the time its clock next falls due, on the monotonic clock in microseconds, or 0 for a channel
+  // with no clock.
+  wakeAt(wait: Selecting) -> long
+    if !timed then return 0
+    lock.acquire()
+    val at = if clock is Some(k) then k.due else 0
+    lock.release()
+    at
+
+// What `after` and a `Ticker` do with the channel they make (`timing.avin`). The clock is of a type
+// private to the module, so only its code calls these.
+impl[T] Channel[T]
+  // Gives the channel, which nothing has reached yet, the clock its values come from.
+  startClock(k: Clock[T])
+    timed = true
+    clock = Some(k)
+
+  // Stops the clock `k`, where it is still the channel's, and drops a value of it not yet received.
+  stopClock(k: Clock[T])
+    lock.acquire()
+    if clock is Some(c) && c === k
+      clock = None
+      items.clear()
+    lock.release()
+
+// When a channel `after` or a `Ticker` made has its next value: `due`, on the monotonic clock in
+// microseconds, and every `period` after it where `period` is positive. `stamp` makes the value for a
+// time it fell due.
+private class Clock[T](var due: long, val period: long, val stamp: (long) -> T)
 
 // A channel's capacity, which is not negative.
 private boundOf(capacity: int) -> int

@@ -8621,6 +8621,71 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   actor's `ActorContext` is; members have no module-wide visibility. Alternatives weighed: a member
   visibility private to the module (a language change of its own); intrinsics the compiler calls
   directly (the arms are generic, and the channel logic belongs in Avin).
+- Proposed (built on branch `timing`): **`after` and `Ticker` are channels holding a clock, not a
+  timer** ([Threads](/spec/threads/#timers-and-deadlines)). `after(d) -> Channel[Instant]` and
+  `Ticker(period)` with its channel `ticks` give ordinary `Channel[Instant]`s whose next value's due
+  time is kept in the channel; the first receive, `tryReceive` or select arm that looks once it is
+  due delivers it, a waiting receive waits on its condition until then at the most, and a select
+  parks until the soonest due time among its arms' channels, then tries them again. The value is the
+  instant the time fell due (the wall clock, offset by the monotonic clock's lateness), not when it
+  was received. Why: an `after` nobody receives from, the common loser of a select, then leaves
+  nothing behind (no timer in the runtime's heap, no thread, no registration) and is collected as
+  any object is, whatever its duration; a channel is what a select arm takes, so no new arm kind or
+  receive-only type is needed. Alternatives weighed: a thread per `after` that sleeps and sends (lives
+  for the whole duration, ten thousand hour-long `after`s holding ten thousand stacks); a runtime
+  timer that sends when it fires (needs the runtime to run Avin code from its timer thread, and a
+  timer to cancel by finalizer when the channel is dropped); a receive-only `Timer` type (a second
+  kind of select arm for the same wait). `Channel`'s `wakeAt`, `startClock` and `stopClock`, which
+  the select and the clocks call, are public as the select's names are, each taking a type private to
+  `avin.threads`, so no program can call them.
+- Proposed (built on branch `timing`): **Nothing sends to a channel `after` or a `Ticker` made.** A
+  `send`, `trySend`, timed send or select send arm on one traps; `close` is allowed and ends it, no
+  value delivered after. Why: the channel is the clock's; a value sent into it would take the tick's
+  place or sit beside it, and Avin has no receive-only channel type to make the mistake a compile
+  error. Alternatives weighed: letting sends through (a receiver could not trust a value to be a
+  tick); a receive-only channel type (a language feature of its own, which a later decision could
+  still add, making this a compile error). Review with the user if a receive-only view of `Channel`
+  is wanted.
+- Proposed (built on branch `timing`): **A ticker drops the ticks a slow receiver misses, and `stop`
+  drops a waiting one.** The channel holds one tick; one falling due while it is held is dropped, and
+  the ticker moves on to its first period after now. The held tick is the oldest missed. `stop()`
+  also drops a tick fallen due and not received, so none is received after it; a period of zero or
+  less traps; the first tick comes a period after the ticker is made; there is no `reset`. Why: a
+  ticker paces work, and a backlog delivered at once to a receiver that fell behind is the opposite
+  of pacing; after `stop`, a stale tick is a surprise. Alternatives weighed: an unbounded backlog;
+  the newest missed tick held rather than the oldest (needs a write into a value the receiver may be
+  taking); keeping the waiting tick after `stop`.
+- Proposed (built on branch `timing`): **Timed channel waits are `receive(timeout: Duration)` and
+  `send(x, timeout: Duration)`**, overloads beside the plain forms, as `Future.await(timeout)` and
+  `Condition.waitFor(timeout)` are. `receive(timeout)` answers `Option[T]`: `None` for a time that ran
+  out and for a closed, drained channel alike (`isClosed()` tells them apart); `send(x, timeout)`
+  answers whether it sent, and traps on a closed channel as `send` does. A timeout of zero or less is
+  `tryReceive`/`trySend`. Why: the shape of `Future.await(timeout)`, and a loop over a channel's values
+  ends the same way whichever ended it. Alternatives weighed: a three-way result (a value, closed,
+  timed out), heavier at every call for a distinction rarely needed; a `within:` named argument (Avin
+  overloads by type already, and no other timed wait is named so); a millisecond `long` overload (the
+  migration below goes the other way). **Proposed migration, not made here**: the
+  millisecond overloads `Condition.waitFor(timeoutMillis: long)` and `Future.await(timeoutMillis:
+  long)` duplicate their `Duration` forms and could be retired in a release that breaks source, their
+  callers moved to `millis(n)`.
+- Proposed (built on branch `timing`): **A scope with a time limit is `withTimeout(timeout, s -> …)
+  -> Option[T]`**, `None` where the time ran out. The body runs with a new scope on a lightweight thread
+  of its own while the caller waits in a select with an `after`; when the time runs out the body's
+  thread is cancelled, which cancels its scope's threads and all below them, and `withTimeout` answers
+  once every one has ended. A result the body returned is kept, however close to the time; a timeout of
+  zero or less runs nothing and answers `None`; nested timeouts end at the sooner time. Why: `Option` is
+  what `Future.await(timeout)` answers, and a timeout is not an error the body made; running the body
+  on a thread of its own is what lets it be stopped wherever it is, `main` included, whose thread no
+  cancellation reaches, with no new runtime mechanism: a timeout is a scope's cancellation. Its cost
+  is that the body is on another thread: `isMainThread()` answers `false` there, and a lock or a
+  condition's mutex the caller holds is not the body's. Alternatives weighed: `Result[T, TimedOut]`
+  (a new error type for a case with nothing to say); `scope(timeout = d, …)` (an overload of `scope`
+  whose result type changes with an argument); a deadline at an `Instant` (the wall clock moves, and a
+  monotonic instant type does not exist yet; one could be added as `withDeadline`); cancelling the
+  calling thread itself from a timer and catching it at the timeout (a new runtime mechanism, an
+  un-cancellable `main`, and a cancellation that must tell its own timeout from an outer cancel).
+  Review with the user: the body running on another thread is visible to code that asks which
+  thread it is on.
 
 ## Open
 

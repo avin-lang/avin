@@ -1,0 +1,154 @@
+// expect: exit 0
+// `withTimeout(d, s -> …)` answers `Some` of what its body returns in time and `None` where the time
+// runs out first. Then the body is stopped where it is, waiting or computing, with every thread its
+// scope started and everything below them, and `withTimeout` answers only once they have all ended.
+// A timeout of zero or less runs nothing. Timeouts nest, the sooner ending first, and a
+// `withTimeout` running on a thread a scope cancels ends at once with it. The body reaches the
+// caller's variables and returns to it, from `main` and from a lightweight thread alike. Upper bounds
+// are generous so a loaded machine cannot fail the test.
+import avin.threads.{Atomic, Channel, isMainThread, scope, sleep, spawn, withTimeout}
+import avin.time.{hours, millis, monotonic, seconds}
+
+@sysl("avin.rt.scheduler_timers")
+timers() -> long
+
+// Spins until `stop` is set, with no wait in its loop, so only a poll can stop it.
+spin(stop: Atomic[bool]) -> long
+  var n: long = 0
+  while !stop.load() do n +%= 1
+  n
+
+main() -> int
+  val timersBefore = timers()
+
+  // In time: the body's result, the body run once.
+  var runs = 0
+  val inTime = withTimeout(seconds(30), s ->
+    runs++
+    "done")
+  println(s"in time: $inTime, runs: $runs")
+
+  // Out of time: `None`, and nothing of the body after its wait runs.
+  val after = Atomic(0)
+  val t0 = monotonic()
+  val late = withTimeout(millis(30), s ->
+    sleep(hours(1))
+    after.add(1)
+    1)
+  val took = monotonic() - t0
+  println(s"late: $late, ran on: ${after.load()}, waited: ${took >= millis(30)}, ${took < seconds(30)}")
+
+  // Zero or less runs nothing.
+  var touched = false
+  val zero = withTimeout(millis(0), s ->
+    touched = true
+    1)
+  println(s"zero: $zero, ${withTimeout(millis(-1), s -> 2)}, touched: $touched")
+
+  // The scope's threads, waiting on channels, sleeping and computing, are cancelled with the body,
+  // and so is a scope of their own; all have ended when `withTimeout` answers.
+  val started = Atomic(0)
+  val ended = Atomic(0)
+  val stop = Atomic(false)
+  val threads = withTimeout(millis(50), s ->
+    val never = Channel[int]()
+    s.spawn(() ->
+      started.add(1)
+      never.receive()
+      ended.add(1))
+    s.spawn(() ->
+      started.add(1)
+      sleep(hours(1))
+      ended.add(1))
+    s.spawn(() ->
+      started.add(1)
+      spin(stop)
+      ended.add(1))
+    s.spawn(() ->
+      started.add(1)
+      scope(inner -> inner.spawn(() -> sleep(hours(1))).join())
+      ended.add(1))
+    never.receive()
+    "body done")
+  println(s"threads: $threads, ran on: ${ended.load()}")
+
+  // A body that computes without waiting is stopped at its loop's poll.
+  val spun = withTimeout(millis(30), s -> spin(stop))
+  println(s"spinning: $spun")
+
+  // A body that returns keeps its result, though its threads are still finishing.
+  val quick = withTimeout(seconds(30), s ->
+    val t = s.spawn(() ->
+      sleep(millis(20))
+      21)
+    t.join() * 2)
+  println(s"quick: $quick")
+
+  // Nesting: the inner timeout ends first where it is sooner, and the outer goes on.
+  val nested = withTimeout(seconds(30), s ->
+    val inner = withTimeout(millis(20), s2 ->
+      sleep(hours(1))
+      "inner")
+    s"inner was $inner")
+  println(s"nested: $nested")
+
+  // Nesting: the outer timeout ends the inner, sooner than the inner's own time.
+  val reached = Atomic(0)
+  val o0 = monotonic()
+  val outer = withTimeout(millis(30), s ->
+    val inner = withTimeout(hours(1), s2 ->
+      sleep(hours(1))
+      "inner")
+    reached.add(1)
+    inner)
+  println(s"outer: $outer, past inner: ${reached.load()}, quick: ${monotonic() - o0 < seconds(30)}")
+
+  // The body reaches the caller's variables, and runs on a lightweight thread of its own.
+  var count = 0
+  var onMain = true
+  withTimeout(seconds(30), s ->
+    for _ in 0 ..< 10 do count++
+    onMain = isMainThread())
+  println(s"count: $count, body on main: $onMain, caller on main: ${isMainThread()}")
+
+  // From a lightweight thread, and cancelled with it by its scope: it ends at once.
+  val fromThread = spawn(() -> withTimeout(millis(20), s -> sleep(hours(1)))).join()
+  val cancelledRan = Atomic(0)
+  val cancelled = scope(s ->
+    val t = s.spawn(() ->
+      val r = withTimeout(hours(1), s2 ->
+        s2.spawn(() -> sleep(hours(1)))
+        sleep(hours(1)))
+      cancelledRan.add(1)
+      r)
+    sleep(millis(20))
+    s.cancel()
+    t.result())
+  println(s"from a thread: $fromThread, cancelled: $cancelled, ran on: ${cancelledRan.load()}")
+
+  // Generic results: a tuple and an option, and a result returned at the edge of the time is kept.
+  println(withTimeout(seconds(30), s -> (1, Some("ü"))))
+  val nothing: Option[Option[int]] = withTimeout(seconds(30), s -> None)
+  println(nothing)
+  var kept = 0
+  for i in 0 ..< 50
+    if withTimeout(millis(2), s ->
+      sleep(millis(long(i % 4)))
+      i) is Some(v) then kept += if v == i then 1 else 100
+  println(s"edge: ${kept <= 50}")
+
+  // Many at once, on lightweight threads, each with its own timeout.
+  val timedOut = Atomic(0)
+  val finished = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 200
+      s.spawn(() ->
+        val r = withTimeout(if i % 2 == 0 then millis(20) else seconds(60), s2 ->
+          if i % 2 == 0 then sleep(hours(1))
+          i)
+        if r.isDefined then finished.add(1) else timedOut.add(1)))
+  println(s"many: ${finished.load()}, ${timedOut.load()}")
+
+  stop.store(true)
+  println(s"timers: ${timers() - timersBefore}")
+  0

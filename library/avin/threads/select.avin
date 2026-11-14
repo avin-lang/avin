@@ -56,6 +56,10 @@ trait SelectArm
   // Passes on a notification the arm was woken by and did not use.
   passOn(wait: Selecting) -> unit
 
+  // When the select is to try the arm again although nothing notifies it, on the monotonic clock in
+  // microseconds: the time a channel `after` or a `Ticker` made next falls due; 0 for never.
+  wakeAt(wait: Selecting) -> long = 0
+
 // A receive arm, `channel.receive() as pattern`, wanting what `wants` says: 0 a value or the channel
 // closed, 1 a value, 2 the channel closed and drained.
 class SelectReceive[T](private val channel: Channel[T], private val wants: int): SelectArm
@@ -69,6 +73,8 @@ class SelectReceive[T](private val channel: Channel[T], private val wants: int):
       None -> false
 
   override passOn(wait: Selecting) = channel.passOn(wait, false)
+
+  override wakeAt(wait: Selecting) -> long = channel.wakeAt(wait)
 
   // What the arm received: the value, or `None` from a closed and drained channel.
   received() -> Option[T] = got
@@ -119,9 +125,18 @@ private chosen(arms: Vector[SelectArm], deadline: long, timed: bool) -> int
       if arms(i).offer(wait, i, true)
         selectWithdraw(wait.handle)
         return i
-    val ended = selectPark(wait.handle, if timed then deadline else 0)
-    if ended < 0 then return arms.length
-    woken = int(ended)
+    // An arm on a channel `after` or a `Ticker` made is notified by nothing, so the select also wakes
+    // when the soonest of their clocks falls due, and tries the arms again.
+    var limit = if timed then deadline else 0
+    for arm in arms
+      val at = arm.wakeAt(wait)
+      if at > 0 && (limit <= 0 || at < limit) then limit = at
+    val ended = selectPark(wait.handle, limit)
+    if ended >= 0
+      woken = int(ended)
+    elif timed && limit == deadline
+      return arms.length
+    else woken = -1
 
 // The draws of every select, each a step of a sequence no two draws share.
 private val draws = Atomic(long(0))

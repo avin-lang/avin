@@ -219,3 +219,44 @@ scope[T](body: (Scope) -> T) -> T
   out.value match
     Some(v) -> v
     None -> fail("a scope's body left no result")
+
+// Runs `body` with a new scope, as `scope` does, for at most `timeout`: `Some` of what it returns
+// where it returns in time, and `None` where the time runs out first. Then the body is cancelled where
+// it is, with every thread the scope started and everything below them, as a scope's `cancel` cancels
+// them, and `withTimeout` answers once they have all ended. A body that has returned keeps its
+// result, however close to the time it did. A timeout of zero or less runs nothing and answers
+// `None`. Timeouts nest: an inner one ends at its own time or when the outer one's runs out, whichever
+// comes first, and so does a `scope` inside.
+//
+// So that it can be stopped wherever it is, even when `withTimeout` is called from `main`, the body
+// runs on a lightweight thread of its own while the calling thread waits for it; it reaches what the
+// calling code reaches, its Sysl handles among them, and returns to it. Its waits, and the waits of
+// the threads it starts, park on the runtime's timers as every wait does, holding no worker.
+//
+//     val page = withTimeout(seconds(5), s -> fetch(url)) match
+//       Some(p) -> p
+//       None -> "timed out"
+withTimeout[T](timeout: Duration, body: (Scope) -> T) -> Option[T]
+  if timeout.micros <= 0 then return None
+  val started = Started()
+  val out = Outcome[T]()
+  val ended = Channel[unit](1)
+  val owner = currentOwner()
+  val runBody = () ->
+    runAs(owner)
+    out.finish(scope(body))
+    ended.send(())
+  val run = () ->
+    // A cancellation of the calling thread does not come between starting the body and recording
+    // it, so its scope always waits for the body.
+    enterUncancellable()
+    val joint = start(runBody, 8388608)
+    started.joints = joint :: started.joints
+    leaveUncancellable()
+    if selectWithin(timeout, SelectReceive(ended, ReceiveEither)) != 0 then started.cancelAll()
+    started.close()
+  if cancelGuarded(run)
+    started.cancelAll()
+    started.close()
+    resumeCancel()
+  out.value

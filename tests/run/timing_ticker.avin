@@ -1,0 +1,97 @@
+// expect: exit 0
+// A `Ticker` delivers a tick every period, the first a period after it is made, each the instant it
+// fell due and later than the one before. A slow receiver gets one waiting tick, the oldest it
+// missed, and the rest are dropped rather than kept. `stop` ends the ticks, a waiting one among them,
+// and stopping twice is stopping once. A ticker works as a `select` arm, is shared by threads, and is
+// read by `for`. Upper bounds are generous so a loaded machine cannot fail the test.
+import avin.threads.{Atomic, Channel, Ticker, scope, sleep, spawn}
+import avin.time.{Instant, hours, millis, monotonic, now, seconds}
+
+main() -> int
+  // Not before its first period, and then one tick a period.
+  val t0 = monotonic()
+  val t = Ticker(millis(20))
+  println(s"none at once: ${t.ticks.tryReceive().isEmpty}")
+  val first = t.ticks.receive()
+  println(s"first after a period: ${first.isDefined && monotonic() - t0 >= millis(20)}")
+  var last = first.getOrElse(now())
+  var increasing = true
+  for _ in 0 ..< 5
+    t.ticks.receive() match
+      Some(at) ->
+        if !(at > last) then increasing = false
+        last = at
+      None -> increasing = false
+  val took = monotonic() - t0
+  println(s"six ticks: ${took >= millis(120)}, ${took < seconds(20)}, increasing: $increasing")
+
+  // A slow receiver: ten periods pass with nobody receiving, and only one tick is waiting, the
+  // oldest; the next comes a period on, not at once.
+  val slow = Ticker(millis(10))
+  val made = now()
+  sleep(millis(105))
+  val waiting = slow.ticks.tryReceive()
+  val oldest = waiting match
+    Some(at) -> at - made < millis(60)
+    None -> false
+  println(s"one waiting: ${waiting.isDefined}, the oldest: $oldest, no backlog: ${slow.ticks.tryReceive().isEmpty}")
+  val n0 = monotonic()
+  slow.ticks.receive()
+  println(s"the next in a period at most: ${monotonic() - n0 < seconds(10)}")
+  slow.stop()
+
+  // `stop` drops a tick that is waiting, delivers none after, and may be called twice.
+  val stopped = Ticker(millis(5))
+  sleep(millis(30))
+  stopped.stop()
+  stopped.stop()
+  println(s"stopped: ${stopped.ticks.tryReceive()}, ${stopped.ticks.receive(millis(40))}")
+
+  // In a select, beside a channel: the ticks come while the channel stays quiet.
+  val quiet = Channel[int]()
+  val tick = Ticker(millis(5))
+  var ticks = 0
+  while ticks < 5
+    select
+      quiet.receive() as Some(_) -> ()
+      tick.ticks.receive() as Some(_) -> ticks++
+      after seconds(30) -> ticks = 100
+  tick.stop()
+  println(s"select ticks: $ticks")
+
+  // Stopped from another thread while a select waits on it with an `after`: the `after` runs.
+  val ending = Ticker(hours(1))
+  val stopper = spawn(() ->
+    sleep(millis(10))
+    ending.stop())
+  val r = select
+    ending.ticks.receive() -> "tick"
+    after millis(60) -> "after"
+  stopper.join()
+  println(s"stopped while waited on: $r")
+
+  // Shared by threads: every tick goes to one of them.
+  val shared = Ticker(millis(3))
+  val got = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 4
+      s.spawn(() ->
+        while got.load() < 20
+          if shared.ticks.receive(millis(50)).isDefined then got.add(1)))
+  shared.stop()
+  println(s"shared: ${got.load() >= 20}")
+
+  // Read by `for`, until the loop breaks.
+  val looped = Ticker(millis(2))
+  var count = 0
+  for _ in looped.ticks
+    count++
+    if count == 3 then break
+  looped.stop()
+  println(s"for: $count")
+
+  // A long period: nothing comes in a short wait.
+  val hourly = Ticker(hours(1))
+  println(s"long: ${hourly.ticks.receive(millis(20))}")
+  hourly.stop()
+  0
