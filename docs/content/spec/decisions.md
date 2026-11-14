@@ -8644,6 +8644,48 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   function parameter takes the `@sendable` form, which asks a little more than the mark (no
   captured `var`). Method values keep their own wording, from the call inside the closure they are.
 
+**Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
+
+- Proposed: **a type with a constructor parameter derives nothing through a template, and has no
+  automatic `Display` or `Debug`**: `derives Eq` on a class, `Hash`, `Ord` or a library trait is
+  refused with the parameter named, and a value is shown by its type, as a value of no `Display`
+  is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
+  type's parameters by the trait, a bound for types that no constructor parameter takes, and what
+  displays an `F[A]` is unknown where `F` is any constructor. Alternatives: deriving through a
+  bounded hole (`F[_: Eq]`, waits for hole bounds in step 2); requiring `F[A]: Display` per field
+  (needs constraints on applications, step 2's `impls may add` rule). Review with the user once
+  step 2 lands: derivation should then follow the holes' bounds.
+- Proposed: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
+  is written the same way everywhere else, and a contravariant hole is the dual demand
+  (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
+- Proposed: **hole bounds `F[_: B]` are left to step 2**; in step 1 a hole is unbounded, and a type
+  whose parameter is bounded by anything other than `Eq` or `Hash` is refused at any hole
+  (`Sorted[A: Ord]` is no constructor for `F[_]`). Why: an unbounded `F` may be applied to any
+  type, so such a constructor could be instantiated at a type its bound refuses; `Eq` and `Hash`
+  are admitted because every Avin type has equality and hashing (which is what lets `Map[_, V]`
+  and `Set` be constructors). Alternatives: refusing every bounded parameter (excludes `Map`);
+  checking each application at instantiation (an instance could then fail, against the design).
+- Proposed: **the arguments of an applied constructor parameter `F[X]` are invariant until step 2**,
+  so `+A` or `-A` inside `F[A]` is refused wherever variance is checked. Why: the constructor
+  passed may be invariant (`Array`), and holes' variance demands (`F[+_]`) are what make a variant
+  position sound; until those are checked at each constructor passed, invariance is the sound
+  choice. Alternatives: treating `F[+_]` as covariant at once (unsound until the demand is
+  checked at the call).
+- Proposed: **a constructor parameter has no `Nothing` default**: one that is neither written nor
+  inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
+  Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
+  of `Nothing` (meaningless as a constructor).
+- Proposed: **with overloads, the first candidate's type parameters decide which written argument
+  is resolved as a constructor**, before a candidate is chosen. Why: written type arguments are
+  resolved once, before overload resolution, and overloads differing in the kinds of their type
+  parameters are rare; resolving per candidate would need resolution repeated per overload.
+  Alternatives: resolving the arguments once per candidate (correct for mixed kinds, more work in
+  the hottest path); refusing overloads whose type parameters differ in kind. Review with the user
+  if overloads of mixed kinds turn up.
+- Proposed: **`_` alone as a written argument at a call is read as a hole**, so that the checker
+  says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
+  instead of `unknown type`.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

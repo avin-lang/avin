@@ -567,7 +567,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Not started. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Step 1 is done; steps
+2 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -582,7 +583,7 @@ holes filled, so after monomorphization no `Applied` or `Constructor` is left, a
 and emission see only the types they see today; `type_key` names a constructor
 (`Result[_,ParseError]`) so instance keys and the incremental store keep one copy per constructor.
 
-1. **Kinds and constructor parameters, written.** Parse `F[_]`, `F[_, _]`, `F[+_]` in every type
+1. **Kinds and constructor parameters, written.** *Done.* Parse `F[_]`, `F[_, _]`, `F[+_]` in every type
    parameter list and `_` in type arguments (`parse_decl.sysl`, `formatter.sysl`); the two `Type`
    forms, `substitute`, `solve`, `same_type`, `type_key`; kind checking wherever a type is resolved
    (`check.sysl`'s type resolution); constructor arguments written at calls and in types: a bare
