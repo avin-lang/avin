@@ -184,12 +184,14 @@ impl[K, V] Map[K, V]
   // the map's own `apply` traps. `get`, `contains`, `getOrElse`, `size` and iteration see only the
   // entries really held, and the default is never stored. `updated`, `removed` and the other
   // updates answer a map with the same default.
-  // A default of a supertype of `V` makes a map of that type.
-  withDefault[W >: V](f: (K) -> W) -> Map[K, W] = DefaultMap[K, W](self, f)
+  // A default of a supertype of `V` makes a map of that type. The default is a `@sendable`
+  // function, using only sendable values from around it, so the map stays a value any thread may
+  // read.
+  withDefault[W >: V](@sendable f: (K) -> W) -> Map[K, W] = DefaultMap[K, W](self, Computed(f))
 
-  // This map seen with `value` as the default of every key it does not hold: `withDefault(k ->
-  // value)`.
-  withDefaultValue[W >: V](value: W) -> Map[K, W] = DefaultMap[K, W](self, k -> value)
+  // This map seen with `value` as the default of every key it does not hold, as `withDefault(k ->
+  // value)` is; the map is sendable wherever `value` is.
+  withDefaultValue[W >: V](value: W) -> Map[K, W] = DefaultMap[K, W](self, Fixed(value))
 
 // A map seen without its key and value types: how two maps held as `Any`, or as maps of different
 // kinds, are compared by their entries. Every `Map` is one.
@@ -254,14 +256,16 @@ object Map
 // and displays as it does. `apply` of an absent key answers the default and does not add the key. An
 // update answers a `DefaultMap` of the updated map with the same default; `transform` and `mapValues`
 // answer the wrapped map's own, which has no default.
-class DefaultMap[K, V](private val underlying: Map[K, V], private val default: (K) -> V): Map[K, V]
+class DefaultMap[K, V](private val underlying: Map[K, V], private val default: MapDefault[K, V]): Map[K, V]
   override size -> int = underlying.size
 
   override get(key: K) -> Option[V] = underlying.get(key)
 
   override apply(key: K) -> V = underlying.get(key) match
     Some(v) -> v
-    None -> default(key)
+    None -> default match
+      Fixed(v) -> v
+      Computed(f) -> f(key)
 
   override updated[W >: V](key: K, value: W) -> DefaultMap[K, W] = DefaultMap(underlying.updated(key, value), default)
 
@@ -272,6 +276,12 @@ class DefaultMap[K, V](private val underlying: Map[K, V], private val default: (
   override transform[W](f: (K, V) -> W) -> Map[K, W] = underlying.transform(f)
 
   override iterator() -> Iterator[(K, V)] = underlying.iterator()
+
+// A `DefaultMap`'s default: one value for every absent key, or a function of the key. The function
+// is `@sendable`, so the default is sendable wherever the value type is, as the map is.
+private data MapDefault[K, +V]
+  Fixed(value: V)
+  Computed(f: @sendable (K) -> V)
 
 impl[K, V: Eq] Eq for DefaultMap[K, V]
   equals(other: DefaultMap[K, V]) -> bool = erasedMapEquals(self, other)

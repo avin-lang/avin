@@ -79,6 +79,7 @@ private class Outcome[T]()
 impl[T: Sendable] Sendable for Thread[T]
 
 // A running or finished thread whose body yields a `T`.
+@trusted_sendable("its joint is the runtime's thread, and its outcome is written once, before the join that reads it")
 @keeps_owners
 class Thread[T](private val joint: Any, private val outcome: Outcome[T])
   // Waits for the thread to finish and gives back what its body returned. Joining again gives the
@@ -132,6 +133,24 @@ private cancelThread(joint: Any)
 // The thread is then still cancelled, but nothing stops it again until it calls `resumeCancel`.
 @intrinsic("cancel_guarded")
 private cancelGuarded(run: () -> unit) -> bool
+
+// Runs `run` holding a share of something other threads wait for (a share of a read-write lock, a
+// semaphore's permit), taken under a lock let go with `releaseHolding`, then `giveBack`, which gives
+// the share back, and answers whether a cancellation stopped `run`. Nothing stops the thread between
+// taking the share and giving it back but, where `cancellable`, a cancellation inside `run`, which
+// returns here; a trap inside `run` stops the program, as one under a lock does, rather than leaving
+// the share held for ever.
+@intrinsic("cancel_guarded_held")
+private cancelGuardedHeld(run: () -> unit, giveBack: () -> unit, cancellable: bool) -> bool
+
+// Runs `body` holding a share that `giveBack` gives back, and gives back what the body returns; a
+// cancellation that stopped a `cancellable` body goes on once the share is given back.
+private holding[R](body: () -> R, giveBack: () -> unit, cancellable: bool) -> R
+  val out = Outcome[R]()
+  if cancelGuardedHeld(() -> out.finish(body()), giveBack, cancellable) then resumeCancel()
+  out.value match
+    Some(v) -> v
+    None -> fail("a body holding a share left no result")
 
 // Goes on with the calling thread's cancellation, which returned to `cancelGuarded`: to the scope
 // around this one, or to the end of the thread.

@@ -1093,7 +1093,8 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   `Pair[int, string].zero()`) or a type parameter whose bounds have it (`T.zero()` with `T: Add`).
   Through a bound each instance calls its type argument's own directly, an open class's included,
   since no object is involved. Calling one on a value is an error, and so is calling a value's method
-  on a type. A local, a parameter, a member or a module value of the name hides the type. A
+  on a type. A local, a parameter, a member or a module value of the name hides the type; a built-in
+  type's name [names no value](/spec/operators-and-control-flow/#match), so its type is never hidden. A
   companion object does not: `BigInt.zero()` calls the type's static member beside
   `object BigInt`'s `apply`, unless the companion declares a member of that name itself, which
   `Name.member` then means.
@@ -1520,6 +1521,101 @@ name an alias declared after it.
 `type` declares an alias only where a name follows it; anywhere else it is an ordinary name, so a
 function, a parameter, a field or a local may be called `type`.
 
+### Opaque types
+
+`opaque type Name = Repr` declares an **opaque type**: a new type whose values are laid out exactly
+as values of its **representation** `Repr`, and which is otherwise a type apart. A `UserId` and an
+`OrderId` that are both `long` underneath cannot be mixed up, and neither can be passed where a
+`long` is expected, while each costs what a `long` costs:
+
+```text
+module ids
+
+opaque type UserId = long
+opaque type Email = string
+opaque type Id[T] = long
+
+impl UserId
+  next() -> UserId = UserId(repr + 1)
+  def id -> long = repr
+
+impl Ord for UserId
+  compare(other: UserId) -> int = repr.compare(other.repr)
+
+impl Display for Email
+  display(out: Writer, spec: FormatSpec) = out.write(s"<$repr>")
+
+user(n: long) -> UserId = UserId(n)
+email(s: string) -> Email = Email(s.toLower)
+```
+
+Only the module that declares an opaque type sees its representation:
+
+- In that module, `Name(r)` makes a value of the opaque type from a value `r` of its
+  representation, and `x.repr` is the representation of a value `x`. In a method an impl adds to
+  the type, `repr` alone is `self.repr`. A generic opaque type's type arguments are written,
+  `Id[User](1)`, or inferred from the representation and the expected type, as a function's are.
+- Outside it, `Name(r)`, `x.repr` and a bare `repr` are refused, with a diagnostic saying that the
+  representation is seen only in the declaring module. Code there names the type, passes, stores
+  and compares its values, calls its methods, and makes and takes apart values through the functions
+  the module offers.
+- No conversion is implicit in either direction, in the module or outside it: a `long` is not a
+  `UserId`, and a `UserId` is not a `long`. Two instances of a generic opaque type at different type
+  arguments are different types, `Id[User]` and `Id[Order]`.
+- The name is a type's and nothing else: it is not a value, and it is not a pattern, so a `match`
+  takes a value apart with `x.repr`, in the module, rather than with `Name(r)`.
+
+An opaque type has the traits and methods its impls give it, and no others; the representation's
+are not inherited. An impl of a trait takes the trait's default bodies, so `compare` alone gives
+`<`, `<=`, `less`, `max` and sorting, and `display` gives interpolation. An impl that only adds
+methods may be written in any module, as an extension, and there it uses only what the type offers;
+a trait's impl is written in the module of the type or of the trait. Equality and hashing are the
+representation's: two values are equal when their representations are, so an opaque type is a key
+of a `Map` and an element of a `Set`. A value with no `Display` prints as the type's name, which
+shows nothing of the representation. An opaque type derives nothing.
+
+A value of an opaque type becomes an `Any` or a trait's value in a box that names the opaque type,
+whatever the representation, a reference included. A type pattern for the opaque type finds it
+there, one for the representation does not, and a value of the representation is never taken for
+the opaque type:
+
+```text
+describe(x: Any) -> string = x match
+  u: UserId -> s"user ${u.id}"
+  n: long -> s"long $n"
+  _ -> "other"
+```
+
+`describe(user(1))` is `"user 1"` and `describe(long(1))` is `"long 1"`; a union `UserId | long`
+tells its members apart the same way. A value of an opaque type is sendable where its
+representation is.
+
+- The representation is any type with values to lay out: a number, a `string`, a data value, an
+  object (the very object, shared), a tuple, a function, an `Option`, a collection, another opaque
+  type. It may not be `Nothing` or `unit`, a union, or a type parameter alone, which could be
+  either; and it may not name the opaque type, directly or through aliases, since the type is laid
+  out as it. A recursive type is a `data` type.
+- A generic opaque type's parameters are plain names: invariant, with no bounds. The types its
+  representation names hold each type argument to their own bounds where the opaque type is used,
+  as an alias's do. A parameter the representation does not name is allowed, and tells values apart
+  by type alone: `Id[User]` and `Id[Order]` are both a `long`.
+- An opaque type is no type constructor. A generic one is not passed for a constructor parameter
+  `F[_]`, whose instances are each an object, and an opaque type takes no constructor parameter of
+  its own, which would leave its layout undecided. It is a type argument of a constructor
+  parameter's application like any type: `F[UserId]` at `Vector` is a `Vector[UserId]`.
+- A refined variant's result does not name an opaque type, alone or inside another type
+  (`Newest -> Query[UserId]` is refused); its fields may be of opaque types, and a type with refined
+  variants takes one as its type argument like any type.
+- A union of an opaque type and its representation keeps its members apart; only a union naming
+  one type twice, the opaque type or the representation, collapses to it.
+- An opaque type has no supertype (`opaque type X <: Y` is refused), no annotations and no
+  `derives` clause.
+- Its name is a type's, under the rules for an alias's name; it is public unless marked `private`,
+  and imported or reached through its module as any type is.
+
+`opaque` declares an opaque type only before `type` and a name; anywhere else it is an ordinary
+name.
+
 ## Visibility and modules
 
 Declarations are public unless marked `private` (visible in the module). A directory is a module;
@@ -1707,7 +1803,8 @@ server reads it the same way.
 ### Positions are the document's
 
 Every line of program text stays where it was written, so every position the compiler reports, in
-a diagnostic, a trap's report, a failed test or the language server, is the line and column of the
+a diagnostic, a trap's report, a failed test, the language server or the debug information a
+debugger reads, is the line and column of the
 document the reader has open, the four columns included:
 
 ```text
@@ -1970,17 +2067,35 @@ passed by name, a method value), and it traps at that read rather than read what
 
 - **`lazy val name = expr`** (its type optional, as for `val`) is computed on its first read instead,
   exactly once, and every later read gives the value kept. One that is never read is never
-  computed. It is declared at module level or in a class or object body, where each instance has
-  its own; `lazy` is a modifier only before `val`, and elsewhere an ordinary name. A `lazy var` is
-  an error, since the value is never assigned, and so is `lazy` on a parameter, a class parameter, a
-  data field or a local, each of which is given its value where it is made.
+  computed. It is declared at module level, in a class or object body, where each instance has its
+  own, or in a block, as a local; `lazy` is a modifier only before `val`, and elsewhere an ordinary
+  name. A `lazy var` is an error, since the value is never assigned, and so is one without an
+  initializer, and `lazy` on a parameter, a class parameter or a data field, each of which is given
+  its value where it is made.
 
   ```avin
   lazy val table: Vector[string] = loadTable() // read the file when something first needs it
 
   class Report(title: string)
     lazy val heading = s"== $title ==" // per instance, on the instance's first read
+
+  summary(rows: Vector[Row], verbose: bool) -> string
+    lazy val detail = rows.map(describe).mkString("\n") // only if the branch below reads it
+    if verbose then detail else s"${rows.length} rows"
   ```
+
+  **A local `lazy val`** names one value (a pattern that takes a value apart is an error) and is in
+  scope from its declaration to the end of its block, its own initializer included. Each time the
+  declaration runs it makes a new value not yet computed, so one in a loop body is a fresh one on
+  every pass. Its initializer sees the locals around it as they are when it runs, on the first
+  read, not where it is declared, and its type is its declared one or its initializer's, which must
+  be known where it is declared. It is never assigned: an assignment, a compound one or a step is
+  refused. A closure that reads it captures it and shares it with the code around it: whichever
+  reads it first computes it, and every other read, in the closure or outside it, gives the value
+  kept, even after the block that declared it has finished. A closure carried to another thread
+  carries the initializer with it, so a `@sendable` closure may capture a local `lazy val` only
+  where its type is [sendable](threads.md) and what its initializer captures and reaches is what
+  such a closure itself may capture and reach, through every lazy value it reads in turn.
 
   A module-level `lazy val` takes no place in the initialization order: its initializer runs where
   it is first read, and an eager value that reads it depends on what that initializer reads. Its
@@ -2009,6 +2124,9 @@ passed by name, a method value), and it traps at that read rather than read what
       Some(n) -> n.depth + 1
       None -> 0
   ```
+
+  A local `lazy val` is held to the same rule, its initializer's own code being the block's code
+  that it runs and the functions that code calls.
 
   Code the initializer makes and hands on without running it itself (a lambda, an argument passed by
   name, a method value) may read the value: that is how a value refers to itself, as a lazy list

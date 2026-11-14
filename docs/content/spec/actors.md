@@ -164,7 +164,7 @@ so the check is made once, where the type is named, and never at a send:
 | a class with no `var` field, whose fields are all sendable, and which is not `open` or `abstract`; an `object` likewise | deeply immutable: no code can change it, and a subclass cannot add a `var` |
 | a trait declared `: Sendable` | every type implementing it is checked to be sendable, at its `impl` or declaration |
 | `ActorRef[M]`, `Behaviour[M]`, `Future[T]` and `Promise[T]` of a sendable `T` | made to be handed between threads |
-| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` of any `T`, a mutex's `Condition`, `Once` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
+| `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` and `RwLock[T]` of any `T`, a mutex's `Condition`, `Once`, `WaitGroup`, `Semaphore`, `Barrier` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
 | `Thread[T]` of a sendable `T`, an `Executor` | joining a thread and giving an executor work are synchronized |
 | a [Sysl handle](/spec/sysl-bindings/#handles) | sent by handing over its ownership, checked when it is used (below) |
 | `Isolated[T]` | an object graph nothing else reaches (below) |
@@ -190,9 +190,15 @@ each type implementing a trait that promises it is. A generic trait that promise
 sendable at sendable type arguments, and a type implementing it has the parameters it passes to the
 trait taken as sendable when it is checked. A type that implements one through a generic trait,
 `HashMap[K, V]` through `Map[K, V]`, is sendable at sendable arguments for those parameters. The
-standard library promises `Sendable` for the types whose structure cannot show it, the synchronized
-ones and `Vector`, and the immutable `Map` and `Set` traits promise it. `Sendable` is only a bound
-and a promise, never the type of a value.
+immutable `Map` and `Set` traits promise it, and `Vector` of sendable elements, and the standard
+library's promises are checked against the structure as every other one is. A few of its types are
+safe to share for a reason the structure cannot show, synchronization the runtime does or an owner
+every operation checks, and each is marked `@trusted_sendable("why")` with the reason, so that
+nothing is trusted silently: `Mutex`, `Condition`, `Atomic`, `Channel` and `Thread`, the lock, the
+cell, the pool and the registry inside them and the futures, a running actor, `Isolated`, and the
+connections, listeners and child processes, which belong to one thread at a time. A `Future`, a `Promise`, an `Executor` and a
+`Once` are sendable by their structure, built of those. The mark is the standard library's alone.
+`Sendable` is only a bound and a promise, never the type of a value.
 
 ### Handing over ownership
 
@@ -269,7 +275,8 @@ doubt, and the runtime can contain it:
   is. The actor's `Failed` reason is the trap's reason, without its place: `Failed(integer
   overflow)`.
 - **Where the trap leaves shared state in doubt, the program stops instead**, as it would for a
-  thread: a trap while the actor holds a `Mutex`, runs a `Once` body or initializes a `lazy val`
+  thread: a trap while the actor holds a `Mutex`, reads or writes a `RwLock`, holds a semaphore's
+  permit in `withPermit`, runs a barrier's action, runs a `Once` body or initializes a `lazy val`
   (each of which other threads may be waiting on), or inside a Sysl call: an Avin function Sysl
   called back, or a value a binding cannot take. The report still names the actor. A stack that
   runs out stops the program too, with the same `avin: trap: stack overflow` a thread's does, since

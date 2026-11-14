@@ -88,7 +88,10 @@ parse(src: Source) -> Parsed
             file.items.push(FunctionItem(actor.function))
             file.actors.push(actor.site)
         elif type_alias_ahead(&p)
-            file.items.push(AliasItem(parse_alias(&p, start, annotations)))
+            file.items.push(AliasItem(parse_alias(&p, start, annotations, false)))
+        elif opaque_type_ahead(&p)
+            p.toks.advance()
+            file.items.push(AliasItem(parse_alias(&p, start, annotations, true)))
         elif p.at("impl") && (p.ahead(1) != "(" || impl_of_function_ahead(&p))
             file.items.push(ImplItem(parse_impl(&p, start, annotations)))
         elif p.at("derive") && p.ahead(1) != "(" && p.ahead(1) != "[" && p.ahead(1) != "="
@@ -199,22 +202,44 @@ type_alias_ahead(p: *Parser) -> bool
         None -> return false
     next.value == Word
 
-/** `type Name[T] = Body`: a type alias. It is another name for its body, so it takes no
- * annotations. */
-private parse_alias(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &AliasDecl
+/** Whether `opaque type Name` begins an opaque type here: `opaque` declares something only before
+ * `type` and a name, and elsewhere is an ordinary name. */
+opaque_type_ahead(p: *Parser) -> bool
+    if !p.at("opaque") || p.ahead(1) != "type" then return false
+    val next = p.toks.peek_at(2) match
+        Some(t) -> t
+        None -> return false
+    next.value == Word
+
+/** `type Name[T] = Body`: a type alias, another name for its body; or, with `opaque` (already read)
+ * before it, an opaque type, a new type laid out as its body. Neither takes annotations. */
+private parse_alias(p: *Parser, start: Span, annotations: Buf[Annotation], opaque: bool) -> &AliasDecl
     for a in annotations
-        p.report.add(error(a.span, "a type alias takes no annotations: it is another name for its type"))
+        if opaque then p.report.add(error(a.span, "an opaque type takes no annotations"))
+        else p.report.add(error(a.span, "a type alias takes no annotations: it is another name for its type"))
     p.expect("type")
     val name_start = p.toks.here()
     val name = declared_name(p, "a type")
     val name_span = name_start.to(p.ended())
     val type_params = parse_type_params(p)
+    if opaque && p.at("<:")
+        val at = p.toks.here()
+        p.toks.advance()
+        val parent = parse_type(p)
+        p.report.add(error(at.to(parent.span), "an opaque type has no supertype: it is a type of its own, and an `impl` makes it conform to a trait"))
     p.expect("=")
     val body = parse_type(p)
-    AliasDecl(start.to(p.ended()), name_span, name, type_params, body)
+    if opaque && p.at("derives")
+        val at = p.toks.here()
+        var last = at
+        while !p.at_line_end() && !p.toks.at_end()
+            last = p.toks.here()
+            p.toks.advance()
+        p.report.add(error(at.to(last), "an opaque type derives nothing: an `impl` gives it a trait, written in its module against its representation"))
+    AliasDecl(start.to(p.ended()), name_span, name, type_params, body, opaque)
 
 /** Reports `lazy var`: a lazy value is computed once and never assigned. */
-private reject_lazy_var(p: *Parser, at: Span, mutable: bool)
+reject_lazy_var(p: *Parser, at: Span, mutable: bool)
     if mutable then p.report.add(error(at, "a `lazy` value is computed once and never assigned, so it is declared `lazy val`"))
 
 /** Whether a word may not be declared as a name. `end` is contextual (it closes a form only when a
@@ -235,7 +260,13 @@ declared_name(p: *Parser, what: string) -> string
         p.toks.advance()
         reject_keyword(p, at, word, what)
         return word
+    if what == "a value" || what == "a field" || what == "a parameter" then refuse_builtin_name(p, at, word, what)
     required_name(p)
+
+/** A built-in type's name where a value is named: a local, a field or a parameter. It is refused,
+ * since in a pattern the name tests for its type, and in an expression it converts to it. */
+refuse_builtin_name(p: *Parser, at: Span, word: string, what: string)
+    if builtin_type_name(word) then p.report.add(error(at, s"`$word` is a built-in type, so it cannot name $what"))
 
 // A method's name that is a run of operator characters. Most of the language's own operators are not
 // method names: a type has `==` through `Eq`, and the logical, wrapping and saturating operators not
@@ -440,11 +471,14 @@ private parse_bound_pattern(p: *Parser, typed: bool) -> &Pattern
     if typed && p.at(":") && binder(inner)
         p.toks.advance()
         val ty = parse_pattern_type(p)
-        return Pattern(inner.span.to(ty.span), Typed(inner, ty))
+        return Pattern(inner.span.to(ty.span), Typed(bound_builtin(p, inner), ty))
     if !p.at("@") then return inner
     val at = p.toks.here()
     p.toks.advance()
     val nested = parse_named_pattern(p, typed)
+    if builtin_name_pattern(inner) is Some(_)
+        bound_builtin(p, inner)
+        return nested
     inner.kind match
         Name(name) -> Pattern(inner.span.to(nested.span), Named(name, nested))
         _ ->
@@ -469,7 +503,19 @@ private bound_of(p: *Parser, pattern: &Pattern, message: string) -> &Expr = patt
         p.report.add(error(pattern.span, message))
         Expr(pattern.span, Invalid)
 
-private binder(pattern: &Pattern) -> bool = pattern.kind is Name(_) || pattern.kind is Wildcard
+// A built-in type's name counts as one, so that binding it is reported by `bound_builtin` rather than
+// read as some other mistake.
+private binder(pattern: &Pattern) -> bool = pattern.kind is Name(_) || pattern.kind is Wildcard || builtin_name_pattern(pattern) is Some(_)
+
+// A built-in type's name where a pattern binds one, as in `int: T`, `int @ p`, `int + 1`, `int < 3`
+// or `int*`: reported, and read as `_`.
+private bound_builtin(p: *Parser, pattern: &Pattern) -> &Pattern = builtin_name_pattern(pattern) match
+    Some(name) ->
+        p.report.add(error(pattern.span, builtin_bound(name)))
+        Pattern(pattern.span, Wildcard)
+    None -> pattern
+
+builtin_bound(name: string) -> string = s"`$name` is a built-in type, so a pattern cannot bind it: alone it tests for the type, and `n: $name` binds the value as one"
 
 // `n + k` and the comparison patterns: `n < k`, `n <= k`, `n > k`, `n >= k`, and a bound before
 // the name, `lo <= n` or `lo <= n < hi`, with `<` or `<=` on either side. The name may be `_`.
@@ -479,7 +525,7 @@ private parse_comparison_pattern(p: *Parser) -> &Pattern
         p.toks.advance()
         val amount = parse_pattern_atom(p)
         val k = bound_of(p, amount, "the amount in `n + k` is a positive integer literal")
-        return Pattern(first.span.to(amount.span), Successor(first, k))
+        return Pattern(first.span.to(amount.span), Successor(bound_builtin(p, first), k))
     if !at_comparison(p) then return first
     val at = p.toks.here()
     val op = p.ahead(0)
@@ -493,12 +539,13 @@ private parse_comparison_pattern(p: *Parser) -> &Pattern
             p.report.add(error(p.toks.here(), "a comparison pattern with two bounds puts the name between them, as in `0 <= n < 10`"))
             p.toks.advance()
             parse_pattern_atom(p)
-        if op == "<" || op == "<=" then return Pattern(span, Bounded(first, None, Some(bound)))
-        return Pattern(span, Bounded(first, Some(bound), None))
+        val named = bound_builtin(p, first)
+        if op == "<" || op == "<=" then return Pattern(span, Bounded(named, None, Some(bound)))
+        return Pattern(span, Bounded(named, Some(bound), None))
     val low = bound_of(p, first, "a comparison pattern compares a name with a literal")
     if op != "<" && op != "<="
         p.report.add(error(at, "a comparison pattern that starts with its bound uses `<` or `<=`, as in `0 <= n < 10`"))
-    val name = parse_pattern_atom(p)
+    val name = bound_builtin(p, parse_pattern_atom(p))
     if !binder(name) then p.report.add(error(name.span, "a comparison pattern binds a name or `_` between its bounds"))
     val lower = Some(PatternBound(low, op == "<="))
     if !p.at("<") && !p.at("<=") then return Pattern(first.span.to(name.span), Bounded(name, lower, None))
@@ -577,7 +624,10 @@ private parse_pattern_atom(p: *Parser) -> &Pattern
         p.report.add(error(start.to(p.ended()), s"a pattern takes its type arguments from the value it matches; write `$path`"))
     if !p.accept("(")
         if path.contains(".") then return Pattern(start.to(p.ended()), Constructor(path, buf(), false))
-        return Pattern(start.to(p.ended()), Name(path))
+        // A built-in type's name is a type pattern, `int` for `_: int`, and never a binding.
+        val span = start.to(p.ended())
+        if !written && builtin_type_name(path) then return Pattern(span, Typed(Pattern(span, Wildcard), TypeExpr(span, Named(path, buf()))))
+        return Pattern(span, Name(path))
     var args: Buf[&Pattern] = buf()
     if !p.at(")")
         loop
@@ -597,7 +647,7 @@ private parse_sequence_item(p: *Parser) -> &Pattern
     if !binder(item)
         p.report.add(error(star, "only a name or `_` stands for the rest of a sequence, as in `rest*`"))
         return item
-    Pattern(item.span.to(p.ended()), Rest(item))
+    Pattern(item.span.to(p.ended()), Rest(bound_builtin(p, item)))
 
 // A function parameter is `pattern: type`, optionally by-name (`: -> T`), repeated (`T*`), or
 // defaulted (`= value`). Data fields allow only plain and defaulted fields.
@@ -624,7 +674,11 @@ parse_params(p: *Parser, function: bool) -> Buf[Param]
                 p.report.add(error(start, what))
                 p.toks.advance()
                 if p.at("val") || p.at("var") then p.toks.advance()
-            val pattern = parse_untyped_pattern(p)
+            var pattern = parse_untyped_pattern(p)
+            if builtin_name_pattern(pattern) is Some(name)
+                // Reported here, and read on as the name, so the one mistake is reported once.
+                refuse_builtin_name(p, pattern.span, name, if function then "a parameter" else "a field")
+                pattern = Pattern(pattern.span, Name(name))
             val named = pattern.kind is Name(_)
             p.expect(":")
             val by_name = p.accept("->")
@@ -662,15 +716,7 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
             val holes = parse_type_holes(p)
             var lower: Option[&TypeExpr] = None
             if p.accept(">:") then lower = Some(parse_type(p))
-            var bounds: Buf[&TypeExpr] = buf()
-            if p.accept(":")
-                loop
-                    bounds.push(parse_type_operand(p))
-                    if p.at("+")
-                        p.report.add(error(p.toks.here(), "a type parameter's bounds are joined with `&`, as in `[T: Ord & Display]`"))
-                        p.toks.advance()
-                        continue
-                    if !p.accept("&") then break
+            val bounds = parse_bounds(p)
             if p.at(">:")
                 p.report.add(error(p.toks.here(), "a lower bound comes before the bounds, as in `[W >: T: Display]`"))
                 p.toks.advance()
@@ -680,6 +726,20 @@ parse_type_params(p: *Parser) -> Buf[TypeParam]
             if !p.accept(",") || p.at("]") then break
     p.expect("]")
     params
+
+// The bounds after a `:`, of a type parameter or of a constructor parameter's hole, joined with `&`:
+// `Ord & Display`. None where no `:` follows. `+` between them is refused with the spelling to use.
+private parse_bounds(p: *Parser) -> Buf[&TypeExpr]
+    var bounds: Buf[&TypeExpr] = buf()
+    if !p.accept(":") then return bounds
+    loop
+        bounds.push(parse_type_operand(p))
+        if p.at("+")
+            p.report.add(error(p.toks.here(), "a type parameter's bounds are joined with `&`, as in `[T: Ord & Display]`"))
+            p.toks.advance()
+            continue
+        if !p.accept("&") then break
+    bounds
 
 // The holes of a constructor parameter, `F[_, +_]`, after its name; none for a parameter that stands
 // for a type. A hole is a type argument, so it takes no holes of its own: `F[_[_]]` is refused.
@@ -696,11 +756,14 @@ private parse_type_holes(p: *Parser) -> Buf[TypeHole]
         else
             p.report.add(error(p.toks.here(), "a constructor parameter's arguments are written `_`, one for each argument it takes, as in `F[_]` or `F[_, _]`"))
             if !p.at("]") && !p.at(",") then p.toks.advance()
-        holes.push(TypeHole(at.to(p.ended()), variance))
         if p.at("[")
             val nested = p.toks.here()
             skip_brackets(p)
             p.report.add(error(nested.to(p.ended()), "a constructor parameter's arguments are types, never constructors, so a hole takes no arguments: write `F[_]`"))
+        // `F[_: Ord]`, `F[+_: Ord & Hash]`: the bounds every type the hole is filled with meets, written
+        // as a type parameter's are.
+        val bounds = parse_bounds(p)
+        holes.push(TypeHole(at.to(p.ended()), variance, bounds))
         if !p.accept(",") || p.at("]") then break
     p.expect("]")
     holes
@@ -953,9 +1016,9 @@ local_function_ahead(p: *Parser) -> bool
             params = true
         elif params && text == "{" then braces += 1
         elif params && text == "}" then braces -= 1
-        // A parameter is typed as `name: T`; `f(1: long)` is a call with an ascribed argument.
-        elif text == ":" && params && depth == 1 && braces == 0
-            if p.toks.peek_at(i - 1).unwrap().value == Word then typed = true
+        // A parameter is typed as `name: T`; `f(1: long)` is a call with an ascribed argument, and
+        // `f(x is _: T)` one with a type pattern in its argument.
+        elif text == ":" && params && depth == 1 && braces == 0 && parameter_colon(p, i) then typed = true
         elif text == ")"
             depth -= 1
             if params && depth == 0
@@ -1366,9 +1429,24 @@ local_parameterless_ahead(p: *Parser) -> bool
         i += 1
     false
 
+// Whether the `:` `i` tokens ahead types a parameter: it follows the parameter's name, which begins
+// its item of the list. A call's argument has a `:` only inside an expression, as in `f(x is _: T)`,
+// where something other than the list's `(` or `,` comes before the name.
+private parameter_colon(p: *Parser, i: usize) -> bool
+    if i < 2 then return false
+    val name = p.toks.peek_at(i - 1) match
+        Some(t) -> t
+        None -> return false
+    if name.value != Word then return false
+    val before = p.toks.peek_at(i - 2) match
+        Some(t) -> t
+        None -> return false
+    val text = p.spelling(before)
+    text == "(" || text == "[" || text == "," || text == "val" || text == "var" || before.value == Word && !is_keyword(text)
+
 // A member that is a name, type parameters perhaps, and a parameter list with a typed parameter,
-// ending its line, is the signature of an abstract method yielding `unit`: a call never has a `:`
-// among its arguments.
+// ending its line, is the signature of an abstract method yielding `unit`: a call has a `:` among its
+// arguments only inside an expression.
 private signature_ahead(p: *Parser) -> bool
     if !p.at_kind(Word) then return false
     val next = p.ahead(1)
@@ -1383,7 +1461,7 @@ private signature_ahead(p: *Parser) -> bool
         if token.value == Newline || token.value == Dedent then return false
         val text = p.spelling(token)
         if text == "(" || text == "[" then depth += 1
-        elif text == ":" && depth == 1 then typed = true
+        elif text == ":" && depth == 1 && parameter_colon(p, i) then typed = true
         elif text == ")" || text == "]"
             depth -= 1
             if text == ")" && depth == 0

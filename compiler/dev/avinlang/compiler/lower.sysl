@@ -3,6 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.fs.canonicalize
 import sysl.path.file_name
 import sysl.text.from_utf8_unchecked
 
@@ -24,6 +25,8 @@ mir_type(t: &Type) -> Option[MirType] = *t match
     Tuple(_) -> Some(MRef)
     Function(_, _, _) -> Some(MRef)
     ByName(_) -> Some(MRef)
+    // An opaque type's values are its representation's, with no box.
+    Opaque(_, _, _, repr) -> mir_type(repr)
     // A constructor applied is a data type, a class or a trait in every instance.
     Applied(_, _) -> Some(MRef)
     // A trait's `Self` is left in the code of the trait's default bodies, which every conforming
@@ -70,6 +73,10 @@ private struct VariantLayout
 private struct FieldSlot
     offset: usize
     ty: MirType
+
+/** The descriptor of a variant an instance of its data type cannot hold: a refined variant whose
+ * result is another instance. It has no fields and no descriptor. */
+private const AbsentVariant: usize = 0xffffffffffffffff
 
 /** The layout of a data type at particular type arguments: one entry per variant. */
 private struct DataLayout
@@ -124,6 +131,9 @@ private struct Lowering
     /** The type arguments of the instance being lowered, and the function they belong to. */
     subst: Buf[&Type]
     subst_owner: usize
+    /** What the arms being lowered read back of the refined variants they match: each owner's type
+     * parameters, replaced after `subst`. */
+    refined: Buf[Refinement]
     /** The value holding each parameter of the top-level function, or `None` for a unit one or, in
      * a local function, one it does not capture. */
     param_values: Buf[Option[usize]]
@@ -293,6 +303,32 @@ private struct Lowering
     /** The deferred statements reached in the blocks enclosing the code being lowered, innermost
      * last: each is lowered again at every edge that leaves its block. */
     defers: Buf[&TExpr]
+    /** Whether the program is built with debug information, which the functions declared in the
+     * source carry as `Locate` and `Variable` instructions. */
+    debug: bool
+    /** Whether the function being lowered is placed in the source: one the source declares, in a
+     * program built with debug information. */
+    locating: bool
+    /** The places the current block's code comes from, by where in it each begins: see `mark`. */
+    marks: Buf[Mark]
+    /** In an instance of a constructor trait's method, the owner of the trait's `Self`, and the
+     * constructor it stands for in `self_args`; 0 in any other instance. */
+    self_owner: usize
+    self_args: Buf[&Type]
+    /** Set where control has just left for good through code a test's failing pattern decided at
+     * this copy: the rest of the enclosing block holds that pattern's equalities, false here, and
+     * is not compiled. */
+    dead: bool
+    /** Set where the condition just lowered is a constant an `is` test's pattern decided at this
+     * copy, so the code holding its equalities can be left out; any other constant condition is
+     * compiled as written. */
+    refuted: bool
+
+/** The code of the current block from instruction `at` on comes from the source at `span`, until
+ * the next mark. */
+private struct Mark
+    at: usize
+    span: Span
 
 /** A method table's entry for an option kept as a pointer, `option`: the method takes the pointer
  * where its trait's method takes `Self`, so the entry takes the object, in `selfs`, and gives an
@@ -392,8 +428,10 @@ lower_program(program: TProgram) -> MirProgram = lower_program_cached(program, m
 
 /** `lower_program` with the instance cache's lowered entries `cached`: with `caching`, an instance
  * whose own key has an entry there is read back rather than lowered, and every instance lowered that
- * an entry can hold gets one, in the program's `key_inputs`. */
-lower_program_cached(program: TProgram, cached: Map[string, string], caching: bool) -> MirProgram
+ * an entry can hold gets one, in the program's `key_inputs`. With `debug`, every function the source
+ * declares carries where its code comes from and its variables, and the program each function's
+ * `FunctionDebug`. */
+lower_program_cached(program: TProgram, cached: Map[string, string], caching: bool, debug: bool = false) -> MirProgram
     var global_types: Buf[Option[MirType]] = buf()
     for g in 0..<program.globals.len()
         // A union with a scalar member keeps its tag and bits here, and its reference word apart.
@@ -418,7 +456,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
     val ordinals = local_ordinals(program)
     var constant_globals: Buf[bool] = buf()
     val keyer = key_maker(program, ordinals, constant_globals, world)
-    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf())
+    var l = Lowering(program, buf(), map(), buf(), map(), buf(), buf(), map(), buf(), buf(), map(), map(), map(), map(), buf(), map(), buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), 0, buf(), buf(), 0, map(), false, global_types, generic_base, buf(), map(), buf(), buf(), buf(), false, false, Span(0, 0), buf(), false, buf(), false, 0, buf(), plan, map(), buf(), map(), buf(), buf(), false, buf(), false, None, buf(), false, buf(), buf(), map(), conformance_memo(), map(), buf(), local, ordinals, map(), "", map(), false, buf(), keyer, buf(), cached, caching, buf(), buf(), false, 0, entry_writer(), 0, false, type_names(program), map(), map(), map(), map(), 0, map(), 0, map(), 0, map(), 0, global_names(program), buf(), buf(), debug, false, buf(), 0, buf(), false, false)
     // Record 0 is for the objects no value of the program's types is: the boxes of captured
     // variables. A closure's record is its function type's.
     l.records.push(TypeRecord("a captured variable", buf(), None, None, None, None, false, buf(), 0))
@@ -546,7 +584,7 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
         l.stored.push("")
         l.reused.push(false)
     val inputs = KeyInputs(keyed, l.local_ordinals, l.instance_facts, devirt_facts, scalar_facts, constant_globals, world, l.own_keys, bodies_fingerprinted(l.keyer))
-    var mir = MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, entry_answer, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf(), l.stored, l.reused)
+    var mir = MirProgram(functions,l.strings, l.descriptors, l.records, l.closures, l.constants, l.traps, l.global_types, entry, init, l.bound, l.handles, tests, program.testing, entry_arguments, entry_answer, strings, l.c_handles, l.trampolines, global_names(program), string_names(l.strings), inputs, buf(), l.stored, l.reused, if debug then functions_debug(&l) else buf())
     mir
 
 /** Each string's name: the first 16 hexadecimal digits of the SHA-256 of its bytes. Two different
@@ -643,8 +681,12 @@ private layout_made(l: *Lowering, t: &Type) -> DataLayout
             val d = l.program.data[id]
             val methods = method_table(l, t)
             val call = call_entry(l, t)
+            // A refined variant that makes no value of this instance has no descriptor in it; the
+            // others keep their declared positions as their tags.
             for v in 0..<d.variants.len()
-                variants.push(variant_layout(l, key + "." + d.variants[v].name, v, variant_fields(d, id, v, args), true, true, methods, record, call))
+                variant_fields_at(d, id, v, args) match
+                    Some(fields) -> variants.push(variant_layout(l, key + "." + d.variants[v].name, v, fields, true, true, methods, record, call))
+                    None -> variants.push(VariantLayout(AbsentVariant, buf()))
         Tuple(items) -> variants.push(variant_layout(l, key, 0, items, true, true, method_table(l, t), record, None))
         Class(id, _, args) ->
             if is_array_class(l.program.classes[id])
@@ -701,7 +743,7 @@ private layout_made(l: *Lowering, t: &Type) -> DataLayout
         _ -> panic("a layout of a type that is not data, a tuple or a class: " + key)
     if holds_generic_methods(l, t)
         for v in variants
-            hold_generic_slots(l, v.descriptor, t)
+            if v.descriptor != AbsentVariant then hold_generic_slots(l, v.descriptor, t)
     val result = DataLayout(variants)
     l.layout_index.put(identity, l.layouts.len())
     l.layouts.push(result)
@@ -798,7 +840,7 @@ private table_entry(l: *Lowering, t: &Type, m: usize, type_args: Buf[&Type], pos
 
 /** Whether a value of type `t` is kept in a box when it is an `Any` or a trait's value: a built-in
  * value that is no reference. */
-private value_boxed(l: *Lowering, t: &Type) -> bool = is_builtin(t) && !(machine(l, t) is Some(MRef))
+private value_boxed(l: *Lowering, t: &Type) -> bool = (is_builtin(t) && !(machine(l, t) is Some(MRef))) || *concrete(l, t) is Opaque(_, _, _, _)
 
 /** The method a trait `t` conforms to declares at checker position `position`, named `name`. */
 private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -> Option[usize]
@@ -808,6 +850,8 @@ private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -
         val m = c.methods[position - c.base]
         if l.program.symbols[m].decl.name != name then continue
         if ancestor_type(l.program.classes, l.program.data, t, k) is Some(_) then return Some(m)
+        // An opaque type conforms through impls, which its boxed value's default bodies reach.
+        if *t is Opaque(_, _, _, _) && meets_bound(lowering_conformances(l), t, Class(k, c.decl.name, buf())) then return Some(m)
     None
 
 /** The function a call of a value of class or data type `t` as a function value runs: the type's
@@ -829,6 +873,7 @@ private names_type_parameter(t: &Type) -> bool = *t match
     ByName(inner) -> names_type_parameter(inner)
     Data(_, _, args) -> any_names_type_parameter(args)
     Class(_, _, args) -> any_names_type_parameter(args)
+    Opaque(_, _, args, _) -> any_names_type_parameter(args)
     _ -> false
 
 private any_names_type_parameter(items: Buf[&Type]) -> bool
@@ -881,7 +926,7 @@ private fill_used_slots(l: *Lowering) -> bool
     val before = l.instances.len()
     for i in 0..<l.descriptors.len()
         val t = l.record_types[l.descriptors[i].record]
-        if !(*t is Data(_, _, _) || *t is Class(_, _, _) || *t is Tuple(_) || is_builtin(t)) then continue
+        if !(*t is Data(_, _, _) || *t is Class(_, _, _) || *t is Tuple(_) || is_builtin_or_opaque(t)) then continue
         if l.descriptors[i].call is None
             if call_entry(l, t) is Some(f) then l.descriptors[i].call = Some(f)
         val old = l.descriptors[i].methods
@@ -901,7 +946,7 @@ private fill_used_slots(l: *Lowering) -> bool
 /** The lowering's view of conformances: of concrete types only, so with no type parameters in scope,
  * and the bounds of the impls for tuples, which a tuple's parts must meet. */
 private lowering_conformances(l: *Lowering) -> Conformances =
-    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.core, l.program.bounds, None, map())
+    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.core, l.program.bounds, None, map(), None)
 
 // For each position of `t`'s method table, whether it belongs to a trait `t` does not conform to at
 // its type arguments, though an impl with bounds of its own places the trait in every instance's
@@ -1268,6 +1313,9 @@ private constant_construct(l: *Lowering, e: &TExpr, variant: usize, args: Buf[&T
             val v = values[i] match
                 Some(v) -> v
                 None -> return None
+            // Inside a function only an object named by its content is made at compile time (see
+            // `constant_object_made`).
+            if l.constant_owner == "" && constant_key(v).contains("?") then return None
             fields.push(ConstantField(slot.offset, slot.ty, v))
     Some(Constant(Some(constant_object(l, shape.descriptor, l.descriptors[shape.descriptor].size, fields, true))))
 
@@ -1312,8 +1360,9 @@ private core_class(l: *Lowering, name: string) -> Option[usize]
 /** A new constant object; with `shared`, the one already made with the same descriptor and fields,
  * if there is one. */
 private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
-    if begin_request(l, "B")
-        var w = entry_writer()
+    val outermost = begin_request(l, "B")
+    var w = entry_writer()
+    if outermost
         w.text(l.descriptors[descriptor].name)
         w.num(size)
         w.flag(shared)
@@ -1322,15 +1371,29 @@ private constant_object(l: *Lowering, descriptor: usize, size: usize, fields: Bu
             w.num(f.offset)
             write_machine(&w, f.ty)
             if !write_operand(l, &w, f.value) then l.unrecordable = true
-        l.requests.out.push(w.finish())
     l.depth -= 1
-    constant_object_made(l, descriptor, size, fields, shared)
+    val made = constant_object_made(l, descriptor, size, fields, shared)
+    // The name the object was given, which the instance's code reads it by: replaying the request
+    // must give it the same name, or the entry does not read back (see `replay_requests`).
+    if outermost
+        w.text(constant_name(l, made))
+        l.requests.out.push(w.finish())
+    made
+
+/** The name of the constant object `o`, "" for any other operand. */
+private constant_name(l: *Lowering, o: Operand) -> string = o match
+    ConstData(index, _) -> l.constants[index].name
+    _ -> ""
 
 private constant_object_made(l: *Lowering, descriptor: usize, size: usize, fields: Buf[ConstantField], shared: bool) -> Operand
     var key = s"$descriptor:$size"
     for f in fields
         key = key + s";${f.offset}=" + constant_key(f.value)
-    // A real's text need not tell two reals apart, so an object holding one is never shared.
+    // An object is named by its content, which no edit elsewhere in the program moves, unless it
+    // is not to be shared or holds a value its key cannot spell. Such an object is named by the
+    // module-level value it is made for and its place among that value's objects; one inside a
+    // function body would be numbered in the order lowering met the functions, which a function
+    // read back from the instance cache does not follow, so `constant_construct` never makes one.
     var name = ""
     if shared && !key.contains("?")
         if l.constant_index.get(key) is Some(index) then return ConstData(index, descriptor)
@@ -1340,6 +1403,7 @@ private constant_object_made(l: *Lowering, descriptor: usize, size: usize, field
             content = content + s"\n${f.offset}=" + stable_constant_key(l, f.value)
         name = "=" + content_key(content)
     else
+        if l.constant_owner == "" then panic("avin: a constant object outside a module-level value has no stable name")
         val place = l.place_counts.get(l.constant_owner).unwrap_or(0) + 1
         l.place_counts.put(l.constant_owner, place)
         name = s"${l.constant_owner}#$place"
@@ -1350,6 +1414,7 @@ private constant_object_made(l: *Lowering, descriptor: usize, size: usize, field
 private constant_key(o: Operand) -> string = o match
     ConstInt(bits, digits) -> s"i$bits:$digits"
     ConstBool(value) -> if value then "t" else "f"
+    ConstReal(value) -> s"r${value.bits()}"
     ConstStr(index) -> s"s$index"
     ConstObject(descriptor) -> s"o$descriptor"
     ConstData(index, _) -> s"d$index"
@@ -1408,7 +1473,7 @@ private tuple_parts(l: *Lowering, e: &TExpr) -> Option[Buf[Option[Operand]]]
 // Tests a value against a pattern, as `test_pattern` does; a tuple pattern over a tuple written out
 // tests each part where it is computed, without making the tuple.
 private test_parts(l: *Lowering, pattern: &TPattern, value: &TExpr, fail: usize)
-    if pattern.kind is PVariant(_, fields) && *concrete(l, value.ty) is Tuple(_)
+    if pattern.kind is PVariant(_, fields, _) && *concrete(l, value.ty) is Tuple(_)
         val parts = tuple_parts(l, value) match
             Some(p) -> p
             None -> return
@@ -1629,6 +1694,7 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             for item in items
                 if holds_handles(l, item, seen) then return true
             false
+        Opaque(_, _, _, repr) -> holds_handles(l, repr, seen)
         Data(id, _, args) ->
             val key = type_key(t)
             for s in *seen
@@ -1636,7 +1702,7 @@ private holds_handles(l: *Lowering, t: &Type, seen: *Buf[string]) -> bool
             seen.push(key)
             val d = l.program.data[id]
             for v in 0..<d.variants.len()
-                for field in variant_fields(d, id, v, args)
+                for field in variant_fields_at(d, id, v, args).unwrap_or(buf())
                     if holds_handles(l, field, seen) then return true
             false
         Class(id, _, args) ->
@@ -1741,7 +1807,10 @@ private value_box_made(l: *Lowering, t: &Type) -> usize
     val record = object_record(l, t)
     val methods = method_table(l, t)
     val d = l.descriptors.len()
-    l.descriptors.push(Descriptor("box of " + stable_type_key(l.program, t), 0, size, buf(), size == 0, methods, record, Fields, None))
+    // A box of an opaque type may hold a reference, its representation's object.
+    var refs: Buf[usize] = buf()
+    if machine(l, t) is Some(m) then push_reference_words(&refs, m, 0)
+    l.descriptors.push(Descriptor("box of " + stable_type_key(l.program, t), 0, size, refs, size == 0, methods, record, Fields, None))
     l.boxes.put(key, d)
     // A built-in type's impls may add methods with type parameters of their own, which a call
     // through a trait reaches at a slot of their own type arguments, as an object's does.
@@ -1757,7 +1826,9 @@ private box_value(l: *Lowering, t: &Type, value: Option[Operand]) -> Option[Oper
     if is_scalar_union(t) then return Some(cell_as_any(l, t, v))
     val m = machine(l, t)?
     if pointer_option(l, t) then return Some(option_object(l, t, v))
-    if m is MRef then return Some(v)
+    // A value of an opaque type is boxed whatever its representation, so the box names the opaque
+    // type and a type pattern never finds the representation's object in its place.
+    if m is MRef && !(*t is Opaque(_, _, _, _)) then return Some(v)
     val object = fresh(l, MRef)
     l.insts.push(Alloc(object, value_box(l, t)))
     l.insts.push(Store(field_address(l, Value(object), FieldSlot(0, m)), v))
@@ -1819,7 +1890,8 @@ private scalar_bits(l: *Lowering, m: &Type, value: Option[Operand]) -> Operand
     val v = value match
         Some(v) -> v
         None -> return ConstInt(64, "0")
-    *m match
+    // An opaque member is kept as its representation is.
+    *representation(m) match
         Int(bits) -> resize(l, v, bits, 64, true)
         Byte -> resize(l, v, 8, 64, false)
         Char -> resize(l, v, 32, 64, false)
@@ -1828,7 +1900,7 @@ private scalar_bits(l: *Lowering, m: &Type, value: Option[Operand]) -> Operand
         _ -> ConstInt(64, "0")
 
 /** The value of the scalar type `m` that the bits `bits` of a union's cell keep. */
-private scalar_of_bits(l: *Lowering, m: &Type, bits: Operand) -> Option[Operand] = *m match
+private scalar_of_bits(l: *Lowering, m: &Type, bits: Operand) -> Option[Operand] = *representation(m) match
     Int(width) -> Some(resize(l, bits, 64, width, true))
     Byte -> Some(resize(l, bits, 64, 8, false))
     Char -> Some(resize(l, bits, 64, 32, false))
@@ -2121,7 +2193,7 @@ private seen_as(l: *Lowering, from: KnownType, target: KnownType) -> bool
     if always_is_known(l, from, target) then return true
     // For a reference that is not boxed to be seen as a trait, `always_is` has already looked
     // through `view_as`, and its no stands.
-    val boxed = (is_builtin(from.ty) || *from.ty is Tuple(_)) && *to is Class(_, _, _)
+    val boxed = (is_builtin_or_opaque(from.ty) || *from.ty is Tuple(_)) && *to is Class(_, _, _)
     if is_reference(from.ty) && !boxed then return false
     same_type(view_as(lowering_conformances(l), from.ty, to), to)
 
@@ -2132,7 +2204,7 @@ private unbox(l: *Lowering, t: &Type, object: Operand) -> Option[Operand]
     val c = concrete(l, t)
     if is_scalar_union(c) then return Some(any_as_cell(l, c, object))
     machine(l, t) match
-        Some(MRef) -> Some(object)
+        Some(MRef) -> if *c is Opaque(_, _, _, _) then Some(load_field(l, object, FieldSlot(0, MRef))) else Some(object)
         Some(m) -> Some(load_field(l, object, FieldSlot(0, m)))
         None -> None
 
@@ -2197,7 +2269,7 @@ private always_is(l: *Lowering, from: &Type, to: &Type) -> bool = value_always_i
 value_always_is(f: Conformances, from: &Type, to: &Type) -> bool
     if *to is AnyType || same_type(from, to) then return true
     // A built-in value or a tuple is a value of each trait it conforms to, once boxed as one.
-    if (is_builtin(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(f, from, to)
+    if (is_builtin_or_opaque(from) || *from is Tuple(_)) && *to is Class(_, _, _) then return meets_bound(f, from, to)
     if !is_reference(from) then return false
     same_type(view_as(f, from, to), to)
 
@@ -2506,7 +2578,7 @@ private never_reaches(f: Conformances, head: usize, up: &Type, receiver: &Type) 
     false
 
 /** Whether `t` is a number, a `char`, a `bool` or `unit`: a built-in type held as its value. */
-private is_plain_value(t: &Type) -> bool = is_builtin(t) && !(*t is Str)
+private is_plain_value(t: &Type) -> bool = (is_builtin(t) && !(*t is Str)) || *t is Opaque(_, _, _, _)
 
 // What the finished program shows of each call through a method table on a receiver of known static
 // type. Every object such a call can reach has a descriptor of a type that conforms to the receiver's
@@ -2600,6 +2672,11 @@ private struct DispatchAnswer
 // type, which is not passed.
 private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr], type_args: Buf[&Type]) -> Option[Operand]
     val callee = l.program.symbols[function]
+    // A constructor trait's method is compiled for each constructor implementing it, which follows
+    // its type arguments, so its `Self` is the value's own type.
+    if constructor_trait_method(l, callee) && args.len() > 0
+        val operands = call_operands(l, callee, args, false)?
+        return call_resolved(l, e, function, callee, args, operands, with_constructor(l, function, args[0].ty, type_args))
     // A trait's default body is compiled once for every conforming type, its `Self` an object: an
     // option kept as a pointer goes in as the object it stands for, and comes out as a pointer again.
     val default_body = is_trait_method(l, callee)
@@ -2607,7 +2684,16 @@ private direct_call(l: *Lowering, e: &TExpr, function: usize, args: Buf[&TExpr],
     if default_body && is_self_type(callee.result.unwrap_or(Unit)) && pointer_option(l, e.ty)
         val object = call_resolved(l, e, function, callee, args, operands, type_args)?
         return Some(option_pointer(l, e.ty, object))
+    // A value of an opaque type goes in boxed, and comes out of its box again.
+    if default_body && is_self_type(callee.result.unwrap_or(Unit)) && *concrete(l, e.ty) is Opaque(_, _, _, _)
+        val object = call_resolved(l, e, function, callee, args, operands, type_args)?
+        return unbox(l, e.ty, object)
     call_resolved(l, e, function, callee, args, operands, type_args)
+
+/** Whether `symbol` is a method a constructor trait declares. */
+private constructor_trait_method(l: *Lowering, symbol: FunctionSymbol) -> bool = symbol.owner_class match
+    Some(k) -> l.program.classes[k].constructor_trait
+    None -> false
 
 // The arguments of a direct call of `callee`, lowered, those with no runtime value and a static
 // member's type receiver left out; `None` where one never finishes, which ends the code there, since
@@ -2625,6 +2711,7 @@ private call_operands(l: *Lowering, callee: FunctionSymbol, args: Buf[&TExpr], d
                 Some(v) ->
                     val self_typed = i == 0 || (i < callee.params.len() && is_self_type(callee.params[i]))
                     if default_body && self_typed && pointer_option(l, a.ty) then operands.push(option_object(l, a.ty, v))
+                    elif default_body && self_typed && *concrete(l, a.ty) is Opaque(_, _, _, _) then operands.push(box_value(l, concrete(l, a.ty), Some(v)).unwrap())
                     else operands.push(v)
                 None -> return None
     Some(operands)
@@ -2751,6 +2838,20 @@ private bound_call(l: *Lowering, e: &TExpr, function: usize, slot: Option[usize]
     var concrete_args: Buf[&Type] = buf()
     for a in implementation_args(l, receiver, m)
         concrete_args.push(a)
+    // A method meeting a constructor trait's takes the type arguments of its own the meeting
+    // decided, in the trait method's and the type's.
+    if l.program.meetings.get(meeting_key(m, function)) is Some(decided)
+        var trait_args: Buf[&Type] = buf()
+        for t in type_args
+            trait_args.push(concrete(l, t))
+        var outer: Buf[&Type] = buf()
+        for a in concrete_args
+            outer.push(a)
+        while outer.len() < l.program.symbols[m].type_params.len()
+            outer.push(ErrorType)
+        for d in decided
+            concrete_args.push(concrete(l, substitute(substitute(d, l.program.symbols[m].type_owner, outer), l.program.symbols[function].type_owner, trait_args)))
+        return direct_call(l, e, m, args, concrete_args)
     val own = l.program.symbols[function].decl.type_params.len()
     for i in type_args.len() - own..<type_args.len()
         concrete_args.push(concrete(l, type_args[i]))
@@ -2851,10 +2952,71 @@ private bind_local(l: *Lowering, x: usize, value: Option[Operand])
 /** A type of the code being lowered, with the instance's type arguments substituted. A union of
  * references is laid out as an `Any` holding its member, so lowering sees it as `Any`; a union with
  * a scalar member is kept, since it has a layout of its own (see `make_cell`). */
-private concrete(l: *Lowering, t: &Type) -> &Type = erase_reference_unions(substitute(solve(l.program.vars, t), l.subst_owner, l.subst))
+private concrete(l: *Lowering, t: &Type) -> &Type = erase_reference_unions(written_concrete(l, t))
 
-/** `t` in the instance being lowered, with its unions kept: what a type pattern naming a union tests. */
-private written_concrete(l: *Lowering, t: &Type) -> &Type = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
+/** `t` in the instance being lowered, with its unions kept: what a type pattern naming a union tests.
+ * Inside an arm on a refined variant, the variant's parameters are what the arm read back; in an
+ * instance of a constructor trait's method, `Self` is the constructor implementing it. */
+private written_concrete(l: *Lowering, t: &Type) -> &Type
+    var out = substitute(solve(l.program.vars, t), l.subst_owner, l.subst)
+    for r in l.refined
+        out = substitute(out, r.owner, r.args)
+    if l.self_owner == 0 then out else substitute(out, l.self_owner, l.self_args)
+
+/** What a lambda or local function written inside refining patterns' scopes reads back of them at
+ * the copy being lowered: each pattern's matched type, at the copy and at what the patterns around
+ * it read, gives its variant's arguments, as the enclosing code's arm read them. */
+private function_refinements(l: *Lowering, symbol: usize) -> Buf[Refinement]
+    l.refined = buf()
+    for rf in l.program.refined_functions
+        if rf.symbol != symbol then continue
+        for k in rf.sites
+            val site = l.program.refine_sites[k]
+            if *concrete(l, site.matched) is Data(id, _, args)
+                if variant_args(l.program.data[id], id, site.variant, args) is Some(full)
+                    l.refined.push(Refinement(pattern_owner(k), full))
+        break
+    l.refined
+
+/** The type arguments an arm read back from a refined variant's instance, for `owner`'s parameters. */
+private struct Refinement
+    owner: usize
+    args: Buf[&Type]
+
+// An instance of a constructor trait's method is given the constructor implementing the trait after
+// the method's type arguments, which `Self` stands for in it.
+private set_self(l: *Lowering, function: usize)
+    l.self_owner = 0
+    val symbol = l.program.symbols[function]
+    val k = symbol.owner_class match
+        Some(k) -> k
+        None -> return
+    if !l.program.classes[k].constructor_trait || l.subst.len() <= symbol.type_params.len() then return
+    l.self_owner = self_owner(k)
+    var args: Buf[&Type] = buf()
+    args.push(l.subst[symbol.type_params.len()])
+    l.self_args = args
+
+/** The type arguments of a call of constructor trait method `function` on a receiver of type
+ * `receiver`, with the constructor implementing the trait after them. */
+private with_constructor(l: *Lowering, function: usize, receiver: &Type, type_args: Buf[&Type]) -> Buf[&Type]
+    val symbol = l.program.symbols[function]
+    val k = symbol.owner_class match
+        Some(k) -> k
+        None -> return type_args
+    if !l.program.classes[k].constructor_trait || type_args.len() != symbol.type_params.len() then return type_args
+    val r = concrete(l, receiver)
+    val made = *r match
+        Applied(head, _) -> Some(head)
+        _ -> constructor_of_value(l.program.classes, l.program.data, r, k)
+    val f = made match
+        Some(f) -> f
+        None -> return type_args
+    var out: Buf[&Type] = buf()
+    for t in type_args
+        out.push(t)
+    out.push(f)
+    out
 
 private machine(l: *Lowering, t: &Type) -> Option[MirType] = mir_type(concrete(l, t))
 
@@ -2928,6 +3090,7 @@ stable_type_key(program: TProgram, t: &Type) -> string = *t match
         val k = program.classes[id]
         val kind = if k.decl.object then "object " else "class "
         s"$kind${module_prefix(k.module_name)}.${k.name}[" + stable_key_list(program, args) + "]"
+    Opaque(id, _, args, _) -> s"opaque ${program.opaques[id]}[" + stable_key_list(program, args) + "]"
     // The members' keys in sorted order, so a union is one key whatever order it was written in.
     Union(members) ->
         var keys: Buf[string] = buf()
@@ -2958,11 +3121,17 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.tail_calls = false
     l.param_slots = buf()
     l.result_words = buf()
+    l.marks = buf()
+    l.locating = false
     if inst.generated != Written then return lower_generated(l, inst)
     val f = l.program.functions[inst.function]
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
     l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
+    set_self(l, symbol.root.unwrap_or(inst.function))
+    l.refined = function_refinements(l, f.symbol)
+    l.dead = false
+    l.refuted = false
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -2976,6 +3145,9 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     l.locals = f.locals
     l.boxed = boxed_locals(l, symbol.root.unwrap_or(inst.function), f.locals)
     if inst.entry then return lower_entry(l, inst)
+    // The code before the body's first expression, which takes the parameters in, is placed
+    // nowhere, so a debugger stopping at the function's first line sees them taken.
+    l.locating = l.debug
     var signature = signature_of(l, f)
     var name = function_symbol(l, f.symbol, inst.type_args)
     if inst.words
@@ -3011,6 +3183,7 @@ private lower_function(l: *Lowering, k: usize) -> MirFunction
     f.body match
         Some(body) ->
             if loops_on_itself(l, symbol, body) then start_loop(l, symbol)
+            if l.locating then declare_variables(l, symbol, f.symbol, f.locals)
             l.tail_calls = !is_class_constructor(l.program, f.symbol)
             val result = lower_at(l, body, true)
             l.tail_calls = false
@@ -3057,6 +3230,66 @@ private start_loop(l: *Lowering, symbol: FunctionSymbol)
     val head = new_block(l)
     finish_into(l, Jump(head), head)
     l.tail_head = Some(head)
+
+/** A `Variable` for each parameter and local of the function being lowered that lives in a slot of
+ * its own or is a parameter's value: a local a closure shares lives in a box, and is left out, as
+ * is one the compiler made, whose name no program can spell. A top-level function compiled as a
+ * loop keeps its parameters in slots, which are then where they live. */
+private declare_variables(l: *Lowering, symbol: FunctionSymbol, function: usize, locals: Buf[TLocal])
+    var args: Map[usize, usize] = map()
+    if symbol.root is None
+        for i in 0..<symbol.params.len()
+            if i >= symbol.param_names.len() || !spelled_name(symbol.param_names[i]) then continue
+            val ty = type_name(concrete(l, symbol.params[i]))
+            if i < l.param_slots.len() && l.param_slots[i] is Some(p)
+                l.insts.push(Variable(symbol.param_names[i], ty, p.address, i + 1))
+            elif i < l.param_values.len() && l.param_values[i] is Some(v)
+                l.insts.push(Variable(symbol.param_names[i], ty, Value(v), i + 1))
+    else
+        for i in 0..<symbol.param_locals.len()
+            args.put(symbol.param_locals[i], i + 1)
+    for x in 0..<locals.len()
+        val local = locals[x]
+        if local.owner != function || l.boxed[x] || !spelled_name(local.name) then continue
+        if l.local_slots[x] is Some(p)
+            if p.address is SlotAddress(_)
+                l.insts.push(Variable(local.name, type_name(concrete(l, local.ty)), p.address, args.get(x).unwrap_or(0)))
+
+/** Whether `name` is one a program can write: a local the compiler makes is named otherwise. */
+private spelled_name(name: string) -> bool
+    if name.len == 0 then return false
+    val c = name.bytes[0]
+    u8('a') <= c <= u8('z') || u8('A') <= c <= u8('Z') || c == u8('_')
+
+/** What the debugger is told of each function of the program, by instance: a function the source
+ * declares is named as Avin spells it, its symbol without the prefix of the program's own module,
+ * and placed at its name in the file it is declared in, by that file's full path. */
+private functions_debug(l: *Lowering) -> Buf[FunctionDebug]
+    var out: Buf[FunctionDebug] = buf()
+    var paths: Map[usize, string] = map()
+    for k in 0..<l.instances.len()
+        val inst = l.instances[k]
+        if inst.generated != Written || inst.entry
+            out.push(FunctionDebug("", "", 0, 0, false))
+            continue
+        val f = l.program.functions[inst.function]
+        val symbol = l.program.symbols[f.symbol]
+        val src = l.program.sources[symbol.unit]
+        val file = paths.get(symbol.unit) match
+            Some(p) -> p
+            None ->
+                val p = canonicalize(src.name).unwrap_or(src.name)
+                paths.put(symbol.unit, p)
+                p
+        val at = src.locate(symbol.decl.name_span.start)
+        var name = function_symbol(l, f.symbol, inst.type_args)
+        if inst.words then name = name + "#words"
+        if name.starts_with(ProgramModulePrefix) then name = name[ProgramModulePrefix.len..]
+        out.push(FunctionDebug(name, file, at.line, at.col, true))
+    out
+
+/** How the symbol of a function of the program's own module begins. */
+private const ProgramModulePrefix: string = "<program>."
 
 /** The value of parameter `x` of the top-level function, where the code being lowered can reach it. */
 private param_operand(l: *Lowering, x: usize) -> Option[Operand]
@@ -5350,10 +5583,10 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
             val shape = layout(l, t)
             val start = layouts.len()
             for v in shape.variants
-                layouts.push(if l.descriptors[v.descriptor].constant then ConstObject(v.descriptor) else DescriptorAddress(v.descriptor))
+                layouts.push(if v.descriptor == AbsentVariant then NullAddress elif l.descriptors[v.descriptor].constant then ConstObject(v.descriptor) else DescriptorAddress(v.descriptor))
             var variants: Buf[CrossVariant] = buf()
             for v in 0..<d.variants.len()
-                val types = variant_fields(d, id, v, args)
+                val types = variant_fields_at(d, id, v, args).unwrap_or(buf())
                 var fields: Buf[CrossField] = buf()
                 for k in 0..<types.len()
                     val base = layouts.len() - start
@@ -5361,7 +5594,8 @@ private crossing(l: *Lowering, t: &Type, layouts: *Buf[Operand]) -> &Crossing
                         Some(slot) -> Some(slot.offset)
                         None -> None
                     fields.push(CrossField(d.variants[v].field_names[k], offset, crossing(l, types[k], layouts), base))
-                variants.push(CrossVariant(d.variants[v].name, l.descriptors[shape.variants[v].descriptor].constant, fields))
+                val constant = shape.variants[v].descriptor != AbsentVariant && l.descriptors[shape.variants[v].descriptor].constant
+                variants.push(CrossVariant(d.variants[v].name, constant, fields))
             val form = mirror_target(d.decl) match
                 Some(target) -> Mirror(d.name, target, d.unit, d.decl.span, d.variants.len() == 1 && d.variants[0].name == d.name)
                 None -> if d.name == "Option" then OptionForm(pointer_option(l, t)) else ResultForm
@@ -5530,8 +5764,9 @@ private intrinsic_body(l: *Lowering, symbol: FunctionSymbol)
             params.push(t)
     // The runtime runs a started thread's closure, an actor's guarded code and the exit hooks
     // through the program's closure runner, since it calls with the C convention and the closure's
-    // entry has the program's own; a scope's body run so that a cancellation returns to it, too.
-    if name == "thread_start" || name == "actor_guarded" || name == "exit_hooks" || name == "cancel_guarded"
+    // entry has the program's own; a scope's body run so that a cancellation returns to it, too, and
+    // a body holding what other threads wait for.
+    if name == "thread_start" || name == "actor_guarded" || name == "exit_hooks" || name == "cancel_guarded" || name == "cancel_guarded_held"
         args.push(ClosureRunner)
         params.push(MPtr)
     val result = machine(l, found.2)
@@ -5687,9 +5922,12 @@ private new_block(l: *Lowering) -> usize
 
 /** Ends the current block with `term`. */
 private finish(l: *Lowering, term: Terminator)
-    l.blocks[l.current].insts = l.insts
+    l.blocks[l.current].insts = if l.locating then located(l) else l.insts
     l.blocks[l.current].term = term
     l.insts = buf()
+    if l.locating
+        l.marks = buf()
+        mark(l, l.here)
 
 /** Ends the current block and continues in `block`. */
 private finish_into(l: *Lowering, term: Terminator, block: usize)
@@ -5833,7 +6071,10 @@ private trap_site_made(l: *Lowering, reason: string, at: Span) -> usize
     val key = if made == "" then s"${l.unit}:${at.start}:$reason" else s"${l.unit}:made $made:$reason"
     if l.trap_index.get(key) is Some(index) then return index
     val src = l.program.sources[l.unit]
-    val position = src.locate(at.start)
+    // A site the compiler made is placed where its function is declared: it is one site however
+    // many places it is asked for at, so where it is reported cannot depend on which came first.
+    val placed = if made != "" && l.function_index < l.instances.len() then instance_declaration(l, l.function_index).start else at.start
+    val position = src.locate(placed)
     val file = file_name(src.name).unwrap_or(src.name)
     val name = if made == "" then trap_name(l, reason, at, file) else s"$made+made:" + content_key(reason)[0..<12]
     l.traps.push(TrapSite(name, intern(l, reason), intern(l, file), position.line, position.col))
@@ -5975,9 +6216,46 @@ private lower_expr(l: *Lowering, e: &TExpr) -> Option[Operand] = lower_at(l, e, 
 private lower_at(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand]
     val outer = l.here
     l.here = e.span
+    if l.locating then mark(l, e.span)
     val value = lower_kind(l, e, tail)
     l.here = outer
+    if l.locating then mark(l, outer)
     value
+
+/** Places the code lowering makes from here on at `span`, in a function built with debug
+ * information; a span of code the compiler wrote, which is empty, leaves the place as it was. */
+private mark(l: *Lowering, span: Span)
+    if span.start == span.end then return
+    val at = l.insts.len()
+    val n = l.marks.len()
+    if n > 0 && l.marks[n - 1].at == at
+        l.marks[n - 1] = Mark(at, span)
+    else l.marks.push(Mark(at, span))
+
+/** The current block's instructions with a `Locate` before each run that comes from one place. The
+ * block begins at the place lowering was at when it began, and no `Locate` comes between a call
+ * and the words of its result, or among the words a return gives, which belong together. */
+private located(l: *Lowering) -> Buf[Inst]
+    var out: Buf[Inst] = buf()
+    val src = l.program.sources[l.unit]
+    var j = 0usize
+    var pending: Option[Span] = None
+    var line = 0usize
+    var col = 0usize
+    for i in 0..<l.insts.len()
+        while j < l.marks.len() && l.marks[j].at <= i
+            pending = Some(l.marks[j].span)
+            j += 1
+        val inst = l.insts[i]
+        if pending is Some(span) && !(inst is CallWord(_, _, _) || inst is ReturnWord(_, _))
+            val p = src.locate(span.start)
+            if p.line != line || p.col != col
+                out.push(Locate(span.start, p.line, p.col))
+                line = p.line
+                col = p.col
+            pending = None
+        out.push(inst)
+    out
 
 private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.kind match
     IntConst(digits) -> Some(ConstInt(int_bits(e.ty), digits))
@@ -6005,6 +6283,11 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     CallValue(callee, args) -> returned_call(l, tail, call_value(l, callee, args))
     Field(value, index) ->
         val object = lower_expr(l, value)?
+        // An instance whose one variant is refined to another instance has no values, so no read of
+        // its field is reached.
+        if layout(l, concrete(l, value.ty)).variants[0].descriptor == AbsentVariant
+            leave(l, trap_at(l, "a value of a type no variant makes", e.span))
+            return None
         layout(l, concrete(l, value.ty)).variants[0].fields[index] match
             Some(field) -> constant_field(l, object, field) match
                 Some(known) -> Some(known)
@@ -6022,6 +6305,10 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         val object = lower_expr(l, value)?
         val fields = layout(l, concrete(l, value.ty)).variants[0].fields
         lazy_read(l, e.span, name, LazyPlace(Some(object), 0, fields[index + 1], fields[index]), initialize)
+    LazyLocal(cell, initialize, _, name) ->
+        val object = lower_expr(l, cell)?
+        val fields = layout(l, concrete(l, cell.ty)).variants[0].fields
+        lazy_read(l, e.span, name, LazyPlace(Some(object), 0, fields[1], fields[0]), initialize)
     StoreGlobal(index, value, yields) ->
         // A value made at compile time is never initialized: its initializer has no effects.
         if l.constant_values[index] is Some(object) then return if yields then Some(object) else None
@@ -6047,6 +6334,12 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         var last: Option[Operand] = None
         for i in 0..<items.len()
             last = lower_at(l, items[i], tail && !deferring && i + 1 == items.len())
+            // The rest of a block after a test whose pattern no value reaches at this copy holds
+            // that pattern's equalities, false here, and is never reached: it is not compiled.
+            if l.dead
+                l.dead = false
+                last = None
+                break
         if l.defers.len() > mark
             if machine(l, e.ty) is Some(_)
                 val slot = new_slot(l, e.ty)
@@ -6065,7 +6358,14 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         bind_local(l, local, lower_expr(l, value))
         None
     LetPattern(pattern, value) ->
-        // The pattern cannot fail, so its failure block is never reached.
+        // The pattern cannot fail, so its failure block is never reached. Its equalities hold for
+        // the rest of the block; where they are false at this copy, no value reaches it, and the
+        // rest is not compiled.
+        if !keep_refinements(l, pattern)
+            lower_expr(l, value)
+            finish_into(l, trap_at(l, "no value matched the binding's pattern", pattern.span), new_block(l))
+            l.dead = true
+            return None
         val fail = new_block(l)
         val join = new_block(l)
         test_parts(l, pattern, value, fail)
@@ -6088,7 +6388,11 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         if !is_machine_scalar(t) then return operator_call(l, t, "negate", [x], machine(l, t))
         Some(negate_value(l, t, x, e.span))
     Not(operand) ->
+        l.refuted = false
         val x = lower_expr(l, operand)?
+        if l.refuted
+            if x is ConstBool(known) then return Some(ConstBool(!known))
+        l.refuted = false
         Some(binary(l, MBool, OpXor, x, ConstBool(true)))
     Complement(operand) ->
         val x = lower_expr(l, operand)?
@@ -6127,6 +6431,8 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
         if v is None && machine(l, value.ty) is Some(_) then return None
         if pointer_option(l, e.ty) then Some(NullAddress)
         else Some(ConstObject(layout(l, concrete(l, e.ty)).variants[none_variant(l)].descriptor))
+    // An opaque type and its representation are laid out alike, so the value is itself.
+    Reveal(value) -> lower_expr(l, value)
     Logic(and, left, right) -> logic(l, and, left, right, tail)
     Compare(operands, ops) -> compare_chain(l, operands, ops)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no, tail)
@@ -6361,13 +6667,22 @@ max_digits(bits: u32) -> string
     head + char(last).to_string()
 
 private logic(l: *Lowering, and: bool, left: &TExpr, right: &TExpr, tail: bool) -> Option[Operand]
+    l.refuted = false
     val a = lower_expr(l, left)?
+    // A left operand an `is` test decided at this copy decides the whole where it can, and the right
+    // one, which may be checked under equalities false here, is not compiled.
+    if l.refuted
+        if a is ConstBool(known)
+            if known != and then return Some(a)
+    l.refuted = false
     val slot = new_slot(l, Bool)
     store(l, slot, Some(a))
     val rest = new_block(l)
     val done = new_block(l)
     finish_into(l, if and then Branch(a, rest, done) else Branch(a, done, rest), rest)
     store(l, slot, lower_at(l, right, tail))
+    l.dead = false
+    l.refuted = false
     finish_into(l, Jump(done), done)
     load(l, slot)
 
@@ -6498,7 +6813,23 @@ private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) 
     load(l, slot)
 
 private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr], tail: bool) -> Option[Operand]
+    l.refuted = false
     val c = lower_expr(l, condition)?
+    val decided = l.refuted
+    l.refuted = false
+    // A condition an `is` test decided at this copy compiles only the branch it takes: the other may
+    // be checked under equalities false here. A taken branch that never finishes, as `if e is not
+    // V(x) then return` at a copy no `V` reaches, leaves the rest of its block uncompiled too (`dead`).
+    if decided
+        if c is ConstBool(known)
+            val slot = new_slot(l, e.ty)
+            if known
+                store(l, slot, lower_at(l, yes, tail))
+                if *yes.ty is Nothing then l.dead = true
+            elif no is Some(n)
+                store(l, slot, lower_at(l, n, tail))
+                if *n.ty is Nothing then l.dead = true
+            return load(l, slot)
     val slot = new_slot(l, e.ty)
     val then_block = new_block(l)
     val join = new_block(l)
@@ -6506,10 +6837,12 @@ private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Op
     finish_into(l, Branch(c, then_block, else_block), then_block)
     store(l, slot, lower_at(l, yes, tail))
     finish(l, Jump(join))
+    l.dead = false
     if no is Some(n)
         l.current = else_block
         store(l, slot, lower_at(l, n, tail))
         finish(l, Jump(join))
+        l.dead = false
     l.current = join
     load(l, slot)
 
@@ -6518,12 +6851,24 @@ private lower_while(l: *Lowering, e: &TExpr, label: usize, condition: &TExpr, bo
     val head = new_block(l)
     val exit = new_block(l)
     finish_into(l, Jump(head), head)
+    l.refuted = false
     val c = lower_expr(l, condition)?
+    val decided = l.refuted
+    l.refuted = false
+    // A condition an `is` test made false at this copy runs no body, which may be checked under
+    // equalities false here.
+    if decided
+        if c is ConstBool(false)
+            if otherwise is Some(o)
+                store(l, slot, lower_expr(l, o))
+            finish_into(l, Jump(exit), exit)
+            return load(l, slot)
     val body_block = new_block(l)
     val else_block = if otherwise is Some(_) then new_block(l) else exit
     finish_into(l, Branch(c, body_block, else_block), body_block)
     l.loops.push(LoopTarget(label, head, exit, slot, l.defers.len()))
     lower_expr(l, body)
+    l.dead = false
     l.loops.truncate(l.loops.len() - 1)
     finish(l, Jump(head))
     if otherwise is Some(o)
@@ -6532,6 +6877,33 @@ private lower_while(l: *Lowering, e: &TExpr, label: usize, condition: &TExpr, bo
         finish(l, Jump(exit))
     l.current = exit
     load(l, slot)
+
+// Pushes onto `l.refined` the arguments each refined variant pattern in `p` reads back from the
+// instance it matches at the copy being lowered, so the arm is compiled at them; false where one
+// names a variant that instance cannot hold, so no value reaches the arm and it is not compiled.
+// A pattern written in the program names the variant's parameters as its own fresh types, and the
+// code derived for a type names them as the type's.
+private refine_pattern(l: *Lowering, p: &TPattern) -> bool = p.kind match
+    PVariant(variant, fields, site) ->
+        if *concrete(l, p.ty) is Data(id, _, args)
+            val d = l.program.data[id]
+            if d.variants[variant].params.len() > d.decl.type_params.len() || d.variants[variant].result is Some(_)
+                val full = variant_args(d, id, variant, args) match
+                    Some(full) -> full
+                    None -> return false
+                l.refined.push(Refinement(data_owner(id), full))
+                if site is Some(k) then l.refined.push(Refinement(pattern_owner(k), full))
+        for f in fields
+            if !refine_pattern(l, f) then return false
+        true
+    PNamed(_, inner) -> refine_pattern(l, inner)
+    // Each alternative is tested at what its own patterns read back; one the instance cannot hold
+    // matches nothing, and the others still may.
+    PAlternatives(options) ->
+        for o in options
+            refine_pattern(l, o)
+        true
+    _ -> true
 
 /** Continues only when `condition` holds; otherwise control goes to `fail`. */
 private continue_if(l: *Lowering, condition: Operand, fail: usize)
@@ -6547,12 +6919,19 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm], t
     val slot = new_slot(l, e.ty)
     val join = new_block(l)
     for arm in arms
+        l.dead = false
+        val depth = l.refined.len()
+        if !refine_pattern(l, arm.pattern)
+            l.refined.truncate(depth)
+            continue
         val fail = new_block(l)
         test_pattern(l, arm.pattern, s, fail)
         if arm.guard is Some(g)
             if lower_expr(l, g) is Some(ok) then continue_if(l, ok, fail)
         store(l, slot, lower_at(l, arm.body, tail))
         finish_into(l, Jump(join), fail)
+        l.refined.truncate(depth)
+    l.dead = false
     finish_into(l, trap_at(l, "no arm of the match took the value", e.span), join)
     load(l, slot)
 
@@ -6566,6 +6945,14 @@ private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: B
     val slot = new_slot(l, e.ty)
     val join = new_block(l)
     for clause in clauses
+        l.dead = false
+        val depth = l.refined.len()
+        var possible = true
+        for p in clause.patterns
+            if possible && !refine_pattern(l, p) then possible = false
+        if !possible
+            l.refined.truncate(depth)
+            continue
         val fail = new_block(l)
         for i in 0..<clause.patterns.len()
             test_pattern(l, clause.patterns[i], values[i], fail)
@@ -6576,12 +6963,36 @@ private lower_clauses(l: *Lowering, e: &TExpr, subjects: Buf[&TExpr], clauses: B
             store(l, slot, lower_at(l, b.body, tail))
             finish_into(l, Jump(join), next)
         finish_into(l, Jump(fail), fail)
+        l.refined.truncate(depth)
+    l.dead = false
     finish_into(l, trap_at(l, "no clause took the arguments", e.span), join)
     load(l, slot)
+
+// The arguments `p`'s refining patterns read back, kept for the rest of the function: an `is` test's
+// and a binding's equalities hold where their names are in scope, which is no one block, and each
+// pattern's fresh types are its own, so keeping them is harmless past that. False where one names a
+// variant the matched instance cannot hold at this copy.
+private keep_refinements(l: *Lowering, p: &TPattern) -> bool
+    val depth = l.refined.len()
+    if !refine_pattern(l, p)
+        l.refined.truncate(depth)
+        return false
+    // The type's own parameters are named only by the code derived for it, which binds nothing past
+    // its arms.
+    var kept: Buf[Refinement] = buf()
+    for i in 0..<l.refined.len()
+        if i < depth || is_pattern_owner(l.refined[i].owner) then kept.push(l.refined[i])
+    l.refined = kept
+    true
 
 private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool) -> Option[Operand]
     val v = lower_expr(l, value)
     if v is None && machine(l, value.ty) is Some(_) then return None
+    // A pattern no value of the instance can match fails at this copy, and the code that holds its
+    // equalities is not compiled (`lower_if`, `logic`).
+    if !keep_refinements(l, pattern)
+        l.refuted = true
+        return Some(ConstBool(negated))
     val slot = new_slot(l, Bool)
     val fail = new_block(l)
     val join = new_block(l)
@@ -6749,7 +7160,7 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
             bind_local(l, local, value)
             test_pattern(l, inner, lower_expr(l, view), fail)
         PUnion(parts) -> test_union(l, p, parts, value, fail)
-        PVariant(variant, fields) ->
+        PVariant(variant, fields, _) ->
             if value is Some(v)
                 // An option kept as a pointer is `None` where it is null, and otherwise the `Some`
                 // whose value it is.
@@ -6759,6 +7170,10 @@ private test_pattern(l: *Lowering, p: &TPattern, value: Option[Operand], fail: u
                     if some && fields.len() == 1 && !(fields[0].kind is PWildcard) then test_pattern(l, fields[0], Some(v), fail)
                     return
                 val shape = layout(l, concrete(l, p.ty))
+                // A variant the instance cannot hold matches no value of it.
+                if shape.variants[variant].descriptor == AbsentVariant
+                    finish_into(l, Jump(fail), new_block(l))
+                    return
                 // A type with one variant needs no test; otherwise the tag is in the descriptor.
                 if shape.variants.len() > 1
                     val descriptor = fresh(l, MPtr)
@@ -6915,6 +7330,9 @@ private operator_values(l: *Lowering, t: &Type, name: string, values: Buf[Operan
             // goes in as the object it stands for.
             if pointer_option(l, t) && implemented_by_trait(l, t, m)
                 for i in 0..<values.len() do values[i] = option_object(l, t, values[i])
+            // And a value of an opaque type goes in boxed.
+            elif *concrete(l, t) is Opaque(_, _, _, _) && implemented_by_trait(l, t, m)
+                for i in 0..<values.len() do values[i] = box_value(l, concrete(l, t), Some(values[i])).unwrap()
             call_instance(l, index, values, result)
         None ->
             // An instance the checker never lets run: a conditional impl's method at type
@@ -7003,6 +7421,8 @@ private equals_values(l: *Lowering, t: &Type, a: Operand, b: Operand) -> Operand
     Function(_, _, _) -> compare(l, CmpEq, a, b)
     ByName(_) -> compare(l, CmpEq, a, b)
     Union(_) -> if is_scalar_union(t) then union_equals(l, t, a, b) else call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
+    // An opaque type's values are equal as their representations are.
+    Opaque(_, _, _, repr) -> equals_values(l, repr, a, b)
     _ ->
         if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqEquals", e), two(a, b), Some(MBool)).unwrap()
         elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyEquals, AnyType), two(a, b), Some(MBool)).unwrap()
@@ -7032,6 +7452,7 @@ private hash_value(l: *Lowering, t: &Type, a: Operand) -> Operand = *t match
     Function(_, _, _) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     ByName(_) -> runtime_call(l, "avin_rt_identity_hash", [MRef], MInt(64), [a])
     Union(_) -> if is_scalar_union(t) then union_hash(l, t, a) else call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
+    Opaque(_, _, _, repr) -> hash_value(l, repr, a)
     _ ->
         if is_abstract_or_trait(l, t) && seq_element(l, t) is Some(e) then call_instance(l, library_instance(l, "seqHash", e), one(a), Some(MInt(64))).unwrap()
         elif decided_at_run_time(l, t) then call_instance(l, generated(l, AnyHash, AnyType), one(a), Some(MInt(64))).unwrap()
@@ -7213,7 +7634,7 @@ private record_rendering(l: *Lowering, t: &Type, name: string) -> MirFunction
 /** The instance of type `t`'s own implementation of the rendering method `m`, where `t` conforms to
  * the trait declaring it. */
 private own_rendering(l: *Lowering, t: &Type, m: usize) -> Option[usize]
-    if !(*t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) || is_builtin(t)) then return None
+    if !(*t is Class(_, _, _) || *t is Data(_, _, _) || *t is Tuple(_) || is_builtin_or_opaque(t)) then return None
     val k = l.program.symbols[m].owner_class?
     if !meets_bound(lowering_conformances(l), t, Class(k, l.program.classes[k].decl.name, buf())) then return None
     explicit_implementation(l, t, m)
@@ -7222,6 +7643,7 @@ private own_rendering(l: *Lowering, t: &Type, m: usize) -> Option[usize]
 private lower_generated(l: *Lowering, inst: Instance) -> MirFunction
     l.subst = buf()
     l.subst_owner = 0
+    l.self_owner = 0
     l.values = buf()
     l.slots = buf()
     l.blocks = buf()
@@ -7291,6 +7713,7 @@ private lower_adapter(l: *Lowering, inst: Instance) -> MirFunction
     val symbol = l.program.symbols[inst.function]
     l.subst = inst.type_args
     l.subst_owner = symbol.type_owner
+    set_self(l, inst.function)
     val boxed = value_boxed(l, shape.option)
     val signature = signature_of(l, l.program.functions[inst.function])
     var params: Buf[MirType] = buf()
@@ -7337,7 +7760,7 @@ private single(m: MirType) -> Buf[MirType]
 /** The field types of variant `v` of a tuple or data type `t`. */
 private field_types(l: *Lowering, t: &Type, v: usize) -> Buf[&Type] = *t match
     Tuple(items) -> items
-    Data(id, _, args) -> variant_fields(l.program.data[id], id, v, args)
+    Data(id, _, args) -> variant_fields_at(l.program.data[id], id, v, args).unwrap_or(buf())
     _ -> buf()
 
 /** The tag of a data value's variant, from its descriptor. */
@@ -7592,6 +8015,8 @@ private enter_instance(l: *Lowering, k: usize)
     val symbol = l.program.symbols[f.symbol]
     l.subst = inst.type_args
     l.subst_owner = l.program.symbols[symbol.root.unwrap_or(inst.function)].type_owner
+    set_self(l, symbol.root.unwrap_or(inst.function))
+    l.refined = function_refinements(l, f.symbol)
     l.unit = symbol.unit
     l.library = library_instance(l, k)
     l.here = symbol.decl.name_span
@@ -7703,7 +8128,8 @@ private replay_requests(l: *Lowering, r: *EntryReader, apply: bool) -> Option[un
                 val t = read_machine(r)?
                 val value = read_operand(l, r, apply)?
                 fields.push(ConstantField(offset, t, value))
-            if apply then _ = constant_object(l, descriptor_named(l, name)?, size, fields, shared)
+            val recorded = r.text()
+            if apply && constant_name(l, constant_object(l, descriptor_named(l, name)?, size, fields, shared)) != recorded then return None
         else return None
         if r.failed then return None
     if r.failed then None else Some(())
@@ -7996,6 +8422,20 @@ private write_inst(l: *Lowering, w: *EntryWriter, inst: Inst) -> bool
             w.num(dest)
             w.text(l.descriptors[d].name)
         Publish -> w.word("pu")
+        Locate(at, _, _) ->
+            // Kept counted from the start of the declaration the instance belongs to, as a trap
+            // site is, so the place is found again where the declaration is now.
+            val base = instance_declaration(l, l.function_index)
+            val inside = base.start <= at && at <= base.end
+            w.word("lo")
+            w.flag(inside)
+            w.num(if inside then at - base.start else at)
+        Variable(name, type_name, address, arg) ->
+            w.word("va")
+            w.text(name)
+            w.text(type_name)
+            w.num(arg)
+            return write_operand(l, w, address)
         AtomicLoad(dest, address) ->
             w.word("aL")
             w.num(dest)
@@ -8068,6 +8508,17 @@ private read_inst(l: *Lowering, r: *EntryReader) -> Option[Inst]
             callee = Some(CFunction(symbol, params, result))
         return Some(Call(dest, callee?, read_operands(l, r)?))
     if tag == "pu" then return Some(Publish)
+    if tag == "lo"
+        val inside = r.flag()
+        val offset = r.num()
+        val at = if inside then instance_declaration(l, l.function_index).start + offset else offset
+        val p = l.program.sources[l.unit].locate(at)
+        return Some(Locate(at, p.line, p.col))
+    if tag == "va"
+        val name = r.text()
+        val type_name = r.text()
+        val arg = r.num()
+        return Some(Variable(name, type_name, read_operand(l, r, true)?, arg))
     val dest = r.num()
     if tag == "bi"
         val op = op_of(r.num())?

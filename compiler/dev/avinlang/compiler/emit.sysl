@@ -129,10 +129,15 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
     var intrinsics: Buf[string] = buf()
     val graph = call_graph(program)
     val collects = collecting_functions(program, graph)
-    val shims: Map[string, string] = if caching then shim_texts(program) else map()
+    // A program built with debug information numbers its metadata across the whole module, and its
+    // locations follow the source's lines, which no function's key covers: its text is never taken
+    // from the cache, nor kept in it.
+    var meta = debug_meta()
+    val texts_cached = caching && program.debug.len() == 0
+    val shims: Map[string, string] = if texts_cached then shim_texts(program) else map()
     for i in 0..<program.functions.len()
-        if !caching || i >= program.keys.len()
-            emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i)
+        if !texts_cached || i >= program.keys.len()
+            emit_function(&out, &intrinsics, program, graph, plan_roots(program, graph, collects, i), i, &meta)
             continue
         val key = content_key(program.keys[i] + "\n" + emission_facts(program, graph, collects, shims, i))
         if texts.get(key) is Some(payload)
@@ -152,7 +157,7 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
                 continue
         var own: Buf[string] = buf()
         var piece = str_builder()
-        emit_function(&piece, &own, program, graph, plan_roots(program, graph, collects, i), i)
+        emit_function(&piece, &own, program, graph, plan_roots(program, graph, collects, i), i, &meta)
         val text = piece.finish()
         out.push(text)
         var w = entry_writer()
@@ -184,6 +189,7 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
     if roots > 0 then out.push("declare void @avin_rt_globals(ptr)\n")
     if program.testing
         emit_test_main(&out, program, roots)
+        finish_debug_meta(&out, &meta)
         return Emitted(out.finish(), keys, payloads, reused)
     val entry = program.functions[program.entry.unwrap()]
     out.push("\ndefine i32 @main(i32 %argc, ptr %argv) {\nentry:\n")
@@ -219,6 +225,7 @@ emit_llvm_cached(program: MirProgram, texts: Map[string, string], caching: bool)
             out.push("  %status = add i32 0, 0\n")
     out.push("  %exit = call i32 @avin_rt_finish(ptr %ctx, i32 %status)\n  ret i32 %exit\n")
     out.push("}\n")
+    finish_debug_meta(&out, &meta)
     Emitted(out.finish(), keys, payloads, reused)
 
 /** What the whole program decides for the text of function `index` beyond its code: for each call,
@@ -531,7 +538,49 @@ private shim_extensions(program: MirProgram, symbol: string) -> Buf[string]
         return out
     out
 
-private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, plan: RootPlan, index: usize)
+/** Function `index`'s text; in a program built with debug information, a function the source
+ * declares with its subprogram and a location on every instruction (see `debug_info.sysl`). */
+private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, plan: RootPlan, index: usize, meta: *DebugMeta)
+    var marks: Buf[LocationMark] = buf()
+    if index >= program.debug.len() || !program.debug[index].described
+        return emit_function_text(out, intrinsics, program, graph, plan, index, meta, 0, &marks)
+    val d = program.debug[index]
+    val scope = debug_subprogram(meta, d, program.functions[index].symbol)
+    var piece = str_builder()
+    emit_function_text(&piece, intrinsics, program, graph, plan, index, meta, scope, &marks)
+    out.push(attach_locations(piece.finish(), marks, debug_location(meta, d.line, d.col, scope)))
+
+/** Spills each parameter a `Variable` describes, so the debugger can read it wherever the function
+ * is stopped, and declares every described variable where it lives, at the function's entry. */
+private emit_variables(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, f: MirFunction, plan: RootPlan, meta: *DebugMeta, scope: usize, d: FunctionDebug)
+    val file = debug_file(meta, d.file)
+    for block in f.blocks
+        for inst in block.insts
+            if inst is Variable(name, type_name, address, arg)
+                var machine: Option[MirType] = None
+                if address is SlotAddress(s) then machine = Some(f.slots[s])
+                // A parameter is described while it is still one of the function's own: a union
+                // parameter, which crosses as its words, is a value made from them, and left out.
+                if address is Value(v)
+                    if v < f.signature.params.len() then machine = Some(f.value_types[v])
+                if machine is Some(m)
+                    if debug_type(meta, type_name, m) is Some(ty)
+                        val variable = debug_variable(meta, name, arg, scope, file, d.line, ty)
+                        need(intrinsics, "declare void @llvm.dbg.declare(metadata, metadata, metadata)")
+                        var place = ""
+                        var expression = "!DIExpression()"
+                        if address is SlotAddress(s)
+                            place = s"%s$s"
+                            if plan.slot_cells[s] is Some(k)
+                                place = "%frame"
+                                expression = s"!DIExpression(DW_OP_plus_uconst, ${16 + 8 * k})"
+                        if address is Value(v)
+                            val t = llvm_type(m)
+                            out.push(s"  %dbg.v$v = alloca $t\n  store $t %v$v, ptr %dbg.v$v\n")
+                            place = s"%dbg.v$v"
+                        out.push(s"  call void @llvm.dbg.declare(metadata ptr $place, metadata !$variable, metadata $expression)\n")
+
+private emit_function_text(out: *StrBuilder, intrinsics: *Buf[string], program: MirProgram, graph: CallGraph, plan: RootPlan, index: usize, meta: *DebugMeta, scope: usize, marks: *Buf[LocationMark])
     val f = program.functions[index]
     // Nothing outside the module calls a function of the program by its name: the runtime reaches the
     // ones it runs through descriptors, records and `main`. So each is internal, which lets the
@@ -543,7 +592,11 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
     out.push("define internal " + convention(f.signature) + result_type(f.signature) + " @\"" + f.symbol + "\"(ptr %ctx")
     for i in 0..<f.signature.params.len()
         out.push(", " + llvm_type(f.signature.params[i]) + s" %v$i")
-    out.push(") {\n")
+    out.push(if scope > 0 then s") !dbg !$scope {\n" else ") {\n")
+    // With debug information, each block begins where the code reaching it ends (`block_places`),
+    // and each `Locate` moves the place on.
+    var places: Buf[Option[(usize, usize)]] = buf()
+    if scope > 0 then places = block_places(f, (program.debug[index].line, program.debug[index].col))
     // The references live across a collection point are the function's roots, kept in its frame on
     // the shadow stack (see `plan_roots`): each such value is stored to its frame slot where it is
     // made, and a local slot of reference type that needs one is that frame slot. The frame's first
@@ -559,6 +612,11 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
     val polled_on_entry = polled_before(graph, index, f)
     for b in 0..<f.blocks.len()
         out.push(s"b$b:\n")
+        if scope > 0
+            val node = places[b] match
+                Some((line, col)) -> debug_location(meta, line, col, scope)
+                None -> 0usize
+            marks.push(LocationMark(out.len, node))
         if b == 0
             // The context's caller site, which calls into the core library set and calls out of it
             // keep; offset 24 in the runtime's context.
@@ -584,6 +642,7 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
                     if plan.slot_zeroed[s] then out.push(s"  store ptr null, ptr %s$s\n")
             for i in 0..<f.signature.params.len()
                 if value_roots[i] is Some(k) then out.push(s"  store ptr %v$i, ptr %root$k\n")
+            if scope > 0 then emit_variables(out, intrinsics, program, f, plan, meta, scope, program.debug[index])
         val block = f.blocks[b]
         var polled = polled_on_entry[b]
         val tail_at = tail_call_at(program, f, block)
@@ -594,6 +653,7 @@ private emit_function(out: *StrBuilder, intrinsics: *Buf[string], program: MirPr
             // carries.
             if tail_at is Some(c)
                 if i > c then continue
+            if scope > 0 && inst is Locate(_, line, col) then marks.push(LocationMark(out.len, debug_location(meta, line, col, scope)))
             if !polled && closes_cycle(graph, index, inst)
                 polls = emit_poll(out, intrinsics, polls)
                 polled = true
@@ -998,6 +1058,10 @@ inst_operands(inst: Inst) -> Buf[Operand]
         // The word is read out of the call's result, not out of its first word's value.
         CallWord(_, _, _) -> ()
         ReturnWord(_, value) -> out.push(value)
+        // A debugger's description uses nothing: a parameter's value is there from the entry and a
+        // slot is the function's.
+        Locate(_, _, _) -> ()
+        Variable(_, _, _, _) -> ()
     out
 
 // The strongly connected components of a graph of `n` vertices, numbered from 0, by Tarjan's
@@ -1310,6 +1374,8 @@ inst_dest(inst: Inst) -> Option[usize] = inst match
     CallEntry(dest, _) -> Some(dest)
     CallWord(dest, _, _) -> Some(dest)
     ReturnWord(_, _) -> None
+    Locate(_, _, _) -> None
+    Variable(_, _, _, _) -> None
 
 private need(intrinsics: *Buf[string], declaration: string)
     if !contains(*intrinsics, declaration) then intrinsics.push(declaration)
@@ -1583,6 +1649,9 @@ private emit_inst(out: *StrBuilder,intrinsics: *Buf[string], program: MirProgram
             out.push(s"  %v$dest = extractvalue ${call_result_type(program, f, call)} %r$call, $word\n")
         // The block's return gathers the later words of its result.
         ReturnWord(_, _) -> ()
+        // What a debugger is told is written beside the code, not as code (`debug_info.sysl`).
+        Locate(_, _, _) -> ()
+        Variable(_, _, _, _) -> ()
         Call(dest, Runtime(symbol, signature), args) ->
             var parts: Buf[string] = buf()
             parts.push("ptr %ctx")

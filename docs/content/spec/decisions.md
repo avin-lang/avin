@@ -968,9 +968,10 @@ Settled by the user on 2026-11-04:
   `await` inside a body is allowed. The pool is a module's `lazy val`, so a program that makes no
   future never makes it.
 - [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
-  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  (each instance its own), and in blocks (each declaration's run its own, see the entry for branch
+  `lazy-local`), is computed on its first read, exactly once, and kept; never read, never
   computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
-  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
   reads; an initializer that needs its own value, directly or through other lazy values, traps at
   that read, naming the value. A field's initializer may use every field and method; the class
@@ -1875,7 +1876,9 @@ their words are reserved.
   - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
     trait's header, or in an impl for a data type. The promise is checked against the structure,
     outside the standard library, and an `open` or `abstract` class that promises it is sendable,
-    each subclass being checked. The standard library's promises are taken as made, since they are
+    each subclass being checked. (Replaced by the Proposed `@trusted_sendable` entry, branch
+    `fix-core-promises`: the library's promises are checked too, but for the classes it marks.)
+    The standard library's promises are taken as made, since they are
     for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
     sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
     and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
@@ -7862,7 +7865,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
   then fetches again over the network); a lock around a program's cache (the content-addressed,
   rename-published entries need none). Review with the user: whether a cache of a deleted project
-  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+  should ever be trimmed on its own (answered by the cache's limit: least recently used first, see
+  the Proposed entries of branch `cache-trim`).
 
 - Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
   tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
@@ -8283,10 +8287,219 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
   cancellation token passed to every handler (every handler signature changes); leaving shutdown
   to the write timeout (a quiet stream would hold it for `writeTimeout`).
+- Proposed (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
+  cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
+  state word and the closure computing it, so a read is that cell's lazy field read: once on the
+  first read, under the same protocol as a field's between threads, with the same trap for a read
+  made while it is being computed. The choices the request left open:
+  - *Closures share it.* A closure capturing the name captures the cell, so a first read inside
+    the closure computes it for the enclosing scope too, and the reverse; it outlives its block. A
+    declaration in a loop body makes a new cell on every pass. *Alternatives*: copying the value
+    into the closure at capture (would force it where the closure is made, defeating the point);
+    one cell per declaration site (wrong for loops and recursion).
+  - *The initializer sees the locals as they are at the first read*, a captured `var` included,
+    since it is a lambda run then; fields see their object at the first read in the same way.
+    *Alternative*: snapshotting the locals at the declaration (would need a copy of every captured
+    `var`, and differs from what a lambda written in the same place does).
+  - *Across threads, sendable where its type is and its initializer would be.* A `@sendable`
+    closure (a thread's body, a future's) may capture a local `lazy val` only where the value's
+    type is sendable and every local and parameter the initializer captures passes the rules that
+    closure is held to, a `var` refused, through each lazy value the initializer reads in turn; what
+    the initializer reaches is held to the module-level state rule too. *Why*: the initializer may
+    run on whichever thread reads first, so it is code the closure carries; a field's initializer
+    captures only its object, which the object's own sendability covers. *Alternatives*: refusing
+    every capture of a lazy local by a `@sendable` closure (simpler, but refuses the plain case of
+    a sendable value computed from sendable `val`s); checking the value's type alone (unsound: an
+    initializer capturing a `Buffer` or a `var` would run on another thread).
+  - *A self-read follows the other lazy values*: today it traps at run time, ``avin: trap: `x` is
+    read while it is being initialized``, as a field's and a module-level value's do, and a lazy
+    list may refer to itself through its cells. The sound-initialization design (`### lazy val` in
+    declarations) makes a read the initializer's own code reaches a compile error; a local is held
+    to it in the same way when that is built, and its run tests `lazy_local_self_direct` (a direct
+    read, which becomes a reject test) and `lazy_local_self` (a read through a closure the
+    initializer calls, which stays a trap) say which side each falls on. A trap in the initializer
+    stops the program as any trap does.
+  - *The type must be known where it is declared*: an initializer whose type is not settled there
+    (one reading only its own value) is refused with "cannot infer the type of `x`", as a field's
+    is, rather than settled by later uses as a plain `val`'s may be. An initializer that never
+    finishes gives the type `Nothing`. A mismatch with a declared type is reported as "the
+    initializer of `x` yields …".
+  - *One name per declaration*: `lazy val (a, b) = …` and `lazy val a, b = …` are refused ("take
+    the value apart where it is read"), as is a `lazy val` without an initializer; an assignment, a
+    compound assignment and a step are refused as for a module-level `lazy val`.
+  - *Cost*: a declaration allocates the cell and the initializer's closure, both kept until the cell
+    is unreachable. *Alternative weighed*: storing the value, state and closure in boxed locals
+    without an object (saves one allocation but needs a layout of its own in the lowering and a
+    separate sendability rule); clearing the closure after the first read (frees its captures early,
+    but fields keep theirs, and a race-free clear needs another store on the hot path).
+  Review with the user: the cross-thread rule (the more permissive of the two sound choices).
+
+- Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
+  `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
+  starts threads and waits for them structurally, so a spawning wait group would be a second way to
+  do what `scope` does; what a wait group adds is counting work finished by threads started
+  elsewhere (an executor, an actor, another scope) or by no thread at all. Alternatives weighed:
+  `wg.spawn(body)` starting and counting a thread (duplicates `Scope.spawn`, and an unscoped spawn
+  escapes cancellation); answering a negative count by clamping at zero (hides a double `done`).
+- Proposed (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
+  traps.** `Semaphore(permits, capacity = permits)`; negative permits, a capacity below one or more
+  permits than the capacity trap too. Permits belong to no thread, and waiters are not queued (one
+  arriving as a permit comes back may take it first). Why: an over-release is the same bug as a
+  wait group's double `done`, a permit given back that nobody took, and a trap finds it where it
+  happens; the separate capacity keeps the signalling use (`Semaphore(0, capacity = 1)`) that an
+  "at most the initial permits" rule would forbid. Alternatives weighed: an unbounded count (a
+  silent over-release grows the limit for good); permits owned by the thread that took them (rules
+  out a permit taken by one thread and given back by another, which hand-offs need); a FIFO queue
+  of waiters (a cancelled waiter would have to take its place back, for a fairness the condition's
+  oldest-first wake mostly gives already). Review with the user: trap or ignore an over-release.
+- Proposed (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
+  hold when a cancellation stops their body; a `RwLock`'s write runs to its end; a trap in any of
+  them stops the program.** The share is taken under the library's lock and held in a region in
+  doubt from that moment until it is given back (the runtime's new `lock_release_holding` and
+  `cancel_guarded_held`), so no cancellation can come between taking it and the body. A read body
+  or a permit's body runs at a cancellation point of its own inside that region, so a cancelled scope stops
+  a long download inside `withPermit` at once and the permit goes back, while a trap there, even in
+  an actor, stops the program as one under a lock does, since recovering the actor's turn would
+  leave the share held for ever. A write body is also uncancellable, as a `Mutex`'s body is, since
+  stopping it could leave the value half changed. Why: a semaphore guards no value, and a reader
+  changes nothing, so nothing is left in doubt by stopping them; a writer does change the value.
+  Alternatives weighed: every body uncancellable, as a mutex's (a scope's cancellation would wait
+  for every permit holder's whole body); every body cancellable (a write could leave the value
+  torn); a trap in an actor's body failing only the actor (needs a give-back chain run by the
+  actor's recovery, which the runtime does not have).
+- Proposed (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
+  a write kept waiting before the next writer.** A reader that arrives while a writer waits waits
+  behind it; when a write ends, every reader then waiting is admitted ahead of the writers waiting.
+  Why: writers do not starve under overlapping readers, and readers do not starve under back-to-back
+  writers, with no tuning. Alternatives weighed: pure writer preference (readers starve while
+  writers keep coming); reader preference (writers starve); a strict FIFO of both (serialises
+  readers that could share). Review with the user: a read body is trusted only to read; nothing
+  stops it changing a mutable value other readers share, which races with them (a race is not
+  undefined behaviour in Avin, but the type system does not rule it out here as it does elsewhere).
+  A read-only view of a value would close it and is a language feature, not a library one.
+- Proposed (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
+  cancelled while waiting withdraws.** The last arrival runs the action holding the barrier's lock,
+  so the action is uncancellable and one that waits on its own barrier traps as a lock taken twice
+  does; `wait` answers whether the caller arrived last. A cancelled waiter takes its arrival back
+  (it is not counted for the round), through the runtime's settling condition wait, which answers a
+  cancellation with the lock held again rather than stopping at once. Why: a scope cancelled
+  mid-round leaves the barrier as if the stopped parties had never come, ready for new ones.
+  Alternatives weighed: a cancelled party staying counted (the round could trip with a party
+  missing); "breaking" the barrier for every party (a state each `wait` would have to answer);
+  running the action outside the lock (waiting on its own barrier would then deadlock instead of
+  trapping).
 
 
 ## Proposed
 
+- Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
+  Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
+  opaque type reads as the alias it resembles, with one word saying the difference, and the parser
+  and formatter treat it as an alias. Alternatives weighed: `newtype Name = Repr` (a new keyword for
+  a small feature); `data Name(value: Repr)` with an annotation (a data value is an object, and the
+  layout is the point); `type Name = new Repr` (a modifier inside the body reads as part of the
+  type).
+- Proposed (built on branch `opaque-types`): **the representation is seen only in the declaring
+  module, through `Name(r)` and `x.repr` (and bare `repr` in its impls), with no implicit
+  conversion either way even inside the module.** Why: an explicit wrap and unwrap keep every
+  crossing between the type and its representation visible in the source, which is what the type
+  exists for, and one rule holds everywhere; `repr` is one short name that cannot be confused with
+  a field of the representation. Alternatives weighed: the type transparent inside its module (the
+  module's own code could mix `UserId` and `long` unnoticed, and the type checker would need two
+  views of every type); a `.value` accessor (a common field name of representations, so it would
+  shadow or be shadowed); an unwrapping pattern `Name(n)` (it reads as a constructor pattern of a
+  data type, which an opaque type is not, and `x.repr` covers it). Review with the user: whether the
+  module that declares the type should see it as its representation.
+- Proposed (built on branch `opaque-types`): **an opaque type is nominal, `Type.Opaque(id, name,
+  args, repr)`, a value type that is boxed only where it becomes an `Any` or a trait's value, and
+  its box names the opaque type over a reference too.** Its parameters are invariant and take no
+  bounds; a phantom parameter is allowed. The representation may not be `Nothing`, `unit`, a union,
+  a bare type parameter or name the type. Why: laid out as its representation, a `Vector[UserId]`
+  holds the `long`s themselves and the type costs nothing; a box naming the opaque type is what lets
+  `x: Any` be matched as `UserId` and never as `long` or `string`, so the abstraction holds through
+  `Any`. Variance would expose the representation's own variance, which only the module sees;
+  bounds have nothing to bound, since the representation's types hold their own. `Nothing`, `unit`,
+  unions and a bare parameter have no single layout to share. Alternatives weighed: reusing the
+  representation's box for a reference representation (cheaper, but `x is _: string` would find an
+  `Email`); covariant parameters (unsound for a mutable representation); refusing phantom
+  parameters as an alias does (they are a main use: typed identifiers).
+- Proposed (built on branch `opaque-types`): **an opaque type is no type constructor**: a generic
+  one is refused for a constructor parameter `F[_]`, and an opaque type declares no constructor
+  parameter of its own; it is an ordinary type argument of `F[A]`. Why: every instance of a
+  constructor parameter's application is laid out as an object, which an opaque type over `long`
+  is not, and a representation `F[int]` would leave the opaque type's layout to each use. Refusing
+  both is the sound position that can be loosened later. Alternatives weighed: accepting an opaque
+  type over a reference type as a constructor (sound for the layout, but it would make the rule
+  depend on the representation, which outside code should not see); accepting `opaque type W[F[_]]`
+  (the layout question is only deferred, to every use).
+- Proposed (built on branch `opaque-types`): **a refined variant's result does not name an opaque
+  type** (`Newest -> Query[UserId]`, `Query[Id[User]]`, `Query[Vector[UserId]]` are refused); a
+  variant's fields may be of opaque types and the type's own argument may be one. Why: a `match`
+  on a refined variant will learn type equalities from the result, and whether one learning
+  `R = UserId` should see the representation inside the opaque type's module is not decided; keeping
+  opaque types out of results is sound and can be loosened once matching on refined variants is
+  built. Alternatives weighed: accepting them as nominal types now (sound for values and layouts,
+  but it fixes the answer to the open question before the matching it affects exists).
+- Proposed (built on branch `opaque-types`): **equality and hashing are the representation's;
+  every other trait comes from an impl, which takes the trait's default bodies; an opaque type
+  derives nothing and has no supertype.** Why: every Avin type has `==` and a hash, so an opaque
+  type is a `Map` key and a `Set` element without ceremony, while order and printing are choices the
+  module makes for its type (an `Email` may print as `<…>`, a `UserId` may have no order). Default
+  bodies run on the boxed value, so `compare` gives `<`, `less`, `max` and sorting. Alternatives
+  weighed: `derives Ord, Display` forwarding to the representation (convenient, but it would show
+  the representation's text and order outside the module by default); inheriting every trait of the
+  representation (the opaque type would leak its representation's whole interface).
+
+- Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+  take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
+  the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
+  live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
+  was. Alternatives: `-O0` implying `-g` (the usual "debug build"; costs every `-O0` corpus and test
+  build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
+  user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
+
+- Proposed (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+  (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
+  the program's own module prefix left off the readable name; lldb shows the linkage name. The
+  compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
+  `char32_t`). `char` is a UTF-32 code point, `byte` unsigned, `bool` a byte; a reference is a
+  pointer to an opaque structure named by its Avin type. A local a lambda shares (boxed) is not
+  described, nor is a local the compiler made. DWARF version 4. Why: each is the smallest choice that
+  makes `b`, `bt` and `frame variable` work with no lldb plugin. Alternatives: a vendor language code
+  (lldb then treats frames as unknown language), describing objects' fields as DWARF structures
+  (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
+  data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
+
+- Proposed (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+  function's first line lands after the parameters are stored where their variables are read (a
+  lambda's parameter otherwise read a stale slot). A call there still gets the function's own
+  location, which LLVM's verifier asks of every call in a function with debug information.
+  Alternative: placing that code at the function's name, as it was first built: lldb then stopped
+  before the stores and showed the slot's previous value.
+
+- Proposed (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+  cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
+  counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
+  and locations follow lines no function key covers, so cached text would carry stale lines; the
+  lowered code is still reused, and `AVIN_INCREMENTAL=verify` matches a clean build. Alternatives:
+  per-function metadata numbering with a renumbering pass (the text cache would then work under
+  `-g`), or a key over absolute positions (every edit above a function would relower it).
+
+- Proposed (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+  other module-level line, so any line moved anywhere changes every unit's text and recompiles every
+  unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
+  each unit's definitions through the metadata lines and renders only the nodes reached (plus the
+  compile unit and the flags), which also shrinks each unit.
+
+- Proposed (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+  its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
+  build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
+  program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
+  and `avin` (or a user with `atos -o prog.dSYM -l <image> <pc>`) turns it into `file:line` after the
+  process has stopped; a table of function start addresses with their names, emitted as a constant,
+  would let the handler name the function itself, without lines, at any `-g` level. Neither is
+  built: the first needs a runtime change and a symbolizing step, the second a table the emitter does
+  not make yet.
 - **A package's tests import its gated modules; a test module is read only while every module it
   imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
   The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
@@ -8647,7 +8860,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   without the refinement of step 3 would be read at the wrong types; refusing the type keeps the
   declaration step sound with no partial path. Alternatives weighed: refusing only refined variants'
   calls and patterns (a value of a plain variant of the type, or a type pattern on `Any`, would still
-  reach a layout holding them).
+  reach a layout holding them). **Step 2 (branch `gadt-2`) lifted it**, and what it leaves refused
+  is the next entry's.
+- Proposed (branch `gadt-2`, the values-and-layouts step): **until the steps that build them, four
+  uses stay refused, each with a "yet" message**: a variant pattern of a type with refined variants,
+  its plain variants included, in code the program writes (step 3: ``"`IntLit` is a variant of
+  `Expr`, which has refined variants: a pattern cannot take one of its values apart yet"``); a field
+  read by name on such a type's one variant (step 3: ``"`One[int]` has refined variants: a field of
+  one is not read by name yet"``); a value of a variant with a hidden parameter, the type's or its
+  own (step 5: ``"`First` hides `B`, named by its fields and not by its result: a value of a variant
+  with hidden type parameters cannot be made yet"``); and a value of a variant bounding its own
+  parameter (step 6). The code the derived templates write for the type (`Display`, `Debug`, `Ord`,
+  any `walk`) matches every variant and is accepted, its copies compiled only for the variants
+  possible at each instance, each arm at the arguments it reads back from the instance. Why: each
+  refused use needs what a later step builds (an arm's equalities, packs, bounds held in the arm),
+  and a plain variant's pattern needs coverage over the possible variants, which is step 4's; the
+  derived code is the plan's "derived per instance", and needs only what lowering knows at a copy.
+  Alternatives weighed: accepting patterns on plain variants now (coverage would demand arms for
+  impossible variants that step 4 then makes errors). **Step 3 (branch `gadt-3`) lifted the first
+  two**; a pattern on a variant with hidden parameters is refused in their place (the `gadt-3` entry
+  below).
+- Proposed (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
+  its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
+  is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
+  of `Done -> Plan[From, From]` writes `From`, and `IntLit[int](1)` takes no type argument. On the
+  type, `Expr[(int, bool)].Pair(…)` names the instance the value makes: the variant's parameters are
+  inferred from it and the value is held to it. Why: the chapter says a variant is called as a
+  generic function, and such a parameter is no parameter of that function; leaving it to inference
+  would make every call of `IntLit` an unsolvable "cannot infer `T`". Alternatives weighed: dropping
+  the parameter from the variant's list (its field defaults are functions of the whole list);
+  reading `T[A].V` as written arguments of `V` (they are the type's, and need not match `V`'s own in
+  number or meaning).
+- Proposed (branch `gadt-2`): **a derived trait holds of a refined variant's own parameter where the
+  trait on the instance implies it**: the parameter sits in the result under constructors whose
+  trait needs their argument's (a tuple's, `Vector`'s), tested by whether the constructor at the
+  parameter has the trait where every other argument does and the parameter alone has none. Where
+  it is not implied (`Hold[A](x: A) -> Odd[Wrap[A]]`, with `Wrap` showing itself whatever `A` is),
+  the field falls short and the type has no automatic `Display`, as any type with such a field. A
+  hidden parameter is given the trait, since no value of its variant is made before step 5, **which
+  must decide it per pack. Review with the user**: whether a refined type's `Display` should rather
+  be decided per instance, at the instance's own arguments. Why: a derived impl is checked once, over
+  its type's parameters, and this is the most that check can know of a variant's own; it is sound,
+  since the trait at an instance gives it to the parameter read back there. Alternatives weighed:
+  no trait for own parameters (every type with `Pair` would lose `Display`); the trait
+  unconditionally (unsound for `Odd`).
+- Proposed (branch `gadt-2`, where refined variants meet higher-kinded types): **a variant's own
+  type parameters are types, and a constructor parameter of the type keeps its place in a result**:
+  `V[G[_]](…)` is refused with ``"a variant's own type parameters stand for types, not type
+  constructors: `G` of `V` takes type arguments; declare a constructor parameter on the type, as in
+  `data D[G[_]]`"``, and `W(…) -> D[Vector, T]` with ``"a variant fixes no constructor parameter: `W`
+  makes `D[Vector, T]`, and `F` of `D` is a constructor parameter, so its place holds `F`"``, while
+  `Y(x: F[int]) -> D[F, int]`, keeping `F` and fixing `T`, is accepted (step 1 refused it as "no type
+  a `match` can take apart", which was a mistake). Why: the `gadt-1` entry below settles that no
+  constructor parameter is fixed, and keeping one in its place fixes nothing. Alternatives weighed: refusing any
+  refined variant of a type with a constructor parameter (needlessly narrow).
 - Proposed (branch `gadt-1`), **for constructor parameters ([higher-kinded
   types](/spec/generics/#higher-kinded-types)), the conservative reading until a design says more: a
   variant fixes no constructor parameter of its type, its own type parameters are no constructor
@@ -8658,12 +8924,117 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameters, and any other form, a constructor or its application among them, is refused with
   ``"`F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are
   built of data types, classes, tuples and function types"``; a constructor parameter among a
-  variant's own (`V[G[_]]`) is to be refused where the two branches meet, since this branch has no
-  holes to read. Fields name constructor applications freely, as any variant's do. Why: refinement
+  variant's own (`V[G[_]]`) is refused since the two branches met (branch `gadt-2`, the entry
+  above). Fields name constructor applications freely, as any variant's do. Why: refinement
   solves equalities by decomposition, which needs every parameter under a constructor that the
   instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
   X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
   among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
+- Proposed (branch `gadt-3`, the refinement step): **each pattern on a refined variant gives the
+  variant's parameters fresh types of its own**, so two `Pair` patterns, nested or one after the
+  other, give two unrelated sets, and **the equalities are solved with those fresh types first, then
+  the enclosing code's type parameters**: `Vector[A] = Vector[T]` makes `A` the `T` around the arm,
+  so a field reads as a type the code can name, and `T = (A, B)` keeps `T` as the pair of the fresh
+  types. A union or a type constructor that names a type parameter is not taken apart and teaches
+  nothing (`T | string = int | string` has two solutions); any other two different types, and a
+  cyclic `T = Vector[T]`, are a contradiction, which step 4 (branch `gadt-4`) makes an error at the
+  pattern; the arm's body is then checked with no equalities, and is not compiled at any copy. The equalities hold where a marker local the pattern declares beside its names is in
+  scope, which carries them exactly where the names go: an arm, a clause, an `is` test's branch,
+  the right operand of `&&` and `||`, the rest of a block after an early return or a binding. At a
+  copy where a pattern is impossible, lowering leaves out what holds its equalities: the arm, the
+  branch an `is` test then cannot take, the right operand of `&&` and `||`, a `while` body, and the
+  rest of a block whose taken branch never finishes. Why: the chapter's "fresh types known only by
+  these equalities", and a substitution the arm's code can read. Alternatives weighed: naming the
+  fresh types by the data type's own parameters (two nested patterns would share them); stopping
+  with an error at an equality not taken apart (refuses sound programs).
+- Proposed (branch `gadt-3`): **a variant's own parameter that the equalities leave a fresh type
+  never leaves its arm**, as a hidden one does not (the chapter states it for hidden parameters
+  only): with no type expected, an arm, a clause, an `is` branch or a block whose result names one is
+  refused with ``"this arm's result is an `Expr[A]`, and `A` is a type `Pair` takes from the value it
+  matches, which is not known outside its arm"``, and an inference variable made before the pattern
+  settled to one with ``"a type declared outside this arm cannot be settled to an `Expr[A]`: …"``,
+  reported at the pattern. Why: such a type is known only through the value matched, so no copy can
+  compile code outside the arm that names it. Alternatives weighed: settling the escaped type as
+  `Nothing` (lays out a value at the wrong type); allowing it (no copy could compile it).
+- Proposed (branch `gadt-3`): **inside an arm a value of a type an equality fixes is used at what
+  it is there** for operators, members and comparisons (`x + n` with `x: T` and `T = int` is an
+  `int`), the type expected of an expression is the one under the equalities (a literal where a `T`
+  that is an `int` is expected is an `int`, a value where a `T` that is `Any` is expected is boxed),
+  while **an inference variable still settles to the type as written** where it meets one. An arm
+  that refines, with a type expected, is checked against it under its equalities and **yields the
+  expected type itself**; one that does not fit it is refused with ``"this arm yields int, not the T
+  expected of the `match`"``. Clauses with no declared result that agree on no type are reported as
+  the chapter reports arms: ``"the clauses of `f` agree on no type: `IntLit`'s yields an `int`, which
+  is `T` only inside that clause; declare the result type"``. Why: the chapter's "a type and
+  anything it equals are one type" and its "as written" rule for inference variables, each where it
+  can apply. Alternatives weighed: rewriting every type in the arm to its refined form (would settle
+  variables outside the arm to refined types, against the chapter).
+- Proposed (branch `gadt-3`): **`val V = x`, where `V` is a variant of `x`'s type and that type has
+  refined variants, takes the value apart** as the chapter's `val Refl = proof` does; anywhere else
+  `val Name = x` binds a name, as before. **Review with the user**: whether `val V = x` should take
+  apart a value whenever `V` is a variant in scope, as a bare name in a pattern does. Why: the
+  chapter's example, with no change for any program written before refined variants. Alternatives
+  weighed: requiring `val V() = x` (not the chapter's spelling); the general rule (changes what
+  existing bindings mean).
+- Proposed (branch `gadt-3`): **a field of a refined type's one variant is read by name where the
+  instance says the field's type**: `o.value` on `One[T]` with `Mk(value: int) -> One[int]` is an
+  `int`; an instance the variant cannot make is refused with ``"`One[bool]` has no values: no
+  variant of `One` makes one"``, and a field whose type keeps a parameter the instance does not say
+  with ``"the field `items` of `Hold` has a type a `Holder[T]` does not determine; take the value
+  apart with `match`"``. Why: every value of the instance is the variant's, so the read is the arm
+  of a one-arm `match`, and only its result type must be one known outside. Alternatives weighed:
+  refusing every such read (the chapter's single-variant types would lose field access).
+- Proposed (branch `gadt-3`): **until step 5, a pattern on a variant with hidden parameters is
+  refused** (``"`First` hides `B`, named by its fields and not by its result: a pattern cannot take
+  apart a value of a variant with hidden type parameters yet"``), as a value of one is; **a pattern
+  on a variant bounding its own parameters is accepted, its arm without those bounds until step 6**.
+  Why: an arm on a hidden parameter is compiled per pack, which step 5 builds; no value of either
+  kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
+  arms would never be compiled, and a program would meet step 5's rules later as a change).
+
+- Proposed (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
+  type matched as the equalities in scope see it**, splitting a column on a refined type's variant
+  only where the variant's result has a solution with the column's instance, the variant's own
+  parameters given types of their own for that split; **the solution carries to the other columns**,
+  so a row's equalities travel along it, and an instance no variant makes is a column with no
+  values. Why: the chapter's Coverage, and the same solving the checker does for a pattern, so the
+  two agree on what is possible. Alternatives weighed: carrying the equalities as a substitution
+  beside the columns (the same, with every function of the coverage check threading it; applying
+  them to the columns at each split needs no more state).
+- Proposed (branch `gadt-4`): **an impossible pattern is reported at the pattern, by the checker,
+  with the chapter's three reasons**, chosen by re-solving: against the equalities in scope before
+  its row alone it fails (`` `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` ``,
+  or the empty-instance message where no variant is possible), a cyclic equality
+  (`` `Wrap` needs `T` to be `Vector[T]`, which no type is ``), or the first equality of an earlier
+  pattern of its row that leaves it none (`` `IntLit` needs `T` to be `int`, and `BoolLit` in the
+  same pattern needs it to be `bool` ``). A row is an arm's pattern, a clause's arguments (`in the
+  same clause`), an `is` test's pattern, a binding's pattern. **The lead says what never happens**:
+  `this arm is never reached`, `this clause is never reached`, and `this pattern never matches` for
+  an `is` test, a binding and one of a set of alternatives, which the chapter does not word. An
+  impossible pattern on the right of `&&`, under the left's equalities, is an error the same way.
+  **A `match` on an empty instance is an error at the value matched even when no arm names a
+  variant** (`_ -> 0` on a `Same[int, string]`). Why: the pattern is where the contradiction is,
+  and a test that can never succeed is dead code as an arm is. Alternatives weighed: reporting
+  impossible arms from the coverage check (it sees rows, not which equality failed, and would say
+  only "never reached"); leaving an impossible `is` test legal (it folds to `false` at every copy,
+  which hides a mistake). **Review with the user:** the wording for tests, bindings and alternatives.
+- Proposed (branch `gadt-4`): **each alternative of a pattern matches on its own: the equalities an
+  alternative learns hold neither in the alternatives after it nor in the arm**, and lowering tests
+  each alternative at what its own patterns read back from the value. A step-3 bug: an alternative's
+  equalities stayed in scope, so `IntLit(_) | BoolLit(_) -> 5` on an `Expr[T]` was checked as if
+  `T` were `int`, and its `bool` copy answered `false` for the `5`; and an alternative was compiled
+  without its patterns' arguments, so `Pair(IntLit(3), _) | …` never matched. Why: the arm runs for
+  whichever alternative matched, so only what all of them imply could hold, and alternatives bind
+  no names. Alternatives weighed: keeping the equalities every alternative implies (sound, but needs
+  a meet of substitutions the chapter does not describe; no program has needed it).
+- Proposed (branch `gadt-4`): **two types that read the same in a message are named apart by the
+  refining patterns that took them**: ``expected Expr[A of `Pair` on line 4], found Expr[A of `Pair`
+  on line 5]``, with the column too where both patterns are on one line, in the expected/found,
+  operator-operand, `cannot compare` and declared-result messages. Only where the two names would
+  otherwise be identical; every other message is unchanged. Why: two patterns on one variant give
+  two unrelated sets of fresh types with the variant's parameter names. Alternatives weighed:
+  numbering the fresh types (`A1`, `A2`), which every message would show, even where nothing
+  clashes.
 
 - Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
@@ -8870,6 +9241,246 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Decided by the user 2026-11-14: **a built-in type's name in a pattern is a type pattern**:
+  `x is int` tests the type and an arm `int ->` matches an int, for every name in the table of
+  built-in types, the sized integers `iN` included; generic forms stay `_: Vector[int]`; a name
+  with a binding is `n: int`. Built on branch `is-type-name`, where `x is int` had bound a new
+  `int` and was always true (`tests/run/operands_for_traits.avin` tested nothing). Proposed with it:
+  - **Such a name never names a value**: a local (`val`, `var`), a function's, a lambda's or a
+    class's parameter, a data field, and a pattern binding it (`int: T`, `int @ p`, `int + 1`, a
+    comparison pattern, `int*`) are errors, `` `int` is a built-in type, so it cannot name a value
+    `` and `` …, so a pattern cannot bind it: alone it tests for the type, and `n: int` binds the
+    value as one ``. Why: with the names type patterns, `val (a, int) = p` would test where `val int
+    = 3` binds, and `int(x)` in an expression would mean the conversion or the local by context;
+    refusing them everywhere keeps one meaning per name. It also settles the hiding rule for built-in
+    statics: `val string = …; string.byteLength` no longer arises. The library and tests renamed
+    their locals (`unit` → `identity`/`scale`, the vector tree's `i1`–`i6` → `d1`–`d6`, `long`,
+    `real`, `int` locals in tests). Alternatives: allowing them as `val`/parameter names and
+    refusing them only in patterns (two meanings for one name, and destructuring differs from a
+    plain binding); allowing only the eight word names and leaving `iN` free (the user listed the
+    sized integers). Review with the user: `i1`, `i2`, … are common index names, and they are
+    refused too.
+  - **Every type's name in a pattern is its type pattern** (the same decision, extended by the
+    director 2026-11-14 after `a is Cell` was found binding too): a bare or dotted name with no
+    parentheses that is no variant but resolves to a class, trait, `object`, `data` type, alias,
+    `Any`, `Nothing` or type parameter is `_: T`. A variant wins where both exist, so
+    `data Cell(value: int)`'s `Cell` stays the variant's pattern and every variant pattern is
+    unchanged. A local, a parameter (of a function, local function or lambda) or a pattern binding
+    named after a type in scope is refused: `` `Cell` is a type, so it cannot name a value: in a
+    pattern it tests for the type, and `x: Cell` binds a value of it ``. Fields named after a user
+    type are not refused (they are reached as members, and a data field's pattern is positional).
+    Why: one meaning per name in a pattern; a capitalised name quietly binding was the same defect.
+    Alternatives: only refusing capitalised bindings that shadow a type (keeps the always-true test
+    as an error rather than a feature); including field names (more renames for no pattern
+    ambiguity).
+  - **A generic type's name alone in a pattern is refused**, `` `Box` is a generic type, and a type
+    pattern names its type arguments, as in `_: Box[int]` ``. Why: a type pattern compares type
+    arguments exactly, and the run-time test of "a `Box` at any arguments" would be a new kind of
+    test with no sound meaning for variance and value-type arguments yet. Alternatives: testing the
+    class at any arguments (needs a class-only run-time test and a binding type, `Box[?]`, Avin
+    lacks); inferring the arguments from the matched type (works only where they are known, and
+    reads differently by context). Review with the user if a "any instance of `Box`" test is wanted.
+  - A type alias in a constructor pattern, `P(a, b)`, stays refused as before.
+  - **Functions and methods may still be named so** (`cli`'s `int(name)` and `string(name)`
+    options): a function is called, never matched, so no pattern can mean it. A missing-member
+    witness still reads `_: string`, which is the same pattern.
+- Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
+  against the structure, except where `@trusted_sendable("why")` marks a class**
+  ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
+  standard library's promises are taken as made", under which `Map.withDefault(f)` answered a
+  sendable map holding a plain function and a thread raced on what it captured. The mark is a
+  class annotation (it trusts the class whether its header or an impl makes the promise), takes one
+  non-empty string saying why the class is safe, is refused outside the standard library, and is
+  an error on a class that promises nothing. Seventeen classes carry it: `Lock`, `Condition`,
+  `Mutex`, `Atomic`, `Channel`, `Thread`, and the futures' `Cell`, `Pool` and `Registry`
+  (synchronization the runtime does); the running `Actor` (its turns are serial) and `Isolated`
+  (an atomic state arbitrates its objects); `TcpStream`, `TcpListener`, `UnixStream`,
+  `UnixListener`, `TlsStream` and `Child` (one owner at a time, checked by every operation).
+  `Future`, `Promise`, `Executor` and `Once` became sendable by their structure, `Cell` gained an
+  `impl[T: Sendable] Sendable` and `Lock` a `: Sendable` for it. Why: the trust is greppable and
+  each entry says its reason; trusting the innermost synchronized class rather than each composite
+  keeps the list short and checks the rest. Alternatives weighed: a list of names in the compiler
+  (invisible at the type, drifts from the library); trusting every class of `avin.threads` (too
+  wide: it hid nothing here, but would hide the next `DefaultMap`); marking the composites
+  (`Future`, `Promise`) instead of `Cell` (more entries, fewer types checked).
+- Proposed (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
+  `DefaultMap` holds its default as a private `MapDefault` data value, `Fixed(v)` or
+  `Computed(f)`, so `withDefaultValue(v)` takes any value and the wrapper is sendable wherever the
+  map and `v` are. Why: `Map` promises `Sendable` and every map is one, so the default must be
+  sendable for the wrapper to keep the promise; most defaults (`k -> 0`, `k -> k.length`) capture
+  nothing mutable and are unchanged. Alternatives weighed: `Map` not promising `Sendable` (every
+  immutable map would stop being sendable); `DefaultMap` alone not being a `Map` (breaks
+  `val m: Map[K, V] = ….withDefault(f)`); keeping a plain function and making the wrapper not
+  sendable (a trait's implementers cannot opt out). Review with the user: a default that mutated a
+  captured local (a call counter) now uses an `Atomic`.
+- Proposed (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
+  through a token handle as `Child` does, so a stream handed to another thread traps its previous
+  owner at a read served from the bytes read ahead; before, only a read that reached the socket
+  checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
+  sound.
+
+- Proposed (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
+  used first, with no index**: an entry is a program's build directory (`build/`, `test-builds/`) or
+  one object or archive (`units/`, `runtime/`, `shims/`, `cunit/`), and its modification time is its
+  last use, touched by every build that takes it from the cache (a program's directory when its
+  build starts and before each test `avin test` runs). Every command that builds sweeps the cache at
+  most once in ten minutes, a stamp file in the cache shared by every process, and evicts the
+  oldest entries until the cache is within `AVIN_CACHE_LIMIT` (a size with `K`/`M`/`G`/`T`, `off`
+  for none, default 5G; a value that is neither is an error from every command). Why: builds run in
+  many worktrees and sessions at once, so a shared index would need a lock Sysl's library does not
+  offer, while a touch is one system call and the existing unit-object trim already worked by
+  modification time. Alternatives: an index file of use times (a lock, and a writer killed halfway
+  through it); access times (`noatime` mounts, and macOS updates them lazily); a sweep after every
+  build (the size walk on every build); an hourly sweep (24G had grown within hours). Review with
+  the user: the 5G default and the ten-minute interval.
+- Proposed (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
+  aside, looked at again and put back if a build touched it in between**, before it is removed.
+  Why: no build reading or writing an entry loses it, without a lock; a cache whose fresh entries
+  alone pass the limit stays past it until they age. Alternatives: lease files naming the process
+  (Sysl's library has no way to ask whether a process is alive); `flock` (not in Sysl's library);
+  no grace (a sweep could take the executable `avin test` starts once per test). A shim archive and
+  the record of the libraries it needs beside it are one entry, the archive evicted first and a
+  record newer than the sweep's choice kept, so no build finds the record without its archive.
+- Proposed (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
+  error**: every object and archive a build takes from the cache is touched first, and one missing
+  (or a shim archive without its record) is built again; the link looks again at everything it takes
+  from the cache before clang runs and after clang fails, answers an entry gone in between as such
+  rather than as clang's error, and the build then compiles again, which builds the entry anew, and
+  links once more. Why: a cache emptied by hand, or by a disk being cleared, while builds ran made two
+  gates fail to link a shim archive that had been there when the program compiled (2026-11-13).
+  Alternatives: holding the entries open across the link (clang opens them by name); copying them
+  out of the cache first (the copying costs every build).
+- Proposed (branch `cache-trim`): **another version's cache is removed three days after its last
+  use**, judged by the newest time on it, its kinds and their entries, and only beside the default
+  cache (never beside a directory `AVIN_CACHE` names), and only for a name that is a version's. Why:
+  no compiler of this version can read it, and three days spares a user switching back. Alternatives:
+  removing every other version at once (an older installed compiler still in use would rebuild each
+  time); never (the unreachable caches are what filled the disk).
+- Proposed (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
+  sweep**; a sweep removes only the debris of interrupted fetches, and `avin cache clean --packages`
+  removes packages (with `--older-than`, those no build has read for that long; a build touches the
+  package it reads). Why: a package is source pinned by `avin.sum`, small beside a build, and
+  fetching it again needs the network and a tag that may since have been removed, so evicting one
+  could break an offline or archived build. Alternatives: counting packages in the limit (evicted
+  first, being rarely touched, for a few hundred kilobytes saved).
+- Proposed (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
+  `.pending-` (a write that was never renamed into place) that nothing has written to for an hour,
+  and in the temporary directory the directories a build works in (`avin-link`, `avin-shims`,
+  `avin-c-unit` and the six characters `make_temp_dir` adds) that nothing has written to for a day,
+  and the `avin-test-builds` ones the compiler's tests left before their builds moved into the
+  cache's `test-builds/`. Why: a killed or out-of-space build leaves these behind, and on this
+  machine its tests had left 8,673 such directories. A program's own temporary directories are never
+  touched, whatever they are called. Alternatives: every `avin-` directory (a program may name its
+  own so); none (the debris is unbounded).
+- Proposed (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
+  limit, each kind's entries and size, the total with its oldest and newest use, debris, fetched
+  packages and other versions' caches; `trim` sweeps now; `clean` removes every entry, the debris and
+  other versions' caches, `--older-than <n>m|h|d` only what no build has used for that long, and
+  `--packages` the fetched packages too. `avin clean` keeps its meaning (one program's builds, or
+  `--all` every program's). Why: the user sees what the cache holds and can empty it without
+  knowing its layout. Alternatives: folding these into `avin clean` (whose argument is a program).
+- Proposed: **a marked parameter survives a function becoming a value only through its type**
+  (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
+  `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
+  type, which for a function is a `@sendable` function type; with no function type expected, the
+  value takes that form of each marked function parameter (`val sp = spawn[int]` is a
+  `(@sendable () -> int, long) -> Thread[int]`). A type that is a function (a class naming it, or an
+  impl of it for a data type) has an `apply` that marks a parameter only where its function type
+  makes that parameter sendable, and a `@sendable` parameter matches a `@sendable` function type's.
+  Why: function types carry no parameter marks, so `val sp: (() -> unit, long) -> Thread[unit] =
+  spawn` ran a buffer-capturing closure on four threads, and `Isolated`/`Mutex` as values kept an
+  object the caller still used. Alternatives: marks in function types (`(@sendable f: () -> unit) ->
+  unit`; a second way to say what `@sendable () -> unit` says for functions, and for a non-function
+  `@isolating` value a new kind of type); refusing every such function as a value, as a `@threaded`
+  one is (also sound, but `spawn` and `onExit` could never be held or passed). A by-name marked
+  parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
+  function parameter takes the `@sendable` form, which asks a little more than the mark (no
+  captured `var`). Method values keep their own wording, from the call inside the closure they are.
+- Proposed: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+  `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
+  an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
+  "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
+  at the comma the same way. A comma after an arm when the next line at the arms' depth reads as
+  another arm (it starts with `else` or holds an `->` outside brackets) is reported as a tuple that
+  needs parentheses. Why: the indented arms were read as lines of a block, so the last arm's body
+  swallowed the following arguments as a tuple, a type error far from the cause; a `return` value,
+  a lambda's and a one-line `if`'s bodies already stop at the comma. Alternatives: keep the arms a
+  line context (the spec's "an indented block starts a line again"), which makes `_ -> 0, "a")` a
+  tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
+  line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
+  lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
+  writes. An indented arm body stays a block, where a comma list is a tuple.
+
+**Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
+
+- Proposed: **a type with a constructor parameter derives nothing through a template, and has no
+  automatic `Display` or `Debug`**: `derives Eq` on a class, `Hash`, `Ord` or a library trait is
+  refused with the parameter named, and a value is shown by its type, as a value of no `Display`
+  is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
+  type's parameters by the trait, a bound for types that no constructor parameter takes, and what
+  displays an `F[A]` is unknown where `F` is any constructor. Reviewed once step 2 landed (branch
+  `hkt-2`) and kept: a hole's bounds (`F[_: Eq]`) say what `F` is applied to, never what an
+  `F[A]` meets, so they give a derivation nothing to call. Alternatives: deriving through a bounded
+  hole (unsound for the reason above: `F[_: Eq]` admits a constructor whose values have no `Eq`
+  of their own beyond identity); requiring `F[A]: Display` per field (a constraint on
+  applications, which impls over constructor parameters, step 6, are the place for). Review with
+  the user once step 6 lands.
+- Proposed: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
+  is written the same way everywhere else, and a contravariant hole is the dual demand
+  (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
+- Proposed: **a type whose parameter is bounded is a constructor only for a hole whose bounds imply
+  that bound** (step 2, branch `hkt-2`, replacing step 1's refusal of every such type at any hole):
+  a hole's bound implies a parameter's where it is the same trait or class, or one that is an
+  instance of it (a trait requiring it, a subclass), as `Ord` implies `Eq`; `Eq` and `Hash` need
+  no hole bound, since every Avin type has them (which is what lets `Map[_, V]` and `Set` be
+  constructors for a plain `_`); a parameter's bound that names the parameter itself is implied by
+  no hole bound. A constructor parameter passed for another is held the same way by its own holes'
+  bounds. The check is made where the type arguments are held to their bounds, so a constructor
+  written and one inferred are refused alike, with one message. Why: an `F[_]` may be applied to
+  any type, so a constructor with a bounded parameter could otherwise be instantiated at a type its
+  bound refuses; implication is the least the hole must promise. Alternatives: checking each
+  application at instantiation (an instance could then fail, against the design); entailment
+  through impls with bounds of their own (no case needs it yet).
+- Proposed: **every `F[X]` a declaration writes is held to the bounds of `F`'s holes where it is
+  written**, once per application, with the message "`X` does not conform to `B`, the bound of
+  `F`'s argument in `F[_: B]`": a signature naming `F[A]` twice for an `A` without the bound reports
+  both. Why: the spec's rule is "checked wherever the declaration writes `F[X]`"; each place is a
+  separate mistake to fix. Alternatives: one report per declaration (hides the second place).
+- Proposed: **a hole's variance is what makes `F[A]` variant** (step 2, replacing step 1's
+  invariance of every applied argument): inside the declaration an argument of `F[A]` is at the
+  position its hole gives it, kept at `+_`, flipped at `-_`, invariant at `_`, so `+A` in a field
+  `F[A]` is accepted for `F[+_]` and refused for `F[_]`; `F[Dog]` is an `F[Animal]` only at `+_`
+  (and `F[Animal]` an `F[Dog]` at `-_`), where the arguments are references, as for any type. At
+  each constructor passed, written or inferred, the type's parameter at a `+_` hole must be
+  covariant and at a `-_` hole contravariant; a constructor parameter passed must declare that
+  variance on its own hole. Why: the subtyping assumed inside the declaration is then exactly what
+  each instance grants. Alternatives: none sound that keep `F[+_]` useful.
+- Proposed: **a constructor parameter has no `Nothing` default**: one that is neither written nor
+  inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
+  Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
+  of `Nothing` (meaningless as a constructor).
+- Proposed: **with overloads, the first candidate's type parameters decide which written argument
+  is resolved as a constructor**, before a candidate is chosen. Why: written type arguments are
+  resolved once, before overload resolution, and overloads differing in the kinds of their type
+  parameters are rare; resolving per candidate would need resolution repeated per overload.
+  Alternatives: resolving the arguments once per candidate (correct for mixed kinds, more work in
+  the hottest path); refusing overloads whose type parameters differ in kind. Review with the user
+  if overloads of mixed kinds turn up.
+- Proposed: **`_` alone as a written argument at a call is read as a hole**, so that the checker
+  says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
+  instead of `unknown type`.
+
+- Proposed: **a `for` loop admits its source by conformance to `Iterable`** (branch
+  `nominal-for-in`): besides a range written in place, a `Range` and an array, the source's type
+  conforms to `Iterable` at some element type through its class's or data type's parents and impls,
+  a type parameter's bounds, a built-in type's impls, or, for a union, every member's. A type with
+  an `iterator()` method and no conformance is refused, the error naming the type and the impl to
+  declare; `Option` and `Either`, which have `iterator()` but are not `Iterable`s, are refused too,
+  an option pointed at `toList`. Why: the user's rule that Avin is nominal, and collections.md
+  already said a class is iterable by conforming; the structural check admitted any type with a
+  method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
+  anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
+  conforms, and the loop's `iterator()` call is answered by every member).
 - Proposed (built on branch `select`): **A `select` block's syntax** ([Threads](/spec/threads/#select)).
   `select` ending its line opens a block of arms written as a match's: `ch.receive() as P -> body`,
   `ch.send(x) -> body`, `after d -> body`, and `else body` with no arrow; `end select` may close it.
@@ -8988,77 +9599,115 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   un-cancellable `main`, and a cancellation that must tell its own timeout from an outer cancel).
   Review with the user: the body running on another thread is visible to code that asks which
   thread it is on.
-- Proposed: **a marked parameter survives a function becoming a value only through its type**
-  (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
-  `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
-  type, which for a function is a `@sendable` function type; with no function type expected, the
-  value takes that form of each marked function parameter (`val sp = spawn[int]` is a
-  `(@sendable () -> int, long) -> Thread[int]`). A type that is a function (a class naming it, or an
-  impl of it for a data type) has an `apply` that marks a parameter only where its function type
-  makes that parameter sendable, and a `@sendable` parameter matches a `@sendable` function type's.
-  Why: function types carry no parameter marks, so `val sp: (() -> unit, long) -> Thread[unit] =
-  spawn` ran a buffer-capturing closure on four threads, and `Isolated`/`Mutex` as values kept an
-  object the caller still used. Alternatives: marks in function types (`(@sendable f: () -> unit) ->
-  unit`; a second way to say what `@sendable () -> unit` says for functions, and for a non-function
-  `@isolating` value a new kind of type); refusing every such function as a value, as a `@threaded`
-  one is (also sound, but `spawn` and `onExit` could never be held or passed). A by-name marked
-  parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
-  function parameter takes the `@sendable` form, which asks a little more than the mark (no
-  captured `var`). Method values keep their own wording, from the call inside the closure they are.
 
-**Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
+**Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
+2, branch `hkt-2`)
 
-- Proposed: **a type with a constructor parameter derives nothing through a template, and has no
-  automatic `Display` or `Debug`**: `derives Eq` on a class, `Hash`, `Ord` or a library trait is
-  refused with the parameter named, and a value is shown by its type, as a value of no `Display`
-  is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
-  type's parameters by the trait, a bound for types that no constructor parameter takes, and what
-  displays an `F[A]` is unknown where `F` is any constructor. Alternatives: deriving through a
-  bounded hole (`F[_: Eq]`, waits for hole bounds in step 2); requiring `F[A]: Display` per field
-  (needs constraints on applications, step 2's `impls may add` rule). Review with the user once
-  step 2 lands: derivation should then follow the holes' bounds.
-- Proposed: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
-  is written the same way everywhere else, and a contravariant hole is the dual demand
-  (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
-- Proposed: **hole bounds `F[_: B]` are left to step 2**; in step 1 a hole is unbounded, and a type
-  whose parameter is bounded by anything other than `Eq` or `Hash` is refused at any hole
-  (`Sorted[A: Ord]` is no constructor for `F[_]`). Why: an unbounded `F` may be applied to any
-  type, so such a constructor could be instantiated at a type its bound refuses; `Eq` and `Hash`
-  are admitted because every Avin type has equality and hashing (which is what lets `Map[_, V]`
-  and `Set` be constructors). Alternatives: refusing every bounded parameter (excludes `Map`);
-  checking each application at instantiation (an instance could then fail, against the design).
-- Proposed: **the arguments of an applied constructor parameter `F[X]` are invariant until step 2**,
-  so `+A` or `-A` inside `F[A]` is refused wherever variance is checked. Why: the constructor
-  passed may be invariant (`Array`), and holes' variance demands (`F[+_]`) are what make a variant
-  position sound; until those are checked at each constructor passed, invariance is the sound
-  choice. Alternatives: treating `F[+_]` as covariant at once (unsound until the demand is
-  checked at the call).
-- Proposed: **a constructor parameter has no `Nothing` default**: one that is neither written nor
-  inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
-  Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
-  of `Nothing` (meaningless as a constructor).
-- Proposed: **with overloads, the first candidate's type parameters decide which written argument
-  is resolved as a constructor**, before a candidate is chosen. Why: written type arguments are
-  resolved once, before overload resolution, and overloads differing in the kinds of their type
-  parameters are rare; resolving per candidate would need resolution repeated per overload.
-  Alternatives: resolving the arguments once per candidate (correct for mixed kinds, more work in
-  the hottest path); refusing overloads whose type parameters differ in kind. Review with the user
-  if overloads of mixed kinds turn up.
-- Proposed: **`_` alone as a written argument at a call is read as a hole**, so that the checker
-  says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
-  instead of `unknown type`.
+- Proposed: **an unbounded constructor parameter is inferred from the type an argument or the
+  expected type gives `F[X]`, named bare**: a data type, class or trait with exactly as many type
+  parameters as `F` has holes, a subclass by its own name (`Crate[A]` passed as `F[A]` is `Crate`,
+  not its superclass), or another constructor parameter in scope applied to as many arguments.
+  Once `F` is known, the rest of the argument is held to the type it makes with that type's own
+  variance, so a covariant argument still widens (`both(Some(dog), Some(cat))` for
+  `both[F[_], A](x: F[A], y: F[A])` takes `A` as `Animal`, since `Option` is covariant). A type
+  of more parameters, of fewer, a type whose parameter takes a constructor, or one that is no
+  data type, class or trait decides nothing and is reported as "cannot infer `F` from `T`: …;
+  write it, as in `f[…](arguments)`", the example leaving open the arguments that match the
+  application's own known ones (`Either[string, _]` for an `F[int]` given an
+  `Either[string, int]`), else the first ones. Why: the spec's rule ("a type of more is an error
+  asking for `F` to be written"); the example is the likeliest constructor meant. Alternatives:
+  always leaving the first arguments open in the example (wrong for `Either[string, int]`);
+  holding the arguments invariantly once `F` is decided (refuses calls every instance accepts).
+- Proposed: **a function's or method's type arguments taken as a value (`k.pick[Dog]`) are held
+  to their bounds, as at a call** (a fix found in step 2: a method value checked no bound at all,
+  so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
+  it may not fill among them).
 
-- Proposed: **a `for` loop admits its source by conformance to `Iterable`** (branch
-  `nominal-for-in`): besides a range written in place, a `Range` and an array, the source's type
-  conforms to `Iterable` at some element type through its class's or data type's parents and impls,
-  a type parameter's bounds, a built-in type's impls, or, for a union, every member's. A type with
-  an `iterator()` method and no conformance is refused, the error naming the type and the impl to
-  declare; `Option` and `Either`, which have `iterator()` but are not `Iterable`s, are refused too,
-  an option pointed at `toList`. Why: the user's rule that Avin is nominal, and collections.md
-  already said a class is iterable by conforming; the structural check admitted any type with a
-  method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
-  anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
-  conforms, and the loop's `iterator()` call is answered by every member).
+**Higher-kinded types, constructor traits and their impls** (build plan step 3, branch `hkt-3`)
+
+- Proposed: **a constructor trait's default bodies are compiled once per implementing constructor
+  already in step 3**, not from step 5: each instance of a constructor trait's method takes the
+  constructor after its type arguments, and `Self` stands for it there. Why: a body shared by
+  every conforming type sees `Self` as an object, but a `Self[B]` may be an option or another value
+  laid out as no object is, and a shared `mapTwice` built that way crashed at run time; the
+  per-constructor copy is what the spec's design says in the end, so no later step removes it.
+  Step 5 keeps `Self.pure` and `F.pure`. Alternatives: refusing default bodies in constructor
+  traits until step 5 (a temporary refusal step 5 would remove).
+- Proposed: **the methods that meet a constructor trait's are the type's own: those its
+  declaration and its impls declare, never a superclass's.** Why: the spec's rule names "the
+  type's own methods", and a superclass's method answers the superclass's type, the reason a
+  subclass inherits no conformance. Alternatives: also meeting with inherited methods whose
+  results happen to fit (a `foldLeft` would; a `map` never does). Review with the user if a class
+  hierarchy wants an inherited `foldLeft` to meet `Foldable`.
+- Proposed: **two overloads that both meet one trait method are an error at the impl**, naming
+  the method. Why: a call through the bound would have two methods to call, and choosing the
+  more specific is a second overload resolution no call site shows. Alternatives: the more
+  specific overload, as a written call would pick (more code, and a choice the reader cannot
+  see); the first declared (arbitrary).
+- Proposed: **the meeting decides a method's own type parameters from where they first appear in
+  its parameter types, against the trait's, then in its result; one still undecided takes its
+  lower bound, and one with none is an error naming it.** Every parameter and the result are then
+  checked with what was decided, each seen as the other's with no conversion (a reference seen as
+  a supertype, as a covariant part is; never a box). Why: the spec's "whose own type parameters
+  that call decides (a lower bound by its bound)"; the order makes `List`'s `flatMap(f: (T) ->
+  Iterable[U])` take `U` from the trait's `List[B]` seen as an `Iterable`. Alternatives: full
+  inference by the call checker (heavier, and its tiers of defaults would decide what the trait's
+  call does not).
+- Proposed: **a constructor trait requires only constructor traits**, each at its own parameters
+  in order; `trait Shown[A]: Functor[A], Display` is an error. Why: a trait for types bounds what
+  a value is, and the constructor trait's `Self` is no value's type, so what the requirement would
+  promise is unclear. Alternatives: reading it as a bound on every application `Self[A]` (a
+  constraint on applications, which impls over constructor parameters, step 6, are the place for).
+- Proposed: **a constructor trait's arguments are no position of a variance** for the conforming
+  type: `List[+T]` and `Result[+T, +E]` conform to `Monad[T]`, an invariant parameter. Why: no
+  value has the trait as its type, so `Monad[Dog]` and `Monad[Animal]` are never compared; the
+  subtyping of `F[Dog]` is the hole's (`F[+_]`). Alternatives: none that let a covariant type
+  conform.
+- Proposed: **a class may state a conformance to a constructor trait in its header**, `class
+  Crate[A]: Functor[A]`, held as an impl's is; the form leaving the trait's arguments off is an
+  impl's only. A class's methods meeting the trait's need no `override`, and may write it. Why:
+  a header conformance is one an impl could state, and the meeting methods are the class's own,
+  which override nothing. Alternatives: requiring an impl for constructor traits (no reason a
+  header could not say the same).
+- Proposed: **the conformance's errors are reported at the impl, a meeting's at the method where
+  the impl declares it and at the impl otherwise**: a library type's method that does not meet is
+  reported where the program's impl names the trait. Why: the impl is what the program wrote; the
+  library's method is not the mistake.
+
+**Higher-kinded types, inferring a constructor through its bound** (build plan step 4, branch
+`hkt-4`)
+
+- Proposed: **the spec's third place to look, "the one trait among those it conforms to that has
+  one", is left out, since no type can reach it.** An impl is never for a trait, and a trait that
+  requires a constructor trait is itself one, so a type conforming to it conforms to what it
+  requires at the same holes, as its own; a type conforming to it at fixed arguments
+  (`class Digits: Bag[int]`) is refused at the declaration. A type is therefore matched as itself,
+  then as its superclasses nearest first, and a type with no conformance there is an error naming
+  the bound and the type. Why: code for a case no program can write would be untested. Review
+  with the user: it returns, with its "several such traits" error, if traits come to implement
+  constructor traits by impls (`impl Monad for Seq`), which the spec's `pairUp[Seq, …]` example
+  presumes and the library step will want.
+- Proposed: **with several constructor-trait bounds, each conformance the type (or the superclass
+  matched) has decides; two that leave different arguments open are an error naming both**
+  (`Pair` implements `Mappable` as `Pair[int, _]` and `Lefty` as `Pair[_, int]`), and a bound the
+  type lacks is reported as for a written constructor. Why: the bounds are one demand on one
+  constructor, so the nearest type with any of them is the answer the others are checked against.
+  Alternatives: the first bound written decides (order-dependent); the nearest type with all of
+  them (skips a subclass's own conformance for a superclass's, which the spec's no-inheritance rule
+  forbids).
+- Proposed: **an argument written out of a constructor joins only where the type's parameter is
+  covariant and the argument a reference type known at that argument; the expected type, checked
+  first, fixes it.** `second(dogs, cats)` makes `F` `Result[_, Animal]`; with
+  `val r: Result[int, Dog] = second(dogs, cats)` the expected type has made `F` `Result[_, Dog]` and
+  the cats are refused. Why: the expected type decides type arguments before the arguments do for
+  every generic call. An argument the first argument leaves unknown (`Ok(1)`'s error type) is
+  decided by the next, as an invariant one is.
+- Proposed: **inference sees a subclass as its superclass, or a type as a trait, only where a value
+  is read out** (a fix found in step 4, which matching through a superclass's conformance meets):
+  at an invariant argument or a function's parameter, inference held a `Box[TallShelf[int]]` to be
+  a `Box[Shelf[A]]`, and a `(Dog) -> int` an `(Animal) -> B`, so generic code could store a `Shelf`
+  in the box or pass a cat to the function, reading memory that was never a `TallShelf`'s or a
+  `Dog`'s. Both are now refused; a type that is the class itself is still taken there.
 
 ## Open
 

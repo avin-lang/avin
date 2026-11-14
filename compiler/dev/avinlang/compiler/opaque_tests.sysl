@@ -1,0 +1,64 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// An opaque type is laid out as its representation: making a value, taking it apart, calling its
+// methods, comparing it and keeping it in a vector cost nothing its representation would not. Only a
+// value that becomes an `Any` or a trait's value is put in a box, and it is, over a reference too, so
+// the box names the opaque type.
+
+private opaque_lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private opaque_function(program: MirProgram, name: string) -> MirFunction
+    for f in program.functions
+        if f.symbol == "<program>." + name then return f
+    panic("no function " + name)
+
+// The allocations the function `name` of `program` makes.
+private opaque_allocations(program: MirProgram, name: string) -> int
+    var allocations = 0
+    for block in opaque_function(program, name).blocks
+        for inst in block.insts
+            if inst is Alloc(_, _) then allocations = allocations + 1
+    allocations
+
+private const Opaques: string = "opaque type UserId = long\n\nopaque type Name = string\n\nimpl UserId\n  next() -> UserId = UserId(repr + 1)\n\nimpl Ord for UserId\n  compare(other: UserId) -> int = repr.compare(other.repr)\n\n"
+
+private const Uses: string = "wrap(n: long) -> long = UserId(n).next().repr\n\nstep(u: UserId) -> UserId = u.next()\n\nsame(a: UserId, b: UserId) -> bool = a == b\n\nordered(a: UserId, b: UserId) -> int = a.compare(b)\n\nname(s: string) -> string = Name(s).repr\n\nfirst(xs: Vector[UserId]) -> long = xs(0).repr\n\nhold(n: long) -> Any = UserId(n)\n\nholdName(s: string) -> Any = Name(s)\n\nmain()\n  println(wrap(1) + step(UserId(1)).repr + first([UserId(2)]))\n  println(same(UserId(1), UserId(2)))\n  println(ordered(UserId(1), UserId(2)))\n  println(name(\"a\"))\n  println(hold(1) == holdName(\"b\"))\n"
+
+@test("an opaque type's values are its representation's, with no box, where they are made, taken apart, compared and called")
+opaque_values_are_unboxed()
+    val program = opaque_lowered(Opaques + Uses)
+    for name in ["wrap", "step", "same", "ordered", "name", "first"]
+        assert_eq(opaque_allocations(program, name), 0)
+
+@test("an opaque type's value becomes an `Any` in a box of its own, over a number and over a reference alike")
+opaque_any_is_boxed()
+    val program = opaque_lowered(Opaques + Uses)
+    assert_eq(opaque_allocations(program, "hold"), 1)
+    assert_eq(opaque_allocations(program, "holdName"), 1)
+
+@test("an opaque type's value is laid out as its representation, as a parameter and as a result")
+opaque_layout_is_representation()
+    val program = opaque_lowered(Opaques + Uses)
+    val step = opaque_function(program, "step").signature
+    assert_eq(step.params.len(), 1usize)
+    assert(step.params[0] is MInt(64))
+    assert(step.result is Some(MInt(64)))
+    val name = opaque_function(opaque_lowered(Opaques + "tag(n: Name) -> Name = n\n\nmain()\n  println(tag(Name(\"a\")).repr)\n"), "tag").signature
+    assert_eq(name.params.len(), 1usize)
+    assert(name.params[0] is MRef)
+    assert(name.result is Some(MRef))
+
+@test("a union of opaque types takes the words its members' representations would")
+opaque_union_words()
+    val program = opaque_lowered(Opaques + "pick(x: UserId | Name) -> long = x match\n  u: UserId -> u.repr\n  _ -> 0\n\nmain()\n  println(pick(UserId(1)))\n")
+    val s = opaque_function(program, "pick").signature
+    assert_eq(s.params.len(), 3usize)
+    assert(s.params[0] is MInt(32))
+    assert(s.params[1] is MInt(64))
+    assert(s.params[2] is MRef)

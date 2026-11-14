@@ -7,7 +7,9 @@ weight: 12
 ## Built-in types
 
 Built-in type names are lowercase and belong to the language itself: they have no module path and
-cannot be shadowed by an import. Their methods are defined in the core standard library with
+cannot be shadowed by an import. In a pattern each is a
+[type pattern](/spec/operators-and-control-flow/#match) by itself, `x is int`, so none names a
+local, a parameter or a field. Their methods are defined in the core standard library with
 ordinary `impl` blocks.
 
 | Type | Meaning |
@@ -475,7 +477,8 @@ tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from i
 Where a value fills the rest of a line, a tuple needs no parentheses: after `=` in a function, clause
 or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
 last. Inside brackets and in the body of a one-line `if` or `while`, a comma separates other things,
-so a tuple there is parenthesized.
+so a tuple there is parenthesized, a `match` arm's one-line body inside brackets
+[included](/spec/operators-and-control-flow/#match).
 
 ```text
 divmod(a: int, b: int) -> (int, int) = a / b, a % b
