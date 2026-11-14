@@ -815,7 +815,8 @@ trait SendableMonad[A: Sendable]: SendableFunctor[A]
 
 The type system stays small: generics with bounds, constructor parameters bounded by constructor
 traits, subtyping with declaration-site variance, traits implemented through `impl`,
-[union types](/spec/unions/) written in annotations, and
+[union types](/spec/unions/) written in annotations,
+[opaque types](/spec/declarations/#opaque-types), new types laid out as an existing one, and
 [refined variants](/spec/refined-variants/), whose `match` arms learn type equalities. It has no type lambdas beyond the partial
 application of one type's own arguments, no constructors of constructors, and no type members,
 inferred unions, implicit parameters, implicit conversions or macros. Intersections exist only as

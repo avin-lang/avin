@@ -7865,7 +7865,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
   then fetches again over the network); a lock around a program's cache (the content-addressed,
   rename-published entries need none). Review with the user: whether a cache of a deleted project
-  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+  should ever be trimmed on its own (answered by the cache's limit: least recently used first, see
+  the Proposed entries of branch `cache-trim`).
 
 - Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
   tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
@@ -8391,6 +8392,64 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
+  Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
+  opaque type reads as the alias it resembles, with one word saying the difference, and the parser
+  and formatter treat it as an alias. Alternatives weighed: `newtype Name = Repr` (a new keyword for
+  a small feature); `data Name(value: Repr)` with an annotation (a data value is an object, and the
+  layout is the point); `type Name = new Repr` (a modifier inside the body reads as part of the
+  type).
+- Proposed (built on branch `opaque-types`): **the representation is seen only in the declaring
+  module, through `Name(r)` and `x.repr` (and bare `repr` in its impls), with no implicit
+  conversion either way even inside the module.** Why: an explicit wrap and unwrap keep every
+  crossing between the type and its representation visible in the source, which is what the type
+  exists for, and one rule holds everywhere; `repr` is one short name that cannot be confused with
+  a field of the representation. Alternatives weighed: the type transparent inside its module (the
+  module's own code could mix `UserId` and `long` unnoticed, and the type checker would need two
+  views of every type); a `.value` accessor (a common field name of representations, so it would
+  shadow or be shadowed); an unwrapping pattern `Name(n)` (it reads as a constructor pattern of a
+  data type, which an opaque type is not, and `x.repr` covers it). Review with the user: whether the
+  module that declares the type should see it as its representation.
+- Proposed (built on branch `opaque-types`): **an opaque type is nominal, `Type.Opaque(id, name,
+  args, repr)`, a value type that is boxed only where it becomes an `Any` or a trait's value, and
+  its box names the opaque type over a reference too.** Its parameters are invariant and take no
+  bounds; a phantom parameter is allowed. The representation may not be `Nothing`, `unit`, a union,
+  a bare type parameter or name the type. Why: laid out as its representation, a `Vector[UserId]`
+  holds the `long`s themselves and the type costs nothing; a box naming the opaque type is what lets
+  `x: Any` be matched as `UserId` and never as `long` or `string`, so the abstraction holds through
+  `Any`. Variance would expose the representation's own variance, which only the module sees;
+  bounds have nothing to bound, since the representation's types hold their own. `Nothing`, `unit`,
+  unions and a bare parameter have no single layout to share. Alternatives weighed: reusing the
+  representation's box for a reference representation (cheaper, but `x is _: string` would find an
+  `Email`); covariant parameters (unsound for a mutable representation); refusing phantom
+  parameters as an alias does (they are a main use: typed identifiers).
+- Proposed (built on branch `opaque-types`): **an opaque type is no type constructor**: a generic
+  one is refused for a constructor parameter `F[_]`, and an opaque type declares no constructor
+  parameter of its own; it is an ordinary type argument of `F[A]`. Why: every instance of a
+  constructor parameter's application is laid out as an object, which an opaque type over `long`
+  is not, and a representation `F[int]` would leave the opaque type's layout to each use. Refusing
+  both is the sound position that can be loosened later. Alternatives weighed: accepting an opaque
+  type over a reference type as a constructor (sound for the layout, but it would make the rule
+  depend on the representation, which outside code should not see); accepting `opaque type W[F[_]]`
+  (the layout question is only deferred, to every use).
+- Proposed (built on branch `opaque-types`): **a refined variant's result does not name an opaque
+  type** (`Newest -> Query[UserId]`, `Query[Id[User]]`, `Query[Vector[UserId]]` are refused); a
+  variant's fields may be of opaque types and the type's own argument may be one. Why: a `match`
+  on a refined variant will learn type equalities from the result, and whether one learning
+  `R = UserId` should see the representation inside the opaque type's module is not decided; keeping
+  opaque types out of results is sound and can be loosened once matching on refined variants is
+  built. Alternatives weighed: accepting them as nominal types now (sound for values and layouts,
+  but it fixes the answer to the open question before the matching it affects exists).
+- Proposed (built on branch `opaque-types`): **equality and hashing are the representation's;
+  every other trait comes from an impl, which takes the trait's default bodies; an opaque type
+  derives nothing and has no supertype.** Why: every Avin type has `==` and a hash, so an opaque
+  type is a `Map` key and a `Set` element without ceremony, while order and printing are choices the
+  module makes for its type (an `Email` may print as `<…>`, a `UserId` may have no order). Default
+  bodies run on the boxed value, so `compare` gives `<`, `less`, `max` and sorting. Alternatives
+  weighed: `derives Ord, Display` forwarding to the representation (convenient, but it would show
+  the representation's text and order outside the module by default); inheriting every trait of the
+  representation (the opaque type would leak its representation's whole interface).
+
 - Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
   take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
   the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
@@ -8818,7 +8877,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and a plain variant's pattern needs coverage over the possible variants, which is step 4's; the
   derived code is the plan's "derived per instance", and needs only what lowering knows at a copy.
   Alternatives weighed: accepting patterns on plain variants now (coverage would demand arms for
-  impossible variants that step 4 then makes errors).
+  impossible variants that step 4 then makes errors). **Step 3 (branch `gadt-3`) lifted the first
+  two**; a pattern on a variant with hidden parameters is refused in their place (the `gadt-3` entry
+  below).
 - Proposed (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
   its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
   is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
@@ -8869,6 +8930,68 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
   X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
   among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
+- Proposed (branch `gadt-3`, the refinement step): **each pattern on a refined variant gives the
+  variant's parameters fresh types of its own**, so two `Pair` patterns, nested or one after the
+  other, give two unrelated sets, and **the equalities are solved with those fresh types first, then
+  the enclosing code's type parameters**: `Vector[A] = Vector[T]` makes `A` the `T` around the arm,
+  so a field reads as a type the code can name, and `T = (A, B)` keeps `T` as the pair of the fresh
+  types. A union or a type constructor that names a type parameter is not taken apart and teaches
+  nothing (`T | string = int | string` has two solutions); any other two different types, and a
+  cyclic `T = Vector[T]`, are a contradiction, and **until step 4 makes such an arm an error, a
+  contradictory arm is checked with no equalities** (sound: it knows less), and is not compiled at
+  any copy. The equalities hold where a marker local the pattern declares beside its names is in
+  scope, which carries them exactly where the names go: an arm, a clause, an `is` test's branch,
+  the right operand of `&&` and `||`, the rest of a block after an early return or a binding. At a
+  copy where a pattern is impossible, lowering leaves out what holds its equalities: the arm, the
+  branch an `is` test then cannot take, the right operand of `&&` and `||`, a `while` body, and the
+  rest of a block whose taken branch never finishes. Why: the chapter's "fresh types known only by
+  these equalities", and a substitution the arm's code can read. Alternatives weighed: naming the
+  fresh types by the data type's own parameters (two nested patterns would share them); stopping
+  with an error at an equality not taken apart (refuses sound programs).
+- Proposed (branch `gadt-3`): **a variant's own parameter that the equalities leave a fresh type
+  never leaves its arm**, as a hidden one does not (the chapter states it for hidden parameters
+  only): with no type expected, an arm, a clause, an `is` branch or a block whose result names one is
+  refused with ``"this arm's result is an `Expr[A]`, and `A` is a type `Pair` takes from the value it
+  matches, which is not known outside its arm"``, and an inference variable made before the pattern
+  settled to one with ``"a type declared outside this arm cannot be settled to an `Expr[A]`: …"``,
+  reported at the pattern. Why: such a type is known only through the value matched, so no copy can
+  compile code outside the arm that names it. Alternatives weighed: settling the escaped type as
+  `Nothing` (lays out a value at the wrong type); allowing it (no copy could compile it).
+- Proposed (branch `gadt-3`): **inside an arm a value of a type an equality fixes is used at what
+  it is there** for operators, members and comparisons (`x + n` with `x: T` and `T = int` is an
+  `int`), the type expected of an expression is the one under the equalities (a literal where a `T`
+  that is an `int` is expected is an `int`, a value where a `T` that is `Any` is expected is boxed),
+  while **an inference variable still settles to the type as written** where it meets one. An arm
+  that refines, with a type expected, is checked against it under its equalities and **yields the
+  expected type itself**; one that does not fit it is refused with ``"this arm yields int, not the T
+  expected of the `match`"``. Clauses with no declared result that agree on no type are reported as
+  the chapter reports arms: ``"the clauses of `f` agree on no type: `IntLit`'s yields an `int`, which
+  is `T` only inside that clause; declare the result type"``. Why: the chapter's "a type and
+  anything it equals are one type" and its "as written" rule for inference variables, each where it
+  can apply. Alternatives weighed: rewriting every type in the arm to its refined form (would settle
+  variables outside the arm to refined types, against the chapter).
+- Proposed (branch `gadt-3`): **`val V = x`, where `V` is a variant of `x`'s type and that type has
+  refined variants, takes the value apart** as the chapter's `val Refl = proof` does; anywhere else
+  `val Name = x` binds a name, as before. **Review with the user**: whether `val V = x` should take
+  apart a value whenever `V` is a variant in scope, as a bare name in a pattern does. Why: the
+  chapter's example, with no change for any program written before refined variants. Alternatives
+  weighed: requiring `val V() = x` (not the chapter's spelling); the general rule (changes what
+  existing bindings mean).
+- Proposed (branch `gadt-3`): **a field of a refined type's one variant is read by name where the
+  instance says the field's type**: `o.value` on `One[T]` with `Mk(value: int) -> One[int]` is an
+  `int`; an instance the variant cannot make is refused with ``"`One[bool]` has no values: no
+  variant of `One` makes one"``, and a field whose type keeps a parameter the instance does not say
+  with ``"the field `items` of `Hold` has a type a `Holder[T]` does not determine; take the value
+  apart with `match`"``. Why: every value of the instance is the variant's, so the read is the arm
+  of a one-arm `match`, and only its result type must be one known outside. Alternatives weighed:
+  refusing every such read (the chapter's single-variant types would lose field access).
+- Proposed (branch `gadt-3`): **until step 5, a pattern on a variant with hidden parameters is
+  refused** (``"`First` hides `B`, named by its fields and not by its result: a pattern cannot take
+  apart a value of a variant with hidden type parameters yet"``), as a value of one is; **a pattern
+  on a variant bounding its own parameters is accepted, its arm without those bounds until step 6**.
+  Why: an arm on a hidden parameter is compiled per pack, which step 5 builds; no value of either
+  kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
+  arms would never be compiled, and a program would meet step 5's rules later as a change).
 
 - Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
@@ -9109,6 +9232,67 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   owner at a read served from the bytes read ahead; before, only a read that reached the socket
   checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
   sound.
+
+- Proposed (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
+  used first, with no index**: an entry is a program's build directory (`build/`, `test-builds/`) or
+  one object or archive (`units/`, `runtime/`, `shims/`, `cunit/`), and its modification time is its
+  last use, touched by every build that takes it from the cache (a program's directory when its
+  build starts and before each test `avin test` runs). Every command that builds sweeps the cache at
+  most once in ten minutes, a stamp file in the cache shared by every process, and evicts the
+  oldest entries until the cache is within `AVIN_CACHE_LIMIT` (a size with `K`/`M`/`G`/`T`, `off`
+  for none, default 5G; a value that is neither is an error from every command). Why: builds run in
+  many worktrees and sessions at once, so a shared index would need a lock Sysl's library does not
+  offer, while a touch is one system call and the existing unit-object trim already worked by
+  modification time. Alternatives: an index file of use times (a lock, and a writer killed halfway
+  through it); access times (`noatime` mounts, and macOS updates them lazily); a sweep after every
+  build (the size walk on every build); an hourly sweep (24G had grown within hours). Review with
+  the user: the 5G default and the ten-minute interval.
+- Proposed (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
+  aside, looked at again and put back if a build touched it in between**, before it is removed.
+  Why: no build reading or writing an entry loses it, without a lock; a cache whose fresh entries
+  alone pass the limit stays past it until they age. Alternatives: lease files naming the process
+  (Sysl's library has no way to ask whether a process is alive); `flock` (not in Sysl's library);
+  no grace (a sweep could take the executable `avin test` starts once per test). A shim archive and
+  the record of the libraries it needs beside it are one entry, the archive evicted first and a
+  record newer than the sweep's choice kept, so no build finds the record without its archive.
+- Proposed (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
+  error**: every object and archive a build takes from the cache is touched first, and one missing
+  (or a shim archive without its record) is built again; the link looks again at everything it takes
+  from the cache before clang runs and after clang fails, answers an entry gone in between as such
+  rather than as clang's error, and the build then compiles again, which builds the entry anew, and
+  links once more. Why: a cache emptied by hand, or by a disk being cleared, while builds ran made two
+  gates fail to link a shim archive that had been there when the program compiled (2026-11-13).
+  Alternatives: holding the entries open across the link (clang opens them by name); copying them
+  out of the cache first (the copying costs every build).
+- Proposed (branch `cache-trim`): **another version's cache is removed three days after its last
+  use**, judged by the newest time on it, its kinds and their entries, and only beside the default
+  cache (never beside a directory `AVIN_CACHE` names), and only for a name that is a version's. Why:
+  no compiler of this version can read it, and three days spares a user switching back. Alternatives:
+  removing every other version at once (an older installed compiler still in use would rebuild each
+  time); never (the unreachable caches are what filled the disk).
+- Proposed (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
+  sweep**; a sweep removes only the debris of interrupted fetches, and `avin cache clean --packages`
+  removes packages (with `--older-than`, those no build has read for that long; a build touches the
+  package it reads). Why: a package is source pinned by `avin.sum`, small beside a build, and
+  fetching it again needs the network and a tag that may since have been removed, so evicting one
+  could break an offline or archived build. Alternatives: counting packages in the limit (evicted
+  first, being rarely touched, for a few hundred kilobytes saved).
+- Proposed (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
+  `.pending-` (a write that was never renamed into place) that nothing has written to for an hour,
+  and in the temporary directory the directories a build works in (`avin-link`, `avin-shims`,
+  `avin-c-unit` and the six characters `make_temp_dir` adds) that nothing has written to for a day,
+  and the `avin-test-builds` ones the compiler's tests left before their builds moved into the
+  cache's `test-builds/`. Why: a killed or out-of-space build leaves these behind, and on this
+  machine its tests had left 8,673 such directories. A program's own temporary directories are never
+  touched, whatever they are called. Alternatives: every `avin-` directory (a program may name its
+  own so); none (the debris is unbounded).
+- Proposed (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
+  limit, each kind's entries and size, the total with its oldest and newest use, debris, fetched
+  packages and other versions' caches; `trim` sweeps now; `clean` removes every entry, the debris and
+  other versions' caches, `--older-than <n>m|h|d` only what no build has used for that long, and
+  `--packages` the fetched packages too. `avin clean` keeps its meaning (one program's builds, or
+  `--all` every program's). Why: the user sees what the cache holds and can empty it without
+  knowing its layout. Alternatives: folding these into `avin clean` (whose argument is a program).
 - Proposed: **a marked parameter survives a function becoming a value only through its type**
   (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
   `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable

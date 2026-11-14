@@ -1,0 +1,591 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.fs.{cache_dir, entries, link_metadata, make_dir_all, metadata, pending_name, remove_dir_all, remove_file, rename, set_modified, walk, write_text}
+import sysl.path.parent
+import sysl.slices.sort_by
+import sysl.text.parse_ulong
+import sysl.time.now
+
+// **Keeping the cache bounded.** Everything a build keeps for the next lives in the toolchain's cache
+// (`toolchain_cache`), one directory per version of the compiler, in kinds:
+//
+// - `build/` and `test-builds/`: a directory per program (see `build_cache`), its executables, their
+//   records and its instance cache, an entry each;
+// - `units/`, `runtime/`, `shims/` and `cunit/`: a file per object or archive, by key, an entry each.
+//
+// An entry's modification time is when a build last used it: every build that takes one from the
+// cache touches it first (a program's directory when its build starts and before each of its tests
+// runs, an object or archive when it is found), and a new one is as new as its write. So the cache
+// needs no index, which builds in many places at once would have to share and lock.
+//
+// Every command that builds sweeps the cache at most once per `SweepInterval`, a stamp file in the
+// cache saying when it was last swept, whichever process did it. A sweep:
+//
+// 1. removes the debris an interrupted build leaves, a file or directory whose name has `.pending-`
+//    in it (`pending_name`) that no build has written to for `CacheFresh`;
+// 2. evicts entries, least recently used first, until the cache is within its limit (`AVIN_CACHE_LIMIT`,
+//    `DefaultCacheLimit` unless it is set), and never one used within `CacheFresh`, so nothing a build
+//    is reading or writing now goes: an entry is renamed out of its place, looked at again, and put
+//    back if a build touched it in between, and only then removed;
+// 3. removes the caches of other versions of the compiler, which no build of this one can read, once
+//    none has been used for `OtherVersionAge`;
+// 4. removes what interrupted fetches leave among the fetched packages, and the temporary directories
+//    a build works in (`is_temp_debris_name`) that nothing has written to for `TempJunkAge`, which a
+//    killed build leaves behind.
+//
+// Fetched packages are not counted against the limit and never evicted: a package is source pinned
+// by `avin.sum`, small beside a build, and fetching it again needs the network and a tag its owner may
+// since have removed. `avin cache clean --packages` removes them.
+
+/** The variable that sets the cache's limit: a size, `5G`, `500M`, `0`, or `off` for none. */
+const CacheLimitVariable: string = "AVIN_CACHE_LIMIT"
+
+/** The cache's limit when `AVIN_CACHE_LIMIT` is unset or empty: five gibibytes. */
+const DefaultCacheLimit: long = 5368709120
+
+/** How often the cache is swept, at most, in microseconds: ten minutes. */
+const SweepInterval: long = 600000000
+
+/** What a sweep never removes, however full the cache: anything used or written this recently, in
+ * microseconds: an hour. */
+const CacheFresh: long = 3600000000
+
+/** How long the cache of another version is kept after its last use, in microseconds: three days. */
+const OtherVersionAge: long = 259200000000
+
+/** How long a temporary directory of Avin's own is kept after its last write, in microseconds: a day. */
+const TempJunkAge: long = 86400000000
+
+/** The file whose modification time says when the cache was last swept. */
+const SweepStamp: string = "last-sweep"
+
+/** The directory, in the cache of a version, that `avin cache` names for the packages fetched. */
+const PackagesKind: string = "packages"
+
+/** The kinds of entry the cache keeps, each a directory of it. */
+cache_kinds() -> Buf[string]
+    var kinds: Buf[string] = buf()
+    for k in ["build", "test-builds", "units", "runtime", "shims", "cunit"]
+        kinds.push(k)
+    kinds
+
+/** Where the caches are: `dir`, this version's; `versions`, the directory holding every version's,
+ * or "" where `AVIN_CACHE` names the cache or it is not the default one, and nothing beside it is
+ * the compiler's; `version`, this compiler's; `packages`, where fetched packages are kept, or "" on a
+ * machine with no cache directory; and `temp`, the temporary directory, or "" for none to sweep. */
+struct CacheLayout
+    dir: string
+    versions: string
+    version: string
+    packages: string
+    temp: string
+
+/** The caches of a compiler of version `version`, given `AVIN_CACHE` (`named`), the machine's cache
+ * directory and `TMPDIR`, as `toolchain_cache_of` places them. */
+cache_layout_of(named: Option[string], machine: Option[string], temp: Option[string], version: string) -> CacheLayout
+    val dir = toolchain_cache_of(named, machine, temp, version)
+    var chosen = false
+    if named is Some(d)
+        if d != "" then chosen = true
+    val versions = if chosen then "" else parent(dir).unwrap_or("")
+    val packages = machine match
+        Some(d) -> d + "/avin/pkg"
+        None -> ""
+    CacheLayout(dir, versions, version, packages, temp.unwrap_or("/tmp"))
+
+/** The caches of this compiler, as its environment places them. */
+cache_layout() -> CacheLayout = cache_layout_of(get("AVIN_CACHE"), cache_dir(), get("TMPDIR"), Version)
+
+/** The caches of this compiler with its cache at `dir`, a toolchain's: where `dir` is not the one the
+ * environment names, nothing beside it is touched. */
+cache_layout_at(dir: string) -> CacheLayout
+    val usual = cache_layout()
+    if dir == usual.dir then return usual
+    CacheLayout(dir, "", usual.version, usual.packages, usual.temp)
+
+/** The limit `AVIN_CACHE_LIMIT` names: `DefaultCacheLimit` where it is unset or empty, none for
+ * `off`, and otherwise a number of bytes with an optional `K`, `M`, `G` or `T` (powers of 1024). */
+cache_limit_of(value: Option[string]) -> Result[Option[long], string]
+    val v = value.unwrap_or("").trim()
+    if v == "" then return Ok(Some(DefaultCacheLimit))
+    if v == "off" then return Ok(None)
+    val bad = s"avin: $CacheLimitVariable is `$v`; it is a size such as `5G`, `500M` or `0`, or `off`"
+    var digits = v
+    var scale: long = 1
+    val last = v.bytes[v.bytes.len - 1]
+    val unit = if u8('a') <= last <= u8('z') then last - (u8('a') - u8('A')) else last
+    if unit == u8('K') || unit == u8('M') || unit == u8('G') || unit == u8('T')
+        digits = v[0..<v.bytes.len - 1]
+        scale = if unit == u8('K') then 1024 elif unit == u8('M') then 1048576 elif unit == u8('G') then 1073741824 else 1099511627776
+    if digits == "" then return Err(bad)
+    for b in digits.bytes
+        if !(u8('0') <= b <= u8('9')) then return Err(bad)
+    val n = parse_ulong(digits) match
+        Ok(n) -> n
+        Err(_) -> return Err(bad)
+    // No limit is more than an exbibyte: past it the bytes would not fit.
+    if n > ulong(1152921504606846976 / scale) then return Err(bad)
+    Ok(Some(long(n) * scale))
+
+/** An age `avin cache clean --older-than` takes: a number of minutes, hours or days (`30m`, `12h`,
+ * `7d`), in microseconds. */
+age_of(text: string) -> Option[long]
+    if text.bytes.len < 2 then return None
+    val unit = text.bytes[text.bytes.len - 1]
+    var per: long = 0
+    if unit == u8('m') then per = 60000000
+    elif unit == u8('h') then per = 3600000000
+    elif unit == u8('d') then per = 86400000000
+    else return None
+    val digits = text[0..<text.bytes.len - 1]
+    for b in digits.bytes
+        if !(u8('0') <= b <= u8('9')) then return None
+    val n = parse_ulong(digits) match
+        Ok(n) -> n
+        Err(_) -> return None
+    if n > ulong(9000000000000000000 / per) then return None
+    Some(long(n) * per)
+
+/** One entry of the cache: its kind, where it is, its size in bytes, and when a build last used it,
+ * in microseconds. */
+struct CacheItem
+    kind: string
+    path: string
+    size: long
+    used: long
+
+/** What a look over the cache found: its entries, and the debris of interrupted builds, as many and
+ * as large as they are. */
+struct CacheScan
+    items: Buf[CacheItem]
+    junk: usize
+    junk_bytes: long
+
+/** What a sweep or a clean removed: entries and their bytes, debris, other versions' caches and
+ * temporary directories. */
+struct CacheSweep
+    evicted: usize
+    freed: long
+    junk: usize
+    versions: usize
+    temps: usize
+
+/** Whether `name` is debris of an interrupted write: a pending name (`pending_name`). */
+is_pending_name(name: string) -> bool = name.contains(".pending-")
+
+/** The entries of the cache at `dir`, with `remove` removing the debris no build has written to since
+ * `before` as it goes, and without counting it. A kind that is a symbolic link is another cache's,
+ * and is passed over. */
+scan_cache(dir: string, before: long, remove: bool) -> CacheScan
+    var scan = CacheScan(buf(), 0, 0)
+    for kind in cache_kinds()
+        val kind_dir = dir + "/" + kind
+        val kind_meta = link_metadata(kind_dir) match
+            Ok(m) -> m
+            Err(_) -> continue
+        if kind_meta.is_link() || !kind_meta.is_dir() then continue
+        val names = entries(kind_dir) match
+            Ok(n) -> n
+            Err(_) -> continue
+        for name in names
+            val p = kind_dir + "/" + name
+            val meta = link_metadata(p) match
+                Ok(m) -> m
+                Err(_) -> continue
+            if meta.is_link() then continue
+            if is_pending_name(name)
+                if meta.modified.us < before
+                    var inner = CacheScan(buf(), 0, 0)
+                    val size = if meta.is_dir() then tree_size(p, 0, false, &inner) else meta.size
+                    if !remove || remove_entry(p)
+                        scan.junk += 1
+                        scan.junk_bytes += size
+                continue
+            // A shim archive's record of the libraries it needs is part of it, evicted with it.
+            if kind == "shims" && name.ends_with(".link") && link_metadata(p[0..<p.bytes.len - 5]).is_ok() then continue
+            var size = if meta.is_dir() then tree_size(p, before, remove, &scan) else meta.size
+            if kind == "shims" && link_metadata(link_needs_file(p)) is Ok(m) then size += m.size
+            scan.items.push(CacheItem(kind, p, size, meta.modified.us))
+    scan
+
+/** Evicts `it` as `evict_entry` does, and with a shim archive the record beside it, unless that is
+ * newer than `before`: then it is another build's, published for an archive built again since. The
+ * archive goes first, so a build never finds the record without its archive and links it. */
+evict_item(it: CacheItem, before: long) -> bool
+    if !evict_entry(it.path, before) then return false
+    if it.kind == "shims"
+        val needs = link_needs_file(it.path)
+        if link_metadata(needs) is Ok(m)
+            if m.modified.us < before then _ = remove_file(needs)
+    true
+
+// The bytes of the files under `dir`, debris among them counted in `scan` (and with `remove` removed)
+// rather than in the answer.
+private tree_size(dir: string, before: long, remove: bool, scan: *CacheScan) -> long
+    var total: long = 0
+    var walker = walk(dir)
+    loop
+        val entry = walker.next() match
+            Some(Ok(e)) -> e
+            Some(Err(_)) -> continue
+            None -> break
+        if entry.path == dir || entry.is_link() then continue
+        val name = last_segment(entry.path)
+        if is_pending_name(name) && entry.meta.modified.us < before
+            if entry.is_dir() then walker.skip_dir()
+            if !remove || remove_entry(entry.path)
+                scan.junk += 1
+                if !entry.is_dir() then scan.junk_bytes += entry.meta.size
+            continue
+        if !entry.is_dir() then total += entry.meta.size
+    total
+
+// The last segment of `p`.
+private last_segment(p: string) -> string
+    var i = p.bytes.len
+    while i > 0 && p.bytes[i - 1] != u8('/')
+        i -= 1
+    p[i..]
+
+// Removes the file or directory at `p`, a link itself rather than what it names.
+private remove_entry(p: string) -> bool
+    val meta = link_metadata(p) match
+        Ok(m) -> m
+        Err(_) -> return false
+    if meta.is_dir() && !meta.is_link() then remove_dir_all(p).is_ok() else remove_file(p).is_ok()
+
+/** Evicts the entry at `p` unless a build has used it since `before`: it is renamed aside, looked at
+ * again, since a build may have touched it between the look that chose it and the rename, and put
+ * back if one did; only an entry no build has used since is removed. */
+evict_entry(p: string, before: long) -> bool
+    val aside = pending_name(p)
+    if rename(p, aside).is_err() then return false
+    val used = link_metadata(aside) match
+        Ok(m) -> m.modified.us
+        Err(_) -> return false
+    if used >= before
+        if rename(aside, p).is_ok() then return false
+    // Removed whole or in part, what is left keeps its pending name and old time, and the next sweep
+    // takes it as debris.
+    _ = remove_entry(aside)
+    true
+
+/** Whether a sweep is due: the stamp in the cache is older than `SweepInterval` or missing. A due
+ * sweep renews the stamp at once, so another process starting now does not sweep too. */
+sweep_due(layout: CacheLayout, at: long) -> bool
+    val stamp = layout.dir + "/" + SweepStamp
+    if metadata(stamp) is Ok(m)
+        if m.modified.us > at - SweepInterval then return false
+    if make_dir_all(layout.dir).is_err() then return false
+    write_text(stamp, "").is_ok()
+
+/** Sweeps the cache when one is due (`sweep_due`), within `limit` or none; answers what it removed,
+ * or `None` where no sweep was due. A failure is not the build's: the worst a cache that could not be
+ * swept costs is disk. */
+sweep_if_due(layout: CacheLayout, limit: Option[long], at: long) -> Option[CacheSweep]
+    if !sweep_due(layout, at) then return None
+    Some(sweep_cache(layout, limit, at))
+
+/** Sweeps the cache now, as the comment at the top of this file says: debris, then the entries past
+ * `limit` least recently used first, then other versions' caches, the debris of fetches and stale
+ * temporary directories. */
+sweep_cache(layout: CacheLayout, limit: Option[long], at: long) -> CacheSweep
+    val before = at - CacheFresh
+    var result = CacheSweep(0, 0, 0, 0, 0)
+    var scan = scan_cache(layout.dir, before, true)
+    result.junk += scan.junk
+    if limit is Some(cap)
+        var total: long = 0
+        for it in scan.items
+            total += it.size
+        if total > cap
+            val ordered = scan.items.view_mut()
+            sort_by(ordered, used_earlier)
+            for it in ordered
+                if total <= cap || it.used >= before then break
+                if evict_item(it, before)
+                    total -= it.size
+                    result.evicted += 1
+                    result.freed += it.size
+    result.versions += retire_versions(layout, at - OtherVersionAge, false)
+    result.junk += package_debris(layout.packages, before)
+    result.temps += temp_debris(layout.temp, at - TempJunkAge)
+    result
+
+private used_earlier(a: CacheItem, b: CacheItem) -> bool = a.used < b.used
+
+/** The caches of versions other than `layout.version` beside it, each with when a build last used
+ * it; none where the cache is not the default one. */
+other_versions(layout: CacheLayout) -> Buf[CacheItem]
+    var out: Buf[CacheItem] = buf()
+    if layout.versions == "" then return out
+    val names = entries(layout.versions) match
+        Ok(n) -> n
+        Err(_) -> return out
+    for name in names
+        if name == layout.version || !is_version_name(name) then continue
+        val p = layout.versions + "/" + name
+        val meta = link_metadata(p) match
+            Ok(m) -> m
+            Err(_) -> continue
+        if meta.is_link() || !meta.is_dir() then continue
+        var scratch = CacheScan(buf(), 0, 0)
+        out.push(CacheItem(name, p, tree_size(p, 0, false, &scratch), version_used(p, meta.modified.us)))
+    out
+
+/** Whether `name` is a version's, `0.0.21`: it starts with a digit and holds digits, dots and the
+ * letters and dashes of a pre-release, and nothing pending. */
+is_version_name(name: string) -> bool
+    if name == "" || is_pending_name(name) then return false
+    if !(u8('0') <= name.bytes[0] <= u8('9')) then return false
+    for b in name.bytes
+        if !(u8('0') <= b <= u8('9') || u8('a') <= b <= u8('z') || b == u8('.') || b == u8('-')) then return false
+    true
+
+// When a version's cache at `dir` was last used: the newest time on it, its stamp, its kinds and
+// their entries.
+private version_used(dir: string, own: long) -> long
+    var newest = own
+    for name in entries(dir).unwrap_or(buf())
+        val p = dir + "/" + name
+        if link_metadata(p) is Ok(m)
+            if m.modified.us > newest then newest = m.modified.us
+            if m.is_dir() && !m.is_link()
+                for inner in entries(p).unwrap_or(buf())
+                    if link_metadata(p + "/" + inner) is Ok(im)
+                        if im.modified.us > newest then newest = im.modified.us
+    newest
+
+/** Removes the caches of other versions no build has used since `before`, or with `all` every one;
+ * answers how many went. */
+retire_versions(layout: CacheLayout, before: long, all: bool) -> usize
+    var removed = 0usize
+    for v in other_versions(layout)
+        if !all && v.used >= before then continue
+        val aside = pending_name(v.path)
+        if rename(v.path, aside).is_ok()
+            _ = remove_dir_all(aside)
+            removed += 1
+    removed
+
+// Removes the debris of interrupted fetches under the packages at `dir` that no fetch has written to
+// since `before`, without looking inside a package; answers how many went.
+private package_debris(dir: string, before: long) -> usize
+    if dir == "" then return 0
+    var removed = 0usize
+    var walker = walk(dir)
+    loop
+        val entry = walker.next() match
+            Some(Ok(e)) -> e
+            Some(Err(_)) -> continue
+            None -> break
+        if entry.path == dir || entry.is_link() then continue
+        val name = last_segment(entry.path)
+        if is_pending_name(name)
+            if entry.is_dir() then walker.skip_dir()
+            if entry.meta.modified.us < before && remove_entry(entry.path) then removed += 1
+            continue
+        if entry.is_dir() && (name.starts_with("@v") || name.starts_with("@r")) then walker.skip_dir()
+    removed
+
+/** Whether `name` is one the compiler gives a temporary directory a build works in, `avin-link`,
+ * `avin-shims` or `avin-c-unit`, or that its tests once gave the programs' builds, `avin-test-builds`,
+ * followed by the six letters and digits that make it unique. A program's own temporary directories
+ * are never taken, whatever they are called. */
+is_temp_debris_name(name: string) -> bool
+    for prefix in ["avin-link", "avin-shims", "avin-c-unit", "avin-test-builds"]
+        if name.starts_with(prefix) && name.bytes.len == prefix.bytes.len + 6
+            for i in prefix.bytes.len..<name.bytes.len
+                val b = name.bytes[i]
+                if !(u8('0') <= b <= u8('9') || u8('a') <= b <= u8('z') || u8('A') <= b <= u8('Z')) then return false
+            return true
+    false
+
+// Removes the temporary directories of Avin's own in `dir` that nothing has written to since
+// `before`, the directory or anything directly in it; answers how many went.
+private temp_debris(dir: string, before: long) -> usize
+    if dir == "" then return 0
+    var removed = 0usize
+    for name in entries(dir).unwrap_or(buf())
+        if !is_temp_debris_name(name) then continue
+        val p = dir + "/" + name
+        val meta = link_metadata(p) match
+            Ok(m) -> m
+            Err(_) -> continue
+        if meta.is_link() || !meta.is_dir() || meta.modified.us >= before then continue
+        var fresh = false
+        for inner in entries(p).unwrap_or(buf())
+            if link_metadata(p + "/" + inner) is Ok(im)
+                if im.modified.us >= before then fresh = true
+        if !fresh && remove_dir_all(p).is_ok() then removed += 1
+    removed
+
+/** The packages fetched into `dir`: each package's directory, `@v<version>` or `@r<commit>`, with its
+ * size and when a build last read it. */
+fetched_packages(dir: string) -> Buf[CacheItem]
+    var out: Buf[CacheItem] = buf()
+    if dir == "" then return out
+    var walker = walk(dir)
+    loop
+        val entry = walker.next() match
+            Some(Ok(e)) -> e
+            Some(Err(_)) -> continue
+            None -> break
+        if entry.path == dir || entry.is_link() || !entry.is_dir() then continue
+        val name = last_segment(entry.path)
+        if is_pending_name(name)
+            walker.skip_dir()
+            continue
+        if name.starts_with("@v") || name.starts_with("@r")
+            walker.skip_dir()
+            var scratch = CacheScan(buf(), 0, 0)
+            out.push(CacheItem(PackagesKind, entry.path, tree_size(entry.path, 0, false, &scratch), entry.meta.modified.us))
+    out
+
+/** `bytes` as a person reads a size: `512B`, `12K`, `3.4M`, `1.2G`. */
+size_text(bytes: long) -> string
+    if bytes < 1024 then return s"${bytes}B"
+    val units = ["K", "M", "G", "T"]
+    var scale: long = 1024
+    var i = 0usize
+    while i + 1 < units.len && bytes >= scale * 1024
+        scale *= 1024
+        i += 1
+    val tenths = bytes * 10 / scale
+    if tenths >= 100 then return s"${tenths / 10}${units[i]}"
+    s"${tenths / 10}.${tenths % 10}${units[i]}"
+
+/** How long ago `us` microseconds is, as a person says it: `just now`, `5 min ago`, `3 h ago`,
+ * `2 days ago`. */
+age_text(us: long) -> string
+    val minutes = us / 60000000
+    if minutes < 1 then return "just now"
+    if minutes < 60 then return s"$minutes min ago"
+    val hours = minutes / 60
+    if hours < 48 then return s"$hours h ago"
+    s"${hours / 24} days ago"
+
+/** The usage of `avin cache`. */
+const CacheUsage: string = "usage: avin cache info\n       avin cache trim\n       avin cache clean [--older-than <age>] [--packages]\n<age> is minutes, hours or days: `30m`, `12h`, `7d`"
+
+/** `avin cache info`, `avin cache trim` and `avin cache clean`, over the caches `layout` places,
+ * within `limit`, at the time `at`. */
+cache_command(args: []const string, layout: CacheLayout, limit: Option[long], at: long, say: string -> unit, note: string -> unit) -> int
+    if args.len < 3
+        note(CacheUsage)
+        return 2
+    val sub = args[2]
+    if sub == "info" && args.len == 3
+        cache_info(layout, limit, at, say)
+        return 0
+    if sub == "trim" && args.len == 3
+        if make_dir_all(layout.dir).is_ok() then _ = write_text(layout.dir + "/" + SweepStamp, "")
+        val swept = sweep_cache(layout, limit, at)
+        say(sweep_text(swept))
+        return 0
+    if sub != "clean"
+        note(CacheUsage)
+        return 2
+    var older: Option[long] = None
+    var packages = false
+    var i = 3
+    while i < args.len
+        if args[i] == "--packages" && !packages
+            packages = true
+        elif args[i] == "--older-than" && older is None && i + 1 < args.len
+            older = age_of(args[i + 1])
+            if older is None
+                note(s"avin: `${args[i + 1]}` is not an age: it is minutes, hours or days, such as `30m`, `12h` or `7d`")
+                return 2
+            i += 1
+        else
+            note(CacheUsage)
+            return 2
+        i += 1
+    val swept = clean_cache(layout, older, packages, at)
+    say(if swept.evicted + swept.junk + swept.versions == 0 then "nothing to clean" else sweep_text(swept))
+    0
+
+/** What a sweep or clean removed, in a line. */
+sweep_text(s: CacheSweep) -> string
+    val noun = if s.evicted == 1 then "entry" else "entries"
+    var text = s"removed ${s.evicted} $noun (${size_text(s.freed)})"
+    if s.junk > 0 then text = text + s", ${s.junk} left by interrupted builds"
+    if s.versions > 0 then text = text + s", ${s.versions} " + (if s.versions == 1 then "other version's cache" else "other versions' caches")
+    if s.temps > 0 then text = text + s", ${s.temps} temporary director${if s.temps == 1 then "y" else "ies"}"
+    text
+
+/** Removes every entry of the cache, its debris and other versions' caches, or with `older` only what
+ * no build has used for that long; with `packages`, the fetched packages too, on the same terms. */
+clean_cache(layout: CacheLayout, older: Option[long], packages: bool, at: long) -> CacheSweep
+    val before = older match
+        Some(age) -> at - age
+        None -> at + 1
+    var result = CacheSweep(0, 0, 0, 0, 0)
+    val scan = scan_cache(layout.dir, before, true)
+    result.junk += scan.junk
+    for it in scan.items
+        if it.used < before && evict_item(it, before)
+            result.evicted += 1
+            result.freed += it.size
+    result.versions += retire_versions(layout, before, older is None)
+    if packages
+        result.junk += package_debris(layout.packages, before)
+        for p in fetched_packages(layout.packages)
+            if p.used >= before then continue
+            if evict_entry(p.path, before)
+                _ = remove_file(p.path + ".hash")
+                result.evicted += 1
+                result.freed += p.size
+    result
+
+/** `avin cache info`: where the cache is, its limit, each kind's entries and size, the oldest and
+ * newest use, the debris, the fetched packages and other versions' caches. */
+cache_info(layout: CacheLayout, limit: Option[long], at: long, say: string -> unit)
+    val scan = scan_cache(layout.dir, at - CacheFresh, false)
+    say(s"cache        ${layout.dir}")
+    val cap = limit match
+        Some(c) -> size_text(c)
+        None -> "none"
+    say(s"limit        $cap ($CacheLimitVariable)")
+    var total: long = 0
+    var oldest: long = at
+    var newest: long = 0
+    for kind in cache_kinds()
+        var count = 0usize
+        var bytes: long = 0
+        for it in scan.items
+            if it.kind != kind then continue
+            count += 1
+            bytes += it.size
+            if it.used < oldest then oldest = it.used
+            if it.used > newest then newest = it.used
+        total += bytes
+        say(padded(kind, 13) + padded(s"$count ${if count == 1 then "entry" else "entries"}", 14) + size_text(bytes))
+    var line = padded("total", 13) + padded(s"${scan.items.len()} ${if scan.items.len() == 1 then "entry" else "entries"}", 14) + size_text(total)
+    if scan.items.len() > 0 then line = line + s", oldest used ${age_text(at - oldest)}, newest ${age_text(at - newest)}"
+    say(line)
+    if scan.junk > 0 then say(padded("debris", 13) + padded(s"${scan.junk} left", 14) + size_text(scan.junk_bytes) + " by interrupted builds; the next sweep removes it")
+    val fetched = fetched_packages(layout.packages)
+    var package_bytes: long = 0
+    for p in fetched
+        package_bytes += p.size
+    if layout.packages != ""
+        say(padded(PackagesKind, 13) + padded(s"${fetched.len()} fetched", 14) + size_text(package_bytes) + s" in ${layout.packages}, not counted against the limit")
+    for v in other_versions(layout)
+        say(padded("version " + v.kind, 13) + padded("", 14) + size_text(v.size) + s", last used ${age_text(at - v.used)}; removed once unused for ${OtherVersionAge / 86400000000} days")
+
+// `text` padded with spaces to `width`, and one space past it where it is as wide.
+private padded(text: string, width: usize) -> string = if text.len >= width then text + " " else text + " ".repeat(width - text.len)
+
+/** The cache's limit the environment sets, or the reason it cannot be read. */
+cache_limit() -> Result[Option[long], string] = cache_limit_of(get(CacheLimitVariable))
+
+/** Marks the entry at `p` used now, as a build does to what it takes from the cache; answers whether
+ * it is there. */
+touch_entry(p: string) -> bool = set_modified(p, now()).is_ok()
+
+/** The time now, in microseconds, as a sweep reads it. */
+sweep_now() -> long = now().us

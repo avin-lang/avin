@@ -53,21 +53,16 @@ import sysl.text.from_utf8_unchecked
 // The tests find the corpus from the working directory, which `sysl test` leaves as it found it:
 // they run from the repository root or from `compiler/`.
 
-/** The toolchain of this tree, building into the user's cache, with the programs' own builds, which
- * the tests' programs in temporary directories would leave behind there, kept in a temporary
- * directory of this process's instead. */
+/** The toolchain of this tree, building into the user's cache, with the builds of the tests' programs,
+ * which are in temporary directories of their own, kept apart from the programs' a person runs, in
+ * the cache's `test-builds`, where a sweep evicts them as it does any other (`cache.sysl`). Each test
+ * runs in a process of its own, so a temporary directory per process would leave one behind per
+ * test. */
 repository_toolchain() -> Toolchain
     val here = current_dir().unwrap_or(".")
     for root in [here, here + "/.."]
-        if toolchain_at(root) is Some(tc) then return tc.building_in(test_builds())
+        if toolchain_at(root) is Some(tc) then return tc.building_in(tc.cache + "/test-builds")
     panic("run the tests from the repository root or from compiler/: no library/ and runtime/ at " + here)
-
-private var test_builds_dir: string = ""
-
-/** The directory this process's tests keep the programs' builds in, made the first time it is asked. */
-private test_builds() -> string
-    if test_builds_dir == "" then test_builds_dir = make_temp_dir("avin-test-builds").unwrap()
-    test_builds_dir
 
 private struct Expectation
     exit: int
@@ -288,13 +283,12 @@ private run_all(tc: Toolchain, all: Buf[string]) -> Tally
 private run_case(tc: Toolchain, path: string, program: Case, want: Expectation, scratch: string) -> string
     val compiled = compile_case(tc, program, scratch)
     if compiled.diagnostics != "" then return path + ": did not compile:\n" + compiled.diagnostics
-    val llvm = compiled.llvm.unwrap_or("")
     val stdout = sidecar(sidecar_base(path), ".out")
     val stderr = sidecar(sidecar_base(path), ".err")
     var failures = ""
     for level in ["-O0", "-O2"]
         val binary = scratch + "/program" + level
-        link(tc, llvm, compiled.archive, binary, level, compiled.c_link, keep_units = false) match
+        link_compiled(tc, compiled, () -> compile_case(tc, program, scratch), binary, level, keep_units = false) match
             Err(message) ->
                 failures = failures + s"$path $level: did not link: $message\n"
                 continue
@@ -684,7 +678,7 @@ example_packages_build()
             failures = failures + path + ": did not compile:\n" + compiled.diagnostics
             continue
         for level in ["-O0", "-O2"]
-            link(tc, compiled.llvm.unwrap_or(""), compiled.archive, scratch + "/example" + level, level, compiled.c_link, keep_units = false) match
+            link_compiled(tc, compiled, () -> compile_case(tc, case_at(path), scratch), scratch + "/example" + level, level, keep_units = false) match
                 Err(message) -> failures = failures + s"$path $level: did not link: $message\n"
                 Ok(_) -> ()
     if failures != "" then panic(failures)
