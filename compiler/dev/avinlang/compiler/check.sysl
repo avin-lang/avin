@@ -1845,7 +1845,7 @@ private constructor_impl_written_out(c: *Checker, unit: usize, d: &ImplDecl) -> 
     var declared: Buf[TypeParam] = buf()
     if c.types.get(key) is Some(id) then declared = c.data[id].decl.type_params
     elif c.class_types.get(key) is Some(id) then declared = c.classes[id].decl.type_params
-    else return d
+    elif builtin_type(path) is None then return d
     var params: Buf[TypeParam] = buf()
     var args: Buf[&TypeExpr] = buf()
     for i in 0..<declared.len()
@@ -2572,6 +2572,8 @@ private conforms_directly(traits: Buf[&Type], t: &Type) -> bool
 /** The error for a conformance of type `who` to `t` stated again. */
 private restated(c: *Checker, who: string, t: &Type) -> string
     if *t is Class(k, _, _)
+        if is_constructor_trait(c, k)
+            return s"`$who` already implements `${c.classes[k].name}`; a type implements a constructor trait once, at one choice of holes"
         if is_trait(c, k) && c.classes[k].decl.type_params.len() > 0 && !implemented_several_times(c, k)
             return s"`$who` already conforms to `${c.classes[k].name}`; a type implements a trait at several type arguments only where the trait's members are all static"
     s"`$who` already conforms to `${type_name(t)}`; a conformance is stated once"
@@ -3313,6 +3315,20 @@ private refuse_constructor_conformances(c: *Checker)
         for tp in d.type_params
             if !(tp.variance is Invariant)
                 c.note(unit, tp.span, s"`${d.name}` is a constructor trait, whose parameters are the holes of the constructors implementing it, so they take no variance; a constructor parameter states one on its hole, as in `F[+_]`")
+        // A static member is called on a constructor, which names no type for the trait's
+        // parameters.
+        for member in d.members
+            val (f, static_member) = member match
+                MethodMember(f, _, _, s) -> (f, s)
+                _ -> continue
+            if static_member
+                for tp in d.type_params
+                    var shadowed = false
+                    for own in f.type_params
+                        if own.name == tp.name then shadowed = true
+                    if !shadowed && function_names_type(f, tp.name)
+                        c.note(unit, f.name_span, s"`${f.name}` is a static member of the constructor trait `${d.name}`, so it names no parameter of the trait, and it names `${tp.name}`: a call of it names only the constructor, as in `F.${f.name}(…)`; give it a type parameter of its own")
+                        break
         for parent in c.classes[k].traits
             val (p, xs) = *parent match
                 Class(p, _, xs) -> (p, xs)
@@ -3372,6 +3388,33 @@ private refuse_constructor_conformances(c: *Checker)
     for id in 0..<c.classes.len()
         if !is_trait(c, id) then refuse_second_holes(c, own_class_type(c.classes[id], id), c.classes[id].traits, c.classes[id].unit, c.classes[id].decl.name_span)
 
+/** Whether function `f`'s parameters or result name the type `name`. */
+private function_names_type(f: &Function, name: string) -> bool
+    for p in f.params
+        if writes_name(p.ty, name) then return true
+    if f.result is Some(r) then return writes_name(r, name)
+    false
+
+/** Whether a type written names the type `name`, alone or among the arguments of another. */
+private writes_name(t: &TypeExpr, name: string) -> bool
+    t.kind match
+        Named(path, args) ->
+            if path == name then return true
+            for a in args
+                if writes_name(a, name) then return true
+        Tuple(items) ->
+            for item in items
+                if writes_name(item, name) then return true
+        Function(params, result, _) ->
+            for p in params
+                if writes_name(p.ty, name) then return true
+            return writes_name(result, name)
+        Union(members) ->
+            for m in members
+                if writes_name(m, name) then return true
+        _ -> ()
+    false
+
 /** The parameters' names, joined: `A, B`. */
 private param_names(params: Buf[TypeParam]) -> string
     var names: Buf[string] = buf()
@@ -3393,7 +3436,8 @@ private constructor_conformance_refusal(c: *Checker, impl_params: Buf[TypeParam]
         val p = *xs[j] match
             TypeVar(o, p, _) -> if o == owner && p < declared.len() then p else return Some(left_open_message(trait_name, name, xs[j]))
             _ -> return Some(left_open_message(trait_name, name, xs[j]))
-        if contains_id(seen, p) then return Some(s"`${declared[p].name}` is named twice among `${type_name(t)}`'s arguments; each hole is a different parameter of `$name`")
+        val shown = if p < impl_params.len() then impl_params[p].name else declared[p].name
+        if contains_id(seen, p) then return Some(s"`$shown` is named twice among `${type_name(t)}`'s arguments; each hole is a different parameter of `$name`")
         seen.push(p)
         if p < impl_params.len() && impl_params[p].bounds.len() > 0
             return Some(s"`${impl_params[p].name}` is a hole of `${type_name(t)}`, and a hole takes no bounds: the constructor conforms at every type it is applied to; bound only the parameters written out")
@@ -5622,7 +5666,11 @@ private met_in_table(c: *Checker, own: &Type, t: usize, tm: usize, candidates: B
         Ambiguous(a, b) ->
             if !contains_name(*reported, key)
                 reported.push(key)
-                val text = s"two overloads of `${c.symbols[a].decl.name}` both meet `${c.symbols[tm].name}` for `${type_name(own)}`, so a call through the trait would have two methods to call; exactly one of the name meets it"
+                val shown = *own match
+                    Data(_, n, _) -> n
+                    Class(_, n, _) -> n
+                    _ -> type_name(own)
+                val text = s"two overloads of `${c.symbols[a].decl.name}` both meet `${c.symbols[tm].name}` for `$shown`, so a call through the trait would have two methods to call; exactly one of the name meets it"
                 site match
                     Some(i) -> c.note(c.impls[i].unit, written_trait_span(c.impls[i].decl), text)
                     None -> c.note(c.symbols[b].unit, c.symbols[b].decl.name_span, text)
@@ -11215,6 +11263,10 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 return ErrorType
             if !as_bound && is_class_named(c, id, qualified(CoreModule, "Boundary"))
                 c.note(unit, t.span, "`Boundary` is a bound, as in `[T: Boundary]`, and not a type")
+                return ErrorType
+            if !as_bound && is_trait(c, id) && is_constructor_trait(c, id)
+                val n = k.decl.type_params.len()
+                c.note(unit, t.span, s"`$path` is a constructor trait, so it is a bound of a constructor, as in `[F[${hole_marks(n)}]: $path]`, and not a type")
                 return ErrorType
             if !as_bound && is_trait(c, id) && mentions_self(c, id, 0)
                 c.note(unit, t.span, s"`$path` mentions `Self`, so it is a bound, as in `[T: $path]`, and not a type")

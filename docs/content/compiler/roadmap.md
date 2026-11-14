@@ -579,8 +579,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 and 2 are
-done; steps 3 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 3 are
+done; steps 4 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -615,23 +615,27 @@ and emission see only the types they see today; `type_key` names a constructor
    `_` refusing it; `F[X]` at an `X` missing the hole's bound reported at the definition;
    polymorphic recursion through a growing constructor (`expansion.sysl`) rejected and a
    non-growing one accepted.
-3. **Constructor traits and their impls.** `Self[X]` in a trait's methods, its arity and the
+3. **Constructor traits and their impls.** *Done.* `Self[X]` in a trait's methods, its arity and the
    requirement chain; impls naming the holes and the bare form; coherence (once per type, the
    module rule, no inherited conformance); the meeting rule, recording per trait method the type's
-   method and the type arguments the meeting decided (`TraitImpl`/`TraitMethod` in `check.sysl`),
-   so a call through the bound lowers to a direct call of it; a value of `F[X]` has the bound's
-   members; constructor arguments written explicitly at calls. Tests: a trait and impls for a data
-   type, a class, a two-parameter type at each hole; `List`'s overloaded `flatMap` and `Result`'s
-   lower-bounded one meeting; one reject file per refusal (two holes for one type, a bounded hole in
-   an impl, a meeting that needs a conversion, a method with an extra bound, bare `Self`, the trait
-   as a type, `[T: Functor]`, `[F[_]: Ord]`).
+   method in its table and the type arguments the meeting decided (`meet_method` in `check.sysl`,
+   `TProgram.meetings`), so a call through the bound lowers to a direct call of it; a value of
+   `F[X]` has the bound's members; constructor arguments written explicitly at calls, held to the
+   bound's conformance; default bodies compiled per implementing constructor, `Self` the
+   constructor in each copy. Tests: `tests/run/constructor_traits*.avin` (a data type, a class by
+   its header and by an impl, two-parameter types at each hole, `List`'s overloaded `flatMap` and
+   `Result`'s lower-bounded one meeting, defaults at several constructors, two-hole traits, a
+   bounded trait parameter, a conditional impl, `-O0`/`-O2` and GC stress),
+   `tests/programs/run/constructor_trait_modules`; reject files for each refusal
+   (`tests/reject/constructor_trait_*.avin`, `tests/programs/reject/constructor_trait_module_rule`).
 4. **Inferring a constructor through its bound.** Matching `F[X]` through the conformance, the
    nearest superclass and the one trait; the written-out arguments joined by variance (`Ok(1)` with
    a `Result[int, E]`), the head required to agree; the expected type; a lambda's result deciding
    `G`. Tests: each bullet of the spec's inference section as a run test and each of its errors as a
    reject test; a private `Vector` subclass passed as `Vector`; literals beside a constructor.
 5. **Static members on constructors and per-constructor defaults.** `F.pure`, `Option.pure`,
-   `Result[_, E].pure`; default bodies compiled per implementing constructor, calling `Self.pure`;
+   `Result[_, E].pure`; default bodies, already compiled per implementing constructor, calling
+   `Self.pure`;
    overriding a required trait's method with a default (`Monad`'s `map`). Tests: a trait whose only
    implementation of `map` is the default, at three constructors; a static member as a function
    value; the error for a static called on a value of `F[X]`.
