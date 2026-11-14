@@ -208,17 +208,34 @@ private forget_lwt(p: *Lwt)
     p.all_next = null
 
 /** Puts `p`, a parked or new lightweight thread, at the back of the ready queue, and has a worker
- * take it: an idle one, or a new one while fewer than the target are counted. */
+ * take it: an idle one, or a new one while fewer than the target are counted. The wake is counted
+ * under `sched`, with the thread put on the queue: the main thread's look for a deadlock reads the
+ * count, then whether anything is running or ready, under `sched`, so it sees the thread ready or a
+ * count that has moved, never a quiet scheduler and an unmoved count while the thread is on its way. */
 make_ready(p: *Lwt)
-    _ = wakes.add(1)
+    if ready_pause.load() != 0 then pause_micros(300)
     p.phase.store(PhaseReady)
     sched.lock_raw()
+    _ = wakes.add(1)
     p.next = null
     if ready_tail == null then ready_head = p else ready_tail.next = p
     ready_tail = p
     val start = more_hands()
     sched.unlock_raw()
     if start then start_worker()
+
+/** For the runtime's own tests: 1 has `make_ready` pause before it takes `sched`, which widens the
+ * moment in which a wake counted outside `sched` would have been missed by a look for a deadlock. */
+var ready_pause: Atomic[u32] = Atomic(0)
+
+/** For the runtime's own tests: has `make_ready` pause, or no longer pause, before it takes `sched`. */
+set_ready_pause(on: bool)
+    ready_pause.store(if on then 1 else 0)
+
+// Spins for `us` microseconds, holding no lock.
+private pause_micros(us: long)
+    val until = now_micros() + us
+    while now_micros() < until do ()
 
 // Under `sched`, with a thread ready: wakes an idle worker, or counts one more toward the target,
 // waking a spare or answering `true` for the caller to start a new worker once it has let `sched` go.
