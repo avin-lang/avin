@@ -1,0 +1,144 @@
+// expect: exit 0
+// A channel of capacity zero holds no value: each send hands its value straight to a receiver and
+// returns only once one has taken it. `trySend` succeeds only where a receiver is waiting and
+// `tryReceive` only where a sender is; values of every kind pass whole; threads ping-pong through two
+// such channels; many senders feed one receiver and every value arrives once; the main thread, which
+// is not a worker, hands values to lightweight threads and takes them from them; a closed one hands
+// nothing over and iterating it ends; and a channel made with no capacity is unbounded still.
+import avin.threads.{Atomic, Channel, sleep, spawn, unbounded}
+import avin.time.{millis, monotonic}
+
+class Box(val label: string)
+
+main() -> int
+  // Nobody waiting: neither `try` form hands anything over, and the channel holds nothing.
+  val lonely = Channel[int](0)
+  println(lonely.trySend(1), lonely.tryReceive(), lonely.trySend(2), lonely.isClosed())
+
+  // The sender proceeds strictly after the receiver has the value: what the receiver did before its
+  // receive is seen by the sender once `send` returns, and a send to a receiver that comes late
+  // waits for it.
+  val ch = Channel[int](0)
+  val before = Atomic(0)
+  val late = spawn(() ->
+    sleep(30.millis)
+    before.store(1)
+    ch.receive())
+  val t0 = monotonic().micros
+  ch.send(41)
+  val waited = monotonic().micros - t0
+  println("sent after the receiver came:", before.load(), waited >= 25000)
+  println(late.join())
+
+  // The other way round: a receiver waiting first gets a value sent later, and the send returns at
+  // once.
+  val early = spawn(() -> ch.receive())
+  sleep(20.millis)
+  ch.send(42)
+  println(early.join())
+
+  // `trySend` succeeds once a receiver waits, and `tryReceive` once a sender does.
+  val waiting = spawn(() -> ch.receive())
+  var tries = 0
+  while !ch.trySend(43) do
+    tries++
+    sleep(1.millis)
+  println(waiting.join())
+  val giving = spawn(() ->
+    ch.send(44)
+    "given")
+  var got: Option[int] = None
+  while got.isEmpty
+    got = ch.tryReceive()
+    if got.isEmpty then sleep(1.millis)
+  println(got, giving.join())
+
+  // Ping-pong: each value goes there and back before the next is sent.
+  val ping = Channel[int](0)
+  val pong = Channel[int](0)
+  val echo = spawn(() ->
+    var n = 0
+    for x in ping
+      pong.send(x * 2)
+      n++
+    n)
+  var sum: long = 0
+  var inOrder = true
+  for i in 0 ..< 2000
+    ping.send(i)
+    val back = pong.receive()
+    if back != Some(i * 2) then inOrder = false
+    sum += long(back.getOrElse(0))
+  ping.close()
+  println("ping-pong:", echo.join(), inOrder, sum)
+
+  // Many senders, one receiver: every value arrives exactly once, each sender's in its order.
+  val many = Channel[(int, int)](0)
+  val senders = 16
+  val each = 200
+  val threads = Vector.tabulate(senders, s -> spawn(() ->
+    for k in 0 ..< each do many.send((s, k))
+    s))
+  val next = Array.fill(senders, 0)
+  var ordered = true
+  var count = 0
+  for _ in 0 ..< senders * each
+    val (s, k) = many.receive().get
+    if k != next(s) then ordered = false
+    next(s) = k + 1
+    count++
+  println("many senders:", threads.map(t -> t.join()).sum, count, ordered, many.tryReceive())
+
+  // Values of every kind pass whole: strings with Unicode, objects, options, tuples, the empty
+  // string, the bounds of an `int`.
+  val words = Channel[string](0)
+  val wt = spawn(() ->
+    for w in ["", "héllo", "日本語", "🎉 party"] do words.send(w)
+    words.close())
+  for w in words do println(w, w.charCount)
+  wt.join()
+  val boxes = Channel[Box](0)
+  val bt = spawn(() -> boxes.receive().get.label)
+  val box = Box("boxed")
+  boxes.send(box)
+  println(bt.join())
+  val opts = Channel[Option[int]](0)
+  val ot = spawn(() ->
+    opts.send(None)
+    opts.send(Some(-2147483647 - 1))
+    opts.send(Some(2147483647)))
+  println(opts.receive(), opts.receive(), opts.receive())
+  ot.join()
+
+  // Between lightweight threads alone, with the main thread only waiting for the result.
+  val relay = Channel[int](0)
+  val tail = Channel[int](0)
+  val producer = spawn(() ->
+    for i in 1 .. 100 do relay.send(i)
+    relay.close())
+  val middle = spawn(() ->
+    for x in relay do tail.send(x * x)
+    tail.close())
+  var squares: long = 0
+  for x in tail do squares += long(x)
+  producer.join()
+  middle.join()
+  println("relay:", squares)
+
+  // A closed channel hands nothing over: receivers get `None` at once, and waiting ones wake to it.
+  val shut = Channel[int](0)
+  val stuck = Vector.tabulate(4, _ -> spawn(() -> shut.receive()))
+  sleep(20.millis)
+  shut.close()
+  shut.close()
+  println("closed:", stuck.map(t -> t.join()), shut.receive(), shut.tryReceive(), shut.isClosed())
+
+  // No capacity is unbounded, as `unbounded` is; a capacity of one holds one value.
+  val open = Channel[int]()
+  val explicit = Channel[int](unbounded)
+  for i in 0 ..< 1000
+    open.send(i)
+    explicit.send(i)
+  val one = Channel[int](1)
+  println(unbounded, open.tryReceive(), explicit.tryReceive(), one.trySend(1), one.trySend(2))
+  0

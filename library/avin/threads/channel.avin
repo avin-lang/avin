@@ -2,16 +2,22 @@ module avin.threads
 
 import avin.time.{Duration, micros, monotonic}
 
+// The capacity of a channel with no bound, which a channel made with no capacity has: the largest
+// `int`, more values than a channel could ever hold.
+val unbounded: int = 2147483647
+
 // A channel of sendable values may be shared between threads: every send and receive is synchronized.
 impl[T: Sendable] Sendable for Channel[T]
 
 // A queue between threads. `send` puts a value at the back and `receive` takes the one at the front,
 // so values arrive in the order one thread sent them; a send happens before the receive that gets its
 // value. A channel made with a capacity is bounded: a send waits while it holds that many values, so a
-// fast sender keeps pace with its receivers. With no capacity, or zero, it is unbounded and a send
-// never waits. `close` ends it: a send to a closed channel traps, and once the values sent before the
-// close are received, `receive` gives `None`. A thread waiting to send or receive is safe for the
-// collector while it waits. Iterating a channel receives from it until it is closed and drained:
+// fast sender keeps pace with its receivers. With no capacity it is unbounded and a send never waits.
+// With a capacity of zero it holds no value at all: each send hands its value straight to a receiver,
+// and waits until one has taken it. `close` ends it: a send to a closed channel traps, and once the
+// values sent before the close are received, `receive` gives `None`. A thread waiting to send or
+// receive is safe for the collector while it waits. Iterating a channel receives from it until it is
+// closed and drained:
 //
 //     for job in jobs do run(job)
 //
@@ -21,22 +27,35 @@ impl[T: Sendable] Sendable for Channel[T]
 // come, and a thread waiting on such a channel waits on its condition until that time at the most.
 @trusted_sendable("every field but its lock is read and written only while its lock is held, except `timed`, set before the channel is shared")
 @keeps_owners
-class Channel[T](capacity: int = 0): Iterable[T]
+class Channel[T](capacity: int = unbounded): Iterable[T]
   private val bound = boundOf(capacity)
   private val lock = Lock()
   private val items = Deque[T]()
   private val readable = Condition(lock, ReceiveWait)
   private val writable = Condition(lock, SendWait)
   private var closed = false
+  // A channel of capacity zero holds the threads waiting to hand a value over instead of values: the
+  // senders waiting with theirs, and the receivers waiting for one, each a plain send or receive or
+  // the arm of a select waiting. Receive arms that want only the close wait on `closing`, which only a
+  // close notifies.
+  private val senders = Deque[Party[T]]()
+  private val receivers = Deque[Party[T]]()
+  private val closing = Condition(lock, ReceiveWait)
+  // Whether the last look for a party to complete passed over a select still trying its arms; under
+  // the lock.
+  private var busy = false
   // Whether `after` or a `Ticker` made the channel, which nothing sends to; set before the channel
   // is shared, and never changed after.
   private var timed = false
   private var clock: Option[Clock[T]] = None
 
-  // Puts `x` at the back, waiting while a bounded channel is full; traps where the channel is
-  // closed.
+  // Puts `x` at the back, waiting while a bounded channel is full, or, on a channel of capacity zero,
+  // until a receiver has taken it; traps where the channel is closed, or is closed while it waits.
   send(x: T)
     sendable()
+    if bound == 0
+      _ = handOff(x, 0)
+      return
     lock.acquire()
     while !closed && full() do writable.wait()
     if closed
@@ -47,12 +66,14 @@ class Channel[T](capacity: int = 0): Iterable[T]
     lock.release()
 
   // Puts `x` at the back, waiting at most `timeout` while a bounded channel is full, and answers
-  // whether it did: `false` where the time ran out with the channel still full. A timeout of zero or
+  // whether it did: `false` where the time ran out with the channel still full, or, on a channel of
+  // capacity zero, with no receiver having taken `x`, which is then not sent. A timeout of zero or
   // less is `trySend`. Traps where the channel is closed, as `send` does.
   send(x: T, timeout: Duration) -> bool
     if timeout.micros <= 0 then return trySend(x)
     sendable()
     val deadline = monotonic().micros +| timeout.micros
+    if bound == 0 then return handOff(x, deadline)
     lock.acquire()
     while !closed && full() && monotonic().micros < deadline do waitOn(writable, deadline)
     if closed
@@ -65,10 +86,11 @@ class Channel[T](capacity: int = 0): Iterable[T]
     lock.release()
     room
 
-  // Puts `x` at the back where there is room now, and answers whether it did; traps where the
-  // channel is closed.
+  // Puts `x` at the back where there is room now, or, on a channel of capacity zero, hands it to a
+  // receiver waiting now, and answers whether it did; traps where the channel is closed.
   trySend(x: T) -> bool
     sendable()
+    if bound == 0 then return handOff(x, -1)
     lock.acquire()
     if closed
       lock.release()
@@ -83,6 +105,7 @@ class Channel[T](capacity: int = 0): Iterable[T]
   // Takes the value at the front, waiting while there is none; `None` once the channel is closed
   // and every value sent before is received.
   receive() -> Option[T]
+    if bound == 0 then return handedOver(0)
     lock.acquire()
     ripen()
     while items.isEmpty && !closed
@@ -98,6 +121,7 @@ class Channel[T](capacity: int = 0): Iterable[T]
   receive(timeout: Duration) -> Option[T]
     if timeout.micros <= 0 then return tryReceive()
     val deadline = monotonic().micros +| timeout.micros
+    if bound == 0 then return handedOver(deadline)
     lock.acquire()
     ripen()
     while items.isEmpty && !closed && monotonic().micros < deadline
@@ -107,8 +131,10 @@ class Channel[T](capacity: int = 0): Iterable[T]
     lock.release()
     got
 
-  // Takes the value at the front where there is one now; `None` where there is not.
+  // Takes the value at the front where there is one now, or, on a channel of capacity zero, the value
+  // of a sender waiting now; `None` where there is not.
   tryReceive() -> Option[T]
+    if bound == 0 then return handedOver(-1)
     lock.acquire()
     ripen()
     val got = taken()
@@ -124,6 +150,13 @@ class Channel[T](capacity: int = 0): Iterable[T]
     clock = None
     readable.notifyAll()
     writable.notifyAll()
+    closing.notifyAll()
+    // Every thread waiting to hand a value over wakes to the close: a sender to trap, a receiver to
+    // `None`. The selects among them are woken through their conditions above.
+    for p in senders do p.wake()
+    for p in receivers do p.wake()
+    senders.clear()
+    receivers.clear()
     lock.release()
 
   // Whether the channel is closed.
@@ -179,6 +212,115 @@ class Channel[T](capacity: int = 0): Iterable[T]
     if closed && items.isEmpty then readable.notifyAll()
     Some(x)
 
+  // Hands `x` to a receiver of a channel of capacity zero, waiting for one until `deadline` on the
+  // monotonic clock in microseconds where it is positive, for ever where it is 0, and not at all where
+  // it is negative: whether a receiver took it. Traps where the channel is closed, or is closed while
+  // the send waits. A value whose time ran out is not sent.
+  private handOff(x: T, deadline: long) -> bool
+    lock.acquire()
+    if closed
+      lock.release()
+      fail("a send to a closed channel")
+    if handTo(x, None)
+      lock.release()
+      return true
+    if deadline < 0
+      lock.release()
+      return false
+    val me = Party[T](Some(x), None, 0, HandOffWait)
+    senders.append(me)
+    if busy then poke(receivers, None)
+    awaitParty(me, deadline)
+    val sent = me.done
+    val shut = closed
+    if !sent then withdraw(senders, me)
+    lock.release()
+    if !sent && shut then fail("a send to a closed channel")
+    sent
+
+  // Takes a value from a sender of a channel of capacity zero, waiting for one until `deadline` as
+  // `handOff` does: `None` where the time ran out first or the channel is closed, which ends every
+  // hand-off.
+  private handedOver(deadline: long) -> Option[T]
+    lock.acquire()
+    if closed
+      lock.release()
+      return None
+    val now = takeFrom(None)
+    if now.isDefined || deadline < 0
+      lock.release()
+      return now
+    val me = Party[T](None, None, 0, ReceiveWait)
+    receivers.append(me)
+    if busy then poke(senders, None)
+    awaitParty(me, deadline)
+    if !me.done then withdraw(receivers, me)
+    val got = if me.done then me.value else None
+    lock.release()
+    got
+
+  // Waits, under the lock, until `me` is done, the channel is closed, or `deadline` passes where it is
+  // positive. A cancellation of the thread takes `me` off the channel first, so no hand-off reaches a
+  // thread that has stopped.
+  private awaitParty(me: Party[T], deadline: long)
+    while !me.done && !closed
+      var millis: long = -1
+      if deadline > 0
+        val left = deadline - monotonic().micros
+        if left <= 0 then return
+        millis = waitMillis(micros(left))
+      if lock.awaitSettling(me.condition, millis) == waitCancelled
+        if !me.done
+          withdraw(senders, me)
+          withdraw(receivers, me)
+        lock.releaseCancelled()
+
+  // Hands `x` to the first receiver waiting that can take it now, under the lock, as `partner` finds
+  // one, and answers whether one took it.
+  private handTo(x: T, own: Option[Selecting]) -> bool
+    if partner(receivers, own) is Some(r)
+      r.value = Some(x)
+      r.done = true
+      r.wake()
+      return true
+    false
+
+  // Takes the value of the first sender waiting that can give it now, under the lock, as `partner`
+  // finds one.
+  private takeFrom(own: Option[Selecting]) -> Option[T]
+    if partner(senders, own) is Some(s)
+      s.done = true
+      s.wake()
+      return s.value
+    None
+
+  // The first of `parties` this thread may complete now, taken off the channel, under the lock: a
+  // plain send or receive, or a select this claims through its arm. The arms of `own`, the select
+  // looking, if any, are passed over, since a select never pairs with itself. So is a select still
+  // trying its arms, which stays, and `busy` says afterwards whether there was one; a select whose
+  // wait has ended is taken off.
+  private partner(parties: Deque[Party[T]], own: Option[Selecting]) -> Option[Party[T]]
+    busy = false
+    var i = 0
+    while i < parties.length
+      val p = parties(i)
+      val claim = if p.belongsTo(own) then 0 else p.claimed()
+      if claim == 0
+        if !p.belongsTo(own) then busy = true
+        i += 1
+      else
+        parties.remove(i, 1)
+        if claim > 0 then return Some(p)
+    None
+
+  // Ends the wait of every select among `parties` but `own` still trying its arms, under the lock, so
+  // that each tries its arm here again once its round is over and finds the party just added.
+  private poke(parties: Deque[Party[T]], own: Option[Selecting])
+    for p in parties do p.poke(own)
+
+  // Takes `p` off `parties` where it is there; under the lock.
+  private withdraw(parties: Deque[Party[T]], p: Party[T]) = parties.filterInPlace(q -> q !== p)
+
 // What a `select` block's arms do with a channel (`select.avin`). Only the module makes a
 // `Selecting`, so only its code calls these. Each tries its operation under the channel's lock and,
 // where it cannot complete and the select is to wait, enlists the arm on the condition it waits for
@@ -219,12 +361,90 @@ impl[T] Channel[T]
 
   // Passes on a notification a select took and did not use: wakes the next thread waiting to
   // receive where a value is waiting, or to send, where `sending`, where there is room. Where another
-  // thread has already taken what the notification was for, there is nothing to pass on.
+  // thread has already taken what the notification was for, there is nothing to pass on. A channel of
+  // capacity zero notifies its selects only of its close, which wakes them all, so it has nothing to
+  // pass on.
   passOn(wait: Selecting, sending: bool)
+    if bound == 0 then return
     lock.acquire()
     if sending
       if !closed && !full() then writable.notify()
     elif !items.isEmpty then readable.notify()
+    lock.release()
+
+  // Whether the channel has a capacity of zero, so a select's arms on it hand values over as
+  // `offerTake` and `offerGive` do.
+  handsOver() -> bool = bound == 0
+
+  // A receive on a channel of capacity zero by arm `index` of the select `wait`, as `offerReceive`
+  // answers: the value of a sender waiting, or `None` once the channel is closed, where the arm wants
+  // it. `party` stands for the arm on the channel while the select waits, where `enlist`, so that a
+  // sender can claim the select and hand its value over; one done already holds what was handed.
+  // Where the select is trying again the arm it was woken through, a select still trying its arms
+  // here is waited out, since that select woke this one to find it.
+  offerTake(wants: int, wait: Selecting, index: int, enlist: bool, party: Party[T]) -> Option[Option[T]]
+    loop
+      lock.acquire()
+      if party.done
+        lock.release()
+        return Some(party.value)
+      if closed
+        if wants == ReceiveValue
+          if enlist then closing.enlist(wait, index) else lock.release()
+          return None
+        lock.release()
+        return Some(None)
+      busy = false
+      if wants != ReceiveClosed
+        val got = takeFrom(Some(wait))
+        if got.isDefined
+          lock.release()
+          return Some(got)
+      if enlist
+        if wants == ReceiveClosed
+          closing.enlist(wait, index)
+          return None
+        receivers.append(party)
+        if busy then poke(senders, Some(wait))
+        readable.enlist(wait, index)
+        return None
+      val again = busy && wait.retrying
+      lock.release()
+      if !again then return None
+      sleep(micros(20))
+
+  // A send of `x` on a channel of capacity zero by arm `index` of the select `wait`, as `offerSend`
+  // answers: whether a receiver waiting took it. `party` stands for the arm, and a select still trying
+  // its arms is waited out, as in `offerTake`.
+  offerGive(x: T, wait: Selecting, index: int, enlist: bool, party: Party[T]) -> bool
+    sendable()
+    loop
+      lock.acquire()
+      if party.done
+        lock.release()
+        return true
+      if closed
+        lock.release()
+        fail("a send to a closed channel")
+      if handTo(x, Some(wait))
+        lock.release()
+        return true
+      if enlist
+        senders.append(party)
+        if busy then poke(receivers, Some(wait))
+        writable.enlist(wait, index)
+        return false
+      val again = busy && wait.retrying
+      lock.release()
+      if !again then return false
+      sleep(micros(20))
+
+  // Takes the arm `party` stands for off the channel, where it is still on it, once its select has
+  // ended or begins another round.
+  withdrawParty(party: Party[T])
+    lock.acquire()
+    withdraw(senders, party)
+    withdraw(receivers, party)
     lock.release()
 
   // When the select waiting as `wait` is to look at the channel again although nothing notifies it:
@@ -258,6 +478,35 @@ impl[T] Channel[T]
 // time it fell due. A ticker holds its clock only to name it to `stopClock`.
 @trusted_sendable("`due` is read and written only under the lock of the one channel the clock belongs to, and `stamp` is a top-level function of the module")
 private class Clock[T](var due: long, val period: long, val stamp: (long) -> T): Sendable
+
+// A thread waiting on a channel of capacity zero to hand a value over: a plain send or receive, which
+// waits on a condition of its own, made of the `kind` the thread dump and the deadlock report name, or
+// arm `index` of the select `wait`, which a thread completing it claims first. `value` is the value of
+// a sender, or the one handed to a receiver once it is `done`; all of it is read and written under the
+// channel's lock.
+private class Party[T](var value: Option[T], val wait: Option[Selecting], val index: int, kind: int)
+  val condition: Any = if wait.isDefined then conditionNew() else conditionNewKind(kind)
+  var done = false
+
+  // Whether a thread may complete the hand-off now: 1 where it may, a plain waiter or a select this
+  // claims; 0 where it is a select still trying its arms; -1 where it is a select whose wait has ended.
+  claimed() -> long = wait match
+    Some(w) -> selectClaim(w.handle, long(index), 0)
+    None -> 1
+
+  // Whether this is an arm of the select `own`.
+  belongsTo(own: Option[Selecting]) -> bool = wait is Some(w) && own is Some(o) && w === o
+
+  // Ends the wait of a select that is not `own` and is still trying its arms, so that it tries this
+  // arm again once its round is over.
+  poke(own: Option[Selecting])
+    if belongsTo(own) then return
+    if wait is Some(w) then _ = selectClaim(w.handle, long(index), 1)
+
+  // Wakes a plain waiter, whose hand-off is done or whose channel is closed; a select is woken by its
+  // claim or through its conditions.
+  wake()
+    if wait.isEmpty then conditionNotify(condition)
 
 // A channel's capacity, which is not negative.
 private boundOf(capacity: int) -> int

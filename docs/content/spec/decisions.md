@@ -937,8 +937,9 @@ Settled by the user on 2026-11-04:
   holding it traps. `Atomic[T]` holds any type: a value of one word lock-free, an integer wider
   than 64 bits under one runtime lock; `compareAndSet` compares identity for a reference and the
   bits for a real; `add` and `sub` give back the new value and trap on overflow before storing, and
-  `update(f)` retries `f` until its compare-and-set succeeds. `Channel[T](capacity = 0)` is
-  unbounded at zero and a negative capacity traps; a send to a closed channel traps, closing twice
+  `update(f)` retries `f` until its compare-and-set succeeds. `Channel[T](capacity = unbounded)` is
+  unbounded with no capacity, a rendezvous at zero (Proposed below, which replaced unbounded at
+  zero), and a negative capacity traps; a send to a closed channel traps, closing twice
   does nothing, and a channel is `Iterable`, receiving until it is closed and drained. `Once.run`
   makes every other caller wait for the running body; a body running its own `Once` again traps.
 - [Trailing blocks](/spec/operators-and-control-flow/#trailing-blocks): an indented block on the
@@ -9962,6 +9963,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - No impl of a trait is for `F[A]`: a conformance is a type's, stated once for it, and an
   application of a constructor parameter is no type of its own. The impl declares no static member,
   as no impl adding to a type built from parameters does.
+- Proposed (built on branch `rendezvous`): **a [rendezvous](/spec/threads/#rendezvous) is
+  `Channel[T](0)`, and a channel with no capacity stays unbounded through a default of `unbounded`,
+  a public `val` in `avin.threads` holding the largest `int`.** This replaces the settled "unbounded
+  at zero". Why: zero is the capacity that holds nothing, so reading it as a hand-off says what it
+  is; `Channel[T]()` keeps its meaning, so no program changes (none in the tree passed `0`); and an
+  unbounded channel is the bounded one at a bound it can never reach, so it needs no case of its
+  own. Alternatives weighed: keeping zero unbounded and adding `Channel.rendezvous[T]()` or a
+  `rendezvous` flag (a second spelling of capacity, and zero would still read wrongly);
+  `capacity: Option[int] = None` (every bounded channel would write `Some(n)`); a negative sentinel
+  such as `-1` for unbounded (a capacity that is not one, and a negative one traps). Review with the
+  user: it changes what an explicit `Channel[T](0)` means, from unbounded to a rendezvous.
+- Proposed (built on branch `rendezvous`): **a rendezvous hands values to waiting parties directly,
+  and a select's arm is a party that a partner claims.** A plain sender or receiver waits on a
+  condition of its own until a partner completes it; a select's arm on a rendezvous stands on the
+  channel while it waits, and a partner completes the arm only by first ending the select's wait
+  through that arm (`select_claim` in `runtime/avin/rt/select.sysl`), so no select runs two arms.
+  A select can be claimed only once every arm of its round is tried and enlisted; a partner that
+  meets one still trying its arms wakes it (a poke), and the select, trying that arm again, waits
+  out a partner select still mid-round rather than missing it. Why: it keeps the one-lock-at-a-time
+  select of buffered channels, and the claim is the one atomic step that decides an arm. The
+  receiver "has the value" once a sender completes it, so a receiver cancelled after that stops with
+  the value. Alternatives weighed: a sender depositing its value and waiting for it to be taken (a
+  select's send arm cannot deposit without committing to it); locking every channel of a select at
+  once (a lock order across channels, and a different design for every select). The sender's wait
+  is its own kind in the thread dump and deadlock report, "waiting to hand a value to a receiver".
 
 ## Open
 

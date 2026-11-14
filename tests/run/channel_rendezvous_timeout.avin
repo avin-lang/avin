@@ -1,0 +1,109 @@
+// expect: exit 0
+// The timed forms on a channel of capacity zero: a send with a timeout answers `false` once its time
+// runs out with no receiver, and its value is never received, not by a receiver that comes just
+// after; one that a receiver comes to in time answers `true`. A receive with a timeout answers `None`
+// once its time runs out, and the value a sender gives later goes to the next receiver. A timeout of
+// zero or less is the `try` form. A thread waiting to hand a value over is cancelled at once by a
+// scope's `cancel` or a `withTimeout`, sending or receiving, plainly or in a select, and nothing of it
+// stays on the channel: the next sender's value goes to the next receiver.
+import avin.threads.{Atomic, Channel, scope, sleep, spawn, withTimeout}
+import avin.time.{millis, monotonic, seconds}
+
+main() -> int
+  val ch = Channel[int](0)
+
+  // Nobody comes: `false`, not sooner than the timeout, and the value is gone.
+  val t0 = monotonic().micros
+  val lost = ch.send(1, 30.millis)
+  val took = monotonic().micros - t0
+  println("timed send alone", lost, took >= 30000, ch.tryReceive(), ch.receive(20.millis))
+
+  // A receiver within the time: `true`, and it has the value.
+  val r = spawn(() ->
+    sleep(10.millis)
+    ch.receive())
+  println("timed send in time", ch.send(2, seconds(5)), r.join())
+
+  // A receive with a timeout and nobody sending: `None`, then a later sender's value goes to the next
+  // receiver, not to the one that gave up.
+  println("timed receive alone", ch.receive(20.millis))
+  val g = spawn(() ->
+    sleep(10.millis)
+    ch.send(3)
+    "gave 3")
+  println("timed receive in time", ch.receive(seconds(5)), g.join())
+
+  // A timeout of zero or less is the `try` form.
+  println("zero timeouts", ch.send(4, 0.millis), ch.send(4, -5.millis), ch.receive(0.millis), ch.receive(-1.millis))
+
+  // A run of timed sends that a receiver meets now and then: every `true` is a value received, every
+  // `false` one that never was.
+  val count = Atomic(0)
+  val total = Atomic(long(0))
+  val sink = spawn(() ->
+    var going = true
+    while going
+      ch.receive(200.millis) match
+        Some(x) ->
+          count.add(1)
+          total.add(long(x))
+        None -> going = false
+    0)
+  var sentCount = 0
+  var sentTotal: long = 0
+  for i in 1 .. 300
+    if ch.send(i, 2.millis)
+      sentCount++
+      sentTotal += long(i)
+  sink.join()
+  println("timed sends counted", sentCount == count.load(), sentTotal == total.load())
+
+  // Cancellation: a scope cancels threads blocked sending to one channel and receiving from another,
+  // plainly and in selects.
+  val out = Channel[int](0)
+  val inbox = Channel[int](0)
+  val started = Atomic(0)
+  val ended = Atomic(0)
+  val stopped = scope(s ->
+    val sender = s.spawn(() ->
+      started.add(1)
+      out.send(100)
+      ended.add(1))
+    val receiver = s.spawn(() ->
+      started.add(1)
+      val x = inbox.receive()
+      ended.add(1)
+      x.getOrElse(-1))
+    val selSend = s.spawn(() ->
+      started.add(1)
+      select
+        out.send(101) -> ()
+      ended.add(1))
+    val selReceive = s.spawn(() ->
+      started.add(1)
+      select
+        inbox.receive() as Some(x) -> println("never", x)
+      ended.add(1))
+    while started.load() < 4 do sleep(1.millis)
+    sleep(20.millis)
+    s.cancel()
+    [sender.result().isDefined, receiver.result().isDefined, selSend.result().isDefined, selReceive.result().isDefined])
+  println("cancelled", stopped, ended.load())
+
+  // Nothing of them stays: the cancelled senders' values are received by nobody, and a fresh sender's
+  // value goes to a fresh receiver.
+  println("after cancel", out.tryReceive(), inbox.trySend(1), out.receive(10.millis))
+  val fresh = spawn(() -> inbox.receive())
+  sleep(10.millis)
+  inbox.send(200)
+  val fresh2 = spawn(() -> out.receive())
+  sleep(10.millis)
+  out.send(201)
+  println("fresh", fresh.join(), fresh2.join())
+
+  // `withTimeout` around a blocked hand-off ends it, sending and receiving.
+  println("withTimeout", withTimeout(20.millis, _ -> ch.send(300)), withTimeout(20.millis, _ -> ch.receive()))
+  val again = spawn(() -> ch.receive(seconds(5)))
+  sleep(10.millis)
+  println("after withTimeout", ch.trySend(301), again.join())
+  0

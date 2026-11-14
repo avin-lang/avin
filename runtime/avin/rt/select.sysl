@@ -36,6 +36,10 @@ struct SelectWait
     parked: bool
     /** The arm whose link a notification ended the wait through, or -1; under `guard`. */
     woken_by: i64
+    /** Whether another thread may end the wait by completing one of its arms itself, as a hand-off
+     * on a channel of capacity zero does: set once every arm has been tried and enlisted, and cleared
+     * when the wait ends or a new round begins; under `guard`. */
+    claimable: bool
     count: usize
 
 /** A select's link on a condition's queue: a waiter of the queue that stands for the select, the
@@ -62,7 +66,7 @@ select_new(ctx: *Context, arms: long) -> *u8
     val n: usize = if arms < 0 then 0 else usize(arms)
     val p = allocate_sized(ctx, &select_descriptor, sizeof(SelectWait) + n * sizeof(SelectLink))
     val s: *SelectWait = ptr_cast(p)
-    *s = SelectWait(SleepLock.new(), new_waiter(), false, -1, n)
+    *s = SelectWait(SleepLock.new(), new_waiter(), false, -1, false, n)
     for i in 0..<n
         val l = link_at(s, i)
         *l = SelectLink(new_waiter(), s, i64(i), null)
@@ -79,6 +83,7 @@ select_reset(ctx: *Context, p: *u8)
     s.primary.lwt = if runs_lightweight(ctx) then ptr_cast(ctx) else null
     s.parked = false
     s.woken_by = -1
+    s.claimable = false
     s.guard.unlock()
 
 /** Enlists arm `index` of the select `p` on the queue of the condition `condition`, then lets the lock
@@ -96,6 +101,44 @@ select_enlist(ctx: *Context, p: *u8, index: long, condition: *u8, lock: *u8)
             c.waiting.guard.unlock()
             l.queue = &c.waiting
     lock_release(ctx, lock)
+
+/** Opens the select `p`, every arm of whose round has been tried and enlisted, to claims: from now
+ * until its wait ends, another thread may end the wait through an arm with `select_claim`. A wait
+ * already ended by a notification stays closed to them. */
+@export("avin_rt_select_open")
+select_open(ctx: *Context, p: *u8)
+    val s: *SelectWait = ptr_cast(p)
+    s.guard.lock()
+    if s.primary.state.load() == WaitPending then s.claimable = true
+    s.guard.unlock()
+
+/** Ends the wait of the select `p` through arm `index`, for a thread that completes that arm itself
+ * under the arm's channel lock: answers 1 where this ended the wait, which nothing else can then end;
+ * 0 where the select is still trying its arms, so it may yet complete one or be claimed later; and
+ * -1 where its wait has already ended, by a notification, its time or a cancellation. Where `poke`
+ * is 1 it ends a wait still trying its arms too, as a notification through the arm would, for a
+ * thread that found the select there and cannot complete the arm now: the select tries the arm again
+ * once its round is over, and finds that thread. */
+@export("avin_rt_select_claim")
+select_claim(ctx: *Context, p: *u8, index: long, poke: long) -> long
+    val s: *SelectWait = ptr_cast(p)
+    s.guard.lock()
+    val w = &s.primary
+    var answer: long = -1
+    if w.state.load() == WaitPending
+        answer = 0
+        if s.claimable || poke == 1
+            val t = w.lwt
+            if t == null then _ = wakes.add(1)
+            if w.state.cas(WaitPending, WaitWoken) == WaitPending
+                answer = 1
+                s.claimable = false
+                s.woken_by = index
+                if t == null then wake_blocked()
+                elif s.parked then make_ready(t)
+            else answer = -1
+    s.guard.unlock()
+    answer
 
 /** Takes every link of the select `p` off the queue it was enlisted on. */
 @export("avin_rt_select_withdraw")
@@ -166,6 +209,7 @@ wake_select(l: *SelectLink) -> bool
     if t == null then _ = wakes.add(1)
     val first = w.state.cas(WaitPending, WaitWoken) == WaitPending
     if first
+        s.claimable = false
         s.woken_by = l.index
         if t == null then wake_blocked()
         elif s.parked then make_ready(t)

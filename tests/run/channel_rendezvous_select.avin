@@ -1,0 +1,196 @@
+// expect: exit 0
+// A `select` arm on a channel of capacity zero runs only when it is paired with the other side: a send
+// arm once a receiver takes its value, a receive arm once a sender hands it one. A select pairs with
+// a plain send or receive waiting, with one that comes while it waits, and with another select
+// waiting on the other side, both ways round and with either side on the main thread. With `else`
+// it pairs only with a side already waiting; with `after` it gives up when nobody comes, and the
+// value it would have sent is never received. A select never pairs with itself, even with a send and
+// a receive arm on one channel. A select waiting is a partner for the `try` forms; one whose other
+// arm runs first hands nothing over. Many selecting threads on both sides pass every value exactly
+// once.
+import avin.threads.{Atomic, Channel, sleep, spawn}
+import avin.time.millis
+
+main() -> int
+  val ch = Channel[int](0)
+
+  // A send arm and a receiver already waiting: it pairs at once.
+  val r1 = spawn(() -> ch.receive())
+  sleep(20.millis)
+  val s1 = select
+    ch.send(1) -> "sent 1"
+  println(s1, r1.join())
+
+  // A send arm waiting, and a receiver that comes later.
+  val r2 = spawn(() ->
+    sleep(20.millis)
+    ch.receive())
+  val s2 = select
+    ch.send(2) -> "sent 2"
+  println(s2, r2.join())
+
+  // A receive arm and a sender already waiting, then one that comes later.
+  val g3 = spawn(() ->
+    ch.send(3)
+    "gave 3")
+  sleep(20.millis)
+  val v3 = select
+    ch.receive() as Some(x) -> x
+  println(v3, g3.join())
+  val g4 = spawn(() ->
+    sleep(20.millis)
+    ch.send(4)
+    "gave 4")
+  val v4 = select
+    ch.receive() as Some(x) -> x
+  println(v4, g4.join())
+
+  // Two selects pair with each other: the main thread's sending and a thread's receiving, then the
+  // other way round, each side arriving first in turn.
+  val sel5 = spawn(() -> select
+    ch.receive() as Some(x) -> x)
+  sleep(20.millis)
+  select
+    ch.send(5) -> ()
+  println(sel5.join())
+  val sel6 = spawn(() ->
+    sleep(20.millis)
+    select
+      ch.send(6) -> "sent 6")
+  val v6 = select
+    ch.receive() as Some(x) -> x
+  println(v6, sel6.join())
+
+  // Two lightweight threads, both selecting, many times over.
+  val pairs = 1000
+  val sender = spawn(() ->
+    var n = 0
+    for i in 0 ..< pairs
+      select
+        ch.send(i) -> n++
+    n)
+  val receiver = spawn(() ->
+    var total: long = 0
+    for _ in 0 ..< pairs
+      select
+        ch.receive() as Some(x) -> total += long(x)
+    total)
+  println("select pairs", sender.join(), receiver.join())
+
+  // `else`: nobody waiting, so it runs; then a receiver waiting, so the send arm runs.
+  val e1 = select
+    ch.send(7) -> "sent"
+    else "nobody"
+  val e2 = select
+    ch.receive() as Some(x) -> s"got $x"
+    else "nobody"
+  println(e1, e2)
+  val r8 = spawn(() -> ch.receive())
+  var tries = 0
+  var sent8 = false
+  while !sent8
+    select
+      ch.send(8) -> sent8 = true
+      else
+        tries++
+        sleep(1.millis)
+  println("else after a receiver came", r8.join())
+
+  // `after`: nobody comes, the arm never runs, and its value is never received.
+  val t9 = select
+    ch.send(9) -> "sent 9"
+    after 20.millis -> "timed out"
+  val t10 = select
+    ch.receive() as Some(x) -> s"got $x"
+    after 20.millis -> "timed out"
+  println(t9, t10, ch.tryReceive())
+
+  // A send arm and a receive arm on one channel never pair with each other.
+  val own = select
+    ch.send(11) -> "paired with itself"
+    ch.receive() as Some(x) -> s"received $x"
+    after 20.millis -> "no partner"
+  println(own)
+  // And the same select pairs with another thread on either arm.
+  val other = spawn(() -> ch.receive())
+  val mixed = select
+    ch.send(12) -> "sent 12"
+    ch.receive() as Some(x) -> s"received $x"
+  println(mixed, other.join())
+
+  // A select on a channel of capacity zero beside a buffered one: the buffered arm is ready now, so it
+  // runs and the rendezvous arm hands nothing over.
+  val buffered = Channel[int](1)
+  buffered.send(13)
+  val r14 = spawn(() -> ch.receive(100.millis))
+  sleep(10.millis)
+  val which = select
+    buffered.receive() as Some(x) -> s"buffered $x"
+    after 1000.millis -> "timed out"
+  println(which, r14.join())
+
+  // Several channels of capacity zero, many threads selecting on both sides: every value passes
+  // exactly once, through one channel or another.
+  val a = Channel[int](0)
+  val b = Channel[int](0)
+  val each = 300
+  val producers = Vector.tabulate(4, p -> spawn(() ->
+    for i in 0 ..< each
+      val v = p * each + i
+      select
+        a.send(v) -> ()
+        b.send(v) -> ()
+    p))
+  val seen = Atomic(long(0))
+  val counted = Atomic(0)
+  val consumers = Vector.tabulate(4, _ -> spawn(() ->
+    for _ in 0 ..< each
+      val v = select
+        a.receive() as Some(x) -> x
+        b.receive() as Some(x) -> x
+      seen.add(long(v))
+      counted.add(1)
+    0))
+  producers.foreach(t -> t.join())
+  consumers.foreach(t -> t.join())
+  val n = 4 * each
+  println("many selects", counted.load(), seen.load() == long(n) * long(n - 1) / 2)
+
+  // A select waiting to receive is a receiver waiting: `trySend` hands it the value, and `tryReceive`
+  // takes one from a select waiting to send.
+  val selR = spawn(() -> select
+    ch.receive() as Some(x) -> x)
+  var handed = false
+  while !handed
+    handed = ch.trySend(16)
+    if !handed then sleep(1.millis)
+  val selS = spawn(() -> select
+    ch.send(17) -> "sent 17")
+  var taken: Option[int] = None
+  while taken.isEmpty
+    taken = ch.tryReceive()
+    if taken.isEmpty then sleep(1.millis)
+  println("try forms with selects", selR.join(), taken, selS.join())
+
+  // A select waiting on a hand-off and on a buffered channel, where the buffered one is ready first:
+  // its arm runs, and the value of the send arm is never received.
+  val later = Channel[int](1)
+  val filler = spawn(() ->
+    sleep(20.millis)
+    later.send(18))
+  val first = select
+    ch.send(19) -> "sent 19"
+    later.receive() as Some(x) -> s"buffered $x"
+  filler.join()
+  println(first, ch.receive(20.millis))
+
+  // A plain sender and a select receiving under a timeout pair before the time is out.
+  val g15 = spawn(() ->
+    sleep(10.millis)
+    ch.send(15))
+  val v15 = select
+    ch.receive() as Some(x) -> s"got $x"
+    after 2000.millis -> "timed out"
+  println(v15)
+  g15.join()
+  0

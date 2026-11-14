@@ -394,12 +394,14 @@ will own its handles across every message, whichever thread runs it.
   loaded, trying again where another thread changed it in between. The kind is known for each
   `T`, so a scalar or a class reference costs one hardware compare-and-set. `update(f)` retries by
   the same rule.
-- **`Channel[T](capacity = 0)`**, a queue between threads, unbounded when the capacity is zero and
-  bounded otherwise, where `send` waits while the channel is full. `receive()` waits for a value and
-  gives `Some` of it, or `None` once the channel is closed and every value sent before is received.
-  `close()` wakes every waiting thread, and a send to a closed channel traps; closing twice does
-  nothing. `trySend(x) -> bool` and `tryReceive() -> Option[T]` never wait, and `isClosed()` asks.
-  A channel is `Iterable`: `for x in ch` receives until it is closed and drained. The waits have
+- **`Channel[T](capacity = unbounded)`**, a queue between threads: unbounded with no capacity
+  (`unbounded` is the largest `int`), bounded with a positive one, where `send` waits while the
+  channel is full, and a [rendezvous](#rendezvous) with a capacity of zero; a negative capacity
+  traps. `receive()` waits for a value and gives `Some` of it, or `None` once the channel is closed
+  and every value sent before is received. `close()` wakes every waiting thread, and a send to a
+  closed channel traps; closing twice does nothing. `trySend(x) -> bool` and
+  `tryReceive() -> Option[T]` never wait, and `isClosed()` asks. A channel is `Iterable`:
+  `for x in ch` receives until it is closed and drained. The waits have
   [timed forms](#timers-and-deadlines), `receive(timeout)` and `send(x, timeout)`.
 - **`Once`**, whose `run(body)` runs its body exactly once, whichever threads call it and however
   many at once: every other call waits until that body has returned, and returns without running its
@@ -481,6 +483,57 @@ waiting for a mutex takes it in turn: the mutex goes to the thread that has wait
 taking a lock it already holds traps at once. A program whose threads, `main` among them, all wait for
 each other stops with a [deadlock report](#deadlock); threads that wait for each other while another
 still runs sleep for ever.
+
+### Rendezvous
+
+A channel made with a capacity of zero holds no value at all: each send hands its value straight to a
+receiver, so the two threads meet.
+
+```avin
+import avin.threads.{Channel, spawn}
+
+main() -> int
+  val handoff = Channel[string](0)
+  val worker = spawn(() ->
+    var n = 0
+    for job in handoff do n += job.charCount
+    n)
+  for job in ["parse", "check", "emit"] do handoff.send(job)
+  handoff.close()
+  worker.join()
+```
+
+What a program can rely on:
+
+- **A send returns only once a receiver has the value.** `send(x)` waits until a receiver takes `x`,
+  and a receive waits until a sender hands it one. Everything the receiving thread did before its
+  receive happens before the send returns, as everything the sender did before its send happens
+  before the receive returns, so each side knows the other has reached the meeting point.
+- **The `try` forms need a partner waiting now.** `trySend(x)` hands `x` over only where a receiver is
+  already waiting, a plain `receive` or a `select` waiting on a receive arm, and answers whether it
+  did; `tryReceive()` takes a value only from a sender already waiting. Neither waits. A thread that
+  has not yet begun to wait is not waiting.
+- **The timed forms give up cleanly.** `send(x, timeout)` answers `false` where no receiver took `x`
+  within the time, and then `x` is received by nobody; `receive(timeout)` answers `None` where no
+  sender came. A timeout of zero or less is the `try` form.
+- **A `select` arm hands a value over only when it is paired.** A send arm runs once a receiver has
+  taken its value, a receive arm once a sender has handed it one, and the partner may be a plain
+  `send` or `receive` or another select's arm, waiting first or coming while the select waits. Every
+  arm that does not run hands nothing over, so a value meant for a send arm that lost is never
+  received. A select never pairs with itself: a send and a receive arm on one channel wait for other
+  threads. With `else`, a select pairs only with a partner already waiting.
+- **A close ends every hand-off.** A sender waiting when the channel is closed traps, as any send to a
+  closed channel does, its value handed to nobody; a receiver waiting gets `None`, and so does every
+  receive after, since a closed rendezvous has nothing to drain. A select's send arm traps and its
+  `None` arm runs, as on any closed channel.
+- **Its waits are waits like any other.** A thread waiting to hand a value over, or to take one, parks
+  only itself, is safe for the collector, and is a cancellation point: cancelled, it leaves nothing
+  on the channel, and the next sender's value goes to the next receiver. A cancellation that comes
+  after a value was handed over stops a receiver that has it. The wait counts for the
+  [deadlock check](#deadlock), whose report names a sender as *waiting to hand a value to a
+  receiver*. Which of several waiting receivers gets a value is not specified.
+- **Sendable as any channel.** A channel of capacity zero is sendable where its values are, as every
+  channel is.
 
 ## select
 
@@ -600,8 +653,9 @@ What a program can rely on:
 - **`receive(timeout: Duration) -> Option[T]`** waits at most `timeout` for a value: `Some` of one, as
   soon as it comes, or `None` where the time ran out first or once the channel is closed and every
   value sent before is received; `isClosed()` tells the two apart where it matters. **`send(x,
-  timeout: Duration) -> bool`** waits at most `timeout` for room in a bounded channel and answers
-  whether it sent `x`, at once on an unbounded one; a value whose time ran out is not sent. A send to
+  timeout: Duration) -> bool`** waits at most `timeout` for room in a bounded channel, or for a
+  receiver to take `x` from a [rendezvous](#rendezvous), and answers whether it sent `x`, at once on
+  an unbounded one; a value whose time ran out is not sent. A send to
   a closed channel traps, as `send` does, rather than answering `false`. A timeout of zero or less is
   the `try` form, `tryReceive` or `trySend`. Neither waits less than its timeout where nothing comes,
   a part of a millisecond waited for as a whole one.
