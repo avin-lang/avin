@@ -36,12 +36,23 @@ main()
   how it was composed. Names in different scripts that merely look alike (Latin `a`, Cyrillic `а`)
   are different names.
 - A module's name is a path of names, so each directory of a program is named by the same rule.
-- **The keywords name no value, type or parameter**: `abstract`, `as`, `break`, `class`, `continue`,
-  `data`, `def`, `derives`, `do`, `elif`, `else`, `false`, `for`, `if`, `impl`, `import`, `is`,
-  `loop`, `match`, `module`, `object`, `override`, `private`, `return`, `static`, `super`, `then`,
-  `trait`, `true`, `val`, `var`, `while` and `yield`. `object`, `trait` and `impl` followed by a
-  parameter list name a function; `end`, `open` and `self` have rules of their own, and the words of
-  actors and machines are keywords only where they [begin their forms](/spec/actors/#keywords).
+- **The reserved words name no value, type or parameter**: `as`, `break`, `continue`, `def`,
+  `defer`, `derives`, `do`, `elif`, `else`, `false`, `for`, `if`, `is`, `loop`, `match`,
+  `override`, `private`, `return`, `static`, `super`, `then`, `true`, `val`, `var`, `while` and
+  `yield`. Each either follows a complete operand on its line (`x as T`, `Base(x) derives Eq`), or
+  begins a statement, a binding or a member where a line could also be an expression, or is a
+  value. `end` and `self` have rules of their own.
+- **The words that begin a top-level declaration are keywords only there, before the name it
+  declares**, and ordinary names everywhere else: `data`, `class`, `object`, `trait`, `impl`,
+  `import`, `module`, `type`, `opaque` (before `type`), `export` and `derive`, with `open` and
+  `abstract` before `class`. A top-level line holds only declarations, so such a word followed by a
+  name can mean nothing else, and none of them begins anything inside a block or a class body. So
+  `val data = readFile(p)`, a field `class`, a method `object()`, a named argument `import = 1`, a
+  variant `trait`, a module `data` and `r.type` are all legal; `data(x: int) -> int`, `impl[T](x:
+  T)` and `def class -> int` at the top level declare functions; and `impl` begins an impl before a
+  type, before type parameters and a type (`impl[A, B] (A, B)`), or before a function type with
+  `for`. The words of actors and machines are keywords only where they [begin their
+  forms](/spec/actors/#keywords).
 - **Capitalized** means the first character is an uppercase or titlecase letter (Unicode `Lu` or
   `Lt`): `Ärger`, `Δelta` and `ǅemal` are capitalized. A letter with no case, as in Chinese,
   Japanese or Arabic, is not, so such a name is written where a lowercase one is. Types and

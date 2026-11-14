@@ -39,6 +39,10 @@ test("a line that is complete in itself does not", () => {
         "    a <= b",
         "    val same = a ==",
         "class Point(x: int, y: int) = derived",
+        "    data(x)",
+        "    class += 1",
+        "    object.close()",
+        "    println(data)",
     ]) assert.ok(!increase.test(line), line)
 })
 

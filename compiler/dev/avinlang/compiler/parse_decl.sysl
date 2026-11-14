@@ -21,7 +21,8 @@ parse(src: Source) -> Parsed
             return Parsed(file, refused, src)
     var p = parser_for(program)
     val header = p.toks.here()
-    if p.accept("module")
+    if declares_ahead(&p, "module", 0)
+        p.expect("module")
         file.module_name = qualified_name(&p)
         file.module_span = header.to(p.ended())
         p.expect_kind(Newline, "expected a new line after the module header")
@@ -30,7 +31,8 @@ parse(src: Source) -> Parsed
         if p.accept_kind(Newline) then continue
         val before = p.toks.position
         val start = p.toks.here()
-        if p.accept("import")
+        if declares_ahead(&p, "import", 0)
+            p.expect("import")
             parse_import(&p, start, file.imports, "an import")
             if !p.toks.at_end() then p.expect_kind(Newline, "expected a new line after an import")
             continue
@@ -52,19 +54,21 @@ parse(src: Source) -> Parsed
             parse_import(&p, start, file.exports, "an export")
             if !p.toks.at_end() then p.expect_kind(Newline, "expected a new line after an export")
             continue
-        if hidden && p.at("impl")
+        if hidden && impl_ahead(&p)
             p.report.add(error(start.to(p.ended()), "an impl has no name, so it cannot be private: mark its methods `private`"))
         // `def` comes after `private` and begins a function, with or without a parameter list.
         if accept_def(&p)
             if is_operator_spelling(p.ahead(0))
                 p.report.add(error(p.toks.here(), s"`${p.ahead(0)}` names a function, but only a method can be named by a symbol: declare it in a class, trait, object or impl"))
             file.items.push(FunctionItem(parse_def_function(&p, annotations)))
-        elif p.accept("data") then file.items.push(DataItem(parse_data(&p, start, annotations)))
-        elif p.at("class") || (p.ahead(1) == "class" && (p.at("open") || p.at("abstract")))
+        elif declares_ahead(&p, "data", 0)
+            p.expect("data")
+            file.items.push(DataItem(parse_data(&p, start, annotations)))
+        elif declares_ahead(&p, "class", 0) || ((p.at("open") || p.at("abstract")) && declares_ahead(&p, "class", 1))
             file.items.push(ClassItem(parse_class(&p, start, annotations)))
-        elif p.at("object") && p.ahead(1) != "("
+        elif declares_ahead(&p, "object", 0)
             file.items.push(ClassItem(parse_object(&p, start, annotations)))
-        elif p.at("trait") && p.ahead(1) != "("
+        elif declares_ahead(&p, "trait", 0)
             file.items.push(ClassItem(parse_trait(&p, start, annotations)))
         elif machine_ahead(&p)
             // A machine is its `State` data type and the class that runs it.
@@ -92,7 +96,7 @@ parse(src: Source) -> Parsed
         elif opaque_type_ahead(&p)
             p.toks.advance()
             file.items.push(AliasItem(parse_alias(&p, start, annotations, true)))
-        elif p.at("impl") && (p.ahead(1) != "(" || impl_of_function_ahead(&p))
+        elif impl_ahead(&p)
             file.items.push(ImplItem(parse_impl(&p, start, annotations)))
         elif p.at("derive") && p.ahead(1) != "(" && p.ahead(1) != "[" && p.ahead(1) != "="
             if hidden then p.report.add(error(start.to(p.ended()), "a derive template has no name, so it cannot be private"))
@@ -202,6 +206,62 @@ type_alias_ahead(p: *Parser) -> bool
         None -> return false
     next.value == Word
 
+/** Whether the word `offset` tokens ahead is `word` and begins its declaration: like `type`, the
+ * words that begin a top-level declaration (`data`, `class`, `object`, `trait`, `import`, `module`)
+ * declare something only before a name, and elsewhere are ordinary names, so `data(x: int)` declares
+ * a function called `data`. A reserved word after one is taken as the name, so that `data while` is
+ * reported as a keyword that cannot name a type. */
+declares_ahead(p: *Parser, word: string, offset: usize) -> bool
+    if p.ahead(offset) != word then return false
+    val next = p.toks.peek_at(offset + 1) match
+        Some(t) -> t
+        None -> return false
+    next.value == Word || next.value == MatchKeyword || next.value == IsKeyword
+
+/** Whether `impl` begins an impl here: before a type (`impl Show for Point`), before type parameters
+ * that a type follows (`impl[T] Show for Box[T]`), or before a function type (`impl (int) -> string
+ * for …`). `impl[T](x: T)` and `impl(x: int)` without a function type after them declare a function
+ * called `impl`, and elsewhere `impl` is an ordinary name. */
+impl_ahead(p: *Parser) -> bool
+    if declares_ahead(p, "impl", 0) then return true
+    if !p.at("impl") then return false
+    if p.ahead(1) == "(" then return impl_of_function_ahead(p)
+    if p.ahead(1) != "[" then return false
+    var depth = 0
+    var i = 1usize
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Dedent || token.value == Indent then return false
+        val text = p.spelling(token)
+        if text == "[" then depth += 1
+        elif text == "]"
+            depth -= 1
+            if depth == 0
+                val after = p.ahead(i + 1)
+                if after == "(" then return !typed_group(p, i + 1)
+                return after != "->" && after != "="
+        i += 1
+
+/** At the `(` `offset` tokens ahead: whether its group holds a `:` directly inside it, as a parameter
+ * list does (`(x: T)`) and no tuple or function type does (`(A, B)`, `(A) -> B`). */
+private typed_group(p: *Parser, offset: usize) -> bool
+    var depth = 0
+    var i = offset
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Dedent || token.value == Indent then return false
+        val text = p.spelling(token)
+        if text == "(" || text == "[" then depth += 1
+        elif text == ")" || text == "]"
+            depth -= 1
+            if depth == 0 then return false
+        elif text == ":" && depth == 1 then return true
+        i += 1
+
 /** Whether `opaque type Name` begins an opaque type here: `opaque` declares something only before
  * `type` and a name, and elsewhere is an ordinary name. */
 opaque_type_ahead(p: *Parser) -> bool
@@ -243,9 +303,9 @@ reject_lazy_var(p: *Parser, at: Span, mutable: bool)
     if mutable then p.report.add(error(at, "a `lazy` value is computed once and never assigned, so it is declared `lazy val`"))
 
 /** Whether a word may not be declared as a name. `end` is contextual (it closes a form only when a
- * name follows), `open` is a modifier only before `class`, and `self` is rejected by the checker
- * with a message of its own. */
-private reserved(word: string) -> bool = is_keyword(word) && word != "end" && word != "self" && word != "open"
+ * name follows), and `self` is rejected by the checker with a message of its own; the words that
+ * begin a declaration (`is_declaration_word`) are no keywords at all where a name is declared. */
+private reserved(word: string) -> bool = is_keyword(word) && word != "end" && word != "self"
 
 /** Reports a keyword used to declare `what`: `loop` is a keyword and cannot name a value. */
 reject_keyword(p: *Parser, span: Span, word: string, what: string)
@@ -829,11 +889,8 @@ accept_def(p: *Parser) -> bool
 
 private parse_declared_function(p: *Parser, annotations: Buf[Annotation], defined: bool) -> &Function
     val start = p.toks.here()
-    // `object`, `trait` and `impl` begin a declaration only when no parenthesis follows, so
-    // `object(x: int) = x` declares a function.
-    val declaring = p.at("object") || p.at("trait") || p.at("impl")
     val symbol = is_operator_spelling(p.ahead(0))
-    val name = if symbol then symbol_name(p) elif declaring then required_name(p) else declared_name(p, "a function")
+    val name = if symbol then symbol_name(p) else declared_name(p, "a function")
     val name_span = start.to(p.ended())
     val type_params = parse_type_params(p)
     // A name followed by its result type, with no parameter list, declares a method called by its
