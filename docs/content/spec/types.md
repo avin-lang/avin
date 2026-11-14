@@ -7,7 +7,9 @@ weight: 12
 ## Built-in types
 
 Built-in type names are lowercase and belong to the language itself: they have no module path and
-cannot be shadowed by an import. Their methods are defined in the core standard library with
+cannot be shadowed by an import. In a pattern each is a
+[type pattern](/spec/operators-and-control-flow/#match) by itself, `x is int`, so none names a
+local, a parameter or a field. Their methods are defined in the core standard library with
 ordinary `impl` blocks.
 
 | Type | Meaning |

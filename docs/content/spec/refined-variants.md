@@ -331,10 +331,17 @@ variant but `IntLit`, `BoolLit`, `Add` and `Eq`.
     _ -> false
   ```
 
+  A clause whose argument patterns contradict each other is reported the same way (`this clause is
+  never reached: … in the same clause …`), and so is a pattern in an `is` test, in a binding or
+  among alternatives, which no value matches (`this pattern never matches: …`).
+- **Each of a set of alternatives matches on its own.** `IntLit(_) | BoolLit(_)` on an `Expr[T]` is
+  an arm both values reach, so neither alternative's equalities hold in the arm, nor in the
+  alternatives after it; an alternative no value of the matched type can be is an error, as an arm
+  is.
 - **An instance at which no variant is possible has no values.** With
   `data Same[A, B]` and its one variant `Refl -> Same[A, A]`, a `Same[int, string]` cannot be made,
   and a `match` on one is an error (`` `Same[int, string]` has no values: no variant of `Same`
-  makes one ``).
+  makes one ``), whatever its arms, as is a binding taking one apart.
 - Guards, extractors and the rest count as they do in [match](/spec/operators-and-control-flow/#match).
   The value a missing case is named by is one of a possible variant.
 
@@ -455,6 +462,9 @@ well typed because the clause learns `A = B`.
 | An impossible arm | `` this arm is never reached: `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` `` |
 | A contradiction in a row | `` this arm is never reached: `IntLit` needs `T` to be `int`, and `BoolLit` in the same pattern needs it to be `bool` `` |
 | A cyclic equality | `` this arm is never reached: `Wrap` needs `T` to be `Vector[T]`, which no type is `` |
+| A contradiction in a clause | `` this clause is never reached: `ILit` needs `T` to be `int`, and `BLit` in the same clause needs it to be `bool` `` |
+| An impossible test, binding or alternative | `` this pattern never matches: `BoolLit` makes an `Expr[bool]`, and the value matched is an `Expr[int]` `` |
+| Two types a refining pattern takes, reading the same | each named with its pattern: `` expected Expr[A of `Pair` on line 4], found Expr[A of `Pair` on line 5] ``, with the column too where both are on one line |
 | An empty instance | `` `Same[int, string]` has no values: no variant of `Same` makes one `` |
 | An unknown type matched | `` the type of the value matched must be known to match `IntLit`, which fixes the type's argument; write the type where the value is declared `` |
 | A hidden type leaving its arm | `` this arm's result is an `R`, a type `Ask` hides in the value matched, which is not known outside the arm `` |

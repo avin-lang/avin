@@ -1,0 +1,145 @@
+// expect: exit 0
+// Coverage counts the variants possible at the type matched. A `match` on an `Expr[int]` needs no arm
+// for `BoolLit`, `Eq` or `Pair`, which make no `Expr[int]`; one on an `Expr[(A, B)]` needs only `If`
+// and `Pair`; generic code over `Expr[T]` covers every variant. The equalities of a row travel along
+// it, so a pair of `Expr[T]`s whose parts disagree on `T` needs no arm. An enclosing arm's equalities
+// hold in a nested `match`. Guards, clauses, `is` tests, alternatives, nested refined patterns and a
+// binding taking a one-variant instance apart are counted the same way.
+
+data Expr[T]
+  IntLit(value: int) -> Expr[int]
+  BoolLit(value: bool) -> Expr[bool]
+  Add(a: Expr[int], b: Expr[int]) -> Expr[int]
+  Eq(a: Expr[int], b: Expr[int]) -> Expr[bool]
+  If(cond: Expr[bool], yes: Expr[T], no: Expr[T])
+  Pair[A, B](first: Expr[A], second: Expr[B]) -> Expr[(A, B)]
+
+data Lit[T]
+  ILit(value: int) -> Lit[int]
+  BLit(value: bool) -> Lit[bool]
+
+data Same[A, B]
+  Refl -> Same[A, A]
+
+data Holder[T]
+  IntBox(n: int) -> Holder[int]
+  Many(items: Vector[T])
+
+eval[T](e: Expr[T]) -> T
+eval(IntLit(n)) = n
+eval(BoolLit(b)) = b
+eval(Add(a, b)) = eval(a) + eval(b)
+eval(Eq(a, b)) = eval(a) == eval(b)
+eval(If(c, yes, no)) = if eval(c) then eval(yes) else eval(no)
+eval(Pair(a, b)) = (eval(a), eval(b))
+
+// No arm for `BoolLit`, `Eq` or `Pair`.
+total(e: Expr[int]) -> int = e match
+  IntLit(n) -> n
+  Add(a, b) -> total(a) + total(b)
+  If(c, a, b) -> if truth(c) then total(a) else total(b)
+
+// The same, as clauses.
+totalClauses(e: Expr[int]) -> int
+totalClauses(IntLit(n)) = n
+totalClauses(Add(a, b)) = totalClauses(a) + totalClauses(b)
+totalClauses(If(c, a, b)) = if truth(c) then totalClauses(a) else totalClauses(b)
+
+// No arm for `IntLit`, `Add` or `Pair`.
+truth(e: Expr[bool]) -> bool = e match
+  BoolLit(b) -> b
+  Eq(a, b) -> total(a) == total(b)
+  If(c, a, b) -> if truth(c) then truth(a) else truth(b)
+
+// At a pair only `If` and `Pair` are possible.
+pairOf[A, B](e: Expr[(A, B)]) -> (A, B) = e match
+  Pair(a, b) -> (eval(a), eval(b))
+  If(c, a, b) -> if truth(c) then pairOf(a) else pairOf(b)
+
+// At a pair of ints and bools, `Pair`'s parts are known.
+firstOf(e: Expr[(int, bool)]) -> int = e match
+  Pair(a, _) -> total(a)
+  If(c, a, b) -> if truth(c) then firstOf(a) else firstOf(b)
+
+// A guarded arm counts for nothing; the unguarded ones after it cover.
+sign(e: Expr[int]) -> string = e match
+  IntLit(n) if n < 0 -> "negative"
+  IntLit(_) -> "literal"
+  Add(_, _) -> "sum"
+  If(_, _, _) -> "choice"
+
+// The parts of a row hold together: `(ILit, BLit)` would need `T` to be both `int` and `bool`.
+agree[T](a: Lit[T], b: Lit[T]) -> bool = (a, b) match
+  (ILit(x), ILit(y)) -> x == y
+  (BLit(x), BLit(y)) -> x == y
+
+agreeClauses[T](a: Lit[T], b: Lit[T]) -> bool
+agreeClauses(ILit(x), ILit(y)) = x == y
+agreeClauses(BLit(x), BLit(y)) = x == y
+
+// An enclosing arm's equalities hold in a nested `match`: in the `ILit` arm, `b` is a `Lit[int]`.
+nested[T](a: Lit[T], b: Lit[T]) -> int = a match
+  ILit(x) -> b match
+    ILit(y) -> x + y
+  BLit(_) -> b match
+    BLit(y) -> if y then 1 else 0
+
+// Nested refined patterns: `If(BoolLit(_), …)` and `If(Eq(…), …)` together cover `If`.
+shape(e: Expr[int]) -> string = e match
+  IntLit(_) -> "literal"
+  Add(IntLit(_), _) -> "sum of a literal"
+  Add(_, _) -> "sum"
+  If(BoolLit(_), _, _) -> "fixed choice"
+  If(Eq(_, _), _, _) -> "compared choice"
+  If(If(_, _, _), _, _) -> "nested choice"
+
+// Alternatives over the possible variants cover them.
+plain(e: Lit[int]) -> int = e match
+  ILit(n) -> n
+
+anyLit[T](e: Lit[T]) -> string = e match
+  ILit(_) | BLit(_) -> "literal"
+
+// A one-variant instance is taken apart by a binding, and a `Same[A, B]` by its one variant.
+unwrap(h: Holder[int]) -> int = h match
+  IntBox(n) -> n
+  Many(items) -> items.size
+
+cast[A, B](proof: Same[A, B], x: A) -> B
+cast(Refl, x) = x
+
+castBinding[A, B](proof: Same[A, B], x: A) -> B =
+  val Refl = proof
+  x
+
+// An `is` test on a possible variant, and the rest of the block after an early return.
+literal(e: Expr[int]) -> int =
+  if e is not IntLit(n) then return -1
+  n
+
+main()
+  val sum = Add(IntLit(2), If(Eq(IntLit(1), IntLit(1)), IntLit(40), IntLit(0)))
+  println(total(sum))
+  println(totalClauses(sum))
+  println(truth(Eq(IntLit(3), Add(IntLit(1), IntLit(2)))))
+  println(pairOf(If(BoolLit(false), Pair(IntLit(0), BoolLit(false)), Pair(IntLit(7), BoolLit(true)))))
+  println(firstOf(Pair(Add(IntLit(5), IntLit(6)), BoolLit(true))))
+  println(sign(IntLit(-3)))
+  println(sign(IntLit(3)))
+  println(sign(sum))
+  println(agree(ILit(1), ILit(1)))
+  println(agree(BLit(true), BLit(false)))
+  println(agreeClauses(ILit(2), ILit(3)))
+  println(nested(ILit(4), ILit(5)))
+  println(nested(BLit(false), BLit(true)))
+  println(shape(Add(IntLit(1), IntLit(2))))
+  println(shape(If(Eq(IntLit(1), IntLit(2)), IntLit(1), IntLit(2))))
+  println(shape(If(If(BoolLit(true), BoolLit(true), BoolLit(false)), IntLit(1), IntLit(2))))
+  println(plain(ILit(-2147483648)))
+  println(anyLit(BLit(true)))
+  println(unwrap(IntBox(9)))
+  println(unwrap(Many([1, 2, 3])))
+  println(cast(Refl, "héllo ✓"))
+  println(castBinding(Refl, 2147483647))
+  println(literal(IntLit(0)))
+  println(literal(sum))

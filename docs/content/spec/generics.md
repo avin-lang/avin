@@ -640,17 +640,22 @@ val twoDigits = pairUp(digit, digit).map(match (a, b) -> a * 10 + b)
   arguments and in the same tiers.
 - **With a constructor-trait bound, the type's conformance says which arguments are the holes**:
   `Result`'s `Monad` leaves `T` open, so a `Result[int, AgeError]` makes `F` `Result[_, AgeError]`
-  and `X` `int`. A type with no conformance of its own is matched as the nearest type it passes as
-  that has one: its superclasses, nearest first, then the one trait among those it conforms to that
-  has one; several such traits is an error asking for `F` to be written. A type with none is an
-  error naming the bound and the type.
+  and `X` `int`. A type with no conformance of its own is matched as the nearest superclass that
+  has one, a `TallShelf[int]` as a `Shelf[int]`. A type with none is an error naming the bound and
+  the type. With several bounds, the conformances must leave the same arguments open; a type that
+  implements one bound at one hole and another at another is an error naming both.
+- **A subclass passes as its superclass only where a value is read out**, as for any type
+  argument: a `Box[TallShelf[int]]` given for a `Box[F[int]]` is refused where `Box` is invariant,
+  since the generic code may store a `Shelf` in it.
 - **Without a bound**, a type of exactly as many parameters as `F` takes holes gives `F` that type
   bare; a type of more is an error asking for `F` to be written, since nothing says which arguments
   are open.
 - **The arguments written out are inferred as type arguments are**: each argument naming `F`
   contributes, and where the type's parameter is covariant they join, so `Ok(1)`, a
-  `Result[int, Nothing]`, beside a `Result[int, AgeError]` makes `F` `Result[_, AgeError]`; at an
-  invariant parameter the first decides. The type named must agree: an `Option` and a `List` for
+  `Result[int, Nothing]`, beside a `Result[int, AgeError]` makes `F` `Result[_, AgeError]`, and a
+  `Result[int, Dog]` beside a `Result[int, Cat]` makes it `Result[_, Animal]`; at an invariant
+  parameter the first decides. An expected type decides them first, as it decides any type
+  argument. The type named must agree: an `Option` and a `List` for
   one `F` is an error naming both, never a join to a trait they share, which a written argument
   (`pairUp[Seq, …]`) asks for.
 - **The expected type decides `F` as an argument does**: with
