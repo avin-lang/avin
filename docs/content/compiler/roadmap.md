@@ -579,8 +579,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Step 1 is done; steps
-2 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 and 2 are
+done; steps 3 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -607,7 +607,7 @@ and emission see only the types they see today; `type_key` names a constructor
    per kind error the spec names (constructor as a type, type as a constructor, wrong arity, nested
    `_`, `F[_[_]]`, an alias that is no constructor); `parse_tests.sysl` and `formatter_tests.sysl`
    for the forms.
-2. **Inference without bounds, hole variance and hole bounds.** `F` inferred from a type of as many
+2. **Inference without bounds, hole variance and hole bounds.** *Done.* `F` inferred from a type of as many
    parameters as it takes holes, and the error asking for it otherwise; `F[+_]` subtyping inside the
    declaration and the check on the constructor passed; `F[_: B]` checked at every `F[X]` written
    and against the constructor's own bounds. Tests: inference from arguments and from the expected
