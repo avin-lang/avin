@@ -217,6 +217,12 @@ struct VariantSymbol
     fields: Buf[&Type]
     /** For each field, the function computing its value where a construction omits it. */
     defaults: Buf[Option[usize]]
+    /** The variant's type parameters: its type's, then its own, all owned by `data_owner` of the
+     * type, so its fields and result name them as `TypeVar(data_owner(id), i)`. */
+    params: Buf[TypeParam]
+    /** The instance of its type a refined variant makes, in `params`; none for a variant that makes
+     * the type at the type's own parameters. */
+    result: Option[&Type]
 
 /** A variant, by its data type's index and its own position among the type's variants. */
 struct VariantRef
@@ -2614,6 +2620,9 @@ private declare_variants(c: *Checker, unit: usize)
                 c.note(unit, v.span, s"the variant `${v.name}` is declared more than once")
                 continue
             seen.put(v.name, v.span)
+            val params = variant_params(c, unit, id, v)
+            c.generic = Some(GenericScope(data_owner(id), params))
+            if params.len() > d.decl.type_params.len() then declare_bounds(c, unit, data_owner(id), params, d.decl.type_params.len(), params.len())
             var names: Buf[string] = buf()
             var fields: Buf[&Type] = buf()
             for f in v.fields
@@ -2625,6 +2634,8 @@ private declare_variants(c: *Checker, unit: usize)
                         c.note(unit, f.pattern.span, "a field is a name and a type")
                         names.push("_")
                 fields.push(resolve_type(c, unit, f.ty))
+            val result = variant_result(c, unit, id, v, params, fields)
+            c.generic = Some(GenericScope(data_owner(id), d.decl.type_params))
             // A variant is a name of its type's module, private where its type is. A name several
             // types share is seen from another module where one of them is public: see `exported`.
             val key = qualified(c.data[id].module_name, v.name)
@@ -2638,13 +2649,188 @@ private declare_variants(c: *Checker, unit: usize)
             else
                 c.variants.put(key, made)
                 if c.private_names.get(qualified(c.data[id].module_name, c.data[id].name)) is Some(_) then c.private_names.put(key, true)
-            variants.push(VariantSymbol(v.name, v.span, names, fields, field_defaults(c, unit, id, v, names, fields)))
+            variants.push(VariantSymbol(v.name, v.span, names, fields, field_defaults(c, unit, id, v, params, names, fields), params, result))
         c.data[id].variants = variants
         c.generic = outer_generic
 
+/** Whether variant `v` of `d` is refined: it declares type parameters of its own, or makes an
+ * instance of its type other than the one at the type's own parameters, `-> Expr[T]` for
+ * `data Expr[T]`, which is what every variant makes unless it says otherwise. */
+refined_variant(d: &DataDecl, v: Variant) -> bool
+    if v.type_params.len() > 0 then return true
+    val r = v.result match
+        Some(r) -> r
+        None -> return false
+    r.kind match
+        Named(path, args) ->
+            if path != d.name || args.len() != d.type_params.len() then return true
+            for i in 0..<args.len()
+                args[i].kind match
+                    Named(p, inner) -> if p != d.type_params[i].name || inner.len() > 0 then return true
+                    _ -> return true
+            false
+        _ -> true
+
+/** Whether data type `d` has a refined variant. */
+refined_data(d: &DataDecl) -> bool
+    for v in d.variants
+        if refined_variant(d, v) then return true
+    false
+
+// Values of a refined data type are made and matched by the steps after its declaration: until then
+// the type and its variants are refused wherever a program would use them, so no code is checked or
+// compiled against a variant whose instance is not the type's own. The fields and results of refined
+// variants, checked with their type's parameters in scope, may name such types.
+private refined_use_refused(c: *Checker, unit: usize, at: Span, id: usize, what: string) -> bool
+    if !refined_data(c.data[id].decl) then return false
+    if c.generic is Some(scope)
+        val base = 1usize << 48
+        if scope.owner >= base && scope.owner < (1usize << 49) && refined_data(c.data[scope.owner - base].decl) then return false
+    c.note(unit, at, s"$what has refined variants: they are declared and checked, but no value of the type can be made, matched or named yet")
+    true
+
+/** The type parameters of variant `v` of data type `id`: the type's, then the variant's own, each of
+ * which is checked: it takes no variance, it is no parameter of the type again, and it is declared
+ * once. */
+private variant_params(c: *Checker, unit: usize, id: usize, v: Variant) -> Buf[TypeParam]
+    val d = c.data[id]
+    var params = d.decl.type_params
+    if v.type_params.len() == 0 then return params
+    params = buf()
+    for tp in d.decl.type_params
+        params.push(tp)
+    for j in 0..<v.type_params.len()
+        val tp = v.type_params[j]
+        if !(tp.variance is Invariant) then c.note(unit, tp.span, s"variance is written on the parameters of a type, not on a variant's own: write `${tp.name}` in `${v.name}`")
+        var reused = false
+        for own in d.decl.type_params
+            if own.name == tp.name then reused = true
+        if reused
+            c.note(unit, tp.span, s"`${tp.name}` is already a parameter of `${d.name}`, and stands for the same type in each of its variants")
+            continue
+        var again = false
+        for k in 0..<j
+            if v.type_params[k].name == tp.name then again = true
+        if again
+            c.note(unit, tp.span, s"the type parameter `${tp.name}` is declared more than once")
+            continue
+        params.push(tp)
+    params
+
+/** The instance of its type that variant `v` makes, resolved in `params` and checked; none for a
+ * variant that makes the type at its own parameters, and for a result refused. */
+private variant_result(c: *Checker, unit: usize, id: usize, v: Variant, params: Buf[TypeParam], fields: Buf[&Type]) -> Option[&Type]
+    val d = c.data[id]
+    val owner = data_owner(id)
+    val n = d.decl.type_params.len()
+    var result: Option[&Type] = None
+    // The result as written, refused or not, which may name the variant's parameters.
+    var named: Option[&Type] = None
+    if v.result is Some(r)
+        val t = resolve_type(c, unit, r)
+        *t match
+            Data(rid, _, args) ->
+                if rid != id then c.note(unit, r.span, s"the result of a variant is an instance of its own type: `${v.name}` of `${d.name}` declares `${type_name(t)}`")
+                else
+                    named = Some(t)
+                    if result_checked(c, unit, r.span, d, v, owner, args, type_name(t)) then result = Some(t)
+            ErrorType -> ()
+            _ -> c.note(unit, r.span, s"the result of a variant is an instance of its own type: `${v.name}` of `${d.name}` declares `${type_name(t)}`")
+        // A result that is no instance of the type says nothing of which parameters it names.
+        if named is None then return None
+    // Each of the variant's own parameters is named by a field or by the result.
+    for j in n..<params.len()
+        var used = false
+        for f in fields
+            if names_type_var(f, owner, j) then used = true
+        if named is Some(t)
+            if names_type_var(t, owner, j) then used = true
+        if !used then c.note(unit, params[j].span, s"`${params[j].name}` is declared by `${v.name}` but named by none of its fields and not by its result")
+    if !refined_variant(d.decl, v) then return None
+    result
+
+// The arguments of a refined variant's result: a parameter with a variance is never fixed, and each
+// argument is a type a `match` can take apart again.
+private result_checked(c: *Checker, unit: usize, at: Span, d: DataSymbol, v: Variant, owner: usize, args: Buf[&Type], shown: string) -> bool
+    var ok = true
+    for i in 0..<args.len()
+        if i >= d.decl.type_params.len() then break
+        val tp = d.decl.type_params[i]
+        if tp.variance is Invariant
+            if !result_part_ok(c, unit, at, v, owner, args[i]) then ok = false
+            continue
+        val kept = *args[i] match
+            TypeVar(o, k, _) -> o == owner && k == i
+            _ -> false
+        if kept then continue
+        val kind = if tp.variance is Covariant then "covariant" else "contravariant"
+        var plain = ""
+        for k in 0..<d.decl.type_params.len()
+            if k > 0 then plain = plain + ", "
+            val p = d.decl.type_params[k]
+            val sign = if k == i || p.variance is Invariant then "" elif p.variance is Covariant then "+" else "-"
+            plain = plain + sign + p.name
+        c.note(unit, at, s"`${d.name}` is $kind in `${tp.name}`, so a variant cannot fix `${tp.name}`: `${v.name}` makes a `$shown`; declare the parameter invariant, `data ${d.name}[$plain]`")
+        ok = false
+    ok
+
+// A part of a refined variant's result: a union in it names none of the variant's parameters, since
+// a value of the type would not say which member a parameter is, and every part is built of data
+// types, classes, tuples and function types, which a known instance takes apart in one way only.
+private result_part_ok(c: *Checker, unit: usize, at: Span, v: Variant, owner: usize, t: &Type) -> bool = *t match
+    TypeVar(_, _, _) -> true
+    ErrorType -> true
+    Nothing -> true
+    AnyType -> true
+    Unit -> true
+    Bool -> true
+    Char -> true
+    Real -> true
+    Str -> true
+    Byte -> true
+    Int(_) -> true
+    Tuple(items) -> result_parts_ok(c, unit, at, v, owner, items)
+    Function(ps, r, _) -> result_parts_ok(c, unit, at, v, owner, ps) && result_part_ok(c, unit, at, v, owner, r)
+    ByName(inner) -> result_part_ok(c, unit, at, v, owner, inner)
+    Data(_, _, args) -> result_parts_ok(c, unit, at, v, owner, args)
+    Class(_, _, args) -> result_parts_ok(c, unit, at, v, owner, args)
+    Union(members) ->
+        for m in members
+            if first_param_named(m, owner) is Some(name)
+                c.note(unit, at, s"`$name` is inside a union in the result of `${v.name}`, so a value of the type does not say what `$name` is")
+                return false
+        true
+    _ ->
+        c.note(unit, at, s"`${type_name(t)}` in the result of `${v.name}` is no type a `match` can take apart: the result's arguments are built of data types, classes, tuples and function types")
+        false
+
+private result_parts_ok(c: *Checker, unit: usize, at: Span, v: Variant, owner: usize, items: Buf[&Type]) -> bool
+    for item in items
+        if !result_part_ok(c, unit, at, v, owner, item) then return false
+    true
+
+// The first type parameter of `owner` that `t` names, by its name.
+private first_param_named(t: &Type, owner: usize) -> Option[string] = *t match
+    TypeVar(o, _, name) -> if o == owner then Some(name) else None
+    Tuple(items) -> first_param_named_in(items, owner)
+    Function(ps, r, _) ->
+        if first_param_named_in(ps, owner) is Some(name) then return Some(name)
+        first_param_named(r, owner)
+    ByName(inner) -> first_param_named(inner, owner)
+    Data(_, _, args) -> first_param_named_in(args, owner)
+    Class(_, _, args) -> first_param_named_in(args, owner)
+    Union(members) -> first_param_named_in(members, owner)
+    _ -> None
+
+private first_param_named_in(items: Buf[&Type], owner: usize) -> Option[string]
+    for item in items
+        if first_param_named(item, owner) is Some(name) then return Some(name)
+    None
+
 // The defaults of a variant's fields, as a constructor's: each a function of the fields before it,
-// sharing the data type's type parameters, called where a construction omits the field.
-private field_defaults(c: *Checker, unit: usize, id: usize, v: Variant, names: Buf[string], fields: Buf[&Type]) -> Buf[Option[usize]]
+// sharing the variant's type parameters (its type's, then a refined variant's own), called where a
+// construction omits the field.
+private field_defaults(c: *Checker, unit: usize, id: usize, v: Variant, type_params: Buf[TypeParam], names: Buf[string], fields: Buf[&Type]) -> Buf[Option[usize]]
     val d = c.data[id]
     var defaults: Buf[Option[usize]] = buf()
     for i in 0..<v.fields.len()
@@ -2662,8 +2848,8 @@ private field_defaults(c: *Checker, unit: usize, id: usize, v: Variant, names: B
             param_names.push(names[k])
             decls.push(v.fields[k])
         val name = s"${v.name}/${names[i]}"
-        val decl = Function(buf(), value.span, v.fields[i].span, name, d.decl.type_params, decls, None, Some(value), buf(), false)
-        c.symbols.push(FunctionSymbol(unit, d.module_name, name, decl, params, param_names, Some(fields[i]), None, None, buf(), buf(), buf(), false, false, false, buf(), Some(names[i]), data_owner(id), d.decl.type_params, None, false, true, "", None, false))
+        val decl = Function(buf(), value.span, v.fields[i].span, name, type_params, decls, None, Some(value), buf(), false)
+        c.symbols.push(FunctionSymbol(unit, d.module_name, name, decl, params, param_names, Some(fields[i]), None, None, buf(), buf(), buf(), false, false, false, buf(), Some(names[i]), data_owner(id), type_params, None, false, true, "", None, false))
         c.states.push(0)
         c.bodies.push(None)
         c.locals.push(buf())
@@ -9664,6 +9850,7 @@ resolve_type(c: *Checker, unit: usize, t: &TypeExpr) -> &Type = t.kind match
                 return ErrorType
             check_type_args(c, unit, t.span, s"`$path`", data_owner(id), d.decl.type_params, resolved)
             index_data(c, unit, Span(t.span.start, t.span.start + path.bytes.len), id)
+            if refined_use_refused(c, unit, t.span, id, s"`$path`") then return ErrorType
             return Data(id, d.name, resolved)
         if c.class_types.get(key) is Some(id)
             val k = c.classes[id]
@@ -17346,6 +17533,7 @@ private construct(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: B
 
 // A variant made by a call, with `typed` holding the arguments already checked, if any.
 private construct_checked(c: *Checker, at: Span, name_span: Span, v: VariantRef, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], typed: Buf[Option[&TExpr]]) -> &TExpr
+    if refined_use_refused(c, unit_of(c), name_span, v.data, s"`${c.data[v.data].variants[v.index].name}` is a variant of `${c.data[v.data].name}`, which") then return TExpr(at, ErrorType, UnitConst)
     val applied = apply(c, at, name_span, variant_signature(c, v), args, explicit, expected, typed)
     applied.wrap(at, Construct(v.index, applied.args))
 
@@ -19975,6 +20163,11 @@ private variant_pattern(c: *Checker, p: &Pattern, v: VariantRef, args: Buf[&Patt
     val variant = d.variants[v.index]
     var fields: Buf[&Type] = buf()
     var ok = true
+    if refined_use_refused(c, unit, p.span, v.data, s"`${variant.name}` is a variant of `${d.name}`, which")
+        // The fields still bind their names, so the arm reports nothing more.
+        for a in args
+            check_pattern(c, a, ErrorType, no_bind)
+        return TPattern(p.span, ErrorType, PWildcard)
     *ty match
         Data(id, _, type_args) ->
             if id == v.data then fields = variant_fields(d, id, v.index, type_args)

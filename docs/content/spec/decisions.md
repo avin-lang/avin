@@ -8284,6 +8284,54 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a hidden parameter is allowed, since its instances exist only where the program makes a pack.
   Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
   Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+- Proposed (branch `gadt-1`, the declaration step): **a refined variant's parameters, the type's
+  included, are the variant's own in the expansion check.** An instance reaches them through the
+  result (`Expr[X]` holding a `Pair` has `X = (A, B)`, so `A` and `B` lie one level down), and a type
+  argument of a field that names a hidden parameter adds no edge, since its instances are the packs
+  the program makes, which step 5's check of growing packs counts. A growing cycle through a refined
+  variant names the field and the result it is measured against. Why: it is rule 6 exactly, and it
+  reuses the one polymorphic-recursion check rather than a second one for variants. Alternatives
+  weighed: a separate syntactic comparison of each field with the result (misses growth through a
+  second type, which the flow check already follows).
+- Proposed (branch `gadt-1`): **a variant's own type parameter takes bounds and no variance and no
+  lower bound**, and a name reused from the type's parameters or twice among the variant's own is an
+  error. Why: a variant is a constructor, a generic function, whose parameters take no variance; a
+  lower bound asks of a call's argument something a `match` could not hand back. Alternatives
+  weighed: allowing `>:` (sound at the call, but it gives the arm a one-directional fact, the kind
+  [Variance](/spec/refined-variants/#variance) declines).
+- Proposed (branch `gadt-1`): **a result written as the type at its own parameters, `If(…) ->
+  Expr[T]`, with no parameters of the variant's own, is a plain variant**, the same declaration as
+  one with no result. A data parameter a refined variant's result does not name is hidden there like
+  any other (`IntLit(value: T) -> Expr[int]` hides `T`). Why: the chapter says the type's names are
+  every variant's parameters, and a written-out plain result changes nothing a value carries.
+  Alternative weighed: treating any written result as refined (a type would lose its plain uses for
+  a redundant spelling).
+- Proposed (branch `gadt-1`), **until step 2 makes values: a type with a refined variant is
+  declared and checked, and refused wherever a program names it, makes a value of it or matches one**,
+  its plain variants included, with ``"`Expr` has refined variants: they are declared and checked,
+  but no value of the type can be made, matched or named yet"``; the fields and results of refined
+  variants may name such types. Step 2 removes the refusal. Why: lowering lays out every variant at
+  every instance and would meet a variant's own parameters it cannot substitute, and a value matched
+  without the refinement of step 3 would be read at the wrong types; refusing the type keeps the
+  declaration step sound with no partial path. Alternatives weighed: refusing only refined variants'
+  calls and patterns (a value of a plain variant of the type, or a type pattern on `Any`, would still
+  reach a layout holding them).
+- Proposed (branch `gadt-1`), **for constructor parameters ([higher-kinded
+  types](/spec/generics/#higher-kinded-types)), the conservative reading until a design says more: a
+  variant fixes no constructor parameter of its type, its own type parameters are no constructor
+  parameters, and a result's argument never applies a constructor parameter** (`-> D[F, F[A]]` is
+  refused, since `F[A]` against a known instance cannot be taken apart where `F` is itself a
+  parameter of the code matching). The declaration step enforces the last two through one rule: a
+  result's arguments are built of data types, classes, tuples, function types and the variant's
+  parameters, and any other form, a constructor or its application among them, is refused with
+  ``"`F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are
+  built of data types, classes, tuples and function types"``; a constructor parameter among a
+  variant's own (`V[G[_]]`) is to be refused where the two branches meet, since this branch has no
+  holes to read. Fields name constructor applications freely, as any variant's do. Why: refinement
+  solves equalities by decomposition, which needs every parameter under a constructor that the
+  instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
+  X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
+  among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 
