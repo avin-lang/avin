@@ -11144,6 +11144,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     TypeParent(_) ->
         c.note(unit_of(c), e.span, "a type is not a value")
         TExpr(e.span, ErrorType, UnitConst)
+    Ascribe(value, ty) -> ascribe_expr(c, e, value, ty)
     Checked(slot) -> c.checked_slots[slot]
     Member(target, name) ->
         // The rewritten use is judged as this one is, by the caller, so it is checked as used.
@@ -12306,6 +12307,33 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     val index = declare_local(c, e.span, name, ty, mutable)
     // A binding whose value never finishes does not finish either.
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** `(value: ty)`: `value` checked as a declared `val`'s value of type `ty` is, so a literal, `None`,
+ * a lambda, an empty collection and a union's member take `ty`, and a value of a subtype stands as
+ * one of `ty`. Anything else is refused, a value a conversion would take included: an ascription
+ * states a type and converts nothing. The expression is of type `ty`. */
+private ascribe_expr(c: *Checker, e: &Expr, value: &Expr, ty: &TypeExpr) -> &TExpr
+    val want = resolve_type(c, unit_of(c), ty)
+    val typed = check_expr(c, value, Some(want))
+    if !fits(c, typed.ty, want)
+        val found = zonk(c, typed.ty)
+        val w = zonk(c, want)
+        val text = from_utf8_unchecked(c.units[unit_of(c)].src.text(value.span))
+        val hint = if converts_to(c, found, w) then s": an ascription converts nothing; ${conversion_hint(c, typed, w)}"
+        elif *found is Int(_) && takes_integers(c, w)
+            val call = if big_int_type(c, w) || big_decimal_type(c, w) then s"${type_name(w)}($text)" else s"${type_name(w)}.fromInteger($text)"
+            s": an ascription converts nothing; write `$call`"
+        elif real_beside_decimal(c, found, w) != "" then real_beside_decimal(c, found, w)
+        elif fits(c, w, found) then s": an ascription only widens, and `${type_name(w)}` is narrower; test the value with `is` or `match`"
+        else sendable_hint(c, want, found)
+        c.note(unit_of(c), value.span, s"cannot give this `${type_name(found)}` the type `${type_name(w)}`${hint}")
+        return TExpr(e.span, ErrorType, UnitConst)
+    if same_type(zonk(c, typed.ty), zonk(c, want)) then return typed
+    // A value of a subtype is kept as it is and seen as `ty`, as an `if` sees its branches as the
+    // type they agree on.
+    var items: Buf[&TExpr] = buf()
+    items.push(typed)
+    TExpr(e.span, want, Block(items))
 
 /** Brings a new local into scope; a name may be declared once per block. */
 private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize
@@ -18188,6 +18216,7 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
             if exits_lambda(change.value) then return true
         false
     TypeApply(target, _) -> exits_lambda(target)
+    Ascribe(value, _) -> exits_lambda(value)
     _ -> true
 
 private any_exits_lambda(items: Buf[&Expr]) -> bool
@@ -18529,7 +18558,8 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
                         local = Some(ty)
                         ty = zonk(c, wanted[i])
                     elif !unify(c, wanted[i], ty)
-                        c.note(unit, p.span, s"`${p.name}` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
+                        val shown = if p.name.starts_with("_$") then "_" else p.name
+                        c.note(unit, p.span, s"`$shown` is declared ${type_name(ty)}, but this lambda is expected to take ${type_name(zonk(c, wanted[i]))}")
                         ty = ErrorType
             None ->
                 val known: &Type = if i < wanted.len() then zonk(c, wanted[i]) else Var(0)

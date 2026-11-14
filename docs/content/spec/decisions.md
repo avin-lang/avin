@@ -7734,15 +7734,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   argument list or parenthesized group meeting a token other than `,` or `)` reports it once and
   skips to its `)`. `->` there says "write a map as `{"a": 1}`" when the callee's name ends in `Map`
   and "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{"a": 1}`" otherwise;
-  `x: T` says "give the type argument instead, as in `f[T](x, …)`" (Avin has no expression
-  ascription: a value takes its type from where it is used, or from a declared `val`'s type), "a
-  lambda's parameter with a type is written in parentheses" when `->` follows the type, and "declare
-  the value with it, as in `val x: T = …`" in a group. WHY: one mistake made five to ten errors,
+  and "a lambda's parameter with a type is written in parentheses" when `: T ->` follows a name.
+  WHY: one mistake made five to ten errors,
   each naming a token rather than the mistake, and the token shows exactly which mistake it is.
   ALTERNATIVES: suppressing every error after the first in a statement (panic mode), which also
   hides a genuinely separate mistake on the same line; accepting `k -> v` as a pair (a second
-  spelling of a tuple, and `x -> body` is a lambda); accepting `x: T` as an ascription (a second way
-  to state a type the language deliberately gives through declarations and type arguments).
+  spelling of a tuple, and `x -> body` is a lambda). The hints this entry first gave for `x: T` in
+  an argument or a group ("give the type argument instead", "declare the value with it") are gone:
+  `x: T` there is now a [type ascription](#proposed) (the user approved ascription 2026-11-13).
 - Settled on the user's delegation 2026-11-13 (built on branch `diag-spans-recovery`): **A member's mistake is shown at the member** (branch `diag-spans-recovery`). The checker reports
   a missing or private member, an argument-count mistake and `()` on a parameterless member at the
   member's name and argument list; the call's own span, used for a type mismatch and for traps,
@@ -8479,6 +8478,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a hidden parameter is allowed, since its instances exist only where the program makes a pack.
   Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
   Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+
+- Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
+  **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
+  (1) *Where it parses*: a group, a tuple's part or a call's argument (a named one's value
+  included), never a bare `value: T` elsewhere. WHY: inside parentheses `:` has no other meaning
+  (named arguments use `=`, a map literal's `:` is inside braces, a field's or parameter's type is
+  in a declaration), so the grammar stays unambiguous with no new token; at a statement's level
+  `x: T` would read as half of a declaration. ALTERNATIVES: bare `value: T` anywhere (collides with
+  `val x: T`, clause signatures and a match arm's type pattern `n: int -> …`); a keyword
+  (`value as T`, a word read as a conversion, which this is not); parentheses only for a group, not
+  for arguments (`f((None: Option[string]))` doubles every bracket).
+  (2) *What it accepts*: exactly what `val x: T = value` accepts — literals taking `T`, `None`,
+  empty collections and lambdas typed by `T`, a subtype's value, a union's member — and the
+  expression is of type `T`. WHY: one rule a reader already knows, and no conversion hides in a
+  form that looks like a type. ALTERNATIVES: also converting numbers (`(n: long)` of an `int`),
+  which is the implicit widening the spec refuses; accepting narrowing as a checked downcast, which
+  is a `match`'s job.
+  (3) *The refusal* says what to write: `long(n)` for a numeric conversion, `BigInt(k)` /
+  `T.fromInteger(k)` for an integer variable to a type that takes integers, the explicit
+  `BigDecimal.fromReal…` for a `real`, and `is`/`match` for a narrowing.
+  (4) *Ambiguities settled*: `(n: long) -> …` stays a lambda; `x: int -> body` whose rest is not
+  type-shaped keeps its hint "a lambda's parameter with a type is written in parentheses", while
+  `(f: int -> int)` is an ascription to a function type; at the start of a block's line
+  `name(x: T)` followed by `=`, `->`, an indented block or a clause line still declares a local
+  function, and a clause signature now needs its next line to be a clause (followed by `=`, `|` or
+  guards), so two `show(n: long)` calls on consecutive lines are calls; a parameter counts as typed
+  only when a name precedes its `:`, so `show(1: long)` is never a declaration.
+  (5) `(_: T)` in a placeholder lambda is a parameter of type `T`. WHY: it is the one place a
+  placeholder's type can be written. ALTERNATIVES: leaving `_` untyped inside an ascription (the
+  ascription would still constrain it, but a mismatch would read as the ascription's error rather
+  than the parameter's). Review with the user: (1)'s rule that a statement-level `retry(n: long)`
+  followed by an indented block is a declaration (write `retry((n: long))` to call it).
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 

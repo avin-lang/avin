@@ -128,7 +128,12 @@ val x = if ok then 1 else "none"
 
 val y: int | string = if ok then 1 else "none" // each branch becomes the union
 val zs: Vector[int | string] = [1, "two", 3] // each element too
+val w = (1: int | string)                      // an ascription writes it in place
 ```
+
+An [ascription](/spec/types/#type-ascription) writes the union where the value stands, as a
+declared type does: `(n: int | string)` is the member `n` as the union, and `(u: int)` of a union
+`u` is refused, since an ascription never narrows.
 
 The same holds for collection literals, generic calls and lambdas: `[1, "two"]` is an error, and
 `pair[T](a: T, b: T)` called as `pair(1, "one")` is an error, not a `pair[int | string]`.
