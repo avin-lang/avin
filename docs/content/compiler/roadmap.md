@@ -479,11 +479,11 @@ them was refused with the error the chapter gives or ran correctly. What is not:
 
 | Probe | What happens | Kind |
 | --- | --- | --- |
-| A lambda in a superclass's arguments reading a field, `class Late: Base(() -> late)`, the superclass calling it in its body | a `long` field reads `0`; a `string`, `Vector` or generic field crashes (exit 139) | **hole** |
-| The same with a method value, `Base(name)` | crash (exit 139) | **hole** |
-| The same with an argument passed by name, `Base(pick(true, s * 2))` | reads `0` | **hole** |
-| The same for an inherited field, `Leaf: Mid(() -> m)` with `m` Mid's | reads `0` | **hole** |
-| The same from an `object` extending a class | reads `0` | **hole** |
+| A lambda in a superclass's arguments reading a field, `class Late: Base(() -> late)`, the superclass calling it in its body | a `long` field read `0`; a `string`, `Vector` or generic field crashed (exit 139) | closed by item 1: refused |
+| The same with a method value, `Base(name)` | crashed (exit 139) | closed by item 1: refused |
+| The same with an argument passed by name, `Base(pick(true, s * 2))` | read `0` | closed by item 1: refused |
+| The same for an inherited field, `Leaf: Mid(() -> m)` with `m` Mid's | read `0` | closed by item 1: refused |
+| The same from an `object` extending a class | read `0` | closed by item 1: refused |
 | `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | run-time check |
 | A lazy's initializer joining a thread that reads the same lazy | waits for ever | liveness |
 | `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | false error |
@@ -500,7 +500,7 @@ name, which stays legal.
 
 **The items**, each one agent, gated on its own, in this order:
 
-1. **Superclass arguments use nothing of the object.** `check_class_initialization` scans the
+1. **Done: superclass arguments use nothing of the object.** `check_class_initialization` scans the
    superclass-initialization item with an `InitScan` for the superclass's arguments (no field
    ready, inherited or own), so a lambda, a by-name argument, a local function or a method value
    that uses `self`, a field or a method is an error with the chapter's wording; objects extending a
@@ -513,7 +513,15 @@ name, which stays legal.
    through two levels of superclass); `tests/run/initialization_super_args.avin`, the legal cases
    (functions capturing class parameters, module values and another object, a by-name argument
    reading a parameter, the superclass calling each in its body), at `-O0` and `-O2` under GC
-   stress. Every 2026-11-13 hole above is one of these cases.
+   stress. Every 2026-11-13 hole above is one of these cases. Also
+   `tests/reject/initialization_super_args_shapes.avin` (a collection argument, a `lazy val`, a
+   closure in an argument object's field, a `with` copy, a conditional argument),
+   `tests/reject/initialization_super_args_values.avin` (a method value inside a lambda, a lambda
+   assigning a field, a by-name argument making a lambda, a trait's `val` the class supplies, a
+   generic subclass) and `tests/programs/reject/initialization_super_args` (the superclass in
+   another module). A method of the object named as a value there is refused where it is written,
+   as a call of one already was. A local function cannot be written in a superclass's arguments,
+   which take no block, so the scan's case for one is reached by no source today.
 2. **An object's name is `self` in its own body.** The checker resolves the object's own name inside
    its body, methods, lambdas and lazy initializers to `self`, so the object rules apply to it and
    the module order counts only what the body runs while the object is made. File: `check.sysl`
