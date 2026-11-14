@@ -4430,12 +4430,25 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   the same literal to a reader. Two limits, chosen as the smallest rule: of two arguments that
   both hold literals, the first written decides for the second (`same((1, x), (x, 2))` for
   `x: long` is an error, where a part-by-part solution would type it); and choosing an overload
-  checks a nested literal once at its own type where the candidates' parameters differ (`kind(Some(1))`
-  beside `kind(o: Option[long])` and `kind(o: Option[string])` fits neither), as only a bare literal
-  is tried against each candidate. Alternatives: leaving each literal unknown until its use settles
-  it, as a type argument is (solves both limits, but makes every literal an inference variable);
-  trying each candidate's parameter on a nested literal by its structure (collection, tuple and
-  constructor shapes). Review with the user: whether either limit is worth lifting.
+  checked a nested literal once at its own type where the candidates' parameters differ. Review
+  with the user: whether the first limit is worth lifting.
+
+  **Proposed (branch `fix-literal-expected`, 2026-11-14): the second limit is lifted.** Choosing an
+  overload checks a value built around number literals by itself first, as before; where that
+  leaves no candidate fitting (or it does not check by itself, as `[5_000_000_000]` does not), it is
+  checked against each candidate's parameter instead, with the type arguments the receiver, the
+  lower bounds and the other arguments decide, as a bare literal is. So `kind(Some(1))` beside
+  `kind(o: Option[long])` and `kind(o: Option[string])` is the `long` one, and `longs ++ [400]`,
+  which met two overloads of `++` (`Vector[W]` and `Iterable[W]` with `W >: long`), is a
+  `Vector[long]` (found writing marshal). Where the literal fits candidates at its own type, the
+  choice is unchanged, so `own([1])` beside `Vector[int]` and `Vector[long]` stays the `int` one.
+  With it, a reference type that takes integers or decimals (`BigInt`, `BigDecimal`, a type
+  implementing `FromInteger`) is kept in the expected type a literal argument gets, as a number is,
+  so `pair(cents, [3])` for `pair[T](a: Vector[T], b: Vector[T])` builds `Cents` where it had built
+  an `int`. Why: a literal one level down is the same literal to a reader, and an operator method
+  on a collection is the commonest place it meets overloads. Alternatives: checking against each
+  candidate first (would change which overload `own([1])` picks, and is ambiguous where both
+  take it); trying candidates by the literal's structure only (more code, same result).
 
 - Settled on the user's delegation 2026-11-06 (branch `stdout-flush-isnan`): **standard output gets an explicit `flush()`; reading flushes it; `real` gets `isNaN`, `isInfinite` and `isFinite`.** `flush()` is a prelude function and a method on `StandardOutput` and `StandardError` (a no-op beyond flushing output, as error keeps no buffer); a read of standard input that must wait flushes output first. The classifiers are methods on `real` in `avin`, written in Avin (`self != self`; comparison with the infinities; `self - self == 0.0`); `real.NaN`, `real.PositiveInfinity` and `real.NegativeInfinity` already existed, and `real` is the only floating type. WHY: a drawing program must push a frame without a newline, and a prompt must be seen before the wait; the methods read as `char`'s do, where the `avin.math` functions are not methods. ALTERNATIVES: a `Writer.flush` on the trait (every writer would need a meaning); flushing only on `print` (defeats buffering); `math.isNaN(x)` functions (the spec keeps `avin.math` for elementary functions). Review with the user if a `Writer`-level `flush` is wanted.
 
