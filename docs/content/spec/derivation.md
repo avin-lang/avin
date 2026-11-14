@@ -19,8 +19,8 @@ that streams. The [worked example](#a-json-library) below is that library's core
 ## The approach
 
 Generic code over a type's fields needs, for each field, a call at that field's own type, so that
-`string` fields encode as strings and `int` fields as numbers, each call direct. Avin has neither
-higher-kinded types nor type-level lists, and macros are deferred, so the question is who writes
+`string` fields encode as strings and `int` fields as numbers, each call direct. Avin has no
+type-level lists, and macros are deferred, so the question is who writes
 those calls.
 
 | Approach | What it needs | Verdict |

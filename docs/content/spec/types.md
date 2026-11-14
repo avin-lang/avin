@@ -353,7 +353,10 @@ conforms to traits through `impl` (`Eq`, `Hash`, `Ord`, `Display`). A type patte
 - Ordering is by code point, which for UTF-8 is byte order.
 
 The library's methods on `string`. Offsets and lengths count bytes and are `int`; a string holds at
-most the largest `int` bytes.
+most the largest `int` bytes. Every offset a search answers is one where a character begins, or the
+end, so it can be given to `charAt` or `slice` again, and a search from an offset inside a
+character never traps: it starts from the next character, or searching back, from the one the
+offset is inside.
 
 | Method | Result |
 | --- | --- |
@@ -361,16 +364,16 @@ most the largest `int` bytes.
 | `charCount` | The number of characters, O(n) |
 | `isEmpty`, `nonEmpty` | Whether it has no bytes, or some |
 | `startsWith(p)`, `endsWith(p)`, `contains(p)` | Whether `p` occurs at the start, the end, anywhere; the empty string occurs in every string |
-| `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
-| `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
+| `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string, and the empty string occurs only where a character begins or at the end |
+| `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string, and `charAt` also when `at` is inside a character's encoding |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
 | `toUpper`, `toLower` | Each character's simple case mapping, one character for one, as `char`'s methods of the same names map it: `"straße".toUpper` is `STRAßE` |
 | `strip`, `stripLeading`, `stripTrailing` | Without the Unicode `White_Space` characters at both ends, the start, the end |
 | `trim` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
-| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, a string or a `char`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from` |
-| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength`); -1 when there is none. The empty string is found at `end`, or at `byteLength` when `end` is past it |
+| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, a string or a `char`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from`, or at the next character when `from` is inside one |
+| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength`); -1 when there is none. The empty string is found at `end`, at the start of the character `end` is inside, or at `byteLength` when `end` is past it |
 | `indexWhere(f)`, `indexWhere(f, from)` | The byte offset of the first character satisfying `f`, at or after `from`; -1 when none does |
 | `lastIndexWhere(f)`, `lastIndexWhere(f, end)` | The byte offset of the last character satisfying `f` that begins at or before `end` (default: the whole string); -1 when none does or `end` is below 0 |
 | `head`, `last` | The first and the last character; each traps on the empty string |
