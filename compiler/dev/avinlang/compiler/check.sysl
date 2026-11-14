@@ -619,6 +619,12 @@ struct Checker
     /** The unknown standing for each constructor parameter of a call being inferred, by its
      * variable: what an error that cannot decide it names. */
     constructor_vars: Map[usize, ConstructorVar]
+    /** The lambda computing each local `lazy val`, by `"<root>:<local>"`: what it captures is held to
+     * the rules a closure carrying the value to another thread is held to. */
+    lazy_locals: Map[string, usize]
+    /** The name of each local `lazy val` whose initializer is the lambda at a span (`span_key`), which
+     * the lambda's diagnostics call it by. */
+    lazy_names: Map[string, string]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1027,7 +1033,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -7349,12 +7355,13 @@ private first_send_problem(c: *Checker, root: usize, e: &TExpr, mark: int, k: us
     collect_send_uses(c, e, &uses, &bound, held)
     for u in uses
         if !u.param && contains_index(bound, u.index) then continue
-        if send_use_problem(c, root, u, mark, k) is Some(why) then return Some(why)
+        var seen: Buf[usize] = buf()
+        if send_use_problem(c, root, u, mark, k, &seen) is Some(why) then return Some(why)
     None
 
 // Why a use is not allowed: a `var` captured for a `@sendable` parameter, or a value whose type is not
 // sendable.
-private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usize) -> Option[string]
+private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usize, seen: *Buf[usize]) -> Option[string]
     var name = ""
     var t: &Type = ErrorType
     if u.param
@@ -7375,7 +7382,19 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
         val l = locals[u.index]
         name = l.name
         t = l.ty
+        // A local `lazy val`'s cell is sendable where its value is, and is named as its value.
+        if is_lazy_cell(c, t)
+            if *zonk(c, t) is Class(_, _, args) then t = args[0]
         if mark == SendableMark && u.captured && l.mutable then return Some(s"it captures `$name`, a `var`, which the closure would share with the code that made it; copy it into a `val`, or share it through an `Atomic` or a `Mutex`")
+        // A closure that captures a local `lazy val` carries its initializer with it, which may run
+        // wherever the closure first reads the value, so what the initializer captures is held to
+        // the same rules.
+        // `seen` holds the lazy values on the way, each checked once.
+        if u.captured && !contains_index(*seen, u.index)
+            if c.lazy_locals.get(s"$root:${u.index}") is Some(f)
+                seen.push(u.index)
+                if lazy_capture_problem(c, root, f, mark, k, seen) is Some(why)
+                    return Some(s"it captures `$name`, a `lazy val` whose initializer ${why[3..]}")
     val ty = zonk(c, t)
     // An actor's state, whatever its fields, is reached only by the actor's own turns: its context's
     // methods (`stop`, `after`, `watch`, ...) act for the actor that is running.
@@ -7397,6 +7416,15 @@ private send_use_problem(c: *Checker, root: usize, u: SendUse, mark: int, k: usi
                     return Some(s"it uses the state of the actor `${held[ActorClassPrefix.bytes.len..]}`, ${nested_reason(why)}")
             Some(s"it uses `$name`, ${quoted_type(ty)}, ${nested_reason(why)}")
         _ -> None
+
+// The first capture of lambda `f`, a local `lazy val`'s initializer, that `mark` does not allow.
+private lazy_capture_problem(c: *Checker, root: usize, f: usize, mark: int, k: usize, seen: *Buf[usize]) -> Option[string]
+    for x in c.symbols[f].captured_locals
+        if contains_index(*seen, x) then continue
+        if send_use_problem(c, root, SendUse(x, false, true), mark, k, seen) is Some(why) then return Some(why)
+    for i in c.symbols[f].captured_params
+        if send_use_problem(c, root, SendUse(i, true, true), mark, k, seen) is Some(why) then return Some(why)
+    None
 
 private holds_function(t: &Type) -> bool = *t is Function(_, _, _) || *t is ByName(_)
 
@@ -7487,6 +7515,7 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
             push_all(&out, args)
         Field(value, _) -> out.push(value)
         LazyField(object, _, _, _) -> out.push(object)
+        LazyLocal(cell, _, _, _) -> out.push(cell)
         StoreField(object, _, value, _) ->
             out.push(object)
             out.push(value)
@@ -10924,7 +10953,7 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
             symbol.result match
                 Some(declared) ->
                     if !fits(c,body.ty, declared) && !(*declared is Unit)
-                        c.note(unit, b.body.span, s"${described(symbol)} yields ${type_name(body.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, body.ty)}")
+                        c.note(unit, b.body.span, s"${described(c, symbol)} yields ${type_name(body.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, body.ty)}")
                 None ->
                     if agreed
                         join(c, ty, body.ty) match
@@ -10991,7 +11020,7 @@ private check_body(c: *Checker, id: usize, body: &Expr, hint: Option[&Type])
     symbol.result match
         Some(declared) ->
             if !fits(c,typed.ty, declared) && !(*declared is Unit)
-                c.note(symbol.unit, body.span, s"${described(symbol)} yields ${type_name(typed.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, typed.ty)}")
+                c.note(symbol.unit, body.span, s"${described(c, symbol)} yields ${type_name(typed.ty)}, not ${type_name(declared)}${sendable_hint(c, declared, typed.ty)}")
             // A body of a function that yields unit drops its value, as a statement does: a lambda
             // passed where a `(T) -> unit` is wanted, most of all.
             if *declared is Unit then report_discarded(c, yielding(body), typed)
@@ -11564,8 +11593,10 @@ private check_local_symbol(c: *Checker, id: usize)
 unit_of(c: *Checker) -> usize = c.unit_override.unwrap_or(c.symbols[c.current].unit)
 
 /** A function as diagnostics name it. */
-private described(symbol: FunctionSymbol) -> string
+private described(c: *Checker, symbol: FunctionSymbol) -> string
     if symbol.delayed then return "this delayed argument"
+    if symbol.lambda
+        if c.lazy_names.get(span_key(symbol.unit, symbol.decl.span)) is Some(name) then return s"the initializer of `$name`"
     if symbol.lambda && symbol.param_names.len() == 1 && symbol.param_names[0].starts_with("yield guard ") then return "this guard"
     if comprehension_part(symbol) then return "this `for` with `yield`"
     if symbol.lambda then return "this lambda"
@@ -12043,6 +12074,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
     Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
+    LazyBinding(name, declared, value) -> lazy_binding_expr(c, e, name, declared, value)
     Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
     SymbolAssign(target, spelling, value, op_span) -> compound_assign(c, e, target, spelling, None, value, op_span)
     MultiAssign(targets, op, value, op_span) -> multi_assign_expr(c, e, targets, op, value, op_span)
@@ -12682,6 +12714,7 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
 private binding_ref(c: *Checker, at: Span, name: string) -> Option[&TExpr]
     if lookup_local(c, name) is Some(index)
         if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
+        if is_lazy_cell(c, c.body.locals[index].ty) then return Some(lazy_local_read(c, at, index))
         // A local's type may have been settled by a use since it was declared.
         return Some(TExpr(at, zonk(c, c.body.locals[index].ty), Local(index)))
     if param_index(c, name) is Some(i)
@@ -13193,6 +13226,69 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     // A binding whose value never finishes does not finish either.
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
 
+// A local `lazy val`: the local holds a cell, the core library's `LazyCell`, made where the value is
+// declared, whose initializer slot then takes the lambda computing the value. A read of the name is
+// a read of the cell's lazy field, so it runs the lambda once, on the first read, and a closure that
+// captures the name captures the cell and shares it. The name is in scope in its own initializer, as
+// a field's is in its class, so a lazy list may refer to itself; a read made while the value is being
+// computed traps.
+private lazy_binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&TypeExpr], value: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    val k = core_class(c, "LazyCell") match
+        Some(k) -> k
+        None ->
+            c.note(unit, e.span, "a local `lazy val` needs the core library, which this program does not have")
+            return TExpr(e.span, ErrorType, UnitConst)
+    val ty: &Type = declared match
+        Some(d) -> resolve_type(c, unit, d)
+        None -> fresh_var(c)
+    var args: Buf[&Type] = buf()
+    args.push(ty)
+    val cell_type: &Type = Class(k, "LazyCell", args)
+    val index = declare_local_shown(c, e.span, name, cell_type, false, ty)
+    val key = s"${c.body.root}:$index"
+    // The lambda is the next function made; a read inside it names it before it is finished.
+    c.lazy_locals.put(key, c.symbols.len())
+    val run: &Type = Function(buf(), ty, false)
+    // The lambda takes the whole declaration's span, which no lambda inside it shares.
+    c.lazy_names.put(span_key(unit, e.span), name)
+    val typed = check_expr(c, Expr(e.span, Lambda(buf(), value)), Some(run))
+    if typed.kind is FunctionValue(f, _) then c.lazy_locals.put(key, f)
+    // An initializer that never finishes gives a value of no type of its own.
+    if *zonk(c, ty) is Var(v)
+        if *zonk(c, typed.ty) is Function(_, r, _)
+            if *zonk(c, r) is Nothing then c.vars[v] = Some(Nothing)
+    // Like a field's, the type is the initializer's, settled where it is declared.
+    if declared is None && has_unknowns(zonk(c, ty))
+        c.note(unit, e.span, s"cannot infer the type of `$name`; declare it, as in `lazy val $name: int = 0`")
+        give_up_unknowns(c, zonk(c, ty))
+    val cell = TExpr(e.span, cell_type, Local(index))
+    var items: Buf[&TExpr] = buf()
+    items.push(TExpr(e.span, Unit, Let(index, TExpr(e.span, cell_type, New))))
+    items.push(TExpr(e.span, Unit, StoreField(cell, 2, TExpr(typed.span, run, typed.kind), false)))
+    TExpr(e.span, Unit, Block(items))
+
+/** A span of a unit, as a key. */
+private span_key(unit: usize, at: Span) -> string = s"$unit:${at.start}:${at.end}"
+
+/** Whether `t` is the cell a local `lazy val` is kept in. */
+is_lazy_cell(c: *Checker, t: &Type) -> bool = *zonk(c, t) match
+    Class(k, _, _) -> c.classes[k].module_name == CoreModule && c.classes[k].name == "LazyCell"
+    _ -> false
+
+// The read of local `lazy val` `index` kept in its cell: the cell's lazy field, computed by the
+// closure in its initializer slot.
+private lazy_local_read(c: *Checker, at: Span, index: usize) -> &TExpr
+    val cell_type = zonk(c, c.body.locals[index].ty)
+    val ty: &Type = *cell_type match
+        Class(_, _, args) -> if args.len() == 1 then zonk(c, args[0]) else ErrorType
+        _ -> ErrorType
+    val cell = TExpr(at, cell_type, Local(index))
+    val run: &Type = Function(buf(), ty, false)
+    val initialize = TExpr(at, ty, CallValue(TExpr(at, run, Field(cell, 2)), buf()))
+    val f = c.lazy_locals.get(s"${c.body.root}:$index").unwrap_or(c.current)
+    TExpr(at, ty, LazyLocal(cell, initialize, f, c.body.locals[index].name))
+
 /** `(value: ty)`: `value` checked as a declared `val`'s value of type `ty` is, so a literal, `None`,
  * a lambda, an empty collection and a union's member take `ty`, and a value of a subtype stands as
  * one of `ty`. Anything else is refused, a value a conversion would take included: an ascription
@@ -13221,7 +13317,11 @@ private ascribe_expr(c: *Checker, e: &Expr, value: &Expr, ty: &TypeExpr) -> &TEx
     TExpr(e.span, want, Block(items))
 
 /** Brings a new local into scope; a name may be declared once per block. */
-private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize
+private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool) -> usize = declare_local_shown(c, at, name, ty, mutable, ty)
+
+/** `declare_local`, with the type the definition index shows for it, `shown`: a local `lazy val`'s
+ * value type rather than its cell's. */
+private declare_local_shown(c: *Checker, at: Span, name: string, ty: &Type, mutable: bool, shown: &Type) -> usize
     if name == "self"
         if in_actor(c) then c.note(unit_of(c), at, "`self` names the actor's reference; it cannot be declared")
         else c.note(unit_of(c), at, "`self` names the instance a method works on; it cannot be declared")
@@ -13231,7 +13331,7 @@ private declare_local(c: *Checker, at: Span, name: string, ty: &Type, mutable: b
     val index = c.body.locals.len()
     c.body.locals.push(TLocal(name, ty, mutable, c.current))
     c.body.visible.push(index)
-    if c.index is Some(_) then index_declared_local(c, at, name, index, ty)
+    if c.index is Some(_) then index_declared_local(c, at, name, index, shown)
     index
 
 // The mutable local an assignment or update writes, after reporting why anything else cannot be
@@ -13250,7 +13350,8 @@ private assignable(c: *Checker, target: &Expr) -> Option[usize]
             if c.body.locals[index].mutable
                 if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
                 return Some(index)
-            c.note(unit, target.span, s"`$name` is a `val`; only a `var` can be assigned")
+            if is_lazy_cell(c, c.body.locals[index].ty) then c.note(unit, target.span, s"`$name` is a `lazy val`, computed once on its first read, which cannot be assigned")
+            else c.note(unit, target.span, s"`$name` is a `val`; only a `var` can be assigned")
         None ->
             if param_index(c, name) is Some(_) then c.note(unit, target.span, s"`$name` is a parameter, which cannot be assigned")
             elif global_named(c, name) is Some(g)
@@ -16448,11 +16549,11 @@ private return_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
                 Some(v) ->
                     val t = check_expr(c, v, Some(r))
                     if !fits(c, t.ty, r) && !(*r is Unit)
-                        c.note(unit, v.span, s"${described(symbol)} yields ${type_name(r)}, not ${type_name(t.ty)}")
+                        c.note(unit, v.span, s"${described(c, symbol)} yields ${type_name(r)}, not ${type_name(t.ty)}")
                     typed = Some(t)
                 None ->
                     if !(*r is Unit || *r is ErrorType)
-                        c.note(unit, e.span, s"`return` needs a value, because ${described(symbol)} yields ${type_name(r)}")
+                        c.note(unit, e.span, s"`return` needs a value, because ${described(c, symbol)} yields ${type_name(r)}")
         None ->
             if symbol.lambda then c.note(unit, e.span, "this lambda uses `return`, so its result type must be known where it is written, as in `val f: (int) -> int = body`")
             else c.note(unit, e.span, s"`${symbol.name}` uses `return`, so it needs a declared result type")
@@ -16570,7 +16671,7 @@ private propagate_expr(c: *Checker, e: &Expr, value: &Expr) -> &TExpr
     *declared match
         Data(id, _, xs) if id == d -> failure = xs
         _ ->
-            c.note(unit, e.span, s"`?` on ${type_name(ty)} returns ${if is_option then "`None`" else "the `Err`"} from ${described(symbol)}, which yields ${type_name(declared)}, not $wanted")
+            c.note(unit, e.span, s"`?` on ${type_name(ty)} returns ${if is_option then "`None`" else "the `Err`"} from ${described(c, symbol)}, which yields ${type_name(declared)}, not $wanted")
             return TExpr(e.span, ErrorType, UnitConst)
     // The value's own local and the failure's are hidden from the program's names.
     val held = c.body.locals.len()
@@ -16631,7 +16732,7 @@ private passed_error(c: *Checker, e: &Expr, value: &Expr, read: &TExpr, passed: 
         if missing.len() > 0
             val what = if missing.len() == 1 then s"its member ${missing[0]} has" else s"its members ${spoken_list(missing)} have"
             val them = if missing.len() == 1 then "it" else "each"
-            c.note(unit, e.span, s"`?` cannot pass on an error of `${type_name(error)}` from ${described(symbol)}, whose errors are `${type_name(passed)}`: $what no conversion to it; implement `From` for $them, or convert the error first with `mapErr`")
+            c.note(unit, e.span, s"`?` cannot pass on an error of `${type_name(error)}` from ${described(c, symbol)}, whose errors are `${type_name(passed)}`: $what no conversion to it; implement `From` for $them, or convert the error first with `mapErr`")
             return failed
         // A `match` on the error takes each member apart and converts it.
         var arms: Buf[TArm] = buf()
@@ -16684,7 +16785,7 @@ private converted_error(c: *Checker, e: &Expr, value: &Expr, read: &TExpr, passe
     val from = c.class_types.get(qualified(CoreModule, "From")) match
         Some(k) -> k
         None ->
-            c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}; convert it first with `mapErr`")
+            c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(c, symbol)} yields errors of ${type_name(passed)}; convert it first with `mapErr`")
             return failed
     val sources = from_sources(c, passed, from)
     var exact: Option[&Type] = None
@@ -16697,7 +16798,7 @@ private converted_error(c: *Checker, e: &Expr, value: &Expr, read: &TExpr, passe
         Some(s) -> s
         None ->
             if candidates.len() == 0
-                c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(symbol)} yields errors of ${type_name(passed)}, which does not implement From[${type_name(error)}]; implement it, or convert the error first with `mapErr`")
+                c.note(unit, e.span, s"`?` passes on an error of ${type_name(error)}, but ${described(c, symbol)} yields errors of ${type_name(passed)}, which does not implement From[${type_name(error)}]; implement it, or convert the error first with `mapErr`")
                 return failed
             var best: Buf[&Type] = buf()
             for x in candidates
@@ -19161,6 +19262,8 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
     Block(items, _) -> any_exits_lambda(items)
     Binding(_, _, value, _) -> exits_lambda(value)
     Destructure(_, _, value, _) -> exits_lambda(value)
+    // A local `lazy val`'s initializer is a lambda's body.
+    LazyBinding(_, _, _) -> false
     Assign(target, _, value, _, _) -> exits_lambda(target) || exits_lambda(value)
     MultiAssign(targets, _, value, _) -> any_exits_lambda(targets) || exits_lambda(value)
     SymbolAssign(target, _, value, _) -> exits_lambda(target) || exits_lambda(value)
@@ -21709,6 +21812,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             if is_init_self(s, object) then return init_violation(c, s, e.span, s"the `lazy val` `$name`, whose initializer may use `self`, is read", s"the `lazy val` `$name` may use `self`, so it cannot be read")
             scan_init(c, s, object, unsafe)
         LazyGlobal(_, initialize, _) -> scan_init(c, s, initialize, unsafe)
+        LazyLocal(cell, _, _, _) -> scan_init(c, s, cell, unsafe)
         StoreField(object, _, value, _) ->
             val target = is_init_self(s, object) || scan_init(c, s, object, unsafe)
             scan_init(c, s, value, unsafe) && target
