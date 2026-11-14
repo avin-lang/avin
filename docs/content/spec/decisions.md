@@ -8342,6 +8342,56 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+  take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
+  the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
+  live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
+  was. Alternatives: `-O0` implying `-g` (the usual "debug build"; costs every `-O0` corpus and test
+  build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
+  user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
+
+- Proposed (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+  (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
+  the program's own module prefix left off the readable name; lldb shows the linkage name. The
+  compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
+  `char32_t`). `char` is a UTF-32 code point, `byte` unsigned, `bool` a byte; a reference is a
+  pointer to an opaque structure named by its Avin type. A local a lambda shares (boxed) is not
+  described, nor is a local the compiler made. DWARF version 4. Why: each is the smallest choice that
+  makes `b`, `bt` and `frame variable` work with no lldb plugin. Alternatives: a vendor language code
+  (lldb then treats frames as unknown language), describing objects' fields as DWARF structures
+  (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
+  data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
+
+- Proposed (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+  function's first line lands after the parameters are stored where their variables are read (a
+  lambda's parameter otherwise read a stale slot). A call there still gets the function's own
+  location, which LLVM's verifier asks of every call in a function with debug information.
+  Alternative: placing that code at the function's name, as it was first built: lldb then stopped
+  before the stores and showed the slot's previous value.
+
+- Proposed (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+  cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
+  counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
+  and locations follow lines no function key covers, so cached text would carry stale lines; the
+  lowered code is still reused, and `AVIN_INCREMENTAL=verify` matches a clean build. Alternatives:
+  per-function metadata numbering with a renumbering pass (the text cache would then work under
+  `-g`), or a key over absolute positions (every edit above a function would relower it).
+
+- Proposed (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+  other module-level line, so any line moved anywhere changes every unit's text and recompiles every
+  unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
+  each unit's definitions through the metadata lines and renders only the nodes reached (plus the
+  compile unit and the flags), which also shrinks each unit.
+
+- Proposed (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+  its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
+  build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
+  program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
+  and `avin` (or a user with `atos -o prog.dSYM -l <image> <pc>`) turns it into `file:line` after the
+  process has stopped; a table of function start addresses with their names, emitted as a constant,
+  would let the handler name the function itself, without lines, at any `-g` level. Neither is
+  built: the first needs a runtime change and a symbolizing step, the second a table the emitter does
+  not make yet.
 - **A package's tests import its gated modules; a test module is read only while every module it
   imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
   The tests were fenced as an always-compiled module, so a test of a gated module had to live inside

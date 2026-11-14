@@ -77,7 +77,8 @@ every program's; either is always safe.
 
 A program is a source file or a directory: `avin run my-program` builds every `.avin` and `.lavin`
 file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by
-default.
+default. `build` and `emit-llvm` also take `-g`, which builds the program with debug information
+for a debugger such as lldb: [Debugging](/getting-started/debugging/) shows a session.
 
 `run` is the default command and the current directory the default program, so inside a package
 (or a directory of `.avin` files) these are all the same:
