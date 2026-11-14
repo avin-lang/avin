@@ -298,6 +298,16 @@ type parameter of the enclosing code, that type gains the bound in the arm: with
 `Sorted[A: Ord](items: Vector[A]) -> Coll[A]`, a function `smallest[T](c: Coll[T])` may call
 `c.items.min` in the `Sorted` arm, where `T` is `Ord`.
 
+- **The bound is gained where the arm's equalities hold**, and only by a parameter equated with the
+  bounded one as a whole: `U` of a `Coll[Vector[U]]` gains nothing in the `Sorted` arm, and neither
+  does `T` among alternatives, after the arm, or in the other branch of an `is` test.
+- **Bounds do not change coverage**: on a `Coll[Thing]`, with `Thing` not `Ord`, `Sorted` is still a
+  case to cover, and its arm's code is checked at `Thing`, without the bound.
+- **Whether a refined type is `Sendable` is decided at its instance**: a variant's own parameters are
+  what the instance's arguments make them, so `Coll[string]` is sendable though `Sorted` bounds `A`
+  by `Ord` alone, and a variant that cannot make the instance holds nothing in it. A hidden
+  parameter is sendable only by its bounds ([Hidden type parameters](#hidden-type-parameters)).
+
 ### Why it is sound
 
 No value of the variant exists at arguments that break its bounds, so wherever the arm runs, the

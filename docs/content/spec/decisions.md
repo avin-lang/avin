@@ -9020,7 +9020,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
   arms would never be compiled, and a program would meet step 5's rules later as a change). **Step
   5 (branch `gadt-5`) lifted both refusals of hidden parameters**, values and patterns, leaving an
-  `is` test's (the `gadt-5` entries above).
+  `is` test's (the `gadt-5` entries above); **step 6 (branch `gadt-6`) gave the arm the bounds**.
 
 - Proposed (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
   type matched as the equalities in scope see it**, splitting a column on a refined type's variant
@@ -9089,7 +9089,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   without the bound.
 - Proposed (branch `gadt-5`): **a bound on a hidden parameter is allowed now, `T: A & B` included;
   a bound on a variant's own parameter that its result names stays refused until step 6**, even
-  beside a bounded hidden one. A hidden parameter's bounds are checked where a value is made, as a
+  beside a bounded hidden one (step 6, branch `gadt-6`, lifted it: the entries below). A hidden parameter's bounds are checked where a value is made, as a
   call's are, and the fresh type an arm gives it has them. Why: the chapter states them for hidden
   parameters in their own section ("a fresh type, with the bounds its declaration gives it"), and
   the typed protocol needs `Ask[R: Sendable]`; what step 6 adds, an enclosing type parameter gaining
@@ -9129,6 +9129,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   is counted by the construction edges. Alternatives weighed: counting every type argument as
   before (refuses the chapter's `eval`); dropping every edge of an argument naming a hidden type
   (accepts `pairUp((x, y), b)`, which never ends).
+- Proposed (branch `gadt-6`, the bounds step): **an enclosing type parameter gains a variant
+  parameter's bounds only where an equality in scope equates the two as wholes**: with
+  `Sorted[A: Ord](items: Vector[A]) -> Coll[A]`, `T` of `smallest[T](c: Coll[T])` is `Ord` in the
+  `Sorted` arm, a parameter equated in a tuple place (`Conv2[A: Into[B], B](…) -> Conv[(A, B)]` on
+  a `Conv[(X, Y)]`, where `X` gains `Into[Y]`) too; `U` of a `Coll[Vector[U]]` gains nothing, though
+  `Vector[U]` is `Ord`. The bound holds where the arm's equalities do: not among alternatives, not
+  after the arm, not in the other branch of an `is` test. Why: the chapter states it for "a fixed
+  parameter equated with a type parameter", and inferring `U: Ord` from `Vector[U]: Ord` would
+  invert an impl's condition, which holds only where no other impl gives the trait. Alternatives
+  weighed: inverting conditional impls (unsound wherever a type has the trait unconditionally);
+  rewriting `T` to the variant's fresh type in the arm (the arm's result would then be checked as a
+  type that leaves its scope).
+- Proposed (branch `gadt-6`): **a variant's bounds do not prune coverage**: a `match` on a
+  `Coll[Thing]`, with `Thing` not `Ord`, still needs a `Sorted` arm (or a wildcard), whose code is
+  checked at `Thing` without the bound, as the chapter's coverage rule counts equalities alone.
+  Lowering does leave the variant out of the instance: `Coll[Thing]`'s layout has no descriptor for
+  `Sorted`, and an arm, an `is` test or the derived code on it is not compiled there, as for a
+  variant whose equalities fail. Why: coverage stays a fact of the types' shapes, unchanged by which
+  impls the program declares (an impl added in another module would otherwise make a covering
+  `match` incomplete). **Review with the user**: whether an arm on a variant whose bounds a concrete
+  instance fails should rather be "never reached", as an impossible arm is.
+- Proposed (branch `gadt-6`): **whether a refined type is sendable is decided at its instance**: a
+  variant's own parameters are read back from the instance's arguments, so `Coll[string]` is
+  sendable though `Sorted`'s `A` is bounded by `Ord` alone, and a variant whose result is another
+  concrete instance holds nothing there (`Msg[int]` is sendable though `Log`, making only a
+  `Msg[string]`, holds a `Buffer`). Where generic arguments do not say what a parameter is, one
+  bounded by `Sendable` is sendable, as a hidden one is, and any other may be any type. A hidden
+  parameter is still decided by its bounds alone, per the `gadt-5` entry: every pack the program
+  makes was checked where its value was made. Why: before, a refined variant's own parameters were
+  read by position, so every instance of a type with `Sorted` was unsendable, and an actor could not
+  receive one. Alternatives weighed: requiring `Sendable` on every own parameter (a bound the instance
+  already decides).
 
 - Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).

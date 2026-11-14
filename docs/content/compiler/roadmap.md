@@ -236,7 +236,7 @@ carry the chapter's exact messages, at most five per file.
 ### Refined variants: build plan
 
 [Refined variants](/spec/refined-variants/) are designed, their choices proposed in
-[decisions](/spec/decisions/#proposed); steps 1 to 5 are built, steps 6 and 7 are still to come. Each step is one item, gated on its own
+[decisions](/spec/decisions/#proposed); steps 1 to 6 are built, step 7 is still to come. Each step is one item, gated on its own
 targeted files, and ships the tests listed for it: run tests `tests/run/refined_*` (at `-O0` and
 `-O2`, under GC stress) and reject tests `tests/reject/refined_*` carrying the chapter's exact
 messages, at most five per file. A step that meets a missing piece of the checker it builds on
@@ -374,14 +374,27 @@ reports it rather than routing around it.
    a reference one; two packs of one variant compared unequal and hashed apart; the `Plan` example
    driving a `Door` machine; reject: a hidden type leaving its arm as a result, through a local
    settled in the arm, one value's hidden type used with another's; a growing pack cycle.
-6. **Bounds on variant parameters.** Step 5 built them for hidden parameters (checked where a value
-   is made, held by the arm's fresh type, `Sendable` and the derived traits decided by them), with
-   the `Account` protocol end to end and the refusals of an unsendable reply type and of a method no
-   bound gives (`refined_hidden_protocol`, `refined_hidden_bounds`). Still to come, for a variant's
-   own parameter that its result names: checked where a value is made; held in the arm; gained by an
-   enclosing type parameter equated with a bounded one; a copy at a type without the bound leaves the
-   arm out; the refusal `refined_later_steps` holds lifted. *Tests:* run: `Sorted[A: Ord]` and
-   `smallest`; reject: a method of a bound the variant does not give, through the equated parameter.
+6. **Bounds on variant parameters.** *Done (branch `gadt-6`):* step 5's step-6 refusal is gone, with
+   its test `refined_later_steps`. A variant's own parameter that its result names has its bounds
+   checked where a value is made, as a call's are (the variant's signature is generic over it); in
+   the arm the fresh type has them (step 5), and in `check.sysl` an enclosing type parameter that an
+   equality in scope equates with a bounded one as a whole gains its bounds there
+   (`gained_bounds`, carried in `Conformances.gained` and read by `scope_bounds`), so
+   `smallest[T](c: Coll[T])` calls `items.minOption` in the `Sorted` arm. In `lower.sysl` an
+   instance whose arguments fail a variant's own bounds holds no value of it (`meets_own_bounds`):
+   its layout has no descriptor for the variant and an arm, `is` test or derived code on it is not
+   compiled there (`refine_one`). Whether a refined type is sendable is decided at its instance
+   (`structural_sendability` reads a variant's own parameters back from the instance's arguments,
+   and leaves out a variant the concrete instance cannot hold); a hidden parameter's `Sendable` stays
+   decided by its bounds, every pack having been checked where it was made. The `Account` protocol
+   at `long`, `string` and `unit` and the unsendable reply type's refusal were built by step 5
+   (`refined_hidden_protocol`, `refined_hidden_bounds`). *Tests:* run `refined_own_bounds`,
+   `refined_own_bounds_actors`, the program `refined_bounds_across_modules`; reject
+   `refined_own_bounds`, `refined_own_bounds_scope`, `refined_own_bounds_parts`, the program
+   `refined_bounds_across_modules`. The plan as written: checked where a value is made; held in the
+   arm; gained by an enclosing type parameter equated with a bounded one; a copy at a type without
+   the bound leaves the arm out. *Tests:* run: `Sorted[A: Ord]` and `smallest`; reject: a method of
+   a bound the variant does not give, through the equated parameter.
 7. **Tooling and pages.** Hover and completion show a refined variant's signature (`lsp.sysl`,
    `completion.sysl`); the IntelliJ plugin's grammar takes the result (in `avin-intellij`, its own
    item); the chapter's examples become `run` fences with their `output` fences, so the docs test
