@@ -681,6 +681,22 @@ a type built from parameters holds: the type's own methods are found first, such
 module is an [extension](declarations.md#extensions), seen where its module is imported, and two
 that add one name and parameter types to a receiver both match make a call of it an error.
 
+- **It belongs to the trait bounding the constructor it applies**: written in the module of one of
+  `F`'s bounds it is seen everywhere, as an impl adding to that trait is, and elsewhere it is an
+  extension. Like an impl adding to a trait, it never hides or clashes with a method the type has:
+  the type's own method, or the bound's, of the name and parameter types is called, and generic code
+  that sees only the bound calls the added one. An extension adding a method the bound declares is
+  an error where it is declared.
+- **A value of `F[X]` in generic code has the methods** where `F`'s bounds include the impl's: in
+  `go[F[_]: Monad](x: F[int]) = x.twice(f)` each instance calls the impl's `twice` at its constructor.
+- **A receiver no such impl matches is told why**: `twice` on a `Vector[int]`, where `Vector`
+  implements no `Monad`, says so; on an `F[int]` whose `F` lacks the bound, that it is bounded by no
+  `Monad`. A further bound on the element (`impl[F[_]: Monad, A: Display] F[A]`) is reported as any
+  impl's is.
+- An unbounded constructor parameter matches as [inference](#inferring-a-constructor) matches one: a
+  type of exactly as many arguments as it has holes, named bare. Such an impl states no conformance
+  (`impl[F[_]: Monad, A] Display for F[A]` is an error) and declares no static member.
+
 ### Constructors and reification
 
 Each instance of generic code knows every constructor argument, so `F[A]` in it is the type written

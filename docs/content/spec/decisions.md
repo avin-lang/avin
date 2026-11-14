@@ -9622,6 +9622,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   type's own member at `Nothing` for the holes, which it never names, so `Option.pure` and
   `F.pure` at `Option` are one instance.
 
+**Higher-kinded types, impls over constructor parameters** (build plan step 6, branch `hkt-6`)
+
+- Proposed: **an impl adding to `F[A]` belongs to the trait bounding `F`**: written in the module
+  of one of `F`'s bounds (or in the core library) it is that trait's own and seen everywhere, and
+  written anywhere else it is an extension. With `F[G[A]]` it is `F`'s bounds, the head's, that
+  count. Why: such an impl adds to every type the bound's conformance reaches, as `impl[T] Seq[T]`
+  adds to every sequence, and that impl's home is the trait's module. Alternatives: always an
+  extension (would make the library's own `impl[F[_]: Monad, A] F[A]` need an import of its own
+  module); any module of any bound named in the impl (blurs which module owns it).
+- Proposed: **such methods are found after the type's own, wherever the impl is written**: a
+  type's own method, or the bound's, of the name and parameter types is called, and a call that
+  sees only the bound, in generic code, calls the added one. Why: the impl adds to a family of
+  types as an impl adding to a trait does, and that is the trait rule; the rule for impls adding to
+  one type built from parameters, which makes a clash with the type's own method ambiguous, would
+  make every type that has, say, its own `twice` unusable once the library adds one. An extension
+  adding a method the bound already declares is an error where it is declared (`map` on
+  `Mappable`).
+- Proposed: **the constructor parameter need not be bounded**: unbounded, `F` is matched as
+  inference matches it without a bound, a type of exactly as many arguments as `F` has holes,
+  named bare. Why: it is the inference rule, unchanged, and refusing it would add a rule; such an
+  impl's methods reach nothing of `F[A]` but can pass it on. Alternative: require a constructor
+  trait bound (an error naming the bound to add). Review with the user if the unbounded form should
+  rather be an error.
+- Proposed: **a receiver whose type no such impl matches is told why**: `twice` on a
+  `Plain[int]` says the method is for `F[A]` where `F` implements `Mappable` and that `Plain` does
+  not implement it, the reason inference gives; an `F[int]` whose `F` lacks the bound says its
+  constructor is bounded by no `Pointed`. Of several such impls adding the name, only one is named,
+  since every generic type is an instance of each; an impl adding to a type the receiver is an
+  instance of, `Option[Option[T]]`, is named first.
+- Proposed: **a function value of an extension method the file does not see, or of a private
+  added method, is reported as a call of it is** ("`shout` is added to `string` by module
+  `extras`, which this file does not import"), where it said only that the type has no member. This
+  holds for every extension, not only those over constructor parameters.
+- No impl of a trait is for `F[A]`: a conformance is a type's, stated once for it, and an
+  application of a constructor parameter is no type of its own. The impl declares no static member,
+  as no impl adding to a type built from parameters does.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

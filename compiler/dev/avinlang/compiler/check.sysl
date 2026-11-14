@@ -2070,6 +2070,16 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     if d.template then return resolve_template_impl(c, unit, module_name, d)
     if written.len() == 0 && names_type_param(d.type_params, path)
         return resolve_family_impl(c, unit, module_name, d)
+    // An impl adding to the applications of a constructor parameter, `impl[F[_]: Monad, A] F[A]`,
+    // adds to every value whose type matches it, each constructor found through its bound's
+    // conformance. It belongs to the trait bounding the constructor, as one adding to a trait does,
+    // so written in another module it is an extension.
+    if written.len() > 0 && constructor_param_named(d.type_params, path) is Some(tp)
+        if d.trait_name is Some(_)
+            c.note(unit, d.target.span, s"`$path` is a constructor parameter; an impl of a trait is for a data type, a class, an object or a built-in type")
+            return invalid
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, !in_bound_module(c, unit, module_name, tp)))
+        return invalid
     if c.types.get(key) is Some(id)
         owner = data_owner(id)
         home = c.data[id].module_name
@@ -2217,9 +2227,26 @@ private declare_trait_methods(c: *Checker, i: usize)
     for m in block.decl.members
         if m is MethodMember(f, public, overrides, static_member) then declare_trait_method(c, i, f, public, overrides, static_member, target, placeholder)
 
+/** The constructor parameter of `params` named `name`, as `F` in `impl[F[_]: Monad, A] F[A]`. */
+private constructor_param_named(params: Buf[TypeParam], name: string) -> Option[TypeParam]
+    for tp in params
+        if tp.name == name && tp.holes.len() > 0 then return Some(tp)
+    None
+
+/** Whether `module_name` is the core library or the module of a trait bounding constructor parameter
+ * `tp`: an impl there adding to `tp`'s applications is the trait's own, and elsewhere an extension. */
+private in_bound_module(c: *Checker, unit: usize, module_name: string, tp: TypeParam) -> bool
+    if module_name == CoreModule then return true
+    for b in tp.bounds
+        if b.kind is Named(p, _)
+            if c.class_types.get(resolve_name(c, unit, p)) is Some(k)
+                if c.classes[k].module_name == module_name then return true
+    false
+
 /** Whether type `t` names the `index`th type parameter of `owner`. */
 private names_param(t: &Type, owner: usize, index: usize) -> bool = *t match
     TypeVar(o, i, _) -> o == owner && i == index
+    Applied(head, args) -> names_param(head, owner, index) || any_names_param(args, owner, index)
     Tuple(items) -> any_names_param(items, owner, index)
     Function(params, result, _) -> any_names_param(params, owner, index) || names_param(result, owner, index)
     ByName(inner) -> names_param(inner, owner, index)
@@ -2311,7 +2338,7 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
         return
     // So are the arithmetic and orderings of every built-in type: only a data type, a class or a trait
     // has methods of those names, and an impl for every type would reach the built-in ones.
-    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _) || *target is Class(_, _, _))
+    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
         if *target is TypeVar(_, _, _) then c.note(unit, f.name_span, s"`${f.name}` names a method only of a data type, a class or a trait, and an impl for every type would redefine the built-in types' operator")
         else c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
         return
@@ -2347,13 +2374,21 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     // The type's own methods are found first, so an extension one of them always hides could never
     // be called.
     if block.extension && !block.on_trait
+        // An application of a constructor parameter has its bounds' methods, seen in the impl's scope.
+        val scoped = c.generic
+        if *target is Applied(_, _) then c.generic = Some(GenericScope(id, type_params))
         val own = *target match
             Class(t, _, _) -> methods_named(c, t, f.name)
+            Applied(_, _) -> bound_methods(c, target, f.name)
             _ -> receiver_methods(c, target, f.name)
+        var clash = false
         for o in own
-            if c.symbols[o].public && same_params_seen(c, target, o, id)
-                c.note(unit, f.name_span, s"`${f.name}` is already a method of `${head_name(target)}` with the same parameter types, which a call always finds first; an extension adds methods the type does not have")
-                return
+            if c.symbols[o].public && same_params_seen(c, target, o, id) then clash = true
+        val owner_name = if *target is Applied(_, _) then bound_names(c, target) else head_name(target)
+        c.generic = scoped
+        if clash
+            c.note(unit, f.name_span, s"`${f.name}` is already a method of `$owner_name` with the same parameter types, which a call always finds first; an extension adds methods the type does not have")
+            return
 
 /** The name of the type `t` is an instance of, as a diagnostic names it: `Option` for
  * `Option[Option[T]]`. */
@@ -2420,6 +2455,13 @@ private added_applies(c: *Checker, t: &Type, tm: TraitMethod) -> bool
             Data(_, _, _) -> function_ancestor(c.classes, c.data, x) is Some(_)
             Class(_, _, _) -> function_ancestor(c.classes, c.data, x) is Some(_)
             _ -> false
+        // Every generic type is an instance of a constructor's applications, so a call on one whose
+        // constructor misses the bound says why.
+        Applied(_, _) -> *x match
+            Data(_, _, xs) -> xs.len() > 0
+            Class(_, _, xs) -> xs.len() > 0 || added_args(c, x, tm) is Some(_)
+            Applied(_, _) -> true
+            _ -> false
         _ -> added_args(c, x, tm) is Some(_)
 
 /** The impl's type arguments a call of method `tm` takes on a value of type `t`: what the
@@ -2485,7 +2527,74 @@ private match_target(c: *Checker, pattern: &Type, t: &Type, owner: usize, binds:
             *seen match
                 Function(xs, s, marked) -> (marked || !sendable) && ps.len() == xs.len() && match_parts(c, ps, xs, owner, binds, false) && match_target(c, r, s, owner, binds, false)
                 _ -> false
+        Applied(head, ps) -> *head match
+            TypeVar(o, i, _) -> if o == owner then match_applied(c, i, ps, x, owner, binds, covariant) else same_type(pattern, x)
+            _ -> same_type(pattern, x)
         _ -> same_type(pattern, x)
+
+// Matches `F[ps]`, an application of the impl's constructor parameter `F`, the `index`th of `owner`'s,
+// against `t`. `F` is the constructor its bounds' conformance makes of `t`, as inference finds it
+// (`Result[_, E]` for a `Result[int, E]`), or, unbounded, `t`'s type named bare where it has exactly
+// as many arguments as `F` holes; the arguments at the holes are then matched against `ps`. An
+// application of a constructor parameter in scope matches where that parameter's bounds include
+// `F`'s.
+private match_applied(c: *Checker, index: usize, ps: Buf[&Type], t: &Type, owner: usize, binds: *Buf[Option[&Type]], covariant: bool) -> bool
+    val traits = constructor_traits_at(c, owner, index)
+    val arity = ps.len()
+    if *t is Applied(g, xs)
+        val k = zonk(c, g)
+        if !(*k is TypeVar(_, _, _)) || xs.len() != arity || !applied_meets(c, t, traits) then return false
+        return bind_constructor(c, binds, index, parameter_constructor(k, arity)) && match_parts(c, ps, xs, owner, binds, false)
+    val made = if traits.len() == 0 then constructor_of(c, t, arity) else bound_constructor(c, t, traits, arity).made
+    val body = made match
+        Some(m) -> *m match
+            Constructor(b, _) -> b
+            _ -> return false
+        None -> return false
+    // The receiver seen as the type the constructor is made of: a subclass as its superclass.
+    val (params, shape, args) = *body match
+        Data(d, _, bs) -> *t match
+            Data(e, _, xs) -> if d == e then (c.data[d].decl.type_params, bs, xs) else return false
+            _ -> return false
+        Class(k, _, bs) -> ancestor_type(c.classes, c.data, t, k) match
+            Some(up) -> *up match
+                Class(_, _, xs) -> (c.classes[k].decl.type_params, bs, xs)
+                _ -> return false
+            None -> return false
+        _ -> return false
+    if shape.len() != args.len() || !bind_constructor(c, binds, index, made.unwrap()) then return false
+    for p in 0..<shape.len()
+        if *shape[p] is TypeVar(o, h, _)
+            if o == hole_owner() && h < arity
+                val co = covariant && p < params.len() && params[p].variance is Covariant
+                if !match_target(c, ps[h], args[p], owner, binds, co) then return false
+    true
+
+/** The constructor traits bounding type parameter `index` of method `owner`'s, which an impl adding
+ * to its applications names. */
+private constructor_traits_at(c: *Checker, owner: usize, index: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for b in bounds_at(c, owner, c.symbols[owner].type_params, index)
+        if *b is Class(k, _, _)
+            if is_constructor_trait(c, k) && !contains_index(out, k) then out.push(k)
+    out
+
+/** Whether `t`, an application of a constructor parameter in scope, is one of each of `traits`, by
+ * the parameter's bounds or a trait they require. */
+private applied_meets(c: *Checker, t: &Type, traits: Buf[usize]) -> bool
+    for k in traits
+        var met = false
+        for b in bounds_of(c, t)
+            if ancestor_type(c.classes, c.data, b, k) is Some(_) then met = true
+        if !met then return false
+    true
+
+/** Binds constructor parameter `index` to `made`, or, where it is bound already, whether it is that. */
+private bind_constructor(c: *Checker, binds: *Buf[Option[&Type]], index: usize, made: &Type) -> bool = binds[index] match
+    Some(b) -> same_type(zonk(c, b), made)
+    None ->
+        binds[index] = Some(made)
+        true
 
 // The type arguments `ps` of a pattern matched against `xs`, each in a covariant position where the
 // parameter it is for is covariant and the whole is.
@@ -2504,7 +2613,41 @@ private match_parts(c: *Checker, ps: Buf[&Type], xs: Buf[&Type], owner: usize, b
 /** What a receiver must be for method `tm`, as a diagnostic says it: `an `Option` of an `Option``
  * for `Option[Option[T]]`, `a `Seq` of pairs` for `Seq[(A, B)]`; the type written out where it has
  * more than one part built from the parameters. */
-private added_target_phrase(tm: TraitMethod) -> string = target_phrase(tm.target)
+private added_target_phrase(c: *Checker, tm: TraitMethod) -> string
+    var bounded = ""
+    for i in 0..<tm.impl_params
+        val tp = c.symbols[tm.function].type_params[i]
+        if tp.holes.len() == 0 || !names_param(tm.target, tm.function, i) then continue
+        val traits = constructor_traits_at(c, tm.function, i)
+        if traits.len() == 0 then continue
+        bounded = bounded + (if bounded == "" then " where " else " and ") + s"`${tp.name}` implements ${trait_list(c, traits)}"
+    target_phrase(tm.target) + bounded
+
+/** Traits `traits`, named as a diagnostic lists them: `A`, `A` and `B`, `A`, `B` and `C`. */
+private trait_list(c: *Checker, traits: Buf[usize]) -> string
+    var out = ""
+    for i in 0..<traits.len()
+        if i > 0 then out = out + (if i + 1 == traits.len() then " and " else ", ")
+        out = out + s"`${c.classes[traits[i]].name}`"
+    out
+
+/** Why the receiver of type `t` is not an application of the constructor parameter method `tm` is
+ * added to: what the bound's conformance says of its type, as inference reports it. Empty where the
+ * impl adds to no application of a bounded constructor parameter, or the trouble is elsewhere. */
+private unmatched_constructor_reason(c: *Checker, t: &Type, tm: TraitMethod) -> string
+    val (head, arity) = *tm.target match
+        Applied(h, xs) -> (h, xs.len())
+        _ -> return ""
+    val index = *head match
+        TypeVar(_, i, _) -> i
+        _ -> return ""
+    val traits = constructor_traits_at(c, tm.function, index)
+    if traits.len() == 0 then return ""
+    val x = zonk(c, t)
+    if *x is Applied(_, _)
+        return if applied_meets(c, x, traits) then "" else s", whose constructor is bounded by no ${trait_list(c, traits)}"
+    val why = bound_constructor(c, x, traits, arity).why
+    if why == "" then "" else s", and $why"
 
 private target_phrase(t: &Type) -> string
     val inner = *t match
@@ -4619,9 +4762,24 @@ private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize])
         var hidden = false
         for o in own
             if same_params_seen(c, t, o, m) then hidden = true
-        if hidden && (tm.on_trait || tm.extension || adds_to_function(tm) || !matches) then continue
+        if hidden && (tm.on_trait || tm.extension || adds_to_function(tm) || adds_to_constructor(tm) || !matches) then continue
         if matches then matching.push(m) else unmatched.push(m)
-    val offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
+    var offered = if matching.len() > 0 || own.len() > 0 then matching else unmatched
+    // Every generic type is an instance of a constructor's applications, so of the methods added to
+    // them only one is offered to report on where nothing matches, and only where no method added to
+    // a type the receiver is an instance of says more.
+    if matching.len() == 0 && own.len() == 0
+        var shaped: Buf[usize] = buf()
+        var first: Option[usize] = None
+        for m in unmatched
+            val tm = trait_method_of(c, m).unwrap()
+            if !adds_to_constructor(tm) then shaped.push(m)
+            elif first is None then first = Some(m)
+        if shaped.len() > 0 then offered = shaped
+        elif first is Some(m)
+            var one: Buf[usize] = buf()
+            one.push(m)
+            offered = one
     for m in offered
         if !hidden_by_nearer_trait(c, t, m, offered) then out.push(m)
     out
@@ -4630,6 +4788,11 @@ private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize])
  * so a type's own method of the same parameter types is found first, as for a method added to any
  * trait. */
 private adds_to_function(tm: TraitMethod) -> bool = *tm.target is Function(_, _, _)
+
+/** Whether method `tm` is added to the applications of a constructor parameter, `impl[F[_]: Monad,
+ * A] F[A]`: to every type its bound's conformance reaches, as a method added to a trait is, so a
+ * type's own method of the same parameter types is found first. */
+private adds_to_constructor(tm: TraitMethod) -> bool = *tm.target is Applied(_, _)
 
 // Whether method `m`, which an impl adds to a trait, is hidden among `offered` by one of the same
 // parameter types that an impl adds to a trait requiring that trait: the nearer trait's is the
@@ -4728,6 +4891,9 @@ private refuse_private_trait_method(c: *Checker, at: Span, t: &Type, name: strin
     for tm in c.trait_methods
         val m = tm.function
         if c.symbols[m].decl.name != name || !added_applies(c, t, tm) then continue
+        // Every generic type is an instance of a constructor's applications; one only the matching
+        // receivers have is named.
+        if adds_to_constructor(tm) && added_args(c, t, tm) is None then continue
         val home = module_label(c.symbols[m].module_name)
         if !extension_seen(c, tm)
             c.note(unit_of(c), at, s"`$name` is added to `${impls_owner(c, m)}` by $home, which this file does not import")
@@ -4748,7 +4914,7 @@ private refuse_trait_clash(c: *Checker, at: Span, t: &Type, name: string, ms: Bu
         val a = trait_method_of(c, ms[i]) match
             Some(x) -> x
             None -> continue
-        if !a.on_trait && !a.extension && !adds_to_function(a) && added_args(c, t, a) is Some(_)
+        if !a.on_trait && !a.extension && !adds_to_function(a) && !adds_to_constructor(a) && added_args(c, t, a) is Some(_)
             for o in ms
                 if trait_method_of(c, o) is Some(_) then continue
                 if same_params_seen(c, t, o, ms[i])
@@ -12909,7 +13075,8 @@ private bare_methods(c: *Checker, name: string) -> Buf[usize]
     if enclosing_class(c) is Some(k) then return with_trait_methods(c, own_class_type(c.classes[k], k), name, methods_named(c, k, name))
     c.symbols[c.body.root].receiver match
         Some(t) ->
-            var own = if is_trait_self(t) then bound_methods(c, t, name) else visible_methods(c, receiver_methods(c, t, name))
+            // A `Self`, or an application of a constructor parameter, has its bounds' methods.
+            var own = if is_trait_self(t) || *t is Applied(_, _) then bound_methods(c, t, name) else visible_methods(c, receiver_methods(c, t, name))
             if fields_class(c) is Some(k) then own = methods_named(c, k, name)
             with_trait_methods(c, t, name, own)
         None -> buf()
@@ -14287,6 +14454,9 @@ private member_of(c: *Checker, e: &Expr, given: &TExpr, name: string, expected: 
         if ms.len() > 1 then return overloaded_method_value(c, e.span, value, name, ms, None, expected)
         if receiver_method(c, ty, name) is Some(m) then return member_method_value(c, e.span, value, m, None, expected)
         if ms.len() == 1 && trait_method_of(c, ms[0]) is Some(_) then return member_method_value(c, e.span, value, ms[0], None, expected)
+        // A method value of an extension the file does not see, or of a private added method, is
+        // reported as a call of it is.
+        if ms.len() == 0 && refuse_private_trait_method(c, e.span, ty, name) then return TExpr(e.span, ErrorType, UnitConst)
     *ty match
         Data(id, _, args) ->
             val d = c.data[id]
@@ -20050,11 +20220,13 @@ private refuse_unmet_conformance(c: *Checker, at: Span, receiver_type: &Type, m:
     if trait_method_of(c, m) is Some(tm)
         // One an impl adds to a type built from its parameters needs the receiver to match it.
         if added_args(c, t, tm) is None
-            c.note(unit_of(c), at, s"`${symbol.decl.name}` is for ${added_target_phrase(tm)}; this is `${type_name(t)}`")
+            c.note(unit_of(c), at, s"`${symbol.decl.name}` is for ${added_target_phrase(c, tm)}; this is `${type_name(t)}`${unmatched_constructor_reason(c, t, tm)}")
             return true
         val known = receiver_type_args(c, t, m)
         val f = conformances(c)
         for i in 0..<tm.impl_params
+            // A constructor parameter's bounds were met in matching the receiver.
+            if symbol.type_params[i].holes.len() > 0 then continue
             for b in bounds_at(c, symbol.type_owner, symbol.type_params, i)
                 if !meets_bound(f, zonk(c, known[i]), zonk(c, substitute(b, symbol.type_owner, known)))
                     c.note(unit_of(c), at, s"`${symbol.decl.name}` needs `${symbol.type_params[i].name}: ${type_name(b)}`, which ${type_name(t)} does not meet${union_reason(c, known[i], substitute(b, symbol.type_owner, known))}")

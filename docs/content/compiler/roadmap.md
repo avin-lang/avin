@@ -630,8 +630,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 5 are
-done; steps 6 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 6 are
+done; steps 7 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -701,10 +701,17 @@ and emission see only the types they see today; `type_key` names a constructor
    partial applications and an alias, through two bounds, in closures and a generic class; the default `map`
    at four constructors and the types' own meeting `map` still called; GC stress),
    `tests/reject/constructor_static_{refusals,receivers,bounds}.avin`.
-6. **Impls over constructor parameters.** `impl[F[_]: B, A] F[A]` and `F[G[A]]`: receiver matching
-   through the conformance, the own-methods-first rule, extensions seen by import, two matching
-   impls an error. Tests in `tests/programs/run/` (an extension module adding to every `Monad`, seen
-   only where imported) and `tests/programs/reject/`.
+6. **Impls over constructor parameters.** *Done.* `impl[F[_]: B, A] F[A]` and `F[G[A]]`: receiver
+   matching through the conformance (`match_applied` in `check.sysl`, by `bound_constructor`, a
+   subclass as the superclass that conforms, an `F[X]` in generic code where its bounds include the
+   impl's); the own-methods-first rule, as for an impl adding to a trait (`adds_to_constructor`);
+   the impl the bound trait's own in its module and an extension elsewhere (`in_bound_module`);
+   extensions seen by import, their method values reported as calls are; two matching impls an
+   error; a receiver that matches none told why. Tests:
+   `tests/run/constructor_param_impls{,_gc}.avin`, `tests/programs/run/constructor_param_extensions`
+   (an extension module adding to every `Pointed`, seen only where imported),
+   `tests/reject/constructor_param_impl_{calls,decls}.avin`,
+   `tests/programs/reject/constructor_param_extension_{unseen,clash}`.
 7. **The library.** `library/avin/functor.avin`: `Functor`, `Foldable`, `Applicative`, `Monad`,
    `Filter`, `Traverse`, `sequence`, `SendableFunctor`, `SendableMonad`; the impls of the spec's
    table, each giving only what the type lacks (`pure`, `map2`, `traverse`, `foldLeft` on `Option`,
