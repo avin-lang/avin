@@ -8,7 +8,7 @@ A variant of a generic `data` type may say which instance of the type it makes. 
 takes such a variant apart then knows the instance, and the code in the arm is checked with that
 knowledge:
 
-```text
+```text run
 data Expr[T]
   IntLit(value: int) -> Expr[int]
   BoolLit(value: bool) -> Expr[bool]
@@ -33,6 +33,11 @@ main()
   val e = If(Eq(IntLit(2), Add(IntLit(1), IntLit(1))), Pair(IntLit(7), BoolLit(true)), Pair(IntLit(0), BoolLit(false)))
   println(eval(e)) // (7, true)
   println(eval(First(e)) + 1) // 8
+```
+
+```text output
+(7, true)
+8
 ```
 
 `IntLit(n)` is an `Expr[int]`, so in the clause that takes it apart `T` is `int`, `n` is a `T`
@@ -223,7 +228,7 @@ A variant parameter that its fields name and its result does not is **hidden**: 
 say what it is, so each value carries its own. A typed protocol needs one, since a request and the
 address of its reply must agree on a type that the message type does not mention:
 
-```text
+```text run
 import avin.actors.{ActorRef, AskError, spawn}
 import avin.threads.Future
 import avin.time
@@ -255,6 +260,13 @@ main()
   _ = request(account, Deposit(40)).await()
   println(request(account, Balance).await()) // Ok(40)
   println(request(account, Owner).await()) // Ok(ada)
+```
+
+Run, it prints:
+
+```text output
+Ok(40)
+Ok(ada)
 ```
 
 `request(account, Balance)` is a `Future[Result[long, AskError]]`, and a reply of any other type is

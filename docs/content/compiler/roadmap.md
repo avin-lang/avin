@@ -395,10 +395,13 @@ reports it rather than routing around it.
    arm; gained by an enclosing type parameter equated with a bounded one; a copy at a type without
    the bound leaves the arm out. *Tests:* run: `Sorted[A: Ord]` and `smallest`; reject: a method of
    a bound the variant does not give, through the equated parameter.
-7. **Tooling and pages.** Hover and completion show a refined variant's signature (`lsp.sysl`,
-   `completion.sysl`); the IntelliJ plugin's grammar takes the result (in `avin-intellij`, its own
-   item); the chapter's examples become `run` fences with their `output` fences, so the docs test
-   compiles them.
+7. **Tooling and pages.** *Done (branch `gadt-7`):* hover and completion show a refined variant's
+   signature with its own type parameters and its result (`definition_index.sysl`, which both read
+   through `render_target`; tests in `lsp_tests.sysl`); the TextMate grammar already scopes the
+   `->` and result type of a variant, now pinned by `editors/grammar-tests/samples/refined.avin`
+   (the IntelliJ plugin copies that grammar at build time); the chapter's two complete programs are
+   `run` fences with `output` fences, so the corpus test compiles them. The chapter's other
+   examples are fragments or show errors, so stay `text`.
 
 
 Stage 10's incremental builds are designed in the [pipeline](/compiler/#incremental-builds), their
