@@ -137,6 +137,10 @@ knows is asked for by name, and a program's own settings are its own values.
 | `exec(program: string, args: Vector[string], environment: Map[string, string]) -> Result[Nothing, IoError]` | The same, with `environment` as the whole of the new program's environment. |
 | `waitPid(pid: long) -> Result[ExitStatus, IoError]` | Waits for this program's child `pid` to end and answers how it ended, reaping it; see [becoming another program](#becoming-another-program). |
 | `tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]` | Whether the child `pid` has ended, without waiting: `None` while it runs, its status (reaping it) once it has. |
+| `waitPidCpu(pid: long) -> Result[(ExitStatus, CpuTime), IoError]` | `waitPid`, answering with the status the [CPU time](#cpu-time) the child used, its reaped descendants' included. |
+| `tryWaitPidCpu(pid: long) -> Result[Option[(ExitStatus, CpuTime)], IoError]` | `tryWaitPid`, answering with the status the child's CPU time. |
+| `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the program has used so far, every thread's together. |
+| `childrenCpuTime() -> CpuTime` | The CPU time of the program's children that have ended and been reaped, each with the children it reaped in turn. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
 
 Listing a group replaces a `pgrep -g` subprocess, for instance to signal or count everything a
@@ -199,6 +203,32 @@ program's own pid, and a pid of zero or less or past the largest process id are 
 `Err(NotFound)`. A thread waiting in `waitPid` leaves its worker to the program's other threads, as
 every [blocking](/spec/threads/#lightweight-threads) wait does. A child a `Child` still holds is
 its `Child`'s to wait for: one reaped by `waitPid` first is no longer there for `waitFor`.
+
+### CPU time
+
+`CpuTime(user: Duration, system: Duration)` is how long a processor ran a process's own code and
+the kernel's code on its behalf, each in whole microseconds as the kernel accounts for them; `total`
+is the two added, and `CpuTime` is `Add`, with `CpuTime.Zero` its zero. The kernel keeps the count
+per process, and **a process's count is handed to its parent when the parent reaps it**, folded into
+the parent's own children's count. So the CPU of a whole tree reaches the program through the one
+child it started, once every process in the tree was reaped by its own parent: a shell running a
+loop of programs that each exit has their time as well as its own.
+
+```avin
+match Command("/bin/sh", "-c", "make -j4").start()
+  Ok(job) ->
+    _ = job.waitFor()
+    println(s"${job.cpuTime().total.toSecondsReal} s of CPU")   // make, the compilers it ran, theirs
+  Err(e) -> eprint(e.message)
+```
+
+**Only what was reaped counts.** A program still running counts nothing, and so does one that has
+ended and not been waited for, and a grandchild that outlives its parent, or that its parent never
+waited for, never reaches it. `cpuTime()` is the program's own, every thread's, and only grows;
+`childrenCpuTime()` is every reaped child's added. `waitPidCpu` and `tryWaitPidCpu` answer one
+child's, as `waitPid` and `tryWaitPid` answer its status, with the same errors; a `Child`'s
+`cpuTime()` answers its command's. A program that only slept used next to none: what starting it
+took.
 
 ### Commands
 
@@ -270,6 +300,7 @@ it.
 | `signalGroup(sig: int) -> Result[unit, IoError]` | Sends `sig` to every process in the command's group, the programs those programs started that stayed in it among them, however the command ended; an empty group is `Err(Other("No such process"))`, also while its last member has ended but is not yet waited for, and a command not started `inNewGroup` `Err(Other("the command has no group of its own"))`. |
 | `detach() -> long` | Lets go of the command without stopping it, so it outlives its `Child` and the program, and answers `pid()`. |
 | `residentBytes() -> Result[long, IoError]` | The memory the program `pid()` names holds in RAM now, as `process.residentBytes(pid())` answers it; a command seen to have ended, or with no program started, is `Err(NotFound)`. |
+| `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the command's programs used, each with its reaped descendants', a pipeline's stages and a sequence's parts added. After `waitFor` it is the whole command's; before, what the programs seen to have ended used. A detached program counts nothing. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
