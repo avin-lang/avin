@@ -107,10 +107,20 @@ private struct Site
     generic: bool
 
 // Node keys: a function's type parameter `i` is `function * 256 + i`; a data type's and a class's
-// are tagged above every function's.
+// are tagged above every function's. A data type's keys leave room after its own parameters for the
+// parameters of each of its refined variants, 256 to a variant.
 private function_base(id: usize) -> usize = id * 256
 
-private data_base(id: usize) -> usize = (1usize << 62) + id * 256
+private data_base(id: usize) -> usize = (1usize << 62) + (id << 20)
+
+/** The key of parameter 0 of variant `index` of data type `id`: its type's parameters, then its own. */
+private variant_base(id: usize, index: usize) -> usize = data_base(id) + 256 * (index + 1)
+
+/** The data type a data key belongs to. */
+private data_of_key(key: usize) -> usize = (key - (1usize << 62)) >> 20
+
+/** A data key's place within its type: its parameter's index, plus 256 for each variant before it. */
+private data_slot(key: usize) -> usize = (key - (1usize << 62)) & ((1usize << 20) - 1)
 
 private class_base(id: usize) -> usize = (1usize << 61) + id * 256
 
@@ -125,12 +135,82 @@ check_expansion(c: *Checker)
     for d in 0..<c.data.len()
         val data = c.data[d]
         val site = Site(data_base(d), data_owner(d), data.unit, data.decl.type_params.len() > 0)
-        for v in data.variants
-            for t in v.fields
-                mention(c, &f, site, v.span, t)
+        for vi in 0..<data.variants.len()
+            val v = data.variants[vi]
+            if v.result is Some(_) || v.params.len() > data.decl.type_params.len() then refined_edges(c, &f, d, vi)
+            else
+                for t in v.fields
+                    mention(c, &f, site, v.span, t)
     connect_methods(c, &f)
     connect_bounds(c, &f)
     report_cycles(c, &f)
+
+// A refined variant's parameters are nodes of their own, since its `T` need not be its type's `T`.
+// An instance of the type reaches them through the variant's result: an instance `Expr[X]` holding
+// a `Pair[A, B]`, whose result is `Expr[(A, B)]`, has `X = (A, B)`, so `A` and `B` each hold a part
+// of `X` one level down, an edge of weight -1 from the type's `T`. The fields then reach the types
+// they name from the variant's parameters, as a plain variant's do from its type's. A parameter the
+// result does not name is hidden: each value carries its own, so an instance a field names through
+// one is not one every value of the type needs, and the field adds no edge for it.
+private refined_edges(c: *Checker, f: *Flow, d: usize, vi: usize)
+    val data = c.data[d]
+    val v = data.variants[vi]
+    val owner = data_owner(d)
+    val base = variant_base(d, vi)
+    val site = Site(base, owner, data.unit, true)
+    var args: Buf[&Type] = buf()
+    v.result match
+        Some(r) ->
+            if *r is Data(_, _, made) then args = made
+        None ->
+            for i in 0..<data.decl.type_params.len()
+                args.push(TypeVar(owner, i, data.decl.type_params[i].name))
+    var hidden: Buf[usize] = buf()
+    for i in 0..<v.params.len()
+        var shown = false
+        for a in args
+            if names_type_var(a, owner, i) then shown = true
+        if !shown then hidden.push(i)
+    for i in 0..<args.len()
+        if i >= 256 then break
+        var params: Buf[usize] = buf()
+        params_in(c, args[i], owner, &params)
+        for p in params
+            if p < 256 then connect(f, data_base(d) + i, base + p, 0 - depth_of(c, args[i], owner, p), data.unit, v.span, args[i])
+    var decl_fields: Buf[Param] = buf()
+    for written in data.decl.variants
+        if written.name == v.name
+            decl_fields = written.fields
+            break
+    for j in 0..<v.fields.len()
+        val at = if j < decl_fields.len() then decl_fields[j].span else v.span
+        variant_mention(c, f, site, at, v.fields[j], hidden)
+
+/** The edges of the types a refined variant's field `t` names, leaving out each type argument that
+ * names one of the variant's hidden parameters. */
+private variant_mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type, hidden: Buf[usize])
+    *resolved(c, t) match
+        Data(id, _, args) -> variant_args(c, f, site, span, args, data_base(id), hidden)
+        Class(id, _, args) -> variant_args(c, f, site, span, args, class_base(id), hidden)
+        Tuple(items) ->
+            for x in items
+                variant_mention(c, f, site, span, x, hidden)
+        Function(params, result, _) ->
+            for x in params
+                variant_mention(c, f, site, span, x, hidden)
+            variant_mention(c, f, site, span, result, hidden)
+        ByName(inner) -> variant_mention(c, f, site, span, inner, hidden)
+        _ -> ()
+
+private variant_args(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type], target: usize, hidden: Buf[usize])
+    for j in 0..<args.len()
+        var hides = false
+        for i in hidden
+            if names_type_var(args[j], site.owner, i) then hides = true
+        if hides then continue
+        var one: Buf[&Type] = buf()
+        one.push(args[j])
+        flow_into(c, f, site, span, one, target, j)
 
 // The methods by name and the generic local functions by top-level function, read once.
 private index_symbols(c: *Checker, f: *Flow)
@@ -764,7 +844,7 @@ private connect_guarded(c: *Checker, f: *Flow, conformances: Conformances)
  * meet every one of `bounds`. */
 private head_may_meet(c: *Checker, f: Conformances, h: usize, bounds: Buf[&Type]) -> bool
     if h == unknown_head() then return true
-    val t = if h >= (1usize << 62) then data_type_of(c, (h - (1usize << 62)) / 256) else class_type_of(c, (h - (1usize << 61)) / 256)
+    val t = if h >= (1usize << 62) then data_type_of(c, data_of_key(h)) else class_type_of(c, (h - (1usize << 61)) / 256)
     may_meet(c, f, t, bounds)
 
 /** Whether a type argument `t`, its type parameters taken as any type, may meet every one of
@@ -843,7 +923,7 @@ private bound_targets(c: *Checker, f: *Flow)
             // its implementation.
             val from = f.head_nodes.get(s"$key/$h").unwrap_or(node(f, key))
             if h >= (1usize << 62)
-                val d = (h - (1usize << 62)) / 256
+                val d = data_of_key(h)
                 bound_target(c, f, from, data_type_of(c, d), data_owner(d), c.data[d].table, slot)
             else
                 val k = (h - (1usize << 61)) / 256
@@ -922,7 +1002,7 @@ private report_cycles(c: *Checker, f: *Flow)
     for cycle in cycles
         if !only_data(f, cycle) then continue
         for x in cycle
-            nested.put((f.keys[f.edges[x].from] - (1usize << 62)) / 256, true)
+            nested.put(data_of_key(f.keys[f.edges[x].from]), true)
         report_cycle(c, f, cycle)
     for cycle in cycles
         if only_data(f, cycle) then continue
@@ -964,7 +1044,26 @@ private report_cycle(c: *Checker, f: *Flow, cycle: Buf[usize])
         path.push(f.edges[cycle[(best + i) % cycle.len()]].from)
     path.push(e.from)
     val shown = type_name(solve(c.vars, e.arg))
-    c.note(e.unit, e.span, s"polymorphic recursion: each round of the cycle ${cycle_text(c, f, path)} passes `$shown` for `${param_name(c, f, e.to)}`, so its type arguments grow without end and the code has no finite set of copies")
+    c.note(e.unit, e.span, s"polymorphic recursion: each round of the cycle ${cycle_text(c, f, path)} passes `$shown` for `${param_name(c, f, e.to)}`, so its type arguments grow without end and the code has no finite set of copies${refined_field_text(c, f, e)}")
+
+// Where a cycle grows through a refined variant's field, the field and the variant's result, which
+// the growth is measured against.
+private refined_field_text(c: *Checker, f: *Flow, e: FlowEdge) -> string
+    val key = f.keys[e.from]
+    if key < (1usize << 62) then return ""
+    val d = c.data[data_of_key(key)]
+    val block = data_slot(key) / 256
+    if block == 0 || block - 1 >= d.variants.len() then return ""
+    val v = d.variants[block - 1]
+    val made = v.result match
+        Some(r) -> type_name(r)
+        None -> type_name(data_type_of(c, data_of_key(key)))
+    for written in d.decl.variants
+        if written.name != v.name then continue
+        for j in 0..<written.fields.len()
+            if j < v.fields.len() && written.fields[j].span.start == e.span.start && written.fields[j].span.end == e.span.end
+                return s": the field `${v.field_names[j]}` of `${v.name}` has type `${type_name(v.fields[j])}`, and `${v.name}` makes `$made`"
+    ""
 
 private in_library(c: *Checker, unit: usize) -> bool
     val m = c.units[unit].file.module_name
@@ -1107,7 +1206,12 @@ private cycle_text(c: *Checker, f: *Flow, path: Buf[usize]) -> string
 
 private node_label(c: *Checker, f: *Flow, n: usize) -> string
     val key = f.keys[n]
-    if key >= (1usize << 62) then return c.data[(key - (1usize << 62)) / 256].name
+    if key >= (1usize << 62)
+        val d = c.data[data_of_key(key)]
+        val block = data_slot(key) / 256
+        // A refined variant's parameters are its own nodes, named by the variant.
+        if block > 0 && block - 1 < d.variants.len() then return d.variants[block - 1].name
+        return d.name
     if key >= (1usize << 61) then return c.classes[(key - (1usize << 61)) / 256].name
     val symbol = c.symbols[key / 256]
     if symbol.owner_class is Some(k)
@@ -1123,9 +1227,10 @@ private node_label(c: *Checker, f: *Flow, n: usize) -> string
 private param_name(c: *Checker, f: *Flow, n: usize) -> string
     val key = f.keys[n]
     if key >= (1usize << 62)
-        val d = (key - (1usize << 62)) / 256
-        val i = (key - (1usize << 62)) % 256
-        val params = c.data[d].decl.type_params
+        val d = c.data[data_of_key(key)]
+        val block = data_slot(key) / 256
+        val i = data_slot(key) % 256
+        val params = if block > 0 && block - 1 < d.variants.len() then d.variants[block - 1].params else d.decl.type_params
         return if i < params.len() then params[i].name else "_"
     if key >= (1usize << 61)
         val k = (key - (1usize << 61)) / 256

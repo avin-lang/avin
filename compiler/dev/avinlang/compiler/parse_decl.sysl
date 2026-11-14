@@ -962,7 +962,9 @@ local_function_ahead(p: *Parser) -> bool
             params = true
         elif params && text == "{" then braces += 1
         elif params && text == "}" then braces -= 1
-        elif text == ":" && params && depth == 1 && braces == 0 then typed = true
+        // A parameter is typed as `name: T`; `f(1: long)` is a call with an ascribed argument.
+        elif text == ":" && params && depth == 1 && braces == 0
+            if p.toks.peek_at(i - 1).unwrap().value == Word then typed = true
         elif text == ")"
             depth -= 1
             if params && depth == 0
@@ -971,13 +973,35 @@ local_function_ahead(p: *Parser) -> bool
                     None -> return false
                 val word = p.spelling(after)
                 // A signature with no result type is followed by its clauses.
-                if after.value == Newline then return typed && p.ahead(i + 2) == p.ahead(0) && p.ahead(i + 3) == "("
+                if after.value == Newline then return typed && p.ahead(i + 2) == p.ahead(0) && p.ahead(i + 3) == "(" && clause_follows(p, i + 3)
                 // `xs(i) = v` assigns an element, and `retry(3)` before an indented block passes the
                 // block as its last argument: a declaration's parameters are typed.
                 return (word == "=" || after.value == Indent) && (typed || empty) || word == "->" || word == "|"
         elif !params && text != "[" && token.value != Word && text != "]" && text != "," && text != ":" && text != "&" && text != "+" && text != ">:" then return false
         i += 1
     false
+
+// Whether the line whose argument list opens `open` tokens ahead is a clause: its arguments are
+// followed by `=`, a guard's `|` or an indented block of guards. Two calls with ascribed arguments,
+// `show(n: long)` on two lines, are no signature and its clause.
+private clause_follows(p: *Parser, open: usize) -> bool
+    var depth = 0
+    var i = open
+    loop
+        val token = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if token.value == Newline || token.value == Dedent then return false
+        val text = p.spelling(token)
+        if text == "(" then depth += 1
+        elif text == ")"
+            depth -= 1
+            if depth == 0
+                val after = p.toks.peek_at(i + 1) match
+                    Some(t) -> t
+                    None -> return false
+                return p.spelling(after) == "=" || p.spelling(after) == "|" || after.value == Indent
+        i += 1
 
 private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &DataDecl
     val name = declared_name(p, "a type")
@@ -987,7 +1011,7 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
     val one_line = p.at("(")
     if one_line
         val fields = parse_params(p, false)
-        variants.push(Variant(start.to(p.ended()), name, fields, buf()))
+        variants.push(Variant(start.to(p.ended()), name, fields, buf(), buf(), None))
     var derives: Buf[&TypeExpr] = buf()
     if p.accept("derives")
         loop
@@ -1004,9 +1028,14 @@ private parse_data(p: *Parser, start: Span, annotations: Buf[Annotation]) -> &Da
         // An annotation may stand on the line before its variant.
         if variant_annotations.len() > 0 then p.accept_kind(Newline)
         val variant = declared_name(p, "a variant")
+        // A refined variant's own type parameters follow its name, and the instance it makes follows
+        // its fields: `Pair[A, B](first: Expr[A], second: Expr[B]) -> Expr[(A, B)]`.
+        val variant_params = parse_type_params(p)
         var fields: Buf[Param] = buf()
         if p.at("(") then fields = parse_params(p, false)
-        variants.push(Variant(at.to(p.ended()), variant, fields, variant_annotations))
+        var result: Option[&TypeExpr] = None
+        if p.accept("->") then result = Some(parse_type(p))
+        variants.push(Variant(at.to(p.ended()), variant, fields, variant_annotations, variant_params, result))
         if p.toks.position == before then p.toks.advance()
     DataDecl(annotations, start.to(p.ended()), name, type_params, variants, derives)
 
