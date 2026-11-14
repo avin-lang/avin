@@ -123,7 +123,9 @@ a decision changes, this page and the chapter change together.
 - A generic impl of a trait writes the type's parameters, in order, as its own:
   `impl[T] Show for Box[T]`. An impl without `for` may also name a type built from its parameters
   (settled 2026-11-04, below).
-- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
+- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A & B]`
+  (spelled `+` until the intersection-bounds entry under [Proposed](#proposed) made `&` the one
+  spelling).
   A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
   each bound's type; type arguments are held to their bounds where written and where inferred, and
   a bound's own type arguments are inferred from the argument. A call through a bound is direct in
@@ -790,7 +792,7 @@ Settled by the user on 2026-11-04:
   otherwise through `F.from`: at `From[E]`, or else at the one conformance `From[X]` with `E` an `X`
   that is more specific than every other such. Neither is an error naming `From[E]`; several equally
   specific ones are an error naming them. On a type parameter the conformances are its bounds',
-  `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
+  `F: From[IoError] & From[ParseError]`. See [errors](/spec/errors/) and
   [declarations](/spec/declarations/#impl).
 - **One formatting style, applied by `avin fmt [--check] [<path>...]` and the language server's
   `textDocument/formatting`.** Each block level is indented two spaces; a literate file keeps its
@@ -3859,7 +3861,7 @@ spelling is better, as each entry says.
   derivation declares it. Each call's type arguments are held to it as to any bound, a generic
   function passes its own type parameter on only where that one is bounded by it too, and every
   instantiation gets a shim of its own that Sysl checks, so a Sysl bound the instance does not meet is
-  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary + Ord]`) is Avin's to
+  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary & Ord]`) is Avin's to
   check, with no mapping between Sysl's traits and Avin's. A generic handle class,
   `@sysl("m.Signal") class Signal[T: Boundary]`, names the generic type without arguments, its type
   parameters invariant and the Sysl type's in order; each instance the program uses is a handle of its
@@ -7507,7 +7509,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Integer` excludes `real`); taking every operator the integers and `real` share (`Div` and `Rem`
   included, though their meaning differs: integer division truncates and traps on zero) gives the
   most generic code, and `zero`/`one` are already `Add`'s and `Mul`'s. Alternatives: only
-  `Add + Sub + Mul + Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
+  `Add & Sub & Mul & Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
   `Numeric` that also offered `fromInt`/`T(n)` construction, left out since `zero`/`one` cover the
   identities and a conversion from integers is lossy at narrow widths; a separate `Fractional` for
   `real`, not needed while `real` is the one non-integer. **Review with the user**: whether `Div`
@@ -8223,6 +8225,85 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- **A package's tests import its gated modules; a test module is read only while every module it
+  imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
+  The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
+  that module, and a `tests` file importing it was refused even under `avin test`, which turns every
+  feature on. Now `tests` and the modules under it have no fences: they may import every module of
+  the package and its optional dependencies. A build with a feature off passes over each test module
+  importing a module that is off, and, repeated to the end, each test module importing one passed
+  over; the rest are read and run. The module stays the unit, so a file of `tests` importing a gated
+  module takes all of `tests` with it when that feature is off. *Why*: the spec already says
+  `avin test` has every feature on, so the tests see the whole package; and the package's own
+  `tests` are compiled by `build` and `run` too, so a selection-independent refusal was the only
+  thing keeping a build with features off working; deriving each test module's gate from its imports
+  keeps that guarantee with no annotation to write. *Alternatives*: allowing `tests` to import gated
+  modules only under `avin test` (a build or `avin test --no-default-features` would then fail at
+  the import, so the minimal configuration could not be tested); letting a feature list
+  `tests.server` explicitly (works, but repeats in the manifest what the imports already say);
+  skipping single files rather than modules (finer, but a file of `tests` could then lose a helper
+  another file of it uses, breaking only the build with the feature off). Not covered: a test
+  importing an optional dependency's module directly while that dependency is not taken is reported
+  as an unknown module, since a dependency not taken is not read and its modules are unknown; such a
+  test reaches the dependency through the package's gated module. Review with the user: whether a
+  test module passed over should be named in `avin test`'s output rather than silently absent.
+- **An import refused for its module is one error per import declaration**, not one per name it
+  imports (branch `gated-tests`): `import a.b.{c, d}` refused as gated, as an optional dependency's,
+  or as a standard-library module that does not exist, is reported once, at the first name;
+  two import lines are two errors. *Why*: the error is about the module, which the declaration names
+  once. *Alternatives*: one per module per file (hides the second line's error).
+- Proposed (built on branch `intersection-bounds`): **several bounds on one type parameter are
+  joined with `&`, the one spelling, and an intersection is a bound only, never a type.**
+  `[T: Ord & Display]` replaces `[T: Ord + Display]` everywhere type parameters are declared
+  (functions, methods, classes, data types, traits, actors, impl headers, after a lower bound);
+  `+` between bounds is a parse error that says to write `&`, and the library, tests and docs are
+  rewritten. Each operand is a trait or a class, **at most one a class** (a second class is an
+  error naming both, a subclass of the first included), and **each written once** (the same trait
+  at the same type arguments twice is an error; `Make[int] & Make[long]` are two). **Name clashes**:
+  methods of one name from two bounds are overloads, resolved by parameter types; two of the same
+  parameter types are not an error to declare, only a call both accept is, as the existing
+  ambiguous-call error at the generic definition. **`A & B` is not a type**: written as a
+  parameter's, a field's, a `val`'s, a result's, a type argument's or a lower bound's type it is a
+  parse error that shows `[T: A & B](x: T)` instead. Why: `&` reads as "and", which is what
+  conformance to every bound means, and makes the bound read as the intersection it is, where `+`
+  reads as arithmetic and was the only use of `+` in a type; one spelling, since two ways to write
+  one thing is the kind of choice the language avoids. Bounds only, because a type parameter
+  already gives a value of two traits everything an intersection type would, with each instance
+  calling its type argument's methods directly; an intersection *type* would need a new value
+  representation (a pair of method tables, or a table per combination), subtyping rules against
+  unions and variance, and reification for `is` — a large addition the language's programs have
+  not asked for, and a nominal type system with declared traits covers it by declaring a trait
+  that requires both (`trait Shown: Named, Sized`). At most one class, because a class extends one
+  superclass, so two unrelated classes can never both be met and a subclass already implies its
+  superclass. Alternatives weighed: keeping `+` (the existing spelling, no source change, but reads
+  as addition, and the user asked for `&`); accepting both (two spellings of one thing);
+  intersection types in annotations, with `A & B <: A`, commutativity, distribution over unions and
+  a dual-table layout (left out for the reasons above; this decision leaves room to add it, since
+  `A & B` in a type position is an error today, not something else); allowing redundant bounds
+  silently (a repeated bound is always a slip). Review with the user: whether `A & B` should become
+  a type in annotations later, and whether to keep the `+` diagnostic once existing code has moved
+  (it costs nothing and helps code written before the change). Packages outside this repository
+  that still write `+` (the `json` package's tests) move to `&` with the release that carries this.
+
+**Byte offsets inside a character** ([types](/spec/types/#string), branch `fix-charat-boundary`)
+
+- Proposed: **`charAt` at an offset inside a character's encoding traps, `charAt offset is not a
+  character boundary`, as slicing there does; the searches never trap on such an offset and never
+  answer one.** `indexOf(p, from)` and `indexWhere(f, from)` from inside a character start at the
+  next one, so `"café".indexOf("", 4)` is 5; `lastIndexOf(p, end)` and `lastIndexWhere(f, end)` from
+  inside one search back from the character it belongs to, so `"café".lastIndexOf("", 4)` is 3; and
+  `startsWith("", at)` is false inside a character, since the empty string occurs only where a
+  character begins or at the end. Why: `charAt` and `slice` read the text at the offset given, so an
+  offset that is not a place in the text is the caller's mistake, the trap the spec gives slicing;
+  a search is asked "where at or after (before) this", which has an exact answer from any offset,
+  and answering only offsets where a character begins means every result can be fed to `charAt` or
+  `slice` again. The cost on a character boundary is one comparison on a lead byte, none on ASCII.
+  Alternatives weighed: trapping in the searches too (a search from `i + 1` over text with
+  characters beyond ASCII would then trap where the same search over ASCII succeeds); answering the
+  offset itself for an empty needle, as before (a result that traps when sliced at).
+
+**Initialization** ([declarations](/spec/declarations/#initialization), branch `init-design`)
+
 - **Initialization is proved at compile time, by order and by withholding `self`** (branch
   `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
   value or `lazy val` is read before it is set: an object's fields are set in the order written and
@@ -8282,6 +8363,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   through the initializing thread's own wait (a `join`, another lazy value) and trapping when the
   chain returns to the reader, cheap on the slow path. **Review with the user:** it is liveness, not
   soundness, but it is the one way a lazy read can still hang.
+
+**The security primitives an API server needs** (branch `security`; [`avin.encoding`](/spec/system-library/#avinencoding), [`avin.crypto`](/spec/system-library/#avincrypto), [`avin.random`](/spec/system-library/#avinrandom))
+
+- Proposed: **a new module `avin.encoding` holds hexadecimal, base64 and base64url** (`toHex`,
+  `fromHex`, `toBase64`, `fromBase64`, `toBase64Url`, `fromBase64Url`, `DecodeError`), and
+  `toHex` moved there from `avin.crypto`, which keeps offering it with `export avin.encoding.toHex`,
+  so `import avin.crypto.toHex` still works. Why: base64 is not cryptography (data URLs, Basic
+  authentication, binary in JSON all use it), and hexadecimal in one module and its decoder in
+  another would split one encoding. Alternatives weighed: everything in `avin.crypto` (one import for
+  a server, but a module named for secrets would hold plain encodings); `fromHex` beside `toHex` in
+  `avin.crypto` and base64 alone in `avin.encoding` (hexadecimal split across two modules).
+- Proposed: **decoding is strict, one function per alphabet**: `fromBase64` takes only the standard
+  alphabet with its `=` padding, `fromBase64Url` only the URL-safe one with no `=`; whitespace and
+  line breaks are refused, and so is a last digit whose unused bits are not zero (RFC 4648 §3.5
+  allows a decoder to refuse it). Each byte sequence then has exactly one spelling, so a token or a
+  signature cannot be sent in a second form that compares unequal as text but decodes equal.
+  `fromHex` takes either case (a digit's case carries no bits). Errors are checked in order:
+  characters, then padding, then length, then unused bits, so the first offset named is the first
+  character wrong. Why: the module exists for an API server reading untrusted text, where
+  malleability is a defect. Alternatives weighed: Sysl's forgiving decoder (either alphabet, optional
+  padding, unused bits ignored), which is friendlier to sloppy writers but accepts many spellings of
+  one value; a `lenient` flag (two behaviours to test and document for no current need). Review with
+  the user: a reader of MIME-wrapped base64 must strip its line breaks first.
+- Proposed: **`DecodeError` has four cases**, `BadCharacter(at)`, `BadPadding(at)`, `Truncated(at)`
+  (where `at` is the text's length) and `UnusedBits(at)`, all byte offsets, and is an `Error`. Why:
+  the cases are what a caller would report differently, as `UrlError`'s are; `Truncated` carries the
+  length so every case has a position. Alternative weighed: binding Sysl's `DecodeError`, whose
+  `BadLength` has no position and whose `Short` and `Utf8` cannot occur here.
+- Proposed: **the encoders are written in Avin**, while the digests stay bound to Sysl. Why:
+  Avin's decoder is stricter than Sysl's (above), and encoding is a few lines of byte arithmetic with
+  no platform behind it. Alternative weighed: binding `sysl.encoding`'s encoders and writing only the
+  checks in Avin (two passes over the text, and a second implementation of the alphabet anyway).
+- Proposed: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
+  (compared as UTF-8 bytes, so `"é"` and `"e\u{301}"` differ), bound to Sysl's `sysl.crypto.verify`,
+  which reads every byte and branches only on the lengths. Why: Sysl pins that function's
+  branch-free code with its own codegen tests, which an Avin loop would not have; different lengths
+  answering `false` at once leaks only a length, which a token's or a tag's is not secret. Alternatives
+  weighed: an Avin loop accumulating `xor`s (its constant time would rest on the optimizer); a method
+  on `Vector[byte]` (a security property should be found where the secrets are).
+- Proposed: **`SecureRandom`, an object in `avin.random`**, with `Random`'s drawing methods
+  (`nextBytes`, `nextInt`, `nextLong`, both bounded, `between` for `int` and `long`, `nextReal`,
+  `nextBoolean`, `alphanumeric`, `shuffle`, `choose`) and two token functions, `hexToken(byteCount
+  = 32)` and `urlToken(byteCount = 32)`. Every draw reads `getentropy` through Sysl's
+  `sysl.posix.rand.entropy_from_os`, which is on macOS, glibc Linux and the BSDs and loops past the
+  256-byte request limit. A refusal from the operating system traps. Why: one name beside `Random`
+  is found by whoever reads that module's warning; an object, not a class, because there is no seed
+  and no state; trapping because a program wanting key material has no safe fallback. 32 bytes is
+  256 bits, past any guessing. `nextGaussian`, `chooseWeighted` and `setSeed` are left out: no
+  secret is drawn from a normal or weighted distribution, and there is no seed. Alternatives
+  weighed: a class `SecureRandom()` sharing a trait with `Random` (an instance holds nothing, and the
+  trait would add a dispatch to every PCG draw); a buffered pool of entropy (fewer system calls, but
+  secret bytes kept in the heap and a lock); `secureBytes` and token functions in `avin.crypto`
+  (randomness split across two modules); `Result` instead of a trap (a caller of `nextInt` would
+  match on every draw).
 
 **Refined variants** ([chapter](/spec/refined-variants/), branch `gadt-design`; designed, not built)
 
@@ -8460,6 +8595,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
   visible change in the order of evaluation). Review with the user: it breaks programs whose own
   types relied on the structural rule, each fixed by one `impl`.
+- Proposed: **a marked parameter survives a function becoming a value only through its type**
+  (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
+  `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
+  type, which for a function is a `@sendable` function type; with no function type expected, the
+  value takes that form of each marked function parameter (`val sp = spawn[int]` is a
+  `(@sendable () -> int, long) -> Thread[int]`). A type that is a function (a class naming it, or an
+  impl of it for a data type) has an `apply` that marks a parameter only where its function type
+  makes that parameter sendable, and a `@sendable` parameter matches a `@sendable` function type's.
+  Why: function types carry no parameter marks, so `val sp: (() -> unit, long) -> Thread[unit] =
+  spawn` ran a buffer-capturing closure on four threads, and `Isolated`/`Mutex` as values kept an
+  object the caller still used. Alternatives: marks in function types (`(@sendable f: () -> unit) ->
+  unit`; a second way to say what `@sendable () -> unit` says for functions, and for a non-function
+  `@isolating` value a new kind of type); refusing every such function as a value, as a `@threaded`
+  one is (also sound, but `spawn` and `onExit` could never be held or passed). A by-name marked
+  parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
+  function parameter takes the `@sendable` form, which asks a little more than the mark (no
+  captured `var`). Method values keep their own wording, from the call inside the closure they are.
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
