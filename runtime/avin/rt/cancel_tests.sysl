@@ -157,6 +157,102 @@ cancel_racing_many_timers()
     for round in 0..<20
         cancel_on_arming(if round % 2 == 0 then ptr_cast(&sleep_long) else ptr_cast(&wait_long), 16, false)
 
+// Threads waiting on a condition with `condition_wait_settling`, each counting how its wait ended and
+// whether it held the lock when the wait answered.
+private struct Settling
+    lock: *u8
+    condition: *u8
+    millis: long
+    began: Atomic[u32]
+    woken: Atomic[u32]
+    timed_out: Atomic[u32]
+    cancelled: Atomic[u32]
+    held: Atomic[u32]
+    stopped_after: Atomic[u32]
+
+private var settling: Settling = Settling(null, null, 0, Atomic(0), Atomic(0), Atomic(0), Atomic(0), Atomic(0), Atomic(0))
+
+private wait_settling(c: *Context, run: *u8) -> unit
+    val s: *Settling = ptr_cast(run)
+    lock_acquire(c, s.lock)
+    _ = s.began.add(1)
+    val ended = condition_wait_settling(c, s.condition, s.lock, s.millis)
+    val l: *ParkLock = ptr_cast(s.lock)
+    if l.held then _ = s.held.add(1)
+    if ended == WaitEndedWoken then _ = s.woken.add(1)
+    elif ended == WaitEndedTimedOut then _ = s.timed_out.add(1)
+    else _ = s.cancelled.add(1)
+    lock_release(c, s.lock)
+    // Back out of the lock, the thread is stopped at its next cancellation point, as compiled code
+    // reaches one; a thread that was not cancelled goes on.
+    if is_cancelled(c) && may_cancel(c, 0) then return
+    _ = s.stopped_after.add(1)
+
+// Starts `n` threads waiting with `limit` milliseconds as their limit and, once all are waiting, ends their waits by
+// `how`: 0 notifies them all, 1 lets them run out of time, 2 cancels each.
+private settling_round(n: usize, limit: long, how: int)
+    settling.millis = limit
+    settling.began.store(0)
+    settling.woken.store(0)
+    settling.timed_out.store(0)
+    settling.cancelled.store(0)
+    settling.held.store(0)
+    settling.stopped_after.store(0)
+    val me = thread_attach()
+    cancel_joints.frame.prev = me.top
+    me.top = &cancel_joints.frame
+    cancel_joints.slots[14] = lock_new(me)
+    cancel_joints.slots[15] = condition_new(me)
+    settling.lock = cancel_joints.slots[14]
+    settling.condition = cancel_joints.slots[15]
+    for i in 0..<n do cancel_joints.slots[i] = thread_start(me, ptr_cast(&settling), LeastStack, ptr_cast(&wait_settling))
+    for _ in 0..<5000
+        if settling.began.load() == u32(n) then break
+        sleep(millis(1))
+    // Each waiter lets the lock go only once it is on the condition's queue, so holding the lock here
+    // means every one that has begun is waiting.
+    lock_acquire(me, settling.lock)
+    if how == 0 then condition_notify_all(me, settling.condition)
+    lock_release(me, settling.lock)
+    if how == 2
+        for i in 0..<n do thread_cancel(me, cancel_joints.slots[i])
+    for i in 0..<n
+        thread_join(me, cancel_joints.slots[i])
+        cancel_joints.slots[i] = null
+    val l: *ParkLock = ptr_cast(settling.lock)
+    assert(!l.held)
+    val q: *ParkCondition = ptr_cast(settling.condition)
+    assert(q.waiting.head == null)
+    cancel_joints.slots[14] = null
+    cancel_joints.slots[15] = null
+    settling.lock = null
+    settling.condition = null
+    me.top = cancel_joints.frame.prev
+    thread_detach(me)
+    assert_eq(settling.held.load(), u32(n))
+    assert_eq(cancels_outstanding(), 0u64)
+
+@test("a settling wait cancelled answers so with its lock held again, and its thread stops once it lets the lock go")
+settling_wait_cancelled()
+    settling_round(8, -1, 2)
+    assert_eq(settling.cancelled.load(), 8u32)
+    assert_eq(settling.stopped_after.load(), 0u32)
+    settling_round(8, 3600000, 2)
+    assert_eq(settling.cancelled.load(), 8u32)
+    assert_eq(settling.timed_out.load(), 0u32)
+    assert_eq(settling.stopped_after.load(), 0u32)
+
+@test("a settling wait notified, or out of time, answers so with its lock held, and a limit of zero answers at once")
+settling_wait_woken_or_timed_out()
+    settling_round(8, -1, 0)
+    assert_eq(settling.woken.load(), 8u32)
+    assert_eq(settling.stopped_after.load(), 8u32)
+    settling_round(8, 20, 1)
+    assert_eq(settling.timed_out.load(), 8u32)
+    assert_eq(settling.woken.load(), 0u32)
+    settling_round(4, 0, 1)
+    assert_eq(settling.timed_out.load(), 4u32)
+
 @test("a thread that is not lightweight has no cancellation and may not be stopped")
 os_threads_are_not_cancellable()
     val me = thread_attach()

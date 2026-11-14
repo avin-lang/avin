@@ -1,0 +1,133 @@
+module avin.threads
+
+// A value many threads may read at once and one at a time may write, for state read far more often
+// than it changes. `read` runs its body with the value alongside any other readers; `write` runs its
+// body with the value alone, no reader or other writer holding it. Like a `Mutex`, it owns its value,
+// made in the argument that makes the lock, and its bodies are `@isolating` and give back a sendable
+// value, so nothing reaches the value but through the lock; it is sendable whatever `T` is.
+//
+//     val routes = RwLock(HashMap[string, Handler]())
+//     routes.read(m -> m.get(path))
+//     routes.write(m -> m.put(path, handler))
+//
+// A read body only reads: a body that changes a value other readers are reading races with them.
+//
+// Writers come first. Once a writer is waiting, a thread that asks to read waits too, so readers
+// arriving one after another never keep a writer out. When a write ends, every reader that was
+// waiting for it goes in before the next writer, so writers arriving one after another never keep
+// those readers out either: neither side waits for ever while the other keeps coming.
+//
+// The end of each write happens before every read and write that follows it, and the end of each read
+// happens before the write that follows it. A write body runs to its end once begun, as a `Mutex`'s
+// body does, so a cancelled thread never leaves the value half changed; a read body is stopped by a
+// cancellation like any other code, and the lock is let go as it stops. A trap inside either body
+// stops the program, even in an actor, since the lock would otherwise be held for ever. The lock is
+// not reentrant: a thread that reads or writes inside its own write traps, since it would wait for
+// ever, and one that writes inside its own read waits for ever, as does one that reads inside its own
+// read while a writer waits.
+@keeps_owners
+class RwLock[T](@isolating private var value: T): Sendable
+  private val lock = Lock()
+  private val readable = conditionNew()
+  private val writable = conditionNew()
+  // Threads reading now, the thread writing (zero for none), and the threads waiting to do each.
+  private var readers = 0
+  private var writer: long = 0
+  private var writersWaiting = 0
+  private var readersWaiting = 0
+  // How many writes have ended, and how many of the readers waiting when the last one ended have yet
+  // to go in, which every writer waits for.
+  private var writes: long = 0
+  private var admitted = 0
+
+  // Runs `body` with the value alongside any other readers, and gives back what it returns.
+  read[R: Sendable](@isolating body: (T) -> R) -> R
+    beginRead()
+    holding(() -> body(value), () -> endRead(), true)
+
+  // Runs `body` with the value alone, and gives back what it returns.
+  write[R: Sendable](@isolating body: (T) -> R) -> R = writing(() -> body(value))
+
+  // Runs `body` as the writer, to its end once begun: a cancellation stops the thread only after the
+  // write has ended, and a trap inside it stops the program.
+  private writing[R](body: () -> R) -> R
+    beginWrite()
+    holding(body, () -> endWrite(), false)
+
+  // Waits until the calling thread may read, and counts it among the readers; the share is held from
+  // here until `holding` gives it back, with nothing able to stop the thread in between.
+  private beginRead()
+    val me = current()
+    lock.acquire()
+    if writer == me
+      lock.release()
+      fail("a thread reads a read-write lock it holds for writing, which would wait for ever")
+    if writer == 0 && writersWaiting == 0
+      readers += 1
+      lock.releaseHolding()
+      return
+    readersWaiting += 1
+    val seen = writes
+    while writer != 0 || (writersWaiting > 0 && writes == seen)
+      if lock.awaitSettling(readable, -1) == waitCancelled
+        leaveReadersWaiting(seen)
+        lock.releaseCancelled()
+    leaveReadersWaiting(seen)
+    readers += 1
+    lock.releaseHolding()
+
+  // Takes a reader that has waited since `seen` writes had ended off the waiting readers; under the
+  // lock. One admitted ahead of the writers lets the next writer in where it was the last of them.
+  private leaveReadersWaiting(seen: long)
+    readersWaiting -= 1
+    if writes > seen
+      admitted -= 1
+      if admitted == 0 && readers == 0 && writersWaiting > 0 then conditionNotify(writable)
+
+  private endRead()
+    lock.acquire()
+    readers -= 1
+    if readers == 0 && admitted == 0 && writersWaiting > 0 then conditionNotify(writable)
+    lock.release()
+
+  // Waits until the calling thread may write, and makes it the writer, until `holding` ends the write.
+  private beginWrite()
+    val me = current()
+    lock.acquire()
+    if writer == me
+      lock.release()
+      fail("a thread writes a read-write lock it holds for writing, which would wait for ever")
+    writersWaiting += 1
+    while writer != 0 || readers > 0 || admitted > 0
+      if lock.awaitSettling(writable, -1) == waitCancelled
+        writersWaiting -= 1
+        if writersWaiting == 0 then conditionNotifyAll(readable)
+        lock.releaseCancelled()
+    writersWaiting -= 1
+    writer = me
+    lock.releaseHolding()
+
+  // Ends the write: every reader waiting goes in ahead of the next writer, or, where none waits, the
+  // next writer does.
+  private endWrite()
+    lock.acquire()
+    writer = 0
+    writes += 1
+    admitted = readersWaiting
+    if admitted > 0 then conditionNotifyAll(readable)
+    elif writersWaiting > 0 then conditionNotify(writable)
+    lock.release()
+
+// A sendable value may leave the lock and be put back whole, since no thread can change it.
+impl[T: Sendable] RwLock[T]
+  // The value, read alongside any other readers.
+  get() -> T = read(v -> v)
+
+  // Replaces the value, writing.
+  set(v: T) = update(_ -> v)
+
+  // Replaces the value with `f` of it, writing throughout, and gives back the new value.
+  update(f: (T) -> T) -> T
+    writing(() ->
+      value = f(value)
+      value)
