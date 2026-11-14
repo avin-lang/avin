@@ -1706,7 +1706,8 @@ server reads it the same way.
 ### Positions are the document's
 
 Every line of program text stays where it was written, so every position the compiler reports, in
-a diagnostic, a trap's report, a failed test or the language server, is the line and column of the
+a diagnostic, a trap's report, a failed test, the language server or the debug information a
+debugger reads, is the line and column of the
 document the reader has open, the four columns included:
 
 ```text

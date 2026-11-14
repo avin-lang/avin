@@ -8342,6 +8342,56 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+  take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
+  the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
+  live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
+  was. Alternatives: `-O0` implying `-g` (the usual "debug build"; costs every `-O0` corpus and test
+  build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
+  user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
+
+- Proposed (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+  (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
+  the program's own module prefix left off the readable name; lldb shows the linkage name. The
+  compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
+  `char32_t`). `char` is a UTF-32 code point, `byte` unsigned, `bool` a byte; a reference is a
+  pointer to an opaque structure named by its Avin type. A local a lambda shares (boxed) is not
+  described, nor is a local the compiler made. DWARF version 4. Why: each is the smallest choice that
+  makes `b`, `bt` and `frame variable` work with no lldb plugin. Alternatives: a vendor language code
+  (lldb then treats frames as unknown language), describing objects' fields as DWARF structures
+  (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
+  data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
+
+- Proposed (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+  function's first line lands after the parameters are stored where their variables are read (a
+  lambda's parameter otherwise read a stale slot). A call there still gets the function's own
+  location, which LLVM's verifier asks of every call in a function with debug information.
+  Alternative: placing that code at the function's name, as it was first built: lldb then stopped
+  before the stores and showed the slot's previous value.
+
+- Proposed (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+  cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
+  counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
+  and locations follow lines no function key covers, so cached text would carry stale lines; the
+  lowered code is still reused, and `AVIN_INCREMENTAL=verify` matches a clean build. Alternatives:
+  per-function metadata numbering with a renumbering pass (the text cache would then work under
+  `-g`), or a key over absolute positions (every edit above a function would relower it).
+
+- Proposed (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+  other module-level line, so any line moved anywhere changes every unit's text and recompiles every
+  unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
+  each unit's definitions through the metadata lines and renders only the nodes reached (plus the
+  compile unit and the flags), which also shrinks each unit.
+
+- Proposed (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+  its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
+  build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
+  program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
+  and `avin` (or a user with `atos -o prog.dSYM -l <image> <pc>`) turns it into `file:line` after the
+  process has stopped; a table of function start addresses with their names, emitted as a constant,
+  would let the handler name the function itself, without lines, at any `-g` level. Neither is
+  built: the first needs a runtime change and a symbolizing step, the second a table the emitter does
+  not make yet.
 - **A package's tests import its gated modules; a test module is read only while every module it
   imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
   The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
@@ -9057,6 +9107,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
   function parameter takes the `@sendable` form, which asks a little more than the mark (no
   captured `var`). Method values keep their own wording, from the call inside the closure they are.
+- Proposed: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+  `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
+  an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
+  "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
+  at the comma the same way. A comma after an arm when the next line at the arms' depth reads as
+  another arm (it starts with `else` or holds an `->` outside brackets) is reported as a tuple that
+  needs parentheses. Why: the indented arms were read as lines of a block, so the last arm's body
+  swallowed the following arguments as a tuple, a type error far from the cause; a `return` value,
+  a lambda's and a one-line `if`'s bodies already stop at the comma. Alternatives: keep the arms a
+  line context (the spec's "an indented block starts a line again"), which makes `_ -> 0, "a")` a
+  tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
+  line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
+  lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
+  writes. An indented arm body stays a block, where a comma list is a tuple.
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
@@ -9065,26 +9129,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   refused with the parameter named, and a value is shown by its type, as a value of no `Display`
   is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
   type's parameters by the trait, a bound for types that no constructor parameter takes, and what
-  displays an `F[A]` is unknown where `F` is any constructor. Alternatives: deriving through a
-  bounded hole (`F[_: Eq]`, waits for hole bounds in step 2); requiring `F[A]: Display` per field
-  (needs constraints on applications, step 2's `impls may add` rule). Review with the user once
-  step 2 lands: derivation should then follow the holes' bounds.
+  displays an `F[A]` is unknown where `F` is any constructor. Reviewed once step 2 landed (branch
+  `hkt-2`) and kept: a hole's bounds (`F[_: Eq]`) say what `F` is applied to, never what an
+  `F[A]` meets, so they give a derivation nothing to call. Alternatives: deriving through a bounded
+  hole (unsound for the reason above: `F[_: Eq]` admits a constructor whose values have no `Eq`
+  of their own beyond identity); requiring `F[A]: Display` per field (a constraint on
+  applications, which impls over constructor parameters, step 6, are the place for). Review with
+  the user once step 6 lands.
 - Proposed: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
   is written the same way everywhere else, and a contravariant hole is the dual demand
   (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
-- Proposed: **hole bounds `F[_: B]` are left to step 2**; in step 1 a hole is unbounded, and a type
-  whose parameter is bounded by anything other than `Eq` or `Hash` is refused at any hole
-  (`Sorted[A: Ord]` is no constructor for `F[_]`). Why: an unbounded `F` may be applied to any
-  type, so such a constructor could be instantiated at a type its bound refuses; `Eq` and `Hash`
-  are admitted because every Avin type has equality and hashing (which is what lets `Map[_, V]`
-  and `Set` be constructors). Alternatives: refusing every bounded parameter (excludes `Map`);
-  checking each application at instantiation (an instance could then fail, against the design).
-- Proposed: **the arguments of an applied constructor parameter `F[X]` are invariant until step 2**,
-  so `+A` or `-A` inside `F[A]` is refused wherever variance is checked. Why: the constructor
-  passed may be invariant (`Array`), and holes' variance demands (`F[+_]`) are what make a variant
-  position sound; until those are checked at each constructor passed, invariance is the sound
-  choice. Alternatives: treating `F[+_]` as covariant at once (unsound until the demand is
-  checked at the call).
+- Proposed: **a type whose parameter is bounded is a constructor only for a hole whose bounds imply
+  that bound** (step 2, branch `hkt-2`, replacing step 1's refusal of every such type at any hole):
+  a hole's bound implies a parameter's where it is the same trait or class, or one that is an
+  instance of it (a trait requiring it, a subclass), as `Ord` implies `Eq`; `Eq` and `Hash` need
+  no hole bound, since every Avin type has them (which is what lets `Map[_, V]` and `Set` be
+  constructors for a plain `_`); a parameter's bound that names the parameter itself is implied by
+  no hole bound. A constructor parameter passed for another is held the same way by its own holes'
+  bounds. The check is made where the type arguments are held to their bounds, so a constructor
+  written and one inferred are refused alike, with one message. Why: an `F[_]` may be applied to
+  any type, so a constructor with a bounded parameter could otherwise be instantiated at a type its
+  bound refuses; implication is the least the hole must promise. Alternatives: checking each
+  application at instantiation (an instance could then fail, against the design); entailment
+  through impls with bounds of their own (no case needs it yet).
+- Proposed: **every `F[X]` a declaration writes is held to the bounds of `F`'s holes where it is
+  written**, once per application, with the message "`X` does not conform to `B`, the bound of
+  `F`'s argument in `F[_: B]`": a signature naming `F[A]` twice for an `A` without the bound reports
+  both. Why: the spec's rule is "checked wherever the declaration writes `F[X]`"; each place is a
+  separate mistake to fix. Alternatives: one report per declaration (hides the second place).
+- Proposed: **a hole's variance is what makes `F[A]` variant** (step 2, replacing step 1's
+  invariance of every applied argument): inside the declaration an argument of `F[A]` is at the
+  position its hole gives it, kept at `+_`, flipped at `-_`, invariant at `_`, so `+A` in a field
+  `F[A]` is accepted for `F[+_]` and refused for `F[_]`; `F[Dog]` is an `F[Animal]` only at `+_`
+  (and `F[Animal]` an `F[Dog]` at `-_`), where the arguments are references, as for any type. At
+  each constructor passed, written or inferred, the type's parameter at a `+_` hole must be
+  covariant and at a `-_` hole contravariant; a constructor parameter passed must declare that
+  variance on its own hole. Why: the subtyping assumed inside the declaration is then exactly what
+  each instance grants. Alternatives: none sound that keep `F[+_]` useful.
 - Proposed: **a constructor parameter has no `Nothing` default**: one that is neither written nor
   inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
   Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
@@ -9111,6 +9192,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
   anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
   conforms, and the loop's `iterator()` call is answered by every member).
+
+**Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
+2, branch `hkt-2`)
+
+- Proposed: **an unbounded constructor parameter is inferred from the type an argument or the
+  expected type gives `F[X]`, named bare**: a data type, class or trait with exactly as many type
+  parameters as `F` has holes, a subclass by its own name (`Crate[A]` passed as `F[A]` is `Crate`,
+  not its superclass), or another constructor parameter in scope applied to as many arguments.
+  Once `F` is known, the rest of the argument is held to the type it makes with that type's own
+  variance, so a covariant argument still widens (`both(Some(dog), Some(cat))` for
+  `both[F[_], A](x: F[A], y: F[A])` takes `A` as `Animal`, since `Option` is covariant). A type
+  of more parameters, of fewer, a type whose parameter takes a constructor, or one that is no
+  data type, class or trait decides nothing and is reported as "cannot infer `F` from `T`: …;
+  write it, as in `f[…](arguments)`", the example leaving open the arguments that match the
+  application's own known ones (`Either[string, _]` for an `F[int]` given an
+  `Either[string, int]`), else the first ones. Why: the spec's rule ("a type of more is an error
+  asking for `F` to be written"); the example is the likeliest constructor meant. Alternatives:
+  always leaving the first arguments open in the example (wrong for `Either[string, int]`);
+  holding the arguments invariantly once `F` is decided (refuses calls every instance accepts).
+- Proposed: **a function's or method's type arguments taken as a value (`k.pick[Dog]`) are held
+  to their bounds, as at a call** (a fix found in step 2: a method value checked no bound at all,
+  so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
+  it may not fill among them).
 
 ## Open
 
