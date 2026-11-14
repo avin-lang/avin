@@ -99,7 +99,10 @@ stated for a variant whose result is not the plain instance.
 A variant is called as a generic function is, its type arguments inferred from its fields and from
 the type expected, or written: `Pair[int, bool](IntLit(1), BoolLit(true))`, and for a variant of
 the data type's own parameters, on the type as before (`Expr[int].If(…)`). The value has the result's
-type at those arguments.
+type at those arguments. Written on a variant, the type arguments are the parameters its fields and
+result name, in order: a parameter of the type a refined variant names nowhere, as `T` in `IntLit`,
+is none of them, so `IntLit` takes no type argument. Written on the type, `Expr[(int, bool)].Pair(…)`,
+they are the instance the value makes, and the variant's own parameters are inferred from it.
 
 ```text
 val ok: Expr[bool] = Eq(IntLit(1), IntLit(2))
@@ -432,9 +435,12 @@ well typed because the clause learns `A = B`.
 | An unused variant parameter | `` `A` is declared by `V` but named by none of its fields and not by its result `` |
 | A reused name | `` `T` is already a parameter of `Expr`, and stands for the same type in each of its variants `` |
 | A variance on a variant's parameter | `` variance is written on the parameters of a type, not on a variant's own: write `A` in `V` `` |
+| A constructor parameter fixed | `` a variant fixes no constructor parameter: `W` makes `D[Vector, T]`, and `F` of `D` is a constructor parameter, so its place holds `F` `` |
+| A constructor parameter of a variant's own | `` a variant's own type parameters stand for types, not type constructors: `G` of `V` takes type arguments; declare a constructor parameter on the type, as in `data D[G[_]]` `` |
 | A result no `match` takes apart | `` `F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are built of data types, classes, tuples and function types `` |
 | A larger instance | the [nested data type](/spec/generics/#polymorphic-recursion) error, naming the field and the variant's result: `` …: the field `x` of `Lift` has type `Expr[Vector[A]]`, and `Lift` makes `Expr[A]` `` |
 | Making a value | `` `IntLit(1)` is an `Expr[int]`, and an `Expr[bool]` is expected here `` |
+| Making a field's value | `` `BoolLit(true)` is an `Expr[bool]`, and the field `b` of `Add` is an `Expr[int]` `` |
 | An impossible arm | `` this arm is never reached: `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` `` |
 | A contradiction in a row | `` this arm is never reached: `IntLit` needs `T` to be `int`, and `BoolLit` in the same pattern needs it to be `bool` `` |
 | A cyclic equality | `` this arm is never reached: `Wrap` needs `T` to be `Vector[T]`, which no type is `` |

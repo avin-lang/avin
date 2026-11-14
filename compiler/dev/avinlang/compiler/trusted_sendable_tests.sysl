@@ -1,0 +1,73 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.fs.{canonicalize, make_temp_dir, remove_dir_all}
+
+// The standard library's promises to be `Sendable` are checked against the structure, as a
+// program's are, but for a class marked `@trusted_sendable("why")`. These tests compile programs
+// against a toolchain whose library has modules of their own added, since the mark is the library's
+// alone.
+
+private fixture_modules() -> []const (string, string) = [
+    ("trustprobe/trustprobe.avin", "module avin.trustprobe\n\n@trusted_sendable(\"only one thread writes it\")\nclass Trusted(private var n: int): Sendable\n  get() -> int = n\n\n@trusted_sendable(\"every access is guarded\")\nclass Guarded[T](private var v: T)\n  get() -> T = v\n\nimpl[T: Sendable] Sendable for Guarded[T]\n\nclass Built(val t: Trusted, val g: Guarded[int]): Sendable\n"),
+    ("leaky/leaky.avin", "module avin.leaky\n\nclass Leaky(private var n: int): Sendable\n  get() -> int = n\n"),
+    ("leakyfn/leakyfn.avin", "module avin.leakyfn\n\nclass Wrap(private val f: () -> int): Sendable\n  get() -> int = f()\n"),
+    ("leakyimpl/leakyimpl.avin", "module avin.leakyimpl\n\nclass Cell[T](private var v: T)\n  get() -> T = v\n\nimpl[T: Sendable] Sendable for Cell[T]\n"),
+    ("noreason/noreason.avin", "module avin.noreason\n\n@trusted_sendable\nclass A(private var n: int): Sendable\n  get() -> int = n\n"),
+    ("emptyreason/emptyreason.avin", "module avin.emptyreason\n\n@trusted_sendable(\"\")\nclass A(private var n: int): Sendable\n  get() -> int = n\n"),
+    ("nothing/nothing.avin", "module avin.nothing\n\n@trusted_sendable(\"why\")\nclass B(val n: int)\n"),
+]
+
+private lowered_with(text: string) -> Result[MirProgram, string]
+    val dir = canonicalize(make_temp_dir("avin-trusted-sendable").unwrap()).unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = library_fixture_toolchain(dir, fixture_modules())
+    lower_source(tc, source_of("probe.avin", text))
+
+private refused(text: string, expected: string)
+    lowered_with(text) match
+        Ok(_) -> panic("compiled, but should have been refused with: " + expected)
+        Err(message) -> if !message.contains(expected) then panic("expected `" + expected + "` in:\n" + message)
+
+@test("a library class marked `@trusted_sendable` is sendable, by its header's promise or an impl's")
+trusted_classes_are_sendable()
+    val text = "import avin.trustprobe.{Built, Guarded, Trusted}\n\nneeds[T: Sendable](x: T) -> int = 1\n\nmain()\n  println(needs(Trusted(1)) + needs(Guarded(2)) + needs(Guarded(\"s\")) + needs(Built(Trusted(1), Guarded(3))))\n"
+    lowered_with(text) match
+        Ok(_) -> ()
+        Err(message) -> panic(message)
+
+@test("a trusted class's impl still holds its promise only at sendable type arguments")
+trusted_impl_keeps_its_bound()
+    refused("import avin.trustprobe.Guarded\n\nneeds[T: Sendable](x: T) -> int = 1\n\nmain()\n  println(needs(Guarded(Buffer[int]())))\n", "Buffer[int]")
+
+@test("a library class's promise with a `var` and no mark is refused")
+library_var_promise_is_checked()
+    refused("import avin.leaky.Leaky\n\nmain()\n  println(Leaky(1).get())\n", "`Leaky` promises to be `Sendable`, but its field `n` is a `var`")
+
+@test("a library class's promise holding a plain function is refused")
+library_function_promise_is_checked()
+    refused("import avin.leakyfn.Wrap\n\nmain()\n  println(Wrap(() -> 1).get())\n", "`Wrap` promises to be `Sendable`, but its field `f` holds a `() -> int`, which is a function value")
+
+@test("a library class's promise made by an impl is checked too")
+library_impl_promise_is_checked()
+    refused("import avin.leakyimpl.Cell\n\nmain()\n  println(Cell(1).get())\n", "`Cell[T]` promises to be `Sendable`, but its field `v` is a `var`")
+
+@test("`@trusted_sendable` without its reason is refused")
+trust_without_reason()
+    refused("import avin.noreason.A\n\nmain()\n  println(A(1).get())\n", "`@trusted_sendable` takes one string, why the type is safe to share between threads")
+
+@test("`@trusted_sendable` with an empty reason is refused")
+trust_with_empty_reason()
+    refused("import avin.emptyreason.A\n\nmain()\n  println(A(1).get())\n", "`@trusted_sendable` takes one string, why the type is safe to share between threads")
+
+@test("`@trusted_sendable` on a class that promises nothing is refused")
+trust_of_nothing()
+    refused("import avin.nothing.B\n\nmain()\n  println(B(1).n)\n", "`B` is marked `@trusted_sendable` but does not promise to be `Sendable`, so the mark trusts nothing")
+
+@test("the whole library keeps its promises to be `Sendable`, each checked or marked as trusted")
+real_library_trust_list()
+    val text = "import avin.actors\nimport avin.net\nimport avin.net.http\nimport avin.net.tls\nimport avin.process\nimport avin.regex\nimport avin.threads\n\nmain()\n  println(1)\n"
+    lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+        Ok(_) -> ()
+        Err(message) -> panic(message)

@@ -190,9 +190,15 @@ each type implementing a trait that promises it is. A generic trait that promise
 sendable at sendable type arguments, and a type implementing it has the parameters it passes to the
 trait taken as sendable when it is checked. A type that implements one through a generic trait,
 `HashMap[K, V]` through `Map[K, V]`, is sendable at sendable arguments for those parameters. The
-standard library promises `Sendable` for the types whose structure cannot show it, the synchronized
-ones and `Vector`, and the immutable `Map` and `Set` traits promise it. `Sendable` is only a bound
-and a promise, never the type of a value.
+immutable `Map` and `Set` traits promise it, and `Vector` of sendable elements, and the standard
+library's promises are checked against the structure as every other one is. A few of its types are
+safe to share for a reason the structure cannot show, synchronization the runtime does or an owner
+every operation checks, and each is marked `@trusted_sendable("why")` with the reason, so that
+nothing is trusted silently: `Mutex`, `Condition`, `Atomic`, `Channel` and `Thread`, the lock, the
+cell, the pool and the registry inside them and the futures, a running actor, `Isolated`, and the
+connections, listeners and child processes, which belong to one thread at a time. A `Future`, a `Promise`, an `Executor` and a
+`Once` are sendable by their structure, built of those. The mark is the standard library's alone.
+`Sendable` is only a bound and a promise, never the type of a value.
 
 ### Handing over ownership
 

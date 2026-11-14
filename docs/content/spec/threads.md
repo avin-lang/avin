@@ -319,7 +319,9 @@ reach, every closure made on the way, an extractor a pattern calls, and the init
 `lazy val`, module-level or a field, that it reads, since its first read runs the initializer on
 whichever thread makes it. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
-`lazy val` of a sendable type is initialized once whichever threads read it. The error names the
+`lazy val` of a sendable type is initialized once whichever threads read it. A local `lazy val` a
+body captures brings its initializer along, so what that initializer captures and reaches is held to
+these rules too. The error names the
 module-level item and the functions it is reached through:
 
 ```text
@@ -444,7 +446,7 @@ will own its handles across every message, whichever thread runs it.
   end once begun, and one that waits on its own barrier traps. A party whose thread is cancelled while
   it waits takes its arrival back, so the round still waits for `parties` threads. `parties` reads the
   number and `waiting()` how many wait now. A barrier has at least one party, and is sendable.
-- **`lazy val`s**, module-level and fields alike ([Initialization](declarations.md#initialization)),
+- **`lazy val`s**, module-level, fields and locals alike ([Initialization](declarations.md#initialization)),
   initialized by exactly one thread, as a `Once` is run: a thread that reads one while another runs
   its initializer waits, safe for the collector, and the stored value is published with a release
   store that every read pairs with an acquire load, so no thread sees it half made. A read by the
