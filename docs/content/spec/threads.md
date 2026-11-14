@@ -240,6 +240,15 @@ Inside the function, a parameter so marked that holds a function may be passed o
 with the same mark or a weaker one; an unmarked one may not, and the error says to mark it. A
 method that overrides or implements another marks no parameter more strongly than the method it
 overrides does, since a call through that method would not check what is passed.
+A function type carries no marks either, so a function, a constructor or a method whose parameter
+is marked is a value only where the value's type gives that parameter a sendable type, a `@sendable`
+function type for one that takes a function: `spawn` is a `(@sendable () -> T, long) -> Thread[T]`,
+and as a `(() -> unit, long) -> Thread[unit]` it is refused, as `Mutex` as an `(Array[int]) ->
+Mutex[Array[int]]` is. Where no function type is expected, the value takes the `@sendable` form of
+each marked parameter that takes a function, so `val sp = spawn[int]` holds it and what is passed
+through `sp` is checked where it is written. A by-name parameter so marked has no such type, so
+`isolate` is not a value. A class or a data type that is a function has an `apply` that marks a
+parameter only where its function type makes that parameter sendable likewise.
 
 **A parameter marked `@sendable` is sendable inside its function, whatever its type**, since what
 is passed for it was checked where it was passed: a `@sendable` lambda captures it, and it is passed
@@ -438,7 +447,8 @@ will own its handles across every message, whichever thread runs it.
   its initializer waits, safe for the collector, and the stored value is published with a release
   store that every read pairs with an acquire load, so no thread sees it half made. A read by the
   initializing thread itself traps, as a `Once` run again from its body does, and a trap in the
-  initializer stops the program.
+  initializer stops the program; a read that the initializer's own code reaches, not through a
+  function it hands on, is a compile error instead.
 
 ```avin
 import avin.threads.{Channel, scope}

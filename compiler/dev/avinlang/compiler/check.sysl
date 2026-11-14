@@ -5528,14 +5528,16 @@ private result_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) ->
 private check_function_types(c: *Checker)
     for k in 0..<c.classes.len()
         val self_type = own_class_type(c.classes[k], k)
-        c.classes[k].call = function_call(c, c.classes[k].unit, c.classes[k].decl.name_span, self_type, c.classes[k].name, methods_named(c, k, "apply"))
+        c.classes[k].call = function_call(c, c.classes[k].unit, c.classes[k].decl.name_span, self_type, c.classes[k].name, methods_named(c, k, "apply"), c.classes[k].functions.len() > 0)
     for d in 0..<c.data.len()
         val self_type = own_type(c.data[d], d)
-        c.data[d].call = function_call(c, c.data[d].unit, c.data[d].decl.span, self_type, c.data[d].name, receiver_methods(c, self_type, "apply"))
+        c.data[d].call = function_call(c, c.data[d].unit, c.data[d].decl.span, self_type, c.data[d].name, receiver_methods(c, self_type, "apply"), c.data[d].functions.len() > 0)
 
 // The `apply`, among `applies`, that implements the function type `self_type` is a subtype of; `None`
-// where it is no function, or reported where it is two or lacks that `apply`.
-private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name: string, applies: Buf[usize]) -> Option[usize]
+// where it is no function, or reported where it is two or lacks that `apply`. Where the type names
+// its function type itself (`direct`), its `apply` is held to the marks that type allows; one
+// inherited through a trait declares the `apply` it overrides, which holds it to them.
+private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name: string, applies: Buf[usize], direct: bool) -> Option[usize]
     var found: Buf[&Type] = buf()
     function_ancestors(c.classes, c.data, self_type, &found, 0)
     if found.len() == 0 then return None
@@ -5555,10 +5557,15 @@ private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name
         if have.len() != params.len() + 1 || own_type_params(c, m) > 0 then continue
         var same = true
         for i in 0..<params.len()
-            if !same_type(seen_from(c, self_type, m, have[i + 1]), params[i]) then same = false
+            // A parameter marked `@sendable` holds a `@sendable` function, so it takes that type's.
+            var mine = seen_from(c, self_type, m, have[i + 1])
+            if param_mark(c, m, i + 1) == SendableMark && is_sendable_function(params[i]) then mine = as_sendable(mine)
+            if !same_type(mine, params[i]) then same = false
         if !same then continue
         val yields = seen_from(c, self_type, m, c.symbols[m].result.unwrap_or(ErrorType))
-        if alike_or_error(yields, result) || *yields is Nothing || same_type(view_as(conformances(c), yields, result), result) then return Some(m)
+        if alike_or_error(yields, result) || *yields is Nothing || same_type(view_as(conformances(c), yields, result), result)
+            if direct then unchecked_apply_mark(c, unit, at, name, f, m, params)
+            return Some(m)
         c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, so its `apply` yields ${type_name(result)}, not ${type_name(yields)}")
         return None
     var written = ""
@@ -5567,6 +5574,20 @@ private function_call(c: *Checker, unit: usize, at: Span, self_type: &Type, name
         written = written + type_name(params[i])
     c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, so it has `apply($written) -> ${type_name(result)}`")
     None
+
+// A value of a type that is a function is called through its function type, whose parameters carry
+// no marks, so its `apply` marks a parameter only where the function type gives that parameter a
+// sendable type, which every value passed for it meets.
+private unchecked_apply_mark(c: *Checker, unit: usize, at: Span, name: string, f: &Type, m: usize, params: Buf[&Type])
+    val k = c.core.trait_named("Sendable") match
+        Some(k) -> k
+        None -> return
+    for i in 0..<params.len()
+        val mark = param_mark(c, m, i + 1)
+        if mark == NotMarked then continue
+        if sendability(conformances(c), zonk(c, params[i]), k) is CannotSend(why)
+            c.note(unit, at, s"`$name` is a subtype of ${type_name(f)}, but its `apply` marks its parameter `${c.symbols[m].param_names[i + 1]}` `${mark_name(mark)}`, which a call through ${type_name(f)} would not check; the function type gives it ${type_name_quoted(zonk(c, params[i]))}, which is not sendable: $why")
+            return
 
 // The methods in a data type's table implement its traits' methods with their parameters and yield
 // their results, or types conforming to them, as the data type sees both; compared once every body
@@ -6221,10 +6242,27 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
                     if c.classes[k].decl.object then c.note(unit, b.span, s"`${type_name(t)}` is an object, which has one value; a bound is a trait or a class")
                     elif is_class_named(c, k, qualified(CoreModule, "Shaped")) && !c.declaring_template
                         c.note(unit, b.span, "`Shaped` is the bound a derive template's type has, and no other: a template, `derive Trait for T`, reads a type's shape")
+                    elif contains_type(bounds, t)
+                        c.note(unit, b.span, s"`${type_name(t)}` is already a bound of `${tp.name}`")
+                    elif !is_trait(c, k) && class_bound(c, bounds) is Some(other)
+                        c.note(unit, b.span, s"`${tp.name}` has one class among its bounds, and `${type_name(other)}` and `${type_name(t)}` are both classes; the others are traits")
                     else bounds.push(t)
                 ErrorType -> ()
                 _ -> c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
         c.bounds.put(bound_key(owner, i, tp), bounds)
+
+// The bound among `bounds` that is a class rather than a trait, if one is.
+private class_bound(c: *Checker, bounds: Buf[&Type]) -> Option[&Type]
+    for e in bounds
+        if *e is Class(k, _, _)
+            if !is_trait(c, k) then return Some(e)
+    None
+
+// Whether `t` is one of `types`.
+private contains_type(types: Buf[&Type], t: &Type) -> bool
+    for e in types
+        if same_type(e, t) then return true
+    false
 
 // Whether `t`, given as the lower bound of parameter `i` of `owner`, is that parameter, or another of
 // the same declaration whose lower bounds lead back to it.
@@ -6693,7 +6731,7 @@ private hold_to_sendable(c: *Checker, unit: usize, at: Span, context: string, t:
     val arg = zonk(c, t)
     sendability(conformances(c), arg, k) match
         CannotSend(why) -> c.note(unit, at, s"${type_name_quoted(arg)} does not conform to `Sendable`, $context: $why")
-        NotYetKnown -> c.late_sendables.push(LateSendable(unit, at, context, arg, c.generic))
+        NotYetKnown -> c.late_sendables.push(LateSendable(unit, at, context, arg, c.generic, ""))
         CanSend -> ()
 
 private type_name_quoted(t: &Type) -> string = s"`${type_name(t)}`"
@@ -6705,6 +6743,9 @@ struct LateSendable
     context: string
     ty: &Type
     scope: Option[GenericScope]
+    /** Where it is not empty, what the report begins with in place of the type: the type is then the
+     * one a function value gives a marked parameter (`hold_marked_params`). */
+    marked: string
 
 // Holds again each type whose sendability waited for a field's type, now that every body is checked:
 // a field still unknown is one whose initializer failed, already reported.
@@ -6716,7 +6757,12 @@ private check_late_sendables(c: *Checker)
         val outer_generic = c.generic
         c.generic = late.scope
         if sendability(conformances(c), zonk(c, late.ty), k) is CannotSend(why)
-            c.note(late.unit, late.at, s"${type_name_quoted(zonk(c, late.ty))} does not conform to `Sendable`, ${late.context}: $why")
+            val t = zonk(c, late.ty)
+            if late.marked == ""
+                c.note(late.unit, late.at, s"${type_name_quoted(t)} does not conform to `Sendable`, ${late.context}: $why")
+            else
+                val hint = if *t is Function(_, _, false) then s"; give that parameter a `@sendable` function type, as in ${type_name_quoted(as_sendable(t))}" else ""
+                c.note(late.unit, late.at, s"${late.marked} ${type_name_quoted(t)}, which is not sendable: $why$hint")
         c.generic = outer_generic
     c.late_sendables = buf()
 
@@ -6765,6 +6811,42 @@ private sendable_mark_added(c: *Checker, m: usize, base: usize) -> Option[string
         if mark > param_mark(c, base, i)
             return Some(s"which marks its parameter `${c.symbols[m].param_names[i]}` `${mark_name(mark)}` where the method it overrides does not; a call through that method would not check what is passed for it")
     None
+
+// A function, a constructor or a method used as a value is called through a function type, whose
+// parameters carry no marks, so nothing checks what such a call passes for a marked parameter. The
+// value's type therefore gives each marked parameter a type whose every value meets the mark: a
+// sendable type, which for a parameter taking a function is a `@sendable` function type. Where no
+// function type is expected, or the one expected makes that parameter `@sendable`, the value takes
+// the `@sendable` form of a parameter's function type; any other type must be sendable itself.
+
+/** `params`, the parameter types of function `f` as a value, counted from parameter `from` of `f`,
+ * with each marked one taking a function given its `@sendable` form, where `expected` asks no
+ * other. */
+private marked_value_params(c: *Checker, f: usize, from: usize, params: Buf[&Type], expected: Option[&Type]) -> Buf[&Type]
+    var wanted: Option[Buf[&Type]] = None
+    if expected is Some(t)
+        if *zonk(c, t) is Function(ps, _, _) then wanted = Some(ps)
+    var out: Buf[&Type] = buf()
+    for i in 0..<params.len()
+        val p = params[i]
+        var sendable = param_mark(c, f, from + i) != NotMarked && *p is Function(_, _, false)
+        if sendable
+            if wanted is Some(ps)
+                sendable = i < ps.len() && is_sendable_function(zonk(c, ps[i]))
+        out.push(if sendable then as_sendable(p) else p)
+    out
+
+/** Holds each parameter of `value`, function `f` as a value counted from parameter `from` of `f`, that
+ * `f` marks to `Sendable`, once every body is checked and its type is known. */
+private hold_marked_params(c: *Checker, unit: usize, at: Span, f: usize, from: usize, value: &Type)
+    val ps = *value match
+        Function(ps, _, _) -> ps
+        _ -> return
+    for i in 0..<ps.len()
+        val mark = param_mark(c, f, from + i)
+        if mark == NotMarked then continue
+        val name = c.symbols[f].param_names[from + i]
+        c.late_sendables.push(LateSendable(unit, at, "", ps[i], c.generic, s"`${c.symbols[f].name}` cannot be a value of this function type: it marks its parameter `$name` `${mark_name(mark)}`, which a call through a function value does not check, and the type gives that parameter"))
 
 /** A local with no name that holds an argument, evaluated before the call as its parameters' defaults
  * need, and the expression it holds. */
@@ -11255,6 +11337,9 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         Some(FieldOf(i)) -> return field_read(c, at, at, self_ref(c, at), fields_class(c).unwrap(), i, true)
         Some(DataFieldOf(i)) -> return data_field_read(c, at, self_ref(c, at), i)
         Some(MethodOf(m)) ->
+            if c.super_args
+                c.note(unit_of(c), at, method_value_in_super_args(name))
+                return TExpr(at, ErrorType, UnitConst)
             var ms = bare_methods(c, name)
             if ms.len() == 0 then ms.push(m)
             return overloaded_method_value(c, at, self_ref(c, at), name, ms, None, expected)
@@ -11285,6 +11370,9 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
     elif alias_not_value(c, unit_of(c), name) is Some(message) then c.note(symbol.unit, at, message)
     else c.note(symbol.unit, at, s"`$name` is not defined")
     TExpr(at, ErrorType, UnitConst)
+
+/** The error for method `name` of the object named as a value in a superclass's arguments. */
+private method_value_in_super_args(name: string) -> string = s"`$name` is a method of the object, which a superclass's arguments cannot use as a value: they run before the object is initialized"
 
 // Reads field `index` of an object of class `k`. Through `self` in the constructor's own code, a
 // field must already be initialized: a parameter, or a body field declared above the read.
@@ -11530,7 +11618,7 @@ bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
 private bound_names(c: *Checker, t: &Type) -> string
     var text = ""
     for b in bounds_of(c, t)
-        if text != "" then text = text + " + "
+        if text != "" then text = text + " & "
         text = text + type_name(b)
     text
 
@@ -11597,7 +11685,7 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     for i in 1..<target.params.len()
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
-    val declared: &Type = Function(substitute_all(params, target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args), sendable_wanted(c, expected))
+    val declared: &Type = Function(substitute_all(marked_value_params(c, m, 1, params, expected), target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args), sendable_wanted(c, expected))
     if expected is Some(want) then unify(c, declared, want)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
@@ -13299,7 +13387,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             return TExpr(at, ErrorType, UnitConst)
     val companion = global_read(c, at, c.classes[o].global.unwrap())
     // A `newBuilder` declared to return a `Builder` of the expected collection takes its type
-    // arguments from it at the call, where bounds on them are checked: `Set.newBuilder[A: Eq + Hash]`
+    // arguments from it at the call, where bounds on them are checked: `Set.newBuilder[A: Eq & Hash]`
     // learns `A` from the `Set[int]` expected.
     var wanted_builder: Option[&Type] = None
     if want is Some(w)
@@ -18343,9 +18431,10 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
         else
             for i in 0..<types.len()
                 unify(c, type_args[known.len() + i], resolve_type(c, unit, types[i]))
-    val declared: &Type = Function(target.params, result, sendable_wanted(c, expected))
+    val declared: &Type = Function(marked_value_params(c, id, 0, target.params, expected), result, sendable_wanted(c, expected))
     val ty = substitute(declared, target.type_owner, type_args)
     if expected is Some(want) then unify(c, ty, want)
+    hold_marked_params(c, unit, at, id, 0, ty)
     var solved: Buf[&Type] = buf()
     for i in 0..<type_args.len()
         val t = zonk(c, type_args[i])
@@ -20362,6 +20451,9 @@ struct InitScan
      * fields are initialized: they reach only the context's fields, which its superclass constructor
      * has set, and an actor cannot override them, its methods being private. */
     actor: bool
+    /** Whether the code scanned is a superclass's arguments, which run before any field of the
+     * object is initialized, so a function made there may use nothing of the object. */
+    super_args: bool
 
 /** Checks every class body's uses of `self`. */
 private check_initialization(c: *Checker)
@@ -20386,7 +20478,7 @@ private check_mixed_initialization(c: *Checker, k: usize, kind: string, unsafe: 
         var ready: Buf[string] = buf()
         for i in 0..<first + j
             if cls.fields[i].public then ready.push(cls.fields[i].name)
-        if !scan_init(c, InitScan(c.symbols[init].unit, None, cls.fields[first + j].name, kind, true, ready, true, false), body, unsafe) then reported.push(init)
+        if !scan_init(c, InitScan(c.symbols[init].unit, None, cls.fields[first + j].name, kind, true, ready, true, false, false), body, unsafe) then reported.push(init)
 
 private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool], reported: *Buf[usize])
     val cls = c.classes[k]
@@ -20422,18 +20514,34 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool], re
     if items.len() < count + 1 then return
     val start = items.len() - 1 - count
     val kind = if is_open(c, k) then cls.decl.modifier else ""
+    // The superclass's arguments run before any field is initialized, inherited or the class's
+    // own; its initializer's call, after the object, is given the object and then those arguments.
+    if cls.superclass is Some(_) && start > 1 then scan_super_arguments(c, InitScan(cls.unit, Some(self_local), "", "", true, buf(), false, false, true), items[1], unsafe)
     check_mixed_initialization(c, k, kind, unsafe, reported)
     for i in 0..<count
         val early = i < last
         if !early && kind == "" then return
         if deferred[i] then continue
-        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true, buf(), false, cls.decl.name.starts_with(ActorClassPrefix))
+        val scan = InitScan(cls.unit, Some(self_local), if early then last_name else "", kind, true, buf(), false, cls.decl.name.starts_with(ActorClassPrefix), false)
         val item = items[start + i]
         // A field's initializer is checked as it is stored.
         val e = item.kind match
             StoreField(_, _, value, _) -> value
             _ -> item
         scan_init(c, scan, e, unsafe)
+
+/** Scans the call of the superclass's initializer, `e`: the arguments evaluated before it, then the
+ * call, whose first argument is the object itself and the rest the superclass's arguments. */
+private scan_super_arguments(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool])
+    e.kind match
+        Call(_, args, _) if args.len() > 0 && is_init_self(s, args[0]) ->
+            for j in 1..<args.len()
+                scan_init(c, s, args[j], unsafe)
+        Block(items) ->
+            for j in 0..<items.len()
+                if j + 1 == items.len() then scan_super_arguments(c, s, items[j], unsafe)
+                else scan_init(c, s, items[j], unsafe)
+        _ -> scan_init(c, s, e, unsafe)
 
 /** The methods that cannot be called from an open or abstract class's body, which runs before a
  * subclass's fields are initialized: those that use `self` for more than reading and assigning its
@@ -20449,7 +20557,7 @@ private unsafe_methods(c: *Checker) -> Buf[bool]
         for m in 0..<c.symbols.len()
             if !unsafe[m] && is_class_method(c, m)
                 val safe = c.bodies[m] match
-                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false, buf(), false, false), b, &unsafe)
+                    Some(b) -> scan_init(c, InitScan(c.symbols[m].unit, None, "", "", false, buf(), false, false, false), b, &unsafe)
                     None -> false
                 if !safe
                     unsafe[m] = true
@@ -20476,7 +20584,8 @@ private captures_init_self(c: *Checker, s: InitScan, f: usize) -> bool = s.self_
  * initialized, `open` in an open or abstract class's body. Yields false, the scan's verdict. */
 private init_violation(c: *Checker, s: InitScan, at: Span, early: string, open: string) -> bool
     if s.report
-        if s.trait_init then c.note(s.unit, at, s"$early in the value of the trait's field `${s.last}`, which a class computes before its body: it may read only the fields initialized before it, and use `self` for nothing else")
+        if s.super_args then c.note(s.unit, at, s"$early in a superclass's arguments, which run before the object is initialized")
+        elif s.trait_init then c.note(s.unit, at, s"$early in the value of the trait's field `${s.last}`, which a class computes before its body: it may read only the fields initialized before it, and use `self` for nothing else")
         elif s.last != "" then c.note(s.unit, at, s"$early before `${s.last}` is initialized; a class body uses `self` for more than reading and assigning its fields only once every field is")
         else c.note(s.unit, at, s"$open in the body of an ${s.kind} class, which runs before a subclass's fields are initialized")
     false
@@ -20492,7 +20601,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             if args.len() > 0 && is_class_method(c, f) && is_init_self(s, args[0])
                 from = 1
                 if s.actor && actor_context_method(c, f) then ()
-                elif s.last != "" then ok = init_violation(c, s, e.span, s"`$name` is called", "")
+                elif s.last != "" || s.super_args then ok = init_violation(c, s, e.span, s"`$name` is called", "")
                 elif (*unsafe)[f] then ok = init_violation(c, s, e.span, "", s"`$name` uses `self` for more than its fields, so it cannot be called")
             elif c.symbols[f].root is Some(_) && captures_init_self(c, s, f)
                 ok = init_violation(c, s, e.span, s"`$name`, which uses `self`, is called", s"`$name` uses `self`, so it cannot be called")
@@ -20509,6 +20618,7 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
             val symbol = c.symbols[f]
             if symbol.delayed then init_violation(c, s, e.span, "an argument passed by name uses `self`", "an argument passed by name cannot use `self`")
             elif symbol.lambda then init_violation(c, s, e.span, "a lambda that captures `self` is made", "a lambda cannot capture `self`")
+            elif s.super_args then init_violation(c, s, e.span, "a local function that uses `self` is made", "")
             else init_violation(c, s, e.span, s"`${symbol.decl.name}`, which uses `self`, is used as a value", s"`${symbol.decl.name}` uses `self`, so it cannot be used as a value")
         Field(value, _) -> is_init_self(s, value) || scan_init(c, s, value, unsafe)
         // A lazy field's first read runs its initializer, which may use `self` as a method does.
@@ -20531,7 +20641,11 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Construct(_, args) -> scan_init_all(c, s, args, unsafe)
         Collection(_, built) -> scan_init(c, s, built, unsafe)
         Block(items) ->
-            if method_value_of_self(c, s, items) is Some(name) then return init_violation(c, s, e.span, s"`$name` is used as a value", s"`$name` cannot be used as a value")
+            if method_value_of_self(c, s, items) is Some(name)
+                if s.super_args
+                    if s.report then c.note(s.unit, e.span, method_value_in_super_args(name))
+                    return false
+                return init_violation(c, s, e.span, s"`$name` is used as a value", s"`$name` cannot be used as a value")
             scan_init_all(c, s, items, unsafe)
         Let(_, value) -> scan_init(c, s, value, unsafe)
         LetPattern(_, value) -> scan_init(c, s, value, unsafe)
