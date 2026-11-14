@@ -445,7 +445,10 @@ leading prefix with the rest inferred.
 
 The type system stays small: generics with bounds, subtyping with declaration-site variance, and
 traits implemented through `impl`, and [union types](/spec/unions/) written in annotations. It has
-no higher-kinded types, type members, inferred unions, intersection types, implicit parameters,
-implicit conversions or macros. The
+no higher-kinded types, type members, inferred unions, intersection types, implicit conversions or
+macros. A context a call needs (a transaction, a logger) may be passed as a
+[contextual parameter](/spec/contextual-parameters/), filled from a `given` in scope; that is a value
+and never a conformance: a bound is met only by the type's `impl`, whatever givens are in scope, and
+a contextual parameter's type names no type parameter. The
 [collections chapter](/spec/collections/) shows how the library gets precise result types with
 these tools alone.

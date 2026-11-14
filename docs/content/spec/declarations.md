@@ -40,7 +40,8 @@ main()
   `data`, `def`, `derives`, `do`, `elif`, `else`, `false`, `for`, `if`, `impl`, `import`, `is`,
   `loop`, `match`, `module`, `object`, `override`, `private`, `return`, `static`, `super`, `then`,
   `trait`, `true`, `val`, `var`, `while` and `yield`. `object`, `trait` and `impl` followed by a
-  parameter list name a function; `end`, `open` and `self` have rules of their own, and the words of
+  parameter list name a function; `end`, `open` and `self` have rules of their own, `given` and
+  `using` are keywords only where they [begin their forms](/spec/contextual-parameters/), and the words of
   actors and machines are keywords only where they [begin their forms](/spec/actors/#keywords).
 - **Capitalized** means the first character is an uppercase or titlecase letter (Unicode `Lu` or
   `Lt`): `Ärger`, `Δelta` and `ǅemal` are capitalized. A letter with no case, as in Chinese,

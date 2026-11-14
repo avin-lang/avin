@@ -402,6 +402,78 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
    rebuild, a design for checked interfaces per module (today one checker holds the whole program by
    index, so this is a rewrite of how symbols are numbered, not a cache).
 
+### Contextual parameters: build plan
+
+Designed in [contextual parameters](/spec/contextual-parameters/), its choices proposed in
+[decisions](/spec/decisions/#proposed). Not started. A filled argument becomes an ordinary
+argument in the checker's output, so lowering, emission and the runtime change nothing; every step
+is in the front end and tooling. Each step is one agent, gated on its own with the files it names.
+
+1. **Syntax.** `given name [: Type] = value` in blocks, at a module's top level and in object
+   bodies, with `given` a keyword only there at a statement's or declaration's start; a trailing
+   `using` section in the parameter lists of functions, methods, static members, class constructors,
+   actors and lambdas, `using` a keyword only before a parameter's name; the syntax tree, `avin fmt`
+   (a long list breaks before `using` as before any parameter), `syntax_show`. Files: `parser.sysl`,
+   `parse_decl.sysl`, `parse_block.sysl`, `parse_actor.sysl`, `syntax.sysl`, `formatter.sysl`,
+   `syntax_show.sysl`; tests in `parse_tests.sysl` and `formatter_tests.sysl`. Proof that nothing
+   existing changes meaning: `git grep -n -E "^\s*given\b"` over `library/`, `tests/`, `examples/`
+   and marshal's and tui's sources prints nothing, and the corpus is unchanged (`args.given(…)`,
+   `iterable.avin`'s field `given`).
+2. **Declarations.** Given symbols as module values, object members and block locals; `using`
+   parameters on function symbols; the refusals with their messages (a type parameter in a
+   contextual type, a built-in, tuple, function or union type, a trait that is only a bound, a
+   second given of one type in a scope, `given` in a class/trait/data body, a section on a variant,
+   `main`, `@test`, a hook, `@sysl`/`@c`, an unnamed given, an implementation whose section differs
+   from its trait method's). Files: `check.sysl`, `names.sysl`. Tests: `tests/reject/given_*.avin`,
+   one refusal per file group of at most five errors.
+3. **Resolution at calls.** After an overload is chosen, fill each contextual parameter: a named
+   argument, then the levels of the chapter's scope walk, then the default; the errors for none,
+   two, and a positional argument; defaults seeing the section; class constructors, `super`
+   arguments, companions' `apply`, infix calls, clauses, static members through a bound, trait
+   methods through a trait type and through a bound, extensions. Files: `check.sysl`. Tests:
+   `tests/run/given_*.avin` and `tests/reject/given_*.avin`.
+4. **Modules and imports.** A named import (direct, braced, `as`, through an export) brings a given
+   in; a whole import does not, with the hint naming the import to write; `private`; module and
+   object givens made in initialization order; a module of several files sharing its givens.
+   Files: `check.sysl`, `names.sysl`, `incremental.sysl` (a module's givens are part of what an
+   importing file depends on). Tests: `tests/programs/run/given_*` and `tests/programs/reject/given_*`.
+5. **Lambdas, function values, threads and actors.** `using` lambda parameters as givens in the
+   body; a function or method taken as a value filled where taken; captures of givens through the
+   existing capture analysis; the `@sendable`, `spawn`, executor-task and actor checks naming a
+   captured given; actor constructors' sections. Files: `check.sysl`. Tests: run and reject files as
+   above.
+6. **Tooling.** Hover on a call shows each filled argument and the given it came from; go to
+   definition from a call to the given it used; completion offers `given` and `using`. Files:
+   `lsp.sysl`, `completion.sysl`, `definition_index.sysl`; tests in `lsp_tests.sysl`. The
+   IntelliJ plugin's grammar (`avin-intellij`) is its own item, shipped with the release that
+   carries step 1.
+
+**The test matrix.** Each claim of the chapter is a test; these are the cases the steps owe.
+
+- *Declaring*: givens of a class, an object, a trait type, a `data` type with one and several
+  variants, a generic instance (`Pool[Conn]`), a value type `data Retries(count: int)`; a given with
+  a declared wider type; scope from the declaration on (a call before it sees the outer one); a given
+  not in its own value; a nested block's given hiding an outer one; a Unicode-named given; `given`
+  still an ordinary name after `.`, in a class body, as a field and after `then`.
+- *Calls*: a given filling a supertype's parameter; a subtype parameter not filled by a supertype
+  given; explicit `tx = …` beating a given; the default with no given and not with one; a default
+  seeing the section; forwarding through recursion, mutual recursion and a tail call (still a tail
+  call at `-O0` and `-O2`); local functions; overloads where the written arguments choose and a
+  missing given does not fall back; infix calls; clauses; a static member through `T.m()`; a trait
+  method through a trait-typed value (dynamic dispatch) and through a bound; an extension's method.
+- *Classes and actors*: a constructor's section used in field initializers and methods; a subclass
+  passing its own given to its superclass; a companion's `apply`; an actor taking a sendable given.
+- *Generics*: a generic function calling a contextual one at many type arguments, one given for all;
+  `[T: Ord]` code with an unrelated given in scope ordering by `T`'s impl (the coherence claim: a
+  `TreeSet` built in one file and searched in another with givens around keeps its order).
+- *Lambdas*: a closure capturing a given and called after its block ends, under GC stress; a `using`
+  lambda parameter; a method value filled where taken; the error where none is in scope.
+- *Imports*: named, braced, renamed and exported imports bring a given; a whole import does not
+  (reject, with the hint); a private given not importable; a module given beside an imported one of
+  a fitting type (reject, both named).
+- *Refusals*: each message of the chapter's diagnostics list, and each refused type and position.
+- Every run test at `-O0` and `-O2` and under GC stress, as the corpus runs.
+
 ## Releases
 
 Releases are cut from `dev` at any stage, as the language stands, by `scripts/release.sh`

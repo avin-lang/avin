@@ -49,6 +49,7 @@ values. The [design choices chapter](/spec/design/) lists each choice and what i
 | [C bindings](/spec/c-bindings/) | Calling C libraries directly: prototypes checked against headers, handles, buffers, callbacks |
 | [Operators and control flow](/spec/operators-and-control-flow/) | Operators, blocks, `if`, `while`, `match` |
 | [Call-by-name](/spec/by-name/) | `value: -> T` parameters |
+| [Contextual parameters](/spec/contextual-parameters/) | `given` values and `using` parameters: a context carried through calls, resolved lexically and coherently, never a conformance |
 | [Strings and formatting](/spec/strings-and-formatting/) | Interpolation and format specifiers |
 | [System library](/spec/system-library/) | `avin.process` — arguments, environment, exit; `avin.io` — `IoError`, standard input; `avin.fs` — files and directories; `avin.time` (its own chapter below); `avin.math` — the elementary functions on `real`; `avin.random` — seeded and platform-seeded pseudo-random numbers; the environment, commands and pipelines, `Source`, `avin.net` (TCP, URLs, HTTP) and futures' additions |
 | [Dates and times](/spec/time/) | `avin.time`: `Instant`, `Duration`, `Date`, `Time`, `DateTime`, `Zone`, `Zoned` and `Period`; the wall and monotonic clocks, calendar and zone arithmetic, ISO 8601 text and patterns |
