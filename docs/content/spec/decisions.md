@@ -7865,7 +7865,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
   then fetches again over the network); a lock around a program's cache (the content-addressed,
   rename-published entries need none). Review with the user: whether a cache of a deleted project
-  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+  should ever be trimmed on its own (answered by the cache's limit: least recently used first, see
+  the Proposed entries of branch `cache-trim`).
 
 - Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
   tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
@@ -9109,6 +9110,67 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   owner at a read served from the bytes read ahead; before, only a read that reached the socket
   checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
   sound.
+
+- Proposed (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
+  used first, with no index**: an entry is a program's build directory (`build/`, `test-builds/`) or
+  one object or archive (`units/`, `runtime/`, `shims/`, `cunit/`), and its modification time is its
+  last use, touched by every build that takes it from the cache (a program's directory when its
+  build starts and before each test `avin test` runs). Every command that builds sweeps the cache at
+  most once in ten minutes, a stamp file in the cache shared by every process, and evicts the
+  oldest entries until the cache is within `AVIN_CACHE_LIMIT` (a size with `K`/`M`/`G`/`T`, `off`
+  for none, default 5G; a value that is neither is an error from every command). Why: builds run in
+  many worktrees and sessions at once, so a shared index would need a lock Sysl's library does not
+  offer, while a touch is one system call and the existing unit-object trim already worked by
+  modification time. Alternatives: an index file of use times (a lock, and a writer killed halfway
+  through it); access times (`noatime` mounts, and macOS updates them lazily); a sweep after every
+  build (the size walk on every build); an hourly sweep (24G had grown within hours). Review with
+  the user: the 5G default and the ten-minute interval.
+- Proposed (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
+  aside, looked at again and put back if a build touched it in between**, before it is removed.
+  Why: no build reading or writing an entry loses it, without a lock; a cache whose fresh entries
+  alone pass the limit stays past it until they age. Alternatives: lease files naming the process
+  (Sysl's library has no way to ask whether a process is alive); `flock` (not in Sysl's library);
+  no grace (a sweep could take the executable `avin test` starts once per test). A shim archive and
+  the record of the libraries it needs beside it are one entry, the archive evicted first and a
+  record newer than the sweep's choice kept, so no build finds the record without its archive.
+- Proposed (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
+  error**: every object and archive a build takes from the cache is touched first, and one missing
+  (or a shim archive without its record) is built again; the link looks again at everything it takes
+  from the cache before clang runs and after clang fails, answers an entry gone in between as such
+  rather than as clang's error, and the build then compiles again, which builds the entry anew, and
+  links once more. Why: a cache emptied by hand, or by a disk being cleared, while builds ran made two
+  gates fail to link a shim archive that had been there when the program compiled (2026-11-13).
+  Alternatives: holding the entries open across the link (clang opens them by name); copying them
+  out of the cache first (the copying costs every build).
+- Proposed (branch `cache-trim`): **another version's cache is removed three days after its last
+  use**, judged by the newest time on it, its kinds and their entries, and only beside the default
+  cache (never beside a directory `AVIN_CACHE` names), and only for a name that is a version's. Why:
+  no compiler of this version can read it, and three days spares a user switching back. Alternatives:
+  removing every other version at once (an older installed compiler still in use would rebuild each
+  time); never (the unreachable caches are what filled the disk).
+- Proposed (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
+  sweep**; a sweep removes only the debris of interrupted fetches, and `avin cache clean --packages`
+  removes packages (with `--older-than`, those no build has read for that long; a build touches the
+  package it reads). Why: a package is source pinned by `avin.sum`, small beside a build, and
+  fetching it again needs the network and a tag that may since have been removed, so evicting one
+  could break an offline or archived build. Alternatives: counting packages in the limit (evicted
+  first, being rarely touched, for a few hundred kilobytes saved).
+- Proposed (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
+  `.pending-` (a write that was never renamed into place) that nothing has written to for an hour,
+  and in the temporary directory the directories a build works in (`avin-link`, `avin-shims`,
+  `avin-c-unit` and the six characters `make_temp_dir` adds) that nothing has written to for a day,
+  and the `avin-test-builds` ones the compiler's tests left before their builds moved into the
+  cache's `test-builds/`. Why: a killed or out-of-space build leaves these behind, and on this
+  machine its tests had left 8,673 such directories. A program's own temporary directories are never
+  touched, whatever they are called. Alternatives: every `avin-` directory (a program may name its
+  own so); none (the debris is unbounded).
+- Proposed (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
+  limit, each kind's entries and size, the total with its oldest and newest use, debris, fetched
+  packages and other versions' caches; `trim` sweeps now; `clean` removes every entry, the debris and
+  other versions' caches, `--older-than <n>m|h|d` only what no build has used for that long, and
+  `--packages` the fetched packages too. `avin clean` keeps its meaning (one program's builds, or
+  `--all` every program's). Why: the user sees what the cache holds and can empty it without
+  knowing its layout. Alternatives: folding these into `avin clean` (whose argument is a program).
 - Proposed: **a marked parameter survives a function becoming a value only through its type**
   (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
   `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
