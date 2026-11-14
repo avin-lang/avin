@@ -8163,8 +8163,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Deferred**
 
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
+- Path-dependent and intersection types; inferred unions; implicit parameters; macros.
+- Settled by the user 2026-11-13: **Avin has higher-kinded types and a standard Functor, Monad and
+  Traverse family**, reversing their deferral; the design's choices are under
+  [Proposed](#proposed) (branch `hkt-design`), and the guiding rule the user gave with it is that
+  Avin is the ultimate *sound, nominally typed*, compiled, garbage-collected high-level language:
+  every rule is sound with no unchecked escape, the traits are nominal, and `for` comprehensions
+  admit their sources by conformance.
 
 - Settled on the user's delegation 2026-11-12 (built on branch `library-version`): **the standard library carries the compiler's version, and
   the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
@@ -8278,7 +8283,189 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   chain returns to the reader, cheap on the slow path. **Review with the user:** it is liveness, not
   soundness, but it is the one way a lazy read can still hang.
 
+**Refined variants** ([chapter](/spec/refined-variants/), branch `gadt-design`; designed, not built)
+
+- **Spelling: a variant's result after `->`, its own type parameters after its name.**
+  `IntLit(value: int) -> Expr[int]`, `Balance -> Query[long]`, `Pair[A, B](…) -> Expr[(A, B)]`; the
+  data type's parameter names are every variant's parameters, so a variant with no result keeps
+  meaning `-> D[T…]`. Why: a variant is a constructor, and `(fields) -> Type` is exactly how Avin
+  writes a function's signature, so the line reads as the constructor it declares; nothing else is
+  written after a variant's fields. Alternatives weighed: `IntLit(value: int): Expr[int]` (`:` already
+  types each field on the same line and begins an inheritance list, which a variant is not); a
+  `where T = int` clause (names the equality instead of the instance, and needs a second syntax for
+  hidden parameters); a separate keyword per refined variant (a second kind of variant where there
+  is one with an optional result).
+- **A variant fixes only invariant parameters.** Where the type's parameter is `+T` or `-T`, a
+  variant's result has `T` there. Why: an invariant argument is exact, so the equality an arm learns
+  is true; a covariant one is an upper bound, and taking it as an equality is unsound (the chapter's
+  `asDog` makes a cat a `Dog`). Alternatives weighed: refining a covariant place by a bound
+  (`Dog <: T`) and a contravariant one by the opposite bound (sound, but it gives one-directional
+  facts that are hard to read in an error, and no motivating example needs it); forbidding variance
+  on any type with a refined variant (needlessly strict: unfixed places keep their variance soundly).
+  Review with the user: whether bound refinement at variance places is wanted later.
+- **Hidden type parameters are allowed, and compiled per pack.** A variant parameter its result does
+  not name is a fresh type in each arm, never leaving it; each list of hidden types the program makes
+  a variant with has its own descriptor, and an arm on it is compiled once per pack and selected by
+  the descriptor. Why: a typed protocol (a request and its reply address agreeing on a type the
+  message type does not mention) and a chained plan (`Then[Mid]`) need one, and the whole-program
+  compiler already knows every pack, as it knows every implementer of a trait for dynamic generic
+  methods, so nothing is boxed and the value-type fields stay unboxed. Alternatives weighed: refusing
+  hidden parameters (the protocol could then only erase `R` behind a trait, losing the type the
+  design exists to keep); boxing a hidden field behind `Any` (a run-time test where none is needed).
+  Review with the user: code size, since an arm is copied per pack.
+- **Equalities hold exactly where the pattern's names are in scope, and nowhere outside.** An arm's
+  result is checked against the expected type under them; with none expected, arms yield their types
+  as written; an inference variable settled in an arm settles to the type as written; a hidden type
+  in an arm's result is an error. Why: a fact true only in the arm cannot leak to code that runs
+  without it, and "as written" is the one reading that does not guess whether an `int` was meant as
+  `T`. Alternatives weighed: mapping an arm's type back through its equalities (ambiguous: `int` and
+  `T` are one type there and two outside); inferring the result type of a refining `match` (needs a
+  search the local inference does not do).
+- **Only variants refine.** Extractors and type patterns learn no equalities. Why: an extractor's
+  answer type is its signature's; a type pattern's could refine an invariant generic's arguments by
+  the same header argument, but it widens the feature to every generic type and every type test.
+  Alternative weighed: refining by type patterns on invariant instances (sound; deferred). Review
+  with the user.
+- **A union in a result names no variant parameter**, since a value would not say which member a
+  parameter is; closed unions (`-> Expr[int | string]`) are allowed. Alternative weighed: deciding the
+  parameter by normal-form order (arbitrary, and wrong for a value made at another member).
+- **An arm no value can reach because its equalities contradict is an error**, as every unreachable
+  arm is, and coverage counts only the variants possible at the matched type, carrying each row's
+  equalities; a `match` on an instance with no possible variant is an error. Alternatives weighed: a
+  warning for an impossible arm (Avin has no warnings for unreachable code); pruning per column
+  without carrying equalities along a row (simpler, but demands arms for combinations no value has).
+- **Bounds on a variant's parameters** are checked where a value is made and held in the arm, and an
+  enclosing type parameter equated with a bounded one gains the bound there; a copy at a type
+  without the bound compiles no such arm. Why: it is what makes a hidden type useful (`Sendable` for
+  a reply, `Ord` for a sorted payload), and it costs one more test when an arm is decided at a copy.
+  Alternative weighed: no bounds on variant parameters (the protocol could not name `ActorRef[R]`,
+  whose parameter is bounded by `Sendable`).
+- **The nested-data-type rule is measured against the variant's result**, and a larger part made of
+  a hidden parameter is allowed, since its instances exist only where the program makes a pack.
+  Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
+  Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+
+**Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
+
+- Proposed: **a constructor parameter is spelled `F[_]`**, `F[_, _]` for two holes, and a partial
+  application of a type writes `_` for each argument left open: `Result[_, ParseError]`,
+  `Map[string, _]`. Why: the same mark at the declaration and at the use, the `_` the language
+  already uses for "something left out" in patterns and lambdas, and the spelling other chapters'
+  prose already used for "a `Result` of any value with this error". Alternatives weighed: a kind
+  annotation (`F: * -> *`, notation with no other use in the language); a type-lambda form
+  (`[X] => Result[X, E]`, general but a second way to write types, and lambdas make constructor
+  equality undecidable in general); declaring the constructor by an alias only (every partial
+  application would need a named alias). Review with the user: the spelling is the most visible
+  choice of the design.
+- Proposed: **holes are direct arguments of one nominal type; no nested `_`, no constructors of
+  constructors (`F[_[_]]`), no tuple or function constructors.** A generic alias whose parameters
+  are each one direct argument of its expansion is a constructor too. Why: a constructor is then a
+  nominal type with places left open, so equality is structural and inference has one answer, the
+  core of the soundness argument; composition (`Option[List[_]]`) is a data type of the program's
+  own. Alternatives: general type lambdas (undecidable equality, inference with many answers);
+  allowing any alias as a lambda (the same problem behind a name). Review with the user: whether
+  composed constructors are wanted soon.
+- Proposed: **a hole may declare variance (`F[+_]`) and bounds (`F[_: Sendable]`)**, a demand on the
+  constructor passed: `+_` lets `F[Dog]` be an `F[Animal]` inside the declaration and takes only
+  constructors covariant there; a bounded hole is applied only to types meeting the bound, checked
+  at each `F[X]` written, and takes constructors whose parameter's bounds the hole's imply. A plain
+  `_` is invariant and unbounded, and refuses a type with a bounded parameter at the hole
+  (`TreeSet`). Why: each is checked at the definition, so no instance can fail; bounded holes are
+  what let `Future` (`Sendable`) and sorted collections (`Ord`) be constructors at all.
+  Alternatives: always invariant (loses `F[Dog]` as `F[Animal]` where code wants it, at no gain in
+  simplicity); always covariant (unsound for `Array`); refusing bounded types outright (excludes
+  `Future` from comprehensions).
+- Proposed: **constructor traits are spelled with `Self[…]`, the trait's parameters being the
+  holes**: `trait Functor[A]` with `map[B](f: (A) -> B) -> Self[B]`, bounds written `[F[_]: Monad]`.
+  Why: it reads like every other Avin trait (`Iterable[+A]` with `map[B]`), keeps `impl Trait for
+  Type` as the one form of conformance, and the common case (calling `fa.map`, writing
+  `impl Monad for Parser`) needs no new notation beyond `Self[B]`. Alternatives: a type-class-style
+  trait over an explicit parameter (`trait Functor[F[_]]` with `map[A, B](fa: F[A], …)`, which puts
+  the receiver in a parameter and makes every call `F.map(fa, f)` or needs a second rule for method
+  syntax); marking constructor traits with a keyword (redundant: `Self[B]` already says it). Review
+  with the user.
+- Proposed: **a constructor trait is a bound and never a type, its parameters take no variance, and
+  its static members name none of them.** Why: no object of unknown constructor exists, so no dynamic
+  dispatch over constructors and no existential is needed; every call is direct in a monomorphized
+  instance. Alternatives: trait objects of `Monad` (need a run-time constructor witness and type
+  erasure of the element, which reification refuses).
+- Proposed: **an impl gives the trait the type's parameters it leaves open** (`impl[T, E] Monad[T]
+  for Result[T, E]`), **and both may be left off where all are open, in order** (`impl Monad for
+  Option`). Why: the partial application needs no new syntax at the impl, and the common
+  one-parameter case reads as plainly as `impl Ord for Money`. Alternatives: writing the constructor
+  (`impl Monad for Result[_, E]`, which needs `E` declared somewhere); requiring the full form always
+  (noise in the common case). The bare form is the only impl of a generic type without its
+  parameters, a narrow exception.
+- Proposed: **a type implements a constructor trait once, at one choice of holes, and the
+  conformance is not inherited by subclasses or through traits.** Why: coherence gives each argument
+  one constructor; an inherited `map` answers the superclass's type, so inheriting would be unsound.
+  A subclass instance is matched as its nearest superclass with a conformance, then the one trait
+  with one. Alternatives: a conformance per hole (`Either` a functor on both sides, at the cost of
+  ambiguous inference); inheritance with a check that every method is overridden at the subclass's
+  type (a long tail of overrides in the library).
+- Proposed: **a type's own methods implement a constructor trait's where the trait's call is a call
+  of them** with no conversion, no extra bound, their own type parameters decided by the call (a
+  lower bound by its bound) and a result conforming to the trait's. Why: `List`, `Vector`,
+  `Option`, `Result` and `Either` meet the family with their existing overloaded and lower-bounded
+  `flatMap`s, so no collection method is duplicated or changed. This is still nominal: the impl
+  declares the conformance, and the rule only says which declared method serves. Alternatives:
+  exact signatures (forces a second `flatMap` on every collection, an overload clash); adapters
+  generated per mismatch (hidden code and conversions). Review with the user: it is a looser
+  meeting than a class's override, which takes the parameter types exactly.
+- Proposed: **inference of a constructor goes through its bound's conformance**; without a bound
+  only a type of exactly the parameter's arity is inferred, anything wider needs `F` written; the
+  written-out arguments join by the type's variance (`Ok(1)` beside a `Result[int, E]`); two
+  different heads never join. Why: the impl is the one place that says which argument varies, and
+  joining the fixed arguments keeps `Nothing`-typed literals pleasant. Alternatives: the last
+  argument always the hole (wrong for `Result`, whose value is first); unification over every
+  choice of holes (ambiguous, order-dependent).
+- Proposed: **a constructor trait's default bodies are compiled once per implementing constructor
+  and may call its static members on `Self`.** Why: `Monad`'s `map` and `map2` from `flatMap` and
+  `pure`, so a program's own monad gives two members. Alternatives: no defaults (every monad writes
+  four members); defaults shared through a method table, as other traits' are (no `Self` to call
+  `pure` on).
+- Proposed: **impls may add to applications of a bounded constructor parameter**
+  (`impl[F[_]: Traverse, G[_]: Applicative, A] F[G[A]]`), matched through the conformance, with the
+  rules of impls adding to types built from parameters. Why: `xs.sequence()` reads as a method, and
+  a package can extend every monad at once. Alternatives: free functions only (`sequence(xs)`).
+- Proposed: **the standard traits are `Functor`, `Foldable`, `Applicative`, `Monad`, `Filter`,
+  `Traverse`, and the sendable pair `SendableFunctor`/`SendableMonad`, in module `avin`**, with
+  `Applicative`'s second member `map2` and `Foldable` holding `foldLeft` alone. Why: `Foldable` is
+  warranted because `Option`, `Result` and `Either` are no `Iterable`s and `Traverse` needs a fold;
+  `map2` reads better than an `ap` over functions; `Filter` is the nominal home of a comprehension's
+  guard; the sendable pair is how `Future`, whose combinators need `Sendable` values and `@sendable`
+  functions, meets a family. Alternatives: `ap` (the classic, harder to read); `zip`/`product` as
+  the second member (`zip` already pairs sequences by position and `product` multiplies); no
+  `Foldable` (no fold over an option in generic code); `Future` left out (breaks comprehensions over
+  futures). Review with the user: the names, and whether the sendable pair should rather be a hole
+  bound on the ordinary traits.
+- Proposed: **which library types implement what**: `Option`, `Result[_, E]`, `Either[L, _]` and
+  the immutable sequences (`List`, `Vector`, `ArraySeq`, `Queue`, `Seq`) the whole family, `Filter`
+  except on `Result` and `Either`; `LazyList` all but `Traverse`; `Array`, `Buffer`, `Deque` and
+  `Set` `Functor`, `Foldable` and `Filter`; `Future` the sendable pair; `Map`, the sorted
+  collections, `Iterator` and `Range` none, each for the reason its signatures show. A sequence's
+  `map2` is cartesian, as its `flatMap`. Why: each impl is lawful, and the laws are tested.
+  Alternatives: `Monad` for the mutable collections (lawful, but `pure` making a mutable array
+  surprises); `Map` as a functor over its values (its `map` takes entries, so it needs a method of
+  another name).
+- Proposed: **`for` comprehensions admit their sources by conformance**: the last generator an
+  `Iterable` or a `Functor` (or `SendableFunctor`), an earlier one an `Iterable` or a `Monad` (or
+  `SendableMonad`), a guard an `Iterable` (through its lazy `withFilter`, whose views become
+  `Iterable`s) or a `Filter` (through `filter`); in generic code the bounds decide; the calls are
+  then checked as written out, so mixed sources (`for w in words, n in parse(w)`) keep working
+  through the collections' own overloads. A type with `map` and `flatMap` and no impl is no
+  longer a source: the error says which impl to declare. Why: the user's rule that Avin is nominal;
+  the structural rule admitted any type with methods of those names. Alternatives: keeping the
+  structural rule (contradicts the rule); desugaring every comprehension through the traits'
+  members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
+  visible change in the order of evaluation). Review with the user: it breaks programs whose own
+  types relied on the structural rule, each fixed by one `impl`.
+
 ## Open
+
+- Whether constructor traits may carry parameters that are not holes (an error type fixed per
+  trait, `MonadError[A, E]`), and whether composed constructors (`Option[List[_]]`) are wanted; both
+  are left out of the higher-kinded design and need no change to it to add later.
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
   class's own), a later possibility beside module exports; and exporting a whole module as a member
