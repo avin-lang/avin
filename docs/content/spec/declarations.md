@@ -1510,6 +1510,92 @@ name an alias declared after it.
 `type` declares an alias only where a name follows it; anywhere else it is an ordinary name, so a
 function, a parameter, a field or a local may be called `type`.
 
+### Opaque types
+
+`opaque type Name = Repr` declares an **opaque type**: a new type whose values are laid out exactly
+as values of its **representation** `Repr`, and which is otherwise a type apart. A `UserId` and an
+`OrderId` that are both `long` underneath cannot be mixed up, and neither can be passed where a
+`long` is expected, while each costs what a `long` costs:
+
+```text
+module ids
+
+opaque type UserId = long
+opaque type Email = string
+opaque type Id[T] = long
+
+impl UserId
+  next() -> UserId = UserId(repr + 1)
+  def id -> long = repr
+
+impl Ord for UserId
+  compare(other: UserId) -> int = repr.compare(other.repr)
+
+impl Display for Email
+  display(out: Writer, spec: FormatSpec) = out.write(s"<$repr>")
+
+user(n: long) -> UserId = UserId(n)
+email(s: string) -> Email = Email(s.toLower)
+```
+
+Only the module that declares an opaque type sees its representation:
+
+- In that module, `Name(r)` makes a value of the opaque type from a value `r` of its
+  representation, and `x.repr` is the representation of a value `x`. In a method an impl adds to
+  the type, `repr` alone is `self.repr`. A generic opaque type's type arguments are written,
+  `Id[User](1)`, or inferred from the representation and the expected type, as a function's are.
+- Outside it, `Name(r)`, `x.repr` and a bare `repr` are refused, with a diagnostic saying that the
+  representation is seen only in the declaring module. Code there names the type, passes, stores
+  and compares its values, calls its methods, and makes and takes apart values through the functions
+  the module offers.
+- No conversion is implicit in either direction, in the module or outside it: a `long` is not a
+  `UserId`, and a `UserId` is not a `long`. Two instances of a generic opaque type at different type
+  arguments are different types, `Id[User]` and `Id[Order]`.
+- The name is a type's and nothing else: it is not a value, and it is not a pattern, so a `match`
+  takes a value apart with `x.repr`, in the module, rather than with `Name(r)`.
+
+An opaque type has the traits and methods its impls give it, and no others; the representation's
+are not inherited. An impl of a trait takes the trait's default bodies, so `compare` alone gives
+`<`, `<=`, `less`, `max` and sorting, and `display` gives interpolation. An impl that only adds
+methods may be written in any module, as an extension, and there it uses only what the type offers;
+a trait's impl is written in the module of the type or of the trait. Equality and hashing are the
+representation's: two values are equal when their representations are, so an opaque type is a key
+of a `Map` and an element of a `Set`. A value with no `Display` prints as the type's name, which
+shows nothing of the representation. An opaque type derives nothing.
+
+A value of an opaque type becomes an `Any` or a trait's value in a box that names the opaque type,
+whatever the representation, a reference included. A type pattern for the opaque type finds it
+there, one for the representation does not, and a value of the representation is never taken for
+the opaque type:
+
+```text
+describe(x: Any) -> string = x match
+  u: UserId -> s"user ${u.id}"
+  n: long -> s"long $n"
+  _ -> "other"
+```
+
+`describe(user(1))` is `"user 1"` and `describe(long(1))` is `"long 1"`; a union `UserId | long`
+tells its members apart the same way. A value of an opaque type is sendable where its
+representation is.
+
+- The representation is any type with values to lay out: a number, a `string`, a data value, an
+  object (the very object, shared), a tuple, a function, an `Option`, a collection, another opaque
+  type. It may not be `Nothing` or `unit`, a union, or a type parameter alone, which could be
+  either; and it may not name the opaque type, directly or through aliases, since the type is laid
+  out as it. A recursive type is a `data` type.
+- A generic opaque type's parameters are plain names: invariant, with no bounds. The types its
+  representation names hold each type argument to their own bounds where the opaque type is used,
+  as an alias's do. A parameter the representation does not name is allowed, and tells values apart
+  by type alone: `Id[User]` and `Id[Order]` are both a `long`.
+- An opaque type has no supertype (`opaque type X <: Y` is refused), no annotations and no
+  `derives` clause.
+- Its name is a type's, under the rules for an alias's name; it is public unless marked `private`,
+  and imported or reached through its module as any type is.
+
+`opaque` declares an opaque type only before `type` and a name; anywhere else it is an ordinary
+name.
+
 ## Visibility and modules
 
 Declarations are public unless marked `private` (visible in the module). A directory is a module;

@@ -444,7 +444,8 @@ leading prefix with the rest inferred.
 ## Scope of the type system
 
 The type system stays small: generics with bounds, subtyping with declaration-site variance, and
-traits implemented through `impl`, and [union types](/spec/unions/) written in annotations. It has
+traits implemented through `impl`, [union types](/spec/unions/) written in annotations, and
+[opaque types](/spec/declarations/#opaque-types), new types laid out as an existing one. It has
 no higher-kinded types, type members, inferred unions, intersection types, implicit parameters,
 implicit conversions or macros. The
 [collections chapter](/spec/collections/) shows how the library gets precise result types with
