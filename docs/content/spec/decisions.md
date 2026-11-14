@@ -9513,6 +9513,41 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reported where the program's impl names the trait. Why: the impl is what the program wrote; the
   library's method is not the mistake.
 
+**Higher-kinded types, inferring a constructor through its bound** (build plan step 4, branch
+`hkt-4`)
+
+- Proposed: **the spec's third place to look, "the one trait among those it conforms to that has
+  one", is left out, since no type can reach it.** An impl is never for a trait, and a trait that
+  requires a constructor trait is itself one, so a type conforming to it conforms to what it
+  requires at the same holes, as its own; a type conforming to it at fixed arguments
+  (`class Digits: Bag[int]`) is refused at the declaration. A type is therefore matched as itself,
+  then as its superclasses nearest first, and a type with no conformance there is an error naming
+  the bound and the type. Why: code for a case no program can write would be untested. Review
+  with the user: it returns, with its "several such traits" error, if traits come to implement
+  constructor traits by impls (`impl Monad for Seq`), which the spec's `pairUp[Seq, …]` example
+  presumes and the library step will want.
+- Proposed: **with several constructor-trait bounds, each conformance the type (or the superclass
+  matched) has decides; two that leave different arguments open are an error naming both**
+  (`Pair` implements `Mappable` as `Pair[int, _]` and `Lefty` as `Pair[_, int]`), and a bound the
+  type lacks is reported as for a written constructor. Why: the bounds are one demand on one
+  constructor, so the nearest type with any of them is the answer the others are checked against.
+  Alternatives: the first bound written decides (order-dependent); the nearest type with all of
+  them (skips a subclass's own conformance for a superclass's, which the spec's no-inheritance rule
+  forbids).
+- Proposed: **an argument written out of a constructor joins only where the type's parameter is
+  covariant and the argument a reference type known at that argument; the expected type, checked
+  first, fixes it.** `second(dogs, cats)` makes `F` `Result[_, Animal]`; with
+  `val r: Result[int, Dog] = second(dogs, cats)` the expected type has made `F` `Result[_, Dog]` and
+  the cats are refused. Why: the expected type decides type arguments before the arguments do for
+  every generic call. An argument the first argument leaves unknown (`Ok(1)`'s error type) is
+  decided by the next, as an invariant one is.
+- Proposed: **inference sees a subclass as its superclass, or a type as a trait, only where a value
+  is read out** (a fix found in step 4, which matching through a superclass's conformance meets):
+  at an invariant argument or a function's parameter, inference held a `Box[TallShelf[int]]` to be
+  a `Box[Shelf[A]]`, and a `(Dog) -> int` an `(Animal) -> B`, so generic code could store a `Shelf`
+  in the box or pass a cat to the function, reading memory that was never a `TallShelf`'s or a
+  `Dog`'s. Both are now refused; a type that is the class itself is still taken there.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

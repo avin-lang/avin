@@ -615,8 +615,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 3 are
-done; steps 4 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 4 are
+done; steps 5 onward are still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -664,11 +664,16 @@ and emission see only the types they see today; `type_key` names a constructor
    bounded trait parameter, a conditional impl, `-O0`/`-O2` and GC stress),
    `tests/programs/run/constructor_trait_modules`; reject files for each refusal
    (`tests/reject/constructor_trait_*.avin`, `tests/programs/reject/constructor_trait_module_rule`).
-4. **Inferring a constructor through its bound.** Matching `F[X]` through the conformance, the
-   nearest superclass and the one trait; the written-out arguments joined by variance (`Ok(1)` with
-   a `Result[int, E]`), the head required to agree; the expected type; a lambda's result deciding
-   `G`. Tests: each bullet of the spec's inference section as a run test and each of its errors as a
-   reject test; a private `Vector` subclass passed as `Vector`; literals beside a constructor.
+4. **Inferring a constructor through its bound.** *Done.* Matching `F[X]` through the conformance
+   and the nearest superclass (`bound_constructor` in `check.sysl`; the "one trait" case is
+   unreachable while no impl is for a trait, see decisions); the written-out arguments joined by
+   variance (`widened_constructor`: a `Result[int, Dog]` beside a `Result[int, Cat]`), the head
+   required to agree; the expected type; a lambda's result deciding `G`; two bounds disagreeing on
+   the holes an error naming both. Inference no longer sees a subclass as its superclass off a read
+   position (`held_as`), a soundness fix the superclass matching met. Tests:
+   `tests/run/constructor_bound_inference{,_more,_gc}.avin`, `tests/run/inference_subtype_reads.avin`,
+   `tests/reject/constructor_bound_infer_failures.avin`,
+   `tests/reject/inference_no_subtype_off_read.avin`.
 5. **Static members on constructors and per-constructor defaults.** `F.pure`, `Option.pure`,
    `Result[_, E].pure`; default bodies, already compiled per implementing constructor, calling
    `Self.pure`;
