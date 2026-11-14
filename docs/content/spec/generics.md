@@ -564,7 +564,11 @@ is a `Self[A]`, `self` among them.
 - **A static member names no parameter of the trait**, since a call of it names only the
   constructor: `static pure[X](value: X) -> Self[X]`. It is called on a constructor, a bounded
   parameter (`F.pure(1)`), a type named bare (`Option.pure(1)`) or a partial application
-  (`Result[_, string].pure(1)`), each call direct.
+  (`Result[_, string].pure(1)`), each call direct. A constructor has the static members of the
+  constructor traits it implements at exactly the holes it leaves open, so `Result[int, _].pure`
+  is an error, as is `F.pure` where no bound of `F` declares `pure`; a value of `F[X]` has none,
+  its static members being its constructor's. Named without a call, `F.pure` and `Option.pure` are
+  function values.
 - **Its default bodies are compiled for each constructor that implements it**, as a call through a
   bound is, so unlike other traits' defaults they may call a static member on `Self`:
   `override map[B](f: (A) -> B) -> Self[B] = flatMap(a -> Self.pure(f(a)))`.
