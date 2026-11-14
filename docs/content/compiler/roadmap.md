@@ -591,7 +591,7 @@ them was refused with the error the chapter gives or ran correctly. What is not:
 | The same from an `object` extending a class | read `0` | closed by item 1: refused |
 | `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | run-time check |
 | A lazy's initializer joining a thread that reads the same lazy | waits for ever | liveness |
-| `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | false error |
+| `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | closed by item 2: accepted |
 
 The holes have one cause: `field_read` in `check.sysl` refuses a field read only when the
 constructor is the current function, and the superclass's arguments are never scanned by
@@ -627,13 +627,26 @@ name, which stays legal.
    another module). A method of the object named as a value there is refused where it is written,
    as a call of one already was. A local function cannot be written in a superclass's arguments,
    which take no block, so the scan's case for one is reached by no source today.
-2. **An object's name is `self` in its own body.** The checker resolves the object's own name inside
-   its body, methods, lambdas and lazy initializers to `self`, so the object rules apply to it and
-   the module order counts only what the body runs while the object is made. File: `check.sysl`
-   (where a name resolves to a module-level object). Tests: `tests/run/initialization_object_self_name.avin`
-   (a lazy field reading `O.k`, a lambda made after the last field, a method, an object extending a
-   class), `tests/reject/initialization_object_self_name.avin` (`O.y` above `y`, `O` passed before
-   the last field, `O.m()` before the last field, `O` read in its superclass's arguments).
+2. **Done: an object's name is `self` in its own body.** `global_read` in `check.sysl`, where every
+   read of a module-level value is made (a bare name, a call of the object's `apply`, its constructor
+   by the companion's name, a pattern naming it), reads the object's own name as `self` inside its
+   body, methods, overrides, lambdas and lazy initializers, so the object rules apply to it and the
+   module order counts only what the body runs while the object is made; the editor still shows the
+   name as the object's declaration. Tests: `tests/run/initialization_object_self_name.avin` (a lazy
+   field reading `O.k`, a lambda made after the last field stored and called later and one called at
+   once, a method, an override calling `super`, an object extending a class and a generic class, the
+   field it inherits read before its own, a field assigned through the name, a companion's
+   constructor and `apply`, a pattern naming the object, two objects naming each other, a thread
+   and a future in a method of an object with no `var`, a module value declared above the object
+   reading it), `tests/reject/initialization_object_self_name.avin` (`O.y` above `y`, `O` passed
+   before the last field, `O.m()` before the last field, `O` read in its superclass's arguments
+   directly and in a lambda), `tests/reject/initialization_object_self_name_more.avin` (a lambda, a
+   method value, a `lazy val` read and a by-name argument through the name before the last field;
+   a function outside the body reading the object, called while it is made, still a cycle),
+   `tests/programs/run/initialization_object_self_name` and
+   `tests/programs/reject/initialization_object_self_name` (the object in another module), and an
+   `lsp_tests.sysl` case for definition from the name in the body. A field `lazy val l = O.l + 1`
+   in an object is now the run-time trap a bare `l` already was, until item 4.
 3. **Module-level lazy cycles at compile time.** `Uses` (`globals.sysl`) keeps the functions a body
    calls apart from those it makes (lambdas, by-name thunks, method values); the module order
    follows both, as now, and a new reach follows only calls and the lazy values read. A module-level
