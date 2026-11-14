@@ -965,9 +965,10 @@ Settled by the user on 2026-11-04:
   `await` inside a body is allowed. The pool is a module's `lazy val`, so a program that makes no
   future never makes it.
 - [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
-  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  (each instance its own), and in blocks (each declaration's run its own, see the entry for branch
+  `lazy-local`), is computed on its first read, exactly once, and kept; never read, never
   computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
-  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
   reads; an initializer that needs its own value, directly or through other lazy values, traps at
   that read, naming the value. A field's initializer may use every field and method; the class
@@ -8214,6 +8215,48 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatter is meant to settle exactly this); a blank line between clauses only around a
   multi-line one (it still splits one function in two); a blank line between every clause
   (it spreads a short definition over twice its lines).
+- Proposed (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
+  cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
+  state word and the closure computing it, so a read is that cell's lazy field read: once on the
+  first read, under the same protocol as a field's between threads, with the same trap for a read
+  made while it is being computed. The choices the request left open:
+  - *Closures share it.* A closure capturing the name captures the cell, so a first read inside
+    the closure computes it for the enclosing scope too, and the reverse; it outlives its block. A
+    declaration in a loop body makes a new cell on every pass. *Alternatives*: copying the value
+    into the closure at capture (would force it where the closure is made, defeating the point);
+    one cell per declaration site (wrong for loops and recursion).
+  - *The initializer sees the locals as they are at the first read*, a captured `var` included,
+    since it is a lambda run then; fields see their object at the first read in the same way.
+    *Alternative*: snapshotting the locals at the declaration (would need a copy of every captured
+    `var`, and differs from what a lambda written in the same place does).
+  - *Across threads, sendable where its type is and its initializer would be.* A `@sendable`
+    closure (a thread's body, a future's) may capture a local `lazy val` only where the value's
+    type is sendable and every local and parameter the initializer captures passes the rules that
+    closure is held to, a `var` refused, through each lazy value the initializer reads in turn; what
+    the initializer reaches is held to the module-level state rule too. *Why*: the initializer may
+    run on whichever thread reads first, so it is code the closure carries; a field's initializer
+    captures only its object, which the object's own sendability covers. *Alternatives*: refusing
+    every capture of a lazy local by a `@sendable` closure (simpler, but refuses the plain case of
+    a sendable value computed from sendable `val`s); checking the value's type alone (unsound: an
+    initializer capturing a `Buffer` or a `var` would run on another thread).
+  - *A self-read traps at run time*, ``avin: trap: `x` is read while it is being initialized``,
+    as a field's and a module-level value's do, rather than a compile-time diagnostic, so a lazy list
+    may refer to itself through its cells. A trap in the initializer stops the program as any trap
+    does.
+  - *The type must be known where it is declared*: an initializer whose type is not settled there
+    (one reading only its own value) is refused with "cannot infer the type of `x`", as a field's
+    is, rather than settled by later uses as a plain `val`'s may be. An initializer that never
+    finishes gives the type `Nothing`. A mismatch with a declared type is reported as "the
+    initializer of `x` yields …".
+  - *One name per declaration*: `lazy val (a, b) = …` and `lazy val a, b = …` are refused ("take
+    the value apart where it is read"), as is a `lazy val` without an initializer; an assignment, a
+    compound assignment and a step are refused as for a module-level `lazy val`.
+  - *Cost*: a declaration allocates the cell and the initializer's closure, both kept until the cell
+    is unreachable. *Alternative weighed*: storing the value, state and closure in boxed locals
+    without an object (saves one allocation but needs a layout of its own in the lowering and a
+    separate sendability rule); clearing the closure after the first read (frees its captures early,
+    but fields keep theirs, and a race-free clear needs another store on the hot path).
+  Review with the user: the cross-thread rule (the more permissive of the two sound choices).
 
 
 ## Proposed

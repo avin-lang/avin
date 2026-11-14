@@ -1877,17 +1877,35 @@ test the core library or a dependency declares.
   ```
 - **`lazy val name = expr`** (its type optional, as for `val`) is computed on its first read instead,
   exactly once, and every later read gives the value kept. One that is never read is never
-  computed. It is declared at module level or in a class or object body, where each instance has
-  its own; `lazy` is a modifier only before `val`, and elsewhere an ordinary name. A `lazy var` is
-  an error, since the value is never assigned, and so is `lazy` on a parameter, a class parameter, a
-  data field or a local, each of which is given its value where it is made.
+  computed. It is declared at module level, in a class or object body, where each instance has its
+  own, or in a block, as a local; `lazy` is a modifier only before `val`, and elsewhere an ordinary
+  name. A `lazy var` is an error, since the value is never assigned, and so is one without an
+  initializer, and `lazy` on a parameter, a class parameter or a data field, each of which is given
+  its value where it is made.
 
   ```avin
   lazy val table: Vector[string] = loadTable() // read the file when something first needs it
 
   class Report(title: string)
     lazy val heading = s"== $title ==" // per instance, on the instance's first read
+
+  summary(rows: Vector[Row], verbose: bool) -> string
+    lazy val detail = rows.map(describe).mkString("\n") // only if the branch below reads it
+    if verbose then detail else s"${rows.length} rows"
   ```
+
+  **A local `lazy val`** names one value (a pattern that takes a value apart is an error) and is in
+  scope from its declaration to the end of its block, its own initializer included. Each time the
+  declaration runs it makes a new value not yet computed, so one in a loop body is a fresh one on
+  every pass. Its initializer sees the locals around it as they are when it runs, on the first
+  read, not where it is declared, and its type is its declared one or its initializer's, which must
+  be known where it is declared. It is never assigned: an assignment, a compound one or a step is
+  refused. A closure that reads it captures it and shares it with the code around it: whichever
+  reads it first computes it, and every other read, in the closure or outside it, gives the value
+  kept, even after the block that declared it has finished. A closure carried to another thread
+  carries the initializer with it, so a `@sendable` closure may capture a local `lazy val` only
+  where its type is [sendable](threads.md) and what its initializer captures and reaches is what
+  such a closure itself may capture and reach, through every lazy value it reads in turn.
 
   A module-level `lazy val` takes no place in the initialization order: its initializer runs where
   it is first read, and an eager value that reads it depends on what that initializer reads. Its
@@ -1896,7 +1914,10 @@ test the core library or a dependency declares.
   ``avin: trap: `first` is read while it is being initialized``. A field's initializer may read every
   field and call every method, since it runs once the object is complete; the class body reads the
   field only where it could call a method, after its last field and not at all in an `open` or
-  `abstract` class. A trap inside an initializer stops the program as any trap does.
+  `abstract` class. A local one whose initializer reads its own value, directly or through a
+  closure, traps in the same way, naming it; a lazy list may refer to itself, since its cells read
+  the value only after it is stored (`lazy val ones: LazyList[int] = LazyList.cons(1, ones)`). A
+  trap inside an initializer stops the program as any trap does.
 
   The first read is safe between threads: when several threads read the value first at once,
   exactly one runs the initializer and the others wait for it, [safe for the collector](threads.md),

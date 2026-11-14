@@ -301,7 +301,9 @@ whose type is not sendable. Avin compiles the whole program, so every function a
 known: the one a call names, every implementation a call through a trait method or an operator may
 reach, every closure made on the way, and an extractor a pattern calls. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
-`lazy val` of a sendable type is initialized once whichever threads read it. The error names the
+`lazy val` of a sendable type is initialized once whichever threads read it. A local `lazy val` a
+body captures brings its initializer along, so what that initializer captures and reaches is held to
+these rules too. The error names the
 module-level item and the functions it is reached through:
 
 ```text
@@ -383,7 +385,7 @@ will own its handles across every message, whichever thread runs it.
   many at once: every other call waits until that body has returned, and returns without running its
   own. `isDone()` says whether it has run. A body that runs its own `Once` again traps, as a mutex
   taken twice does.
-- **`lazy val`s**, module-level and fields alike ([Initialization](declarations.md#initialization)),
+- **`lazy val`s**, module-level, fields and locals alike ([Initialization](declarations.md#initialization)),
   initialized by exactly one thread, as a `Once` is run: a thread that reads one while another runs
   its initializer waits, safe for the collector, and the stored value is published with a release
   store that every read pairs with an acquire load, so no thread sees it half made. A read by the

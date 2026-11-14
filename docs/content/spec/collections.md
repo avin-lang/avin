@@ -884,7 +884,7 @@ initialized (without a lock, since only one thread reaches it), and a cell whose
 `lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read:
 ``avin: trap: a LazyList cell is read while it is being evaluated``.
 
-A list that refers to itself is a `lazy val`, at module level or in a class: a module-level `val`
+A list that refers to itself is a `lazy val`, at module level, in a class or in a block: a module-level `val`
 initializes before `main` and may not need its own value at all, even inside a delayed expression,
 so `val fibs = 0 #:: fibs` is an error naming `fibs` as needed by its own initializer.
 
