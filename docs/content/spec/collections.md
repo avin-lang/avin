@@ -1419,7 +1419,7 @@ checked as written out:
 - **A guard** filters an `Iterable` through `withFilter`, lazily as below, and any other source
   through `Filter`'s `filter`. The views `withFilter` makes are `Iterable`s themselves, so the calls
   after a guard are on an `Iterable` too.
-- **In generic code** the bounds decide: `fa: F[A]` with `F[_]: Monad + Filter` takes every role,
+- **In generic code** the bounds decide: `fa: F[A]` with `F[_]: Monad & Filter` takes every role,
   and with `F[_]: Functor` alone only the last generator's.
 
 So `Option`, `Result[_, E]` and `Either[L, _]` draw in a comprehension as the collections do, and so

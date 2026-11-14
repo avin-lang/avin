@@ -506,7 +506,7 @@ at `Vector` and at `Result[_, AgeError]`, as any generic call does.
   parameter at that hole has those bounds, `Future` and `TreeSet` (`F[_: Ord]`) among them. A
   variance comes first, as for any parameter: `F[+_: Ord]`.
 - **A constructor parameter's bounds are [constructor traits](#constructor-traits)**:
-  `[F[_]: Monad]`, `[F[_]: Traverse + Monad]`. `[F[_]: Ord]` is an error ("`Ord` is a bound for a
+  `[F[_]: Monad]`, `[F[_]: Traverse & Monad]`. `[F[_]: Ord]` is an error ("`Ord` is a bound for a
   type, and `F` is a constructor"), as is `[T: Monad]` ("`Monad` is a bound for a constructor of one
   argument; declare `T[_]`").
 
