@@ -318,7 +318,35 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 except `!=`. `x.isNaN`, `x.isInfinite` (either infinity) and `x.isFinite` (neither) classify a
 value, and each value is exactly one of NaN, infinite or finite. `x.toInt` and `x.toLong` are
 `int(x)` and `long(x)`, truncating toward zero, saturating at the bounds and mapping NaN to zero;
-`x.toReal` is `x`. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
+`x.toReal` is `x`. There is no implicit fused multiply-add.
+
+`x.toBits` is the IEEE 754 binary64 encoding of `x` as a `long`, sign bit highest, and
+`real.fromBits(bits)` the number of an encoding: `1.0.toBits` is `0x3FF0000000000000`, `(-0.0).toBits`
+is `long.MinValue`, and the two are inverses for every encoding, a NaN's payload included. Since
+there is no single-precision type, binary32 is reached through its encoding, for a file format or a
+wire protocol that carries one: `real.fromBits32(bits: int)` widens a binary32 exactly, and
+`x.toBits32` rounds `x` to the nearest binary32, ties to even, a magnitude past binary32's greatest
+finite value becoming an infinity and one below half its least subnormal a zero of the same sign.
+A NaN narrows to a quiet NaN, keeping as much of its payload as the platform's conversion does (on
+ARM64 and x86-64, the top 22 bits), so a signaling binary32 NaN comes back from
+`real.fromBits32(b).toBits32` with its quiet bit set; every other binary32 comes back as it was.
+
+```text run
+main()
+  println(1.0.toBits == 0x3FF0000000000000) // true
+  println(real.fromBits(0x4000000000000000)) // 2
+  println(real.fromBits32(0x3DCCCCCD)) // 0.10000000149011612
+  println(0.1.toBits32 == 0x3DCCCCCD) // true
+  println(1e39.toBits32 == 0x7F800000) // true
+```
+
+```text output
+true
+2
+0.10000000149011612
+true
+true
+``` The square root, logarithms, trigonometry and
 the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
 `math.sqrt(x)`. `char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
@@ -370,6 +398,7 @@ offset is inside.
 | `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string, and `charAt` also when `at` is inside a character's encoding |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
 | `toUpper`, `toLower` | Each character's simple case mapping, one character for one, as `char`'s methods of the same names map it: `"straße".toUpper` is `STRAßE` |
+| `normalize(form)`, `isNormalized(form)` | The string in a Unicode normalization form, `Nfc`, `Nfd`, `Nfkc` or `Nfkd`, and whether it is in it already ([Normalization](#normalization)) |
 | `strip`, `stripLeading`, `stripTrailing` | Without the Unicode `White_Space` characters at both ends, the start, the end |
 | `trim` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
@@ -455,6 +484,48 @@ println(string.fromUtf8(bytes))                          // Ok(naïve)
 val cut: Array[byte] = [0x61, 0xE2, 0x82]
 println(string.fromUtf8(cut))                            // Err(Utf8Error(1, true))
 println(string.fromUtf8Lossy(cut))                       // a�
+```
+
+### Normalization
+
+The same text can be more than one sequence of characters: `é` is one character, U+00E9, or two,
+`e` and the combining acute accent U+0301, and `==` compares characters, so the two are not equal.
+`s.normalize(form)` puts a string in one of the four Unicode normalization forms (UAX #15), the
+values of `NormalizationForm`, and `s.isNormalized(form)` says whether it is in that form already,
+by the Unicode Character Database 17.0.0, the one `char`'s methods answer from:
+
+| Form | Meaning |
+|---|---|
+| `Nfc` | NFC: canonical decomposition, then canonical composition. The form for storing and sending text |
+| `Nfd` | NFD: canonical decomposition, the combining marks in canonical order |
+| `Nfkc` | NFKC: compatibility decomposition, then canonical composition: `ﬁ` is `fi`, `①` is `1`, a fullwidth `Ａ` is `A` |
+| `Nfkd` | NFKD: compatibility decomposition, the combining marks in canonical order |
+
+Hangul syllables compose and decompose by their algorithm; a code point unassigned in the database
+is left as it is. A string of ASCII characters only is in all four forms and is returned at once,
+unexamined. The compatibility forms discard distinctions, so they are for comparing and matching
+rather than for storing. [`avin.crypto.saslPrep`](/spec/system-library/#avin-crypto) applies NFKC
+as part of preparing a password.
+
+```text run
+main()
+  val composed = "caf\u{e9}"
+  val decomposed = "cafe\u{301}"
+  println(composed == decomposed) // false
+  println(decomposed.normalize(Nfc) == composed) // true
+  println(composed.normalize(Nfd).charCount) // 5
+  println("\u{fb01}le \u{2460}".normalize(Nfkc)) // file 1
+  println(composed.isNormalized(Nfc)) // true
+  println(decomposed.isNormalized(Nfc)) // false
+```
+
+```text output
+false
+true
+5
+file 1
+true
+false
 ```
 
 ## unit

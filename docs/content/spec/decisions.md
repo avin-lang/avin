@@ -10428,3 +10428,56 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   number them. `FromParam` is implemented in `avin.net.http`'s `params.avin`, which imports
   `avin.uuid` (which imports nothing from `avin.net`, so no cycle). Review with the user: the
   `Nil`/`Max` spelling and the variant numbering.
+
+- Settled on the user's delegation 2026-11-15 (branch `real-bits-normalize`): **`real` reaches its
+  IEEE 754 encodings through `toBits -> long`, `real.fromBits(bits: long)`, `toBits32 -> int` and
+  `real.fromBits32(bits: int)`, and there is still no 32-bit float type** ([types](/spec/types/#real-and-char)).
+  A binary protocol (PostgreSQL's `float4`/`float8`) or file format needs the encodings, and a
+  program that needs binary32 needs it only at that edge, so the 32-bit forms convert at the
+  boundary rather than adding a type every arithmetic rule would have to cover. The members are
+  parameterless accessors and statics, as `isNaN` and `real.PositiveInfinity` are; the encoding is
+  signed (`long`, `int`) because there are no unsigned integers, so `(-0.0).toBits` is
+  `long.MinValue`. Narrowing is the hardware's conversion: round to nearest, ties to even,
+  overflow to an infinity, and a NaN quieted with the top of its payload kept (ARM64 and x86-64
+  agree), so a signaling binary32 NaN does not survive a round trip; binary64 bits pass unchanged.
+  Bound to `sysl`'s `FloatBits` through four runtime functions (`avin.rt.real_to_bits` and its
+  siblings). Alternatives weighed: a `float` type (the size of the language change, for an edge
+  need); returning `Vector[byte]` (every protocol orders bytes its own way, and the integer is what
+  shifting code wants); names `doubleToLongBits`-style (Avin names members by what they answer).
+  Review with the user: whether `toBits32` should trap rather than give an infinity on overflow.
+
+- Settled on the user's delegation 2026-11-15 (branch `real-bits-normalize`): **Unicode
+  normalization is `string.normalize(form: NormalizationForm)` and `isNormalized(form)`, the forms
+  `Nfc`, `Nfd`, `Nfkc`, `Nfkd`** ([types](/spec/types/#normalization)). `NormalizationForm` mirrors
+  `sysl.unicode.Form`, so the data is utf8proc's Unicode 17.0.0, the database `char`'s methods and
+  `avin.regex` already answer from, and no table is generated or carried for it; a mirror's
+  variants must have the Sysl names, and `Nfc` is also how Avin spells an acronym in a name
+  (`Utf8Error`, `TlsStream`), so the brief's `NFC` became `Nfc`. A code point unassigned in 17.0.0
+  is left alone (utf8proc's `STABLE`). A string of ASCII characters only is answered without
+  crossing into Sysl, since it is in every form; `isNormalized` normalizes and compares rather than
+  using the quick-check property, which utf8proc does not expose. Tested against every line of
+  `NormalizationTest.txt` 17.0.0 (committed as `tests/fixtures/unicode/NormalizationTest.txt`,
+  1 MB with the character-name comments removed; the original's SHA-256 is in the test) and every
+  code point its part 1 does not list. Alternatives weighed: variants `NFC` … (refused by the
+  mirror, and against the naming rule); four methods `toNfc` … (four names for one operation with
+  a parameter); a table of Avin's own (a second copy of the database to keep in step). Review with
+  the user: the variant spelling `Nfc` over `NFC`, which every other platform writes in capitals.
+
+- Settled on the user's delegation 2026-11-15 (branch `real-bits-normalize`): **`saslPrep(text) ->
+  Option[string]` in `avin.crypto`**, RFC 4013 over RFC 3454's tables B.1, C.1.2–C.9, A.1, D.1 and
+  D.2 ([system library](/spec/system-library/#avin-crypto)). It lives beside PBKDF2 and HMAC because
+  its one use is preparing a SCRAM password. The tables are generated from the RFC's text by
+  `scripts/stringprep_tables.avin` into `library/avin/crypto/stringprep_tables.avin` (8 KB of
+  hexadecimal runs, decoded on first use into a sorted array searched by halves), since stringprep
+  fixes them at Unicode 3.2 and the current database would answer differently. Unassigned code
+  points are prohibited, as for a stored string (RFC 3454 §7), the stricter of the two forms, which
+  PostgreSQL's own SASLprep also applies; normalization is the current NFKC, which differs from 3.2's only for
+  the few CJK compatibility ideographs Unicode corrected since. U+200B, in both C.1.2 and B.1, is
+  mapped to a space, the C.1.2 mapping being applied first; the two orders differ only for it.
+  Prohibition and the bidirectional rule are checked on the normalized string, as RFC 3454 §3
+  orders the steps, so U+0340 (prohibited) normalizes to U+0300 and is accepted. `None` carries no
+  reason, since a client's only response is to fall back to the password as written. Alternatives
+  weighed: `Result[string, SaslPrepError]` naming the step that refused (no caller acts on the
+  reason); an `allowUnassigned` flag for the query form (no SCRAM use needs it); a generic
+  `stringprep(profile)` (no second profile is wanted). Review with the user: whether a reason
+  should be returned after all.
