@@ -1,0 +1,80 @@
+// expect: exit 0
+// WebSockets over TLS: a `wss` client trusting the test authority, talking to the HTTPS server's
+// WebSocket route; text, a binary message far larger than one TLS record each way, a ping, the close
+// handshake begun by the client and a server stopping closing a session with 1001. A certificate the
+// client does not trust is refused, and a `ws` client speaking plain HTTP to the TLS server is closed
+// before an answer.
+import avin.fs
+import avin.io.IoError
+import avin.net.http
+
+import avin.net.http.{
+  BadHandshake, Binary, Closed, Message, Route, Router, Text, Tls, Unreachable, WebSocket, WebSocketError, webSocket
+}
+
+import avin.net.tls.{Certificate, TlsClient, TlsServer}
+import avin.threads.Channel
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+said(r: Result[Message, WebSocketError]) -> string = r match
+  Ok(Text(t)) -> s"text `$t`"
+  Ok(Binary(b)) -> s"binary of ${b.length} bytes, last ${int(b(b.length - 1))}"
+  Err(Closed(code, reason)) -> s"closed $code `$reason`"
+  Err(Unreachable(Tls(Certificate(_, _)))) -> "certificate refused"
+  Err(BadHandshake(text)) -> s"bad handshake: $text"
+  Err(e) -> e.message
+
+echo(ws: WebSocket, heard: Channel[string])
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(Binary(b)) -> _ = ws.send(b)
+      Err(e) ->
+        _ = heard.send(s"echo: ${said(Err(e))}")
+        return
+
+main()
+  val heard = Channel[string]()
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  val router = Router([Route.get("/echo", r -> webSocket(r, ws -> echo(ws, heard)))])
+  val server = ok(http.serve("127.0.0.1", 0, router.handle, tls = Some(identity)))
+  val url = s"wss://localhost:${server.port()}/echo"
+  val trusting = TlsClient().trust(fixture("ca.pem"))
+
+  val ws = WebSocket.connect(url, tls = trusting) match
+    Ok(w) -> w
+    Err(e) -> fail(e.message)
+  _ = ws.send("over TLS ✓")
+  println(said(ws.receive()))
+  _ = ws.send(Array.tabulate(100000, i -> byte(i % 249)))
+  println(said(ws.receive()))
+  println(ws.ping("p".utf8).isOk)
+  _ = ws.send("after the ping")
+  println(said(ws.receive()))
+  println(ws.close(1000, "done").isOk)
+  println(heard.receive().getOrElse("?"))
+
+  // Not trusted, and not speaking TLS.
+  println(said(WebSocket.connect(url).map(_ -> Text("opened"))))
+  println(said(WebSocket.connect(s"ws://127.0.0.1:${server.port()}/echo").map(_ -> Text("opened"))))
+
+  // A server stopping closes a session over TLS with 1001.
+  val last = WebSocket.connect(url, tls = trusting) match
+    Ok(w) -> w
+    Err(e) -> fail(e.message)
+  _ = last.send("still here")
+  println(said(last.receive()))
+  server.stop()
+  println(said(last.receive()))
+  server.join()
+  println(heard.receive().getOrElse("?"))
