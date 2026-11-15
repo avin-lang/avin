@@ -1581,6 +1581,68 @@ server make themselves for an error status: `Router(routes, errors)` its `404` a
 the page answered, and a `405` still carries its `Allow` header. `http.plainError`, the default, answers the
 status's reason phrase as plain text.
 
+**What a middleware sees of a request.** `request.remote: Option[string]` is the client's IP address,
+written numerically without its port (`127.0.0.1`, `::1`), over TCP and over TLS alike; `None` for a
+request made without a connection. `request.route: Option[string]` is the whole pattern of the route
+a router chose (`/api/users/:id` under its groups; a `GET` route's for a `HEAD` it answers), `None`
+until one has, so a middleware wrapped around a whole router's `handle` sees `None`.
+`request.withHeaderReplaced(name, value)` is the request with every header of `name`, any case,
+replaced by one, added last, a name that is not a token or a value holding a line break trapping. A
+`ByteStream`'s `remoteAddress` is where `remote` comes from: the other end's address for a
+`TcpStream`, accepted or connected, and a `TlsStream`, and `None` for a `UnixStream`.
+
+**Access log.** `http.accessLog(sink = standardError, format = PlainLines, clock = monotonic, ids =
+newRequestId)` is a middleware writing one line to `sink`, a `@sendable (string) -> unit` called once
+a line with no line end, for each request once its handler has answered:
+
+```text
+GET /items/7 200 12 1.5ms id=4f1c…e2 remote=127.0.0.1
+{"id":"4f1c…e2","method":"GET","path":"/items/7","status":200,"bytes":12,"micros":1500,"remote":"127.0.0.1"}
+```
+
+The first is `PlainLines`, the second `JsonLines`. The path is the decoded one, its spaces, quotes,
+backslashes and control characters written `%XX` in a plain line and escaped as JSON in a JSON one;
+`bytes` is the body's length, or a streamed body's length said beforehand, `-` or `null` where it is
+not known, as is an address. The request id is the client's `X-Request-Id` where
+`http.isRequestId` takes it (1 to 128 ASCII letters, digits and `-._:+/=@`), and a new one from `ids`
+otherwise, 32 hexadecimal digits from `SecureRandom` by default; the handler reads it in the request's
+`X-Request-Id`, which replaces any the client sent, and the response carries it back unless the
+handler set its own. The default sink writes each line to standard error in one write, so lines from
+several connections never interleave. The time is read from `clock`, a `@sendable () -> Duration`,
+before and after the handler. A handler that traps writes no line.
+
+**Metrics.** `Metrics(buckets = defaultBuckets, clock = monotonic)` counts the requests its
+`middleware` passes on, shared by every connection's actor under a lock of its own:
+`http_requests_total` by `method`, `route` (the route's pattern, `""` where none was chosen) and
+`status` class (`2xx`); `http_request_duration_seconds`, a histogram of `buckets` (5 ms to 10 s by
+default), a time equal to a bound counted in that bound's bucket, with its `_sum` and `_count`; and
+the gauge `http_requests_in_flight`. `render` is the Prometheus text format, series ordered by route,
+method and status class; `handler` answers it as `200` of the type `MetricsContentType`
+(`text/plain; version=0.0.4; charset=utf-8`), and `route(pattern = "/metrics")` mounts it.
+`observe(method, route, status, took)` counts a request answered another way, and `inFlight` is the
+gauge's value. Buckets not in increasing order, or one not above zero, trap.
+
+```text
+val metrics = Metrics()
+val router = Router(Route.group("/api", routes, metrics.middleware) :+ metrics.route())
+```
+
+Wrapping a group or a route labels each request by its route; wrapping a router's `handle` counts the
+`404`s and `405`s too, every request labelled `""`. A handler that traps is not counted, and leaves the
+gauge one higher.
+
+**Rate limiting.** `RateLimiter(rate, per, burst = rate, key = clientAddress, maxKeys = 10000, clock =
+monotonic, errors = plainError)` gives each key a token bucket of `burst` tokens filled again at
+`rate` every `per`. Its `middleware` takes a token for each request, keyed by `key` (the client's
+address by default, `""` for a request with none), and answers one finding its bucket empty `429`,
+rendered by `errors`, with `Retry-After` the seconds until the next token, rounded up and at least
+one. `admit(key) -> Result[unit, Duration]` takes a token directly, `Err` saying how long until the
+next. At most `maxKeys` buckets are held (`size` says how many): making one more forgets every bucket
+full again, which a new one would equal, and where none is, the one nearest to full. A rate, burst
+or `maxKeys` below one traps, and so does a `per` too short to give each token a whole microsecond.
+The three middlewares compose as any do: `h -> metrics.middleware(limiter.middleware(h))` counts the
+`429`s the limiter answers.
+
 **Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
 `write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
 once; its `body` is empty. Its head says `Transfer-Encoding: chunked` and each write is a chunk, the

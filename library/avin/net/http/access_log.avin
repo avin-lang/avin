@@ -1,0 +1,143 @@
+module avin.net.http
+
+// The access log: a middleware writing one line for each request it passes on, saying its method,
+// path, status, the bytes of its body, how long it took, its request id and the client's address.
+// The request id is the one the client sent in `X-Request-Id`, where that is a sensible one, and a
+// new one otherwise; either way the handler finds it in the request's `X-Request-Id` and the client
+// in the response's.
+
+import avin.random.SecureRandom
+import avin.time.{Duration, monotonic}
+
+// What a middleware reads the time by: the monotonic clock, unless a test gives one it moves itself.
+type Clock = @sendable () -> Duration
+
+// Where an access log's lines go: called once for each line, which has no line end.
+type LogSink = @sendable (string) -> unit
+
+// How an access log writes its lines: as words, one field after another, or as JSON objects, one to a
+// line.
+data LogFormat
+  PlainLines
+  JsonLines
+
+// The header a request id travels in, both ways.
+val RequestIdHeader: string = "X-Request-Id"
+
+// The sink an access log writes to unless given another: standard error, each line in one write, so
+// lines written at once by several connections do not interleave.
+standardError(line: string) = eprintln(line)
+
+// A new request id: sixteen random bytes as 32 lower-case hexadecimal digits.
+newRequestId() -> string = SecureRandom.hexToken(16)
+
+// Whether `id`, a request id a client sent, is taken as it is: between 1 and 128 characters, each an
+// ASCII letter or digit or one of `-._:+/=@`, so a log line holding it is still one line of plain
+// fields. Any other is replaced by a new one.
+isRequestId(id: string) -> bool =
+  1 <= id.byteLength <= 128 && id.indexWhere(c -> !isIdChar(c)) < 0
+
+private isIdChar(c: char) -> bool =
+  'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || "-._:+/=@".contains(c.toString())
+
+// The access log as a middleware: each request passed on to the handler it wraps, with its request
+// id, and a line written to `sink` in `format` once the handler has answered, its response carrying
+// the id. A request id comes from the request's `X-Request-Id` where `isRequestId` takes it, and from
+// `ids` otherwise, replacing any the request had; a response the handler gave an `X-Request-Id` of
+// its own keeps it. The time is read from `clock` before and after the handler. A handler that traps
+// writes no line, as it gives no response.
+accessLog(
+    sink: LogSink = standardError,
+    format: LogFormat = PlainLines,
+    clock: Clock = monotonic,
+    ids: @sendable () -> string = newRequestId
+) -> (Handler) -> Handler = next -> request -> logged(next, request, sink, format, clock, ids)
+
+private logged(
+    next: Handler,
+    request: ServerRequest,
+    sink: LogSink,
+    format: LogFormat,
+    clock: Clock,
+    ids: @sendable () -> string
+) -> Response
+  val start = clock()
+  val given = request.header(RequestIdHeader).filter(isRequestId)
+  val id = given.getOrElse(ids())
+  val inner = if given.isDefined then request else request.withHeaderReplaced(RequestIdHeader, id)
+  val response = next(inner)
+  val took = clock() - start
+  val answered = if response.header(RequestIdHeader).isDefined then response else response.withHeader(
+    RequestIdHeader,
+    id
+  )
+  sink(logLine(format, request, answered, took, id))
+  answered
+
+// The length of the body a response gives, `None` for a streamed one whose length is not said.
+private bodyLength(r: Response) -> Option[long] = r.streamed match
+  Some(s) -> s.length
+  None -> Some(long(r.body.length))
+
+// The line `format` writes for `request` answered by `response` after `took`, with the id `id`.
+private logLine(format: LogFormat, request: ServerRequest, response: Response, took: Duration, id: string) -> string =
+  format match
+    PlainLines -> plainLine(request, response, took, id)
+    JsonLines -> jsonLine(request, response, took, id)
+
+// `GET /items/7 200 12 1.5ms id=… remote=127.0.0.1`: a length not known and an address not known
+// written `-`, and the path's spaces, quotes, backslashes and control characters as `%XX`.
+private plainLine(request: ServerRequest, response: Response, took: Duration, id: string) -> string
+  val bytes = bodyLength(response).map(n -> n.toString()).getOrElse("-")
+  val remote = request.remote.getOrElse("-")
+  s"${request.method} ${plainPath(request.path)} ${response.status} $bytes $took id=$id remote=$remote"
+
+private plainPath(path: string) -> string
+  if path.indexWhere(c -> needsEscape(c)) < 0 then return path
+  val out = StringWriter()
+  for c in path.chars
+    if needsEscape(c) then out.write("%" + hexPair(int(c))) else out.write(c.toString())
+  out.text
+
+private needsEscape(c: char) -> bool = c <= ' ' || c == '"' || c == '\\' || c == '\u{7f}'
+
+// `{"id":"…","method":"GET","path":"/items/7","status":200,"bytes":12,"micros":1500,"remote":"127.0.0.1"}`:
+// a length not known and an address not known written `null`.
+private jsonLine(request: ServerRequest, response: Response, took: Duration, id: string) -> string
+  val bytes = bodyLength(response).map(n -> n.toString()).getOrElse("null")
+  val remote = request.remote.map(jsonString).getOrElse("null")
+  val fields = Vector(
+    s"\"id\":${jsonString(id)}",
+    s"\"method\":${jsonString(request.method)}",
+    s"\"path\":${jsonString(request.path)}",
+    s"\"status\":${response.status}",
+    s"\"bytes\":$bytes",
+    s"\"micros\":${took.micros}",
+    s"\"remote\":$remote"
+  )
+  "{" + fields.mkString(",") + "}"
+
+// `text` as a JSON string: in quotes, a quote and a backslash escaped, a control character written
+// `\uXXXX` (`\n`, `\r` and `\t` by their short forms), every other character as it is.
+private jsonString(text: string) -> string
+  val out = StringWriter()
+  out.write("\"")
+  for c in text.chars
+    out.write(jsonChar(c))
+  out.write("\"")
+  out.text
+
+private jsonChar(c: char) -> string
+jsonChar('"') = "\\\""
+jsonChar('\\') = "\\\\"
+jsonChar('\n') = "\\n"
+jsonChar('\r') = "\\r"
+jsonChar('\t') = "\\t"
+jsonChar('\u{7f}') = "\\u007F"
+jsonChar(c < ' ') = "\\u00" + hexPair(int(c))
+jsonChar(c) = c.toString()
+
+// The two upper-case hexadecimal digits of `n`, from 0 to 255.
+private hexPair(n: int) -> string
+  val digits = "0123456789ABCDEF"
+  digits.slice(n / 16, n / 16 + 1) + digits.slice(n % 16, n % 16 + 1)

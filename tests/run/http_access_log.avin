@@ -1,0 +1,119 @@
+// expect: exit 0
+// The access log middleware, without a connection: a line for each request in the plain and the
+// JSON-lines formats, with its method, decoded path, status, body length, duration by an injected
+// clock, request id and client address; a request id taken from the request where it is sensible,
+// made by `ids` where it is missing or is not, replacing the one sent, seen by the handler, echoed in
+// the response, and left alone where the handler set its own; a streamed body's length known and
+// not; a path holding spaces, quotes, backslashes, control characters and Unicode, escaped for each
+// format; the log composed with a route group and with a router; the default sink, standard error;
+// and lines written from several threads at once, each whole.
+import avin.net.http
+import avin.net.http.{JsonLines, PlainLines, Response, Route, Router, ServerRequest}
+import avin.threads.{Atomic, Mutex, spawn}
+import avin.time.{Duration, millis}
+
+// A sink keeping its lines, and a clock moving 1.5 ms each time it is read.
+class Kept(): Sendable
+  val lines = Mutex(Vector.empty[string]())
+  add(line: string) = _ = lines.update(v -> v :+ line)
+  all -> Vector[string] = lines.get()
+
+ticking() -> @sendable () -> Duration
+  val now = Atomic(long(0))
+  () -> Duration(now.add(1500))
+
+hello(r: ServerRequest) -> Response = Response.text(200, s"hello ${r.header("X-Request-Id").getOrElse("none")}")
+
+main()
+  val kept = Kept()
+  val counter = Atomic(0)
+  val ids: @sendable () -> string = () -> s"id${counter.add(1)}"
+  val plain = http.accessLog(line -> kept.add(line), clock = ticking(), ids = ids)
+  val h = plain(hello)
+
+  // A request without an id is given one, which the handler reads and the response carries.
+  val r1 = h(ServerRequest("GET", "/items/7?q=secret", remote = Some("127.0.0.1")))
+  println(s"${r1.text} ${r1.header("X-Request-Id")}")
+
+  // A sensible id the client sent is kept, whatever the case of its header's name.
+  val r2 = h(ServerRequest("POST", "/a", Vector(("x-request-id", "abc-123_./:+=@XYZ"))))
+  println(s"${r2.text} ${r2.header("X-Request-Id")}")
+
+  // An empty one, one too long, and ones holding a space, a quote or a non-ASCII letter are replaced,
+  // and the handler sees only the new one.
+  val long128 = "a".repeat(128)
+  val long129 = "a".repeat(129)
+  for sent in ["", long129, "a b", "a\"b", "é"]
+    val r = h(ServerRequest("GET", "/x", Vector(("X-Request-Id", sent), ("X-Request-Id", "second"))))
+    println(s"${r.text} ${r.header("X-Request-Id")}")
+  println(h(ServerRequest("GET", "/x", Vector(("X-Request-Id", long128)))).header("X-Request-Id") == Some(long128))
+  println(
+    [
+      http.isRequestId(""),
+      http.isRequestId("a"),
+      http.isRequestId(long128),
+      http.isRequestId(long129),
+      http.isRequestId("a\nb")
+    ]
+  )
+
+  // A handler's own `X-Request-Id` is kept.
+  val own = plain(_ -> Response.empty(204).withHeader("x-request-id", "mine"))
+  println(own(ServerRequest("DELETE", "/z")).headers)
+
+  // Streamed bodies: the length said beforehand, and none.
+  val sized = plain(_ -> Response.stream(200, "text/plain", 42, _ -> ()))
+  _ = sized(ServerRequest("GET", "/sized"))
+  val chunked = plain(_ -> Response.stream(200, "text/plain", _ -> ()))
+  _ = chunked(ServerRequest("GET", "/chunked"))
+
+  // Paths: decoded, with what would break a line of fields escaped.
+  _ = h(ServerRequest("GET", "/caf%C3%A9/%E6%97%A5%20x%22y%5Cz%0A%09%7F"))
+  for line in kept.all
+    println(line)
+
+  // The same requests as JSON lines.
+  val jsonKept = Kept()
+  val json = http.accessLog(line -> jsonKept.add(line), JsonLines, ticking(), ids)
+  val j = json(hello)
+  _ = j(ServerRequest("GET", "/items/7", remote = Some("::1")))
+  _ = j(ServerRequest("GET", "/caf%C3%A9/%20x%22y%5Cz%0A%09%7F%01", Vector(("X-Request-Id", "given"))))
+  _ = json(_ -> Response.stream(500, "text/plain", _ -> ()))(ServerRequest("PUT", "/"))
+  for line in jsonKept.all
+    println(line)
+
+  // In a group, the log wraps each of its routes; around a router, every request, unrouted ones too.
+  val grouped = Kept()
+  val router = Router(
+    Route.group(
+      "/api",
+      [Route.get("/items/:id", r -> Response.text(200, r.param("id")))],
+      http.accessLog(line -> grouped.add(line), clock = ticking(), ids = () -> "g")
+    ) :+ Route.get("/free", _ -> Response.text(200, "unlogged"))
+  )
+  _ = router.handle(ServerRequest("GET", "/api/items/9"))
+  _ = router.handle(ServerRequest("GET", "/free"))
+  val outer = http.accessLog(line -> grouped.add(line), PlainLines, ticking(), () -> "o")(router.handle)
+  _ = outer(ServerRequest("GET", "/missing"))
+  _ = outer(ServerRequest("POST", "/free"))
+  for line in grouped.all
+    println(line)
+
+  // The default sink is standard error.
+  val toStderr = http.accessLog(clock = ticking(), ids = () -> "e")(hello)
+  _ = toStderr(ServerRequest("GET", "/stderr"))
+
+  // Several threads logging through one middleware: every line whole, every id its own.
+  val many = Kept()
+  val made = Atomic(0)
+  val shared = http.accessLog(line -> many.add(line), ids = () -> s"t${made.add(1)}")(hello)
+  val threads = Vector.tabulate(8, t -> spawn(() ->
+    for i in 0 ..< 50
+      _ = shared(ServerRequest("GET", s"/t/$t/$i"))
+    ()))
+  for t in threads
+    t.join()
+  val all = many.all
+  println(all.length)
+  println(all.forall(l -> l.startsWith("GET /t/") && l.contains(" 200 ") && l.endsWith(" remote=-")))
+  println(all.map(l -> l.slice(l.indexOf("id="), l.indexOf(" remote"))).toSet.size)

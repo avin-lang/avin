@@ -1,0 +1,132 @@
+// expect: exit 0
+// Rate limiting by token bucket, on an injected clock: a burst taken at once and the next refused
+// with how long until a token comes; tokens filled again at the rate, never past the burst; a burst
+// of one; `Retry-After` in whole seconds rounded up and at least one; buckets kept apart by key, the
+// client's address by default (`""` for a request with none) or a key function's; at most `maxKeys`
+// buckets held, making room by forgetting the full ones, or the one nearest full; the `429` rendered
+// by an error page; the limiter in a route group beside unlimited routes; and threads taking tokens
+// at once, exactly the burst admitted for one key and for each of several.
+import avin.net.http
+import avin.net.http.{RateLimiter, Response, Route, Router, ServerRequest}
+import avin.threads.{Atomic, spawn}
+import avin.time.{Duration, millis, seconds}
+
+class Clock(): Sendable
+  val now = Atomic(long(0))
+  read -> @sendable () -> Duration = () -> Duration(now.load())
+  at(ms: long) = now.store(ms * 1000)
+
+from(address: string) -> ServerRequest = ServerRequest("GET", "/", remote = Some(address))
+
+main()
+  val c = Clock()
+  // Two tokens a second, three at most.
+  val limiter = RateLimiter(2, seconds(1), burst = 3, clock = c.read)
+  println(s"${limiter.rate} ${limiter.per} ${limiter.burst} ${limiter.maxKeys}")
+  val h = limiter.middleware(_ -> Response.text(200, "ok"))
+  for _ in 0 ..< 4
+    val r = h(from("10.0.0.1"))
+    println(s"${r.status} ${r.header("Retry-After")} ${r.text.trim}")
+  println(limiter.admit("10.0.0.1"))
+  c.at(499)
+  println(limiter.admit("10.0.0.1"))
+  c.at(500)
+  println(limiter.admit("10.0.0.1"))
+  println(limiter.admit("10.0.0.1"))
+  // A long wait fills the bucket to the burst and no further.
+  c.at(60000)
+  println([limiter.admit("10.0.0.1"), limiter.admit("10.0.0.1"), limiter.admit("10.0.0.1"), limiter.admit("10.0.0.1")])
+
+  // Another client has a bucket of its own; a request with no address shares the bucket `""`.
+  println(h(from("10.0.0.2")).status)
+  println([http.clientAddress(from("::1")), http.clientAddress(ServerRequest("GET", "/"))])
+  println(h(ServerRequest("GET", "/")).status)
+  println([limiter.admit(""), limiter.admit(""), limiter.admit("")])
+
+  // A burst of one, and `Retry-After` rounded up to whole seconds, never zero.
+  val slow = RateLimiter(1, seconds(90), burst = 1, clock = c.read)
+  val sh = slow.middleware(_ -> Response.empty(204))
+  println([sh(from("a")).status, sh(from("a")).status])
+  println(sh(from("a")).header("Retry-After"))
+  val fast = RateLimiter(1000, seconds(1), burst = 1, clock = c.read)
+  val fh = fast.middleware(_ -> Response.empty(204))
+  _ = fh(from("a"))
+  println(s"${fast.admit("a")} ${fh(from("a")).header("Retry-After")}")
+
+  // A key of the program's own: the `X-Api-Key` header, whatever the address.
+  val keyed = RateLimiter(1, seconds(10), clock = c.read, key = r -> r.header("X-Api-Key").getOrElse("anonymous"))
+  val kh = keyed.middleware(_ -> Response.empty(204))
+  val withKey = (k: string, address: string) -> ServerRequest(
+    "GET",
+    "/",
+    Vector(("X-Api-Key", k)),
+    remote = Some(address)
+  )
+  println(
+    [kh(withKey("k1", "1.1.1.1")).status, kh(withKey("k1", "2.2.2.2")).status, kh(withKey("k2", "1.1.1.1")).status]
+  )
+  println([kh(ServerRequest("GET", "/")).status, kh(ServerRequest("GET", "/")).status])
+
+  // Bounded memory: two buckets at most. A full bucket is forgotten first; where none is full, the
+  // one nearest to full.
+  c.at(100000)
+  val small = RateLimiter(1, seconds(1), burst = 2, maxKeys = 2, clock = c.read)
+  _ = small.admit("x")
+  _ = small.admit("y")
+  _ = small.admit("y")
+  println(small.size)
+  c.at(101000)
+  // "x" is full again by now and "y" is not: "x" goes, "z" comes.
+  println(s"${small.admit("z")} ${small.size}")
+  println([small.admit("y"), small.admit("y")])
+  // None is full: "z" is nearer to full than "y", whose token is a second further off, so "z" goes.
+  _ = small.admit("w")
+  println(small.size)
+  println([small.admit("y"), small.admit("w"), small.admit("w"), small.admit("z")])
+  // A single bucket held at most.
+  val one = RateLimiter(1, seconds(1), burst = 1, maxKeys = 1, clock = c.read)
+  println(s"${[one.admit("p"), one.admit("q"), one.admit("p")]} ${one.size}")
+
+  // The error page renders the `429`, which still says when to try again.
+  val paged = RateLimiter(1, seconds(3), clock = c.read, errors = s -> Response.json(s, s"{\"status\":$s}"))
+  val ph = paged.middleware(_ -> Response.empty(204))
+  _ = ph(from("a"))
+  val refused = ph(from("a"))
+  println(s"${refused.status} ${refused.reason} ${refused.headers} ${refused.text}")
+
+  // In a group, the limiter guards its routes and no other, its routes sharing a client's bucket.
+  val guard = RateLimiter(1, seconds(60), clock = c.read)
+  val router = Router(
+    Route.group(
+      "/api",
+      [Route.get("/a", _ -> Response.text(200, "a")), Route.get("/b", _ -> Response.text(200, "b"))],
+      guard.middleware
+    ) :+ Route.get("/open", _ -> Response.text(200, "open"))
+  )
+  val at = (path: string) -> router.handle(ServerRequest("GET", path, remote = Some("9.9.9.9"))).status
+  println([at("/api/a"), at("/api/b"), at("/open"), at("/open"), at("/api/a")])
+
+  // Eight threads taking 50 tokens each from one bucket of five: exactly five admitted.
+  val shared = RateLimiter(1, seconds(3600), burst = 5, clock = c.read)
+  val admitted = Atomic(0)
+  val threads = Vector.tabulate(8, _ -> spawn(() ->
+    for _ in 0 ..< 50
+      if shared.admit("one").isOk then _ = admitted.add(1)
+    ()))
+  for t in threads
+    t.join()
+  println(admitted.load())
+
+  // Eight threads, each its own key and also all of them a shared one, through the middleware.
+  val perKey = RateLimiter(1, seconds(3600), burst = 3, clock = c.read)
+  val ok = perKey.middleware(_ -> Response.empty(204))
+  val own = Atomic(0)
+  val common = Atomic(0)
+  val workers = Vector.tabulate(8, w -> spawn(() ->
+    for _ in 0 ..< 20
+      if ok(from(s"10.1.0.$w")).status == 204 then _ = own.add(1)
+      if ok(from("10.9.9.9")).status == 204 then _ = common.add(1)
+    ()))
+  for w in workers
+    w.join()
+  println([own.load(), common.load(), perKey.size])

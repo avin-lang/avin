@@ -19,7 +19,9 @@ import avin.time.{Duration, millis, seconds}
 // order, its body, its version (`HTTP/1.1` or `HTTP/1.0`) and the parameters its route bound. A
 // target is a path beginning with `/`, with an optional query, or an absolute `http` URL; any other
 // traps where a request is made with it. A request a server read knows its server, so a handler can
-// wait in a way the server's stopping ends; one made without a server never stops.
+// wait in a way the server's stopping ends; one made without a server never stops. It knows the
+// client's address, `remote`, where its connection has one, and `route`, the pattern of the route a
+// router chose for it, once one has.
 class ServerRequest(
     val method: string,
     val target: string,
@@ -27,6 +29,8 @@ class ServerRequest(
     val body: Array[byte] = Array.empty[byte](),
     val version: string = "HTTP/1.1",
     val params: Vector[(string, string)] = Vector.empty[(string, string)](),
+    val remote: Option[string] = None,
+    val route: Option[string] = None,
     private val server: Option[TcpServer] = None
 )
   private val parts: Target = targetOf(target) match
@@ -97,8 +101,31 @@ class ServerRequest(
     body,
     version,
     bound,
+    remote,
+    route,
     server
   )
+
+  // The request as the route of `pattern` takes it, binding `bound`.
+  routed(pattern: string, bound: Vector[(string, string)]) -> ServerRequest = ServerRequest(
+    method,
+    target,
+    headers,
+    body,
+    version,
+    bound,
+    remote,
+    Some(pattern),
+    server
+  )
+
+  // The request with every header of `name`, compared without regard to case, replaced by one of
+  // `value` after the others, so the handlers a middleware passes it to read that one. A header's
+  // name is a token and its value holds no line break; either traps where it does not hold.
+  withHeaderReplaced(name: string, value: string) -> ServerRequest
+    checkHeader(name, value)
+    val kept = headers.filter(h -> !h.0.equalsIgnoreCase(name))
+    ServerRequest(method, target, kept :+ (name, value), body, version, params, remote, route, server)
 
 // A target read: the URL it is part of, its path decoded, and the path's segments decoded.
 private data Target(url: Url, path: string, segments: Vector[string])
@@ -256,7 +283,7 @@ class Router(private val routes: Vector[Route], private val errors: ErrorPage = 
     for r in routes
       if r.method == method
         r.matches(request.segments) match
-          Some(params) -> return Some(r.handler(request.withParams(params)))
+          Some(params) -> return Some(r.handler(request.routed(r.pattern, params)))
           None -> ()
     None
 
@@ -602,7 +629,7 @@ private readRequest(
   val hosts = all.count(h -> h.0.equalsIgnoreCase("Host"))
   if hosts > 1 || (version == "HTTP/1.1" && hosts == 0) then return Err(Answer(400))
   val body = readBody(input, stream, all, version, s)?
-  Ok(ServerRequest(method, target, all, body, version, server = Some(server)))
+  Ok(ServerRequest(method, target, all, body, version, remote = stream.remoteAddress, server = Some(server)))
 
 // `HTTP/` and a digit, a dot and a digit.
 private isVersion(text: string) -> bool =

@@ -1,0 +1,146 @@
+module avin.net.http
+
+// Request metrics: a middleware counting the requests it passes on by method, route and status
+// class, timing them into a latency histogram of fixed buckets, and keeping how many are being
+// answered at once, all shown in the Prometheus text format by a handler a router mounts. One
+// `Metrics` is shared by every connection's actor, its counts kept under a lock of its own.
+
+import avin.threads.{Atomic, Mutex}
+import avin.time.{Duration, millis, monotonic, seconds}
+
+// The latency buckets a `Metrics` counts into unless given others: from 5 milliseconds to 10 seconds.
+val defaultBuckets: Vector[Duration] = Vector(
+  millis(5),
+  millis(10),
+  millis(25),
+  millis(50),
+  millis(100),
+  millis(250),
+  millis(500),
+  seconds(1),
+  millis(2500),
+  seconds(5),
+  seconds(10)
+)
+
+// The type of the Prometheus text format, version 0.0.4, which `Metrics.handler` answers.
+val MetricsContentType: string = "text/plain; version=0.0.4; charset=utf-8"
+
+// The requests a set of routes has answered. Its `middleware` counts each request it passes on in
+// `http_requests_total`, by its method, its route's pattern and the class of its status (`2xx`), and
+// times it into `http_request_duration_seconds`, a histogram of `buckets`, upper bounds in increasing
+// order, each a duration above zero; any other order, or a bound not above zero, traps. A request
+// being answered is counted in the gauge `http_requests_in_flight`. A request no router chose a route
+// for, as one is for a middleware wrapped around a whole router's `handle`, has the route `""`. The
+// time is read from `clock` before and after the handler.
+class Metrics(val buckets: Vector[Duration] = defaultBuckets, private val clock: Clock = monotonic): Sendable
+  for i in 0 ..< buckets.length
+    if buckets(i).micros <= 0 then fail(s"a latency bucket of ${buckets(i)}: each is above zero")
+    if i > 0 && buckets(i) <= buckets(i - 1) then
+      fail(s"the latency buckets ${buckets(i - 1)} and ${buckets(i)}: each is above the one before")
+
+  private val table = Mutex(Table())
+  private val active = Atomic(long(0))
+
+  // The middleware that counts and times each request it passes on. Wrapping a route or a group in
+  // it labels a request by its route; wrapping a router's `handle` labels each `""`.
+  middleware -> (Handler) -> Handler = next -> request -> measured(next, request)
+
+  private measured(next: Handler, request: ServerRequest) -> Response
+    _ = active.add(1)
+    val start = clock()
+    val response = next(request)
+    val took = clock() - start
+    _ = active.sub(1)
+    observe(request.method, request.route.getOrElse(""), response.status, took)
+    response
+
+  // Counts one request of `method` to the route `route`, answered `status` after `took`: what the
+  // middleware does for each request, for a program counting requests it answers another way. A
+  // negative time counts as zero.
+  observe(method: string, route: string, status: int, took: Duration)
+    val micros = if took.micros < 0 then long(0) else took.micros
+    val bucket = buckets.indexWhere(b -> micros <= b.micros)
+    val n = buckets.length
+    table.with(t -> t.count(method, route, statusClass(status), micros, bucket, n))
+
+  // How many requests the middleware is passing on now, not yet answered.
+  inFlight -> long = active.load()
+
+  // The metrics in the Prometheus text format: each family's help and type, then its series, ordered
+  // by route, then method, then status class.
+  render -> string
+    val bounds = buckets.map(b -> b.micros)
+    val gauge = active.load()
+    table.with(t -> t.rendered(bounds, gauge))
+
+  // A handler answering `render` as `200`, of the type `MetricsContentType`.
+  handler -> Handler = _ -> Response(200, reasonPhrase(200), Vector(("Content-Type", MetricsContentType)), utf8(render))
+
+  // A `GET` route of `pattern` answered by `handler`, mounted beside the routes it counts.
+  route(pattern: string = "/metrics") -> Route = Route.get(pattern, handler)
+
+// The class of a status, its first digit followed by `xx`: `2xx` for 204.
+private statusClass(status: int) -> string = s"${status / 100}xx"
+
+// One route's histogram: the requests in each bucket alone, not counting the ones below, their count
+// and the time they took.
+private class Histogram(n: int)
+  val inBucket: Array[long] = Array.fill(n, long(0))
+  var count: long = 0
+  var sumMicros: long = 0
+
+// Every series counted, by method, route and status class, and by method and route.
+private class Table()
+  var totals = HashMap.empty[(string, string, string), long]()
+  var latency = HashMap.empty[(string, string), Histogram]()
+
+  // Counts one request, `bucket` being the index of the first bucket it falls in, or -1 for none of
+  // the `n`.
+  count(method: string, route: string, kind: string, micros: long, bucket: int, n: int)
+    val key = (method, route, kind)
+    totals = totals.updated(key, totals.get(key).getOrElse(long(0)) + 1)
+    val h = latency.get((method, route)) match
+      Some(found) -> found
+      None ->
+        val made = Histogram(n)
+        latency = latency.updated((method, route), made)
+        made
+    if bucket >= 0 then h.inBucket(bucket) = h.inBucket(bucket) + 1
+    h.count += 1
+    h.sumMicros += micros
+
+  rendered(bounds: Vector[long], inFlight: long) -> string
+    val out = StringWriter()
+    out.write("# HELP http_requests_total Requests answered, by method, route and status class.\n")
+    out.write("# TYPE http_requests_total counter\n")
+    for (k, v) in totals.toVector.sortBy(e -> s"${e.0.1}\u{0}${e.0.0}\u{0}${e.0.2}")
+      out.write(s"http_requests_total{method=${label(k.0)},route=${label(k.1)},status=${label(k.2)}} $v\n")
+    out.write("# HELP http_request_duration_seconds Time taken to answer a request, by method and route.\n")
+    out.write("# TYPE http_request_duration_seconds histogram\n")
+    for (k, h) in latency.toVector.sortBy(e -> s"${e.0.1}\u{0}${e.0.0}")
+      val labels = s"method=${label(k.0)},route=${label(k.1)}"
+      var below: long = 0
+      for i in 0 ..< bounds.length
+        below += h.inBucket(i)
+        out.write(s"http_request_duration_seconds_bucket{$labels,le=\"${secondsText(bounds(i))}\"} $below\n")
+      out.write(s"http_request_duration_seconds_bucket{$labels,le=\"+Inf\"} ${h.count}\n")
+      out.write(s"http_request_duration_seconds_sum{$labels} ${secondsText(h.sumMicros)}\n")
+      out.write(s"http_request_duration_seconds_count{$labels} ${h.count}\n")
+    out.write("# HELP http_requests_in_flight Requests being answered now.\n")
+    out.write("# TYPE http_requests_in_flight gauge\n")
+    out.write(s"http_requests_in_flight $inFlight\n")
+    out.text
+
+// A label's value in quotes, a backslash, a quote and a line end escaped as the format asks.
+private label(value: string) -> string =
+  "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+
+// `micros`, at least zero, as seconds in decimal, without trailing zeros: `0.005`, `2.5`, `10`.
+private secondsText(micros: long) -> string
+  val whole = micros / 1000000
+  val part = micros % 1000000
+  if part == 0 then return whole.toString()
+  var fraction = part.toString().padStart(6, '0')
+  while fraction.endsWith("0") do fraction = fraction.dropRight(1)
+  s"$whole.$fraction"

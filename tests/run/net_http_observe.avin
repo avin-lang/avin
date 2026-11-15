@@ -1,0 +1,93 @@
+// expect: exit 0
+// The access log, metrics and rate limiting over real connections: a server whose router logs each
+// request with the client's address and request id, counts its API group's requests, limits them
+// by client address with `429` and `Retry-After`, and mounts its metrics; a request id a client
+// sent echoed and one made for a client that sent none; HTTPS giving the client's address as TCP
+// does; and the address of each end of a TCP connection, and none for a Unix one.
+import avin.fs
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.net.http
+import avin.net.http.{HttpError, JsonLines, Metrics, RateLimiter, Request, Response, Route, Router, ServerRequest}
+import avin.net.tls.{TlsClient, TlsServer}
+import avin.threads.{Mutex, spawn}
+import avin.time.seconds
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+fetched(r: Result[Response, HttpError]) -> Response = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+class Lines(): Sendable
+  val kept = Mutex(Vector.empty[string]())
+  add(line: string) = _ = kept.update(v -> v :+ line)
+  all -> Vector[string] = kept.get()
+
+main()
+  val lines = Lines()
+  val metrics = Metrics()
+  val limiter = RateLimiter(1, seconds(3600), burst = 2)
+  val api = Route.group(
+    "/api",
+    [Route.get("/who", r -> Response.text(200, s"${r.remote} ${r.route} ${r.header("X-Request-Id").isDefined}"))],
+    h -> metrics.middleware(limiter.middleware(h))
+  )
+  val router = Router(api :+ metrics.route())
+  val logged = http.accessLog(line -> lines.add(line), JsonLines, ids = () -> "made-here")(router.handle)
+  val server = ok(http.serve("127.0.0.1", 0, logged))
+  val base = s"http://127.0.0.1:${server.port()}"
+
+  val first = fetched(http.get(s"$base/api/who", Vector(("X-Request-Id", "client-1"))))
+  println(s"${first.status} ${first.text} ${first.header("X-Request-Id")}")
+  val second = fetched(http.get(s"$base/api/who"))
+  println(s"${second.status} ${second.header("X-Request-Id")}")
+  val third = fetched(http.get(s"$base/api/who"))
+  println(s"${third.status} ${third.header("Retry-After")} ${third.text.trim}")
+  val shown = fetched(http.get(s"$base/metrics"))
+  println(shown.header("Content-Type"))
+  for line in shown.text.split("\n")
+    if line.startsWith("http_requests_total") || line.startsWith(
+      "http_request_duration_seconds_count"
+    ) then println(line)
+  server.shutdown()
+  for line in lines.all
+    // The time each took varies, and so does the length of the metrics, which show the times; the
+    // rest is fixed.
+    val cut = if line.contains("/metrics") then ",\"bytes\"" else ",\"micros\""
+    println(line.slice(0, line.indexOf(cut)) + line.slice(line.indexOf(",\"remote\""), line.byteLength))
+
+  // Over HTTPS, the client's address is the TCP connection's beneath.
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  val secure = ok(http.serve("127.0.0.1", 0, r -> Response.text(200, s"${r.remote}"), tls = Some(identity)))
+  val viaTls = fetched(
+    http.send(Request("GET", s"https://localhost:${secure.port()}/").withTls(TlsClient().trust(fixture("ca.pem"))))
+  )
+  println(viaTls.text)
+  secure.shutdown()
+
+  // Each end of a TCP connection knows the other's address; a Unix connection has none.
+  val listener = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = listener.port()
+  val accepting = spawn(() -> ok(listener.accept()).remoteAddress)
+  val client = ok(TcpStream.connect("127.0.0.1", port))
+  println(s"${client.remoteAddress} ${accepting.join()}")
+  _ = client.close()
+  _ = listener.close()
+
+  val socket = ok(fs.tempDir("observe")).path + "/s"
+  val unixListener = ok(UnixListener.bind(socket))
+  val unixAccepting = spawn(() -> ok(unixListener.accept()).remoteAddress)
+  val unixClient = ok(UnixStream.connect(socket))
+  println(s"${unixClient.remoteAddress} ${unixAccepting.join()}")
+  _ = unixClient.close()
+  _ = unixListener.close()
