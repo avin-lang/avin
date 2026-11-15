@@ -975,8 +975,8 @@ Settled by the user on 2026-11-04:
   `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
   reads; an initializer whose own code needs its own value, directly, through the functions it
-  calls or through other lazy values, is a compile error naming the chain (a module-level one;
-  see the initialization entries), and one that reaches it through a function it hands on traps
+  calls or through other lazy values, is a compile error naming the chain (module-level, field and
+  local ones alike; see the initialization entries), and one that reaches it through a function it hands on traps
   at that read, naming the value. A field's initializer may use every field and method; the class
   body reads the field only where it could call a method. Concurrent first reads run the
   initializer once, the others waiting safe for the collector; the value is published with a
@@ -8834,6 +8834,25 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   module order's (`is needed by its own initializer`), which would give one rule two shapes of
   message; dropping every made function from the order (unsound: a lambda the initializer makes
   and calls reads what it reads).
+
+- Settled on the user's delegation 2026-11-14 (branch `init-4`): **the field and local parts of
+  the `lazy val` rule.** A field's initializer is followed with the object located where its code
+  holds it: the class body's `self` it captures, a local given it (`val me = self`), the parameter
+  a called function or method receives it in, and, for an object, every read through the object's
+  name anywhere in the program. A call through a method table on the object reaches the override of
+  every class descending from the one declaring the field; an operator applied to it, the core
+  trait method of those classes; a local function, the object where its caller sees it. A read of
+  the same field of the object is a node of the chain, a read of another instance's is not
+  followed, and the chain, worded and placed as the module-level one, names lazy fields only. A
+  local `lazy val` is followed through its block's code and the local functions it calls, the
+  other local lazy values it reads being the chain's nodes. A cycle through a module-level lazy
+  value that reads an object's field is the module-level value's cycle as well and is reported for
+  both. Why: it follows from the chapter's "only a read of the same object counts", which a function
+  given `self` or a read through an object's one name is as much as a method called on `self`;
+  anything less leaves the same cycle to the run-time trap by a change of spelling. Alternatives
+  weighed: only bare names, `self.` and methods called on `self` (the chapter's examples, but
+  `helper(self)` would then trap at run time); following every value of the object's class (it
+  would refuse the recursion over a structure, a node's depth, that the chapter keeps legal).
 
 - **A lazy initializer waiting for a thread that reads the same value is not detected** (branch
   `init-design`). It waits for ever, as threads waiting for one another do
