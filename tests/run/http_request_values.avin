@@ -1,0 +1,181 @@
+// expect: exit 0
+// Values a middleware hands to the handlers inside it through `withValue`, read by `value[T]()`:
+// absent before one is handed on; the original request unchanged; a second value of one type
+// replacing the first; two types side by side; the type as the exact key (an `int` is no `long`, a
+// trait's value no class's, `Vector[int]` no `Vector[string]`, `Option[User]` no `User`); values kept
+// through a router's binding of parameters, through groups and nested middleware (the inner one
+// overriding the outer's), through `route.wrap`, and absent in a group without the middleware; a
+// `Result` handler ending early without one; a router's error page answering where a middleware
+// outside it handed on a value; and, on a real server, an auth middleware handing a user to plain,
+// streamed and server-sent-event handlers, concurrent clients each seeing their own, and a value
+// carried onto another thread by `untilStopped`.
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Handler, Response, Route, Router, ServerRequest, ToResponse}
+import avin.threads.spawn
+
+data User(name: string)
+
+data RequestId(value: string)
+
+trait Role: Sendable
+  title() -> string
+
+class Admin(): Role
+  override title() -> string = "admin"
+
+ok[T, E](r: Result[T, E]) -> T = r match
+  Ok(v) -> v
+  Err(_) -> fail("an error")
+
+shown(r: Response) -> string = s"${r.status} ${r.text}"
+
+// Answers `401` without a token, and hands the token's user on to `next` with one.
+auth(next: Handler) -> Handler = r -> r.header("Authorization") match
+  Some(token) -> next(r.withValue(User(token)))
+  None -> Response.text(401, "who are you?")
+
+// Hands a request id on, as a logging middleware would.
+tagged(next: Handler) -> Handler = r -> next(r.withValue(RequestId(s"id-${r.path}")))
+
+// Reads the outer middleware's user and hands on another in its place.
+impersonate(next: Handler) -> Handler = r -> next(
+  r.withValue(User(s"${r.value[User]().map(u -> u.name).getOrElse("nobody")} as root"))
+)
+
+whoAmI(r: ServerRequest) -> Response =
+  Response.text(200, s"${r.value[User]().map(u -> u.name)} ${r.value[RequestId]().map(i -> i.value)}")
+
+profile(r: ServerRequest) -> Result[Response, ToResponse]
+  val user = r.value[User]() match
+    Some(u) -> u
+    None -> return Err(Response.text(401, "sign in"))
+  Ok(Response.text(200, s"profile of ${user.name} (${r.param("id")})"))
+
+connectionless()
+  val bare = ServerRequest("GET", "/")
+  println(s"absent: ${bare.value[User]()} ${bare.value[RequestId]()} ${bare.value[int]()}")
+
+  val ann = bare.withValue(User("ann"))
+  println(s"set: ${ann.value[User]()} original: ${bare.value[User]()}")
+  val bob = ann.withValue(User("bob"))
+  println(s"replaced: ${bob.value[User]()} before: ${ann.value[User]()}")
+
+  val both = ann.withValue(RequestId("r1"))
+  println(s"side by side: ${both.value[User]()} ${both.value[RequestId]()}")
+  val swapped = both.withValue(RequestId("r2"))
+  println(s"one replaced, the other kept: ${swapped.value[User]()} ${swapped.value[RequestId]()}")
+
+  // The request's own fields are carried over.
+  val full = ServerRequest(
+    "POST",
+    "/p?q=1",
+    Vector(("X-A", "1")),
+    Array.tabulate(2, i -> byte(int('a') + i)),
+    "HTTP/1.0"
+  )
+  val carried = full.withValue(User("é✓"))
+  println(
+    s"${carried.method} ${carried.target} ${carried.headers} ${carried.text} ${carried.version} ${carried.query} ${carried.value[User]()}"
+  )
+
+  // The type is the exact key.
+  val numbers = bare.withValue(3).withValue(Vector(1, 2)).withValue(Some(User("o")))
+  println(s"int ${numbers.value[int]()} long ${numbers.value[long]()}")
+  println(s"Vector[int] ${numbers.value[Vector[int]]()} Vector[string] ${numbers.value[Vector[string]]()}")
+  println(s"Option[User] ${numbers.value[Option[User]]()} User ${numbers.value[User]()}")
+  val role: Role = Admin()
+  val asRole = bare.withValue(role)
+  println(s"as Role: ${asRole.value[Role]().map(x -> x.title())} as Admin: ${asRole.value[Admin]().isDefined}")
+  val asAdmin = bare.withValue(Admin())
+  println(s"as Admin: ${asAdmin.value[Admin]().map(x -> x.title())} as Role: ${asAdmin.value[Role]().isDefined}")
+  println(
+    s"empty and long text: ${bare.withValue("").value[string]()} ${bare.withValue("x".repeat(1000)).value[string]().map(s -> s.charCount)}"
+  )
+  println(s"unit: ${bare.withValue(()).value[unit]()} tuple: ${bare.withValue((1, "a")).value[(int, string)]()}")
+
+  // A value read out of the request is sendable, and goes to another thread.
+  val user = ann.value[User]()
+  val elsewhere = spawn(() -> user.map(u -> u.name.toUpper))
+  println(s"on another thread: ${elsewhere.join()}")
+
+routed()
+  val open = [
+    Route.get(
+      "/plain/:id",
+      r -> Response.text(
+        200,
+        s"${r.param("id")} ${r.value[User]().map(u -> u.name)} ${r.value[RequestId]().map(i -> i.value)}"
+      )
+    ),
+    Route.get("/profile/:id", profile)
+  ]
+  val admin = Route.group("/admin", [Route.get("/me", whoAmI)], impersonate)
+  val api = Route.group("/api", [Route.get("/me", whoAmI), Route.get("/profile/:id", profile)] ++ admin, auth)
+  val wrapped = Route.get("/wrapped", whoAmI).wrap(auth).wrap(tagged)
+  val router = Router(open ++ api :+ wrapped, status -> Response.text(status, s"page $status"))
+  // A middleware outside the router hands a value on to every route, through the parameters bound.
+  val outside: Handler = tagged(router.handle)
+  val tries = [
+    ("/plain/7", None),
+    ("/profile/7", None),
+    ("/api/me", None),
+    ("/api/me", Some("ann")),
+    ("/api/profile/9", Some("ann")),
+    ("/api/admin/me", Some("ann")),
+    ("/api/admin/me", None),
+    ("/wrapped", Some("cy")),
+    ("/wrapped", None),
+    ("/nowhere", Some("ann"))
+  ]
+  for (path, token) in tries
+    val headers = token match
+      Some(t) -> Vector(("Authorization", t))
+      None -> Vector.empty[(string, string)]()
+    val request = ServerRequest("GET", path, headers)
+    println(s"$path $token -> ${shown(router.handle(request))} | outside: ${shown(outside(request))}")
+  println(s"405 through it: ${shown(outside(ServerRequest("POST", "/api/me")))}")
+
+nameOf(r: ServerRequest) -> string = r.value[User]().map(u -> u.name).getOrElse("?")
+
+streamed(r: ServerRequest) -> Response = Response.stream(200, "text/plain", w ->
+  for part in ["hello ", nameOf(r), "\n"]
+    _ = w.write(part))
+
+events(r: ServerRequest) -> Response = Response.events(
+  es -> _ = es.send(s"welcome ${nameOf(r)}", event = Some("hello"))
+)
+
+// The user, read on the connection's thread, carried onto the thread `untilStopped` waits on.
+later(r: ServerRequest) -> Response
+  val user = r.value[User]()
+  val upper = r.untilStopped(() -> user.map(u -> u.name.toUpper))
+  Response.text(200, s"${upper.flatten}")
+
+served()
+  val routes = [
+    Route.get("/me", whoAmI),
+    Route.get("/stream", streamed),
+    Route.get("/events", events),
+    Route.get("/later", later)
+  ]
+  val router = Router(Route.group("/s", routes, auth) :+ Route.get("/open", whoAmI))
+  val server = ok(http.serve("127.0.0.1", 0, tagged(router.handle)))
+  val base = s"http://127.0.0.1:${server.port()}"
+  for path in ["/s/me", "/s/stream", "/s/events", "/s/later", "/open"]
+    val r = ok(http.get(base + path, Vector(("Authorization", "dee"))))
+    println(s"$path -> ${r.status} ${r.text.replace("\n", "/")}")
+  println(s"/s/me unauthorized -> ${shown(ok(http.get(base + "/s/me")))}")
+
+  // Concurrent clients, each request handed its own user.
+  val clients = Vector.tabulate(
+    8,
+    i -> spawn(() -> ok(http.get(base + "/s/me", Vector(("Authorization", s"u$i")))).text)
+  )
+  println(clients.map(c -> c.join()))
+  server.shutdown()
+
+main()
+  connectionless()
+  routed()
+  served()
