@@ -1171,6 +1171,7 @@ or a cache, and is written as text only on request. Text is hashed as its UTF-8 
 | `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
 | `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
 | `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
+| `pbkdf2HmacSha256(password, salt, iterations, length)`, `pbkdf2HmacSha512(...)` | `length` bytes of key (RFC 8018 PBKDF2 over HMAC-SHA-256 or -SHA-512) as a `Vector[byte]`; `password` and `salt` both `Vector[byte]` or both `string` (UTF-8), either empty. `iterations` below 1, `length` below 1, or `length` over 8160 (SHA-256) or 16320 (SHA-512) trap. |
 | `constantTimeEquals(a, b) -> bool` | Whether `a` and `b`, both `Vector[byte]` or both `string` (compared as UTF-8 bytes), are the same, taking as long wherever they first differ. Different lengths answer `false` at once. |
 | `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte: [`avin.encoding`](#avinencoding)'s, which this module offers too. |
 
@@ -1198,8 +1199,46 @@ val ok = fromBase64(header) match
   Err(_) -> false
 ```
 
-The digests and the comparison are bound to Sysl's `sysl.crypto`, so they are the same code Sysl
-programs use.
+**The iteration count belongs to the protocol**: SCRAM-SHA-256 (PostgreSQL, MongoDB) sends it, and a
+client using its own derives a different key. It buys the cost of guessing a password and nothing
+else.
+
+```text
+val salted = pbkdf2HmacSha256(password, salt, iterations, 32)
+val clientKey = hmacSha256(salted, "Client Key")
+```
+
+The digests, the key derivation and the comparison are bound to Sysl's `sysl.crypto`, so they are the
+same code Sysl programs use.
+
+## `avin.uuid`
+
+Universally unique identifiers (RFC 9562), 128 bits written as 32 hexadecimal digits in groups of
+8-4-4-4-12.
+
+```text
+import avin.uuid.Uuid
+
+main()
+  val id = Uuid.random()
+  println(id)
+  assertEq(Uuid.parse(id.toString()), Some(id))
+```
+
+`Uuid` is a value: it compares and hashes by its bits, orders by them as sixteen unsigned bytes
+(the first most significant), is a `Map` key as it stands, and is `Sendable`.
+
+| Member | Meaning |
+| --- | --- |
+| `Uuid.random()` | A version 4 identifier from `SecureRandom`, with the version and variant bits set. |
+| `Uuid.parse(text) -> Option[Uuid]` | The canonical 8-4-4-4-12 form in either case; `None` for anything else (braces, a `urn:uuid:` prefix, missing hyphens and white space are not accepted). |
+| `Uuid.fromBytes(bytes) -> Option[Uuid]` | Sixteen bytes, the first most significant; `None` for any other length. |
+| `Uuid.Nil`, `Uuid.Max` | All zero bits and all one bits. |
+| `bytes()`, `toString()` | The sixteen bytes, and the lower-case canonical text. |
+| `version()`, `variant()` | The version (0 to 15), and the variant: 2 for RFC 9562's layout, 0, 6 and 7 for the reserved ones. |
+
+A `Uuid` implements `FromParam` in [`avin.net.http`](#avinnethttp), so `paramAs[Uuid]` and
+`queryAs[Uuid]` read one from a route or query parameter, an invalid one answering `400`.
 
 ## `avin.encoding`
 
