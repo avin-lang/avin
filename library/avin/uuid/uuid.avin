@@ -1,0 +1,110 @@
+module avin.uuid
+
+// Universally unique identifiers (RFC 9562): 128 bits, written as 32 hexadecimal digits in the
+// groups 8-4-4-4-12.
+//
+//     val id = Uuid.random()
+//     println(id)
+//     assertEq(Uuid.parse(id.toString()), Some(id))
+//
+// A `Uuid` is a value: it compares and hashes by its 128 bits, orders by them taken as sixteen
+// unsigned bytes, the first the most significant, and may be handed to another thread, so it is
+// a key of a `Map` or a `Set` as it stands. `Uuid.random()` makes a version 4 identifier from
+// `SecureRandom`; one that arrives as text is read with `Uuid.parse`, which answers `None` for text
+// that is not one rather than trapping, since the text came from outside.
+
+import avin.encoding.toHex
+import avin.random.SecureRandom
+
+// The sixteen bytes as two words, the first eight in `high`, the most significant byte uppermost.
+data Uuid(high: long, low: long)
+
+// The value of the hexadecimal digit `b`, or -1 where `b` is not one; either case is a digit.
+private digitValue(b: int) -> int =
+  if int('0') <= b <= int('9') then b - int('0')
+  elif int('a') <= b <= int('f') then b - int('a') + 10
+  elif int('A') <= b <= int('F') then b - int('A') + 10
+  else -1
+
+// The eight bytes of `bytes` from `from`, as one number, the first the highest.
+private word(bytes: Vector[byte], from: int) -> long
+  var v: long = 0
+  for i in from ..< from + 8 do v = (v << 8) | long(int(bytes(i)))
+  v
+
+// The byte `index` (0 to 7, the first the highest) of `w`.
+private byteOf(w: long, index: int) -> byte = byte(int((w >> long(56 - 8 * index)) & 0xFF))
+
+// An unsigned comparison of two words: negative, zero or positive as `a` is below, equal to or above `b`.
+private compareWords(a: long, b: long) -> int =
+  if a == b then 0 elif (a ^ long.MinValue) < (b ^ long.MinValue) then -1 else 1
+
+// The variant a leading three bits stand for: 0 for 0xx, 2 for 10x, 6 for 110 and 7 for 111.
+private variantOf(top: int) -> int = if top < 4 then 0 elif top < 6 then 2 else top
+
+object Uuid
+  // The identifier of all zero bits, and the one of all one bits.
+  val Nil: Uuid = Uuid(0, 0)
+  val Max: Uuid = Uuid(-1, -1)
+
+  // A new random (version 4) identifier: 122 random bits from the operating system's generator, with
+  // the version and variant bits set as RFC 9562 says.
+  random() -> Uuid
+    val b = SecureRandom.nextBytes(16)
+    b(6) = byte((int(b(6)) & 0x0F) | 0x40)
+    b(8) = byte((int(b(8)) & 0x3F) | 0x80)
+    val v = b.toVector
+    Uuid(word(v, 0), word(v, 8))
+
+  // The identifier of sixteen bytes, the first the most significant, or `None` where there are not
+  // sixteen.
+  fromBytes(bytes: Vector[byte]) -> Option[Uuid] =
+    if bytes.length == 16 then Some(Uuid(word(bytes, 0), word(bytes, 8))) else None
+
+  // The identifier `text` writes in the canonical form, 32 hexadecimal digits in groups of 8, 4, 4, 4
+  // and 12 apart by hyphens, either case; `None` for anything else. Surrounding braces, a `urn:uuid:`
+  // prefix, missing hyphens and white space are not accepted.
+  parse(text: string) -> Option[Uuid]
+    val b = text.bytes
+    if b.length != 36 then return None
+    var high: long = 0
+    var low: long = 0
+    var digits = 0
+    for i in 0 ..< 36
+      val c = int(b(i))
+      if i == 8 || i == 13 || i == 18 || i == 23
+        if c != int('-') then return None
+      else
+        val d = digitValue(c)
+        if d < 0 then return None
+        if digits < 16 then high = (high << 4) | long(d) else low = (low << 4) | long(d)
+        digits += 1
+    Some(Uuid(high, low))
+
+impl Uuid
+  // The sixteen bytes, the most significant first.
+  bytes() -> Vector[byte] = Vector.tabulate(16, i -> if i < 8 then byteOf(high, i) else byteOf(low, i - 8))
+
+  // The version: the four bits RFC 9562 sets aside, 4 for a random identifier, 0 for `Nil`.
+  version() -> int = int((high >> 12) & 0xF)
+
+  // The variant: 2 for the layout RFC 9562 describes (bits `10`), 0 for the reserved earlier layout
+  // (`0`), 6 for the one reserved for Microsoft (`110`) and 7 for the one reserved for later (`111`).
+  variant() -> int = variantOf(int((low >> 61) & 7))
+
+impl Ord for Uuid
+  compare(other: Uuid) -> int =
+    val c = compareWords(high, other.high)
+    if c != 0 then c else compareWords(low, other.low)
+
+// The canonical form, lower case: `123e4567-e89b-12d3-a456-426614174000`.
+impl Display for Uuid
+  display(out: Writer, spec: FormatSpec)
+    val h = toHex(bytes())
+    out.writeField(
+      h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20, 32),
+      spec
+    )
+
+impl Debug for Uuid
+  debug(out: Writer, spec: FormatSpec) = out.writeField("Uuid(" + toString() + ")", spec)

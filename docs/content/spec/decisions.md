@@ -10408,3 +10408,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   matches the new `check`. Review with the user: whether `--bindings` should instead be the
   default for packages that have bindings. (Revised 2026-11-15, branch `c-opaque-errno`: `check`
   builds the C unit too, so what clang rejects of it is reported without `--bindings`.)
+
+- Settled on the user's delegation 2026-11-15 (branch `crypto-pbkdf2-uuid`): **`avin.crypto` gains
+  `pbkdf2HmacSha256` and `pbkdf2HmacSha512`**, taking `Vector[byte]` or `string` for password and
+  salt as `hmacSha256` takes its key and message. Bound to `sysl.crypto.pbkdf2_hmac256`/`512` through
+  a runtime shim (`avin.rt.digest_pbkdf2_*`), since Sysl's takes an unsigned count and an output
+  slice; no OpenSSL involved, as the other digests. A count below 1 and a length below 1 or over 255
+  digests (8160, 16320) trap in Avin with the library's message style, so the shim never sees them.
+  Alternatives weighed: returning a `Result` (a bad count is the caller's bug, as `between`'s bad
+  bounds are); OpenSSL's `PKCS5_PBKDF2_HMAC` (adds a dependency for a digest Sysl has).
+- Settled on the user's delegation 2026-11-15 (branch `crypto-pbkdf2-uuid`): **`Uuid` lives in its own
+  module `avin.uuid`** (`library/avin/uuid/uuid.avin`), as `avin.random` and `avin.crypto` each have
+  a directory; it is a `data Uuid(high: long, low: long)` so equality, hashing and sending come from
+  the structure, with `Ord` implemented as the unsigned order of the sixteen bytes. `parse` and
+  `fromBytes` answer `Option` (the input comes from outside); only the canonical text is accepted,
+  because braces and `urn:uuid:` are other formats, not spellings of this one. The constants are
+  `Uuid.Nil` and `Uuid.Max`, PascalCase like `Duration.Zero`, not `nil`. `variant()` answers 2 for
+  RFC 9562's layout (the value of its bits `10`), 0, 6 and 7 for the others, as other platforms
+  number them. `FromParam` is implemented in `avin.net.http`'s `params.avin`, which imports
+  `avin.uuid` (which imports nothing from `avin.net`, so no cycle). Review with the user: the
+  `Nil`/`Max` spelling and the variant numbering.

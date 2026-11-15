@@ -1,0 +1,164 @@
+// `avin.uuid.Uuid`: parsing and writing the canonical form, the RFC 9562 example values, text that
+// is not an identifier, version and variant, random identifiers, ordering, hashing and use as a key,
+// and the HTTP parameter reading.
+import avin.uuid.Uuid
+import avin.encoding.toHex
+import avin.net.http.FromParam
+import avin.threads.spawn
+
+@test("an identifier parses and writes back to the same lower-case text, whatever the case it came in")
+uuidRoundTrip()
+  val text = "123e4567-e89b-12d3-a456-426614174000"
+  val id = Uuid.parse(text).get
+  assertEq(id.toString(), text)
+  assertEq(Uuid.parse(text.toUpper), Some(id))
+  assertEq(Uuid.parse("123E4567-e89b-12D3-a456-426614174000"), Some(id))
+  assertEq(s"$id", text)
+
+@test("the RFC 9562 example values have the version and variant the document gives")
+uuidRfcExamples()
+  val v4 = Uuid.parse("919108f7-52d1-4320-9bac-f847db4148a8").get
+  assertEq(v4.version(), 4)
+  assertEq(v4.variant(), 2)
+  val v1 = Uuid.parse("c232ab00-9414-11ec-b3c8-9f6bdeced846").get
+  assertEq(v1.version(), 1)
+  assertEq(v1.variant(), 2)
+  val v7 = Uuid.parse("017f22e2-79b0-7cc3-98c4-dc0c0c07398f").get
+  assertEq(v7.version(), 7)
+  assertEq(v7.variant(), 2)
+  val v6 = Uuid.parse("1ec9414c-232a-6b00-b3c8-9f6bdeced846").get
+  assertEq(v6.version(), 6)
+  assertEq(v6.toString(), "1ec9414c-232a-6b00-b3c8-9f6bdeced846")
+
+@test("Nil is all zero bits and Max all one bits, and they write as such")
+uuidNilAndMax()
+  assertEq(Uuid.Nil.toString(), "00000000-0000-0000-0000-000000000000")
+  assertEq(Uuid.Max.toString(), "ffffffff-ffff-ffff-ffff-ffffffffffff")
+  assertEq(Uuid.parse("00000000-0000-0000-0000-000000000000"), Some(Uuid.Nil))
+  assertEq(Uuid.parse("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"), Some(Uuid.Max))
+  assertEq(Uuid.Nil.version(), 0)
+  assertEq(Uuid.Nil.variant(), 0)
+  assertEq(Uuid.Max.version(), 15)
+  assertEq(Uuid.Max.variant(), 7)
+  assertEq(Uuid.Nil.bytes(), Vector.tabulate(16, i -> byte(0)))
+  assertEq(Uuid.Max.bytes(), Vector.tabulate(16, i -> byte(255)))
+
+@test("bytes are the sixteen bytes in order, and fromBytes reads them back; other lengths are None")
+uuidBytes()
+  val id = Uuid.parse("00112233-4455-6677-8899-aabbccddeeff").get
+  assertEq(toHexOf(id.bytes()), "00112233445566778899aabbccddeeff")
+  assertEq(Uuid.fromBytes(id.bytes()), Some(id))
+  assertEq(Uuid.fromBytes(Vector.tabulate(256, i -> byte(i)).take(15)), None)
+  assertEq(Uuid.fromBytes(Vector.tabulate(17, i -> byte(i))), None)
+  assertEq(Uuid.fromBytes(Vector[byte]()), None)
+  assertEq(
+    Uuid.fromBytes(Vector.tabulate(16, i -> byte(255 - i))).get.toString(),
+    "fffefdfc-fbfa-f9f8-f7f6-f5f4f3f2f1f0"
+  )
+
+// The bytes as lower-case hexadecimal text.
+toHexOf(bytes: Vector[byte]) -> string = toHex(bytes)
+
+@test("text that is not a canonical identifier is None: lengths, characters, hyphens, braces, white space")
+uuidInvalid()
+  val good = "123e4567-e89b-12d3-a456-426614174000"
+  assertEq(Uuid.parse(""), None)
+  assertEq(Uuid.parse(good.take(35)), None)
+  assertEq(Uuid.parse(good + "0"), None)
+  assertEq(Uuid.parse(good.replace("-", "")), None)
+  assertEq(Uuid.parse("{" + good + "}"), None)
+  assertEq(Uuid.parse("urn:uuid:" + good), None)
+  assertEq(Uuid.parse(" " + good), None)
+  assertEq(Uuid.parse(good + "\n"), None)
+  assertEq(Uuid.parse("123e4567-e89b-12d3-a456-42661417400g"), None)
+  assertEq(Uuid.parse("g23e4567-e89b-12d3-a456-426614174000"), None)
+  assertEq(Uuid.parse("123e4567-e89b-12d3-a456-42661417400é"), None)
+  assertEq(Uuid.parse("123e4567_e89b-12d3-a456-426614174000"), None)
+  assertEq(Uuid.parse("123e45678-e89-b12d3-a456-426614174000"), None)
+  assertEq(Uuid.parse("123e4567-e89b-12d3a-456-426614174000"), None)
+  assertEq(Uuid.parse("123e4567-e89b-12d3-a456x426614174000"), None)
+  assertEq(Uuid.parse("123e4567-e89b-12d3-a456-4266141740-0"), None)
+  assertEq(Uuid.parse("------------------------------------"), None)
+  assertEq(Uuid.parse("123e4567-e89b-12d3-a456-426614174000".replace("0", " ")), None)
+
+@test("variants: 0xx is 0, 10x is 2, 110 is 6, 111 is 7")
+uuidVariants()
+  assertEq(Uuid.parse("00000000-0000-0000-7000-000000000000").get.variant(), 0)
+  assertEq(Uuid.parse("00000000-0000-0000-8000-000000000000").get.variant(), 2)
+  assertEq(Uuid.parse("00000000-0000-0000-bfff-ffffffffffff").get.variant(), 2)
+  assertEq(Uuid.parse("00000000-0000-0000-c000-000000000000").get.variant(), 6)
+  assertEq(Uuid.parse("00000000-0000-0000-dfff-ffffffffffff").get.variant(), 6)
+  assertEq(Uuid.parse("00000000-0000-0000-e000-000000000000").get.variant(), 7)
+
+@test("random identifiers are version 4, variant 2, round-trip through text and bytes")
+uuidRandom()
+  for i in 0 ..< 200
+    val id = Uuid.random()
+    assertEq(id.version(), 4)
+    assertEq(id.variant(), 2)
+    assertEq(Uuid.parse(id.toString()), Some(id))
+    assertEq(Uuid.fromBytes(id.bytes()), Some(id))
+    val t = id.toString()
+    assertEq(t.byteLength, 36)
+    assertEq(t.charAt(14), '4')
+    assert(t.charAt(19) == '8' || t.charAt(19) == '9' || t.charAt(19) == 'a' || t.charAt(19) == 'b')
+
+@test("ten thousand random identifiers are all different")
+uuidRandomDistinct()
+  val ids = Vector.tabulate(10000, i -> Uuid.random()).toSet
+  assertEq(ids.size, 10000)
+
+@test("equality, hashing and ordering follow the bytes; the ordering is the unsigned order of the bytes")
+uuidOrdering()
+  val a = Uuid.parse("00000000-0000-0000-0000-000000000001").get
+  val b = Uuid.parse("00000000-0000-0000-0000-000000000002").get
+  val c = Uuid.parse("7fffffff-ffff-ffff-ffff-ffffffffffff").get
+  val d = Uuid.parse("80000000-0000-0000-0000-000000000000").get
+  val e = Uuid.parse("00000000-0000-0000-8000-000000000000").get
+  val f = Uuid.parse("00000000-0000-0000-7fff-ffffffffffff").get
+  assert(a < b)
+  assert(b > a)
+  assert(a <= a)
+  assert(a >= a)
+  assert(c < d)
+  assert(d < Uuid.Max)
+  assert(Uuid.Nil < a)
+  assert(f < e)
+  assert(!(e < a))
+  assertEq(a.compare(a), 0)
+  assertEq(a == Uuid.parse("00000000-0000-0000-0000-000000000001").get, true)
+  assertEq(a != b, true)
+  assertEq(a.hash(), Uuid.parse("00000000-0000-0000-0000-000000000001").get.hash())
+  assertEq([d, b, Uuid.Max, a, Uuid.Nil, c].sorted, [Uuid.Nil, a, b, c, d, Uuid.Max])
+
+@test("an identifier is a Map key and a Set member, found by an equal one parsed from text")
+uuidAsKey()
+  val ids = Vector.tabulate(500, i -> Uuid.random())
+  var m = Map.empty[Uuid, int]()
+  for (id, i) in ids.zipWithIndex do m = m.updated(id, i)
+  assertEq(m.size, 500)
+  for (id, i) in ids.zipWithIndex do assertEq(m.get(Uuid.parse(id.toString()).get), Some(i))
+  assertEq(m.get(Uuid.Nil), None)
+  assert(ids.toSet.contains(Uuid.parse(ids(7).toString().toUpper).get))
+
+@test("an identifier is sendable and crosses to another thread")
+uuidSendable()
+  val id = Uuid.random()
+  val back = spawn(() -> id).join()
+  assertEq(back, id)
+  assertEq(spawn(() -> Uuid.random()).join().version(), 4)
+
+@test("an identifier reads as an HTTP route or query parameter, and text that is not one does not")
+uuidFromParam()
+  val id = Uuid.random()
+  assertEq(Uuid.parse(id.toString()), Some(id))
+  assertEq(paramParse[Uuid](id.toString()), Some(id))
+  assertEq(paramParse[Uuid](id.toString().toUpper), Some(id))
+  assertEq(paramParse[Uuid]("nope"), None)
+  assertEq(paramParse[Uuid](""), None)
+  assertEq(paramKind[Uuid](), "a UUID")
+
+// What a handler's `paramAs[T]` reads `text` as, through the trait.
+paramParse[T: FromParam](text: string) -> Option[T] = T.parse(text)
+
+paramKind[T: FromParam]() -> string = T.kind()
