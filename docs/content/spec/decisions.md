@@ -10037,6 +10037,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   that begin with `u` mostly sound a consonant. Alternatives weighed: treating `u` as a vowel, as
   three of the four old helpers did ("an `unit`"); reading every all-capital name as letters
   (`an HTTP`, but `a NASA` reads as a word, and no type name in the library is one).
+- Settled on the user's delegation 2026-11-15 (built on branch `c-void-ptr`): **a C binding's
+  [`void *` or `const void *` parameter](/spec/c-bindings/#memory-of-no-type) takes an array of any
+  element type an array crosses as, or a `ByteBlock`, and its length counts bytes.** The array's
+  elements go to C where they are, as for a typed pointer, with no element type checked against the
+  header (there is none to check); the parameter marked `length(p)` is told the array's length times
+  its element size, a `long`, and an `inout` length C writes back is bytes too, bounded by the
+  array's bytes. `None`, or the word `null`, passes null. C writes through `void *` and only reads
+  through `const void *`. Still refused: `out` or `inout` on a `void *` (C writes no value of a type
+  through one), a `void *` result other than one discarded by a `unit` binding, and an array whose
+  length no parameter carries, so `memcmp`'s second pointer is refused. Why: the gap was met by
+  marshal's `sysctlbyname`, the shape of the C library's every untyped buffer (`read`, `write`,
+  `getentropy`, `sysctl`); an array and a block are already the binding layer's memory, so this adds
+  no new kind of value, only drops the element check, and counting bytes is what every such C
+  function means by its length. Alternatives weighed: an `Array[byte]` only, decoded in Avin (sound,
+  but reading an `int` or a `long` would need a byte decoder in every program, and no such helper
+  exists); `out int *p` written in the prototype where the header says `void *` (breaks the rule
+  that a prototype is the header's, and needs a size for the length); a length in elements (wrong
+  for every `void *` function, which counts bytes); a shared `length(a, b)` for `memcmp`-shaped
+  functions (useful, but a separate feature). **Review with the user**: whether a shared length is
+  wanted, and whether a callback's `const void *` should lend a `ByteView`, which is still refused.
 
 ## Open
 
