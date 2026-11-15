@@ -6957,7 +6957,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **A tuple with a union part is not answered as words** by `val (a, b) = f(x)`: the call makes the
     tuple, and the parts are read from it. *Why*: a result's words do not nest a union's words yet.
     *Alternatives*: flattening the union's words into the result's (a later optimization).
-- Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+- Settled on the user's delegation 2026-11-15 (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
   A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
   part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a
   function, or a union of references) is seen as an `Any` part, so a `(string, string)` and a
@@ -8209,7 +8209,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   than the compiler" (a newer library declares what an older compiler cannot check, which is the
   failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
   library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
-- Proposed (built on branch `c1-diagnostics`): **A method declared `m()` and named bare where a
+- Settled on the user's delegation 2026-11-15 (built on branch `c1-diagnostics`): **A method declared `m()` and named bare where a
   value is expected is reported as "`m` is called with `()`: write `c.m()`, or `() -> c.m()` for a
   function value"**, the call first, written on the receiver as the program named it (a local or
   parameter by name, `self`, a type for a static member, nothing for a bare name's implicit `self`),
@@ -8241,7 +8241,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatter is meant to settle exactly this); a blank line between clauses only around a
   multi-line one (it still splits one function in two); a blank line between every clause
   (it spreads a short definition over twice its lines).
-- Proposed (built on branch `http-stream`): **A streamed response is a `Response` whose body a
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **A streamed response is a `Response` whose body a
   function writes through a `BodyWriter`** (`Response.stream(status, contentType, write)`, with a
   `length` overload, and `Response.events` for server-sent events through an `EventWriter`). The
   head says `Transfer-Encoding: chunked`, or `Content-Length` where the length is given, or to an
@@ -8254,14 +8254,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (every handler type and middleware doubled); a handler handed the connection (the server loses
   its framing and keep-alive); writes that trap when the client has gone (a client leaving is not a
   bug). Review with the user: whether `Response.events`'s fifteen-second keep-alive default suits.
-- Proposed (built on branch `http-stream`): **Typed parameters through a `FromParam` trait of
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Typed parameters through a `FromParam` trait of
   static methods**, `paramAs[T]`, `queryAs[T]` (with a default overload) and `queryOption[T]`
   answering `Result[_, ParamError]`, `Missing` or `Invalid`; `string`, `int`, `long`, `real` and
   `bool` implement it. Why: a static `parse` makes a program's own type a parameter type by one
   `impl`, and a `Result` lets `?` answer the client `400`. Alternatives weighed: separate
   `queryInt`/`queryLong` methods (closed to a program's own types); trapping on bad input (a client
   error is not a server bug).
-- Proposed (built on branch `http-stream`): **Handlers that fail answer `Result[Response,
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Handlers that fail answer `Result[Response,
   ToResponse]`**: `ToResponse` is a trait with `toResponse()`, implemented by `Response` itself and
   `ParamError`, `fromResult` turns such a function into a `Handler`, and each `Route.get` … `patch`
   has an overload taking one. Why: `?` then ends a handler with any failure the program's own error
@@ -8271,26 +8271,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   compiler fixes: a lambda tried against several overloads is compiled only for the one chosen, and
   an argument checked before the overload was chosen is made `@sendable` where the chosen one's
   parameter is (tests `overload_lambda_return`, `overload_sendable`, `overload_sendable_capture`).
-- Proposed (built on branch `http-stream`): **Route groups and middleware are plain functions**:
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Route groups and middleware are plain functions**:
   `type Handler`, a middleware `(Handler) -> Handler`, `Route.wrap`, `Route.under` and
   `Route.group(prefix, routes, middleware)` answering a `Vector[Route]`, nesting with the inner
   middleware inside the outer. A prefix must begin with `/` and not end with one, else it traps.
   Why: groups flatten into the router's one ordered list, so matching, `405` and `HEAD` stay as they
   were. Alternatives weighed: a nested router type (two matching rules); a prefix tolerating a
   trailing `/` (two spellings of one path, and `//` after joining).
-- Proposed (built on branch `http-stream`): **Error pages are an `ErrorPage = @sendable (int) ->
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Error pages are an `ErrorPage = @sendable (int) ->
   Response`**, given to `Router` (its `404` and `405`) and `http.serve` (every status it answers
   itself), defaulting to `plainError`, the reason phrase as text; the status sent is always the one
   given, and a `405` keeps its `Allow`. Why: one function covers JSON or HTML pages without a
   table of statuses. Alternatives weighed: a `Map[int, Response]` (every status listed by hand, and
   none computed); letting the page change the status (a `404` page answering `200` misleads clients).
-- Proposed (built on branch `http-stream`): **`isStopping()` and `untilStopped(wait)` on a
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **`isStopping()` and `untilStopped(wait)` on a
   `ServerRequest`, `BodyWriter` and `EventWriter`**, `untilStopped` running `wait` on its own thread
   through `TcpServer.idle`, so stopping cancels it and the handler gets `None`. Why: a long poll or
   an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
   cancellation token passed to every handler (every handler signature changes); leaving shutdown
   to the write timeout (a quiet stream would hold it for `writeTimeout`).
-- Proposed (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
+- Settled on the user's delegation 2026-11-15 (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
   cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
   state word and the closure computing it, so a read is that cell's lazy field read: once on the
   first read, under the same protocol as a field's between threads, with the same trap for a read
@@ -8337,14 +8337,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     but fields keep theirs, and a race-free clear needs another store on the hot path).
   Review with the user: the cross-thread rule (the more permissive of the two sound choices).
 
-- Proposed (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
   `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
   starts threads and waits for them structurally, so a spawning wait group would be a second way to
   do what `scope` does; what a wait group adds is counting work finished by threads started
   elsewhere (an executor, an actor, another scope) or by no thread at all. Alternatives weighed:
   `wg.spawn(body)` starting and counting a thread (duplicates `Scope.spawn`, and an unscoped spawn
   escapes cancellation); answering a negative count by clamping at zero (hides a double `done`).
-- Proposed (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
   traps.** `Semaphore(permits, capacity = permits)`; negative permits, a capacity below one or more
   permits than the capacity trap too. Permits belong to no thread, and waiters are not queued (one
   arriving as a permit comes back may take it first). Why: an over-release is the same bug as a
@@ -8355,7 +8355,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   out a permit taken by one thread and given back by another, which hand-offs need); a FIFO queue
   of waiters (a cancelled waiter would have to take its place back, for a fairness the condition's
   oldest-first wake mostly gives already). Review with the user: trap or ignore an over-release.
-- Proposed (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
   hold when a cancellation stops their body; a `RwLock`'s write runs to its end; a trap in any of
   them stops the program.** The share is taken under the library's lock and held in a region in
   doubt from that moment until it is given back (the runtime's new `lock_release_holding` and
@@ -8370,7 +8370,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   for every permit holder's whole body); every body cancellable (a write could leave the value
   torn); a trap in an actor's body failing only the actor (needs a give-back chain run by the
   actor's recovery, which the runtime does not have).
-- Proposed (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
   a write kept waiting before the next writer.** A reader that arrives while a writer waits waits
   behind it; when a write ends, every reader then waiting is admitted ahead of the writers waiting.
   Why: writers do not starve under overlapping readers, and readers do not starve under back-to-back
@@ -8380,7 +8380,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   stops it changing a mutable value other readers share, which races with them (a race is not
   undefined behaviour in Avin, but the type system does not rule it out here as it does elsewhere).
   A read-only view of a value would close it and is a language feature, not a library one.
-- Proposed (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
   cancelled while waiting withdraws.** The last arrival runs the action holding the barrier's lock,
   so the action is uncancellable and one that waits on its own barrier traps as a lock taken twice
   does; `wait` answers whether the caller arrived last. A cancelled waiter takes its arrival back
@@ -8505,14 +8505,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
-- Proposed (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
   Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
   opaque type reads as the alias it resembles, with one word saying the difference, and the parser
   and formatter treat it as an alias. Alternatives weighed: `newtype Name = Repr` (a new keyword for
   a small feature); `data Name(value: Repr)` with an annotation (a data value is an object, and the
   layout is the point); `type Name = new Repr` (a modifier inside the body reads as part of the
   type).
-- Proposed (built on branch `opaque-types`): **the representation is seen only in the declaring
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **the representation is seen only in the declaring
   module, through `Name(r)` and `x.repr` (and bare `repr` in its impls), with no implicit
   conversion either way even inside the module.** Why: an explicit wrap and unwrap keep every
   crossing between the type and its representation visible in the source, which is what the type
@@ -8523,7 +8523,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   shadow or be shadowed); an unwrapping pattern `Name(n)` (it reads as a constructor pattern of a
   data type, which an opaque type is not, and `x.repr` covers it). Review with the user: whether the
   module that declares the type should see it as its representation.
-- Proposed (built on branch `opaque-types`): **an opaque type is nominal, `Type.Opaque(id, name,
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **an opaque type is nominal, `Type.Opaque(id, name,
   args, repr)`, a value type that is boxed only where it becomes an `Any` or a trait's value, and
   its box names the opaque type over a reference too.** Its parameters are invariant and take no
   bounds; a phantom parameter is allowed. The representation may not be `Nothing`, `unit`, a union,
@@ -8536,7 +8536,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   representation's box for a reference representation (cheaper, but `x is _: string` would find an
   `Email`); covariant parameters (unsound for a mutable representation); refusing phantom
   parameters as an alias does (they are a main use: typed identifiers).
-- Proposed (built on branch `opaque-types`): **an opaque type is no type constructor**: a generic
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **an opaque type is no type constructor**: a generic
   one is refused for a constructor parameter `F[_]`, and an opaque type declares no constructor
   parameter of its own; it is an ordinary type argument of `F[A]`. Why: every instance of a
   constructor parameter's application is laid out as an object, which an opaque type over `long`
@@ -8545,7 +8545,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   type over a reference type as a constructor (sound for the layout, but it would make the rule
   depend on the representation, which outside code should not see); accepting `opaque type W[F[_]]`
   (the layout question is only deferred, to every use).
-- Proposed (built on branch `opaque-types`): **a refined variant's result does not name an opaque
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **a refined variant's result does not name an opaque
   type** (`Newest -> Query[UserId]`, `Query[Id[User]]`, `Query[Vector[UserId]]` are refused); a
   variant's fields may be of opaque types and the type's own argument may be one. Why: a `match`
   on a refined variant will learn type equalities from the result, and whether one learning
@@ -8553,7 +8553,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   opaque types out of results is sound and can be loosened once matching on refined variants is
   built. Alternatives weighed: accepting them as nominal types now (sound for values and layouts,
   but it fixes the answer to the open question before the matching it affects exists).
-- Proposed (built on branch `opaque-types`): **equality and hashing are the representation's;
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **equality and hashing are the representation's;
   every other trait comes from an impl, which takes the trait's default bodies; an opaque type
   derives nothing and has no supertype.** Why: every Avin type has `==` and a hash, so an opaque
   type is a `Map` key and a `Set` element without ceremony, while order and printing are choices the
@@ -8563,7 +8563,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the representation's text and order outside the module by default); inheriting every trait of the
   representation (the opaque type would leak its representation's whole interface).
 
-- Proposed (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
   take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
   the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
   live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
@@ -8571,7 +8571,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
   user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
 
-- Proposed (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
   (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
   the program's own module prefix left off the readable name; lldb shows the linkage name. The
   compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
@@ -8583,14 +8583,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
   data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
 
-- Proposed (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
   function's first line lands after the parameters are stored where their variables are read (a
   lambda's parameter otherwise read a stale slot). A call there still gets the function's own
   location, which LLVM's verifier asks of every call in a function with debug information.
   Alternative: placing that code at the function's name, as it was first built: lldb then stopped
   before the stores and showed the slot's previous value.
 
-- Proposed (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
   cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
   counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
   and locations follow lines no function key covers, so cached text would carry stale lines; the
@@ -8598,13 +8598,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   per-function metadata numbering with a renumbering pass (the text cache would then work under
   `-g`), or a key over absolute positions (every edit above a function would relower it).
 
-- Proposed (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
   other module-level line, so any line moved anywhere changes every unit's text and recompiles every
   unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
   each unit's definitions through the metadata lines and renders only the nodes reached (plus the
   compile unit and the flags), which also shrinks each unit.
 
-- Proposed (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
   its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
   build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
   program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
@@ -8640,7 +8640,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   or as a standard-library module that does not exist, is reported once, at the first name;
   two import lines are two errors. *Why*: the error is about the module, which the declaration names
   once. *Alternatives*: one per module per file (hides the second line's error).
-- Proposed (built on branch `intersection-bounds`): **several bounds on one type parameter are
+- Settled on the user's delegation 2026-11-15 (built on branch `intersection-bounds`): **several bounds on one type parameter are
   joined with `&`, the one spelling, and an intersection is a bound only, never a type.**
   `[T: Ord & Display]` replaces `[T: Ord + Display]` everywhere type parameters are declared
   (functions, methods, classes, data types, traits, actors, impl headers, after a lower bound);
@@ -8675,7 +8675,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Byte offsets inside a character** ([types](/spec/types/#string), branch `fix-charat-boundary`)
 
-- Proposed: **`charAt` at an offset inside a character's encoding traps, `charAt offset is not a
+- Settled on the user's delegation 2026-11-15: **`charAt` at an offset inside a character's encoding traps, `charAt offset is not a
   character boundary`, as slicing there does; the searches never trap on such an offset and never
   answer one.** `indexOf(p, from)` and `indexWhere(f, from)` from inside a character start at the
   next one, so `"café".indexOf("", 4)` is 5; `lastIndexOf(p, end)` and `lastIndexWhere(f, end)` from
@@ -8693,7 +8693,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 **Initialization** ([declarations](/spec/declarations/#initialization), branch `init-design`)
 
 
-- Proposed (built on branch `deadlock-dump`): **A deadlock of the whole program is a trap; a partial
+- Settled on the user's delegation 2026-11-15 (built on branch `deadlock-dump`): **A deadlock of the whole program is a trap; a partial
   one is not found** ([diagnostics](/spec/threads/#deadlock)). The main thread checks when it begins
   a wait with no limit, and again each time a worker finds no lightweight thread running or ready
   while it waits: the program is deadlocked where no lightweight thread is running or ready, no
@@ -8710,7 +8710,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reporting a held `@threaded` callback or an attached foreign thread as deadlocked too (a C thread
   may call back at any time, so that would be a false report). Review with the user: whether a
   partial deadlock, found by cycles among lock holders and joins, is wanted later.
-- Proposed (branch `deadlock-dump`): **What a thread waits on is named by the runtime's own queue**:
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **What a thread waits on is named by the runtime's own queue**:
   a lock, a condition, a join, a sleep, a socket; a condition the library makes for a channel's
   receive or send, a future or an executor's work says so, through the intrinsic
   `condition_new_kind`, which `Condition`'s constructor reaches with a second parameter the library
@@ -8720,7 +8720,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   machine's processors, and listed in the dump. Alternatives weighed: a label set around each wait
   by the library (a call on every wait); naming waits only by the runtime primitive ("a condition"
   for every channel and future, which says little).
-- Proposed (branch `deadlock-dump`): **The quit signal writes a thread dump and the program goes
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **The quit signal writes a thread dump and the program goes
   on.** A handler in C writes a byte to a pipe; a thread started with the program, with every signal
   blocked, reads it and writes the dump, since a handler may not take the scheduler's locks. A
   program that watches the signal hears it instead; one started with it ignored keeps it ignored.
@@ -8728,14 +8728,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   weighed: writing the dump from the handler (not safe there); starting the thread only on first
   use (a handler cannot start one); ending the program after the dump (loses the program being
   looked at). Cost: one thread and one pipe for every program.
-- Proposed (branch `deadlock-dump`): **A thread dump names no functions.** A frame of the shadow
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **A thread dump names no functions.** A frame of the shadow
   stack holds its previous frame and its count of slots, nothing naming its function, and walking
   the native stack would need a table from code addresses to Avin names, which the compiler does
   not emit (the stack-overflow trap has no place for the same reason). Alternatives weighed: a
   function's descriptor stored in each frame (a store on every call); emitting an address table
   and unwinding the native stack (a table per program and an unwinder for each platform). Review
   with the user: which of the two, if a stack in the dump is wanted.
-- Proposed (branch `deadlock-dump`): **A corpus program's `// stderr: times vary` shows every number
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **A corpus program's `// stderr: times vary` shows every number
   before ` ms` in its standard error as `n`**, so a thread dump's durations do not make the test
   depend on the machine. Alternative: a dump without durations (loses what a dump is for).
 
@@ -8865,7 +8865,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **The security primitives an API server needs** (branch `security`; [`avin.encoding`](/spec/system-library/#avinencoding), [`avin.crypto`](/spec/system-library/#avincrypto), [`avin.random`](/spec/system-library/#avinrandom))
 
-- Proposed: **a new module `avin.encoding` holds hexadecimal, base64 and base64url** (`toHex`,
+- Settled on the user's delegation 2026-11-15: **a new module `avin.encoding` holds hexadecimal, base64 and base64url** (`toHex`,
   `fromHex`, `toBase64`, `fromBase64`, `toBase64Url`, `fromBase64Url`, `DecodeError`), and
   `toHex` moved there from `avin.crypto`, which keeps offering it with `export avin.encoding.toHex`,
   so `import avin.crypto.toHex` still works. Why: base64 is not cryptography (data URLs, Basic
@@ -8873,7 +8873,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   another would split one encoding. Alternatives weighed: everything in `avin.crypto` (one import for
   a server, but a module named for secrets would hold plain encodings); `fromHex` beside `toHex` in
   `avin.crypto` and base64 alone in `avin.encoding` (hexadecimal split across two modules).
-- Proposed: **decoding is strict, one function per alphabet**: `fromBase64` takes only the standard
+- Settled on the user's delegation 2026-11-15: **decoding is strict, one function per alphabet**: `fromBase64` takes only the standard
   alphabet with its `=` padding, `fromBase64Url` only the URL-safe one with no `=`; whitespace and
   line breaks are refused, and so is a last digit whose unused bits are not zero (RFC 4648 §3.5
   allows a decoder to refuse it). Each byte sequence then has exactly one spelling, so a token or a
@@ -8885,23 +8885,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   padding, unused bits ignored), which is friendlier to sloppy writers but accepts many spellings of
   one value; a `lenient` flag (two behaviours to test and document for no current need). Review with
   the user: a reader of MIME-wrapped base64 must strip its line breaks first.
-- Proposed: **`DecodeError` has four cases**, `BadCharacter(at)`, `BadPadding(at)`, `Truncated(at)`
+- Settled on the user's delegation 2026-11-15: **`DecodeError` has four cases**, `BadCharacter(at)`, `BadPadding(at)`, `Truncated(at)`
   (where `at` is the text's length) and `UnusedBits(at)`, all byte offsets, and is an `Error`. Why:
   the cases are what a caller would report differently, as `UrlError`'s are; `Truncated` carries the
   length so every case has a position. Alternative weighed: binding Sysl's `DecodeError`, whose
   `BadLength` has no position and whose `Short` and `Utf8` cannot occur here.
-- Proposed: **the encoders are written in Avin**, while the digests stay bound to Sysl. Why:
+- Settled on the user's delegation 2026-11-15: **the encoders are written in Avin**, while the digests stay bound to Sysl. Why:
   Avin's decoder is stricter than Sysl's (above), and encoding is a few lines of byte arithmetic with
   no platform behind it. Alternative weighed: binding `sysl.encoding`'s encoders and writing only the
   checks in Avin (two passes over the text, and a second implementation of the alphabet anyway).
-- Proposed: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
+- Settled on the user's delegation 2026-11-15: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
   (compared as UTF-8 bytes, so `"é"` and `"e\u{301}"` differ), bound to Sysl's `sysl.crypto.verify`,
   which reads every byte and branches only on the lengths. Why: Sysl pins that function's
   branch-free code with its own codegen tests, which an Avin loop would not have; different lengths
   answering `false` at once leaks only a length, which a token's or a tag's is not secret. Alternatives
   weighed: an Avin loop accumulating `xor`s (its constant time would rest on the optimizer); a method
   on `Vector[byte]` (a security property should be found where the secrets are).
-- Proposed: **`SecureRandom`, an object in `avin.random`**, with `Random`'s drawing methods
+- Settled on the user's delegation 2026-11-15: **`SecureRandom`, an object in `avin.random`**, with `Random`'s drawing methods
   (`nextBytes`, `nextInt`, `nextLong`, both bounded, `between` for `int` and `long`, `nextReal`,
   `nextBoolean`, `alphanumeric`, `shuffle`, `choose`) and two token functions, `hexToken(byteCount
   = 32)` and `urlToken(byteCount = 32)`. Every draw reads `getentropy` through Sysl's
@@ -8978,7 +8978,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a hidden parameter is allowed, since its instances exist only where the program makes a pack.
   Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
   Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
-- Proposed (branch `gadt-1`, the declaration step): **a refined variant's parameters, the type's
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`, the declaration step): **a refined variant's parameters, the type's
   included, are the variant's own in the expansion check.** An instance reaches them through the
   result (`Expr[X]` holding a `Pair` has `X = (A, B)`, so `A` and `B` lie one level down), and a type
   argument of a field that names a hidden parameter adds no edge, since its instances are the packs
@@ -8987,49 +8987,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reuses the one polymorphic-recursion check rather than a second one for variants. Alternatives
   weighed: a separate syntactic comparison of each field with the result (misses growth through a
   second type, which the flow check already follows).
-- Proposed (branch `gadt-1`): **a variant's own type parameter takes bounds and no variance and no
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`): **a variant's own type parameter takes bounds and no variance and no
   lower bound**, and a name reused from the type's parameters or twice among the variant's own is an
   error. Why: a variant is a constructor, a generic function, whose parameters take no variance; a
   lower bound asks of a call's argument something a `match` could not hand back. Alternatives
   weighed: allowing `>:` (sound at the call, but it gives the arm a one-directional fact, the kind
   [Variance](/spec/refined-variants/#variance) declines).
-- Proposed (branch `gadt-1`): **a result written as the type at its own parameters, `If(…) ->
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`): **a result written as the type at its own parameters, `If(…) ->
   Expr[T]`, with no parameters of the variant's own, is a plain variant**, the same declaration as
   one with no result. A data parameter a refined variant's result does not name is hidden there like
   any other (`IntLit(value: T) -> Expr[int]` hides `T`). Why: the chapter says the type's names are
   every variant's parameters, and a written-out plain result changes nothing a value carries.
   Alternative weighed: treating any written result as refined (a type would lose its plain uses for
   a redundant spelling).
-- Proposed (branch `gadt-1`), **until step 2 makes values: a type with a refined variant is
-  declared and checked, and refused wherever a program names it, makes a value of it or matches one**,
-  its plain variants included, with ``"`Expr` has refined variants: they are declared and checked,
-  but no value of the type can be made, matched or named yet"``; the fields and results of refined
-  variants may name such types. Step 2 removes the refusal. Why: lowering lays out every variant at
-  every instance and would meet a variant's own parameters it cannot substitute, and a value matched
-  without the refinement of step 3 would be read at the wrong types; refusing the type keeps the
-  declaration step sound with no partial path. Alternatives weighed: refusing only refined variants'
-  calls and patterns (a value of a plain variant of the type, or a type pattern on `Any`, would still
-  reach a layout holding them). **Step 2 (branch `gadt-2`) lifted it**, and what it leaves refused
-  is the next entry's.
-- Proposed (branch `gadt-2`, the values-and-layouts step): **until the steps that build them, four
-  uses stay refused, each with a "yet" message**: a variant pattern of a type with refined variants,
-  its plain variants included, in code the program writes (step 3: ``"`IntLit` is a variant of
-  `Expr`, which has refined variants: a pattern cannot take one of its values apart yet"``); a field
-  read by name on such a type's one variant (step 3: ``"`One[int]` has refined variants: a field of
-  one is not read by name yet"``); a value of a variant with a hidden parameter, the type's or its
-  own (step 5: ``"`First` hides `B`, named by its fields and not by its result: a value of a variant
-  with hidden type parameters cannot be made yet"``); and a value of a variant bounding its own
-  parameter (step 6). The code the derived templates write for the type (`Display`, `Debug`, `Ord`,
-  any `walk`) matches every variant and is accepted, its copies compiled only for the variants
-  possible at each instance, each arm at the arguments it reads back from the instance. Why: each
-  refused use needs what a later step builds (an arm's equalities, packs, bounds held in the arm),
-  and a plain variant's pattern needs coverage over the possible variants, which is step 4's; the
-  derived code is the plan's "derived per instance", and needs only what lowering knows at a copy.
-  Alternatives weighed: accepting patterns on plain variants now (coverage would demand arms for
-  impossible variants that step 4 then makes errors). **Step 3 (branch `gadt-3`) lifted the first
-  two**; a pattern on a variant with hidden parameters is refused in their place (the `gadt-3` entry
-  below).
-- Proposed (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
+- Settled on the user's delegation 2026-11-15 (built on branches `gadt-1` and `gadt-2`): **a type
+  with refined variants is named, made and matched like any other**, and the code the derived
+  templates write (`Display`, `Debug`, `Ord`, any `walk`) matches every variant, its copies compiled
+  only for the variants possible at each instance, each arm at the arguments it reads back from the
+  instance. The declaration step (`gadt-1`) and the values-and-layouts step (`gadt-2`) first
+  refused the type's uses with "yet" messages; patterns and field reads came with `gadt-3`, hidden
+  parameters with `gadt-5` and bounded parameters with `gadt-6` (the entries below). Why: lowering
+  lays out every variant at every instance, so the derived code needs only what lowering knows at a
+  copy. Alternatives weighed: accepting patterns on plain variants before coverage over the
+  possible variants existed (it would demand arms for impossible variants that `gadt-4` then made
+  errors).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
   its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
   is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
   of `Done -> Plan[From, From]` writes `From`, and `IntLit[int](1)` takes no type argument. On the
@@ -9040,21 +9022,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the parameter from the variant's list (its field defaults are functions of the whole list);
   reading `T[A].V` as written arguments of `V` (they are the type's, and need not match `V`'s own in
   number or meaning).
-- Proposed (branch `gadt-2`): **a derived trait holds of a refined variant's own parameter where the
+- Settled on the user's delegation 2026-11-15 (branch `gadt-2`): **a derived trait holds of a refined variant's own parameter where the
   trait on the instance implies it**: the parameter sits in the result under constructors whose
   trait needs their argument's (a tuple's, `Vector`'s), tested by whether the constructor at the
   parameter has the trait where every other argument does and the parameter alone has none. Where
   it is not implied (`Hold[A](x: A) -> Odd[Wrap[A]]`, with `Wrap` showing itself whatever `A` is),
   the field falls short and the type has no automatic `Display`, as any type with such a field. A
-  hidden parameter is given the trait, since no value of its variant is made before step 5, **which
-  must decide it per pack** (step 5, branch `gadt-5`, decided it: by the parameter's bounds, the
+  hidden parameter is decided per pack, by the parameter's bounds (step 5, branch `gadt-5`, the
   entry below). **Review with the user**: whether a refined type's `Display` should rather
   be decided per instance, at the instance's own arguments. Why: a derived impl is checked once, over
   its type's parameters, and this is the most that check can know of a variant's own; it is sound,
   since the trait at an instance gives it to the parameter read back there. Alternatives weighed:
   no trait for own parameters (every type with `Pair` would lose `Display`); the trait
   unconditionally (unsound for `Odd`).
-- Proposed (branch `gadt-2`, where refined variants meet higher-kinded types): **a variant's own
+- Settled on the user's delegation 2026-11-15 (branch `gadt-2`, where refined variants meet higher-kinded types): **a variant's own
   type parameters are types, and a constructor parameter of the type keeps its place in a result**:
   `V[G[_]](…)` is refused with ``"a variant's own type parameters stand for types, not type
   constructors: `G` of `V` takes type arguments; declare a constructor parameter on the type, as in
@@ -9064,8 +9045,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   a `match` can take apart", which was a mistake). Why: the `gadt-1` entry below settles that no
   constructor parameter is fixed, and keeping one in its place fixes nothing. Alternatives weighed: refusing any
   refined variant of a type with a constructor parameter (needlessly narrow).
-- Proposed (branch `gadt-1`), **for constructor parameters ([higher-kinded
-  types](/spec/generics/#higher-kinded-types)), the conservative reading until a design says more: a
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`), **for constructor parameters ([higher-kinded
+  types](/spec/generics/#higher-kinded-types)), the conservative reading: a
   variant fixes no constructor parameter of its type, its own type parameters are no constructor
   parameters, and a result's argument never applies a constructor parameter** (`-> D[F, F[A]]` is
   refused, since `F[A]` against a known instance cannot be taken apart where `F` is itself a
@@ -9080,7 +9061,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
   X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
   among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
-- Proposed (branch `gadt-3`, the refinement step): **each pattern on a refined variant gives the
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`, the refinement step): **each pattern on a refined variant gives the
   variant's parameters fresh types of its own**, so two `Pair` patterns, nested or one after the
   other, give two unrelated sets, and **the equalities are solved with those fresh types first, then
   the enclosing code's type parameters**: `Vector[A] = Vector[T]` makes `A` the `T` around the arm,
@@ -9097,7 +9078,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   these equalities", and a substitution the arm's code can read. Alternatives weighed: naming the
   fresh types by the data type's own parameters (two nested patterns would share them); stopping
   with an error at an equality not taken apart (refuses sound programs).
-- Proposed (branch `gadt-3`): **a variant's own parameter that the equalities leave a fresh type
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **a variant's own parameter that the equalities leave a fresh type
   never leaves its arm**, as a hidden one does not (the chapter states it for hidden parameters
   only): with no type expected, an arm, a clause, an `is` branch or a block whose result names one is
   refused with ``"this arm's result is an `Expr[A]`, and `A` is a type `Pair` takes from the value it
@@ -9106,7 +9087,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reported at the pattern. Why: such a type is known only through the value matched, so no copy can
   compile code outside the arm that names it. Alternatives weighed: settling the escaped type as
   `Nothing` (lays out a value at the wrong type); allowing it (no copy could compile it).
-- Proposed (branch `gadt-3`): **inside an arm a value of a type an equality fixes is used at what
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **inside an arm a value of a type an equality fixes is used at what
   it is there** for operators, members and comparisons (`x + n` with `x: T` and `T = int` is an
   `int`), the type expected of an expression is the one under the equalities (a literal where a `T`
   that is an `int` is expected is an `int`, a value where a `T` that is `Any` is expected is boxed),
@@ -9119,14 +9100,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   anything it equals are one type" and its "as written" rule for inference variables, each where it
   can apply. Alternatives weighed: rewriting every type in the arm to its refined form (would settle
   variables outside the arm to refined types, against the chapter).
-- Proposed (branch `gadt-3`): **`val V = x`, where `V` is a variant of `x`'s type and that type has
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **`val V = x`, where `V` is a variant of `x`'s type and that type has
   refined variants, takes the value apart** as the chapter's `val Refl = proof` does; anywhere else
   `val Name = x` binds a name, as before. **Review with the user**: whether `val V = x` should take
   apart a value whenever `V` is a variant in scope, as a bare name in a pattern does. Why: the
   chapter's example, with no change for any program written before refined variants. Alternatives
   weighed: requiring `val V() = x` (not the chapter's spelling); the general rule (changes what
   existing bindings mean).
-- Proposed (branch `gadt-3`): **a field of a refined type's one variant is read by name where the
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **a field of a refined type's one variant is read by name where the
   instance says the field's type**: `o.value` on `One[T]` with `Mk(value: int) -> One[int]` is an
   `int`; an instance the variant cannot make is refused with ``"`One[bool]` has no values: no
   variant of `One` makes one"``, and a field whose type keeps a parameter the instance does not say
@@ -9134,17 +9115,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   apart with `match`"``. Why: every value of the instance is the variant's, so the read is the arm
   of a one-arm `match`, and only its result type must be one known outside. Alternatives weighed:
   refusing every such read (the chapter's single-variant types would lose field access).
-- Proposed (branch `gadt-3`): **until step 5, a pattern on a variant with hidden parameters is
-  refused** (``"`First` hides `B`, named by its fields and not by its result: a pattern cannot take
-  apart a value of a variant with hidden type parameters yet"``), as a value of one is; **a pattern
-  on a variant bounding its own parameters is accepted, its arm without those bounds until step 6**.
-  Why: an arm on a hidden parameter is compiled per pack, which step 5 builds; no value of either
-  kind is made yet, so neither arm runs. Alternatives weighed: accepting hidden patterns now (their
-  arms would never be compiled, and a program would meet step 5's rules later as a change). **Step
-  5 (branch `gadt-5`) lifted both refusals of hidden parameters**, values and patterns, leaving an
-  `is` test's (the `gadt-5` entries above); **step 6 (branch `gadt-6`) gave the arm the bounds**.
 
-- Proposed (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
   type matched as the equalities in scope see it**, splitting a column on a refined type's variant
   only where the variant's result has a solution with the column's instance, the variant's own
   parameters given types of their own for that split; **the solution carries to the other columns**,
@@ -9153,7 +9125,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   two agree on what is possible. Alternatives weighed: carrying the equalities as a substitution
   beside the columns (the same, with every function of the coverage check threading it; applying
   them to the columns at each split needs no more state).
-- Proposed (branch `gadt-4`): **an impossible pattern is reported at the pattern, by the checker,
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`): **an impossible pattern is reported at the pattern, by the checker,
   with the chapter's three reasons**, chosen by re-solving: against the equalities in scope before
   its row alone it fails (`` `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` ``,
   or the empty-instance message where no variant is possible), a cyclic equality
@@ -9170,7 +9142,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   impossible arms from the coverage check (it sees rows, not which equality failed, and would say
   only "never reached"); leaving an impossible `is` test legal (it folds to `false` at every copy,
   which hides a mistake). **Review with the user:** the wording for tests, bindings and alternatives.
-- Proposed (branch `gadt-4`): **each alternative of a pattern matches on its own: the equalities an
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`): **each alternative of a pattern matches on its own: the equalities an
   alternative learns hold neither in the alternatives after it nor in the arm**, and lowering tests
   each alternative at what its own patterns read back from the value. A step-3 bug: an alternative's
   equalities stayed in scope, so `IntLit(_) | BoolLit(_) -> 5` on an `Expr[T]` was checked as if
@@ -9179,7 +9151,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   whichever alternative matched, so only what all of them imply could hold, and alternatives bind
   no names. Alternatives weighed: keeping the equalities every alternative implies (sound, but needs
   a meet of substitutions the chapter does not describe; no program has needed it).
-- Proposed (branch `gadt-4`): **two types that read the same in a message are named apart by the
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`): **two types that read the same in a message are named apart by the
   refining patterns that took them**: ``expected Expr[A of `Pair` on line 4], found Expr[A of `Pair`
   on line 5]``, with the column too where both patterns are on one line, in the expected/found,
   operator-operand, `cannot compare` and declared-result messages. Only where the two names would
@@ -9187,7 +9159,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   two unrelated sets of fresh types with the variant's parameter names. Alternatives weighed:
   numbering the fresh types (`A1`, `A2`), which every message would show, even where nothing
   clashes.
-- Proposed (branch `gadt-5`, the hidden-parameters step): **a hidden parameter has exactly the
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`, the hidden-parameters step): **a hidden parameter has exactly the
   bounds its variant declares, and a trait derived for its type holds of it only by them**:
   `Hold[A](value: A)` gives `Box` no automatic `Display`, `Debug`, `Eq`, `Hash` nor `Sendable`, and
   `Hold[A: Display](value: A)` gives it `Display`. A parameter of the type that a refined variant
@@ -9209,15 +9181,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Debug` only, and a change to the derive templates). **Review with the user**: whether `Display`
   and `Debug` should rather render a hidden field through its run-time type, so `Expr` prints
   without the bound.
-- Proposed (branch `gadt-5`): **a bound on a hidden parameter is allowed now, `T: A & B` included;
-  a bound on a variant's own parameter that its result names stays refused until step 6**, even
-  beside a bounded hidden one (step 6, branch `gadt-6`, lifted it: the entries below). A hidden parameter's bounds are checked where a value is made, as a
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **a bound on a hidden parameter is allowed, `T: A & B` included**;
+  a bound on a variant's own parameter that its result names was left to step 6 (branch `gadt-6`,
+  the entries below). A hidden parameter's bounds are checked where a value is made, as a
   call's are, and the fresh type an arm gives it has them. Why: the chapter states them for hidden
   parameters in their own section ("a fresh type, with the bounds its declaration gives it"), and
   the typed protocol needs `Ask[R: Sendable]`; what step 6 adds, an enclosing type parameter gaining
   a bound by equality, does not arise for a hidden one. Alternatives weighed: leaving every bound to
   step 6 (the protocol could not be written in step 5).
-- Proposed (branch `gadt-5`): **an `is` test or a binding takes apart no field of a hidden type**:
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **an `is` test or a binding takes apart no field of a hidden type**:
   `if b is Hold(v, _)` with `value: A` hidden is refused with ``"`Hold` hides `A`, and its field
   `value` names it: an `is` test or a binding takes apart no field of a hidden type; take the value
   apart with `match`, whose arm is compiled for each type the value hides"``; `b is Hold(_, _, t)`,
@@ -9228,7 +9200,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   as far as the names reach. Alternatives weighed: copying the reached code per pack (a block's
   rest, an `&&` chain and a `while` condition each need their own copying); refusing every hidden
   pattern in a test (the tag test and the shared fields are sound and useful).
-- Proposed (branch `gadt-5`): **an arm on a variant with hidden parameters is compiled inline,
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **an arm on a variant with hidden parameters is compiled inline,
   once per pack, and chosen by comparing the value's descriptor with each pack's**, not as a
   function called through the descriptor's method table as the build plan said. Lowering finds the
   packs as it reaches the code making them; an instance compiled for fewer packs than the program
@@ -9239,7 +9211,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   through a table. Alternatives weighed: the plan's function per pack through the table (each arm
   would need its locals captured and its exits returned as codes); boxing hidden fields behind `Any`
   (the chapter's alternative, a run-time test where none is needed).
-- Proposed (branch `gadt-5`): **in the polymorphic-recursion check, a refining pattern's fresh types
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **in the polymorphic-recursion check, a refining pattern's fresh types
   are its variant's parameter nodes, a value made with hidden types reaches them, and a type
   argument holding a hidden type grows no parameter of the code that the value matched holds**: so
   `eval(First(p)) = … eval(p)` at `(T, B)` is ordinary, as the chapter says, while a pack built
@@ -9251,7 +9223,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   is counted by the construction edges. Alternatives weighed: counting every type argument as
   before (refuses the chapter's `eval`); dropping every edge of an argument naming a hidden type
   (accepts `pairUp((x, y), b)`, which never ends).
-- Proposed (branch `gadt-6`, the bounds step): **an enclosing type parameter gains a variant
+- Settled on the user's delegation 2026-11-15 (branch `gadt-6`, the bounds step): **an enclosing type parameter gains a variant
   parameter's bounds only where an equality in scope equates the two as wholes**: with
   `Sorted[A: Ord](items: Vector[A]) -> Coll[A]`, `T` of `smallest[T](c: Coll[T])` is `Ord` in the
   `Sorted` arm, a parameter equated in a tuple place (`Conv2[A: Into[B], B](…) -> Conv[(A, B)]` on
@@ -9263,7 +9235,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   weighed: inverting conditional impls (unsound wherever a type has the trait unconditionally);
   rewriting `T` to the variant's fresh type in the arm (the arm's result would then be checked as a
   type that leaves its scope).
-- Proposed (branch `gadt-6`): **a variant's bounds do not prune coverage**: a `match` on a
+- Settled on the user's delegation 2026-11-15 (branch `gadt-6`): **a variant's bounds do not prune coverage**: a `match` on a
   `Coll[Thing]`, with `Thing` not `Ord`, still needs a `Sorted` arm (or a wildcard), whose code is
   checked at `Thing` without the bound, as the chapter's coverage rule counts equalities alone.
   Lowering does leave the variant out of the instance: `Coll[Thing]`'s layout has no descriptor for
@@ -9272,7 +9244,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   impls the program declares (an impl added in another module would otherwise make a covering
   `match` incomplete). **Review with the user**: whether an arm on a variant whose bounds a concrete
   instance fails should rather be "never reached", as an impossible arm is.
-- Proposed (branch `gadt-6`): **whether a refined type is sendable is decided at its instance**: a
+- Settled on the user's delegation 2026-11-15 (branch `gadt-6`): **whether a refined type is sendable is decided at its instance**: a
   variant's own parameters are read back from the instance's arguments, so `Coll[string]` is
   sendable though `Sorted`'s `A` is bounded by `Ord` alone, and a variant whose result is another
   concrete instance holds nothing there (`Msg[int]` is sendable though `Log`, making only a
@@ -9284,7 +9256,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   receive one. Alternatives weighed: requiring `Sendable` on every own parameter (a bound the instance
   already decides).
 
-- Proposed 2026-11-13 (branch `ascription`; ascription itself approved by the user 2026-11-13):
+- Settled on the user's delegation 2026-11-15 (branch `ascription`; ascription itself approved by the user 2026-11-13):
   **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
   (1) *Where it parses*: a group, a tuple's part or a call's argument (a named one's value
   included), never a bare `value: T` elsewhere. WHY: inside parentheses `:` has no other meaning
@@ -9318,7 +9290,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Actor patterns** ([actors](/spec/actors/#routers), branch `actor-patterns`)
 
-- Proposed 2026-11-13 (branch `actor-patterns`): **Routers are `Router.pool(size, behaviour,
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **Routers are `Router.pool(size, behaviour,
   routing, onFailure, executor)`, giving back a plain `ActorRef[M]`.** The router is an actor of its
   own, the routees its children, so the lifecycle and supervision of actors cover it with nothing
   new: `stop(router)` ends the routees first, a routee's `onFailure` is the router's argument, a
@@ -9335,7 +9307,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `avin.random.Random` is a common import; `Router` shares its name with `avin.net.http.Router`, in
   a different module. **Review with the user:** the names (`AtRandom`, `ByKey`) and the router's
   fixed `Escalate`.
-- Proposed 2026-11-13 (branch `actor-patterns`): **`SmallestMailbox` counts the messages waiting,
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **`SmallestMailbox` counts the messages waiting,
   and `ByKey` hashes by highest weight.** A routee's mailbox alone keeps a count (an atomic add on
   each send and take; other actors' mailboxes pay nothing), the message being handled not counted,
   ties going to the next in turn. `ByKey` weighs each routee against the key by mixing the key with
@@ -9345,12 +9317,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   mailbox (a cost to every actor); counting a message until its handling ends (a second atomic per
   message); the key modulo the pool's size (every key moves when one routee leaves); a hash ring
   (more state for pools that are small).
-- Proposed 2026-11-13 (branch `actor-patterns`): **A message a router finds refused goes to another
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **A message a router finds refused goes to another
   routee.** A routee that has begun to end refuses a message, and the router chooses again among the
   rest, before it has heard of the end; a message a routee accepted and then dropped as it stopped
   is lost, as with any actor that stops. *Why*: the window between a routee ending and the router
   hearing of it would otherwise lose messages for no reason. *Alternative*: dropping them.
-- Proposed 2026-11-13 (branch `actor-patterns`): **A `Stash` is a bounded object of the actor's state,
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **A `Stash` is a bounded object of the actor's state,
   `Stash(self, capacity)`, and adding to a full one traps.** `unstashAll` puts its messages in front of
   every message waiting, in the order added, in a queue the actor's turn reads before its mailbox, so
   a restart keeps them as it keeps the mailbox, while what is still stashed is lost with the state.
@@ -9363,7 +9335,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   given to `spawn` (state outside the actor's fields, and a parameter every actor carries);
   unstashed messages put at the back of the mailbox (behind messages that arrived later, losing
   order). **Review with the user:** trapping on overflow.
-- Proposed 2026-11-13 (branch `actor-patterns`): **A `Topic[E]` is a sendable object, not an actor.**
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **A `Topic[E]` is a sendable object, not an actor.**
   `publish` tells each subscriber in the publisher's own thread, so one publisher's events reach
   each subscriber in order with no hop; subscriptions live in one atomic value; a subscriber's end
   is watched through its `ended()` future from its first subscription, which drops it. An actor is
@@ -9376,7 +9348,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 
-- Proposed: **a constructor parameter is spelled `F[_]`**, `F[_, _]` for two holes, and a partial
+- Settled on the user's delegation 2026-11-15: **a constructor parameter is spelled `F[_]`**, `F[_, _]` for two holes, and a partial
   application of a type writes `_` for each argument left open: `Result[_, ParseError]`,
   `Map[string, _]`. Why: the same mark at the declaration and at the use, the `_` the language
   already uses for "something left out" in patterns and lambdas, and the spelling other chapters'
@@ -9386,7 +9358,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   equality undecidable in general); declaring the constructor by an alias only (every partial
   application would need a named alias). Review with the user: the spelling is the most visible
   choice of the design.
-- Proposed: **holes are direct arguments of one nominal type; no nested `_`, no constructors of
+- Settled on the user's delegation 2026-11-15: **holes are direct arguments of one nominal type; no nested `_`, no constructors of
   constructors (`F[_[_]]`), no tuple or function constructors.** A generic alias whose parameters
   are each one direct argument of its expansion is a constructor too. Why: a constructor is then a
   nominal type with places left open, so equality is structural and inference has one answer, the
@@ -9394,7 +9366,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   own. Alternatives: general type lambdas (undecidable equality, inference with many answers);
   allowing any alias as a lambda (the same problem behind a name). Review with the user: whether
   composed constructors are wanted soon.
-- Proposed: **a hole may declare variance (`F[+_]`) and bounds (`F[_: Sendable]`)**, a demand on the
+- Settled on the user's delegation 2026-11-15: **a hole may declare variance (`F[+_]`) and bounds (`F[_: Sendable]`)**, a demand on the
   constructor passed: `+_` lets `F[Dog]` be an `F[Animal]` inside the declaration and takes only
   constructors covariant there; a bounded hole is applied only to types meeting the bound, checked
   at each `F[X]` written, and takes constructors whose parameter's bounds the hole's imply. A plain
@@ -9404,7 +9376,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives: always invariant (loses `F[Dog]` as `F[Animal]` where code wants it, at no gain in
   simplicity); always covariant (unsound for `Array`); refusing bounded types outright (excludes
   `Future` from comprehensions).
-- Proposed: **constructor traits are spelled with `Self[…]`, the trait's parameters being the
+- Settled on the user's delegation 2026-11-15: **constructor traits are spelled with `Self[…]`, the trait's parameters being the
   holes**: `trait Functor[A]` with `map[B](f: (A) -> B) -> Self[B]`, bounds written `[F[_]: Monad]`.
   Why: it reads like every other Avin trait (`Iterable[+A]` with `map[B]`), keeps `impl Trait for
   Type` as the one form of conformance, and the common case (calling `fa.map`, writing
@@ -9413,26 +9385,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the receiver in a parameter and makes every call `F.map(fa, f)` or needs a second rule for method
   syntax); marking constructor traits with a keyword (redundant: `Self[B]` already says it). Review
   with the user.
-- Proposed: **a constructor trait is a bound and never a type, its parameters take no variance, and
+- Settled on the user's delegation 2026-11-15: **a constructor trait is a bound and never a type, its parameters take no variance, and
   its static members name none of them.** Why: no object of unknown constructor exists, so no dynamic
   dispatch over constructors and no existential is needed; every call is direct in a monomorphized
   instance. Alternatives: trait objects of `Monad` (need a run-time constructor witness and type
   erasure of the element, which reification refuses).
-- Proposed: **an impl gives the trait the type's parameters it leaves open** (`impl[T, E] Monad[T]
+- Settled on the user's delegation 2026-11-15: **an impl gives the trait the type's parameters it leaves open** (`impl[T, E] Monad[T]
   for Result[T, E]`), **and both may be left off where all are open, in order** (`impl Monad for
   Option`). Why: the partial application needs no new syntax at the impl, and the common
   one-parameter case reads as plainly as `impl Ord for Money`. Alternatives: writing the constructor
   (`impl Monad for Result[_, E]`, which needs `E` declared somewhere); requiring the full form always
   (noise in the common case). The bare form is the only impl of a generic type without its
   parameters, a narrow exception.
-- Proposed: **a type implements a constructor trait once, at one choice of holes, and the
+- Settled on the user's delegation 2026-11-15: **a type implements a constructor trait once, at one choice of holes, and the
   conformance is not inherited by subclasses or through traits.** Why: coherence gives each argument
   one constructor; an inherited `map` answers the superclass's type, so inheriting would be unsound.
   A subclass instance is matched as its nearest superclass with a conformance, then the one trait
   with one. Alternatives: a conformance per hole (`Either` a functor on both sides, at the cost of
   ambiguous inference); inheritance with a check that every method is overridden at the subclass's
   type (a long tail of overrides in the library).
-- Proposed: **a type's own methods implement a constructor trait's where the trait's call is a call
+- Settled on the user's delegation 2026-11-15: **a type's own methods implement a constructor trait's where the trait's call is a call
   of them** with no conversion, no extra bound, their own type parameters decided by the call (a
   lower bound by its bound) and a result conforming to the trait's. Why: `List`, `Vector`,
   `Option`, `Result` and `Either` meet the family with their existing overloaded and lower-bounded
@@ -9441,23 +9413,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   exact signatures (forces a second `flatMap` on every collection, an overload clash); adapters
   generated per mismatch (hidden code and conversions). Review with the user: it is a looser
   meeting than a class's override, which takes the parameter types exactly.
-- Proposed: **inference of a constructor goes through its bound's conformance**; without a bound
+- Settled on the user's delegation 2026-11-15: **inference of a constructor goes through its bound's conformance**; without a bound
   only a type of exactly the parameter's arity is inferred, anything wider needs `F` written; the
   written-out arguments join by the type's variance (`Ok(1)` beside a `Result[int, E]`); two
   different heads never join. Why: the impl is the one place that says which argument varies, and
   joining the fixed arguments keeps `Nothing`-typed literals pleasant. Alternatives: the last
   argument always the hole (wrong for `Result`, whose value is first); unification over every
   choice of holes (ambiguous, order-dependent).
-- Proposed: **a constructor trait's default bodies are compiled once per implementing constructor
+- Settled on the user's delegation 2026-11-15: **a constructor trait's default bodies are compiled once per implementing constructor
   and may call its static members on `Self`.** Why: `Monad`'s `map` and `map2` from `flatMap` and
   `pure`, so a program's own monad gives two members. Alternatives: no defaults (every monad writes
   four members); defaults shared through a method table, as other traits' are (no `Self` to call
   `pure` on).
-- Proposed: **impls may add to applications of a bounded constructor parameter**
+- Settled on the user's delegation 2026-11-15: **impls may add to applications of a bounded constructor parameter**
   (`impl[F[_]: Traverse, G[_]: Applicative, A] F[G[A]]`), matched through the conformance, with the
   rules of impls adding to types built from parameters. Why: `xs.sequence()` reads as a method, and
   a package can extend every monad at once. Alternatives: free functions only (`sequence(xs)`).
-- Proposed: **the standard traits are `Functor`, `Foldable`, `Applicative`, `Monad`, `Filter`,
+- Settled on the user's delegation 2026-11-15: **the standard traits are `Functor`, `Foldable`, `Applicative`, `Monad`, `Filter`,
   `Traverse`, and the sendable pair `SendableFunctor`/`SendableMonad`, in module `avin`**, with
   `Applicative`'s second member `map2` and `Foldable` holding `foldLeft` alone. Why: `Foldable` is
   warranted because `Option`, `Result` and `Either` are no `Iterable`s and `Traverse` needs a fold;
@@ -9468,7 +9440,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Foldable` (no fold over an option in generic code); `Future` left out (breaks comprehensions over
   futures). Review with the user: the names, and whether the sendable pair should rather be a hole
   bound on the ordinary traits.
-- Proposed: **which library types implement what**: `Option`, `Result[_, E]`, `Either[L, _]` and
+- Settled on the user's delegation 2026-11-15: **which library types implement what**: `Option`, `Result[_, E]`, `Either[L, _]` and
   the immutable sequences (`List`, `Vector`, `ArraySeq`, `Queue`, `Seq`) the whole family, `Filter`
   except on `Result` and `Either`; `LazyList` all but `Traverse`; `Array`, `Buffer`, `Deque` and
   `Set` `Functor`, `Foldable` and `Filter`; `Future` the sendable pair; `Map`, the sorted
@@ -9477,7 +9449,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives: `Monad` for the mutable collections (lawful, but `pure` making a mutable array
   surprises); `Map` as a functor over its values (its `map` takes entries, so it needs a method of
   another name).
-- Proposed: **`for` comprehensions admit their sources by conformance**: the last generator an
+- Settled on the user's delegation 2026-11-15: **`for` comprehensions admit their sources by conformance**: the last generator an
   `Iterable` or a `Functor` (or `SendableFunctor`), an earlier one an `Iterable` or a `Monad` (or
   `SendableMonad`), a guard an `Iterable` (through its lazy `withFilter`, whose views become
   `Iterable`s) or a `Filter` (through `filter`); in generic code the bounds decide; the calls are
@@ -9537,7 +9509,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **Functions and methods may still be named so** (`cli`'s `int(name)` and `string(name)`
     options): a function is called, never matched, so no pattern can mean it. A missing-member
     witness still reads `_: string`, which is the same pattern.
-- Proposed (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
+- Settled on the user's delegation 2026-11-15 (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
   against the structure, except where `@trusted_sendable("why")` marks a class**
   ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
   standard library's promises are taken as made", under which `Map.withDefault(f)` answered a
@@ -9556,7 +9528,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (invisible at the type, drifts from the library); trusting every class of `avin.threads` (too
   wide: it hid nothing here, but would hide the next `DefaultMap`); marking the composites
   (`Future`, `Promise`) instead of `Cell` (more entries, fewer types checked).
-- Proposed (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
+- Settled on the user's delegation 2026-11-15 (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
   `DefaultMap` holds its default as a private `MapDefault` data value, `Fixed(v)` or
   `Computed(f)`, so `withDefaultValue(v)` takes any value and the wrapper is sendable wherever the
   map and `v` are. Why: `Map` promises `Sendable` and every map is one, so the default must be
@@ -9566,13 +9538,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `val m: Map[K, V] = ….withDefault(f)`); keeping a plain function and making the wrapper not
   sendable (a trait's implementers cannot opt out). Review with the user: a default that mutated a
   captured local (a call counter) now uses an `Atomic`.
-- Proposed (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
+- Settled on the user's delegation 2026-11-15 (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
   through a token handle as `Child` does, so a stream handed to another thread traps its previous
   owner at a read served from the bytes read ahead; before, only a read that reached the socket
   checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
   sound.
 
-- Proposed (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
   used first, with no index**: an entry is a program's build directory (`build/`, `test-builds/`) or
   one object or archive (`units/`, `runtime/`, `shims/`, `cunit/`), and its modification time is its
   last use, touched by every build that takes it from the cache (a program's directory when its
@@ -9586,7 +9558,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   through it); access times (`noatime` mounts, and macOS updates them lazily); a sweep after every
   build (the size walk on every build); an hourly sweep (24G had grown within hours). Review with
   the user: the 5G default and the ten-minute interval.
-- Proposed (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
   aside, looked at again and put back if a build touched it in between**, before it is removed.
   Why: no build reading or writing an entry loses it, without a lock; a cache whose fresh entries
   alone pass the limit stays past it until they age. Alternatives: lease files naming the process
@@ -9594,7 +9566,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   no grace (a sweep could take the executable `avin test` starts once per test). A shim archive and
   the record of the libraries it needs beside it are one entry, the archive evicted first and a
   record newer than the sweep's choice kept, so no build finds the record without its archive.
-- Proposed (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
   error**: every object and archive a build takes from the cache is touched first, and one missing
   (or a shim archive without its record) is built again; the link looks again at everything it takes
   from the cache before clang runs and after clang fails, answers an entry gone in between as such
@@ -9603,20 +9575,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   gates fail to link a shim archive that had been there when the program compiled (2026-11-13).
   Alternatives: holding the entries open across the link (clang opens them by name); copying them
   out of the cache first (the copying costs every build).
-- Proposed (branch `cache-trim`): **another version's cache is removed three days after its last
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **another version's cache is removed three days after its last
   use**, judged by the newest time on it, its kinds and their entries, and only beside the default
   cache (never beside a directory `AVIN_CACHE` names), and only for a name that is a version's. Why:
   no compiler of this version can read it, and three days spares a user switching back. Alternatives:
   removing every other version at once (an older installed compiler still in use would rebuild each
   time); never (the unreachable caches are what filled the disk).
-- Proposed (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
   sweep**; a sweep removes only the debris of interrupted fetches, and `avin cache clean --packages`
   removes packages (with `--older-than`, those no build has read for that long; a build touches the
   package it reads). Why: a package is source pinned by `avin.sum`, small beside a build, and
   fetching it again needs the network and a tag that may since have been removed, so evicting one
   could break an offline or archived build. Alternatives: counting packages in the limit (evicted
   first, being rarely touched, for a few hundred kilobytes saved).
-- Proposed (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
   `.pending-` (a write that was never renamed into place) that nothing has written to for an hour,
   and in the temporary directory the directories a build works in (`avin-link`, `avin-shims`,
   `avin-c-unit` and the six characters `make_temp_dir` adds) that nothing has written to for a day,
@@ -9625,14 +9597,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   machine its tests had left 8,673 such directories. A program's own temporary directories are never
   touched, whatever they are called. Alternatives: every `avin-` directory (a program may name its
   own so); none (the debris is unbounded).
-- Proposed (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
   limit, each kind's entries and size, the total with its oldest and newest use, debris, fetched
   packages and other versions' caches; `trim` sweeps now; `clean` removes every entry, the debris and
   other versions' caches, `--older-than <n>m|h|d` only what no build has used for that long, and
   `--packages` the fetched packages too. `avin clean` keeps its meaning (one program's builds, or
   `--all` every program's). Why: the user sees what the cache holds and can empty it without
   knowing its layout. Alternatives: folding these into `avin clean` (whose argument is a program).
-- Proposed: **a marked parameter survives a function becoming a value only through its type**
+- Settled on the user's delegation 2026-11-15: **a marked parameter survives a function becoming a value only through its type**
   (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
   `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
   type, which for a function is a `@sendable` function type; with no function type expected, the
@@ -9649,7 +9621,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
   function parameter takes the `@sendable` form, which asks a little more than the mark (no
   captured `var`). Method values keep their own wording, from the call inside the closure they are.
-- Proposed: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+- Settled on the user's delegation 2026-11-15: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
   `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
   an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
   "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
@@ -9666,7 +9638,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
-- Proposed: **a type with a constructor parameter derives nothing through a template, and has no
+- Settled on the user's delegation 2026-11-15: **a type with a constructor parameter derives nothing through a template, and has no
   automatic `Display` or `Debug`**: `derives Eq` on a class, `Hash`, `Ord` or a library trait is
   refused with the parameter named, and a value is shown by its type, as a value of no `Display`
   is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
@@ -9677,11 +9649,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   hole (unsound for the reason above: `F[_: Eq]` admits a constructor whose values have no `Eq`
   of their own beyond identity); requiring `F[A]: Display` per field (a constraint on
   applications, which impls over constructor parameters, step 6, are the place for). Review with
-  the user once step 6 lands.
-- Proposed: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
+  the user: whether step 6's impls over constructor parameters should now give a bounded hole's
+  types a derivation.
+- Settled on the user's delegation 2026-11-15: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
   is written the same way everywhere else, and a contravariant hole is the dual demand
   (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
-- Proposed: **a type whose parameter is bounded is a constructor only for a hole whose bounds imply
+- Settled on the user's delegation 2026-11-15: **a type whose parameter is bounded is a constructor only for a hole whose bounds imply
   that bound** (step 2, branch `hkt-2`, replacing step 1's refusal of every such type at any hole):
   a hole's bound implies a parameter's where it is the same trait or class, or one that is an
   instance of it (a trait requiring it, a subclass), as `Ord` implies `Eq`; `Eq` and `Hash` need
@@ -9694,12 +9667,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   bound refuses; implication is the least the hole must promise. Alternatives: checking each
   application at instantiation (an instance could then fail, against the design); entailment
   through impls with bounds of their own (no case needs it yet).
-- Proposed: **every `F[X]` a declaration writes is held to the bounds of `F`'s holes where it is
+- Settled on the user's delegation 2026-11-15: **every `F[X]` a declaration writes is held to the bounds of `F`'s holes where it is
   written**, once per application, with the message "`X` does not conform to `B`, the bound of
   `F`'s argument in `F[_: B]`": a signature naming `F[A]` twice for an `A` without the bound reports
   both. Why: the spec's rule is "checked wherever the declaration writes `F[X]`"; each place is a
   separate mistake to fix. Alternatives: one report per declaration (hides the second place).
-- Proposed: **a hole's variance is what makes `F[A]` variant** (step 2, replacing step 1's
+- Settled on the user's delegation 2026-11-15: **a hole's variance is what makes `F[A]` variant** (step 2, replacing step 1's
   invariance of every applied argument): inside the declaration an argument of `F[A]` is at the
   position its hole gives it, kept at `+_`, flipped at `-_`, invariant at `_`, so `+A` in a field
   `F[A]` is accepted for `F[+_]` and refused for `F[_]`; `F[Dog]` is an `F[Animal]` only at `+_`
@@ -9708,22 +9681,22 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   covariant and at a `-_` hole contravariant; a constructor parameter passed must declare that
   variance on its own hole. Why: the subtyping assumed inside the declaration is then exactly what
   each instance grants. Alternatives: none sound that keep `F[+_]` useful.
-- Proposed: **a constructor parameter has no `Nothing` default**: one that is neither written nor
+- Settled on the user's delegation 2026-11-15: **a constructor parameter has no `Nothing` default**: one that is neither written nor
   inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
   Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
   of `Nothing` (meaningless as a constructor).
-- Proposed: **with overloads, the first candidate's type parameters decide which written argument
+- Settled on the user's delegation 2026-11-15: **with overloads, the first candidate's type parameters decide which written argument
   is resolved as a constructor**, before a candidate is chosen. Why: written type arguments are
   resolved once, before overload resolution, and overloads differing in the kinds of their type
   parameters are rare; resolving per candidate would need resolution repeated per overload.
   Alternatives: resolving the arguments once per candidate (correct for mixed kinds, more work in
   the hottest path); refusing overloads whose type parameters differ in kind. Review with the user
   if overloads of mixed kinds turn up.
-- Proposed: **`_` alone as a written argument at a call is read as a hole**, so that the checker
+- Settled on the user's delegation 2026-11-15: **`_` alone as a written argument at a call is read as a hole**, so that the checker
   says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
   instead of `unknown type`.
 
-- Proposed: **a `for` loop admits its source by conformance to `Iterable`** (branch
+- Settled on the user's delegation 2026-11-15: **a `for` loop admits its source by conformance to `Iterable`** (branch
   `nominal-for-in`): besides a range written in place, a `Range` and an array, the source's type
   conforms to `Iterable` at some element type through its class's or data type's parents and impls,
   a type parameter's bounds, a built-in type's impls, or, for a union, every member's. A type with
@@ -9734,7 +9707,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
   anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
   conforms, and the loop's `iterator()` call is answered by every member).
-- Proposed (built on branch `select`): **A `select` block's syntax** ([Threads](/spec/threads/#select)).
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **A `select` block's syntax** ([Threads](/spec/threads/#select)).
   `select` ending its line opens a block of arms written as a match's: `ch.receive() as P -> body`,
   `ch.send(x) -> body`, `after d -> body`, and `else body` with no arrow; `end select` may close it.
   `select` is a contextual word, a name anywhere else, as `actor` and `export` are. Why: the arms
@@ -9743,7 +9716,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   item's sketch (refused by the lexer and by the settled rule on arrows); a reserved keyword (breaks
   every program naming something `select`, and the library's own prose); a library function taking
   lambdas (no binding by pattern, no `return`/`break` from an arm, every arm a closure).
-- Proposed (built on branch `select`): **What a receive arm's pattern means.** `Some(p)` waits for
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **What a receive arm's pattern means.** `Some(p)` waits for
   a value and binds it by `p`, any irrefutable pattern a `val` takes; `None` waits for the channel
   closed and drained; a name waits for either and binds the `Option`; `_` or no pattern waits for
   either. Any other pattern (a literal, a tuple, alternatives, a type pattern) is an error. So
@@ -9754,7 +9727,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `receive` returns. Alternatives weighed: trapping where a closed channel's `None` matches no arm
   (turns a finished producer into a crash), any pattern with an unmatched receive dropped (loses
   values). **Review with the user**: whether `Some(p)` alone on a closed channel should wait or trap.
-- Proposed (built on branch `select`): **Choosing and evaluating.** Every channel, value sent and
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **Choosing and evaluating.** Every channel, value sent and
   `after` duration is evaluated once, in the order written, before any arm is tried; the arms are
   tried in an order drawn at random each select (a Fisher–Yates shuffle from one shared
   split-mix sequence), so of several ready arms each is equally likely. `after` and `else` together
@@ -9764,7 +9737,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   fair one that needs no state per select site. Alternatives weighed: round-robin per select site
   (needs a hidden mutable per site, shared between threads); trying in written order (starves the
   later arms); a send arm on a closed channel never ready (hides the program's mistake).
-- Proposed (built on branch `select`): **How a select waits.** It waits on the very conditions a
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **How a select waits.** It waits on the very conditions a
   channel's `receive` and `send` wait on: in one pass, each arm is tried under its channel's lock and,
   where it cannot complete, a link of the select is enlisted on that condition's queue before the
   lock goes; the thread then parks once. The runtime wakes a link as it wakes any waiter, and the
@@ -9779,7 +9752,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   channel); passing every unused notification on whatever the channel holds (idle selects hand one
   notification round for ever: two thousand workers ran forty times slower); a select polling with
   sleeps (latency and wasted work).
-- Proposed (built on branch `select`): **The library names a select is read into are public**:
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **The library names a select is read into are public**:
   `avin.threads.SelectArm`, `SelectReceive`, `SelectSend`, `selectWaiting`, `selectOrElse`,
   `selectWithin`, and `Channel`'s `offerReceive`, `offerSend` and `passOn`. Their wait parameter is
   of a type private to `avin.threads`, so no program can call an arm's operations. Why: the code a
@@ -9787,7 +9760,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   actor's `ActorContext` is; members have no module-wide visibility. Alternatives weighed: a member
   visibility private to the module (a language change of its own); intrinsics the compiler calls
   directly (the arms are generic, and the channel logic belongs in Avin).
-- Proposed (built on branch `timing`): **`after` and `Ticker` are channels holding a clock, not a
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **`after` and `Ticker` are channels holding a clock, not a
   timer** ([Threads](/spec/threads/#timers-and-deadlines)). `after(d) -> Channel[Instant]` and
   `Ticker(period)` with its channel `ticks` give ordinary `Channel[Instant]`s whose next value's due
   time is kept in the channel; the first receive, `tryReceive` or select arm that looks once it is
@@ -9804,7 +9777,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   kind of select arm for the same wait). `Channel`'s `wakeAt`, `startClock` and `stopClock`, which
   the select and the clocks call, are public as the select's names are, each taking a type private to
   `avin.threads`, so no program can call them.
-- Proposed (built on branch `timing`): **Nothing sends to a channel `after` or a `Ticker` made.** A
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **Nothing sends to a channel `after` or a `Ticker` made.** A
   `send`, `trySend`, timed send or select send arm on one traps; `close` is allowed and ends it, no
   value delivered after. Why: the channel is the clock's; a value sent into it would take the tick's
   place or sit beside it, and Avin has no receive-only channel type to make the mistake a compile
@@ -9812,7 +9785,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   tick); a receive-only channel type (a language feature of its own, which a later decision could
   still add, making this a compile error). Review with the user if a receive-only view of `Channel`
   is wanted.
-- Proposed (built on branch `timing`): **A ticker drops the ticks a slow receiver misses, and `stop`
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **A ticker drops the ticks a slow receiver misses, and `stop`
   drops a waiting one.** The channel holds one tick; one falling due while it is held is dropped, and
   the ticker moves on to its first period after now. The held tick is the oldest missed. `stop()`
   also drops a tick fallen due and not received, so none is received after it; a period of zero or
@@ -9821,7 +9794,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   of pacing; after `stop`, a stale tick is a surprise. Alternatives weighed: an unbounded backlog;
   the newest missed tick held rather than the oldest (needs a write into a value the receiver may be
   taking); keeping the waiting tick after `stop`.
-- Proposed (built on branch `timing`): **Timed channel waits are `receive(timeout: Duration)` and
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **Timed channel waits are `receive(timeout: Duration)` and
   `send(x, timeout: Duration)`**, overloads beside the plain forms, as `Future.await(timeout)` and
   `Condition.waitFor(timeout)` are. `receive(timeout)` answers `Option[T]`: `None` for a time that ran
   out and for a closed, drained channel alike (`isClosed()` tells them apart); `send(x, timeout)`
@@ -9834,7 +9807,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   millisecond overloads `Condition.waitFor(timeoutMillis: long)` and `Future.await(timeoutMillis:
   long)` duplicate their `Duration` forms and could be retired in a release that breaks source, their
   callers moved to `millis(n)`.
-- Proposed (built on branch `timing`): **A scope with a time limit is `withTimeout(timeout, s -> …)
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **A scope with a time limit is `withTimeout(timeout, s -> …)
   -> Option[T]`**, `None` where the time ran out. The body runs with a new scope on a lightweight thread
   of its own while the caller waits in a select with an `after`; when the time runs out the body's
   thread is cancelled, which cancels its scope's threads and all below them, and `withTimeout` answers
@@ -9856,7 +9829,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 **Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
 2, branch `hkt-2`)
 
-- Proposed: **an unbounded constructor parameter is inferred from the type an argument or the
+- Settled on the user's delegation 2026-11-15: **an unbounded constructor parameter is inferred from the type an argument or the
   expected type gives `F[X]`, named bare**: a data type, class or trait with exactly as many type
   parameters as `F` has holes, a subclass by its own name (`Crate[A]` passed as `F[A]` is `Crate`,
   not its superclass), or another constructor parameter in scope applied to as many arguments.
@@ -9871,33 +9844,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   asking for `F` to be written"); the example is the likeliest constructor meant. Alternatives:
   always leaving the first arguments open in the example (wrong for `Either[string, int]`);
   holding the arguments invariantly once `F` is decided (refuses calls every instance accepts).
-- Proposed: **a function's or method's type arguments taken as a value (`k.pick[Dog]`) are held
+- Settled on the user's delegation 2026-11-15: **a function's or method's type arguments taken as a value (`k.pick[Dog]`) are held
   to their bounds, as at a call** (a fix found in step 2: a method value checked no bound at all,
   so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
   it may not fill among them).
 
 **Higher-kinded types, constructor traits and their impls** (build plan step 3, branch `hkt-3`)
 
-- Proposed: **a constructor trait's default bodies are compiled once per implementing constructor
-  already in step 3**, not from step 5: each instance of a constructor trait's method takes the
-  constructor after its type arguments, and `Self` stands for it there. Why: a body shared by
+- Settled on the user's delegation 2026-11-15 (branch `hkt-3`): **a constructor trait's default
+  bodies are compiled once per implementing constructor**: each instance of a constructor trait's
+  method takes the constructor after its type arguments, and `Self` stands for it there (the
+  static members `Self.pure` and `F.pure` come with step 5, the entry above). Why: a body shared by
   every conforming type sees `Self` as an object, but a `Self[B]` may be an option or another value
-  laid out as no object is, and a shared `mapTwice` built that way crashed at run time; the
-  per-constructor copy is what the spec's design says in the end, so no later step removes it.
-  Step 5 keeps `Self.pure` and `F.pure`. Alternatives: refusing default bodies in constructor
-  traits until step 5 (a temporary refusal step 5 would remove).
-- Proposed: **the methods that meet a constructor trait's are the type's own: those its
+  laid out as no object is, and a shared `mapTwice` built that way crashed at run time.
+  Alternatives: refusing default bodies in constructor traits (needlessly narrow, and `Monad`'s
+  `map` and `map2` come from them).
+- Settled on the user's delegation 2026-11-15: **the methods that meet a constructor trait's are the type's own: those its
   declaration and its impls declare, never a superclass's.** Why: the spec's rule names "the
   type's own methods", and a superclass's method answers the superclass's type, the reason a
   subclass inherits no conformance. Alternatives: also meeting with inherited methods whose
   results happen to fit (a `foldLeft` would; a `map` never does). Review with the user if a class
   hierarchy wants an inherited `foldLeft` to meet `Foldable`.
-- Proposed: **two overloads that both meet one trait method are an error at the impl**, naming
+- Settled on the user's delegation 2026-11-15: **two overloads that both meet one trait method are an error at the impl**, naming
   the method. Why: a call through the bound would have two methods to call, and choosing the
   more specific is a second overload resolution no call site shows. Alternatives: the more
   specific overload, as a written call would pick (more code, and a choice the reader cannot
   see); the first declared (arbitrary).
-- Proposed: **the meeting decides a method's own type parameters from where they first appear in
+- Settled on the user's delegation 2026-11-15: **the meeting decides a method's own type parameters from where they first appear in
   its parameter types, against the trait's, then in its result; one still undecided takes its
   lower bound, and one with none is an error naming it.** Every parameter and the result are then
   checked with what was decided, each seen as the other's with no conversion (a reference seen as
@@ -9906,24 +9879,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Iterable[U])` take `U` from the trait's `List[B]` seen as an `Iterable`. Alternatives: full
   inference by the call checker (heavier, and its tiers of defaults would decide what the trait's
   call does not).
-- Proposed: **a constructor trait requires only constructor traits**, each at its own parameters
+- Settled on the user's delegation 2026-11-15: **a constructor trait requires only constructor traits**, each at its own parameters
   in order; `trait Shown[A]: Functor[A], Display` is an error. (Widened by the settled entry of
   2026-11-14, branch `hkt-7`: it may also require a trait for types that bounds constructors.) Why: a trait for types bounds what
   a value is, and the constructor trait's `Self` is no value's type, so what the requirement would
   promise is unclear. Alternatives: reading it as a bound on every application `Self[A]` (a
   constraint on applications, which impls over constructor parameters, step 6, are the place for).
-- Proposed: **a constructor trait's arguments are no position of a variance** for the conforming
+- Settled on the user's delegation 2026-11-15: **a constructor trait's arguments are no position of a variance** for the conforming
   type: `List[+T]` and `Result[+T, +E]` conform to `Monad[T]`, an invariant parameter. Why: no
   value has the trait as its type, so `Monad[Dog]` and `Monad[Animal]` are never compared; the
   subtyping of `F[Dog]` is the hole's (`F[+_]`). Alternatives: none that let a covariant type
   conform.
-- Proposed: **a class may state a conformance to a constructor trait in its header**, `class
+- Settled on the user's delegation 2026-11-15: **a class may state a conformance to a constructor trait in its header**, `class
   Crate[A]: Functor[A]`, held as an impl's is; the form leaving the trait's arguments off is an
   impl's only. A class's methods meeting the trait's need no `override`, and may write it. Why:
   a header conformance is one an impl could state, and the meeting methods are the class's own,
   which override nothing. Alternatives: requiring an impl for constructor traits (no reason a
   header could not say the same).
-- Proposed: **the conformance's errors are reported at the impl, a meeting's at the method where
+- Settled on the user's delegation 2026-11-15: **the conformance's errors are reported at the impl, a meeting's at the method where
   the impl declares it and at the impl otherwise**: a library type's method that does not meet is
   reported where the program's impl names the trait. Why: the impl is what the program wrote; the
   library's method is not the mistake.
@@ -9931,7 +9904,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 **Higher-kinded types, inferring a constructor through its bound** (build plan step 4, branch
 `hkt-4`)
 
-- Proposed: **the spec's third place to look, "the one trait among those it conforms to that has
+- Settled on the user's delegation 2026-11-15: **the spec's third place to look, "the one trait among those it conforms to that has
   one", is left out, since no type can reach it.** An impl is never for a trait, and a trait that
   requires a constructor trait is itself one, so a type conforming to it conforms to what it
   requires at the same holes, as its own; a type conforming to it at fixed arguments
@@ -9941,7 +9914,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with the user: it returns, with its "several such traits" error, if traits come to implement
   constructor traits by impls (`impl Monad for Seq`), which the spec's `pairUp[Seq, …]` example
   presumes and the library step will want.
-- Proposed: **with several constructor-trait bounds, each conformance the type (or the superclass
+- Settled on the user's delegation 2026-11-15: **with several constructor-trait bounds, each conformance the type (or the superclass
   matched) has decides; two that leave different arguments open are an error naming both**
   (`Pair` implements `Mappable` as `Pair[int, _]` and `Lefty` as `Pair[_, int]`), and a bound the
   type lacks is reported as for a written constructor. Why: the bounds are one demand on one
@@ -9949,14 +9922,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives: the first bound written decides (order-dependent); the nearest type with all of
   them (skips a subclass's own conformance for a superclass's, which the spec's no-inheritance rule
   forbids).
-- Proposed: **an argument written out of a constructor joins only where the type's parameter is
+- Settled on the user's delegation 2026-11-15: **an argument written out of a constructor joins only where the type's parameter is
   covariant and the argument a reference type known at that argument; the expected type, checked
   first, fixes it.** `second(dogs, cats)` makes `F` `Result[_, Animal]`; with
   `val r: Result[int, Dog] = second(dogs, cats)` the expected type has made `F` `Result[_, Dog]` and
   the cats are refused. Why: the expected type decides type arguments before the arguments do for
   every generic call. An argument the first argument leaves unknown (`Ok(1)`'s error type) is
   decided by the next, as an invariant one is.
-- Proposed: **inference sees a subclass as its superclass, or a type as a trait, only where a value
+- Settled on the user's delegation 2026-11-15: **inference sees a subclass as its superclass, or a type as a trait, only where a value
   is read out** (a fix found in step 4, which matching through a superclass's conformance meets):
   at an invariant argument or a function's parameter, inference held a `Box[TallShelf[int]]` to be
   a `Box[Shelf[A]]`, and a `(Dog) -> int` an `(Animal) -> B`, so generic code could store a `Shelf`
@@ -9965,7 +9938,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Higher-kinded types, static members on constructors** (build plan step 5, branch `hkt-5`)
 
-- Proposed: **a constructor named bare, or with `_` for the arguments it leaves open, has as its
+- Settled on the user's delegation 2026-11-15: **a constructor named bare, or with `_` for the arguments it leaves open, has as its
   static members those of the constructor traits it implements at exactly those holes**, each
   conformance held as a constructor argument's is (the holes the impl leaves open, the arguments
   written out meeting the impl's bounds): `Option.pure`, `Result[_, E].pure`, `Parsed.pure` for an
@@ -9974,20 +9947,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   constructor trait names no parameter of the trait, so the constructor is all a call needs, and
   the conformance says which constructor it is. Alternatives: look the member up on the type at
   any arguments (would let `Result[int, _]` reach a member of the conformance at the other hole).
-- Proposed: **a static member of a type's own conformance to an ordinary trait is not reached on
+- Settled on the user's delegation 2026-11-15: **a static member of a type's own conformance to an ordinary trait is not reached on
   the type named bare**: `Box.make()` for `impl[T] Make for Box[T]` is an error asking for the type
   arguments (`Box[A].make(…)`), as before. Why: that member's types name the type's parameters,
   which a bare name leaves unknown. Alternative weighed: inferring them from the call as a generic
   function's are (a separate feature, not part of constructors).
-- Proposed: **a constructor trait's static member still takes no default body**, as every trait's
+- Settled on the user's delegation 2026-11-15: **a constructor trait's static member still takes no default body**, as every trait's
   static member does: defaults that call `Self.pure` are its methods'. Why: the rule for static
   members is one rule for every trait; the per-constructor compilation would allow it, so it can be
   added later without changing anything written now. Review with the user if the library wants a
   derived static member (a `Monad.unit` from `pure`).
-- Proposed: **two bounds that each declare a static member of one name and parameter types make a
+- Settled on the user's delegation 2026-11-15: **two bounds that each declare a static member of one name and parameter types make a
   call of it on the parameter ambiguous**, by the ordinary overloading rule, rather than one bound
   being preferred. Why: nothing says which constructor's member is meant beyond the bounds.
-- Proposed: **a static member called on a value of `F[X]` is an error pointing at `F.pure(…)`**;
+- Settled on the user's delegation 2026-11-15: **a static member called on a value of `F[X]` is an error pointing at `F.pure(…)`**;
   on a value of a known type, `Some(1).pure(2)`, the existing message names the type. Why: the
   member is the constructor's, and the constructor is what the call writes.
 - In each instance a static member called on a constructor is compiled once per constructor: the
@@ -9996,14 +9969,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Higher-kinded types, impls over constructor parameters** (build plan step 6, branch `hkt-6`)
 
-- Proposed: **an impl adding to `F[A]` belongs to the trait bounding `F`**: written in the module
+- Settled on the user's delegation 2026-11-15: **an impl adding to `F[A]` belongs to the trait bounding `F`**: written in the module
   of one of `F`'s bounds (or in the core library) it is that trait's own and seen everywhere, and
   written anywhere else it is an extension. With `F[G[A]]` it is `F`'s bounds, the head's, that
   count. Why: such an impl adds to every type the bound's conformance reaches, as `impl[T] Seq[T]`
   adds to every sequence, and that impl's home is the trait's module. Alternatives: always an
   extension (would make the library's own `impl[F[_]: Monad, A] F[A]` need an import of its own
   module); any module of any bound named in the impl (blurs which module owns it).
-- Proposed: **such methods are found after the type's own, wherever the impl is written**: a
+- Settled on the user's delegation 2026-11-15: **such methods are found after the type's own, wherever the impl is written**: a
   type's own method, or the bound's, of the name and parameter types is called, and a call that
   sees only the bound, in generic code, calls the added one. Why: the impl adds to a family of
   types as an impl adding to a trait does, and that is the trait rule; the rule for impls adding to
@@ -10011,26 +9984,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   make every type that has, say, its own `twice` unusable once the library adds one. An extension
   adding a method the bound already declares is an error where it is declared (`map` on
   `Mappable`).
-- Proposed: **the constructor parameter need not be bounded**: unbounded, `F` is matched as
+- Settled on the user's delegation 2026-11-15: **the constructor parameter need not be bounded**: unbounded, `F` is matched as
   inference matches it without a bound, a type of exactly as many arguments as `F` has holes,
   named bare. Why: it is the inference rule, unchanged, and refusing it would add a rule; such an
   impl's methods reach nothing of `F[A]` but can pass it on. Alternative: require a constructor
   trait bound (an error naming the bound to add). Review with the user if the unbounded form should
   rather be an error.
-- Proposed: **a receiver whose type no such impl matches is told why**: `twice` on a
+- Settled on the user's delegation 2026-11-15: **a receiver whose type no such impl matches is told why**: `twice` on a
   `Plain[int]` says the method is for `F[A]` where `F` implements `Mappable` and that `Plain` does
   not implement it, the reason inference gives; an `F[int]` whose `F` lacks the bound says its
   constructor is bounded by no `Pointed`. Of several such impls adding the name, only one is named,
   since every generic type is an instance of each; an impl adding to a type the receiver is an
   instance of, `Option[Option[T]]`, is named first.
-- Proposed: **a function value of an extension method the file does not see, or of a private
+- Settled on the user's delegation 2026-11-15: **a function value of an extension method the file does not see, or of a private
   added method, is reported as a call of it is** ("`shout` is added to `string` by module
   `extras`, which this file does not import"), where it said only that the type has no member. This
   holds for every extension, not only those over constructor parameters.
 - No impl of a trait is for `F[A]`: a conformance is a type's, stated once for it, and an
   application of a constructor parameter is no type of its own. The impl declares no static member,
   as no impl adding to a type built from parameters does.
-- Proposed (built on branch `rendezvous`): **a [rendezvous](/spec/threads/#rendezvous) is
+- Settled on the user's delegation 2026-11-15 (built on branch `rendezvous`): **a [rendezvous](/spec/threads/#rendezvous) is
   `Channel[T](0)`, and a channel with no capacity stays unbounded through a default of `unbounded`,
   a public `val` in `avin.threads` holding the largest `int`.** This replaces the settled "unbounded
   at zero". Why: zero is the capacity that holds nothing, so reading it as a hand-off says what it
@@ -10041,7 +10014,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `capacity: Option[int] = None` (every bounded channel would write `Some(n)`); a negative sentinel
   such as `-1` for unbounded (a capacity that is not one, and a negative one traps). Review with the
   user: it changes what an explicit `Channel[T](0)` means, from unbounded to a rendezvous.
-- Proposed (built on branch `rendezvous`): **a rendezvous hands values to waiting parties directly,
+- Settled on the user's delegation 2026-11-15 (built on branch `rendezvous`): **a rendezvous hands values to waiting parties directly,
   and a select's arm is a party that a partner claims.** A plain sender or receiver waits on a
   condition of its own until a partner completes it; a select's arm on a rendezvous stands on the
   channel while it waits, and a partner completes the arm only by first ending the select's wait
