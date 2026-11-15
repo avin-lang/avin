@@ -1,0 +1,126 @@
+// expect: exit 0
+// Request metrics, without a connection: requests counted by method, route pattern and status
+// class; latencies counted into fixed buckets, cumulatively, a time equal to a bound counted in its
+// bucket, one past the last only in `+Inf`, a negative one as zero; the sum and count; custom
+// buckets, none at all among them; a route's pattern as its label in a group and `""` around a whole
+// router, unrouted `404`s and `405`s included; label values escaped; the in-flight gauge while
+// handlers are held; the mounted route and its content type; `observe` called directly; and a
+// `Metrics` shared by threads answering and rendering at once, its counts exact.
+import avin.net.http.{Metrics, MetricsContentType, Response, Route, Router, ServerRequest}
+import avin.threads.{Atomic, Channel, spawn}
+import avin.time.{Duration, micros, millis, seconds}
+
+// A clock a handler moves: each request takes the time its path's last segment names, in micros.
+class Stepped(): Sendable
+  val now = Atomic(long(0))
+  clock -> @sendable () -> Duration = () -> Duration(now.load())
+  take(r: ServerRequest) -> Response
+    _ = now.add(r.segments(r.segments.length - 1).toLong())
+    Response.text(if r.path.contains("/fail/") then 503 else 200, "ok")
+
+main()
+  val time = Stepped()
+  val m = Metrics([millis(1), millis(10), seconds(1)], time.clock)
+  val handler: @sendable (ServerRequest) -> Response = r -> time.take(r)
+  val router = Router(
+    Route.group(
+      "/api",
+      [
+        Route.get("/wait/:t", handler),
+        Route.post("/wait/:t", r -> Response.empty(201)),
+        Route.get("/fail/:t", handler),
+        Route.get("/q\"uo\\te/:t", handler)
+      ],
+      m.middleware
+    ) :+ m.route()
+  )
+  // 0 us, exactly 1 ms, just past it, exactly 10 ms, exactly 1 s, and past every bound.
+  for t in ["0", "1000", "1001", "10000", "1000000", "1000001"]
+    _ = router.handle(ServerRequest("GET", s"/api/wait/$t"))
+  _ = router.handle(ServerRequest("POST", "/api/wait/5"))
+  _ = router.handle(ServerRequest("GET", "/api/fail/2500"))
+  _ = router.handle(ServerRequest("GET", "/api/q%22uo%5Cte/1"))
+  // Unrouted, and the metrics route itself: neither counted, as no route counting them matched.
+  _ = router.handle(ServerRequest("GET", "/nowhere"))
+  val shown = router.handle(ServerRequest("GET", "/metrics"))
+  println(
+    s"${shown.status} ${shown.header("Content-Type")} ${shown.header("Content-Type") == Some(MetricsContentType)}"
+  )
+  print(shown.text)
+
+  // A time going backwards counts as zero, and `observe` counts what it is told.
+  m.observe("GET", "/api/wait/:t", 200, micros(-5))
+  m.observe("PATCH", "/elsewhere", 101, seconds(2))
+  m.observe("GET", "/odd", 99, millis(1))
+  print(m.render)
+
+  // No buckets: only `+Inf`, the sum and the count. The default buckets, from 5 ms to 10 s.
+  val bare = Metrics(Vector.empty[Duration](), time.clock)
+  bare.observe("GET", "/", 200, millis(3))
+  print(bare.render)
+  println(Metrics().buckets)
+
+  // Around a whole router: every request, unrouted ones too, is labelled `""`.
+  val whole = Metrics()
+  val plain = Router([Route.get("/a", _ -> Response.text(200, "a"))])
+  val outer = whole.middleware(plain.handle)
+  _ = outer(ServerRequest("GET", "/a"))
+  _ = outer(ServerRequest("GET", "/b"))
+  _ = outer(ServerRequest("POST", "/a"))
+  println(whole.render.split("\n").filter(l -> l.startsWith("http_requests_total")))
+
+  // In flight: three handlers held at once, then let go.
+  val gauge = Metrics()
+  val hold = Channel[unit](0)
+  val entered = Channel[unit](3)
+  val held = gauge.middleware(_ ->
+    entered.send(())
+    _ = hold.receive()
+    Response.empty(204))
+  println(gauge.inFlight)
+  val waiting = Vector.tabulate(3, i -> spawn(() -> held(ServerRequest("GET", "/held")).status))
+  for _ in 0 ..< 3
+    _ = entered.receive()
+  println(gauge.inFlight)
+  println(gauge.render.split("\n").filter(l -> l.startsWith("http_requests_in_flight ")))
+  for _ in 0 ..< 3
+    hold.send(())
+  println(waiting.map(t -> t.join()))
+  println(gauge.inFlight)
+
+  // Eight threads answering 250 requests each over four routes, a ninth rendering all the while.
+  val shared = Metrics()
+  val busy = Router(
+    Route.group(
+      "/c",
+      [
+        Route.get("/ok/:n", _ -> Response.empty(204)),
+        Route.get("/missing/:n", _ -> Response.empty(404)),
+        Route.post("/made/:n", _ -> Response.empty(201)),
+        Route.get("/broken/:n", _ -> Response.empty(500))
+      ],
+      shared.middleware
+    )
+  )
+  val done = Atomic(false)
+  val renderer = spawn(() ->
+    var renders = 0
+    while !done.load()
+      _ = shared.render
+      renders += 1
+    renders > 0)
+  val paths = ["/c/ok/", "/c/missing/", "/c/made/", "/c/broken/"]
+  val workers = Vector.tabulate(8, w -> spawn(() ->
+    for i in 0 ..< 250
+      val p = paths(i % 4)
+      _ = busy.handle(ServerRequest(if p == "/c/made/" then "POST" else "GET", p + i.toString()))
+    ()))
+  for w in workers
+    w.join()
+  done.store(true)
+  println(renderer.join())
+  for line in shared.render.split("\n")
+    if line.startsWith(
+      "http_requests_total"
+    ) || line.contains("_count") || line.contains("le=\"+Inf\"") then println(line)
+  println(shared.inFlight)

@@ -10206,6 +10206,59 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   program; a program that ignores the runner's death by leaving its group or session is beyond
   reach. **Review with the user**: the terminal case keeping the program in the shell's job.
 
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **a request knows its
+  client's address and its route** ([system library](/spec/system-library/#http-server)).
+  `ServerRequest` gains `remote` (the peer's IP address, numeric, without its port) and `route` (the
+  pattern of the route a router chose, set by `Router` as it binds the parameters), and `ByteStream`
+  gains `remoteAddress`, `None` by default, which `TcpStream` (accepted and connected) and `TlsStream`
+  answer. Why: a rate limiter keys by client by default and a metric labels by route; a path as a
+  label would grow without bound, and the address was being dropped at `accept`. The address is
+  without its port, since a client opens many connections and is one client. Alternatives weighed:
+  wrapping `Route`s in a metrics-specific function that knows each pattern (no help for the access log
+  or a program's own middleware); taking the address from `X-Forwarded-For` (anyone can send it; a
+  program behind a proxy gives the limiter a `key` that reads it). Review with the user: whether
+  `remote` should also carry the port.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **the access log.**
+  `http.accessLog(sink, format, clock, ids)` is a middleware, writing after the handler answers, in
+  two formats, `PlainLines` and `JsonLines`, with method, decoded path (escaped so the line stays one
+  line of fields), status, body length, duration, request id and address. No timestamp: whatever
+  collects standard error stamps lines, and a test's lines stay fixed. The query is left out, as it
+  can hold secrets. A client's `X-Request-Id` is kept when it is 1 to 128 characters of letters,
+  digits and `-._:+/=@`, else replaced by 16 `SecureRandom` bytes in hex; the handler reads it from
+  the request's own header, which `withHeaderReplaced` sets, and the response echoes it unless the
+  handler set one. A streamed body of unknown length logs `-`/`null` and not the bytes written,
+  since the line is written when the handler returns, before the body is. Alternatives weighed: a
+  common/combined log format (no request id, timestamp in brackets, request line quoted with the
+  query); counting a streamed body as it is written (the line would wait for the stream to end); a
+  request-scoped value in place of the header (that mechanism is a separate branch,
+  `api-request-values`; the header is what clients and proxies already read). Review with the user:
+  a handler that traps writes no line, since Avin has no unwinding; logging the server's `500` would
+  need a hook in `serve`.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **request metrics.**
+  `Metrics` holds per-(method, route, status class) counters and per-(method, route) histograms of
+  fixed buckets in one `Mutex`, plus an atomic in-flight gauge, rendered as Prometheus text format
+  0.0.4 with the names `http_requests_total`, `http_request_duration_seconds` and
+  `http_requests_in_flight`; times are whole microseconds, written as seconds without trailing
+  zeros. Default buckets are the usual 5 ms to 10 s. A request with no route is labelled `""`. Why: one
+  lock per `Metrics` is simple and exact, and a request does a few map updates under it; the format is
+  what every scraper reads. Alternatives weighed: per-route atomics (route series are created on
+  demand, so a map and a lock are still needed); a metrics registry of general counters and gauges
+  (more than this item needs; `observe` covers counting another way); labelling by status code rather
+  than class (more series for little gain). Review with the user: a handler that traps leaves the
+  in-flight gauge one too high, for the same lack of unwinding.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **rate limiting.**
+  `RateLimiter(rate, per, burst, key, maxKeys, clock, errors)` is a token bucket per key, computed as
+  each bucket's next-token time in integer microseconds (the generic cell rate algorithm, exactly a
+  token bucket), so a bucket is one `long` and needs no floating point. A full bucket equals a new
+  one, so forgetting it loses nothing; at `maxKeys`, making a bucket forgets every full one, or where
+  none is full the one nearest to full. A `429` carries `Retry-After` in whole seconds, rounded up and
+  at least one. Alternatives weighed: refusing a new key when the table is full (a flood of
+  addresses would lock every new client out); a periodic sweep on a timer thread (a thread per
+  limiter; sweeping when room is needed bounds memory the same); a sliding-window counter (less
+  smooth, more state). Review with the user: evicting a bucket that is not full forgives that
+  client's debt, which an attacker cycling more than `maxKeys` addresses can use; and the default
+  key, the client's address, puts every client behind one proxy in one bucket.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per
