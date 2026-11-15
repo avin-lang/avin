@@ -2064,7 +2064,10 @@ passed by name, a method value), and it traps at that read rather than read what
   The order is the program's, across modules as within one: modules may import one another in a
   cycle, and only a cycle of values is an error. A call through a trait or an `open` class depends on
   every implementation it may reach, and an operator on every method it may call. An object that
-  extends a class depends on what its superclass's arguments and constructor read.
+  extends a class depends on what its superclass's arguments and constructor read. Making an
+  object with a `lazy val` field depends on nothing its initializer reads, since only a read of
+  the field runs it; a read does, wherever it is. So two objects whose lazy fields read each other
+  are no cycle, while one whose body reads its own lazy field depends on what that field reads.
 
   *Why it is sound:* each value is computed after everything its initializer can read while it
   runs, so every such read finds a value. The functions a call reaches are known, since the whole
@@ -2124,6 +2127,10 @@ passed by name, a method value), and it traps at that read rather than read what
   lazy val second: int = later()
   later() -> int = first * 2
   ```
+
+  The chain is reported at its earliest-declared member, by module and then by position, and may
+  run through several modules, as a cycle of module values may. A value that only reaches a chain
+  without being on it is not named.
 
   A field's value is its object's, so for a field only a read of the same object counts: by bare
   name, through `self`, or in a method called on `self`. A read of another instance's field is a

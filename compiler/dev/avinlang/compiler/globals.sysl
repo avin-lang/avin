@@ -9,7 +9,14 @@ import sysl.buf.{Buf, buf}
  * functions it calls or makes closures of. Each is listed once, in the order first used. */
 struct Uses
     globals: Buf[usize]
+    /** Every function the code calls or makes: `calls` and `made` together. */
     functions: Buf[usize]
+    /** The functions the code runs itself: those it calls, the implementations a call through a
+     * method table or an operator may reach, and the initializers of the lazy values it reads. */
+    calls: Buf[usize]
+    /** The functions the code makes and hands on without running them: lambdas, arguments passed
+     * by name and method values. */
+    made: Buf[usize]
     /** The method and the method table slot of each call made through a method table. Which
      * functions such a call may reach depends on the classes of the program, so the caller adds
      * them to `functions`. */
@@ -34,7 +41,7 @@ struct LazyFieldRead
     name: string
 
 uses_of(body: &TExpr) -> Uses
-    var u = Uses(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    var u = Uses(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
     collect(&u, body)
     u
 
@@ -66,10 +73,18 @@ private compare_method(op: CompareOp) -> Option[string] = op match
 /** Records that the code may call `f`. */
 add_function(u: *Uses, f: usize)
     add(&u.functions, f)
+    add(&u.calls, f)
 
-/** The module-level values `start` uses, directly or through every function it reaches, in the
- * order they are first found. */
-globals_reached(direct: Buf[Option[Uses]], start: usize) -> Buf[usize]
+/** Records that the code makes a function value of `f`. */
+private add_made(u: *Uses, f: usize)
+    add(&u.functions, f)
+    add(&u.made, f)
+
+/** The module-level values `start` uses, directly or through every function it calls or makes, in
+ * the order they are first found. A function marked in `read_only` (a `lazy val` field's
+ * initializer, which only a read of the field runs, and every read calls it) is followed where it
+ * is called, not where it is made. */
+globals_reached(direct: Buf[Option[Uses]], read_only: Buf[bool], start: usize) -> Buf[usize]
     var seen: Buf[bool] = buf()
     for _ in direct
         seen.push(false)
@@ -84,8 +99,36 @@ globals_reached(direct: Buf[Option[Uses]], start: usize) -> Buf[usize]
         if direct[f] is Some(u)
             for g in u.globals
                 add(&out, g)
-            for callee in u.functions
+            for callee in u.calls
                 if !seen[callee]
+                    seen[callee] = true
+                    pending.push(callee)
+            for made in u.made
+                if !seen[made] && !read_only[made]
+                    seen[made] = true
+                    pending.push(made)
+    out
+
+/** The module-level `lazy val`s whose read the code of `start` runs itself: directly or through the
+ * functions it calls, however deeply, but not through a function it only makes. The initializer of
+ * a lazy value it reads, marked in `stops`, is not entered: that value is listed instead. */
+lazies_reached(direct: Buf[Option[Uses]], stops: Buf[bool], start: usize) -> Buf[usize]
+    var seen: Buf[bool] = buf()
+    for _ in direct
+        seen.push(false)
+    var pending: Buf[usize] = buf()
+    pending.push(start)
+    seen[start] = true
+    var out: Buf[usize] = buf()
+    var next = 0usize
+    while next < pending.len()
+        val f = pending[next]
+        next += 1
+        if direct[f] is Some(u)
+            for g in u.lazies
+                add(&out, g)
+            for callee in u.calls
+                if callee < seen.len() && !seen[callee] && !stops[callee]
                     seen[callee] = true
                     pending.push(callee)
     out
@@ -115,28 +158,29 @@ private collect(u: *Uses, e: &TExpr)
             collect(u, initialize)
         // A local one's read may run the lambda its declaration made, wherever the read is.
         LazyLocal(cell, initialize, function, _) ->
-            add(&u.functions, function)
+            add_function(u, function)
             collect(u, cell)
             collect(u, initialize)
         StoreGlobal(g, value, _) ->
             add(&u.globals, g)
             collect(u, value)
         Call(f, args, _) ->
-            add(&u.functions, f)
+            add_function(u, f)
             collect_all(u, args)
         Dispatch(f, slot, args, _) ->
-            add(&u.functions, f)
+            add_function(u, f)
             u.dispatched.push(f)
             u.dispatched_slots.push(slot)
             collect_all(u, args)
         // A call through a bound reaches the implementation of whichever type an instance has.
         BoundCall(f, slot, args, _) ->
-            add(&u.functions, f)
+            add_function(u, f)
             if slot is Some(s)
                 u.dispatched.push(f)
                 u.dispatched_slots.push(s)
             collect_all(u, args)
-        FunctionValue(f, _) -> add(&u.functions, f)
+        // A function value is made here and runs wherever it is called, which the code may hand on.
+        FunctionValue(f, _) -> add_made(u, f)
         CallValue(callee, args) ->
             collect(u, callee)
             collect_all(u, args)

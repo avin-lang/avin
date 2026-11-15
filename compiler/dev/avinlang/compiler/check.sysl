@@ -1323,6 +1323,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_tailrec(&c)
     val direct = direct_uses(&c)
     check_module_state_in_threads(&c, direct)
+    check_lazy_cycles(&c, direct)
     val init = initializer(&c, initialization_order(&c, direct), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
@@ -15952,9 +15953,16 @@ private direct_uses(c: *Checker) -> Buf[Option[Uses]]
     direct
 
 private initialization_order(c: *Checker, direct: Buf[Option[Uses]]) -> Buf[usize]
+    // A `lazy val` field's initializer runs only when the field is read, and a read is a call of
+    // it, so making it, as a constructor does, needs nothing.
+    var read_only: Buf[bool] = buf()
+    for _ in direct
+        read_only.push(false)
+    for init in c.lazy_initializers
+        if init.function < read_only.len() then read_only[init.function] = true
     var o = InitOrder(buf(), buf(), buf(), buf())
     for g in c.globals
-        o.needs.push(globals_reached(direct, g.init))
+        o.needs.push(globals_reached(direct, read_only, g.init))
         o.state.push(0)
     // A `lazy val` has no place in the order: nothing reads it as a module-level value, since its
     // reads call its initializer, so the values that initializer needs are needed by its readers.
@@ -15993,6 +16001,50 @@ private report_cycle(c: *Checker, o: *InitOrder, start: usize)
     for i in 0..<members.len()
         cycle = cycle + s"`${c.globals[members[(earliest + i) % members.len()]].name}` → "
     c.note(first.unit, first.span, s"module-level values need one another to initialize: $cycle`${first.name}`")
+
+// A module-level `lazy val` whose initializer's own code reads the value, directly, through the
+// functions it calls (every implementation a call may reach) or through the initializers of the
+// other lazy values it reads, would read it while it is being initialized: an error naming the
+// chain of lazy values. A function the code only makes is not followed, since it may run after the
+// initializer has returned; a read through one is checked when it runs.
+private check_lazy_cycles(c: *Checker, direct: Buf[Option[Uses]])
+    var stops: Buf[bool] = buf()
+    for _ in direct
+        stops.push(false)
+    for g in c.globals
+        if g.lazy && g.init < stops.len() then stops[g.init] = true
+    var o = InitOrder(buf(), buf(), buf(), buf())
+    for g in c.globals
+        o.needs.push(if g.lazy then lazies_reached(direct, stops, g.init) else buf())
+        o.state.push(0)
+    for g in 0..<c.globals.len()
+        if o.state[g] == 0 && c.globals[g].lazy then follow_lazy(c, &o, g)
+
+private follow_lazy(c: *Checker, o: *InitOrder, g: usize)
+    o.state[g] = 1
+    o.path.push(g)
+    for need in o.needs[g]
+        if o.state[need] == 1 then report_lazy_cycle(c, o, need)
+        elif o.state[need] == 0 then follow_lazy(c, o, need)
+    o.path.truncate(o.path.len() - 1)
+    o.state[g] = 2
+
+// The chain runs from `start` to the path's end and back, reported from its earliest-declared
+// member as a cycle of module values is.
+private report_lazy_cycle(c: *Checker, o: *InitOrder, start: usize)
+    var members: Buf[usize] = buf()
+    var on = false
+    for g in o.path
+        if g == start then on = true
+        if on then members.push(g)
+    var earliest = 0
+    for i in 1..<members.len()
+        if declared_before(c.globals[members[i]], c.globals[members[earliest]]) then earliest = i
+    val first = c.globals[members[earliest]]
+    var chain = ""
+    for i in 0..<members.len()
+        chain = chain + s"`${c.globals[members[(earliest + i) % members.len()]].name}` → "
+    c.note(first.unit, first.span, s"the `lazy val` `${first.name}` needs its own value to initialize: $chain`${first.name}`")
 
 /** Whether `a` is declared before `b`: in an earlier unit, or earlier in the same one. */
 private declared_before(a: &GlobalSymbol, b: &GlobalSymbol) -> bool

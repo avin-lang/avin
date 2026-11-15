@@ -589,7 +589,7 @@ them was refused with the error the chapter gives or ran correctly. What is not:
 | The same with an argument passed by name, `Base(pick(true, s * 2))` | read `0` | closed by item 1: refused |
 | The same for an inherited field, `Leaf: Mid(() -> m)` with `m` Mid's | read `0` | closed by item 1: refused |
 | The same from an `object` extending a class | read `0` | closed by item 1: refused |
-| `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | run-time check |
+| `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | module-level closed by item 3: refused; a field's, item 4 |
 | A lazy's initializer joining a thread that reads the same lazy | waits for ever | liveness |
 | `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | closed by item 2: accepted |
 
@@ -647,18 +647,31 @@ name, which stays legal.
    `tests/programs/reject/initialization_object_self_name` (the object in another module), and an
    `lsp_tests.sysl` case for definition from the name in the body. A field `lazy val l = O.l + 1`
    in an object is now the run-time trap a bare `l` already was, until item 4.
-3. **Module-level lazy cycles at compile time.** `Uses` (`globals.sysl`) keeps the functions a body
-   calls apart from those it makes (lambdas, by-name thunks, method values); the module order
-   follows both, as now, and a new reach follows only calls and the lazy values read. A module-level
-   `lazy val` that reaches itself is an error naming the chain of lazy values, reported from its
-   earliest-declared member as module cycles are. The run-time trap (`lower.sysl`, `trap_site` of
-   `is read while it is being initialized`) stays for reads through handed-on functions. Tests:
-   `tests/reject/lazy_cycles.avin` (itself, through another lazy, through a function, through a
-   trait's implementation, through an operator), `tests/programs/reject/lazy_cycle_modules/` (across
-   two modules), `tests/run/lazy_self_deferred.avin` (`ones`, the Fibonacci knot, a handler naming
-   its own value, a method value stored), `tests/run/lazy_deferred_trap.avin` (a lambda the
-   initializer makes and calls at once: still the trap, `.err`); `lazy_cycle.avin` becomes a reject
-   test.
+3. **Done: module-level lazy cycles at compile time.** `Uses` (`globals.sysl`) keeps the functions
+   a body calls (`calls`) apart from those it makes (`made`: lambdas, by-name thunks, method
+   values); `check_lazy_cycles` in `check.sysl` follows only calls and the lazy values read
+   (`lazies_reached`), stopping at another lazy value's initializer, and a module-level `lazy val`
+   that reaches itself is an error naming the chain of lazy values, reported from its
+   earliest-declared member as module cycles are. The module order follows both, except a `lazy
+   val` field's initializer where a constructor makes it (only a read runs it, and a read is a
+   call), which removed the false cycle of two objects whose lazy fields read each other. The
+   run-time trap stays for reads through handed-on functions. Tests: `tests/reject/lazy_cycles.avin`
+   (itself, through another lazy, through a function, through a trait's implementation, through an
+   operator), `tests/reject/lazy_cycles_more.avin` (an `open` class's override, a generic function,
+   a generic class's method, a default argument, a comparison operator),
+   `tests/reject/lazy_cycles_reach.avin` (a chain of three named from its earliest member when the
+   check meets it from outside, a lazy field's initializer, an iterator's `next` in a `for`, a local
+   `lazy val` in a called function, two values read by two threads),
+   `tests/reject/lazy_field_made_order.avin` (a body reading its own lazy field, a lambda made and
+   called while the object is made: still module cycles), `tests/reject/lazy_cycle.avin` (moved
+   from `tests/run`), `tests/programs/reject/lazy_cycle_modules/` (across two modules),
+   `tests/run/lazy_self_deferred.avin` (`ones`, the Fibonacci knot, `#::`, a handler naming its own
+   value, a method value stored, self-recursive and mutually recursive lambdas, a generic cell, a
+   chain with no cycle, the two objects, a value holding a class and a generic class whose lazy
+   field reads it, threads), `tests/programs/run/lazy_objects_modules` (the objects across two
+   modules), `tests/run/lazy_deferred_trap.avin` (a lambda the initializer makes and calls at once:
+   still the trap, `.err`) and `tests/run/lazy_deferred_trap_passed.avin` (one passed to a function
+   that calls it).
 4. **Field lazy cycles at compile time.** A pass beside `check_initialization` (`check.sysl`) follows,
    per class, the lazy fields read and the methods called on `self` (bare names, `self.`, the
    overrides a call through a slot may reach in subclasses), from each lazy field's initializer; a

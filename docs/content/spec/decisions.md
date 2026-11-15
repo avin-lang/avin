@@ -974,8 +974,10 @@ Settled by the user on 2026-11-04:
   computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
   `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
-  reads; an initializer that needs its own value, directly or through other lazy values, traps at
-  that read, naming the value. A field's initializer may use every field and method; the class
+  reads; an initializer whose own code needs its own value, directly, through the functions it
+  calls or through other lazy values, is a compile error naming the chain (a module-level one;
+  see the initialization entries), and one that reaches it through a function it hands on traps
+  at that read, naming the value. A field's initializer may use every field and method; the class
   body reads the field only where it could call a method. Concurrent first reads run the
   initializer once, the others waiting safe for the collector; the value is published with a
   release store paired with the readers' acquire load, a stored value read with one atomic load
@@ -8791,6 +8793,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   through dispatch the reach counts every override, so a lazy value calling a trait method one of
   whose implementations reads the value is refused even where that implementation never runs, as
   module values already are.
+
+- Settled on the user's delegation 2026-11-14 (branch `init-3`): **the module-level part of the
+  `lazy val` rule, and making a lazy field needs nothing.** `Uses` keeps the functions code calls
+  (with every implementation a call through a method table or an operator may reach, and the
+  initializers of the lazy values it reads) apart from those it makes; the lazy reach follows only
+  the first, stopping at another module-level lazy value's initializer and naming that value, so
+  the error is ``the `lazy val` `first` needs its own value to initialize: `first` → `second` →
+  `first` ``, a value on its own as `` `l` → `l` ``, reported from the chain's earliest-declared
+  member, and a value that only reaches a chain is not named. The module order still follows both,
+  except a `lazy val` field's initializer where a constructor makes it: only a read of the field
+  runs it, and every read is a call of it, which the order follows. Why: it follows from the
+  chapter (the order needs what the body runs while the object is made), and it removes a false
+  cycle — two objects whose lazy fields read each other, or a module value holding an object whose
+  lazy field reads that value, were refused. Alternatives weighed: the self-cycle worded as the
+  module order's (`is needed by its own initializer`), which would give one rule two shapes of
+  message; dropping every made function from the order (unsound: a lambda the initializer makes
+  and calls reads what it reads).
 
 - **A lazy initializer waiting for a thread that reads the same value is not detected** (branch
   `init-design`). It waits for ever, as threads waiting for one another do
