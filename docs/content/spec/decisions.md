@@ -10055,7 +10055,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   select's send arm cannot deposit without committing to it); locking every channel of a select at
   once (a lock order across channels, and a different design for every select). The sender's wait
   is its own kind in the thread dump and deadlock report, "waiting to hand a value to a receiver".
-- Proposed (built on branch `hkt-9`): **a diagnostic's article follows how a type's name is read.**
+- Settled on the user's delegation 2026-11-15 (built on branch `hkt-9`): **a diagnostic's article follows how a type's name is read.**
   A capital letter standing alone at the start of a name (`F[int]`, `T`, `X2`) is read as the letter,
   so it takes `an` before A, E, F, H, I, L, M, N, O, R, S and X and `a` otherwise (`an F[int]`,
   `a T`, `a U`); any other name takes `an` before a, e, i, o in either case and `a` before `u`
