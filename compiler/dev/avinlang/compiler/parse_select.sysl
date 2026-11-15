@@ -4,20 +4,22 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 
 // A `select` block: `select` ending its line, and an indented block of arms, each run when its
-// channel operation completes, of which exactly one runs.
+// channel operation completes or its stream is readable, of which exactly one runs.
 //
 //     select
 //       jobs.receive() as Some(j) -> run(j)
 //       jobs.receive() as None -> done = true
 //       results.send(r) -> sent++
+//       conn.readable() -> echo(conn)
 //       after 100.millis -> idle()
 //       else nothing()
 //
 // It is read into the code it means, a block of:
 //
 // - an arm object for each channel arm, in the order written, `val select$<at>$<i> =
-//   avin.threads.SelectReceive(jobs, wants)` or `avin.threads.SelectSend(results, r)`, so each
-//   channel and each value sent is evaluated once, before any arm is tried, and an `after`'s
+//   avin.threads.SelectReceive(jobs, wants)`, `avin.threads.SelectSend(results, r)` or
+//   `avin.threads.SelectReadable(conn)`, so each channel, stream and value sent is evaluated once,
+//   before any arm is tried, and an `after`'s
 //   duration bound where it is written, `val select$<at>$after = 100.millis`;
 // - the choice, `val select$<at> = avin.threads.selectWaiting(arms)`, or `selectOrElse(arms)` with
 //   an `else`, or `selectWithin(duration, arms)` with an `after`, answering the number of the arm
@@ -44,6 +46,8 @@ select_ahead(p: *Parser) -> bool = p.at_kind(Indent)
 private enum SelectArmKind
     ReceiveArm(channel: &Expr, wants: string, binding: Option[&Pattern])
     SendArm(channel: &Expr, value: &Expr)
+    /** `stream.readable()`: ready once a read of the stream would answer without waiting. */
+    ReadableArm(stream: &Expr)
     AfterArm(duration: &Expr)
     ElseArm
     /** An arm already reported, which makes no code. */
@@ -81,7 +85,7 @@ private select_arm(p: *Parser) -> WrittenArm
         val body = parse_line_body(p, false)
         return WrittenArm(start.to(p.ended()), ElseArm, body)
     if p.at("if")
-        p.report.add(error(start, "a select arm is a channel's `receive()` or `send(x)`, `after` a duration, or `else`; it takes no guard"))
+        p.report.add(error(start, MalformedArmText + "; it takes no guard"))
         skip_line(p)
         return WrittenArm(start, MalformedArm, Expr(start, UnitLit))
     val previous = p.lambda_boundary
@@ -100,9 +104,13 @@ private select_arm(p: *Parser) -> WrittenArm
     val body = parse_line_body(p, false)
     WrittenArm(start.to(p.ended()), kind, body)
 
-// The arm a channel operation and its pattern make: `ch.receive()` or `ch.send(x)`.
+/** What an arm that is none of a select's arms is told. */
+private const MalformedArmText: string =
+    "a select arm is a channel's `receive()` or `send(x)`, a stream's `readable()`, `after` a duration, or `else`"
+
+// The arm a channel or stream operation and its pattern make: `ch.receive()`, `ch.send(x)` or
+// `stream.readable()`.
 private channel_arm(p: *Parser, op: &Expr, pattern: Option[&Pattern]) -> SelectArmKind
-    val malformed = "a select arm is a channel's `receive()` or `send(x)`, `after` a duration, or `else`"
     op.kind match
         Call(callee, args) -> callee.kind match
             Member(target, name) ->
@@ -111,9 +119,12 @@ private channel_arm(p: *Parser, op: &Expr, pattern: Option[&Pattern]) -> SelectA
                 if name == "send" && args.len() == 1 && args[0].name is None && !args[0].block
                     if pattern is Some(pt) then p.report.add(error(pt.span, "a send arm binds nothing, so it has no `as` pattern"))
                     return SendArm(target, args[0].value)
+                if name == "readable" && args.len() == 0
+                    if pattern is Some(pt) then p.report.add(error(pt.span, "a readable arm binds nothing, so it has no `as` pattern; its body reads the stream"))
+                    return ReadableArm(target)
             _ -> ()
         _ -> ()
-    if !(op.kind is Invalid) then p.report.add(error(op.span, malformed))
+    if !(op.kind is Invalid) then p.report.add(error(op.span, MalformedArmText))
     MalformedArm
 
 // A receive arm: what its pattern makes it wait for, and the pattern its body binds.
@@ -194,6 +205,12 @@ private select_code(span: Span, at: Span, number: usize, arms: Buf[WrittenArm]) 
                 val made = call_of(channel.span, select_ref(channel.span, core_path("threads.SelectSend")), values)
                 items.push(Expr(arm.span, Binding(name, None, made, false)))
                 channel_arms.push(select_ref(channel.span, name))
+            ReadableArm(stream) ->
+                var values: Buf[&Expr] = buf()
+                values.push(stream)
+                val made = call_of(stream.span, select_ref(stream.span, core_path("threads.SelectReadable")), values)
+                items.push(Expr(arm.span, Binding(name, None, made, false)))
+                channel_arms.push(select_ref(stream.span, name))
             AfterArm(d) ->
                 if duration is None
                     items.push(Expr(d.span, Binding(name, None, d, false)))
@@ -225,6 +242,9 @@ private select_code(span: Span, at: Span, number: usize, arms: Buf[WrittenArm]) 
                 bodies.push(number_arm(arm.span, n, received_body(arm, name, wants, binding)))
                 n += 1
             SendArm(_, _) ->
+                bodies.push(number_arm(arm.span, n, arm.body))
+                n += 1
+            ReadableArm(_) ->
                 bodies.push(number_arm(arm.span, n, arm.body))
                 n += 1
             AfterArm(_) -> if after_body is None then after_body = Some(arm.body)

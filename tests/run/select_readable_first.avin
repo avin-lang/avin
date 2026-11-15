@@ -1,0 +1,105 @@
+// expect: exit 0
+// A `readable()` arm waits for bytes on a connection beside a select's channel arms, and whichever
+// comes first runs: bytes arriving while a channel stays empty, a message while the connection stays
+// quiet. With neither, an `after` runs once its time is up and an `else` at once; with bytes already
+// there, the readable arm runs even in a select with `else`. Running the arm reads nothing: the bytes
+// are still there for its body. Every shape is tried from `main`, which is not a lightweight thread
+// and blocks its own system thread, and from a lightweight thread, which parks on the poller; after
+// every select, nothing of it is left on the poller.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Channel, sleep, spawn}
+import avin.time.{millis, seconds}
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// One select on `conn` and `ch`, waiting at most five seconds, in words.
+waited(conn: TcpStream, ch: Channel[string]) -> string = select
+  conn.readable() -> "bytes: " + ok(conn.readLine()).getOrElse("(end)")
+  ch.receive() as Some(m) -> "message: " + m
+  after seconds(5) -> "timed out"
+
+// The same, with `else`.
+now(conn: TcpStream, ch: Channel[string]) -> string = select
+  conn.readable() -> "bytes: " + ok(conn.readLine()).getOrElse("(end)")
+  ch.receive() as Some(m) -> "message: " + m
+  else "nothing yet"
+
+// Every shape, on `conn`, whose peer `peer` writes what it is told on `say` after a short pause.
+shapes(where: string, conn: TcpStream, say: Channel[string])
+  val ch = Channel[string](1)
+  println(where, now(conn, ch))
+  // Bytes first: the peer writes after the select has begun to wait.
+  say.send("hello")
+  println(where, waited(conn, ch))
+  // A message first: another thread sends while the connection stays quiet.
+  val sender = spawn(() ->
+    sleep(millis(20))
+    ch.send("hi"))
+  println(where, waited(conn, ch))
+  sender.join()
+  // Neither: the `after` runs.
+  println(where, select
+    conn.readable() -> "bytes"
+    ch.receive() as Some(m) -> m
+    after millis(30) -> "timed out")
+  // Bytes already there: `else` does not run, and the readable arm alone runs at once.
+  say.send("ready")
+  arrived(conn)
+  println(where, now(conn, ch))
+  say.send("again")
+  arrived(conn)
+  println(where, select
+    conn.readable() -> "bytes: " + ok(conn.readLine()).getOrElse("(end)"))
+  println(where, socketWaiters())
+
+// The peer of a connection: writes each line `say` carries, after a short pause.
+peer(conn: TcpStream, say: Channel[string])
+  loop
+    say.receive() match
+      Some(line) ->
+        sleep(millis(20))
+        ok(conn.writeText(line + "\n"))
+      None -> break
+  ok(conn.close())
+
+// Waits until bytes have arrived on `conn`, looking without waiting: what a peer writes on the
+// loopback reaches its other end soon, not at once.
+arrived(conn: TcpStream)
+  while !conn.readable() do sleep(millis(1))
+
+// A connected pair of streams, the first to be selected on.
+pair() -> (TcpStream, TcpStream)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val s = ok(l.accept())
+  _ = l.close()
+  (c, s)
+
+main()
+  val (c, s) = pair()
+  val say = Channel[string](4)
+  val p = spawn(() -> peer(s, say))
+  shapes("main", c, say)
+  say.close()
+  p.join()
+  // The end of the input is readable too.
+  println("main", waited(c, Channel[string]()))
+  ok(c.close())
+
+  val (c2, s2) = pair()
+  val say2 = Channel[string](4)
+  val p2 = spawn(() -> peer(s2, say2))
+  val t = spawn(() ->
+    shapes("thread", c2, say2)
+    say2.close()
+    p2.join()
+    println("thread", waited(c2, Channel[string]()))
+    ok(c2.close()))
+  t.join()
+  println(socketWaiters())

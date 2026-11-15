@@ -636,9 +636,10 @@ Err(the pool is closed)
 
 ## select
 
-A `select` block waits on several channels at once and runs exactly one of its arms: the first
-whose channel operation can complete. `select` ending its line opens the block of its arms, written
-as a match's are; elsewhere `select` is an ordinary name.
+A `select` block waits on several channels at once, and on connections, and runs exactly one of its
+arms: the first whose channel operation can complete or whose connection has bytes to read.
+`select` ending its line opens the block of its arms, written as a match's are; elsewhere `select`
+is an ordinary name.
 
 ```avin
 import avin.threads.Channel
@@ -656,14 +657,30 @@ What a program can rely on:
 - **The arms.** `ch.receive()` receives, with an optional `as` pattern: `Some(p)` runs for a value
   and binds it by `p`, any pattern a `val` takes; `None` runs once the channel is closed and every
   value sent before is received; a name runs for either and binds the `Option` received; `_`, or no
-  pattern, runs for either and binds nothing. `ch.send(x)` sends, and binds nothing. `after d` runs
+  pattern, runs for either and binds nothing. `ch.send(x)` sends, and binds nothing.
+  `stream.readable()` runs once a read of `stream` would answer without waiting, and binds nothing:
+  its body reads. `after d` runs
   where no other arm became ready within the [`Duration`](/spec/time/) `d`; `else` runs where no
   arm is ready now, and is written as a match's `else` is, with no arrow. A select has at most one
   `after` and one `else`, and not both, since a select with `else` never waits. Any other arm, a
-  guard among them, is an error.
-- **Evaluation.** Every channel, every value sent and the `after`'s duration are evaluated once, in
-  the order the arms are written, before any arm is tried. Only the arm that runs receives or sends:
-  every other channel keeps its values, and a value meant for an arm that does not run is never sent.
+  guard or an `as` pattern on a `readable()` arm among them, is an error.
+- **Evaluation.** Every channel, every stream, every value sent and the `after`'s duration are
+  evaluated once, in the order the arms are written, before any arm is tried. Only the arm that runs
+  receives or sends: every other channel keeps its values, and a value meant for an arm that does not
+  run is never sent. A `readable()` arm reads nothing, whether it runs or not.
+- **Streams.** A `readable()` arm's stream is any `Readiness` (`avin.threads`), which every
+  [connection](/spec/system-library/#avin-net), a `ByteStream`, is: TCP, Unix and TLS. It is ready
+  where the stream's `readable()` answers `true` when the arm is tried: bytes already buffered, those
+  a `readLine` read beyond its line or plaintext TLS has decrypted and not yet handed over, or bytes
+  arrived on the socket, and also the other end having finished sending or reset the connection, or
+  the connection closed, each of which its read then answers. A TLS stream counts only whole records
+  of plaintext, so bytes of a record still arriving do not make it ready. Where it is not ready, a
+  select that waits watches the stream's descriptor on the runtime's poller under the same one wait
+  as its channel arms, and whichever comes first, bytes, a channel's value, the `after`'s time or a
+  cancellation, ends it. The arm uses its stream as a read does, so only the thread a connection
+  belongs to may name it in a select; any other traps. This is how a thread that owns a connection
+  waits both for its peer and for work other threads send it: it does all of the connection's reads
+  and writes, which only it may.
 - **Choosing.** Of several arms ready at once, each is as likely to run as any other: the arms are
   tried in an order drawn at random each time. Where none is ready, a select with `else` runs it, and
   one without waits, parking only its thread, until an arm can complete and runs it, or until its
@@ -680,8 +697,8 @@ What a program can rely on:
   one.
 - **Waiting.** A select that waits is a wait like a channel's own: safe for the collector, and a
   cancellation point, so a scope's `cancel` stops a thread parked in it at once. Nothing of a
-  select that has ended, by an arm, its time or a cancellation, is left on the channels it waited on,
-  and a notification a select was woken by and could not use is passed on to the next thread
+  select that has ended, by an arm, its time or a cancellation, is left on the channels or the
+  poller it waited on, and a notification a select was woken by and could not use is passed on to the next thread
   waiting on that channel, so no other waiter, a plain `receive` or another select, misses it.
 
 ```avin
@@ -695,6 +712,24 @@ work(jobs: Channel[int], stop: Channel[unit], results: Channel[int])
       jobs.receive() as Some(j) -> results.send(j * j)
       jobs.receive() as None -> going = false
       stop.receive() as None -> going = false
+```
+
+```avin
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.threads.Channel
+
+// The thread that owns a connection echoes each line its peer sends and forwards each message other
+// threads put on `pushed`, until the peer finishes sending.
+serve(conn: TcpStream, pushed: Channel[string]) -> Result[unit, IoError]
+  var open = true
+  while open
+    select
+      conn.readable() -> conn.readLine()? match
+        Some(line) -> conn.writeText(s"echo $line\n")?
+        None -> open = false
+      pushed.receive() as Some(m) -> conn.writeText(s"push $m\n")?
+  conn.close()
 ```
 
 ## Timers and deadlines

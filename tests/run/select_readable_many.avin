@@ -1,0 +1,60 @@
+// expect: exit 0
+// A hundred lightweight threads each select on a connection of their own and on one channel they all
+// share, parked at once on a few workers: every ping on a connection is answered by its own thread,
+// every value sent on the shared channel is taken by exactly one of them, and each thread ends when
+// its connection's peer finishes sending. Nothing is left on the poller afterwards.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Atomic, Channel, Thread, sleep, spawn}
+import avin.time.millis
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+val Threads = 100
+val Values = 1000
+
+// Answers each ping on `conn` and adds each value `work` carries to `sum`, until the peer finishes;
+// answers how many pings it answered.
+serve(conn: TcpStream, work: Channel[int], sum: Atomic[long]) -> int
+  var pings = 0
+  var open = true
+  while open
+    select
+      conn.readable() -> ok(conn.readLine()) match
+        Some(line) ->
+          ok(conn.writeText(s"pong $line\n"))
+          pings += 1
+        None -> open = false
+      work.receive() as Some(v) -> sum.add(long(v))
+  ok(conn.close())
+  pings
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val work = Channel[int]()
+  val sum = Atomic(long(0))
+  val threads = Buffer[Thread[int]]()
+  for _ in 0 ..< Threads
+    val c = ok(TcpStream.connect("127.0.0.1", port))
+    threads.addOne(spawn(() -> serve(c, work, sum)))
+  val peers = Vector.tabulate(Threads, _ -> ok(l.accept()))
+  while socketWaiters() < long(Threads) do sleep(millis(1))
+  var answered = 0
+  for round in 0 ..< 2
+    for i in 0 ..< Threads
+      ok(peers(i).writeText(s"$round\n"))
+    for i in 0 ..< Threads
+      if ok(peers(i).readLine()) == Some(s"pong $round") then answered += 1
+  for v in 1 .. Values do work.send(v)
+  for p in peers do ok(p.shutdownOutput())
+  var pings = 0
+  for t in threads do pings += t.join()
+  println(answered, pings, sum.load(), socketWaiters())
+  for p in peers do _ = p.close()
+  _ = l.close()

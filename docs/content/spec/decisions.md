@@ -8663,6 +8663,30 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `avin.io`'s `TimedOut` in a program importing both. Timeouts are `Option[Duration]`, `None` for
   waiting for ever. Alternatives weighed: a `string` error (loses the database's own error);
   `Option[T]` from `use` (a caller could not tell a timeout from a closed pool).
+- Settled on the user's delegation 2026-11-15 (built on branch `select-readable`): **a thread waits
+  for a connection's bytes OR a channel's value with a `select` arm, `stream.readable() -> body`,
+  not with a second waiting mechanism.** A connection belongs to one thread (its reference counts
+  are not atomic, and OpenSSL is single-threaded per connection), so the thread that owns a
+  WebSocket must do all of its reads and writes, and so must wait for "bytes arrived or another
+  thread queued a frame". The arm fits the others' shape, an operation on its operand
+  (`ch.receive()`, `ch.send(x)`), so it composes with channel arms, `after` and `else`, and the
+  select's one-park, wake-once token covers it: where the stream is not readable when tried, its
+  descriptor is registered with the runtime's poller for one report under the select's own waiter,
+  and every ending withdraws it under the poller's lock, as channel links are withdrawn. The arm
+  binds nothing and reads nothing (its body reads), since a read's size and form (`read(max)`,
+  `readLine`) are the body's choice. Ready means a read would answer without waiting: buffered
+  read-ahead, TLS plaintext already decrypted or a whole record arrived (TLS's `readable()` hands
+  the engine the ciphertext already on the socket, so part of a record does not count, and keeps
+  any failure it meets for the next read), the end, a reset or a closed connection. Its operand is
+  the trait `avin.threads.Readiness` (`readable() -> bool`, `readinessDescriptor() -> int`), which
+  `ByteStream` extends, so `avin.threads` needs nothing of `avin.net`, and a source of one's own,
+  with `-1` for no descriptor, can be named too. The thread dump counts the arms as sockets ("in a
+  select on 1 channel and 1 socket"). Alternatives weighed: an interruptible socket wait rung by a
+  waker (smaller, but a second way to wait beside select, composing with neither `after` nor several
+  channels); an arm that reads and binds the bytes, `conn.read(n) as bytes` (fixes the read's form
+  in the arm, and a `readLine` could not use it); waking on socket readiness alone for TLS (a partial
+  record would wake a select whose read then blocks). Review with the user: the spelling
+  `readable()` and the name `Readiness`; whether the descriptor should stay a public method.
 
 ## Proposed
 

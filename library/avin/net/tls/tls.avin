@@ -222,6 +222,46 @@ class TlsStream(
   // Who the connection belongs to, checked before every operation, one served from the bytes read
   // ahead included: handed over, the connection moves with it.
   private val owner = newOwner()
+  // A failure `readable()` met while it looked, which the next read answers.
+  private var failure: Option[IoError] = None
+
+  // Whether a read would answer now, without waiting: plaintext is buffered, TLS holds decrypted
+  // plaintext or has a whole record of it among what has arrived, the peer has closed TLS or the
+  // connection, or the connection has failed or is closed. It reads whatever ciphertext has already
+  // arrived, so a partial record is not mistaken for plaintext, and never waits for more.
+  override readable() -> bool
+    owner.held()
+    if closed || buffered.pending || failure is Some(_) then return true
+    val into = Array.fill(RecordSize, byte(0))
+    while true
+      val got = engine.receive(into)
+      val sent = flush()
+      if sent is Err(e)
+        failure = Some(e)
+        return true
+      got match
+        Ok(Data(n)) ->
+          buffered.keep(if n == long(into.length) then into else into.slice(0, int(n)))
+          return true
+        Ok(Closed) -> return true
+        Ok(Wants) ->
+          if !tcp.readable() then return false
+          pull() match
+            Ok(true) -> ()
+            Ok(false) -> return true
+            Err(e) ->
+              failure = Some(e)
+              return true
+        Err(f) ->
+          failure = Some(streamError(f, "read from", peer))
+          return true
+    true
+
+  // The descriptor of the TCP connection beneath, which a select's `readable()` arm watches; -1 once
+  // closed.
+  override readinessDescriptor() -> int
+    owner.held()
+    if closed then -1 else tcp.readinessDescriptor()
 
   // The address of the other end of the TCP connection beneath.
   override remoteAddress -> Option[string] = tcp.remoteAddress
@@ -332,6 +372,9 @@ class TlsStream(
   // Up to `max` bytes of plaintext, waiting for at least one; empty once the peer has closed TLS
   // or the connection.
   private received(max: int) -> Result[Array[byte], IoError]
+    if failure is Some(e)
+      failure = None
+      return Err(e)
     val into = Array.fill(max, byte(0))
     while true
       engine.receive(into) match

@@ -196,6 +196,53 @@ private park_on_fd(ctx: *Context, fd: int, interest: Interest, deadline: long) -
     if w.state.load() == WaitCancelled then return Err(from_errno(CancelledCode))
     Ok(w.state.load() == WaitWoken)
 
+/** Registers `fd` with the poller for one report of being readable, to wake `w` when it comes: answers
+ * the token naming `w`'s slot, or 0 where the poller cannot take the descriptor. A descriptor already
+ * readable is reported at once. The slot is let go by the poller's thread when the report comes, or
+ * by `unwatch_fd`, whichever is first. */
+watch_fd(w: *Waiter, fd: int) -> u64
+    io_lock.lock()
+    val p = poller() match
+        Ok(q) -> q
+        Err(_) ->
+            io_lock.unlock()
+            return 0
+    val token = take_slot(w)
+    val wanted = [Readable]
+    val registered = p.register(fd, wanted[..], token, OneShot) match
+        Err(AlreadyExists) -> p.modify(fd, wanted[..], token, OneShot)
+        r -> r
+    if registered.is_err()
+        _ = give_slot(token)
+        io_lock.unlock()
+        return 0
+    io_lock.unlock()
+    token
+
+/** Withdraws the registration `watch_fd` made of `fd` under `token`: its slot is let go and, where
+ * its report has not come, the descriptor is taken off the poller, so it reports nothing later. A
+ * poller thread waking the slot's waiter holds `io_lock` throughout, so once this has it, no wake
+ * through the slot is under way or still to come. */
+unwatch_fd(token: u64, fd: int)
+    io_lock.lock()
+    if give_slot(token) != null
+        io_poller match
+            Some(p) -> _ = p.deregister(fd)
+            None -> ()
+    io_lock.unlock()
+
+/** Whether a read of `s` would answer without waiting: bytes have arrived, the other end has finished
+ * sending, or the connection has failed. A socket whose readiness cannot be read counts as readable,
+ * so the read that follows answers why. */
+socket_readable(s: Socket) -> bool
+    var c = s
+    val fd = c.fd() match
+        Ok(d) -> d
+        Err(_) -> return true
+    ready(fd, Readable, micros(0)) match
+        Ok(b) -> b
+        Err(_) -> true
+
 /** Makes `s` non-blocking, as every socket the runtime waits on is. */
 socket_non_blocking(c: *Socket) -> Result[unit, IoError] = c.non_blocking(true)
 

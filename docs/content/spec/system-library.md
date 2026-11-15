@@ -1317,6 +1317,8 @@ uses it again.
 | `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer for the other end fails with `TimedOut`; zero or less takes the limit away. Each wait has the whole limit, so a write that waits for room several times fails only where one wait runs out. |
 | `s.shutdownOutput() -> Result[unit, IoError]` | Tells the other end nothing more will be sent; reading goes on. |
 | `s.close() -> Result[unit, IoError]` | Ends the connection and answers `Ok`; closing again does nothing. Every connection and listener is an [`io.Close`](#close). |
+| `s.readable() -> bool` | Whether a read would answer now, without waiting: bytes a `readLine` read ahead are still to be read, bytes have arrived, the other end has finished sending or reset the connection, or the connection is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.readable()` arm waits for it. |
+| `s.readinessDescriptor() -> int` | The socket's descriptor, which that arm watches on the runtime's poller; `-1` once closed. |
 | `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
 | `l.port() -> int` | The port it listens on. |
 | `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
@@ -1341,7 +1343,7 @@ main()
 
 A `UnixStream` and a `UnixListener` connect two programs on one machine by a path in the file system
 rather than a host and port. A `UnixStream` has every reading and writing operation of a `TcpStream`
-(`read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`) with the
+(`read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable`, `readinessDescriptor`) with the
 same meanings, including the bytes `readLine` reads beyond its line, and a `UnixListener` accepts
 them as a `TcpListener` does. Both are sendable and owned by one thread at a time, and every wait is
 safe for the collector, as TCP's are.
@@ -1393,13 +1395,19 @@ avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 ```
 
 **`ByteStream` is what the three connections share**: a trait with `read`, `readLine`, `readAll`,
-`write`, `writeText`, `setTimeout`, `shutdownOutput` and `close`, which `TcpStream`, `UnixStream` and
-`TlsStream` implement, so code that speaks a protocol, as the HTTP client and server do, takes a
-`ByteStream` and runs over any of them. It is [sendable](/spec/actors/#what-may-be-sent), and it is
-an [`io.Reader`](#reader) by its `read`, so whatever reads a `Reader` reads any connection, a TLS one
-included. `ReadAhead`,
-the bytes a connection has read beyond what its caller asked for and the line reading over them, is
-public for a connection of one's own.
+`write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable` and
+`readinessDescriptor`, which `TcpStream`, `UnixStream` and `TlsStream` implement, so code that speaks
+a protocol, as the HTTP client and server do, takes a `ByteStream` and runs over any of them. It is
+[sendable](/spec/actors/#what-may-be-sent), and it is an [`io.Reader`](#reader) by its `read`, so
+whatever reads a `Reader` reads any connection, a TLS one included. It is a `threads.Readiness` by
+`readable` and `readinessDescriptor`, so a [`select`](/spec/threads/#select) waits on any connection
+beside its channels: the thread that owns a connection waits in one select for its peer's bytes
+and for what other threads send it, and does every read and write itself. `Readiness` is a trait of
+its own, for a source that is not a connection: its `readinessDescriptor` may be `-1`, and a select
+then finds it readable only when it tries its arms. `ReadAhead`, the bytes a connection has read
+beyond what its caller asked for and the line reading over them, is public for a connection of
+one's own: `pending` says whether any are still to be read, and `keep(bytes)` adds bytes that
+arrived before anything asked for them.
 
 ### TLS
 
@@ -1429,6 +1437,7 @@ main() -> Result[unit, TlsError | IoError]
 | `TlsStream.client(tcp: TcpStream, host, settings = TlsClient()) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, its handshake waiting with `tcp`'s limit. Where it fails, `tcp` is the caller's to close. |
 | `TlsStream.server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate. |
 | `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
+| `s.readable() -> bool`, `s.readinessDescriptor() -> int` | Whether a read of plaintext would answer now: plaintext is buffered or TLS holds some decrypted, a whole record of it has arrived, or the peer has closed TLS or the connection. It hands TLS the ciphertext already on the socket, so part of a record is not taken for plaintext, and never waits for more; a failure it meets is answered by the next read. The descriptor is the TCP connection's. |
 | `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
 | `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Again does nothing and answers `Ok`. |
 | `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |

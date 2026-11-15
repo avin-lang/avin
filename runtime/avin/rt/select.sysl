@@ -26,6 +26,12 @@ import sysl.threads.SleepLock
 // a link on that queue: after it, nothing of the object is reached by any other thread, and the
 // library's reference to it is the only one. The library keeps the object, and the channels whose
 // conditions it is enlisted on, alive until then.
+//
+// A `readable()` arm's link waits on the runtime's poller instead (`sockets.sysl`): where its stream
+// is not readable when tried, its descriptor is registered for one report under a slot naming the
+// link's waiter, and the poller's thread wakes that waiter as it wakes a socket's, which wakes the
+// select. Its withdrawal lets the slot go and takes the descriptor off the poller under `io_lock`,
+// which the poller's thread holds while it wakes, so it too leaves nothing of the select behind.
 
 /** The payload of a select's wait, followed in its object by `count` links. */
 struct SelectWait
@@ -41,15 +47,20 @@ struct SelectWait
      * when the wait ends or a new round begins; under `guard`. */
     claimable: bool
     count: usize
+    /** How many of its links watch a descriptor on the poller in this round, for the thread dump. */
+    sockets: usize
 
-/** A select's link on a condition's queue: a waiter of the queue that stands for the select, the
- * select it belongs to, its arm, and the queue it is enlisted on, or null. The waiter is first, so a
- * queue's `*Waiter` is the link. */
+/** A select's link on a condition's queue, or on the poller for a `readable()` arm: a waiter that
+ * stands for the select, the select it belongs to, its arm, the queue it is enlisted on, or null, and
+ * the poller's token and the descriptor it watches, or 0. The waiter is first, so a queue's or a
+ * poller slot's `*Waiter` is the link. */
 struct SelectLink
     waiter: Waiter
     wait: *SelectWait
     index: i64
     queue: *WaitQueue
+    token: u64
+    fd: int
 
 @assert(offsetof(SelectLink, waiter) == 0, "a link's waiter is the start of the link")
 
@@ -66,10 +77,10 @@ select_new(ctx: *Context, arms: long) -> *u8
     val n: usize = if arms < 0 then 0 else usize(arms)
     val p = allocate_sized(ctx, &select_descriptor, sizeof(SelectWait) + n * sizeof(SelectLink))
     val s: *SelectWait = ptr_cast(p)
-    *s = SelectWait(SleepLock.new(), new_waiter(), false, -1, false, n)
+    *s = SelectWait(SleepLock.new(), new_waiter(), false, -1, false, n, 0)
     for i in 0..<n
         val l = link_at(s, i)
-        *l = SelectLink(new_waiter(), s, i64(i), null)
+        *l = SelectLink(new_waiter(), s, i64(i), null, 0, -1)
         l.waiter.link = l
     published(p)
 
@@ -84,7 +95,26 @@ select_reset(ctx: *Context, p: *u8)
     s.parked = false
     s.woken_by = -1
     s.claimable = false
+    s.sockets = 0
     s.guard.unlock()
+
+/** Watches the descriptor `fd` for arm `index` of the select `p`, a `readable()` arm the calling
+ * thread found not readable: the poller's report that `fd` is readable reaches the arm's link, as a
+ * notification of a channel's condition reaches a channel arm's. A descriptor that became readable
+ * since the arm looked is reported at once. Answers 1, or 0 where the poller cannot take the
+ * descriptor, which the library takes as the arm being ready, so that its read answers why. */
+@export("avin_rt_select_watch")
+select_watch(ctx: *Context, p: *u8, index: long, fd: int) -> long
+    val s: *SelectWait = ptr_cast(p)
+    if index < 0 || usize(index) >= s.count || fd < 0 then return 0
+    val l = link_at(s, usize(index))
+    if l.token != 0 then return 1
+    val token = watch_fd(&l.waiter, fd)
+    if token == 0 then return 0
+    l.token = token
+    l.fd = fd
+    s.sockets += 1
+    1
 
 /** Enlists arm `index` of the select `p` on the queue of the condition `condition`, then lets the lock
  * `lock` go, which the calling thread holds and under which it found the arm could not complete: a
@@ -148,6 +178,12 @@ select_withdraw(ctx: *Context, p: *u8)
 private withdraw(s: *SelectWait)
     for i in 0..<s.count
         val l = link_at(s, i)
+        // A watched descriptor is taken off the poller under `io_lock`, which the poller's thread
+        // holds while it wakes the link, so after it that thread reaches the select no more.
+        if l.token != 0
+            unwatch_fd(l.token, l.fd)
+            l.token = 0
+            l.fd = -1
         val q = l.queue
         if q == null then continue
         // Taken even where a waker has already unlinked it: a waker still in `wake_select` for this
@@ -172,7 +208,7 @@ select_park(ctx: *Context, p: *u8, deadline: long) -> long
         s.parked = true
         // A select with no time limit waits without one, so it is a wait the deadlock check counts;
         // one with a limit, as for an `after` or a channel's clock, has a timer, which can always end it.
-        begin_waiting(ctx, select_waits(s.count), deadline > 0)
+        begin_waiting(ctx, select_waits(s.count - s.sockets, s.sockets), deadline > 0)
         if runs_lightweight(ctx)
             park_as(ctx, &s.guard, if deadline > 0 then w else null, deadline, if may_cancel(ctx, 0) then w else null)
             if deadline > 0 then cancel_timer(w)
