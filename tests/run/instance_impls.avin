@@ -1,0 +1,102 @@
+// expect: exit 0
+// An impl of a trait for an instance of a generic type: `bytea` is a `Vector[byte]`, decoded and
+// encoded by `impl FromPg for Vector[byte]` and `impl ToPg for Vector[byte]`, while an array is any
+// other vector, through `impl[T: FromPg] FromPg for Vector[T]`, whose bound `byte` does not meet. So
+// each instance has exactly one impl, and every way of reaching it finds that one: a static member
+// called on the type and through a bound, a method called on a value, through a bound and through a
+// trait value, a bound met by the instance, a generic impl at an argument that conforms through an
+// instance impl, an `Option` of the instance, and a type pattern on an `Any`.
+
+trait FromPg
+  static fromPg(text: string) -> Option[Self]
+
+trait ToPg
+  toPg() -> string
+  // A default body the instance impl does not replace.
+  quoted() -> string = "'" + toPg() + "'"
+
+impl FromPg for int
+  static fromPg(text: string) -> Option[int] = text.toIntOption()
+
+impl ToPg for int
+  toPg() -> string = s"$self"
+  quoted() -> string = toPg()
+
+// The bytes themselves: `\x` and two hex digits for each.
+impl FromPg for Vector[byte]
+  static fromPg(text: string) -> Option[Vector[byte]] = Some(text.bytes)
+
+impl ToPg for Vector[byte]
+  toPg() -> string = "\\x" + map(b -> hex(b)).mkString("")
+
+hex(b: byte) -> string
+  val digits = "0123456789abcdef"
+  val n = int(b)
+  digits.slice(n / 16, n / 16 + 1) + digits.slice(n % 16, n % 16 + 1)
+
+// An array: its elements, separated by commas.
+impl[T: FromPg] FromPg for Vector[T]
+  static fromPg(text: string) -> Option[Vector[T]]
+    var out: Vector[T] = []
+    for part in text.split(',')
+      T.fromPg(part) match
+        Some(v) -> out = out :+ v
+        None -> return None
+    Some(out)
+
+impl[T: ToPg] ToPg for Vector[T]
+  toPg() -> string = "{" + map(x -> x.toPg()).mkString(",") + "}"
+
+// `NULL` is `None`.
+impl[T: FromPg] FromPg for Option[T]
+  static fromPg(text: string) -> Option[Option[T]] =
+    if text == "NULL" then Some(None) else T.fromPg(text).map(v -> Some(v))
+
+decode[T: FromPg](text: string) -> Option[T] = T.fromPg(text)
+
+encode[T: ToPg](x: T) -> string = x.toPg()
+
+encodeAll(xs: ToPg*) -> string = xs.map(x -> x.toPg()).mkString(" ")
+
+// A bound met through the instance impl, held where the type argument is written.
+class Column[T: ToPg](val value: T)
+  render() -> string = value.quoted()
+
+main()
+  val bytes: Vector[byte] = "hi".bytes
+  // Static members, on the instance and through bounds.
+  println(Vector[byte].fromPg("ab").map(v -> v.length))
+  println(decode[Vector[byte]]("xyz").map(v -> v.toPg()))
+  println(decode[Vector[int]]("1,2,3"))
+  println(decode[Vector[int]]("1,x"))
+  println(decode[Option[Vector[byte]]]("NULL").map(o -> o.isEmpty))
+  println(decode[Option[Vector[byte]]]("ok").map(o -> o.map(v -> v.toPg())))
+  println(decode[Option[Vector[int]]]("4,5"))
+  // Methods, on the value, through a bound, a default body, and trait values.
+  println(bytes.toPg())
+  println(bytes.quoted())
+  println(encode(bytes))
+  println(encode([1, 2, 3]))
+  println(encode([bytes, "ok".bytes]))
+  println(encodeAll(bytes, [7, 8], 9))
+  val t: ToPg = bytes
+  println(t.toPg())
+  println(t.quoted())
+  val ts: Vector[ToPg] = [bytes, [1], 2]
+  println(ts.map(x -> x.quoted()).mkString(" "))
+  println(Column(bytes).render())
+  println(Column([[1], [2, 3]]).render())
+  // A type pattern on an `Any` asks the value's own instance.
+  val things: Vector[Any] = [bytes, [1, 2], ["a"], "s"]
+  for a in things
+    a match
+      p: ToPg -> println(s"ToPg ${p.toPg()}")
+      _ -> println("not ToPg")
+  // Many short-lived values through every path.
+  var total = 0
+  for i in 0..<200
+    val v: Vector[byte] = s"n$i".bytes
+    total += encode(v).byteLength +decode[Vector[byte]](s"$i").map(x -> x.length).getOrElse(0)
+    val o: ToPg = v
+    total += o.toPg().byteLength
+  println(total)

@@ -477,6 +477,8 @@ lower_program_cached(program: TProgram, cached: Map[string, string], caching: bo
         if d.table.len() > generic_base then generic_base = d.table.len()
     for b in program.builtins
         if b.table.len() > generic_base then generic_base = b.table.len()
+    for x in program.instances
+        if x.table.len() > generic_base then generic_base = x.table.len()
     val local = local_values(program)
     val plan = option_plan(program)
     val world = s"options ${plan.pointers} ${plan.nothing} ${plan.nothing_as_pointer} ${plan.nothing_as_object}"
@@ -1089,6 +1091,8 @@ private trait_method_at(l: *Lowering, t: &Type, position: usize, name: string) -
         val m = c.methods[position - c.base]
         if l.program.symbols[m].decl.name != name then continue
         if ancestor_type(l.program.classes, l.program.data, t, k) is Some(_) then return Some(m)
+        // An impl for instances of the type may state it.
+        if l.program.instances.len() > 0 && holding_ancestor(lowering_conformances(l), t, k) is Some(_) then return Some(m)
         // An opaque type conforms through impls, which its boxed value's default bodies reach.
         if *t is Opaque(_, _, _, _) && meets_bound(lowering_conformances(l), t, Class(k, c.decl.name, buf())) then return Some(m)
     None
@@ -1185,7 +1189,7 @@ private fill_used_slots(l: *Lowering) -> bool
 /** The lowering's view of conformances: of concrete types only, so with no type parameters in scope,
  * and the bounds of the impls for tuples, which a tuple's parts must meet. */
 private lowering_conformances(l: *Lowering) -> Conformances =
-    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.core, l.program.bounds, None, map(), None, buf())
+    Conformances(l.program.classes, l.program.data, l.program.builtins, l.program.conditional, l.program.instances, l.program.core, l.program.bounds, None, map(), None, buf())
 
 // Whether variant `v` of data type `id`, at its arguments `full` (its type's, then its own), meets
 // the bounds it declares on its own parameters that its result names. A value is made only at
@@ -1249,11 +1253,33 @@ private unheld_positions(l: *Lowering, known: KnownType) -> Buf[bool]
             if symbol.base + j < out.len() then out[symbol.base + j] = true
     out
 
-/** The checker's method table of class, data or built-in type `t`: the method at each position. */
-private checker_table(l: *Lowering, t: &Type) -> Buf[Option[usize]] = *t match
-    Class(k, _, _) -> l.program.classes[k].table
-    Data(d, _, _) -> l.program.data[d].table
-    _ -> builtin_table(l, t)
+/** The checker's method table of class, data or built-in type `t`: the method at each position, and
+ * at the positions of a trait an impl for instances of the type makes it conform to, that impl's. */
+private checker_table(l: *Lowering, t: &Type) -> Buf[Option[usize]]
+    val own = *t match
+        Class(k, _, _) -> l.program.classes[k].table
+        Data(d, _, _) -> l.program.data[d].table
+        _ -> return builtin_table(l, t)
+    if l.program.instances.len() == 0 then return own
+    var table: Buf[Option[usize]] = buf()
+    for entry in own
+        table.push(entry)
+    val f = lowering_conformances(l)
+    for n in 0..<l.program.instances.len()
+        if instance_args(f, n, t) is None then continue
+        val placed = l.program.instances[n].table
+        while table.len() < placed.len()
+            table.push(None)
+        for p in 0..<placed.len()
+            if placed[p] is Some(_) then table[p] = placed[p]
+    table
+
+/** The instance conformance whose impl declares method `m`, if one does. */
+private instance_of_method(l: *Lowering, m: usize) -> Option[usize]
+    for n in 0..<l.program.instances.len()
+        for x in l.program.instances[n].methods
+            if x == m then return Some(n)
+    None
 
 /** A built-in type's table, which the first of its conformances keeps. An integer width with no
  * impl of its own has the integer family's. */
@@ -1275,6 +1301,18 @@ private implementation_args(l: *Lowering, t: &Type, m: usize) -> Buf[&Type]
     // A method of an impl for every tuple of an arity takes the tuple's parts.
     if is_tuple_owner(l.program.symbols[m].type_owner)
         if *t is Tuple(parts) then return parts
+    // A method of an impl for instances of a type takes the impl's parameters as `t`'s parts give
+    // them; a trait's default body that impl's table holds, the trait's arguments the impl states.
+    if l.program.instances.len() > 0
+        val f = lowering_conformances(l)
+        if instance_of_method(l, m) is Some(n) then return instance_args(f, n, t).unwrap_or(buf())
+        if l.program.symbols[m].owner_class is Some(k)
+            if ancestor_type(l.program.classes, l.program.data, t, k) is None
+                for n in 0..<l.program.instances.len()
+                    if instance_args(f, n, t) is Some(args)
+                        val stated = substitute(l.program.instances[n].trait_type, instance_owner(n), args)
+                        if ancestor_type(l.program.classes, l.program.data, stated, k) is Some(a)
+                            if *a is Class(_, _, xs) then return xs
     if l.program.symbols[m].owner_class is None
         if *t is Data(_, _, xs) then return xs
         return buf()

@@ -550,9 +550,38 @@ a decision changes, this page and the chapter change together.
 - A class and its companion object use each other's private members, in both directions.
 - An initializer's dependencies count every lambda it makes as if it were called, and every function
   it calls in full, whatever branch is taken, so a cycle that no run could follow is still rejected.
-- An impl for particular type arguments of a generic type (`impl Show for Box[int]`) is not allowed:
-  an impl covers every instance of its type. Allowing one needs a rule for its overlap with a generic
-  impl of the same trait.
+- Settled on the user's delegation 2026-11-15 (built on branch `concrete-impls`; replaces the
+  earlier rule that an impl covers every instance of its type): **An impl of a trait may be for an
+  instance of a generic data type or class**, `impl FromPg for Vector[byte]`, or for a partly applied
+  one, `impl[K] Show for Map[K, int]` or `impl[T] Show for Box[Option[T]]`, since the rule for the
+  concrete case covers those unchanged: the type conforms where it is such an instance, its parts
+  matched exactly (no variance: a `Vector[Nothing]` is not a `Vector[byte]` here) and seen through
+  its superclasses, the impl's parameters taking the parts and then held to their bounds. Its
+  members, static ones included, are the type's at those instances, found by every path that finds
+  an impl: a call on the value or the type, a call through a bound, a bound held where a type
+  argument is written, a trait value and its method table, a type pattern on an `Any`, and a
+  template walking a field of that type; a member of the type's own of the same parameter types is
+  hidden there. The impl belongs in the module of the type or of the trait, as any impl of a trait
+  does (the core library's `Vector` takes one in the trait's module). **No overlap**: two impls of
+  one trait may not both hold of any instance, so an instance impl beside the type's own impl of the
+  trait is allowed only where the instance misses that impl's bounds (`byte` is no `FromPg`), and two
+  instance impls only where no instance matches both; there is no specialization, no "more specific
+  wins". A missed bound keeps the two apart only if it is missed for good: where a module other than
+  the impl's own and the core library could still write the impl meeting it, one that names both
+  the bound and the type without importing a module that imports it, the two overlap and the
+  diagnostic names that module. A parameter of a partly applied instance may be any type, so it
+  meets every bound. `Eq`, `Hash`, `Sendable` and `Boundary` are a type's at every instance alike and
+  take no instance impl. An instance impl of `Display` or `Debug` for a data type is an impl of the
+  trait of its own, so the type has no automatic one at its other instances, as with any impl of
+  the trait. Why: a PostgreSQL client needs `bytea` as `Vector[byte]` beside a generic
+  impl for arrays, and every domain with a byte string, a matrix of reals or a map of strings meets
+  the same need; refusing overlap keeps a conformance one answer everywhere, decided where the impls
+  are written. Alternatives weighed: specialization, the most specific impl winning (complex, with
+  unsound corners where a generic body relies on the general impl); a library byte-string type for
+  `bytea` (does not help the next domain); leaving it (forces `bytea` through `byte: FromPg`, element
+  by element). Review with the user: whether the core library should stay fixed in the overlap
+  rule (it could in principle add a conformance later, but it changes with the compiler), and
+  whether a module of the instance's arguments should also be allowed to declare such an impl.
 - The singleton declaration keeps the keyword `object`.
 - A program's binding shims are one Sysl package that depends on the runtime's, built into one
   archive the program links in place of the runtime's, so all of a program's Sysl code shares one
@@ -922,7 +951,8 @@ Settled by the user on 2026-11-04:
   learned parameters to the impl's bounds; a receiver that does not match is an error saying what
   it would need to be. Two impls that both match a receiver and add a method of one name and
   parameter types make the call an error, as does such a method clashing with the type's own. An
-  impl of a trait still names its type's parameters in order, so conformances never overlap. The
+  impl of a trait for such a type is an impl for instances of it, whose overlap with another impl of
+  the trait is an error (see the impl for instances of a generic type, 2026-11-15). The
   core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
   (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
   `Seq[(A, B)]`.
