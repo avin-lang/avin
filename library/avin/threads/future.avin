@@ -24,7 +24,7 @@ private processors() -> long
 // The workers are never joined: the program ends when `main` returns, whatever they are doing. Once
 // shut down, a worker that finds no task left ends.
 @trusted_sendable("every field but its lock and target is read and written only while its lock is held")
-private class Pool(private val target: int): Sendable
+private class WorkerPool(private val target: int): Sendable
   private val lock = Lock()
   private val work = Condition(lock, WorkWait)
   private val tasks = Deque[() -> unit]()
@@ -129,9 +129,9 @@ private class Pool(private val target: int): Sendable
 @trusted_sendable("its map of pools is read and written only while its lock is held")
 private class Registry(): Sendable
   private val lock = Lock()
-  private val pools = MutableMap[long, Pool]()
+  private val pools = MutableMap[long, WorkerPool]()
 
-  enrol(me: long, p: Pool)
+  enrol(me: long, p: WorkerPool)
     lock.acquire()
     pools(me) = p
     lock.release()
@@ -141,7 +141,7 @@ private class Registry(): Sendable
     pools.remove(me)
     lock.release()
 
-  poolOf(me: long) -> Option[Pool]
+  poolOf(me: long) -> Option[WorkerPool]
     lock.acquire()
     val p = pools.get(me)
     lock.release()
@@ -152,18 +152,18 @@ private lazy val registry: Registry = Registry()
 
 // The pool `Future(body)` uses, one worker for each processor, made by the first thread to need it; a
 // program that makes no future never makes it.
-private lazy val pool: Pool = Pool(int(processors()))
+private lazy val pool: WorkerPool = WorkerPool(int(processors()))
 
 // Counts the calling thread as waiting where it is a worker of a pool that does not count it already,
 // and answers that pool, for `endWait`.
-private beginWait() -> Option[Pool]
+private beginWait() -> Option[WorkerPool]
   val me = current()
   registry.poolOf(me) match
     Some(p) -> if p.countWaiting(me) then Some(p) else None
     None -> None
 
 // Counts the calling thread as working again where `beginWait` counted it.
-private endWait(counted: Option[Pool])
+private endWait(counted: Option[WorkerPool])
   if counted is Some(p) then p.resumed(current())
 
 // Runs `body`, which waits on something other than a future (a lock, a channel, a blocking binding,
@@ -180,7 +180,7 @@ blocking[T](body: -> T) -> T
   v
 
 // Runs `body` on `p` and gives back the future of what it returns.
-private startOn[T: Sendable](p: Pool, @sendable body: () -> T) -> Future[T]
+private startOn[T: Sendable](p: WorkerPool, @sendable body: () -> T) -> Future[T]
   val cell = Cell[T]()
   p.submit(body, v ->
     cell.complete(v)
@@ -276,7 +276,7 @@ impl[T: Sendable] Sendable for Future[T]
 // A future belongs to the executor it was made on, the shared pool unless one was chosen, and its
 // `map`, `flatMap` and `onComplete` run their functions there.
 @keeps_owners
-class Future[T](private val cell: Cell[T], private val home: Pool)
+class Future[T](private val cell: Cell[T], private val home: WorkerPool)
   // Waits for the value, safe for the collector while it waits, and gives it back. A body on the pool
   // that waits leaves its place to another worker, so waits nested in bodies never stall the pool.
   await() -> T = cell.waitFor(None) match
@@ -421,7 +421,7 @@ object Future
 //
 // An executor may be shared between threads: giving it work and shutting it down are synchronized.
 @keeps_owners
-class Executor(private val p: Pool, private val isShared: bool): Sendable
+class Executor(private val p: WorkerPool, private val isShared: bool): Sendable
   // Runs `body` on this executor and gives back the future of what it returns; traps after
   // `shutdown`.
   future[T: Sendable](@sendable body: -> T) -> Future[T]
@@ -455,7 +455,7 @@ object Executor
   // A pool of `n` workers of its own, at least one; none is started until there is work for it.
   fixed(n: int) -> Executor
     if n < 1 then fail("an executor has at least one worker")
-    Executor(Pool(n), false)
+    Executor(WorkerPool(n), false)
 
   // The pool `Future(body)` runs on, one worker for each processor: the same executor every time,
   // so `Executor.shared() === Executor.shared()`.

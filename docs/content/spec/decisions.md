@@ -8503,6 +8503,64 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Box[int]` ``), "this source" otherwise; a guard's refusal is reported at the guard. A source
   is checked for its roles before any call on it, and a refused one checks nothing after it.
   Alternatives: always suggesting an impl (wrong advice for a library type).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a resource pool is
+  `avin.threads.Pool[T, E]`, lending through a body** ([pools](/spec/threads/#pools)). `use(f)`
+  and `lease(f)` lend a resource for the call of `f` and always take it back, answering
+  `Result[R, PoolError[E]]`; there is no `acquire`/`release` pair. Why: the scope of the body is
+  what makes "always returned" true by construction, on a return, a cancellation inside it, and a
+  trap (which stops the program); a resource handed out by `acquire` comes back only if every path
+  remembers to give it back. It sits in `avin.threads` beside the semaphore it resembles, built on
+  the same lock and cancellation machinery; the executor's private worker pool, which was also
+  called `Pool`, is renamed `WorkerPool`. Alternatives weighed: an `acquire()` answering a lease to
+  `release()` by hand (an actor holding a connection across messages would want it; it can be added
+  beside the body form later); a module of its own (`avin.pool`), which would need the threads
+  module's private machinery made public. **Review with the user:** whether an explicit
+  acquire/release form is wanted for resources held across an actor's messages.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a pool's resources
+  are isolated rather than sendable.** A `Pool` is sendable whatever `T` is, as a `Mutex` is:
+  `create`, `validate` and `destroy` are `@sendable`, so a resource is made from sendable values
+  alone, and `use`'s and `lease`'s bodies are `@isolating` and give back a sendable `R`, so the
+  resource never leaves the call it is lent to. Why: the resources worth pooling are mutable
+  (a connection's buffers and state), and a program's mutable class cannot promise `Sendable` (the
+  `@trusted_sendable` mark is the standard library's), so a pool that asked `T: Sendable` could not
+  hold the database client it exists for. The cost: a body may not capture a mutable value from
+  around it, and two mutable resources cannot be used in one nested body (`db.use(c ->
+  cache.use(r -> … c …))` is refused, since the inner body captures `c`). Alternatives weighed:
+  `T: Sendable` (sound, and too narrow, as above); unrestricted bodies (a resource kept past its
+  call would be used by two threads at once). **Review with the user:** the nested-body
+  restriction, which a borrow form the language does not have would lift.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a pool's waiters
+  are served first come, first served, by direct hand-off.** A resource given back goes straight
+  to the call that has waited longest, and so does the place a destroyed resource or a failed make
+  gives up; a new call queues behind any waiter even when it comes just as a resource is given
+  back, so no call is overtaken. Idle resources are lent most recently used first, so the oldest
+  expire under `idleTimeout`. Why: fairness the brief asks for, and an `AcquireTimedOut` under
+  load then means the pool is too small rather than unlucky. Alternatives weighed: waking any
+  waiter and letting it race (the semaphore's way; cheaper, and unfair); oldest idle first (keeps
+  every connection warm, and none ever expires on a quiet server).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **every function a
+  pool runs for a call runs where a trap cannot be contained.** A trap inside `f`, `create`,
+  `validate` or `destroy` stops the program even in an actor, as one inside `withPermit` does.
+  Why: an actor that survived the trap would leave the pool counting a resource or a place that is
+  never given back, shrinking it for good. `f` and `create` stay cancellable; `destroy` runs to its
+  end. Alternatives weighed: containing the trap and leaking the place (a pool that slowly loses
+  capacity in a long-running server). **Review with the user:** a server whose handlers are actors
+  may prefer the handler's failure to the program's.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **idle resources
+  expire when the pool is next used, not on a timer of their own.** A call looking for a resource,
+  and `evictIdle()`, destroy those idle longer than `idleTimeout`, keeping `minIdle`; `minIdle`
+  also sets what `warm()` makes, and is not kept topped up as resources are destroyed. Why: a pool
+  then starts no thread and holds no timer, and a program that wants eviction on a quiet pool calls
+  `evictIdle` from a `Ticker`. Alternatives weighed: a reaper thread per pool (a thread that
+  outlives every call and must be stopped by `close`); refilling to `minIdle` after each eviction
+  (a `create` failing in the background has nobody to report to).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a pool's failure is
+  `PoolError[E]`: `AcquireTimedOut`, `PoolClosed`, `CreateFailed(error: E)`.** It is an `Error`
+  where `E` is, `CreateFailed` having `error` as its `cause`, and shows the same sentence wherever
+  `E` has a `Display`. The case names carry `Acquire`/`Pool` so that they do not clash with
+  `avin.io`'s `TimedOut` in a program importing both. Timeouts are `Option[Duration]`, `None` for
+  waiting for ever. Alternatives weighed: a `string` error (loses the database's own error);
+  `Option[T]` from `use` (a caller could not tell a timeout from a closed pool).
 
 ## Proposed
 

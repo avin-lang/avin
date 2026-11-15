@@ -1,0 +1,117 @@
+// expect: exit 0
+// A cancellation of the thread using a pool puts back whatever the call held, wherever it was:
+// waiting for a resource (its place in the queue is given up, and the calls behind it are served in
+// order), inside the body (the resource comes back idle, and nothing of the body after the wait
+// runs), inside `create` (the place it held goes to the next call waiting, which makes a resource
+// there), and inside `validate` (the resource being checked is destroyed). A `withTimeout` around a
+// call that waits ends it the same way. Waits of an hour would hold the test for an hour if the
+// cancellation did not end them.
+import avin.threads.{Atomic, Channel, Mutex, Pool, scope, sleep, spawn, withTimeout}
+import avin.time.{hours, millis}
+
+class Conn(val id: int): Sendable
+
+waitFor(pool: Pool[Conn, string], n: int)
+  while pool.stats().waiting < n do sleep(millis(1))
+
+main()
+  val after = Atomic(0)
+  val pool = Pool[Conn, string](() -> Ok(Conn(1)), maxSize = 1)
+  val hold = Channel[int](1)
+  val holding = Channel[int](1)
+  val holder = spawn(() ->
+    pool.use(c ->
+      holding.send(c.id)
+      _ = hold.receive()
+      c.id))
+  _ = holding.receive()
+
+  // Waiting: three calls queued and cancelled.
+  val waited = scope(s ->
+    val ts = [0, 1, 2].map(_ -> s.spawn(() ->
+      val r = pool.use(c -> c.id)
+      after.add(1)
+      r))
+    waitFor(pool, 3)
+    s.cancel()
+    ts.map(t -> t.result()))
+  println(s"waiting: $waited after ${after.load()} ${pool.stats()}")
+
+  // Waiting in the middle of the queue: the first and the last are still served, in order.
+  val order = Mutex(Vector[string]())
+  scope(outer ->
+    outer.spawn(() -> _ = pool.use(_ -> order.update(v -> v :+ "first")))
+    waitFor(pool, 1)
+    scope(inner ->
+      inner.spawn(() -> _ = pool.use(_ -> order.update(v -> v :+ "middle")))
+      waitFor(pool, 2)
+      inner.cancel())
+    outer.spawn(() -> _ = pool.use(_ -> order.update(v -> v :+ "last")))
+    waitFor(pool, 2)
+    hold.send(0))
+  println(s"middle: ${order.get()} ${holder.join()} ${pool.stats()}")
+
+  // Inside the body: the resource comes back idle.
+  val inside = scope(s ->
+    val t = s.spawn(() ->
+      pool.use(c ->
+        holding.send(c.id)
+        sleep(hours(1))
+        after.add(1)
+        c.id))
+    _ = holding.receive()
+    s.cancel()
+    t.result())
+  println(s"body: $inside after ${after.load()} ${pool.stats()}")
+  println(pool.use(c -> c.id))
+
+  // `withTimeout` around a call waiting for a resource.
+  val held = spawn(() ->
+    pool.use(c ->
+      holding.send(c.id)
+      _ = hold.receive()
+      c.id))
+  _ = holding.receive()
+  println(s"withTimeout: ${withTimeout(millis(20), _ -> pool.use(c -> c.id))} ${pool.stats()}")
+  hold.send(0)
+  _ = held.join()
+
+  // Inside `create`: the first make waits for an hour and is cancelled; the call behind it is given
+  // its place and makes a resource there.
+  val makes = Atomic(0)
+  val slow = Pool[Conn, string](maxSize = 1, create = () ->
+    val n = makes.add(1)
+    if n == 1
+      holding.send(n)
+      sleep(hours(1))
+    Ok(Conn(n)))
+  val behind = scope(outer ->
+    val second = scope(inner ->
+      inner.spawn(() -> _ = slow.use(c -> c.id))
+      _ = holding.receive()
+      val t = outer.spawn(() -> slow.use(c -> c.id))
+      waitFor(slow, 1)
+      inner.cancel()
+      t)
+    second.join())
+  println(s"create: $behind made ${makes.load()} ${slow.stats()}")
+
+  // Inside `validate`: the resource being checked is destroyed.
+  val checks = Atomic(0)
+  val destroyed = Atomic(0)
+  val checked = Pool[Conn, string](
+    () -> Ok(Conn(1)),
+    maxSize = 1,
+    validate = Some(_ ->
+      holding.send(checks.add(1))
+      sleep(hours(1))
+      true),
+    destroy = Some(_ -> _ = destroyed.add(1))
+  )
+  println(checked.use(c -> c.id))
+  val checking = scope(s ->
+    val t = s.spawn(() -> checked.use(c -> c.id))
+    _ = holding.receive()
+    s.cancel()
+    t.result())
+  println(s"validate: $checking checks ${checks.load()} destroyed ${destroyed.load()} ${checked.stats()}")

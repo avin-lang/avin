@@ -1,0 +1,61 @@
+// expect: exit 0
+// Calls waiting for a pool's resource are served in the order they came. One resource is held while
+// eight threads queue for it one after another; each gets it in turn, the resource going straight
+// from one to the next, so only one is ever made. With two places, one resource held and the other
+// being made slowly, the place a broken resource gives up goes to the first waiter, which makes a
+// resource there and hands it on to the second once it is done.
+import avin.threads.{Atomic, Channel, Mutex, Pool, scope, sleep}
+import avin.time.millis
+
+class Conn(val id: int): Sendable
+
+waitFor(pool: Pool[Conn, string], n: int)
+  while pool.stats().waiting < n do sleep(millis(1))
+
+main()
+  val made = Atomic(0)
+  val pool = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 1)
+  val order = Mutex(Vector[int]())
+  val hold = Channel[int](1)
+  val holding = Channel[int](1)
+  scope(s ->
+    s.spawn(() ->
+      _ = pool.use(c ->
+        holding.send(c.id)
+        _ = hold.receive()))
+    _ = holding.receive()
+    for i in 1 .. 8
+      s.spawn(() -> _ = pool.use(c -> order.update(v -> v :+ i)))
+      waitFor(pool, i)
+    println(pool.stats())
+    hold.send(0))
+  println(order.get())
+  println(s"made ${made.load()} ${pool.stats()}")
+
+  // Two places, one resource held and one being made slowly; the first waiter is given the place a
+  // broken resource gives up, ahead of the second.
+  val slow = Atomic(0)
+  val gate = Channel[int](1)
+  val two = Pool[Conn, string](maxSize = 2, create = () ->
+    val n = slow.add(1)
+    if n == 2 then _ = gate.receive()
+    Ok(Conn(n)))
+  val got = Mutex(Vector[string]())
+  scope(s ->
+    s.spawn(() ->
+      _ = two.lease(l ->
+        holding.send(l.resource.id)
+        _ = hold.receive()
+        l.markBroken()))
+    _ = holding.receive()
+    s.spawn(() -> _ = two.use(c -> got.update(v -> v :+ s"maker ${c.id}")))
+    while slow.load() < 2 do sleep(millis(1))
+    s.spawn(() -> _ = two.use(c -> got.update(v -> v :+ s"first ${c.id}")))
+    waitFor(two, 1)
+    s.spawn(() -> _ = two.use(c -> got.update(v -> v :+ s"second ${c.id}")))
+    waitFor(two, 2)
+    hold.send(0)
+    while got.get().length < 1 do sleep(millis(1))
+    gate.send(0))
+  println(got.get())
+  println(two.stats())

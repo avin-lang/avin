@@ -1,0 +1,56 @@
+// expect: exit 0
+// A `create` that fails makes the call fail with `CreateFailed`, carrying the error, and gives its
+// place up: the pool holds nothing after, and a later call tries again. A call waiting behind a
+// failing make is given the place and makes its own resource. A pool whose `create` fails with an
+// `Error` fails with one too, its message and its cause showing through; with an error that is only
+// `Display`, the failure shows the same way.
+import avin.io.{ConnectionRefused, IoError}
+import avin.threads.{AcquireTimedOut, Atomic, Channel, CreateFailed, Pool, PoolClosed, PoolError, scope, sleep}
+import avin.time.millis
+
+class Conn(val id: int): Sendable
+
+main()
+  val tries = Atomic(0)
+  val flaky = Pool[Conn, string](maxSize = 2, create = () ->
+    val n = tries.add(1)
+    if n <= 2 then Err(s"refused $n") else Ok(Conn(n)))
+  println(flaky.use(c -> c.id))
+  println(flaky.stats())
+  println(flaky.use(c -> c.id) is Err(CreateFailed("refused 2")))
+  println(flaky.use(c -> c.id))
+  println(flaky.stats())
+
+  // A waiter behind a make that fails is given the place.
+  val gate = Channel[int](1)
+  val started = Channel[int](1)
+  val makes = Atomic(0)
+  val one = Pool[Conn, string](maxSize = 1, create = () ->
+    val n = makes.add(1)
+    if n == 1
+      started.send(n)
+      _ = gate.receive()
+      Err("first make fails")
+    else Ok(Conn(n)))
+  val results = scope(s ->
+    val first = s.spawn(() -> one.use(c -> c.id))
+    _ = started.receive()
+    val second = s.spawn(() -> one.use(c -> c.id))
+    while one.stats().waiting < 1 do sleep(millis(1))
+    gate.send(0)
+    s"${first.join()} ${second.join()}")
+  println(results)
+  println(one.stats())
+
+  // An `Error` from `create` shows as the pool's failure and is its cause.
+  val refused = Pool[Conn, IoError](() -> Err(IoError(ConnectionRefused, "connect to", "db:5432")), maxSize = 1)
+  refused.use(c -> c.id) match
+    Ok(_) -> println("made")
+    Err(e) ->
+      println(e)
+      println(e.message)
+      println(e.cause.isDefined)
+  val errs: Vector[PoolError[IoError]] = [AcquireTimedOut, PoolClosed]
+  for e in errs do println(s"$e ${e.cause.isDefined}")
+  val shown: PoolError[string] = CreateFailed("no route")
+  println(shown)

@@ -1740,6 +1740,7 @@ with futures reaches for is there, under these names:
 | Run on threads of one's own | `Executor.fixed(n)`, a pool of `n` workers, and `ex.future(body)`; `Executor.shared()` is the pool `Future(body)` uses. A future's `map`, `flatMap` and `onComplete` run on the executor it was made on. `ex.shutdown()` lets its workers end once the queued work is done. |
 | Say a body will wait on something other than a future | `threads.blocking(body)`: the pool starts a worker in its place while it waits, as it does for `await` |
 | Pause a thread | `threads.sleep(d: Duration)`, safe for the collector while it sleeps |
+| Share costly resources, connections for one | [`Pool(create, maxSize)`](/spec/threads/#pools) and `pool.use(c -> …)`, which lends one for the call and always takes it back |
 
 ## JSON
 

@@ -1,0 +1,74 @@
+// expect: exit 0
+// `validate` checks an idle resource before it is lent again, never a fresh one: one it fails is
+// destroyed and the next idle one, or a new one, is lent instead. A resource idle longer than
+// `idleTimeout` is destroyed when the pool is next used, oldest first, keeping `minIdle`, and
+// `evictIdle` does the same at once and says how many went; with no `idleTimeout` nothing is ever
+// evicted. `warm` makes resources until the pool holds `minIdle`, and answers a failing make.
+import avin.threads.{Atomic, Mutex, Pool, sleep}
+import avin.time.millis
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val checks = Mutex(Vector[int]())
+  val destroyed = Mutex(Vector[int]())
+  val sick = Mutex(Set[int]())
+  val pool = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 3,
+    validate = Some(c ->
+      checks.update(v -> v :+ c.id)
+      !sick.get().contains(c.id)),
+    destroy = Some(c -> _ = destroyed.update(v -> v :+ c.id))
+  )
+  println(pool.use(a -> pool.use(b -> pool.use(c -> s"${a.id} ${b.id} ${c.id}"))))
+  println(s"checks ${checks.get()}")
+  // Idle now, most recent last: 3 2 1. The next lent is 1, which falls sick; its next check fails,
+  // and 2 is lent instead.
+  println(pool.use(c ->
+    sick.update(s -> s.incl(c.id))
+    c.id))
+  println(pool.use(c -> c.id))
+  println(s"checks ${checks.get()} destroyed ${destroyed.get()} ${pool.stats()}")
+  // Every idle one falls sick: each fails its check, and a new one is made.
+  sick.update(s -> s.incl(2).incl(3))
+  println(pool.use(c -> c.id))
+  println(s"checks ${checks.get()} destroyed ${destroyed.get()} made ${made.load()} ${pool.stats()}")
+
+  // Idle timeout, keeping one.
+  val gone = Atomic(0)
+  val idle = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 3,
+    minIdle = 1,
+    destroy = Some(_ -> _ = gone.add(1)),
+    idleTimeout = Some(millis(500))
+  )
+  println(idle.warm())
+  println(idle.stats())
+  println(idle.use(a -> idle.use(b -> idle.use(c -> 0))))
+  println(s"${idle.stats()} evicted ${idle.evictIdle()}")
+  sleep(millis(600))
+  println(s"evicted ${idle.evictIdle()} ${idle.stats()} destroyed ${gone.load()}")
+  println(s"evicted ${idle.evictIdle()}")
+  println(idle.use(a -> idle.use(b -> 0)))
+  sleep(millis(600))
+  println(idle.use(c -> 0))
+  println(s"by use ${idle.stats()} destroyed ${gone.load()}")
+
+  // No idle timeout: nothing is evicted, however long it waits.
+  val kept = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2, minIdle = 2)
+  println(kept.warm())
+  println(kept.warm())
+  sleep(millis(10))
+  println(s"evicted ${kept.evictIdle()} ${kept.stats()}")
+
+  // A failing make stops `warm`, keeping what it made before.
+  val tries = Atomic(0)
+  val partial = Pool[Conn, string](maxSize = 3, minIdle = 3, create = () ->
+    if tries.add(1) == 2 then Err("second make fails") else Ok(Conn(0)))
+  println(partial.warm())
+  println(partial.stats())
+  println(partial.warm())
+  println(partial.stats())
