@@ -8311,6 +8311,54 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
   cancellation token passed to every handler (every handler signature changes); leaving shutdown
   to the write timeout (a quiet stream would hold it for `writeTimeout`).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-websocket`): **An upgrade is a
+  `Response` too**: `Response.upgrade(protocol, take)` is a `101` carrying an `Upgrade`, and the
+  server, seeing one, writes the head with `Upgrade: protocol` and `Connection: Upgrade` and hands
+  `take` an `Upgraded` (the stream, the bytes it had read ahead past the request, the write limit,
+  and the server's `isStopping`/`untilStopped`), reading no more requests and closing the connection
+  once `take` returns; a trap in `take` closes it with no `500`. Why: routes, groups and middleware
+  apply to a WebSocket route unchanged, as they do to a streamed one, and the bytes read ahead are
+  not lost when a client sends its first frame with the handshake. Alternatives weighed: a separate
+  upgrade handler type on `Route` (middleware written twice); handing the raw `ByteStream` alone
+  (a frame read ahead with the request would vanish).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-websocket`): **WebSockets in
+  `avin.net.http`**: `webSocket(request, session, protocols, maxMessageBytes = 1 MiB, closeTimeout
+  = 5 s) -> Response` checks the handshake and answers `101`, `405` (not `GET`), `426` with
+  `Upgrade: websocket` (no upgrade to a WebSocket asked), `426` with `Sec-WebSocket-Version: 13`
+  (another version) or `400` (HTTP/1.0, no `Connection: Upgrade`, a key not sixteen bytes of
+  base64); the subprotocol chosen is the server's first that the client offers. `WebSocket.connect(url,
+  headers, protocols, tls, timeout, maxMessageBytes)` is the client, `ws` and `wss`. Both ends share
+  one `WebSocket`: `send(text)`, `send(bytes)`, `ping`, `receive()`, `receive(limit)`, `close(code,
+  reason)`, `isOpen`, `isStopping`, `untilStopped`, answering `Result[_, WebSocketError]` (`Closed(code,
+  reason)`, `Broken`, and for `connect` `Refused`, `BadHandshake`, `Unreachable`). Why: one module
+  with the HTTP server it upgrades from, and errors the program's control flow handles, as a
+  `BodyWriter`'s are. Alternatives weighed: an `avin.net.websocket` module (it needs the server's
+  private connection loop); a callback per message (`onText`, `onClose`; the session's own loop
+  reads more plainly and keeps its state in locals).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-websocket`): **What a WebSocket
+  does by itself**: a ping is answered with a pong as it arrives and a pong is passed over; a
+  fragmented message is put back together, control frames between its fragments answered; the size
+  limit is checked against a frame's declared length before its payload is read, so an oversized
+  message is refused without being buffered (`1009`); text is checked to be UTF-8 once the message
+  is whole (`1007`), and so is a close reason; a frame breaking the protocol (`1002`) — a client's
+  frame not masked or a server's masked, a reserved bit, an unknown opcode, a fragmented or long
+  control frame, a continuation with nothing to continue or a new message inside one, a close of
+  one byte or with a code no endpoint may send, a 64-bit length with its top bit set — fails the
+  connection: the close frame is sent and the connection closed at once. A close from the other end
+  is answered with its code (none for none, heard as `1005`) and the connection closed; this end's
+  `close` waits `closeTimeout` for the answer. A session returning with its WebSocket open closes it
+  with `1000`; a server stopping closes it with `1001` at its next receive (the wait being through
+  `idle`) or send; a peer going without a close is `Closed(1006, …)`. A frame's length need not be
+  in its fewest bytes, though this end writes it so; every message is sent as one frame; a client
+  masks each frame with four bytes from `SecureRandom`. Why: these are RFC 6455's rules where it
+  gives them, and where it leaves a choice (validating UTF-8 at the end rather than as fragments
+  arrive, accepting a longer-than-needed length) the simpler one that still refuses what it must.
+  Alternatives weighed: surfacing pings and pongs as messages (every session would answer them by
+  hand); validating UTF-8 per fragment (fails a bad message sooner, at more code). **Review with the
+  user:** a `WebSocket` belongs to one thread, as its stream does (a TLS stream checks its owner), so
+  a session that must send what another thread produces while also receiving polls with
+  `receive(limit)`; a `select`-like receive over a channel, or a sendable sending half, would be the
+  next step if a program needs one.
 - Settled on the user's delegation 2026-11-15 (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
   cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
   state word and the closure computing it, so a read is that cell's lazy field read: once on the

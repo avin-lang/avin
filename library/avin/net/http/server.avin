@@ -417,6 +417,9 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
       refuse(stream, 503, s)
       return
     val response = handler(request)
+    if response.upgraded is Some(upgrade)
+      upgradedOut(stream, server, response, upgrade, input.rest(), s, marks)
+      return
     val keep = keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
     val headOnly = request.method == "HEAD"
     val kept = response.streamed match
@@ -427,6 +430,34 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
         if marks then _ = s.streaming.release(stream)
         going
     if !kept then return
+
+// Sends the `101` of `response` and hands the connection to `upgrade`, with the bytes the client sent
+// after its request, which were read ahead; the connection is no longer HTTP's, so the server reads
+// no request after it. Where `marks`, it is held in `s.streaming` while `upgrade` has it, so a trap
+// there closes it without an HTTP `500` written into the other protocol.
+private upgradedOut(
+    stream: ByteStream,
+    server: TcpServer,
+    response: Response,
+    upgrade: Upgrade,
+    ahead: Array[byte],
+    s: Settings,
+    marks: bool
+)
+  val out = StringWriter()
+  out.write("HTTP/1.1 101 Switching Protocols\r\n")
+  out.write(s"Upgrade: ${upgrade.protocol}\r\nConnection: Upgrade\r\n")
+  for (name, value) in response.headers
+    checkHeader(name, value)
+    val own = name.equalsIgnoreCase("Content-Length") || name.equalsIgnoreCase(
+      "Transfer-Encoding"
+    ) || name.equalsIgnoreCase("Connection") || name.equalsIgnoreCase("Upgrade")
+    if !own then out.write(s"$name: $value\r\n")
+  out.write("\r\n")
+  if !(stream.setTimeout(s.writeTimeout).isOk && stream.write(utf8(out.text)).isOk) then return
+  if marks then s.streaming.hold(stream)
+  upgrade.take(Upgraded(stream, ahead, server, s.writeTimeout))
+  if marks then _ = s.streaming.release(stream)
 
 // Whether the client asks for its connection to stay open after this request: by default in
 // HTTP/1.1, unless `Connection: close`; in HTTP/1.0 only with `Connection: keep-alive`.
@@ -568,6 +599,9 @@ private class Incoming(private val stream: ByteStream)
         out.addOne(b)
       fill(limit)?
     Err(Quietly)
+
+  // The bytes read ahead and not yet handed out.
+  rest() -> Array[byte] = ahead.slice(at, ahead.length)
 
   // Exactly `n` bytes.
   bytes(n: int, limit: Duration) -> Result[Array[byte], Refusal]

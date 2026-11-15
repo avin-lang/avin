@@ -1677,6 +1677,83 @@ then is closed without an answer. **Shutting down**, the server answers the requ
 `Connection: close`, and one arriving on a kept-alive connection `503`; a connection waiting for its
 next request ends when its idle limit runs out, and `join()` waits for that.
 
+**Upgrades.** `Response.upgrade(protocol, take)` answers `101 Switching Protocols` with `Upgrade:
+protocol` and `Connection: Upgrade` (the protocol a token, else it traps), and once that head is
+sent the connection is no longer HTTP's: `take` is given an `Upgraded`, with its `stream`, the bytes
+the client sent after its request that the server had already read (`ahead`), the `writeTimeout`, and
+`isStopping()` and `untilStopped(wait)` as a request has them. No request is read after it, the
+connection is closed when `take` returns, and a `take` that traps closes it with nothing written.
+
+### WebSockets
+
+`webSocket(request, session)` answers a WebSocket handshake (RFC 6455) from a handler, and
+`WebSocket.connect(url)` opens one as a client; each end holds a `WebSocket` and the two speak alike:
+
+```text
+import avin.net.http
+import avin.net.http.{Binary, Route, Router, Text, WebSocket, webSocket}
+
+echo(ws: WebSocket)
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(Binary(b)) -> _ = ws.send(b)
+      Err(_) -> return
+
+main()
+  val router = Router([Route.get("/echo", r -> webSocket(r, echo))])
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+```
+
+`webSocket(request, session, protocols = [], maxMessageBytes = 1048576, closeTimeout = seconds(5))
+-> Response` checks the handshake and answers `101` with its `Sec-WebSocket-Accept`
+(`acceptKey(key)`, the base64 of the SHA-1 of the key and the protocol's GUID), then runs
+`session` with the WebSocket, closing it with `1000` if `session` returns leaving it open. Of
+`protocols`, the subprotocols the server speaks, the first the client offers in
+`Sec-WebSocket-Protocol` is chosen, answered and found in `ws.protocol`; none where the client
+offers none of them. A request that is not a handshake is answered without `session` running:
+`405` for a method other than `GET`; `426` with `Upgrade: websocket` where it does not ask to
+upgrade to a WebSocket; `426` with `Sec-WebSocket-Version: 13` for another version; `400` in
+HTTP/1.0, without `upgrade` in `Connection`, or with a `Sec-WebSocket-Key` that is not sixteen bytes
+of base64. A negative `maxMessageBytes` traps. A route is otherwise an ordinary route, under groups
+and middleware alike, and it works over TLS as every route does.
+
+`WebSocket.connect(url, headers = [], protocols = [], tls = TlsClient(), timeout = seconds(30),
+maxMessageBytes = 1048576) -> Result[WebSocket, WebSocketError]` opens `ws://` and `wss://` URLs,
+the latter over TLS checked as an `https` request's is, sending `headers` and offering `protocols`
+in the handshake; `timeout` limits each wait of the handshake and each write after it.
+
+A `WebSocket` sends `send(text)` and `send(bytes)` as one message each, `ping(payload = [])` (at most
+125 bytes, else it traps), and `close(code = 1000, reason = "")`, which sends the close frame, waits
+the close timeout for the other end's answer and closes the connection; a code is 1000 to 1003, 1007
+to 1014 or 3000 to 4999 and a reason at most 123 bytes of UTF-8, either trapping where it is not.
+`receive()` answers the next `Message`, `Text(text)` or `Binary(bytes)`, waiting as long as it
+takes; `receive(limit)` answers `Ok(None)` where no whole message has arrived by then, keeping a
+message that arrived in part. `isOpen()` says whether it can still be used, and `isStopping()` and
+`untilStopped(wait)` are the server's, a client's never stopping. A `WebSocket` belongs to the code
+it was given to, as its connection does.
+
+While it receives, a WebSocket keeps the protocol by itself: a ping is answered with a pong at once
+and a pong passed over, a message arriving in fragments is put back together with control frames
+answered between them, and a close from the other end is answered with its code, the connection
+closed, and the receive answers `Err(Closed(code, reason))` (`1005` for a close giving no code).
+Every send and receive after the WebSocket is closed answers the same error. A server stopping
+closes its WebSockets with `1001` at their next receive, which waits through `idle`, or send.
+
+| Close | When this end closes with it |
+| --- | --- |
+| `1002` | A client's frame not masked or a server's masked; a reserved bit set; an unknown opcode; a control frame fragmented or over 125 bytes; a continuation with no message to continue, or a new message inside a fragmented one; a close frame of one byte or with a code no endpoint may send; a 64-bit length with its top bit set |
+| `1007` | A text message, or a close reason, that is not UTF-8, checked once the message is whole |
+| `1009` | A message longer than `maxMessageBytes`, refused by its frames' lengths before their payloads are read |
+| `1001` | The server is stopping |
+
+A frame breaking the protocol fails the connection: the close frame is sent and the connection
+closed at once. A `WebSocketError` is `Closed(code, reason)`, which also reports `1006` where the
+other end went without a close; `Broken(error)`, the connection having failed; and, from `connect`,
+`Refused(status, reason)` for an answer other than `101`, `BadHandshake(text)` for a `101` that is
+not a WebSocket server's (an accept key not the key's, no `Upgrade: websocket`, a subprotocol not
+offered), and `Unreachable(error)`, the URL, the connection or its TLS failing as an `HttpError`.
+
 ### `Url`
 
 `import avin.net.Url` brings in a URL as RFC 3986 reads a URI. `Url.parse(text) -> Result[Url,
