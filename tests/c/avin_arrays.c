@@ -63,6 +63,25 @@ int aa_load(long tag, long offset, uint8_t *buf, unsigned long *len) {
 
 void aa_overrun(uint8_t *buf, size_t *len) { (void)buf; *len = *len + 1; }
 
+void aa_void_fill(void *p, int c, size_t n) { memset(p, c, n); }
+
+long long aa_void_sum(const void *p, size_t n) {
+    const unsigned char *b = p;
+    long long s = 0;
+    for (size_t i = 0; i < n; i++) s += b[i];
+    return s;
+}
+
+long long aa_void_sum_two(const void *a, size_t na, const void *b, int nb) {
+    return aa_void_sum(a, na) * 1000 + aa_void_sum(b, (size_t)nb);
+}
+
+void aa_void_take(void *buf, size_t *len) { aa_take(buf, len); }
+
+void aa_void_overrun(void *buf, size_t *len) { (void)buf; *len = *len + 1; }
+
+int aa_void_null(const void *p, size_t n) { return p == NULL ? (n == 0 ? -1 : -2) : (int)n; }
+
 void aa_squares(int *buf, int *len) {
     int half = *len / 2;
     for (int i = 0; i < half; i++) buf[i] = i * i;

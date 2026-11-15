@@ -875,6 +875,52 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   private getFrame(index: int) -> Result[Frame, int]
   ```
 
+### Memory of no type
+
+**A `void *` or `const void *` parameter takes an array of any element type an array crosses as, or
+a `ByteBlock`, and its length counts bytes** ([settled](/spec/decisions/#settled)). C's untyped
+buffers are memory whose type the caller chooses: `sysctlbyname` writes an `int` or a `long`, `write`
+reads any bytes. So an `Array[byte]`, `Array[int]`, `Array[long]` or `Array[real]` goes to the pointer
+as it is, its elements where they are, and the header has no element type to check. The parameter
+marked `length(p)` is told the array's length times the size of its element, as a `long`, converted
+to the parameter's C type as any `long` argument is; an `inout` length C writes back through is in
+bytes too, and stops the program where it exceeds the array's bytes. C writes through `void *`, and
+what it wrote is in the array after the call, and only reads through `const void *`. An `Option` of
+the array passes null and a length of zero for `None`, and a `void *` marked `null` is passed null.
+A `ByteBlock` is passed as a pointer to its bytes, as to any pointer.
+
+```avin
+@c(
+  "int sysctlbyname(const char *name, void *oldp, length(oldp) inout size_t *oldlenp, null void *newp, size_t newlen)"
+)
+private sysctlRaw(name: string, into: Array[int], newlen: long) -> (int, long)
+
+// The `int` the kernel holds under `name`, where it holds one.
+sysctlInt(name: string) -> Option[int] =
+  val v = Array.fill(1, 0)
+  sysctlRaw(name, v, 0) match
+    (0, 4) -> Some(v(0))
+    _ -> None
+```
+
+`sysctlInt("kern.maxfilesperproc")` answers the limit; the same binding over an `Array[long]` reads
+`hw.memsize`, and asked with `None` for the array (bound as an `Option`), C answers the size it
+needs. The header check holds a `void *` to the header's type as it holds every pointer, so a binding
+saying `const void *` where the header writes `void *` is refused, and so is one saying `void *`
+where the header writes a typed pointer. What is still refused:
+
+- **an array whose length no parameter carries**, as everywhere: `memcmp(const void *a, const void
+  *b, size_t n)` carries one length for two, and its second array is refused;
+- **`out` and `inout` on a `void *`**: C writes no value of a type through one (`` C writes no value
+  through `out void *p`, which points at memory of no type ``), so the memory is an array or a block
+  passed in;
+- **anything else for a `void *` parameter**: a scalar, a string or an array of strings (`` `const
+  void *` points at memory of no type, so it takes an `Array[byte]`, `Array[int]`, `Array[long]` or
+  `Array[real]`, its length in bytes carried by the parameter marked `length(buf)`, or a
+  `ByteBlock` ``);
+- **a `void *` result**, whose length nothing says, except that a binding answering `unit`
+  discards it.
+
 ## Buffers
 
 Pixels and samples are memory C owns, often megabytes of it, valid while the object that owns them
@@ -1137,7 +1183,7 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
 | Refused | Instead |
 | --- | --- |
 | A variadic function (`...`) | A fixed-arity function the library offers, or a C wrapper the package carries ([proposed](/spec/decisions/#proposed)) |
-| `void *` other than a callback's `userdata` | A handle on a typed pointer |
+| `void *` other than a callback's `userdata` or a parameter taking an array or a `ByteBlock` ([memory of no type](#memory-of-no-type)) | A handle on a typed pointer |
 | A pointer type in Avin code | Handles, arrays, out parameters and views |
 | A function pointer C answers | Bind the C functions it would point at |
 | `long double`, `_Complex`, vector types, `va_list` | — |

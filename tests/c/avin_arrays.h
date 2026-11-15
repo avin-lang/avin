@@ -60,6 +60,17 @@ void aa_take(uint8_t *buf, size_t *len);
 int aa_load(long tag, long offset, uint8_t *buf, unsigned long *len);
 /* Answers one more than it was told, which the binding must refuse. */
 void aa_overrun(uint8_t *buf, size_t *len);
+
+/* Memory of no type, through `void *`: `n` bytes set to `c`; `n` bytes summed, each as an unsigned
+ * byte; the two summed in one call; the first `*len` bytes of the table copied, or, for null, its
+ * length asked, as `aa_take`; one more byte answered than it was told, which the binding must
+ * refuse; and -1 for null with a length of zero, -2 for null with any other, or the length. */
+void aa_void_fill(void *p, int c, size_t n);
+long long aa_void_sum(const void *p, size_t n);
+long long aa_void_sum_two(const void *a, size_t na, const void *b, int nb);
+void aa_void_take(void *buf, size_t *len);
+void aa_void_overrun(void *buf, size_t *len);
+int aa_void_null(const void *p, size_t n);
 /* Squares into the first half of `buf`, and answers that half's length, through an `int`. */
 void aa_squares(int *buf, int *len);
 /* Answers a length an `int` cannot hold. */
