@@ -771,8 +771,8 @@ Settled by the user on 2026-11-03:
   to a line in a block after `for`, a line starting with `if` guarding the generator above, with
   `yield` on the line after the block. `yield` is a keyword. A `for` without `yield` keeps one
   generator and no guards.
-- A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
-  of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
+- A guard is `withFilter`, a lazy view each collection provides; on a source that is no `Iterable`
+  it is `Filter`'s `filter` (see the entry on comprehensions by conformance). `flatMap` on
   the library's collections takes any `Iterable` from its function, or an `Option` (see the
   entry on `flatMap` with options, branch `map-flatmap`); a `Range` maps to a `Vector`;
   a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
@@ -8476,6 +8476,30 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   A conformance had held `T` to `Sendable` as an ordinary trait argument, against the spec's
   "bounded by no more than `Sendable`". Alternatives: none that keep `Future` a `SendableMonad`
   with its parameter unbounded.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-8`): **a value bounded by two
+  traits that reach one method, one of them overriding it, has the override alone**: with
+  `F[_]: Monad & Filter`, `fa.map` is `Monad`'s default, not also the `Functor` method `Filter`
+  requires; with `T: Loud & Quiet` over `Base`, `describe` is `Loud`'s override. The calls had
+  been reported ambiguous, so the spec's `F[_]: Monad & Filter` took no comprehension. Why: a
+  type conforming to both has the override as its one method, so the bound has it too, as a type
+  inheriting both already did (`unreplaced`). Alternatives: none; the ambiguity was a bug.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-8`): **the views
+  `withFilter` makes conform to `Iterable`**, each by an `iterator()` that tests the source's
+  elements as they are reached; their own `map`, `flatMap`, `withFilter` and `foreach` are
+  kept, so a comprehension's result is the collection's as before. Why: the spec says the calls
+  after a guard are on an `Iterable`; a view may now be held as one, looped over and folded.
+  Alternatives: leaving the views outside the hierarchy (a guard's result could not be passed
+  where an `Iterable` is wanted).
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-8`): **a refused
+  comprehension source names the fix only where the module can make it**: `declare impl Monad for
+  Box` for a type of one parameter declared in the module being checked, "declare an impl of
+  `Monad` for `Pair` at the parameter it holds its elements in" for one of more, "a type of no
+  parameters is a source only as an `Iterable`" for one of none, "add `Monad` to the bounds of
+  `F`" in generic code, and nothing for another module's type (`Result`'s missing `Filter`), whose
+  impl the module rule puts out of reach. The source is named where it is a name (`` `box` is a
+  `Box[int]` ``), "this source" otherwise; a guard's refusal is reported at the guard. A source
+  is checked for its roles before any call on it, and a refused one checks nothing after it.
+  Alternatives: always suggesting an impl (wrong advice for a library type).
 
 ## Proposed
 
@@ -9425,8 +9449,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the structural rule admitted any type with methods of those names. Alternatives: keeping the
   structural rule (contradicts the rule); desugaring every comprehension through the traits'
   members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
-  visible change in the order of evaluation). Review with the user: it breaks programs whose own
-  types relied on the structural rule, each fixed by one `impl`.
+  visible change in the order of evaluation). Built on branch `hkt-8` (`admitted_source` in
+  `check.sysl`; `tests/run/for_yield_conformance{,_gc}.avin`, `tests/reject/for_yield_roles{,_more}.avin`,
+  `tests/reject/for_yield_generator_mismatch.avin`), with a definition a guard follows asking
+  `Monad` of its source, as the collections chapter says, though its `map` and `filter` would
+  need only `Functor` and `Filter`. Review with the user: it breaks programs whose own
+  types relied on the structural rule, each fixed by one `impl`; and whether a guarded definition
+  should ask only `Functor`.
 - Decided by the user 2026-11-14: **a built-in type's name in a pattern is a type pattern**:
   `x is int` tests the type and an arm `int ->` matches an int, for every name in the table of
   built-in types, the sized integers `iN` included; generic forms stay `_: Vector[int]`; a name
