@@ -1,0 +1,118 @@
+// expect: exit 0
+// A cancelled thread runs its deferred statements wherever its cancellation stops it, as it would
+// leaving their blocks any other way: parked in a sleep, a channel's receive, a join, a `select`, a
+// socket's read, a mutex's condition, and at the poll of a loop that never waits. A thread waiting
+// for a mutex's lock is not stopped there; it takes the lock, runs the body, and stops at its next
+// cancellation point. Inside a mutex's `with`, a cancelled condition wait stops the thread holding the
+// lock again: the body's own deferred statements run under it, and the mutex is free afterwards.
+// Nothing after a cancellation point runs.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Atomic, Channel, Condition, Mutex, Thread, scope, sleep, spawn}
+import avin.time.{hours, millis}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+sleeper(log: Channel[string], started: Atomic[int])
+  defer log.send("sleep")
+  started.add(1)
+  sleep(hours(1))
+  log.send("sleep went on")
+
+receiver(log: Channel[string], started: Atomic[int], idle: Channel[int])
+  defer log.send("receive")
+  started.add(1)
+  val got = idle.receive()
+  log.send(s"received $got")
+
+joiner(log: Channel[string], started: Atomic[int], t: Thread[int])
+  defer log.send("join")
+  started.add(1)
+  val n = t.join()
+  log.send(s"joined $n")
+
+selector(log: Channel[string], started: Atomic[int], a: Channel[int], b: Channel[int])
+  defer log.send("select")
+  started.add(1)
+  select
+    a.receive() -> log.send("a")
+    b.receive() -> log.send("b")
+  log.send("selected")
+
+reader(log: Channel[string], started: Atomic[int], s: TcpStream)
+  defer log.send("socket")
+  started.add(1)
+  val line = s.readLine()
+  log.send(s"read ${line.isOk}")
+
+spinner(log: Channel[string], started: Atomic[int])
+  defer log.send("poll")
+  started.add(1)
+  var n = 0
+  while n >= 0 do n = (n + 1) % 1000
+  log.send("spun out")
+
+waiter(log: Channel[string], started: Atomic[int], m: Mutex[Buffer[string]], ready: Condition)
+  defer log.send("condition")
+  m.with(q ->
+    defer q.append("body's deferred statement")
+    started.add(1)
+    while q.isEmpty do ready.wait()
+    q.append("woken"))
+
+locker(log: Channel[string], started: Atomic[int], m: Mutex[Buffer[string]])
+  defer log.send("lock")
+  started.add(1)
+  m.with(q -> q.append("took the lock"))
+  sleep(hours(1))
+  log.send("slept with the lock")
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val client = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val server = ok(l.accept())
+  val log = Channel[string](64)
+  val started = Atomic(0)
+  val idle = Channel[int]()
+  val a = Channel[int]()
+  val b = Channel[int]()
+  val m = Mutex(Buffer[string]())
+  val ready = m.condition()
+  val held = Mutex(Buffer[string]())
+  val holding = Atomic(0)
+  val release = Channel[int](1)
+  scope(s ->
+    s.spawn(() -> sleeper(log, started))
+    s.spawn(() -> receiver(log, started, idle))
+    val forever = s.spawn(() ->
+      sleep(hours(1))
+      7)
+    s.spawn(() -> joiner(log, started, forever))
+    s.spawn(() -> selector(log, started, a, b))
+    s.spawn(() -> reader(log, started, server))
+    s.spawn(() -> spinner(log, started))
+    s.spawn(() -> waiter(log, started, m, ready))
+    // The lock is held by a thread outside the scope while the locker waits for it.
+    val owner = threadsSpawn(held, holding, release)
+    while holding.load() == 0 do sleep(millis(1))
+    s.spawn(() -> locker(log, started, held))
+    while started.load() < 8 do sleep(millis(1))
+    sleep(millis(30))
+    s.cancel()
+    release.send(1)
+    owner.join())
+  var lines: Buffer[string] = Buffer()
+  while log.tryReceive() is Some(line) do lines.append(line)
+  for line in lines.toVector.sorted do println(line)
+  println(m.with(q -> q.toVector))
+  println(held.with(q -> q.toVector))
+  ok(client.writeText("after\n"))
+  println(server.readLine().isOk)
+
+threadsSpawn(held: Mutex[Buffer[string]], holding: Atomic[int], release: Channel[int]) -> Thread[unit] =
+  spawn(() -> held.with(q ->
+    holding.store(1)
+    _ = release.receive()
+    q.append("owner")))

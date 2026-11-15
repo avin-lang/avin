@@ -19,7 +19,7 @@ the standard library — in one run.
 | Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
 | C unit | `@c` declarations → C unit object + measurements | Generates one C file of header checks, measurements and glue, compiles it with clang under the C libraries' flags, and reads the measurements out of the object ([stage 13](/compiler/roadmap/)). |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
-| Lower | mono HIR → MIR | Explicit control flow (a deferred statement lowered again at every edge that leaves its block), object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
+| Lower | mono HIR → MIR | Explicit control flow (a deferred statement's closure put on the thread's list where it is reached, and the block's own run from the list at every edge that leaves its block), object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
 | Link | `.ll` + runtime + shim → executable | The module cut into codegen units, each compiled by its own clang at once and its object cached by its text; then clang links the objects, the runtime library, the cached shim library, the C unit's object and the C libraries' link flags. |
 
@@ -1331,7 +1331,10 @@ channel's receive or send, a future or an executor's work), `condition_wait`, `c
 waiting writers, a barrier's arrivals): it takes a limit in milliseconds or none, and answers
 woken, out of time, or cancelled, a cancellation ending it with the lock held again instead of
 stopping the thread, so the library takes the waiter's mark back, lets the lock go and reaches
-`cancel_point`, which stops it. A share others wait for (a read-write lock's read or write, a
+`cancel_point`, which stops it. A mutex's condition waits the settling way too, and on a
+cancellation reaches `cancel_point_held`, which stops the thread still holding the lock: the
+deferred statements it runs as it stops (`defers.sysl`) include `with`'s own, which lets the lock go
+last. A share others wait for (a read-write lock's read or write, a
 semaphore's permit in `withPermit`) is taken under the library's lock, which `lock_release_holding`
 lets go while staying in the region in doubt taking it entered; `cancel_guarded_held` then runs the
 body and the closure giving the share back, and leaves the region. Nothing can stop the thread

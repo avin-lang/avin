@@ -1,0 +1,69 @@
+// expect: exit 0
+// A cancelled thread running a scope stops first at that scope: the scope body's own deferred
+// statements run as its frames are dropped, then the scope cancels its threads and waits for them,
+// each running its own, and only then do the deferred statements of the functions around the scope
+// run. `withTimeout` cancels its body and the body's threads when the time runs out, and each runs
+// its deferred statements. A scope an actor's turn runs and cancels is no different: its threads run
+// theirs, and the turn's own run as the turn ends.
+import avin.actors.spawn
+import avin.threads.{Atomic, Channel, Promise, scope, sleep, withTimeout}
+import avin.time.{hours, millis}
+
+child(log: Channel[string], started: Atomic[int], name: string)
+  defer log.send(s"$name child")
+  started.add(1)
+  sleep(hours(1))
+
+parent(log: Channel[string], started: Atomic[int])
+  defer log.send("parent function")
+  scope(s ->
+    defer log.send("parent scope body")
+    s.spawn(() -> child(log, started, "scope's"))
+    started.add(1)
+    sleep(hours(1)))
+  log.send("parent went on")
+
+drain(log: Channel[string]) -> Vector[string]
+  var lines: Buffer[string] = Buffer()
+  while log.tryReceive() is Some(line) do lines.append(line)
+  lines.toVector
+
+data Msg
+  Run(done: Promise[unit])
+
+actor Host(log: Channel[string]) receives Msg
+  receive
+    Run(done) ->
+      defer done.complete(())
+      defer log.send("turn")
+      val started = Atomic(0)
+      val out = log
+      scope(s ->
+        s.spawn(() -> child(out, started, "turn's"))
+        while started.load() == 0 do sleep(millis(1))
+        s.cancel())
+
+main()
+  val log = Channel[string](64)
+  val started = Atomic(0)
+  scope(s ->
+    s.spawn(() -> parent(log, started))
+    while started.load() < 2 do sleep(millis(1))
+    s.cancel())
+  for line in drain(log) do println(line)
+  val timedOut = withTimeout(millis(30), s ->
+    defer log.send("timed out body")
+    s.spawn(() -> child(log, started, "timed out body's"))
+    sleep(hours(1))
+    1)
+  println(timedOut)
+  for line in drain(log).sorted do println(line)
+  val inTime = withTimeout(hours(1), s ->
+    defer log.send("body in time")
+    2)
+  println(inTime)
+  for line in drain(log) do println(line)
+  val done = Promise[unit]()
+  spawn(Host(log)).tell(Run(done))
+  done.future.await()
+  for line in drain(log) do println(line)

@@ -74,6 +74,11 @@ private val waitCancelled = 2
 @intrinsic("cancel_point")
 private cancelPoint()
 
+// `cancelPoint` for a thread holding one lock: it stops holding it, for a deferred statement to let
+// it go.
+@intrinsic("cancel_point_held")
+private cancelPointHeld()
+
 @intrinsic("condition_notify")
 private conditionNotify(condition: Any)
 
@@ -146,6 +151,15 @@ private class Lock(): Sendable
     holder = me
     ended
 
+  // `await` for a condition of a mutex, for at most `millis` milliseconds or with no limit where it is
+  // negative, answering whether a notification ended it. A cancellation that ends the wait stops the
+  // thread holding the lock again, so the deferred statements of the body waiting run under it, and
+  // `with`'s own lets it go after them.
+  awaitHeld(condition: Any, millis: long) -> bool
+    val ended = awaitSettling(condition, millis)
+    if ended == waitCancelled then cancelPointHeld()
+    ended == waitWoken
+
   // Lets the lock go and stops the thread, whose cancellation ended a settling wait, once its state
   // is put right.
   releaseCancelled() -> Nothing
@@ -174,7 +188,7 @@ class Mutex[T](@isolating private var value: T): Sendable
     body(value)
 
   // A new condition to wait for with this mutex held.
-  condition() -> Condition = Condition(lock)
+  condition() -> Condition = Condition(lock, PlainWait, true)
 
 // A sendable value may leave the lock and be put back whole, since no thread can change it.
 impl[T: Sendable] Mutex[T]
@@ -198,23 +212,29 @@ impl[T: Sendable] Mutex[T]
 //     while queue.isEmpty() do ready.wait()
 //
 // A condition is made by its mutex's `condition()` and waited for with that mutex only; waiting from a
-// thread that does not hold it traps. Like its mutex, it may be shared between threads.
+// thread that does not hold it traps. Like its mutex, it may be shared between threads. A
+// cancellation that ends a wait stops the thread holding the mutex again, so the deferred statements
+// of the `with` body run under it, and the `with` lets it go after them.
 @trusted_sendable("its handle is a runtime condition, made to be waited on and notified from any thread")
 @keeps_owners
-class Condition(private val lock: Lock, kind: int = 2): Sendable
+class Condition(private val lock: Lock, kind: int = 2, private val held: bool = false): Sendable
   private val handle = if kind == PlainWait then conditionNew() else conditionNewKind(kind)
 
   // Lets the mutex go, sleeps until notified, and holds the mutex again.
-  wait() = lock.await(handle)
+  wait()
+    if held then _ = lock.awaitHeld(handle, -1) else lock.await(handle)
 
   // `wait` for at most `timeoutMillis` milliseconds: `false` where the time ran out before a
   // notification, `true` where the wait ended sooner, which may also be with nothing having changed.
   // A time that is not positive answers `false` at once, holding the mutex throughout.
-  waitFor(timeoutMillis: long) -> bool = lock.awaitFor(handle, timeoutMillis)
+  waitFor(timeoutMillis: long) -> bool =
+    if !held then lock.awaitFor(handle, timeoutMillis)
+    elif timeoutMillis <= 0 then false
+    else lock.awaitHeld(handle, timeoutMillis)
 
   // `wait` for at most `timeout`, as `waitFor(timeoutMillis)` does, a part of a millisecond waited
   // for as a whole one.
-  waitFor(timeout: Duration) -> bool = lock.awaitFor(handle, waitMillis(timeout))
+  waitFor(timeout: Duration) -> bool = waitFor(waitMillis(timeout))
 
   // Wakes one thread waiting, if any is.
   notify() = conditionNotify(handle)

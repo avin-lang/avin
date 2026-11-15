@@ -93,6 +93,12 @@ struct Context
      * itself, read by the thread dump and the deadlock report. */
     waits: Atomic[u32]
     waits_since: Atomic[long]
+    /** The deferred statements the thread has reached and not yet run, the newest last: closures
+     * that take nothing and return nothing, roots of every collection (`defers.sysl`). `defer_room`
+     * is how many the storage holds. */
+    defers: **u8
+    defer_count: usize
+    defer_room: usize
 
 @assert(offsetof(Context, caller) == 24, "the compiler writes a context's caller site at 24")
 @assert(offsetof(Context, owner) == OwnerOffset, "the compiler reads a context's owner at 32")
@@ -104,7 +110,7 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0))
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0)
 
 /** One operating system thread's state: the chunk of the heap that the contexts running on the thread
  * allocate from with no lock, and, on a worker of the scheduler, what the scheduler keeps about the
@@ -244,6 +250,7 @@ private roots(h: *gc.Heap)
     var c = contexts
     while c != null
         mark_frames(h, c.top)
+        mark_defers(h, c)
         c = c.next
 
 /** The frames of module-level values, linked through `prev`: each program's references that live
@@ -446,6 +453,7 @@ private unlink_carrier(k: *Carrier)
 
 /** Under the heap lock: takes `c` out of the list of contexts; one that is not in it is left alone. */
 unlink(c: *Context)
+    drop_defers(c)
     if c.prev != null
         c.prev.next = c.next
     elif contexts == c

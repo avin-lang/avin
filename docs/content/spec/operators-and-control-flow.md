@@ -881,6 +881,19 @@ the value of a `return` included, is a real call, and `@tailrec` refuses it.
 **A trap runs nothing.** A trap stops the program, or the actor's turn, where it happens, without
 running the deferred statements of the functions it stops: the program's state is already wrong, and
 cleanup run against it could do harm. An actor's `stopping` block still runs, as for any failed turn.
-A thread stopped by [cancellation](/spec/threads/#cancellation) and a program ended by
-`process.exit` run none either; a file or a connection left open then is closed when the collector
-frees it.
+A program ended by `process.exit` runs none either; a file or a connection left open then is closed
+when the collector frees it.
+
+**A cancelled thread runs them all.** [Cancellation](/spec/threads/#cancellation) stops a thread at
+a known point, a wait or a loop's poll, where nothing is in doubt, so the deferred statements of
+every frame it drops run there, innermost first, as leaving their blocks any other way would run
+them: a cancelled query can still tell its server, a transaction roll back, a lease go back to its
+pool. A deferred statement runs to its end once begun: the cancellation does not stop it inside one,
+even where it waits, and the thread stops at its next cancellation point after. One that traps stops
+the program.
+
+```text
+fetch(pool: Pool[Conn, IoError]) -> Result[Rows, PoolError[IoError]] = pool.use(c ->
+  defer c.cancelIfBusy() // runs if the thread is cancelled while the query waits
+  c.query("select ..."))
+```

@@ -1,0 +1,51 @@
+// expect: exit 0
+// A cancellation runs the deferred statements of every frame it drops, innermost first, exactly as
+// leaving their blocks one by one would: the nested blocks of one function, the functions that called
+// it, a loop's body (only the iterations reached, each once), a lambda's and a generic function's
+// own. Each deferred statement sees the variables it captured as they are when it runs, not as they
+// were at the `defer`. One whose block was left before the cancellation has already run, and does
+// not run again; one not yet reached does not run at all.
+import avin.threads.{Atomic, Channel, scope, sleep}
+import avin.time.{hours, millis}
+
+inner(log: Channel[string], started: Atomic[int])
+  defer log.send("inner function")
+  if started.load() >= 0
+    defer log.send("inner if block")
+    started.add(1)
+    sleep(hours(1))
+  defer log.send("never reached")
+
+middle(log: Channel[string], started: Atomic[int])
+  var state = "starting"
+  defer log.send(s"middle sees $state")
+  for i in 0 ..< 3
+    defer log.send(s"iteration $i")
+    if i == 2
+      state = "running"
+      inner(log, started)
+  log.send("middle went on")
+
+wrapped[T: Display](log: Channel[string], value: T, body: () -> unit)
+  defer log.send(s"generic holding $value")
+  body()
+
+outer(log: Channel[string], started: Atomic[int])
+  defer log.send("outer")
+  block(log)
+  wrapped(log, 42, () ->
+    defer log.send("lambda")
+    middle(log, started))
+
+block(log: Channel[string])
+  defer log.send("already left")
+  ()
+
+main()
+  val log = Channel[string](64)
+  val started = Atomic(0)
+  scope(s ->
+    s.spawn(() -> outer(log, started))
+    while started.load() == 0 do sleep(millis(1))
+    s.cancel())
+  while log.tryReceive() is Some(line) do println(line)

@@ -69,7 +69,10 @@ one it starts from then on; the scope still returns only once all of them have e
 goes on running after the call. What a program can rely on:
 
 - **A cancelled thread stops at its next cancellation point** and ends with no result: nothing of its
-  body runs after that point. Its `result() -> Option[T]` answers `None`, and its `join()` traps,
+  body runs after that point but its [deferred statements](/spec/operators-and-control-flow/#defer),
+  which run there, innermost first, as its frames are dropped. A deferred statement runs to its end
+  once begun: its own waits are not cancellation points while it runs, and a cancellation that comes
+  meanwhile stops the thread at its next cancellation point after. Its `result() -> Option[T]` answers `None`, and its `join()` traps,
   since there is no value to give back; a thread that finished before its cancellation reached it
   keeps its result, and `join` answers it as before. A thread started in a cancelled scope runs
   nothing.
@@ -87,16 +90,19 @@ goes on running after the call. What a program can rely on:
   action, while it initializes a `lazy val`, while it runs what
   waits for a future it completed. It goes on to the end of that region and stops at its first
   cancellation point after, so a cancelled thread never leaves a mutex held or a value half made. Waiting
-  for a lock is not a cancellation point; waiting on a condition is, and a thread stopped there does
-  not take its mutex again. A wait that left a mark on what it waits for takes it back as it stops:
+  for a lock is not a cancellation point; waiting on a condition is, and a thread stopped there takes
+  its mutex again, so the deferred statements of the `with` body run under it, and `with` lets it go
+  after them. A wait that left a mark on what it waits for takes it back as it stops:
   a writer or a reader waiting for a `RwLock` no longer holds back those behind it, and a party
   waiting at a `Barrier` withdraws its arrival. A thread stopped inside a `RwLock`'s read body or a
   semaphore's `withPermit` body gives its share of the lock, or its permit, back as it stops, as one
   inside a pool's `use` or `lease` body gives its resource back; what
   such a body was doing is its own, as any cancelled code's is.
 - **Cancellation reaches down through scopes.** A cancelled thread that is running a scope of its own,
-  in that scope's body or waiting for its threads, stops first at that scope: the inner scope cancels
-  its threads and waits for them to end, and only then does the thread go on stopping. So every
+  in that scope's body or waiting for its threads, stops first at that scope: the scope body's
+  deferred statements run, the inner scope cancels its threads and waits for them to end, each
+  running its own, and only then does the thread go on stopping, running those of the functions
+  around the scope. So every
   thread below a cancelled scope has ended once that scope returns. Cancelling an inner scope cancels
   only its own threads. A scope opened while its thread holds a lock is not cancelled with that
   thread, since nothing stops the thread there: its threads finish, and the thread stops once it has

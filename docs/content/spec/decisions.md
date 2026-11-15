@@ -7494,10 +7494,45 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     one-line branch or in a class body it is refused. While one waits, nothing is in tail position,
     so `@tailrec` refuses a self-call there. `defer` becomes a keyword (one test function named
     `defer` was renamed).
-  - **A trap, a cancelled thread and `process.exit` run no deferred statement.** There is no
-    unwinding; files and connections left open are closed by the collector's finalizers.
-  - **Lowering emits each deferred statement at every edge that leaves its block** (`lower.sysl`'s
-    `run_defers`), as Sysl does: no run-time list, no cost where nothing is deferred.
+  - **A trap and `process.exit` run no deferred statement.** There is no unwinding; files and
+    connections left open are closed by the collector's finalizers.
+  - Settled on the user's delegation 2026-11-15 (built on branch `defer-on-cancel`): **a cancelled
+    thread runs its deferred statements**, innermost first, as at any other way out of their blocks,
+    wherever its cancellation stops it (a wait, a safepoint poll), and then its frames are dropped
+    as before. A thread running a scope stops first at that scope: the scope body's deferred
+    statements run, the scope cancels its threads and waits for them (each running its own), then the
+    functions around the scope run theirs. **A deferred statement runs to its end once begun**: the
+    thread's cancellation does not stop it inside one (its own waits are not cancellation points
+    while it runs, as while a lock is held), and one that comes meanwhile stops the thread at its next
+    cancellation point after; one that traps stops the program, as any trap. **A cancelled wait on a
+    mutex's condition stops the thread holding the lock again**, so a `with` body's deferred
+    statements run under it and `with`'s own `defer` lets it go; the library's internal conditions
+    still stop without the lock, as their code expects. `Pool`'s putting back what a cancelled call
+    held is now a `defer`.
+    *Why*: cancellation stops a thread at a known point, a wait or a poll, in a consistent state,
+    unlike a trap. Without it no library or package can clean up after a cancelled task: found
+    writing a PostgreSQL client, where a cancelled query must send a CancelRequest, a cancelled
+    `transaction(f)` must roll back, and a pool lease or a `Mutex.with` must be given back.
+    *Alternatives weighed*: a public `onCancel(cleanup)(body)` in `avin.threads` (a second mechanism
+    beside `defer`, and lambdas again, with the `return`/`?`/`break` problem `defer` was chosen to
+    avoid); leaving it (no cleanup at all after a cancellation); running a deferred statement with
+    cancellation live (a cleanup that waits could itself be cut off half done).
+  - **Each deferred statement is its closure, put on the thread's list where the `defer` is
+    reached** (`lower.sysl`'s `Defer`, `runtime/avin/rt/defers.sysl`): every way out of the block runs
+    the block's own from the list, newest first, and a cancellation runs every one reached since the
+    cancellation point it returns to before it drops their frames; a trap in an actor's turn drops
+    the ones it passes unrun. A function that defers nothing never touches the list. The checker
+    checks the statement as a lambda of no parameters that no jump may leave, so a `var` it reads is
+    shared as a captured one is. *Why*: the cancellation unwinds by returning to the cancellation
+    point past every frame between, so what those frames deferred must be reachable from the thread
+    itself; a list costs a closure and two runtime calls per deferred statement and nothing anywhere
+    else. *Alternatives weighed*: emitting each deferred statement inline at every exit, as before,
+    and a landing pad per function that defers (a `setjmp` in every such call, with the locals it
+    reads unreliable after the return); a frame-local record pointing at a compiled cleanup function
+    (no allocation, but a new kind of stack object for the collector and the code generator).
+    **Review with the user**: deferred statements now allocate a closure where they capture
+    anything, a cost on the ordinary path (`Mutex.with` among them); a later pass could emit them
+    inline again where no cancellation point can be reached between the `defer` and its block's end.
   - **`trait io.Close { close() -> Result[unit, IoError] }`**, closing twice answering `Ok`:
     `fs.File` (unchanged), the new `fs.TempDir` from `fs.tempDir(prefix)` (`close` removes the tree),
     every `net.ByteStream`, `TcpListener` and `UnixListener` (their `close` now answers `Ok(())`
@@ -7518,9 +7553,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     statements on a trap (unwinding through a broken state); a `Close` whose `close` answers `unit`
     (would drop `File.close`'s flush error and a `TempDir`'s removal error); `use x = e` binding sugar
     over `defer x.close()` (left for later; `defer` covers it in one more line).
-  - **Review with the user**: whether a cancelled lightweight thread should run its deferred
-    statements (it needs cancellation points compiled as exits); whether discarding a `close`'s
-    `Result` in `defer` deserves a warning; whether `use x = e` sugar is wanted.
+  - **Review with the user**: whether discarding a `close`'s `Result` in `defer` deserves a warning;
+    whether `use x = e` sugar is wanted.
 
 - Settled on the user's delegation 2026-11-12 (built on branch `numeric`): **`Numeric`, the numbers' bound.** A core trait
   `Numeric: Add, Sub, Mul, Div, Rem, Neg, Ord, Display, Debug` declaring `toReal -> real`; `Integer`

@@ -412,8 +412,11 @@ struct BodyState
     /** The local type equalities refining patterns have given, each held where its pattern's
      * marker local is in scope. */
     equalities: Buf[Equality]
+    /** Set while the lambda a deferred statement is checked as is begun: its body is a deferred
+     * statement's, which no jump may leave. */
+    deferring: bool
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf())
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf(), false)
 
 /** A local type equality: type parameter `index` of `owner` is `ty` wherever local `marker`, which a
  * refining pattern declares beside the names it binds, is in scope. */
@@ -7521,6 +7524,8 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         result = Nothing
     elif name == "cancel_point"
         entry = "avin_rt_cancel_point"
+    elif name == "cancel_point_held"
+        entry = "avin_rt_cancel_point_held"
     elif name == "uncancellable_enter"
         entry = "avin_rt_uncancellable_enter"
     elif name == "uncancellable_leave"
@@ -18985,14 +18990,18 @@ private innermost_loop(c: *Checker, e: &Expr, word: string) -> Option[usize]
 /** Why a jump cannot leave a deferred statement. */
 private deferred_exit(word: string) -> string = s"a deferred statement runs while its block is being left, so it cannot leave by `$word`; there is no exit left to take"
 
-/** `defer body`, a statement of the block `items` being checked: the body is checked as a
- * statement whose value is discarded, where no jump may leave it. */
+/** `defer body`, a statement of the block `items` being checked: the body is checked as the body of
+ * a lambda of no parameters, a statement whose value is discarded, where no jump may leave it. The
+ * deferred statement is that lambda's closure, made where the `defer` is reached, so that it runs
+ * both where its block is left and where a cancellation drops its frame (`lower.sysl`). */
 private defer_statement(c: *Checker, e: &Expr, body: &Expr) -> &TExpr
-    val outer = c.body.defer_floor
-    c.body.defer_floor = Some(c.body.loops.len())
-    val typed = check_statement(c, body)
-    c.body.defer_floor = outer
-    TExpr(e.span, Unit, Defer(typed))
+    var items: Buf[&Expr] = buf()
+    items.push(body)
+    var none: Buf[&Type] = buf()
+    c.body.deferring = true
+    val closure = lambda_expr(c, e, buf(), Expr(body.span, Block(items, true)), Some(Function(none, Unit, false)), false)
+    c.body.deferring = false
+    TExpr(e.span, Unit, Defer(closure))
 
 private break_expr(c: *Checker, e: &Expr, value: Option[&Expr]) -> &TExpr
     val target = innermost_loop(c, e, "break")
@@ -22435,7 +22444,9 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     val mark = c.body.visible.len()
     c.current = id
     c.body.loops = buf()
-    c.body.defer_floor = None
+    // The lambda of a deferred statement is one no jump may leave; a lambda written inside it is not.
+    c.body.defer_floor = if c.body.deferring then Some(0) else None
+    c.body.deferring = false
     c.body.block_start = mark
     var param_locals: Buf[usize] = buf()
     for i in 0..<params.len()

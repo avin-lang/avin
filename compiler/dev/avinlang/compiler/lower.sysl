@@ -6794,8 +6794,19 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
             l.defers.truncate(mark)
             return None
         if machine(l, e.ty) is Some(_) then last else None
-    Defer(body) ->
-        l.defers.push(body)
+    Defer(closure) ->
+        // The deferred statement's closure goes on the thread's list of deferred statements, which a
+        // cancellation that drops this frame runs; leaving the block runs it from there too.
+        val v = lower_expr(l, closure)
+        if v is Some(x)
+            var types: Buf[MirType] = buf()
+            types.push(MRef)
+            types.push(MPtr)
+            var args: Buf[Operand] = buf()
+            args.push(x)
+            args.push(ClosureRunner)
+            l.insts.push(Call(None, Runtime("avin_rt_defer_push", mir_signature(types, None)), args))
+        l.defers.push(closure)
         None
     Let(local, value) ->
         bind_local(l, local, lower_expr(l, value))
@@ -6926,14 +6937,16 @@ private loop_target(l: *Lowering, label: usize) -> LoopTarget
         if t.label == label then return t
     LoopTarget(label, 0, 0, None, 0)
 
-/** Lowers the deferred statements reached past the first `from`, the last reached first, where
- * control leaves their blocks. None of them can leave by a jump, so each sees the others as they
- * are. */
+/** Runs the deferred statements reached past the first `from`, the last reached first, where control
+ * leaves their blocks: each is the newest on the thread's list, run and taken off by the runtime.
+ * None of them can leave by a jump, so each sees the others as they are. */
 private run_defers(l: *Lowering, from: usize)
-    var i = l.defers.len()
-    while i > from
-        i -= 1
-        lower_expr(l, l.defers[i])
+    if l.defers.len() <= from then return
+    var types: Buf[MirType] = buf()
+    types.push(MInt(64))
+    var args: Buf[Operand] = buf()
+    args.push(ConstInt(64, (l.defers.len() - from).to_string()))
+    l.insts.push(Call(None, Runtime("avin_rt_defers_run", mir_signature(types, None)), args))
 
 private step(l: *Lowering, e: &TExpr, local: usize, increment: bool, postfix: bool, op_span: Span) -> Option[Operand]
     val slot = local_place(l, local)
