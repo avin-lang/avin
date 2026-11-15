@@ -589,7 +589,7 @@ them was refused with the error the chapter gives or ran correctly. What is not:
 | The same with an argument passed by name, `Base(pick(true, s * 2))` | read `0` | closed by item 1: refused |
 | The same for an inherited field, `Leaf: Mid(() -> m)` with `m` Mid's | read `0` | closed by item 1: refused |
 | The same from an `object` extending a class | read `0` | closed by item 1: refused |
-| `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | module-level closed by item 3: refused; a field's, item 4 |
+| `lazy val first = second + 1`, `lazy val second = first + 1`; a field `lazy val l = l + 1` | trap at run time, although the cycle is in the code | module-level closed by item 3, fields and locals by item 4: refused |
 | A lazy's initializer joining a thread that reads the same lazy | waits for ever | liveness |
 | `object O` whose `lazy val` or a lambda made after its last field names `O.k` | refused: `O` is needed by its own initializer (bare `k` is accepted) | closed by item 2: accepted |
 
@@ -603,7 +603,9 @@ no code there. The `lazy` change turns `tests/run/lazy_cycle.avin` and
 (the `LazyList` knots in `lazy_list.avin`) read themselves by name inside an argument passed by
 name, which stays legal.
 
-**The items**, each one agent, gated on its own, in this order:
+**All four items are done**: every probe above is refused at compile time or runs correctly, but
+the liveness case, which the chapter leaves to the threads rule. The items, each one agent, gated
+on its own, in this order:
 
 1. **Done: superclass arguments use nothing of the object.** `check_class_initialization` scans the
    superclass-initialization item with an `InitScan` for the superclass's arguments (no field
@@ -646,7 +648,7 @@ name, which stays legal.
    `tests/programs/run/initialization_object_self_name` and
    `tests/programs/reject/initialization_object_self_name` (the object in another module), and an
    `lsp_tests.sysl` case for definition from the name in the body. A field `lazy val l = O.l + 1`
-   in an object is now the run-time trap a bare `l` already was, until item 4.
+   in an object, a run-time trap here as a bare `l` was, is refused by item 4.
 3. **Done: module-level lazy cycles at compile time.** `Uses` (`globals.sysl`) keeps the functions
    a body calls (`calls`) apart from those it makes (`made`: lambdas, by-name thunks, method
    values); `check_lazy_cycles` in `check.sysl` follows only calls and the lazy values read
@@ -672,15 +674,31 @@ name, which stays legal.
    modules), `tests/run/lazy_deferred_trap.avin` (a lambda the initializer makes and calls at once:
    still the trap, `.err`) and `tests/run/lazy_deferred_trap_passed.avin` (one passed to a function
    that calls it).
-4. **Field lazy cycles at compile time.** A pass beside `check_initialization` (`check.sysl`) follows,
-   per class, the lazy fields read and the methods called on `self` (bare names, `self.`, the
-   overrides a call through a slot may reach in subclasses), from each lazy field's initializer; a
-   read of another instance is not followed. Tests: `tests/reject/lazy_field_cycles.avin` (direct,
-   through another lazy field, through a method, through `self.x`, through a subclass's override)
-   and its generic and object variants; `tests/run/lazy_field_other_instance.avin` (a node's depth, a
-   tree's size, a lazy reading the same lazy of another instance through a method, at `-O0` and
-   `-O2`); `lazy_threads_cycle.avin` becomes a reject test and a handed-on read on a second thread
-   keeps a run test with its trap.
+4. **Done: field and local lazy cycles at compile time.** `check_lazy_field_cycles` in `check.sysl`
+   follows each lazy field's initializer (`reach_function`, `LazyReach`) with the places its code
+   holds the object (`SelfAt`: the captured `self`, a local given it, the parameter a called function
+   receives it in, and an object's name anywhere), through calls, the overrides a call through a
+   slot on the object may reach in classes descending from the field's, operators and local
+   functions; a read of another instance is not followed. `check_local_lazy_cycles` follows each
+   local `lazy val`'s lambda through its block and the local functions it calls. Both report
+   through `report_lazy_cycle`, worded as the module-level check. Tests:
+   `tests/reject/lazy_field_cycles.avin` (direct, through another lazy field, a method, `self.x`, a
+   subclass's override), `lazy_field_cycles_generic.avin` (a generic class, a chain, a generic
+   method, a generic subclass's override, a generic function given `self`),
+   `lazy_field_cycles_object.avin` (bare name, the object's name, a function outside the body, a
+   module-level lazy between), `lazy_field_cycles_more.avin` (an object extending a class, an
+   actor, an operator, `val me = self`, a local function), `lazy_field_cycles_reach.avin` (a chain
+   of three from its earliest member, a trait's default method, a local lazy in the initializer, a
+   default argument, a superclass's field and the subclass's override),
+   `tests/programs/reject/lazy_field_cycle_modules` (a subclass and a function in another module),
+   `tests/reject/lazy_local_cycles.avin` and `lazy_local_cycles_more.avin` (direct, nested, a local
+   function, a method, a loop body, a lambda's body, a field's initializer, a generic function, two
+   local functions, a match arm), `tests/reject/lazy_threads_cycle.avin` and
+   `lazy_local_self_direct.avin` (moved from `tests/run`); `tests/run/lazy_field_other_instance.avin`
+   (a node's depth, a tree's size, another instance's field through a method, a generic chain, an
+   object over instances, a chain with no cycle, an override reading another field, a handed-on
+   lambda, threads), `tests/run/lazy_local_no_cycle.avin`, and
+   `tests/run/lazy_threads_handed_trap.avin` (a handed-on read on a second thread: still the trap).
 
 The test matrix every item fills, each cell a test that would fail if the rule were false:
 
