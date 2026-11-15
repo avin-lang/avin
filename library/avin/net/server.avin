@@ -10,7 +10,7 @@ module avin.net
 
 import avin.actors.{Stop, spawn as startActor}
 import avin.io.IoError
-import avin.threads.{Executor, Mutex, Promise, scope, sleep, spawn}
+import avin.threads.{Channel, Executor, Mutex, Promise, scope, sleep, spawn}
 import avin.time.{Duration, millis}
 
 // The counts a server's acceptor, its connections and its handle share.
@@ -31,6 +31,8 @@ private class Counts()
 private class Gate(private val max: int): Sendable
   private val counts = Mutex(Counts())
   private val changed = counts.condition()
+  // Closed by `stop`, so a select waiting on it wakes when the server is asked to stop.
+  val stopSignal = Channel[unit]()
 
   // Waits for room for one more connection; false once the server is stopping. Only the acceptor
   // adds connections, so the room is still there when it has accepted one.
@@ -60,6 +62,7 @@ private class Gate(private val max: int): Sendable
         for (_, woken) in c.waits do woken.tryComplete(true)
         c.waits = HashMap.empty[long, Promise[bool]]()
         signal.notifyAll())
+    stopSignal.close()
 
   // Runs `wait` on a thread of its own, in a scope this thread runs, and answers its result, or
   // `None` where the server stops before it answers: stopping cancels the scope, so the wait ends
@@ -122,6 +125,11 @@ class TcpServer(private val gate: Gate, private val boundPort: int): Sendable
   // server is already stopping, `wait` is not run. The connection `wait` reads is the calling
   // code's again once `idle` returns. A trap in `wait` stops the program, as any thread's does.
   idle[T: Sendable](@sendable wait: () -> T) -> Option[T] = gate.untilStopped(wait)
+
+  // A channel closed once the server is asked to stop, and never sent on, so a `select` that waits for
+  // a connection's bytes or other work gives an arm `server.stopped().receive()` that runs once the
+  // server stops, ending the wait at once as `idle` does, with no thread of its own.
+  stopped() -> Channel[unit] = gate.stopSignal
 
   // Stops accepting connections and returns at once: the acceptor's `accept` is cancelled, and so
   // is every wait through `idle`. The connections it holds go on until their code returns.

@@ -1,0 +1,61 @@
+// expect: exit 0
+// Two threads racing large messages through one WebSocket's senders: each message is longer than a
+// fragment, so it goes on the wire in several, and the client receives every one whole, never two
+// interleaved (which it would close with 1002), each sender's in the order it queued them.
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Binary, Closed, Message, Route, Router, Text, WebSocket, WebSocketError, webSocket}
+import avin.threads.{Channel, Thread, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// Three messages of 150000 bytes from sender `k`, the `j`th all `16 * k + j`.
+racing(ws: WebSocket, k: int) -> Thread[int]
+  val snd = ws.sender()
+  spawn(() ->
+    var sent = 0
+    for j in 0 ..< 3
+      if snd.send(Array.fill(150000, byte(16 * k + j))).isOk then sent += 1
+    sent)
+
+flood(ws: WebSocket, heard: Channel[string])
+  val threads = Buffer[Thread[int]]()
+  val why = ws.serve(m -> m match
+    Text("go") ->
+      threads.addOne(racing(ws, 1))
+      threads.addOne(racing(ws, 2))
+    _ -> ())
+  var sent = 0
+  for t in threads
+    sent += t.join()
+  heard.send(s"session: $sent queued, then ${why.message}")
+
+main()
+  val heard = Channel[string]()
+  val router = Router([Route.get("/flood", r -> webSocket(r, ws -> flood(ws, heard)))])
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+  val c = WebSocket.connect(s"ws://127.0.0.1:${server.port()}/flood") match
+    Ok(w) -> w
+    Err(e) -> fail(e.message)
+  _ = c.send("go")
+  var whole = true
+  val seen = Buffer[int]()
+  for _ in 0 ..< 6
+    c.receive() match
+      Ok(Binary(b)) ->
+        val v = int(b(0))
+        if b.length != 150000 || !b.forall(x -> int(x) == v) then whole = false
+        seen.addOne(v)
+      other ->
+        whole = false
+        println(s"unexpected: $other")
+  val first = seen.filter(v -> v >> 4 == 1).toVector
+  val second = seen.filter(v -> v >> 4 == 2).toVector
+  println(s"six whole messages: $whole")
+  println(s"each sender's in order: ${first == [16, 17, 18] && second == [32, 33, 34]}")
+  _ = c.close()
+  println(heard.receive().getOrElse("?"))
+  server.stop()
+  server.join()

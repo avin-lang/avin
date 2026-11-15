@@ -1,0 +1,163 @@
+// expect: exit 0
+// A WebSocket's sender, used from other threads, against an echoing server. Messages queued while the
+// owning thread does not receive wait in the outbox, in order, and are written once it receives; a
+// full outbox makes a send wait the write timeout and answer `Err`, the WebSocket still open. A close
+// a sender asks for is carried out by the owner after the messages queued before it, and every call
+// after answers it. The owner's own close and the peer's close refuse the senders, and wake one
+// waiting for room. An outbox of zero hands each message to the owner. A sender racing a close
+// answers `Ok` until the close and `Err` from then on.
+import avin.io.{IoError, TimedOut}
+import avin.net.http
+import avin.net.http.{Binary, Broken, Closed, Message, Route, Router, Text, WebSocket, WebSocketError, webSocket}
+import avin.threads.{Channel, sleep, spawn}
+import avin.time.{millis, monotonic, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+said(r: Result[Message, WebSocketError]) -> string = r match
+  Ok(Text(t)) -> s"text `$t`"
+  Ok(Binary(b)) -> s"binary of ${b.length} bytes"
+  Err(e) -> why(e)
+
+why(e: WebSocketError) -> string = e match
+  Closed(code, reason) -> s"closed $code `$reason`"
+  Broken(IoError(TimedOut, _, _)) -> "timed out"
+  other -> other.message
+
+answer(r: Result[unit, WebSocketError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> why(e)
+
+echo(ws: WebSocket, heard: Channel[string])
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(Binary(b)) -> _ = ws.send(b)
+      Err(e) ->
+        heard.send(s"echo: ${why(e)}")
+        return
+
+// Reports every text message received, and why the WebSocket closed.
+log(ws: WebSocket, heard: Channel[string])
+  loop
+    ws.receive() match
+      Ok(m) -> heard.send(s"log: ${said(Ok(m))}")
+      Err(e) ->
+        heard.send(s"log: ${why(e)}")
+        return
+
+open(url: string, timeout: long = 5000, outbox: int = 64) -> WebSocket = WebSocket.connect(
+  url,
+  timeout = millis(timeout),
+  outboxSize = outbox
+) match
+  Ok(w) -> w
+  Err(e) -> fail(e.message)
+
+main()
+  val heard = Channel[string]()
+  val router = Router(
+    [
+      Route.get("/echo", r -> webSocket(r, ws -> echo(ws, heard))),
+      Route.get("/bye", r -> webSocket(r, ws -> _ = ws.close(4001, "go away"))),
+      Route.get("/log", r -> webSocket(r, ws -> log(ws, heard)))
+    ]
+  )
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+  val url = s"ws://127.0.0.1:${server.port()}"
+
+  // Queued while the owner does not receive; the third finds the outbox full.
+  val c = open(url + "/echo", timeout = 300, outbox = 2)
+  val snd = c.sender()
+  val first = spawn(() ->
+    val a = answer(snd.send("héllo ✓"))
+    val b = answer(snd.send(Array.tabulate(3, i -> byte(i))))
+    val started = monotonic()
+    val full = answer(snd.send("one too many"))
+    s"$a $b $full after the write timeout: ${monotonic() - started >= millis(250)}")
+  println(first.join())
+  println(s"still open: ${c.isOpen()} ${snd.isOpen()}")
+  println(said(c.receive()))
+  println(said(c.receive()))
+  // Empty messages, and the owner's own sends beside its sender's.
+  println(answer(snd.send("")))
+  println(answer(snd.send(Array.empty[byte]())))
+  println(said(c.receive()))
+  println(said(c.receive()))
+  _ = c.send("own")
+  println(said(c.receive()))
+  println(answer(c.close()))
+  println(heard.receive().getOrElse("?"))
+
+  // A close asked by a sender, carried out after the messages queued before it.
+  val c6 = open(url + "/log")
+  val s6 = c6.sender()
+  val asked = spawn(() ->
+    val before = answer(s6.send("before the close"))
+    val closing = answer(s6.close(4000, "asked"))
+    val after = answer(s6.send("after the close"))
+    val again = answer(s6.close())
+    s"$before; $closing; $after; $again; open ${s6.isOpen()}")
+  println(asked.join())
+  println(s"owner open until it receives: ${c6.isOpen()}")
+  println(said(c6.receive()))
+  println(said(c6.receive()))
+  println(s"owner open: ${c6.isOpen()}")
+  println(heard.receive().getOrElse("?"))
+  println(heard.receive().getOrElse("?"))
+
+  // The owner's own close.
+  val c2 = open(url + "/echo")
+  val s2 = c2.sender()
+  println(answer(c2.close(1000, "bye")))
+  println(s"${answer(s2.send("late"))}; ${answer(s2.send(Array.fill(4, byte(1))))}; ${answer(s2.close())}")
+  println(heard.receive().getOrElse("?"))
+
+  // The peer's close.
+  val c3 = open(url + "/bye")
+  val s3 = c3.sender()
+  println(said(c3.receive()))
+  println(answer(s3.send("late")))
+
+  // A sender waiting for room is woken by the owner's close.
+  val c4 = open(url + "/echo", outbox = 1)
+  val s4 = c4.sender()
+  val waiting = spawn(() ->
+    val a = answer(s4.send("fills it"))
+    val started = monotonic()
+    val b = answer(s4.send("waits"))
+    s"$a; $b; woken at once: ${monotonic() - started < seconds(3)}")
+  sleep(millis(200))
+  _ = c4.close()
+  println(waiting.join())
+  println(heard.receive().getOrElse("?"))
+
+  // An outbox of zero: each send waits for the owner to take its message.
+  val c5 = open(url + "/echo", outbox = 0)
+  val s5 = c5.sender()
+  val handed = spawn(() -> answer(s5.send("handed over")))
+  println(said(c5.receive()))
+  println(handed.join())
+
+  // A sender racing a close: `Ok` until the close, `Err` from then on.
+  val racer = spawn(() ->
+    var sent = 0
+    var firstErr = ""
+    while firstErr.isEmpty
+      s5.send(s"m$sent") match
+        Ok(_) -> sent += 1
+        Err(e) -> firstErr = why(e)
+    var laterAllErr = true
+    for _ in 0 ..< 5
+      if s5.send("later").isOk then laterAllErr = false
+    s"first error: $firstErr; every later send errs: $laterAllErr")
+  for _ in 0 ..< 3
+    _ = c5.receive()
+  _ = c5.close(1000, "enough")
+  println(racer.join())
+  println(heard.receive().getOrElse("?"))
+
+  server.stop()
+  server.join()

@@ -8687,6 +8687,51 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   in the arm, and a `readLine` could not use it); waking on socket readiness alone for TLS (a partial
   record would wake a select whose read then blocks). Review with the user: the spelling
   `readable()` and the name `Readiness`; whether the descriptor should stay a public method.
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **a WebSocket's other
+  threads send through `ws.sender()`, a sendable `WebSocketSender` that queues whole messages in a
+  bounded outbox the owning thread writes while it receives.** The owner's `receive` waits in one
+  `select` on the stream's `readable()`, the outbox, a sender's close request, the server's
+  `stopped()` channel and the limit, so every frame (senders', its own, pongs, the close handshake)
+  is written by the thread the connection belongs to, a message at a time, never interleaved.
+  Alternatives weighed: a mutex around the socket shared by every writer (impossible: a TLS stream
+  and a socket's handles belong to one thread); a writer thread per WebSocket (a second owner of the
+  connection, the same impossibility); an unbounded outbox (a slow client would hold every message
+  ever sent to it).
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **the outbox is bounded
+  in messages, `outboxSize = 64` on `webSocket` and `WebSocket.connect`, not in bytes; a send to a
+  full one waits up to the WebSocket's write timeout and answers `Err(Broken(IoError(TimedOut, _,
+  _)))`, the WebSocket left open.** A message bound is one bounded channel, and the owner's write to
+  a client that does not read fails at the same write timeout, closing it, so a slow client holds at
+  most 64 messages and its senders at most one write timeout each. Zero is a hand-over: each send
+  waits for the owner to take it. Alternatives weighed: a byte bound (needs a second counter beside
+  the channel, and one huge message would still have to be admitted); failing at once when full
+  (a burst would lose messages a healthy client reads a moment later); closing the WebSocket when a
+  send times out (the owner's write timeout already does, for a client that really stopped).
+  Review with the user: whether a byte bound is wanted beside the message bound, and the default 64.
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **`Ok` from a sender
+  means queued while open; the close is a request, and the senders are refused from the start of
+  any close.** A sender's `close(code, reason)` sets the shared state at once (every sender call
+  after answers `Err(Closed(code, reason))`) and the owner carries it out while it receives, after
+  writing what was queued before it. The owner's close refuses senders from the start of its
+  handshake, and its end (close, peer close, failure, server stopping, cancellation) drops what is
+  queued and wakes every sender waiting for room. A message queued in the instant the WebSocket
+  ends may answer `Ok` and be dropped, as a write accepted by a socket that then breaks is.
+  Alternatives weighed: an `Ok` only once written (every send would wait for the owner's next
+  receive); closing from the sender's thread (it does not own the connection).
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **a session that only
+  answers what arrives loops in `ws.serve(onMessage) -> WebSocketError`**, which receives until the
+  WebSocket closes and answers why, beside `receive()`, which a session may loop on itself; it is
+  while the owner receives that its senders' messages are written, so a session must be in one or
+  the other. Alternatives weighed: a background writer started by `sender()` (a second owner); no
+  helper, documenting the `receive()` loop (the chat server's loop is written once in every app).
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **data messages over
+  65536 bytes are sent in fragments of 65536, written back to back**, by the owner's `send` and by
+  senders alike, so a peer limiting frame sizes still takes large messages; a pong waits for the end
+  of the message being written. A thread cancelled while it receives closes the connection with no
+  close frame (a frame may have been half written) and ends the WebSocket with `1006`.
+  `TcpServer.stopped()` is a channel closed by `stop`, which the owner's select watches in place of
+  running each wait on a thread of its own through `idle`. Review with the user: the fragment size,
+  and whether `stopped()` should be a receive-only view rather than a `Channel[unit]`.
 
 ## Proposed
 

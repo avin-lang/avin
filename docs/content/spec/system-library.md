@@ -1491,6 +1491,7 @@ main()
 | `s.connections() -> int` | How many connections it holds now. |
 | `s.isStopping() -> bool` | Whether it has been asked to stop, for code serving a connection to finish early. |
 | `s.idle[T: Sendable](@sendable wait: () -> T) -> Option[T]` | Runs `wait`, a connection's wait for its next piece of work, on a thread of its own; `Some` of its result, or `None` where the server stops first, which cancels `wait`. |
+| `s.stopped() -> Channel[unit]` | A channel closed once the server is asked to stop and never sent on, so a `select` waiting for a connection's bytes or other work ends at once with an arm `s.stopped().receive()`, with no thread of its own. |
 | `s.stop()` | Stops accepting and returns at once, cancelling the parked `accept` and every wait in `idle`; stopping again does nothing. |
 | `s.join()` | Waits until it has stopped and every connection it held has ended. |
 | `s.shutdown()` | `stop()`, then `join()`. |
@@ -1815,8 +1816,8 @@ main()
   http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
 ```
 
-`webSocket(request, session, protocols = [], maxMessageBytes = 1048576, closeTimeout = seconds(5))
--> Response` checks the handshake and answers `101` with its `Sec-WebSocket-Accept`
+`webSocket(request, session, protocols = [], maxMessageBytes = 1048576, closeTimeout = seconds(5),
+outboxSize = 64) -> Response` checks the handshake and answers `101` with its `Sec-WebSocket-Accept`
 (`acceptKey(key)`, the base64 of the SHA-1 of the key and the protocol's GUID), then runs
 `session` with the WebSocket, closing it with `1000` if `session` returns leaving it open. Of
 `protocols`, the subprotocols the server speaks, the first the client offers in
@@ -1825,15 +1826,16 @@ offers none of them. A request that is not a handshake is answered without `sess
 `405` for a method other than `GET`; `426` with `Upgrade: websocket` where it does not ask to
 upgrade to a WebSocket; `426` with `Sec-WebSocket-Version: 13` for another version; `400` in
 HTTP/1.0, without `upgrade` in `Connection`, or with a `Sec-WebSocket-Key` that is not sixteen bytes
-of base64. A negative `maxMessageBytes` traps. A route is otherwise an ordinary route, under groups
+of base64. A negative `maxMessageBytes` or `outboxSize` traps. A route is otherwise an ordinary route, under groups
 and middleware alike, and it works over TLS as every route does.
 
 `WebSocket.connect(url, headers = [], protocols = [], tls = TlsClient(), timeout = seconds(30),
-maxMessageBytes = 1048576) -> Result[WebSocket, WebSocketError]` opens `ws://` and `wss://` URLs,
+maxMessageBytes = 1048576, outboxSize = 64) -> Result[WebSocket, WebSocketError]` opens `ws://` and `wss://` URLs,
 the latter over TLS checked as an `https` request's is, sending `headers` and offering `protocols`
 in the handshake; `timeout` limits each wait of the handshake and each write after it.
 
-A `WebSocket` sends `send(text)` and `send(bytes)` as one message each, `ping(payload = [])` (at most
+A `WebSocket` sends `send(text)` and `send(bytes)` as one message each, a message over 65536 bytes in
+fragments of that many written one after another, `ping(payload = [])` (at most
 125 bytes, else it traps), and `close(code = 1000, reason = "")`, which sends the close frame, waits
 the close timeout for the other end's answer and closes the connection; a code is 1000 to 1003, 1007
 to 1014 or 3000 to 4999 and a reason at most 123 bytes of UTF-8, either trapping where it is not.
@@ -1848,7 +1850,66 @@ and a pong passed over, a message arriving in fragments is put back together wit
 answered between them, and a close from the other end is answered with its code, the connection
 closed, and the receive answers `Err(Closed(code, reason))` (`1005` for a close giving no code).
 Every send and receive after the WebSocket is closed answers the same error. A server stopping
-closes its WebSockets with `1001` at their next receive, which waits through `idle`, or send.
+closes its WebSockets with `1001` at their next send, or at once where one is waiting in a receive,
+which watches the server's `stopped()` channel. A thread cancelled while it receives closes the
+connection, the WebSocket then closed with `1006`.
+
+#### Sending from other threads
+
+A `WebSocket` belongs to one thread, which does all of its connection's reads and writes. Other
+threads send on it through `ws.sender()`, a sendable `WebSocketSender` with `send(text)`,
+`send(bytes)`, `close(code = 1000, reason = "")` and `isOpen()`. A send queues one whole message in
+the WebSocket's outbox, at most `outboxSize` messages; the owning thread writes them while it
+receives, in the one wait that also watches its connection, so its senders' messages, its own, the
+pongs and the close handshake all go on the wire from it, each message whole and never interleaved
+with another, and each sender's in the order it queued them. A thread whose session only answers
+what arrives, or whose messages all come from senders, loops in `ws.serve(onMessage) ->
+WebSocketError`, which receives until the WebSocket closes, runs `onMessage` for every message and
+answers why it closed. A broadcast chat server puts each session's sender in a room:
+
+```text
+import avin.net.http
+import avin.net.http.{Route, Router, Text, WebSocket, WebSocketSender, webSocket}
+import avin.threads.Mutex
+
+class Room(): Sendable
+  private val members = Mutex(Vector.empty[(int, WebSocketSender)]())
+  private val count = Mutex(0)
+
+  join(s: WebSocketSender) -> int
+    val n = count.update(c -> c + 1)
+    _ = members.update(v -> v :+ (n, s))
+    n
+
+  leave(n: int) = _ = members.update(v -> v.filter((k, _) -> k != n))
+
+  broadcast(from: int, text: string)
+    for (n, s) in members.get()
+      if n != from then _ = s.send(text)
+
+chat(ws: WebSocket, room: Room)
+  val me = room.join(ws.sender())
+  defer room.leave(me)
+  _ = ws.serve(m -> m match
+    Text(t) -> room.broadcast(me, t)
+    _ -> ())
+
+main()
+  val room = Room()
+  val router = Router([Route.get("/chat", r -> webSocket(r, ws -> chat(ws, room)))])
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+```
+
+A send answers `Ok` once its message is queued while the WebSocket is open; one the WebSocket closes
+before writing is dropped. A full outbox, as a client that reads slowly leaves it, makes a send wait
+up to the WebSocket's write timeout and then answer `Err(Broken(IoError(TimedOut, _, _)))`, the
+message not queued and the WebSocket still open, so a slow client never holds up the threads
+sending to every other one; the owner's own write to such a client fails at the same timeout and
+closes it. A sender's `close` asks the owner to close the WebSocket, which it does, as its own
+`close` would, once the messages queued before are written; every sender call from then on answers
+`Err(Closed(code, reason))`. The owner's `close`, a close from the other end, a failure and a server
+stopping end the outbox: what is queued is dropped, and every sender call, a send waiting for room
+among them, answers why. Messages queued while the owner is not receiving wait until it next is.
 
 | Close | When this end closes with it |
 | --- | --- |

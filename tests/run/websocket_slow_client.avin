@@ -1,0 +1,74 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// A client that never reads: its session's sender floods it until the connection's buffers fill, the
+// owner's write waits the server's write timeout and fails, and the sender answers `Err` rather than
+// waiting for ever. Meanwhile another client of the same server keeps being answered. It sends
+// megabytes, so it runs without GC stress; the same paths run stressed in `websocket_sender*.avin`.
+import avin.io.{IoError, TimedOut}
+import avin.net.http
+import avin.net.http.{Broken, Closed, Message, Route, Router, Text, WebSocket, WebSocketError, webSocket}
+import avin.threads.{Channel, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+why(e: WebSocketError) -> string = e match
+  Closed(code, reason) -> s"closed $code `$reason`"
+  Broken(IoError(TimedOut, _, _)) -> "timed out"
+  other -> other.message
+
+said(r: Result[Message, WebSocketError]) -> string = r match
+  Ok(Text(t)) -> s"text `$t`"
+  Ok(m) -> s"unexpected $m"
+  Err(e) -> why(e)
+
+echo(ws: WebSocket)
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(_) -> ()
+      Err(_) -> return
+
+// Sends megabyte messages until a send answers `Err`.
+flood(ws: WebSocket, heard: Channel[string])
+  val snd = ws.sender()
+  val flooding = spawn(() ->
+    var sent = 0
+    var failed = ""
+    while failed.isEmpty
+      snd.send(Array.fill(1048576, byte(7))) match
+        Ok(_) -> sent += 1
+        Err(e) -> failed = why(e)
+    s"sender: $failed after some were sent: ${sent > 0}")
+  val ended = ws.serve(_ -> ())
+  heard.send(flooding.join())
+  heard.send(s"session: ${why(ended)}")
+
+main()
+  val heard = Channel[string]()
+  val router = Router(
+    [
+      Route.get("/flood", r -> webSocket(r, ws -> flood(ws, heard))),
+      Route.get("/echo", r -> webSocket(r, ws -> echo(ws)))
+    ]
+  )
+  val server = ok(http.serve("127.0.0.1", 0, router.handle, writeTimeout = millis(300)))
+  val url = s"ws://127.0.0.1:${server.port()}"
+  val slow = WebSocket.connect(url + "/flood") match
+    Ok(w) -> w
+    Err(e) -> fail(e.message)
+  val other = WebSocket.connect(url + "/echo") match
+    Ok(w) -> w
+    Err(e) -> fail(e.message)
+  _ = other.send("while it floods")
+  println(said(other.receive()))
+  println(heard.receive().getOrElse("?"))
+  println(heard.receive().getOrElse("?"))
+  _ = other.send("after")
+  println(said(other.receive()))
+  _ = other.close()
+  _ = slow.close(1000, "")
+  server.stop()
+  server.join()
