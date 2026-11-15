@@ -10346,6 +10346,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
         var named_ok = true
         var borrowed = false
         var blocking = false
+        var errno = false
         var keeps: Buf[string] = buf()
         var consumes: Buf[string] = buf()
         var given: Buf[string] = buf()
@@ -10366,7 +10367,10 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                     elif arg.value.kind is Name(word) && word == "writable"
                         if writable then c.note(unit, arg.value.span, "`writable` is said once")
                         writable = true
-                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers, `blocking` that the call may wait, `view` that C lends the memory it answers and `writable` that Avin may write it")
+                    elif arg.value.kind is Name(word) && word == "errno"
+                        if errno then c.note(unit, arg.value.span, "`errno` is said once")
+                        errno = true
+                    elif arg.value.kind is Name(word) then c.note(unit, arg.value.span, s"`$word` is not a word of `@c` on a function; `borrowed` says C only lends the handle it answers, `blocking` that the call may wait, `view` that C lends the memory it answers, `writable` that Avin may write it and `errno` that C answers -1 where it fails, saying why in `errno`")
                     else named_ok = false
                     continue
             if n == "keeps" || n == "consumes"
@@ -10426,7 +10430,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 else c.note(unit, arg.value.span, s"`$n:` takes a string, as in " + (if n == "array" then "`array: \"glyphs\"`" elif n == "bytes" then "`bytes: \"data\"`" elif n == "view" then "`view: \"buffer\"`" else "`length: \"num_glyphs\"`"))
                 continue
             if n != "free"
-                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `array:`, `bytes:`, `view:`, `length:`, `borrowed`, `blocking`, `view` and `writable`")
+                c.note(unit, arg.value.span, s"`$n:` is not a word of `@c` on a function, which takes `free:`, `keeps:`, `consumes:`, `array:`, `bytes:`, `view:`, `length:`, `borrowed`, `blocking`, `view`, `writable` and `errno`")
                 continue
             if free is Some(_) || free_text is Some(_) || free_listed
                 c.note(unit, arg.value.span, "`free:` is given once")
@@ -10568,7 +10572,9 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 problem = s"C could read past the end of an array whose length nothing carries: mark the integer parameter that carries it `length(${cp.name})`"
                 // A pointer C may write through may be an array C fills, as many elements as another
                 // call says.
-                if !(" " + cp.text + " ").contains(" const ") && !c_is_void_pointer(cp.text) then problem = problem + s", or, for an array C fills with as many elements as the binding can work out before the call, write it `out ${cp.text}${cp.name}` and name it with `array: \"${cp.name}\"`, its length a C expression given with `length:`"
+                if (" " + cp.text + " ").contains(" const ") then ()
+                elif c_is_void_pointer(cp.text) then problem = problem + s", or, for memory C fills with as many bytes as the binding can work out before the call, write it `out ${cp.text}${cp.name}` and name it with `array: \"${cp.name}\"`, its length in bytes a C expression given with `length:`"
+                elif !c_is_untyped_pointer(cp.text) then problem = problem + s", or, for an array C fills with as many elements as the binding can work out before the call, write it `out ${cp.text}${cp.name}` and name it with `array: \"${cp.name}\"`, its length a C expression given with `length:`"
             elif c_handle_form(t, c.data, c.classes) is Some(h)
                 problem = if inout then "a handle is not passed `inout`: whether C keeps the reference it is passed or replaces it, the binding cannot say" else c_handle_problem(c, h.class_index, cp.text, false)
             elif c_struct_form(t, c.data) is Some(m) then problem = c_struct_problem(c, m, cp)
@@ -10578,14 +10584,22 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                 elif !c_names_struct(cp.text, wanted) then problem = s"`${c.classes[k].name}` is a copy of `$wanted`, so it is passed by value, as `$wanted`"
             elif c_value_option(t, c.data, c.classes) then problem = "an opaque value is passed by value, which is never null, so it is not in an `Option`"
             elif c_mirror_of(t, c.data) is Some(d) then problem = c_mirror_problem(c.data[d].decl, c.data[d].name, ctext)
-            elif !inout && c_is_void_pointer(cp.text) then problem = c_void_param_problem(cp)
+            elif !inout && c_is_untyped_pointer(cp.text) then problem = c_void_param_problem(cp)
             else
                 val form = c_text_form(t, c.data, c.classes)
                 problem = c_crossing_problem(c_text_position(ctype, ctext, form), t, form, false)
             if problem != "" then c.note(unit, decl.ty.span, s"parameter ${i + 1} of the C binding `${f.name}` is `${type_name(t)}` in Avin and `${cp.text}` in C" + (if inout then ", `inout`" else "") + s": $problem")
-        val r = result.unwrap_or(Unit)
+        var r = result.unwrap_or(Unit)
         val at = if f.result is Some(t) then t.span else f.name_span
         var made: Option[usize] = None
+        // A binding marked `errno` answers a `Result`: `Err` of `errno` where C answers -1, and `Ok` of
+        // what the C result and the out values make otherwise, which is checked as any result is.
+        if errno && !(*r is ErrorType)
+            val problem = c_errno_problem(r, p, result_view, c.data)
+            if problem != ""
+                c.note(unit, at, s"the result of the C binding `${f.name}` is `${type_name(r)}` in Avin and `${p.result_text}` in C: $problem")
+                r = ErrorType
+            else r = c_errno_ok(r, c.data).unwrap()
         if !(*r is ErrorType)
             val parts = c_result_parts(p, r, c.data) match
                 Ok(parts) -> Some(parts)
@@ -10678,6 +10692,7 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                                 Some(form) -> *form.element is Byte
                                 None -> false
                             if !bytes then problem = "`bytes:` copies the bytes C answers into an `Array[byte]`, or an `Option` of one for null; `array:` copies an array of any other element"
+                    elif q.pointee is CVoidType && c_struct_form(t, c.data) is None then problem = c_void_out_problem(q)
                     elif c_memory_form(t, c.data, c.classes) is Some(m)
                         problem = if m.kind is MemBlock then "a `ByteBlock` is memory Avin gives C, made by `ByteBlock(length)`, never answered by C" else s"a view C lends through `${q.name}` is named with `view:`, its length given with `length:`, as in `view: \"${q.name}\", length: \"size\"`"
                     elif q.length_of != ""
@@ -10688,7 +10703,10 @@ private check_c_binding(c: *Checker, unit: usize, f: &Function, params: Buf[&Typ
                         val d = c.data[m.class_index]
                         val wanted = c_struct_text(d.decl)
                         if m.optional then problem = s"C fills an out value, so it is never `None`"
-                        elif wanted != "" && q.pointee_text != wanted then problem = s"`${d.name}` mirrors `$wanted`, so C fills it through `${if q.mode is CInOut then "inout" else "out"} $wanted *`"
+                        // C may fill the struct through a pointer to memory of no type, `out void *`,
+                        // `out void **`, or a pointer to a typedef the C unit checks is the struct or
+                        // `void *`, as `rusage_info_t` is.
+                        elif wanted != "" && q.pointee_text != wanted && !c_out_untyped(q) then problem = s"`${d.name}` mirrors `$wanted`, so C fills it through `${if q.mode is CInOut then "inout" else "out"} $wanted *`, or through a pointer to memory of no type, `out void *`"
                     elif c_value_class_of(t, c.classes) is Some(_) || c_value_option(t, c.data, c.classes) then problem = "an opaque value is passed and answered by value, and never through a pointer"
                     elif c_array_form(t, c.data, c.classes) is Some(_) && c_text_form(t, c.data, c.classes) is NoText then problem = s"an array C answers through `${q.name}` is named with `array:`, its length given with `length:`, as in `array: \"${q.name}\", length: \"count\"`"
                     elif c_handle_form(t, c.data, c.classes) is Some(h)
@@ -10912,6 +10930,9 @@ private c_array_out_problem(c: *Checker, q: CParam, t: &Type) -> string
         if wanted != "" && !c_names_struct(element_text, wanted) then return s"`${c.data[d].name}` mirrors `$wanted`, so an array of it is answered as `out $wanted $stars${q.name}`"
         return ""
     if c_array_element_size(form.element) == 0 then return "an array C answers is copied into an `Array[byte]`, `Array[int]`, `Array[long]`, `Array[real]` or an `Array` of a struct mirror"
+    // Memory of no type C allocates is as long as its length says in bytes, which need not be a whole
+    // number of wider elements; memory C fills is the binding's, made whole.
+    if !filled && c_is_void_text(element_text) && !(*form.element is Byte) then return s"C allocates memory of no type for `${q.name}`, whose length in bytes need not be a whole number of `${type_name(form.element)}`s, so it is answered as an `Array[byte]`"
     ""
 
 // Whether `t` is an `Option` of an opaque value, which no C position takes.

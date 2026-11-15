@@ -316,7 +316,7 @@ private text_binding(name: string, text: string, params: Buf[&Type], result: &Ty
     var by_value: Buf[bool] = buf()
     by_value.push(false)
     for _ in params do by_value.push(false)
-    CUnitBinding(name, prototype(text), params, result, 0, Span(0, 0), "p", forms, free, buf(), 0, false, by_value, buf(), buf())
+    CUnitBinding(name, prototype(text), params, result, 0, Span(0, 0), "p", forms, free, buf(), 0, false, by_value, buf(), buf(), buf(), false, buf())
 
 private libc(headers: Buf[string]) -> Buf[CLibrary]
     var out: Buf[CLibrary] = buf()
@@ -946,22 +946,46 @@ void_pointers()
     assert(c_points_at_void(p.params[1]) && c_points_at_void(p.params[3]))
     assert(!c_points_at_void(p.params[0]) && !c_points_at_void(p.params[2]) && !c_points_at_void(p.params[4]))
     assert(c_is_array_param(p, 1) && c_is_array_param(p, 3))
-    assert(*c_length_type(p, p.params[2]) is Int(64))
-    assert(*c_length_type(p, p.params[4]) is Int(64))
+    assert(*c_length_type(p, p.params[2], map()) is Int(64))
+    assert(*c_length_type(p, p.params[4], map()) is Int(64))
     assert_eq(c_avin_positions(p).len(), 3)
     assert_eq(c_out_count(p), 1)
-    // A typed pointer's length counts elements, an `int`, and a pointer to a pointer to `void` is no
-    // memory of no type.
+    // A typed pointer's length counts elements, an `int`, and a pointer to a pointer to `void` is
+    // memory of no type, as a header's pointer to an opaque pointer is.
     val q = prototype("int f(const int *a, length(a) size_t n, void **v, length(v) int m)")
-    assert(*c_length_type(q, q.params[1]) is Int(32))
-    assert(!c_points_at_void(q.params[2]))
-    assert(*c_length_type(q, q.params[3]) is Int(32))
+    assert(*c_length_type(q, q.params[1], map()) is Int(32))
+    assert(c_points_at_void(q.params[2]))
+    assert(*c_length_type(q, q.params[3], map()) is Int(64))
     assert(c_is_void_pointer("void *") && c_is_void_pointer(" const void * ") && c_is_void_pointer("void const *"))
     assert(!c_is_void_pointer("void **") && !c_is_void_pointer("int *") && !c_is_void_pointer("void"))
-    assert_eq(refused("int f(out void *p)"), "C writes no value through `out void *p`, which points at memory of no type: pass an array or a `ByteBlock` for C to write, as in `void *p, length(p) size_t n`")
+    assert(c_is_untyped_pointer("void *") && c_is_untyped_pointer(q.params[2].text) && !c_is_untyped_pointer("int *") && !c_is_untyped_pointer("int * *"))
+    assert(c_is_void_text("void") && c_is_void_text("const void") && !c_is_void_text("void *"))
+    // C fills memory of no type through `out void *`, which the checker holds to an array or a mirror;
+    // it writes no value it is passed through `inout void *`.
+    assert(prototype("int f(out void *p)").params[0].pointee is CVoidType)
     assert_eq(refused("int f(inout void *p)"), "C writes no value through `inout void *p`, which points at memory of no type: pass an array or a `ByteBlock` for C to write, as in `void *p, length(p) size_t n`")
-    // A pointer to a pointer to `void` is a pointer C writes one through.
     assert(prototype("int f(out void **p)").params[0].mode is COut)
+
+@test("a pointer to a typedef points at memory of no type where the C unit measured the typedef as `void *`, and its length then counts bytes, a `long`")
+typedef_untyped_pointers()
+    val p = prototype("int f(rusage_info_t *b, length(b) size_t n, const aa_fixed *c, length(c) int m)")
+    assert(c_points_at_typedef(p.params[0]) && c_points_at_typedef(p.params[2]))
+    assert(!c_points_at_void(p.params[0]))
+    var measures: Map[string, CMeasure] = map()
+    // With no measures, before the C unit is built, a typedef is taken as an element type.
+    assert(!c_points_at_no_type(p.params[0], measures))
+    assert(*c_length_type(p, p.params[1], measures) is Int(32))
+    measures.put(c_untyped_key("rusage_info_t"), CMeasure(8, false))
+    measures.put(c_untyped_key("aa_fixed"), CMeasure(0, false))
+    assert(c_points_at_no_type(p.params[0], measures))
+    assert(!c_points_at_no_type(p.params[2], measures))
+    assert(*c_length_type(p, p.params[1], measures) is Int(64))
+    assert(*c_length_type(p, p.params[3], measures) is Int(32))
+    // An `out` pointer to a typedef is not one passed in.
+    assert(!c_points_at_typedef(prototype("int f(out rusage_info_t *b)").params[0]))
+    assert(c_out_untyped(prototype("int f(out rusage_info_t *b)").params[0]))
+    assert(c_out_untyped(prototype("int f(out void *b)").params[0]) && c_out_untyped(prototype("int f(out void **b)").params[0]))
+    assert(!c_out_untyped(prototype("int f(out struct s *b)").params[0]) && !c_out_untyped(prototype("int f(out int *b)").params[0]))
 
 @test("a prototype's `length(…)` is refused where it names no array, marks no integer or is written out of place")
 array_lengths_refused()

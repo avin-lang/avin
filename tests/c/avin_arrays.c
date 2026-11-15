@@ -1,5 +1,7 @@
 /* The functions of avin_arrays.h. */
 #include "avin_arrays.h"
+#include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -81,6 +83,40 @@ void aa_void_take(void *buf, size_t *len) { aa_take(buf, len); }
 void aa_void_overrun(void *buf, size_t *len) { (void)buf; *len = *len + 1; }
 
 int aa_void_null(const void *p, size_t n) { return p == NULL ? (n == 0 ? -1 : -2) : (int)n; }
+
+int aa_info(int flavor, aa_info_t *buffer) {
+    if (flavor < 1 || flavor > 9) { errno = EINVAL; return -1; }
+    struct aa_info_v1 *info = (struct aa_info_v1 *)buffer;
+    for (int i = 0; i < 16; i++) info->tag[i] = (uint8_t)(i + 1);
+    info->a = 7;
+    info->b = 8;
+    info->flavor = (uint64_t)flavor;
+    return 0;
+}
+int aa_info_const(int flavor, aa_const_info_t *buffer) { return aa_info(flavor, (aa_info_t *)buffer); }
+int aa_counts(void *out, int k) { struct aa_counts *c = out; c->a = 3; c->b = 4; c->c = k; return 0; }
+int aa_counts_pp(void **out, int k) { return aa_counts((void *)out, k); }
+int aa_info_counts(aa_info_t *buffer, int k) { return aa_counts((void *)buffer, k); }
+int aa_fixed_out(aa_fixed *p, int k) { *p = k; return 0; }
+long long aa_info_sum(aa_info_t *p, size_t n) { return aa_void_sum((const void *)p, n); }
+long long aa_pp_sum(void **p, size_t n) { return aa_void_sum((const void *)p, n); }
+void aa_info_fill(aa_info_t *p, int c, size_t n) { memset((void *)p, c, n); }
+int aa_info_octets(aa_octet *p, int n) { for (int i = 0; i < n; i++) p[i] = (aa_octet)(i + 1); return n; }
+int aa_alloc_bytes(void **out, int n, int *len) {
+    uint8_t *p = malloc(n > 0 ? (size_t)n : 1);
+    if (!p) return -1;
+    for (int i = 0; i < n; i++) p[i] = (uint8_t)(i + 1);
+    *out = p;
+    *len = n;
+    return 0;
+}
+
+int aa_errno(int code, int value) { if (code != 0) { errno = code; return -1; } return value; }
+long aa_errno_long(int code, long value) { if (code != 0) { errno = code; return -1; } return value; }
+ssize_t aa_errno_ssize(int code, ssize_t value) { if (code != 0) { errno = code; return -1; } return value; }
+size_t aa_errno_size(int code, size_t value) { if (code != 0) { errno = code; return (size_t)-1; } return value; }
+int aa_errno_out(int code, int value, int *out) { if (code != 0) { errno = code; return -1; } *out = value; return 0; }
+int aa_errno_set(int code, int value) { errno = code; return value; }
 
 void aa_squares(int *buf, int *len) {
     int half = *len / 2;

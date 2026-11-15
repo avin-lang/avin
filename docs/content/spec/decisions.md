@@ -3167,8 +3167,9 @@ their words are reserved.
     generate) are the whole trusted surface.** *Why*: soundness in safe code, and one grep finds
     everything to review. *Alternative*: an `unsafe` region with a raw pointer type, which would let
     a binding's pleasant layer be written in Avin but makes every Avin file a possible hole.
-  - **`errno`** is not read by a binding yet; an `errno` flag answering `Result[T, int]` from a `-1`
-    result is the likely form when a POSIX library needs it.
+  - **`errno`** was not read by a binding at first; an `errno` flag answering `Result[T, int]` from a
+    `-1` result was the likely form, and is what was built, with `Errno` besides (settled 2026-11-15,
+    branch `c-opaque-errno`).
   - **Review with the user**: the prototype-string form of `@c`, the largest syntax choice here; whether a
     package may carry C sources, which widens the trusted surface beyond the `@c` lines; the two
     parser additions (`val` with no initializer for `@c(const:)`, list-valued annotation
@@ -10057,6 +10058,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   for every `void *` function, which counts bytes); a shared `length(a, b)` for `memcmp`-shaped
   functions (useful, but a separate feature). **Review with the user**: whether a shared length is
   wanted, and whether a callback's `const void *` should lend a `ByteView`, which is still refused.
+- Settled on the user's delegation 2026-11-15 (built on branch `c-opaque-errno`): **a pointer to an
+  opaque pointer is [memory of no type](/spec/c-bindings/#memory-of-no-type)**: `void **`, and a pointer
+  to a typedef the headers make `void *` or `const void *` (`rusage_info_t *`), take what `void *`
+  takes, their length in bytes; C fills an array through `out void *` or `out T *` with `T` such a
+  typedef, its `length:` counting bytes, rounded up to whole elements, the rest zero; and C fills a
+  struct mirror through `out void *`, `out void **` or a pointer to a typedef. The prototype is still
+  the header's: `rusage_info_t *`, held to the header exactly. Only the headers say what a typedef
+  is, so the C unit checks an array's elements through a pointer to a typedef as the typedef's
+  elements *or* the typedef being `void *`, and measures which, beside the integer measurements, for
+  lowering to count the length in bytes or in elements; a mirror's typedef is checked to be its
+  struct or `void *`. Memory of no type C *allocates* (`out void **` with `array:` or `bytes:`) is an
+  `Array[byte]`, since its length in bytes need not be a whole number of wider elements, and copying
+  a rounded-up count would read past C's allocation. Why: marshal's `proc_pid_rusage` needed a
+  process's physical footprint, and every form it tried was refused; the typedef's kind is decided
+  where the spec decides every typedef's, by the Avin type and the C unit's check. `length:` counts
+  bytes for memory of no type as `length(p)` does, so `sizeof(struct rusage_info_v2)` is written as
+  the header says it. Alternatives weighed: a word in the prototype marking the pointer untyped, or a
+  cast (`(void *) rusage_info_t *buffer`), which the C unit's measurement makes unnecessary; a
+  `length:` in elements for memory C fills (consistent with typed arrays, but the binding would divide
+  the struct's size itself); a mirror field for a fixed array (`uint8_t ri_uuid[16]`), which would make
+  the struct mirrorable, left for when a program needs a field after one rather than the array form.
+  **Review with the user**: fixed-array fields in struct mirrors.
+- Settled on the user's delegation 2026-11-15 (built on branch `c-opaque-errno`): **a binding marked
+  [`errno`](/spec/c-bindings/#errno) answers `Err` of `errno` where C answers -1**, `Result[T, Errno]`
+  or `Result[T, <integer>]`, its `Ok` split as a result that is not a status is (the C result kept
+  as an integer or left out, then the out values). The bare word follows `blocking`'s form. `errno`
+  is read by the C unit's glue straight after the call, written through a pointer the binding passes
+  after the arrays' lengths, so nothing — a `length:` expression, a `blocking` call's return to the
+  scheduler, a collection — runs between the call and the read; the binding is always called through
+  glue. The failure is the -1, not `errno` (a function may set `errno` and succeed); a C result of an
+  unsigned type fails at all ones. `avin.c.Errno` is a data type of the standard library with a case
+  per POSIX error number both macOS and Linux define, named as C names them (`ESRCH`, `ENOENT`), and
+  `Other(code)`; its `message` is the number's sentence, the same on every platform. The C unit
+  measures each case's value by its macro (`<errno.h>` is included for a program with an `errno`
+  binding), and lowering compares the number against them. Why: the C bindings' first decisions named
+  an `errno` flag answering `Result[T, int]` from a `-1` result as the likely form;
+  named cases let a program match `Err(ESRCH)` without knowing a platform's numbers, and C's own
+  names are what a reader of a man page looks for. Alternatives weighed: mapping to `io.IoError`
+  (loses `ESRCH` and `EPERM`, which it has no kinds for); an enum mirror in the library (needs a C
+  unit for every program and traps on a number no variant holds); PascalCase descriptive names
+  (`NoSuchProcess`), which a man page does not use; a null pointer result as the failure too (not
+  built: a handle or string answered with `errno` is still refused, the C result being an integer).
+  **Review with the user**: the C names as variant names, and `errno` on pointer results.
+- Settled on the user's delegation 2026-11-15 (built on branch `c-opaque-errno`): **`avin check`
+  builds the C unit**, revising `check-stops-early` (2026-11-06) for C: a binding the headers refuse
+  (a prototype the header contradicts, an array's elements, a typedef's kind, a constant) is refused
+  by `check` as by `build`, `run` and `test`. Why: marshal met a binding `check` passed and `test`
+  refused; the C unit is one clang compile, cached by its source's hash, far cheaper than the shims
+  and the lowering `check` gave up, and only C bindings make one. The Sysl shims stay behind
+  `--bindings`. Alternatives weighed: keeping `check` silent and documenting it (the disagreement
+  marshal met); moving the checks into the checker (impossible: only the headers know a typedef).
 
 ## Open
 
@@ -10113,4 +10165,5 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   this fixes); dropping binding validation from `check` with no flag (leaves no command that
   reports a bad binding without linking). The language server already stops at checking, so it
   matches the new `check`. Review with the user: whether `--bindings` should instead be the
-  default for packages that have bindings.
+  default for packages that have bindings. (Revised 2026-11-15, branch `c-opaque-errno`: `check`
+  builds the C unit too, so what clang rejects of it is reported without `--bindings`.)

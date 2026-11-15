@@ -71,7 +71,8 @@ a shim would add a compile step, a cache and a Sysl dependency and check nothing
 4. **Link** passes the C unit's object and the libraries' link flags to clang with the program.
 
 The C unit is cached by a hash of its source, the include and link flags `pkg-config` answers, and
-`clang --version`. Nothing about a C binding needs the `sysl` command.
+`clang --version`. Nothing about a C binding needs the `sysl` command. `avin check` builds the C
+unit too, so a binding its headers refuse is refused by `check` exactly as by a build.
 
 ## C libraries
 
@@ -234,9 +235,9 @@ C reports most failures as an integer. A C integer result bound as `Result[unit,
 when it is zero and `Err(code)` otherwise. The code may be any integer type, converted with the check
 a scalar result has (`Result[unit, long]` for a `long long` status). With [out parameters](#arrays-and-out-parameters), a status result
 bound as `Result[T, int]` holds the out values in its `Ok`, and they are read only when the status is
-zero. Other conventions — a negative error number, `-1` beside `errno` — are written in Avin over the
-integer, and a public function maps the code to the library's own error type. Whether `errno` is read
-by the binding is [proposed](/spec/decisions/#proposed).
+zero. A function that answers -1 and says why in `errno` is bound [with `errno`](#errno); other
+conventions, a negative error number among them, are written in Avin over the integer, and a public
+function maps the code to the library's own error type.
 
 A status that is a C enum may be bound as `Result[unit, E]` with `E` its [mirror](#enums-and-constants):
 `Ok(())` for the enumerator whose value is zero, `Err` of the variant otherwise. The mirror keeps its
@@ -246,6 +247,44 @@ zero variant, since the same type is what a [callback](#callbacks) answers C wit
 ```avin
 @c("cairo_status_t cairo_surface_write_to_png(cairo_surface_t *self, const char *filename)")
 private writePngRaw(filename: string) -> Result[unit, Status]
+```
+
+### errno
+
+**A binding marked `errno` answers `Err` of `errno` where C answers -1** ([settled](/spec/decisions/#settled)).
+The word is written among `@c`'s arguments, as `blocking` is, and the binding answers a `Result`:
+`Ok` of what the C result and the out values make, by the rules for a result that is
+[not a status](#arrays-and-out-parameters) (the C result kept as an integer or left out, followed by
+the out values), and `Err` of why. The error is an `avin.c.Errno`, each POSIX error number by its
+own name, `ENOENT`, `ESRCH`, `EACCES`, whatever value it has on the machine the program is built for,
+which the C unit measures, and `Other(code)` for a number no named case is; or it is the number
+itself, any integer type. An `Errno` is an `Error`, whose message is the number's sentence, the same
+on every platform (`no such process`).
+
+```avin
+import avin.c.{Errno, ENOENT, EACCES}
+
+@c("int access(const char *path, int mode)", errno)
+private access(path: string, mode: int) -> Result[unit, Errno]
+
+describe(path: string) -> string = access(path, 4) match
+  Ok(()) -> "readable"
+  Err(ENOENT) -> "missing"
+  Err(EACCES) -> "forbidden"
+  Err(e) -> e.message
+```
+
+`errno` is read by the binding's glue in the C unit straight after the call, before anything else
+runs, a `length:` expression and a `blocking` call's return among them, so what it holds is what the
+function left. It is read only where the C result is -1, which is the failure, whatever `errno`
+holds; a function that sets `errno` and answers anything else has not failed, and the out values are
+read only where it has not, as a status's are. A C result of an unsigned type fails at its greatest
+value, which -1 converts to. A binding marked `errno` answers a `Result` whose error is an `Errno` or
+an integer, over a C integer result, and its `Ok` holds no status of its own; each is refused at the
+binding otherwise:
+
+```text
+error: the result of the C binding `text` is `Result[string, Errno]` in Avin and `const char *` in C: `errno` marks a C function that answers -1 where it fails, so its result is a C integer
 ```
 
 ### Errors kept on the object
@@ -907,13 +946,56 @@ sysctlInt(name: string) -> Option[int] =
 `hw.memsize`, and asked with `None` for the array (bound as an `Option`), C answers the size it
 needs. The header check holds a `void *` to the header's type as it holds every pointer, so a binding
 saying `const void *` where the header writes `void *` is refused, and so is one saying `void *`
-where the header writes a typed pointer. What is still refused:
+where the header writes a typed pointer.
+
+**A pointer to an opaque pointer points at memory of no type too** ([settled](/spec/decisions/#settled)):
+`void **`, and a pointer to a typedef the headers make `void *` or `const void *`, as Apple's
+`rusage_info_t *` is. Headers write one where C writes whatever the caller's flavour says through it.
+Passed in, it takes what `void *` takes, its length in bytes. Only the headers say what a typedef
+is, so the C unit measures it, and checks the elements of an array passed to a pointer to a typedef
+are either what the typedef is or the typedef is `void *`; a typedef of an integer type points at
+elements, which its length counts. The header check still holds the prototype to the header's own
+type, so the binding writes `rusage_info_t *`, as the header does, never `void *` or the struct.
+
+**C fills memory of no type through `out`**: through `out void *` or a pointer to a typedef that is
+`void *`, `out rusage_info_t *buffer`, it fills [an array the binding allocates](#arrays-and-out-parameters),
+named with `array:`, its `length:` counting **bytes**, as many elements of the array's type as hold
+them, the last zero past what C writes; or a struct mirror, which `out void **` takes as well, the
+C unit checking a typedef is the mirror's struct or `void *`. `proc_pid_rusage` writes a
+`struct rusage_info_v2` through its `rusage_info_t *`, sixteen bytes of `ri_uuid`, which no mirror's
+field holds, then eighteen `uint64_t` fields, so its bytes are answered as `long`s:
+
+```avin
+import avin.c.Errno
+
+@c(
+  "int proc_pid_rusage(int pid, int flavor, out rusage_info_t *buffer)",
+  array: "buffer",
+  length: "sizeof(struct rusage_info_v2)",
+  errno
+)
+private rusage(pid: int, flavor: int) -> Result[Array[long], Errno]
+
+@c(const: "RUSAGE_INFO_V2")
+val rusageInfoV2: int
+
+// The physical footprint of the process `pid`, in bytes: the ninth `uint64_t` after `ri_uuid`'s
+// two `long`s. A process that does not exist is `Err(ESRCH)`.
+footprintBytes(pid: int) -> Result[long, Errno] = rusage(pid, rusageInfoV2).map(info -> info(9))
+```
+
+Memory of no type C allocates and answers through `out void **`, named with `bytes:` or `array:`, is
+an `Array[byte]`, as long as its `length:` says in bytes, which need not be a whole number of wider
+elements. What is still refused:
 
 - **an array whose length no parameter carries**, as everywhere: `memcmp(const void *a, const void
   *b, size_t n)` carries one length for two, and its second array is refused;
-- **`out` and `inout` on a `void *`**: C writes no value of a type through one (`` C writes no value
-  through `out void *p`, which points at memory of no type ``), so the memory is an array or a block
-  passed in;
+- **a value through `out void *`, and `inout void *`**: C writes no value of a type through one
+  (`` C writes no value through `out void *p`, which points at memory of no type ``), so the memory is
+  an array or a block passed in, or an array or a struct mirror C fills;
+- **an array of anything but bytes for memory of no type C allocates** (`` C allocates memory of no
+  type for `p`, whose length in bytes need not be a whole number of `long`s, so it is answered as an
+  `Array[byte]` ``);
 - **anything else for a `void *` parameter**: a scalar, a string or an array of strings (`` `const
   void *` points at memory of no type, so it takes an `Array[byte]`, `Array[int]`, `Array[long]` or
   `Array[real]`, its length in bytes carried by the parameter marked `length(buf)`, or a

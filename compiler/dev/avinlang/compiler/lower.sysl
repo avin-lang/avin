@@ -3958,7 +3958,8 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
     var outs: Buf[COutSlot] = buf()
     val skipped = symbol.params.len() - symbol.decl.params.len()
     val result_type = concrete(l, symbol.result.unwrap_or(Unit))
-    val parts = c_result_parts(p, result_type, l.program.data) match
+    val errno = c_binding_flag(symbol.decl, "errno")
+    val parts = c_result_parts(p, c_answered_type(symbol.decl, result_type, l.program.data), l.program.data) match
         Ok(parts) -> parts
         Err(why) -> panic(why)
     val blocking = c_is_blocking(symbol.decl)
@@ -3995,7 +3996,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         // A length is the array's, filled in rather than passed by the caller.
         if q.length_of != "" && q.mode is CIn
             val a = arrays.of[c_param_index(p, q.length_of)].unwrap()
-            val lt = c_length_type(p, q)
+            val lt = c_length_type(p, q, l.program.c_measures)
             val s = c_scalar_of(q.ty, lt, l.program.c_measures)
             scalars.push(s)
             passed.push(c_argument(l, a.length, lt, s, s"${c_integer_name(q.ty, s)}, the length of `${q.length_of}`", at))
@@ -4004,7 +4005,7 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
             val a = arrays.of[c_param_index(p, q.length_of)].unwrap()
             val t = concrete(l, parts.outs[out_at])
             out_at += 1
-            var slot = c_out_slot(l, symbol, q, t, Some(a.length), c_length_type(p, q), &copies, at)
+            var slot = c_out_slot(l, symbol, q, t, Some(a.length), c_length_type(p, q, l.program.c_measures), &copies, at)
             slot.limit = Some(a.limit)
             outs.push(slot)
             scalars.push(CAddress)
@@ -4140,6 +4141,46 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         passed.push(SlotAddress(slot_of(place)))
     val length_slot: Option[usize] = if length_slots.len() > 0 then Some(length_slots[0]) else None
     val outs_read = COutsRead(n, length_slots)
+    // A binding marked `errno`: the glue writes `errno` after the lengths, straight after the call.
+    // Where C answers -1 the result is `Err` of it, and the out values are not read; otherwise `Ok` of
+    // the C result, where the binding keeps it, and the out values.
+    if errno
+        val code_place = machine_slot(l, MInt(32))
+        store(l, code_place, Some(ConstInt(32, "0")))
+        scalars.push(CAddress)
+        passed.push(SlotAddress(slot_of(code_place)))
+        val s = c_scalar_of(p.result, if *answered is Unit then Int(64) else answered, l.program.c_measures)
+        val answer = fresh(l, c_machine(s))
+        c_call(l, Call(Some(answer), CFunction(callee, scalars, Some(s)), passed), blocking, arrays, objects)
+        val failed = compare(l, CmpEq, Value(answer), c_integer_constant(-1i64, s))
+        val slot = machine_slot(l, MRef)
+        val yes = new_block(l)
+        val no = new_block(l)
+        val join = new_block(l)
+        finish_into(l, Branch(failed, no, yes), yes)
+        val read = c_read_outs(l, symbol, calls, outs, outs_read, at)
+        c_keeps(l, symbol, calls, read.made, read.made_optional, None)
+        var values: Buf[Option[Operand]] = buf()
+        if !(*answered is Unit) then values.push(Some(c_answer(l, Value(answer), s, answered, at)))
+        for v in read.values
+            values.push(v)
+        store(l, slot, Some(variant_object(l, result_type, "Ok", c_assemble(l, c_errno_ok(result_type, l.program.data).unwrap(), values))))
+        finish_into(l, Jump(join), no)
+        // An array C answered before failing is freed unread.
+        c_free_array_outs(l, outs, n)
+        val code = load(l, code_place).unwrap()
+        val e = c_result_error(result_type)
+        val error = if c_errno_type(e, l.program.data) then c_errno_answer(l, code, e) else c_answer(l, code, CSigned(32), e, at)
+        store(l, slot, Some(variant_object(l, result_type, "Err", Some(error))))
+        finish_into(l, Jump(join), join)
+        c_release_copies(l, copies)
+        c_release_structs(l, symbol, structs, arrays)
+        c_free_records(l, record_slots)
+        c_consumes(l, symbol, calls)
+        val value = load(l, slot).unwrap()
+        l.library = outer
+        finish(l, Return(Some(value)))
+        return
     // A handle answered in a `Result`: `Ok` of the handle, or, where the `attach:` that ties what the
     // call keeps to the C object answers non-zero, `Err` of that answer, the handle given back.
     if c_attach_result(answered, outs.len(), l.program.data, l.program.classes) is Some(e)
@@ -4311,7 +4352,7 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
             if c_memory_form(b, l.program.data, l.program.classes) is Some(_)
                 var block = c_block_in(l, Value(l.param_values[i].unwrap()), symbol.decl.name_span)
                 // A pointer to `void` is told its length as a `long`, in bytes.
-                if c_points_at_void(q) then block.length = block.limit
+                if c_points_at_no_type(q, l.program.c_measures) then block.length = block.limit
                 of.push(Some(block))
                 continue
         if !c_is_array_param(p, k)
@@ -4328,8 +4369,9 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
         var length = a
         var limit = a
         // A pointer to `void` is told the array's length in bytes, a `long`, which an `int` may not
-        // hold for an array of `long` or `real`; a length C writes back through it is in bytes too.
-        if c_points_at_void(q)
+        // hold for an array of `long` or `real`; a length C writes back through it is in bytes too. A
+        // pointer to a typedef the C unit measured as `void *` points at memory of no type as well.
+        if c_points_at_no_type(q, l.program.c_measures)
             length = runtime_call(l, "avin_rt_c_array_bytes", [MRef, MInt(64)], MInt(64), [a, ConstInt(64, size.to_string())])
             limit = runtime_call(l, "avin_rt_c_array_byte_limit", [MRef, MInt(64)], MInt(64), [a, ConstInt(64, size.to_string())])
         elif form.optional
@@ -5032,6 +5074,26 @@ private c_mirror_argument(l: *Lowering, x: Operand, d: usize, s: CScalar) -> Ope
         l.insts.push(Select(dest, compare(l, CmpEq, tag, ConstInt(64, v.to_string())), c_integer_constant(values[v], s), result))
         result = Value(dest)
     result
+
+// The `Errno` `t` the error number `x`, an `int`, is: the named case whose error number the C unit
+// measured as `x`, or `Other` of it.
+private c_errno_answer(l: *Lowering, x: Operand, t: &Type) -> Operand
+    val d = *t match
+        Data(d, _, _) -> d
+        _ -> panic("an `Errno` is a data type")
+    val slot = machine_slot(l, MRef)
+    val join = new_block(l)
+    for v in l.program.data[d].decl.variants
+        if v.name == "Other" then continue
+        val value = c_value(l, c_value_key(CConstInteger, v.name)).integer
+        val yes = new_block(l)
+        val next = new_block(l)
+        finish_into(l, Branch(compare(l, CmpEq, x, c_integer_constant(value, CSigned(32))), yes, next), yes)
+        store(l, slot, Some(variant_object(l, t, v.name, None)))
+        finish_into(l, Jump(join), next)
+    store(l, slot, Some(variant_object(l, t, "Other", Some(x))))
+    finish_into(l, Jump(join), join)
+    load(l, slot).unwrap()
 
 // The variant of the enum mirror `d` holding the C value `x`, crossing as `s`: the first one whose
 // enumerator has that value. A value no variant holds stops the program, `who` saying what answered.
