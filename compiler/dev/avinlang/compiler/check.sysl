@@ -773,6 +773,8 @@ struct Checker
     /** The lambda computing each local `lazy val`, by `"<root>:<local>"`: what it captures is held to
      * the rules a closure carrying the value to another thread is held to. */
     lazy_locals: Map[string, usize]
+    /** Every local `lazy val` checked, with the lambda computing it. */
+    local_lazies: Buf[LocalLazy]
     /** The name of each local `lazy val` whose initializer is the lambda at a span (`span_key`), which
      * the lambda's diagnostics call it by. */
     lazy_names: Map[string, string]
@@ -811,12 +813,21 @@ struct Checker
         self.units[unit].report.add(error(shown_at(self.shown, at), message))
 end Checker
 
-/** The `lazy val` field at `index` of class `owner`, which declares it, and the function its
- * initializer is checked as. */
+/** The `lazy val` field at `index` of class `owner`, which declares it, the function its
+ * initializer is checked as, and the local of the class body that holds the object, `self`, which
+ * that function captures. */
 struct LazyInitializer
     owner: usize
     index: usize
     function: usize
+    receiver: usize
+
+/** A local `lazy val` named `name`, declared at `span` of `unit`, and the lambda computing it. */
+struct LocalLazy
+    function: usize
+    name: string
+    unit: usize
+    span: Span
 
 /** Where a diagnostic reported at `at` is shown: the place the nearest entry of `shown` for `at`
  * gives, or `at` itself. */
@@ -1205,7 +1216,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1328,6 +1339,8 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     val direct = direct_uses(&c)
     check_module_state_in_threads(&c, direct)
     check_lazy_cycles(&c, direct)
+    check_lazy_field_cycles(&c)
+    check_local_lazy_cycles(&c)
     val init = initializer(&c, initialization_order(&c, direct), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
@@ -13032,7 +13045,11 @@ private lazy_field(c: *Checker, k: usize, made: *Construction, f: FieldDecl)
     val declared = c.classes[k].fields[index].ty
     val mark = c.unknowns.len()
     val typed = check_expr(c, Expr(f.value.span, Lambda(buf(), f.value)), lazy_initializer_type(declared))
-    if typed.kind is FunctionValue(fn_id, _) then c.lazy_initializers.push(LazyInitializer(k, index, fn_id))
+    // The class body's `self` is always a local of the constructor or initializer.
+    val receiver: usize = made.receiver.kind match
+        Local(r) -> r
+        _ -> c.body.locals.len()
+    if typed.kind is FunctionValue(fn_id, _) then c.lazy_initializers.push(LazyInitializer(k, index, fn_id, receiver))
     if declared is None
         settle_unknowns(c, mark)
         val result: &Type = *zonk(c, typed.ty) match
@@ -15233,7 +15250,9 @@ private lazy_binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[
     // The lambda takes the whole declaration's span, which no lambda inside it shares.
     c.lazy_names.put(span_key(unit, e.span), name)
     val typed = check_expr(c, Expr(e.span, Lambda(buf(), value)), Some(run))
-    if typed.kind is FunctionValue(f, _) then c.lazy_locals.put(key, f)
+    if typed.kind is FunctionValue(f, _)
+        c.lazy_locals.put(key, f)
+        c.local_lazies.push(LocalLazy(f, name, unit, e.span))
     // An initializer that never finishes gives a value of no type of its own.
     if *zonk(c, ty) is Var(v)
         if *zonk(c, typed.ty) is Function(_, r, _)
@@ -16033,37 +16052,261 @@ private check_lazy_cycles(c: *Checker, direct: Buf[Option[Uses]])
     for g in c.globals
         if g.lazy && g.init < stops.len() then stops[g.init] = true
     var o = InitOrder(buf(), buf(), buf(), buf())
+    var members: Buf[LazyMember] = buf()
     for g in c.globals
         o.needs.push(if g.lazy then lazies_reached(direct, stops, g.init) else buf())
         o.state.push(0)
+        members.push(LazyMember(g.unit, g.span, g.name))
     for g in 0..<c.globals.len()
-        if o.state[g] == 0 && c.globals[g].lazy then follow_lazy(c, &o, g)
+        if o.state[g] == 0 && c.globals[g].lazy then follow_lazy(c, &o, members, g)
 
-private follow_lazy(c: *Checker, o: *InitOrder, g: usize)
+/** A lazy value as a lazy cycle names it: where it is declared, and its name. */
+private struct LazyMember
+    unit: usize
+    span: Span
+    name: string
+
+private follow_lazy(c: *Checker, o: *InitOrder, members: Buf[LazyMember], g: usize)
     o.state[g] = 1
     o.path.push(g)
     for need in o.needs[g]
-        if o.state[need] == 1 then report_lazy_cycle(c, o, need)
-        elif o.state[need] == 0 then follow_lazy(c, o, need)
+        if o.state[need] == 1 then report_lazy_cycle(c, o, members, need)
+        elif o.state[need] == 0 then follow_lazy(c, o, members, need)
     o.path.truncate(o.path.len() - 1)
     o.state[g] = 2
 
 // The chain runs from `start` to the path's end and back, reported from its earliest-declared
 // member as a cycle of module values is.
-private report_lazy_cycle(c: *Checker, o: *InitOrder, start: usize)
-    var members: Buf[usize] = buf()
+private report_lazy_cycle(c: *Checker, o: *InitOrder, members: Buf[LazyMember], start: usize)
+    var chain_of: Buf[usize] = buf()
     var on = false
     for g in o.path
         if g == start then on = true
-        if on then members.push(g)
+        if on then chain_of.push(g)
     var earliest = 0
-    for i in 1..<members.len()
-        if declared_before(c.globals[members[i]], c.globals[members[earliest]]) then earliest = i
-    val first = c.globals[members[earliest]]
+    for i in 1..<chain_of.len()
+        val a = members[chain_of[i]]
+        val b = members[chain_of[earliest]]
+        if a.unit < b.unit || (a.unit == b.unit && a.span.start < b.span.start) then earliest = i
+    val first = members[chain_of[earliest]]
     var chain = ""
-    for i in 0..<members.len()
-        chain = chain + s"`${c.globals[members[(earliest + i) % members.len()]].name}` → "
+    for i in 0..<chain_of.len()
+        chain = chain + s"`${members[chain_of[(earliest + i) % chain_of.len()]].name}` → "
     c.note(first.unit, first.span, s"the `lazy val` `${first.name}` needs its own value to initialize: $chain`${first.name}`")
+
+// A field's `lazy val` is its object's, so its initializer needs its own value when its own code
+// reads the same field of the same object: by bare name or through `self`, in a method called on
+// `self` (every override a call through the method table may reach in a class descending from the
+// one declaring the field), in a function `self` is passed to, or through the initializers of the
+// object's other lazy fields it reads. For an object's field every read through the object's name is
+// of the same instance. A read of another instance's field is a different value and is not followed,
+// nor is a function the code only makes. Such a read is an error naming the chain of lazy fields.
+private check_lazy_field_cycles(c: *Checker)
+    var o = InitOrder(buf(), buf(), buf(), buf())
+    var members: Buf[LazyMember] = buf()
+    for init in c.lazy_initializers
+        val k = c.classes[init.owner]
+        var r = LazyReach(init.owner, k.global, false, map(), buf(), buf())
+        var at = SelfAt(buf(), buf())
+        at.locals.push(init.receiver)
+        reach_function(c, &r, init.function, at)
+        o.needs.push(r.fields)
+        o.state.push(0)
+        val field = k.fields[init.index]
+        members.push(LazyMember(k.unit, field.span, field.name))
+    for i in 0..<c.lazy_initializers.len()
+        if o.state[i] == 0 then follow_lazy(c, &o, members, i)
+
+// A local `lazy val` is held to the same rule: its initializer's own code is the code it runs and
+// the local functions that code calls, and the initializers of the other local lazy values it reads.
+private check_local_lazy_cycles(c: *Checker)
+    var o = InitOrder(buf(), buf(), buf(), buf())
+    var members: Buf[LazyMember] = buf()
+    for l in c.local_lazies
+        var r = LazyReach(0, None, true, map(), buf(), buf())
+        reach_function(c, &r, l.function, SelfAt(buf(), buf()))
+        var needs: Buf[usize] = buf()
+        for f in r.locals
+            for j in 0..<c.local_lazies.len()
+                if c.local_lazies[j].function == f then add_once(&needs, j)
+        o.needs.push(needs)
+        o.state.push(0)
+        members.push(LazyMember(l.unit, l.span, l.name))
+    for i in 0..<c.local_lazies.len()
+        if o.state[i] == 0 then follow_lazy(c, &o, members, i)
+
+/** Following a lazy value's initializer: the object it belongs to and the lazy values its code reaches. */
+private struct LazyReach
+    /** The class declaring the field: the object is of it or of a class descending from it. */
+    owner: usize
+    /** For an object's field, the module-level value holding the object. */
+    object: Option[usize]
+    /** Whether a local `lazy val` read is a value reached rather than code to follow. */
+    locals_as_values: bool
+    /** Each function followed, with where it holds the object (`self_key`). */
+    seen: Map[string, bool]
+    /** The lazy fields of the object read, by their place in `lazy_initializers`. */
+    fields: Buf[usize]
+    /** The lambdas of the local lazy values read. */
+    locals: Buf[usize]
+
+/** Where a function's code holds the object: the parameters and locals of its top-level function. */
+private struct SelfAt
+    params: Buf[usize]
+    locals: Buf[usize]
+
+private self_key(f: usize, at: SelfAt) -> string
+    var key = s"$f:"
+    for p in at.params
+        key = key + s"$p,"
+    key = key + "/"
+    for l in at.locals
+        key = key + s"$l,"
+    key
+
+private add_once(items: *Buf[usize], x: usize)
+    for item in *items
+        if item == x then return
+    items.push(x)
+
+private holds(items: Buf[usize], x: usize) -> bool
+    for item in items
+        if item == x then return true
+    false
+
+private is_self(r: *LazyReach, at: *SelfAt, e: &TExpr) -> bool = e.kind match
+    Local(x) -> holds(at.locals, x)
+    Param(i) -> holds(at.params, i)
+    Global(g) -> r.object match
+        Some(o) -> o == g
+        None -> false
+    _ -> false
+
+private reach_function(c: *Checker, r: *LazyReach, f: usize, at: SelfAt)
+    if f >= c.bodies.len() then return
+    val key = self_key(f, at)
+    if r.seen.get(key) is Some(_) then return
+    r.seen.put(key, true)
+    val body = c.bodies[f] match
+        Some(b) -> b
+        None -> return
+    var here = at
+    reach_expr(c, r, f, &here, body)
+
+private reach_expr(c: *Checker, r: *LazyReach, f: usize, at: *SelfAt, e: &TExpr)
+    e.kind match
+        LazyField(object, index, _, _) ->
+            if is_self(r, at, object)
+                if lazy_initializer_of(c, object.ty, index) is Some(i) then add_once(&r.fields, i)
+        LazyLocal(_, _, function, _) ->
+            if r.locals_as_values then add_once(&r.locals, function)
+            else reach_call(c, r, f, at, function, buf())
+        LazyGlobal(g, _, _) -> reach_call(c, r, f, at, c.globals[g].init, buf())
+        // A local given the object holds it too.
+        Let(x, value) ->
+            if is_self(r, at, value) then add_once(&at.locals, x)
+        Call(g, args, _) -> reach_call(c, r, f, at, g, args)
+        Dispatch(g, slot, args, _) -> reach_dispatch(c, r, f, at, g, slot, args)
+        BoundCall(g, slot, args, _) -> slot match
+            Some(s) -> reach_dispatch(c, r, f, at, g, s, args)
+            None -> reach_call(c, r, f, at, g, args)
+        Negate(x) ->
+            var operands: Buf[&TExpr] = buf()
+            operands.push(x)
+            reach_operator(c, r, f, at, "negate", operands)
+        Arith(op, a, b, _) ->
+            if binary_operator_method(op) is Some(om)
+                var operands: Buf[&TExpr] = buf()
+                operands.push(a)
+                operands.push(b)
+                reach_operator(c, r, f, at, om.method, operands)
+        Compare(operands, ops) ->
+            for i in 0..<ops.len()
+                if compare_operator_method(ops[i]) is Some(om)
+                    var pair: Buf[&TExpr] = buf()
+                    pair.push(operands[i])
+                    pair.push(operands[i + 1])
+                    reach_operator(c, r, f, at, om.method, pair)
+        _ -> ()
+    for x in texpr_children(e)
+        reach_expr(c, r, f, at, x)
+
+/** The place in `lazy_initializers` of the lazy field at `index` of an object of type `t`. */
+private lazy_initializer_of(c: *Checker, t: &Type, index: usize) -> Option[usize]
+    val k = *zonk(c, t) match
+        Class(id, _, _) -> id
+        _ -> return None
+    if index >= c.classes[k].fields.len() then return None
+    val owner = c.classes[k].fields[index].owner
+    for i in 0..<c.lazy_initializers.len()
+        val init = c.lazy_initializers[i]
+        if init.owner == owner && init.index == index then return Some(i)
+    None
+
+// A call is followed where it is given the object: a local function of the same top-level function
+// sees the object where its caller does, as well as in the parameters given it; any other function,
+// in the parameters given it. For an object, every function may read it by name.
+private reach_call(c: *Checker, r: *LazyReach, f: usize, at: *SelfAt, g: usize, args: Buf[&TExpr])
+    if g >= c.symbols.len() then return
+    val root = c.symbols[f].root.unwrap_or(f)
+    val local = c.symbols[g].root match
+        Some(rt) -> rt == root
+        None -> false
+    var next = SelfAt(buf(), buf())
+    if local
+        for p in at.params
+            next.params.push(p)
+        for l in at.locals
+            next.locals.push(l)
+        val given = c.symbols[g].param_locals
+        for i in 0..<args.len()
+            if i < given.len() && is_self(r, at, args[i]) then add_once(&next.locals, given[i])
+    else
+        for i in 0..<args.len()
+            if is_self(r, at, args[i]) then next.params.push(i)
+        if next.params.len() == 0 && r.object is None then return
+    reach_function(c, r, g, next)
+
+// A call through a method table reaches the method it names or an override of it: on the object, in
+// a class descending from the one declaring the field; on any other value, in any class.
+private reach_dispatch(c: *Checker, r: *LazyReach, f: usize, at: *SelfAt, g: usize, slot: usize, args: Buf[&TExpr])
+    reach_call(c, r, f, at, g, args)
+    val name = c.symbols[g].decl.name
+    val on_self = args.len() > 0 && is_self(r, at, args[0])
+    for kk in 0..<c.classes.len()
+        if !on_self || descends(c, kk, r.owner)
+            if slot < c.classes[kk].table.len()
+                if c.classes[kk].table[slot] is Some(m)
+                    if m != g && c.symbols[m].decl.name == name then reach_call(c, r, f, at, m, args)
+
+// An operator applied to the object calls the core trait method of that name in the table of its
+// class, which may be any class descending from the field's.
+private reach_operator(c: *Checker, r: *LazyReach, f: usize, at: *SelfAt, name: string, operands: Buf[&TExpr])
+    var any = false
+    for x in operands
+        if is_self(r, at, x) then any = true
+    if !any then return
+    val on_self = is_self(r, at, operands[0])
+    for kk in 0..<c.classes.len()
+        if !on_self || descends(c, kk, r.owner)
+            for entry in c.classes[kk].table
+                if entry is Some(m)
+                    if c.symbols[m].decl.name == name then reach_call(c, r, f, at, m, operands)
+
+/** Whether class `k` is `ancestor` or descends from it. */
+private descends(c: *Checker, k: usize, ancestor: usize) -> bool
+    var at = k
+    var depth = 0
+    while depth <= c.classes.len()
+        if at == ancestor then return true
+        val next = c.classes[at].superclass match
+            Some(t) -> *t match
+                Class(id, _, _) -> id
+                _ -> return false
+            None -> return false
+        at = next
+        depth += 1
+    false
 
 /** Whether `a` is declared before `b`: in an earlier unit, or earlier in the same one. */
 private declared_before(a: &GlobalSymbol, b: &GlobalSymbol) -> bool

@@ -2133,7 +2133,10 @@ passed by name, a method value), and it traps at that read rather than read what
   without being on it is not named.
 
   A field's value is its object's, so for a field only a read of the same object counts: by bare
-  name, through `self`, or in a method called on `self`. A read of another instance's field is a
+  name, through `self` or a local holding it, in a method called on `self` (every override of it a
+  class descending from the field's may have), in a function `self` is passed to, or through an
+  operator applied to it. An object has one instance, so for an object's field every read through
+  the object's name counts, wherever the code is. A read of another instance's field is a
   different value, and recursion through a structure is fine:
 
   ```text
@@ -2144,7 +2147,15 @@ passed by name, a method value), and it traps at that read rather than read what
   ```
 
   A local `lazy val` is held to the same rule, its initializer's own code being the block's code
-  that it runs and the functions that code calls.
+  that it runs, the local functions that code calls and the initializers of the other local lazy
+  values it reads:
+
+  ```text
+  count() -> int
+    lazy val n: int = twice() // error: the `lazy val` `n` needs its own value to initialize: `n` → `n`
+    twice() -> int = n * 2
+    n
+  ```
 
   Code the initializer makes and hands on without running it itself (a lambda, an argument passed by
   name, a method value) may read the value: that is how a value refers to itself, as a lazy list
