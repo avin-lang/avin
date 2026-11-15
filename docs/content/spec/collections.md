@@ -1450,7 +1450,9 @@ A source admitted for its role whose call still fails is reported at the generat
 in `for p in parser, n in maybeInt yield …` where `parser` is a `Parser[int]`, the error names the
 second generator, an `Option[int]` where `Parser`'s `flatMap` takes a function yielding a `Parser`.
 A guard on a source that is neither an `Iterable` nor a `Filter` names the guard and the bound it
-needs.
+needs. A refused source is told what to declare where the module can declare it: the impl, for a
+type of its own, or the bound, for a constructor parameter (add `Monad` to the bounds of `F`);
+another module's type, such as `Result`, which is no `Filter`, is only refused.
 
 `withFilter` is lazy. It returns a view of the collection that tests each element just before
 `map`, `flatMap` or `foreach` uses it, and another `withFilter` on the view combines the tests. So

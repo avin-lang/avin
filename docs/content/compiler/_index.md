@@ -1522,13 +1522,19 @@ out, dispatched through the trait. `loop_tests.sysl` holds the counts of calls a
 form makes.
 
 **`for` with `yield`** is parsed as `ForYield`, its generators each holding their pattern, source and
-guards, and checked as the calls it means (`for_yield_expr`). The first source is checked; each of
-its guards becomes a `withFilter` call on what came before, and the whole is called with `map` (the
+guards, and checked as the calls it means (`for_yield_expr`). The first source is checked, then
+admitted for its roles by conformance (`admitted_source`): an `Iterable` takes every role, and any
+other source's constructor must implement `Functor` (or `SendableFunctor`) as the last generator's,
+`Monad` (or `SendableMonad`) where a generator or a guarded definition follows, and `Filter` where
+a guard does, a constructor parameter by its bounds (`implements_role`, through `bound_constructor`
+and `applied_meets`). Each guard becomes a `withFilter` call on an `Iterable`, whose views are
+`Iterable`s too, and a `filter` call on any other source; the whole is called with `map` (the
 last generator) or `flatMap`, each given a lambda of one hidden parameter whose body binds it by the
 generator's pattern, as a loop's element is bound, and goes on with the guard, the yielded value or
 a `ForYield` of the remaining generators. Each call goes through the method resolution a written call
-uses, overloads included, with the comprehension's expected type passed to the outermost one; a
-receiver without the method is reported at the generator's source. The lambdas are named apart so a
+uses, overloads included, with the comprehension's expected type passed to the outermost one. While
+a `flatMap`'s function is checked, what its overloads take is held in `yield_frames`, so a later
+generator whose source makes none of it is reported at that generator (`taken_by_frame`). The lambdas are named apart so a
 diagnostic says "this guard" rather than "this lambda", and `return`, `break`, `continue` and `?`
 in them are reported as unable to leave the comprehension.
 

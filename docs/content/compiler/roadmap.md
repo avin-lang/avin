@@ -698,8 +698,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 7 are
-done; steps 8 onward are still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 8 are
+done; step 9 is still to come. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -797,17 +797,22 @@ and emission see only the types they see today; `type_key` names a constructor
    `tests/reject/foldable_constructor_bound_{refusals,inference}.avin`,
    `tests/reject/sendable_monad_conformance.avin`; the spec's `pairUp`, `Parser` and `traverse`
    examples are `run` fences.
-8. **Comprehensions by conformance.** `for_yield_expr` (`check.sysl`) admits each source by its
-   role (`Iterable`, or `Functor`/`Monad`/`Filter` or the sendable pair, through bounds in generic
-   code) before checking its calls as today; the guard on a non-`Iterable` source calls `filter`;
-   the library's `withFilter` views conform to `Iterable`. The generator-mismatch diagnostic naming
-   the later generator is taken from the parked branch `monadic-for` (6824d3bb), not merged whole.
-   Migration: `tests/run/for_yield_forms.avin`'s `Maybe` gains `impl Monad`/`impl Filter`;
-   `tests/run/futures_for_yield.avin` stays as it is, through `SendableMonad`; every other
-   comprehension over a type of a program's own in the corpus, the examples and the packages
-   (grep `yield` beside a `class` or `data`) gains its impl in the same commit. Tests: every role
-   accepted and refused, at a concrete type and through a bound; the order of evaluation unchanged
-   (the interleaving test); one reject file per new diagnostic.
+8. **Comprehensions by conformance.** *Done.* `for_yield_expr` (`check.sysl`) admits each source
+   by its roles (`admitted_source`, `implements_role`: an `Iterable`, or `Functor`/`Monad`/`Filter`
+   or the sendable pair, through bounds in generic code) before checking its calls as before; the
+   guard on a non-`Iterable` source calls `filter`; the library's `withFilter` views conform to
+   `Iterable`. The generator-mismatch diagnostic naming the later generator (`yield_frames`,
+   `taken_by_frame`) is taken from the parked branch `monadic-for`. A bound of two traits reaching
+   one method through an override (`F[_]: Monad & Filter`'s `map`) has the override alone
+   (`bound_methods`), a bug the comprehensions met. Migration: the `Maybe` of
+   `tests/run/for_yield_forms.avin` and `for_yield_definitions.avin` and the `Box` of
+   `spec_collections_comprehensions.avin` gain their impls; `futures_for_yield.avin` is unchanged,
+   through `SendableMonad`. Tests: `tests/run/for_yield_conformance{,_gc}.avin` (every role at a
+   class, a data type, two parameters, a subclass, `Option`, `Result`, `Either`, mixed with
+   collections and through bounds, with the order of evaluation logged),
+   `tests/run/filtered_views_iterable.avin`, `tests/run/bound_override_diamond.avin`,
+   `tests/reject/for_yield_roles{,_more}.avin`, `tests/reject/for_yield_generator_mismatch.avin`,
+   and the updated `tests/reject/for_yield_{sources,definitions}.avin`.
 9. **Tooling.** Hover and completion of a constructor's members (`lsp.sysl`, `completion.sysl`),
    the IntelliJ plugin's grammar for `F[_]` and `_` arguments (`avin-lang/avin-intellij`, shipped
    with the release that carries step 1), and `avin fmt` of every form.
