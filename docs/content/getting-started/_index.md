@@ -66,7 +66,8 @@ location, and is only for development: an installed `avin` needs no setting.
 
 The program writes to the terminal as it runs, and `avin run` exits with the program's own status;
 when a trap stops the program, the status is 128 and the signal's number, as a shell reports it.
-Everything after `--` is passed to the program as its arguments. The executable is kept in the
+The program, and whatever it starts, ends with `avin run`: a signal that stops `avin run` is passed
+on to it, and even an `avin run` killed outright takes it along. Everything after `--` is passed to the program as its arguments. The executable is kept in the
 program's own directory in the cache ([running and testing](/compiler/#running-and-testing)), and the
 next run of an unchanged program starts it without building it again. Any change to the program's
 sources, the standard library, the runtime or the compiler builds it again, and every build, `avin
@@ -153,7 +154,8 @@ leavesInRange()
 reports the place of the assertion itself.
 
 `avin test` builds the program's tests into one executable and runs each test in a process of its
-own, so a test that traps stops only itself:
+own, so a test that traps stops only itself. A test's process, and whatever it starts, ends with the
+test — passed, failed, trapped or timed out — and with `avin test` itself, however that is stopped:
 
 ```sh
 ./compiler/avin test my-program

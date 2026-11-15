@@ -10109,6 +10109,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   and the lowering `check` gave up, and only C bindings make one. The Sysl shims stay behind
   `--bindings`. Alternatives weighed: keeping `check` silent and documenting it (the disagreement
   marshal met); moving the checks into the checker (impossible: only the headers know a typedef).
+- Settled on the user's delegation 2026-11-15 (built on branch `test-orphans`): **a program `avin
+  run` or `avin test` starts watches its runner and ends when the runner does, even one killed
+  with `SIGKILL`; and `avin run` contains its program too**, closing the known limit of
+  `runner-orphans` (2026-11-12). The runner names itself in `AVIN_RUNNER_PID`; the runtime, as a
+  program starts, takes the variable out of its environment and, only when the process it names is
+  the program's parent, starts a thread that waits for that process to exit (a kqueue
+  `EVFILT_PROC`/`NOTE_EXIT` on macOS; elsewhere a check of the parent every 100 ms). When the runner
+  is gone the program sets its own `SIGTERM` aside, sends `SIGTERM` to the group it leads (or to
+  itself when it leads none), waits 200 ms, and sends `SIGKILL`. A program started any other way, or
+  with the variable naming a process that is not its parent, watches nothing. `avin run` started
+  away from a terminal now starts its program as the leader of a group of its own, passes `SIGTERM`,
+  `SIGINT` and `SIGHUP` on to the group, kills it 2 s after the first if it is still running, exits
+  with the program's status, and stops whatever is left of the group once the program has ended.
+  Started at a terminal as its foreground job, `avin run` keeps the program in that job, so the
+  terminal's Ctrl-C and Ctrl-Z and the shell's job control reach both as before; it passes on
+  `SIGTERM` and `SIGHUP` to the program alone and lets the program decide what Ctrl-C means. Why: four
+  test programs of 0.0.21 runs were found alive after 37 h at PPID 1, one still holding a port
+  another project's tests then collided with: runners killed outright (a deadline, a stopped
+  agent) cannot act, and `avin run` did not contain its program at all. Alternatives weighed: a
+  thread in every program that polls its parent (a cost for programs nobody runs under a runner,
+  and on macOS a kqueue waits for free); Linux's `PR_SET_PDEATHSIG` (fires when the parent
+  *thread* that started the child ends, and runners start programs from worker threads; macOS has
+  none); keeping the terminal case in a group of its own given the terminal (`foreground`), which
+  would leave a Ctrl-Z stopping the program alone while `avin run` waits for it, wedging the shell;
+  a longer grace for the watch (the runner that would have waited is gone). Known limits: at a
+  terminal, a program's own children are not reached when `avin run` is killed outright, only the
+  program; a program that ignores the runner's death by leaving its group or session is beyond
+  reach. **Review with the user**: the terminal case keeping the program in the shell's job.
 
 ## Open
 
