@@ -2036,3 +2036,90 @@ lsp_completion_refined_variant()
     val items = lsp_complete_in("t.avin", lsp_refined_text(), 8, 14, false)
     assert_eq(lsp_item(items, "Pair").detail, "Expr.Pair[A, B](first: Expr[A], second: Expr[B]) -> Expr[(A, B)]")
     assert(lsp_offers(items, "Pair"))
+
+private lsp_constructor_text() -> string =
+    "trait Pointed[A]\n    static point[X](value: X) -> Self[X]\n    peek() -> A\n\n" +
+    "data Box[T](value: T)\n\nimpl Pointed for Box\n    static point[X](value: X) -> Box[X] = Box(value)\n    peek() -> T = value\n\n" +
+    "impl[F[_]: Pointed, A] F[A]\n    again() -> F[A] = F.point(peek())\n\n" +
+    "twice[F[_]: Monad](fa: F[int]) -> F[int] = fa.map(x -> x + 1)\n\n" +
+    "made[F[_]: Applicative]() -> F[int] = F.pure(1)\n\n" +
+    "used(b: Box[int]) -> Box[int] = b.again()\n\n" +
+    "data Nested[F[_], A]\n    Deep(inner: F[Option[A]])\n    Flat\n\nclass Wrapper[F[+_], A](val inner: F[A])\n\ntype IntsOf[F[_, _: Ord]] = F[int, int]\n\nmain() = ()\n"
+
+// The trait, the impl and the impl over a constructor parameter that the completions below see,
+// ten lines and a blank one before the line completed.
+private lsp_pointed_text() -> string =
+    "trait Pointed[A]\n    static point[X](value: X) -> Self[X]\n    peek() -> A\n\n" +
+    "data Box[T](value: T)\n\nimpl Pointed for Box\n    static point[X](value: X) -> Box[X] = Box(value)\n    peek() -> T = value\n\n" +
+    "impl[F[_]: Pointed, A] F[A]\n    again() -> F[A] = F.point(peek())\n\n"
+
+private lsp_hovers(server: *LspServer, uri: string, id: int, line: int, character: int, code: string, c0: int, c1: int)
+    assert_eq(lsp_one(server, lsp_request(id, "textDocument/hover", lsp_test_at(uri, line, character))), lsp_hover_of(id, code, "", line, c0, line, c1))
+
+@test("lsp: hover on a constructor's members shows the bound trait's method, and a constructor parameter is shown with its holes and bounds")
+lsp_hover_constructor_members()
+    val dir = lsp_normal(make_temp_dir("avin-lsp").unwrap())
+    val uri = lsp_file_uri(dir + "/t.avin")
+    var server = lsp_ready()
+    assert_eq(lsp_one(&server, lsp_open(uri, lsp_constructor_text())), lsp_publish_of(uri, ""))
+    // A member of a value of `F[int]` is the bound's method, an inherited one named by the bound.
+    lsp_hovers(&server, uri, 2, 13, 47, "Monad.map[B](f: (A) -> B) -> Self[B]", 46, 49)
+    lsp_hovers(&server, uri, 3, 13, 44, "fa: F[int]", 43, 45)
+    // A function's signature keeps its constructor parameter's holes.
+    lsp_hovers(&server, uri, 4, 13, 1, "twice[F[_]: Monad](fa: F[int]) -> F[int]", 0, 5)
+    lsp_hovers(&server, uri, 5, 13, 7, "type parameter F[_]: Monad", 6, 7)
+    // `F.pure`: the parameter as a receiver, and the static member its bound declares.
+    lsp_hovers(&server, uri, 6, 15, 38, "type parameter F[_]: Applicative", 38, 39)
+    lsp_hovers(&server, uri, 7, 15, 41, "Applicative.pure[X](value: X) -> Self[X]", 40, 44)
+    // A method an impl over a constructor parameter adds, called on a type that conforms.
+    lsp_hovers(&server, uri, 8, 17, 35, "F[A].again() -> F[A]", 34, 39)
+    // Inside that impl: the parameter, its bound's static member and the receiver's own method.
+    lsp_hovers(&server, uri, 9, 11, 23, "type parameter F[_]: Pointed", 22, 23)
+    lsp_hovers(&server, uri, 10, 11, 26, "Pointed.point[X](value: X) -> Self[X]", 24, 29)
+    lsp_hovers(&server, uri, 11, 11, 32, "Pointed.peek() -> A", 30, 34)
+    lsp_hovers(&server, uri, 12, 10, 5, "type parameter F[_]: Pointed", 5, 6)
+    lsp_hovers(&server, uri, 13, 0, 7, "trait Pointed[A]", 6, 13)
+    // Declarations taking constructor parameters show their holes, a hole's variance and bounds.
+    lsp_hovers(&server, uri, 14, 19, 6, "data Nested[F[_], A]\n    Deep(inner: F[Option[A]])\n    Flat", 5, 11)
+    lsp_hovers(&server, uri, 15, 23, 7, "class Wrapper[F[+_], A](val inner: F[A])", 6, 13)
+    lsp_hovers(&server, uri, 16, 25, 6, "type IntsOf[F[_, _: Ord]] = F[int, int]", 5, 11)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("lsp: completion of a constructor's members offers its bounds' methods and static members, an impl's added methods, and the parameter with its holes")
+lsp_completion_constructor_members()
+    val fa = lsp_complete_in("t.avin", "twice[F[_]: Monad](fa: F[int]) -> F[int] = fa.\n\nmain() = ()\n", 0, 46, false)
+    assert_eq(lsp_item(fa, "map").detail, "Monad.map[B](f: (A) -> B) -> Self[B]")
+    assert_eq(lsp_item(fa, "map").kind, 2)
+    assert_eq(lsp_item(fa, "flatMap").detail, "Monad.flatMap[B](f: (A) -> Self[B]) -> Self[B]")
+    assert_eq(lsp_item(fa, "map2").detail, "Monad.map2[B, C](other: Self[B], f: (A, B) -> C) -> Self[C]")
+    // A static member is not a value's member.
+    assert(!lsp_offers(fa, "pure"))
+    val statics = lsp_complete_in("t.avin", "made[F[_]: Applicative]() -> F[int] = F.\n\nmain() = ()\n", 0, 40, false)
+    assert_eq(lsp_item(statics, "pure").detail, "Applicative.pure[X](value: X) -> Self[X]")
+    assert(!lsp_offers(statics, "map"))
+    val option = lsp_complete_in("t.avin", "show(o: Option[int]) -> int = Option.\n\nmain() = ()\n", 0, 37, false)
+    assert_eq(lsp_item(option, "pure").detail, "Option[T].pure[X](value: X) -> Option[X]")
+    assert(lsp_offers(option, "when"))
+    val partial = lsp_complete_in("t.avin", "made() -> Result[int, string] = Result[_, string].\n\nmain() = ()\n", 0, 50, false)
+    assert_eq(lsp_item(partial, "pure").detail, "Applicative.pure[X](value: X) -> Self[X]")
+    assert(!lsp_offers(partial, "map"))
+    // An alias that is a constructor offers the same.
+    val alias = lsp_complete_in("t.avin", "type Parsed[T] = Result[T, string]\n\nmade() -> Parsed[int] = Parsed.\n\nmain() = ()\n", 2, 31, false)
+    assert_eq(lsp_item(alias, "pure").detail, "Applicative.pure[X](value: X) -> Self[X]")
+    // A partial application of a type no constructor trait is implemented by offers nothing.
+    val none = lsp_complete_in("t.avin", "data Pair[A, B](a: A, b: B)\n\nmade() -> int = Pair[_, int].\n\nmain() = ()\n", 2, 29, false)
+    assert(!lsp_offers(none, "pure"))
+    val own = lsp_complete_in("t.avin", "trait Lifted[A]: Applicative[A]\n    lift() -> Self[A] = Self.\n\nmain() = ()\n", 1, 29, false)
+    assert_eq(lsp_item(own, "pure").detail, "Applicative.pure[X](value: X) -> Self[X]")
+    // An impl over a constructor parameter adds its method to a value of the parameter and of a
+    // type that conforms to the bound.
+    val added = lsp_complete_in("t.avin", lsp_pointed_text() + "lift[F[_]: Pointed](fa: F[int]) -> F[int] = fa.\n\nmain() = ()\n", 13, 47, false)
+    assert(lsp_offers(added, "again"))
+    assert(lsp_offers(added, "peek"))
+    val boxed = lsp_complete_in("t.avin", lsp_pointed_text() + "boxed() -> int = Box(1).\n\nmain() = ()\n", 13, 24, false)
+    assert(lsp_offers(boxed, "again"))
+    assert(lsp_offers(boxed, "peek"))
+    assert(lsp_offers(boxed, "value"))
+    // A constructor parameter offered where a type is written shows its holes and bound.
+    val typed = lsp_complete_in("t.avin", "f[F[_]: Monad](x: F) = 0\n\nmain() = ()\n", 0, 19, false)
+    assert_eq(lsp_item(typed, "F").detail, "type parameter F[_]: Monad")

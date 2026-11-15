@@ -698,8 +698,8 @@ The test matrix every item fills, each cell a test that would fail if the rule w
 
 [Higher-kinded types](/spec/generics/#higher-kinded-types) and the
 [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse) are designed in
-generics, their choices proposed in [decisions](/spec/decisions/#proposed). Steps 1 to 8 are
-done; step 9 is still to come. Each step
+generics, their choices proposed in [decisions](/spec/decisions/#proposed). All nine steps are
+done. Each step
 is one agent's item, gated on its own (targeted files plus the corpus), and lands the tests listed;
 no step builds a path a later one removes. The spec's examples are plain `text` fences, which no
 test reads; step 7 makes the finished ones `text run` programs with `text output` fences, which
@@ -813,9 +813,27 @@ and emission see only the types they see today; `type_key` names a constructor
    `tests/run/filtered_views_iterable.avin`, `tests/run/bound_override_diamond.avin`,
    `tests/reject/for_yield_roles{,_more}.avin`, `tests/reject/for_yield_generator_mismatch.avin`,
    and the updated `tests/reject/for_yield_{sources,definitions}.avin`.
-9. **Tooling.** Hover and completion of a constructor's members (`lsp.sysl`, `completion.sysl`),
-   the IntelliJ plugin's grammar for `F[_]` and `_` arguments (`avin-lang/avin-intellij`, shipped
-   with the release that carries step 1), and `avin fmt` of every form.
+9. **Tooling.** *Done.* Hover and completion of a constructor's members: a value of `F[X]` offers
+   and shows its bounds' methods, `F.` and `Self.` their static members, `Option.`,
+   `Result[_, E].` and an alias that is a constructor the static members of the constructor traits
+   it implements (`constructor_static_members` in `check.sysl`; a partial application offered
+   nothing before), and a conforming type the methods an impl over a constructor
+   parameter adds; a signature, a declaration and a type parameter are shown with their holes
+   (`show_type_param` in `syntax_show.sysl`, used by `definition_index.sysl`'s headers and the
+   type parameter's own hover, `type parameter F[_]: Monad`). `avin fmt` of every form: constructor
+   traits, their impls by name and by holes, impls over constructor parameters, `F.pure` and the
+   static members of a partial application and an alias, hole variance and bounds. A method or a
+   local function whose constructor parameter opens with `-_` was read as an expression
+   (`local_function_ahead` in `parse_decl.sysl`), a bug the formatter met. The editor grammar
+   (`editors/vscode/syntaxes/avin.tmLanguage.json`, which the IntelliJ plugin bundles) reads the
+   brackets after a name as types: a hole and its variance, a type parameter's variance, and
+   declarations and calls whose type brackets nest. Diagnostics give a letter standing alone its
+   letter's article (`an F[int]`, `a T`, `a unit`; `article` in `check.sysl`). Tests:
+   `lsp_tests.sysl` (`lsp_hover_constructor_members`, `lsp_completion_constructor_members`),
+   `formatter_tests.sysl` (`fmt_constructor_traits`, `fmt_constructor_param_impls`,
+   `fmt_constructor_statics`), `parse_tests.sysl` (`constructor_param_contravariant_members`),
+   `editors/grammar-tests/samples/constructors.avin`, the plugin's `AvinEditorTest`, and
+   `tests/reject/article_letter_{names,types,sendable}.avin`.
 
 ## Releases
 

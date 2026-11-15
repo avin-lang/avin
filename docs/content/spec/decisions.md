@@ -10036,6 +10036,15 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   select's send arm cannot deposit without committing to it); locking every channel of a select at
   once (a lock order across channels, and a different design for every select). The sender's wait
   is its own kind in the thread dump and deadlock report, "waiting to hand a value to a receiver".
+- Proposed (built on branch `hkt-9`): **a diagnostic's article follows how a type's name is read.**
+  A capital letter standing alone at the start of a name (`F[int]`, `T`, `X2`) is read as the letter,
+  so it takes `an` before A, E, F, H, I, L, M, N, O, R, S and X and `a` otherwise (`an F[int]`,
+  `a T`, `a U`); any other name takes `an` before a, e, i, o in either case and `a` before `u`
+  (`a unit`, `a usize`, `a Unicorn`), one helper (`article` in `check.sysl`) for every message. Why:
+  constructor and type parameters are single letters, and "a `F[int]`" read wrongly; the type names
+  that begin with `u` mostly sound a consonant. Alternatives weighed: treating `u` as a vowel, as
+  three of the four old helpers did ("an `unit`"); reading every all-capital name as letters
+  (`an HTTP`, but `a NASA` reads as a word, and no type name in the library is one).
 
 ## Open
 
