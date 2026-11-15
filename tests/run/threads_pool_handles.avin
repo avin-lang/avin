@@ -1,0 +1,46 @@
+// expect: exit 0
+// A pool holds resources that are neither sendable nor plain: open files, mutable and each holding a
+// Sysl handle that belongs to one thread at a time. Thirty threads write a line each through a pool
+// of two; each file is made on one thread and used on many, its handle going with it to each
+// borrower, and the pool's `destroy` closes them when it is closed. A mutable resource of the
+// program's own, with a `var`, is pooled the same way.
+import avin.fs
+import avin.fs.File
+import avin.io.IoError
+import avin.threads.{Atomic, Pool, scope, sleep}
+import avin.time.millis
+
+class Counter()
+  var uses = 0
+
+main()
+  val dir = fs.tempDir("pool-handles").ok.get
+  val name = dir.path + "/log.txt"
+  _ = fs.writeText(name, "")
+  val closed = Atomic(0)
+  val files = Pool[File, IoError](
+    () -> fs.append(name),
+    maxSize = 2,
+    destroy = Some(f ->
+      _ = f.close()
+      _ = closed.add(1))
+  )
+  val wrote = Atomic(0)
+  scope(s ->
+    for i in 1 .. 30
+      s.spawn(() ->
+        val r = files.use(f ->
+          sleep(millis(1))
+          f.writeText(s"line $i\n").isOk)
+        if r == Ok(true) then wrote.add(1)))
+  println(s"wrote ${wrote.load()} ${files.stats()}")
+  files.close()
+  println(s"closed ${closed.load()} ${files.stats()}")
+  val text = fs.readText(name).ok.get
+  println(text.split("\n").filter(l -> l != "").length)
+
+  val counters = Pool[Counter, string](() -> Ok(Counter()), maxSize = 1)
+  scope(s ->
+    for _ in 1 .. 10 do s.spawn(() -> _ = counters.use(c -> c.uses += 1)))
+  println(counters.use(c -> c.uses))
+  _ = dir.close()

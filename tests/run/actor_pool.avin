@@ -1,0 +1,29 @@
+// expect: exit 0
+// Actors share a pool as threads do: four workers, each told five jobs, borrow from a pool of two
+// open files, writing a line per job, and reply on a channel. Each file's handle goes to whichever
+// actor borrows it next. A worker's turn that waits for a resource waits its turn in the queue.
+import avin.actors.spawn
+import avin.fs
+import avin.fs.File
+import avin.io.IoError
+import avin.threads.{Channel, Pool}
+
+actor Worker(files: Pool[File, IoError], done: Channel[bool]) receives int
+  receive
+    n -> done.send(files.use(f -> f.writeText(s"job $n\n").isOk) == Ok(true))
+
+main()
+  val dir = fs.tempDir("actor-pool").ok.get
+  val name = dir.path + "/log.txt"
+  _ = fs.writeText(name, "")
+  val files = Pool[File, IoError](() -> fs.append(name), maxSize = 2, destroy = Some(f -> _ = f.close()))
+  val done = Channel[bool]()
+  val workers = [0, 1, 2, 3].map(_ -> spawn(Worker(files, done)))
+  for i in 0 ..< 20 do workers(i % 4).tell(i)
+  var ok = 0
+  for _ in 0 ..< 20
+    if done.receive() == Some(true) then ok += 1
+  println(s"ok $ok ${files.stats()}")
+  files.close()
+  println(fs.readText(name).ok.get.split("\n").filter(l -> l != "").length)
+  _ = dir.close()

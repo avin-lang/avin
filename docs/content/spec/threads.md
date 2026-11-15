@@ -77,7 +77,7 @@ goes on running after the call. What a program can rely on:
   `send`, timed or not, a `select`, a `withTimeout`'s wait for its body, a future's `await`, a
   promise's future, a condition's `wait` (plain or timed), a wait group's `wait` (plain or timed), a
   semaphore's `acquire` (plain, timed or in `withPermit`), a read-write lock's `read` and `write`
-  waiting to go in, a barrier's `wait`, a socket's
+  waiting to go in, a barrier's `wait`, a [pool](#pools)'s `use` or `lease` waiting for a resource, a socket's
   `accept`, `connect`, read or write that waits for its connection. A thread
   parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
   compiled code makes on every back edge of a loop and before every call that may recur, so a thread
@@ -91,7 +91,8 @@ goes on running after the call. What a program can rely on:
   not take its mutex again. A wait that left a mark on what it waits for takes it back as it stops:
   a writer or a reader waiting for a `RwLock` no longer holds back those behind it, and a party
   waiting at a `Barrier` withdraws its arrival. A thread stopped inside a `RwLock`'s read body or a
-  semaphore's `withPermit` body gives its share of the lock, or its permit, back as it stops; what
+  semaphore's `withPermit` body gives its share of the lock, or its permit, back as it stops, as one
+  inside a pool's `use` or `lease` body gives its resource back; what
   such a body was doing is its own, as any cancelled code's is.
 - **Cancellation reaches down through scopes.** A cancelled thread that is running a scope of its own,
   in that scope's body or waiting for its threads, stops first at that scope: the inner scope cancels
@@ -534,6 +535,98 @@ What a program can rely on:
   receiver*. Which of several waiting receivers gets a value is not specified.
 - **Sendable as any channel.** A channel of capacity zero is sendable where its values are, as every
   channel is.
+
+### Pools
+
+A **`Pool[T, E]`** holds resources that are costly to make, connections to a database or a server
+for one, and lends them again and again. `use(f)` lends one for the call of `f`, takes it back when
+`f` returns, and answers `Ok` of what `f` returned, or the `PoolError[E]` that kept the call from
+getting one:
+
+```avin
+class Pool[T, E](
+    create: @sendable () -> Result[T, E],
+    maxSize: int,
+    minIdle: int = 0,
+    validate: Option[@sendable (T) -> bool] = None,
+    destroy: Option[@sendable (T) -> unit] = None,
+    idleTimeout: Option[Duration] = None,
+    acquireTimeout: Option[Duration] = None
+): Sendable
+
+data PoolError[+E]
+  AcquireTimedOut
+  PoolClosed
+  CreateFailed(error: E)
+
+data PoolStats(size: int, idle: int, lent: int, waiting: int)
+```
+
+- **A resource is made when it is wanted.** A call that finds a resource idle takes the one given
+  back last; one that finds none, with fewer than `maxSize` made, makes one with `create`; one that
+  finds all `maxSize` lent waits for one to come back. A `create` that fails makes the call fail with
+  `CreateFailed`, carrying the error, and gives up its place, so the pool holds nothing more than
+  before and the next call tries again. `warm()` makes resources until the pool holds `minIdle`, each
+  left idle, answering the first failure of `create`.
+- **Waiters are served in the order they came.** A resource given back goes straight to the call that
+  has waited longest, and so does the place a destroyed resource gives up, where that call then makes
+  a resource of its own; a call that comes while others wait queues behind them.
+- **A call waits for at most its timeout.** `use(timeout, f)` waits at most `timeout`, `use(f)` the
+  pool's `acquireTimeout`, or for ever where there is none, and a call whose time runs out fails
+  with `AcquireTimedOut`, leaving the queue as if it had never come. A timeout of zero or less takes
+  a resource only where one is idle, or can be made, now.
+- **A broken resource is destroyed, not lent again.** `lease(f)` and `lease(timeout, f)` lend the
+  resource as a `Lease[T]`, whose `resource` is the resource and whose `markBroken()` says it is no
+  good any more: the pool destroys it, with `destroy` where one is given, when the body returns.
+  `validate` checks an idle resource before it is lent again, never one just made: one it answers
+  `false` for is destroyed and the call looks again.
+- **Idle resources expire.** A resource idle for longer than `idleTimeout` is destroyed the next time
+  a call looks for one, oldest first, keeping at least `minIdle`; `evictIdle()` does the same at once
+  and answers how many it destroyed. With no `idleTimeout` nothing expires.
+- **The resource always comes back.** It is taken back when `f` returns and when the thread running
+  `f` is cancelled inside it. A cancellation anywhere else in the call puts back what the call held:
+  its place among the waiters, a resource handed to it there, the place it held while `create` ran,
+  a resource `validate` was checking, which is destroyed. A trap inside `f`, `create`, `validate` or
+  `destroy` stops the program, even in an [actor](/spec/actors/), as one inside a semaphore's
+  `withPermit` does, since what the pool counts would otherwise never come right.
+- **`close()` ends the pool.** Every call waiting fails with `PoolClosed`, as does every call after,
+  the idle resources are destroyed, and `close` waits for the lent ones to come back, destroying each
+  as it does; a resource whose make finishes after the close is destroyed too. Closing a closed pool
+  waits for the same, and a thread that closes a pool while a resource is lent to it waits for ever.
+  `isClosed()` says whether it was closed.
+- **`stats()`** answers what the pool holds now: `size` resources in all, of which `idle` wait to be
+  lent and `lent` are lent, and `waiting` calls waiting for one; the rest are being made or checked.
+  `maxSize` below one, and `minIdle` below zero or above `maxSize`, trap where the pool is made.
+- **A resource belongs to one call at a time**, so a pool of any type is sendable, as a `Mutex` is,
+  and its resources may be mutable connections. So that nothing else reaches one, `create`,
+  `validate` and `destroy` are `@sendable`, and a body is `@isolating` and gives back only a sendable
+  value: it may not keep the resource, or its lease, or hand it to the body of another pool's call.
+  Each resource given back has its [Sysl handles](/spec/sysl-bindings/#handles) put in transit, so
+  the thread or actor it is lent to next uses them as its own.
+
+```avin run
+import avin.threads.{Atomic, Pool, scope}
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val db = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2)
+  val total = Atomic(0)
+  scope(s ->
+    for n in 1 .. 10 do s.spawn(() -> _ = db.use(c -> total.add(n))))
+  println(s"total ${total.load()}, made at most 2: ${made.load() <= 2}")
+  val st = db.stats()
+  println(s"lent ${st.lent}, all idle: ${st.idle == st.size}")
+  db.close()
+  println(db.use(c -> c.id))
+```
+
+```text output
+total 55, made at most 2: true
+lent 0, all idle: true
+Err(the pool is closed)
+```
 
 ## select
 

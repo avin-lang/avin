@@ -1,0 +1,78 @@
+// expect: exit 0
+// `close` fails every call waiting with `PoolClosed`, destroys the idle resources at once, and waits
+// for the lent ones: each is destroyed as it comes back, even one its body did not mark broken, and
+// `close` returns once the last is. Every call after fails with `PoolClosed`, `warm` included, and
+// closing again returns at once. A resource whose make finishes after the close is destroyed too.
+import avin.threads.{Atomic, Channel, Pool, PoolClosed, scope, sleep, spawn}
+import avin.time.millis
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val destroyed = Atomic(0)
+  val pool = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2, destroy = Some(_ -> _ = destroyed.add(1)))
+  println(pool.use(c -> pool.use(d -> c.id + d.id)))
+  println(pool.stats())
+  val hold = Channel[int](1)
+  val holdSecond = Channel[int](1)
+  val holding = Channel[int](1)
+  val log = Channel[string](8)
+  scope(s ->
+    s.spawn(() ->
+      val r = pool.use(c ->
+        holding.send(c.id)
+        _ = hold.receive()
+        log.send(s"body ends, destroyed ${destroyed.load()}")
+        c.id)
+      log.send(s"lent call: $r"))
+    _ = holding.receive()
+    s.spawn(() -> _ = pool.use(c ->
+      holding.send(c.id)
+      _ = holdSecond.receive()
+      c.id))
+    _ = holding.receive()
+    s.spawn(() -> log.send(s"waiter: ${pool.use(c -> c.id)}"))
+    while pool.stats().waiting < 1 do sleep(millis(1))
+    val closer = s.spawn(() ->
+      pool.close()
+      log.send(s"closed, destroyed ${destroyed.load()}"))
+    while !pool.isClosed() do sleep(millis(1))
+    println(log.receive())
+    println(s"closing ${pool.stats()} destroyed ${destroyed.load()}")
+    println(pool.use(c -> c.id) == Err(PoolClosed))
+    hold.send(0)
+    println(log.receive())
+    println(log.receive())
+    println(s"closer still waiting ${pool.stats()} destroyed ${destroyed.load()}")
+    holdSecond.send(0)
+    _ = closer.join()
+    println(log.receive()))
+  println(s"made ${made.load()} destroyed ${destroyed.load()} ${pool.stats()}")
+  pool.close()
+  println(pool.lease(l -> l.resource.id))
+  println(pool.warm())
+  println(pool.evictIdle())
+
+  // Idle resources are destroyed by the close itself.
+  val gone = Atomic(0)
+  val idle = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2, destroy = Some(_ -> _ = gone.add(1)))
+  println(idle.use(c -> idle.use(d -> c.id + d.id)))
+  println(idle.stats())
+  idle.close()
+  println(s"idle closed, destroyed ${gone.load()} ${idle.stats()}")
+
+  // A make that finishes after the close: the resource is destroyed and the call fails.
+  val gate = Channel[int](1)
+  val late = Atomic(0)
+  val slow = Pool[Conn, string](maxSize = 1, destroy = Some(_ -> _ = late.add(1)), create = () ->
+    holding.send(0)
+    _ = gate.receive()
+    Ok(Conn(9)))
+  val maker = spawn(() -> slow.use(c -> c.id))
+  _ = holding.receive()
+  val closing = spawn(() -> slow.close())
+  while !slow.isClosed() do sleep(millis(1))
+  gate.send(0)
+  closing.join()
+  println(s"${maker.join()} destroyed ${late.load()} ${slow.stats()}")
