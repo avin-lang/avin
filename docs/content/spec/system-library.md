@@ -1525,7 +1525,8 @@ to case, its `body` with `text` reading it as UTF-8, and the `params` its route 
 escapes decoded, `segments`, the path's segments each decoded (so `/a%2Fb` is the one segment
 `a/b`, and `/` one empty one), `query` as written, and `queryParams` as `Url.queryParams` reads
 them. A target is a path beginning with `/` or an absolute `http` URL; `ServerRequest(method,
-target)` traps on any other, so a handler can be tried without a connection.
+target)` traps on any other, so a handler can be tried without a connection. A request also carries
+the values a middleware handed on, read by `value[T]()` (below).
 
 A `Response` is the client's: `Response.text(status, text)` (`text/plain; charset=utf-8`),
 `Response.json(status, text)` (`application/json`, the text sent as given and not checked to be
@@ -1574,6 +1575,43 @@ putting the newer outside, so it runs first; `route.under(prefix)` puts a route'
 h)` answers each of `routes` under `prefix` and wrapped by `middleware`, and groups nest, an inner
 group's middleware running inside the outer's. A prefix begins with `/`, does not end with one and
 may bind parameters as a pattern does; one that does not hold traps.
+
+**Values a middleware hands on.** `request.withValue(value)` answers the request carrying `value`,
+and `request.value[T]()` answers `Some` of the value the request carries as its `T`, `None` where it
+carries none; both take a `T: Sendable`, since a request may be answered on any thread. A request is
+a value: `withValue` answers a new one and leaves the request it was called on as it was. The type is
+the key, compared exactly, as a type pattern compares a generic type's arguments: handing on a
+second value of one type replaces the first, a value handed on as an `int` is no `long`, one handed
+on as a trait's type is read as that trait and not as its class, and `Vector[int]` is not
+`Vector[string]`. Two values of one type are handed on as two types of the program's own, a
+`data RequestId(value: string)` beside a `data TraceId(value: string)`. The values go wherever the
+request goes: through a router's binding of parameters, groups, nested middleware (an inner one
+replacing what an outer one handed on, if it hands on the same type) and the streamed and
+event-stream handlers, whose `write` reads the request it was made from. An authenticating
+middleware hands its user to the handlers inside it:
+
+```text
+import avin.net.http
+import avin.net.http.{Handler, Response, Route, Router, ServerRequest}
+
+data User(name: string)
+
+// Answers `401` without a token, and hands the token's user to the handler with one.
+auth(next: Handler) -> Handler = r -> r.header("Authorization") match
+  Some(token) -> next(r.withValue(User(token)))
+  None -> Response.text(401, "who are you?")
+
+me(r: ServerRequest) -> Response = r.value[User]() match
+  Some(u) -> Response.text(200, s"hello, ${u.name}\n")
+  None -> Response.text(500, "the route is outside `auth`\n")
+
+main()
+  val router = Router(Route.group("/api", [Route.get("/me", me)], auth) :+ Route.get("/me", me))
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+```
+
+`GET /api/me` with an `Authorization` header is answered `hello` and the token; `/me`, outside the
+group, finds no `User`.
 
 **Error pages.** `type ErrorPage = @sendable (int) -> Response` renders the responses a router and a
 server make themselves for an error status: `Router(routes, errors)` its `404` and `405`, and

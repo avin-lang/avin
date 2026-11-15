@@ -8272,6 +8272,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   compiler fixes: a lambda tried against several overloads is compiled only for the one chosen, and
   an argument checked before the overload was chosen is made `@sendable` where the chosen one's
   parameter is (tests `overload_lambda_return`, `overload_sendable`, `overload_sendable_capture`).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-request-values`): **A middleware
+  hands values on through the request, keyed by their exact type**: `ServerRequest.withValue[T:
+  Sendable](value: T) -> ServerRequest` and `value[T: Sendable]() -> Option[T]`. `withValue`
+  answers a new request; a second value of one type replaces the first; the key is the type
+  `withValue` was given, compared exactly as a type pattern compares a generic type's arguments
+  (each value is held in an invariant private `Carried[T]` as an `Any`), so a value handed on as a
+  trait is not read as its class nor the reverse, and `int` is not `long`. Parameters a router
+  binds keep the values. Why: the type is a key no two middlewares collide on by accident and that
+  needs no cast to read, reified type patterns make it sound with no new language feature, and a
+  request id or a span from a logging middleware fits the same API as a user from an auth one.
+  The names follow `withParams` and `header(name)` beside it. Both take `Sendable` because a
+  handler may move what it reads onto another thread (`untilStopped`), and a non-sendable `T` is
+  refused at `value` too rather than silently answering `None`. Alternatives weighed: a key
+  object (`RequestKey[T]`) for two values of one type — not built, since a program wraps each in
+  its own `data` type, which also names what the value is, and the library has no key-object
+  idiom elsewhere; subtype matching on read (`value[Role]()` finding an `Admin`) — refused, since
+  which of two values answers would depend on their order; route parameters or headers as the
+  carrier — strings only, and spoofable from the client; the names `with`/`get` — `with` already
+  means running a body on a `Mutex`, and `withX` is the request's and the response's existing
+  form. Review with the user: whether a key-object form is wanted after all.
 - Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Route groups and middleware are plain functions**:
   `type Handler`, a middleware `(Handler) -> Handler`, `Route.wrap`, `Route.under` and
   `Route.group(prefix, routes, middleware)` answering a `Vector[Route]`, nesting with the inner
