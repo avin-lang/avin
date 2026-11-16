@@ -2,6 +2,7 @@ module avin.rt
 @tests
 
 import sysl.net.{Socket, resolve, socket, timed_out, would_block}
+import sysl.io.poll.{Event, Poller}
 import sysl.io.wait.{Readable, Writable}
 import sysl.time.monotonic
 
@@ -88,3 +89,133 @@ connect_refused()
     socket_connect(socket(to).unwrap(), to) match
         Ok(_) -> panic("nobody listens")
         Err(err) -> assert(net_failure(err) is Refused)
+
+private var waiting: [2]Waiter = [new_waiter(); 2]
+
+// A report of `fd`, as the poller's thread reads one.
+private report(fd: int, readable: bool, writable: bool, hangup: bool, error: bool) -> Event
+    var e = Event.none
+    e.token = u64(fd)
+    e.readable = readable
+    e.writable = writable
+    e.hangup = hangup
+    e.error = error
+    e
+
+// Under `io_lock`: a slot for each direction of `fd`, both waited for at once.
+private both_ways(p: Poller, fd: int) -> (u64, u64)
+    val r = take_slot(&waiting[0])
+    val w = take_slot(&waiting[1])
+    begin_fd_wait(p, fd, Readable, r).unwrap()
+    begin_fd_wait(p, fd, Writable, w).unwrap()
+    assert_eq(io_fds[usize(fd)].reading, r)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    (r, w)
+
+@test("a descriptor waited on for reading and for writing at once keeps both waiters, and a report of one direction wakes that direction's alone")
+two_directions_on_one_descriptor()
+    val e = ends()
+    val fd = e.served.fd().unwrap()
+    io_lock.lock()
+    val p = poller().unwrap()
+    val (r, w) = both_ways(p, fd)
+    reported(p, report(fd, true, false, false, false))
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    // The report let the reader's slot go, and the writer's is still taken.
+    assert(give_slot(r) == null)
+    reported(p, report(fd, false, true, false, false))
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    assert(give_slot(w) == null)
+    // Writable first, the other way round.
+    val (r2, w2) = both_ways(p, fd)
+    reported(p, report(fd, false, true, false, false))
+    assert_eq(io_fds[usize(fd)].reading, r2)
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    assert(give_slot(w2) == null)
+    reported(p, report(fd, true, false, false, false))
+    assert(give_slot(r2) == null)
+    io_lock.unlock()
+
+@test("a hang-up with one direction named wakes that direction alone, a hang-up naming neither or a failure wakes both, and a report for a descriptor nobody waits on wakes nobody")
+hangups_and_failures()
+    val e = ends()
+    val fd = e.served.fd().unwrap()
+    io_lock.lock()
+    val p = poller().unwrap()
+    // A peer that has only finished sending leaves the descriptor writable: the writer waits on.
+    val (r, w) = both_ways(p, fd)
+    reported(p, report(fd, true, false, true, false))
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    assert(give_slot(w) != null)
+    end_fd_wait(fd, w)
+    // A hang-up naming neither direction.
+    val (r2, w2) = both_ways(p, fd)
+    reported(p, report(fd, false, false, true, false))
+    assert(give_slot(r2) == null)
+    assert(give_slot(w2) == null)
+    // A failure, with the readable direction named.
+    val (r3, w3) = both_ways(p, fd)
+    reported(p, report(fd, true, false, false, true))
+    assert(give_slot(r3) == null)
+    assert(give_slot(w3) == null)
+    // Nobody waits now, and a report for a descriptor beyond any waited on is dropped.
+    reported(p, report(fd, true, true, false, false))
+    reported(p, report(fd + 100000, true, true, false, false))
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    io_lock.unlock()
+
+@test("a wait that ends by itself takes its direction's waiter off the descriptor and leaves the other's")
+ended_wait_leaves_the_other_direction()
+    val e = ends()
+    val fd = e.served.fd().unwrap()
+    io_lock.lock()
+    val p = poller().unwrap()
+    val (r, w) = both_ways(p, fd)
+    _ = give_slot(r)
+    end_fd_wait(fd, r)
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    // Ending it again, or under a token it never had, changes nothing.
+    end_fd_wait(fd, r)
+    end_fd_wait(fd, 12345)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    _ = give_slot(w)
+    end_fd_wait(fd, w)
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    // A descriptor that is not one is refused, and leaves nothing waiting.
+    val t = take_slot(&waiting[0])
+    assert(begin_fd_wait(p, -1, Readable, t).is_err())
+    assert(give_slot(t) == &waiting[0])
+    io_lock.unlock()
+
+@test("a socket is writable until its buffers fill, a send of some sends at least one byte while it is, and then waits at most its limit; a send of nothing sends nothing at once")
+send_some_until_full()
+    val e = ends()
+    val block = [7u8; 65536]
+    assert_eq(socket_send_some(e.client, block[0..<0], 0).unwrap(), 0usize)
+    assert(socket_writable(e.client))
+    assert(descriptor_writable(e.client.fd().unwrap()))
+    var sent: usize = 0
+    while socket_writable(e.client)
+        val n = socket_send_some(e.client, block[..], 0).unwrap()
+        assert(n >= 1)
+        sent += n
+    assert(sent > 0)
+    assert(!descriptor_writable(e.client.fd().unwrap()))
+    socket_send_some(e.client, block[..], 20) match
+        Ok(_) -> panic("the buffers are full")
+        Err(err) -> assert(timed_out(err))
+    // A descriptor that is not one counts as writable, so the write that follows answers why.
+    assert(descriptor_writable(-1))
+
+@test("a socket shared for the other half of a connection names its descriptor, and closing either closes both")
+shared_socket_is_one_descriptor()
+    val e = ends()
+    var shared = socket_share(e.client)
+    assert_eq(shared.fd().unwrap(), e.client.fd().unwrap())
+    shared.close().unwrap()
+    assert(e.client.fd().is_err())
+    assert(socket_writable(e.client))

@@ -1355,6 +1355,10 @@ uses it again.
 | `s.close() -> Result[unit, IoError]` | Ends the connection and answers `Ok`; closing again does nothing. Every connection and listener is an [`io.Close`](#close). |
 | `s.readable() -> bool` | Whether a read would answer now, without waiting: bytes a `readLine` read ahead are still to be read, bytes have arrived, the other end has finished sending or reset the connection, or the connection is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.readable()` arm waits for it. |
 | `s.readinessDescriptor() -> int` | The socket's descriptor, which that arm watches on the runtime's poller; `-1` once closed. |
+| `s.writeSome(bytes: Array[byte]) -> Result[int, IoError]` | Sends what of `bytes` goes without waiting, after waiting for room for the first byte where there is none, and answers how many: at least one, unless `bytes` is empty. After `writable()` answered `true` it does not wait. |
+| `s.writable() -> bool` | Whether a write would send something now, without waiting: the socket has room, or the connection has failed or is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.writable()` arm waits for it. |
+| `s.writabilityDescriptor() -> int` | The descriptor that arm watches; `-1` once closed. |
+| `s.split() -> (StreamReader, StreamWriter)` | The connection divided into a reading half and a writing half, for two threads to use at once; see [split connections](#split-connections). |
 | `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
 | `l.port() -> int` | The port it listens on. |
 | `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
@@ -1379,7 +1383,7 @@ main()
 
 A `UnixStream` and a `UnixListener` connect two programs on one machine by a path in the file system
 rather than a host and port. A `UnixStream` has every reading and writing operation of a `TcpStream`
-(`read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable`, `readinessDescriptor`) with the
+(`read`, `readLine`, `readAll`, `write`, `writeSome`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable`, `readinessDescriptor`, `writable`, `writabilityDescriptor`, `split`) with the
 same meanings, including the bytes `readLine` reads beyond its line, and a `UnixListener` accepts
 them as a `TcpListener` does. Both are sendable and owned by one thread at a time, and every wait is
 safe for the collector, as TCP's are.
@@ -1431,16 +1435,80 @@ avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 ```
 
 **`ByteStream` is what the three connections share**: a trait with `read`, `readLine`, `readAll`,
-`write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable` and
-`readinessDescriptor`, which `TcpStream`, `UnixStream` and `TlsStream` implement, so code that speaks
+`write`, `writeSome`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable`,
+`readinessDescriptor`, `writable`, `writabilityDescriptor` and `split`, which `TcpStream`,
+`UnixStream` and `TlsStream` implement, so code that speaks
 a protocol, as the HTTP client and server do, takes a `ByteStream` and runs over any of them. It is
 [sendable](/spec/actors/#what-may-be-sent), and it is an [`io.Reader`](#reader) by its `read`, so
 whatever reads a `Reader` reads any connection, a TLS one included. It is a `threads.Readiness` by
 `readable` and `readinessDescriptor`, so a [`select`](/spec/threads/#select) waits on any connection
 beside its channels: the thread that owns a connection waits in one select for its peer's bytes
-and for what other threads send it, and does every read and write itself. `Readiness` is a trait of
-its own, for a source that is not a connection: its `readinessDescriptor` may be `-1`, and a select
-then finds it readable only when it tries its arms. `ReadAhead`, the bytes a connection has read
+and for what other threads send it, and does every read and write itself. It is a
+`threads.Writability` by `writable` and `writabilityDescriptor`, so a select's `writable()` arm waits
+for room as a `readable()` arm waits for bytes. `Readiness` and `Writability` are traits of
+their own, for a source or sink that is not a connection: its descriptor may be `-1`, and a select
+then finds it ready only when it tries its arms.
+
+#### Split connections
+
+**`split()` divides a connection into a `StreamReader` and a `StreamWriter`**, each sendable and
+each its own thread's, so one thread sends while another receives over the same connection. A
+connection used by one thread at a time must stop writing to read: two ends that each send more
+than the buffers between them hold before they read would both wait for ever. Split, the writer
+waits for room and the reader for bytes at the same time, each parking only its own lightweight
+thread on the poller, both on the connection's one descriptor.
+
+```text
+import avin.io.IoError
+import avin.net.{StreamWriter, TcpStream}
+import avin.threads.spawn
+
+sendAll(w: StreamWriter, queries: Vector[string]) -> Result[unit, IoError]
+  for q in queries do w.writeText(q + "\n")?
+  w.close()
+
+// Sends every query and reads every answer at once, so a long batch never waits for itself.
+pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoError]
+  val (r, w) = c.split()
+  val sending = spawn(() -> sendAll(w, queries))
+  val answers = Buffer[string]()
+  while answers.length < queries.length
+    answers.addOne(r.readLine()?.getOrElse(""))
+  sending.join()?
+  r.close()?
+  Ok(answers.toVector)
+```
+
+- **The halves.** A `StreamReader` is an `io.Reader`, an `io.Close` and a `threads.Readiness`, with
+  `readLine`, `readAll`, `setTimeout` and `remoteAddress`; a `StreamWriter` is an `io.Close` and a
+  `threads.Writability`, with `write`, `writeSome`, `writeText`, `setTimeout` and `remoteAddress`.
+  Bytes the connection had read ahead go to the reader, and each half starts with the connection's
+  timeout, then keeps its own.
+- **Closing.** Closing the writer tells the other end nothing more will be sent, as
+  `shutdownOutput` does; the reader reads on, and the other end reads the end of its input. Closing
+  the reader stops its reading and leaves the writer sending. The connection closes once both halves
+  are closed, or once both are unreachable. A closed half answers an error to every use but closing
+  again, which does nothing and answers `Ok`; a TCP or Unix writer's close answers `Ok` even where
+  the other end has gone, and a TLS writer's answers whether TLS's close notice went out. There is
+  no way to join the halves again.
+- **The connection split.** It is used up: every operation on it answers an error saying it has
+  been split, it is readable and writable so that a select's arm runs and finds that out, its
+  descriptors are `-1`, and closing it does nothing. Splitting it again, or splitting a closed
+  connection, traps.
+- **Each half belongs to one thread at a time**, as the connection did, its traps naming
+  `StreamReader` or `StreamWriter`. After the peer resets the connection, each half answers
+  `ConnectionReset`, or the reader the end of its input, at every use, and a parked half's wait ends
+  with it. A half's thread may be cancelled while it waits, and the other half works on.
+- **TLS.** The halves of a `TlsStream` share one TLS session. Each reaches it only under a lock that
+  nothing holds while it waits for the connection, so the reader decrypts records as they arrive
+  while the writer waits for room; what TLS has to send goes out in order, a record whole, whichever
+  half made it, and a reader never waits for room to send anything of its own while the writer is
+  sending. A cancellation that stops a half inside an operation lets the locks go.
+
+A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext and sends
+what of the record the connection has room for; the rest goes before anything else is sent, and
+`writable()` sends it as room comes and answers `true` once it has gone. So after `writable()`
+answered `true`, `writeSome` does not wait. `ReadAhead`, the bytes a connection has read
 beyond what its caller asked for and the line reading over them, is public for a connection of
 one's own: `pending` says whether any are still to be read, and `keep(bytes)` adds bytes that
 arrived before anything asked for them.

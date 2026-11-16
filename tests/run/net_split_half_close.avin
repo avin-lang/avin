@@ -1,0 +1,136 @@
+// expect: exit 0
+// Closing the writing half of a split connection tells the other end nothing more will be sent: it
+// reads the end of the input, and may still answer, which the reading half reads. Closing the reading
+// half leaves the writing half working. Once both halves are closed the connection is, and the other
+// end reads its end. A closed half answers an error to every use but closing again, which does
+// nothing. The connection a split used up answers an error naming the split, is readable and
+// writable so a select's arm runs and finds out, watches no descriptor, and closing it does nothing.
+// All of it holds for TCP, Unix and TLS connections.
+import avin.fs
+import avin.io.IoError
+import avin.net.{ByteStream, StreamReader, StreamWriter, TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Thread, spawn}
+import avin.time.seconds
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+line(r: Result[Option[string], IoError]) -> string = ok(r).getOrElse("(end)")
+
+// The far end: reads a line, then the end of the input, answers, and reads the end once more after
+// the near end has closed its other half.
+farEnd(s: ByteStream) -> string
+  val first = line(s.readLine())
+  val end = line(s.readLine())
+  ok(s.writeText("answer\n"))
+  val last = line(s.readLine())
+  ok(s.close())
+  s"$first $end $last"
+
+nearEnd(name: string, c: ByteStream, far: Thread[string])
+  val (r, w) = c.split()
+  ok(w.writeText("hello\n"))
+  ok(w.close())
+  println(
+    name,
+    "closed writer",
+    w.write(Array.fill(1, byte(0))).isErr,
+    w.writeSome(Array.fill(1, byte(0))).isErr,
+    w.setTimeout(1.seconds).isErr,
+    w.writable(),
+    w.writabilityDescriptor(),
+    w.close().isOk
+  )
+  println(name, "reader reads", line(r.readLine()))
+  // The connection the split used up.
+  println(
+    name,
+    "used up",
+    c.read(1).isErr,
+    c.write(Array.fill(1, byte(0))).isErr,
+    c.readable(),
+    c.writable(),
+    c.readinessDescriptor(),
+    c.writabilityDescriptor(),
+    c.close().isOk
+  )
+  c.read(1) match
+    Err(e) -> println(name, e.kind.description)
+    Ok(_) -> println(name, "read a split connection")
+  ok(r.close())
+  println(
+    name,
+    "closed reader",
+    r.read(1).isErr,
+    r.readLine().isErr,
+    r.readAll().isErr,
+    r.readable(),
+    r.readinessDescriptor(),
+    r.close().isOk
+  )
+  println(name, "far end", far.join())
+
+// The far end of `readerFirst`: every line until the end of the input.
+allLines(s: ByteStream) -> string
+  val lines = Buffer[string]()
+  while ok(s.readLine()) is Some(text)
+    lines.addOne(text)
+  ok(s.close())
+  lines.toVector.mkString("+")
+
+// Closing the reading half first leaves the writing half sending.
+readerFirst(name: string, c: ByteStream, far: Thread[string])
+  val (r, w) = c.split()
+  ok(r.close())
+  ok(w.writeText("after\n"))
+  ok(w.writeText("the reader closed\n"))
+  ok(w.close())
+  println(name, "reader first", far.join())
+
+// A listener's port, and a thread serving its one connection with `serve`.
+tcpServing(@sendable serve: (TcpStream) -> string) -> (int, Thread[string])
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  (port, spawn(() ->
+    val s = ok(l.accept())
+    _ = l.close()
+    serve(s)))
+
+// A thread serving the one connection to a Unix listener at `path` with `serve`.
+unixServing(path: string, @sendable serve: (UnixStream) -> string) -> Thread[string]
+  val l = ok(UnixListener.bind(path))
+  spawn(() ->
+    val s = ok(l.accept())
+    _ = l.close()
+    serve(s))
+
+main()
+  val (port, tcpFar) = tcpServing(s -> farEnd(s))
+  nearEnd("tcp", ok(TcpStream.connect("127.0.0.1", port)), tcpFar)
+  val (again, tcpLines) = tcpServing(s -> allLines(s))
+  readerFirst("tcp", ok(TcpStream.connect("127.0.0.1", again)), tcpLines)
+
+  val dir = ok(fs.createTempDir("avsplit"))
+  val unixFar = unixServing(dir + "/a", s -> farEnd(s))
+  nearEnd("unix", ok(UnixStream.connect(dir + "/a")), unixFar)
+
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val trust = TlsClient().trust(fixture("ca.pem"))
+  val (secure, tlsFar) = tcpServing(s -> farEnd(tls(TlsStream.server(s, server))))
+  nearEnd("tls", tls(TlsStream.connect("localhost", secure, trust)), tlsFar)
+  val (secureAgain, tlsLines) = tcpServing(s -> allLines(tls(TlsStream.server(s, server))))
+  readerFirst("tls", tls(TlsStream.connect("localhost", secureAgain, trust)), tlsLines)
+  println("waiters", socketWaiters())

@@ -1,0 +1,43 @@
+// expect: trap
+// The writing half of a split TLS connection belongs to one thread at a time too: handed to a
+// thread, it traps in the code that handed it over at its next use, a `writable()` that would only
+// look included, while the reading half, kept, works on.
+import avin.fs
+import avin.io.IoError
+import avin.net.TcpListener
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Channel, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val serving = spawn(() ->
+    val s = tls(TlsStream.server(ok(l.accept()), server))
+    ok(s.writeText("kept\n"))
+    _ = s.readLine()
+    ok(s.close()))
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  val (r, w) = c.split()
+  val go = Channel[int]()
+  val t = spawn(() ->
+    go.receive()
+    ok(w.close()))
+  println(ok(r.readLine()).getOrElse("(end)"))
+  _ = w.writable()
+  println("not reached")
+  go.send(1)
+  t.join()
+  serving.join()

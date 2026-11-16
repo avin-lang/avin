@@ -1,6 +1,7 @@
 module avin.threads
 
-// What a `select` block is read into: an arm object for each of its channel and `readable()` arms,
+// What a `select` block is read into: an arm object for each of its channel, `readable()` and
+// `writable()` arms,
 // made in the order written, and a call of `selectWaiting`, `selectOrElse` or `selectWithin` with
 // them, which answers the arm that ran, its body then chosen by that number. A program writes
 // `select` rather than calling these.
@@ -12,7 +13,8 @@ module avin.threads
 // thread parks once, until the first of those conditions is notified, the select's time runs out or
 // its thread is cancelled (`runtime/avin/rt/select.sysl`). A `readable()` arm whose source is not
 // readable has its descriptor watched by the runtime's poller under the same wait instead, so bytes
-// arriving end it as a channel's notification does. Woken through an arm, it tries that arm
+// arriving end it as a channel's notification does; a `writable()` arm's sink is watched for room
+// the same way. Woken through an arm, it tries that arm
 // first; where another thread got there first, it passes the notification on to the next thread
 // waiting on that channel, so a notification a select took is never lost, and then begins again.
 
@@ -164,10 +166,22 @@ trait Readiness
   // one with none, which a select finds readable only when it tries its arms.
   readinessDescriptor() -> int
 
-// Watches descriptor `fd` for arm `index` of the select waiting as `wait`, on the runtime's poller:
-// 1, or 0 where the poller cannot take it.
+// What a select's `writable()` arm waits on: a sink of bytes to outside the program, a connection's
+// `ByteStream` or the writing half of one among them, that says at once whether a write to it would
+// send something without waiting, and names the descriptor whose becoming writable may make it so.
+trait Writability
+  // Whether a write would send at least one byte now, without waiting: there is room for it, or the
+  // sink has failed or been closed, which the write then reports. Never waits.
+  writable() -> bool
+
+  // The operating system descriptor a select watches for the sink to become writable, or -1 for one
+  // with none, which a select finds writable only when it tries its arms.
+  writabilityDescriptor() -> int
+
+// Watches descriptor `fd` for arm `index` of the select waiting as `wait`, on the runtime's poller,
+// for being readable, or writable where `writing` is 1: 1, or 0 where the poller cannot take it.
 @intrinsic("select_watch")
-private selectWatch(wait: Any, index: long, fd: int) -> long
+private selectWatch(wait: Any, index: long, fd: int, writing: int) -> long
 
 // A `readable()` arm, `source.readable()`: ready once a read of `source` would answer without
 // waiting. Running it reads nothing; its body reads.
@@ -177,10 +191,23 @@ class SelectReadable(private val source: Readiness): SelectArm
     if !enlist then return false
     val fd = source.readinessDescriptor()
     // A descriptor the poller cannot take makes the arm ready, so that its read answers why.
-    fd >= 0 && selectWatch(wait.handle, long(index), fd) == 0
+    fd >= 0 && selectWatch(wait.handle, long(index), fd, 0) == 0
 
   // A report of the descriptor that the select could not use, the source not readable after all,
   // is the select's alone: nobody else waits on it.
+  override passOn(wait: Selecting) = ()
+
+// A `writable()` arm, `sink.writable()`: ready once a write to `sink` would send something without
+// waiting. Running it writes nothing; its body writes, with `writeSome` to send only what goes at once.
+class SelectWritable(private val sink: Writability): SelectArm
+  override offer(wait: Selecting, index: int, enlist: bool) -> bool
+    if sink.writable() then return true
+    if !enlist then return false
+    val fd = sink.writabilityDescriptor()
+    // A descriptor the poller cannot take makes the arm ready, so that its write answers why.
+    fd >= 0 && selectWatch(wait.handle, long(index), fd, 1) == 0
+
+  // A report the select could not use is its alone, as a `readable()` arm's is.
   override passOn(wait: Selecting) = ()
 
 // A select with no `else` and no `after`: waits until one of `arms` runs, and answers which.

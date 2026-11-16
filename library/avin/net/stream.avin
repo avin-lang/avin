@@ -1,7 +1,7 @@
 module avin.net
 
 import avin.io.{Close, IoError, Reader}
-import avin.threads.Readiness
+import avin.threads.{Readiness, Writability}
 import avin.time.Duration
 
 // A connection that carries bytes both ways: a `TcpStream`, a `UnixStream`, or a TLS one over a
@@ -11,8 +11,10 @@ import avin.time.Duration
 // sending, so anything that reads a `Reader` (a streaming JSON reader, say) reads a connection. It is
 // a `Close`: `close()` ends the connection, and closing again does nothing and answers `Ok`. It is a
 // `Readiness`: `readable()` says at once whether a read would answer without waiting, and a
-// `select` waits for it with a `stream.readable()` arm beside its channel arms.
-trait ByteStream: Sendable, Reader, Close, Readiness
+// `select` waits for it with a `stream.readable()` arm beside its channel arms. It is a
+// `Writability`: `writable()` says at once whether a write would send something without waiting, and
+// a `stream.writable()` arm waits for that.
+trait ByteStream: Sendable, Reader, Close, Readiness, Writability
   // The next line, without its terminator, or `None` once the other end has finished sending and
   // every line has been read. A line ends at `\n`, a `\r` just before it being part of the
   // terminator; bytes that are not UTF-8 become U+FFFD.
@@ -24,6 +26,11 @@ trait ByteStream: Sendable, Reader, Close, Readiness
   // Sends all of `bytes`.
   write(bytes: Array[byte]) -> Result[unit, IoError]
 
+  // Sends what of `bytes` goes without waiting, after waiting for room for the first byte where
+  // there is none, and answers how many were sent: at least one, unless `bytes` is empty. After
+  // `writable()` answered `true` it does not wait.
+  writeSome(bytes: Array[byte]) -> Result[int, IoError]
+
   // Sends `text` as UTF-8.
   writeText(text: string) -> Result[unit, IoError]
 
@@ -33,6 +40,52 @@ trait ByteStream: Sendable, Reader, Close, Readiness
   // Tells the other end nothing more will be sent; reading goes on.
   shutdownOutput() -> Result[unit, IoError]
 
+  // Divides the connection into a half that reads and a half that writes, each its own sendable
+  // value that one thread may use while another uses the other, so a thread can go on sending while
+  // another receives. Bytes read ahead go to the reading half, and each half starts with the
+  // connection's timeout. The connection itself is used up: every operation on it afterwards answers
+  // an error, and closing it does nothing. Splitting a connection a second time, or a closed one,
+  // traps.
+  split() -> (StreamReader, StreamWriter)
+
   // The other end's IP address, written numerically without its port (`127.0.0.1`, `::1`), for a
   // connection over TCP, TLS's included; `None` for one with no such address, a Unix socket's.
+  remoteAddress -> Option[string] = None
+
+// The reading half of a connection `split` divided. It reads as the connection did, and a `select`
+// waits for it with a `reader.readable()` arm. Closing it stops its reading and leaves the writing
+// half working; the connection ends once both halves are closed, or once both are unreachable.
+trait StreamReader: Sendable, Reader, Close, Readiness
+  // The next line, as `ByteStream.readLine` reads one.
+  readLine() -> Result[Option[string], IoError]
+
+  // Everything the other end sends until it finishes, after what earlier reads left.
+  readAll() -> Result[Array[byte], IoError]
+
+  // A read that waits longer than `d` fails with `TimedOut` from now on; zero or less takes the
+  // limit away. The writing half keeps its own limit.
+  setTimeout(d: Duration) -> Result[unit, IoError]
+
+  // The other end's IP address, as the connection's `remoteAddress` is.
+  remoteAddress -> Option[string] = None
+
+// The writing half of a connection `split` divided. It writes as the connection did, and a `select`
+// waits for room with a `writer.writable()` arm. Closing it tells the other end nothing more will be
+// sent, as `shutdownOutput` does, and leaves the reading half working; the connection ends once both
+// halves are closed, or once both are unreachable.
+trait StreamWriter: Sendable, Close, Writability
+  // Sends all of `bytes`.
+  write(bytes: Array[byte]) -> Result[unit, IoError]
+
+  // Sends what of `bytes` goes without waiting, as `ByteStream.writeSome` does.
+  writeSome(bytes: Array[byte]) -> Result[int, IoError]
+
+  // Sends `text` as UTF-8.
+  writeText(text: string) -> Result[unit, IoError]
+
+  // A write that waits longer than `d` fails with `TimedOut` from now on; zero or less takes the
+  // limit away. The reading half keeps its own limit.
+  setTimeout(d: Duration) -> Result[unit, IoError]
+
+  // The other end's IP address, as the connection's `remoteAddress` is.
   remoteAddress -> Option[string] = None

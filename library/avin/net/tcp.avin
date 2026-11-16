@@ -105,9 +105,16 @@ private recv(s: Socket, into: Array[byte], limitMs: int) -> Result[long, SyslErr
 @sysl("avin.rt.socket_accept")
 private acceptOn(s: ListenSocket) -> Result[(Socket, Address), SyslError]
 
+@sysl("avin.rt.socket_send_some")
+private sendSome(s: Socket, bytes: Array[byte], limitMs: int) -> Result[long, SyslError]
+
 // Whether a read of `s` would answer without waiting, never waiting itself.
 @sysl("avin.rt.socket_readable")
 private socketReadable(s: Socket) -> bool
+
+// Whether a write to `s` would send something without waiting, never waiting itself.
+@sysl("avin.rt.socket_writable")
+private socketWritable(s: Socket) -> bool
 
 @sysl("avin.rt.socket_non_blocking")
 private nonBlocking(s: ListenSocket) -> Result[unit, SyslError]
@@ -230,11 +237,14 @@ class TcpStream(
   // The other end's address, written numerically without its port.
   override remoteAddress -> Option[string] = other
 
+  // Whether `split` has given the connection to its halves.
+  private var halved = false
+
   // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
   // sending. `max` is at least one.
   override read(max: int) -> Result[Array[byte], IoError]
     mine()
-    if closed then return Err(closedError("read from", peer))
+    if closed || halved then return Err(unusable("read from", peer))
     buffered.read(max, received)
 
   // The next line, without its terminator, or `None` once the other end has finished sending and
@@ -242,13 +252,13 @@ class TcpStream(
   // terminator, and the last line needs none; bytes that are not UTF-8 become U+FFFD.
   override readLine() -> Result[Option[string], IoError]
     mine()
-    if closed then return Err(closedError("read from", peer))
+    if closed || halved then return Err(unusable("read from", peer))
     buffered.readLine(received)
 
   // Everything the other end sends until it finishes, after what earlier reads left.
   override readAll() -> Result[Array[byte], IoError]
     mine()
-    if closed then return Err(closedError("read from", peer))
+    if closed || halved then return Err(unusable("read from", peer))
     buffered.readAll(received)
 
   // Whether a read would answer now, without waiting: bytes read ahead are still to be read, bytes
@@ -256,21 +266,37 @@ class TcpStream(
   // closed. Never waits.
   override readable() -> bool
     mine()
-    closed || buffered.pending || socketReadable(conn)
+    closed || halved || buffered.pending || socketReadable(conn)
 
   // The socket's descriptor, which a select's `readable()` arm watches; -1 once closed.
   override readinessDescriptor() -> int
     mine()
-    if closed then return -1
+    if closed || halved then return -1
     conn.held() match
       Ok(fd) -> fd
       Err(_) -> -1
 
+  // Whether a write would send something now, without waiting: there is room for it, the
+  // connection has failed, or it is closed. Never waits.
+  override writable() -> bool
+    mine()
+    closed || halved || socketWritable(conn)
+
+  // The socket's descriptor, which a select's `writable()` arm watches; -1 once closed.
+  override writabilityDescriptor() -> int = readinessDescriptor()
+
   // Sends all of `bytes`.
   override write(bytes: Array[byte]) -> Result[unit, IoError]
     mine()
-    if closed then return Err(closedError("write to", peer))
+    if closed || halved then return Err(unusable("write to", peer))
     afterWait(sendAll(conn, bytes, limitMs)).mapErr(failed("write to", peer))
+
+  // Sends what of `bytes` goes without waiting, after waiting for room for the first byte, and
+  // answers how many were sent.
+  override writeSome(bytes: Array[byte]) -> Result[int, IoError]
+    mine()
+    if closed || halved then return Err(unusable("write to", peer))
+    afterWait(sendSome(conn, bytes, limitMs)).map(n -> int(n)).mapErr(failed("write to", peer))
 
   // Sends `text` as UTF-8.
   override writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
@@ -281,29 +307,42 @@ class TcpStream(
   // room several times fails only where one of those waits runs out.
   override setTimeout(d: Duration) -> Result[unit, IoError]
     mine()
-    if closed then return Err(closedError("set the timeout of", peer))
+    if closed || halved then return Err(unusable("set the timeout of", peer))
     limitMs = millisOf(d)
     Ok(())
 
   // Tells the other end nothing more will be sent; reading goes on.
   override shutdownOutput() -> Result[unit, IoError]
     mine()
-    if closed then return Err(closedError("shut down", peer))
+    if closed || halved then return Err(unusable("shut down", peer))
     conn.shutdown(Write).mapErr(failed("shut down", peer))
 
   // Ends the connection; closing again does nothing. A read or write afterwards answers an error.
+  // A connection that has been split is its halves' to close, and closing it does nothing.
   override close() -> Result[unit, IoError]
     mine()
-    if !closed
+    if !closed && !halved
       closed = true
       conn.close()
     Ok(())
 
+  // The reading and writing halves of the connection, each with a handle of its own on the socket.
+  override split() -> (StreamReader, StreamWriter)
+    mine()
+    if halved || closed then unsplittable(halved)
+    halved = true
+    halves(readHalfOf(conn), writeHalfOf(conn), buffered, limitMs, peer, other)
+
   // Stops the program where the connection belongs to another thread. `held()` checks an open
   // socket's owner, and `close()` of a closed one checks it and does nothing else; each is called
-  // for that check alone, so what it answers is dropped.
+  // for that check alone, so what it answers is dropped. A split connection's socket is its halves',
+  // so it is only ever looked at.
   private mine()
-    if closed then _ = conn.close() else _ = conn.held()
+    if closed && !halved then _ = conn.close() else _ = conn.held()
+
+  // What an operation on the connection answers once it is closed or split.
+  private unusable(operation: string, subject: string) -> IoError =
+    if halved then splitError(operation, subject) else closedError(operation, subject)
 
   // Up to `max` bytes from the connection itself.
   private received(max: int) -> Result[Array[byte], IoError]
