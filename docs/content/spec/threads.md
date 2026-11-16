@@ -659,15 +659,18 @@ What a program can rely on:
   value sent before is received; a name runs for either and binds the `Option` received; `_`, or no
   pattern, runs for either and binds nothing. `ch.send(x)` sends, and binds nothing.
   `stream.readable()` runs once a read of `stream` would answer without waiting, and binds nothing:
-  its body reads. `after d` runs
+  its body reads. `sink.writable()` runs once a write to `sink` would send something without
+  waiting, and binds nothing: its body writes, with `writeSome` to send only what goes at once.
+  `after d` runs
   where no other arm became ready within the [`Duration`](/spec/time/) `d`; `else` runs where no
   arm is ready now, and is written as a match's `else` is, with no arrow. A select has at most one
   `after` and one `else`, and not both, since a select with `else` never waits. Any other arm, a
-  guard or an `as` pattern on a `readable()` arm among them, is an error.
+  guard or an `as` pattern on a `readable()` or `writable()` arm among them, is an error.
 - **Evaluation.** Every channel, every stream, every value sent and the `after`'s duration are
   evaluated once, in the order the arms are written, before any arm is tried. Only the arm that runs
   receives or sends: every other channel keeps its values, and a value meant for an arm that does not
-  run is never sent. A `readable()` arm reads nothing, whether it runs or not.
+  run is never sent. A `readable()` arm reads nothing and a `writable()` arm writes nothing,
+  whether it runs or not.
 - **Streams.** A `readable()` arm's stream is any `Readiness` (`avin.threads`), which every
   [connection](/spec/system-library/#avin-net), a `ByteStream`, is: TCP, Unix and TLS. It is ready
   where the stream's `readable()` answers `true` when the arm is tried: bytes already buffered, those
@@ -680,7 +683,16 @@ What a program can rely on:
   cancellation, ends it. The arm uses its stream as a read does, so only the thread a connection
   belongs to may name it in a select; any other traps. This is how a thread that owns a connection
   waits both for its peer and for work other threads send it: it does all of the connection's reads
-  and writes, which only it may.
+  and writes, which only it may. A connection [split](/spec/system-library/#tcp) into a reading and
+  a writing half gives each half to a thread of its own, the reader's select naming its half's
+  `readable()` and the writer's its half's `writable()`.
+- **Sinks.** A `writable()` arm's sink is any `Writability` (`avin.threads`): every connection, and
+  the writing half of a split one. It is ready where the sink's `writable()` answers `true` when the
+  arm is tried: the socket has room, or the connection has failed or is closed, which its write then
+  answers. A TLS sink is ready once the record an earlier `writeSome` began has gone, `writable()`
+  sending what of it there is room for. Where it is not ready, a select that waits watches the
+  descriptor for room on the poller as a `readable()` arm watches it for bytes, and a reading and a
+  writing half of one connection may each wait on it at once, each woken by its own direction.
 - **Choosing.** Of several arms ready at once, each is as likely to run as any other: the arms are
   tried in an order drawn at random each time. Where none is ready, a select with `else` runs it, and
   one without waits, parking only its thread, until an arm can complete and runs it, or until its
@@ -730,6 +742,22 @@ serve(conn: TcpStream, pushed: Channel[string]) -> Result[unit, IoError]
         None -> open = false
       pushed.receive() as Some(m) -> conn.writeText(s"push $m\n")?
   conn.close()
+```
+
+```avin
+import avin.io.IoError
+import avin.net.StreamWriter
+import avin.threads.Channel
+
+// The writing half of a split connection sends `data` a part at a time, as room comes, and stops
+// early where `stop` is closed. Answers how much went.
+send(w: StreamWriter, data: Array[byte], stop: Channel[unit]) -> Result[int, IoError]
+  var at = 0
+  while at < data.length
+    select
+      w.writable() -> at += w.writeSome(data.slice(at, data.length))?
+      stop.receive() as None -> return Ok(at)
+  Ok(at)
 ```
 
 ## Timers and deadlines

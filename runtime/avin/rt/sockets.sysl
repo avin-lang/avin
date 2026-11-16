@@ -18,16 +18,27 @@ import sysl.time.micros
 // the descriptor alone, safe for the collector. A wait with a limit gives up when the limit runs out,
 // a lightweight thread's by the same timer a timed wait or a sleep parks on.
 //
-// A descriptor is registered for one readiness report at a time, under a token naming the slot its
-// waiter holds. The slot is let go under `io_lock` by whichever ends the wait, the poller thread
-// waking it or the thread itself after its time ran out, so a report that arrives late finds its slot
-// gone, or taken again under a newer token, and wakes nobody.
+// Each waiting thread holds a slot, named by a token. A descriptor is waited on in two directions at
+// once at most, one thread waiting for it to be readable and another for it to be writable, as the
+// two halves of a split connection do from their own threads; `io_fds` keeps, for each descriptor,
+// the token of each direction's waiter. The descriptor is registered for one report under its own
+// number, asking for every direction somebody waits for, and the poller's thread wakes the waiter of
+// each direction the report names, then registers the descriptor again for the direction still
+// waited for. A slot is let go under `io_lock` by whichever ends the wait, the poller thread waking it
+// or the thread itself after its time ran out, so a report that arrives late finds its slot gone, or
+// taken again under a newer token, and wakes nobody.
 
 /** One waiting thread's place among the poller's tokens: its waiter, null while the slot is free, and
  * how many times the slot has been taken, which a token carries in its high half. */
 struct IoSlot
     waiter: *Waiter
     round: u32
+
+/** The waits on one descriptor: the token of the slot of the thread waiting for it to be readable,
+ * and of the one waiting for it to be writable, 0 for none. */
+struct FdWaits
+    reading: u64
+    writing: u64
 
 /** The time-out code of the platform, which `sysl.net.timed_out` recognises. */
 #if bsd
@@ -36,12 +47,14 @@ private const InProgressCode: int = 36
 private const SolSocket: int = 65535
 private const SoError: int = 4103
 private const CancelledCode: int = 89
+private const BadDescriptorCode: int = 9
 #else
 private const TimedOutCode: int = 110
 private const InProgressCode: int = 115
 private const SolSocket: int = 1
 private const SoError: int = 4
 private const CancelledCode: int = 125
+private const BadDescriptorCode: int = 9
 #endif
 
 private extern "getsockopt" c_getsockopt(fd: int, level: int, name: int, value: *i32, len: *u32) -> int
@@ -56,6 +69,8 @@ var io_lock: SleepLock = SleepLock.new()
 private var io_poller: Option[Poller] = None
 private var io_slots: Buf[IoSlot] = buf()
 private var io_free: Buf[usize] = buf()
+/** The waits on each descriptor, by its number; under `io_lock`. */
+var io_fds: Buf[FdWaits] = buf()
 private var io_started: Atomic[u64] = Atomic(0)
 /** How many times a lightweight thread has parked on the poller. */
 var io_parks: Atomic[u64] = Atomic(0)
@@ -77,7 +92,7 @@ socket_waiters() -> long
 private timed_out_error() -> IoError = from_errno(TimedOutCode)
 
 /** The poller, opened with its thread on first use. Under `io_lock`. */
-private poller() -> Result[Poller, IoError]
+poller() -> Result[Poller, IoError]
     io_poller match
         Some(p) -> return Ok(p)
         None -> ()
@@ -131,9 +146,74 @@ private poll_loop(started: *Atomic[u64]) -> unit
             Err(_) -> 0
         io_lock.lock()
         for i in 0..<n
-            val w = give_slot(got[i].token)
-            if w != null then _ = wake_waiter(w)
+            reported(p, got[i])
         io_lock.unlock()
+
+// Under `io_lock`: wakes the waiters of the directions the report `e` names on the descriptor its
+// token is, and registers the descriptor again for a direction still waited for. A failure or a
+// hang-up wakes the waiter of a direction the report does not name, unless it names the other, since
+// a peer that has only finished sending leaves the descriptor writable.
+reported(p: Poller, e: Event)
+    if e.token >= u64(io_fds.len()) then return
+    val i = usize(e.token)
+    val read = e.readable || e.error || (e.hangup && !e.writable)
+    val write = e.writable || e.error || (e.hangup && !e.readable)
+    if read && io_fds[i].reading != 0
+        val w = give_slot(io_fds[i].reading)
+        io_fds[i].reading = 0
+        if w != null then _ = wake_waiter(w)
+    if write && io_fds[i].writing != 0
+        val w = give_slot(io_fds[i].writing)
+        io_fds[i].writing = 0
+        if w != null then _ = wake_waiter(w)
+    if io_fds[i].reading != 0 || io_fds[i].writing != 0 then _ = armed(p, int(e.token))
+
+// Under `io_lock`: registers `fd` for one report of each direction a thread waits on it for, under
+// its own number, or takes it off the poller where none is waited for.
+private armed(p: Poller, fd: int) -> Result[unit, IoError]
+    val i = usize(fd)
+    val reading = i < io_fds.len() && io_fds[i].reading != 0
+    val writing = i < io_fds.len() && io_fds[i].writing != 0
+    if reading && writing
+        val both = [Readable, Writable]
+        return registered(p, fd, both[..])
+    if reading
+        val r = [Readable]
+        return registered(p, fd, r[..])
+    if writing
+        val w = [Writable]
+        return registered(p, fd, w[..])
+    _ = p.deregister(fd)
+    Ok(())
+
+// Registers `fd` with `p` for one report of `interest`, replacing what it was registered for.
+private registered(p: Poller, fd: int, interest: []const Interest) -> Result[unit, IoError] =
+    p.register(fd, interest, u64(fd), OneShot) match
+        Err(AlreadyExists) -> p.modify(fd, interest, u64(fd), OneShot)
+        r -> r
+
+// Under `io_lock`: makes `token` the waiter of `fd` for `interest` and registers the descriptor for
+// it, with whatever the other direction waits for; a failure to register leaves the direction
+// unwaited.
+begin_fd_wait(p: Poller, fd: int, interest: Interest, token: u64) -> Result[unit, IoError]
+    if fd < 0 then return Err(from_errno(BadDescriptorCode))
+    val i = usize(fd)
+    while io_fds.len() <= i do io_fds.push(FdWaits(0, 0))
+    interest match
+        Readable -> io_fds[i].reading = token
+        Writable -> io_fds[i].writing = token
+    armed(p, fd) match
+        Ok(_) -> Ok(())
+        Err(e) ->
+            end_fd_wait(fd, token)
+            Err(e)
+
+// Under `io_lock`: `fd` no longer waited on through `token`, in whichever direction it was.
+end_fd_wait(fd: int, token: u64)
+    if fd < 0 || usize(fd) >= io_fds.len() then return
+    val i = usize(fd)
+    if io_fds[i].reading == token then io_fds[i].reading = 0
+    if io_fds[i].writing == token then io_fds[i].writing = 0
 
 /** Waits until `fd` is ready for `interest`, or until `limit_ms` milliseconds have passed where it is
  * positive: answers whether it became ready. A lightweight thread parks on the poller; any other
@@ -174,11 +254,7 @@ private park_on_fd(ctx: *Context, fd: int, interest: Interest, deadline: long) -
             io_lock.unlock()
             return Err(e)
     val token = take_slot(w)
-    val wanted = [interest]
-    val registered = p.register(fd, wanted[..], token, OneShot) match
-        Err(AlreadyExists) -> p.modify(fd, wanted[..], token, OneShot)
-        r -> r
-    registered match
+    begin_fd_wait(p, fd, interest, token) match
         Ok(_) -> ()
         Err(e) ->
             _ = give_slot(token)
@@ -189,6 +265,7 @@ private park_on_fd(ctx: *Context, fd: int, interest: Interest, deadline: long) -
     if deadline > 0 then cancel_timer(w)
     io_lock.lock()
     _ = give_slot(token)
+    end_fd_wait(fd, token)
     io_lock.unlock()
     // A cancellation that ended the wait fails the operation, and the library stops the thread as
     // soon as the operation has returned to it (`cancel.sysl`), with nothing of Sysl's left on its
@@ -196,11 +273,11 @@ private park_on_fd(ctx: *Context, fd: int, interest: Interest, deadline: long) -
     if w.state.load() == WaitCancelled then return Err(from_errno(CancelledCode))
     Ok(w.state.load() == WaitWoken)
 
-/** Registers `fd` with the poller for one report of being readable, to wake `w` when it comes: answers
- * the token naming `w`'s slot, or 0 where the poller cannot take the descriptor. A descriptor already
- * readable is reported at once. The slot is let go by the poller's thread when the report comes, or
- * by `unwatch_fd`, whichever is first. */
-watch_fd(w: *Waiter, fd: int) -> u64
+/** Registers `fd` with the poller for one report of being ready for `interest`, to wake `w` when it
+ * comes: answers the token naming `w`'s slot, or 0 where the poller cannot take the descriptor. A
+ * descriptor already ready is reported at once. The slot is let go by the poller's thread when the
+ * report comes, or by `unwatch_fd`, whichever is first. */
+watch_fd(w: *Waiter, fd: int, interest: Interest) -> u64
     io_lock.lock()
     val p = poller() match
         Ok(q) -> q
@@ -208,11 +285,7 @@ watch_fd(w: *Waiter, fd: int) -> u64
             io_lock.unlock()
             return 0
     val token = take_slot(w)
-    val wanted = [Readable]
-    val registered = p.register(fd, wanted[..], token, OneShot) match
-        Err(AlreadyExists) -> p.modify(fd, wanted[..], token, OneShot)
-        r -> r
-    if registered.is_err()
+    if begin_fd_wait(p, fd, interest, token).is_err()
         _ = give_slot(token)
         io_lock.unlock()
         return 0
@@ -220,14 +293,16 @@ watch_fd(w: *Waiter, fd: int) -> u64
     token
 
 /** Withdraws the registration `watch_fd` made of `fd` under `token`: its slot is let go and, where
- * its report has not come, the descriptor is taken off the poller, so it reports nothing later. A
+ * its report has not come, the descriptor is registered again for the other direction alone where a
+ * thread waits for that, and is otherwise taken off the poller, so it reports nothing later. A
  * poller thread waking the slot's waiter holds `io_lock` throughout, so once this has it, no wake
  * through the slot is under way or still to come. */
 unwatch_fd(token: u64, fd: int)
     io_lock.lock()
     if give_slot(token) != null
+        end_fd_wait(fd, token)
         io_poller match
-            Some(p) -> _ = p.deregister(fd)
+            Some(p) -> _ = armed(p, fd)
             None -> ()
     io_lock.unlock()
 
@@ -242,6 +317,43 @@ socket_readable(s: Socket) -> bool
     ready(fd, Readable, micros(0)) match
         Ok(b) -> b
         Err(_) -> true
+
+/** Whether a write to `s` would send at least one byte without waiting, or fail at once: there is room
+ * for it, or the connection has failed. A socket whose readiness cannot be read counts as writable,
+ * so the write that follows answers why. */
+socket_writable(s: Socket) -> bool
+    var c = s
+    val fd = c.fd() match
+        Ok(d) -> d
+        Err(_) -> return true
+    ready(fd, Writable, micros(0)) match
+        Ok(b) -> b
+        Err(_) -> true
+
+/** Whether a write to the descriptor `fd` would send at least one byte without waiting, or fail at
+ * once, as `socket_writable` says of a socket: for a library value that reaches its socket only
+ * under a lock, and keeps the descriptor's number to look at it without one. */
+descriptor_writable(fd: int) -> bool
+    if fd < 0 then return true
+    ready(fd, Writable, micros(0)) match
+        Ok(b) -> b
+        Err(_) -> true
+
+/** Another handle on the socket `s`, sharing its descriptor, for the second half of a split
+ * connection: the descriptor stays open while either lives, and closing either closes it. */
+socket_share(s: Socket) -> Socket = s
+
+/** As many bytes of `bytes` as `s` takes without waiting, after waiting for room for the first where
+ * there is none; a wait longer than `limit_ms` milliseconds, where it is positive, fails as timed
+ * out. Answers how many were sent: at least one, unless `bytes` is empty. */
+socket_send_some(s: Socket, bytes: []const u8, limit_ms: int) -> Result[usize, IoError]
+    var c = s
+    if bytes.len == 0 then return Ok(0)
+    loop
+        c.send(bytes) match
+            Err(e) if would_block(e) ->
+                if !wait_for_fd(c.fd()?, Writable, limit_ms)? then return Err(timed_out_error())
+            r -> return r
 
 /** Makes `s` non-blocking, as every socket the runtime waits on is. */
 socket_non_blocking(c: *Socket) -> Result[unit, IoError] = c.non_blocking(true)

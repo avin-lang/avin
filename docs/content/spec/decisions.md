@@ -8782,6 +8782,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `TcpServer.stopped()` is a channel closed by `stop`, which the owner's select watches in place of
   running each wait on a thread of its own through `idle`. Review with the user: the fragment size,
   and whether `stopped()` should be a receive-only view rather than a `Channel[unit]`.
+- Settled on the user's delegation 2026-11-15 (built on branch `net-split-writable`): **a
+  connection splits into a reader and a writer for two threads at once.** `ByteStream.split() ->
+  (StreamReader, StreamWriter)`, for `TcpStream`, `UnixStream` and `TlsStream`; both halves are
+  sendable traits, each half its own thread's, so a driver pipelines a batch of any size without
+  stopping at windows for the send/receive buffer deadlock (found by the pg driver's batch item).
+  Closing the writer half-closes (shutdown write; TLS sends its close notice first); closing the
+  reader only stops reading; the connection closes once both halves are closed or unreachable.
+  The split connection is used up (every operation answers an error naming the split; closing it
+  does nothing); splitting it again, or splitting a closed connection, traps. **No `reunite`**: a
+  protocol that wants one owner again keeps both halves on one thread, and a reunite would have to
+  check that the two halves are of one connection and that neither has pending state. A TCP or Unix
+  writer's `close` answers `Ok` where the peer has gone, as a connection's does; a TLS writer's answers
+  whether the close notice went out, as `TlsStream.close` does. Each half holds its own handle on the
+  socket (`avin.rt.socket_share`), so each is owner-checked on its own. The runtime's poller keeps,
+  per descriptor, the waiter of each direction and registers the union of the two
+  (`runtime/avin/rt/sockets.sysl`), so a reader parked for bytes and a writer parked for room wait
+  on one descriptor at once; before this a second registration replaced the first under epoll. A TLS
+  stream's halves share one session in a `@keeps_owners` object: the engine and the TCP writer are
+  reached only holding a lock of their own, each handle taken from transit by the code holding the
+  lock and handed back before it goes (a cancellation included, by `defer`), and nothing is held
+  while waiting for the connection, so the reader decrypts while the writer waits for room. A reader
+  that has ciphertext of its own to send sends it only where nobody else is sending (`tryAcquire`),
+  and otherwise leaves it owed to the writer. Alternatives weighed: concurrent reads and writes on
+  one connection value, with no halves (no owner check could then tell a misuse from a use);
+  `dup`ing the descriptor for the writer (Sysl's `Socket` cannot adopt one, and the poller would
+  still need two registrations under kqueue's filters); a TLS writer that waits for the reader on
+  every record (a renegotiation alone needs that, and the writer does wait for it then).
+  **Review with the user:** whether a reunite is wanted, and that a writer told by TLS to wait for
+  the peer (a renegotiation) waits for its reader to read.
+- Settled on the user's delegation 2026-11-15 (built on branch `net-split-writable`): **`writable()`
+  is a select arm beside `readable()`, with a partial write `writeSome(bytes) -> Result[int,
+  IoError]`.** `threads.Writability` (`writable()`, `writabilityDescriptor()`) beside `Readiness`;
+  every `ByteStream` and every `StreamWriter` is one, and `select` reads `sink.writable()` into a
+  `SelectWritable` arm, watched on the poller for room. `writeSome` is added because the arm needs
+  it to be useful: `write` sends everything and so waits again after the arm said there was room.
+  It waits for room for the first byte only where there is none, sends what fits, and answers at
+  least one unless given nothing. Over TLS it hands TLS at most one record (16384 bytes of
+  plaintext) and sends what of the record fits; the rest is kept and goes before anything else, and
+  `writable()` sends it as room comes and answers `true` only once it has gone, so `writeSome` after
+  `writable()` never waits; a read meanwhile leaves its own ciphertext queued behind that record
+  rather than waiting for room. Alternatives weighed: no `writeSome`, the arm for `write` (waits
+  again on a large write, as above); a TLS `writeSome` that sends its whole record (waits for room
+  for a record after the arm said there was some); a `writable()` that ignores the kept record (a
+  select that finds the socket writable and the arm not, round after round, spinning).
+  **Review with the user:** the TLS record bound of `writeSome`, and the names `writeSome` and
+  `writabilityDescriptor`.
 
 ## Proposed
 

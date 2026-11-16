@@ -1,0 +1,95 @@
+// expect: exit 0
+// The thread of either half of a split connection may be cancelled while it is parked, and the
+// other half goes on working. A reader cancelled while it waits for bytes stops at once, its deferred
+// statements running and handing the half back; meanwhile the writer sends a megabyte the peer
+// reads, and the handed-back reader then reads what the peer sends. A writer cancelled while it waits
+// for room stops the same way, and the reader goes on reading. Over TLS the halves share the TLS
+// state and the TCP writer under locks, so a cancellation that stops a writer inside its write also
+// lets those go: the reader still reads, and the cancelled writer, handed back, closes. Nothing is
+// left on the poller after.
+import avin.fs
+import avin.io.IoError
+import avin.net.{ByteStream, StreamReader, StreamWriter, TcpListener, TcpStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Atomic, Channel, scope, sleep, spawn}
+import avin.time.millis
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+val Mega = 1048576
+
+// Reads `n` bytes from `s`, or what comes before its end.
+readCount(s: ByteStream, n: int) -> int
+  var got = 0
+  while got < n
+    val bytes = ok(s.read(65536))
+    if bytes.length == 0 then return got
+    got += bytes.length
+  got
+
+waitParked(n: long)
+  while socketWaiters() < n do sleep(millis(1))
+  sleep(millis(10))
+
+run(name: string, c: ByteStream, s: ByteStream)
+  val (r, w) = c.split()
+  val readerBack = Channel[StreamReader](1)
+  val writerBack = Channel[StreamWriter](1)
+  val went = Atomic(0)
+  // The reader's thread, cancelled while it waits for bytes.
+  scope(sc ->
+    sc.spawn(() ->
+      defer readerBack.send(r)
+      _ = r.read(10)
+      went.add(1))
+    waitParked(1)
+    sc.cancel())
+  // The writer works on: the peer reads all it sends.
+  val peerRead = spawn(() -> (readCount(s, Mega), s))
+  ok(w.write(Array.fill(Mega, byte(7))))
+  val (count, t) = peerRead.join()
+  println(name, "after the reader's cancellation, the peer read", count, "went", went.load())
+  val reader = readerBack.receive().get
+  ok(t.writeText("still reading\n"))
+  println(name, "reader", ok(reader.readLine()).getOrElse("(end)"))
+  // The writer's thread, cancelled while it waits for room: the peer reads nothing meanwhile.
+  scope(sc ->
+    sc.spawn(() ->
+      defer writerBack.send(w)
+      _ = w.write(Array.fill(8 * Mega, byte(9)))
+      went.add(1))
+    waitParked(1)
+    sc.cancel())
+  val writer = writerBack.receive().get
+  ok(t.writeText("reading on\n"))
+  println(name, "reader", ok(reader.readLine()).getOrElse("(end)"), "went", went.load())
+  // The peer goes, with bytes it never read, so the writer's close, which may have something to send,
+  // does not wait for room for ever.
+  println(name, "reader closed", reader.close().isOk)
+  _ = t.close()
+  _ = writer.close()
+  println(name, "waiters", socketWaiters())
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val s = ok(l.accept())
+  run("tcp", c, s)
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val port = l.port()
+  val accepting = spawn(() -> tls(TlsStream.server(ok(l.accept()), server)))
+  val d = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  run("tls", d, accepting.join())
