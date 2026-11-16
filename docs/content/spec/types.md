@@ -318,7 +318,9 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 except `!=`. `x.isNaN`, `x.isInfinite` (either infinity) and `x.isFinite` (neither) classify a
 value, and each value is exactly one of NaN, infinite or finite. `x.toInt` and `x.toLong` are
 `int(x)` and `long(x)`, truncating toward zero, saturating at the bounds and mapping NaN to zero;
-`x.toReal` is `x`. There is no implicit fused multiply-add.
+`x.toReal` is `x`. There is no implicit fused multiply-add. The square root, logarithms,
+trigonometry and the other elementary functions are in the module
+[`avin.math`](/spec/system-library/#avin-math): `math.sqrt(x)`.
 
 `x.toBits` is the IEEE 754 binary64 encoding of `x` as a `long`, sign bit highest, and
 `real.fromBits(bits)` the number of an encoding: `1.0.toBits` is `0x3FF0000000000000`, `(-0.0).toBits`
@@ -346,9 +348,9 @@ true
 0.10000000149011612
 true
 true
-``` The square root, logarithms, trigonometry and
-the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
-`math.sqrt(x)`. `char` supports ordering and equality but no
+```
+
+`char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
 
 A `char` has these methods, classifying by the Unicode Character Database:
