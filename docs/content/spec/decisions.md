@@ -10469,6 +10469,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   smooth, more state). Review with the user: evicting a bucket that is not full forgives that
   client's debt, which an attacker cycling more than `maxKeys` addresses can use; and the default
   key, the client's address, puts every client behind one proxy in one bucket.
+- Settled on the user's delegation 2026-11-15 (built on branch `resolve-blocking`): **which library
+  bindings are [blocking](/spec/sysl-bindings/#calls-that-wait).** Name resolution
+  (`sysl.net.resolve`, which `TcpStream.connect` calls) and connecting a Unix socket are, as are
+  reading, writing and opening a file in `avin.fs` and `avin.process`'s redirections (the whole-file
+  calls, `File`'s `read`, `write` and `flush`, and every open), and reading a time zone's file: each
+  can wait on a pipe, a FIFO, a device or the network. Asking about a path, listing a directory,
+  creating, removing and renaming entries are not, nor are closing a file, spawning a process,
+  reading the OS's entropy or the in-memory TLS engine. A test in `shim_tests.sysl` names each
+  waiting binding a program reaches and asserts it blocking. Alternatives weighed: binding every
+  file-system call blocking (the metadata calls do not wait on another party, and each blocking call
+  is copied across); only the calls that touch the network (a FIFO open or read held its worker and
+  every collection, which `tests/run/fs_fifo_blocking.avin` shows). Review with the user: a
+  directory operation on a network file system can also wait, and standard input and output, which
+  the runtime reads and writes through intrinsics rather than bindings, are not yet safe for the
+  collector while they wait.
 
 ## Open
 

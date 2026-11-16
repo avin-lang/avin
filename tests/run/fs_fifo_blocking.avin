@@ -1,0 +1,53 @@
+// expect: exit 0
+// Opening, reading and writing a file wait on its other end where it is a FIFO, and each is a
+// blocking call: the thread waiting in one is safe for the collector, so the main thread allocates
+// and collects many times over while another thread waits to open a FIFO and, once it is open, to
+// read a line nobody has written yet.
+import avin.fs
+import avin.process.Command
+import avin.threads
+import avin.threads.spawn
+import avin.time
+
+churn(rounds: int) -> int
+  var kept: List[string] = []
+  for r in 0 ..< rounds
+    kept = s"r$r" :: kept
+    if r % 50 == 0 then kept = []
+  kept.length
+
+main() -> int
+  val dir = fs.createTempDir("avin-fifo").getOrElse("")
+  defer _ = fs.removeDirAll(dir)
+  // A whole-file read waits in `open` until a writer opens the FIFO.
+  val whole = dir + "/whole"
+  println(Command("mkfifo", whole).run().isOk)
+  val reader = spawn(() -> fs.readText(whole).getOrElse("failed"))
+  threads.sleep(time.millis(50))
+  println(churn(3000))
+  println(fs.writeText(whole, "all at once\n").isOk)
+  print(reader.join())
+  // A file read waits in `read` for a line the writer has not written yet.
+  val lines = dir + "/lines"
+  println(Command("mkfifo", lines).run().isOk)
+  val lineReader = spawn(() ->
+    fs.open(lines) match
+      Ok(f) ->
+        val first = f.readLine()
+        val second = f.readLine()
+        _ = f.close()
+        s"$first $second"
+      Err(e) -> s"$e")
+  val writer = fs.append(lines) match
+    Ok(f) -> f
+    Err(e) ->
+      println(e)
+      return 1
+  println(writer.writeText("first\n").isOk)
+  println(writer.flush().isOk)
+  threads.sleep(time.millis(50))
+  println(churn(3000))
+  println(writer.writeText("second\n").isOk)
+  println(writer.close().isOk)
+  println(lineReader.join())
+  0
