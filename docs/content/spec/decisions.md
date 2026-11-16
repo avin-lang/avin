@@ -10202,6 +10202,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   un-cancellable `main`, and a cancellation that must tell its own timeout from an outer cancel).
   Review with the user: the body running on another thread is visible to code that asks which
   thread it is on.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **The request
+  context is ambient: it belongs to the running thread, not to an argument.** `Context.current()`
+  reads it (`deadline`, `remaining()`, `value(key)`); `withValue(key, v, body)` and
+  `withDeadline(t, s -> …)` / `withTimeout(d, s -> …)` set it for a dynamic scope, and it is put back
+  as the scope ends. Why: the API server and the pg driver need a deadline and request values to reach
+  every call a request makes, and threading a parameter through every signature on the way (the
+  explicit-argument design) taxes every library in between that does not care, and is lost the first
+  time one forgets it; Avin already has a thread-shaped structure, the scope, that a cancellation
+  follows down, so the context follows the same tree. Alternatives weighed: an explicit `ctx`
+  parameter (the tax above); a general thread-local facility (wider than needed, and a thread-local
+  does not say what a new thread takes, which is the whole question here). The context lives in one
+  slot of the thread's runtime context, marked by every collection. Review with the user: ambient
+  state is invisible at the call site, which is its point and its cost.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **What a new
+  thread takes follows what can cancel it.** A scope's threads (`s.spawn`, and a `withTimeout` or
+  `withDeadline` body) take the whole context, deadline and values, since a cancellation of their
+  scope reaches them. A plain `spawn`, a future's code (`Future(…)`, `map`, `flatMap`, `onComplete`,
+  `executor.future`) and an executor's task (`execute`) take the values with no deadline: nothing
+  cancels them when it passes, so a deadline there would be a number nothing keeps; a future's
+  callback takes the context of the code that attached it, not of the thread that completed the
+  future. An actor's turn takes nothing, from the code that told it or from a worker: an actor
+  outlives any request, and its turns are not a scope's threads, as for cancellation. A pool worker
+  runs between tasks with none. Alternatives weighed: everything takes everything (a deadline readable
+  where it is never enforced, `remaining()` reading zero in a thread still running); nothing but a
+  scope's threads takes anything (a request id lost at the first `Future`); an actor's turn taking the
+  teller's values (a context then travels with a message, which no other message property does).
+  Review with the user: the actor rule means a request id does not cross a `tell`, so tracing across
+  actors needs it in the message.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **A deadline is
+  kept by cancellation, and its error is `withDeadline`'s.** `withDeadline(t, s -> …) ->
+  Result[T, DeadlineExceeded]` is `withTimeout` with an instant: the body runs on a thread of its own
+  and is cancelled when the time comes, so every existing cancellation point observes it (a socket's
+  accept, connect, read and write, a pool's `use` and `lease`, a channel's send and receive, `select`,
+  `sleep`, a future's `await`, a safepoint poll) and no blocking call gained a new error. Its error is
+  `DeadlineExceeded(deadline: Instant)`, an `Error` whose message is `deadline exceeded`. A nested
+  deadline can tighten the context's deadline and never loosen it: the context keeps the sooner one,
+  and an outer deadline cancels an inner later one with its body. The wall clock is read once, as the
+  scope opens; the deadline then runs on the monotonic clock, and `deadline` reports the instant asked
+  for, `remaining()` the monotonic time left, never below zero. Why: a deadline is a cancellation at a
+  time, and the cancellation machinery already reaches every wait, unwinds with deferred statements
+  run, and gives pooled resources back; `Result` because request code returns `Result` and `?`s it
+  (`withTimeout` keeps its `Option`). Alternatives weighed: each blocking call checking the context and
+  answering an error (every wait's signature and every caller change, and code that computes is never
+  stopped); cancelling the calling thread itself (rejected for `withTimeout` above). Review with the
+  user: inside the body the deadline is never an error value, it is a stop; code that must tidy up
+  (pg sending a CancelRequest) does it in a `defer`, whose waits are not cancellation points.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **Keys are typed
+  and told apart by identity: `Key[T](name)`.** `withValue[K: Sendable, T](key: Key[K], value: K,
+  body: () -> T)` takes only a value of the key's type, and `value[T](key: Key[T]) -> Option[T]`
+  answers that type; the value is held as an `Any` and recovered by a type pattern inside the library,
+  which reification makes exact, so no lookup casts. Two keys of one name are two keys, so a module's
+  values are reached by its own key alone. The value must be sendable, since the threads a scope starts
+  read it. Alternatives weighed: string keys (a lookup that must name its type and can be wrong);
+  keys compared by name (two modules' `"id"` would collide).
 
 **Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
 2, branch `hkt-2`)

@@ -870,6 +870,78 @@ What a program can rely on:
   the body, and a lock the caller holds is not the body's, so a body that takes it waits for ever, and
   one that waits on a condition of it traps.
 
+## Request context
+
+A piece of work, a request a server handles above all, carries a deadline and values that every call
+it makes may need: the time left for a query, the request's id for a log line. They live in the
+running thread's **request context**, in `avin.threads`, which code reads where it is rather than
+being handed it through every signature on the way. A scope sets it for the code it runs:
+
+```avin
+import avin.threads.{Context, Key, withDeadline, withValue}
+import avin.time.{now, seconds}
+
+val requestId = Key[string]("request id")
+
+handle(id: string, request: Request) -> Reply
+  withValue(requestId, id, () ->
+    withDeadline(now() + seconds(5), s -> respond(request)) match
+      Ok(reply) -> reply
+      Err(e) -> Reply.unavailable(e.message))
+
+// Far below, with no parameter for either.
+log(line: string) = println(s"[${Context.current().value(requestId).getOrElse("-")}] $line")
+```
+
+- **`Context.current() -> Context`** is the calling thread's context: what the scopes around the
+  running code set, or one with no deadline and no values. A `Context` is an immutable snapshot, and
+  sendable: the scopes the code opens after reading it change the thread's context, not the snapshot.
+  It answers **`deadline -> Option[Instant]`**, the instant the work must be done by, and
+  **`remaining() -> Option[Duration]`**, the time left on the monotonic clock, never less than zero;
+  both `None` where no scope set a deadline. `main` and every thread begin with an empty context.
+- **`Key[T](name)`** names a value of type `T`. **Keys are told apart by identity**, not by name, so
+  two keys of one name are two keys: a module makes each of its keys once, as a module-level value, and
+  what it sets is reached by that key alone. `key.name` is for showing.
+- **`withValue[K: Sendable, T](key: Key[K], value: K, body: () -> T) -> T`** runs `body` on the
+  calling thread with `value` under `key`, and puts the context back however the body ends, by
+  returning or by a cancellation. Inside, **`value[T](key: Key[T]) -> Option[T]`** answers `Some(value)`,
+  in the body, everything it calls and the threads it starts, until a scope inside sets the key again,
+  which shadows it for its own body. A value of another type is not set under a key, and a lookup
+  answers the key's own type, so nothing is cast; the value is sendable, since other threads read it.
+- **`withDeadline[T](deadline: Instant, body: (Scope) -> T) -> Result[T, DeadlineExceeded]`** is
+  [`withTimeout`](#timers-and-deadlines) at an instant: `Ok` of what the body returns before
+  `deadline`, and `Err(DeadlineExceeded(deadline))` where the deadline passes first. Then the body is
+  cancelled where it is, with every thread its scope started and everything below them, and
+  `withDeadline` answers once they have all ended. A deadline already past runs nothing. The wall clock
+  is read once, as the scope opens; from then on the deadline runs on the monotonic clock, so setting
+  the wall clock moves nothing. **`DeadlineExceeded(deadline: Instant)`** is an
+  [`Error`](/spec/errors/#the-error-trait) whose message is `deadline exceeded`.
+- **`withTimeout` sets the deadline too**, `timeout` from the call, so code below either reads the
+  time it has left the same way.
+- **A nested deadline tightens and never loosens.** The context keeps the sooner of a scope's deadline
+  and the one around it, so the code inside a later deadline still reads the earlier one, and the
+  outer scope's cancellation ends the inner one with its body: no scope can buy its body more time than
+  the scope around it has.
+- **Blocking calls observe the deadline through cancellation.** Since a deadline that passes cancels
+  its body, every [cancellation point](#cancellation) below it ends at once: a socket's `accept`,
+  `connect`, read or write, a [pool](#pools)'s `use` or `lease` waiting for a resource, a channel's
+  `receive` or `send`, a `select`, a `sleep`, a join, a future's `await`, and the safepoint poll of
+  code that computes without waiting. Nothing inside sees an error value: the body stops, its deferred
+  statements run, and the error is `withDeadline`'s answer. Code that must tidy up when it is stopped,
+  a database driver telling its server to drop a query, does it in a `defer`, whose waits run to their
+  end.
+- **What a new thread takes follows what can cancel it.** A thread a scope starts, through `s.spawn`
+  or as the body of a `withTimeout` or `withDeadline`, takes the starter's whole context, its deadline
+  with its values, since a cancellation of the scope reaches it. A plain `spawn`, the code of a future
+  (`Future(…)`, `executor.future`, `map`, `flatMap`, `onComplete`) and an executor's `execute` task take
+  the values with no deadline, since nothing cancels them when it passes; a future's callback takes the
+  context of the code that attached it, not of the thread that completed the future. **An actor's turn
+  takes nothing**, neither from the code that told the actor nor from the worker it runs on: an actor
+  outlives any one request, and its turns are not a scope's threads. A value that should cross a
+  `tell` goes in the message.
+- **Siblings share nothing.** A value a thread sets is its own and its children's: the thread that
+  started it, and the threads beside it, do not see it.
+
 ## Futures
 
 A `Future[T]` is a value some thread is computing. `Future(body)` runs `body` on a shared pool of
