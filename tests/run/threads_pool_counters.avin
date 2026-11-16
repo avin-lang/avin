@@ -1,0 +1,70 @@
+// expect: exit 0
+// `counters` keeps running totals: calls lent a resource and those of them that waited, the time
+// they took, calls whose time ran out (a zero timeout among them), resources made and let go (broken,
+// failing their check, expired or closed). A `create` that fails makes nothing. Many threads at once:
+// every call is counted once.
+import avin.threads.{Atomic, Channel, Mutex, Pool, scope, sleep}
+import avin.time.millis
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val fresh = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 1)
+  println(fresh.counters())
+  println(fresh.use(c -> c.id))
+  println(fresh.use(c -> c.id))
+  var c = fresh.counters()
+  println(s"acquires ${c.acquires} waited ${c.waited} created ${c.created} destroyed ${c.destroyed}")
+  // Timeouts: one that waits and one that will not.
+  val gate = Channel[unit]()
+  scope(s ->
+    val holder = s.spawn(() -> fresh.use(c ->
+      _ = gate.receive()
+      c.id))
+    while fresh.stats().lent == 0 do sleep(millis(1))
+    println(fresh.use(millis(20), c -> c.id))
+    println(fresh.use(millis(0), c -> c.id))
+    // A call that waits, then gets the resource the holder gives back.
+    val waiter = s.spawn(() -> fresh.use(c -> c.id))
+    while fresh.stats().waiting == 0 do sleep(millis(1))
+    sleep(millis(30))
+    gate.send(())
+    println(s"${holder.join()} ${waiter.join()}"))
+  c = fresh.counters()
+  println(s"acquires ${c.acquires} waited ${c.waited} timeouts ${c.timeouts}")
+  println(s"waited at least 30ms in all: ${c.waitTime >= millis(30)}")
+  // Broken resources are destroyed, and closing destroys the rest.
+  println(fresh.lease(l -> l.markBroken()))
+  println(fresh.use(c -> c.id))
+  fresh.close()
+  c = fresh.counters()
+  println(s"created ${c.created} destroyed ${c.destroyed}")
+
+  // A failing create makes nothing; a resource failing its check is let go.
+  val failing = Atomic(0)
+  val sick = Mutex(false)
+  val flaky = Pool[Conn, string](
+    () -> if failing.add(1) == 1 then Err("refused") else Ok(Conn(made.add(1))),
+    maxSize = 1,
+    validate = Some(c -> !sick.get())
+  )
+  println(flaky.use(c -> c.id).isErr)
+  println(flaky.use(c -> c.id).isOk)
+  sick.update(_ -> true)
+  println(flaky.use(c -> c.id).isOk)
+  c = flaky.counters()
+  println(s"acquires ${c.acquires} created ${c.created} destroyed ${c.destroyed}")
+  flaky.close()
+
+  // A hundred threads of ten calls each on three resources.
+  val busy = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 3)
+  scope(s ->
+    for t in 0 ..< 100
+      s.spawn(() ->
+        for i in 0 ..< 10 do _ = busy.use(c -> c.id)))
+  c = busy.counters()
+  println(s"acquires ${c.acquires} created ${c.created <= 3} timeouts ${c.timeouts} destroyed ${c.destroyed}")
+  println(s"waited ${c.waited <= c.acquires}")
+  busy.close()
+  println(busy.counters().destroyed == busy.counters().created)
