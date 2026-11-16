@@ -647,8 +647,9 @@ a decision changes, this page and the chapter change together.
   no left projection (`swap` serves), no `?` on an `Either`, and no conversion between `Either` and
   `Result`, which stays the type for failure. See [errors](/spec/errors/#either).
 - `?` returns from the function or lambda it is written in, so that one's result type must be
-  declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
-  body.
+  declared or, for a lambda, known where it is written, at least in shape (an `Option`, or a `Result`
+  with its error type known; see the `lambda-question-shape` entry). It cannot leave a delayed
+  argument or a class body.
 - Builders are the trait `Builder[-A, +C]` (`addOne`, `addAll`, `result`, and, as the reference
   library's, `clear`, which every builder defines and which readies a spent one for a new
   collection, `sizeHint`, a hint that changes no result, and `knownSize`, -1 where a builder does not
@@ -4752,10 +4753,29 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   lambda checked last let the `0` fix `T = int` first, so the lambda and a named function of the
   same type behaved differently (marshal met it). Alternatives: deferring the literal instead of
   advancing the lambda (the same order in effect, but it reaches only literals, not the lambda's own
-  literal result); checking a lambda with `?` early against a result type known only in shape (a
-  larger change to how `?` finds the type it returns, left for when a program needs
-  `pick(s -> Some(s.toLongOption()? + 1), 0)` to be a `long`). Review with the user: whether a
-  lambda that uses `?` should also take part, which needs `?` to work from a result known in shape.
+  literal result); checking a lambda with `?` against a result type known only in shape, deferred
+  here and since built (next paragraph).
+
+  **Settled on the user's delegation 2026-11-15 (branch `lambda-question-shape`): a lambda using `?`
+  or `return` checks against a result known only in shape.** Where the function type expected for
+  a lambda yields an `Option[T]`, or a `Result[T, E]` with `E` known, and `T` is still to be
+  inferred (wholly or in part), the lambda's result is that shape: `?` passes a `None`, or an `Err`
+  converted to `E` as in any function, and the body's value solves `T`, so
+  `inside(n -> Ok(half(n + 1)? + 1))` for `inside[T](f: (int) -> Result[T, string])` takes
+  `T = int`. A `Result` whose `E` is itself unknown, and any other shape, stay refused with "this
+  lambda uses `?`, so its result type must be known where it is written". WHY: the pg package
+  needs it for every `c.transaction(tx -> { tx.execute(…)?; Ok(x) })` and `pool.use` body, where
+  the transaction's value type is the caller's and the error type is the library's; the error
+  type is what `?` needs, and it is known. Only a lambda that exits by `?` or `return` takes the
+  shape as its declared result; any other lambda still infers from the body against the shape as a
+  hint, so nothing it accepted changes. ALTERNATIVES: inferring `E` from the first `?` too (makes a
+  lambda's error type depend on which failure is written first, and a later `?` of another error
+  type then fails to convert rather than widen); making a `?` lambda take part in the literal tiers
+  as well (it is still checked after the other arguments, so
+  `pick(s -> Some(s.toLongOption()? + 1), 0)` still fixes `T = int` from the `0` and is refused:
+  checking it earlier would refuse a `?` lambda whose result is a bare `T` that only a later
+  argument decides). Review with the user: whether a `?` lambda should also join the literal tiers
+  when its expected result has the shape, which would make the `pick` example a `long`.
 - **Settled on the user's delegation 2026-11-07 (branch `hash-digest`): `avin.crypto`, digests over `sysl.crypto`.**
   The module is `avin.crypto`; it has `sha256`, `sha512`, `sha1` and `md5` (each taking a
   `Vector[byte]` or a `string`, hashed as UTF-8, answering a `Vector[byte]`), `hmacSha256` and

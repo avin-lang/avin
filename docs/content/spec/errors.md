@@ -116,8 +116,14 @@ so a whole program can use `?`: an `Err` reaching the end of `main` is written t
 
 `?` returns from the function it is written in; inside a lambda, from the lambda. That function's
 result type must be declared, or for a lambda known where it is written, as in
-`val f: (string) -> Option[int] = s -> Some(parse(s)? + 1)`. A delayed argument and a class body
-cannot be left by `?`, as they cannot by `return`.
+`val f: (string) -> Option[int] = s -> Some(parse(s)? + 1)`. For a lambda, known in shape is
+enough: where the function expected yields an `Option`, or a `Result` whose error type is known,
+and the value's type is still to be inferred, as in a generic
+`transaction[T](f: (Tx) -> Result[T, DbError]) -> Result[T, DbError]`, `?` checks against that
+shape and the body decides the value's type, so `db.transaction(tx -> Ok(tx.execute(sql)? + 1))`
+takes `T = int`. `return` in such a lambda checks against the same shape. A `Result` whose error
+type is itself still unknown, and a result of any other shape, are not enough. A delayed argument
+and a class body cannot be left by `?`, as they cannot by `return`.
 
 ## A Result is not dropped
 
