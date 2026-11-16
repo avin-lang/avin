@@ -484,7 +484,10 @@ main() -> int
 ```
 
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
-parked on a lock, a condition, a channel or a join, or blocked on input, never holds up a collection.
+parked on a lock, a condition, a channel or a join, blocked on standard input, or writing to standard
+output or standard error where they lead to a full pipe, its own trap report included, never holds up
+a collection. A lightweight thread waiting for standard input from a pipe, a socket or a terminal
+parks and leaves its worker to the others; that wait is not a cancellation point.
 A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A thread
 waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. A thread
 taking a lock it already holds traps at once. A program whose threads, `main` among them, all wait for

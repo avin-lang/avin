@@ -8782,6 +8782,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `TcpServer.stopped()` is a channel closed by `stop`, which the owner's select watches in place of
   running each wait on a thread of its own through `idle`. Review with the user: the fragment size,
   and whether `stopped()` should be a receive-only view rather than a `Channel[unit]`.
+- Settled on the user's delegation 2026-11-15 (built on branch `stdio-blocking`): **standard input
+  and output wait safe for the collector.** Every read of standard input and every write to standard
+  output or standard error, a flush and a trap's report included, marks its thread safe for the
+  collector while it waits, the string being written kept in a frame of the runtime's own. A
+  lightweight thread reading standard input from a stream with no position (a pipe, a socket, a
+  terminal where the platform answers so) parks on the poller first; one reading a file or a device
+  reads at once, since the poller does not report a file at its end as ready. Writes do not park: the
+  output goes through the C library's buffer, shared with any C code the program calls, so a thread
+  held up writing keeps its worker, counted as blocked, and the monitor runs another in its place.
+  **The wait for standard input is not a cancellation point**, as it was not before: a cancelled
+  thread goes on waiting for its line. *Why*: the smallest fix that keeps the behaviour the program
+  sees; making it one would add a failure path to `readLine`, which answers no error. *Alternatives*:
+  parking writes too (needs non-blocking standard output, which a pipe shared with the parent
+  process cannot be given safely); a cancellable input wait that unwinds the thread as a sleep does.
+  Review with the user: whether waiting for standard input should be a cancellation point.
 
 ## Proposed
 

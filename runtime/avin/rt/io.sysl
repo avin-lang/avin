@@ -2,35 +2,84 @@ module avin.rt
 
 // Entry points compiled Avin code calls with the C convention. Their names and signatures are a
 // private contract with the compiler's intrinsics. Each takes the calling thread's context first.
+//
+// A write to standard output or standard error waits wherever the stream leads somewhere that does
+// not take the bytes at once, a pipe whose reader is slow most of all, so every write is made safe for
+// the collector: a thread held up writing does not hold up a collection the other threads need. The
+// string being written is kept in a frame of its own meanwhile, so a collection cannot take it.
+
+/** A frame of one slot, which keeps a string reachable while its thread writes it out. */
+private struct Keeping
+    frame: Frame
+    text: *u8
+
+@assert(offsetof(Keeping, text) == offsetof(Keeping, frame) + sizeof(Frame), "a frame's slots follow its header")
 
 /** Writes the string at `text`, then a new line, to standard output. */
 @export("avin_rt_print_line")
 print_line(ctx: *Context, text: *u8)
-    write_out(ctx, text)
+    var k = Keeping(Frame(ctx.top, 1), text)
+    ctx.top = &k.frame
+    enter_safe(ctx)
+    putbytes(text_bytes(text)[0..<text_length(text)])
     putbytes("\n".bytes)
+    leave_safe(ctx)
+    ctx.top = k.frame.prev
 
 /** Writes the string at `text` to standard output, with nothing after it. */
 @export("avin_rt_write_out")
 write_out(ctx: *Context, text: *u8)
-    val data = text_bytes(text)
-    putbytes(data[0..<text_length(text)])
+    var k = Keeping(Frame(ctx.top, 1), text)
+    ctx.top = &k.frame
+    enter_safe(ctx)
+    putbytes(text_bytes(text)[0..<text_length(text)])
+    leave_safe(ctx)
+    ctx.top = k.frame.prev
 
 /** Sends everything written to standard output so far on its way, whether or not a line is complete. */
 @export("avin_rt_flush_out")
 flush_out(ctx: *Context)
-    flush()
+    flush_safely(ctx)
 
 /** Writes the string at `text` to standard error, flushing standard output first so that what the
  * program wrote to the two streams arrives in the order it wrote it. Standard error keeps no buffer:
  * the text has left when this returns. */
 @export("avin_rt_write_err")
 write_err(ctx: *Context, text: *u8)
+    var k = Keeping(Frame(ctx.top, 1), text)
+    ctx.top = &k.frame
+    enter_safe(ctx)
     flush()
-    val data = text_bytes(text)
-    eputbytes(data[0..<text_length(text)])
+    eputbytes(text_bytes(text)[0..<text_length(text)])
+    leave_safe(ctx)
+    ctx.top = k.frame.prev
 
 /** Writes the decimal digits of `value`, with a sign when it is negative, to standard output,
  * rendered on the stack. */
 @export("avin_rt_write_int")
 write_int(ctx: *Context, value: long)
+    enter_safe(ctx)
     printi(value)
+    leave_safe(ctx)
+
+/** Flushes standard output from the thread of `ctx`, safe for the collector while the bytes wait to
+ * leave. A thread already safe stays so. */
+flush_safely(ctx: *Context)
+    if ctx.state.load() == Safe
+        flush()
+        return
+    enter_safe(ctx)
+    flush()
+    leave_safe(ctx)
+
+/** Writes `message` to standard error from the thread of `ctx`, flushing standard output first, safe
+ * for the collector while the bytes wait to leave. A thread already safe stays so. */
+eprints_safely(ctx: *Context, message: string)
+    if ctx.state.load() == Safe
+        flush()
+        eprints(message)
+        return
+    enter_safe(ctx)
+    flush()
+    eprints(message)
+    leave_safe(ctx)

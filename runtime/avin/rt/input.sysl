@@ -2,6 +2,7 @@ module avin.rt
 
 import sysl.buf.{Buf, buf}
 import sysl.io.{Reader, fd_reader, find_byte}
+import sysl.io.wait.Readable
 import sysl.slices.copy
 import sysl.text.{chars_of, from_utf8_lossy}
 
@@ -23,20 +24,48 @@ var input_done: bool = false
 /** How many bytes one read asks for. */
 const input_chunk: usize = 65536
 
-/** Reads more of standard input onto the end of `input`; false when there was no more. The bytes not
- * yet taken are moved to the front first, so `input` holds at most the line being gathered and one
- * read past it. */
-private read_more() -> bool
+/** Whether standard input is a stream with no position, a pipe, a socket or a terminal, which the
+ * poller can wait on: 0 not yet asked, 1 it is, 2 it is not. A file or a device that can be read at
+ * any time is read at once instead, since the poller would not report a file at its end as ready. */
+var input_streams: u32 = 0
+
+private extern "lseek" c_lseek(fd: i32, offset: i64, whence: i32) -> i64
+
+/** Whether standard input is a stream the poller can wait on, asked once. */
+private input_is_stream() -> bool
+    if input_streams == 0 then input_streams = if c_lseek(0, 0, 1) < 0 then 1 else 2
+    input_streams == 1
+
+/** Waits until standard input has something to read, or has ended, from the thread of `ctx`, which is
+ * running. A lightweight thread reading a stream parks on the poller and leaves its worker to the
+ * others; any other wait happens in the read itself, made safe for the collector. The wait is no
+ * cancellation point: a cancelled thread goes on reading, as it did before the input came. */
+private await_input(ctx: *Context)
+    if !runs_lightweight(ctx) || !input_is_stream() then return
+    ctx.uncancellable += 1
+    // A poller that cannot take the descriptor leaves the wait to the read.
+    _ = wait_for_fd(0, Readable, 0)
+    ctx.uncancellable -= 1
+
+/** Reads more of standard input onto the end of `input`, from the thread of `ctx`; false when there
+ * was no more. The bytes not yet taken are moved to the front first, so `input` holds at most the line
+ * being gathered and one read past it. A thread waiting for input does not hold up a collection. */
+private read_more(ctx: *Context) -> bool
     if input_done then return false
     // What the program has written, a prompt most of all, is out before it waits for an answer.
-    flush()
+    flush_safely(ctx)
+    // Parking lets another thread run, so the buffer is rearranged only once the wait is over.
+    await_input(ctx)
+    if input_done then return false
     if input_at > 0
         val kept = copy(input.view_mut(), input.view()[input_at..])
         input.truncate(kept)
         input_at = 0
     input.reserve(input_chunk)
     var reader = fd_reader(0)
+    enter_safe(ctx)
     val got = reader.read(input.spare())
+    leave_safe(ctx)
     if got.len == 0
         input_done = true
         return false
@@ -48,7 +77,7 @@ private text_from(ctx: *Context, b: []const u8) -> *u8 = text_of(ctx, from_utf8_
 
 /** Whether standard input has nothing left to take, reading to find out when the buffer is empty. */
 @export("avin_rt_input_ended")
-input_ended(ctx: *Context) -> bool = input_at == input.len() && !read_more()
+input_ended(ctx: *Context) -> bool = input_at == input.len() && !read_more(ctx)
 
 /** The next line of standard input, without its terminator, as a new string. Past the end it is the
  * empty string; the library asks only after `input_ended` has said there is more. */
@@ -58,6 +87,8 @@ read_line(ctx: *Context) -> *u8
     var searched: usize = 0
     while true
         val have = input.view()[input_at..]
+        // Another thread may have taken from the buffer while this one waited: look again from the start.
+        if searched > have.len then searched = 0
         find_byte(have[searched..], 10) match
             Some(i) ->
                 val until = searched + i
@@ -66,7 +97,7 @@ read_line(ctx: *Context) -> *u8
                 input_at += until + 1
                 return line
             None -> searched = have.len
-        if !read_more()
+        if !read_more(ctx)
             val last = text_from(ctx, input.view()[input_at..])
             input_at = input.len()
             return last
@@ -80,7 +111,7 @@ read_line(ctx: *Context) -> *u8
 read_char(ctx: *Context) -> char
     var more = true
     while more && input.len() - input_at < 4
-        more = read_more()
+        more = read_more(ctx)
     val have = input.view()[input_at..]
     val window = if have.len < 4 then have else have[..<4]
     var cursor = chars_of(window)
@@ -93,7 +124,7 @@ read_char(ctx: *Context) -> char
 read_rest(ctx: *Context) -> *u8
     var more = true
     while more
-        more = read_more()
+        more = read_more(ctx)
     val rest = text_from(ctx, input.view()[input_at..])
     input_at = input.len()
     rest

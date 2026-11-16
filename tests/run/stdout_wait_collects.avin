@@ -1,0 +1,62 @@
+// expect: exit 0
+// A thread whose write to standard output or standard error waits on a full pipe does not hold up a
+// collection the other threads need. The program runs itself as a child whose output goes into a pipe
+// a shell drains only once a marker file exists, and the child makes the marker only after another of
+// its threads has allocated through many collections: a writer that held the collector up would keep
+// the marker from ever appearing. The writer is a lightweight thread while `main` allocates, and
+// `main` while a lightweight thread allocates, and it writes by each way there is: a string, a line,
+// numbers, small pieces each flushed, and standard error.
+import avin.fs
+import avin.process
+import avin.process.Command
+import avin.threads
+
+// Allocates enough to collect many times over, then makes the marker the draining shell waits for.
+churn(marker: string) -> int
+  var kept = 0
+  for i in 0 ..< 2000
+    kept = kept + s"item $i".byteLength % 2
+  if !fs.writeText(marker, "churned").isOk then fail("no marker")
+  kept
+
+// Writes far more than a pipe holds, the way `how` names: 1 MB in all, but 108890 bytes of numbers.
+write(how: string) -> int
+  val big = "x".repeat(1048576)
+  how match
+    "print" -> print(big)
+    "println" -> println(big.drop(1))
+    "numbers" -> for i in 0 ..< 20000 do println(i)
+    "flushed" ->
+      val piece = "y".repeat(1024)
+      for _ in 0 ..< 1024
+        print(piece)
+        flush()
+    _ -> eprint(big)
+  flush()
+  0
+
+// The child: `who` writes while the other allocates.
+child(who: string, how: string, marker: string)
+  if who == "thread"
+    val writer = threads.spawn(() -> write(how))
+    _ = churn(marker)
+    _ = writer.join()
+  else
+    val allocator = threads.spawn(() -> churn(marker))
+    _ = write(how)
+    _ = allocator.join()
+
+main(args: Vector[string])
+  if args.length == 4 && args(0) == "child" then return child(args(1), args(2), args(3))
+  if !args.isEmpty then fail(s"unexpected arguments $args")
+  val program = process.executable().getOrElse("")
+  // The shell that drains the child late: its first argument is the program, then the child's own.
+  // Standard error is drained as standard output is, and the child's standard output then goes nowhere.
+  val drainer = "d=$(mktemp -d); if [ \"$2\" = err ]; then \"$0\" child \"$1\" \"$2\" \"$d/m\" 2>&1 >/dev/null; else \"$0\" child \"$1\" \"$2\" \"$d/m\"; fi | (while [ ! -e \"$d/m\" ]; do sleep 0.02; done; wc -c | tr -d ' '); s=$?; rm -rf \"$d\"; exit $s"
+  for who in ["thread", "main"]
+    for how in ["print", "println", "numbers", "flushed", "err"]
+      flush()
+      print(s"$who $how: ")
+      flush()
+      val status = Command("/bin/sh", "-c", drainer, program, who, how).run()
+      if !status.map(s -> s.isSuccess).getOrElse(false) then println(s"$status")

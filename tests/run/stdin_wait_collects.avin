@@ -1,0 +1,51 @@
+// expect: exit 0
+// A thread waiting for standard input does not hold up a collection the other threads need. The
+// program runs itself as a child whose standard input is a pipe a shell keeps open and writes to only
+// once a marker file exists, and the child makes the marker only after another of its threads has
+// allocated through many collections: a reader that held the collector up would keep the marker from
+// ever appearing. The reader is a lightweight thread while `main` allocates, and `main` while a
+// lightweight thread allocates, and it reads by each way there is: a line, the lines, everything
+// left, and one character at a time.
+import avin.fs
+import avin.io
+import avin.io.Source
+import avin.process
+import avin.process.Command
+import avin.threads
+
+// Allocates enough to collect many times over, then makes the marker the feeding shell waits for.
+churn(marker: string) -> int
+  var kept = 0
+  for i in 0 ..< 2000
+    kept = kept + s"item $i".byteLength % 2
+  if !fs.writeText(marker, "churned").isOk then fail("no marker")
+  kept
+
+// Reads standard input the way `how` names, answering what it read.
+read(how: string) -> string = how match
+  "line" -> io.readLine().getOrElse("none")
+  "lines" -> io.lines().mkString("+")
+  "all" -> io.readAll().replace("\n", "+")
+  _ -> Source.stdin().chars().take(3).mkString("")
+
+// The child: `who` reads while the other allocates.
+child(who: string, how: string, marker: string)
+  if who == "thread"
+    val reader = threads.spawn(() -> read(how))
+    val kept = churn(marker)
+    println(s"thread $how: ${reader.join()} ($kept)")
+  else
+    val allocator = threads.spawn(() -> churn(marker))
+    val got = read(how)
+    println(s"main $how: $got (${allocator.join()})")
+
+main(args: Vector[string])
+  if args.length == 4 && args(0) == "child" then return child(args(1), args(2), args(3))
+  if !args.isEmpty then fail(s"unexpected arguments $args")
+  val program = process.executable().getOrElse("")
+  // The shell that feeds the child late: its first argument is the program, then the child's own.
+  val feeder = "d=$(mktemp -d); (while [ ! -e \"$d/m\" ]; do sleep 0.02; done; printf 'fed\\nmore\\n') | \"$0\" child \"$1\" \"$2\" \"$d/m\"; s=$?; rm -rf \"$d\"; exit $s"
+  for who in ["thread", "main"]
+    for how in ["line", "lines", "all", "chars"]
+      val status = Command("/bin/sh", "-c", feeder, program, who, how).run()
+      if !status.map(s -> s.isSuccess).getOrElse(false) then println(s"$who $how: $status")
