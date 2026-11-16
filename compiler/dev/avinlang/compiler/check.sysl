@@ -8790,22 +8790,54 @@ private promised_sendability(f: Conformances, x: &Type, k: usize, a: SendAssumed
             NotYetKnown -> undecided = true
             CanSend -> ()
     // The impl's other bounds; its `Sendable` ones were held above, with the type's parts being
-    // decided, so a type holding itself through one is decided by its other parts.
+    // decided, so a type holding itself through one is decided by its other parts. A type its own
+    // declaration makes `Sendable` takes no condition from an impl of a trait that promises it, and
+    // where several impls make it `Sendable` (its own `Sendable` impl and an impl of a trait that
+    // promises it), each is a source: the type is `Sendable` at arguments meeting the bounds of any.
     val owner = *x match
         Data(d, _, _) -> data_owner(d)
         Class(c, _, _) -> class_owner(c)
         _ -> return CanSend
+    if declared_sendable(f, x, k) then return if undecided then NotYetKnown else CanSend
+    var refusal: Option[string] = None
     for cc in f.conditional
         if cc.owner != owner then continue
         if !(cc.trait_id == k || ancestor_type(f.classes, f.data, own_class_type(f.classes[cc.trait_id], cc.trait_id), k) is Some(_)) then continue
-        for i in 0..<cc.conditions.len()
-            if i >= args.len() then break
-            for b in cc.conditions[i]
-                if *b is Class(bk, _, _)
-                    if bk == k then continue
-                if !meets_bound(f, args[i], substitute(b, owner, args))
-                    return CannotSend(s"its type argument ${type_name_quoted(args[i])} does not meet the bound `${type_name(b)}` of the impl that makes it `Sendable`")
+        val missed = unmet_send_condition(f, owner, cc.conditions, args, k)
+        missed match
+            None -> return if undecided then NotYetKnown else CanSend
+            Some(why) -> if refusal is None then refusal = Some(why)
+    if refusal is Some(why) then return CannotSend(why)
     if undecided then NotYetKnown else CanSend
+
+/** Whether `x`'s own declaration (its header, its superclass, or an impl with no bounds of its own)
+ * makes it `Sendable`, so no conditional impl is its source. */
+private declared_sendable(f: Conformances, x: &Type, k: usize) -> bool
+    var parents: Buf[&Type] = buf()
+    *x match
+        Data(d, _, _) ->
+            for p in f.data[d].traits
+                parents.push(p)
+        Class(c, _, _) ->
+            for p in f.classes[c].traits
+                parents.push(p)
+            if f.classes[c].superclass is Some(s) then parents.push(s)
+        _ -> return false
+    for p in parents
+        if ancestor_type(f.classes, f.data, p, k) is Some(_) then return true
+    false
+
+/** Why type arguments `args` of the type `owner` owns miss the bounds other than `Sendable` of an
+ * impl making it `Sendable`; `None` where they meet them all. */
+private unmet_send_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args: Buf[&Type], k: usize) -> Option[string]
+    for i in 0..<conditions.len()
+        if i >= args.len() then break
+        for b in conditions[i]
+            if *b is Class(bk, _, _)
+                if bk == k then continue
+            if !meets_bound(f, args[i], substitute(b, owner, args))
+                return Some(s"its type argument ${type_name_quoted(args[i])} does not meet the bound `${type_name(b)}` of the impl that makes it `Sendable`")
+    None
 
 /** For each type parameter of `x`'s type, whether `x` is sendable only where its argument is: one
  * passed, other than contravariantly, to a trait that promises `Sendable`; one an impl making the
@@ -9666,6 +9698,16 @@ private check_sendable_declarations(c: *Checker)
             if trusted_sendable(c, id) then continue
         if *block.target is Data(_, _, _) || *block.target is Class(_, _, _)
             keep_send_promise(c, block.unit, written_trait_span(block.decl), block.target, k, Some(GenericScope(block.owner, block.decl.type_params)))
+    // An impl for one instance of a type does not make it `Sendable`, which holds of a type at every
+    // instance alike, so an impl of a trait promising it requires the instance to be so already.
+    for n in 0..<c.instances.len()
+        val x = c.instances[n]
+        if ancestor_type(c.classes, c.data, x.trait_type, k) is None then continue
+        val outer_generic = c.generic
+        c.generic = Some(GenericScope(instance_owner(n), x.params))
+        if sendability(conformances(c), x.ty, k) is CannotSend(why)
+            c.note(x.unit, x.span, s"`${type_name(x.trait_type)}` promises to be `Sendable`, so an impl of it for `${type_name(x.ty)}` requires `${type_name(x.ty)}` to be `Sendable` already, but $why")
+        c.generic = outer_generic
     for id in 0..<c.classes.len()
         val cls = c.classes[id]
         if cls.decl.modifier == "trait" then continue
