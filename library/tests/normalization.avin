@@ -1,0 +1,173 @@
+// `string.normalize` and `isNormalized` in the four Unicode normalization forms: the conformance
+// file of the Unicode Character Database the library answers from, every line and all four forms,
+// and the cases a reader meets first.
+//
+// `tests/fixtures/unicode/NormalizationTest.txt` is `NormalizationTest.txt` of Unicode 17.0.0
+// (`https://www.unicode.org/Public/17.0.0/ucd/NormalizationTest.txt`, SHA-256
+// `5019ffd530751a741900c849c0e010332f142a3612234639bd200b82138a87db`) with its header kept and every
+// other comment removed: the character names after each line's `#` and the comment lines between
+// the parts.
+
+import avin.fs
+
+hexCode(text: string) -> int
+  var n = 0
+  for c in text.chars
+    n = n * 16 + (if '0' <= c <= '9' then int(c) - int('0') else int(c) - int('A') + 10)
+  n
+
+// A column of the file, code points in hexadecimal with a space between them, as a string.
+column(text: string) -> string
+  val out = StringWriter()
+  for code in text.trim.split(" ") do out.writeChar(char(hexCode(code)))
+  out.text
+
+// The lines of the conformance file, each its part and its five columns: source, Nfc, Nfd, Nfkc,
+// Nfkd.
+conformance() -> Vector[(int, Vector[string])]
+  val text = fs.readText("tests/fixtures/unicode/NormalizationTest.txt") match
+    Ok(t) -> t
+    Err(e) -> fail(s"cannot read the conformance file: ${e.message}")
+  val found = Buffer[(int, Vector[string])]()
+  var part = -1
+  for line in text.split("\n")
+    if line.startsWith("@Part")
+      part = int(line.byteAt(5)) - int('0')
+    elif line.nonEmpty && !line.startsWith("#")
+      val fields = line.split(";")
+      found.addOne(
+        (part, [column(fields(0)), column(fields(1)), column(fields(2)), column(fields(3)), column(fields(4))])
+      )
+  found.toVector
+
+@test("every line of the Unicode conformance file holds in all four forms")
+conformanceFile()
+  val lines = conformance()
+  assert(lines.length > 20000)
+  var failures = 0
+  for (_, c) in lines
+    val (c1, c2, c3, c4, c5) = (c(0), c(1), c(2), c(3), c(4))
+    // The invariants the file's header states, form by form.
+    val nfc = c2 == c1.normalize(Nfc) && c2 == c2.normalize(Nfc) && c2 == c3.normalize(Nfc)
+    val nfcCompat = c4 == c4.normalize(Nfc) && c4 == c5.normalize(Nfc)
+    val nfd = c3 == c1.normalize(Nfd) && c3 == c2.normalize(Nfd) && c3 == c3.normalize(Nfd)
+    val nfdCompat = c5 == c4.normalize(Nfd) && c5 == c5.normalize(Nfd)
+    val nfkc = [c1, c2, c3, c4, c5].forall(s -> s.normalize(Nfkc) == c4)
+    val nfkd = [c1, c2, c3, c4, c5].forall(s -> s.normalize(Nfkd) == c5)
+    if !(nfc && nfcCompat && nfd && nfdCompat && nfkc && nfkd)
+      if failures < 5 then eprintln(s"conformance line fails: ${c.map(s -> s.chars.map(ch -> int(ch)).toVector)}")
+      failures += 1
+  assert(failures == 0)
+
+@test("every code point the conformance file's character part does not list is in all four forms")
+conformanceUnlisted()
+  val listed = Array.fill(0x110000, false)
+  for (part, c) in conformance()
+    if part == 1 then listed(int(c(0).head)) = true
+  var failures = 0
+  for code in 0 ..< 0x110000
+    if 0xD800 <= code <= 0xDFFF || listed(code) then continue
+    val x = char(code).toString()
+    if !(x.normalize(Nfc) == x && x.normalize(Nfd) == x && x.normalize(Nfkc) == x && x.normalize(Nfkd) == x)
+      failures += 1
+  assert(failures == 0)
+
+@test("isNormalized agrees with normalize on every line of the conformance file")
+conformanceIsNormalized()
+  for (_, c) in conformance()
+    for form in [Nfc, Nfd, Nfkc, Nfkd]
+      for s in c
+        assert(s.isNormalized(form) == (s.normalize(form) == s))
+    assert(c(1).isNormalized(Nfc) && c(2).isNormalized(Nfd))
+    assert(c(3).isNormalized(Nfkc) && c(4).isNormalized(Nfkd))
+
+@test("composition joins a letter and its accent, decomposition splits them")
+composeDecompose()
+  assert("e\u{301}".normalize(Nfc) == "\u{e9}")
+  assert("\u{e9}".normalize(Nfd) == "e\u{301}")
+  assert("\u{e9}".normalize(Nfc) == "\u{e9}")
+  assert("e\u{301}".normalize(Nfd) == "e\u{301}")
+  assert("\u{e9}".normalize(Nfd).charCount == 2 && "e\u{301}".normalize(Nfc).charCount == 1)
+  assert("Ångström".normalize(Nfd).normalize(Nfc) == "Ångström")
+  // U+212B ANGSTROM SIGN is canonically U+00C5, so it does not survive Nfc.
+  assert("\u{212b}".normalize(Nfc) == "\u{c5}")
+  assert("\u{212b}".normalize(Nfd) == "A\u{30a}")
+
+@test("Hangul syllables decompose to their jamo and compose back")
+hangul()
+  assert("\u{ac00}".normalize(Nfd) == "\u{1100}\u{1161}")
+  assert("\u{1100}\u{1161}".normalize(Nfc) == "\u{ac00}")
+  assert("\u{ac01}".normalize(Nfd) == "\u{1100}\u{1161}\u{11a8}")
+  assert("\u{1100}\u{1161}\u{11a8}".normalize(Nfc) == "\u{ac01}")
+  assert("\u{ac00}\u{11a8}".normalize(Nfc) == "\u{ac01}")
+  assert("\u{d7a3}".normalize(Nfd) == "\u{1112}\u{1175}\u{11c2}")
+  assert("한국어".normalize(Nfd).normalize(Nfc) == "한국어")
+  assert("한국어".normalize(Nfkd).charCount == 8)
+
+@test("combining marks are put in canonical order by their combining classes")
+canonicalOrdering()
+  // U+0323 DOT BELOW (class 220) goes before U+0307 DOT ABOVE (class 230) however they are written.
+  assert("q\u{307}\u{323}".normalize(Nfd) == "q\u{323}\u{307}")
+  assert("q\u{323}\u{307}".normalize(Nfd) == "q\u{323}\u{307}")
+  assert("q\u{307}\u{323}".normalize(Nfc) == "q\u{323}\u{307}")
+  // Marks of one class keep their order.
+  assert("a\u{301}\u{300}".normalize(Nfd) == "a\u{301}\u{300}")
+  assert("a\u{301}\u{300}".normalize(Nfc) == "\u{e1}\u{300}")
+  assert("a\u{300}\u{301}".normalize(Nfc) == "\u{e0}\u{301}")
+  // The dot below composes with the d past the dot above.
+  assert("d\u{307}\u{323}".normalize(Nfc) == "\u{1e0d}\u{307}")
+  assert(!"q\u{307}\u{323}".isNormalized(Nfd) && "q\u{323}\u{307}".isNormalized(Nfd))
+
+@test("the compatibility forms fold ligatures, circled and fullwidth forms, and superscripts")
+compatibility()
+  assert("\u{fb01}".normalize(Nfkc) == "fi" && "\u{fb01}".normalize(Nfkd) == "fi")
+  assert("\u{fb01}".normalize(Nfc) == "\u{fb01}" && "\u{fb01}".normalize(Nfd) == "\u{fb01}")
+  assert("\u{2460}".normalize(Nfkc) == "1" && "\u{2460}".normalize(Nfc) == "\u{2460}")
+  assert("ＡＢＣ１２３".normalize(Nfkc) == "ABC123")
+  assert("x\u{b2}".normalize(Nfkc) == "x2")
+  assert("\u{2168}".normalize(Nfkc) == "IX")
+  assert("\u{3000}".normalize(Nfkc) == " ")
+  assert("\u{1e9b}\u{323}".normalize(Nfkc) == "\u{1e69}")
+  assert("\u{1e9b}\u{323}".normalize(Nfkd) == "s\u{323}\u{307}")
+  assert("\u{1e9b}\u{323}".normalize(Nfc) == "\u{1e9b}\u{323}")
+  assert("\u{1e9b}\u{323}".normalize(Nfd) == "\u{17f}\u{323}\u{307}")
+  assert(!"\u{fb01}".isNormalized(Nfkc) && "\u{fb01}".isNormalized(Nfc))
+
+@test("ASCII and the empty string are in every form, and come back as they were")
+alreadyNormalized()
+  for form in [Nfc, Nfd, Nfkc, Nfkd]
+    assert("".normalize(form) == "" && "".isNormalized(form))
+    assert("hello, world 123 ~".normalize(form) == "hello, world 123 ~")
+    assert("hello".isNormalized(form))
+    assert("\u{0}\u{7f}\t\n".normalize(form) == "\u{0}\u{7f}\t\n")
+    assert("café".normalize(Nfc).normalize(form) == "café".normalize(form))
+    assert("\u{e9}".normalize(form).normalize(form) == "\u{e9}".normalize(form))
+  assert("caf\u{e9}".isNormalized(Nfc) && !"caf\u{e9}".isNormalized(Nfd))
+  assert("cafe\u{301}".isNormalized(Nfd) && !"cafe\u{301}".isNormalized(Nfc))
+
+@test("characters outside the Basic Multilingual Plane, unassigned code points and non-characters")
+beyondTheBmp()
+  // U+1D15E MUSICAL SYMBOL HALF NOTE is excluded from composition: it decomposes in Nfc too.
+  assert("\u{1d15e}".normalize(Nfc) == "\u{1d157}\u{1d165}")
+  assert("\u{1d157}\u{1d165}".normalize(Nfc) == "\u{1d157}\u{1d165}")
+  assert("\u{1d400}".normalize(Nfkc) == "A" && "\u{1d400}".normalize(Nfc) == "\u{1d400}")
+  assert("😀".normalize(Nfc) == "😀" && "😀".normalize(Nfkd) == "😀")
+  for form in [Nfc, Nfd, Nfkc, Nfkd]
+    assert("\u{fffe}\u{10ffff}\u{e0000}".normalize(form) == "\u{fffe}\u{10ffff}\u{e0000}")
+    assert("a\u{50000}\u{301}".normalize(form).charCount == 3)
+  // Normalizing changes the length of a string, in either direction.
+  assert("\u{fdfa}".normalize(Nfkc).charCount == 18)
+  assert("\u{1100}\u{1161}\u{11a8}".normalize(Nfc).byteLength == 3)
+
+@test("a long string and one mixing every case normalize alike in pieces and whole")
+longStrings()
+  val piece = "e\u{301}ﬁ①Ａ\u{ac00}q\u{307}\u{323}"
+  val whole = StringWriter()
+  for _ in 0 ..< 2000 do whole.write(piece)
+  val text = whole.text
+  for form in [Nfc, Nfd, Nfkc, Nfkd]
+    val expected = StringWriter()
+    val one = piece.normalize(form)
+    for _ in 0 ..< 2000 do expected.write(one)
+    assert(text.normalize(form) == expected.text)
+    assert(text.normalize(form).isNormalized(form))

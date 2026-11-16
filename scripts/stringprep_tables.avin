@@ -1,0 +1,130 @@
+// Writes `library/avin/crypto/stringprep_tables.avin`, the tables of RFC 3454 (stringprep) that
+// `avin.crypto.saslPrep` applies, the SASLprep profile of RFC 4013, from the text of the RFC:
+//
+//     avin run scripts/stringprep_tables.avin -- <rfc3454.txt> library/avin/crypto/stringprep_tables.avin
+//
+// The RFC is at `https://www.rfc-editor.org/rfc/rfc3454.txt`. Its tables are fixed at Unicode 3.2,
+// which is why they are read from it rather than from the current Unicode Character Database.
+//
+// Each table the profile uses becomes a set of code points, written as its runs in increasing
+// order, a space between them: `0221` for one code point, `0234-024F` for a run, in hexadecimal.
+// Tables the profile treats alike (every prohibition table) are merged into one set.
+
+import avin.fs
+import avin.process
+
+val Limit: int = 0x110000
+
+hexDigit(c: char) -> int =
+  if '0' <= c <= '9' then int(c) - int('0') elif 'A' <= c <= 'F' then int(c) - int('A') + 10 else -1
+
+// Whether `text` is a code point or a run of them, as a table line writes it.
+isCodes(text: string) -> bool
+  if text.isEmpty then return false
+  var dashes = 0
+  for c in text.chars
+    if c == '-' then dashes += 1 elif hexDigit(c) < 0 then return false
+  dashes <= 1 && !text.startsWith("-") && !text.endsWith("-")
+
+hexValue(text: string) -> int
+  var n = 0
+  for c in text.chars do n = n * 16 + hexDigit(c)
+  n
+
+// The code points of table `name`, the lines between its `Start Table` and `End Table` markers. A
+// line that is not a code point or run, such as a page's header or footer, is skipped.
+table(text: string, name: string) -> Array[int]
+  val values = Array.fill(Limit, 0)
+  var inside = false
+  var any = false
+  for line in text.split("\n")
+    val content = line.trim
+    if content == "----- Start Table " + name + " -----"
+      inside = true
+    elif content == "----- End Table " + name + " -----"
+      inside = false
+    elif inside
+      val semi = content.indexOf(";")
+      val codes = (if semi >= 0 then content.slice(0, semi) else content).trim
+      if isCodes(codes)
+        val dash = codes.indexOf("-")
+        val first = hexValue(if dash >= 0 then codes.slice(0, dash) else codes)
+        val last = if dash >= 0 then hexValue(codes.slice(dash + 1, codes.byteLength)) else first
+        for c in first .. last do values(c) = 1
+        any = true
+  if !any
+    eprintln("no table " + name)
+    process.exit(1)
+  values
+
+union(tables: Vector[Array[int]]) -> Array[int]
+  val values = Array.fill(Limit, 0)
+  for t in tables
+    for c in 0 ..< Limit
+      if t(c) == 1 then values(c) = 1
+  values
+
+hex(n: int) -> string
+  val digits = "0123456789ABCDEF"
+  var text = ""
+  var rest = n
+  loop
+    text = digits.slice(rest % 16, rest % 16 + 1) + text
+    rest = rest / 16
+    if rest == 0 then break
+  while text.byteLength < 4 do text = "0" + text
+  text
+
+// The set as runs, in increasing order.
+runs(values: Array[int]) -> string
+  val out = StringWriter()
+  var c = 0
+  var first = true
+  while c < Limit
+    if values(c) == 1
+      var last = c
+      while last + 1 < Limit && values(last + 1) == 1 do last += 1
+      if !first then out.write(" ")
+      first = false
+      out.write(hex(c))
+      if last > c then out.write("-" + hex(last))
+      c = last + 1
+    else
+      c += 1
+  out.text
+
+set(out: StringWriter, name: string, doc: string, values: Array[int])
+  out.write("\n// " + doc + "\n")
+  out.write("private val " + name + ": string = \"" + runs(values) + "\"\n")
+
+main(args: Vector[string]) -> int
+  if args.length != 2
+    eprintln("usage: stringprep_tables <rfc3454.txt> <output file>")
+    return 2
+  val text = fs.readText(args(0)) match
+    Ok(t) -> t
+    Err(_) ->
+      eprintln("cannot read " + args(0))
+      return 1
+  val out = StringWriter()
+  out.write("module avin.crypto\n\n")
+  out.write("// The tables of RFC 3454 (stringprep, Unicode 3.2) that SASLprep (RFC 4013) applies, written by\n")
+  out.write("// `scripts/stringprep_tables.avin`, which says how they are encoded. Do not edit: run the script\n")
+  out.write("// again.\n")
+  set(out, "MappedToNothing", "B.1, the code points mapped to nothing.", table(text, "B.1"))
+  set(out, "NonAsciiSpaces", "C.1.2, the spaces other than U+0020, mapped to U+0020.", table(text, "C.1.2"))
+  val prohibited = ["C.1.2", "C.2.1", "C.2.2", "C.3", "C.4", "C.5", "C.6", "C.7", "C.8", "C.9"]
+  set(
+    out,
+    "Prohibited",
+    "C.1.2, C.2.1, C.2.2, C.3, C.4, C.5, C.6, C.7, C.8 and C.9, the code points SASLprep prohibits.",
+    union(prohibited.map(name -> table(text, name)))
+  )
+  set(out, "Unassigned", "A.1, the code points unassigned in Unicode 3.2.", table(text, "A.1"))
+  set(out, "RandALCat", "D.1, the characters of bidirectional property R or AL.", table(text, "D.1"))
+  set(out, "LCat", "D.2, the characters of bidirectional property L.", table(text, "D.2"))
+  fs.writeText(args(1), out.text) match
+    Ok(_) -> 0
+    Err(_) ->
+      eprintln("cannot write " + args(1))
+      1

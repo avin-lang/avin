@@ -1149,7 +1149,8 @@ since nothing could stand in for them.
 ## `avin.crypto`
 
 Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two,
-comparison of secrets in constant time, and hexadecimal text for any digest.
+PBKDF2, comparison of secrets in constant time, SASLprep for passwords, and hexadecimal text for any
+digest.
 
 ```text
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
@@ -1207,6 +1208,41 @@ else.
 val salted = pbkdf2HmacSha256(password, salt, iterations, 32)
 val clientKey = hmacSha256(salted, "Client Key")
 ```
+
+**SCRAM prepares the password with SASLprep before deriving its key**, so that the same password
+typed on two machines, as two sequences of characters, gives one key. `saslPrep(text) ->
+Option[string]` is RFC 4013's profile of stringprep (RFC 3454): each space other than U+0020
+becomes U+0020 and the characters mapped to nothing (the soft hyphen, the zero-width joiners, the
+variation selectors) are removed; the result is put in normalization form
+[NFKC](/spec/types/#normalization); and it is `None` where that holds a prohibited character
+(controls, private use, non-characters, the characters that change the display direction, tags),
+a code point unassigned in Unicode 3.2 (the RFC's version, as for a stored string), or right-to-left
+text that also holds a left-to-right character or does not begin and end with a right-to-left one.
+The tables are the RFC's, held as Unicode 3.2 fixed them; normalization is by the current Unicode
+Character Database, which differs from 3.2's only for a few CJK compatibility ideographs Unicode
+has corrected since.
+
+```text run
+import avin.crypto.saslPrep
+
+main()
+  println(saslPrep("I\u{ad}X")) // Some(IX)
+  println(saslPrep("\u{2168}")) // Some(IX)
+  println(saslPrep("pass\u{a0}word")) // Some(pass word)
+  println(saslPrep("\u{7}")) // None
+  println(saslPrep("\u{627}1")) // None
+```
+
+```text output
+Some(IX)
+Some(IX)
+Some(pass word)
+None
+None
+```
+
+PostgreSQL's client falls back to the password as it was written where SASLprep refuses it, and so
+may a client written with this: `saslPrep(password).getOrElse(password)`.
 
 The digests, the key derivation and the comparison are bound to Sysl's `sysl.crypto`, so they are the
 same code Sysl programs use.
