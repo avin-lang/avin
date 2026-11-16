@@ -1,0 +1,194 @@
+// expect: exit 0
+// Deadlines: `withDeadline(t, s -> …)` answers `Ok` of what its body returns before `t` and
+// `Err(DeadlineExceeded(t))` where `t` passes first, the body then cancelled wherever it waits: a
+// socket's read, a pool's `use`, a channel's `receive`, a `select`, a sleep. Inside, the context has the
+// deadline and how long is left; a nested deadline tightens it and never loosens it, and an outer one
+// ends a later inner one. `withTimeout` sets the deadline too. A scope's threads take the deadline; a
+// plain thread and a future take the values only. Upper bounds are generous so a loaded machine cannot
+// fail the test.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+
+import avin.threads.{
+  Atomic, Channel, Context, DeadlineExceeded, Future, Key, Pool, scope, sleep, spawn, withDeadline, withTimeout,
+  withValue
+}
+
+import avin.time.{Duration, Instant, hours, millis, monotonic, now, seconds}
+
+class Conn(val id: int): Sendable
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// The deadline of the calling thread's context, as how far it lies from `t`, to the second.
+near(t: Instant) -> bool = Context.current().deadline match
+  Some(d) -> (d - t).abs < seconds(2)
+  None -> false
+
+left() -> Duration = Context.current().remaining().getOrElse(Duration.Max)
+
+val tag = Key[string]("tag")
+
+main()
+  // No deadline outside any scope.
+  println(s"outside: ${Context.current().deadline} ${Context.current().remaining()}")
+
+  // In time: `Ok`, with the deadline and what is left visible inside, and none after.
+  val t1 = now() + seconds(30)
+  val inTime = withDeadline(t1, s -> (near(t1), left() > seconds(20), left() <= seconds(30)))
+  println(s"in time: $inTime, after: ${Context.current().deadline}")
+
+  // The error: its type, its deadline, its message and how it shows.
+  val t2 = now() + millis(30)
+  val late = withDeadline(t2, s ->
+    sleep(hours(1))
+    1)
+  late match
+    Ok(_) -> println("late: Ok")
+    Err(e) ->
+      println(s"late: ${e.message}, deadline kept: ${e.deadline == t2}, shown: $e")
+      val err: Error = e
+      println(s"as an Error: ${err.message}, cause: ${err.cause.isDefined}")
+  println(s"display: ${DeadlineExceeded(Instant.Epoch).message}")
+  println(s"context chain: ${late.context("running the query")}")
+
+  // A deadline already past, or now, runs nothing.
+  var touched = false
+  val past = withDeadline(now() - seconds(1), s ->
+    touched = true
+    1)
+  println(s"past: ${past.isErr}, touched: $touched")
+
+  // A socket's read that nothing answers ends at the deadline.
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val accepted = spawn(() -> ok(l.accept()))
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  val server = accepted.join()
+  val r0 = monotonic()
+  val read = withDeadline(now() + millis(40), s -> c.read(5).isOk)
+  val took = monotonic() - r0
+  println(s"socket read: ${read.isErr}, waited: ${took >= millis(30)}, ${took < seconds(30)}")
+  // The connection is still usable after.
+  ok(server.write(Array.tabulate(5, i -> "hello".byteAt(i))))
+  println(s"read after: ${string.fromUtf8Lossy(ok(c.read(5)))}")
+
+  // A pool's `use` waiting for a resource ends at the deadline and gives up its place.
+  val pool = Pool[Conn, string](() -> Ok(Conn(1)), maxSize = 1)
+  val hold = Channel[int](1)
+  val holding = Channel[int](1)
+  val holder = spawn(() ->
+    pool.use(c ->
+      holding.send(c.id)
+      _ = hold.receive()
+      c.id))
+  _ = holding.receive()
+  val acquire = withDeadline(now() + millis(30), s -> pool.use(c -> c.id))
+  println(s"pool use: ${acquire.isErr} ${pool.stats()}")
+  hold.send(0)
+  println(s"pool after: ${holder.join()} ${pool.use(c -> c.id)}")
+
+  // A channel's receive and a select end at the deadline.
+  val never = Channel[int]()
+  println(s"receive: ${withDeadline(now() + millis(20), s -> never.receive()).isErr}")
+  val sel = withDeadline(now() + millis(20), s ->
+    var got = 0
+    select
+      never.receive() as Some(v) -> got = v
+    got)
+  println(s"select: ${sel.isErr}")
+
+  // A body that computes without waiting is stopped at its loop's poll.
+  val spinning = withDeadline(now() + millis(20), s ->
+    var n: long = 0
+    while true do n +%= 1
+    n)
+  println(s"spinning: ${spinning.isErr}")
+
+  // Nesting tightens: an inner sooner deadline is the one seen and ends first; the outer goes on.
+  val outerT = now() + seconds(30)
+  val tight = withDeadline(outerT, s ->
+    val innerT = now() + millis(20)
+    val inner = withDeadline(innerT, s2 ->
+      val seen = near(innerT)
+      sleep(hours(1))
+      seen)
+    (inner.isErr, near(outerT)))
+  println(s"tighten: $tight")
+
+  // Nesting never loosens: an inner later deadline still reads the outer's, and the outer ends it.
+  val reached = Atomic(0)
+  val sawOuter = Atomic(false)
+  val o0 = monotonic()
+  val loose = withDeadline(now() + millis(40), s ->
+    val inner = withDeadline(now() + hours(1), s2 ->
+      sawOuter.store(left() < seconds(30))
+      sleep(hours(1))
+      "inner")
+    reached.add(1)
+    inner)
+  println(
+    s"loosen: ${loose.isErr}, inner saw the outer: ${sawOuter.load()}, past inner: ${reached.load()}, quick: ${monotonic() - o0 < seconds(30)}"
+  )
+
+  // `withTimeout` sets the deadline as well, and nests with `withDeadline` either way.
+  println(s"withTimeout: ${withTimeout(seconds(30), s -> left() <= seconds(30) && left() > seconds(20))}")
+  println(s"mixed: ${withTimeout(seconds(30), s -> withDeadline(now() + hours(1), s2 -> left() <= seconds(30)))}")
+
+  // A scope's threads, and a nested scope's, take the deadline and are cancelled with the body; a plain
+  // thread and a future take the values without the deadline.
+  val ended = Atomic(0)
+  val inherited = withValue(tag, "req", () ->
+    withDeadline(now() + seconds(30), s ->
+      val a = s.spawn(() -> left() < seconds(31))
+      val b = s.spawn(() -> scope(s2 -> s2.spawn(() -> Context.current().deadline.isDefined).join()))
+      val plain = spawn(() -> (Context.current().deadline, Context.current().value(tag))).join()
+      val fut = Future((Context.current().deadline, Context.current().value(tag))).await()
+      (a.join(), b.join(), plain, fut)))
+  println(s"inherited: $inherited")
+  val cancelled = withDeadline(now() + millis(30), s ->
+    s.spawn(() ->
+      scope(s2 -> s2.spawn(() -> sleep(hours(1))).join())
+      ended.add(1))
+    s.spawn(() ->
+      never.receive()
+      ended.add(1))
+    sleep(hours(1)))
+  println(s"threads cancelled: ${cancelled.isErr}, ran on: ${ended.load()}")
+
+  // A deadline cancels a body that a value scope is around, and the value is still seen until then.
+  val valued = withDeadline(now() + millis(20), s ->
+    withValue(tag, "in", () ->
+      sleep(hours(1))
+      Context.current().value(tag)))
+  println(s"valued: ${valued.isErr}, after: ${Context.current().value(tag)}")
+
+  // A cancelled body's deferred statements run with each value scope taken off as it unwinds.
+  val unwound = Channel[string](1)
+  val stopped = withDeadline(now() + millis(20), s ->
+    defer unwound.send(Context.current().value(tag).getOrElse("none"))
+    withValue(tag, "in", () -> sleep(hours(1))))
+  println(s"unwound: ${stopped.isErr} ${unwound.receive().get}")
+
+  // A context read is a snapshot, and sendable: kept past its deadline it has none left, never less.
+  val kept = withDeadline(now() + seconds(1), s -> Context.current())
+  kept match
+    Ok(k) ->
+      sleep(millis(1500))
+      println(s"snapshot: ${k.remaining()}, read on a thread: ${spawn(() -> k.deadline.isDefined).join()}")
+    Err(_) -> println("snapshot: the body did not return in time")
+
+  // Generic results, and many at once on lightweight threads.
+  println(withDeadline(now() + seconds(30), s -> (1, Some("ü"))))
+  val timedOut = Atomic(0)
+  val finished = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 200
+      s.spawn(() ->
+        val r = withDeadline(now() + (if i % 2 == 0 then millis(20) else seconds(60)), s2 ->
+          if i % 2 == 0 then sleep(hours(1))
+          i)
+        if r.isOk then finished.add(1) else timedOut.add(1)))
+  println(s"many: ${finished.load()}, ${timedOut.load()}")

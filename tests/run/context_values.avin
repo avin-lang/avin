@@ -1,0 +1,113 @@
+// expect: exit 0
+// Request-scoped values: `withValue(key, v, body)` sets `v` under a typed key for the body, what it
+// calls and the threads it starts, and the context outside is as it was. Keys are told apart by
+// identity, a lookup answers the key's own type with no cast, and an inner scope shadows an outer one
+// for its body alone. A scope's threads, plain threads and futures see the values of the code that
+// started them; a sibling thread and the code after the scope do not; an actor's turn sees none.
+import avin.actors.spawn as spawnActor
+import avin.threads.{Channel, Context, Executor, Future, Key, Mutex, scope, spawn, withValue}
+
+val requestId = Key[string]("request id")
+val attempt = Key[int]("attempt")
+val other = Key[string]("request id")
+val tags = Key[Vector[string]]("tags")
+val point = Key[(int, Option[string])]("point")
+
+data Seen(id: Option[string], n: Option[int])
+
+seen() -> Seen = Seen(Context.current().value(requestId), Context.current().value(attempt))
+
+deep(n: int) -> Option[string] = if n == 0 then Context.current().value(requestId) else deep(n - 1)
+
+actor Echo(replies: Channel[Option[string]]) receives string
+  receive
+    _ -> replies.send(Context.current().value(requestId))
+
+main()
+  println(s"outside: ${seen()}")
+  println(s"key name: ${requestId.name}")
+
+  // The body, and what it calls however deep, see the value; the context is put back after.
+  val inside = withValue(requestId, "r-1", () ->
+    println(s"body: ${seen()}, deep: ${deep(200)}")
+    42)
+  println(s"result: $inside, after: ${seen()}")
+
+  // Two keys of one name and type are two keys.
+  withValue(requestId, "mine", () -> println(s"other key: ${Context.current().value(other)}"))
+
+  // Nesting: an inner scope adds a key and shadows one, for its body alone.
+  withValue(requestId, "outer", () ->
+    withValue(attempt, 3, () ->
+      withValue(requestId, "inner", () -> println(s"shadowed: ${seen()}"))
+      println(s"unshadowed: ${seen()}"))
+    println(s"outer only: ${seen()}"))
+
+  // Typed values of every shape come back as their own type.
+  withValue(tags, ["a", "ü", ""], () ->
+    withValue(point, (7, Some("x")), () ->
+      val t: Option[Vector[string]] = Context.current().value(tags)
+      val p: Option[(int, Option[string])] = Context.current().value(point)
+      println(s"typed: $t $p")))
+
+  // Extreme values and the empty string.
+  withValue(attempt, int.MinValue, () -> println(s"min: ${Context.current().value(attempt)}"))
+  withValue(requestId, "", () -> println(s"empty: ${Context.current().value(requestId)}"))
+
+  // Threads: a scope's, a plain one, and a future all see the starter's values; one started outside
+  // does not, and a sibling's scope does not leak into another.
+  withValue(requestId, "r-2", () ->
+    val inScope = scope(s ->
+      val a = s.spawn(() -> seen())
+      val b = s.spawn(() -> scope(s2 -> s2.spawn(() -> seen()).join()))
+      (a.join(), b.join()))
+    println(s"scope threads: $inScope")
+    println(s"plain thread: ${spawn(() -> seen()).join()}")
+    println(s"future: ${Future(seen()).await()}")
+    println(s"future map: ${Future(1).map(_ -> seen()).await()}"))
+  println(s"thread outside: ${spawn(() -> seen()).join()}")
+
+  // Siblings: each sees only its own value, and a value a child sets stays in the child.
+  val gate = Channel[unit]()
+  val results = Mutex(Vector[string]())
+  scope(s ->
+    s.spawn(() -> withValue(requestId, "left", () ->
+      gate.receive()
+      results.update(v -> v :+ s"left sees ${Context.current().value(requestId)}")))
+    s.spawn(() -> withValue(requestId, "right", () ->
+      gate.send(())
+      results.update(v -> v :+ s"right sees ${Context.current().value(requestId)}")))
+    s.spawn(() ->
+      gate.send(())
+      results.update(v -> v :+ s"bare sees ${Context.current().value(requestId)}"))
+    s.spawn(() ->
+      gate.receive()
+      ()))
+  println(s"siblings: ${results.get().sorted}")
+  println(s"parent after children: ${seen()}")
+
+  // Many threads, each with its own value, under the collector's pressure.
+  val many = scope(s ->
+    (0 ..< 200).map(i -> s.spawn(() ->
+      withValue(attempt, i, () ->
+        var junk: List[string] = []
+        for j in 0 ..< 50 do junk = s"$i-$j" :: junk
+        Context.current().value(attempt) == Some(i)))).map(t -> t.join()))
+  println(s"many: ${many.forall(ok -> ok)}")
+
+  // An actor's turn takes no context from the code that told it.
+  val replies = Channel[Option[string]](1)
+  val echo = spawnActor(Echo(replies))
+  withValue(requestId, "teller", () -> echo.tell("hi"))
+  println(s"actor turn: ${replies.receive()}")
+  val pooled = spawnActor(Echo(replies), executor = Executor.fixed(1))
+  withValue(requestId, "teller", () -> pooled.tell("hi"))
+  println(s"actor turn on an executor: ${replies.receive()}")
+
+  // An executor's task sees the values of the code that gave it.
+  val ex = Executor.fixed(1)
+  withValue(requestId, "task", () -> ex.execute(() -> replies.send(Context.current().value(requestId))))
+  println(s"executor task: ${replies.receive()}")
+  ex.execute(() -> replies.send(Context.current().value(requestId)))
+  println(s"executor task outside: ${replies.receive()}")
+  ex.shutdown()

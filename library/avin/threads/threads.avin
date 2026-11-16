@@ -9,7 +9,7 @@ module avin.threads
 // in any thread stops the whole program, and the program ends when `main` returns, whatever other
 // threads are still running.
 
-import avin.time.Duration
+import avin.time.{Duration, Instant, now}
 
 // Waits until `micros` microseconds have passed, safe for the collector while it waits: the runtime
 // parks the lightweight thread on a timer, freeing its worker, rather than blocking it.
@@ -101,13 +101,24 @@ class Thread[T](private val joint: Any, private val outcome: Outcome[T])
 // and committed only as the thread touches it, and 64 KiB at the least. The
 // Sysl handles `body` reaches that the calling code owns are the new thread's until its body
 // returns; then they, and those in what it returns, are in transit, for the next code to use them.
-spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T] = launch(body, stack).0
+// The thread takes the values of the calling thread's request context and no deadline, since nothing
+// cancels it when one passes.
+spawn[T: Sendable](
+    @sendable body: () -> T,
+    stack: long = 8388608
+) -> Thread[T] = launch(body, stack, currentState().detached).0
 
 // `spawn`, giving back too what a scope keeps of the thread: its joint, which the scope cancels it
 // by, and what hands back the Sysl handles its body reaches once it has ended, which a thread
-// cancelled before its body returned did not do itself. Where `runs` is false the thread is one a
-// cancelled scope starts: it runs nothing, and ends with no result.
-private launch[T: Sendable](@sendable body: () -> T, stack: long, runs: bool = true) -> (Thread[T], Any, () -> unit)
+// cancelled before its body returned did not do itself. The thread runs with `context` as its request
+// context state. Where `runs` is false the thread is one a cancelled scope starts: it runs nothing, and
+// ends with no result.
+private launch[T: Sendable](
+    @sendable body: () -> T,
+    stack: long,
+    context: ContextState,
+    runs: bool = true
+) -> (Thread[T], Any, () -> unit)
   val outcome = Outcome[T]()
   if !runs
     val joint = start(() -> (), stack)
@@ -115,6 +126,7 @@ private launch[T: Sendable](@sendable body: () -> T, stack: long, runs: bool = t
   val owner = newOwner()
   handOver(body, currentOwner(), owner)
   val run = () ->
+    contextSet(context)
     runAs(owner)
     val v = body()
     handOver(body, owner, inTransit)
@@ -199,14 +211,15 @@ private class Started()
 class Scope(private val started: Started)
   // Starts `body` on a new thread with a stack of `stack` bytes, as `spawn` does, which the scope
   // waits for before it returns. In a cancelled scope the thread starts cancelled, and ends before
-  // its body runs.
+  // its body runs. The thread takes the calling thread's whole request context, its deadline with
+  // its values, since a cancellation of the scope reaches it.
   spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]
     started.use("started")
     // A cancellation of the calling thread does not come between starting the thread and
     // recording it, so the scope always waits for it.
     // A thread started in a cancelled scope runs nothing, and ends with no result.
     enterUncancellable()
-    val (t, joint, handBack) = launch(body, stack, !started.cancelled)
+    val (t, joint, handBack) = launch(body, stack, currentState(), !started.cancelled)
     started.joints = joint :: started.joints
     started.handBacks = handBack :: started.handBacks
     leaveUncancellable()
@@ -252,16 +265,24 @@ scope[T](body: (Scope) -> T) -> T
 // calling code reaches, its Sysl handles among them, and returns to it. Its waits, and the waits of
 // the threads it starts, park on the runtime's timers as every wait does, holding no worker.
 //
+// The body's request context has the deadline `timeout` from now, where it is sooner than the one
+// around it, so the code below reads how long it has left (`Context.current().remaining()`).
+//
 //     val page = withTimeout(seconds(5), s -> fetch(url)) match
 //       Some(p) -> p
 //       None -> "timed out"
-withTimeout[T](timeout: Duration, body: (Scope) -> T) -> Option[T]
+withTimeout[T](timeout: Duration, body: (Scope) -> T) -> Option[T] = timed(timeout, now() + timeout, body)
+
+// `withTimeout`, its deadline the instant `wall` on the wall clock.
+private timed[T](timeout: Duration, wall: Instant, body: (Scope) -> T) -> Option[T]
   if timeout.micros <= 0 then return None
   val started = Started()
   val out = Outcome[T]()
   val ended = Channel[unit](1)
   val owner = currentOwner()
+  val context = currentState().bounded(timeout, wall)
   val runBody = () ->
+    contextSet(context)
     runAs(owner)
     out.finish(scope(body))
     ended.send(())

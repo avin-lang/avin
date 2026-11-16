@@ -42,15 +42,16 @@ private class WorkerPool(private val target: int): Sendable
   // calling code owns are the task's, an owner of its own whichever worker runs it, until `task`
   // returns; then they are in transit, for the next code to use them, before `finish` runs. So
   // `finish` is where the task's result is published: code that sees the result, a future's awaiter
-  // among them, finds every handle the task used already given up.
-  submit[R](task: () -> R, finish: (R) -> unit)
+  // among them, finds every handle the task used already given up. The task runs with `context` as
+  // its request context state.
+  submit[R](task: () -> R, finish: (R) -> unit, context: ContextState)
     val owner = newOwner()
     handOver(task, currentOwner(), owner)
     handOver(finish, currentOwner(), owner)
     val run: () -> unit = () ->
       val worker = currentOwner()
       runAs(owner)
-      val r = task()
+      val r = within(context, task)
       handOver(task, owner, inTransit)
       handOver(finish, owner, inTransit)
       finish(r)
@@ -97,9 +98,11 @@ private class WorkerPool(private val target: int): Sendable
 
   // Starts one more worker, counted at once; under the lock. The worker is enrolled as this pool's
   // before it runs a task, so a wait in any task finds the pool to tell.
+  // A worker runs with no request context of its own: each task brings the one it runs with.
   private start()
     starting += 1
     spawn(() ->
+      contextSet(emptyState)
       registry.enrol(current(), self)
       lock.acquire()
       starting -= 1
@@ -182,16 +185,16 @@ blocking[T](body: -> T) -> T
 // Runs `body` on `p` and gives back the future of what it returns.
 private startOn[T: Sendable](p: WorkerPool, @sendable body: () -> T) -> Future[T]
   val cell = Cell[T]()
-  p.submit(body, v ->
-    cell.complete(v)
-    ())
+  p.submit(body, v -> _ = cell.complete(v), currentState().detached)
   Future(cell, p)
 
 // A cell of a sendable value may be shared between threads, as the future holding it is.
 impl[T: Sendable] Sendable for Cell[T]
 
 // Where a future's value is left, once, and what is to run with it.
-@trusted_sendable("its value, and its waiting functions, which its future makes of sendable values, are read and written only while its lock is held")
+@trusted_sendable(
+  "its value, and its waiting functions, which its future makes of sendable values, are read and written only while its lock is held"
+)
 private class Cell[T]()
   private val lock = Lock()
   private val done = Condition(lock, FutureWait)
@@ -298,25 +301,27 @@ class Future[T](private val cell: Cell[T], private val home: WorkerPool)
   value() -> Option[T] = cell.peek()
 
   // Runs `f` with the value on a thread of this future's executor once it is there.
-  onComplete(@sendable f: (T) -> unit) = cell.whenDone(v -> home.submit(() -> f(v), u -> u))
+  // `f` runs with the values of the request context of the code that called this, as `map`'s and
+  // `flatMap`'s do.
+  onComplete(@sendable f: (T) -> unit)
+    val context = currentState().detached
+    cell.whenDone(v -> home.submit(() -> f(v), u -> u, context))
 
   // The future of `f` of the value, which runs on a thread of this future's executor once the value
   // is there.
   map[U: Sendable](@sendable f: (T) -> U) -> Future[U]
     val next = Cell[U]()
-    cell.whenDone(v -> home.submit(() -> f(v), u ->
-      next.complete(u)
-      ()))
+    val context = currentState().detached
+    cell.whenDone(v -> home.submit(() -> f(v), u -> _ = next.complete(u), context))
     Future(next, home)
 
   // The future of the value of the future `f` gives for the value; `f` runs on a thread of this
   // future's executor once the value is there.
   flatMap[U](@sendable f: (T) -> Future[U]) -> Future[U]
     val next = Cell[U]()
-    cell.whenDone(v -> home.submit(() -> f(v), inner ->
-      inner.cell.whenDone(u ->
-        next.complete(u)
-        ())))
+    val context = currentState().detached
+    val finish = (inner: Future[U]) -> inner.cell.whenDone(u -> _ = next.complete(u))
+    cell.whenDone(v -> home.submit(() -> f(v), finish, context))
     Future(next, home)
 
   // The future of both values, once both are there.
@@ -433,12 +438,14 @@ class Executor(private val p: WorkerPool, private val isShared: bool): Sendable
   // of its own, and nothing is handed to it: a Sysl handle it reaches that the giving code owns
   // traps there, and one in transit is taken by its first use. Work given after `shutdown` still
   // runs, on a worker started for it where none is left, as the functions of futures do.
+  // The task runs with the values of the calling code's request context.
   execute(@sendable task: () -> unit)
     val owner = newOwner()
+    val context = currentState().detached
     p.post(() ->
       val worker = currentOwner()
       runAs(owner)
-      task()
+      within(context, task)
       runAs(worker))
 
   // Lets the workers end once the work queued is done. No new body may be given to the executor
