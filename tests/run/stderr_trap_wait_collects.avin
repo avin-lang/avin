@@ -1,0 +1,49 @@
+// expect: exit 0
+// A thread whose trap report waits on a full standard error pipe does not hold up a collection the
+// other threads need, whether the trap fails only an actor and the program goes on, or stops the
+// program. The program runs itself as a child whose standard error goes into a pipe a shell drains
+// only once a marker file exists, and the child makes the marker only after another of its threads
+// has allocated through many collections: a reporting thread that held the collector up would keep
+// the marker from ever appearing. The trap's message is far longer than a pipe holds; the shell
+// shows the report with the message's `#`s taken out.
+import avin.actors.{Stop, spawn}
+import avin.fs
+import avin.process
+import avin.process.Command
+import avin.threads
+
+// Allocates enough to collect many times over, then makes the marker the draining shell waits for.
+churn(marker: string) -> int
+  var kept = 0
+  for i in 0 ..< 2000
+    kept = kept + s"item $i".byteLength % 2
+  if !fs.writeText(marker, "churned").isOk then fail("no marker")
+  kept
+
+actor Failing receives int
+  receive
+    n -> fail("#".repeat(1048576 * n))
+
+// The child: an actor or a thread traps while `main` allocates.
+child(how: string, marker: string)
+  if how == "actor"
+    val a = spawn(Failing(), onFailure = Stop)
+    a.tell(1)
+    _ = churn(marker)
+    _ = a.ended().await()
+    eprintln("the program goes on")
+  else
+    val t = threads.spawn(() -> fail("#".repeat(1048576)))
+    _ = churn(marker)
+    t.join()
+
+main(args: Vector[string])
+  if args.length == 3 && args(0) == "child" then return child(args(1), args(2))
+  if !args.isEmpty then fail(s"unexpected arguments $args")
+  val program = process.executable().getOrElse("")
+  // The shell that drains the child late: its first argument is the program, then the child's own.
+  val drainer = "d=$(mktemp -d); \"$0\" child \"$1\" \"$d/m\" 2>&1 >/dev/null | (while [ ! -e \"$d/m\" ]; do sleep 0.02; done; tr -d '#'); s=$?; rm -rf \"$d\"; exit $s"
+  for how in ["actor", "program"]
+    flush()
+    val status = Command("/bin/sh", "-c", drainer, program, how).run()
+    if !status.map(s -> s.isSuccess).getOrElse(false) then println(s"$status")
