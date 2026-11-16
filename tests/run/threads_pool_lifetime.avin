@@ -1,0 +1,96 @@
+// expect: exit 0
+// A resource older than `maxLifetime` is never lent again: one found idle is destroyed instead of
+// lent, one given back is destroyed instead of kept, and `evictIdle` destroys the idle ones whatever
+// `minIdle` asks, which `warm` then makes up. `jitter` lengthens each resource's lifetime and idle
+// limit by its own part of it, never shortens them: with a jitter as long as the limit, every
+// resource outlasts the limit and is gone by twice it; with a jitter far longer, resources made
+// together expire at different times.
+import avin.threads.{Atomic, Mutex, Pool, sleep}
+import avin.time.{millis, seconds}
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val destroyed = Mutex(Vector[int]())
+  val pool = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 2,
+    destroy = Some(c -> _ = destroyed.update(v -> v :+ c.id)),
+    maxLifetime = Some(millis(60))
+  )
+  println(pool.use(c -> c.id))
+  sleep(millis(100))
+  // 1 is idle and too old: destroyed, and 2 made in its place.
+  println(pool.use(c -> c.id))
+  println(s"destroyed ${destroyed.get()} ${pool.stats()}")
+  // 2 outlives its lifetime while lent, and is destroyed as it comes back.
+  println(pool.use(c ->
+    sleep(millis(100))
+    c.id))
+  println(s"destroyed ${destroyed.get()} ${pool.stats()}")
+  pool.close()
+
+  // `evictIdle` retires old resources below `minIdle`, and `warm` makes the pool whole again.
+  val kept = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 3, minIdle = 2, maxLifetime = Some(millis(60)))
+  println(kept.warm())
+  println(kept.evictIdle())
+  sleep(millis(100))
+  println(s"evicted ${kept.evictIdle()} ${kept.stats()}")
+  println(kept.warm())
+  println(kept.stats())
+  val c = kept.counters()
+  println(s"created ${c.created} destroyed ${c.destroyed}")
+  kept.close()
+
+  // A jitter as long as the lifetime: none is gone at the lifetime's first tenth, all are by twice it.
+  val even = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 20,
+    minIdle = 20,
+    maxLifetime = Some(millis(150)),
+    jitter = Some(millis(150))
+  )
+  println(even.warm())
+  sleep(millis(15))
+  println(s"early ${even.evictIdle()}")
+  sleep(millis(300))
+  println(s"late ${even.evictIdle()}")
+  even.close()
+
+  // A jitter far longer than the lifetime spreads the resources out: few are gone soon after.
+  val spread = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 20,
+    minIdle = 20,
+    maxLifetime = Some(millis(1)),
+    jitter = Some(seconds(100))
+  )
+  println(spread.warm())
+  sleep(millis(20))
+  println(s"spread: some kept ${spread.evictIdle() < 20}")
+  spread.close()
+
+  // The same for `idleTimeout`, which keeps `minIdle`, here none.
+  val idle = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 20,
+    idleTimeout = Some(millis(1)),
+    jitter = Some(seconds(100))
+  )
+  println(idle.use(a -> idle.use(b -> idle.use(c -> idle.use(d -> idle.use(e -> e.id - a.id))))))
+  sleep(millis(20))
+  println(s"idle spread: some kept ${idle.evictIdle() < 5}")
+  idle.close()
+  val idleEven = Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 5,
+    idleTimeout = Some(millis(100)),
+    jitter = Some(millis(100))
+  )
+  println(idleEven.use(a -> idleEven.use(b -> idleEven.use(c -> c.id - a.id))))
+  sleep(millis(10))
+  println(s"idle early ${idleEven.evictIdle()}")
+  sleep(millis(250))
+  println(s"idle late ${idleEven.evictIdle()} ${idleEven.stats()}")
+  idleEven.close()

@@ -557,15 +557,29 @@ class Pool[T, E](
     validate: Option[@sendable (T) -> bool] = None,
     destroy: Option[@sendable (T) -> unit] = None,
     idleTimeout: Option[Duration] = None,
-    acquireTimeout: Option[Duration] = None
+    acquireTimeout: Option[Duration] = None,
+    maxLifetime: Option[Duration] = None,
+    jitter: Option[Duration] = None,
+    maxWaiting: Option[int] = None
 ): Sendable
 
 data PoolError[+E]
   AcquireTimedOut
+  QueueFull
   PoolClosed
   CreateFailed(error: E)
 
 data PoolStats(size: int, idle: int, lent: int, waiting: int)
+
+data PoolCounters(
+    acquires: long,
+    waited: long,
+    waitTime: Duration,
+    timeouts: long,
+    rejected: long,
+    created: long,
+    destroyed: long
+)
 ```
 
 - **A resource is made when it is wanted.** A call that finds a resource idle takes the one given
@@ -581,6 +595,11 @@ data PoolStats(size: int, idle: int, lent: int, waiting: int)
   pool's `acquireTimeout`, or for ever where there is none, and a call whose time runs out fails
   with `AcquireTimedOut`, leaving the queue as if it had never come. A timeout of zero or less takes
   a resource only where one is idle, or can be made, now.
+- **The queue may be bounded.** Where `maxWaiting` calls already wait, a call that would join them
+  fails at once with `QueueFull`, so a server can turn a request away instead of letting it queue;
+  a call that finds a resource idle, or a place to make one, is never turned away, and a zero
+  `maxWaiting` means no call ever waits. With no `maxWaiting` the queue has no bound. A negative
+  `maxWaiting` traps where the pool is made.
 - **A broken resource is destroyed, not lent again.** `lease(f)` and `lease(timeout, f)` lend the
   resource as a `Lease[T]`, whose `resource` is the resource and whose `markBroken()` says it is no
   good any more: the pool destroys it, with `destroy` where one is given, when the body returns.
@@ -589,6 +608,12 @@ data PoolStats(size: int, idle: int, lent: int, waiting: int)
 - **Idle resources expire.** A resource idle for longer than `idleTimeout` is destroyed the next time
   a call looks for one, oldest first, keeping at least `minIdle`; `evictIdle()` does the same at once
   and answers how many it destroyed. With no `idleTimeout` nothing expires.
+- **Old resources retire.** A resource older than `maxLifetime` is never lent again: one found idle
+  is destroyed instead of being lent, and the call looks again; one given back is destroyed instead
+  of being kept; and `evictIdle()` destroys the idle ones however few that leaves, `warm()` making
+  up `minIdle` again. `jitter` lengthens each resource's `maxLifetime` and `idleTimeout` by its own
+  random part of `jitter`, from none up to all of it, drawn when the resource is made, so resources
+  made together do not all expire together; it never shortens either limit.
 - **The resource always comes back.** It is taken back when `f` returns and when the thread running
   `f` is cancelled inside it. A cancellation anywhere else in the call puts back what the call held:
   its place among the waiters, a resource handed to it there, the place it held while `create` ran,
@@ -603,6 +628,11 @@ data PoolStats(size: int, idle: int, lent: int, waiting: int)
 - **`stats()`** answers what the pool holds now: `size` resources in all, of which `idle` wait to be
   lent and `lent` are lent, and `waiting` calls waiting for one; the rest are being made or checked.
   `maxSize` below one, and `minIdle` below zero or above `maxSize`, trap where the pool is made.
+  **`counters()`** answers running totals since the pool was made: `acquires` calls lent a resource,
+  `waited` of them after waiting in the queue, and `waitTime` all of them took from the call to the
+  lending, making or checking a resource included; `timeouts` calls whose time ran out; `rejected`
+  calls turned away with `QueueFull`; and `created` resources made and `destroyed` let go, for
+  whatever reason. A `create` that fails makes nothing.
 - **A resource belongs to one call at a time**, so a pool of any type is sendable, as a `Mutex` is,
   and its resources may be mutable connections. So that nothing else reaches one, `create`,
   `validate` and `destroy` are `@sendable`, and a body is `@isolating` and gives back only a sendable

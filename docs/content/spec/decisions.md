@@ -8713,6 +8713,42 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `avin.io`'s `TimedOut` in a program importing both. Timeouts are `Option[Duration]`, `None` for
   waiting for ever. Alternatives weighed: a `string` error (loses the database's own error);
   `Option[T]` from `use` (a caller could not tell a timeout from a closed pool).
+- Settled on the user's delegation 2026-11-15 (built on branch `pool-production`, for the PostgreSQL
+  driver's pool): **a `Pool` takes `maxWaiting: Option[int]`, and a call that would wait while that
+  many already wait fails at once with a new case, `QueueFull`.** A server on lightweight threads
+  under overload otherwise queues every request behind the pool until each one's timeout, holding a
+  thread and a socket for each; failing at once lets it answer 503. The bound is checked under the
+  pool's lock where the call would join the queue, so it is exact under any number of threads; a
+  call that finds a resource idle or a place to make one is never refused, and a call already
+  queued that has to look again (its resource failed `validate`) is not refused either. It lives in
+  `Pool` rather than in a wrapper because only the lock knows the queue's length: a count kept
+  outside overshoots by every caller racing past the check. Alternatives weighed: a separate
+  admission `Semaphore` in front of the pool (bounds callers inside, not callers waiting, so it
+  refuses while resources are idle); reusing `AcquireTimedOut` (a server cannot tell overload from
+  a slow database). **Review with the user**: `QueueFull` is a new case of a public `data`, so an
+  exhaustive `match` on `PoolError` elsewhere needs an arm.
+- Settled on the user's delegation 2026-11-15 (branch `pool-production`): **`maxLifetime` and
+  `jitter` retire old resources, and `jitter` lengthens limits, never shortens them.** A resource
+  older than `maxLifetime` is destroyed rather than lent (looked at in the lending, before
+  `validate`) or kept (looked at as it comes back), and `evictIdle` destroys idle ones however
+  few that leaves, `minIdle` being `warm`'s to make up, since an aged connection is replaced, not
+  kept. Each resource draws its part of `jitter`, from 0 up to `jitter`, once when it is made, and
+  both its lifetime and its idle limit are lengthened by it; the draw comes from a SplitMix64
+  generator of the pool's own under its lock, since `avin.random` builds on `avin.threads`. Adding
+  rather than subtracting follows the PostgreSQL driver pgx (`MaxConnLifetimeJitter`), keeps
+  every limit a true minimum, and needs no clamp when `jitter` exceeds a limit. Alternatives
+  weighed: subtracting the jitter (a limit becomes a ceiling, which suits a server-side cutoff,
+  but a jitter longer than the limit would need clamping); a jitter as a fraction of each limit;
+  jitter on the lifetime only. **Review with the user**: subtracting is the other common choice.
+- Settled on the user's delegation 2026-11-15 (branch `pool-production`): **`counters()` answers a
+  `PoolCounters` of running totals beside `stats()`, rather than widening `PoolStats`.** `acquires`,
+  `waited`, `waitTime`, `timeouts`, `rejected`, `created` and `destroyed` are what a server exports as
+  metrics (pgx's `Stat`, a pool's usual gauges); `PoolStats` stays the deterministic snapshot of what
+  is held now, which tests and programs print, while `waitTime` varies run to run. `waitTime` runs
+  from the call to the lending, so it includes making or checking a resource, as pgx's
+  `AcquireDuration` does. Alternatives weighed: one wider `PoolStats` (its printed form would stop
+  being stable); counting in each user's wrapper (`waited` and `timeouts` are only known under the
+  lock).
 - Settled on the user's delegation 2026-11-15 (built on branch `select-readable`): **a thread waits
   for a connection's bytes OR a channel's value with a `select` arm, `stream.readable() -> body`,
   not with a second waiting mechanism.** A connection belongs to one thread (its reference counts
