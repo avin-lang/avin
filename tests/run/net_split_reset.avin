@@ -2,9 +2,11 @@
 // The peer of a split connection resets it while both halves are parked, the reader waiting for
 // bytes and the writer for room, each on its own lightweight thread: each half's wait ends, the
 // writer's with `ConnectionReset` and the reader's with that or the end of the input, and every use
-// of either half after answers the same way, never ending the program. Each half then closes, and
-// nothing is left on the poller. The peer resets by closing with bytes it has not read, after the
-// writer has filled its buffers. Over TCP and TLS.
+// of either half after answers the reset or, for the reader, the end of the input, never ending the
+// program. Each half then closes: a TLS writer's close answers `Err`, since its close notice cannot
+// go out, even where the reader was the one that tried to send it; and nothing is left on the poller.
+// The peer resets by closing with bytes it has not read, after the writer has filled its buffers.
+// Over TCP and TLS.
 import avin.fs
 import avin.io
 import avin.io.IoError
@@ -34,6 +36,13 @@ readOutcome(r: Result[Array[byte], IoError]) -> string = r match
   Ok(bytes) -> if bytes.length == 0 then "ended" else s"read ${bytes.length}"
   Err(e) -> e.kind.description
 
+// What a reader's readLine came to, likewise.
+lineOutcome(r: Result[Option[string], IoError]) -> string = r match
+  Err(IoError(io.ConnectionReset, _, _)) -> "ended"
+  Ok(None) -> "ended"
+  Ok(Some(text)) -> s"line $text"
+  Err(e) -> e.kind.description
+
 writeOutcome(r: Result[unit, IoError]) -> string = r match
   Err(IoError(io.ConnectionReset, _, _)) -> "reset"
   Ok(_) -> "sent"
@@ -50,8 +59,9 @@ run(name: string, c: ByteStream, go: Channel[int], far: Thread[string])
   val reading = spawn(() ->
     val first = readOutcome(r.read(100))
     val again = readOutcome(r.read(100))
-    val line = r.readLine().isErr || ok(r.readLine()) is None
-    s"$first $again $line ${r.close().isOk}")
+    val line = lineOutcome(r.readLine())
+    val lineAgain = lineOutcome(r.readLine())
+    s"$first $again $line $lineAgain ${r.close().isOk}")
   val writing = spawn(() ->
     val big = Array.fill(4194304, byte(120))
     val first = writeOutcome(w.write(big))

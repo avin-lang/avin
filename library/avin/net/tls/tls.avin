@@ -554,6 +554,10 @@ private class TlsShared(
   private val fed = Semaphore(0, capacity = 1)
   // The halves not yet closed; the second to close lets TLS go.
   private val open = Atomic(2)
+  // How sending to the connection failed, by whichever half sent, other than by running out of time.
+  // Every later send answers it, so the writer learns of a failure the reader met sending for it,
+  // and a TLS close notice the reader tried to send counts as not sent. Holding `sending`.
+  private var broken: Option[IoError] = None
 
   // `body` with the TLS state, holding `state`.
   engaged[R](body: (Engine) -> R) -> R = state.withPermit(() -> lent(body))
@@ -582,6 +586,18 @@ private class TlsShared(
   // until it has none.
   private pushed(o: StreamWriter) -> Result[unit, IoError]
     owed.store(false)
+    if broken is Some(e) then return Err(e)
+    kept(pushedNow(o))
+
+  // A failure to send, kept in `broken` unless it is a timeout. Holding `sending`.
+  private kept(r: Result[unit, IoError]) -> Result[unit, IoError]
+    r match
+      Err(IoError(io.TimedOut, _, _)) -> ()
+      Err(e) -> broken = Some(e)
+      Ok(_) -> ()
+    r
+
+  private pushedNow(o: StreamWriter) -> Result[unit, IoError]
     // A part at a time, so that what went is known where a wait fails.
     while pending.length > 0
       val k = o.writeSome(pending)?
@@ -597,6 +613,10 @@ private class TlsShared(
   // as the connection has room, waiting only where it has none at all; the rest is kept.
   private pushedSome(o: StreamWriter) -> Result[unit, IoError]
     owed.store(false)
+    if broken is Some(e) then return Err(e)
+    kept(pushedSomeNow(o))
+
+  private pushedSomeNow(o: StreamWriter) -> Result[unit, IoError]
     val all = Buffer[byte]()
     all.addAll(pending)
     for c in engaged(e -> outgoingOf(e))
@@ -668,14 +688,16 @@ private class TlsShared(
   // For the reading half: sends the ciphertext TLS has to send where no other code is sending and no
   // `writeSome` has left a record part sent, and otherwise leaves it owed to the writer, which sends
   // it before it lets `sending` go, or after that record. So a reader never waits for a writer that
-  // waits for the peer, nor for room for the writer's record.
-  offer() -> Result[unit, IoError]
+  // waits for the peer, nor for room for the writer's record. A failure to send is not the reader's
+  // to answer: it is kept, and the writer answers it at its next use.
+  offer()
     while true
       owed.store(true)
-      if !sending.tryAcquire() then return Ok(())
-      if !offered()? then return Ok(())
-      if !owed.load() then return Ok(())
-    Ok(())
+      if !sending.tryAcquire() then return
+      if offered() is Ok(true)
+        if !owed.load() then return
+      else
+        return
 
   // Holding `sending`: sends what TLS has to send and answers `true`, or answers `false`, leaving it
   // owed, where a `writeSome` has left part of a record.
@@ -727,10 +749,7 @@ private class TlsReader(
     val into = Array.fill(RecordSize, byte(0))
     while true
       val got = shared.engaged(e -> e.receive(into))
-      val sent = shared.offer()
-      if sent is Err(e)
-        failure = Some(e)
-        return true
+      shared.offer()
       got match
         Ok(Data(n)) ->
           buffered.keep(if n == long(into.length) then into else into.slice(0, int(n)))
@@ -800,7 +819,7 @@ private class TlsReader(
     val into = Array.fill(max, byte(0))
     while true
       val got = shared.engaged(e -> e.receive(into))
-      shared.offer()?
+      shared.offer()
       got match
         Ok(Data(n)) -> return Ok(if n == long(max) then into else into.slice(0, int(n)))
         Ok(Closed) -> return Ok(Array.empty[byte]())

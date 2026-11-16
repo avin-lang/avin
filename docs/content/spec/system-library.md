@@ -1503,7 +1503,10 @@ pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoErro
   nothing holds while it waits for the connection, so the reader decrypts records as they arrive
   while the writer waits for room; what TLS has to send goes out in order, a record whole, whichever
   half made it, and a reader never waits for room to send anything of its own while the writer is
-  sending. A cancellation that stops a half inside an operation lets the locks go.
+  sending. A failure to send is the writer's to answer whichever half was sending: the reader reads
+  on, and the writer answers it at every use after, its close included, so a close notice the reader
+  tried and failed to send is one that did not go out. A cancellation that stops a half inside an
+  operation lets the locks go.
 
 A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext and sends
 what of the record the connection has room for; the rest goes before anything else is sent, and
