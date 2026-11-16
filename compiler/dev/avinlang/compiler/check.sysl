@@ -556,7 +556,9 @@ struct ConditionalImpl
  * trait has them. Or an impl adding methods to a type built from its parameters, `impl[T]
  * Seq[Seq[T]]` or `impl[T] Option[Option[T]]`: the values whose type matches it have them. `on_trait`
  * tells which the type the impl adds to is; `trait_id` is that trait's. `extension` tells whether
- * the impl is written outside the module of the type or trait it adds to. */
+ * the impl is written outside the module of the type or trait it adds to. An impl of a trait for
+ * instances of a generic type, `impl FromPg for Vector[byte]`, is one too, whose methods implement
+ * the trait there: `instance` is its place among the instance conformances. */
 struct TraitImpl
     unit: usize
     module_name: string
@@ -564,6 +566,7 @@ struct TraitImpl
     trait_id: usize
     on_trait: bool
     extension: bool
+    instance: Option[usize]
 
 /** A method an impl adds to trait `trait_id`. It is a generic function whose type parameters are the
  * impl's (`impl_params` of them), then `Self`, the receiver's type, bounded by the trait at the impl's
@@ -673,6 +676,8 @@ struct Checker
     derivations: Buf[Derivation]
     /** The conformances that hold only at type arguments meeting an impl's own bounds. */
     conditional: Buf[ConditionalConformance]
+    /** The conformances impls state for instances of generic types, `impl FromPg for Vector[byte]`. */
+    instances: Buf[InstanceConformance]
     /** The methods impls add to classes, which are not variance positions in a class whose fields
      * are all immutable. */
     impl_methods: Buf[usize]
@@ -1219,7 +1224,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1277,6 +1282,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
         check_data_parameterless_overloads(&c, id)
     // Type arguments written in declarations are held to their bounds once every conformance is known.
     c.conformances_known = true
+    check_instance_overlaps(&c)
     for p in c.pending
         val outer_generic = c.generic
         c.generic = p.scope
@@ -1411,7 +1417,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     var sites: Buf[RefineSite] = buf()
     for s in c.sites
         sites.push(RefineSite(s.matched, s.data, s.variant))
-    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), c.meetings, opaques, sites, c.refined_functions)), references, overrides, completions)
+    Checked(c.units, Some(TProgram(sources, c.symbols, c.data, c.classes, c.globals, functions, c.vars, entry, entry_answer, init, c.builtins, c.conditional, c.instances, c.core, c.bounds, tests, testing, views, type_tests, map(), map(), c.meetings, opaques, sites, c.refined_functions)), references, overrides, completions)
 
 /** Each view with its unknowns solved, each distinct one once. */
 private solved_views(vars: Buf[Option[&Type]], views: Buf[TypeView]) -> Buf[TypeView]
@@ -2103,7 +2109,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     // to any other type built from its parameters: `impl[A, B] (A, B)`, `impl[A, B] (A) -> B`. The
     // tuple and function types are the core library's, so written elsewhere it is an extension.
     if d.trait_name is None && (d.target.kind is Tuple(_) || d.target.kind is Function(_, _, _))
-        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != CoreModule))
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != CoreModule, None))
         return invalid
     if d.target.kind is Tuple(_) then return resolve_tuple_impl(c, unit, module_name, d)
     val path = d.target.kind match
@@ -2136,7 +2142,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
         if d.trait_name is Some(_)
             c.note(unit, d.target.span, s"`$path` is a constructor parameter; an impl of a trait is for a data type, a class, an object or a built-in type")
             return invalid
-        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, !in_bound_module(c, unit, module_name, tp)))
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, !in_bound_module(c, unit, module_name, tp), None))
         return invalid
     if c.types.get(key) is Some(id)
         owner = data_owner(id)
@@ -2171,10 +2177,10 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     // adding methods to a type of another module is matched the same way: its methods are not the
     // type's, so they reach no private member and no method table.
     if !in_order && d.trait_name is Some(_)
-        c.note(unit, d.target.span, "the type an impl of a trait is for takes the impl's type parameters, in order, as in `impl[T] Display for Box[T]`")
+        resolve_instance_impl(c, unit, module_name, d, path, home)
         return invalid
     if !in_order || (d.trait_name is None && module_name != home)
-        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != home))
+        c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != home, None))
         return invalid
     val outer_generic = c.generic
     c.generic = Some(GenericScope(owner, d.type_params))
@@ -2258,7 +2264,291 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
 // sequences. Written in another module than the trait's, it is an extension. Its methods are declared
 // once every trait's own methods are.
 private resolve_trait_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, id: usize)
-    c.trait_impls.push(TraitImpl(unit, module_name, d, id, true, module_name != c.classes[id].module_name))
+    c.trait_impls.push(TraitImpl(unit, module_name, d, id, true, module_name != c.classes[id].module_name, None))
+
+// Two impls of one trait never both hold of a type, so its conformance is one answer wherever it is
+// asked, with no impl preferred to another. An impl for instances of a type overlaps another such
+// impl where some instance matches both, and the type's own impl of the trait where the instance
+// meets that impl's bounds. An instance missing a bound keeps them apart only while it goes on
+// missing it: a module that could still write the impl meeting it, one able to name both the bound
+// and the type, makes the two overlap the day it does, and so they overlap now. Only this module and
+// the core library are fixed; any other module could, unless it would have to import a module that
+// imports it.
+private check_instance_overlaps(c: *Checker)
+    for n in 0..<c.instances.len()
+        val x = c.instances[n]
+        val k = *x.trait_type match
+            Class(k, _, _) -> k
+            _ -> continue
+        val decl = instance_decl(c, n)
+        val mine = impl_header(decl)
+        var reported = false
+        for e in 0..<n
+            if reported then break
+            val y = c.instances[e]
+            if !same_head(y.ty, x.ty) || !instances_unify(y.ty, instance_owner(e), x.ty, instance_owner(n)) || !instances_unify(y.trait_type, instance_owner(e), x.trait_type, instance_owner(n)) then continue
+            val other = instance_decl(c, e)
+            c.note(x.unit, x.span, s"`$mine` overlaps `${impl_header(other)}`: both hold for `${type_name(unified(x.ty, instance_owner(n), y.ty, instance_owner(e)))}`, and a type conforms to a trait through one impl; the other is at ${declared_at(c, y.unit, other.span)}")
+            reported = true
+        if !reported then check_generic_overlap(c, n, k, mine)
+
+/** Whether some instance matches both `a` and `b`, each naming its impl's parameters as `owner_a`'s
+ * and `owner_b`'s, any of which may be any type. */
+private instances_unify(a: &Type, owner_a: usize, b: &Type, owner_b: usize) -> bool
+    if *a is TypeVar(o, _, _)
+        if o == owner_a then return true
+    if *b is TypeVar(o, _, _)
+        if o == owner_b then return true
+    *a match
+        Data(x, _, ps) -> *b match
+            Data(y, _, qs) -> x == y && all_unify(ps, owner_a, qs, owner_b)
+            _ -> false
+        Class(x, _, ps) -> *b match
+            Class(y, _, qs) -> x == y && all_unify(ps, owner_a, qs, owner_b)
+            _ -> false
+        Opaque(x, _, ps, _) -> *b match
+            Opaque(y, _, qs, _) -> x == y && all_unify(ps, owner_a, qs, owner_b)
+            _ -> false
+        Tuple(ps) -> *b match
+            Tuple(qs) -> all_unify(ps, owner_a, qs, owner_b)
+            _ -> false
+        Function(ps, r, marked) -> *b match
+            Function(qs, s, also) -> marked == also && all_unify(ps, owner_a, qs, owner_b) && instances_unify(r, owner_a, s, owner_b)
+            _ -> false
+        _ -> same_type(a, b)
+
+/** The instances `a` and `b` both match, as `instances_unify` finds them, a parameter of either
+ * standing for the other's part at its place: `Pair[string, int]` for `Pair[K, int]` and
+ * `Pair[string, V]`. */
+private unified(a: &Type, owner_a: usize, b: &Type, owner_b: usize) -> &Type
+    if *a is TypeVar(o, _, _)
+        if o == owner_a then return b
+    if *b is TypeVar(o, _, _)
+        if o == owner_b then return a
+    *a match
+        Data(x, name, ps) -> *b match
+            Data(_, _, qs) -> Data(x, name, all_unified(ps, owner_a, qs, owner_b))
+            _ -> a
+        Class(x, name, ps) -> *b match
+            Class(_, _, qs) -> Class(x, name, all_unified(ps, owner_a, qs, owner_b))
+            _ -> a
+        Tuple(ps) -> *b match
+            Tuple(qs) -> Tuple(all_unified(ps, owner_a, qs, owner_b))
+            _ -> a
+        _ -> a
+
+private all_unified(ps: Buf[&Type], owner_a: usize, qs: Buf[&Type], owner_b: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for i in 0..<ps.len()
+        out.push(if i < qs.len() then unified(ps[i], owner_a, qs[i], owner_b) else ps[i])
+    out
+
+private all_unify(ps: Buf[&Type], owner_a: usize, qs: Buf[&Type], owner_b: usize) -> bool
+    if ps.len() != qs.len() then return false
+    for i in 0..<ps.len()
+        if !instances_unify(ps[i], owner_a, qs[i], owner_b) then return false
+    true
+
+// An instance impl beside the type's own conformance to the trait, stated at its parameters by its
+// declaration or an impl, or reached through a superclass or a trait it requires.
+private check_generic_overlap(c: *Checker, n: usize, k: usize, mine: string)
+    val x = c.instances[n]
+    var anything: Buf[&Type] = buf()
+    for _ in x.params
+        anything.push(ErrorType)
+    // The impl's parameters may be any type, so they meet every bound; the parts it names are fixed.
+    val loose = substitute(x.ty, instance_owner(n), anything)
+    if ancestor_type(c.classes, c.data, loose, k) is None then return
+    val (owner, args) = *x.ty match
+        Data(d, _, xs) -> (data_owner(d), xs)
+        Class(j, _, xs) -> (class_owner(j), xs)
+        _ -> return
+    val theirs = own_impl_of(c, x.ty, k)
+    val f = conformances(c)
+    var direct: Option[ConditionalConformance] = None
+    for y in c.conditional
+        if y.owner == owner && y.trait_id == k then direct = Some(y)
+    val shown = type_name(x.ty)
+    direct match
+        Some(y) ->
+            var unsettled: Option[(string, &Type, &Type)] = None
+            for i in 0..<y.conditions.len()
+                if i >= args.len() then break
+                for b in y.conditions[i]
+                    if names_owner(args[i], instance_owner(n)) then continue
+                    val bound = substitute(b, owner, args)
+                    if meets_bound(f, args[i], bound) then continue
+                    could_add_impl(c, x.module_name, bound, args[i]) match
+                        None -> return
+                        Some(m) -> if unsettled is None then unsettled = Some((m, args[i], bound))
+            unsettled match
+                Some((m, a, b)) -> c.note(x.unit, x.span, s"`$mine` overlaps $theirs: `${type_name(a)}` does not meet `${type_name(b)}`, but module `$m` could still make it, and then both would hold for `$shown`; a type conforms to a trait through one impl")
+                None -> c.note(x.unit, x.span, s"`$mine` overlaps $theirs: `$shown` meets its bounds, so both hold for it, and a type conforms to a trait through one impl")
+        None ->
+            var settled = f
+            settled.instances = buf()
+            if holding_ancestor(settled, loose, k) is None then return
+            c.note(x.unit, x.span, s"`$mine` overlaps $theirs: `$shown` is a `${c.classes[k].name}` through it already, and a type conforms to a trait through one impl")
+
+/** Whether `t` names a type parameter of `owner`. */
+private names_owner(t: &Type, owner: usize) -> bool = *t match
+    TypeVar(o, _, _) -> o == owner
+    Data(_, _, xs) -> any_names_owner(xs, owner)
+    Class(_, _, xs) -> any_names_owner(xs, owner)
+    Opaque(_, _, xs, _) -> any_names_owner(xs, owner)
+    Tuple(xs) -> any_names_owner(xs, owner)
+    Function(xs, r, _) -> any_names_owner(xs, owner) || names_owner(r, owner)
+    _ -> false
+
+private any_names_owner(xs: Buf[&Type], owner: usize) -> bool
+    for x in xs
+        if names_owner(x, owner) then return true
+    false
+
+/** The impl stating type `t`'s own conformance to trait `k`, as a diagnostic names it with where it
+ * is; or, with none, the conformance. */
+private own_impl_of(c: *Checker, t: &Type, k: usize) -> string
+    for block in c.impls
+        if block.trait_type is Some(tt)
+            if *tt is Class(j, _, _)
+                if j == k && same_head(block.target, t) then return s"`${impl_header(block.decl)}` at ${declared_at(c, block.unit, block.decl.span)}"
+    s"the conformance of every `${head_name(t)}` to `${c.classes[k].name}`"
+
+/** The module, other than `here` and the core library, that could still write the impl making `arg`
+ * meet trait `bound`: the trait's module or one declaring a type `arg` names, able to reach every other
+ * of those modules without importing one that imports it. `None` where no module could. */
+private could_add_impl(c: *Checker, here: string, bound: &Type, arg: &Type) -> Option[string]
+    val b = *bound match
+        Class(b, _, _) -> b
+        _ -> return None
+    var involved: Buf[string] = buf()
+    involved.push(c.classes[b].module_name)
+    collect_type_modules(c, bound, &involved)
+    collect_type_modules(c, arg, &involved)
+    for m in involved
+        if m == here || m == CoreModule then continue
+        var able = true
+        for other in involved
+            if other != m && other != CoreModule && module_depends_on(c, other, m) then able = false
+        if able then return Some(m)
+    None
+
+/** Adds to `out` the module of each data type, class and opaque type `t` names. */
+private collect_type_modules(c: *Checker, t: &Type, out: *Buf[string])
+    val (module_name, args) = *t match
+        Data(d, _, xs) -> (c.data[d].module_name, xs)
+        Class(k, _, xs) -> (c.classes[k].module_name, xs)
+        Opaque(a, _, xs, _) -> (c.aliases[a].module_name, xs)
+        Tuple(xs) -> (CoreModule, xs)
+        Function(xs, r, _) ->
+            collect_type_modules(c, r, out)
+            (CoreModule, xs)
+        _ -> return
+    var seen = false
+    for i in 0..<out.len()
+        if out[i] == module_name then seen = true
+    if !seen then out.push(module_name)
+    for a in args
+        collect_type_modules(c, a, out)
+
+/** Whether a file of module `a` imports module `b`, or a module that does, and so on. */
+private module_depends_on(c: *Checker, a: string, b: string) -> bool
+    var seen: Buf[string] = buf()
+    var pending: Buf[string] = buf()
+    pending.push(a)
+    while pending.len() > 0
+        val m = pending.pop().unwrap()
+        if contains_name(seen, m) then continue
+        seen.push(m)
+        for u in c.units
+            if u.file.module_name != m then continue
+            for i in u.file.imports
+                val reached = imported_module(c, i.path)
+                if reached == b then return true
+                if !contains_name(seen, reached) then pending.push(reached)
+    false
+
+/** The module an import names: the path, or the module declaring what it names. */
+private imported_module(c: *Checker, path: string) -> string
+    if module_has_unit(c, path) then return path
+    path.last_index_of(".") match
+        Some(dot) -> path[0..<dot]
+        None -> path
+
+/** The impl that states instance conformance `n`. */
+private instance_decl(c: *Checker, n: usize) -> &ImplDecl
+    var found = c.trait_impls[0].decl
+    for block in c.trait_impls
+        if block.instance is Some(i)
+            if i == n then found = block.decl
+    found
+
+/** An impl's header as it is written: `impl[T: Ord] Ord for Box[T]`. */
+private impl_header(d: &ImplDecl) -> string
+    val written = d.trait_name match
+        Some(t) -> show_type(t) + " for "
+        None -> ""
+    s"impl${show_type_params(d.type_params)} $written${show_type(d.target)}"
+
+/** Where `at` in `unit` is, as a diagnostic names a place: the file, line and column. */
+private declared_at(c: *Checker, unit: usize, at: Span) -> string
+    val src = c.units[unit].src
+    s"${src.name}:${src.locate(at.start)}"
+
+// An impl of a trait for instances of a generic data type or class, `impl FromPg for Vector[byte]` or
+// `impl[K] Show for Map[K, int]`: the type conforms where it is such an instance, its parts there
+// giving the impl's parameters, which then meet their bounds. Its methods are functions over the
+// impl's parameters whose first parameter is the value, as those of an impl adding to a type built
+// from its parameters are; its table places them at the trait's positions. Whether it overlaps
+// another impl of the trait is decided once every conformance is known.
+private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, path: string, home: string)
+    val n = c.instances.len()
+    val owner = instance_owner(n)
+    val outer_generic = c.generic
+    c.generic = Some(GenericScope(owner, d.type_params))
+    val target = resolve_type(c, unit, d.target)
+    var trait_type: Option[&Type] = None
+    var trait_home = ""
+    if d.trait_name is Some(written_trait)
+        if written_trait.kind is Function(_, _, _)
+            c.note(unit, written_trait.span, "an impl naming a function type is for its type at the impl's type parameters, in order, as in `impl[T] () -> T for Box[T]`")
+        else
+            val t = resolve_bound(c, unit, written_trait)
+            *t match
+                Class(k, _, _) ->
+                    if is_trait(c, k)
+                        trait_type = Some(t)
+                        trait_home = c.classes[k].module_name
+                    else c.note(unit, written_trait.span, s"`${c.classes[k].name}` is not a trait; an impl names a trait before `for`")
+                ErrorType -> ()
+                _ -> c.note(unit, written_trait.span, s"${type_name(t)} is not a trait; an impl names a trait before `for`")
+    declare_bounds(c, unit, owner, d.type_params, 0, 0)
+    c.generic = outer_generic
+    if *target is ErrorType then return
+    val t = trait_type match
+        Some(t) -> t
+        None -> return
+    if !(*target is Data(_, _, _) || *target is Class(_, _, _))
+        c.note(unit, d.target.span, s"an impl of a trait for an instance of a type is for an instance of a data type or a class, and `$path` is neither")
+        return
+    for j in 0..<d.type_params.len()
+        if !names_param(target, owner, j)
+            val tp = d.type_params[j]
+            c.note(unit, tp.span, s"`${tp.name}` is not part of `${show_type(d.target)}`; each of an impl's type parameters is, so an instance of the type gives it")
+            return
+    if refuse_closed_trait(c, unit, written_trait_span(d), t) then return
+    // A conformance is one answer everywhere, so it is stated where the type or the trait is.
+    if module_name != home && module_name != trait_home
+        c.note(unit, d.target.span, s"neither `$path` nor `${type_name(t)}` is declared in this module; an impl belongs in the module of its type or of its trait")
+        return
+    // Equality, hashing, sending and crossing to Sysl are a type's at every instance alike.
+    if *t is Class(k, _, _)
+        for name in ["Eq", "Hash", "Sendable", "Boundary"]
+            if is_class_named(c, k, qualified(CoreModule, name))
+                c.note(unit, written_trait_span(d), s"`$name` holds of a type at every instance alike, so its impl is for the type at the impl's type parameters, in order, as in `impl[T] $name for Box[T]`")
+                return
+    c.instances.push(InstanceConformance(target, t, d.type_params, unit, d.target.span, module_name, buf(), buf()))
+    c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, false, Some(n)))
 
 // Each method an impl adds to a trait is a generic function over the impl's parameters, then `Self`,
 // the type of the value it is called on, bounded by the trait, then its own. Its receiver, `self`, is
@@ -2323,8 +2613,15 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     val unit = block.unit
     val k = block.trait_id
     val trait_name = if block.on_trait then c.classes[k].name else head_name(written_target)
+    // An impl of a trait for instances of a type implements the trait's members there, its static
+    // ones among them, and no others.
+    if block.instance is Some(n)
+        if *c.instances[n].trait_type is Class(t, _, _)
+            if !trait_declares(c, t, f.name, 0)
+                c.note(unit, f.name_span, s"`${f.name}` is not a member of `${c.classes[t].name}`; an impl of a trait implements the trait's members, and an impl without a trait adds others")
+                return
     // A built-in type's static members may be added where its methods may, as an extension.
-    if static_member && (block.on_trait || block.decl.type_params.len() > 0 || !scalar_builtin(written_target))
+    if static_member && block.instance is None && (block.on_trait || block.decl.type_params.len() > 0 || !scalar_builtin(written_target))
         val adds = if block.on_trait then "a trait's member and its implementations are" else "a type's own member is"
         c.note(unit, f.name_span, s"`${f.name}` is static, which only $adds; an impl adding to `$trait_name` adds methods of values")
         return
@@ -2336,7 +2633,7 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     if method_annotations(f) > 0
         c.note(unit, f.name_span, "annotations on methods are not implemented")
         return
-    if overrides
+    if overrides && block.instance is None
         c.note(unit, f.name_span, s"`${f.name}` overrides nothing; the methods an impl adds to `$trait_name` are not the trait's, so no type implements or overrides them")
         return
     if block.on_trait && trait_declares(c, k, f.name, 0)
@@ -2401,7 +2698,10 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
         else c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
         return
     var same_name: Buf[usize] = buf()
+    // Two impls of a trait for one instance are an overlap, reported as one once every conformance
+    // is known.
     for tm in c.trait_methods
+        if block.instance is Some(_) then break
         val other = c.symbols[tm.function]
         if other.decl.name == f.name && other.module_name == block.module_name && same_added_target(c, tm, block.on_trait, k, target, id, impl_params) then same_name.push(tm.function)
     if same_as_overload(c, symbol, same_name)
@@ -2427,6 +2727,10 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     c.locals.push(buf())
     declare_defaults(c, id)
     c.trait_methods.push(TraitMethod(id, k, impl_params, block.on_trait, target, block.extension))
+    if block.instance is Some(n)
+        var methods = c.instances[n].methods
+        methods.push(id)
+        c.instances[n].methods = methods
     same_name.push(id)
     if same_name.len() > 1 then mark_overloads(c, same_name)
     // The type's own methods are found first, so an extension one of them always hides could never
@@ -4828,8 +5132,13 @@ private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
 // where none does, those whose type the receiver is an instance of are, so the call reports what the
 // receiver would need to be. Such a method is not hidden by the type's own of the same parameter
 // types: both are the type's, so the call is ambiguous, as `refuse_trait_clash` reports.
-private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize]) -> Buf[usize]
-    if c.trait_methods.len() == 0 then return own
+//
+// Where an impl of a trait for instances of the type holds of `t`, its members are the type's there,
+// in place of the type's own of the same parameter types: the type's own impl of the trait, which
+// they would be, does not hold where the instance impl does.
+private with_trait_methods(c: *Checker, t: &Type, name: string, all_own: Buf[usize]) -> Buf[usize]
+    if c.trait_methods.len() == 0 then return all_own
+    val own = without_instance_hidden(c, t, name, all_own)
     var out: Buf[usize] = buf()
     for m in own
         out.push(m)
@@ -4863,6 +5172,35 @@ private with_trait_methods(c: *Checker, t: &Type, name: string, own: Buf[usize])
             offered = one
     for m in offered
         if !hidden_by_nearer_trait(c, t, m, offered) then out.push(m)
+    out
+
+/** The members named `name` of the impls for instances of a type that hold of `t`. */
+private instance_methods_named(c: *Checker, t: &Type, name: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    if c.instances.len() == 0 then return out
+    val x = zonk(c, t)
+    if !(*x is Data(_, _, _) || *x is Class(_, _, _)) then return out
+    val f = conformances(c)
+    for n in 0..<c.instances.len()
+        var named = false
+        for m in c.instances[n].methods
+            if c.symbols[m].decl.name == name then named = true
+        if !named || instance_args(f, n, x) is None then continue
+        for m in c.instances[n].methods
+            if c.symbols[m].decl.name == name then out.push(m)
+    out
+
+/** `own`, the type's methods named `name`, without those an impl for instances of the type holding
+ * of `t` replaces: one of the same parameter types as a member of that impl. */
+private without_instance_hidden(c: *Checker, t: &Type, name: string, own: Buf[usize]) -> Buf[usize]
+    val replacing = instance_methods_named(c, t, name)
+    if replacing.len() == 0 then return own
+    var out: Buf[usize] = buf()
+    for o in own
+        var hidden = false
+        for m in replacing
+            if c.symbols[m].static_member == c.symbols[o].static_member && same_params_seen(c, t, o, m) then hidden = true
+        if !hidden then out.push(o)
     out
 
 /** Whether method `tm` is added to a function type, `impl[A, B] (A) -> B`. A function type is a trait,
@@ -5760,6 +6098,32 @@ private place_traits(c: *Checker)
         builtin_conformed.push(ids)
         holders.push(ids)
         slot_counts.push(0)
+    // An instance conformance's positions join the table of every instance of its type, a subclass's
+    // too, beside the other instance conformances of that type: each class or data type with one
+    // holds its own traits, its subclasses', and every such conformance's trait with what it requires.
+    var instance_conformed: Buf[Buf[usize]] = buf()
+    for n in 0..<c.instances.len()
+        var ids: Buf[usize] = buf()
+        var slots = 0usize
+        val head = c.instances[n].ty
+        *head match
+            Data(d, _, _) ->
+                for t in data_conformed[d]
+                    if !contains_id(ids, t) then ids.push(t)
+            Class(k, _, _) ->
+                for j in 0..<c.classes.len()
+                    if j != k && ancestor_type(c.classes, c.data, own_class_type(c.classes[j], j), k) is None then continue
+                    for t in conformed[j]
+                        if !contains_id(ids, t) then ids.push(t)
+                    if c.classes[j].slots.len() > slots then slots = c.classes[j].slots.len()
+            _ -> ()
+        for e in 0..<c.instances.len()
+            if !same_head(c.instances[e].ty, head) then continue
+            for t in instance_traits(c, e)
+                if !contains_id(ids, t) then ids.push(t)
+        instance_conformed.push(instance_traits(c, n))
+        holders.push(ids)
+        slot_counts.push(slots)
     var placed: Buf[bool] = buf()
     for _ in c.classes
         placed.push(false)
@@ -5788,6 +6152,8 @@ private place_traits(c: *Checker)
         build_data_table(c, d, data_conformed[d])
     for b in 0..<c.builtins.len()
         build_builtin_table(c, b, builtin_conformed[b])
+    for n in 0..<c.instances.len()
+        build_instance_table(c, n, instance_conformed[n])
 
 // A built-in type's method table, kept by the first of its conformances: at each position of a
 // trait it conforms to, the method of the type's impl that implements it. A built-in value is no
@@ -5839,6 +6205,96 @@ private build_builtin_table(c: *Checker, b: usize, conformed: Buf[usize])
                     val what = if is_trait_field(c, methods[j]) then s"`val $name`, which a built-in type has no field to supply" else s"`$name`; a built-in type takes no default bodies, so its impl implements every method of the trait"
                     c.note(c.builtins[at].unit, c.builtins[at].span, s"`$name_of` does not implement ${c.classes[t].name}'s $what")
     c.builtins[b].table = table
+
+/** Whether `a` and `b` are instances of one class or data type. */
+private same_head(a: &Type, b: &Type) -> bool = *a match
+    Data(x, _, _) -> *b match
+        Data(y, _, _) -> x == y
+        _ -> false
+    Class(x, _, _) -> *b match
+        Class(y, _, _) -> x == y
+        _ -> false
+    _ -> false
+
+/** The traits instance conformance `n` places in a table: its trait and every trait that requires. */
+private instance_traits(c: *Checker, n: usize) -> Buf[usize]
+    var ids: Buf[usize] = buf()
+    val t = c.instances[n].trait_type
+    if *t is Class(k, _, _) then ids.push(k)
+    for r in trait_ids(c, t)
+        if !contains_id(ids, r) then ids.push(r)
+    ids
+
+// An instance conformance's table: at each position of its trait, the impl's method implementing it
+// there, compared with the trait's as the instance sees both, or the trait's default body. A trait it
+// requires is the instance's through this impl too, so a method of one the impl implements is placed
+// as well; one it leaves is the type's own, where an impl of that trait for the type supplies it.
+private build_instance_table(c: *Checker, n: usize, conformed: Buf[usize])
+    val x = c.instances[n]
+    val name_of = type_name(x.ty)
+    var size = 0usize
+    for t in conformed
+        val end = c.classes[t].base + c.classes[t].methods.len()
+        if end > size then size = end
+    var table: Buf[Option[usize]] = buf()
+    for _ in 0..<size
+        table.push(None)
+    val k = *x.trait_type match
+        Class(k, _, _) -> k
+        _ -> return
+    val outer_seen = c.seen_instance
+    var used: Buf[usize] = buf()
+    for t in conformed
+        val methods = c.classes[t].methods
+        for j in 0..<methods.len()
+            if is_trait_override(c, methods[j]) || is_universal(c, methods[j]) then continue
+            val name = c.symbols[methods[j]].decl.name
+            var own: Option[usize] = None
+            var named: Option[usize] = None
+            for m in x.methods
+                if c.symbols[m].decl.name != name || c.symbols[m].static_member != c.symbols[methods[j]].static_member then continue
+                named = Some(m)
+                val self_type = c.symbols[m].receiver.unwrap()
+                c.seen_instance = instance_trait_seen(c, n, m, t)
+                if own is None && param_mismatch(c, self_type, m, methods[j]) is None then own = Some(m)
+                c.seen_instance = outer_seen
+            own match
+                Some(m) ->
+                    val self_type = c.symbols[m].receiver.unwrap()
+                    c.seen_instance = instance_trait_seen(c, n, m, t)
+                    val wrong = bound_mismatch(c, self_type, m, methods[j]) match
+                        Some(text) -> Some(text)
+                        None -> result_mismatch(c, self_type, m, methods[j])
+                    c.seen_instance = outer_seen
+                    if wrong is Some(text) then c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].name}` implements `${c.symbols[methods[j]].name}`, $text")
+                    inherit_defaults(c, m, methods[j])
+                    used.push(m)
+                    table[c.classes[t].base + j] = Some(m)
+                None ->
+                    if named is Some(m)
+                        val self_type = c.symbols[m].receiver.unwrap()
+                        c.seen_instance = instance_trait_seen(c, n, m, t)
+                        val text = param_mismatch(c, self_type, m, methods[j]).unwrap_or("")
+                        c.seen_instance = outer_seen
+                        used.push(m)
+                        c.note(c.symbols[m].unit, c.symbols[m].decl.name_span, s"`${c.symbols[m].name}` implements `${c.symbols[methods[j]].name}`, $text")
+                    elif t != k then ()
+                    elif !is_abstract_method(c.symbols[methods[j]]) && !is_trait_field(c, methods[j]) then table[c.classes[t].base + j] = Some(methods[j])
+                    else
+                        val what = if is_trait_field(c, methods[j]) then s"`val $name`" else s"`$name`"
+                        c.note(x.unit, x.span, s"`$name_of` does not implement ${c.classes[t].name}'s $what")
+    c.instances[n].table = table
+
+/** The instance of trait `t`, the impl's trait or one it requires, that the instance conformance `n`
+ * states, naming the impl's parameters as method `m` does: what `Self` and the trait's parameters
+ * are where `m` is compared with the trait's method. */
+private instance_trait_seen(c: *Checker, n: usize, m: usize, t: usize) -> Option[&Type]
+    val x = c.instances[n]
+    var names: Buf[&Type] = buf()
+    for j in 0..<x.params.len()
+        names.push(TypeVar(m, j, x.params[j].name))
+    val own = substitute(x.trait_type, instance_owner(n), names)
+    ancestor_type(c.classes, c.data, own, t)
 
 /** The owner of the type parameters of a method being met with a constructor trait's, while the
  * meeting decides them. */
@@ -6027,7 +6483,7 @@ private declared_site(c: *Checker, owner: usize, index: usize) -> string
     ""
 
 /** The conformances as a meeting asks of them: of types alone, with no generic scope. */
-private meeting_conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers, None, buf())
+private meeting_conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.instances, c.core, c.bounds, None, c.lowers, None, buf())
 
 /** Whether a value of type `x` is one of type `to` with no conversion: the same type, or a reference
  * seen as a supertype of it, as a covariant part is. */
@@ -8005,6 +8461,7 @@ struct Conformances
     data: Buf[DataSymbol]
     builtins: Buf[BuiltinConformance]
     conditional: Buf[ConditionalConformance]
+    instances: Buf[InstanceConformance]
     core: CoreTraits
     bounds: Map[string, Buf[&Type]]
     generic: Option[GenericScope]
@@ -8119,7 +8576,7 @@ private rebuilt(t: &Type, parts: Buf[&Type]) -> &Type = *t match
     _ -> t
 
 /** The conformances as the code being checked sees them. */
-private conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, c.generic, c.lowers, own_bounds_in_scope(c), gained_bounds(c))
+private conformances(c: *Checker) -> Conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.instances, c.core, c.bounds, c.generic, c.lowers, own_bounds_in_scope(c), gained_bounds(c))
 
 // In an arm of a refined variant, a type parameter of the enclosing code that an equality in scope
 // equates with a bounded parameter of the variant has that parameter's bounds there: the value was
@@ -9283,6 +9740,10 @@ rendered_at_run_time(classes: Buf[ClassSymbol], t: &Type) -> bool = *t match
  * conformances that hold at `t`'s type arguments: one an impl with bounds of its own states holds
  * where the arguments meet them. */
 holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
+    if f.instances.len() > 0 && (*t is Data(_, _, _) || *t is Class(_, _, _))
+        for n in 0..<f.instances.len()
+            if instance_args(f, n, t) is Some(args)
+                if holding_ancestor(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target) is Some(found) then return Some(found)
     if *t is Data(d, _, xs)
         for required in f.data[d].traits
             if !conformance_holds(f, data_owner(d), required, xs) then continue
@@ -9309,6 +9770,7 @@ holding_ancestors(f: Conformances, t: &Type, target: usize) -> Buf[&Type]
 
 private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
     if depth > f.classes.len() then return
+    collect_instance_ancestors(f, t, target, out, depth)
     if *t is Data(d, _, xs)
         for required in f.data[d].traits
             if conformance_holds(f, data_owner(d), required, xs) then collect_ancestors(f, substitute(required, data_owner(d), xs), target, out, depth + 1)
@@ -9338,6 +9800,72 @@ conformance_holds(f: Conformances, owner: usize, required: &Type, args: Buf[&Typ
     for x in f.conditional
         if x.owner == owner && x.trait_id == id then return conditions_met(f, x, args)
     true
+
+/** The type arguments instance conformance `n` takes where it holds of `t`: `t` is an instance of the
+ * type the impl is for, seen through its superclasses where it is a subclass, each parameter taking
+ * the part of `t` at its place, and those meet the parameters' bounds. `None` where it does not
+ * hold. The parts are matched exactly, so `Vector[byte]`'s conformance is not a `Vector[Nothing]`'s. */
+instance_args(f: Conformances, n: usize, t: &Type) -> Option[Buf[&Type]]
+    val x = f.instances[n]
+    val seen = *x.ty match
+        Class(k, _, _) -> ancestor_type(f.classes, f.data, t, k)?
+        Data(d, _, _) -> *t match
+            Data(e, _, _) -> if d == e then t else return None
+            _ -> return None
+        _ -> return None
+    var binds: Buf[Option[&Type]] = buf()
+    for _ in x.params
+        binds.push(None)
+    if !match_instance(x.ty, instance_owner(n), seen, &binds) then return None
+    var args: Buf[&Type] = buf()
+    for b in binds
+        args.push(b?)
+    for i in 0..<x.params.len()
+        if f.bounds.get(bound_key(instance_owner(n), i, x.params[i])) is Some(bounds)
+            for b in bounds
+                if !meets_bound(f, args[i], substitute(b, instance_owner(n), args)) then return None
+    Some(args)
+
+/** Whether `t` is the type `pattern` names, a parameter of `owner` in it taking the part of `t` at
+ * its place, one named twice the same part, as `binds` records. */
+private match_instance(pattern: &Type, owner: usize, t: &Type, binds: *Buf[Option[&Type]]) -> bool = *pattern match
+    TypeVar(o, i, _) ->
+        if o != owner then return same_type(pattern, t)
+        binds[i] match
+            Some(b) -> same_type(b, t)
+            None ->
+                binds[i] = Some(t)
+                true
+    Data(d, _, ps) -> *t match
+        Data(e, _, xs) -> d == e && match_instance_parts(ps, owner, xs, binds)
+        _ -> false
+    Class(k, _, ps) -> *t match
+        Class(j, _, xs) -> k == j && match_instance_parts(ps, owner, xs, binds)
+        _ -> false
+    Opaque(a, _, ps, _) -> *t match
+        Opaque(b, _, xs, _) -> a == b && match_instance_parts(ps, owner, xs, binds)
+        _ -> false
+    Tuple(ps) -> *t match
+        Tuple(xs) -> match_instance_parts(ps, owner, xs, binds)
+        _ -> false
+    Function(ps, r, marked) -> *t match
+        Function(xs, s, also) -> marked == also && match_instance_parts(ps, owner, xs, binds) && match_instance(r, owner, s, binds)
+        _ -> false
+    _ -> same_type(pattern, t)
+
+private match_instance_parts(ps: Buf[&Type], owner: usize, xs: Buf[&Type], binds: *Buf[Option[&Type]]) -> bool
+    if ps.len() != xs.len() then return false
+    for i in 0..<ps.len()
+        if !match_instance(ps[i], owner, xs[i], binds) then return false
+    true
+
+/** The instances of trait `target` that `t` is through the instance conformances holding of it and
+ * the traits theirs require. */
+private collect_instance_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
+    if f.instances.len() == 0 then return
+    if !(*t is Data(_, _, _) || *t is Class(_, _, _)) then return
+    for n in 0..<f.instances.len()
+        if instance_args(f, n, t) is Some(args) then collect_ancestors(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, out, depth + 1)
 
 /** Whether type arguments `args` meet the bounds of conditional conformance `x`. */
 conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool = unmet_condition(f, x.owner, x.conditions, args) is None
@@ -20346,7 +20874,17 @@ private receiver_param(at: Span, arity: usize) -> TypeParam
 /** The members named `name` of known type `t`, static or not, as a call on the type's name finds
  * them; a built-in type's include those an extension the file sees adds. */
 private members_of_type(c: *Checker, t: &Type, name: string) -> Buf[usize] = *t match
-    Class(k, _, _) -> methods_named(c, k, name)
+    // An impl for instances of the type adds its members there, in place of the type's own.
+    Class(k, _, _) ->
+        var out = without_instance_hidden(c, t, name, methods_named(c, k, name))
+        for m in instance_methods_named(c, t, name)
+            out.push(m)
+        out
+    Data(_, _, _) ->
+        var out = without_instance_hidden(c, t, name, visible_methods(c, receiver_methods(c, t, name)))
+        for m in instance_methods_named(c, t, name)
+            out.push(m)
+        out
     _ ->
         val own = visible_methods(c, receiver_methods(c, t, name))
         if scalar_builtin(t) then with_trait_methods(c, t, name, own) else own

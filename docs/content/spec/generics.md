@@ -72,7 +72,8 @@ class SortedPair[T: Ordered](first: T, second: T)
   parameter, a field, a `val`, a result, a type argument or a lower bound written `Named & Sized` is
   an error, which shows the form to write instead, `[T: Named & Sized](x: T)`. A value that is both
   is reached through such a parameter, whose instances call each type's methods directly.
-- **An impl's parameters are its type's**, and have the bounds the type declares. **An impl of a
+- **An impl's parameters are its type's** where it names them as the type's arguments, in order
+  (`impl[T] Ord for Box[T]`), and have the bounds the type declares. **An impl of a
   trait may bound them further**, making the type conform only for the type arguments that meet the
   bounds: with `impl[T: Ord] Ord for Box[T]`, a `Box[int]` is an `Ord` and a `Box[Plain]` is not. Each
   type argument written or inferred for a bound is held to them, and the impl's methods have the
@@ -83,6 +84,61 @@ class SortedPair[T: Ordered](first: T, second: T)
   on an instance only where it conforms, in the type's own methods too, where its parameters have
   only the bounds the type declares. Inside generic code, `Box[T]` conforms where `T`'s bounds meet
   the impl's. An impl of `Eq` or `Hash` may be bounded only by them, since every type meets them.
+- **An impl of a trait may be for an instance of a generic type** rather than for the type at its
+  own parameters: `impl FromPg for Vector[byte]`, or a partly applied one, `impl[K] Show for
+  Map[K, int]`, `impl[T] Show for Box[Option[T]]`. The type conforms to the trait where it is such
+  an instance, seen through its superclasses, with its parts exactly the impl's (a `Vector[Nothing]`
+  is not a `Vector[byte]` here); each of the impl's parameters is part of the type, takes the part at
+  its place and is held to its bounds. The impl's members, static ones included, are the type's at
+  those instances, wherever an impl is found: called on a value or on the type
+  (`Vector[byte].fromPg(text)`), through a bound, in a bound held where a type argument is written,
+  on a trait value, by a type pattern, and by a template walking a field. It belongs in the module of
+  the type or of the trait, as any impl of a trait does. `Eq`, `Hash`, `Sendable` and `Boundary`
+  are a type's at every instance alike, so their impls are for the type at its own parameters. An
+  impl of `Display` or `Debug` for an instance of a data type is an impl of the trait like any
+  other, so the type has no automatic one at its other instances.
+- **Two impls of one trait never both hold of a type**: there is no "more specific wins". An
+  instance impl beside the type's own impl of the trait is allowed only where the instance misses
+  that impl's bounds, and two instance impls only where no instance matches both. A missed bound
+  counts only if it is missed for good: where some module other than the impl's own and the core
+  library could still write the impl meeting it (one able to name the bound and the type without
+  importing a module that imports it), the two impls overlap. The error names both impls, and the
+  module where one could arise.
+
+```avin run
+trait FromPg
+  static fromPg(text: string) -> Option[Self]
+
+impl FromPg for int
+  static fromPg(text: string) -> Option[int] = text.toIntOption()
+
+// `bytea`: the bytes themselves.
+impl FromPg for Vector[byte]
+  static fromPg(text: string) -> Option[Vector[byte]] = Some(text.bytes)
+
+// An array: comma-separated elements. `byte` is no `FromPg`, so this impl never holds of a
+// `Vector[byte]`, and the two do not overlap.
+impl[T: FromPg] FromPg for Vector[T]
+  static fromPg(text: string) -> Option[Vector[T]]
+    var out: Vector[T] = []
+    for part in text.split(',')
+      T.fromPg(part) match
+        Some(v) -> out = out :+ v
+        None -> return None
+    Some(out)
+
+decode[T: FromPg](text: string) -> Option[T] = T.fromPg(text)
+
+main()
+  println(decode[Vector[byte]]("hi").map(v -> v.length))
+  println(decode[Vector[int]]("1,2,3"))
+```
+
+```text output
+Some(2)
+Some([1, 2, 3])
+```
+
 - **An impl without a trait may bound its parameters too**, adding its methods only for the type
   arguments that meet the bounds: with `impl[T: Display] List[T]`, a `List[int]` has `mkString` and a
   `List[Plain]` does not. Calling such a method, or taking it as a value, on an instance that misses
