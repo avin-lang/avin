@@ -1,0 +1,104 @@
+// expect: exit 0
+// A cancellation that stops `validate` part way puts the resource it was checking back as a resource
+// given back is put back: idle, or handed to the first call waiting, and checked again before it is
+// lent; destroyed only where the pool was closed meanwhile or the resource has outlived
+// `maxLifetime`. A check that really answers false still destroys the resource, and counts it.
+// The first check of each pool waits for an hour, so the test would hold for an hour if the
+// cancellation did not stop it.
+import avin.threads.{Atomic, Channel, Pool, PoolError, scope, sleep, spawn}
+import avin.time.{Duration, hours, millis}
+
+class Conn(val id: int): Sendable
+
+// A pool of one resource whose first check waits for an hour, saying on `started` that it began, and
+// whose later checks answer `answer(n)` for the nth check; `destroyed` counts what it destroys.
+poolOf(
+    started: Channel[int],
+    checks: Atomic[int],
+    destroyed: Atomic[int],
+    answer: @sendable (int) -> bool,
+    maxLifetime: Option[Duration] = None
+) -> Pool[Conn, string]
+  val made = Atomic(0)
+  Pool[Conn, string](
+    () -> Ok(Conn(made.add(1))),
+    maxSize = 1,
+    validate = Some(_ ->
+      val n = checks.add(1)
+      if n == 1
+        started.send(n)
+        sleep(hours(1))
+      answer(n)),
+    destroy = Some(_ -> _ = destroyed.add(1)),
+    maxLifetime = maxLifetime
+  )
+
+// Starts a call on `pool` whose check `started` reports, cancels it there, and answers what it got.
+stopCheck(pool: Pool[Conn, string], started: Channel[int]) -> Option[Result[int, PoolError[string]]] = scope(s ->
+  val t = s.spawn(() -> pool.use(c -> c.id))
+  _ = started.receive()
+  s.cancel()
+  t.result())
+
+waitFor(pool: Pool[Conn, string], n: int)
+  while pool.stats().waiting < n do sleep(millis(1))
+
+main()
+  val started = Channel[int](1)
+
+  // A check stopped, then one that answers false: the resource is destroyed at that second check,
+  // counted, and a new one made in its place.
+  val checks = Atomic(0)
+  val destroyed = Atomic(0)
+  val failing = poolOf(started, checks, destroyed, n -> n != 2)
+  println(failing.use(c -> c.id))
+  println(s"stopped: ${stopCheck(failing, started)} destroyed ${destroyed.load()} ${failing.stats()}")
+  println(s"false: ${failing.use(c -> c.id)} checks ${checks.load()} destroyed ${destroyed.load()}")
+  println(s"counted: ${failing.counters().destroyed} made ${failing.counters().created} ${failing.stats()}")
+
+  // A call waiting while the check is stopped is handed the resource, which is checked again for it.
+  val waitChecks = Atomic(0)
+  val waitDestroyed = Atomic(0)
+  val waited = poolOf(started, waitChecks, waitDestroyed, _ -> true)
+  println(waited.use(c -> c.id))
+  val handed = scope(outer ->
+    val behind = scope(inner ->
+      inner.spawn(() -> _ = waited.use(c -> c.id))
+      _ = started.receive()
+      val t = outer.spawn(() -> waited.use(c -> c.id))
+      waitFor(waited, 1)
+      inner.cancel()
+      t)
+    behind.join())
+  println(s"waiter: $handed checks ${waitChecks.load()} destroyed ${waitDestroyed.load()} ${waited.stats()}")
+
+  // The pool closed while the check is stopped: `close` waits for the resource being checked, which
+  // is destroyed when the check is stopped, not kept.
+  val closeChecks = Atomic(0)
+  val closeDestroyed = Atomic(0)
+  val closing = poolOf(started, closeChecks, closeDestroyed, _ -> true)
+  println(closing.use(c -> c.id))
+  val closed = scope(s ->
+    val t = s.spawn(() -> closing.use(c -> c.id))
+    _ = started.receive()
+    val closer = spawn(() -> closing.close())
+    while !closing.isClosed() do sleep(millis(1))
+    s.cancel()
+    closer.join()
+    t.result())
+  println(s"closed: $closed destroyed ${closeDestroyed.load()} ${closing.stats()} ${closing.use(c -> c.id)}")
+
+  // The resource outlives `maxLifetime` while its check is stopped: destroyed then, and the next call
+  // makes a new one, which is not checked.
+  val oldChecks = Atomic(0)
+  val oldDestroyed = Atomic(0)
+  val aging = poolOf(started, oldChecks, oldDestroyed, _ -> true, Some(millis(50)))
+  println(aging.use(c -> c.id))
+  val aged = scope(s ->
+    val t = s.spawn(() -> aging.use(c -> c.id))
+    _ = started.receive()
+    sleep(millis(80))
+    s.cancel()
+    t.result())
+  println(s"outlived: $aged destroyed ${oldDestroyed.load()} ${aging.stats()}")
+  println(s"${aging.use(c -> c.id)} checks ${oldChecks.load()} made ${aging.counters().created}")
