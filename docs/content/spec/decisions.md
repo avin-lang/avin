@@ -10818,3 +10818,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (the binding still copies the whole buffer in and out at every call, and an idle server would
   hold one per connection); reading ahead into the stream's buffered bytes (changes what a
   select's descriptor says). Review with the user: the 256 KiB ceiling on one socket read.
+  Each try at a receive ends its view of the carrier's buffer before the thread can wait (branch
+  `pool-trap`, 2026-11-17): a view held across a park was let go on whichever carrier the thread
+  resumed on, changing the buffer's count there while the buffer's own carrier used it, which
+  freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
+  reading at once).
