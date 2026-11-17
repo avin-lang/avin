@@ -8882,6 +8882,25 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Settled on the user's delegation 2026-11-17 (built on branch `println-atomic`): **`println(x)` and
+  `print(x)` render all their arguments (and `println` its new line) first, into a string, and add
+  that to standard output in ONE write, so a line printed is never split by another thread's
+  output** (spec system-library.md, beside `eprintln`'s same promise). Found when two threads'
+  `println(99)` came out `9999\n\n`: `println` wrote each value and then the new line as separate
+  writes. The one write is a single `fwrite` on the C stream, which holds the stream's lock for the
+  whole call, so another thread's write lands before or after it and a flush sends it out whole, in
+  order, however long it is. Rendering happens before the write, outside any lock, so a value slow
+  or large to render holds no other thread up. Consequences: a value rendered for `println` is now
+  built as a string first (one allocation and copy per call; the digits of `println(n)` no longer go
+  out from the stack); a `Display` that itself prints puts its own output before the line rather
+  than inside it, and one that traps part way leaves none of the line rather than a part. Output
+  built from several calls, or written to `StandardOutput` piece by piece, is still several pieces.
+  Alternatives weighed: hold the stream's lock across the whole render (a slow render, or one that
+  parks the thread or waits on a collection, would stall every printing thread, and a `Display`
+  that prints would deadlock); keep separate writes and promise nothing (the spec already promises
+  whole lines for standard error, and interleaved lines from threads are the commonest complaint);
+  a per-thread line buffer in the runtime (more machinery for the same guarantee). Review with the
+  user: only if the extra allocation per `println` shows up in a benchmark that prints heavily.
 - Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
   Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
   opaque type reads as the alias it resembles, with one word saying the difference, and the parser

@@ -681,6 +681,15 @@ standard error first flushes what the program has written to standard output, so
 terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` (or all its arguments) and its
 new line first and writes them in one write, so a line is never split.
 
+**A line printed is never split, whichever threads print.** `println(x)` (with any number of
+arguments) renders all its arguments and its new line first, then adds them to standard output's
+buffer in one step, and `print(x)` does the same with no new line: one call, one piece of output.
+Another thread's output lands before the piece or after it, never inside it, however long the piece
+is and wherever standard output leads (a terminal, a pipe, a file); a flush sends the buffer's
+pieces out whole and in order. Rendering is done before the step, so a value slow or large to render
+holds no other thread up. Output built from several calls (`print(a)` then `println(b)`, or writes
+to `StandardOutput` piece by piece) is several pieces, and another thread's may land between them.
+
 **`flush()` sends a partial line on its way.** `flush()` in the prelude (and `StandardOutput.flush()`,
 and `StandardError.flush()`, which has nothing to send) sends everything written to standard output so
 far out of the buffer whether or not a line is complete, so a program that draws a frame without a
