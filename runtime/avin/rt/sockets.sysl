@@ -381,28 +381,38 @@ const ReceiveLimit: int = 262144
  * end of the input; a wait longer than `limit_ms` milliseconds, where it is positive, fails as timed
  * out. The answer is exactly as long as what arrived: the bytes are received into the thread's own
  * buffer, which its carrier keeps from one receive to the next, and copied out at their length, so a
- * small message read with a large `max` costs what the message does. Nothing between the receive
- * and the copy can switch the carrier to another thread. */
+ * small message read with a large `max` costs what the message does. Each try at a receive is
+ * `receive_now`, which lets go of the buffer before the thread waits. */
 socket_receive(s: Socket, max: int, limit_ms: int) -> Result[[]u8, IoError]
     val want = usize(if max > ReceiveLimit then ReceiveLimit elif max < 1 then 1 else max)
     var c = s
     loop
-        val ctx = current_context
-        val k = if ctx == null then null else ctx.carrier
-        var own: []u8 = []
-        if k == null
-            own = [0; want]
-        elif k.receiving.len < want
-            k.receiving = [0; want]
-        val room: []u8 = if k == null then own[0..<want] else k.receiving[0..<want]
-        c.recv(room) match
-            Ok(n) ->
-                var out: []u8 = [0; n]
-                copy(out, room[0..<n])
-                return Ok(out)
-            Err(e) if would_block(e) ->
-                if !wait_for_fd(c.fd()?, Readable, limit_ms)? then return Err(timed_out_error())
-            Err(e) -> return Err(e)
+        receive_now(&c, want)? match
+            Some(out) -> return Ok(out)
+            None -> if !wait_for_fd(c.fd()?, Readable, limit_ms)? then return Err(timed_out_error())
+
+/** One try at receiving up to `want` bytes from `c` without waiting: the bytes that arrived, copied
+ * out of the carrier's buffer at their length, or `None` where the receive would have to wait.
+ * Nothing in it can switch the thread to another carrier, and the view of the carrier's buffer ends
+ * with it: a view still held across a wait would have its count changed by whichever carrier the
+ * thread resumed on, racing the carrier that owns the buffer, whose other threads use it meanwhile,
+ * and the buffer could be freed or overwritten under them. */
+private receive_now(c: *Socket, want: usize) -> Result[Option[[]u8], IoError]
+    val ctx = current_context
+    val k = if ctx == null then null else ctx.carrier
+    var own: []u8 = []
+    if k == null
+        own = [0; want]
+    elif k.receiving.len < want
+        k.receiving = [0; want]
+    val room: []u8 = if k == null then own[0..<want] else k.receiving[0..<want]
+    c.recv(room) match
+        Ok(n) ->
+            var out: []u8 = [0; n]
+            copy(out, room[0..<n])
+            Ok(Some(out))
+        Err(e) if would_block(e) -> Ok(None)
+        Err(e) -> Err(e)
 
 /** Every byte of `bytes` to `s`, waiting for room as often as it takes; a wait longer than `limit_ms`
  * milliseconds, where it is positive, fails as timed out. */

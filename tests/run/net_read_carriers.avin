@@ -1,0 +1,138 @@
+// expect: exit 0
+// Many lightweight threads read sockets at once, more of them than there are workers, each read
+// parking part way through a message and resuming on whichever worker takes it next. A read
+// receives into a buffer its worker keeps, so these are the shapes that buffer meets: threads
+// moving between workers between reads and in the middle of one, the buffer grown by one thread
+// while another that used it is parked, reads smaller than a message, exactly its size, larger than
+// it and larger than the most one receive takes, over TCP and TLS, the reading half of a split
+// connection among them. Every byte read is checked against what was sent, and the threads'
+// answers against what each was asked.
+import avin.fs
+import avin.io.IoError
+import avin.io.Reader
+import avin.net.{ByteStream, TcpListener, TcpStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Atomic, Thread, sleep, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// The size of the message the peer answers each command with.
+sizeOf(command: int) -> int = [40, 700, 5000, 40000](command)
+
+// The sizes the readers read with, in turn: one byte, a few, a page, more than a TLS record, more
+// than one receive takes.
+val Maxes = [1, 13, 4096, 65536, 400000]
+
+// The byte at `i` of the answer to `command` on connection `n`.
+byteAt(n: int, command: int, i: int) -> byte = byte((i * 7 + command * 11 + n * 13) % 251)
+
+// The peer of connection `n`: answers each command byte with its message, half of it, a pause in
+// which the reader parks, and the rest, until a command of 255 or the end of the input.
+serve(s: ByteStream, n: int)
+  while true
+    val got = ok(s.read(1))
+    if got.length == 0 || got(0) == byte(255) then break
+    val c = int(got(0))
+    val size = sizeOf(c)
+    val message = Array.tabulate(size, i -> byteAt(n, c, i))
+    val half = size / 2
+    ok(s.write(message.slice(0, half)))
+    sleep(millis(1))
+    ok(s.write(message.slice(half, size)))
+  _ = s.close()
+
+// Reads the answer to `command` on connection `n` with reads of `max`: whether every byte is right.
+answered(r: Reader, n: int, command: int, max: int) -> bool
+  var at = 0
+  var right = true
+  while at < sizeOf(command)
+    val bytes = ok(r.read(max))
+    if bytes.length == 0 then fail("the end of the input in the middle of a message")
+    if bytes.length > max then fail(s"a read of $max answered ${bytes.length}")
+    for k in 0 ..< bytes.length
+      if bytes(k) != byteAt(n, command, at + k) then right = false
+    at += bytes.length
+  right
+
+// The client of connection `n`: `rounds` commands, each read with the next of `Maxes`, so threads
+// sharing a worker grow its buffer while others that read with it are parked. How many answers
+// came back right.
+client(r: Reader, write: (Array[byte]) -> Result[unit, IoError], n: int, rounds: int, largest: int) -> int
+  val one = Array.fill(1, byte(0))
+  var right = 0
+  for round in 0 ..< rounds
+    val command = (n + round) % (largest + 1)
+    one(0) = byte(command)
+    ok(write(one))
+    if answered(r, n, command, Maxes((n * 3 + round) % Maxes.length)) then right += 1
+  one(0) = byte(255)
+  ok(write(one))
+  right
+
+// A TCP connection `n`, its reads made through the reading half of a split one where `splitting`.
+tcp(n: int, rounds: int, splitting: bool) -> int
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val peer = spawn(() ->
+    serve(ok(l.accept()), n)
+    _ = l.close())
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  val right = if splitting
+    val (r, w) = c.split()
+    val got = client(r, w.write, n, rounds, 3)
+    _ = r.close()
+    _ = w.close()
+    got
+  else
+    val got = client(c, c.write, n, rounds, 3)
+    _ = c.close()
+    got
+  peer.join()
+  right
+
+// A TLS connection `n`, as `tcp` makes one.
+secure(n: int, rounds: int, splitting: bool) -> int
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val peer = spawn(() ->
+    serve(tls(TlsStream.server(ok(l.accept()), server)), n)
+    _ = l.close())
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  val right = if splitting
+    val (r, w) = c.split()
+    val got = client(r, w.write, n, rounds, 2)
+    _ = r.close()
+    _ = w.close()
+    got
+  else
+    val got = client(c, c.write, n, rounds, 2)
+    _ = c.close()
+    got
+  peer.join()
+  right
+
+main()
+  val tcpThreads = 64
+  val tlsThreads = 16
+  val rounds = 8
+  val right = Atomic(0)
+  val threads = Buffer[Thread[unit]]()
+  for n in 0 ..< tcpThreads
+    threads.addOne(spawn(() -> _ = right.add(tcp(n, rounds, n % 4 == 3))))
+  for n in 0 ..< tlsThreads
+    threads.addOne(spawn(() -> _ = right.add(secure(tcpThreads + n, rounds, n % 4 == 3))))
+  for t in threads
+    t.join()
+  println(s"answers right: ${right.load()} of ${(tcpThreads + tlsThreads) * rounds}")
