@@ -701,7 +701,9 @@ trait Reader
 ```
 
 `read(max)` gives up to `max` bytes, `max` being at least one, waiting for at least one where the
-source is still going, and an empty array once it has ended. `fs.File` is a reader by its own
+source is still going, and an empty array once it has ended. A stream's read allocates the bytes
+it answers, not `max`, so a small message read with a large `max` costs what the message does.
+`fs.File` is a reader by its own
 `read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
 JSON package's `JsonReader` ([`dev.avinlang.json`](/spec/json/)) reads JSON from any reader.

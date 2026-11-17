@@ -99,6 +99,8 @@ struct Context
     defers: **u8
     defer_count: usize
     defer_room: usize
+    /** How many bytes of objects the thread has allocated, headers not counted. */
+    allocated: usize
 
 @assert(offsetof(Context, caller) == 24, "the compiler writes a context's caller site at 24")
 @assert(offsetof(Context, owner) == OwnerOffset, "the compiler reads a context's owner at 32")
@@ -110,7 +112,7 @@ const Running: u32 = 0
 const Safe: u32 = 1
 
 /** A context no thread is running yet: safe, with an empty stack, and an owner of its own. */
-new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0)
+new_context() -> Context = Context(null, null, Atomic(Safe), null, fresh_owner(), null, null, 0, null, new_waiter(), null, 0, Atomic(0), Atomic(0), null, 0, 0, 0)
 
 /** One operating system thread's state: the chunk of the heap that the contexts running on the thread
  * allocate from with no lock, and, on a worker of the scheduler, what the scheduler keeps about the
@@ -153,11 +155,14 @@ struct Carrier
     worker_next: *Carrier
     /** The low end of the worker's own stack, for the overflow report. */
     own_low: *u8
+    /** Where a socket receive on the thread puts the bytes before they are copied out at their own
+     * length (`sockets.sysl`), grown to the largest receive asked for, up to a limit. */
+    receiving: []u8
 
 /** A carrier holding no chunk, for an attached thread or, with `worker`, for a worker of the
  * scheduler. It keeps itself alive until `me` is cleared. */
 new_carrier(worker: bool) -> *Carrier
-    val k: &Carrier = Carrier(gc.chunk(), null, None, worker, fiber.Context.new(), AfterNothing, null, null, 0, null, Atomic(0), Atomic(0), Atomic(0), 0, false, Atomic(0), Atomic(0), null, null)
+    val k: &Carrier = Carrier(gc.chunk(), null, None, worker, fiber.Context.new(), AfterNothing, null, null, 0, null, Atomic(0), Atomic(0), Atomic(0), 0, false, Atomic(0), Atomic(0), null, null, [])
     k.me = Some(k)
     ptr_cast(&*k)
 
@@ -546,10 +551,16 @@ allocate(ctx: *Context, d: *Descriptor) -> *u8 = allocate_sized(ctx, d, d.size)
  * takes no lock; one that takes the heap lock is also a safepoint, since a thread waiting for it is
  * safe. `ctx` is the allocating thread's. */
 allocate_sized(ctx: *Context, d: *Descriptor, size: usize) -> *u8
+    ctx.allocated += size
     if !stress
         val p = gc.chunk_alloc(&ctx.carrier.chunk, size, &d.kind)
         if p != null then return p
     allocate_locked(ctx, d, size)
+
+/** How many bytes of objects the calling thread has allocated since it began, headers not counted:
+ * the difference across a stretch of code is what that code allocated, which tests of the library's
+ * allocation read. */
+allocated_bytes() -> long = if current_context == null then 0 else long(current_context.allocated)
 
 // The allocation a carrier's chunk cannot serve: the chunk is spent, or the object is too large for
 // any chunk. Under stress every allocation comes here, collects first, and is then taken from a

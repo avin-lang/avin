@@ -261,6 +261,8 @@ class TlsStream(
   // Ciphertext of a record a `writeSome` made that the connection had no room for yet, which goes
   // before anything else is sent.
   private var pending = Array.empty[byte]()
+  // Where TLS puts the plaintext of a read, kept from one read to the next.
+  private var room = Array.empty[byte]()
 
   // Whether a read would answer now, without waiting: plaintext is buffered, TLS holds decrypted
   // plaintext or has a whole record of it among what has arrived, the peer has closed TLS or the
@@ -269,7 +271,8 @@ class TlsStream(
   override readable() -> bool
     owner.held()
     if closed || halved || buffered.pending || failure is Some(_) then return true
-    val into = Array.fill(RecordSize, byte(0))
+    room = plaintextRoom(room, MaxPlaintext)
+    val into = room
     while true
       val got = engine.receive(into)
       val sent = readerFlush()
@@ -278,7 +281,7 @@ class TlsStream(
         return true
       got match
         Ok(Data(n)) ->
-          buffered.keep(if n == long(into.length) then into else into.slice(0, int(n)))
+          buffered.keep(into.slice(0, int(n)))
           return true
         Ok(Closed) -> return true
         Ok(Wants) ->
@@ -505,12 +508,14 @@ class TlsStream(
     if failure is Some(e)
       failure = None
       return Err(e)
-    val into = Array.fill(max, byte(0))
+    room = plaintextRoom(room, max)
+    val into = room
     while true
       engine.receive(into) match
         Ok(Data(n)) ->
+          val got = into.slice(0, int(n))
           readerFlush()?
-          return Ok(if n == long(max) then into else into.slice(0, int(n)))
+          return Ok(got)
         Ok(Closed) ->
           readerFlush()?
           return Ok(Array.empty[byte]())
@@ -522,6 +527,14 @@ class TlsStream(
 
 // The most plaintext one TLS record carries.
 private val MaxPlaintext = 16384
+
+// An array for TLS to put up to `max` bytes of plaintext in, never more than one record's: `room`
+// itself where it is that long, so a connection read with one size again and again allocates only
+// what each read answers, or a new one. TLS fills at most the array's length, so it is never longer
+// than the read asked for.
+private plaintextRoom(room: Array[byte], max: int) -> Array[byte]
+  val want = if max > MaxPlaintext then MaxPlaintext else max
+  if room.length == want then room else Array.fill(want, byte(0))
 
 // The first record's worth of `bytes`.
 private firstRecordOf(bytes: Array[byte]) -> Array[byte] =
@@ -717,6 +730,8 @@ private class TlsReader(
 ): Sendable, StreamReader
   private val owner = newReaderOwner()
   private var closed = false
+  // Where TLS puts the plaintext of a read, kept from one read to the next.
+  private var room = Array.empty[byte]()
 
   override remoteAddress -> Option[string] = other
 
@@ -724,7 +739,8 @@ private class TlsReader(
   override readable() -> bool
     owner.held()
     if closed || buffered.pending || failure is Some(_) then return true
-    val into = Array.fill(RecordSize, byte(0))
+    room = plaintextRoom(room, MaxPlaintext)
+    val into = room
     while true
       val got = shared.engaged(e -> e.receive(into))
       val sent = shared.offer()
@@ -733,7 +749,7 @@ private class TlsReader(
         return true
       got match
         Ok(Data(n)) ->
-          buffered.keep(if n == long(into.length) then into else into.slice(0, int(n)))
+          buffered.keep(into.slice(0, int(n)))
           return true
         Ok(Closed) -> return true
         Ok(Wants) ->
@@ -797,12 +813,13 @@ private class TlsReader(
     if failure is Some(e)
       failure = None
       return Err(e)
-    val into = Array.fill(max, byte(0))
+    room = plaintextRoom(room, max)
+    val into = room
     while true
       val got = shared.engaged(e -> e.receive(into))
       shared.offer()?
       got match
-        Ok(Data(n)) -> return Ok(if n == long(max) then into else into.slice(0, int(n)))
+        Ok(Data(n)) -> return Ok(into.slice(0, int(n)))
         Ok(Closed) -> return Ok(Array.empty[byte]())
         Ok(Wants) -> if !pull()? then return Ok(Array.empty[byte]())
         Err(f) -> return Err(streamError(f, "read from", peer))
