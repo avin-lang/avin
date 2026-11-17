@@ -4,7 +4,10 @@ module avin.rt
 import sysl.net.{Socket, resolve, socket, timed_out, would_block}
 import sysl.io.poll.{Event, Poller}
 import sysl.io.wait.{Readable, Writable}
-import sysl.time.monotonic
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import sysl.threads.spawn
+import sysl.time.{millis, monotonic, sleep}
 
 // The poller's tokens, and the waits and operations of a thread that is not lightweight, which waits
 // on the descriptor alone. A lightweight thread's parking is exercised by the programs that serve
@@ -92,6 +95,60 @@ receive_answers_what_arrived()
     var c = e.client
     c.close().unwrap()
     assert_eq(socket_receive(e.served, 65536, 1000).unwrap().len, 0usize)
+
+// What a second thread sees of a carrier while the carrier's thread waits in a receive: how many
+// shares its receiving buffer has, and then the bytes that end the wait, sent on `client`.
+private struct Watch
+    carrier: *Carrier
+    client: Option[Socket]
+    shares: Atomic[u64]
+
+private var watch: Watch = Watch(null, None, Atomic(0))
+
+// How many shares the storage of `k`'s receiving buffer has: the count is the first word of the
+// storage the slice's owner word names.
+private receiving_shares(k: *Carrier) -> u64
+    val owner: **u64 = ptr_cast(&k.receiving)
+    if owner[0] == null then 0 else owner[0][0]
+
+// Waits until the receiving thread has grown its buffer, and a while more, by which time the thread
+// is waiting; counts the buffer's shares, then sends the bytes that end the wait.
+private watch_receive(w: *Watch) -> unit
+    while w.carrier.receiving.len < 65536 do sleep(millis(1))
+    sleep(millis(200))
+    w.shares.store(receiving_shares(w.carrier))
+    socket_send_all(w.client.unwrap(), "late".bytes, 0).unwrap()
+
+@test("a receive that waits holds no share of its carrier's buffer meanwhile, since a lightweight thread let go of one on whichever carrier it resumed on; the buffer is kept for the next receive")
+receive_waits_sharing_nothing()
+    val me = thread_attach()
+    val e = ends()
+    watch.carrier = me.carrier
+    watch.client = Some(e.client)
+    watch.shares.store(0)
+    val t = spawn(&watch_receive, &watch).unwrap()
+    val got = socket_receive(e.served, 65536, 10000).unwrap()
+    assert(t.join())
+    watch.client = None
+    assert_eq(got.len, 4usize)
+    assert_eq(got[3], u8('e'))
+    assert_eq(watch.shares.load(), 1u64)
+    assert_eq(receiving_shares(me.carrier), 1u64)
+    // A smaller receive takes the same buffer rather than a new one.
+    val before: **u8 = ptr_cast(&me.carrier.receiving)
+    val storage = before[0]
+    socket_send_all(e.client, "again".bytes, 0).unwrap()
+    val small = socket_receive(e.served, 16, 1000).unwrap()
+    assert_eq(small.len, 5usize)
+    assert_eq(small[4], u8('n'))
+    assert(before[0] == storage)
+    assert_eq(receiving_shares(me.carrier), 1u64)
+    // A receive whose wait times out leaves no share behind either.
+    socket_receive(e.served, 65536, 20) match
+        Ok(_) -> panic("nothing was sent")
+        Err(err) -> assert(timed_out(err))
+    assert_eq(receiving_shares(me.carrier), 1u64)
+    thread_detach(me)
 
 @test("an accepted connection is non-blocking, so a receive with nothing to read answers would-block rather than waiting")
 accepted_is_non_blocking()
