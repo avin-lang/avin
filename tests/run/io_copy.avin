@@ -1,0 +1,111 @@
+// expect: exit 0
+// `io.copy(from, to)` reads a `Reader` to its end and writes everything to a `ByteWriter`, a piece of
+// at most 64 KiB at a time, and answers how many bytes it copied. Nothing to copy is `Ok(0)` with no
+// write; exactly one piece's worth is one write; more is pieces of at most 64 KiB, however large a
+// piece the reader would give. The first read's or write's `Err` is the answer, and nothing is read
+// or written after it. It copies a file to a connection and a connection to a file, and leaves both
+// sides open.
+import avin.fs
+import avin.io
+import avin.io.{ByteWriter, IoError, Reader}
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// The byte at `i` of everything a source gives.
+patternAt(i: int) -> byte = byte((i * 7 + 3) % 251)
+
+// Whether `got` is the first `got.length` bytes of the pattern, or where it is not.
+checked(got: Array[byte]) -> string
+  for k in 0 ..< got.length
+    if got(k) != patternAt(k) then return s"differs at byte $k"
+  s"${got.length} bytes"
+
+// A source of `total` bytes of the pattern, giving all a read asks for, that fails once `breakAt`
+// bytes have been read, never when `breakAt` is negative.
+class Pattern(private val total: int, private val breakAt: int): Reader
+  var at = 0
+  var reads = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    reads += 1
+    if 0 <= breakAt <= at then return Err(IoError(io.Other("the source broke"), "read", "the source"))
+    val from = at
+    val end = if total - at > max then at + max else total
+    at = end
+    Ok(Array.tabulate(end - from, i -> patternAt(from + i)))
+
+// A sink that keeps what is written and the size of its largest write, and refuses every write after
+// the first `room`, no limit when `room` is negative.
+class Sink(private val room: int): ByteWriter
+  val bytes = Buffer[byte]()
+  var writes = 0
+  var largest = 0
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    writes += 1
+    if 0 <= room < writes then return Err(IoError(io.Other("the sink is full"), "write to", "the sink"))
+    if bytes.length > largest then largest = bytes.length
+    self.bytes.addAll(bytes)
+    Ok(())
+
+// What a copy came to.
+shown(r: Result[long, IoError]) -> string = r match
+  Ok(n) -> s"copied $n"
+  Err(e) -> e.message
+
+// Copies `total` bytes into a sink of `room` writes, the source breaking at `breakAt`.
+run(name: string, total: int, breakAt: int, room: int)
+  val from = Pattern(total, breakAt)
+  val to = Sink(room)
+  val answer = io.copy(from, to)
+  println(
+    s"$name: ${shown(answer)}; ${from.reads} reads, ${to.writes} writes, the largest ${to.largest}; ${checked(to.bytes.toArray())}"
+  )
+
+// The same through a generic function bounded by both traits.
+generic[R: Reader, W: ByteWriter](from: R, to: W) -> Result[long, IoError] = io.copy(from, to)
+
+main()
+  run("empty", 0, -1, -1)
+  run("one byte", 1, -1, -1)
+  run("one piece", 65536, -1, -1)
+  run("a piece and a byte", 65537, -1, -1)
+  run("large", 1000000, -1, -1)
+  run("source breaks at once", 1000, 0, -1)
+  run("source breaks later", 200000, 70000, -1)
+  run("sink refuses the first", 200000, -1, 0)
+  run("sink refuses the third", 200000, -1, 2)
+  run("both fail, the write first", 200000, 70000, 1)
+
+  val p = Pattern(100000, -1)
+  val s = Sink(-1)
+  println("generic", shown(generic(p, s)), checked(s.bytes.toArray()))
+
+  // A file to a connection, and a connection to a file.
+  val dir = ok(fs.createTempDir("avin-io-copy"))
+  val source = dir + "/source"
+  val target = dir + "/target"
+  ok(fs.writeBytes(source, Array.tabulate(150000, patternAt)))
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val peer = spawn(() ->
+    val s = ok(l.accept())
+    val t = ok(fs.create(target))
+    val n = ok(io.copy(s, t))
+    ok(t.close())
+    _ = s.close()
+    _ = l.close()
+    n)
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  val f = ok(fs.open(source))
+  println("file to connection", shown(io.copy(f, c)), "the file still open", !f.isClosed())
+  // The file is at its end: a second copy has nothing to give.
+  println("again", shown(io.copy(f, c)))
+  ok(f.close())
+  ok(c.close())
+  println("connection to file", peer.join(), checked(ok(fs.readBytes(target))))
+  ok(fs.removeDirAll(dir))
