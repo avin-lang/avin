@@ -171,20 +171,23 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 userdata = true
                 *at = *at + 1
             val p = c_declaration(tokens, at)?
-            if nulled && (*at < tokens.len() && tokens[*at] == "(" || !p.text.ends_with("*"))
+            val function = *at < tokens.len() && tokens[*at] == "("
+            if nulled && !function && !p.text.ends_with("*")
                 return Err(s"`null` marks a pointer the binding passes null, as in `null int *num_clusters`, and `${p.text}` is not one")
-            if *at < tokens.len() && tokens[*at] == "("
+            if function
                 if inner then return Err("a callback's parameter taking a function cannot cross a C binding: a function crosses only as a binding's own parameter")
                 if userdata || length_of != "" || !(mode is CIn) then return Err("a parameter taking a function is passed in, with no `userdata`, `out`, `inout` or `length` of its own")
                 if p.name is Some(n) then return Err(s"a parameter taking a function is written `${p.text} (*$n)(...)`, its name in parentheses after a `*`")
-                val f = c_function_pointer(tokens, at, p)?
+                val f = c_function_pointer(tokens, at, p, nulled)?
                 var shown = ""
                 for q in f.params
                     shown = shown + (if shown == "" then "" else ", ") + q.text
                 if shown == "" then shown = "void"
+                // A function pointer passed null is never called, so it carries no closure and no
+                // trampoline: it is a pointer like any other marked `null`.
                 var own: Buf[CPrototype] = buf()
-                own.push(f)
-                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own, false))
+                if !nulled then own.push(f)
+                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own, nulled))
                 if *at < tokens.len() && tokens[*at] == ","
                     *at = *at + 1
                     continue
@@ -225,7 +228,8 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
 
 // A function pointer's declarator from `tokens[*at]`, after its result type `result`: `(*name)` and
 // its parameter list, read as the prototype of the function C calls, named by the parameter.
-private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared) -> Result[CPrototype, string]
+// One marked `null` is never called, so C's types alone are read: no `userdata`, and any result.
+private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared, nulled: bool) -> Result[CPrototype, string]
     val shape = "a parameter taking a function is written as C declares a function pointer, as in `void (*listener)(userdata void *data, int value)`"
     *at = *at + 1
     if *at >= tokens.len() || tokens[*at] != "*" then return Err(shape)
@@ -239,6 +243,11 @@ private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared) -
     if *at >= tokens.len() || tokens[*at] != "(" then return Err(shape)
     *at = *at + 1
     val params = c_param_list(tokens, at, true)?
+    if nulled
+        if name == "" then return Err(s"a parameter taking a function is named, as in `null ${result.text} (*callback)(...)`")
+        for q in params
+            if q.userdata || q.length_of != "" then return Err(s"`$name` is passed `null`, so C never calls it, and its parameters carry no `userdata` or `length`")
+        return Ok(CPrototype(name, result.ty, result.text, params))
     // A byte pointer with `length(p)` beside it is memory C lends the function, crossing as a view.
     c_check_lengths(params)?
     if result.ty is CText(_) then return Err("a callback answers C a scalar or an enum mirror; a string it answered would have to outlive the call, which nothing frees")
@@ -425,6 +434,9 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
             return Err(s"`$t` is written first, before the parameter's type, as in `$t int *x`")
         if t == "userdata"
             return Err("`userdata` is written first, before the parameter's type, as in `userdata void *data`")
+        // A parameter may be named `null`; the word before its type is the marker.
+        if t == "null" && words.len() == 0 && base is None && !signed && !unsigned && !short && longs == 0 && !char_word && !int_word
+            return Err("`null` is written once, first, before the parameter's type, as in `null int *p`")
         if t == "length" && *at + 1 < tokens.len() && tokens[*at + 1] == "("
             return Err("`length(data)` is written first, before the parameter's type and before `inout`, as in `length(data) size_t n`")
         if t == "static" || t == "inline" || t == "register" || t == "typedef"

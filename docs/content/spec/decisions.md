@@ -10684,6 +10684,19 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `ByteWriter` (against `Write` or `Sink`), and whether standard output should gain a byte path
   and be a `ByteWriter` too.
 
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`, for the libssh2
+  binding): **a function pointer marked `null` is passed null**
+  ([C bindings](/spec/c-bindings/#arrays-and-out-parameters)). `libssh2_session_init_ex` is the only
+  way to make a session (`libssh2_session_init()` is a macro passing four nulls), and a function
+  pointer without a `userdata` was refused with no way to pass null. The prototype word `null`,
+  which already passed null for any other pointer, now takes a function pointer too; its parameters
+  are read only as C's types for the header check (named, no `userdata` or `length`, any result),
+  since C never calls it. Refused: `null` twice, after `out`, on a struct by value or a scalar, and an
+  unnamed function pointer. *Alternatives*: an `Option[function]` parameter with only `None` legal (a
+  parameter whose one value is written at every call, and an `Option` that never holds `Some`);
+  binding a header macro (`libssh2_session_init`), which the C unit cannot type-check as a function
+  and which most hooks have no macro for.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

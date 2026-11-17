@@ -72,4 +72,11 @@ int cb_registry_visit(cb_registry *r, int (*f)(void *ud, cb_registry *self), voi
 /* What the process has done: 0 registries made, 1 freed, 2 listeners kept, 3 forgotten. */
 long cb_registry_count(int what);
 
+/* Takes allocator hooks, as libssh2's `libssh2_session_init_ex` does, any of them null for the
+ * default, and answers which pointers it was passed null, a bit each from the lowest: `alloc`,
+ * `release`, `name`, `abstract`, `counts`; it writes `n + 1` through `next` where it is not null. */
+int cb_nulls(void *(*alloc)(size_t count, void **abstract), void (*release)(void *ptr, void **abstract), const char *(*name)(char **into, cb_count *n), void *abstract, int n, int *counts, int *next);
+/* `f(ud, x)` where `f` is not null, and otherwise `x`; plus 1000 where `g` is null. */
+int cb_nulls_beside(int (*f)(void *ud, int x), void *ud, void (*g)(void *ud), int x);
+
 #endif

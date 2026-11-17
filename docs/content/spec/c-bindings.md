@@ -138,6 +138,7 @@ are written before the parameter's type and removed before the header check:
 | `out` | A pointer C writes a value through; the value is part of the binding's [result](#arrays-and-out-parameters), and the parameter is not an Avin parameter |
 | `inout` | A pointer C reads a value through and writes one back; an Avin parameter and part of the result |
 | `userdata` | The `void *` that travels beside a [callback](#callbacks); not an Avin parameter |
+| `null` | A pointer, a function pointer among them, the binding [passes null](#arrays-and-out-parameters); not an Avin parameter |
 
 `length(data)` before an integer parameter says it is the length of the array parameter `data`, and
 it is filled in from the array rather than written by the caller. It is written first, before the
@@ -895,8 +896,26 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   private glyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int), Status]
   ```
 
-  `null` is never `out`, `inout` or `userdata` besides, never an array a length is filled in from, and
-  never a callback's parameter.
+  `null` is never `out`, `inout` or `userdata` besides, never written twice, never an array a length
+  is filled in from, and never a callback's parameter; a struct passed by value or a scalar is no
+  pointer, and is refused.
+
+  **A function pointer marked `null` is passed null too** ([proposed](/spec/decisions/#proposed)), for C
+  that takes optional hooks and uses its own where it is given none. libssh2 makes a session only
+  through `libssh2_session_init_ex`, which takes an allocator, a free function, a reallocator and the
+  `void *` they share, `libssh2_session_init()` being a macro that passes four nulls:
+
+  ```avin
+  @c(
+    "LIBSSH2_SESSION *libssh2_session_init_ex(null void *(*my_alloc)(size_t count, void **abstract), null void (*my_free)(void *ptr, void **abstract), null void *(*my_realloc)(void *ptr, size_t count, void **abstract), null void *abstract)"
+  )
+  private sessionInit() -> Option[Session]
+  ```
+
+  C never calls a function it is passed null for, so its parameters are read only as C's types, for the
+  header check: it is named, as every function pointer is, takes no `userdata` or `length` among its
+  parameters, and may answer any type, a string too. A function pointer passed null sits beside a
+  callback C does call, and beside every other kind of parameter.
 
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without
@@ -1187,7 +1206,8 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
   ([proposed](/spec/decisions/#proposed)). A string or a handle is never a callback's answer: it
   would have to outlive the call, with nothing to free it. A binding takes one function per
   `userdata`, which the function pointer's own `userdata` names (`listener`'s `data` above), and a
-  function pointer with no `userdata` beside it is refused: there is nowhere to find the closure.
+  function pointer with no `userdata` beside it is refused: there is nowhere to find the closure. One
+  C allows null is [marked `null`](#arrays-and-out-parameters) and passed null instead.
   libc's `qsort` and `bsearch` are such functions; a binding reaches them through a C function that
   passes a `userdata` of its own, as `qsort_r` does.
 - **Memory C lends a callback is a view** ([proposed](/spec/decisions/#proposed)). In a function

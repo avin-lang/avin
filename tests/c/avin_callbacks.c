@@ -227,3 +227,12 @@ int cb_registry_visit(cb_registry *r, int (*f)(void *ud, cb_registry *self), voi
     cb_registry_live(r, "a visit");
     return f(ud, null ? 0 : r);
 }
+
+int cb_nulls(void *(*alloc)(size_t count, void **abstract), void (*release)(void *ptr, void **abstract), const char *(*name)(char **into, cb_count *n), void *abstract, int n, int *counts, int *next) {
+    if (next) *next = n + 1;
+    return (alloc == 0) | (release == 0) << 1 | (name == 0) << 2 | (abstract == 0) << 3 | (counts == 0) << 4;
+}
+
+int cb_nulls_beside(int (*f)(void *ud, int x), void *ud, void (*g)(void *ud), int x) {
+    return (f ? f(ud, x) : x) + (g == 0 ? 1000 : 0);
+}
