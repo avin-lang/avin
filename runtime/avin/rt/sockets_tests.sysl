@@ -191,23 +191,47 @@ ended_wait_leaves_the_other_direction()
     assert(give_slot(t) == &waiting[0])
     io_lock.unlock()
 
-@test("a socket is writable until its buffers fill, a send of some sends at least one byte while it is, and then waits at most its limit; a send of nothing sends nothing at once")
+@test("a socket is writable until its buffers fill, a send of some sends at least one byte while it is, and then waits at most its limit; a send of nothing sends nothing at once; once the peer has read everything, a send goes through again")
 send_some_until_full()
     val e = ends()
+    val fd = e.client.fd().unwrap()
     val block = [7u8; 65536]
     assert_eq(socket_send_some(e.client, block[0..<0], 0).unwrap(), 0usize)
     assert(socket_writable(e.client))
-    assert(descriptor_writable(e.client.fd().unwrap()))
+    assert(descriptor_writable(fd))
+    // The kernel moves queued bytes on to the peer, and takes them out of the sender's buffer, after the
+    // send that queued them has returned, so a socket found without room can have room again a moment
+    // later, until the peer's receive buffer has filled as well. Room only grows while nothing is sent:
+    // the descriptor looked at between two looks at the socket that both find no room has none either.
+    // Filling goes on until a send with a limit finds no room for its whole limit.
     var sent: usize = 0
-    while socket_writable(e.client)
-        val n = socket_send_some(e.client, block[..], 0).unwrap()
-        assert(n >= 1)
-        sent += n
+    var full = false
+    while !full
+        while socket_writable(e.client)
+            val n = socket_send_some(e.client, block[..], 0).unwrap()
+            assert(n >= 1)
+            sent += n
+        val between = descriptor_writable(fd)
+        if socket_writable(e.client) then continue
+        assert(!between)
+        socket_send_some(e.client, block[..], 20) match
+            Ok(n) ->
+                assert(n >= 1)
+                sent += n
+            Err(err) ->
+                assert(timed_out(err))
+                full = true
     assert(sent > 0)
-    assert(!descriptor_writable(e.client.fd().unwrap()))
-    socket_send_some(e.client, block[..], 20) match
-        Ok(_) -> panic("the buffers are full")
-        Err(err) -> assert(timed_out(err))
+    // The peer reads every byte sent, and the connection has room again.
+    var into: [65536]u8 = [0; 65536]
+    var got: usize = 0
+    while got < sent
+        val n = socket_recv(e.served, into[..], 5000).unwrap()
+        assert(n >= 1)
+        assert(into[0] == 7)
+        got += n
+    assert_eq(got, sent)
+    assert(socket_send_some(e.client, block[..], 5000).unwrap() >= 1)
     // A descriptor that is not one counts as writable, so the write that follows answers why.
     assert(descriptor_writable(-1))
 
