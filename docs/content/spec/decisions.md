@@ -10805,3 +10805,16 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   scales (it only matters below 8 MiB live). Review with the user: whether the default should be
   above 100, since the collector stops every thread and marks on one, so the trade favours memory
   less than it would for a concurrent collector.
+
+- Settled on the user's delegation 2026-11-16 (branch `read-alloc`): **a stream's `read(max)`
+  allocates what it answers, not `max`.** A TCP, Unix or split socket read receives into a buffer
+  the runtime keeps per operating system thread (on its carrier), grown to the largest read asked
+  for up to 256 KiB, and copies out exactly the bytes that arrived; a read asking for more than
+  256 KiB answers at most that much, which the contract ("up to `max`") already allows. A TLS read
+  decrypts into a plaintext array the connection keeps, of `max` bytes up to one record's 16 KiB,
+  reused while reads ask for the same size and replaced when they do not. The contract and API are
+  unchanged. Alternatives weighed: asking the kernel how many bytes are readable (`FIONREAD`; one
+  more system call per read, and no binding for it); a buffer kept per stream on the Avin side
+  (the binding still copies the whole buffer in and out at every call, and an idle server would
+  hold one per connection); reading ahead into the stream's buffered bytes (changes what a
+  select's descriptor says). Review with the user: the 256 KiB ceiling on one socket read.
