@@ -562,7 +562,8 @@ belonging to one thread at a time as a connection does, so a thread of its own m
 
 ## `avin.io`
 
-Standard input, read as text, and the error every module that reads or writes shares. Standard
+Standard input, read as text, the error every module that reads or writes shares, and the traits
+that let one function read bytes from, or write them to, a file and a connection alike. Standard
 output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
 writers `StandardOutput` and `StandardError`; each is one function taking `Any*` (see
 [Strings and formatting](/spec/strings-and-formatting/)).
@@ -707,6 +708,42 @@ it answers, not `max`, so a small message read with a large `max` costs what the
 `read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
 JSON package's `JsonReader` ([`dev.avinlang.json`](/spec/json/)) reads JSON from any reader.
+
+### `ByteWriter`
+
+A `ByteWriter` is somewhere bytes are written, so one function can write to a file, a connection,
+a streamed HTTP body, or a sink the program makes itself:
+
+```text
+trait ByteWriter
+  write(bytes: Array[byte]) -> Result[unit, IoError]
+```
+
+`write(bytes)` writes all of `bytes` or answers why it could not; an empty array writes nothing.
+`fs.File` is a byte writer by its own `write`, and so are every `net.ByteStream` (`TcpStream`,
+`UnixStream` and `TlsStream`), the `StreamWriter` half of a [split connection](#split-connections)
+and a streamed response's `BodyWriter`; a write to any of them once it is closed is an `Err`. A
+class of the program's own is one by naming `io.ByteWriter` after `:` and overriding `write`, and a
+generic function takes any of them as `[W: ByteWriter]`.
+
+It writes bytes, and the prelude's [`Writer`](/spec/strings-and-formatting/) is where values render
+as text; the two names differ, so a program sees both unqualified and one class may be both, its two
+`write`s told apart by what they take. A byte writer is not a `Close`, as a `Reader` is not: a
+streamed body is ended by its response, not closed, and code holding a resource that is both bounds
+it by both. Nor does it flush: a file's `flush()` is the file's own, and whoever opened the file
+closes it, which flushes it.
+
+`io.copy(from: Reader, to: ByteWriter) -> Result[long, IoError]` reads `from` to its end and writes
+everything it gives to `to`, a piece of at most 64 KiB at a time, so a copy of any length holds no
+more than one piece. It answers how many bytes it copied, or the first read's or write's `Err`, after
+which nothing more is read or written. It neither closes, flushes nor rewinds either side:
+
+```text
+upload(name: string, to: TcpStream) -> Result[long, IoError]
+  val f = fs.open(name)?
+  defer f.close()
+  io.copy(f, to)
+```
 
 ### `Close`
 
@@ -986,7 +1023,7 @@ follow(log: string) -> Result[unit, IoError]
 | `read(max)` | Up to `max` bytes, fewer only at the end of the file; empty at the end. Negative `max` traps. |
 | `readAll()`, `readText()` | The rest of the file as bytes, or as text (`InvalidUtf8`, the offset counted from the position the read began at). |
 | `readLine()`, `readCompleteLine()` | The next line, `None` at the end. `readLine` also answers a last line with no `\n`; `readCompleteLine` answers only a line ended by `\n`, and leaves later bytes unread, so a line another program is still writing arrives whole. |
-| `write(bytes)`, `writeText(text)` | Writes at the position, buffered. |
+| `write(bytes)`, `writeText(text)` | Writes at the position, buffered. A file is an [`io.ByteWriter`](#bytewriter) by `write`, and an [`io.Reader`](#reader) by `read`. |
 | `flush()`, `close()` | `flush` hands what is written to the platform, so other handles and programs see it. `close` flushes and releases, answering the flush's `Err`; closing twice is fine and answers `Ok`. A file is an [`io.Close`](#close). |
 
 **One position serves reading and writing**, and lines, `read` and `position` agree on it: bytes the
@@ -1452,7 +1489,9 @@ avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 `UnixStream` and `TlsStream` implement, so code that speaks
 a protocol, as the HTTP client and server do, takes a `ByteStream` and runs over any of them. It is
 [sendable](/spec/actors/#what-may-be-sent), and it is an [`io.Reader`](#reader) by its `read`, so
-whatever reads a `Reader` reads any connection, a TLS one included. It is a `threads.Readiness` by
+whatever reads a `Reader` reads any connection, a TLS one included, and an
+[`io.ByteWriter`](#bytewriter) by its `write`, so whatever writes to a `ByteWriter` writes to any
+connection. It is a `threads.Readiness` by
 `readable` and `readinessDescriptor`, so a [`select`](/spec/threads/#select) waits on any connection
 beside its channels: the thread that owns a connection waits in one select for its peer's bytes
 and for what other threads send it, and does every read and write itself. It is a
@@ -1492,8 +1531,8 @@ pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoErro
 ```
 
 - **The halves.** A `StreamReader` is an `io.Reader`, an `io.Close` and a `threads.Readiness`, with
-  `readLine`, `readAll`, `setTimeout` and `remoteAddress`; a `StreamWriter` is an `io.Close` and a
-  `threads.Writability`, with `write`, `writeSome`, `writeText`, `setTimeout` and `remoteAddress`.
+  `readLine`, `readAll`, `setTimeout` and `remoteAddress`; a `StreamWriter` is an `io.ByteWriter`,
+  an `io.Close` and a `threads.Writability`, with `write`, `writeSome`, `writeText`, `setTimeout` and `remoteAddress`.
   Bytes the connection had read ahead go to the reader, and each half starts with the connection's
   timeout, then keeps its own.
 - **Closing.** Closing the writer tells the other end nothing more will be sent, as
@@ -1858,7 +1897,9 @@ body ends with the connection. `Response.stream(status, contentType, length, wri
 body ending short closes the connection. `BodyWriter.write(bytes)` and `write(text)` answer
 `Result[unit, IoError]`: `Err` once the client has gone or the server is stopping, and for every
 write after one that failed, so the code writing a stream ends there; a failed write closes the
-connection. No body is written for `HEAD`, `204` or `304`, and `write` is not run.
+connection. A `BodyWriter` is an [`io.ByteWriter`](#bytewriter) by `write(bytes)`, so
+`io.copy(reader, w)` streams a file or any other `Reader` into a body. No body is written for
+`HEAD`, `204` or `304`, and `write` is not run.
 
 `Response.events(write)` is a stream of server-sent events, `200` of the type `text/event-stream`,
 written through an `EventWriter`: `send(text, event = None, id = None)` sends an event, each line of

@@ -10658,6 +10658,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   same host and port in flight at once should share one helper, which would keep repeated retries
   during a resolver outage from filling the 64.
 
+- Settled on the user's delegation 2026-11-17 (built on branch `byte-writer`, for the PostgreSQL
+  package's `COPY … TO STDOUT`): **`avin.io.ByteWriter` is the byte sink beside `Reader`**
+  ([`ByteWriter`](/spec/system-library/#bytewriter)): one method, `write(bytes: Array[byte]) ->
+  Result[unit, IoError]`, writing all of `bytes`. `fs.File`, every `net.ByteStream` (`TcpStream`,
+  `UnixStream`, `TlsStream`), `net.StreamWriter` and `http.BodyWriter` implement it by the `write`
+  they already had, so no call changes; `ByteStream` and `StreamWriter` now take `write` from the
+  trait instead of declaring it. **The name**: the pair of `Reader` would be `Writer`, but the
+  prelude's `Writer` (`module avin`, seen by every program unqualified) is the text sink values
+  render into, so `avin.io.Writer` would make `Writer` mean two things in any program importing it,
+  and `Display`'s `display(out: Writer, …)` would read as the wrong one. Alternatives weighed:
+  `Write` (a verb, as `Close` is; but `avin.net` already has a `Write` case of how a socket is shut
+  down, and `Write`/`Writer` side by side invite the wrong one); `Sink` (short, but `avin.io`'s
+  `Source` is a TEXT source, so `Sink` reads as its text pair); `Output` (says nothing of bytes,
+  and reads as a command's output); `ByteSink`. `ByteWriter` says what it takes and pairs with
+  `ByteStream`. **No `flush()`**: files buffer and sockets do not, so a flush on the trait would be
+  a no-op for most implementations, and TLS keeps a private `flush` of its own that a public one
+  would collide with; whoever opened a file closes it, which flushes. **Not a `Close`**, as `Reader`
+  is not: a `BodyWriter` is ended by its response, not closed; code holding a resource that is
+  both bounds it by both. **`io.copy(from: Reader, to: ByteWriter) -> Result[long, IoError]`**
+  copies in pieces of at most 64 KiB, answering the count or the first `Err`, closing, flushing and
+  rewinding nothing. Standard output and standard error stay text-only `Writer`s: they have no byte
+  path to write through. No in-memory byte sink is added: a `Buffer[byte]` is filled by
+  `addAll`, and a sink of the program's own is a five-line class. Review with the user: the name
+  `ByteWriter` (against `Write` or `Sink`), and whether standard output should gain a byte path
+  and be a `ByteWriter` too.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per
