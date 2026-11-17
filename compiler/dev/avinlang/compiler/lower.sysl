@@ -4204,8 +4204,9 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
             values.push(v)
         store(l, slot, Some(variant_object(l, result_type, "Ok", c_assemble(l, c_errno_ok(result_type, l.program.data).unwrap(), values))))
         finish_into(l, Jump(join), no)
-        // An array C answered before failing is freed unread.
+        // An array C answered before failing is freed unread, as is a string `free:` names.
         c_free_array_outs(l, outs, n)
+        c_free_text_outs(l, symbol, calls, outs, n)
         val code = load(l, code_place).unwrap()
         val e = c_result_error(result_type)
         val error = if c_errno_type(e, l.program.data) then c_errno_answer(l, code, e) else c_answer(l, code, CSigned(32), e, at)
@@ -4270,8 +4271,9 @@ private c_binding_body(l: *Lowering, symbol: FunctionSymbol, n: usize, p: CProto
         val ok_type = c_status_ok(answered)
         store(l, slot, Some(variant_object(l, answered, "Ok", c_assemble(l, ok_type, read.values))))
         finish_into(l, Jump(join), no)
-        // An array C answered before failing is freed unread.
+        // An array C answered before failing is freed unread, as is a string `free:` names.
         c_free_array_outs(l, outs, n)
+        c_free_text_outs(l, symbol, calls, outs, n)
         val code = mirror match
             Some(d) -> c_mirror_answer(l, Value(answer), d, s, s"`${p.symbol}` answered", at)
             None -> c_answer(l, Value(answer), s, e, at)
@@ -4600,6 +4602,8 @@ private c_read_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf
         val form = c_text_form(o.t, l.program.data, l.program.classes)
         if !(form is NoText)
             values.push(c_text_answer(l, x, o.t, form, None, who, at))
+            // A string `free:` frees is given back once copied.
+            c_free_text_out(l, symbol, call, reading.symbol, o, x)
             continue
         if c_mirror_of(o.t, l.program.data) is Some(d)
             values.push(Some(c_mirror_answer(l, x, d, o.scalar, who, at)))
@@ -4875,6 +4879,37 @@ private c_free_struct_memory(l: *Lowering, memory: Operand)
     var args: Buf[Operand] = buf()
     args.push(memory)
     l.insts.push(Call(None, Runtime("avin_rt_c_struct_free", mir_signature(types, None)), args))
+
+// Frees the string C answered at `pointer` through the out slot `o`, where `free:` names it, through
+// the glue of the binding numbered `n`, which is passed the receiver's object for a method and frees
+// nothing for null.
+private c_free_text_out(l: *Lowering, symbol: FunctionSymbol, call: CCall, n: usize, o: COutSlot, pointer: Operand)
+    var named = false
+    for e in c_out_frees(symbol.decl)
+        if e.name == o.q.name then named = true
+    if !named then return
+    val p = c_prototype_of(symbol.decl).unwrap()
+    var k = 0usize
+    for j in 0..<p.params.len()
+        if p.params[j].name == o.q.name && p.params[j].mode is COut then k = j
+    var params: Buf[CScalar] = buf()
+    params.push(CAddress)
+    params.push(CAddress)
+    var args: Buf[Operand] = buf()
+    args.push(pointer)
+    var receiver: Operand = NullAddress
+    if call.skipped > 0 && call.objects.len() > 0
+        if call.objects[0] is Some(r) then receiver = r
+    args.push(receiver)
+    l.insts.push(Call(None, CFunction(c_out_free_glue(n, k), params, None), args))
+
+// Frees, unread, each string `free:` names that C answered before failing.
+private c_free_text_outs(l: *Lowering, symbol: FunctionSymbol, call: CCall, outs: Buf[COutSlot], n: usize)
+    for o in outs
+        if o.memory is Some(_) || o.array is Some(_) || !(o.scalar is CAddress) then continue
+        if c_text_form(o.t, l.program.data, l.program.classes) is NoText then continue
+        val pointer = load(l, Some(Place(SlotAddress(o.slot), MPtr))).unwrap()
+        c_free_text_out(l, symbol, call, n, o, pointer)
 
 // Frees, unread, the array C answered through the `out` pointer `array:` names, as a failed status
 // leaves it.
@@ -5475,6 +5510,7 @@ private c_after_call(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Op
 // `None` where it is `optional`, and keeps nothing then; where the call answers no handle, by the
 // receiver.
 private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], optional: bool, fail: Option[CAttachFail])
+    c_holds(l, symbol, call, made, optional)
     val keeps = c_binding_names(symbol.decl, "keeps")
     if keeps.len() == 0 then return
     var holder: Option[Operand] = made
@@ -5488,6 +5524,11 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
     var attached: Option[usize] = None
     if holder_class is Some(hk)
         if c_class_text(l.program.classes[hk].decl, "attach") is Some(_) then attached = Some(hk)
+    // The class the holder's `kept:` names, where it is held as its Avin object, kept from the
+    // collector until the holder's `release` has run.
+    var pinned: Option[usize] = None
+    if holder_class is Some(hk)
+        if c_kept_pinned(l.program.classes, hk) then pinned = c_kept_class(l.program.classes, hk)
     val join = c_if_present(l, o, optional && made is Some(_))
     var kept_objects = false
     for name in keeps
@@ -5502,7 +5543,11 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
         val kept = call.objects[i] match
             Some(k) -> k
             None -> continue
-        if attached is Some(_)
+        if pinned is Some(pk) && call.classes[i] == pk
+            val present = c_if_present(l, kept, call.optionals[i])
+            c_glue_call(l, "avin_c_keep_pinned", [o, kept])
+            c_end_present(l, present)
+        elif attached is Some(_)
             val present = c_if_present(l, kept, call.optionals[i])
             c_keep_object(l, o, kept)
             c_end_present(l, present)
@@ -5510,6 +5555,46 @@ private c_keeps(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[
         else c_keep(l, o, kept, call.args[i], call.classes[i], call.optionals[i])
     if attached is Some(hk)
         if kept_objects then c_attach(l, o, hk, symbol.name, symbol.decl.name_span, fail)
+    c_end_present(l, join)
+
+// Each integer `hold:` names is held by `made`, the handle the call answered, which is null for
+// `None` where it is `optional`, or where the call answers no handle by the receiver: the value
+// passed C, converted to the type the holder's class declares it with `holds:`, given to the
+// class's `release:` by its name. A value held again replaces the one held before.
+private c_holds(l: *Lowering, symbol: FunctionSymbol, call: CCall, made: Option[Operand], optional: bool)
+    val holds = c_binding_holds(symbol.decl)
+    if holds.len() == 0 then return
+    var holder: Option[Operand] = made
+    if holder is None && call.skipped > 0 && !call.answers then holder = call.objects[0]
+    val o = holder match
+        Some(o) -> o
+        None -> return
+    val hk = if made is Some(_) then c_first_handle_class(l, concrete(l, symbol.result.unwrap_or(Unit))) else symbol.owner_class
+    val k = hk match
+        Some(k) -> k
+        None -> return
+    val declared = c_class_holds(l.program.classes[k].decl)
+    val join = c_if_present(l, o, optional && made is Some(_))
+    for name in holds
+        val i = c_named_parameter(symbol, call, name) match
+            Some(i) -> i
+            None -> continue
+        var j: Option[usize] = None
+        for m in 0..<declared.len()
+            if declared[m].name == name then j = Some(m)
+        if j is None then continue
+        val width = *concrete(l, symbol.params[i]) match
+            Int(w) -> w
+            _ -> continue
+        val x = Value(l.param_values[i].unwrap())
+        val wide = if width < 64 then resize(l, x, width, 64, true) else x
+        var params: Buf[CScalar] = buf()
+        params.push(CAddress)
+        params.push(CSigned(64))
+        var args: Buf[Operand] = buf()
+        args.push(o)
+        args.push(wide)
+        l.insts.push(Call(None, CFunction(c_hold_glue(k, j.unwrap()), params, None), args))
     c_end_present(l, join)
 
 /** Where an `attach:` answering non-zero goes for a binding answering its handle in a `Result`: the

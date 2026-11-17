@@ -6,8 +6,10 @@
 #ifndef AVIN_HANDLES_H
 #define AVIN_HANDLES_H
 
+#include <stddef.h>
+
 /* The kinds of object counted, and what is counted of each, for `fx_count`. */
-enum fx_kind { FX_OBJECT = 0, FX_LIBRARY = 1, FX_FACE = 2, FX_MMVAR = 3, FX_PLAIN = 4, FX_SHELF = 5, FX_SHAPE = 6 };
+enum fx_kind { FX_OBJECT = 0, FX_LIBRARY = 1, FX_FACE = 2, FX_MMVAR = 3, FX_PLAIN = 4, FX_SHELF = 5, FX_SHAPE = 6, FX_NODE = 7, FX_CONN = 8, FX_TEXT = 9, FX_STREAM = 10 };
 enum fx_what { FX_CREATED = 0, FX_RETAINED = 1, FX_RELEASED = 2, FX_FREED = 3, FX_AFTER = 4, FX_BEFORE = 5 };
 /* For faces, FX_AFTER counts those freed once their library's other references had gone, the library
  * holding only the face's own, and FX_BEFORE those freed while it held more: which of the two a
@@ -81,5 +83,49 @@ enum fx_result { FX_RESULT_OK = 0, FX_RESULT_BAD = 3, FX_RESULT_WORSE = -2 };
 enum fx_result fx_result_of(int which);
 long long fx_long_status(long long code);
 unsigned char fx_byte_status(unsigned char code);
+
+/* A tree of nodes with no reference count, as libssh2's sessions and channels are: freeing a node
+ * first frees each node still under it, as `libssh2_session_free` frees its channels, and a node
+ * freed after its parent, or twice, stops the process, as a channel freed after its session would
+ * be a use after free. For FX_NODE, FX_AFTER counts the nodes freed by their own free, their parent
+ * still alive, and FX_BEFORE those freed by a parent's. */
+typedef struct fx_node fx_node;
+fx_node *fx_node_new(fx_node *parent);
+void fx_node_free(fx_node *n);
+int fx_node_depth(const fx_node *n);
+/* The sum of two nodes' depths, which uses both. */
+int fx_node_pair(const fx_node *a, const fx_node *b);
+/* Answers strings allocated through the node's root, freed only by `fx_text_free` with that root, as
+ * libssh2 answers strings freed with `libssh2_free(session, p)`: `which` 0 answers both and zero, 1
+ * null for `name` and zero, 2 both and the status 7, 3 neither and the status 7. FX_TEXT counts the
+ * strings made and freed; one freed twice, or with another root, stops the process. */
+int fx_node_texts(fx_node *n, int which, char **name, size_t *name_len, char **other);
+void fx_text_free(fx_node *root, void *p);
+/* Frees a string by itself, whatever root made it. */
+void fx_text_release(void *p);
+fx_node *fx_node_root(fx_node *n);
+
+/* A connection given a descriptor it does not own, as a libssh2 session is given its socket: freeing
+ * it writes `bye` to the descriptor and closes it, as `libssh2_session_free` writes to its socket.
+ * FX_CONN counts connections made and freed, FX_AFTER the farewells written and FX_BEFORE those that
+ * failed, the descriptor closed already. */
+typedef struct fx_conn fx_conn;
+fx_conn *fx_conn_new(void);
+int fx_conn_start(fx_conn *c, int fd);
+/* A new connection, null where `fd` is negative. */
+fx_conn *fx_conn_with(int fd);
+void fx_conn_free(fx_conn *c, int fd);
+/* A stream owning a descriptor, closed when the stream is freed, as an Avin `TcpStream` owns its
+ * socket. */
+typedef struct fx_stream fx_stream;
+fx_stream *fx_stream_new(int fd);
+void fx_stream_free(fx_stream *s);
+int fx_stream_fd(const fx_stream *s);
+/* A pipe: its read end, and its write end through `write_end`. */
+int fx_pipe(int *write_end);
+int fx_dup(int fd);
+int fx_close(int fd);
+/* The bytes read from `fd` until every write end is closed, as text; the read end is closed. */
+char *fx_drain(int fd);
 
 #endif

@@ -644,6 +644,120 @@ c_class_kept(d: &ClassDecl) -> Option[CKept]
     if !is_c_identifier(name) || class_name == "" then return None
     Some(CKept(name, class_name))
 
+/** Whether the class a handle class's `kept:` names is held as its Avin object, kept from the
+ * collector until the holder's `release` has run, rather than by a C reference: it declares no
+ * `retain`, or a `kept:` of its own. */
+c_kept_pinned(classes: Buf[ClassSymbol], holder: usize) -> bool
+    val k = c_kept_class(classes, holder) match
+        Some(k) -> k
+        None -> return false
+    val d = classes[k].decl
+    c_class_text(d, "retain") is None || c_class_kept(d) is Some(_)
+
+/** A C value a handle class's `holds:` declares: its C type as written, its name, which `release:`
+ * uses, and the C expression it is until a binding's `hold:` gives it one, "0" where none is written. */
+struct CHolds
+    ty: string
+    name: string
+    init: string
+
+/** Reads one `holds:` entry, a C declaration of an integer, `"int sock = -1"`: a type, a name and
+ * perhaps `=` and the value it starts as. */
+c_holds_entry(text: string) -> Result[CHolds, string]
+    val shape = s"`holds:` declares a C integer the handle holds for its `release:`, as in `holds: \"int sock = -1\"`, and `$text` is not one"
+    var declared = text
+    var init = "0"
+    val b = text.bytes
+    for i in 0..<b.len
+        if b[i] == u8('=')
+            declared = text[..<i]
+            init = text[i + 1..].trim()
+            if init == "" then return Err(shape)
+            break
+    val words = declared.trim()
+    val d = words.bytes
+    var end = d.len
+    var start = end
+    while start > 0 && is_c_word_byte(d[start - 1])
+        start -= 1
+    if start == end then return Err(shape)
+    val name = words[start..]
+    val ty = words[..<start].trim()
+    if ty == "" || !is_c_identifier(name) || is_c_keyword(name) then return Err(shape)
+    val parsed = parse_c_type(ty) match
+        Ok(t) -> t.ty
+        Err(_) -> return Err(shape)
+    val integer = parsed match
+        CKeyword(n) -> !n.starts_with("enum ")
+        CTypedef(_) -> true
+        _ -> false
+    if !integer then return Err(s"`holds:` declares a C integer, such as a descriptor, and `$ty` is not one")
+    Ok(CHolds(ty, name, init))
+
+/** The C values a handle class's `holds:` declares, read; those not well formed are left out. */
+c_class_holds(d: &ClassDecl) -> Buf[CHolds]
+    var out: Buf[CHolds] = buf()
+    for t in c_class_texts(d, "holds")
+        if c_holds_entry(t) is Ok(h) then out.push(h)
+    out
+
+/** The strings of an annotation's value: the string, or each string of a list. */
+c_string_items(e: &Expr) -> Buf[string]
+    var out: Buf[string] = buf()
+    e.kind match
+        StringLit(t) -> out.push(t)
+        ListLit(items) ->
+            for item in items
+                if item.kind is StringLit(t) then out.push(t)
+        _ -> ()
+    out
+
+/** The C unit's glue that frees the string the binding numbered `symbol` answers through its
+ * parameter `k`, an `out` one `free:` names. */
+c_out_free_glue(symbol: usize, k: usize) -> string = s"avin_c_out_free_${symbol}_$k"
+
+/** The C unit's glue that makes a handle of class `k` hold its `j`th `holds:` value. */
+c_hold_glue(k: usize, j: usize) -> string = s"avin_c_hold_${k}_$j"
+
+/** The parameters a C binding's `hold:` names, whose values the handle it makes, or its receiver,
+ * holds for its class's `release:`. */
+c_binding_holds(f: &Function) -> Buf[string]
+    var out: Buf[string] = buf()
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is Some(n) && n == "hold" then out = c_string_items(arg.value)
+    out
+
+/** How a C binding frees a string C answered through an `out` parameter: the parameter's name, and
+ * a C function of the string or a C expression in its name. */
+struct COutFree
+    name: string
+    how: string
+
+/** Reads one `free:` entry naming an out string, `"errmsg: libssh2_free(session, errmsg)"`: the out
+ * parameter's name, `:`, and how it is freed; `None` for an entry naming no parameter. */
+c_out_free_entry(text: string) -> Option[COutFree]
+    val b = text.bytes
+    for i in 0..<b.len
+        if b[i] == u8(':')
+            val name = text[..<i].trim()
+            val how = text[i + 1..].trim()
+            if !is_c_identifier(name) || how == "" then return None
+            return Some(COutFree(name, how))
+    None
+
+/** Every out string a C binding's `free:` frees, by name. */
+c_out_frees(f: &Function) -> Buf[COutFree]
+    var out: Buf[COutFree] = buf()
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name != Some("free") then continue
+            for t in c_string_items(arg.value)
+                if c_out_free_entry(t) is Some(e) then out.push(e)
+    out
+
 /** The class a handle class's `kept:` names, by its index: a class of the holder's own module, or one
  * named with its module, `freetype.Face`. */
 c_kept_class(classes: Buf[ClassSymbol], holder: usize) -> Option[usize]
@@ -1395,11 +1509,13 @@ c_names_handle(text: string, handle: string, result: bool) -> bool
 c_free_text(f: &Function) -> Option[string]
     // With `array:`, `free:` frees the array.
     if c_array_out_of(f) is Some(_) then return None
+    // An entry `name: how` frees an out string, and the one entry without a name the result.
     for a in f.annotations
         if a.name != "c" then continue
         for arg in a.args
             if arg.name is Some(n) && n == "free"
-                if arg.value.kind is StringLit(text) then return Some(text)
+                for text in c_string_items(arg.value)
+                    if c_out_free_entry(text) is None then return Some(text)
     None
 
 /** Whether a C binding's call may wait: its `@c` says `blocking`, or it takes a function marked

@@ -10696,6 +10696,63 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   parameter whose one value is written at every call, and an `Option` that never holds `Some`);
   binding a header macro (`libssh2_session_init`), which the C unit cannot type-check as a function
   and which most hooks have no macro for.
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`): **a kept handle no C
+  reference can hold is kept from the collector until its holder's `release` has run**
+  ([C bindings](/spec/c-bindings/#kept-handles-and-the-order-they-are-given-back)). libssh2 counts no
+  references, frees every channel in `libssh2_session_free`, and reaches the session from
+  `libssh2_channel_free`; a channel and its session found dead in one collection were finalized in
+  address order, so the session could go first and the channel's release free it again. `kept:` may
+  now name a class with no `retain` (or with a `kept:` of its own): the holder pins the kept handle's
+  Avin object in a runtime table, a root of every collection, and lets go of the pin after its own
+  `release`, by `close()` or its finalizer; the kept one is finalized in a later collection. Its
+  `kept:` name is the kept handle's pointer, or null once that handle was closed, so the release
+  can tell (`session ? libssh2_channel_free(self) : 0`). A chain is finalized one link per
+  collection, holder first. **A cycle through a pin is never collected** (a session keeping, as its
+  Avin object, a channel that pins it): both are given back once either is closed. *Why*: the
+  collector finalizes in address order and a finalizer cannot resurrect, so ordering can only come
+  from keeping the kept object reachable until the holder is done; a root held per holder does that
+  with no change to the collector. *Alternatives*: collector-ordered finalization (topological, as
+  some collectors offer; the gc library has none, and Avin does not change it); the holder's release
+  given back without its kept object, on trust (the unsound state this replaces); a `retain:` of the
+  package's own (libssh2 has no count to take). **Review with the user**: that a cycle through a
+  pin leaks until closed, rather than being refused.
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`): **a handle holds C
+  integers for its `release:`, `holds:` on the class and `hold:` on a binding**
+  ([C bindings](/spec/c-bindings/#values-a-handle-holds)). libssh2 is given the socket of an Avin
+  `TcpStream` and writes to it in `libssh2_session_free`; a stream finalized first, or closed by
+  the program first, gives its descriptor's number to the next one opened, so the session's
+  farewell could reach an unrelated connection, and a release that sees only `self` cannot say which
+  socket it used. A class declares `holds: "int sock = -1"`, a C declaration of an integer and the
+  value it starts as; a binding's `hold: "sock"` makes the handle it answers, or its receiver, hold
+  the value of that integer parameter when the call succeeds, replacing one held before; the release
+  uses it by name. The value is an entry on the list the glue keeps of what the handle holds, beside
+  its C references, so the layout of a handle does not change. The package holds a descriptor of its
+  own, `dup`ed from the stream's, which makes the session's release sound whichever object the
+  collector finalizes first and whether the stream was closed before. Refused: `holds:` on a
+  `shared` class or one with `retain:` (one reference of many), a name `release:` does not use, `self`
+  or the `kept:` name, a declaration that is no integer; `hold:` naming no integer parameter, or a
+  name the holder's class does not declare, or on a binding answering no handle and no method of
+  one. *Alternatives*: the kept stream pinned until the session's release, as kept handles now are
+  (the release still could not read the descriptor from an Avin object, finalizers running no Avin
+  code, and a stream the program closed first would hand the release a number already reused);
+  holding the stream's own descriptor without `dup` (the same reuse); a C handle over the descriptor
+  (a handle is on a pointer). **Review with the user**: whether `holds:` should also take pointers.
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`): **`free:` frees a
+  string C answers through an `out` pointer by an entry `"name: how"`**
+  ([C bindings](/spec/c-bindings/#strings)). `libssh2_channel_get_exit_signal` answers three strings
+  freed by `libssh2_free(session, p)`, and `free:` covered only a result. `how` is a C function of the
+  string or a C expression in its name, compiled in a glue function per string that a method passes
+  its receiver's object: the expression may use `self`, the receiver class's `kept:` name and the
+  values it `holds:` (here the channel's kept session). It is called once the copy is made, never
+  for null, and on a failed status for each string C answered, unread. Refused: a name that is no
+  `out` parameter answering a string or its bytes, `inout` (C may answer the copy it was passed), a
+  name freed twice, an expression not in the name, and named entries beside arrays `array:` frees by
+  position. *Why the spelling*: `free:` already says how what C answers is freed, and `name:` reads
+  as the `kept: "face: Face"` entries do; a name is needed because a binding answers several strings.
+  *Alternatives*: a separate key (`frees:`), a second word for one idea; any parameter of the call in
+  the expression (the strings C was passed are freed once converted, before the outs are, so only
+  the receiver's own names are offered); copying the string in the call's glue and freeing it there
+  (a second copy of every string).
 
 ## Open
 

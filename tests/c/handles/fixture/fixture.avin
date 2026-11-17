@@ -120,6 +120,99 @@ class Shelf
 @c("fx_shelf *fx_shelf_new(fx_plain *p)", keeps: "p")
 newShelf(p: Plain) -> Shelf
 
+// A tree of nodes with no count, as libssh2's sessions and channels are: each node's free frees what
+// is under it, so a node is freed by its own release only while its parent is open. A node keeps its
+// parent with no C reference, and its `release:` is passed the parent's pointer, null once the parent
+// was closed, which freed it.
+@c(type: "fx_node *", release: "fx_node_free")
+class Root
+  @c("fx_node *fx_node_new(fx_node *self)", keeps: "self")
+  branch() -> Branch
+
+  // The root keeps a branch, as the Avin object: with the branch keeping its root, a cycle.
+  @c("int fx_node_pair(const fx_node *self, const fx_node *b)", keeps: "b")
+  adopt(b: Branch) -> int
+
+@c("fx_node *fx_node_new(fx_node *parent)")
+private rootNode(parent: Option[Root]) -> Root
+
+newRoot() -> Root = rootNode(None)
+
+@c(type: "fx_node *", kept: "root: Root", release: "root ? fx_node_free(self) : (void)0")
+class Branch
+  @c("fx_node *fx_node_new(fx_node *self)", keeps: "self")
+  leaf() -> Leaf
+
+  @c("int fx_node_depth(const fx_node *self)")
+  depth() -> int
+
+  // Strings allocated through the root, each freed with it once copied, through the name `kept:`
+  // gives the root and through `self`: freed where C answered them, null ones not, and on a failed
+  // status unread.
+  @c(
+    "int fx_node_texts(fx_node *self, int which, out char **name, out size_t *name_len, out char **other)",
+    free: ["name: fx_text_free(root, name)", "other: fx_text_free(fx_node_root(self), other)"]
+  )
+  texts(which: int) -> Result[(Option[string], long, Option[string]), int]
+
+  // The same strings as the C result's companions, freed whatever the result, `other` by a C
+  // function of the string alone, and `name` as its bytes.
+  @c(
+    "int fx_node_texts(fx_node *self, int which, out char **name, out size_t *name_len, out char **other)",
+    free: ["name: fx_text_free(root, name)", "other: fx_text_release"]
+  )
+  textsAnswered(which: int) -> (int, Option[Array[byte]], long, Option[string])
+
+@c(type: "fx_node *", kept: "branch: Branch", release: "branch ? fx_node_free(self) : (void)0")
+class Leaf
+  @c("int fx_node_depth(const fx_node *self)")
+  depth() -> int
+
+// Strings freed by a binding that is no method: by a C function of the string alone.
+@c(
+  "int fx_node_texts(fx_node *n, int which, out char **name, out size_t *name_len, out char **other)",
+  free: ["name: fx_text_release", "other: fx_text_release(other)"]
+)
+textsOf(n: Branch, which: int) -> Result[(Option[string], long, Option[string]), int]
+
+// A stream owning a descriptor, and a connection given its own copy of one, which it holds for its
+// release: freeing it writes `bye` to it and closes it.
+@c(type: "fx_stream *", release: "fx_stream_free")
+class Stream
+  @c("int fx_stream_fd(const fx_stream *self)")
+  descriptor() -> int
+
+@c("fx_stream *fx_stream_new(int fd)")
+newStream(fd: int) -> Stream
+
+@c(type: "fx_conn *", holds: "int sock = -1", release: "fx_conn_free(self, sock)")
+class Conn
+  @c("int fx_conn_start(fx_conn *self, int sock)", hold: "sock")
+  start(sock: int) -> Result[unit, int]
+
+@c("fx_conn *fx_conn_new(void)")
+newConn() -> Conn
+
+// A connection made holding a descriptor, by the binding that answers it.
+@c("fx_conn *fx_conn_with(int sock)", hold: "sock")
+connWith(sock: int) -> Conn
+
+// The same, in an `Option`.
+@c("fx_conn *fx_conn_with(int sock)", hold: "sock")
+maybeConnWith(sock: int) -> Option[Conn]
+
+@c("int fx_pipe(out int *write_end)")
+pipe() -> (int, int)
+
+@c("int fx_dup(int fd)")
+dup(fd: int) -> int
+
+@c("int fx_close(int fd)")
+closeDescriptor(fd: int) -> int
+
+@c("char *fx_drain(int fd)", free: "free")
+drain(fd: int) -> string
+
 // Statuses of every C integer shape.
 @c("fx_status fx_status_of(int code)")
 status(code: int) -> Result[unit, int]
@@ -153,6 +246,20 @@ mmVars() -> Counts = countsOf(3)
 plains() -> Counts = countsOf(4)
 shelves() -> Counts = countsOf(5)
 shapes() -> Counts = countsOf(6)
+nodes() -> Counts = countsOf(7)
+conns() -> Counts = countsOf(8)
+texts() -> Counts = countsOf(9)
+
+// How many nodes were freed by their own free, their parent alive, and how many by a parent's.
+nodesFreedOwn() -> long = count(7, 4)
+nodesFreedByParent() -> long = count(7, 5)
+
+// How many connections wrote their farewell to the descriptor they hold, and how many could not.
+farewellsWritten() -> long = count(8, 4)
+farewellsFailed() -> long = count(8, 5)
+
+// How many streams were freed, each closing its descriptor.
+streamsFreed() -> long = count(10, 3)
 
 // How many faces were freed after their library's own handle had given its reference back, and how
 // many before.

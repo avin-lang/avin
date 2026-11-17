@@ -59,6 +59,17 @@ struct CUnitBinding
      * unit measures. */
     errno: bool
     errno_names: Buf[string]
+    /** The strings C answers through `out` pointers that `free:` frees, each by its glue
+     * `avin_c_out_free_<symbol>_<param>` once copied; and for a method, its receiver's class, whose
+     * pointer, `kept:` name and `holds:` values the C expressions that free them may use. */
+    out_frees: Buf[CUnitOutFree]
+    receiver: Option[usize]
+
+/** A string C answers through the `out` parameter `param`, freed by `how`: a C function of it, or a C
+ * expression in its name. */
+struct CUnitOutFree
+    param: usize
+    how: string
 
 /** A struct mirror C fills through the `out` parameter `param` that points at a typedef: the mirror's
  * data type's index. */
@@ -140,6 +151,8 @@ struct CUnitHandle
      * what it keeps to the C object, and `key:`, the type of the static object whose address keys it. */
     attach: Option[string]
     key: Option[string]
+    /** The C integers its `holds:` declares, which its `release:` uses by name. */
+    holds: Buf[CHolds]
 
 /** A field accessor as the C unit compiles its glue: the method's name, the index of its symbol, which
  * names its glue, the field, the names of its indices and the bound of each, whether it writes the
@@ -169,6 +182,10 @@ struct CUnitKept
     name: string
     index: usize
     ty: string
+    /** Whether it is held as its Avin object, kept from the collector until the holder's `release`
+     * has run, rather than by a C reference: its name is then the pointer of that object's handle,
+     * null once it is closed. */
+    pinned: bool
 
 /** An enum mirror as the C unit checks it: its name, the C type it mirrors, the enumerator of each
  * variant, in order, whether the variant names its own with `@c`, the variants' names and spans,
@@ -361,7 +378,12 @@ c_unit_bindings(program: TProgram, files: Buf[ProgramFile], library: usize) -> B
             if c_handle_form(t, program.data, program.classes) is Some(h)
                 val used = package_of(program.classes[h.class_index].unit, files, library)
                 if used != package && !contains_text(uses, used) then uses.push(used)
-        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_outs, blocks, struct_outs, errno, errno_names))
+        var out_frees: Buf[CUnitOutFree] = buf()
+        for e in c_out_frees(s.decl)
+            for k in 0..<p.params.len()
+                if p.params[k].name == e.name && p.params[k].mode is COut then out_frees.push(CUnitOutFree(k, e.how))
+        val receiver = if s.owner_class is Some(k) && c_handle_type(program.classes[k].decl) is Some(_) then Some(k) else None
+        out.push(CUnitBinding(s.name, p, params, result, s.unit, s.decl.name_span, package, forms, c_free_text(s.decl), uses, n, glued, by_value, array_outs, blocks, struct_outs, errno, errno_names, out_frees, receiver))
     out
 
 /** The struct mirrors of a checked program, in the order of its data types. */
@@ -418,9 +440,9 @@ c_unit_handles(program: TProgram, files: Buf[ProgramFile], library: usize) -> Bu
         if c_class_kept(d) is Some(name)
             if c_kept_class(program.classes, k) is Some(j)
                 val kd = program.classes[j].decl
-                if c_handle_type(kd) is Some(kt) && c_class_text(kd, "retain") is Some(_) && c_class_kept(kd) is None
-                    kept = Some(CUnitKept(name.name, j, kt))
-        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k), c_class_text(d, "forget"), c_class_text(d, "attach"), c_class_text(d, "key")))
+                if c_handle_type(kd) is Some(kt)
+                    kept = Some(CUnitKept(name.name, j, kt, c_kept_pinned(program.classes, k)))
+        out.push(CUnitHandle(program.classes[k].name, k, ty.text, ty.ty is CTypedef(_), c_class_text(d, "release").unwrap_or(""), c_class_text(d, "retain"), kept, program.classes[k].unit, d.name_span, package_of(program.classes[k].unit, files, library), c_class_as(d), c_unit_fields(program, k), c_class_text(d, "forget"), c_class_text(d, "attach"), c_class_text(d, "key"), c_class_holds(d)))
     out
 
 // The kind of C type a field read or written as the scalar `avin` is.
@@ -806,6 +828,7 @@ c_unit_source_of(parts: CUnitParts, libraries: Buf[CLibrary]) -> CUnitSource
         out.push(s"${p.result_text} ${p.symbol}($params);\n")
         lines.push(DeclareLine(i))
         if b.glued then binding_glue(&out, &lines, b, i)
+        out_free_glue(&out, &lines, b, i, handles)
         // The function `free:` names takes the string C answered, or any pointer, and answers nothing.
         if b.free is Some(f)
             val fp = s"__typeof__(&$f)"
@@ -954,10 +977,20 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
     glue(out, lines, "void avin_rt_c_callback_drop(void *record);", Plain)
     glue(out, lines, "void avin_rt_c_attach_destroy(void *data);", Plain)
     glue(out, lines, "void avin_rt_c_attach_drop(void *id);", Plain)
-    glue(out, lines, "static void avin_c_hold_all(void **o, void **kept) { for (struct avin_c_kept *k = kept[2]; k; k = k->next) { if (k->drop == avin_rt_c_callback_drop) continue; k->take(k->pointer); avin_c_hold(o, k->pointer, k->take, k->drop); } }", Plain)
+    glue(out, lines, "void avin_rt_c_pin(void *object);", Plain)
+    glue(out, lines, "void avin_rt_c_unpin(void *object);", Plain)
     glue(out, lines, "static void avin_c_no_take(void *p) { (void)p; }", Plain)
+    // What a handle holds that is no C reference — a callback's record, an Avin object kept from the
+    // collector, a value `holds:` declares — takes nothing, and is never held by another for it.
+    glue(out, lines, "static void avin_c_hold_all(void **o, void **kept) { for (struct avin_c_kept *k = kept[2]; k; k = k->next) { if (k->take == avin_c_no_take) continue; k->take(k->pointer); avin_c_hold(o, k->pointer, k->take, k->drop); } }", Plain)
     glue(out, lines, "void avin_c_keep_callback(void **o, void *record) { avin_c_hold(o, record, avin_c_no_take, avin_rt_c_callback_drop); }", Plain)
-    glue(out, lines, "static void *avin_c_held(void **o, void (*drop)(void *)) { for (struct avin_c_kept *k = o[2]; k; k = k->next) if (k->drop == drop) return k->pointer; return 0; }", Plain)
+    glue(out, lines, "static struct avin_c_kept *avin_c_entry(void **o, void (*drop)(void *)) { for (struct avin_c_kept *k = o[2]; k; k = k->next) if (k->drop == drop) return k; return 0; }", Plain)
+    glue(out, lines, "static void *avin_c_held(void **o, void (*drop)(void *)) { struct avin_c_kept *k = avin_c_entry(o, drop); return k ? k->pointer : 0; }", Plain)
+    // A handle a holder's `kept:` names with no C reference to take is kept from the collector, as its
+    // Avin object, until the holder's `release` has run; its name is then its C pointer, null once
+    // it is closed.
+    glue(out, lines, "void avin_c_keep_pinned(void **o, void *kept) { avin_rt_c_pin(kept); avin_c_hold(o, kept, avin_c_no_take, avin_rt_c_unpin); }", Plain)
+    glue(out, lines, "static void *avin_c_pinned(void **o) { void **k = avin_c_held(o, avin_rt_c_unpin); return k ? k[0] : 0; }", Plain)
     glue(out, lines, "static void avin_c_drain(void **o) { struct avin_c_kept *k = o[2]; o[2] = 0; while (k) { struct avin_c_kept *next = k->next; k->drop(k->pointer); free(k); k = next; } }", Plain)
     for h in handles
         if kept_by_reference(h) then glue(out, lines, s"void avin_c_drop_${h.index}(void *p);", Plain)
@@ -985,10 +1018,29 @@ private handle_glue(out: *StrBuilder, lines: *Buf[CUnitLine], handles: Buf[CUnit
             glue(out, lines, "}", Plain)
             glue(out, lines, s"void avin_c_take_$n(void *p) { avin_c_retain_$n(p, 0); }", Plain)
             glue(out, lines, s"void avin_c_keep_$n(void **o, void *p, void **kept) { avin_c_take_$n(p); avin_c_hold(o, p, avin_c_take_$n, avin_c_drop_$n); avin_c_hold_all(o, kept); }", Plain)
+        // Each value `holds:` declares is an entry on the list of what the handle holds, found by a
+        // function of its own that does nothing, its value carried in the entry's pointer.
+        for j in 0..<h.holds.len()
+            val v = h.holds[j]
+            glue(out, lines, s"_Static_assert((__builtin_classify_type((${v.ty})0) == 1 || __builtin_classify_type((${v.ty})0) == 2) && sizeof(${v.ty}) <= sizeof(void *), \"avin: the holds of ${h.name}\");", GlueLine(i, "holds"))
+            glue(out, lines, s"static void avin_c_held_${n}_$j(void *p) { (void)p; }", Plain)
+            glue(out, lines, s"void ${c_hold_glue(n, j)}(void **o, long long avin_v) {", Plain)
+            glue(out, lines, s"    void *avin_p = (void *)(__INTPTR_TYPE__)(${v.ty})avin_v;", GlueLine(i, "holds"))
+            glue(out, lines, s"    struct avin_c_kept *k = avin_c_entry(o, avin_c_held_${n}_$j);", Plain)
+            glue(out, lines, s"    if (k) k->pointer = avin_p; else avin_c_hold(o, avin_p, avin_c_no_take, avin_c_held_${n}_$j);", Plain)
+            glue(out, lines, "}", Plain)
         glue(out, lines, s"void avin_c_give_back_$n(void **o) {", Plain)
         glue(out, lines, "    if (o[0]) {", Plain)
         glue(out, lines, s"        $t self = ($t)o[0];", Plain)
-        if h.kept is Some(k) then glue(out, lines, s"        ${k.ty} ${k.name} = (${k.ty})avin_c_held(o, avin_c_drop_${k.index});", GlueLine(i, "kept"))
+        h.kept match
+            Some(k) ->
+                if k.pinned then glue(out, lines, s"        ${k.ty} ${k.name} = (${k.ty})avin_c_pinned(o);", GlueLine(i, "kept"))
+                else glue(out, lines, s"        ${k.ty} ${k.name} = (${k.ty})avin_c_held(o, avin_c_drop_${k.index});", GlueLine(i, "kept"))
+            None -> ()
+        for j in 0..<h.holds.len()
+            val v = h.holds[j]
+            glue(out, lines, s"        ${v.ty} ${v.name} = (${v.init});", GlueLine(i, "holds"))
+            glue(out, lines, s"        if (avin_c_entry(o, avin_c_held_${n}_$j)) ${v.name} = (${v.ty})(__INTPTR_TYPE__)avin_c_held(o, avin_c_held_${n}_$j);", Plain)
         glue(out, lines, "        o[0] = 0;", Plain)
         // C is told to stop calling each callback the handle keeps before the object goes back.
         if h.forget is Some(f)
@@ -1211,6 +1263,43 @@ private binding_glue(out: *StrBuilder, lines: *Buf[CUnitLine], b: CUnitBinding, 
                 glue(out, lines, s"    if ($name) { $freed; }", BindingGlueLine(i, c_array_glue_part("free", j)))
             None -> ()
         glue(out, lines, "}", BindingGlueLine(i, c_array_glue_part("free", j)))
+
+// The glue `avin_c_out_free_<symbol>_<param>` that frees each string C answered through an `out`
+// pointer `free:` names, once it is copied, where it is not null: it is passed the string and, for a
+// method, the receiver's object, whose pointer is `self` and whose `kept:` name and `holds:` values
+// are named as in its class's `release:`.
+private out_free_glue(out: *StrBuilder, lines: *Buf[CUnitLine], b: CUnitBinding, i: usize, handles: Buf[CUnitHandle])
+    val p = b.prototype
+    var receiver: Option[CUnitHandle] = None
+    if b.receiver is Some(k)
+        for h in handles
+            if h.index == k then receiver = Some(h)
+    for e in b.out_frees
+        val q = p.params[e.param]
+        val name = q.name
+        val part = "free " + name
+        glue(out, lines, s"void ${c_out_free_glue(b.symbol, e.param)}(void *avin_p, void **avin_o) {", Plain)
+        glue(out, lines, s"    ${q.pointee_text} $name = (${q.pointee_text})avin_p;", BindingGlueLine(i, part))
+        glue(out, lines, "    (void)avin_o;", Plain)
+        receiver match
+            Some(h) ->
+                glue(out, lines, s"    ${h.ty} self = avin_o ? (${h.ty})avin_o[0] : 0;", Plain)
+                glue(out, lines, "    (void)self;", Plain)
+                h.kept match
+                    Some(k) ->
+                        val held = if k.pinned then "avin_c_pinned(avin_o)" else s"avin_c_held(avin_o, avin_c_drop_${k.index})"
+                        glue(out, lines, s"    ${k.ty} ${k.name} = avin_o ? (${k.ty})$held : 0;", Plain)
+                        glue(out, lines, s"    (void)${k.name};", Plain)
+                    None -> ()
+                for j in 0..<h.holds.len()
+                    val v = h.holds[j]
+                    glue(out, lines, s"    ${v.ty} ${v.name} = (${v.init});", Plain)
+                    glue(out, lines, s"    if (avin_o && avin_c_entry(avin_o, avin_c_held_${h.index}_$j)) ${v.name} = (${v.ty})(__INTPTR_TYPE__)avin_c_held(avin_o, avin_c_held_${h.index}_$j);", Plain)
+                    glue(out, lines, s"    (void)${v.name};", Plain)
+            None -> ()
+        val freed = if is_c_identifier(e.how.trim()) then s"${e.how.trim()}($name)" else e.how
+        glue(out, lines, s"    if ($name) { $freed; }", BindingGlueLine(i, part))
+        glue(out, lines, "}", Plain)
 
 // Whether the elements of the array `a` a binding answers are memory of no type: "1" where the
 // prototype shows `void`, the C unit's test where they are a typedef the headers may make `void *`,
@@ -1813,6 +1902,14 @@ c_unit_diagnostics_of(output: string, unit: CUnitSource, parts: CUnitParts, libr
                 if contains_text(troubles[i].glue_parts, part) then continue
                 troubles[i].glue_parts.push(part)
                 val b = bindings[i]
+                // The glue that frees an out string is named by `free ` and the string's name.
+                if part.starts_with("free ")
+                    val name = part[5..]
+                    var how = ""
+                    for e in b.out_frees
+                        if b.prototype.params[e.param].name == name then how = e.how
+                    troubles[i].glue.push(s"the C binding `${b.name}` frees the string C answers through `$name` with `$how`, which does not compile against its headers: clang says '${d.message}'")
+                    continue
                 // A part of the `j`th array's glue is named by its word followed by `j`, but for the first.
                 var word = part
                 var j = 0usize

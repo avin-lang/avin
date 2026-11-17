@@ -203,6 +203,25 @@ avin: trap: value out of range for long at main.avin:13:13
   checks that the headers declare it taking the string or any pointer and answering nothing; it is
   not called for null. A binding with `free:` whose result is `unit` frees what C answered and
   discards it ([proposed](/spec/decisions/#proposed)).
+- **A string C answers through an `out` pointer is freed by an entry of `free:` naming it**
+  ([proposed](/spec/decisions/#proposed)): `"name: how"`, `how` a C function of the string or a C
+  expression in its name, compiled in the C unit's glue and called once the copy is made, never for
+  null; where a status fails, a string C answered is freed unread. A method's expression may also use
+  `self`, its receiver's `kept:` name and the values the receiver [holds](#values-a-handle-holds), as
+  its class's `release:` does. libssh2 answers a channel's exit signal and its message in strings
+  freed by `libssh2_free(session, p)`, and the session is the one the channel keeps:
+
+  ```avin
+  @c(
+    "int libssh2_channel_get_exit_signal(LIBSSH2_CHANNEL *self, out char **exitsignal, out size_t *exitsignal_len, out char **errmsg, out size_t *errmsg_len, null char **langtag, null size_t *langtag_len)",
+    free: ["exitsignal: libssh2_free(session, exitsignal)", "errmsg: libssh2_free(session, errmsg)"]
+  )
+  private exitSignalRaw() -> Result[(Option[string], long, Option[string], long), int]
+  ```
+
+  `free:` names each out string once, an `out` one answering a string or its bytes, never `inout`,
+  since C may answer the copy it was passed; an entry without a name frees the result as before, and a
+  binding whose `array:` names arrays frees them by position and no out string besides.
 - **A typedef of either pointer crosses as the header's type is**: as a result a `char *` or a
   `const char *` typedef, as a parameter only a `const char *` one, which the C unit checks.
 - **So does one pointer to a typedef of `char`** ([proposed](/spec/decisions/#proposed)), as
@@ -454,8 +473,9 @@ keeping a face keeps the face's library too, so when the face's own handle is co
 gives back its reference to the library, the library still outlives the face the descriptor's
 `release` reaches through.
 
-A kept handle with no `retain`, a `ByteBlock` and a callback's closure are held as the Avin object, as
-before, and the holder's `release` must not use them: that is taken on [trust](#soundness).
+A kept handle with no `retain` that no `kept:` names, a `ByteBlock` and a callback's closure are held
+as the Avin object, as before, and the holder's `release` must not use them: that is taken on
+[trust](#soundness). One a `kept:` names is kept for the holder's release, as below.
 
 **A holder's `release` may name what it keeps.** A class declaring `kept: "face: Face"` is made only
 by bindings that keep exactly one `Face`, and its `release:` and `retain:` may use `face` as that
@@ -472,12 +492,66 @@ private mmVar(face: Face) -> Result[MMVar, int]
 ```
 
 A class with `kept:` made by a binding that does not keep one handle of that class is refused at the
-binding, as is a `kept:` name that `release:` and `retain:` never use. The class `kept:` names is one
-of the holder's module, or one written with its module (`freetype.Face`), and it declares `retain`
-and no `kept:` of its own, since its pointer is valid only while a C reference holds it. `retain:`
-sees the name where it takes the reference of a `borrowed` result, as the pointer of the handle the
-binding keeps; a holder keeping a handle of a class with `kept:` holds it as the Avin object
-([proposed](/spec/decisions/#proposed)).
+binding, as is a `kept:` name that `release:` and `retain:` never use. The class `kept:` names is a C
+handle of the holder's module, or one written with its module (`freetype.Face`). `retain:` sees the
+name where it takes the reference of a `borrowed` result, as the pointer of the handle the binding
+keeps ([proposed](/spec/decisions/#proposed)).
+
+**A kept handle no C reference can hold is kept from the collector until the holder's `release` has
+run** ([proposed](/spec/decisions/#proposed)): one whose class declares no `retain`, or a `kept:` of its
+own. libssh2 counts no references: a channel belongs to its session, `libssh2_session_free` frees
+every channel still open, and `libssh2_channel_free` reaches through the channel to its session. So
+the channel's class names its session with `kept:`, and the session's handle is held as its Avin
+object, a root of every collection while the channel's handle holds it; the collector may find both
+dead at once, and finalizes the channel then and the session in a later collection. **The name is the
+kept handle's pointer, or null once that handle was closed**, so a release that must not run after
+the kept object's own says so:
+
+```avin
+@c(type: "LIBSSH2_CHANNEL *", kept: "session: Session", release: "session ? libssh2_channel_free(self) : 0")
+class Channel
+```
+
+A chain is given back in its order: a handle keeping a channel this way is finalized first, the
+channel in the next collection and the session in the one after. What the closed handle freed with
+it is the release's to know; only its own pointer is passed. **A cycle through such a kept handle is
+never collected**: a session whose handle keeps, as its Avin object, a channel that keeps the session
+this way is reachable from the channel's root for as long as both are open, and both are given back
+once either is closed ([proposed](/spec/decisions/#proposed)). The handle is kept by one root for each
+holder, and a holder closed lets go of its own at once.
+
+### Values a handle holds
+
+**A handle may hold C integers for its `release:`** ([proposed](/spec/decisions/#proposed)), declared by
+its class with `holds:`, a C declaration or a list of them, each starting at the value written
+(`= -1`) or zero. A binding names with `hold:` the parameters whose values the handle it answers, or
+for a method answering none its receiver, holds, when the call succeeds, converted to the declared
+type; a later `hold:` of the same name replaces the value. `release:` uses each by its name.
+
+libssh2 is handed the socket of a session and never closes it, and `libssh2_session_free` writes to
+it. An Avin `TcpStream` closes its socket when it is closed or collected, and its descriptor's number
+goes to the next one opened, so a session given the stream's own descriptor could write its farewell
+into an unrelated connection. Given a descriptor of its own, `dup`ed from the stream's, the session
+owns what its release writes to, whichever is collected first and whether or not the stream was
+closed before it:
+
+```avin
+@c(
+  type: "LIBSSH2_SESSION *",
+  holds: "int sock = -1",
+  release: "(libssh2_session_set_blocking(self, 1), libssh2_session_free(self), sock >= 0 ? close(sock) : 0)"
+)
+class Session
+  @c("int libssh2_session_handshake(LIBSSH2_SESSION *self, int sock)", hold: "sock")
+  private handshakeRaw(sock: int) -> Result[unit, int]
+```
+
+A value held is a C integer, no wider than a pointer, never a reference: what it names is the
+release's to give back, and a holder holds nothing for another. A class with `holds:` is not `shared`,
+since only the handle's owner sets what it holds, and declares no `retain:`, since what it holds is the
+one handle's. Each name is used by `release:`, and is neither `self` nor the `kept:` name; `hold:`
+names integer parameters, on a binding answering a handle or a method of one whose class declares
+each name.
 
 ### Handles of another package
 
@@ -1313,7 +1387,9 @@ result is owned or `borrowed`, that a function `keeps` or `consumes` a pointer, 
 `length` or `bound:` is right, that C calls a function only from the thread a missing `@threaded`
 implies, that `forget` stops the callbacks, that `attach:`'s `destroy` is called only once C has
 finished with what it keeps, that a holder's `release` does not use a kept object held as the Avin
-object (a handle with no `retain`, a `ByteBlock`), which the collector may free first, and that C
+object (a handle with no `retain` that no `kept:` names, a `ByteBlock`), which the collector may free
+first, that a value a handle `holds:` is its own to use in its release (a descriptor `dup`ed for it,
+not one another object closes), that what a closed `kept:` handle freed with it is not touched, and that C
 reads no more of a `ByteBlock` than the library checked. A wrong `borrowed` or `length` is a binding bug of the kind a wrong
 `extern` is in C.
 
