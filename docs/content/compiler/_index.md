@@ -589,6 +589,13 @@ operating system commits its pages as they are first used, so the heap grows wit
 and costs nothing until then. A program whose live data outgrows the limit stops with a message
 naming it.
 
+After each collection the heap may allocate as much again as survived before the next one, and
+never less than 8 MiB, so it stays within about twice what is live and a collection's cost, which
+grows with what is live, is spread over that much allocation. `AVIN_GC_PERCENT` changes the
+proportion: 200 lets the heap allocate twice what survived between collections, halving what
+marking costs per byte allocated for a heap that much larger; 0 collects at every 8 MiB whatever is
+live. It is a whole number in decimal digits, at most 100000; any other value is ignored.
+
 The collector owns each object's header, which sits just before the object: the word 16 bytes
 before an object's address holds its **kind**, the collector's record of how to trace it, and the
 word after that is the collector's own. An object's address is its first field. Every descriptor

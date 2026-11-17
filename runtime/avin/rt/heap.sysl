@@ -199,26 +199,54 @@ descriptor(tag: usize, size: usize, refs: usize) -> Descriptor = Descriptor(gc.K
 /** The descriptor of the object at `p`, which may be on the heap or a constant outside it. */
 descriptor_of(p: *u8) -> *Descriptor = ptr_cast(gc.kind_of(p))
 
-private const DefaultLimit: usize = 8589934592
+/** The heap's size when `AVIN_HEAP_LIMIT` does not say. */
+const DefaultLimit: usize = 8589934592
 
 /** The least the heap may allocate between collections, so a small heap does not collect at every
  * step. */
-private const Floor: usize = 8388608
+const Floor: usize = 8388608
 
-private heap_limit() -> usize
-    val text = env.get("AVIN_HEAP_LIMIT") match
-        Some(t) -> t
-        None -> return DefaultLimit
+/** How much the heap may allocate between collections, as a percentage of what the last one left
+ * live, when `AVIN_GC_PERCENT` does not say. */
+const DefaultPercent: usize = 100
+
+/** The most `AVIN_GC_PERCENT` may ask for; a larger value is taken as this. */
+const MostPercent: usize = 100000
+
+/** The whole number `text` writes in decimal digits; `absent` when `text` is empty, holds anything
+ * but digits, or has more than 15 of them. */
+setting_number(text: string, absent: usize) -> usize
+    if text.bytes.len == 0 || text.bytes.len > 15 then return absent
     var n = 0usize
     for b in text.bytes
-        if b < u8('0') || b > u8('9') then return DefaultLimit
+        if b < u8('0') || b > u8('9') then return absent
         n = n * 10 + usize(b - u8('0'))
+    n
+
+/** The heap's size for an `AVIN_HEAP_LIMIT` of `text`, and never less than 4096 bytes. */
+heap_limit_of(text: Option[string]) -> usize
+    val n = text match
+        Some(t) -> setting_number(t, DefaultLimit)
+        None -> DefaultLimit
     if n < 4096 then 4096 else n
+
+/** The percentage for an `AVIN_GC_PERCENT` of `text`, and never more than `MostPercent`. */
+gc_percent_of(text: Option[string]) -> usize
+    val n = text match
+        Some(t) -> setting_number(t, DefaultPercent)
+        None -> DefaultPercent
+    if n > MostPercent then MostPercent else n
+
+/** What the heap may allocate after a collection that left `live` bytes before it collects again:
+ * `percent` of `live`, and never less than `Floor`. */
+budget_for(live: usize, percent: usize) -> usize
+    val share = live / 100 * percent + live % 100 * percent / 100
+    if share > Floor then share else Floor
 
 var main_context: Context = new_context()
 /** Every attached context, whose frames are the roots of a collection. */
 var contexts: *Context = null
-var block: []u8 = [0u8; heap_limit()]
+var block: []u8 = [0u8; heap_limit_of(env.get("AVIN_HEAP_LIMIT"))]
 var space: gc.Heap = gc.heap(&block[0], block.len, null)
 
 /** With `AVIN_GC_STRESS=1` every allocation collects first, which finds a missing root at the
@@ -226,10 +254,15 @@ var space: gc.Heap = gc.heap(&block[0], block.len, null)
  * finds a reference not kept alive across a loop that does not allocate. */
 var stress: bool = env.get("AVIN_GC_STRESS") == Some("1") || env.get("AVIN_GC_STRESS") == Some("2")
 var poll_stress: bool = env.get("AVIN_GC_STRESS") == Some("2")
+/** `AVIN_GC_PERCENT`: how much the heap may allocate between collections, as a percentage of what
+ * the last one left live. */
+var percent: usize = gc_percent_of(env.get("AVIN_GC_PERCENT"))
 var budget: usize = Floor
 /** What the heap held when the last collection finished. A carrier's chunk is charged whole when it
  * is claimed, so what has been allocated since is at most what the heap holds now beyond this. */
 var settled: usize = 0
+/** How many collections the program has run. */
+var collections: usize = 0
 
 // The tracer of every object. A reference may be null or to a constant object outside the heap;
 // the collector ignores both.
@@ -503,8 +536,11 @@ thread_detach(c: *Context)
     val t: *ThreadContext = ptr_cast(c)
     t.me = None
 
-// After a collection the next one waits until as much has been allocated as survived, so the heap
-// stays within about twice what is live and collecting costs in proportion to what is allocated.
+// After a collection the next one waits until `percent` of what survived has been allocated (as
+// much as survived, by default), so the heap stays within about twice what is live and collecting
+// costs in proportion to what is allocated. A larger percentage trades memory for time: each
+// collection traces what is live once, so allocating twice as much between collections halves what
+// marking costs per byte allocated.
 // The caller holds the heap lock and every other thread is stopped. The chunk of every carrier is
 // given back first, so the collector sees the heap as a run of whole objects and free blocks; a
 // detached thread's carrier gave its own back when it detached.
@@ -514,9 +550,10 @@ collect_now()
         gc.retire(&space, &k.chunk)
         k = k.next
     gc.collect(&space, &roots)
+    collections += 1
     val live = gc.live_size(&space)
     settled = live
-    budget = if live > Floor then live else Floor
+    budget = budget_for(live, percent)
 
 // How much the heap has taken on since the last collection, counting every chunk out whole.
 private allocated_since() -> usize
