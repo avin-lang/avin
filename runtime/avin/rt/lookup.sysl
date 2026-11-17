@@ -1,0 +1,296 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, from_errno}
+import sysl.io.wait.Readable
+import sysl.net.{Address, ipv4, resolve}
+import sysl.raw.str_cast
+import sysl.sync.Atomic
+import sysl.threads.{SleepLock, spawn}
+import sysl.time.{millis, sleep}
+
+// Host-name lookups that a cancellation can end. The system's resolver answers only when it is done,
+// however long the network takes, and nothing can stop it halfway, so a lookup is made on a helper
+// thread of the runtime's own while the thread that asked waits for its answer on a pipe: a
+// lightweight thread parks on the runtime's poller as a socket's wait does, so a cancellation ends
+// the wait at once, and any other thread waits on the pipe alone, safe for the collector.
+//
+// A wait a cancellation ended abandons its lookup. One still queued is dropped; one a helper is
+// making runs to its end, and the helper throws its answer away and closes the pipe. So the thread
+// that asked returns promptly, and what it left behind holds no worker and is let go once the
+// resolver answers.
+//
+// Each lookup holds a slot, under `lookup_lock`. The host name, the port and the answer are copied
+// into the slot and out again rather than shared, so nothing the two threads touch carries a count
+// either changes outside the lock. A helper takes the oldest queued lookup, makes it, and takes the
+// next, ending once none is queued, and at most `LookupHelpersMost` helpers run at once. That bounds
+// how many abandoned lookups can still be running; past it, a new lookup waits in the queue for a
+// helper to come free, and that wait is ended by a cancellation like any other. A numeric address
+// asks the network nothing, so it is resolved where it is asked, with no helper.
+
+private const LookupFree: u32 = 0
+private const LookupQueued: u32 = 1
+private const LookupRunning: u32 = 2
+private const LookupDone: u32 = 3
+
+/** The most bytes of a host name a lookup carries: `NI_MAXHOST` less its terminator. A longer name
+ * is not one any resolver answers for. */
+private const HostMost: usize = 1024
+
+/** The most addresses a lookup answers, as many as `sysl.net.resolve` gathers. */
+private const AnswerMost: usize = 8
+
+/** The most helper threads that make lookups at once, and so the most abandoned lookups that can be
+ * running at once. */
+const LookupHelpersMost: u64 = 64
+
+/** The stack a helper runs the system's resolver on. */
+private const HelperStackBytes: usize = 524288
+
+private const NotFoundCode: int = 2
+#if bsd
+private const AgainCode: int = 35
+#else
+private const AgainCode: int = 11
+#endif
+private const CloseOnExecFlag: int = 2
+private const SetDescriptorFlags: int = 2
+
+private extern "pipe" c_pipe(fds: *i32) -> int
+private extern "close" c_close(fd: int) -> int
+private extern "write" c_write(fd: int, bytes: *u8, len: usize) -> isize
+private extern "fcntl" c_fcntl(fd: int, command: int, arg: int) -> int
+private extern "pthread_self" c_pthread_self() -> u64
+private extern "pthread_detach" c_pthread_detach(t: u64) -> int
+#if bsd
+private extern "__error" lookup_errno_location() -> *i32
+#elif android
+private extern "__errno" lookup_errno_location() -> *i32
+#else
+private extern "__errno_location" lookup_errno_location() -> *i32
+#endif
+
+/** One lookup: where it is, the host and port asked for, the answer once it is made (the addresses,
+ * or the error's code), and the two ends of the pipe its helper writes a byte into once it is. */
+private struct LookupSlot
+    stage: u32
+    abandoned: bool
+    ticket: u64
+    host: [1024]u8
+    host_len: usize
+    port: int
+    found: [8]Address
+    count: usize
+    code: int
+    read_fd: int
+    write_fd: int
+
+private var lookup_lock: SleepLock = SleepLock.new()
+private var lookup_slots: Buf[LookupSlot] = buf()
+private var lookup_free: Buf[usize] = buf()
+private var lookup_tickets: u64 = 0
+/** Under `lookup_lock`: how many lookups are queued, how many helpers run, and how many of those are
+ * making a lookup rather than looking for one. */
+private var lookup_queued: u64 = 0
+private var lookup_helpers: u64 = 0
+private var lookup_busy: u64 = 0
+private var lookup_started: Atomic[u64] = Atomic(0)
+/** For the runtime's and the library's tests: while it is not zero, a helper holds each lookup
+ * before asking the resolver, as a resolver that does not answer would. */
+private var lookup_held: Atomic[u64] = Atomic(0)
+
+/** Every address `host` and `port` resolve to, as `sysl.net.resolve` answers them, made on a helper
+ * thread: a cancellation of the calling thread ends its wait and answers the cancellation's error,
+ * which the library stops the thread at. */
+resolve_host(host: string, port: int) -> Result[Buf[Address], IoError]
+    if is_numeric_host(host) then return resolve(host, port)
+    if host.bytes.len > HostMost then return Err(from_errno(NotFoundCode))
+    var ends: [2]i32 = [-1, -1]
+    if c_pipe(&ends[0]) != 0 then return Err(from_errno(int(*lookup_errno_location())))
+    _ = c_fcntl(int(ends[0]), SetDescriptorFlags, CloseOnExecFlag)
+    _ = c_fcntl(int(ends[1]), SetDescriptorFlags, CloseOnExecFlag)
+    var slot = LookupSlot(LookupQueued, false, 0, [0; 1024], host.bytes.len, port, [ipv4(0, 0, 0, 0, 0); 8],
+                          0, 0, int(ends[0]), int(ends[1]))
+    for k in 0..<host.bytes.len do slot.host[k] = host.bytes[k]
+    lookup_lock.lock()
+    lookup_tickets += 1
+    slot.ticket = lookup_tickets
+    if lookup_free.len() == 0
+        lookup_slots.push(slot)
+        lookup_free.push(lookup_slots.len() - 1)
+    val i = lookup_free.pop().unwrap()
+    lookup_slots[i] = slot
+    lookup_queued += 1
+    if !helper_enough()
+        lookup_queued -= 1
+        let_go(i)
+        lookup_lock.unlock()
+        return Err(from_errno(AgainCode))
+    lookup_lock.unlock()
+    loop
+        lookup_lock.lock()
+        if lookup_slots[i].stage == LookupDone
+            val answer = answer_of(i)
+            let_go(i)
+            lookup_lock.unlock()
+            return answer
+        val fd = lookup_slots[i].read_fd
+        lookup_lock.unlock()
+        wait_for_fd_as(fd, Readable, 0, WaitsOnLookup) match
+            Ok(_) -> ()
+            Err(e) ->
+                abandon(i)
+                return Err(e)
+
+// Under `lookup_lock`: starts a helper where the queued lookups outnumber the helpers free to take
+// them and fewer than the most run; answers false only where no helper runs and none could start, so
+// nothing would ever make the lookup.
+private helper_enough() -> bool
+    if lookup_helpers - lookup_busy >= lookup_queued || lookup_helpers >= LookupHelpersMost then return true
+    spawn(&helper_loop, &lookup_started, HelperStackBytes) match
+        Some(_) ->
+            lookup_helpers += 1
+            true
+        None -> lookup_helpers > 0
+
+// Under `lookup_lock`: what the lookup in slot `i`, made, answered.
+private answer_of(i: usize) -> Result[Buf[Address], IoError]
+    val s = lookup_slots[i]
+    if s.code != 0 then return Err(from_errno(s.code))
+    var out: Buf[Address] = buf()
+    for k in 0..<s.count do out.push(s.found[k])
+    Ok(out)
+
+// Under `lookup_lock`: closes slot `i`'s pipe and frees it.
+private let_go(i: usize)
+    _ = c_close(lookup_slots[i].read_fd)
+    _ = c_close(lookup_slots[i].write_fd)
+    lookup_slots[i].stage = LookupFree
+    lookup_slots[i].read_fd = -1
+    lookup_slots[i].write_fd = -1
+    lookup_free.push(i)
+
+// The thread that asked for the lookup in slot `i` no longer waits for it: one still queued is
+// dropped, one being made is left to its helper to let go, and one made is let go.
+private abandon(i: usize)
+    lookup_lock.lock()
+    val stage = lookup_slots[i].stage
+    if stage == LookupQueued
+        lookup_queued -= 1
+        let_go(i)
+    elif stage == LookupRunning
+        lookup_slots[i].abandoned = true
+    else
+        let_go(i)
+    lookup_lock.unlock()
+
+// Under `lookup_lock`: the queued lookup asked for first, if any.
+private oldest_queued() -> Option[usize]
+    var best: Option[usize] = None
+    var ticket: u64 = 0
+    for i in 0..<lookup_slots.len()
+        if lookup_slots[i].stage == LookupQueued && (best.is_none() || lookup_slots[i].ticket < ticket)
+            best = Some(i)
+            ticket = lookup_slots[i].ticket
+    best
+
+// A helper: makes the oldest queued lookup, then the next, and ends once none is queued. Nobody joins
+// it, so it detaches itself.
+private helper_loop(started: *Atomic[u64]) -> unit
+    _ = c_pthread_detach(c_pthread_self())
+    _ = started.add(1)
+    loop
+        lookup_lock.lock()
+        val i = oldest_queued() match
+            Some(k) -> k
+            None ->
+                lookup_helpers -= 1
+                lookup_lock.unlock()
+                return
+        lookup_queued -= 1
+        lookup_busy += 1
+        lookup_slots[i].stage = LookupRunning
+        val s = lookup_slots[i]
+        val host = str_cast(s.host[0..<s.host_len])
+        lookup_lock.unlock()
+        while lookup_held.load() != 0 do sleep(millis(1))
+        val answer = resolve(host, s.port)
+        lookup_lock.lock()
+        lookup_busy -= 1
+        answer match
+            Ok(found) ->
+                val n = if found.len() > AnswerMost then AnswerMost else found.len()
+                for k in 0..<n do lookup_slots[i].found[k] = found[k]
+                lookup_slots[i].count = n
+                lookup_slots[i].code = 0
+            Err(e) ->
+                lookup_slots[i].count = 0
+                lookup_slots[i].code = if e.code() != 0 then e.code() else NotFoundCode
+        if lookup_slots[i].abandoned
+            let_go(i)
+        else
+            lookup_slots[i].stage = LookupDone
+            var one: u8 = 1
+            _ = c_write(lookup_slots[i].write_fd, &one, 1)
+        lookup_lock.unlock()
+
+/** Whether `host` is a numeric address, which the system resolves without asking the network: four
+ * decimal numbers of at most 255 joined by dots, or an IPv6 address (hexadecimal digits, colons and
+ * the dots of an embedded IPv4 one, with a `%` zone after). */
+private is_numeric_host(host: string) -> bool
+    val b = host.bytes
+    if b.len == 0 then return false
+    var colons = 0
+    var zone = false
+    for k in 0..<b.len
+        val c = b[k]
+        if c == u8('%') && colons > 0 then zone = true
+        elif c == u8(':') && !zone then colons += 1
+        elif !zone && !is_hex(c) && c != u8('.') then return false
+        elif zone && c <= u8(' ') then return false
+    if colons >= 2 then return true
+    if colons > 0 then return false
+    var parts = 0
+    var value = 0
+    var digits = 0
+    for k in 0..<b.len
+        val c = b[k]
+        if c == u8('.')
+            if digits == 0 then return false
+            parts += 1
+            value = 0
+            digits = 0
+        elif u8('0') <= c <= u8('9')
+            value = value * 10 + int(c - u8('0'))
+            digits += 1
+            if value > 255 || digits > 3 then return false
+        else
+            return false
+    digits > 0 && parts == 3
+
+private is_hex(c: u8) -> bool = u8('0') <= c <= u8('9') || u8('a') <= c <= u8('f') || u8('A') <= c <= u8('F')
+
+/** For tests: makes every helper hold its lookup before asking the resolver while `on`, as a resolver
+ * that does not answer would, and lets them go on once it is off. */
+resolve_hold(on: bool)
+    lookup_held.store(if on then 1 else 0)
+
+/** How many helper threads run now. */
+resolve_helpers() -> long
+    lookup_lock.lock()
+    val n = long(lookup_helpers)
+    lookup_lock.unlock()
+    n
+
+/** How many lookups hold a slot now: queued, being made (abandoned ones among them), or made and not
+ * yet collected. */
+resolve_in_flight() -> long
+    lookup_lock.lock()
+    var n: long = 0
+    for i in 0..<lookup_slots.len()
+        if lookup_slots[i].stage != LookupFree then n += 1
+    lookup_lock.unlock()
+    n
+
+/** How many helper threads have started since the program did. */
+resolve_helpers_started() -> long = long(lookup_started.load())

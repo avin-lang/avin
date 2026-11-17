@@ -81,7 +81,8 @@ goes on running after the call. What a program can rely on:
   promise's future, a condition's `wait` (plain or timed), a wait group's `wait` (plain or timed), a
   semaphore's `acquire` (plain, timed or in `withPermit`), a read-write lock's `read` and `write`
   waiting to go in, a barrier's `wait`, a [pool](#pools)'s `use` or `lease` waiting for a resource, a socket's
-  `accept`, `connect`, read or write that waits for its connection. A thread
+  `accept`, `connect`, read or write that waits for its connection, and the lookup of a host's name
+  that a `connect` or a `bind` makes, however long the resolver takes to answer. A thread
   parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
   compiled code makes on every back edge of a loop and before every call that may recur, so a thread
   that computes without waiting stops too, within a loop's turn.

@@ -10568,7 +10568,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   key, the client's address, puts every client behind one proxy in one bucket.
 - Settled on the user's delegation 2026-11-15 (built on branch `resolve-blocking`): **which library
   bindings are [blocking](/spec/sysl-bindings/#calls-that-wait).** Name resolution
-  (`sysl.net.resolve`, which `TcpStream.connect` calls) and connecting a Unix socket are, as are
+  (`sysl.net.resolve`, which `TcpStream.connect` calls; since 2026-11-16 made on a helper thread
+  instead, below) and connecting a Unix socket are, as are
   reading, writing and opening a file in `avin.fs` and `avin.process`'s redirections (the whole-file
   calls, `File`'s `read`, `write` and `flush`, and every open), and reading a time zone's file: each
   can wait on a pipe, a FIFO, a device or the network. Asking about a path, listing a directory,
@@ -10581,6 +10582,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   directory operation on a network file system can also wait, and standard input and output, which
   the runtime reads and writes through intrinsics rather than bindings, are not yet safe for the
   collector while they wait.
+- Settled on the user's delegation 2026-11-16 (built on branch `resolve-cancel`): **a host-name
+  lookup is a [cancellation point](/spec/threads/#cancellation).** As a blocking call it was not: a
+  `withTimeout` waits for what it cancelled to end, so a slow resolver held a connect's time limit
+  past its deadline (a 100 ms `withTimeout` around a connect whose lookup took 3 s answered after
+  3009 ms). The runtime (`runtime/avin/rt/lookup.sysl`) makes each lookup on a helper thread and the
+  caller waits for a byte on a pipe as it waits on a socket, so a cancellation ends the wait at once;
+  an abandoned lookup runs on to the resolver's answer, which its helper throws away before closing
+  the pipe. The host, port and answer are copied into a slot and out again under one lock, so
+  nothing either thread holds is shared. Helpers are detached, take the oldest queued lookup, and end
+  once none is queued; at most 64 run at once, which bounds how many abandoned lookups can still be
+  running. Past the bound a new lookup waits in the queue, and a cancellation drops it from there. A
+  numeric address is resolved inline. A lightweight thread waiting on a lookup shows in a thread dump
+  as "looking up a host name". Tests hold the helpers through a runtime hook (`resolve_hold`), since
+  no resolver that never answers can be stood up without system configuration on every platform.
+  Alternatives weighed: one detached thread per lookup with no bound (abandoned threads pile up
+  without limit while the resolver is down); failing a lookup at once past the bound (fails lookups
+  of hosts that would answer); the platform's asynchronous resolver (`getaddrinfo_a` is glibc's
+  alone, and macOS's is a different API); a resolver of Avin's own speaking DNS (loses
+  `/etc/hosts`, NSS and the system's configuration). Review with the user: whether lookups of the
+  same host and port in flight at once should share one helper, which would keep repeated retries
+  during a resolver outage from filling the 64.
 
 ## Open
 

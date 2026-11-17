@@ -1,0 +1,129 @@
+// expect: exit 0
+// A host name's lookup is a cancellation point. The runtime makes each lookup on a helper thread of
+// its own and the thread that asked waits for the answer as it waits on a socket, so a cancellation
+// ends the wait at once however long the resolver takes. The runtime's test hook holds every helper
+// before it asks the resolver, as a resolver that never answers would. Held: a scope's cancellation
+// and a `withTimeout`'s deadline each end a `connect` promptly; two hundred cancelled lookups at once
+// leave no helper thread, no slot and no descriptor behind once the resolver answers; more lookups
+// than the helpers' bound wait for a helper and are all answered once it is lifted. Not held: a
+// lookup answers from a thread and from `main`, and a numeric address starts no helper. Every name
+// is `localhost`, which the resolver answers without the network.
+import avin.fs
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Atomic, scope, sleep, spawn, withTimeout}
+import avin.time.{Duration, millis, monotonic}
+
+@sysl("avin.rt.resolve_hold")
+resolveHold(on: bool)
+
+@sysl("avin.rt.resolve_helpers")
+helpers() -> long
+
+@sysl("avin.rt.resolve_in_flight")
+inFlight() -> long
+
+@sysl("avin.rt.resolve_helpers_started")
+helpersStarted() -> long
+
+// How many descriptors the program has open.
+openDescriptors() -> int = fs.listDir("/dev/fd") match
+  Ok(names) -> names.length
+  Err(e) -> fail(e.message)
+
+// Waits until `ready` holds, stopping the program where it has not within a minute.
+within(what: string, ready: () -> bool)
+  val deadline = monotonic() + millis(60000)
+  while !ready()
+    if monotonic() > deadline then fail(s"$what did not happen within a minute")
+    sleep(millis(1))
+
+// Everything has been let go: no helper runs and no lookup holds a slot.
+settled() = within("the lookups settling", () -> helpers() == 0 && inFlight() == 0)
+
+// Milliseconds since `start`.
+since(start: Duration) -> long = (monotonic() - start).micros / 1000
+
+main() -> int
+  val l = TcpListener.bind("127.0.0.1", 0).getOrElse(fail("bind"))
+  val port = l.port()
+  // A lookup from a thread first, refused, so the runtime's poller is open before the descriptors are
+  // counted.
+  if spawn(() -> TcpStream.connect("localhost", 1).isOk).join() then fail("port 1 accepted")
+  settled()
+  val descriptors = openDescriptors()
+  resolveHold(true)
+
+  // A scope's cancellation ends a thread waiting for a lookup.
+  var cancelledAt = monotonic()
+  val ended = scope(s ->
+    val t = s.spawn(() -> TcpStream.connect("localhost", 1).isOk)
+    within("the lookup starting", () -> inFlight() == 1 && helpers() == 1)
+    cancelledAt = monotonic()
+    s.cancel()
+    t)
+  val stoppedAfter = since(cancelledAt)
+  if ended.result().nonEmpty then fail("a cancelled lookup gave a result")
+  if stoppedAfter > 2000 then fail(s"a cancelled lookup took $stoppedAfter ms to stop")
+  if inFlight() != 1 || helpers() != 1 then fail("the abandoned lookup is not still being made")
+  println("a cancelled lookup stops at once, its helper left to finish")
+
+  // A deadline that expires during the lookup ends it.
+  val start = monotonic()
+  val answer = withTimeout(millis(100), _ -> TcpStream.connect("localhost", 1).isOk)
+  val took = since(start)
+  if answer.nonEmpty then fail("a lookup the deadline cut off answered")
+  if took < 100 || took > 2000 then fail(s"withTimeout took $took ms for a 100 ms deadline")
+  println("withTimeout ends a lookup at its deadline")
+
+  // Two hundred lookups, each cut off by its deadline, more than the helpers' bound.
+  val stopped = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 200
+      s.spawn(() ->
+        if withTimeout(millis(50), _ -> TcpStream.connect("localhost", 1).isOk).isEmpty then
+          _ = stopped.add(1)))
+  if stopped.load() != 200 then fail(s"only ${stopped.load()} of 200 lookups were cut off")
+  if helpers() > 64 then fail(s"${helpers()} helpers run, past the bound of 64")
+  // The abandoned lookups still being made are bounded by the helpers; the queued ones were dropped.
+  if inFlight() > 64 then fail(s"${inFlight()} lookups hold a slot, past the bound of 64")
+  resolveHold(false)
+  settled()
+  if openDescriptors() != descriptors then fail(s"${openDescriptors()} descriptors open, not $descriptors")
+  println("200 cancelled lookups leave no helper, slot or descriptor behind")
+
+  // More lookups than the bound, none cancelled: the rest wait for a helper and all are answered.
+  resolveHold(true)
+  val answered = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 100
+      s.spawn(() ->
+        if TcpStream.connect("localhost", 1).isErr then _ = answered.add(1))
+    within("the lookups queuing", () -> inFlight() == 100)
+    if helpers() != 64 then fail(s"${helpers()} helpers run for 100 lookups, not the bound of 64")
+    resolveHold(false))
+  if answered.load() != 100 then fail(s"${answered.load()} of 100 lookups were answered")
+  settled()
+  if openDescriptors() != descriptors then fail(s"${openDescriptors()} descriptors open after the queued lookups")
+  println("lookups past the bound wait for a helper and are all answered")
+
+  // Not held: a name resolves on a helper thread and the connection is made, from a thread.
+  val accepted = spawn(() -> l.accept().isOk)
+  val before = helpersStarted()
+  val viaName = spawn(() -> TcpStream.connect("localhost", port).isOk)
+  if !viaName.join() then fail("a name did not resolve from a thread")
+  if !accepted.join() then fail("the listener accepted nothing")
+  if helpersStarted() <= before then fail("the lookup started no helper")
+  settled()
+  // From `main`, which waits on the pipe alone.
+  val accepted2 = spawn(() -> l.accept().isOk)
+  if TcpStream.connect("localhost", port).isErr then fail("a name did not resolve from main")
+  if !accepted2.join() then fail("the listener accepted nothing")
+  // A numeric address is resolved where it is asked.
+  settled()
+  val numeric = helpersStarted()
+  val accepted3 = spawn(() -> l.accept().isOk)
+  if TcpStream.connect("127.0.0.1", port).isErr then fail("a numeric address did not connect")
+  if !accepted3.join() then fail("the listener accepted nothing")
+  if helpersStarted() != numeric then fail("a numeric address started a helper")
+  println("a lookup answers from a thread and from main; a numeric address starts no helper")
+  0
