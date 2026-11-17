@@ -10712,3 +10712,20 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   reason); an `allowUnassigned` flag for the query form (no SCRAM use needs it); a generic
   `stringprep(profile)` (no second profile is wanted). Review with the user: whether a reason
   should be returned after all.
+
+- Settled on the user's delegation 2026-11-16 (branch `gc-pacing`): **`AVIN_GC_PERCENT` paces the
+  collector** ([runtime](/compiler/#runtime)). After a collection the heap may allocate that
+  percentage of what survived before it collects again, and never less than the 8 MiB floor; the
+  default stays 100, so the heap keeps within about twice what is live, as before. The value is
+  decimal digits; one that is not, or is longer than 15 digits, is ignored; 0 paces by the floor
+  alone, and anything above 100000 is taken as 100000. Measured on a program keeping 200k small
+  objects (37 MB live) while discarding ~800 bytes per element: collection time falls from 3.79 s
+  to 2.06 s at 200 and 1.12 s at 400, for a heap 1.2× and 1.5× as large. The pacing itself was
+  already proportional to what is live, so the cost per element allocated levels off once the live
+  heap passes the floor; what remains is that every collection traces the whole live heap (about
+  30 ns an object) and walks every block the sweep can reach. Alternatives weighed: a larger default
+  (faster, but a program's memory would grow with no setting of its own; left for the user); a
+  library call to set it at run time (no program needs to change it mid-run yet); a floor that
+  scales (it only matters below 8 MiB live). Review with the user: whether the default should be
+  above 100, since the collector stops every thread and marks on one, so the trade favours memory
+  less than it would for a concurrent collector.

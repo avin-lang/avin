@@ -309,3 +309,128 @@ reused_chunks_are_zeroed()
         for i in 0..<16
             assert_eq(p[i], 0u8)
     reset()
+
+// -- Pacing: when the next collection comes ---------------------------------------------------------
+
+private const MiB: usize = 1048576
+private var garbage: Descriptor = descriptor(2, 1008, 0)
+
+// How many collections allocating `made` bytes of short-lived objects runs, with `kept` bytes held
+// live in one object and the heap paced at `share` percent. Each object is 1 KiB with its header.
+private collections_making(kept: usize, share: usize, made: usize) -> usize
+    attach(&first)
+    percent = share
+    if kept > 0
+        a.slot = allocate_sized(&first, &small, kept)
+        a.frame.prev = first.top
+        first.top = &a.frame
+    collect_now()
+    val before = collections
+    var bytes = 0usize
+    while bytes < made
+        _ = allocate(&first, &garbage)
+        bytes += 1024
+    val ran = collections - before
+    percent = DefaultPercent
+    reset()
+    collect_now()
+    ran
+
+@test("the budget after a collection is the live bytes, and never less than the floor")
+budget_follows_what_is_live()
+    assert_eq(budget_for(0, 100), Floor)
+    assert_eq(budget_for(Floor - 1, 100), Floor)
+    assert_eq(budget_for(Floor, 100), Floor)
+    assert_eq(budget_for(Floor + 1, 100), Floor + 1)
+    assert_eq(budget_for(100000000, 100), 100000000usize)
+
+@test("the budget is the percentage of the live bytes, rounded down, and never less than the floor")
+budget_scales_by_percent()
+    assert_eq(budget_for(100000000, 200), 200000000usize)
+    assert_eq(budget_for(100000000, 50), 50000000usize)
+    assert_eq(budget_for(100000001, 150), 150000001usize)
+    assert_eq(budget_for(1000000099, 1), 10000000usize)
+    assert_eq(budget_for(100000000, 1), Floor)
+    assert_eq(budget_for(100000000, 0), Floor)
+    assert_eq(budget_for(0, MostPercent), Floor)
+
+@test("the largest heap at the largest percentage does not overflow the budget")
+budget_does_not_overflow()
+    val most = 1usize << 40
+    assert_eq(budget_for(most, MostPercent), most * 1000)
+    assert_eq(budget_for(most + 99, MostPercent), most * 1000 + 99000)
+
+@test("a setting is its decimal digits; empty, anything else or more than 15 digits is the default")
+settings_parse()
+    assert_eq(setting_number("0", 7), 0usize)
+    assert_eq(setting_number("250", 7), 250usize)
+    assert_eq(setting_number("007", 7), 7usize)
+    assert_eq(setting_number("999999999999999", 7), 999999999999999usize)
+    assert_eq(setting_number("1000000000000000", 7), 7usize)
+    assert_eq(setting_number("", 7), 7usize)
+    assert_eq(setting_number("-1", 7), 7usize)
+    assert_eq(setting_number("+1", 7), 7usize)
+    assert_eq(setting_number("1.5", 7), 7usize)
+    assert_eq(setting_number(" 1", 7), 7usize)
+    assert_eq(setting_number("1 ", 7), 7usize)
+    assert_eq(setting_number("12a", 7), 7usize)
+    assert_eq(setting_number("١٢", 7), 7usize)
+
+@test("AVIN_GC_PERCENT unset or not a number is 100, and is never more than the most")
+gc_percent_settings()
+    assert_eq(gc_percent_of(None), DefaultPercent)
+    assert_eq(DefaultPercent, 100usize)
+    assert_eq(gc_percent_of(Some("")), DefaultPercent)
+    assert_eq(gc_percent_of(Some("off")), DefaultPercent)
+    assert_eq(gc_percent_of(Some("0")), 0usize)
+    assert_eq(gc_percent_of(Some("1")), 1usize)
+    assert_eq(gc_percent_of(Some("400")), 400usize)
+    assert_eq(gc_percent_of(Some("100000")), MostPercent)
+    assert_eq(gc_percent_of(Some("100001")), MostPercent)
+    assert_eq(gc_percent_of(Some("999999999999999")), MostPercent)
+
+@test("AVIN_HEAP_LIMIT unset or not a number is 8 GiB, and is never less than 4096 bytes")
+heap_limit_settings()
+    assert_eq(heap_limit_of(None), DefaultLimit)
+    assert_eq(heap_limit_of(Some("")), DefaultLimit)
+    assert_eq(heap_limit_of(Some("1G")), DefaultLimit)
+    assert_eq(heap_limit_of(Some("0")), 4096usize)
+    assert_eq(heap_limit_of(Some("4095")), 4096usize)
+    assert_eq(heap_limit_of(Some("4097")), 4097usize)
+    assert_eq(heap_limit_of(Some("1073741824")), 1073741824usize)
+
+@test("a heap with little live collects once per floor's worth allocated")
+small_heaps_collect_at_the_floor()
+    assert_eq(collections_making(0, 100, 60 * MiB), 7usize)
+    assert_eq(collections_making(MiB, 100, 60 * MiB), 7usize)
+
+@test("a heap with more live than the floor collects once per live bytes' worth allocated")
+large_heaps_collect_in_proportion()
+    assert_eq(collections_making(16 * MiB, 100, 60 * MiB), 3usize)
+    assert_eq(collections_making(32 * MiB, 100, 60 * MiB), 1usize)
+    assert_eq(collections_making(24 * MiB, 100, 100 * MiB), 4usize)
+
+@test("AVIN_GC_PERCENT scales the allocation between collections, down to the floor")
+percent_scales_collections()
+    assert_eq(collections_making(16 * MiB, 200, 60 * MiB), 1usize)
+    assert_eq(collections_making(16 * MiB, 300, 60 * MiB), 1usize)
+    assert_eq(collections_making(16 * MiB, 400, 60 * MiB), 0usize)
+    assert_eq(collections_making(16 * MiB, 50, 60 * MiB), 7usize)
+    assert_eq(collections_making(16 * MiB, 0, 60 * MiB), 7usize)
+    assert_eq(collections_making(0, 1000, 60 * MiB), 7usize)
+
+@test("objects kept across collections paced by any percentage survive them, and the rest do not")
+pacing_keeps_what_is_live()
+    for share in [0usize, 100, 400]
+        attach(&first)
+        percent = share
+        hold(&first, &a)
+        val kept = a.slot
+        kept[0] = 0x5au8
+        for _ in 0..<20000
+            _ = allocate(&first, &garbage)
+        assert_eq(a.slot, kept)
+        assert_eq(kept[0], 0x5au8)
+        assert_eq(live_objects(), 1)
+        percent = DefaultPercent
+        reset()
