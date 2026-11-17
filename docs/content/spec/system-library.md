@@ -1423,6 +1423,16 @@ closed fails with `ConnectionReset`, never ending the program. Nothing else can 
 since a connection [belongs to one thread](#tcp): another thread that tries to close a connection or
 listener a thread is parked on traps, as any use of it from there does.
 
+**Looking up a host's name waits the same way, and a cancellation ends it.** The system's resolver
+cannot be stopped halfway, so the runtime makes each lookup on a helper thread of its own, and the
+`connect` or `bind` that asked waits for the answer as it waits on a socket: a lightweight thread
+parks, `main` waits safe for the collector, and a [cancellation](/spec/threads/#cancellation) or a
+`withTimeout`'s deadline stops the thread at once, so a connect's time limit covers the lookup too.
+The lookup it abandoned runs on to the resolver's answer, which is thrown away. At most 64 helpers
+run at once, which bounds how many abandoned lookups can still be running; a lookup asked for while
+all 64 are busy waits for one to come free, and that wait too is ended by a cancellation. A numeric
+address (`127.0.0.1`, `::1`) asks the network nothing and is resolved where it is asked.
+
 **A connection belongs to one thread at a time**, as every [handle](/spec/sysl-bindings/#handles)
 does: a server accepts a connection and hands it to the thread or future that serves it, the bytes
 read ahead going with it, and the code that handed it over traps at any operation on it while the
