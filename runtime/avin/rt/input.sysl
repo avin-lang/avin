@@ -79,6 +79,32 @@ private text_from(ctx: *Context, b: []const u8) -> *u8 = text_of(ctx, from_utf8_
 @export("avin_rt_input_ended")
 input_ended(ctx: *Context) -> bool = input_at == input.len() && !read_more(ctx)
 
+// The functions below look at the buffer through views that end with them. A reader calls them
+// between its calls of `read_more`, never holding a view across one: `read_more` can park a
+// lightweight thread, which may resume on another carrier, and a view's share of the buffer let go
+// there would race the threads using the buffer on this one.
+
+/** How far past `input_at` the next `\n` is, searching from `searched` bytes past it. */
+private newline_from(searched: usize) -> Option[usize]
+    find_byte(input.view()[input_at + searched..], 10) match
+        Some(i) -> Some(searched + i)
+        None -> None
+
+/** The `until` bytes past `input_at` as a new string, a `\r` ending them left out, taking them and the
+ * `\n` after them. */
+private take_line(ctx: *Context, until: usize) -> *u8
+    val have = input.view()[input_at..]
+    val trimmed = if until > 0 && have[until - 1] == 13 then until - 1 else until
+    val line = text_from(ctx, have[..<trimmed])
+    input_at += until + 1
+    line
+
+/** Every byte not yet taken, as a new string, taking them. */
+private take_rest(ctx: *Context) -> *u8
+    val rest = text_from(ctx, input.view()[input_at..])
+    input_at = input.len()
+    rest
+
 /** The next line of standard input, without its terminator, as a new string. Past the end it is the
  * empty string; the library asks only after `input_ended` has said there is more. */
 @export("avin_rt_read_line")
@@ -86,22 +112,13 @@ read_line(ctx: *Context) -> *u8
     // How far past `input_at` has been searched for a `\n` already, so a long line is scanned once.
     var searched: usize = 0
     while true
-        val have = input.view()[input_at..]
         // Another thread may have taken from the buffer while this one waited: look again from the start.
-        if searched > have.len then searched = 0
-        find_byte(have[searched..], 10) match
-            Some(i) ->
-                val until = searched + i
-                val trimmed = if until > 0 && have[until - 1] == 13 then until - 1 else until
-                val line = text_from(ctx, have[..<trimmed])
-                input_at += until + 1
-                return line
-            None -> searched = have.len
-        if !read_more(ctx)
-            val last = text_from(ctx, input.view()[input_at..])
-            input_at = input.len()
-            return last
-    text_from(ctx, input.view()[0..<0])
+        if input_at + searched > input.len() then searched = 0
+        newline_from(searched) match
+            Some(until) -> return take_line(ctx, until)
+            None -> searched = input.len() - input_at
+        if !read_more(ctx) then return take_rest(ctx)
+    take_rest(ctx)
 
 /** The next character of standard input. Bytes that are not UTF-8 are one U+FFFD for each maximal
  * ill-formed run, as a line or the rest of the input would decode them: four bytes hold any character
@@ -125,6 +142,4 @@ read_rest(ctx: *Context) -> *u8
     var more = true
     while more
         more = read_more(ctx)
-    val rest = text_from(ctx, input.view()[input_at..])
-    input_at = input.len()
-    rest
+    take_rest(ctx)
