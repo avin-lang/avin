@@ -10773,6 +10773,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the receiver's own names are offered); copying the string in the call's glue and freeing it there
   (a second copy of every string).
 
+- Settled on the user's delegation 2026-11-17 (built on branch `pool-check-cancel`, for the
+  PostgreSQL package's pool under deadlines): **a `Pool` call cancelled while `validate` checks a
+  resource puts the resource back as one given back is put back** ([Pool](/spec/threads/)): idle, or
+  to the first call waiting, destroyed only where the pool was closed meanwhile or the resource has
+  outlived `maxLifetime`. It was destroyed. A deadline (`withDeadline`, `withTimeout`) cancels a
+  thread, and a function entry or a loop's back edge is a cancellation point, so a deadline passing
+  just as an idle resource was taken stopped its check even where `validate` never waits, and good
+  resources were destroyed: up to 5 of a pool of 4 in a round of 100 calls under short deadlines.
+  *Why it is sound*: every resource is checked before it is lent, one handed to a waiter included,
+  so one a stopped check left in a bad state (a ping half sent) is caught and destroyed at its next
+  lend. *Alternatives weighed*: running `validate` where cancellation cannot stop it (a check that
+  blocks, a ping to a server that does not answer, would then hold the caller past its own deadline
+  until the check's own timeout); destroying the resource only where `validate` had begun to wait
+  (the pool cannot see inside the check, and a resource cut off mid-exchange is caught at its next
+  check either way). Of the pool's other cancellable steps, a cancelled `create` already gives its
+  place up, or keeps what it made, and a cancelled `f` already gives the resource back; destroying
+  outlived and closed resources runs where nothing stops it.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

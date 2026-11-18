@@ -622,7 +622,9 @@ data PoolCounters(
 - **The resource always comes back.** It is taken back when `f` returns and when the thread running
   `f` is cancelled inside it. A cancellation anywhere else in the call puts back what the call held:
   its place among the waiters, a resource handed to it there, the place it held while `create` ran,
-  a resource `validate` was checking, which is destroyed. A trap inside `f`, `create`, `validate` or
+  a resource `validate` was checking, which goes back as one given back does (destroyed only where
+  the pool is closed by then or the resource has outlived `maxLifetime`) and is checked again before it is next lent, so a deadline passing
+  during a check never destroys a good resource. A trap inside `f`, `create`, `validate` or
   `destroy` stops the program, even in an [actor](/spec/actors/), as one inside a semaphore's
   `withPermit` does, since what the pool counts would otherwise never come right.
 - **`close()` ends the pool.** Every call waiting fails with `PoolClosed`, as does every call after,
