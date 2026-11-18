@@ -1568,10 +1568,16 @@ pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoErro
   tried and failed to send is one that did not go out. A cancellation that stops a half inside an
   operation lets the locks go.
 
-A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext and sends
-what of the record the connection has room for; the rest goes before anything else is sent, and
-`writable()` sends it as room comes and answers `true` once it has gone. So after `writable()`
-answered `true`, `writeSome` does not wait. `ReadAhead`, the bytes a connection has read
+A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext. A
+`TlsStream` sends what of the record the connection has room for; the rest goes before anything
+else is sent, and `writable()` sends it as room comes and answers `true` once it has gone. So after
+`writable()` answered `true`, its `writeSome` does not wait. The writing half of a split one sends
+the whole record before it answers, waiting for room for the rest where there is too little, so what
+it answers has gone even where the writer writes nothing after it; its reading half reads
+meanwhile, so the wait never holds up the peer's answers. Where the writer's time limit runs out
+first, it still answers the plaintext TLS took, and the rest goes before anything else, `writable()`
+sending it as room comes. Ciphertext a wait that failed did not send is kept, in order, to go first,
+never dropped. `ReadAhead`, the bytes a connection has read
 beyond what its caller asked for and the line reading over them, is public for a connection of
 one's own: `pending` says whether any are still to be read, and `keep(bytes)` adds bytes that
 arrived before anything asked for them.

@@ -727,7 +727,8 @@ What a program can rely on:
   the writing half of a split one. It is ready where the sink's `writable()` answers `true` when the
   arm is tried: the socket has room, or the connection has failed or is closed, which its write then
   answers. A TLS sink is ready once the record an earlier `writeSome` began has gone, `writable()`
-  sending what of it there is room for. Where it is not ready, a select that waits watches the
+  sending what of it there is room for; the writing half of a split TLS connection sends each
+  record whole before its `writeSome` answers, so the loop below leaves nothing behind when it ends. Where it is not ready, a select that waits watches the
   descriptor for room on the poller as a `readable()` arm watches it for bytes, and a reading and a
   writing half of one connection may each wait on it at once, each woken by its own direction.
 - **Choosing.** Of several arms ready at once, each is as likely to run as any other: the arms are
