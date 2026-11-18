@@ -1,0 +1,207 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import sysl.threads.{Thread, spawn}
+import sysl.time.{millis, sleep}
+
+// Standard input read while its reader waits: a pipe stands in for it, and a second thread writes to
+// the pipe only once the reader is waiting for more, counting the shares of the input buffer's storage
+// first. A read that waits holds no view of the buffer meanwhile, since a lightweight thread that
+// parked would let go of it on whichever carrier it resumed on, racing the threads using the buffer
+// there; so the count while it waits is the count once it has finished.
+
+private extern "pipe" input_test_pipe(fds: *i32) -> int
+private extern "dup" input_test_dup(fd: int) -> int
+private extern "dup2" input_test_dup2(from: int, to: int) -> int
+private extern "close" input_test_close(fd: int) -> int
+private extern "write" input_test_write(fd: int, bytes: *u8, len: usize) -> isize
+
+/** Held by the test using standard input, so two never swap it at once. */
+private var input_test_held: Atomic[u64] = Atomic(0)
+
+/** The most chunks a writing thread writes. */
+private const FeedMost: usize = 4
+
+// What the writing thread does: the first `n` chunks in turn, each `lengths[i]` bytes at `starts[i]`,
+// once the reader has waited a while for it, then the end of the input where `closes`; `most` is the
+// most shares it counted while the reader waited. The chunks are bytes of strings the test holds
+// until the thread has finished, so the thread shares nothing counted.
+private struct Feed
+    fd: int
+    n: usize
+    starts: [4]*u8
+    lengths: [4]usize
+    closes: bool
+    most: Atomic[u64]
+
+private var feed: Feed = Feed(-1, 0, [null; 4], [0; 4], false, Atomic(0))
+
+/** Every one of the `n` bytes at `p` to `fd`. */
+private write_all(fd: int, p: *u8, n: usize)
+    var at: usize = 0
+    while at < n
+        val wrote = input_test_write(fd, &p[at], n - at)
+        assert(wrote > 0)
+        at += usize(wrote)
+
+private bytes_of(s: string) -> *u8 = ptr_cast(&s.bytes[0])
+
+// How many shares the storage of the input buffer has, besides the one this count takes: the count is
+// the first word of the storage a slice's owner word names.
+private input_shares() -> u64
+    var s = input.elems
+    val owner: **u64 = ptr_cast(&s)
+    if owner[0] == null then 0 else owner[0][0] - 1
+
+private note_shares(f: *Feed)
+    // By now the reader is waiting for what comes next.
+    sleep(millis(200))
+    val n = input_shares()
+    if n > f.most.load() then f.most.store(n)
+
+private write_feed(f: *Feed) -> unit
+    for i in 0..<f.n
+        note_shares(f)
+        write_all(f.fd, f.starts[i], f.lengths[i])
+    if f.closes
+        note_shares(f)
+        _ = input_test_close(f.fd)
+
+private forget_input()
+    input = buf()
+    input_at = 0
+    input_done = false
+    input_streams = 0
+
+// Standard input made a pipe holding `first`, with the thread writing `chunks` after it, and the
+// end of the input after them where `closes`; `finish` puts standard input back. The caller holds the
+// chunks until then.
+private struct Piped
+    saved: int
+    me: *Context
+
+private piped(first: string, chunks: []const string, closes: bool) -> Piped
+    while input_test_held.swap(1) != 0 do sleep(millis(1))
+    var ends: [2]i32 = [-1, -1]
+    assert_eq(input_test_pipe(&ends[0]), 0)
+    val saved = input_test_dup(0)
+    assert(saved >= 0)
+    assert(input_test_dup2(int(ends[0]), 0) == 0)
+    _ = input_test_close(int(ends[0]))
+    forget_input()
+    write_all(int(ends[1]), bytes_of(first), first.bytes.len)
+    feed.fd = int(ends[1])
+    assert(chunks.len <= FeedMost)
+    feed.n = chunks.len
+    for i in 0..<chunks.len
+        feed.starts[i] = bytes_of(chunks[i])
+        feed.lengths[i] = chunks[i].bytes.len
+    feed.closes = closes
+    feed.most.store(0)
+    Piped(saved, thread_attach())
+
+/** Waits for the writing thread, and checks the reader held nothing of the buffer while it waited. */
+private finish(p: Piped, writer: Thread)
+    assert(writer.join())
+    val idle = input_shares()
+    assert_eq(feed.most.load(), idle)
+    thread_detach(p.me)
+    if !feed.closes then _ = input_test_close(feed.fd)
+    assert(input_test_dup2(p.saved, 0) == 0)
+    _ = input_test_close(p.saved)
+    forget_input()
+    feed.n = 0
+    input_test_held.store(0)
+
+/** Whether the string `p` holds exactly the bytes of `want`. */
+private same(p: *u8, want: string) -> bool
+    val n = text_length(p)
+    if n != want.bytes.len then return false
+    val b = text_bytes(p)
+    for i in 0..<n
+        if b[i] != want.bytes[i] then return false
+    true
+
+@test("a line that waits for its end holds no share of the input buffer meanwhile, where the buffer already has storage from a line before it")
+line_waits_sharing_nothing()
+    val p = piped("first\n", ["second\n"], false)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "first"))
+    assert(same(read_line(p.me), "second"))
+    finish(p, writer)
+
+@test("a line part of which has arrived waits for the rest holding no share, and is whole when it ends")
+line_part_waits_sharing_nothing()
+    val p = piped("x\nhalf", [" and half\n"], false)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert(same(read_line(p.me), "half and half"))
+    finish(p, writer)
+
+@test("a line longer than one read gathers over several waits, holding no share during any of them")
+long_line_waits_sharing_nothing()
+    val a = "a".repeat(40000)
+    val ended = a + "\n"
+    val p = piped("x\n", [a, a, ended], false)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert(same(read_line(p.me), a + a + a))
+    finish(p, writer)
+
+@test("a \\r\\n split between two reads ends the line, the \\r going with the terminator")
+crlf_split_waits_sharing_nothing()
+    val p = piped("x\r\nsplit\r", ["\nnext\r\n"], false)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert(same(read_line(p.me), "split"))
+    assert(same(read_line(p.me), "next"))
+    finish(p, writer)
+
+@test("a last line with no terminator ends with the input, after a wait that holds no share")
+last_line_waits_sharing_nothing()
+    val p = piped("x\nlast", [], true)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert(same(read_line(p.me), "last"))
+    assert(input_ended(p.me))
+    finish(p, writer)
+
+@test("a character read with fewer than four bytes buffered waits for more, holding no share of the input buffer meanwhile")
+char_waits_sharing_nothing()
+    val p = piped("x\nab", ["cd"], true)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert_eq(read_char(p.me), 'a')
+    assert_eq(read_char(p.me), 'b')
+    finish(p, writer)
+
+@test("a character whose bytes all come after a wait is decoded whole, holding no share meanwhile")
+char_after_wait_sharing_nothing()
+    val p = piped("x\n", ["é", "z"], true)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert_eq(read_char(p.me), 'é')
+    assert_eq(read_char(p.me), 'z')
+    assert(input_ended(p.me))
+    finish(p, writer)
+
+@test("the rest of the input gathers over several waits, holding no share during any of them")
+rest_waits_sharing_nothing()
+    val p = piped("one\ntw", ["o\r\n", "three"], true)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "one"))
+    assert(same(read_rest(p.me), "two\r\nthree"))
+    assert(input_ended(p.me))
+    finish(p, writer)
+
+@test("whether the input has ended waits for a read, holding no share meanwhile")
+ended_waits_sharing_nothing()
+    val p = piped("x\n", ["y"], true)
+    val writer = spawn(&write_feed, &feed).unwrap()
+    assert(same(read_line(p.me), "x"))
+    assert(!input_ended(p.me))
+    assert(same(read_line(p.me), "y"))
+    assert(input_ended(p.me))
+    finish(p, writer)
