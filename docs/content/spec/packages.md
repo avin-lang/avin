@@ -41,8 +41,9 @@ was, and needs no ceremony.
 ## The manifest
 
 `package` names the package and gives its version; both are required, and `description` and `avin`
-are optional. Beside it a manifest holds `dependencies`, [`features`](#features) and
-[`workspace`](#workspaces).
+are optional. Beside it a manifest holds `dependencies`, [`features`](#features),
+[`workspace`](#workspaces), and for its C bindings [`c-libraries`](#c-libraries) and
+[`static-c-libraries`](/spec/c-bindings/#linking-statically).
 
 - **A name** begins with a lowercase letter and holds lowercase letters, digits, `_` and `-`
   (`geom-tools`). It names the package, not a module: modules are named by their directories.
@@ -173,7 +174,10 @@ c-libraries {
 ```
 
 A program links the C libraries of every package in it, asking `pkg-config` at every build. They are
-the machine's, not fetched: they get no line in `avin.sum`.
+the machine's, not fetched: they get no line in `avin.sum`. A program whose manifest says
+`static-c-libraries = true` links them from their static archives, so the machine it runs on needs
+none of them; only the root package's key is read ([C
+bindings](/spec/c-bindings/#linking-statically)).
 
 ### What a dependency brings in
 

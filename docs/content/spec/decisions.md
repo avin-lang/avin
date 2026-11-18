@@ -10791,6 +10791,35 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   place up, or keeps what it made, and a cancelled `f` already gives the resource back; destroying
   outlived and closed resources runs where nothing stops it.
 
+- Settled on the user's delegation 2026-11-18 (built on branch `static-link`, for tend's one
+  self-contained binary): **a program links its C libraries from their static archives when its
+  manifest says `static-c-libraries = true`** ([C bindings](/spec/c-bindings/#linking-statically)).
+  The user decided that static linking is avin's own item; the shape is this branch's. One
+  top-level key of the root package, a boolean; a dependency's is not read, since how a program is
+  linked is decided once for the whole of it, and a library package deciding it would decide for
+  programs it never sees (Sysl's `link` key, root-only for the same reason). For every library a
+  `pkg-config` module finds, of every package in the program, the build asks `pkg-config --static
+  --libs`, which adds what the library links privately (`Libs.private`), and replaces each `-l<name>`
+  whose `lib<name>.a` is in one of the answer's `-L` directories by **the archive's path**, the only
+  spelling that reaches an archive on macOS, where the linker takes a `.dylib` over a `.a` in the
+  same directory. A name none of those directories holds is the system's own (libSystem, libz) and
+  stays dynamic. **A name whose shared library is in one of them but whose archive is in none stops
+  the build** with an error naming the shared library and the archive it lacks, where Sysl's
+  `link = "static"` links such a library dynamically and says so only under `--verbose`: a program
+  asking for static libraries exists so that the machine running it needs nothing installed, and a
+  silent `.dylib` is the very program the key is there to prevent. A library named by `link` is
+  passed as `-l` as before. *Alternatives weighed*: a per-library `static = true` in `c-libraries`
+  (the library's author would decide for every program, and a program could not ask for a
+  dependency's library); Sysl's `link = "static" | [names]` with a `--link` flag (a top-level `link`
+  beside the `link` of a C library meaning `-l` names would read as one key with two meanings; a list
+  of names and a flag can come later without changing this one); a `--static-libs` build flag alone
+  (how the program must be linked is a property of the program, and a release built without the flag
+  would quietly need Homebrew). **Review with the user**: the key's name and its boolean shape against
+  Sysl's `link`; that it is stricter than Sysl's `"static"`; that a library `pkg-config` gives no
+  `-L` directory for counts as the system's, which on Linux leaves a distribution's `/usr/lib`
+  libraries dynamic; and that the C libraries of a program's Sysl packages (`requires { pkg_config }`)
+  are not covered.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

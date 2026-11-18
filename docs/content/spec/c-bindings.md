@@ -128,6 +128,46 @@ c-libraries {
 program that never names MLT itself. A package whose bindings name a [handle of another
 package](#handles-of-another-package) is checked with that package's headers too.
 
+### Linking statically
+
+**A program whose manifest says `static-c-libraries = true` links its C libraries from their static
+archives**, so the machine it runs on needs none of them installed
+([settled](/spec/decisions/#proposed)):
+
+```hocon
+package { name = "tend", version = "0.1.0" }
+
+static-c-libraries = true
+
+dependencies {
+  ssh { git = "github.com/avin-lang/ssh", version = "0.0.1" }
+}
+```
+
+- **The program decides, for every package in it.** Only the root package's key is read: a library
+  package that says it is built dynamically into a program that does not, and a program that says
+  it links the C libraries of its dependencies statically too. Without the key, or with `false`,
+  every library is linked as `pkg-config --libs` answers.
+- For each library a `pkg-config` module finds, the build asks `pkg-config --static --libs`, which
+  adds the libraries it links privately (`Libs.private`: libssh2's OpenSSL), and replaces each
+  `-l<name>` whose `lib<name>.a` is in one of the answer's `-L` directories by the archive's path, the
+  first directory holding one winning. **The path, because on macOS the linker takes a `.dylib` over
+  a `.a` in the same directory**, and Homebrew installs both side by side. The `-L` and run-path flags
+  are dropped; every other flag (`-framework`, `-pthread`) is kept.
+- **The system's own libraries stay dynamic.** A name none of the `-L` directories holds is one the
+  linker finds by itself, in the system (libSystem and libz on macOS), and stays `-l<name>`. A library
+  named by `link` is passed as `-l` as always.
+- **A library with no archive stops the build.** A name whose shared library is in one of the `-L`
+  directories but whose archive is in none would be linked dynamically, the very program the key is
+  there to prevent, so it is an error naming what is missing; `avin check` reports it too:
+
+  ```text
+  error: the C library `libssh2` of package `ssh` is linked statically (`static-c-libraries = true`), but `-lcrypto`, which `pkg-config --static --libs libssh2` names, has no static archive: `/opt/homebrew/opt/openssl@4/lib/libcrypto.dylib` has no `libcrypto.a` beside it
+  ```
+
+`otool -L` is the check: a program binding libssh2 and built this way lists only
+`/usr/lib/libSystem.B.dylib` and `/usr/lib/libz.1.dylib`.
+
 ## Prototypes
 
 The prototype is C's declaration with three words of its own, which say what C's types cannot. They
