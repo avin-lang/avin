@@ -1,7 +1,7 @@
 module dev.avinlang.compiler
 @tests
 
-import sh.sysl.parsing.source_of
+import sh.sysl.parsing.{Span, source_of}
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
 import sysl.path.parent
@@ -1557,7 +1557,61 @@ c_library_manifest_errors()
     assert(manifest_error(manifest("a", "c-libraries = [\"zlib\"]\n")).contains("`c-libraries` is a block naming each C library"))
     assert(manifest_error(manifest("a", "c-libraries {\n  Zlib { }\n}\n")).contains("`Zlib` is not a C library's name"))
     assert(manifest_error("workspace = [\"app\"]\nc-libraries {\n  z { headers = [\"zlib.h\"] }\n}\n").contains("so it has no C bindings to call its C libraries"))
-    assert(manifest_error(manifest("a", "c-library {\n}\n")).contains("which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `features` and `workspace`"))
+    assert(manifest_error(manifest("a", "c-library {\n}\n")).contains("which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `static-c-libraries`, `features` and `workspace`"))
+
+@test("static-c-libraries is true or false, false when unsaid, and a workspace with no package says none")
+static_c_libraries_read()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", manifest("app", "")).unwrap()
+    assert(!read_manifest(dir).unwrap().static_c_libraries)
+    write_text(dir + "/avin.hocon", manifest("app", "static-c-libraries = true\n")).unwrap()
+    assert(read_manifest(dir).unwrap().static_c_libraries)
+    write_text(dir + "/avin.hocon", manifest("app", "static-c-libraries = false\n")).unwrap()
+    assert(!read_manifest(dir).unwrap().static_c_libraries)
+    // It may come before the `package` block, as every key may.
+    write_text(dir + "/avin.hocon", "static-c-libraries = true\n" + manifest("app", "")).unwrap()
+    assert(read_manifest(dir).unwrap().static_c_libraries)
+    // A library read from a manifest is never linked statically until a program asks for it.
+    write_text(dir + "/avin.hocon", manifest("app", "static-c-libraries = true\nc-libraries {\n  z { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n")).unwrap()
+    assert(!read_manifest(dir).unwrap().c_libraries[0].linked_statically)
+    for wrong in ["\"true\"", "1", "[true]", "{ }"]
+        val e = manifest_error(manifest("a", s"static-c-libraries = $wrong\n"))
+        assert(e.contains("`static-c-libraries` is `true` or `false`"), e)
+        assert(e.contains("avin.hocon:5:"), e)
+    // A per-library `static` is not a key: the program decides how it is linked.
+    assert(manifest_error(manifest("a", "c-libraries {\n  z { pkg-config = \"zlib\", static = true }\n}\n")).contains("`static` is not a key of a C library"))
+    val workspace = manifest_error("workspace = [\"app\"]\nstatic-c-libraries = true\n")
+    assert(workspace.contains("a workspace with no `package` block builds no program of its own, so it has nothing to link statically"), workspace)
+    // A workspace root that is a package too may say it.
+    write_text(dir + "/avin.hocon", manifest("app", "workspace = [\"member\"]\nstatic-c-libraries = true\n")).unwrap()
+    assert(read_manifest(dir).unwrap().static_c_libraries)
+    // A program of one file has no manifest to say it in: its header holds `dependencies` only.
+    val script = script_manifest("/nowhere", source_of("main.avin", ""), ScriptHeader(source_of("main.avin", "static-c-libraries = true\n"), Span(0, 0)))
+    assert(script is Err(_))
+
+@test("the root package's static-c-libraries reaches every package's C libraries; a dependency's is not read")
+static_c_libraries_of_a_graph()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/app/avin.hocon", manifest("app", "static-c-libraries = true\ndependencies {\n  zip { path = \"../zip\" }\n}\nc-libraries {\n  libc { headers = [\"<stdlib.h>\"] }\n}\n"))
+    put(dir + "/app/main.avin", "import zip\n\nmain() = zip.one()\n")
+    put(dir + "/zip/avin.hocon", manifest("zip", "c-libraries {\n  zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n"))
+    put(dir + "/zip/zip/zip.avin", "module zip\n\none() -> int = 1\n")
+    val program = load_package(dir + "/app", default_fetching()).unwrap()
+    assert_eq(program.c.len(), 2)
+    assert(program.c[0].linked_statically)
+    assert(program.c[1].linked_statically)
+    // The dependency asking for it does not make the program static.
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  zip { path = \"../zip\" }\n}\n"))
+    put(dir + "/zip/avin.hocon", manifest("zip", "static-c-libraries = true\nc-libraries {\n  zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n"))
+    val dynamic = load_package(dir + "/app", default_fetching()).unwrap()
+    assert_eq(dynamic.c.len(), 1)
+    assert(!dynamic.c[0].linked_statically)
+    // The dependency built as a program of its own takes its own word.
+    put(dir + "/zip/main.avin", "import zip\n\nmain() = zip.one()\n")
+    val own = load_package(dir + "/zip", default_fetching()).unwrap()
+    assert(own.c[0].linked_statically)
 
 @test("a package's C libraries reach the program, every package's in it, its own first")
 c_libraries_of_a_graph()

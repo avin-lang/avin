@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.{Source, Span, error, report}
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
-import sysl.fs.{make_dir_all, make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
+import sysl.fs.{exists, make_dir_all,make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
 import sysl.process.capture
 import sysl.text.{StrBuilder, from_utf8, str_builder}
 
@@ -574,12 +574,12 @@ ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sou
         library.pkg_config match
             Some(m) ->
                 val c = ask_pkg_config(tc, library, m, "--cflags")?
-                val l = ask_pkg_config(tc, library, m, "--libs")?
+                val l = ask_pkg_config(tc, library, m, if library.linked_statically then "--static --libs" else "--libs")?
                 answered = answered + m + "\n" + c + "\n" + l + "\n"
                 for flag in c.fields()
                     add_flag(&cflags, flag)
-                for flag in l.fields()
-                    add_flag(&link, flag)
+                val flags = if library.linked_statically then static_link_flags(library, m, l)? else words_of(l)
+                add_link_flags(&link, flags)
             None ->
                 for name in library.link
                     add_flag(&link, "-l" + name)
@@ -645,12 +645,85 @@ private add_flag(flags: *Buf[string], flag: string)
         if f == flag then return
     flags.push(flag)
 
+private words_of(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for w in text.fields()
+        out.push(w)
+    out
+
+/** Adds the link flags `words` to `flags`, each once: a flag that takes the word after it as its
+ * value (`-framework Security`) is one flag with that word, so two frameworks are both kept. */
+add_link_flags(flags: *Buf[string], words: Buf[string])
+    var i = 0usize
+    while i < words.len()
+        val w = words[i]
+        if is_paired_link_flag(w) && i + 1 < words.len()
+            val value = words[i + 1]
+            var seen = false
+            var k = 0usize
+            while k + 1 < flags.len()
+                if (*flags)[k] == w && (*flags)[k + 1] == value then seen = true
+                k += 1
+            if !seen
+                flags.push(w)
+                flags.push(value)
+            i += 2
+        else
+            add_flag(flags, w)
+            i += 1
+
+private is_paired_link_flag(w: string) -> bool = w == "-framework" || w == "-weak_framework" || w == "-Xlinker"
+
+/** The link flags of `library`, whose module `module_name` answered `answer` to `pkg-config --static
+ * --libs`, with each library it names linked from its static archive. A `-l` name whose
+ * `lib<name>.a` is in one of the answer's `-L` directories is replaced by that archive's path, the
+ * first directory holding one winning, as the linker searches them. A name none of those directories
+ * holds is the system's own (libSystem, libz, libm on macOS), which the linker finds by itself, and
+ * stays `-l<name>`, linked dynamically. A name whose shared library is in one of them but whose
+ * archive is in none has no static archive to link, and is an error naming it. The `-L` and run-path
+ * flags are dropped: no shared library is taken from those directories. Every other flag
+ * (`-framework`, `-pthread`) is kept as it is. */
+static_link_flags(library: CLibrary, module_name: string, answer: string) -> Result[Buf[string], string]
+    var dirs: Buf[string] = buf()
+    for flag in answer.fields()
+        if flag.starts_with("-L") && flag.bytes.len > 2usize then dirs.push(flag[2..])
+    var out: Buf[string] = buf()
+    for flag in answer.fields()
+        if flag.starts_with("-L") || flag.starts_with("-R") || flag.starts_with("-Wl,-rpath") then continue
+        if !flag.starts_with("-l") || flag.bytes.len <= 2usize
+            out.push(flag)
+            continue
+        val name = flag[2..]
+        if archive_in(dirs, "lib" + name + ".a") is Some(a)
+            out.push(a)
+        elif shared_library_in(dirs, name) is Some(shared)
+            return Err(s"error: the C library `${library.label}` of package `${library.package}` is linked statically (`static-c-libraries = true`), but `$flag`, which `pkg-config --static --libs $module_name` names, has no static archive: `$shared` has no `lib$name.a` beside it\n")
+        else out.push(flag)
+    Ok(out)
+
+private archive_in(dirs: Buf[string], file: string) -> Option[string]
+    for d in dirs
+        if exists(d + "/" + file) then return Some(d + "/" + file)
+    None
+
+// The shared library the linker would take for `-l<name>` from one of `dirs`, if one holds it.
+private shared_library_in(dirs: Buf[string], name: string) -> Option[string]
+    for d in dirs
+        for suffix in [".dylib", ".tbd", ".so"]
+            val file = d + "/lib" + name + suffix
+            if exists(file) then return Some(file)
+    None
+
 // What `pkg-config <question> <module>` prints, or the error a build that cannot find the library
-// gives, with what the manifest says to do.
+// gives, with what the manifest says to do. `question` is one flag or several, separated by spaces.
 private ask_pkg_config(tc: Toolchain, library: CLibrary, module_name: string, question: string) -> Result[string, string]
     val tail = if library.install == "" then "" else " " + library.install
     val asked = s"`pkg-config $question $module_name`"
-    val result = capture(tc.pkg_config, [question, module_name], stderr = true, timeout = 60000) match
+    var args: Buf[string] = buf()
+    for w in question.fields()
+        args.push(w)
+    args.push(module_name)
+    val result = capture(tc.pkg_config, args.view(), stderr = true, timeout = 60000) match
         Ok(r) -> r
         Err(e) -> return Err(s"error: the C library `${library.label}` of package `${library.package}` was not found: $asked could not run (${e.to_string()}).$tail\n")
     if !result.status.ok() then return Err(s"error: the C library `${library.label}` of package `${library.package}` was not found: $asked failed.$tail\n")
