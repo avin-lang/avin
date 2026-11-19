@@ -669,6 +669,14 @@ has read ahead, so `readLine`, `lines()` and `readAll` can be mixed: each takes 
 stopped, and nothing read ahead is lost. Reading blocks until a line is complete or the input ends,
 so a program reading a terminal sees each line as it is entered.
 
+**Threads read standard input one at a time, and each read is whole.** A `readLine`, a step of an
+iterator and `readAll` each take what they read in one step: a line goes whole to exactly one reader,
+never split between two or given to both, and a reader that finds the input ended gets `None`. A
+lightweight thread waiting for its turn, or for the input itself, parks and leaves its worker to the
+others. An iterator over standard input takes the line (or character) `hasNext` answers for and keeps
+it for `next`, so a `true` from `hasNext` is never undone by another thread; a `readLine` after
+`hasNext` reads the line after the one the iterator holds.
+
 **Input is text, and reading it does not fail.** Bytes that are not UTF-8 become U+FFFD, one for each
 ill-formed run, as they are read; a line is always a valid string, and a program reading text is
 never stopped by a stray byte. A read that fails ends the input, as its end does. Standard input is a

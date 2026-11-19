@@ -10889,6 +10889,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   argument nested in another contravariant one is still held whole. **Review with the user**: whether
   the meet is worth adding when a program meets the order-dependent case.
 
+- Proposed (branch `stdin-serialize`, 2026-11-18): **threads read standard input one at a time, and
+  each read is whole** ([system library](/spec/system-library/#standard-input)). A `readLine`, an
+  iterator's step, a character and `readAll` each hold the input from their look at whether it has
+  ended to their taking of what they read, so a line goes to exactly one reader, never split
+  between two or given to both, and a reader past the end gets `None`, never a stray empty line.
+  Found because nothing serialized the one buffer: two lightweight threads reading at once hung
+  (both parked on the descriptor) or trapped out of range in the runtime. The lock is a runtime lock
+  of the library's kind (`ParkLock`, held across the reader's wait for input): a lightweight thread
+  waiting for it, or waiting for input while holding it, parks, so neither holds up a carrier; it is
+  a region a trap is not contained in, as any lock's is, so a contained trap never leaves it held.
+  **An iterator over standard input takes the line (or character) `hasNext` answers for and keeps it
+  until `next`**, since otherwise another thread could take that line between the two and `next`
+  would fail on a `hasNext` that said `true`. On one thread this is seen only by code that asks
+  `hasNext` and then reads by another way: the other read gets the line after the one the iterator
+  holds. Alone, a reader pays two uncontended lock operations per read (2M lines: 0.136 s before,
+  0.139 s after). *Alternatives weighed*: a lock taken inside each runtime call only (the library's
+  look at the end and its take are two calls, so a reader could still get `Some("")` past the end);
+  an OS lock (held across the wait for input it would block a carrier, and a thread parked holding
+  it would resume on another carrier and let go of a lock it does not own there); a `Mutex` in
+  `avin.io` (the same lock, with an object to keep alive and the module made to depend on
+  `avin.threads`); an iterator whose `hasNext` takes nothing (racy across threads, as above).
+  **Review with the user**: the iterator's taking of its line at `hasNext`.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

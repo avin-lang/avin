@@ -58,17 +58,31 @@ lock_acquire(ctx: *Context, p: *u8)
 // that lets it go.
 private take_lock(ctx: *Context, p: *u8)
     val l: *ParkLock = ptr_cast(p)
-    l.waiting.guard.lock()
-    if !l.held
-        l.held = true
-        l.waiting.guard.unlock()
-        return
-    val w = waiter_of(ctx)
+    if take_free(l) then return
     var r = Holding(Frame(ctx.top, 1), p, null)
     ctx.top = &r.frame
+    await_lock(ctx, l)
+    ctx.top = r.frame.prev
+
+/** Takes the lock `l`, which is not on the collected heap: at once where it is free, and otherwise as
+ * the oldest waiter, from the thread that lets it go. A lightweight thread waiting for it parks. */
+hold_park_lock(ctx: *Context, l: *ParkLock)
+    if !take_free(l) then await_lock(ctx, l)
+
+// Takes the lock `l` where it is free, answering whether it did; otherwise answers false holding its
+// guard, for `await_lock`.
+private take_free(l: *ParkLock) -> bool
+    l.waiting.guard.lock()
+    if l.held then return false
+    l.held = true
+    l.waiting.guard.unlock()
+    true
+
+// Waits, holding the guard of the lock `l`, until the thread that lets `l` go hands it over.
+private await_lock(ctx: *Context, l: *ParkLock)
+    val w = waiter_of(ctx)
     enqueue(&l.waiting, w)
     _ = wait_on(ctx, &l.waiting, w, 0)
-    ctx.top = r.frame.prev
 
 /** Lets the lock `p` go, which the calling thread holds. */
 @export("avin_rt_lock_release")
@@ -85,8 +99,11 @@ lock_release_holding(ctx: *Context, p: *u8)
     let_lock_go(p)
 
 // Lets the lock `p` go: to the oldest thread waiting for it, which then holds it, or free.
-private let_lock_go(p: *u8)
-    val l: *ParkLock = ptr_cast(p)
+private let_lock_go(p: *u8) = let_park_lock_go(ptr_cast(p))
+
+/** Lets the lock `l` go, which the calling thread holds: to the oldest thread waiting for it, which
+ * then holds it, or free. */
+let_park_lock_go(l: *ParkLock)
     l.waiting.guard.lock()
     if !wake_one(&l.waiting) then l.held = false
     l.waiting.guard.unlock()

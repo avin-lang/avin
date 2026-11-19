@@ -13,6 +13,28 @@ import sysl.text.{chars_of, from_utf8_lossy}
 // A line ends at `\n`, and a `\r` just before it goes with it; the last line of input needs no
 // terminator. Bytes that are not UTF-8 become U+FFFD, one for each maximal ill-formed run, as they are
 // turned into a string. A read that fails ends the input, as its end does.
+//
+// Threads read standard input one at a time. A reader holds `input_readers` across the whole of one
+// read, the library's look at whether the input has ended and its taking of a line included, so a line
+// goes whole to one reader and is never split or taken twice. The lock is the kind the library's own
+// locks are: a lightweight thread waiting for it parks, as one waiting for input while it holds it
+// does, so neither holds up a carrier. Every function below that reads the buffer is called holding it.
+
+/** Held by the thread reading standard input, from `input_hold` to `input_release`. */
+var input_readers: ParkLock = ParkLock(new_wait_queue_for(WaitsOnInput), false)
+
+/** Takes the lock over standard input, waiting while another thread reads it. A trap while the lock
+ * is held is not contained, as one holding any other lock is not, so it is never left held. */
+@export("avin_rt_input_hold")
+input_hold(ctx: *Context)
+    enter_doubt(ctx)
+    hold_park_lock(ctx, &input_readers)
+
+/** Lets the lock over standard input go, which the calling thread holds. */
+@export("avin_rt_input_release")
+input_release(ctx: *Context)
+    leave_doubt(ctx)
+    let_park_lock_go(&input_readers)
 
 /** Bytes read and not yet taken: those of `input` from `input_at` on. */
 var input: Buf[u8] = buf()
@@ -112,8 +134,6 @@ read_line(ctx: *Context) -> *u8
     // How far past `input_at` has been searched for a `\n` already, so a long line is scanned once.
     var searched: usize = 0
     while true
-        // Another thread may have taken from the buffer while this one waited: look again from the start.
-        if input_at + searched > input.len() then searched = 0
         newline_from(searched) match
             Some(until) -> return take_line(ctx, until)
             None -> searched = input.len() - input_at

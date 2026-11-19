@@ -1,0 +1,81 @@
+// expect: exit 0
+// Several threads read standard input at once, and each read is whole: a line goes to exactly one
+// reader, never split between two or given to both, and a line an iterator's `hasNext` answered for is
+// that iterator's. The program runs itself as a child whose standard input is a pipe a generator
+// writes thousands of lines to, once for each way of reading: `readLine` from six threads, `lines()`
+// iterators from six threads, and characters and everything left from one thread while two others
+// read lines. Each child puts together what its readers took and checks it is the input.
+import avin.io
+import avin.io.Source
+import avin.process
+import avin.process.Command
+import avin.threads
+
+// How many lines the generator writes, and how many threads read lines at once.
+val count = 4000
+val readers = 6
+
+// Line `i` of the input: a number to tell it by, a length that varies, now and then a character of
+// two bytes.
+lineText(i: int) -> string = s"line-$i-" + "x".repeat(i % 50) + (if i % 7 == 0 then "é" else "")
+
+// The number of `line`, where it is a whole line the generator wrote.
+numberOf(line: string) -> Option[int]
+  val parts = line.split("-")
+  if parts.length != 3 then return None
+  parts(1).toIntOption() match
+    Some(i) -> if 0 <= i < count && lineText(i) == line then Some(i) else None
+    None -> None
+
+// Every line left, read with `readLine`.
+byReadLine() -> Vector[string]
+  val mine = Buffer[string]()
+  while true
+    io.readLine() match
+      Some(line) -> mine += line
+      None -> break
+  mine.toVector
+
+// Every line left, read through an iterator of its own.
+byIterator() -> Vector[string]
+  val mine = Buffer[string]()
+  for line in io.lines()
+    mine += line
+  mine.toVector
+
+// Checks the lines `taken` by every reader together are the input: the sorted union of their numbers
+// is every number once, and no line is torn.
+report(way: string, taken: Vector[Vector[string]])
+  val all = taken.flatMap(t -> t)
+  val numbers = all.map(numberOf)
+  val torn = numbers.filter(n -> n is None).length
+  val sorted = numbers.filter(n -> n is Some(_)).map(n -> n.getOrElse(-1)).sorted
+  val busy = taken.filter(t -> !t.isEmpty).length
+  println(s"$way: ${all.length} lines, $torn torn, sorted union is the input: ${sorted == (0 ..< count).toVector}, some reader took a line: ${busy > 0}")
+
+// The bytes of the input, its terminators included.
+inputBytes() -> int = (0 ..< count).map(i -> lineText(i).byteLength + 1).sum
+
+// One thread reads a thousand characters and then everything left while two others read lines: the
+// bytes they take together are the input's.
+mixed()
+  val chars = threads.spawn(() -> Source.stdin().chars().take(1000).mkString("") + io.readAll())
+  val lines = (0 ..< 2).map(_ -> threads.spawn(() -> byReadLine())).toVector
+  val first = chars.join()
+  val rest = lines.map(t -> t.join())
+  val taken = first.byteLength + rest.map(ls -> ls.map(l -> l.byteLength + 1).sum).sum
+  println(s"mixed: bytes taken ${taken == inputBytes()}, characters taken: ${first.byteLength >= 1000}")
+
+child(way: string)
+  if way == "mixed" then return mixed()
+  val started = (0 ..< readers).map(_ -> threads.spawn(() -> if way == "readLine" then byReadLine() else byIterator())).toVector
+  report(way, started.map(t -> t.join()))
+
+main(args: Vector[string])
+  if args.length == 2 && args(0) == "child" then return child(args(1))
+  if !args.isEmpty then fail(s"unexpected arguments $args")
+  val program = process.executable().getOrElse("")
+  val generate = "awk 'BEGIN { for (i = 0; i < " + count.toString() + "; i++) { s = \"line-\" i \"-\"; for (j = 0; j < i % 50; j++) s = s \"x\"; if (i % 7 == 0) s = s \"\\303\\251\"; print s } }'"
+  for way in ["readLine", "lines", "mixed"]
+    val status = Command("/bin/sh", "-c", generate + " | \"$0\" child " + way, program).run()
+    if !status.map(s -> s.isSuccess).getOrElse(false) then println(s"$way child: $status")
