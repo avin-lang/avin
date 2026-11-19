@@ -1,0 +1,428 @@
+// `avin.diff`: the shortest edit script of two sequences and of two texts' lines, the hunks cut from
+// it, the unified diff written from them (byte for byte against `diff -u` on the fixtures in
+// `tests/fixtures/diff`) and applying a script back to its input.
+import avin.diff.{Edit, Keep, Insert, Delete, Line, LineOptions, Hunk}
+import avin.diff.{diff, apply, changes, splitLines, joinLines, diffLines, hunks, renderUnified, unifiedDiff}
+import avin.fs
+
+// The length of the longest common subsequence, by the quadratic table: the oracle the script's
+// length is held to.
+private diffLcs(a: Vector[int], b: Vector[int]) -> int
+  val table = Array.fill((a.length + 1) * (b.length + 1), 0)
+  val w = b.length + 1
+  for i in 1 .. a.length
+    for j in 1 .. b.length
+      table(i * w + j) = if a(i - 1) == b(j - 1) then table(i * w + j - 1 - w) + 1 else max(
+        table(i * w + j - w),
+        table(i * w + j - 1)
+      )
+  table(a.length * w + b.length)
+
+// Whether `edits` is a script of the least length for `a` and `b`, and applies.
+private diffIsShortest(a: Vector[int], b: Vector[int]) -> bool
+  val edits = diff(a, b)
+  apply(a, edits) == b && changes(edits) == a.length + b.length - 2 * diffLcs(a, b)
+
+// The pseudo-random numbers the property tests draw: a linear congruential generator, so a failing
+// pair is the same one on every run.
+private class DiffRandom(private var state: long)
+  next(range: int) -> int
+    state = (state * 1103515245 + 12345) % 2147483648
+    int((state / 65536) % long(range))
+
+private diffRandomVector(r: DiffRandom, maxLength: int, alphabet: int) -> Vector[int]
+  val n = r.next(maxLength + 1)
+  val b = Vector.newBuilder[int]()
+  for i in 0 ..< n do b.addOne(r.next(alphabet))
+  b.result()
+
+@test("two empty sequences have an empty script, and an empty one beside a full one inserts or deletes it all")
+diffEmpty()
+  val none = Vector.empty[int]()
+  assertEq(diff(none, none), Vector.empty[Edit[int]]())
+  assertEq(diff(none, [1, 2]), [Insert(1), Insert(2)])
+  assertEq(diff([1, 2], none), [Delete(1), Delete(2)])
+  assertEq(diff(none, [7]), [Insert(7)])
+  assertEq(diff([7], none), [Delete(7)])
+
+@test("identical sequences are all kept")
+diffIdentical()
+  assertEq(diff([1, 2, 3], [1, 2, 3]), [Keep(1), Keep(2), Keep(3)])
+  assertEq(diff([5], [5]), [Keep(5)])
+  assertEq(changes(diff([1, 2, 3], [1, 2, 3])), 0)
+
+@test("a single change at the start, in the middle and at the end")
+diffSingleChange()
+  assertEq(diff([1, 2, 3], [9, 2, 3]), [Delete(1), Insert(9), Keep(2), Keep(3)])
+  assertEq(diff([1, 2, 3], [1, 9, 3]), [Keep(1), Delete(2), Insert(9), Keep(3)])
+  assertEq(diff([1, 2, 3], [1, 2, 9]), [Keep(1), Keep(2), Delete(3), Insert(9)])
+  assertEq(diff([1, 2, 3], [2, 3]), [Delete(1), Keep(2), Keep(3)])
+  assertEq(diff([1, 2, 3], [1, 2]), [Keep(1), Keep(2), Delete(3)])
+  assertEq(diff([2, 3], [1, 2, 3]), [Insert(1), Keep(2), Keep(3)])
+  assertEq(diff([1, 3], [1, 2, 3]), [Keep(1), Insert(2), Keep(3)])
+  assertEq(diff([1, 2], [1, 2, 3]), [Keep(1), Keep(2), Insert(3)])
+
+@test("when nothing is shared everything is deleted and then inserted")
+diffEverythingChanged()
+  assertEq(diff([1, 2, 3], [4, 5]), [Delete(1), Delete(2), Delete(3), Insert(4), Insert(5)])
+  assertEq(diff([1], [2]), [Delete(1), Insert(2)])
+
+@test("the deletes of a run of changes come before its inserts")
+diffDeletesFirst()
+  assertEq(diff([1, 2, 3, 4], [1, 5, 6, 4]), [Keep(1), Delete(2), Delete(3), Insert(5), Insert(6), Keep(4)])
+  assertEq(
+    diff([1, 2, 3, 4, 5], [1, 9, 3, 8, 5]),
+    [Keep(1), Delete(2), Insert(9), Keep(3), Delete(4), Insert(8), Keep(5)]
+  )
+
+@test("a swap and a rotation take the fewest edits")
+diffSwap()
+  assertEq(changes(diff([1, 2], [2, 1])), 2)
+  assertEq(changes(diff([1, 2, 3, 4], [2, 3, 4, 1])), 2)
+  assertEq(changes(diff([1, 2, 3, 4], [4, 1, 2, 3])), 2)
+
+@test("repeated elements, where several scripts are possible, still give a shortest one")
+diffRepeated()
+  assert(diffIsShortest([1, 1, 1, 1], [1, 1]))
+  assert(diffIsShortest([1, 1], [1, 1, 1, 1]))
+  assert(diffIsShortest([1, 2, 1, 2, 1, 2], [2, 1, 2, 1, 2, 1]))
+  assert(diffIsShortest([1, 2, 1, 2], [2, 1, 2, 1]))
+  assert(diffIsShortest([0, 0, 1, 0, 0], [0, 1, 0, 0, 1, 0]))
+  assert(diffIsShortest([1, 1, 2, 2, 1, 1], [2, 2, 1, 1, 2, 2]))
+  assertEq(changes(diff([1, 2, 1, 2, 1, 2], [2, 1, 2, 1, 2, 1])), 2)
+  assertEq(changes(diff([7, 7, 7], [7, 7, 7, 7])), 1)
+
+@test("elements of any type with equality are compared: strings, tuples and data")
+diffOtherTypes()
+  assertEq(diff(["a", "b", "c"], ["a", "x", "c"]), [Keep("a"), Delete("b"), Insert("x"), Keep("c")])
+  assertEq(diff([(1, "a"), (2, "b")], [(1, "a"), (3, "b")]), [Keep((1, "a")), Delete((2, "b")), Insert((3, "b"))])
+  assertEq(diff([Line("a", true)], [Line("a", false)]), [Delete(Line("a", true)), Insert(Line("a", false))])
+  assertEq(diff(Vector.empty[string](), Vector.empty[string]()), Vector.empty[Edit[string]]())
+
+@test("apply gives back the second sequence")
+applyRebuilds()
+  val a = [1, 2, 3, 4, 5]
+  val b = [2, 3, 9, 5, 6]
+  assertEq(apply(a, diff(a, b)), b)
+  assertEq(apply(Vector.empty[int](), diff(Vector.empty[int](), b)), b)
+  assertEq(apply(a, diff(a, Vector.empty[int]())), Vector.empty[int]())
+  assertEq(apply(Vector.empty[int](), Vector.empty[Edit[int]]()), Vector.empty[int]())
+
+@test(should_trap: "apply: edit 1 does not match the input")
+applyWrongKeep()
+  apply([1, 2], [Keep(9), Keep(2)])
+
+@test(should_trap: "apply: edit 2 does not match the input")
+applyWrongDelete()
+  apply([1, 2], [Keep(1), Delete(3)])
+
+@test(should_trap: "apply: edit 2 does not match the input")
+applyPastEnd()
+  apply([1], [Keep(1), Keep(1)])
+
+@test(should_trap: "apply: the edits stop before the end of the input")
+applyShort()
+  apply([1, 2, 3], [Keep(1), Keep(2)])
+
+@test("apply accepts inserts anywhere, and a hand-written script that is not a shortest one")
+applyHandWritten()
+  assertEq(apply([1, 2], [Insert(0), Keep(1), Insert(5), Delete(2), Insert(3)]), [0, 1, 5, 3])
+
+@test("the script is a shortest one for every pair of small sequences over three values")
+diffExhaustiveSmall()
+  val all = Buffer[Vector[int]]()
+  all.addOne(Vector.empty[int]())
+  var from = 0
+  for length in 1 .. 5
+    val stop = all.length
+    for i in from ..< stop
+      for v in 0 ..< 3 do all.addOne(all(i) :+ v)
+    from = stop
+  var checked = 0
+  for a in all
+    for b in all
+      if a.length <= 4 && b.length <= 4
+        assert(diffIsShortest(a, b))
+        checked += 1
+  assert(checked > 10000)
+
+@test("random pairs apply back to the second, in the fewest edits against the quadratic table")
+diffRandomPairs()
+  val r = DiffRandom(12345)
+  for round in 0 ..< 400
+    val alphabet = if round % 3 == 0 then 2 elif round % 3 == 1 then 4 else 30
+    val a = diffRandomVector(r, 40, alphabet)
+    val b = diffRandomVector(r, 40, alphabet)
+    assert(diffIsShortest(a, b))
+
+@test("random pairs of similar sequences, a few edits apart, are shortest too")
+diffRandomSimilar()
+  val r = DiffRandom(777)
+  for round in 0 ..< 200
+    val a = diffRandomVector(r, 120, 6)
+    val b = Buffer[int]()
+    for x in a
+      val roll = r.next(10)
+      if roll == 0 then continue
+      b.addOne(x)
+      if roll == 1 then b.addOne(r.next(6))
+    assert(diffIsShortest(a, b.toVector))
+
+@test("ten thousand lines with sparse changes are compared quickly, in a script of exactly the changes")
+diffLarge()
+  val n = 10000
+  val a = Vector.tabulate(n, i -> s"line $i")
+  val b = Buffer[string]()
+  var expected = 0
+  for i in 0 ..< n
+    if i % 500 == 0
+      b.addOne(s"changed $i")
+      expected += 2
+    elif i % 777 == 3
+      expected += 1
+    else b.addOne(s"line $i")
+  val edits = diff(a, b.toVector)
+  assertEq(changes(edits), expected)
+  assertEq(apply(a, edits), b.toVector)
+
+@test("a large input with nothing in common is compared without a table of the product of the sizes")
+diffLargeDisjoint()
+  val a = Vector.tabulate(3000, i -> i)
+  val b = Vector.tabulate(3000, i -> i + 100000)
+  val edits = diff(a, b)
+  assertEq(changes(edits), 6000)
+  assertEq(apply(a, edits), b)
+
+@test("a large input that is reversed still applies back")
+diffLargeReversed()
+  val a = Vector.tabulate(1500, i -> i)
+  val b = a.reverse
+  val edits = diff(a, b)
+  assertEq(apply(a, edits), b)
+  assertEq(changes(edits), 2998)
+
+@test("text splits at newlines, keeping a carriage return, with the last line marked unterminated")
+splitLinesCases()
+  assertEq(splitLines(""), Vector.empty[Line]())
+  assertEq(splitLines("\n"), [Line("", true)])
+  assertEq(splitLines("a"), [Line("a", false)])
+  assertEq(splitLines("a\n"), [Line("a", true)])
+  assertEq(splitLines("a\nb"), [Line("a", true), Line("b", false)])
+  assertEq(splitLines("a\n\nb\n"), [Line("a", true), Line("", true), Line("b", true)])
+  assertEq(splitLines("a\r\nb\r\n"), [Line("a\r", true), Line("b\r", true)])
+  assertEq(splitLines("\n\n"), [Line("", true), Line("", true)])
+
+@test("joining lines gives back the text, whatever its endings")
+joinLinesRoundTrip()
+  for text in ["", "\n", "a", "a\n", "a\nb", "a\r\nb\r\n", "\n\n\nx", "日本\n語"]
+    assertEq(joinLines(splitLines(text)), text)
+
+@test("a line diff of two empty texts is empty, and of one empty text inserts or deletes every line")
+diffLinesEmpty()
+  assertEq(diffLines("", ""), Vector.empty[Edit[Line]]())
+  assertEq(diffLines("", "a\nb\n"), [Insert(Line("a", true)), Insert(Line("b", true))])
+  assertEq(diffLines("a\nb\n", ""), [Delete(Line("a", true)), Delete(Line("b", true))])
+
+@test("a line diff of identical texts keeps every line")
+diffLinesIdentical()
+  assertEq(diffLines("a\nb\n", "a\nb\n"), [Keep(Line("a", true)), Keep(Line("b", true))])
+  assertEq(diffLines("a\nb", "a\nb"), [Keep(Line("a", true)), Keep(Line("b", false))])
+
+@test("a last line without a newline differs from the same line with one, unless the option says otherwise")
+diffLinesFinalNewline()
+  assertEq(diffLines("a\nb", "a\nb\n"), [Keep(Line("a", true)), Delete(Line("b", false)), Insert(Line("b", true))])
+  assertEq(diffLines("a\nb\n", "a\nb"), [Keep(Line("a", true)), Delete(Line("b", true)), Insert(Line("b", false))])
+  assertEq(
+    diffLines("a\nb", "a\nb\n", LineOptions(finalNewline = false)),
+    [Keep(Line("a", true)), Keep(Line("b", false))]
+  )
+  assertEq(
+    diffLines("a\nb\n", "a\nb", LineOptions(finalNewline = false)),
+    [Keep(Line("a", true)), Keep(Line("b", true))]
+  )
+  assertEq(diffLines("x", "x\n"), [Delete(Line("x", false)), Insert(Line("x", true))])
+  assertEq(diffLines("x", "x\n", LineOptions(finalNewline = false)), [Keep(Line("x", false))])
+  assertEq(
+    diffLines("a\nb", "a\nc", LineOptions(finalNewline = false)),
+    [Keep(Line("a", true)), Delete(Line("b", false)), Insert(Line("c", false))]
+  )
+
+@test("trailing white space is ignored only when the option says so")
+diffLinesTrailingSpace()
+  val a = "x  \ny\t\nz\n"
+  val b = "x\ny\nz\n"
+  assertEq(changes(diffLines(a, b)), 4)
+  val ignored = diffLines(a, b, LineOptions(ignoreTrailingSpace = true))
+  assertEq(ignored, [Keep(Line("x  ", true)), Keep(Line("y\t", true)), Keep(Line("z", true))])
+  assertEq(changes(diffLines("x \n y\n", "x\ny\n", LineOptions(ignoreTrailingSpace = true))), 2)
+  assertEq(changes(diffLines(" x\n", "x\n", LineOptions(ignoreTrailingSpace = true))), 2)
+  assertEq(diffLines("a  ", "a", LineOptions(ignoreTrailingSpace = true)), [Keep(Line("a  ", false))])
+
+@test("trailing white space ignored and the final newline ignored may be combined")
+diffLinesBothOptions()
+  val both = LineOptions(ignoreTrailingSpace = true, finalNewline = false)
+  assertEq(changes(diffLines("a \nb", "a\nb  \n", both)), 0)
+  assertEq(changes(diffLines("a \nb", "a\nb  \n", LineOptions(ignoreTrailingSpace = true))), 2)
+
+@test("a carriage return is part of the line unless trailing white space is ignored")
+diffLinesCrlf()
+  assertEq(changes(diffLines("a\r\nb\r\n", "a\nb\n")), 4)
+  assertEq(changes(diffLines("a\r\nb\r\n", "a\nb\n", LineOptions(ignoreTrailingSpace = true))), 0)
+  assertEq(changes(diffLines("a\r\nb\r\n", "a\r\nc\r\n")), 2)
+
+@test("Unicode lines are compared whole")
+diffLinesUnicode()
+  val edits = diffLines("café\n日本\n😀\n", "café\n日本語\n😀\n")
+  assertEq(
+    edits,
+    [Keep(Line("café", true)), Delete(Line("日本", true)), Insert(Line("日本語", true)), Keep(Line("😀", true))]
+  )
+  assertEq(changes(diffLines("é\n", "é\n")), 2)
+
+@test("a line diff applies back to the second text, for every pair of small texts")
+diffLinesApply()
+  val texts = [
+    "", "a", "a\n", "a\nb", "a\nb\n", "b\na\n", "\n", "\n\n", "a\n\nb\n", "a\r\nb\r\n", "a\na\na\n", "a\na", "x\ny\nz"
+  ]
+  for a in texts
+    for b in texts
+      val edits = diffLines(a, b)
+      assertEq(joinLines(apply(splitLines(a), edits)), b)
+      assertEq(a == b, edits.forall(e -> e match
+        Keep(_) -> true
+        _ -> false))
+
+@test("hunks of a script with no changes: none")
+hunksNone()
+  assertEq(hunks(Vector.empty[Edit[int]](), 3).length, 0)
+  assertEq(hunks([Keep(1), Keep(2)], 3).length, 0)
+  assertEq(hunks([Keep(1), Keep(2)], 0).length, 0)
+
+@test("a hunk holds its changes with the context around them, and the counts and starts of both sides")
+hunksOne()
+  val edits = diff([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [1, 2, 3, 4, 50, 6, 7, 8, 9, 10])
+  val cut = hunks(edits, 2)
+  assertEq(cut.length, 1)
+  assertEq(cut(0), Hunk(2, 5, 2, 5, [Keep(3), Keep(4), Delete(5), Insert(50), Keep(6), Keep(7)]))
+
+@test("a hunk cannot reach past either end")
+hunksClipped()
+  val cut = hunks(diff([1, 2, 3], [9, 2, 8]), 5)
+  assertEq(cut.length, 1)
+  assertEq(cut(0).aStart, 0)
+  assertEq(cut(0).aCount, 3)
+  assertEq(cut(0).bStart, 0)
+  assertEq(cut(0).bCount, 3)
+  assertEq(cut(0).edits.length, 5)
+
+@test("changes whose contexts overlap or touch share a hunk, and ones further apart are two")
+hunksMerge()
+  val keep = Vector.tabulate(12, i -> i + 1)
+  val gap6 = keep.updated(1, 100).updated(8, 200)
+  val gap7 = keep.updated(1, 100).updated(9, 200)
+  assertEq(hunks(diff(keep, gap6), 3).length, 1)
+  assertEq(hunks(diff(keep, gap7), 3).length, 2)
+  assertEq(hunks(diff(keep, gap7), 4).length, 1)
+  assertEq(hunks(diff(keep, gap6), 2).length, 2)
+
+@test("hunk starts and counts follow insertions and deletions on each side")
+hunksCounts()
+  val a = Vector.tabulate(20, i -> i)
+  val b = a.filter(x -> x != 4 && x != 5).patch(14, [100, 101, 102], 0)
+  val cut = hunks(diff(a, b), 1)
+  assertEq(cut.length, 2)
+  assertEq((cut(0).aStart, cut(0).aCount, cut(0).bStart, cut(0).bCount), (3, 4, 3, 2))
+  assertEq(cut(1).bCount - cut(1).aCount, 3)
+  assertEq(cut(1).aStart - cut(1).bStart, 2)
+
+@test("context 0 gives each run of changes its own hunk, with no unchanged lines")
+hunksContextZero()
+  val cut = hunks(diff([1, 2, 3, 4, 5], [1, 9, 3, 8, 5]), 0)
+  assertEq(cut.length, 2)
+  assertEq(cut(0), Hunk(1, 1, 1, 1, [Delete(2), Insert(9)]))
+  assertEq(cut(1), Hunk(3, 1, 3, 1, [Delete(4), Insert(8)]))
+  assertEq(hunks(diff([1, 2, 3], [1, 3]), 0)(0), Hunk(1, 1, 1, 0, [Delete(2)]))
+  assertEq(hunks(diff([1, 3], [1, 2, 3]), 0)(0), Hunk(1, 0, 1, 1, [Insert(2)]))
+  assertEq(hunks(diff([1, 2, 3, 4, 5, 6], [1, 9, 3, 4, 5, 6]), 0).length, 1)
+
+@test(should_trap: "hunks: negative context")
+hunksNegative()
+  hunks([Keep(1)], -1)
+
+private diffFixture(name: string) -> string = fs.readText(s"tests/fixtures/diff/$name") match
+  Ok(t) -> t
+  Err(e) -> fail(s"cannot read fixture $name: ${e.message}")
+
+private val diffFixtureNames = [
+  "allchanged", "blank", "crlf", "crlf_mixed", "end", "far", "from_empty", "gap1", "gap2", "gap6", "gap7", "insert_mid",
+  "middle", "noeol_a", "noeol_b", "noeol_only", "noeol_same", "start", "to_empty", "unicode"
+]
+
+@test("the unified diff is byte for byte what diff -u prints, at context 3, 1 and 0")
+unifiedMatchesDiff()
+  var checked = 0
+  for name in diffFixtureNames
+    val a = diffFixture(s"$name.a")
+    val b = diffFixture(s"$name.b")
+    for context in [0, 1, 3]
+      val want = diffFixture(s"$name.u$context")
+      assertEq(unifiedDiff(a, b, "a", "b", context), want)
+      checked += 1
+  assertEq(checked, 60)
+
+@test("the default context is three lines")
+unifiedDefaultContext()
+  val a = diffFixture("gap7.a")
+  val b = diffFixture("gap7.b")
+  assertEq(unifiedDiff(a, b, "a", "b"), diffFixture("gap7.u3"))
+
+@test("identical texts have no unified diff at all, not even headers")
+unifiedIdentical()
+  assertEq(unifiedDiff("", "", "a", "b"), "")
+  assertEq(unifiedDiff("x\ny\n", "x\ny\n", "a", "b"), "")
+  assertEq(unifiedDiff("x\ny", "x\ny", "a", "b"), "")
+
+@test("the headers name the two sides as given")
+unifiedHeaders()
+  assertEq(
+    unifiedDiff("a\n", "b\n", "old/file.txt", "new/file.txt"),
+    "--- old/file.txt\n+++ new/file.txt\n@@ -1 +1 @@\n-a\n+b\n"
+  )
+  assertEq(unifiedDiff("a\n", "b\n", "", ""), "--- \n+++ \n@@ -1 +1 @@\n-a\n+b\n")
+
+@test("an empty side is written as a range of no lines starting at the line before")
+unifiedEmptyRanges()
+  assertEq(unifiedDiff("", "x\n", "a", "b"), "--- a\n+++ b\n@@ -0,0 +1 @@\n+x\n")
+  assertEq(unifiedDiff("x\n", "", "a", "b"), "--- a\n+++ b\n@@ -1 +0,0 @@\n-x\n")
+  assertEq(unifiedDiff("a\nb\n", "a\nb\nc\n", "a", "b", 0), "--- a\n+++ b\n@@ -2,0 +3 @@\n+c\n")
+
+@test("a missing final newline is marked after the line, and ignoring it leaves no difference")
+unifiedNoNewline()
+  assertEq(unifiedDiff("x", "x\n", "a", "b"), "--- a\n+++ b\n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+x\n")
+  assertEq(unifiedDiff("x\n", "x", "a", "b"), "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+x\n\\ No newline at end of file\n")
+  assertEq(unifiedDiff("x", "x\n", "a", "b", 3, LineOptions(finalNewline = false)), "")
+
+@test("trailing white space ignored shows only the real changes")
+unifiedIgnoreSpace()
+  val got = unifiedDiff("a  \nb\nc\n", "a\nB\nc\n", "a", "b", 3, LineOptions(ignoreTrailingSpace = true))
+  assertEq(got, "--- a\n+++ b\n@@ -1,3 +1,3 @@\n a  \n-b\n+B\n c\n")
+
+@test("renderUnified writes the script it is given, whatever found it")
+renderGivenScript()
+  val edits = [Keep(Line("a", true)), Delete(Line("b", true)), Insert(Line("c", true)), Keep(Line("d", true))]
+  assertEq(renderUnified(edits, "x", "y"), "--- x\n+++ y\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n")
+  assertEq(renderUnified(Vector.empty[Edit[Line]](), "x", "y"), "")
+  assertEq(renderUnified([Keep(Line("a", true))], "x", "y"), "")
+
+@test("a unified diff of random texts applies back, and has the same changes as the script")
+unifiedRandomTexts()
+  val r = DiffRandom(99)
+  for round in 0 ..< 100
+    val a = diffRandomVector(r, 30, 4).map(n -> s"line $n").mkString("\n")
+    val b = diffRandomVector(r, 30, 4).map(n -> s"line $n").mkString("\n")
+    val edits = diffLines(a, b)
+    assertEq(joinLines(apply(splitLines(a), edits)), b)
+    val text = renderUnified(edits, "a", "b")
+    val minus = text.lines.count(l -> l.startsWith("-") && !l.startsWith("---"))
+    val plus = text.lines.count(l -> l.startsWith("+") && !l.startsWith("+++"))
+    assertEq(minus + plus, changes(edits))

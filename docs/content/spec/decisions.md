@@ -11829,3 +11829,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   program's own collections get the form by declaring `apply`). Review with the user: whether the
   tuple form `Map((1, "one"), …)` should stay beside `{1: "one"}`, since it is a second way to write
   a map that no one needs.
+- Settled on the user's delegation 2026-11-19 (branch `diff`): **`avin.diff`, a module of the
+  standard library for the differences between two sequences and between two texts' lines.** It is
+  `library/avin/diff/diff.avin`, a module of its own beside `avin.uuid`, not part of the prelude, so
+  a program names what it uses (`import avin.diff.{diff, unifiedDiff}`). The API: `diff[T: Eq](a, b)
+  -> Vector[Edit[T]]` with `Edit[T]` the variants `Keep(value)`, `Insert(value)` and
+  `Delete(value)`; `apply(a, edits)`, which checks every `Keep` and `Delete` against the input and
+  traps naming the edit; `changes`; `Line(text, terminated)` with `splitLines` and `joinLines`;
+  `LineOptions(ignoreTrailingSpace = false, finalNewline = true)` and `diffLines`; `Hunk`, `hunks(edits,
+  context)`; `renderUnified` and `unifiedDiff`, whose output is `diff -u`'s byte for byte (checked
+  against GNU diff's on twenty fixture pairs at context 0, 1 and 3). The algorithm is Myers' O(ND)
+  with the linear-space middle-snake refinement, so memory is proportional to the inputs (three
+  arrays of their combined size, and the script) and never to their product; a run of changes lists
+  its deletes before its inserts, as `diff -u` prints them. Choices: edits carry the elements, not
+  indices, so a script is self-describing and `apply` can verify it (a `Keep` holds the first
+  sequence's element, so a line diff that ignores trailing space keeps the original text); lines
+  split at `\n` only and keep a `\r`, as `diff` does, so CRLF is a difference unless
+  `ignoreTrailingSpace` is set (which ignores a `\r` with the rest); a last line with no `\n` differs
+  from the same line with one by default, as `diff` reports it, and `finalNewline = false` makes them
+  equal; two changes share a hunk when no more than `2 * context` unchanged lines lie between them;
+  an empty range is written `start,0` with `start` the line before, a range of one line as its
+  number alone, as `diff -u` does. Alternatives weighed: edits as index ranges
+  (`Keep(aStart, bStart, count)`, more compact for large inputs, but cannot be applied without the
+  second sequence and reads less well in a pattern match); the quadratic table of the longest common
+  subsequence (simplest, but 10,000 lines against 10,000 takes 10^8 cells); a patience or histogram
+  diff (often reads better on source code, but is not shortest and does not match `diff -u`); a
+  prelude placement (every program would carry the names `Edit`, `Keep` and `Delete`). Tests:
+  `library/tests/diff.avin`, with every pair of sequences over three values up to four long and
+  random pairs checked against the quadratic table for minimality. Review with the user: the names
+  `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
+  patience diff should join this one as `diffLines`' option.
