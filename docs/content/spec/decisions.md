@@ -8900,6 +8900,77 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   **Review with the user:** the TLS record bound of `writeSome`, and the names `writeSome` and
   `writabilityDescriptor`.
 
+- Settled on the user's delegation 2026-11-19 (branch `read-secret`): **`io.readSecret(prompt)`,
+  `readSecretBytes` and `readSecretOrLine` read a line from the controlling terminal with echo
+  off.** fettle prompts for a sudo or ssh password, as does any tool asking for a passphrase, and
+  nothing in the library read input with echo off. The calls open `/dev/tty` (so a piped standard
+  input does not matter), write the prompt to it, turn off `ECHO` and `ECHONL` while keeping
+  `ICANON`, and restore the exact `termios` found. Details settled: (1) **no terminal** is
+  `Err(IoError(NoTerminal, "read", "the terminal"))`, a new `ErrorKind` case, since a program
+  tells it apart from a failed read; `readSecretOrLine` is the opt-in fallback, writing the prompt
+  to standard error and reading a line from standard input, as a tool run by a script with its
+  password piped in needs. (2) **Signals**: `ISIG` stays on, and for the length of the read the C
+  side (`runtime/avin/rt/__posix__/secret_tty.c`) catches interrupt, hangup, terminate and quit: its
+  handler restores the terminal, gives the signal its previous action back and sends it again, so
+  the program dies or handles the signal with echo on; a program that survives sees the read fail
+  as `Other("interrupted")`. A terminal stop (Ctrl-Z) is caught too: the handler restores the
+  terminal, stops the program with the default action, and on continue hides the terminal again
+  and the read writes its prompt again and goes on (as `sudo` and `getpass` do); what was typed before
+  the Ctrl-Z is discarded by the terminal. SIGTTIN and SIGTTOU are not caught: they stop a program before the terminal has been
+  changed. (3) **Concurrency**: the read holds
+  `input_readers`, the lock of every standard input reader, so a secret and a `readLine` never
+  read the terminal at once; a lightweight thread waiting for the line is not cancellable, as one
+  waiting for standard input is, so a cancel takes effect once the line has been read and the
+  terminal is back. (4) **Bytes**: `readSecretBytes` returns an `Array[byte]` the caller can
+  overwrite; `readSecret` is a string, which has no way to be cleared, and the runtime clears its
+  own gathering buffers. (5) A trailing `\n` and a `\r` before it are dropped; the end of input
+  with bytes typed ends the line, with none it is `Other("end of input")`. Alternatives weighed:
+  turning `ISIG` off as `getpass` does (Ctrl-C then arrives as a byte only once the line ends,
+  so it would not interrupt a prompt); reading standard input when there is no terminal by default
+  (a secret would then show on the screen, and a program that means to read one must ask by
+  name); a cancellable wait (the existing standard input lock holds the thread's cancellation off,
+  and a read cut short would leave typed bytes half taken); a single `readSecret` with a
+  fallback flag. Tests drive real programs over a pseudo-terminal (`tests/pty/pty_drive.c`,
+  `secret_tests.sysl`). **Review with the user:** the name `readSecret` (against `readPassword`
+  or `promptSecret`), and the no-terminal behaviour: an error by default with `readSecretOrLine`
+  as the explicit fallback, rather than falling back to standard input on its own.
+
+- Settled on the user's delegation 2026-11-19 (branch `stdio-bytes`): **`io.stdin()` is standard
+  input as a `Reader` of bytes, and `io.stdout()` and `io.stderr()` are standard output and error
+  as `ByteWriter`s**, answering the `Sendable` objects `StandardInputBytes`, `StandardOutputBytes`
+  and `StandardErrorBytes`. Source: the avin-lang/lsp package could not serve LSP over stdio, whose
+  `Content-Length` counts bytes, since `avin.io` read standard input only as text decoded with
+  U+FFFD and had no byte writer for standard output; the workaround would have bound Sysl's
+  `FdReader` directly, as the tui package does. Details settled: (1) **Mixing**: byte reads take
+  from the one buffer `readLine`, `lines()`, `readAll` and `Source.stdin()` share
+  (`runtime/avin/rt/input.sysl`), so a header read as a line and a body read as bytes go on from
+  each other with no byte lost or read twice; a read answers what the buffer holds, else one read
+  of the input. (2) **Serialization**: byte reads hold `input_readers`, the lock of every standard
+  input reader and of `readSecret`. (3) **Parking**: a lightweight thread waits on the poller, as a
+  line read does. (4) **End and failure**: the end is an empty array, every time it is asked; a
+  read that fails is `Err(Other(<platform sentence>))` for bytes, while the text readers keep seeing
+  the end. (5) **Output**: a byte write is unbuffered and goes out whole before it returns, behind
+  what `print` buffered: it holds standard output's stdio lock while flushing that buffer and
+  writing to the descriptor, and `println` writes its whole line through the same stream, so a
+  printed line is never split by a byte write (the println-atomic entry of 2026-11-15 still holds);
+  a write to standard error flushes standard output first, as `eprint` does. (6) **A reader that
+  has gone**: SIGPIPE is blocked on the writing thread for the length of a byte write, and the one
+  the write raised is taken back, so the write answers `ConnectionReset` (`EPIPE`, the kind a
+  connection's write answers) and the program goes on; `print` keeps its quiet death, which a
+  filter in a pipeline wants. (7) **Closed descriptors**: a bug met on the way, a program started
+  with standard input closed read the runtime's own pipe, which had taken descriptor 0; the runtime
+  now opens `/dev/null` on each of 0, 1 and 2 that is missing before it opens anything. Alternatives
+  weighed: an error for mixing text and byte reads (two buffers or a mode switch, and a header and
+  body protocol could not be written at all); a buffered `stdout()` with `flush` (a byte write
+  could then be overtaken by, or split, a `println`, and an LSP message must leave whole); ignoring
+  SIGPIPE for the whole program (every `print` to a closed pipe would then have to fail somewhere,
+  where today it ends the program quietly); public objects alone with no functions (a module-level
+  function reads as `io.readLine()` does). Tests: `stdio_tests.sysl`, driving
+  `tests/stdio/stdio_bytes.avin` through `sh` and `tests/pty/stdio_tty.avin` over a
+  pseudo-terminal, at -O0 and -O2. **Review with the user:** the names `stdin()`, `stdout()`,
+  `stderr()` and the object names `StandardInputBytes`, `StandardOutputBytes`,
+  `StandardErrorBytes` (beside the text writers `StandardOutput` and `StandardError`).
+
 - **Linux as a target, and machines in packages** (branch `linux-plan`, 2026-11-19; the user,
   2026-11-19: Avin is "for anyone who would enjoy using it"). The plan is
   [Linux](/compiler/linux/); the package surface is [machines](/spec/packages/#machines).
@@ -8974,6 +9045,89 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `FD_CLOEXEC` is `1` on macOS and on Linux, so the pipe is inherited by a child started during a
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
+
+- **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
+  `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
+  `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
+  run-time condition ("watch `local.writable()` only while bytes are pending for it") and spelled
+  out twelve selects, one per combination; and nothing could wait on N connections or N tunnels,
+  which blocks a multi-connection `ssh -L` and `-R`. The surface is [select](/spec/threads/#select)
+  and [selectors](/spec/threads/#selectors).
+  - Settled on the user's delegation 2026-11-19: **any arm but `else` may end in an `if` guard**,
+    written as a match arm's is, after the operation and its `as` pattern. **A false guard makes the
+    arm absent**: not evaluated beyond its guard, not watched, never run, its value never sent. **The
+    guard is evaluated first**, with the arms' other expressions, once and in written order, before
+    any arm is tried, so it cannot name the arm's pattern's bindings, which no value has yet. WHY:
+    evaluating the guard first lets it protect the arm's own expressions (`conns(i).readable() if i
+    < n`) and keeps a value meant for an absent arm from being computed; an arm that is not there
+    should cost nothing. ALTERNATIVES: the guard after the arm's expressions (a send's value computed
+    for nothing, and a guard that cannot protect its arm); a guard that sees the received value, as
+    a match guard sees its bindings (it would have to receive before deciding, then put the value
+    back, which a channel cannot do without reordering).
+  - Settled on the user's delegation 2026-11-19: **a select whose every arm is guarded off, with no
+    `after` or `else` left, traps**, and so does `wait` on an empty `Selector`. WHY: only a
+    cancellation could end such a wait, which is almost always a loop's exit condition gone wrong;
+    the trap names it where it happens, instead of a thread that hangs or a deadlock report later.
+    A thread meant to wait for its cancellation says so with an `after` or a channel. ALTERNATIVES:
+    waiting for cancellation (as the brief offered; silent where it is a bug); a compile-time error
+    (guards are run-time values, so it can only be caught at run time).
+  - Settled on the user's delegation 2026-11-19: **`after` takes a guard; `else` does not.** A false
+    guard on `after` leaves a select that waits until an arm runs. `else`'s body follows it with no
+    arrow, so `else if c then a else b` already means an `if` there. WHY: a guarded `after` is the
+    "time out only while something is pending" case; a guarded `else` is `after 0` guarded, which
+    already exists. ALTERNATIVES: a guard on `else` (`else if` would read two ways).
+  - Settled on the user's delegation 2026-11-19: **the dynamic form is a library type,
+    `avin.threads.Selector[K: Eq]`**: entries `receive(channel, key) -> SelectReceive[T]` (whose
+    `received()` holds what was received), `send(channel, x, key)`, `readable(source, key)` and
+    `writable(sink, key)`; `remove(key)`, `removeWhere(p)`, `clear()`, `size`, `isEmpty`; waits
+    `wait() -> K`, `within(timeout)`, `until(deadline)` and `poll() -> Option[K]`. The entries stay
+    between waits; a send entry is taken out once its value has gone. Each entry is the arm object a
+    `select` block is read into, and a wait runs the same library loop and the same runtime park on
+    the poller, so there is one wait path. WHY: a set of N sources needs a value the program can
+    build, keep and change between waits, and keys of the program's choosing answer "which one"
+    without index bookkeeping; mixed kinds (channels and streams) live in one set. ALTERNATIVES: a
+    `for` arm in `select` (`for c in conns: c.readable() -> …`), which reads well for one homogeneous
+    collection but rebuilds the set every time the select is reached, needs a second arm per kind of
+    source, and adds a binding form to the select grammar; both (two ways to say the same thing, the
+    `for` arm being sugar the library type can carry later if programs want it); entries answered by
+    index (indices shift as entries are removed); a send entry that stays after it ran (it would send
+    the same value again at the next wait).
+    **Review with the user:** the `Selector` surface (its name, keys over indices, `receive`
+    answering the entry, a send entry taken out once it ran), and whether `select` should gain a
+    `for` arm as sugar over it.
+
+- Settled on the user's delegation 2026-11-19 (branch `stdin-readiness`): **`io.stdin()` is a
+  `Readiness`, any thread may wait on it, and `readAvailable(max)` reads only what is there.**
+  Source: the `stdio-bytes` branch found that the tui package could not move off its own Sysl
+  binding of descriptor 0 (`sysl.io.wait.ready` with a time limit, then a raw read), because
+  `io.stdin()` had no timed wait and bytes in the runtime's shared buffer would never show as the
+  descriptor's readiness; any interactive program (a TUI, a REPL, a language server with timers)
+  needs standard input in one wait with channels and timers. Details settled: (1) **Ready** means
+  bytes are in the shared buffer (a `readLine`'s read-ahead among them), the input has ended or
+  failed, standard input is a file (whose read never waits), or descriptor 0 polls readable;
+  `readable()` never waits, and answers `false` while another thread holds the input lock.
+  (2) **Ownership: none.** Standard input is process-global, so any thread may name it in a
+  select or a `Selector`, and several at once; a connection keeps its owner rule. (3) **The lock**:
+  a select never takes `input_readers` to wait. Every select arm on standard input is enlisted on
+  a runtime queue (`input_changed`) that every reader notifies as it lets the lock go, so bytes
+  another thread's `readLine` left in the buffer end the wait; one select at a time watches
+  descriptor 0 on the poller (which holds one waiter per descriptor and direction), and hands the
+  watch on, waking the others, when its wait ends; a reader parked on descriptor 0 takes the
+  watch's place and tells the selects when it lets go. The library is unchanged: the runtime's
+  `select_watch` takes descriptor 0 by this path. (4) **`readAvailable(max) ->
+  Result[Option[Array[byte]], IoError]`**: `Some` of what `read(max)` would answer without
+  waiting, an empty array at the end, `None` where a read would wait or another thread is
+  reading; it is a method of `StandardInputBytes`, not of `Reader`. WHY: one wait path for every
+  source; the queue closes the one gap readiness on the descriptor alone leaves (bytes already
+  buffered) without polling; `Option` keeps "nothing yet" apart from "ended", which a TUI must
+  tell apart. ALTERNATIVES: only the thread that first waits on standard input may wait on it,
+  trapping others (a rule a program could not see, for a resource that has no owner); taking the
+  input lock to look (a select would then wait behind a thread parked in `readLine`, past its
+  `after`); a select re-trying standard input on a timer (`wakeAt`) while another thread reads
+  (polling, and a delay); `readAvailable` answering an empty array for both "nothing yet" and the
+  end (ambiguous); `readSome`/`readAvailable` on the `Reader` trait (every reader would owe it,
+  and files and connections have no use for it yet). tui switched in its branch `stdin-api`.
+  **Review with the user:** the name `readAvailable` and its `Option` answer.
 
 ## Proposed
 

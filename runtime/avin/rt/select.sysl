@@ -110,6 +110,7 @@ select_watch(ctx: *Context, p: *u8, index: long, fd: int, writing: int) -> long
     val s: *SelectWait = ptr_cast(p)
     if index < 0 || usize(index) >= s.count || fd < 0 then return 0
     val l = link_at(s, usize(index))
+    if fd == 0 && writing == 0 then return watch_input(ctx, s, l)
     if l.token != 0 then return 1
     val token = watch_fd(&l.waiter, fd, if writing != 0 then Writable else Readable)
     if token == 0 then return 0
@@ -117,6 +118,35 @@ select_watch(ctx: *Context, p: *u8, index: long, fd: int, writing: int) -> long
     l.fd = fd
     s.sockets += 1
     1
+
+/** Watches standard input, descriptor 0, for the arm whose link is `l` in the select `s` (`input.sysl`):
+ * the link is put on `input_changed` first, so a thread holding the lock over standard input now tells
+ * the select when it lets it go; then, where the lock is free, standard input is looked at under it,
+ * and where it is not ready, the link watches the descriptor on the poller unless another select's
+ * already does. Answers 0 where standard input is ready, which the library takes as the arm being
+ * ready, and 1 where the select is to wait for it. */
+private watch_input(ctx: *Context, s: *SelectWait, l: *SelectLink) -> long
+    if l.queue == null
+        input_changed.guard.lock()
+        enqueue(&input_changed, &l.waiter)
+        input_changed.guard.unlock()
+        l.queue = &input_changed
+        s.sockets += 1
+    if !input_try_hold(ctx) then return 1
+    if input_ready_held()
+        input_release_quietly(ctx)
+        return 0
+    var answer: long = 1
+    if l.token == 0 && input_watch_take(l)
+        val token = watch_fd(&l.waiter, 0, Readable)
+        if token == 0
+            input_watch_give(l)
+            answer = 0
+        else
+            l.token = token
+            l.fd = 0
+    input_release_quietly(ctx)
+    answer
 
 /** Enlists arm `index` of the select `p` on the queue of the condition `condition`, then lets the lock
  * `lock` go, which the calling thread holds and under which it found the arm could not complete: a
@@ -184,6 +214,8 @@ private withdraw(s: *SelectWait)
         // holds while it wakes the link, so after it that thread reaches the select no more.
         if l.token != 0
             unwatch_fd(l.token, l.fd)
+            // The select watching standard input for every other hands the watch on.
+            if l.fd == 0 then input_watch_give(l)
             l.token = 0
             l.fd = -1
         val q = l.queue

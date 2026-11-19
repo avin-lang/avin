@@ -702,10 +702,22 @@ What a program can rely on:
   `after d` runs
   where no other arm became ready within the [`Duration`](/spec/time/) `d`; `else` runs where no
   arm is ready now, and is written as a match's `else` is, with no arrow. A select has at most one
-  `after` and one `else`, and not both, since a select with `else` never waits. Any other arm, a
-  guard or an `as` pattern on a `readable()` or `writable()` arm among them, is an error.
-- **Evaluation.** Every channel, every stream, every value sent and the `after`'s duration are
-  evaluated once, in the order the arms are written, before any arm is tried. Only the arm that runs
+  `after` and one `else`, and not both, since a select with `else` never waits. Any other arm, an
+  `as` pattern on a `readable()` or `writable()` arm among them, is an error.
+- **Guards.** Any arm but `else` may end in an `if` guard before its arrow, as a match arm does:
+  `local.writable() if pending.length > 0 -> …`, `ch.receive() as Some(x) if open -> …`, `after d
+  if waiting -> …`. Where the guard is `false` the arm is absent from this select: its channel or
+  stream is not evaluated, its value is not evaluated or sent, nothing of it is watched, and it never
+  runs, as if it were not written. A guard is evaluated before anything is received, so unlike a
+  match guard it cannot name what its arm's pattern binds. An absent `after` leaves a select that
+  waits until an arm runs.
+  `else` takes no guard: what follows it is its body, so `else if c then a else b` is an `if`. A
+  select whose every arm is guarded off, with no `after` or `else` left, traps when it is reached,
+  since nothing but a cancellation could end its wait; with an `else` it runs the `else`, and with
+  an `after` it waits its time.
+- **Evaluation.** The arms are evaluated once, in the order they are written, before any arm is
+  tried: an arm's guard first, then, where it is `true` or there is none, its channel or stream, its
+  value sent and the `after`'s duration. Only the arm that runs
   receives or sends: every other channel keeps its values, and a value meant for an arm that does not
   run is never sent. A `readable()` arm reads nothing and a `writable()` arm writes nothing,
   whether it runs or not.
@@ -724,6 +736,12 @@ What a program can rely on:
   and writes, which only it may. A connection [split](/spec/system-library/#tcp) into a reading and
   a writing half gives each half to a thread of its own, the reader's select naming its half's
   `readable()` and the writer's its half's `writable()`.
+  [Standard input](/spec/system-library/#standard-streams-as-bytes), `io.stdin()`, is a
+  `Readiness` too: ready where bytes are in the buffer every reader of it shares, those a
+  `readLine` read past its line among them, or have arrived, or the input has ended or failed, or it
+  is a file. It belongs to no thread, so any thread may name it, and several at once; a select
+  waits on it while another thread reads it, and bytes that read leaves in the buffer end the wait
+  as arriving bytes do.
 - **Sinks.** A `writable()` arm's sink is any `Writability` (`avin.threads`): every connection, and
   the writing half of a split one. It is ready where the sink's `writable()` answers `true` when the
   arm is tried: the socket has room, or the connection has failed or is closed, which its write then
@@ -798,6 +816,102 @@ send(w: StreamWriter, data: Array[byte], stop: Channel[unit]) -> Result[int, IoE
       stop.receive() as None -> return Ok(at)
   Ok(at)
 ```
+
+```avin
+import avin.io.IoError
+import avin.net.TcpStream
+
+// Relays bytes both ways between two connections on one thread. Each side is read only while
+// nothing it gave is still waiting to be written, and watched for room only while something is.
+relayPair(a: TcpStream, b: TcpStream) -> Result[unit, IoError]
+  var toA: Array[byte] = Array.empty()
+  var toB: Array[byte] = Array.empty()
+  var aOpen = true
+  var bOpen = true
+  while aOpen || bOpen || toA.length > 0 || toB.length > 0
+    select
+      a.readable() if aOpen && toB.length == 0 ->
+        toB = a.read(4096)?
+        if toB.length == 0
+          aOpen = false
+          b.shutdownOutput()?
+      b.readable() if bOpen && toA.length == 0 ->
+        toA = b.read(4096)?
+        if toA.length == 0
+          bOpen = false
+          a.shutdownOutput()?
+      a.writable() if toA.length > 0 -> toA = toA.slice(a.writeSome(toA)?, toA.length)
+      b.writable() if toB.length > 0 -> toB = toB.slice(b.writeSome(toB)?, toB.length)
+  Ok(())
+```
+
+### Selectors
+
+A `Selector[K]` (`avin.threads`) is a select whose arms are made at run time, for a set of sources
+whose size is known only then: N connections, N tunnels, N workers' channels. Each entry is added
+under a key of the program's choosing, and a wait answers the key of the entry that ran.
+
+```avin
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.threads.Selector
+
+// One direction of a relayed connection pair, and what it has read and not yet written.
+class Leg(val from: TcpStream, val to: TcpStream)
+  var pending: Array[byte] = Array.empty()
+  var open = true
+
+// Relays bytes both ways between each pair of connections, all on one thread, until every pair has
+// finished: each leg's reading side is watched while it has nothing pending, and its writing side
+// while it has.
+relay(pairs: Vector[(TcpStream, TcpStream)]) -> Result[unit, IoError]
+  val legs = Buffer[Leg]()
+  for (a, b) in pairs
+    legs.append(Leg(a, b))
+    legs.append(Leg(b, a))
+  val sel = Selector[int]()
+  while legs.exists(l -> l.open || l.pending.length > 0)
+    sel.clear()
+    for i in 0 ..< legs.length
+      val leg = legs(i)
+      if leg.pending.length > 0 then sel.writable(leg.to, i)
+      elif leg.open then sel.readable(leg.from, i)
+    val leg = legs(sel.wait())
+    if leg.pending.length > 0
+      leg.pending = leg.pending.slice(leg.to.writeSome(leg.pending)?, leg.pending.length)
+    else
+      val bytes = leg.from.read(4096)?
+      if bytes.length == 0
+        leg.open = false
+        leg.to.shutdownOutput()?
+      else leg.pending = bytes
+  Ok(())
+```
+
+What a program can rely on:
+
+- **Entries.** `receive(channel, key) -> SelectReceive[T]` adds a receive, ready for a value or the
+  channel closed and drained, and answers the entry, whose `received()` is the `Option` received
+  once a wait has answered its key. `send(channel, x, key)` adds a send of `x`, which a wait sends
+  only where it answers the key; the entry is then taken out, so a value goes once.
+  `readable(source, key)` and `writable(sink, key)` add a stream or a sink, as a select's
+  `readable()` and `writable()` arms take them. Several entries may share a key.
+- **The set.** The entries stay from one wait to the next, so a loop may keep them and change only
+  what changed, or `clear()` them and add afresh. `remove(key)` and `removeWhere(p)` take out every
+  entry under a key, or whose key satisfies `p`, and answer how many; `size` and `isEmpty` count
+  them. The set is changed only between waits, by the thread that waits on it.
+- **Waiting.** `wait() -> K` waits until an entry can complete, does its one operation and answers
+  its key. `within(timeout) -> Option[K]` waits at most `timeout`, `None` where the time runs out
+  first; `until(deadline)` waits until an [`Instant`](/spec/time/); `poll() -> Option[K]` tries the
+  entries once, as `else` does, and a timeout of zero or less does the same. A `wait` on an empty
+  selector traps, as a select with every arm guarded off does; `within` and `until` on one wait out
+  their time, and `poll` answers `None`.
+- **The same wait as `select`.** A selector's wait is a select's own: entries tried in an order
+  drawn at random each time, so of several ready at once each is as likely to run, and none is
+  starved; one pass and one park on the runtime's poller however many entries there are; at most one
+  operation done, no other entry receiving, sending, reading or writing; a closed channel, a send to
+  a closed channel, a stream used by a thread it does not belong to, cancellation and collection
+  all as a select's arms meet them, above.
 
 ## Timers and deadlines
 

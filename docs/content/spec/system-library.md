@@ -562,7 +562,8 @@ belonging to one thread at a time as a connection does, so a thread of its own m
 
 ## `avin.io`
 
-Standard input, read as text, the error every module that reads or writes shares, and the traits
+Standard input, read as text or as bytes, standard output and error written as bytes, the error
+every module that reads or writes shares, and the traits
 that let one function read bytes from, or write them to, a file and a connection alike. Standard
 output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
 writers `StandardOutput` and `StandardError`; each is one function taking `Any*` (see
@@ -587,6 +588,7 @@ data ErrorKind
   ConnectionRefused
   ConnectionReset
   TimedOut
+  NoTerminal
   Other(text: string)
 ```
 
@@ -602,6 +604,7 @@ data ErrorKind
 | `ConnectionRefused` | Nothing listens at the address a connection was made to. | `connection refused` |
 | `ConnectionReset` | The other end reset or closed a connection while it was in use. | `connection reset by peer` |
 | `TimedOut` | A read or write on a connection waited past its timeout. | `timed out` |
+| `NoTerminal` | The program has no controlling terminal to read from or write to. | `there is no terminal` |
 | `Other(text)` | Any other failure, described in words. | `text` |
 
 **An `IoError` names its subject.** `operation` is what was being done, in words that follow
@@ -707,6 +710,140 @@ the program blocks for the answer.
 
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
+
+**A closed standard stream is `/dev/null`.** A program started with standard input, output or error
+closed (`prog <&-`) finds `/dev/null` there: the runtime opens it on each of the three that is
+missing before it opens anything of its own, so none of its own descriptors takes the number. A
+closed standard input reads as empty; what is written to a closed output or error goes nowhere.
+
+### Standard streams as bytes
+
+```text
+import avin.io
+
+// Copies standard input to standard output byte for byte.
+main()
+  io.copy(io.stdin(), io.stdout()) match
+    Ok(n) -> eprintln(s"$n bytes")
+    Err(e) -> eprintln(e.message)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `stdin() -> StandardInputBytes` | Standard input as a [`Reader`](#reader) of bytes and a `Readiness`, with `readAvailable(max)`. |
+| `stdout() -> StandardOutputBytes` | Standard output as a [`ByteWriter`](#bytewriter). |
+| `stderr() -> StandardErrorBytes` | Standard error as a `ByteWriter`. |
+
+The three answers are objects, `Sendable`, so a thread of their own can read or write: a server's
+writing thread takes `stdout()` as a `W: ByteWriter & Sendable`. They are for input whose length is
+counted in bytes, a `Content-Length` header most of all, and for input and output that is not text.
+
+**Bytes and lines share one buffer.** `stdin().read(max)` takes from the buffer `readLine`,
+`lines()`, `readAll` and `Source.stdin()` take from, so a program reads a header as a line and the
+body after it as bytes, or the other way round, and no byte is lost or read twice. A read answers
+the bytes already read ahead where there are any, else waits for one read of the input, so it may
+answer fewer than `max`; it never waits for more once it has some. Byte reads take the same lock as
+the text reads, one thread at a time, and a lightweight thread waiting for input parks on the
+runtime's poller, leaving its worker to the others.
+
+**The end of input is an empty array, as often as it is asked.** Standard input may be a terminal,
+a pipe, a file or `/dev/null`. A read that fails answers `Err(IoError(Other(m), "read", "standard
+input"))` with the platform's sentence (standard input that is a directory: `is a directory`), where
+the text readers see the end. A `max` below one traps, as a connection's read does.
+
+**Standard input can be waited on with channels, timers and connections.** `stdin()` is a
+[`Readiness`](/spec/threads/#select), so `stdin().readable() -> …` is an arm of a `select` beside
+channel arms and an `after`, and `Selector.readable(stdin(), key)` puts it among connections. Its
+`readable()` answers at once whether a read would answer without waiting: bytes are in the shared
+buffer, those a `readLine` read past its line among them, or have arrived on the descriptor, or the
+input has ended or failed, or it is a file, whose read never waits; it answers `false` while
+another thread is in the middle of reading it. `readAvailable(max) -> Result[Option[Array[byte]],
+IoError]` reads only what is there and never waits: `Some` of what `read(max)` would answer now,
+an empty array once the input has ended, or `None` where a read would wait, so a loop that is
+also drawing a screen or keeping time takes what has come and goes on.
+
+```text
+import avin.io
+import avin.threads.Channel
+import avin.time.millis
+
+// Echoes what is typed, a piece at a time as it comes, and says each tick, until the input ends.
+run(ticks: Channel[int])
+  var open = true
+  while open
+    select
+      io.stdin().readable() -> io.stdin().readAvailable(4096) match
+        Ok(Some(b)) -> if b.length == 0 then open = false else io.stdout().write(b).getOrElse(())
+        Ok(None) -> ()
+        Err(_) -> open = false
+      ticks.receive() as Some(t) -> println(s"tick $t")
+      after millis(500) -> println("idle")
+```
+
+Standard input belongs to no thread, so any thread may wait on it, where a connection may be named
+in a select only by the thread it belongs to. Waiting takes no lock: a select waits while another
+thread reads, and bytes that read leaves in the buffer end the wait as bytes arriving do. Several
+threads may wait on it at once; each is woken, and the reads that follow share the bytes, each byte
+going to one of them.
+
+**A byte write goes out whole before it returns.** Standard output's buffer, what `print` and
+`println` have written so far, is sent on first, so the bytes land after it; the write holds
+standard output for its whole length, so another thread's printed line lands before it or after it,
+never inside it. There is nothing to flush afterwards. A write to standard error flushes standard
+output first, as `eprint` does. An empty write writes nothing and answers `Ok`.
+
+**A write to a reader that has gone fails; it does not end the program.** A byte write to a pipe or
+socket whose reader has closed answers `Err(IoError(ConnectionReset, "write", "standard output"))`
+(or `"standard error"`), and every later byte write answers the same; the program goes on. `print`
+is not changed by it: a program that only prints still ends quietly when its reader goes, as a
+filter in a pipeline should.
+
+### Secrets typed at the terminal
+
+```text
+import avin.io
+
+main()
+  io.readSecret("Password: ") match
+    Ok(password) -> login(password)
+    Err(e) -> eprintln(e.message)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `readSecret(prompt: string) -> Result[string, IoError]` | One line typed at the controlling terminal with echo off, after `prompt` is written to the terminal. Bytes that are not UTF-8 become U+FFFD. |
+| `readSecretBytes(prompt: string) -> Result[Array[byte], IoError]` | The same line as bytes the caller owns and can overwrite when done with them. |
+| `readSecretOrLine(prompt: string) -> Result[string, IoError]` | `readSecret`, or where the program has no terminal, `prompt` written to standard error and a line read from standard input, shown as it arrives. |
+
+**The line is read from the terminal, not from standard input.** The terminal is the one the program
+was started from (`/dev/tty`), so a program whose input or output is a pipe can still ask, as `sudo`
+and `ssh` do. The prompt goes to the terminal too, and what the program has written to standard
+output is flushed before it. A program with no controlling terminal gets
+`Err(IoError(NoTerminal, "read", "the terminal"))`; `readSecretOrLine` is the call for a program a
+script may run with its password piped in.
+
+**Echo is off and the terminal is put back exactly as it was found.** Line editing stays on, so the
+user can still correct what they type; the newline the user's Enter did not echo is written once the
+terminal is back. The terminal is put back on every way out: a line, the end of input, an error, a
+cancelled thread's stop and a signal. Ctrl-C, a hangup, terminate or quit signal arriving during
+the read puts the terminal back first and then reaches the program as it would have: the program
+ends, or, where it watches the signal, sees the read fail with `Other("interrupted")` and the signal
+in its watch. Typed-ahead input is discarded when the read starts, so nothing typed before the prompt
+is taken for the secret. A stop from the terminal (Ctrl-Z) puts the terminal back before the program
+stops, so a stopped program leaves the user's shell with echo on; when it is continued, echo goes off
+again, the prompt is written again and the read goes on; what was typed before the Ctrl-Z is
+discarded by the terminal, as it is for any signal character.
+
+**The line has no terminator.** A trailing `\n` and a `\r` before it are dropped. A line ended by the
+terminal's end-of-file character counts if it has bytes in it; the end of input before any byte is
+`Err(IoError(Other("end of input"), _, _))`. An empty line is an empty secret. A line is at most what
+the terminal itself keeps of one: 1023 bytes on macOS, 4095 on Linux.
+
+**It never runs at the same time as a read of standard input, or another secret.** The read takes
+the lock every reader of standard input takes: a thread that asks waits for a reader of either, and
+the other way round. A thread cancelled while it waits for the line is stopped once the line has
+been read, as one reading standard input is. A secret asked for with no way to clear it is still a
+`string`; `readSecretBytes` is the form to overwrite, and the runtime clears its own copies.
 
 ### `Reader`
 
