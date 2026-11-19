@@ -6234,6 +6234,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with the user whether `avin new` should write the running version (it ties a new package to the
   Avin that made it, which may be later than the package needs).
 
+- Settled on the user's delegation 2026-11-19 (branch `min-avin`; completes the entry above, which
+  had left the question in § Open): **the minimum stays the whole design, the running version is the
+  stamped `Version`, and a missing library module points at the upgrade.** The key (`package.avin`),
+  its checking of every package of the graph, `avin check` and `avin new` were settled and built
+  2026-11-11; this adds only the hint: the "the standard library has no module" error ends with
+  "if the program was written for a later Avin than this one (X), upgrade Avin, and let its package
+  say which it needs with `avin = "…"`". It names no manifest state, because every declared
+  minimum has already been met by the time a module is looked up, so the error means either a typo
+  or a package that does not say what it needs. *Dev builds*: the version compared is the number
+  `scripts/release.sh` stamps into `const Version`, three numbers with no pre-release suffix, so a
+  tree between releases is the last release; a package naming a release not yet cut is refused by it
+  with the usual message. *Why no exemption*: a version has meaning only once a release stamps it,
+  and a pre-release rule would add a suffix to a version syntax that is three numbers. *`avin tidy`
+  warning on a dependency's minimum above the root's*: not added; the root's `avin` is what its
+  author tests with, and a dependency above the running Avin is already refused. *Alternatives*: a
+  hint only where the manifest has no `avin` (the driver does not see manifests, and the hint is
+  harmless where one is declared); an `AVIN_VERSION` override for dev trees. Review with the user:
+  the key's name (`avin`, after `sysl` in `sysl.hocon`) and whether ranges are wanted (refused above,
+  because Avin's versions only add).
+
 - Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
   part (identity, body fingerprint, interfaces read) and the world facts the whole-program steps
   decided for it, both made on every build after lowering** ([the instance
@@ -11197,9 +11217,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
   - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
     vendored package, or trust the hash recorded beside each package as it trusts the cache's.
-  - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
-    the standard library's modules arrive with the compiler and a package using a new one fails on an
-    older compiler with "no module" rather than a version message.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
   [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a

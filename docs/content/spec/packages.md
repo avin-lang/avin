@@ -73,7 +73,11 @@ error: `cairo` 0.2.0 needs Avin 0.0.19 or later, and this is Avin 0.0.18: upgrad
 
 That error comes before anything else wrong in the manifest: one written for a later Avin may hold a
 key this one does not know, and the upgrade is what it needs. An `avin` that is not a version is an
-error at its value, like any other. `avin lsp` reports both on the manifest: on `avin.hocon` itself
+error at its value, like any other. The version compared is the running Avin's own, three numbers: a
+tree between releases is the last release, so a package naming one not yet cut is refused by it. A
+program that imports a standard-library module this Avin lacks is told, with the modules it has, that
+it may have been written for a later Avin, and that its package says which it needs with `avin`.
+`avin lsp` reports both on the manifest: on `avin.hocon` itself
 when the editor opens it, and on the manifest of the package a file being edited belongs to.
 - **Every key is known.** A key the manifest does not hold (`author`, `build`, `tag`) is an error at
   the key, as are a value of the wrong kind and a block missing what it needs. Each error points at
