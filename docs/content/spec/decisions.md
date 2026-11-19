@@ -9270,9 +9270,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   nested `&&` blocks in the checker (a second lowering of chains to keep in step with the first).
   Amends "the arithmetic operators … are free method names" above.
 
-## Proposed
-
-- Proposed (built on branch `machine-conditions`, 2026-11-19): **the choices
+- Settled on the user's delegation 2026-11-19 (built on branch `machine-conditions`): **the choices
   [machines](/spec/packages/#machines) left open in the manifest.**
   - **A feature that does not exist on a machine turns nothing on there**, even when a feature that
     does exist `enables` it: the selection leaves it out, and what only it would turn on stays off.
@@ -9317,7 +9315,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     following a whole condition; symbols are lowercase and `-` belongs to a word, so a target's name
     is read whole and refused with the condition it means. WHY: one place and one sentence per
     mistake, as the manifest's other errors give. ALTERNATIVES: one generic "not a condition" error.
-- Proposed (built on branch `machine-files`, 2026-11-19): **the choices
+- Settled on the user's delegation 2026-11-19 (built on branch `machine-files`): **the choices
   [files for one machine](/spec/packages/#files-for-one-machine) and
   [the machine in an expression](/spec/packages/#the-machine-in-an-expression) left open.**
   - **A literate file is selected as an ordinary one** (`watch.linux.lavin`), and **a file's name
@@ -9370,6 +9368,268 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **The language server checks the files of the machine it runs on**, so a file for another machine
     open in an editor is not analyzed as part of its package. A later item may check it for a machine
     that reads it.
+- Settled on the user's delegation 2026-11-19 (branch `bounded-mailbox`): **A mailbox may be bounded,
+  given as `spawn(b, mailbox = Bounded(capacity, overflow))`; a `tell` to a full one drops by the
+  actor's `Overflow`, and senders that must know or wait use `offer` and `send`.** `data Mailbox` is
+  `Unbounded` (the default) or `Bounded(capacity: int, overflow: Overflow)`, `Overflow` being
+  `DropNewest` or `DropOldest`; a capacity less than one traps in `spawn`. `tell` keeps its settled
+  promise, never waiting and never failing, and drops as the policy says, counted by
+  `ref.dropped() -> long`. `offer(m) -> Result[unit, SendError]` never waits and answers `Err(Full)`;
+  `send(m)` and `send(m, timeout)` park the sending thread until there is room (a timed one answering
+  `Err(TimedOut)`, a timeout of zero or less being `offer`), as a cancellation point that leaves
+  nothing in the mailbox, waking with `Err(Ended)` where the actor ends; an actor's `send` to its own
+  full mailbox answers `Err(Full)` at once. `SendError` is `Full`, `TimedOut` or `Ended`; `AskError`
+  gains `Full`, and an ask of a full mailbox completes with it at once under either policy, dropping
+  nothing to make room. What the actor arranged for itself (a watch's notice, a timer's message, a
+  piped future's) goes in outside the bound and is never refused, and stop, restart and escalation
+  are not messages, so no bound holds them back; a restart keeps the mailbox and its bound; messages a
+  stash gives back do not count again. `Router.pool(…, mailbox)` bounds the router's mailbox and each
+  routee's at one capacity, and the router waits for room in the routee it chose (`SmallestMailbox`
+  only once every routee is full), so a full pool's backpressure reaches the router's own mailbox,
+  where the policy and `offer`/`send` act. A bounded mailbox is a queue under a lock, so the oldest
+  message may be dropped and senders may wait on a condition; unbounded actors keep the lock-free
+  queue and pay nothing. *Why*: the bound is a property of the actor, chosen where it is started, as
+  its supervision and executor are; separating the sender's choice (`tell` fire-and-forget, `offer`
+  to know, `send` to wait) from the actor's policy keeps `tell`'s settled meaning and gives every
+  program its backpressure path (marshal's queues, a pg pool) with no new wait inside `tell`; an ask
+  that cannot be delivered answering at once is what `Ended` already does. *Alternatives weighed*:
+  a capacity and policy on `Behaviour` or the `actor` declaration (the same actor wants different
+  bounds in different places); a third policy that fails the `tell` (`tell` answers nothing, so the
+  failure would be a trap in the sender for the receiver's slowness); a `tell` that waits (breaks the
+  settled rule, and deadlocks two actors telling each other); `offer` answering a `bool` (cannot tell
+  `Full` from `Ended`); `send` as a `Future` (the message would still be delivered after its awaiter
+  was cancelled); a dead-letters hook called with each dropped message (needs a typed callback on the
+  mailbox and runs user code inside the sender's `tell`; a counter is enough to observe overload);
+  counting the actor's own notices against the bound (a full mailbox would lose a watch's notice of
+  an end); each routee bounded but the router not (a full pool would make the router drop or block
+  with no policy of the caller's); a bounded lock-free ring (cannot drop the oldest without the
+  actor's help, and would cap the actor's own notices too). **Review with the user:** the overflow
+  surface (two policies, the policy always written out with no default, no failing policy), the names `offer`,
+  `send` and `dropped`, and the router's bound being shared by router and routees.
+- Settled on the user's delegation 2026-11-19 (branch `lambda-trailing-arg`): **a block's last line
+  that closes a bracket opened before the block ends the block at its first comma**: in
+  `spawn(() ->` … `a + f(n), 67108864)` the lambda yields `a + f(n)` and `67108864` is `spawn`'s
+  second argument, as on one line. The items after the comma are the bracket's own (positional or
+  named arguments, collection elements, map entries); every block opened in the same brackets on the
+  way (an `if`'s or `match`'s, an inner lambda's) ends there too, and a trailing block the line itself
+  opens and closes is stepped over. A tuple the block yields on that line is written in parentheses,
+  `(a, b))`; a `)` on a line of its own, a tuple on an earlier line and `a, b = b, a` on an earlier
+  line are unchanged. Why: the block's lines read the trailing items as a tuple the block yields, so
+  the call silently lost its argument (the thread got the default stack and yielded a tuple), and the
+  spec's "a block inside brackets starts a line again" said nothing about the line that leaves the
+  brackets; the rule makes the multi-line form mean what the one-line form means, as the
+  `match`-arm rule of 2026-11-15 ("inside brackets a comma ends a `match` arm's one-line body") did
+  for arms. Alternatives: an error for an unparenthesized tuple on such a
+  line, asking for parentheses either way (safe, but rejects the natural way to write a trailing
+  argument); keeping the tuple (silent wrong code). It changes code that compiled before; a scan of
+  every `.avin` file in the avin-lang repos found none relying on the old reading, and code that did
+  now fails to compile (an argument count or a lambda's type). **Review with the user**: it changes
+  the meaning of code that compiled before.
+- Settled on the user's delegation 2026-11-19 (branch `link-control`; the user: *"It should be as
+  flexible as possible. Avin isn't just for me, it's for anyone who would enjoy using it."*): **a
+  program chooses how each C library is linked in its root manifest's `c-linking` block, and a C
+  library's own block says what else links it** ([C
+  bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)). The program's block holds
+  `default` (`"static"` or `"dynamic"`), `static` and `dynamic` lists of libraries (`<library>` or
+  `<package>/<library>`), `static-system` (`-l` names the system provides, linked from their archives)
+  and `search` (where those archives are, absolute or root-relative). `static-c-libraries = true`
+  keeps its meaning as the shorthand of `default = "static"`; saying both is an error, so nothing
+  that builds today changes. A C library gains `files` (archives and shared libraries by path),
+  `search` (`-L` directories, searched for archives when static), `include` (`-I` directories, since a
+  vendored library's headers are not where `pkg-config` would say), `frameworks` and `link-flags`
+  (raw, the escape hatch); their paths are relative to the package and may not be absolute or hold a
+  `..` segment, so a fetched package builds wherever it lands. **Static is a promise, dynamic is "as
+  named"**: a library linked statically takes no shared library from a search directory (an error
+  names the missing archive, as before, now for `link` names and `files` too), while one linked
+  dynamically is linked from the flags as given, so a vendored `.a` is static either way. *Why one
+  block*: one place says how the program links, and a `static`/`dynamic` pair reads as the program's
+  sentence ("all static except mlt"). *Alternatives weighed*: a per-library `static = true` in the
+  library's block (the author would decide for every program; refused before and still refused, its
+  test kept); per-library keys inside the program's own `dependencies` entries (a library of a
+  dependency's dependency has no entry to put it in); a top-level `link` key as Sysl writes it (reads
+  as one key with the `-l` meaning of a library's `link`); `static-c-libraries` taking a list (one key
+  with two types, and no room for `dynamic`). **The command line** (`--static-c-libraries`,
+  `--dynamic-c-libraries` on build, run, test and check) stands in for the manifest's default only;
+  a library the manifest names keeps its way, since such a name usually records a reason (a licence,
+  a missing archive) a one-off flag should not erase. *Alternative*: the flag overruling everything
+  (simpler to state, but `--static-c-libraries` would then trip over every `dynamic-only` library
+  the program had already answered for). A cached `run`/`test` build is keyed by how each library is
+  linked and by its files, which also fixed the cache reusing a static build after the manifest
+  changed. **A library package may say `dynamic-only = "<why>"`**, one key for both "must be dynamic"
+  (licence) and "has no archive": both mean the same to a build and differ only in the reason, which
+  the error quotes. A program that would link it statically, by its default, the flag or its
+  `static` list, is refused with that reason and told to name it in `dynamic`; it is never made
+  dynamic silently, because a program asking to be static would then ship needing the library
+  installed. *Alternatives*: the requirement silently winning over the program's default (quiet,
+  and breaks the static promise); a requirement the program could override by `static` (a licence
+  is not the program's to waive); two keys, `dynamic-only` and `no-archive` (two names for one
+  effect). **System libraries stay dynamic unless `static-system` names them**; a named one with no
+  archive in the searched directories, or named but linked by no library, is an error. **On Linux**
+  (not built yet) an archive is still linked by its path; a `-l` kept dynamic stays `-l`; a
+  `static-system` name maps onto `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`; `frameworks` are macOS's.
+  A package's vendored C sources are compiled by the library's `sources` (the next entry); `files`
+  links a prebuilt archive. **Review with the user**: the surface syntax (`c-linking` and its five keys,
+  `<package>/<library>` naming, the library keys `files`/`search`/`include`/`frameworks`/`link-flags`,
+  the two flags' names), and the library-requirement rule (`dynamic-only` refusing a static program
+  rather than yielding to it, and the program's `static` list not overriding it).
+- Settled on the user's delegation 2026-11-19 (branch `c-sources`; the gap is link-control's report:
+  a package could link a prebuilt archive by `files` but not compile the `.c` files it ships, so a
+  binding of a library distributed as source, sqlite3.c, miniz or stb, needed its user to build an
+  archive for each machine; only a Sysl dependency's own `.c` was compiled, by Sysl): **a C library
+  names the C files its package ships in `sources`, and the flags they are compiled with in
+  `cflags`** ([C bindings](/spec/c-bindings/#c-sources-a-package-ships)). `sources` are paths relative
+  to the package, under the rules of `files` (no absolute path, no `..` segment), and a `*` matches
+  within one directory, as a workspace's members do; `**` is refused, a pattern matching no file
+  and a path that is not there are errors, and the matches are sorted and each file taken once.
+  They are compiled by the clang the C unit is compiled with, for the build's machine, with `-O2`
+  unless `cflags` names a level (whatever the program's own `-O`, so `-O0` and `-O2` builds share
+  the objects), the library's `include` directories as `-I`, the `--cflags` of its `pkg-config`
+  module, then `cflags`, last. **`cflags` holds what a package says about its C and nothing about the
+  build**: defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`, `-pedantic`), the
+  standard (`-std=`) and code generation (`-f`). `-I` and its kin are refused with a pointer at
+  `include`, `-Wl,`/`-Wa,`/`-Wp,` with a pointer at `link-flags`, and anything else (the target, the
+  output, `-l`, `-g`) as not a package's to say; `cflags` with no `sources` is an error, since it
+  would read as flags of the C unit, which it is not. The objects are linked into the program before
+  the libraries' link flags, **statically, always**, whatever `c-linking`, the command line or
+  `static-c-libraries` say of the library: they are part of the program. So **`dynamic-only` beside
+  `sources` is an error at the entry**, and `pkg-config` or `link` beside `sources` are allowed (a
+  wrapper compiled against an installed library, a source calling libz). **The cache**: each object
+  is kept in `csources/` by a key over the source's text, its flags (an `include` directory read as
+  the package writes it, so a package keys alike wherever it is fetched), the target, the compiler's
+  version and `clang --version`, and the path (package-relative where inside it) and text of every
+  header it includes, which clang lists (`-MD`) when it compiles and a record keeps; a source with no
+  record is scanned with `clang -M` first, so two packages shipping the same file compile it once
+  and link it once. `avin run`'s cached executables are keyed by each source's and recorded header's
+  modification time. **The clangs run at once, one per processor at most**: Avin has no job count of
+  its own, and this is the bound codegen units already keep. **A source clang refuses** is reported
+  as `error: the source `<path>` of the C library `<l>` of package `<p>` does not compile:` followed
+  by clang's own output, which names the file and the line; warnings of a source that compiles are
+  not shown (a vendored library's warnings are its maintainers'; `-Werror` makes them errors).
+  **`avin check` does not compile the sources**; it checks each is there and each pattern matches,
+  as it checks `files`. **Per-machine sources are entries with an `if`**: a library whose sources
+  differ by machine is written as one entry for what is common and one per machine (`vend-macos { if
+  = "macos", sources = [...] }`), using the conditions every entry already takes, rather than a
+  condition inside `sources`. **A header-only library needs nothing new**: its package ships the
+  one-line `.c` that asks for its implementation (`#define STB_IMAGE_IMPLEMENTATION` then the
+  include) and names it in `sources`. *Alternatives weighed*: a top-level `c-sources` block apart
+  from `c-libraries` (the sources belong to the library whose headers and `include` they share, and
+  a second block would repeat them); `cflags` passing anything (a package could then name a target
+  or an output and break the build's own choices); `-I` allowed in `cflags` (two ways to say
+  `include`, one of them able to name an absolute path); the program's `-O` level (debug builds of
+  the program would rebuild and slow every vendored library, which is not what is being debugged);
+  conditions inside `sources` (`sources { macos = [...] }`, a second condition syntax where `if`
+  already serves); keying objects by the source alone (an edited header would be missed) or by its
+  preprocessed text (a preprocessing on every build, even when nothing changed); a shared library
+  built from the sources (they are the program's, and a static object needs no install). **Review
+  with the user**: the key names `sources` and `cflags`, which flags `cflags` allows, the default
+  `-O2` independent of the program's level, and silencing warnings of sources that compile.
+- Settled on the user's delegation 2026-11-19 (branch `target-keys`): **every cache entry names the
+  machine it was built for, in its name and in its key**. A toolchain has a `target` (the compiler's
+  own machine unless a build names another). Under `units/`, `shims/`, `cunit/` and `csources/` an
+  entry is `<target>-<key>`; the runtime archive is `libavinrt-<target>-<key>.a`, in the cache and
+  shipped as `share/avin/lib/<target>/libavinrt-<target>-<key>.a`; a program's directory under
+  `build/` is `<name>-<target>-<key>`, which holds its executables and its instance cache; the key
+  hashed into each entry also holds the target, and an executable's record does too. Without a cache
+  directory the compiler's own machine keeps `.avin/build` and another machine uses
+  `.avin/build/<target>`. `avin cache info` lists the entries per target and `avin cache clean
+  --target <target>` removes one target's. **Existing caches are not carried over**: an old entry has
+  no target in its name, so no build finds it (it is never misread), `avin cache info` lists it as
+  `untargeted`, and the least-recently-used sweep removes it, so the first build after the upgrade
+  rebuilds. *Why*: a cross build, or a prefix shipping archives for two machines, must never reuse an
+  object built for the other, and the name makes the target visible to `info` and `clean` without
+  opening a file. *Alternatives weighed*: the target in the hash alone (disjoint, but `info` and
+  `clean --target` could not tell targets apart); a subdirectory per target in each kind (the sweep
+  and `info` count entries one level down, and a directory would become one entry holding every
+  object of its target, evicted whole); keeping old names for the compiler's own machine (a
+  compatibility rule with no reader once a second machine exists, and the rebuild is one build). The
+  `.avin/build` fallback keeps its path for the compiler's own machine so existing programs'
+  directories do not move, which is the one place an old entry stays valid, and its executable
+  records carry the target so a stale one is rebuilt. `avin clean` removes a program's builds
+  for every target there, and each target's directory once it is empty.
+- Settled on the user's delegation 2026-11-19 (branch `prefix-ops`; the user approved the feature
+  that day): **a data type, a class or a trait may define the prefix `!`, `~` and `+` as methods
+  taking no argument, as it defines `-`** ([operator methods](/spec/operators-and-control-flow/#operator-methods)).
+  `!a`, `~a` and `+a` call `a`'s method of that name where its type, or a type parameter's bound, has
+  one taking no argument; each yields any type, binds at the prefix level, and is resolved by the one
+  path the prefix `-` already took. Choices this branch made: **a `!` yielding something other than
+  `bool` is allowed**, as a method `<` may yield a `Cond`, so a query builder's `!cond` is a
+  condition object. **In a condition (`if`, `while`, an operand of `&&` or `||`) the `!` call must
+  yield `bool`**, and one that does not is "expected bool, found Cond", the same message any
+  non-`bool` condition gets; the condition then binds no names, since an `is` test is never the
+  operand of a method `!`. **A method `!` takes no argument at all**, a defaulted one included: `!`
+  has no binary form, and an `a ! b` reading would be a new infix operator nobody asked for. `~` and
+  `+` keep their one-argument overloads for `a ~ b` and `a + b`. **Generic code reaches them through
+  a user trait that declares them** (`trait Flip` with `!() -> Self`); there is no core trait for
+  them, since no built-in type's `!`, `~` or `+` is anything generic code over user types needs, and
+  `Neg` stays the only prefix core trait. **Where the type has no such method the operator keeps its
+  meaning**: on a data type or a class `!a`, `~a` and `+a` are the errors they were ("expected bool",
+  "`~` needs an integer or a byte", "`+` needs a number"). **The built-in types stay closed**: a
+  method `!`, or `~` or `+` taking no argument, on `int`, `real`, `byte`, `char`, `string`, `bool` or
+  a tuple, in an extension or a trait's implementation, is an error ("a prefix `!` on bool is the
+  language's own…"); `!` is no longer among the reserved method spellings. **Two prefix operators
+  written together stay one name** (`!!x` and `-~x` are the existing "a symbol method has no prefix
+  form" error), so nesting is written `! !x` and `- ~x`, as the operator-run rule already said.
+  *Alternatives weighed*: requiring `bool` from every method `!` (rules out the query builder the
+  feature is for); core traits `Not`, `Complement` and `Positive` (no program asks for them, and
+  each would need an impl for every built-in type); splitting a run of prefix characters such as
+  `!!` into nested operators (it breaks the one longest-run rule the lexer and `++`/`--` rely on).
+  **Review with the user**: whether `!!x` should read as `! !x` without the space.
+- Settled on the user's delegation 2026-11-19 (branch `collection-apply`): **a collection is made by
+  naming its type and listing its elements.** `Array(1, 2, 3)` was refused; it now works, as an
+  ordinary companion `apply[T](elements: T*)` in the library (no compiler special case: the
+  repeated parameter infers `T` from the elements, from the expected type, or from type arguments
+  written at the call, and `Array()` with none is the existing "cannot infer" error). Types that
+  gained the form: `Array`, `Buffer`, `Deque`, `ArraySeq`, `LazyList`, the mutable `Set` and
+  `LinkedSet`, and `PriorityQueue` (by the elements' own order); `Vector`, `List`, `Queue`, `Set`,
+  `HashSet`, `SortedSet`, `SeqSet`, `OrderedSet`, `TreeSet` (immutable and mutable) and `BitSet`
+  already had it. `Array(1, 2.5)` widens to `Array[real]`; mismatched types are the ordinary
+  argument error. A class that keeps fields its own code fills in (`LazyList`) no longer offers
+  its constructor to a call outside that code, so `LazyList[T]()` calls the companion's `apply`
+  and makes the empty list instead of being refused. An empty call with no element type to infer
+  follows the settled rule of 2026-11-04 (generics.md): the covariant collections (`Vector`,
+  `List`, `Queue`, `ArraySeq`, `LazyList`) take `Nothing`, as `[]` and `Vector.empty()` do, and an
+  invariant or bounded element type (`Array`, `Buffer`, `Deque`, every set, `PriorityQueue`) is a
+  "cannot infer" error. The refusal of an array's name with type arguments used as a value
+  (`Array[int]`) stays, its text now naming `Array(a, b)`. The old refusal of calling an array's constructor is removed, and the
+  literal `[1, 2, 3]` is unchanged. **Maps are excluded** (settled 2026-11-09): `Map("k" -> 7)` stays
+  refused with its hint to write `{"k": 7}`, and no pair operator is added. `Map((k, v), …)` taking
+  tuples already exists and stays; no other map gained a form. Alternatives weighed: a compiler
+  special case treating `Name(a, b)` as a literal (rejected: the library form needs none, and a
+  program's own collections get the form by declaring `apply`). Review with the user: whether the
+  tuple form `Map((1, "one"), …)` should stay beside `{1: "one"}`, since it is a second way to write
+  a map that no one needs.
+- Settled on the user's delegation 2026-11-19 (branch `diff`): **`avin.diff`, a module of the
+  standard library for the differences between two sequences and between two texts' lines.** It is
+  `library/avin/diff/diff.avin`, a module of its own beside `avin.uuid`, not part of the prelude, so
+  a program names what it uses (`import avin.diff.{diff, unifiedDiff}`). The API: `diff[T: Eq](a, b)
+  -> Vector[Edit[T]]` with `Edit[T]` the variants `Keep(value)`, `Insert(value)` and
+  `Delete(value)`; `apply(a, edits)`, which checks every `Keep` and `Delete` against the input and
+  traps naming the edit; `changes`; `Line(text, terminated)` with `splitLines` and `joinLines`;
+  `LineOptions(ignoreTrailingSpace = false, finalNewline = true)` and `diffLines`; `Hunk`, `hunks(edits,
+  context)`; `renderUnified` and `unifiedDiff`, whose output is `diff -u`'s byte for byte (checked
+  against GNU diff's on twenty fixture pairs at context 0, 1 and 3). The algorithm is Myers' O(ND)
+  with the linear-space middle-snake refinement, so memory is proportional to the inputs (three
+  arrays of their combined size, and the script) and never to their product; a run of changes lists
+  its deletes before its inserts, as `diff -u` prints them. Choices: edits carry the elements, not
+  indices, so a script is self-describing and `apply` can verify it (a `Keep` holds the first
+  sequence's element, so a line diff that ignores trailing space keeps the original text); lines
+  split at `\n` only and keep a `\r`, as `diff` does, so CRLF is a difference unless
+  `ignoreTrailingSpace` is set (which ignores a `\r` with the rest); a last line with no `\n` differs
+  from the same line with one by default, as `diff` reports it, and `finalNewline = false` makes them
+  equal; two changes share a hunk when no more than `2 * context` unchanged lines lie between them;
+  an empty range is written `start,0` with `start` the line before, a range of one line as its
+  number alone, as `diff -u` does. Alternatives weighed: edits as index ranges
+  (`Keep(aStart, bStart, count)`, more compact for large inputs, but cannot be applied without the
+  second sequence and reads less well in a pattern match); the quadratic table of the longest common
+  subsequence (simplest, but 10,000 lines against 10,000 takes 10^8 cells); a patience or histogram
+  diff (often reads better on source code, but is not shortest and does not match `diff -u`); a
+  prelude placement (every program would carry the names `Edit`, `Keep` and `Delete`). Tests:
+  `library/tests/diff.avin`, with every pair of sequences over three values up to four long and
+  random pairs checked against the quadratic table for minimality. Review with the user: the names
+  `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
+  patience diff should join this one as `diffLines`' option.
+
+## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
@@ -10282,44 +10542,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   message, watching subscribers with `watch` (an extra hop per event, a lifecycle to manage, and a
   count that is only known by asking); topics named in a global registry (shared mutable state by
   name).
-- Settled on the user's delegation 2026-11-19 (branch `bounded-mailbox`): **A mailbox may be bounded,
-  given as `spawn(b, mailbox = Bounded(capacity, overflow))`; a `tell` to a full one drops by the
-  actor's `Overflow`, and senders that must know or wait use `offer` and `send`.** `data Mailbox` is
-  `Unbounded` (the default) or `Bounded(capacity: int, overflow: Overflow)`, `Overflow` being
-  `DropNewest` or `DropOldest`; a capacity less than one traps in `spawn`. `tell` keeps its settled
-  promise, never waiting and never failing, and drops as the policy says, counted by
-  `ref.dropped() -> long`. `offer(m) -> Result[unit, SendError]` never waits and answers `Err(Full)`;
-  `send(m)` and `send(m, timeout)` park the sending thread until there is room (a timed one answering
-  `Err(TimedOut)`, a timeout of zero or less being `offer`), as a cancellation point that leaves
-  nothing in the mailbox, waking with `Err(Ended)` where the actor ends; an actor's `send` to its own
-  full mailbox answers `Err(Full)` at once. `SendError` is `Full`, `TimedOut` or `Ended`; `AskError`
-  gains `Full`, and an ask of a full mailbox completes with it at once under either policy, dropping
-  nothing to make room. What the actor arranged for itself (a watch's notice, a timer's message, a
-  piped future's) goes in outside the bound and is never refused, and stop, restart and escalation
-  are not messages, so no bound holds them back; a restart keeps the mailbox and its bound; messages a
-  stash gives back do not count again. `Router.pool(…, mailbox)` bounds the router's mailbox and each
-  routee's at one capacity, and the router waits for room in the routee it chose (`SmallestMailbox`
-  only once every routee is full), so a full pool's backpressure reaches the router's own mailbox,
-  where the policy and `offer`/`send` act. A bounded mailbox is a queue under a lock, so the oldest
-  message may be dropped and senders may wait on a condition; unbounded actors keep the lock-free
-  queue and pay nothing. *Why*: the bound is a property of the actor, chosen where it is started, as
-  its supervision and executor are; separating the sender's choice (`tell` fire-and-forget, `offer`
-  to know, `send` to wait) from the actor's policy keeps `tell`'s settled meaning and gives every
-  program its backpressure path (marshal's queues, a pg pool) with no new wait inside `tell`; an ask
-  that cannot be delivered answering at once is what `Ended` already does. *Alternatives weighed*:
-  a capacity and policy on `Behaviour` or the `actor` declaration (the same actor wants different
-  bounds in different places); a third policy that fails the `tell` (`tell` answers nothing, so the
-  failure would be a trap in the sender for the receiver's slowness); a `tell` that waits (breaks the
-  settled rule, and deadlocks two actors telling each other); `offer` answering a `bool` (cannot tell
-  `Full` from `Ended`); `send` as a `Future` (the message would still be delivered after its awaiter
-  was cancelled); a dead-letters hook called with each dropped message (needs a typed callback on the
-  mailbox and runs user code inside the sender's `tell`; a counter is enough to observe overload);
-  counting the actor's own notices against the bound (a full mailbox would lose a watch's notice of
-  an end); each routee bounded but the router not (a full pool would make the router drop or block
-  with no policy of the caller's); a bounded lock-free ring (cannot drop the oldest without the
-  actor's help, and would cap the actor's own notices too). **Review with the user:** the overflow
-  surface (two policies, the policy always written out with no default, no failing policy), the names `offer`,
-  `send` and `dropped`, and the router's bound being shared by router and routees.
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 
@@ -10611,24 +10833,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
   writes. An indented arm body stays a block, where a comma list is a tuple (up to a last line that
   closes the brackets, below).
-- Settled on the user's delegation 2026-11-19 (branch `lambda-trailing-arg`): **a block's last line
-  that closes a bracket opened before the block ends the block at its first comma**: in
-  `spawn(() ->` … `a + f(n), 67108864)` the lambda yields `a + f(n)` and `67108864` is `spawn`'s
-  second argument, as on one line. The items after the comma are the bracket's own (positional or
-  named arguments, collection elements, map entries); every block opened in the same brackets on the
-  way (an `if`'s or `match`'s, an inner lambda's) ends there too, and a trailing block the line itself
-  opens and closes is stepped over. A tuple the block yields on that line is written in parentheses,
-  `(a, b))`; a `)` on a line of its own, a tuple on an earlier line and `a, b = b, a` on an earlier
-  line are unchanged. Why: the block's lines read the trailing items as a tuple the block yields, so
-  the call silently lost its argument (the thread got the default stack and yielded a tuple), and the
-  spec's "a block inside brackets starts a line again" said nothing about the line that leaves the
-  brackets; the rule makes the multi-line form mean what the one-line form means, as the
-  `match`-arm rule above did for arms. Alternatives: an error for an unparenthesized tuple on such a
-  line, asking for parentheses either way (safe, but rejects the natural way to write a trailing
-  argument); keeping the tuple (silent wrong code). It changes code that compiled before; a scan of
-  every `.avin` file in the avin-lang repos found none relying on the old reading, and code that did
-  now fails to compile (an argument count or a lambda's type). **Review with the user**: it changes
-  the meaning of code that compiled before.
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
@@ -11501,155 +11705,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
-- Settled on the user's delegation 2026-11-19 (branch `link-control`; the user: *"It should be as
-  flexible as possible. Avin isn't just for me, it's for anyone who would enjoy using it."*): **a
-  program chooses how each C library is linked in its root manifest's `c-linking` block, and a C
-  library's own block says what else links it** ([C
-  bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)). The program's block holds
-  `default` (`"static"` or `"dynamic"`), `static` and `dynamic` lists of libraries (`<library>` or
-  `<package>/<library>`), `static-system` (`-l` names the system provides, linked from their archives)
-  and `search` (where those archives are, absolute or root-relative). `static-c-libraries = true`
-  keeps its meaning as the shorthand of `default = "static"`; saying both is an error, so nothing
-  that builds today changes. A C library gains `files` (archives and shared libraries by path),
-  `search` (`-L` directories, searched for archives when static), `include` (`-I` directories, since a
-  vendored library's headers are not where `pkg-config` would say), `frameworks` and `link-flags`
-  (raw, the escape hatch); their paths are relative to the package and may not be absolute or hold a
-  `..` segment, so a fetched package builds wherever it lands. **Static is a promise, dynamic is "as
-  named"**: a library linked statically takes no shared library from a search directory (an error
-  names the missing archive, as before, now for `link` names and `files` too), while one linked
-  dynamically is linked from the flags as given, so a vendored `.a` is static either way. *Why one
-  block*: one place says how the program links, and a `static`/`dynamic` pair reads as the program's
-  sentence ("all static except mlt"). *Alternatives weighed*: a per-library `static = true` in the
-  library's block (the author would decide for every program; refused before and still refused, its
-  test kept); per-library keys inside the program's own `dependencies` entries (a library of a
-  dependency's dependency has no entry to put it in); a top-level `link` key as Sysl writes it (reads
-  as one key with the `-l` meaning of a library's `link`); `static-c-libraries` taking a list (one key
-  with two types, and no room for `dynamic`). **The command line** (`--static-c-libraries`,
-  `--dynamic-c-libraries` on build, run, test and check) stands in for the manifest's default only;
-  a library the manifest names keeps its way, since such a name usually records a reason (a licence,
-  a missing archive) a one-off flag should not erase. *Alternative*: the flag overruling everything
-  (simpler to state, but `--static-c-libraries` would then trip over every `dynamic-only` library
-  the program had already answered for). A cached `run`/`test` build is keyed by how each library is
-  linked and by its files, which also fixed the cache reusing a static build after the manifest
-  changed. **A library package may say `dynamic-only = "<why>"`**, one key for both "must be dynamic"
-  (licence) and "has no archive": both mean the same to a build and differ only in the reason, which
-  the error quotes. A program that would link it statically, by its default, the flag or its
-  `static` list, is refused with that reason and told to name it in `dynamic`; it is never made
-  dynamic silently, because a program asking to be static would then ship needing the library
-  installed. *Alternatives*: the requirement silently winning over the program's default (quiet,
-  and breaks the static promise); a requirement the program could override by `static` (a licence
-  is not the program's to waive); two keys, `dynamic-only` and `no-archive` (two names for one
-  effect). **System libraries stay dynamic unless `static-system` names them**; a named one with no
-  archive in the searched directories, or named but linked by no library, is an error. **On Linux**
-  (not built yet) an archive is still linked by its path; a `-l` kept dynamic stays `-l`; a
-  `static-system` name maps onto `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`; `frameworks` are macOS's.
-  A package's vendored C sources are compiled by the library's `sources` (the next entry); `files`
-  links a prebuilt archive. **Review with the user**: the surface syntax (`c-linking` and its five keys,
-  `<package>/<library>` naming, the library keys `files`/`search`/`include`/`frameworks`/`link-flags`,
-  the two flags' names), and the library-requirement rule (`dynamic-only` refusing a static program
-  rather than yielding to it, and the program's `static` list not overriding it).
-- Settled on the user's delegation 2026-11-19 (branch `c-sources`; the gap is link-control's report:
-  a package could link a prebuilt archive by `files` but not compile the `.c` files it ships, so a
-  binding of a library distributed as source, sqlite3.c, miniz or stb, needed its user to build an
-  archive for each machine; only a Sysl dependency's own `.c` was compiled, by Sysl): **a C library
-  names the C files its package ships in `sources`, and the flags they are compiled with in
-  `cflags`** ([C bindings](/spec/c-bindings/#c-sources-a-package-ships)). `sources` are paths relative
-  to the package, under the rules of `files` (no absolute path, no `..` segment), and a `*` matches
-  within one directory, as a workspace's members do; `**` is refused, a pattern matching no file
-  and a path that is not there are errors, and the matches are sorted and each file taken once.
-  They are compiled by the clang the C unit is compiled with, for the build's machine, with `-O2`
-  unless `cflags` names a level (whatever the program's own `-O`, so `-O0` and `-O2` builds share
-  the objects), the library's `include` directories as `-I`, the `--cflags` of its `pkg-config`
-  module, then `cflags`, last. **`cflags` holds what a package says about its C and nothing about the
-  build**: defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`, `-pedantic`), the
-  standard (`-std=`) and code generation (`-f`). `-I` and its kin are refused with a pointer at
-  `include`, `-Wl,`/`-Wa,`/`-Wp,` with a pointer at `link-flags`, and anything else (the target, the
-  output, `-l`, `-g`) as not a package's to say; `cflags` with no `sources` is an error, since it
-  would read as flags of the C unit, which it is not. The objects are linked into the program before
-  the libraries' link flags, **statically, always**, whatever `c-linking`, the command line or
-  `static-c-libraries` say of the library: they are part of the program. So **`dynamic-only` beside
-  `sources` is an error at the entry**, and `pkg-config` or `link` beside `sources` are allowed (a
-  wrapper compiled against an installed library, a source calling libz). **The cache**: each object
-  is kept in `csources/` by a key over the source's text, its flags (an `include` directory read as
-  the package writes it, so a package keys alike wherever it is fetched), the target, the compiler's
-  version and `clang --version`, and the path (package-relative where inside it) and text of every
-  header it includes, which clang lists (`-MD`) when it compiles and a record keeps; a source with no
-  record is scanned with `clang -M` first, so two packages shipping the same file compile it once
-  and link it once. `avin run`'s cached executables are keyed by each source's and recorded header's
-  modification time. **The clangs run at once, one per processor at most**: Avin has no job count of
-  its own, and this is the bound codegen units already keep. **A source clang refuses** is reported
-  as `error: the source `<path>` of the C library `<l>` of package `<p>` does not compile:` followed
-  by clang's own output, which names the file and the line; warnings of a source that compiles are
-  not shown (a vendored library's warnings are its maintainers'; `-Werror` makes them errors).
-  **`avin check` does not compile the sources**; it checks each is there and each pattern matches,
-  as it checks `files`. **Per-machine sources are entries with an `if`**: a library whose sources
-  differ by machine is written as one entry for what is common and one per machine (`vend-macos { if
-  = "macos", sources = [...] }`), using the conditions every entry already takes, rather than a
-  condition inside `sources`. **A header-only library needs nothing new**: its package ships the
-  one-line `.c` that asks for its implementation (`#define STB_IMAGE_IMPLEMENTATION` then the
-  include) and names it in `sources`. *Alternatives weighed*: a top-level `c-sources` block apart
-  from `c-libraries` (the sources belong to the library whose headers and `include` they share, and
-  a second block would repeat them); `cflags` passing anything (a package could then name a target
-  or an output and break the build's own choices); `-I` allowed in `cflags` (two ways to say
-  `include`, one of them able to name an absolute path); the program's `-O` level (debug builds of
-  the program would rebuild and slow every vendored library, which is not what is being debugged);
-  conditions inside `sources` (`sources { macos = [...] }`, a second condition syntax where `if`
-  already serves); keying objects by the source alone (an edited header would be missed) or by its
-  preprocessed text (a preprocessing on every build, even when nothing changed); a shared library
-  built from the sources (they are the program's, and a static object needs no install). **Review
-  with the user**: the key names `sources` and `cflags`, which flags `cflags` allows, the default
-  `-O2` independent of the program's level, and silencing warnings of sources that compile.
-- Settled on the user's delegation 2026-11-19 (branch `target-keys`): **every cache entry names the
-  machine it was built for, in its name and in its key**. A toolchain has a `target` (the compiler's
-  own machine unless a build names another). Under `units/`, `shims/`, `cunit/` and `csources/` an
-  entry is `<target>-<key>`; the runtime archive is `libavinrt-<target>-<key>.a`, in the cache and
-  shipped as `share/avin/lib/<target>/libavinrt-<target>-<key>.a`; a program's directory under
-  `build/` is `<name>-<target>-<key>`, which holds its executables and its instance cache; the key
-  hashed into each entry also holds the target, and an executable's record does too. Without a cache
-  directory the compiler's own machine keeps `.avin/build` and another machine uses
-  `.avin/build/<target>`. `avin cache info` lists the entries per target and `avin cache clean
-  --target <target>` removes one target's. **Existing caches are not carried over**: an old entry has
-  no target in its name, so no build finds it (it is never misread), `avin cache info` lists it as
-  `untargeted`, and the least-recently-used sweep removes it, so the first build after the upgrade
-  rebuilds. *Why*: a cross build, or a prefix shipping archives for two machines, must never reuse an
-  object built for the other, and the name makes the target visible to `info` and `clean` without
-  opening a file. *Alternatives weighed*: the target in the hash alone (disjoint, but `info` and
-  `clean --target` could not tell targets apart); a subdirectory per target in each kind (the sweep
-  and `info` count entries one level down, and a directory would become one entry holding every
-  object of its target, evicted whole); keeping old names for the compiler's own machine (a
-  compatibility rule with no reader once a second machine exists, and the rebuild is one build). The
-  `.avin/build` fallback keeps its path for the compiler's own machine so existing programs'
-  directories do not move, which is the one place an old entry stays valid, and its executable
-  records carry the target so a stale one is rebuilt. `avin clean` removes a program's builds
-  for every target there, and each target's directory once it is empty.
-- Settled on the user's delegation 2026-11-19 (branch `prefix-ops`; the user approved the feature
-  that day): **a data type, a class or a trait may define the prefix `!`, `~` and `+` as methods
-  taking no argument, as it defines `-`** ([operator methods](/spec/operators-and-control-flow/#operator-methods)).
-  `!a`, `~a` and `+a` call `a`'s method of that name where its type, or a type parameter's bound, has
-  one taking no argument; each yields any type, binds at the prefix level, and is resolved by the one
-  path the prefix `-` already took. Choices this branch made: **a `!` yielding something other than
-  `bool` is allowed**, as a method `<` may yield a `Cond`, so a query builder's `!cond` is a
-  condition object. **In a condition (`if`, `while`, an operand of `&&` or `||`) the `!` call must
-  yield `bool`**, and one that does not is "expected bool, found Cond", the same message any
-  non-`bool` condition gets; the condition then binds no names, since an `is` test is never the
-  operand of a method `!`. **A method `!` takes no argument at all**, a defaulted one included: `!`
-  has no binary form, and an `a ! b` reading would be a new infix operator nobody asked for. `~` and
-  `+` keep their one-argument overloads for `a ~ b` and `a + b`. **Generic code reaches them through
-  a user trait that declares them** (`trait Flip` with `!() -> Self`); there is no core trait for
-  them, since no built-in type's `!`, `~` or `+` is anything generic code over user types needs, and
-  `Neg` stays the only prefix core trait. **Where the type has no such method the operator keeps its
-  meaning**: on a data type or a class `!a`, `~a` and `+a` are the errors they were ("expected bool",
-  "`~` needs an integer or a byte", "`+` needs a number"). **The built-in types stay closed**: a
-  method `!`, or `~` or `+` taking no argument, on `int`, `real`, `byte`, `char`, `string`, `bool` or
-  a tuple, in an extension or a trait's implementation, is an error ("a prefix `!` on bool is the
-  language's own…"); `!` is no longer among the reserved method spellings. **Two prefix operators
-  written together stay one name** (`!!x` and `-~x` are the existing "a symbol method has no prefix
-  form" error), so nesting is written `! !x` and `- ~x`, as the operator-run rule already said.
-  *Alternatives weighed*: requiring `bool` from every method `!` (rules out the query builder the
-  feature is for); core traits `Not`, `Complement` and `Positive` (no program asks for them, and
-  each would need an impl for every built-in type); splitting a run of prefix characters such as
-  `!!` into nested operators (it breaks the one longest-run rule the lexer and `++`/`--` rely on).
-  **Review with the user**: whether `!!x` should read as `! !x` without the space.
 
 ## Open
 
@@ -11804,58 +11859,3 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resumed on, changing the buffer's count there while the buffer's own carrier used it, which
   freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
   reading at once).
-
-- Settled on the user's delegation 2026-11-19 (branch `collection-apply`): **a collection is made by
-  naming its type and listing its elements.** `Array(1, 2, 3)` was refused; it now works, as an
-  ordinary companion `apply[T](elements: T*)` in the library (no compiler special case: the
-  repeated parameter infers `T` from the elements, from the expected type, or from type arguments
-  written at the call, and `Array()` with none is the existing "cannot infer" error). Types that
-  gained the form: `Array`, `Buffer`, `Deque`, `ArraySeq`, `LazyList`, the mutable `Set` and
-  `LinkedSet`, and `PriorityQueue` (by the elements' own order); `Vector`, `List`, `Queue`, `Set`,
-  `HashSet`, `SortedSet`, `SeqSet`, `OrderedSet`, `TreeSet` (immutable and mutable) and `BitSet`
-  already had it. `Array(1, 2.5)` widens to `Array[real]`; mismatched types are the ordinary
-  argument error. A class that keeps fields its own code fills in (`LazyList`) no longer offers
-  its constructor to a call outside that code, so `LazyList[T]()` calls the companion's `apply`
-  and makes the empty list instead of being refused. An empty call with no element type to infer
-  follows the settled rule of 2026-11-04 (generics.md): the covariant collections (`Vector`,
-  `List`, `Queue`, `ArraySeq`, `LazyList`) take `Nothing`, as `[]` and `Vector.empty()` do, and an
-  invariant or bounded element type (`Array`, `Buffer`, `Deque`, every set, `PriorityQueue`) is a
-  "cannot infer" error. The refusal of an array's name with type arguments used as a value
-  (`Array[int]`) stays, its text now naming `Array(a, b)`. The old refusal of calling an array's constructor is removed, and the
-  literal `[1, 2, 3]` is unchanged. **Maps are excluded** (settled 2026-11-09): `Map("k" -> 7)` stays
-  refused with its hint to write `{"k": 7}`, and no pair operator is added. `Map((k, v), …)` taking
-  tuples already exists and stays; no other map gained a form. Alternatives weighed: a compiler
-  special case treating `Name(a, b)` as a literal (rejected: the library form needs none, and a
-  program's own collections get the form by declaring `apply`). Review with the user: whether the
-  tuple form `Map((1, "one"), …)` should stay beside `{1: "one"}`, since it is a second way to write
-  a map that no one needs.
-- Settled on the user's delegation 2026-11-19 (branch `diff`): **`avin.diff`, a module of the
-  standard library for the differences between two sequences and between two texts' lines.** It is
-  `library/avin/diff/diff.avin`, a module of its own beside `avin.uuid`, not part of the prelude, so
-  a program names what it uses (`import avin.diff.{diff, unifiedDiff}`). The API: `diff[T: Eq](a, b)
-  -> Vector[Edit[T]]` with `Edit[T]` the variants `Keep(value)`, `Insert(value)` and
-  `Delete(value)`; `apply(a, edits)`, which checks every `Keep` and `Delete` against the input and
-  traps naming the edit; `changes`; `Line(text, terminated)` with `splitLines` and `joinLines`;
-  `LineOptions(ignoreTrailingSpace = false, finalNewline = true)` and `diffLines`; `Hunk`, `hunks(edits,
-  context)`; `renderUnified` and `unifiedDiff`, whose output is `diff -u`'s byte for byte (checked
-  against GNU diff's on twenty fixture pairs at context 0, 1 and 3). The algorithm is Myers' O(ND)
-  with the linear-space middle-snake refinement, so memory is proportional to the inputs (three
-  arrays of their combined size, and the script) and never to their product; a run of changes lists
-  its deletes before its inserts, as `diff -u` prints them. Choices: edits carry the elements, not
-  indices, so a script is self-describing and `apply` can verify it (a `Keep` holds the first
-  sequence's element, so a line diff that ignores trailing space keeps the original text); lines
-  split at `\n` only and keep a `\r`, as `diff` does, so CRLF is a difference unless
-  `ignoreTrailingSpace` is set (which ignores a `\r` with the rest); a last line with no `\n` differs
-  from the same line with one by default, as `diff` reports it, and `finalNewline = false` makes them
-  equal; two changes share a hunk when no more than `2 * context` unchanged lines lie between them;
-  an empty range is written `start,0` with `start` the line before, a range of one line as its
-  number alone, as `diff -u` does. Alternatives weighed: edits as index ranges
-  (`Keep(aStart, bStart, count)`, more compact for large inputs, but cannot be applied without the
-  second sequence and reads less well in a pattern match); the quadratic table of the longest common
-  subsequence (simplest, but 10,000 lines against 10,000 takes 10^8 cells); a patience or histogram
-  diff (often reads better on source code, but is not shortest and does not match `diff -u`); a
-  prelude placement (every program would carry the names `Edit`, `Keep` and `Delete`). Tests:
-  `library/tests/diff.avin`, with every pair of sequences over three values up to four long and
-  random pairs checked against the quadratic table for minimality. Review with the user: the names
-  `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
-  patience diff should join this one as `diffLines`' option.
