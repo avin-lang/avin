@@ -2,28 +2,45 @@
 // Actors share a pool as threads do: four workers, each told five jobs, borrow from a pool of two
 // open files, writing a line per job, and reply on a channel. Each file's handle goes to whichever
 // actor borrows it next. A worker's turn that waits for a resource waits its turn in the queue.
+//
+// The order is pinned so that no scheduling changes what is printed: the first two jobs each hold a
+// file until `main` meets them at a barrier, so the pool makes both files; the next two are told
+// only then, and wait in the queue until `main` has seen them there and lets the first two go on.
 import avin.actors.spawn
 import avin.fs
 import avin.fs.File
 import avin.io.IoError
-import avin.threads.{Channel, Pool}
+import avin.threads.{Barrier, Channel, Pool, sleep}
+import avin.time.millis
 
-actor Worker(files: Pool[File, IoError], done: Channel[bool]) receives int
+actor Worker(files: Pool[File, IoError], hold: Barrier, done: Channel[bool]) receives int
   receive
-    n -> done.send(files.use(f -> f.writeText(s"job $n\n").isOk) == Ok(true))
+    n ->
+      val meet = hold
+      done.send(files.use(f ->
+        if n < 2 then _ = meet.wait()
+        f.writeText(s"job $n\n").isOk) == Ok(true))
 
 main()
   val dir = fs.tempDir("actor-pool").ok.get
   val name = dir.path + "/log.txt"
   _ = fs.writeText(name, "")
   val files = Pool[File, IoError](() -> fs.append(name), maxSize = 2, destroy = Some(f -> _ = f.close()))
+  val hold = Barrier(3)
   val done = Channel[bool]()
-  val workers = [0, 1, 2, 3].map(_ -> spawn(Worker(files, done)))
-  for i in 0 ..< 20 do workers(i % 4).tell(i)
+  val workers = [0, 1, 2, 3].map(_ -> spawn(Worker(files, hold, done)))
+  for i in 0 ..< 2 do workers(i).tell(i)
+  while files.stats().lent < 2 do sleep(millis(1))
+  for i in 2 ..< 4 do workers(i).tell(i)
+  while files.stats().waiting < 2 do sleep(millis(1))
+  println(s"held ${files.stats()}")
+  _ = hold.wait()
+  for i in 4 ..< 20 do workers(i % 4).tell(i)
   var ok = 0
   for _ in 0 ..< 20
     if done.receive() == Some(true) then ok += 1
-  println(s"ok $ok ${files.stats()}")
+  val c = files.counters()
+  println(s"ok $ok ${files.stats()} created ${c.created} waited ${c.waited >= 2}")
   files.close()
   println(fs.readText(name).ok.get.split("\n").filter(l -> l != "").length)
   _ = dir.close()
