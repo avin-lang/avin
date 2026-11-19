@@ -51,7 +51,9 @@ class SortedPair[T: Ordered](first: T, second: T)
   parameter. A bound's type arguments are inferred from the argument, as `A` in
   `drain[S: Source[A], A](s: S)` is from the source passed.
 - **A bound is a trait or a class**, and may name the declaration's other parameters. A trait whose
-  methods mention `Self` is named only here, and in an impl's header.
+  methods mention `Self` is named only here, and in an impl's header. A function's or a method's own
+  type parameter may also be bounded by a [type parameter](#bounds-by-a-type-parameter) declared
+  before it.
 - **Several bounds are joined with `&`**, the one spelling, wherever type parameters are declared:
   on functions, methods, classes, data types, traits, actors and impl headers
   (`impl[T: Ord & Display] Display for Box[T]`), after a lower bound too (`[W >: T: Display & Ord]`).
@@ -251,6 +253,63 @@ impl[A] Chain[A]
   type arguments than the method it overrides does. Calls through a trait dispatch as any generic
   trait method's do.
 
+## Bounds by a type parameter
+
+`[J: I]`, where `I` is a type parameter in scope, requires every type argument for `J` to be a subtype
+of the one for `I`. It is the twin of the [lower bound](#lower-bounds): where `[W >: T]` lets a
+covariant type take a value of its parameter in, `[J: I]` lets a contravariant one narrow the values
+it reads. A `Rule[-I: Reader, +T]` reads any `I`; joined with a rule that reads only an `Input`, the
+join reads an `Input`:
+
+```text
+abstract class Reader(val length: int)
+  var offset = 0
+
+class Input(val source: string): Reader(source.byteLength)
+
+class Rule[-I: Reader, +T](val run: I -> Option[T])
+
+impl[I: Reader, T] Rule[I, T]
+  |[J: I](other: -> Rule[J, T]) -> Rule[J, T] = Rule(input ->
+    val start = input.offset
+    run(input) match
+      Some(a) -> Some(a)
+      None ->
+        input.offset = start
+        other.run(input))
+```
+
+- **Only a function's or a method's own type parameters are bounded by a type parameter**, as only
+  they have a lower bound. The bounding one is the enclosing type's or impl's, or one declared
+  earlier in the same list (`[A: Named, B: A]`); a later one is an error that shows the order to
+  write, so a chain of such bounds never leads back to where it starts, and `[A: B, B: A]` is refused
+  at its first bound. A parameter has one at most, and may have trait and class bounds beside it
+  (`[B: A & Loud]`). A constructor parameter, `F[_]`, bounds nothing.
+- **A value of the parameter is a value of the bounding one, with no conversion**: inside `|`, an
+  `input` of type `J` is passed to `run`, which takes an `I`, and `self`, a `Rule[I, T]`, is a
+  `Rule[J, T]`. It has the bounding parameter's bounds and their members (`input.offset`, through
+  `Reader`), and through a chain, each one's further along: in `[A: Named, B: A, C: B]` a `C` is a `B`
+  and an `A`, and has `Named`'s methods. Two branches yielding a `J` and an `I` agree on `I`.
+- **Each type argument is held to it at the call**: the argument must be the bounding argument, or
+  be seen as it as a covariant part is (both references, as [variance](#variance) requires). So a
+  `Pen[Dog]`'s `swap[U: T]` refuses a `Cat`, a `Pen[Animal]`'s refuses an `int`, and the error names
+  the argument, the type the bounding parameter is and both parameters.
+- **Inference takes the narrower**: a type argument decided where a value is passed in, as `J` is
+  by the `Rule[J, T]` given for `other`, is decided as the type given; where that type is not a
+  subtype of the bounding argument but the bounding argument is a subtype of it, the bounding argument
+  is taken instead, which the given value is also an instance of there. So `err[long]("no") | digit()`
+  (`I` a `Reader`, `other` reading an `Input`) and `digit() | success(4)` (`I` an `Input`, `other`
+  reading any `Reader`) are both `Rule[Input, long]`s. A bounding parameter nothing else decides is
+  decided as the argument of the parameter it bounds: `describe[A: Named, B: A](b: B)` called with a
+  `Dog` takes `A` as `Dog`.
+- **It is a position where a value is passed in**, as every bound of a method's own parameter is
+  ([variance](#variance)): a `-I` may bound one and a `+T` may not. That mirrors the lower bound's
+  rule, and for the same reason: a `Rule[Reader, T]` seen as a `Rule[Input, T]` is called with a `J`
+  that is an `Input`, which is a `Reader`, so the bound the method was written against still holds;
+  a `Box[Dog]` seen as a `Box[Animal]` could be called with a `J` that is a `Cat`, which is no `Dog`.
+- **An override writes the overridden method's bound, or none**, as for a lower bound: it may assume
+  no more of its type arguments than the method it overrides does.
+
 ## Reification
 
 Generics are monomorphized: each distinct set of type arguments produces its own code and layout.
@@ -328,6 +387,8 @@ ordinary recursion: it compiles, and its derived and structural methods have one
 - both are instances of one generic type and each argument follows its declared variance (below);
 - `T` is a type parameter with a [lower bound](#lower-bounds) that `S` is, or is a subtype of as a
   covariant part is;
+- `S` is a type parameter [bounded by](#bounds-by-a-type-parameter) the type parameter `T`, or by
+  one that is;
 - `T` is a [union](/spec/unions/#subtyping) with a member `S` is a subtype of, or `S` is a union
   each of whose members is a subtype of `T`.
 
@@ -375,7 +436,9 @@ The checker verifies each declared parameter's positions:
 - The bounds of a method's own type parameter are positions where a value is passed in; its
   [lower bound](#lower-bounds) is one where a value is read out, so a `+T` may be the lower bound
   of a method's parameter, `put[W >: V](key: K, value: W)`, and a `-T` may not. A `+V` in the
-  parameter itself, `put(key: K, value: V)`, is still an error.
+  parameter itself, `put(key: K, value: V)`, is still an error. A [type parameter bounding
+  it](#bounds-by-a-type-parameter) is a bound like any other: a `-I` may bound a method's own
+  parameter, `|[J: I](other: -> Rule[J, T])`, and a `+T` may not.
 - A mutable field is both, so neither may appear in a `var`.
 - A function type's parameters flip the position and its result keeps it; an argument of another
   generic type takes the position as that type's parameter's variance turns it, and an invariant
