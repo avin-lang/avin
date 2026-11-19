@@ -349,7 +349,8 @@ error: what is passed for `body` of `spawn` may run on another thread, which sha
 With `val hits = Atomic(0)` and `record() = hits.add(1)` the program is legal. Printing is legal from any
 thread: `print`, `println` and `eprintln` reach the runtime's streams, which keep no state of the
 program's, and each call's output goes out whole: a line one thread prints is never split by
-another's (system-library.md § Standard input). What is passed for an `@isolating` parameter is held to it too, though it runs at once on
+another's (system-library.md § Standard input). Reading standard input is legal from any thread
+too: threads read it one at a time, and a line goes whole to exactly one of them. What is passed for an `@isolating` parameter is held to it too, though it runs at once on
 the calling thread: a module-level value is where it could leave what it isolates for code that
 does not take the lock. What is passed for an `@isolated` one is not.
 
