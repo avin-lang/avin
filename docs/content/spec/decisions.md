@@ -1068,8 +1068,9 @@ Settled by the user on 2026-11-04:
   method is just a method: on a type with both, the operator calls the method and code bounded by
   `Add` calls `add`. Prefix `-a` calls a method `-` taking no argument (`-() -> Vec`), and otherwise
   is `Neg`'s `negate`. `a < b` alone calls the method `<`, whatever it yields; a comparison by a
-  method does not chain, and `a < b < c` through one is an error saying to join the comparisons with
-  `&&`. `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
+  method chains when every link yields `bool` (amended 2026-11-19; see "a comparison chain's links
+  may call operator methods" below, among the decisions settled on the user's delegation).
+  `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
   included. The built-in types keep their operators: a method of one of these names on `int`,
   `real`, `byte`, `char`, `string`, `bool` or a tuple, by an extension or a trait implementation, is
   an error. `==` and `!=` stay `Eq`'s, and the wrapping, saturating and yielding forms stay
@@ -9128,6 +9129,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   end (ambiguous); `readSome`/`readAvailable` on the `Reader` trait (every reader would owe it,
   and files and connections have no use for it yet). tui switched in its branch `stdin-api`.
   **Review with the user:** the name `readAvailable` and its `Option` answer.
+
+- Settled on the user's delegation 2026-11-19 (the user asked for the change, branch
+  `method-chain`): **a comparison chain's links may call operator methods; a chain is allowed when
+  every link yields `bool`.** `lo <= x < hi` with `x`'s type defining `<=` and `<` as methods is one
+  chain, as it is for built-in comparisons, and links of methods mix with built-in links, `==` and
+  `!=` among them. The chain keeps its meaning: operands are evaluated left to right, each middle
+  operand exactly once, and evaluation stops at the first false link. Each link resolves on its own
+  left operand's type, so overloads are chosen per link (`t0 < t <= d` calls `Instant < Instant`
+  and then `Instant <= Duration`). A link whose method yields anything but `bool` (a query builder's
+  `age < 30` yielding a condition) makes the chain an error naming the link, its method and the type
+  it yields, and saying to join the comparisons with `&&` or parenthesize one; `a < b` alone still
+  yields whatever the method yields. The compiler lowers a method link through the chain's one
+  lowering: the checker records the link's resolved call on two unnamed locals, and the chain
+  gives them the operands' values it already holds. Why: chains read as the mathematics they
+  write, and the house style asks for them wherever possible; the earlier rule's reason, that a
+  method may yield anything, is kept exactly where it applies, a link that does not yield `bool`.
+  Alternatives weighed: keeping the error (forces `lo <= x && x < hi` on types with methods only);
+  allowing any result type and joining links with the result's own `&&` (no single meaning for
+  short-circuiting, and a condition builder's `&&` is a method too); desugaring method chains into
+  nested `&&` blocks in the checker (a second lowering of chains to keep in step with the first).
+  Amends "the arithmetic operators … are free method names" above.
 
 ## Proposed
 

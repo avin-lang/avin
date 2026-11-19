@@ -7023,7 +7023,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     // An opaque type and its representation are laid out alike, so the value is itself.
     Reveal(value) -> lower_expr(l, value)
     Logic(and, left, right) -> logic(l, and, left, right, tail)
-    Compare(operands, ops) -> compare_chain(l, operands, ops)
+    Compare(operands, ops, methods) -> compare_chain(l, operands, ops, methods)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no, tail)
     While(label, condition, body, otherwise) -> lower_while(l, e, label, condition, body, otherwise)
     Break(label, value) ->
@@ -7385,7 +7385,7 @@ private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: Mi
     Value(dest)
 
 // A chain evaluates each operand when its link is reached, and the first false link decides.
-private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) -> Option[Operand]
+private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp], methods: Buf[Option[LinkMethod]]) -> Option[Operand]
     // `target.os == MacOS` is decided here, as an `is` test on it is.
     if ops.len() == 1 && (ops[0] is Equal || ops[0] is NotEqual) && same_type(operands[0].ty, operands[1].ty)
         if target_variant(l, operands[0]) is Some(_) || target_variant(l, operands[1]) is Some(_)
@@ -7396,12 +7396,12 @@ private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) 
     var previous = link_operand(l, operands[0])?
     if ops.len() == 1
         val next = link_operand(l, operands[1])?
-        return Some(compare_link(l, ops[0], operands[0].ty, operands[1].ty, previous, next))
+        return Some(chain_link(l, ops[0], methods[0], operands[0].ty, operands[1].ty, previous, next))
     val slot = new_slot(l, Bool)
     val done = new_block(l)
     for i in 0..<ops.len()
         val next = link_operand(l, operands[i + 1])?
-        val result = compare_link(l, ops[i], operands[i].ty, operands[i + 1].ty, previous, next)
+        val result = chain_link(l, ops[i], methods[i], operands[i].ty, operands[i + 1].ty, previous, next)
         store(l, slot, Some(result))
         if i + 1 < ops.len()
             val more = new_block(l)
@@ -7409,6 +7409,16 @@ private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) 
         previous = next
     finish_into(l, Jump(done), done)
     load(l, slot)
+
+/** One link of a chain on its operands' values `a` and `b`: the operator method the link calls, given
+ * the values through its two locals, or the built-in comparison. */
+private chain_link(l: *Lowering, op: CompareOp, method: Option[LinkMethod], x: &Type, y: &Type, a: Operand, b: Operand) -> Operand
+    val m = method match
+        Some(m) -> m
+        None -> return compare_link(l, op, x, y, a, b)
+    bind_local(l, m.left, Some(a))
+    bind_local(l, m.right, Some(b))
+    lower_expr(l, m.call).unwrap_or(ConstBool(false))
 
 private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr], tail: bool) -> Option[Operand]
     l.refuted = false
