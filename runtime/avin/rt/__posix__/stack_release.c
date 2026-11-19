@@ -12,30 +12,46 @@
  * stack's guard, below the range, is not touched.
  */
 
+#include <errno.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 /* Gives back the whole pages of `[low, top - keep)`, where `low` is the lowest address the stack's
- * thread may use. A range with no whole page in it is left alone. */
-void avin_rt_stack_release(char *low, char *top, size_t keep) {
+ * thread may use, and answers 0, or the `errno` of a release the system refused. A range with no whole
+ * page in it is left alone and answers 0.
+ *
+ * A refusal leaves the range as it was, mapped and committed: a failed `madvise` changes nothing, and
+ * a fixed mapping the kernel cannot make puts back the mapping it was to replace before it fails. A
+ * remap that answered some other address than the one asked for would be a mapping the stack does not
+ * own, so it is unmapped again and counted as refused, the range still holding its old pages. The
+ * trim is only a saving, so its caller counts a refusal and goes on. */
+int avin_rt_stack_release(char *low, char *top, size_t keep) {
     uintptr_t page = (uintptr_t)getpagesize();
     uintptr_t lo = ((uintptr_t)low + page - 1) & ~(page - 1);
     uintptr_t hi;
 
-    if ((uintptr_t)top < lo + keep + page) return;
+    if ((uintptr_t)top < lo + keep + page) return 0;
     hi = ((uintptr_t)top - keep) & ~(page - 1);
-    if (hi <= lo) return;
+    if (hi <= lo) return 0;
 #if defined(__APPLE__)
     {
         int flags = MAP_PRIVATE | MAP_ANON | MAP_FIXED;
+        void *got;
 #if defined(MAP_NORESERVE)
         flags |= MAP_NORESERVE;
 #endif
-        (void)mmap((void *)lo, hi - lo, PROT_READ | PROT_WRITE, flags, -1, 0);
+        got = mmap((void *)lo, hi - lo, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (got == MAP_FAILED) return errno != 0 ? errno : EINVAL;
+        if (got != (void *)lo) {
+            if (munmap(got, hi - lo) != 0) return errno != 0 ? errno : EINVAL;
+            return EINVAL;
+        }
+        return 0;
     }
 #else
-    (void)madvise((void *)lo, hi - lo, MADV_DONTNEED);
+    if (madvise((void *)lo, hi - lo, MADV_DONTNEED) != 0) return errno != 0 ? errno : EINVAL;
+    return 0;
 #endif
 }
 

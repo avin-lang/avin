@@ -4164,7 +4164,10 @@ spelling is better, as each entry says.
   about to run it marks it running and unsettled and only then waits for `trimming` to fall, so a
   trim never overlaps the thread's next run. The release is `madvise(MADV_DONTNEED)` on Linux; on
   macOS that advice leaves the pages resident, so the range is mapped afresh in place
-  (`MAP_FIXED`), which frees them at once (`runtime/avin/rt/__posix__/stack_release.c`). The
+  (`MAP_FIXED`), which frees them at once (`runtime/avin/rt/__posix__/stack_release.c`). A release
+  the system refuses leaves the range as it was, mapped and committed (a failed `madvise` changes
+  nothing, and a fixed mapping the kernel cannot make puts the old one back), so the runtime only
+  counts it (`stack_releases_refused`) and the thread goes on untrimmed; nothing traps. The
   overflow trap is untouched: the guard and the report's low end are the stack's own, and a trimmed
   stack still overflows at its end with `stack overflow`. *Measured* (macOS, arm64, 16 KiB pages,
   `-O2`, resident bytes per parked thread after its recursion returned): depth 0, 17 KB before and

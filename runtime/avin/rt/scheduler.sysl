@@ -934,7 +934,7 @@ take_stack(size: usize) -> Option[&fiber.Stack]
 // a fresh one soon will, whatever depth its last thread reached.
 private give_stack(p: *Lwt)
     p.stack match
-        Some(s) -> release_stack(s.low(), s.high(), TrimKeep)
+        Some(s) -> release_stack(s.low(), s.high())
         None -> ()
     stack_lock.lock()
     keep_stack(p)
@@ -976,9 +976,21 @@ private var trims_listed: Atomic[u64] = Atomic(0)
 private var trim_batch: Buf[*Lwt] = buf()
 /** How many parked threads' stacks have been trimmed. */
 var stacks_trimmed: Atomic[u64] = Atomic(0)
+/** How many releases of a stack's pages the system refused: each left its pages committed, as they
+ * were, and the thread went on as an untrimmed one does. */
+var stack_releases_refused: Atomic[u64] = Atomic(0)
+/** For the runtime's own tests: 1 has every release of a stack's pages answer as refused without
+ * asking the system, so the path a refusal takes can be run. */
+var refuse_stack_releases: Atomic[u32] = Atomic(0)
 
-extern "avin_rt_stack_release" release_stack(low: *u8, top: *u8, keep: usize) -> unit
+extern "avin_rt_stack_release" c_release_stack(low: *u8, top: *u8, keep: usize) -> i32
 extern "avin_rt_stack_here" stack_here() -> *u8
+
+// Gives back the pages of the stack from `low` to `TrimKeep` below `top`. A refusal is counted and
+// otherwise ignored: the pages stay committed, and trimming is only a saving.
+private release_stack(low: *u8, top: *u8)
+    val refused = if refuse_stack_releases.load() != 0 then true else c_release_stack(low, top, TrimKeep) != 0
+    if refused then _ = stack_releases_refused.add(1)
 
 // Puts `p`, parked and not listed, at the back of the list, and wakes the monitor if it rests.
 private list_for_trim(p: *Lwt)
@@ -1048,7 +1060,7 @@ private trim_parked()
     trim_lock.unlock()
     for i in 0..<trim_batch.len()
         val q = trim_batch[i]
-        release_stack(q.low, q.park_top, TrimKeep)
+        release_stack(q.low, q.park_top)
         _ = stacks_trimmed.add(1)
         q.trimming.store(0)
     trim_batch.clear()
