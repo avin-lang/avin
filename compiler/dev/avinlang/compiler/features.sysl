@@ -29,6 +29,8 @@ struct Feature
     /** Features of this package that must be on whenever this one is. */
     requires: Buf[string]
     require_spans: Buf[Span]
+    /** The machines the feature exists on, as its `if` writes them, or empty for every machine. */
+    condition: string
 
 /** What a member of a feature's `enables` turns on. */
 enum Enabled
@@ -40,23 +42,44 @@ enum Enabled
     EnabledDependencyFeature(label: string, feature: string)
 
 /** Which of the root package's features a command turns on: every one, or its defaults unless
- * `defaults` is false, and the features `names` besides. */
+ * `defaults` is false, and the features `names` besides; and `target`, the machine the build is for,
+ * which decides which entries of every manifest are taken and which features exist. */
 struct FeatureChoice
     all: bool
     defaults: bool
     names: Buf[string]
+    target: string
 
-/** The defaults, as a build gets them when no flag says otherwise. */
-default_features() -> FeatureChoice = FeatureChoice(false, true, buf())
+/** The defaults, as a build gets them when no flag says otherwise, for the machine the compiler runs on. */
+default_features() -> FeatureChoice = FeatureChoice(false, true, buf(), host_target())
 
 /** Every feature, as `avin test`, `avin check`, the language server, `avin tidy` and `avin vendor` take
- * them when no flag says otherwise. */
-every_feature() -> FeatureChoice = FeatureChoice(true, true, buf())
+ * them when no flag says otherwise, for the machine the compiler runs on. */
+every_feature() -> FeatureChoice = FeatureChoice(true, true, buf(), host_target())
 
-/** An import a file may not make: of the module `prefix` or one under it, refused with `message`. */
+/** `choice` made for the machine `target`. */
+choice_for(choice: FeatureChoice, target: string) -> FeatureChoice = FeatureChoice(choice.all, choice.defaults, choice.names, target)
+
+/** The names of the features among `features` that do not exist on the machine `target`: each whose
+ * `if` does not hold there. */
+absent_features(features: Buf[Feature], target: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for f in features
+        if !condition_holds(f.condition, target) then out.push(f.name)
+    out
+
+/** The message for a request of the feature `name` of `package`, declared among `features`, which
+ * does not exist on the machine `target`. */
+absent_feature(package: string, features: Buf[Feature], name: string, target: string) -> string
+    val condition = features[feature_index(features, name).unwrap()].condition
+    s"the feature `$name` of `$package` exists only where `$condition` holds, and this build is for $target"
+
+/** An import a file may not make: of the module `prefix` or one under it, refused with `message`; with
+ * `exact`, of that module alone or a declaration of it. */
 struct Fence
     prefix: string
     message: string
+    exact: bool
 
 // Reading the manifest's `features` block.
 
@@ -65,7 +88,7 @@ read_features(f: Field, into: *Buf[Feature]) -> Result[unit, Diagnostic]
     for g in f.value.fields()
         if !valid_feature_name(g.key) then return Err(error(g.key_span, s"`${g.key}` is not a feature's name: a feature is named as a package is, and ${FeatureNameRule}"))
         if g.key == "default" then return Err(error(g.key_span, "no feature is named `default`: a feature is made one of the defaults by `default = true` in its block"))
-        var feature = Feature(g.key, g.key_span, "", false, buf(), buf(), buf(), buf(), buf(), buf())
+        var feature = Feature(g.key, g.key_span, "", false, buf(), buf(), buf(), buf(), buf(), buf(), "")
         if g.value.is_arr()
             feature_list(g, &feature.enables, &feature.enable_spans)?
         elif g.value.is_obj()
@@ -84,8 +107,10 @@ read_features(f: Field, into: *Buf[Feature]) -> Result[unit, Diagnostic]
                     feature_list(h, &feature.enables, &feature.enable_spans)?
                 elif h.key == "requires"
                     feature_list(h, &feature.requires, &feature.require_spans)?
+                elif h.key == "if"
+                    feature.condition = read_condition(h)?
                 else
-                    return Err(error(h.key_span, s"`${h.key}` is not a key of a feature, which holds `doc`, `default`, `modules`, `enables` and `requires`"))
+                    return Err(error(h.key_span, s"`${h.key}` is not a key of a feature, which holds `doc`, `default`, `modules`, `enables`, `requires` and `if`"))
         else
             return Err(error(g.value.span, s"the feature `${g.key}` is a block, `${g.key} { enables = [json] }`, or the list of what it enables, `${g.key} = [json]`"))
         into.push(feature)
@@ -255,17 +280,22 @@ private listing(items: Buf[string]) -> string
     out
 
 /** `on` with every feature its members turn on, theirs too, in the order `features` declares them. */
-feature_closure(features: Buf[Feature], on: Buf[string]) -> Buf[string]
+feature_closure(features: Buf[Feature], on: Buf[string]) -> Buf[string] = feature_closure_without(features, on, buf())
+
+/** `on` with every feature its members turn on, as `feature_closure` answers, leaving out the features
+ * `absent` names and what only they would turn on: a feature that does not exist on a machine turns
+ * nothing on there. */
+feature_closure_without(features: Buf[Feature], on: Buf[string], absent: Buf[string]) -> Buf[string]
     var reached: Buf[string] = buf()
     for n in on
-        if !has_name(reached, n) then reached.push(n)
+        if !has_name(reached, n) && !has_name(absent, n) then reached.push(n)
     var next = 0usize
     while next < reached.len()
         val i = feature_index(features, reached[next]).unwrap()
         next += 1
         for member in features[i].enables
             if enabled_by(features, features[i].name, member) is EnabledFeature(g)
-                if !has_name(reached, g) then reached.push(g)
+                if !has_name(reached, g) && !has_name(absent, g) then reached.push(g)
     var out: Buf[string] = buf()
     for f in features
         if has_name(reached, f.name) then out.push(f.name)
@@ -388,12 +418,12 @@ fences_of(features: Buf[Feature], module_name: string, optional: Buf[string], op
         for m in f.modules
             for g in gate_of(features, m)
                 if has_name(implied, g) then continue
-                out.push(Fence(m, s"`$m` exists only while the feature `$g` is on, and ${gated_importer(importer, module_name, own, g)}"))
+                out.push(Fence(m, s"`$m` exists only while the feature `$g` is on, and ${gated_importer(importer, module_name, own, g)}", false))
                 break
     for i in 0..<optional.len()
         if dependency_turned_on(features, implied, optional[i]) then continue
         for m in optional_modules[i]
-            out.push(Fence(m, s"`$m` is a module of the optional dependency `${optional[i]}`, and ${gated_importer(importer, module_name, own, optional[i])}"))
+            out.push(Fence(m, s"`$m` is a module of the optional dependency `${optional[i]}`, and ${gated_importer(importer, module_name, own, optional[i])}", false))
     out
 
 // The second half of a fence's message: what the importing module is compiled with, and what to do.

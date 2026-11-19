@@ -1,0 +1,277 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.path.parent
+
+// How a program links its C libraries, as manifests say it: the root package's `c-linking` block and
+// its synonym `static-c-libraries`, the keys of a C library that link it (`files`, `search`,
+// `include`, `frameworks`, `link-flags`, `dynamic-only`), and how a program's choice, the command
+// line's and a library's requirement meet.
+
+private put(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+private manifest(name: string, rest: string) -> string = s"package {\n  name = \"$name\"\n  version = \"0.1.0\"\n}\n$rest"
+
+// The message reading a manifest of `text` fails with, or "read".
+private manifest_error(text: string) -> string
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", text).unwrap()
+    read_manifest(dir) match
+        Ok(_) -> "read"
+        Err(message) -> message
+
+private read_at(dir: string, text: string) -> Manifest
+    write_text(dir + "/avin.hocon", text).unwrap()
+    read_manifest(dir).unwrap()
+
+private joined(items: Buf[string]) -> string
+    var out = ""
+    for s in items
+        out = out + (if out == "" then "" else " ") + s
+    out
+
+@test("c-linking reads its default, its static and dynamic libraries, static-system and search")
+c_linking_read()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    val m = read_at(dir, manifest("app", "c-linking {\n  default = \"static\"\n  static = [\"a\", \"zip/b\"]\n  dynamic = [\"c\"]\n  static-system = [\"z\", \"iconv\"]\n  search = [\"/opt/x/lib\", \"vendor/lib\"]\n}\n"))
+    assert(m.static_c_libraries)
+    assert_eq(joined(m.linking.statically), "a zip/b")
+    assert_eq(joined(m.linking.dynamically), "c")
+    assert_eq(joined(m.linking.static_system), "z iconv")
+    assert_eq(joined(m.linking.search), "/opt/x/lib vendor/lib")
+    assert(m.linking.default_span.end > 0usize)
+    assert(!read_at(dir, manifest("app", "c-linking { default = \"dynamic\" }\n")).static_c_libraries)
+    // Unsaid, the default is dynamic, and a block may name libraries alone.
+    val lists = read_at(dir, manifest("app", "c-linking { static = [\"a\"] }\n"))
+    assert(!lists.static_c_libraries)
+    assert_eq(joined(lists.linking.statically), "a")
+    assert_eq(lists.linking.default_span.end, 0usize)
+    val empty = read_at(dir, manifest("app", "c-linking { }\n"))
+    assert(!empty.static_c_libraries)
+    assert_eq(empty.linking.statically.len(), 0)
+
+@test("static-c-libraries keeps its meaning beside c-linking, which may not say the default too")
+static_c_libraries_is_a_synonym()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    val both = read_at(dir, manifest("app", "static-c-libraries = true\nc-linking { dynamic = [\"mlt\"] }\n"))
+    assert(both.static_c_libraries)
+    assert_eq(joined(both.linking.dynamically), "mlt")
+    // Either order, saying the default twice is an error at the second.
+    val after = manifest_error(manifest("app", "static-c-libraries = true\nc-linking { default = \"static\" }\n"))
+    assert(after.contains("`static-c-libraries` and `c-linking`'s `default` say one thing: keep one of them"), after)
+    assert(after.contains("avin.hocon:6:"), after)
+    val before = manifest_error(manifest("app", "c-linking { default = \"dynamic\" }\nstatic-c-libraries = false\n"))
+    assert(before.contains("say one thing: keep one of them"), before)
+    assert(before.contains("avin.hocon:6:"), before)
+
+@test("a c-linking block that is wrong says what is wrong and where")
+c_linking_errors()
+    for wrong in ["\"Static\"", "true", "[\"static\"]", "\"\""]
+        val e = manifest_error(manifest("a", s"c-linking { default = $wrong }\n"))
+        assert(e.contains("`default` is `\"static\"` or `\"dynamic\"`"), e)
+        assert(e.contains("avin.hocon:5:"), e)
+    for key in ["static", "dynamic"]
+        for wrong in ["\"a\"", "[3]", "[\"\"]", "[\"Zlib\"]", "[\"a/b/c\"]", "[\"/a\"]", "[\"a/\"]", "[\"a b\"]"]
+            val e = manifest_error(manifest("a", s"c-linking { $key = $wrong }\n"))
+            assert(e.contains(s"`$key` is a list of C libraries, each `<library>` or `<package>/<library>`"), e)
+    val twice = manifest_error(manifest("a", "c-linking {\n  static = [\"z\"]\n  dynamic = [\"y\", \"z\"]\n}\n"))
+    assert(twice.contains("`z` is in both `static` and `dynamic`: a C library is linked one way"), twice)
+    assert(twice.contains("avin.hocon:7:"), twice)
+    val twice_back = manifest_error(manifest("a", "c-linking {\n  dynamic = [\"p/z\"]\n  static = [\"p/z\"]\n}\n"))
+    assert(twice_back.contains("`p/z` is in both"), twice_back)
+    for wrong in ["\"z\"", "[\"-lz\"]", "[\"\"]", "[\"l z\"]", "[1]"]
+        val e = manifest_error(manifest("a", s"c-linking { static-system = $wrong }\n"))
+        assert(e.contains("`static-system` is a list of `-l` names"), e)
+    for wrong in ["\"/x\"", "[\"\"]", "[\" \"]", "[2]"]
+        val e = manifest_error(manifest("a", s"c-linking { search = $wrong }\n"))
+        assert(e.contains("`search` is a list of directories"), e)
+    assert(manifest_error(manifest("a", "c-linking { statics = [\"z\"] }\n")).contains("`statics` is not a key of `c-linking`, which holds `default`, `static`, `dynamic`, `static-system` and `search`"))
+    assert(manifest_error(manifest("a", "c-linking = \"static\"\n")).contains("`c-linking` is a block saying how the program links its C libraries"))
+    val workspace = manifest_error("workspace = [\"app\"]\nc-linking { default = \"static\" }\n")
+    assert(workspace.contains("a workspace with no `package` block builds no program of its own, so it has nothing to link: say `c-linking` in the member that is the program"), workspace)
+
+@test("a C library's files, search and include are paths in its package, and its frameworks, link-flags and dynamic-only are read")
+c_library_link_keys()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    val m = read_at(dir, manifest("app", "c-libraries {\n  foo {\n    link = [\"foo\"]\n    files = [\"vendor/libbar.a\", \"vendor/my lib/libbaz.dylib\"]\n    search = [\"vendor/lib\", \"./lib\"]\n    include = [\"vendor/include\"]\n    frameworks = [\"Security\", \"CoreFoundation\"]\n    link-flags = [\"-Wl,-dead_strip\", \"-pthread\"]\n    dynamic-only = \"LGPL-2.1: its users may replace it\"\n    headers = [\"foo.h\"]\n  }\n}\n"))
+    val foo = m.c_libraries[0]
+    assert_eq(joined(foo.files), "vendor/libbar.a vendor/my lib/libbaz.dylib")
+    assert_eq(joined(foo.search), "vendor/lib ./lib")
+    assert_eq(joined(foo.include), "vendor/include")
+    assert_eq(joined(foo.frameworks), "Security CoreFoundation")
+    assert_eq(joined(foo.flags), "-Wl,-dead_strip -pthread")
+    assert_eq(foo.dynamic_only, "LGPL-2.1: its users may replace it")
+    // A library read from a manifest is in no program yet: no directory, and linked as nothing says.
+    assert_eq(foo.dir, "")
+    assert(!foo.linked_statically)
+    // `files` may go with `pkg-config`, which `link` may not.
+    assert_eq(read_at(dir, manifest("app", "c-libraries {\n  z { pkg-config = \"zlib\", files = [\"libextra.a\"] }\n}\n")).c_libraries[0].files.len(), 1)
+
+@test("a C library's paths that leave its package, or are not paths, are errors at the entry")
+c_library_path_errors()
+    for key in ["files", "search", "include"]
+        val absolute = manifest_error(manifest("a", s"c-libraries {\n  z { $key = [\"/usr/lib/libz.a\"] }\n}\n"))
+        assert(absolute.contains("`/usr/lib/libz.a` is absolute, and a package's paths are relative to its directory"), absolute)
+        assert(absolute.contains("avin.hocon:6:"), absolute)
+        for up in ["../libz.a", "vendor/../../libz.a", ".."]
+            val e = manifest_error(manifest("a", s"c-libraries {\n  z { $key = [\"$up\"] }\n}\n"))
+            assert(e.contains(s"`$up` leaves the package's directory"), e)
+        for wrong in ["\"libz.a\"", "[\"\"]", "[\"  \"]", "[3]"]
+            val e = manifest_error(manifest("a", s"c-libraries {\n  z { $key = $wrong }\n}\n"))
+            assert(e.contains(s"`$key` is a list of"), e)
+            assert(e.contains("relative to the package's directory"), e)
+    // A name holding `..` that is not a segment is a name.
+    assert_eq(manifest_error(manifest("a", "c-libraries {\n  z { files = [\"lib..z.a\"] }\n}\n")), "read")
+    for wrong in ["\"Security\"", "[\"Core Foundation\"]", "[\"\"]"]
+        assert(manifest_error(manifest("a", s"c-libraries {\n  z { frameworks = $wrong }\n}\n")).contains("`frameworks` is a list of the macOS frameworks"))
+        assert(manifest_error(manifest("a", s"c-libraries {\n  z { link-flags = $wrong }\n}\n")).contains("`link-flags` is a list of flags passed to the linker as they are"))
+    for wrong in ["\"\"", "\"  \""]
+        assert(manifest_error(manifest("a", s"c-libraries {\n  z { dynamic-only = $wrong }\n}\n")).contains("`dynamic-only` says why the library is never linked statically"))
+    assert(manifest_error(manifest("a", "c-libraries {\n  z { dynamic-only = true }\n}\n")).contains("`dynamic-only` is written as a string"))
+
+// The program tests: an app with its own C library `own` and a dependency `zip` with `zlib`.
+
+private graph(dir: string, linking: string, zlib: string)
+    put(dir + "/app/avin.hocon", manifest("app", linking + "dependencies {\n  zip { path = \"../zip\" }\n}\nc-libraries {\n  own { link = [\"own\"], headers = [\"own.h\"] }\n}\n"))
+    put(dir + "/app/main.avin", "import zip\n\nmain() = zip.one()\n")
+    put(dir + "/zip/avin.hocon", manifest("zip", s"c-libraries {\n  zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"]$zlib }\n}\n"))
+    put(dir + "/zip/zip/zip.avin", "module zip\n\none() -> int = 1\n")
+
+private load(dir: string, linking: Option[bool]) -> Result[LoadedProgram, string] = load_package_with(dir + "/app", default_fetching(), default_features(), linking)
+
+private modes(p: LoadedProgram) -> string
+    var out = ""
+    for library in p.c
+        out = out + (if out == "" then "" else " ") + library.label + (if library.linked_statically then "=static" else "=dynamic")
+    out
+
+private load_error(dir: string, linking: Option[bool]) -> string = load(dir, linking) match
+    Ok(_) -> "loaded"
+    Err(message) -> message
+
+@test("the program links each C library as c-linking names it, and any other by its default")
+per_library_choice()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    // All static except one.
+    graph(dir, "c-linking {\n  default = \"static\"\n  dynamic = [\"zlib\"]\n}\n", "")
+    val all_but_one = load(dir, None).unwrap()
+    assert_eq(modes(all_but_one), "own=static zlib=dynamic")
+    assert_eq(all_but_one.c[0].linked_why, "`c-linking`'s `default = \"static\"`")
+    assert_eq(all_but_one.c[1].linked_why, "")
+    // All dynamic except one, named with its package.
+    graph(dir, "c-linking { static = [\"zip/zlib\"] }\n", "")
+    val one = load(dir, None).unwrap()
+    assert_eq(modes(one), "own=dynamic zlib=static")
+    assert_eq(one.c[1].linked_why, "`c-linking`'s `static = [\"zip/zlib\"]`")
+    // The default for all, by either spelling.
+    graph(dir, "static-c-libraries = true\n", "")
+    val all = load(dir, None).unwrap()
+    assert_eq(modes(all), "own=static zlib=static")
+    assert_eq(all.c[0].linked_why, "`static-c-libraries = true`")
+    graph(dir, "c-linking { default = \"static\" }\n", "")
+    assert_eq(modes(load(dir, None).unwrap()), "own=static zlib=static")
+    graph(dir, "", "")
+    assert_eq(modes(load(dir, None).unwrap()), "own=dynamic zlib=dynamic")
+    // The program's own library by its qualified name.
+    graph(dir, "c-linking { static = [\"app/own\"] }\n", "")
+    assert_eq(modes(load(dir, None).unwrap()), "own=static zlib=dynamic")
+
+@test("each library is in its package's directory, made absolute, and the program's static-system and search reach every library")
+library_directories()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    graph(dir, "c-linking {\n  static-system = [\"z\"]\n  search = [\"/opt/zlib/lib\", \"sys\"]\n}\n", "")
+    val p = load(dir, None).unwrap()
+    assert(p.c[0].dir.ends_with("/app"), p.c[0].dir)
+    assert(p.c[1].dir.ends_with("/zip"), p.c[1].dir)
+    assert(p.c[0].dir.starts_with("/"), p.c[0].dir)
+    for library in p.c
+        assert_eq(joined(library.static_system), "z")
+        assert_eq(library.system_search.len(), 2)
+        assert_eq(library.system_search[0], "/opt/zlib/lib")
+        assert(library.system_search[1].ends_with("/app/sys"), library.system_search[1])
+
+@test("the command line's linking replaces the manifest's default, and c-linking's names keep their own way")
+command_line_precedence()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    graph(dir, "static-c-libraries = true\n", "")
+    assert_eq(modes(load(dir, Some(false)).unwrap()), "own=dynamic zlib=dynamic")
+    graph(dir, "", "")
+    val forced = load(dir, Some(true)).unwrap()
+    assert_eq(modes(forced), "own=static zlib=static")
+    assert_eq(forced.c[0].linked_why, "`--static-c-libraries`")
+    graph(dir, "c-linking { dynamic = [\"zlib\"] }\n", "")
+    assert_eq(modes(load(dir, Some(true)).unwrap()), "own=static zlib=dynamic")
+    graph(dir, "c-linking {\n  default = \"static\"\n  static = [\"own\"]\n}\n", "")
+    assert_eq(modes(load(dir, Some(false)).unwrap()), "own=static zlib=dynamic")
+
+@test("a name in c-linking's static or dynamic that is no C library of the program is an error at the name")
+unknown_library_names()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    for key in ["static", "dynamic"]
+        for name in ["zlb", "app/zlib", "zap/zlib"]
+            graph(dir, s"c-linking { $key = [\"$name\"] }\n", "")
+            val e = load_error(dir, None)
+            assert(e.contains(s"`$name` names no C library of the program: it has `app/own`, `zip/zlib`"), e)
+            assert(e.contains("avin.hocon:5:"), e)
+    put(dir + "/solo/avin.hocon", manifest("solo", "c-linking { static = [\"z\"] }\n"))
+    put(dir + "/solo/main.avin", "main() = ()\n")
+    val none = load_package_with(dir + "/solo", default_fetching(), default_features(), None)
+    assert(none is Err(_))
+    val message = none match
+        Err(m) -> m
+        Ok(_) -> ""
+    assert(message.contains("`z` names no C library of the program: it has none"), message)
+    put(dir + "/solo/avin.hocon", manifest("solo", "c-linking { static-system = [\"z\"] }\n"))
+    val system = load_package_with(dir + "/solo", default_fetching(), default_features(), None)
+    val system_message = system match
+        Err(m) -> m
+        Ok(_) -> ""
+    assert(system_message.contains("`z` is linked by none of the program's C libraries: it has none"), system_message)
+
+@test("a library its package says is dynamic-only is linked dynamically, and a program that would link it statically is told why it cannot")
+dynamic_only_requirement()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    val reason = ", dynamic-only = \"LGPL-2.1: its users may replace it\""
+    // Nothing asks for it statically: it is linked dynamically and nothing is said.
+    graph(dir, "", reason)
+    assert_eq(modes(load(dir, None).unwrap()), "own=dynamic zlib=dynamic")
+    // The program's default asks: an error naming the reason and the way out.
+    for linking in ["static-c-libraries = true\n", "c-linking { default = \"static\" }\n"]
+        graph(dir, linking, reason)
+        val e = load_error(dir, None)
+        assert(e.contains("error: the C library `zlib` of package `zip` is never linked statically, as its package says (`dynamic-only`): LGPL-2.1: its users may replace it; the program links it statically by "), e)
+        assert(e.contains("name it in `c-linking { dynamic = [\"zlib\"] }` to link it dynamically"), e)
+    // So does the command line.
+    graph(dir, "", reason)
+    assert(load_error(dir, Some(true)).contains("statically by `--static-c-libraries`"))
+    // Named dynamic, the program has acknowledged it.
+    graph(dir, "c-linking {\n  default = \"static\"\n  dynamic = [\"zlib\"]\n}\n", reason)
+    assert_eq(modes(load(dir, None).unwrap()), "own=static zlib=dynamic")
+    assert_eq(modes(load(dir, Some(true)).unwrap()), "own=static zlib=dynamic")
+    // Named static, it is a conflict reported at the name.
+    graph(dir, "c-linking { static = [\"zip/zlib\"] }\n", reason)
+    val named = load_error(dir, None)
+    assert(named.contains("is never linked statically, as its package says (`dynamic-only`): LGPL-2.1"), named)
+    assert(named.contains("by `c-linking`'s `static = [\"zip/zlib\"]`"), named)
+    assert(named.contains("avin.hocon:5:"), named)
+
+@test("a dependency's c-linking is not read: the program decides")
+dependency_linking_not_read()
+    val dir = make_temp_dir("avin-link").unwrap()
+    defer _ = remove_dir_all(dir)
+    graph(dir, "", "")
+    put(dir + "/zip/avin.hocon", manifest("zip", "c-linking {\n  default = \"static\"\n  static = [\"nothing\"]\n}\nc-libraries {\n  zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n"))
+    assert_eq(modes(load(dir, None).unwrap()), "own=dynamic zlib=dynamic")

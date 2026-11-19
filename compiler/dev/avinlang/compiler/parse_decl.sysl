@@ -396,12 +396,13 @@ private symbol_name(p: *Parser) -> string
 /** Whether `name` is one of the language's operators, which no method may be named. The bitwise `&`,
  * `^` and `|`, `~` between two operands, and the shifts `<<` and `>>` are the integers' operators and
  * free to name a method of any other type; the arithmetic `+ - * / %` and the orderings `< <= > >=`
- * are the built-in types' operators and free to name a method of a data type, a class or a trait. */
+ * are the built-in types' operators and free to name a method of a data type, a class or a trait,
+ * and so is `!`, which a prefix `!` calls. */
 language_operator(name: string) -> bool
     if bitwise_method_name(name) || arithmetic_method_name(name) then return false
     if compound_operator(name) then return true
     if name.ends_with(":=") && compound_operator(name[0..<name.bytes.len - 2]) then return true
-    for op in ["&&", "||", "!", "==", "!=", "<", "<=", ">", ">=", "===", "!==", "::", "=", ":=", ":", "?", "->", "=>"]
+    for op in ["&&", "||", "==", "!=", "<", "<=", ">", ">=", "===", "!==", "::", "=", ":=", ":", "?", "->", "=>"]
         if name == op then return true
     false
 
@@ -969,6 +970,9 @@ private parse_declared_function(p: *Parser, annotations: Buf[Annotation], define
     if parameterless && type_params.len() > 0
         p.report.add(error(name_span, s"`$name` has no parameter list, so it takes no type parameters: a call `$name[T]` would read as indexing its result; give it a parameter list, as in `$name[T]() -> body`"))
     val params = if parameterless then buf() else parse_params(p, true)
+    // `!` is a prefix operator alone, so the method it calls takes no argument.
+    if symbol && name == "!" && params.len() > 0
+        p.report.add(error(name_span, "a method `!` is what a prefix `!` calls, so it takes no argument: write `!() -> T`"))
     var result: Option[&TypeExpr] = None
     if p.accept("->") then result = Some(parse_type(p))
     if p.at("|")
@@ -1488,6 +1492,11 @@ parse_class_member(p: *Parser) -> ClassMember
     val overrides = p.accept("override")
     if !static_member then static_member = p.accept("static")
     skip_member_modifiers(p)
+    if member_export_ahead(p)
+        if annotations.len() > 0 then p.report.add(error(annotations[0].span, "an export takes no annotations"))
+        if overrides then p.report.add(error(start, "an export is no method, so it takes no `override`"))
+        if static_member then p.report.add(error(start, "an export presents the members of a value the type holds, so it cannot be `static`"))
+        return ExportMember(parse_member_export(p, start, !hidden))
     // `def` follows the modifiers and begins a method, with or without a parameter list.
     if p.at("def") && accept_def(p) then return MethodMember(parse_def_function(p, annotations), !hidden, overrides, static_member)
     // A given in an object's body; the checker refuses one in any other body.
@@ -1619,6 +1628,64 @@ export_ahead(p: *Parser) -> bool
         Some(t) -> t
         None -> return false
     next.value == Word
+
+/** Whether `export` begins a member export here, in a class, object or impl body: `export`, a name and
+ * a dot. Anywhere else in a body `export` is an ordinary name. */
+private member_export_ahead(p: *Parser) -> bool
+    if !p.at("export") then return false
+    val next = p.toks.peek_at(1) match
+        Some(t) -> t
+        None -> return false
+    next.value == Word && p.ahead(2) == "."
+
+// `export f.m`, `export f.m as n`, `export f.{m, n as k}` and `export f.*`, the members of a member
+// presented as the type's own. A member is a name or an operator's spelling, `export f.+`.
+private parse_member_export(p: *Parser, start: Span, public: bool) -> MemberExport
+    p.expect("export")
+    val via_at = p.toks.here()
+    val via = required_name(p)
+    val via_span = via_at.to(p.ended())
+    p.expect(".")
+    var names: Buf[ExportedMember] = buf()
+    var wildcard = false
+    val wildcard_at = p.toks.here()
+    var wildcard_span = wildcard_at
+    if p.at("*")
+        p.toks.advance()
+        wildcard = true
+        wildcard_span = wildcard_at.to(p.ended())
+        if p.at("as")
+            p.report.add(error(p.toks.here(), s"`export $via.*` presents each member under its own name; to rename one, name it, as in `export $via.{m as n}`"))
+            p.toks.advance()
+            member_name(p)
+    elif p.accept("{")
+        loop
+            names.push(exported_member(p))
+            if !p.accept(",") || p.at("}") then break
+        p.expect("}")
+    else names.push(exported_member(p))
+    if p.at(".")
+        p.report.add(error(p.toks.here(), s"an export in a type's body names one of its members, then members of what that holds, as in `export $via.size`; what a member of `$via` holds is exported by its own type"))
+        skip_line(p)
+    MemberExport(start.to(p.ended()), via, via_span, names, wildcard, wildcard_span, public)
+
+// One member a member export names, `m` or `m as n`.
+private exported_member(p: *Parser) -> ExportedMember
+    val name_at = p.toks.here()
+    val name = member_name(p)
+    val name_span = name_at.to(p.ended())
+    if !p.accept("as") then return ExportedMember(name, name_span, name, name_span)
+    val binding_at = p.toks.here()
+    val binding = member_name(p)
+    ExportedMember(name, name_span, binding, binding_at.to(p.ended()))
+
+// The name of a member: a name, or the spelling of an operator a method is named by.
+private member_name(p: *Parser) -> string
+    if is_operator_spelling(p.ahead(0))
+        val word = p.ahead(0)
+        p.toks.advance()
+        return word
+    required_name(p)
 
 // `import a.b.c`, `import a.b.c as d`, `import a.b.{c, d as e}`, and `export` written the same ways;
 // `what` names which it is in diagnostics.

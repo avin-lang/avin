@@ -48,6 +48,11 @@ parse_body(p: *Parser, discard: bool) -> &Expr
             p.report.add(error(declaration.name_span, s"a local function declared without a parameter list is written with `def`, as in `def ${declaration.name} -> body`, and runs again at every read; for a value computed once, write `val ${declaration.name} = value`; or give it a parameter list, `${declaration.name}() -> body`"))
             items.push(Expr(declaration.span, Invalid))
         else items.push(line_statement(p))
+        if p.at(",") && closes_bracket_ahead(p)
+            // The line closes a bracket opened before the block, so the comma ends the line, the
+            // block and the item it stands in; the block's Dedent comes before the closing bracket.
+            p.owed_dedents += 1
+            break
         if p.toks.position == position then p.toks.advance()
         if p.at_kind(Indent) && method_name_ahead(p) then indented_infix(p)
         elif !p.toks.at_end() && !p.at_kind(Newline) && !p.at_kind(Dedent)
@@ -61,6 +66,37 @@ parse_body(p: *Parser, discard: bool) -> &Expr
     p.open_lines = lines
     if items.len() == 0 then p.report.add(error(start, "expected a nonempty block"))
     Expr(start.to(p.ended()), Block(items, discard))
+
+/** Whether the comma the parser is at stands on the line that ends its block at a closing bracket
+ * opened before the block: `spawn(() ->` … `a + f(n), 67108864)`. The items after the comma are the
+ * enclosing list's, not parts of a tuple, so the comma ends the line and the block. A block that a
+ * trailing form on the line opens and closes again is stepped over; a line break at the comma's own
+ * depth means the block goes on, and the comma makes a tuple as on any block line. */
+closes_bracket_ahead(p: *Parser) -> bool
+    var depth = 0
+    var blocks = 0
+    var i = 1usize
+    loop
+        val t = p.toks.peek_at(i) match
+            Some(t) -> t
+            None -> return false
+        if depth == 0 && t.value == Indent then blocks += 1
+        elif depth == 0 && t.value == Newline
+            if blocks == 0 then return false
+        elif depth == 0 && t.value == Dedent
+            if blocks == 0
+                // A Dedent a closing bracket adds is spelled as that bracket; one a shallower line
+                // adds is empty.
+                val word = p.spelling(t)
+                return word == ")" || word == "]" || word == "}"
+            blocks -= 1
+        elif t.value != Indent && t.value != Newline && t.value != Dedent
+            val word = p.spelling(t)
+            if word == "(" || word == "[" || word == "{" then depth += 1
+            elif word == ")" || word == "]" || word == "}"
+                if depth == 0 then return false
+                depth -= 1
+        i += 1
 
 // Whether the indented line after a statement starts with a name and then an argument, as an
 // infix call continued from the line above would: `b` then `    add 2`.
@@ -404,6 +440,11 @@ private match_arms(p: *Parser) -> Buf[Arm]
             p.report.add(error(p.toks.here(), "a leading `|` needs a pattern, not `else`"))
         arms.push(match_arm(p, fallback, false))
         if p.toks.position == before then break
+        if p.at(",") && !p.in_list && closes_bracket_ahead(p)
+            // The arm's line closes a bracket opened before the block the `match` stands in.
+            p.owed_dedents += 1
+            p.open_lines = lines
+            return arms
         if p.in_list && p.at(",")
             // The comma ends the arm, the `match` and the item it stands in; the block's Dedent
             // comes before the closing bracket.
@@ -419,7 +460,7 @@ private match_arms(p: *Parser) -> Buf[Arm]
 // Whether, after the comma the parser is at, the items on the arm's line run on to a line at the
 // arms' own depth that reads as another arm: one starting with `else` or holding an `->` outside
 // brackets. Such a comma was meant to make a tuple of a middle arm's body.
-private next_line_is_arm(p: *Parser) -> bool
+next_line_is_arm(p: *Parser) -> bool
     var depth = 0
     var i = 1usize
     var next_line = false

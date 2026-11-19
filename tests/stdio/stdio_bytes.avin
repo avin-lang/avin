@@ -1,0 +1,209 @@
+import avin.io
+import avin.io.{ByteWriter, IoError, Reader}
+import avin.process
+import avin.threads.{Atomic, spawn}
+
+// Standard input, output and error as bytes, driven by `stdio_tests.sysl` through the shell, which
+// gives the program pipes, files, `/dev/null` and closed descriptors. The first argument picks what
+// the program does; each says on standard error, or standard output where noted, what it found.
+
+// The byte at `i` of the pattern `gen` writes and `check` expects: every value in turn.
+patternAt(i: long) -> byte = byte(int(i % 256))
+
+// Writes `n` bytes of the pattern in pieces of 4093 bytes, so a piece rarely ends at a power of two.
+gen[W: ByteWriter](out: W, n: long)
+  var at: long = 0
+  while at < n
+    val size = if n - at < 4093 then int(n - at) else 4093
+    val start = at
+    val piece = Array.tabulate(size, i -> patternAt(start + long(i)))
+    out.write(piece) match
+      Ok(_) -> ()
+      Err(e) -> fail(e.message)
+    at += long(size)
+
+// Reads standard input to its end, checking it is `n` bytes of the pattern.
+check(input: Reader, n: long) -> string
+  var at: long = 0
+  while true
+    val piece = input.read(65536) match
+      Ok(p) -> p
+      Err(e) -> return s"error ${e.message}"
+    if piece.length == 0 then return if at == n then s"ok $at" else s"short: $at of $n"
+    for b in piece
+      if b != patternAt(at) then return s"bad byte at $at: ${int(b)}"
+      at += 1
+  "unreachable"
+
+// Byte values, for showing what came back.
+codes(bytes: Array[byte]) -> string = bytes.map(b -> int(b).toString()).toVector.mkString(" ")
+
+// A line read, a few bytes, then a line again and what is left, each step said.
+mix()
+  val r = io.stdin()
+  println(s"line: ${io.readLine()}")
+  println(s"bytes: ${r.read(5).map(codes)}")
+  println(s"line: ${io.readLine()}")
+  println(s"bytes: ${r.read(100).map(codes)}")
+  println(s"bytes: ${r.read(100).map(codes)}")
+  println(s"line: ${io.readLine()}")
+  println(s"all: [${io.readAll()}]")
+
+// Bytes, then `lines()`, then bytes: the iterator takes only whole lines.
+mixLines()
+  val r = io.stdin()
+  println(s"bytes: ${r.read(2).map(codes)}")
+  val it = io.lines()
+  println(s"next: ${it.next()}")
+  println(s"bytes: ${r.read(3).map(codes)}")
+  println(s"rest: ${io.readAll().byteLength}")
+
+// Reads to the end, then asks again and again; each asking after the end is an empty array.
+eof()
+  val r = io.stdin()
+  var total = 0
+  while true
+    val got = r.read(7).getOrElse(Array.empty[byte]())
+    if got.length == 0 then break
+    total += got.length
+  val again = Vector.tabulate(3, _ -> r.read(1).map(a -> a.length))
+  println(s"total $total, then $again, line ${io.readLine()}, all [${io.readAll()}]")
+
+// Several threads reading at once: every piece one gets is a run of the pattern with nothing
+// missing inside it, and between them they get every byte once.
+threads(n: long)
+  val counts = Vector.tabulate(4, t -> spawn(() ->
+    val r = io.stdin()
+    var got: long = 0
+    var sum: long = 0
+    var bad = ""
+    while true
+      val piece = r.read(7 + t).getOrElse(Array.empty[byte]())
+      if piece.length == 0 then break
+      for i in 0 ..< piece.length - 1
+        if (int(piece(i)) + 1) % 256 != int(piece(i + 1)) then bad = s"a piece split at $i"
+      for b in piece do sum += long(int(b))
+      got += long(piece.length)
+    (got, sum, bad)))
+  val results = counts.map(t -> t.join())
+  val total = results.map(r -> r.0).sum
+  val sum = results.map(r -> r.1).sum
+  var expected: long = 0
+  for i in long(0) ..< n do expected += long(int(patternAt(i)))
+  val bad = results.map(r -> r.2).filter(b -> b != "").mkString(", ")
+  eprintln(
+    s"threads: $total bytes, sum ${if sum == expected then "right" else "wrong"}, every thread read: ${results.forall(r -> r.0 > 0)}, $bad"
+  )
+
+// Writes the pattern until the reader goes, then says how the write failed, by `say`, which writes to
+// the other stream.
+whilePossible(out: ByteWriter, what: string, say: (string) -> unit)
+  val piece = Array.tabulate(65536, i -> patternAt(long(i)))
+  var writes = 0
+  while true
+    out.write(piece) match
+      Ok(_) -> writes += 1
+      Err(e) ->
+        say(s"$what: ${e.message}; reset ${e.kind is io.ConnectionReset}; after some ${writes > 0}")
+        // The stream stays failed: a second write answers the same way.
+        say(s"again: ${out.write(piece).isErr}")
+        return
+    if writes > 100000
+      say(s"$what: never failed")
+      return
+
+// Threads printing lines and writing lines as bytes at once; `verify` checks each line arrived whole.
+// The writer is taken as a writing thread of a server takes it, sendable.
+interleave() = interleaveTo(io.stdout())
+
+interleaveTo[W: ByteWriter & Sendable](out: W)
+  val ts = Vector.tabulate(8, t -> spawn(() ->
+    for i in 0 ..< 200
+      if i % 2 == 0 then println(s"t$t $i ${"p".repeat(100 + i)}")
+      else out.write(s"t$t $i ${"b".repeat(300 + i)}\n".utf8).getOrElse(())
+    t))
+  for t in ts do t.join()
+
+// Each line `t<k> <i> <filler>` whole, and each thread's `i`s in order, with all 1600 there.
+verify()
+  var next = Vector.fill(8, 0)
+  var lines = 0
+  var bad = ""
+  for line in io.lines()
+    val words = line.split(" ")
+    val ok = words.length == 3 && words(0).startsWith("t")
+    if !ok
+      bad = s"line $lines: $line"
+      break
+    val t = words(0).drop(1).toInt()
+    val i = words(1).toInt()
+    val fill = words(2)
+    val expectedFill = if i % 2 == 0 then "p".repeat(100 + i) else "b".repeat(300 + i)
+    if t < 0 || t >= 8 || i != next(t) || fill != expectedFill
+      bad = s"line $lines: ${line.take(40)}"
+      break
+    next = next.updated(t, i + 1)
+    lines += 1
+  println(if bad == "" then s"ok $lines lines" else s"bad $bad")
+
+// `print` and byte writes in one thread come out in the order they were made, standard error after
+// what standard output was given first.
+order()
+  print("p1 ")
+  io.stdout().write("b1 ".utf8).getOrElse(())
+  println("p2")
+  io.stderr().write("e1\n".utf8).getOrElse(())
+  print("p3 ")
+  io.stderr().write("e2\n".utf8).getOrElse(())
+  io.stdout().write("b2".utf8).getOrElse(())
+  println(" p4")
+  println(s"empty: ${io.stdout().write(Array.empty[byte]())}")
+
+// A thread waiting on an empty pipe parks: other threads run and finish while it waits.
+park()
+  val reader = spawn(() -> io.stdin().read(100).map(a -> a.length))
+  val ran = Atomic(0)
+  val others = Vector.tabulate(32, _ -> spawn(() ->
+    ran.add(1)
+    ()))
+  for t in others do t.join()
+  println(s"others ran: ${ran.load()}")
+  println(s"reader got: ${reader.join()}")
+
+report(r: Result[Array[byte], IoError]) = r match
+  Ok(a) -> println(s"ok ${a.length}")
+  Err(e) -> println(s"err ${e.message}")
+
+main(args: Vector[string])
+  args(0) match
+    "gen" -> gen(io.stdout(), args(1).toLong())
+    "cat" -> eprintln(s"copied ${io.copy(io.stdin(), io.stdout())}")
+    "check" -> println(check(io.stdin(), args(1).toLong()))
+    "codes" ->
+      val all = Array.newBuilder[byte]()
+      var more = true
+      while more
+        val piece = io.stdin().read(3).getOrElse(Array.empty[byte]())
+        for b in piece do all.addOne(b)
+        more = piece.length > 0
+      println(codes(all.result()))
+    "mix" -> mix()
+    "mix-lines" -> mixLines()
+    "eof" -> eof()
+    "threads" -> threads(args(1).toLong())
+    "epipe" -> whilePossible(io.stdout(), "stdout", m -> eprintln(m))
+    "epipe-err" ->
+      whilePossible(io.stderr(), "stderr", m -> println(m))
+      println("stderr: survived")
+      flush()
+      process.exit(0)
+    "interleave" -> interleave()
+    "verify" -> verify()
+    "order" -> order()
+    "park" -> park()
+    "read" -> report(io.stdin().read(16))
+    "line" -> eprintln(s"line: ${io.readLine()}")
+    "read-zero" -> report(io.stdin().read(0))
+    "write" -> eprintln(s"write: ${io.stdout().write("x".utf8)}")
+    _ -> fail(s"no mode ${args(0)}")
+  eprintln("exit-ok")

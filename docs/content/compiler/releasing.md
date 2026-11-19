@@ -22,9 +22,10 @@ each step timed into `release-out/<version>/release.log` with its output beside 
 2. **The compiler**, built at `-O2` by the `sysl` on `PATH`.
 3. **The prefix.** `bin/avin`; `share/avin/library` and `share/avin/runtime` as git tracks them;
    `share/avin/editors`, the TextMate grammars of `.avin` and `.lavin`; and
-   `share/avin/lib/libavinrt-<key>.a`, the runtime's archive. The archive is built by the staged
-   compiler from the staged runtime, so its key, a hash of the compiler's version and the runtime's
-   sources, is the one an installed compiler computes, and an installed compiler links it without
+   `share/avin/lib/<target>/libavinrt-<target>-<key>.a`, the runtime's archive for the machine the
+   release is built on. The archive is built by the staged compiler from the staged runtime, so its
+   key, a hash of the compiler's version, the target and the runtime's sources, is the one an
+   installed compiler computes, and an installed compiler links it without
    running Sysl.
 4. **The tarball**, `avin-<version>-darwin-arm64.tar.gz`, and its sha256.
 5. **The proof, from the tarball.** It unpacks the tarball outside the repository, makes the prefix

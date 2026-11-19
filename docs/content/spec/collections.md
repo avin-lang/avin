@@ -767,7 +767,21 @@ is made with each element set:
 val zeros = Array.fill(8, 0) // eight 0s; the value is evaluated once and shared
 val squares = Array.tabulate(5, i -> i * i)
 val none = Array.empty[string]()
+val given = Array(1, 2, 3) // the elements listed
 ```
+
+**Naming a collection and listing its elements** makes one of it: `Array(1, 2, 3)`, `Vector("a", "b")`,
+`List(1, 2)`, `Buffer(4)`, `Deque(1, 2)`, `Queue(1, 2)`, `ArraySeq(1, 2)`, `LazyList(1, 2)`,
+`Set(1, 2)` and every other sequence and set of the library, the mutable and sorted ones too (`HashSet`, `SortedSet`, `OrderedSet`, `LinkedSet`,
+mutable `Set` and `TreeSet`, `BitSet`, `PriorityQueue`). It is the companion's `apply` taking its
+elements as a [repeated parameter](/spec/declarations/#repeated-parameters), so the element type is
+inferred from the elements as for any call (`Array(1, 2.5)` is an `Array[real]`, and elements of two
+types that no widening joins are an error), or comes from the expected type
+(`val xs: Array[long] = Array(1, 2)`) or from type arguments written at the call
+(`Array[long](1, 2)`); `Array()` with none of them is an error, as is any call whose element type
+cannot be inferred. `Array(xs*)` makes an array of the elements of `xs`, and a set made so holds each
+equal element once. A map is never made this way: it is written `{"k": 7}`, and `Map("k" -> 7)` is
+refused.
 
 `List`, `Vector` and `ArraySeq` have the same two companions, with the same shapes:
 `Vector.tabulate(n, f)` calls `f` with `0 ..< n` in order, and `Vector.fill(n, element)` takes
@@ -782,7 +796,7 @@ from index `from` into `dest` from index `at`. A range outside either array trap
 may be the array itself with the ranges overlapping, in either direction: the elements land as they
 were before the call.
 
-`Array[int]()` is an error. `xs.length` is the length, which never changes; `xs.slice(from, until)`
+`Array[int]()` is an empty array. `xs.length` is the length, which never changes; `xs.slice(from, until)`
 and `xs.copy()` make new arrays; `xs.lift(i)` is an `Option`. `xs(i) += 1`, `xs(i) := v` and `xs(i)++`
 work as they do on a variable, evaluating `xs` and `i` once. Because a call with untyped arguments
 before `=` assigns an element, a local function's declaration always types its parameters or has

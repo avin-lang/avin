@@ -1,0 +1,99 @@
+module avin.threads
+
+// A `Selector` is a `select` whose arms are made at run time: a set of channel receives and sends,
+// `readable()` streams and `writable()` sinks, each under a key the program chooses, that a thread
+// waits on all at once. Each entry is the same arm object a `select` block is read into, and a wait
+// is the same wait (`select.avin`): one pass over the entries in an order drawn at random, one park
+// under the runtime's poller, at most one operation done, and a cancellation point.
+
+import avin.time.{Duration, Instant, now}
+
+// The sources one thread waits on, each under a key of type `K`, which a wait answers. The entries
+// stay from one wait to the next, so a loop adds and removes only what changes; a send entry is
+// taken out once its value has gone, since a value is sent once.
+class Selector[K: Eq]()
+  private val arms = Buffer[SelectArm]()
+  private val keys = Buffer[K]()
+  private val sends = Buffer[bool]()
+
+  // How many entries the selector has.
+  size -> int = keys.length
+
+  // Whether it has none.
+  isEmpty -> bool = keys.length == 0
+
+  // Adds a receive from `channel` under `key`, ready for a value or the channel closed and drained,
+  // and answers the entry: once a wait answers `key` for it, its `received()` is the value, or `None`
+  // from the closed channel.
+  receive[T](channel: Channel[T], key: K) -> SelectReceive[T]
+    val arm = SelectReceive(channel, ReceiveEither)
+    added(arm, key, false)
+    arm
+
+  // Adds a send of `x` on `channel` under `key`. `x` goes only where a wait answers `key` for it, and
+  // the entry is then taken out.
+  send[T](channel: Channel[T], x: T, key: K) = added(SelectSend(channel, x), key, true)
+
+  // Adds `source` under `key`, ready once a read of it would answer without waiting.
+  readable(source: Readiness, key: K) = added(SelectReadable(source), key, false)
+
+  // Adds `sink` under `key`, ready once a write to it would send something without waiting.
+  writable(sink: Writability, key: K) = added(SelectWritable(sink), key, false)
+
+  // Takes out every entry under `key`, and answers how many there were.
+  remove(key: K) -> int = removeWhere(k -> k == key)
+
+  // Takes out every entry whose key satisfies `p`, and answers how many there were.
+  removeWhere(p: (K) -> bool) -> int
+    var gone = 0
+    var i = 0
+    while i < keys.length
+      if p(keys(i))
+        dropped(i)
+        gone += 1
+      else i += 1
+    gone
+
+  // Takes out every entry.
+  clear()
+    arms.clear()
+    keys.clear()
+    sends.clear()
+
+  // Waits until an entry is ready, does its operation, and answers its key. An empty selector traps,
+  // since only a cancellation could end its wait.
+  wait() -> K
+    if keys.length == 0 then fail("a `Selector` with no entries has nothing to wait on")
+    ran(chosen(arms, 0, false))
+
+  // Waits at most `timeout` for an entry to be ready, and answers its key, or `None` where the time
+  // ran out first. A timeout of zero or less tries the entries once, as `poll` does. An empty
+  // selector waits out its time.
+  within(timeout: Duration) -> Option[K]
+    val i = timedOut(timeout, arms)
+    if i == keys.length then None else Some(ran(i))
+
+  // Waits until `deadline` at the latest, as `within` does for the time left until it.
+  until(deadline: Instant) -> Option[K] = within(deadline - now())
+
+  // Answers the key of an entry ready now, its operation done, or `None` where none is, without
+  // waiting.
+  poll() -> Option[K]
+    val i = tried(arms)
+    if i == keys.length then None else Some(ran(i))
+
+  private added(arm: SelectArm, key: K, sending: bool)
+    arms.append(arm)
+    keys.append(key)
+    sends.append(sending)
+
+  private dropped(i: int)
+    _ = arms.remove(i)
+    _ = keys.remove(i)
+    _ = sends.remove(i)
+
+  // The key of entry `i`, which has run, taking it out where it was a send.
+  private ran(i: int) -> K
+    val key = keys(i)
+    if sends(i) then dropped(i)
+    key

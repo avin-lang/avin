@@ -1,0 +1,93 @@
+// expect: exit 0
+// A program started while a host name's lookup is in flight does not inherit the lookup's pipe. The
+// runtime makes each lookup on a helper thread that writes a byte into a pipe once it has the answer,
+// and the pipe's two ends are closed on exec. `ls /dev/fd` lists the descriptors open in it, its own
+// among them: `0 1 2 3` on Linux, and `0 1 2 3 4` on macOS, where `ls` holds the directory it runs in
+// open as well. The runtime's test hook holds every helper before it asks the resolver, so the
+// lookups stay in flight for the listing: one lookup, a cancelled one whose helper still runs, and
+// several at once, each in every way a command is run. A descriptor the child had been handed would
+// show as one more. The runtime also reports how many of the lookups' descriptors lack the
+// close-on-exec flag, which is read back with `F_GETFD` and must be none, since a system that starts
+// a program without handing on stray descriptors would hide a wrong flag from the listing.
+import avin.net.TcpStream
+import avin.process
+import avin.process.Command
+import avin.threads.{scope, sleep, spawn, withTimeout}
+import avin.time.{millis, monotonic}
+
+@sysl("avin.rt.resolve_hold")
+resolveHold(on: bool)
+
+@sysl("avin.rt.resolve_helpers")
+helpers() -> long
+
+@sysl("avin.rt.resolve_in_flight")
+inFlight() -> long
+
+// How many descriptors held by the lookups in flight are not closed on exec (`FD_CLOEXEC`): the
+// descriptor flag is read back from the pipe's two ends, so a lookup that set the wrong flag shows
+// even where the system starts a program without handing on what it should not.
+@sysl("avin.rt.resolve_inheritable")
+inheritable() -> long
+
+listing() -> Command = Command("/bin/ls", "/dev/fd")
+
+words(text: string) -> string = text.split("\n").filter(w -> w.nonEmpty).mkString(" ")
+
+// Whether `ls /dev/fd` listed only the standard streams and its own.
+clean(text: string) -> bool = words(text) == (if process.os() == process.MacOS then "0 1 2 3 4" else "0 1 2 3")
+
+// Waits until `ready` holds, stopping the program where it has not within a minute.
+within(what: string, ready: () -> bool)
+  val deadline = monotonic() + millis(60000)
+  while !ready()
+    if monotonic() > deadline then fail(s"$what did not happen within a minute")
+    sleep(millis(1))
+
+// Every way a command is run, each of which must see only the standard streams.
+listed() -> bool
+  if inheritable() != 0 then fail(s"${inheritable()} lookup descriptors are not closed on exec")
+  val outputs = [
+    listing().output().ok.get,
+    listing().lines().ok.get.mkString("\n"),
+    listing().withInput("input\n").output().ok.get,
+    listing().inNewGroup.output().ok.get,
+    (listing() | Command("/bin/cat")).output().ok.get]
+  outputs.forall(clean)
+
+main() -> int
+  // A lookup from a thread first, refused, so the runtime's poller is open before the listings.
+  if spawn(() -> TcpStream.connect("localhost", 1).isOk).join() then fail("port 1 accepted")
+  within("the lookups settling", () -> helpers() == 0 && inFlight() == 0)
+  if !listed() then fail("a program started with no lookup in flight saw another descriptor")
+  println("no lookup in flight: only the standard streams")
+
+  resolveHold(true)
+
+  // One lookup in flight.
+  val one = spawn(() -> TcpStream.connect("localhost", 1).isOk)
+  within("the lookup starting", () -> inFlight() == 1 && helpers() == 1)
+  if !listed() then fail("a program started during a lookup inherited its pipe")
+  println("one lookup in flight: a started program sees only the standard streams")
+
+  // Eight at once.
+  val more = for i in 0 ..< 7 yield spawn(() -> TcpStream.connect("localhost", 1).isOk)
+  within("the lookups starting", () -> inFlight() == 8)
+  if !listed() then fail("a program started during eight lookups inherited a pipe")
+  println("eight lookups in flight: a started program sees only the standard streams")
+
+  resolveHold(false)
+  if one.join() then fail("port 1 accepted")
+  for t in more do if t.join() then fail("port 1 accepted")
+  within("the lookups settling", () -> helpers() == 0 && inFlight() == 0)
+
+  // A cancelled lookup whose helper is still making it: the pipe is still open.
+  resolveHold(true)
+  val ended = withTimeout(millis(50), _ -> TcpStream.connect("localhost", 1).isOk)
+  if ended.nonEmpty then fail("a lookup the deadline cut off answered")
+  if inFlight() != 1 then fail("the abandoned lookup is not still being made")
+  if !listed() then fail("a program started during an abandoned lookup inherited its pipe")
+  println("an abandoned lookup still being made: a started program sees only the standard streams")
+  resolveHold(false)
+  within("the lookups settling", () -> helpers() == 0 && inFlight() == 0)
+  0

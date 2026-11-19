@@ -1,0 +1,73 @@
+// expect: exit 0
+// Many senders racing on one bounded actor, under each way of sending. With `tell` the messages
+// handled and those dropped add up to those told, under either policy, and each sender's messages that
+// were handled came in the order told. With `offer`, those accepted are those handled, and nothing is
+// dropped. With `send`, every message is handled and nothing is dropped. Under the collector's stress
+// the mailbox's lock and its waiting senders keep every message reachable.
+import avin.actors.{ActorRef, Bounded, DropNewest, DropOldest, Mailbox, spawn}
+import avin.threads.{Promise}
+import avin.threads as threads
+
+data Msg
+  Note(sender: int, i: int)
+  Report(handled: Promise[int], ordered: Promise[bool])
+
+val Senders = 8
+val Each = 400
+
+actor Counter receives Msg
+  val last = Array.fill(Senders, -1)
+  var handled = 0
+  var ordered = true
+  receive
+    Note(sender, i) ->
+      if i <= last(sender) then ordered = false
+      last(sender) = i
+      handled += 1
+    Report(h, o) ->
+      h.complete(handled)
+      o.complete(ordered)
+
+report(r: ActorRef[Msg]) -> (int, bool)
+  val h = Promise[int]()
+  val o = Promise[bool]()
+  _ = r.send(Report(h, o))
+  (h.future.await(), o.future.await())
+
+// Races `Senders` threads, each sending `Each` notes by `how`, and gives back how many each counted
+// as accepted.
+race(r: ActorRef[Msg], how: int) -> int
+  val ts = (0 ..< Senders).toVector.map(k -> threads.spawn(() ->
+    var accepted = 0
+    for i in 0 ..< Each
+      if how == 0
+        r.tell(Note(k, i))
+        accepted += 1
+      elif how == 1
+        if r.offer(Note(k, i)) is Ok(_) then accepted += 1
+      elif r.send(Note(k, i)) is Ok(_) then accepted += 1
+    accepted))
+  ts.map(t -> t.join()).sum
+
+check(label: string, mailbox: Mailbox, how: int)
+  val r = spawn(Counter(), mailbox = mailbox)
+  val accepted = race(r, how)
+  val (handled, ordered) = report(r)
+  val dropped = r.dropped()
+  val total = Senders * Each
+  if how == 0
+    println(s"$label: handled and dropped add up ${long(handled) + dropped == long(total)}, in order $ordered")
+  else
+    println(
+      s"$label: accepted handled ${accepted == handled}, all ${handled == total && how == 2}, dropped $dropped, in order $ordered"
+    )
+
+main()
+  check("tell newest 16", Bounded(16, DropNewest), 0)
+  check("tell oldest 16", Bounded(16, DropOldest), 0)
+  check("tell newest 1", Bounded(1, DropNewest), 0)
+  check("tell oldest 1", Bounded(1, DropOldest), 0)
+  check("offer 16", Bounded(16, DropNewest), 1)
+  check("offer 1", Bounded(1, DropOldest), 1)
+  check("send 16", Bounded(16, DropNewest), 2)
+  check("send 1", Bounded(1, DropOldest), 2)

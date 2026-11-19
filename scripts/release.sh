@@ -28,7 +28,8 @@
 #   3. build the compiler with the `sysl` on PATH, at `-O2` unless `-O<level>` says otherwise
 #   4. stage the prefix: `bin/avin`; `share/avin/library` and `share/avin/runtime`, the sources the
 #      compiler reads; `share/avin/editors`, the TextMate grammars of `.avin` and `.lavin`; and
-#      `share/avin/lib/libavinrt-<key>.a`, the runtime's archive, built here by the staged compiler
+#      `share/avin/lib/<target>/libavinrt-<target>-<key>.a`, the runtime's archive for the machine
+#      the release is built on, built here by the staged compiler
 #      from the staged runtime so that the key is the one an installed compiler computes
 #   5. package `avin-<version>-darwin-arm64.tar.gz` and its sha256
 #   6. unpack it to a scratch prefix outside the repository, made read-only, and from a scratch
@@ -247,8 +248,14 @@ stage_prefix() {
     [[ $($out/prime/prime) == primed ]] || { print "the priming program did not run"; return 1 }
     local built=($cache/runtime/libavinrt-*.a(N))
     (( ${#built} == 1 )) || { print "expected one runtime archive in $cache/runtime, found ${#built}"; return 1 }
-    cp $built[1] $stage/share/avin/lib/ || return 1
-    ls -la $stage/share/avin/lib
+    # The archive's name is libavinrt-<target>-<key>.a (the key is hex, so the last hyphen ends the
+    # target), and a prefix keeps it in the directory of its target.
+    local archive=${built[1]:t}
+    local machine=${${archive#libavinrt-}%-*}
+    [[ -n $machine && $archive == libavinrt-$machine-*.a ]] || { print "the archive $archive names no target"; return 1 }
+    mkdir -p $stage/share/avin/lib/$machine || return 1
+    cp $built[1] $stage/share/avin/lib/$machine/ || return 1
+    ls -laR $stage/share/avin/lib
 }
 
 step 04-stage stage_prefix
