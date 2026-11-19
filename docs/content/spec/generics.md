@@ -453,7 +453,12 @@ infer is.
   type only where they leave it open. `watch(spawn(Worker()), …)`, whose parameter is an
   `ActorRef[Nothing]`, takes `M` from the `Behaviour` passed to `spawn`. An invariant or contravariant
   use (an argument of `Box[T]` for an invariant `T`, a lambda's parameter) decides it for good, as
-  the type the lower bounds so far fit, and a later argument must be an instance of that. A number
+  the type the lower bounds so far fit, and a later argument must be an instance of that. An argument
+  is held to its parameter by each type argument's variance: at a contravariant argument of a
+  generic type or a function type's parameter it may name a supertype of what the parameter names,
+  so `take(x)` for `take[T](b: Box[B, T])`, `Box[-I, +T]`, accepts an `x: Box[A, int]` where `B` is an
+  `A`, and takes `T` as `int`; a type argument named there is decided as the type the argument
+  gives, the most it may be. A number
   literal takes the type the other arguments decide, and so does one inside a value built around
   it, a collection literal, a tuple or a call such as `Some(1)`, wherever it is written: with
   `f() -> Vector[long]`, `assertEq(f(), [1, 2])` and `assertEq(Some(1), someLong())` are well typed.

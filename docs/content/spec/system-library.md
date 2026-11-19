@@ -1399,6 +1399,7 @@ uses it again.
 | `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
 | `s.write(bytes: Array[byte])`, `s.writeText(text: string)` `-> Result[unit, IoError]` | Sends all of it. |
 | `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer for the other end fails with `TimedOut`; zero or less takes the limit away. Each wait has the whole limit, so a write that waits for room several times fails only where one wait runs out. |
+| `s.timeout -> Duration` | The limit `setTimeout` set, in whole milliseconds, a part of one counting as one; zero where there is none. |
 | `s.shutdownOutput() -> Result[unit, IoError]` | Tells the other end nothing more will be sent; reading goes on. |
 | `s.close() -> Result[unit, IoError]` | Ends the connection and answers `Ok`; closing again does nothing. Every connection and listener is an [`io.Close`](#close). |
 | `s.readable() -> bool` | Whether a read would answer now, without waiting: bytes a `readLine` read ahead are still to be read, bytes have arrived, the other end has finished sending or reset the connection, or the connection is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.readable()` arm waits for it. |
@@ -1571,7 +1572,12 @@ pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoErro
 A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext. A
 `TlsStream` sends what of the record the connection has room for; the rest goes before anything
 else is sent, and `writable()` sends it as room comes and answers `true` once it has gone. So after
-`writable()` answered `true`, its `writeSome` does not wait. The writing half of a split one sends
+`writable()` answered `true`, its `writeSome` does not wait. A read of a `TlsStream` that has to
+wait for input while such a rest is still to go waits for input or room, whichever comes first,
+sending the rest as room comes, so a caller that only reads after its last `writeSome` still has
+the whole record sent, and its peer's answer, given once that record has come, still arrives;
+waiting for both, the read takes input while the peer is itself waiting to send. Its wait has the
+connection's time limit, and a rest it did not send is kept for the next read or write. The writing half of a split one sends
 the whole record before it answers, waiting for room for the rest where there is too little, so what
 it answers has gone even where the writer writes nothing after it; its reading half reads
 meanwhile, so the wait never holds up the peer's answers. Where the writer's time limit runs out
