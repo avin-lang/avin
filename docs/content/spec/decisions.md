@@ -8915,6 +8915,42 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   or `promptSecret`), and the no-terminal behaviour: an error by default with `readSecretOrLine`
   as the explicit fallback, rather than falling back to standard input on its own.
 
+- Settled on the user's delegation 2026-11-19 (branch `stdio-bytes`): **`io.stdin()` is standard
+  input as a `Reader` of bytes, and `io.stdout()` and `io.stderr()` are standard output and error
+  as `ByteWriter`s**, answering the `Sendable` objects `StandardInputBytes`, `StandardOutputBytes`
+  and `StandardErrorBytes`. Source: the avin-lang/lsp package could not serve LSP over stdio, whose
+  `Content-Length` counts bytes, since `avin.io` read standard input only as text decoded with
+  U+FFFD and had no byte writer for standard output; the workaround would have bound Sysl's
+  `FdReader` directly, as the tui package does. Details settled: (1) **Mixing**: byte reads take
+  from the one buffer `readLine`, `lines()`, `readAll` and `Source.stdin()` share
+  (`runtime/avin/rt/input.sysl`), so a header read as a line and a body read as bytes go on from
+  each other with no byte lost or read twice; a read answers what the buffer holds, else one read
+  of the input. (2) **Serialization**: byte reads hold `input_readers`, the lock of every standard
+  input reader and of `readSecret`. (3) **Parking**: a lightweight thread waits on the poller, as a
+  line read does. (4) **End and failure**: the end is an empty array, every time it is asked; a
+  read that fails is `Err(Other(<platform sentence>))` for bytes, while the text readers keep seeing
+  the end. (5) **Output**: a byte write is unbuffered and goes out whole before it returns, behind
+  what `print` buffered: it holds standard output's stdio lock while flushing that buffer and
+  writing to the descriptor, and `println` writes its whole line through the same stream, so a
+  printed line is never split by a byte write (the println-atomic entry of 2026-11-15 still holds);
+  a write to standard error flushes standard output first, as `eprint` does. (6) **A reader that
+  has gone**: SIGPIPE is blocked on the writing thread for the length of a byte write, and the one
+  the write raised is taken back, so the write answers `ConnectionReset` (`EPIPE`, the kind a
+  connection's write answers) and the program goes on; `print` keeps its quiet death, which a
+  filter in a pipeline wants. (7) **Closed descriptors**: a bug met on the way, a program started
+  with standard input closed read the runtime's own pipe, which had taken descriptor 0; the runtime
+  now opens `/dev/null` on each of 0, 1 and 2 that is missing before it opens anything. Alternatives
+  weighed: an error for mixing text and byte reads (two buffers or a mode switch, and a header and
+  body protocol could not be written at all); a buffered `stdout()` with `flush` (a byte write
+  could then be overtaken by, or split, a `println`, and an LSP message must leave whole); ignoring
+  SIGPIPE for the whole program (every `print` to a closed pipe would then have to fail somewhere,
+  where today it ends the program quietly); public objects alone with no functions (a module-level
+  function reads as `io.readLine()` does). Tests: `stdio_tests.sysl`, driving
+  `tests/stdio/stdio_bytes.avin` through `sh` and `tests/pty/stdio_tty.avin` over a
+  pseudo-terminal, at -O0 and -O2. **Review with the user:** the names `stdin()`, `stdout()`,
+  `stderr()` and the object names `StandardInputBytes`, `StandardOutputBytes`,
+  `StandardErrorBytes` (beside the text writers `StandardOutput` and `StandardError`).
+
 - **Linux as a target, and machines in packages** (branch `linux-plan`, 2026-11-19; the user,
   2026-11-19: Avin is "for anyone who would enjoy using it"). The plan is
   [Linux](/compiler/linux/); the package surface is [machines](/spec/packages/#machines).

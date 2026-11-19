@@ -1,6 +1,7 @@
 module avin.io
 
-// Talking to the world outside the program: standard input, read as text, and what can go wrong when
+// Talking to the world outside the program: standard input, read as text or as bytes, standard output
+// and error written as bytes, and what can go wrong when
 // a program reads or writes files, directories and connections. Each failure is a
 // value a correct program can meet and handle.
 
@@ -209,6 +210,63 @@ private takeAllInput() -> string
   val rest = takeRest()
   releaseInput()
   rest
+
+// Why reading or writing a standard stream failed, as the runtime tells the failures apart.
+@sysl("avin.rt.StdioFailure")
+private data StdioFailure
+  Closed
+  Failed(message: string)
+
+@sysl("avin.rt.read_input_bytes")
+private takeInputBytes(max: int) -> Result[Array[byte], StdioFailure]
+
+@sysl("avin.rt.write_standard")
+private writeStandard(fd: int, bytes: Array[byte]) -> Result[unit, StdioFailure]
+
+private stdioError(operation: string, subject: string) -> (StdioFailure) -> IoError = e -> e match
+  Closed -> IoError(ConnectionReset, operation, subject)
+  Failed(m) -> IoError(Other(m), operation, subject)
+
+// Standard input as bytes: what `stdin()` answers. See there.
+object StandardInputBytes: Reader
+  override read(max: int) -> Result[Array[byte], IoError]
+    if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
+    takeInputBytes(max).mapErr(stdioError("read", "standard input"))
+
+// Standard output as bytes: what `stdout()` answers. See there.
+object StandardOutputBytes: ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError] =
+    writeStandard(1, bytes).mapErr(stdioError("write", "standard output"))
+
+// Standard error as bytes: what `stderr()` answers. See there.
+object StandardErrorBytes: ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError] =
+    writeStandard(2, bytes).mapErr(stdioError("write", "standard error"))
+
+// Standard input as a `Reader` of bytes, for input whose bytes count, a `Content-Length` most of all,
+// or that is not text. Its bytes come from the same buffer `readLine`, `lines`, `readAll` and
+// `Source.stdin()` take from, so a program may mix them: a header read as a line and a body read as
+// bytes go on from each other, and no byte is lost or read twice. Threads read it one at a time, under
+// the same lock as the text reads, and a lightweight thread waiting for input parks, leaving its
+// worker to the others.
+//
+// `read(max)` answers the bytes already read ahead where there are any, else waits for one read of
+// the input, so it may answer fewer than `max`; an empty array once the input has ended, as often as
+// it is asked. A read that fails answers `Err`, with the platform's sentence, where the text readers
+// see the end. Standard input may be a terminal, a pipe or a file. A `max` below one traps, as a
+// connection's read does. The answer is `Sendable`.
+stdin() -> StandardInputBytes = StandardInputBytes
+
+// Standard output as a `ByteWriter`. Each write goes out whole before it returns: behind whatever
+// `print` and `println` have written so far, which is sent on first, and never inside a line
+// another thread prints, so there is nothing to flush afterwards. A write to a pipe or a socket whose
+// reader has gone answers `Err(IoError(ConnectionReset, "write", "standard output"))` rather than
+// ending the program. The answer is `Sendable`, so a thread of its own can do the writing.
+stdout() -> StandardOutputBytes = StandardOutputBytes
+
+// Standard error as a `ByteWriter`: each write goes out whole before it returns, after standard
+// output has been flushed, as `eprint` does; a reader that has gone is `Err` as for `stdout()`.
+stderr() -> StandardErrorBytes = StandardErrorBytes
 
 // The lines of standard input. `hasNext` takes the next line when it has none in hand, so a line it
 // answers for is this iterator's even while other threads read.

@@ -562,7 +562,8 @@ belonging to one thread at a time as a connection does, so a thread of its own m
 
 ## `avin.io`
 
-Standard input, read as text, the error every module that reads or writes shares, and the traits
+Standard input, read as text or as bytes, standard output and error written as bytes, the error
+every module that reads or writes shares, and the traits
 that let one function read bytes from, or write them to, a file and a connection alike. Standard
 output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
 writers `StandardOutput` and `StandardError`; each is one function taking `Any*` (see
@@ -709,6 +710,58 @@ the program blocks for the answer.
 
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
+
+**A closed standard stream is `/dev/null`.** A program started with standard input, output or error
+closed (`prog <&-`) finds `/dev/null` there: the runtime opens it on each of the three that is
+missing before it opens anything of its own, so none of its own descriptors takes the number. A
+closed standard input reads as empty; what is written to a closed output or error goes nowhere.
+
+### Standard streams as bytes
+
+```text
+import avin.io
+
+// Copies standard input to standard output byte for byte.
+main()
+  io.copy(io.stdin(), io.stdout()) match
+    Ok(n) -> eprintln(s"$n bytes")
+    Err(e) -> eprintln(e.message)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `stdin() -> StandardInputBytes` | Standard input as a [`Reader`](#reader) of bytes. |
+| `stdout() -> StandardOutputBytes` | Standard output as a [`ByteWriter`](#bytewriter). |
+| `stderr() -> StandardErrorBytes` | Standard error as a `ByteWriter`. |
+
+The three answers are objects, `Sendable`, so a thread of their own can read or write: a server's
+writing thread takes `stdout()` as a `W: ByteWriter & Sendable`. They are for input whose length is
+counted in bytes, a `Content-Length` header most of all, and for input and output that is not text.
+
+**Bytes and lines share one buffer.** `stdin().read(max)` takes from the buffer `readLine`,
+`lines()`, `readAll` and `Source.stdin()` take from, so a program reads a header as a line and the
+body after it as bytes, or the other way round, and no byte is lost or read twice. A read answers
+the bytes already read ahead where there are any, else waits for one read of the input, so it may
+answer fewer than `max`; it never waits for more once it has some. Byte reads take the same lock as
+the text reads, one thread at a time, and a lightweight thread waiting for input parks on the
+runtime's poller, leaving its worker to the others.
+
+**The end of input is an empty array, as often as it is asked.** Standard input may be a terminal,
+a pipe, a file or `/dev/null`. A read that fails answers `Err(IoError(Other(m), "read", "standard
+input"))` with the platform's sentence (standard input that is a directory: `is a directory`), where
+the text readers see the end. A `max` below one traps, as a connection's read does.
+
+**A byte write goes out whole before it returns.** Standard output's buffer, what `print` and
+`println` have written so far, is sent on first, so the bytes land after it; the write holds
+standard output for its whole length, so another thread's printed line lands before it or after it,
+never inside it. There is nothing to flush afterwards. A write to standard error flushes standard
+output first, as `eprint` does. An empty write writes nothing and answers `Ok`.
+
+**A write to a reader that has gone fails; it does not end the program.** A byte write to a pipe or
+socket whose reader has closed answers `Err(IoError(ConnectionReset, "write", "standard output"))`
+(or `"standard error"`), and every later byte write answers the same; the program goes on. `print`
+is not changed by it: a program that only prints still ends quietly when its reader goes, as a
+filter in a pipeline should.
 
 ### Secrets typed at the terminal
 

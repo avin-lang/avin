@@ -1,9 +1,9 @@
 module avin.rt
 
 import sysl.buf.{Buf, buf}
-import sysl.io.{Reader, fd_reader, find_byte}
+import sysl.io.find_byte
 import sysl.io.wait.Readable
-import sysl.slices.copy
+import sysl.slices.{as_mut_ptr, copy}
 import sysl.text.{chars_of, from_utf8_lossy}
 
 // Standard input, read as text. The runtime holds the one buffer every reader of it shares, so a
@@ -42,6 +42,14 @@ var input_at: usize = 0
 
 /** Whether standard input has ended: a read gave nothing, at its end or because it failed. */
 var input_done: bool = false
+
+/** The errno of the read that ended standard input by failing, or 0 where it ended at its end. The
+ * text readers see a failure as the end; the byte reader answers it. */
+var input_failure: i64 = 0
+
+/** Up to `n` bytes of standard input into `p`: how many, 0 at its end, or -errno; a read a signal
+ * interrupts is made again (`__posix__/stdio_bytes.c`). */
+private extern "avin_rt_stdin_read" c_stdin_read(p: *u8, n: i64) -> i64
 
 /** How many bytes one read asks for. */
 const input_chunk: usize = 65536
@@ -84,14 +92,15 @@ private read_more(ctx: *Context) -> bool
         input.truncate(kept)
         input_at = 0
     input.reserve(input_chunk)
-    var reader = fd_reader(0)
+    val room = input.spare()
     enter_safe(ctx)
-    val got = reader.read(input.spare())
+    val got = c_stdin_read(as_mut_ptr(room), i64(room.len))
     leave_safe(ctx)
-    if got.len == 0
+    if got <= 0
+        if got < 0 then input_failure = -got
         input_done = true
         return false
-    input.set_len(input.len() + got.len)
+    input.set_len(input.len() + usize(got))
     true
 
 /** The bytes `b` as a new string, with ill-formed UTF-8 replaced. */
@@ -139,6 +148,19 @@ read_line(ctx: *Context) -> *u8
             None -> searched = input.len() - input_at
         if !read_more(ctx) then return take_rest(ctx)
     take_rest(ctx)
+
+/** Up to `max` bytes of standard input, at least one: those the buffer holds, or where it holds none,
+ * those one read gives; none once the input has ended. A byte the buffer holds is never read past,
+ * so a line taken after it begins where the bytes ended. */
+take_bytes(ctx: *Context, max: int) -> []u8
+    if input_at == input.len() then _ = read_more(ctx)
+    val have = input.len() - input_at
+    val want = usize(if max < 1 then 1 else max)
+    val n = if have < want then have else want
+    var out: []u8 = [0; n]
+    copy(out, input.view()[input_at..<input_at + n])
+    input_at += n
+    out
 
 /** The next character of standard input. Bytes that are not UTF-8 are one U+FFFD for each maximal
  * ill-formed run, as a line or the rest of the input would decode them: four bytes hold any character
