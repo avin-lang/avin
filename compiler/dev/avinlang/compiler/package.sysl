@@ -85,15 +85,47 @@ struct Manifest
     /** The C libraries the package's C bindings call, in the order its `c-libraries` block lists
      * them. */
     c_libraries: Buf[CLibrary]
-    /** Whether `static-c-libraries = true`: a program this package is the root of links each C
-     * library a `pkg-config` module finds from its static archive. A dependency's is not read. */
+    /** Whether a program this package is the root of links its C libraries statically unless it
+     * names one otherwise: `static-c-libraries = true`, or `default = "static"` in `c-linking`. A
+     * dependency's is not read. */
     static_c_libraries: bool
+    /** The rest of the `c-linking` block: how a program this package is the root of links each of
+     * its C libraries. A dependency's is not read. */
+    linking: CLinking
+
+/** How a program links its C libraries, as its root package's `c-linking` block says beyond its
+ * default: the C libraries it links statically and those it links dynamically, each named
+ * `<library>` or `<package>/<library>`, with where each name is written; the `-l` names it links
+ * from their archives although the system provides them (`static-system`); the directories, as
+ * written, it searches for those archives; and where the block's `default` is written, `Span(0, 0)`
+ * where it is not. */
+struct CLinking
+    statically: Buf[string]
+    static_spans: Buf[Span]
+    dynamically: Buf[string]
+    dynamic_spans: Buf[Span]
+    static_system: Buf[string]
+    system_spans: Buf[Span]
+    search: Buf[string]
+    default_span: Span
+
+/** A program's linking that names nothing. */
+no_linking() -> CLinking = CLinking(buf(), buf(), buf(), buf(), buf(), buf(), buf(), Span(0, 0))
 
 /** A C library a package's manifest names under `c-libraries`: its name there; the `pkg-config`
  * module that finds it, or the libraries `link` names directly; the headers the package's bindings
  * are checked against, as written; and what a build that cannot find it says to do. `package` is the
  * name of the package whose manifest names it. `linked_statically` is whether the program it is
- * linked into asks for its static archive (`static-c-libraries` in the root package's manifest). */
+ * linked into links it from its archives, and `linked_why` what in the program decided so.
+ *
+ * `dir` is the package's directory, absolute once the library is in a program, which `files`,
+ * `search` and `include` are relative to: the archives and shared libraries it links by path, the
+ * directories its `-l` names are searched in, and the directories its headers are included from.
+ * `frameworks` are passed as `-framework <name>` and `flags` to the linker as they are. A
+ * `dynamic_only` that is not empty is the package's reason the library is never linked statically.
+ * `static_system` and `system_search` are the program's: the `-l` names linked from their archives
+ * although no search directory of the library holds them, and the absolute directories searched for
+ * those archives. */
 struct CLibrary
     package: string
     label: string
@@ -102,6 +134,25 @@ struct CLibrary
     headers: Buf[string]
     install: string
     linked_statically: bool
+    linked_why: string
+    dir: string
+    files: Buf[string]
+    search: Buf[string]
+    include: Buf[string]
+    frameworks: Buf[string]
+    flags: Buf[string]
+    dynamic_only: string
+    static_system: Buf[string]
+    system_search: Buf[string]
+
+/** A C library of `package` named `label`, found by `pkg_config` or linked by `link`, checked against
+ * `headers`, with `install` to say where it is missing, linked statically when `statically` (as
+ * `static-c-libraries = true` asks), and nothing else said of it. */
+c_library(package: string, label: string, pkg_config: Option[string], link: Buf[string], headers: Buf[string], install: string, statically: bool) -> CLibrary =
+    CLibrary(package, label, pkg_config, link, headers, install, statically, if statically then StaticByDefault else "", "", buf(), buf(), buf(), buf(), buf(), "", buf(), buf())
+
+/** What a program says to link a C library statically by, as an error about it names it. */
+const StaticByDefault: string = "`static-c-libraries = true`"
 
 /** The file that makes a directory a Sysl package. */
 const SyslManifestName: string = "sysl.hocon"
@@ -123,7 +174,7 @@ read_manifest_named(dir: string, name: string) -> Result[Manifest, string]
 manifest_from(dir: string, src: Source, running: string) -> Result[Manifest, Diagnostic]
     val doc = parse_hocon(src)?
     if later_avin_required(doc.root, running) is Some(d) then return Err(d)
-    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false)
+    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false, no_linking())
     read_fields(&m, doc.root)?
     Ok(m)
 
@@ -160,6 +211,7 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
     var features = Span(0, 0)
     var c_libraries = Span(0, 0)
     var static_c_libraries = Span(0, 0)
+    var c_linking = Span(0, 0)
     for f in root.fields()
         if f.key == "package"
             m.has_package = true
@@ -180,11 +232,15 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
             read_features(f, &m.features)?
         elif f.key == "static-c-libraries"
             static_c_libraries = f.key_span
+            if m.linking.default_span.end > 0usize then return Err(error(f.key_span, "`static-c-libraries` and `c-linking`'s `default` say one thing: keep one of them"))
             m.static_c_libraries = f.value.as_bool() match
                 Some(b) -> b
                 None -> return Err(error(f.value.span, "`static-c-libraries` is `true` or `false`: with `true`, the program links each C library a `pkg-config` module finds from its static archive"))
+        elif f.key == "c-linking"
+            c_linking = f.key_span
+            read_c_linking(m, f, static_c_libraries.end > 0usize)?
         else
-            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `static-c-libraries`, `features` and `workspace`"))
+            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `static-c-libraries`, `c-linking`, `features` and `workspace`"))
     if !m.has_package && !m.has_workspace
         return Err(error(Span(0, 0), s"$ManifestName has no `package` block: a package is named and versioned, `package { name = \"geom\", version = \"0.1.0\" }`"))
     if !m.has_package && m.dependencies.len() > 0
@@ -195,6 +251,8 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
         return Err(error(c_libraries, "a workspace with no `package` block compiles nothing of its own, so it has no C bindings to call its C libraries: name each in the member whose bindings call it"))
     if !m.has_package && static_c_libraries.end > 0usize
         return Err(error(static_c_libraries, "a workspace with no `package` block builds no program of its own, so it has nothing to link statically: say `static-c-libraries` in the member that is the program"))
+    if !m.has_package && c_linking.end > 0usize
+        return Err(error(c_linking, "a workspace with no `package` block builds no program of its own, so it has nothing to link: say `c-linking` in the member that is the program"))
     for i in 0..<m.c_libraries.len()
         m.c_libraries[i].package = m.name
     if !m.has_package && m.features.len() > 0
@@ -332,13 +390,14 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
     Ok(())
 
 // The C libraries a `c-libraries` block names: each a block with `pkg-config` or `link`, or neither
-// for the C library itself, `headers` and `install`.
+// for the C library itself, `headers` and `install`, and what else links it: `files`, `search`,
+// `include`, `frameworks`, `link-flags` and `dynamic-only`.
 private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnostic]
     if !f.value.is_obj() then return Err(error(f.value.span, "`c-libraries` is a block naming each C library, `zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }`"))
     for d in f.value.fields()
         if !valid_package_name(d.key) then return Err(error(d.key_span, s"`${d.key}` is not a C library's name: ${PackageNameRule}"))
         if !d.value.is_obj() then return Err(error(d.value.span, s"the C library `${d.key}` is a block saying how to find it and which headers declare it: `{ pkg-config = \"zlib\", headers = [\"zlib.h\"] }`"))
-        var library = CLibrary("", d.key, None, buf(), buf(), "", false)
+        var library = c_library("", d.key, None, buf(), buf(), "", false)
         var linked = false
         for g in d.value.fields()
             if g.key == "pkg-config"
@@ -352,11 +411,99 @@ private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnos
                 library.headers = word_list(g, "`headers` is a list of the headers the bindings are checked against, `headers = [\"zlib.h\"]` or `[\"<stdlib.h>\"]`")?
             elif g.key == "install"
                 library.install = text_of(g)?
-            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `headers` and `install`"))
+            elif g.key == "files"
+                library.files = package_paths(g, "`files` is a list of the archives and shared libraries linked by their paths, each relative to the package's directory, `files = [\"vendor/libfoo.a\"]`")?
+            elif g.key == "search"
+                library.search = package_paths(g, "`search` is a list of the directories the library's `-l` names are searched in, each relative to the package's directory, `search = [\"vendor/lib\"]`")?
+            elif g.key == "include"
+                library.include = package_paths(g, "`include` is a list of the directories its headers are included from, each relative to the package's directory, `include = [\"vendor/include\"]`")?
+            elif g.key == "frameworks"
+                library.frameworks = word_list(g, "`frameworks` is a list of the macOS frameworks the library links, each passed as `-framework <name>`, `frameworks = [\"Security\"]`")?
+            elif g.key == "link-flags"
+                library.flags = word_list(g, "`link-flags` is a list of flags passed to the linker as they are, one flag a string, `link-flags = [\"-Wl,-dead_strip\"]`")?
+            elif g.key == "dynamic-only"
+                library.dynamic_only = text_of(g)?
+                if library.dynamic_only.trim() == "" then return Err(error(g.value.span, "`dynamic-only` says why the library is never linked statically, `dynamic-only = \"LGPL-2.1: its users may replace it\"`"))
+            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `files`, `search`, `include`, `frameworks`, `link-flags`, `dynamic-only`, `headers` and `install`"))
         if library.pkg_config is Some(_) && linked
             return Err(error(d.key_span, s"the C library `${d.key}` names both `pkg-config` and `link`: `pkg-config` answers the flags it links with, so it is one or the other"))
         into.push(library)
     Ok(())
+
+// A list of paths each relative to the package's directory and inside it: not empty, not absolute,
+// and with no `..` segment, so the package links the same files wherever it is fetched. `wrong`
+// is the error at the list or the entry.
+private package_paths(f: Field, wrong: string) -> Result[Buf[string], Diagnostic]
+    if !f.value.is_arr() then return Err(error(f.value.span, wrong))
+    var out: Buf[string] = buf()
+    for v in f.value.items()
+        val p = v.as_text() match
+            Some(t) -> t
+            None -> return Err(error(v.span, wrong))
+        if p.trim() == "" then return Err(error(v.span, wrong))
+        if is_absolute(p) then return Err(error(v.span, s"`$p` is absolute, and a package's paths are relative to its directory, so it builds wherever it is fetched"))
+        for segment in p.split("/")
+            if segment == ".." then return Err(error(v.span, s"`$p` leaves the package's directory, and a package's paths stay inside it, so it builds wherever it is fetched"))
+        out.push(p)
+    Ok(out)
+
+// The `c-linking` block of `m`: `default`, `static`, `dynamic`, `static-system` and `search`.
+// `said_static` is whether `static-c-libraries` came before it.
+private read_c_linking(m: *Manifest, f: Field, said_static: bool) -> Result[unit, Diagnostic]
+    if !f.value.is_obj() then return Err(error(f.value.span, "`c-linking` is a block saying how the program links its C libraries, `c-linking { default = \"static\", dynamic = [\"mlt\"] }`"))
+    for g in f.value.fields()
+        if g.key == "default"
+            if said_static then return Err(error(g.key_span, "`static-c-libraries` and `c-linking`'s `default` say one thing: keep one of them"))
+            m.linking.default_span = g.key_span
+            val wrong = error(g.value.span, "`default` is `\"static\"` or `\"dynamic\"`: how the program links each C library it names in neither `static` nor `dynamic`")
+            val said = g.value.as_text().unwrap_or("")
+            if said == "static" then m.static_c_libraries = true
+            elif said == "dynamic" then m.static_c_libraries = false
+            else return Err(wrong)
+        elif g.key == "static" || g.key == "dynamic"
+            val static_list = g.key == "static"
+            val wrong = s"`${g.key}` is a list of C libraries, each `<library>` or `<package>/<library>` as the packages' `c-libraries` name them, `${g.key} = [\"zlib\", \"ssh/libssh2\"]`"
+            if !g.value.is_arr() then return Err(error(g.value.span, wrong))
+            for v in g.value.items()
+                val name = v.as_text() match
+                    Some(t) -> t
+                    None -> return Err(error(v.span, wrong))
+                if !valid_library_reference(name) then return Err(error(v.span, wrong))
+                val other = if static_list then m.linking.dynamically else m.linking.statically
+                if contains(other, name) then return Err(error(v.span, s"`$name` is in both `static` and `dynamic`: a C library is linked one way"))
+                if static_list
+                    m.linking.statically.push(name)
+                    m.linking.static_spans.push(v.span)
+                else
+                    m.linking.dynamically.push(name)
+                    m.linking.dynamic_spans.push(v.span)
+        elif g.key == "static-system"
+            val wrong = "`static-system` is a list of `-l` names the program links from their archives although the system provides them, `static-system = [\"z\"]`"
+            if !g.value.is_arr() then return Err(error(g.value.span, wrong))
+            for v in g.value.items()
+                val name = v.as_text() match
+                    Some(t) -> t
+                    None -> return Err(error(v.span, wrong))
+                if name == "" || name.contains(" ") || name.starts_with("-") then return Err(error(v.span, wrong))
+                m.linking.static_system.push(name)
+                m.linking.system_spans.push(v.span)
+        elif g.key == "search"
+            val wrong = "`search` is a list of directories, each absolute or relative to the package's directory, searched for the archives `static-system` names, `search = [\"/opt/homebrew/opt/zlib/lib\"]`"
+            if !g.value.is_arr() then return Err(error(g.value.span, wrong))
+            for v in g.value.items()
+                val dir = v.as_text() match
+                    Some(t) -> t
+                    None -> return Err(error(v.span, wrong))
+                if dir.trim() == "" then return Err(error(v.span, wrong))
+                m.linking.search.push(dir)
+        else return Err(error(g.key_span, s"`${g.key}` is not a key of `c-linking`, which holds `default`, `static`, `dynamic`, `static-system` and `search`"))
+    Ok(())
+
+// Whether `name` names a C library as `c-linking` does: `<library>` or `<package>/<library>`.
+private valid_library_reference(name: string) -> bool
+    val parts = name.split("/")
+    if parts.len == 1 then return valid_package_name(parts[0])
+    parts.len == 2 && valid_package_name(parts[0]) && valid_package_name(parts[1])
 
 // A list of strings none of which is empty or holds a space, or `wrong` at the list.
 private word_list(f: Field, wrong: string) -> Result[Buf[string], Diagnostic]
@@ -1599,12 +1746,14 @@ private origin_text(o: Origin) -> string = o match
  * by itself. */
 load_program(path: string, fetching: Fetching) -> Result[LoadedProgram, string] = load_program_with(path, fetching, default_features())
 
-/** The program `path` names, as `load_program` reads it, a package with the features `choice` turns on. */
-load_program_with(path: string, fetching: Fetching, choice: FeatureChoice) -> Result[LoadedProgram, string]
+/** The program `path` names, as `load_program` reads it, a package with the features `choice` turns
+ * on. `linking`, when given, is how the command line says to link the program's C libraries, `true`
+ * for statically, in place of its manifest's default. */
+load_program_with(path: string, fetching: Fetching, choice: FeatureChoice, linking: Option[bool] = None) -> Result[LoadedProgram, string]
     if enclosing_package(path)? is Some(dir)
         // The package's directory is named as it was given, when it was given.
         val root = if dir == absolute_path(path) then path else dir
-        return load_package_with(root, fetching, choice)
+        return load_package_with(root, fetching, choice, linking)
     if choice.names.len() > 0
         return Err(s"avin: `--features` names features of a package, and $path is in none")
     if is_dir(path)
@@ -1613,7 +1762,7 @@ load_program_with(path: string, fetching: Fetching, choice: FeatureChoice) -> Re
         refuse_headers(files, s"is one of the files of the program at $path, and only a program of one file names its dependencies in a header: give the program an $ManifestName and name them there")?
         return Ok(LoadedProgram(path, files, None, buf(), buf()))
     val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
-    load_script(path, source_of(path, text), fetching)
+    load_script(path, source_of(path, text), fetching, linking)
 
 // Programs of one file.
 
@@ -1690,7 +1839,7 @@ private blanks(n: usize) -> string
  * always: a program of one file is in no workspace and has no features to turn one on. */
 script_manifest(dir: string, src: Source, h: ScriptHeader) -> Result[Manifest, Diagnostic]
     val doc = parse_hocon(h.hocon)?
-    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false)
+    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false, no_linking())
     for f in doc.root.fields()
         if f.key != "dependencies"
             return Err(error(f.key_span, s"`${f.key}` is not a key of a dependencies header, which holds only `dependencies`: a program that needs more is a package, with an $ManifestName"))
@@ -1705,12 +1854,12 @@ script_manifest(dir: string, src: Source, h: ScriptHeader) -> Result[Manifest, D
 /** The program of one file `path`, whose text is `src`: the file alone, or with a dependencies header,
  * the file and every package the header depends on, resolved as a package's manifest's are. Each
  * fetched package is held to, and recorded in, the sum file beside it. */
-load_script(path: string, src: Source, fetching: Fetching) -> Result[LoadedProgram, string]
+load_script(path: string, src: Source, fetching: Fetching, linking: Option[bool] = None) -> Result[LoadedProgram, string]
     val res = script_resolution(path, src, fetching)? match
         Some(r) -> r
         None -> return Ok(LoadedProgram(path, single_file(src), None, buf(), buf()))
     record_sums(res)?
-    assemble(path, res, Some(single_file(src)))
+    assemble(path, res, Some(single_file(src)), linking)
 
 /** What the dependencies header of the program of one file `path`, whose text is `src`, resolves to;
  * none for a file with no header. What is wrong with the header is rendered at its place. */
@@ -1755,14 +1904,15 @@ load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string] 
 
 /** The package at `root` as `load_package` reads it, with the features `choice` turns on. A module a
  * feature that is off lists is not read, and each file carries the imports its gate does not allow. */
-load_package_with(root: string, fetching: Fetching, choice: FeatureChoice) -> Result[LoadedProgram, string]
+load_package_with(root: string, fetching: Fetching, choice: FeatureChoice, linking: Option[bool] = None) -> Result[LoadedProgram, string]
     val res = resolve_with(root, fetching, false, choice)?
     record_sums(res)?
-    assemble(root, res, None)
+    assemble(root, res, None, linking)
 
 // The program resolution `res` reads: each dependency's modules first, then the program's own files,
 // which are `own` for a program of one file and otherwise the files of the package at `root`.
-private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]]) -> Result[LoadedProgram, string]
+// `linking` is the command line's word on how to link the C libraries, as `load_program_with` takes it.
+private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]], linking: Option[bool] = None) -> Result[LoadedProgram, string]
     // Each package's files, read without the modules its features that are off list, then the modules
     // each holds, which are what an import of an optional dependency is checked against.
     var each: Buf[Buf[ProgramFile]] = buf()
@@ -1816,16 +1966,77 @@ private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]]) -
                 modules.push(module_name)
                 holders.push(owners[i])
     val sysl = sysl_packages(res)?
-    // Every package's C libraries, the package's own first, are the program's, linked statically
-    // when the root package, the program, asks for it.
-    val statically = res.packages[0].manifest.static_c_libraries
+    val c = linked_c_libraries(res, linking)?
+    Ok(LoadedProgram(root, files, if own is Some(_) then None else Some(res.packages[0].name), sysl, c))
+
+/** Every package's C libraries in the resolution `res`, the program's own first, each with how the
+ * program links it. The root package, the program, decides for all of them: a library its
+ * `c-linking` names in `static` or `dynamic` is linked that way; any other by `linking`, the command
+ * line's word, when given, and otherwise by the manifest's default (`static-c-libraries` or
+ * `c-linking`'s `default`), dynamically when it says none. A library whose package says it is
+ * `dynamic-only` and that would be linked statically is an error naming the package's reason, and so
+ * is a name in `static` or `dynamic` that names no C library of the program. */
+linked_c_libraries(res: Resolution, linking: Option[bool]) -> Result[Buf[CLibrary], string]
+    val program = res.packages[0].manifest
+    val chosen = program.linking
+    val by_default = linking.unwrap_or(program.static_c_libraries)
+    val why_default = linking match
+        Some(true) -> "`--static-c-libraries`"
+        Some(false) -> "`--dynamic-c-libraries`"
+        None -> if program.linking.default_span.end > 0usize then "`c-linking`'s `default = \"static\"`" else StaticByDefault
+    var system_search: Buf[string] = buf()
+    for d in chosen.search
+        system_search.push(if is_absolute(d) then normalize(d) else normalize(absolute_path(program.dir) + "/" + d))
+    var named_static: Buf[bool] = buf()
+    for i in 0..<chosen.statically.len()
+        named_static.push(false)
+    var named_dynamic: Buf[bool] = buf()
+    for i in 0..<chosen.dynamically.len()
+        named_dynamic.push(false)
     var c: Buf[CLibrary] = buf()
     for p in res.packages
         for library in p.manifest.c_libraries
             var linked = library
-            linked.linked_statically = statically
+            linked.dir = normalize(absolute_path(p.manifest.dir))
+            linked.static_system = chosen.static_system
+            linked.system_search = system_search
+            val qualified = library.package + "/" + library.label
+            var explicit: Option[Span] = None
+            linked.linked_statically = by_default
+            linked.linked_why = if by_default then why_default else ""
+            for i in 0..<chosen.statically.len()
+                if chosen.statically[i] == library.label || chosen.statically[i] == qualified
+                    named_static[i] = true
+                    linked.linked_statically = true
+                    linked.linked_why = s"`c-linking`'s `static = [\"${chosen.statically[i]}\"]`"
+                    explicit = Some(chosen.static_spans[i])
+            for i in 0..<chosen.dynamically.len()
+                if chosen.dynamically[i] == library.label || chosen.dynamically[i] == qualified
+                    named_dynamic[i] = true
+                    linked.linked_statically = false
+                    linked.linked_why = ""
+            if linked.linked_statically && library.dynamic_only != ""
+                val message = s"the C library `${library.label}` of package `${library.package}` is never linked statically, as its package says (`dynamic-only`): ${library.dynamic_only}; the program links it statically by ${linked.linked_why}"
+                return explicit match
+                    Some(at) -> Err(error(at, message).render(program.src))
+                    None -> Err(s"error: $message: name it in `c-linking { dynamic = [\"${library.label}\"] }` to link it dynamically\n")
             c.push(linked)
-    Ok(LoadedProgram(root, files, if own is Some(_) then None else Some(res.packages[0].name), sysl, c))
+    for i in 0..<chosen.statically.len()
+        if !named_static[i] then return Err(error(chosen.static_spans[i], s"`${chosen.statically[i]}` names no C library of the program: ${library_names(c)}").render(program.src))
+    for i in 0..<chosen.dynamically.len()
+        if !named_dynamic[i] then return Err(error(chosen.dynamic_spans[i], s"`${chosen.dynamically[i]}` names no C library of the program: ${library_names(c)}").render(program.src))
+    if c.len() == 0 && chosen.static_system.len() > 0
+        return Err(error(chosen.system_spans[0], s"`${chosen.static_system[0]}` is linked by none of the program's C libraries: it has none").render(program.src))
+    Ok(c)
+
+// The C libraries of a program, as `c-linking` names them, for an error naming one that is not.
+private library_names(c: Buf[CLibrary]) -> string
+    if c.len() == 0 then return "it has none"
+    var out = "it has "
+    for i in 0..<c.len()
+        if i > 0 then out = out + ", "
+        out = out + s"`${c[i].package}/${c[i].label}`"
+    out
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
  * manifest, of the package with every feature on and its dependencies without fetching any: what the
