@@ -1,0 +1,80 @@
+module avin.crypto
+
+// SASLprep, the profile of stringprep (RFC 3454) that RFC 4013 defines for user names and passwords,
+// and that SCRAM authentication applies to a password before deriving its key.
+//
+// The string is taken through the profile's steps in order. Mapping replaces each space other than
+// U+0020 with U+0020 and removes the characters mapped to nothing (the soft hyphen U+00AD, the
+// zero-width joiners, the variation selectors). Normalization puts the result in Unicode
+// normalization form NFKC. Then each character is checked: the result is refused where it holds a
+// prohibited character (controls, private use, surrogates, non-characters, the code points that
+// change the display direction or are tagging characters) or a code point unassigned in Unicode 3.2,
+// the version the RFC fixes its tables at, as for a stored string. Last, a string holding any
+// right-to-left character (bidirectional property R or AL) is refused where it also holds a
+// left-to-right one (property L), or does not begin and end with a right-to-left character.
+//
+// `saslPrep("I\u{ad}X")` is `Some("IX")`, `saslPrep("\u{2168}")` is `Some("IX")`, and
+// `saslPrep("\u{7}")` is `None`. Normalization follows the Unicode Character Database the library's
+// other character data answers from rather than Unicode 3.2. A character added since is refused as
+// unassigned, so the two differ only where Unicode has corrected a decomposition since 3.2, which it
+// has done for a few CJK compatibility ideographs.
+saslPrep(text: string) -> Option[string]
+  val mapped = StringWriter()
+  for c in text.chars
+    val code = int(c)
+    if NonAsciiSpaceSet.contains(code)
+      mapped.writeChar(' ')
+    elif !MappedToNothingSet.contains(code)
+      mapped.writeChar(c)
+  val normal = mapped.text.normalize(Nfkc)
+  var anyRightToLeft = false
+  var anyLeftToRight = false
+  var first = -1
+  var last = -1
+  for c in normal.chars
+    val code = int(c)
+    if ProhibitedSet.contains(code) || UnassignedSet.contains(code) then return None
+    if RandALCatSet.contains(code) then anyRightToLeft = true
+    if LCatSet.contains(code) then anyLeftToRight = true
+    if first < 0 then first = code
+    last = code
+  if anyRightToLeft
+    if anyLeftToRight || !RandALCatSet.contains(first) || !RandALCatSet.contains(last) then return None
+  Some(normal)
+
+// A set of code points held as its runs, each a first and last code point, in increasing order; made
+// from a table of `stringprep_tables.avin` the first time it is read, and read-only after.
+private class CodeSet(text: string): Sendable
+  private val bounds: ArraySeq[int] = decodeRuns(text)
+
+  contains(c: int) -> bool
+    var low = 0
+    var high = bounds.length / 2
+    while low < high
+      val mid = (low + high) / 2
+      if c < bounds(2 * mid) then high = mid
+      elif c > bounds(2 * mid + 1) then low = mid + 1
+      else return true
+    false
+
+private decodeRuns(text: string) -> ArraySeq[int]
+  val found = Buffer[int]()
+  for run in text.split(" ")
+    val dash = run.indexOf("-")
+    val first = hexCode(if dash >= 0 then run.slice(0, dash) else run)
+    found.addOne(first)
+    found.addOne(if dash >= 0 then hexCode(run.slice(dash + 1, run.byteLength)) else first)
+  found.toArraySeq
+
+private hexCode(text: string) -> int
+  var n = 0
+  for c in text.chars
+    n = n * 16 + (if '0' <= c <= '9' then int(c) - int('0') else int(c) - int('A') + 10)
+  n
+
+private lazy val MappedToNothingSet: CodeSet = CodeSet(MappedToNothing)
+private lazy val NonAsciiSpaceSet: CodeSet = CodeSet(NonAsciiSpaces)
+private lazy val ProhibitedSet: CodeSet = CodeSet(Prohibited)
+private lazy val UnassignedSet: CodeSet = CodeSet(Unassigned)
+private lazy val RandALCatSet: CodeSet = CodeSet(RandALCat)
+private lazy val LCatSet: CodeSet = CodeSet(LCat)

@@ -1,0 +1,79 @@
+// expect: exit 0
+// stderr: actor numbers vary
+// A server's own answers rendered by its error page, as JSON: a malformed request's `400`, a body
+// over the limit's `413` and a handler's trap's `500`, each keeping its status; a router's `404`
+// through the same page. A long poll waiting through the request's `untilStopped`: a shutdown ends
+// the wait at once and the handler answers `503`, with `Connection: close`, so `shutdown` returns
+// promptly; a wait that answers first is served as usual. A request made without a server never
+// stops: its `untilStopped` runs the wait as it is.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+import avin.net.http.{Response, Route, Router, ServerRequest}
+import avin.threads.{Atomic, Promise, sleep, spawn}
+import avin.time
+import avin.time.monotonic
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+shown(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes).replace("\r\n", "|")
+
+open(server: TcpServer) -> TcpStream
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  c
+
+// Everything the server sends for `text` until it closes the connection.
+exchange(server: TcpServer, text: string) -> string
+  val c = open(server)
+  ok(c.writeText(text))
+  val got = shown(ok(c.readAll()))
+  _ = c.close()
+  got
+
+page(status: int) -> Response = Response.json(status, s"{\"status\": $status}")
+
+// A long poll: the news, or `503` where the server stops first.
+polled(r: ServerRequest, waiting: Atomic[int], news: Promise[string]) -> Response
+  waiting.add(1)
+  val pending = news.future
+  r.untilStopped(() -> pending.await()) match
+    Some(v) -> Response.text(200, v)
+    None -> Response.text(503, s"stopping: ${r.isStopping()}")
+
+main()
+  val waiting = Atomic(0)
+  val news = Promise[string]()
+  val router = Router(
+    [
+      Route.get("/trap", r -> Response.text(200, s"${1 / r.body.length}")),
+      Route.get("/poll", r -> polled(r, waiting, Promise[string]())),
+      Route.get("/news", r -> polled(r, Atomic(0), news))
+    ],
+    page
+  )
+  val server = ok(http.serve("127.0.0.1", 0, router.handle, maxBodyBytes = 4, errors = page))
+  println(exchange(server, "GET / HTTP/1.1\r\n\r\n"))
+  println(exchange(server, "POST /poll HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\n0123456789"))
+  println(exchange(server, "GET /trap HTTP/1.1\r\nHost: t\r\n\r\n"))
+  println(exchange(server, "GET /missing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+
+  // A wait that answers before any stop is served as usual.
+  val answered = spawn(() -> exchange(server, "GET /news HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"))
+  news.complete("fresh")
+  println(answered.join())
+
+  // A long poll waiting when the server stops.
+  val poll = spawn(() -> exchange(server, "GET /poll HTTP/1.1\r\nHost: t\r\n\r\n"))
+  while waiting.load() == 0 do sleep(time.millis(5))
+  sleep(time.millis(50))
+  val start = monotonic()
+  server.shutdown()
+  println(s"shutdown at once: ${monotonic() - start < time.seconds(5)}, held: ${server.connections()}")
+  println(poll.join())
+
+  // Without a server.
+  val alone = ServerRequest("GET", "/")
+  println(s"alone: ${alone.untilStopped(() -> 7)} stopping: ${alone.isStopping()}")

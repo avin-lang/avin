@@ -23,6 +23,7 @@ import sysl.threads.SleepLock
 private var pinned: Buf[*u8] = buf()
 private var free_slots: Buf[usize] = buf()
 private var held_count: usize = 0
+private var threaded_count: usize = 0
 private var pins_lock: SleepLock = SleepLock.new()
 
 /** An Avin function value a Sysl closure holds: its object, rooted in slot `slot`, the owner of the
@@ -39,14 +40,14 @@ struct Callback
     from_c: bool
 
 impl Drop for Callback
-    drop(self) = unpin(self.slot)
+    drop(self) = unpin(self.slot, self.threaded)
 
 /** Makes `object` a root of every collection and answers the callback holding it, for code owned by
  * `ctx`'s owner: the `count` layouts at `layouts` are copied. */
-callback_pin(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &Callback = Callback(object, pin(object), ctx.owner, false, copied(layouts, count), name_of(binding), false)
+callback_pin(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &Callback = Callback(object, pin(object, false), ctx.owner, false, copied(layouts, count), name_of(binding), false)
 
 /** A callback any thread may call, as `callback_pin` makes one for the code that gave it. */
-callback_pin_threaded(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &sync Callback = Callback(object, pin(object), ctx.owner, true, copied(layouts, count), name_of(binding), false)
+callback_pin_threaded(ctx: *Context, object: *u8, layouts: **u8, count: usize, binding: string) -> &sync Callback = Callback(object, pin(object, true), ctx.owner, true, copied(layouts, count), name_of(binding), false)
 
 private copied(layouts: **u8, count: usize) -> &sync Frozen[*u8]
     var own: Buf[*u8] = buf()
@@ -62,9 +63,10 @@ private name_of(binding: string) -> &sync Frozen[u8]
 
 private binding_name(cb: *Callback) -> string = from_utf8_unchecked(cb.binding.view())
 
-private pin(object: *u8) -> usize
+private pin(object: *u8, threaded: bool) -> usize
     pins_lock.lock()
     held_count += 1
+    if threaded then threaded_count += 1
     val slot = free_slots.pop() match
         Some(s) ->
             pinned[s] = object
@@ -75,11 +77,12 @@ private pin(object: *u8) -> usize
     pins_lock.unlock()
     slot
 
-private unpin(slot: usize)
+private unpin(slot: usize, threaded: bool)
     pins_lock.lock()
     pinned[slot] = null
     free_slots.push(slot)
     held_count -= 1
+    if threaded then threaded_count -= 1
     pins_lock.unlock()
 
 /** Marks every pinned function value. The collector calls it with every attached thread stopped. */
@@ -93,6 +96,14 @@ mark_pinned(h: *gc.Heap)
 callbacks_held() -> long
     pins_lock.lock()
     val n = held_count
+    pins_lock.unlock()
+    long(n)
+
+/** How many of the callbacks held any thread may call: a thread the program did not start may call
+ * one of them at any time, so the program is never found deadlocked while one is held. */
+threaded_callbacks_held() -> long
+    pins_lock.lock()
+    val n = threaded_count
     pins_lock.unlock()
     long(n)
 
@@ -167,7 +178,7 @@ private var records_lock: SleepLock = SleepLock.new()
 @export("avin_rt_c_callback_new")
 c_callback_new(ctx: *Context, object: *u8, threaded: bool, binding: *u8) -> *u8
     val no_layouts: Buf[*u8] = buf()
-    val cb: &sync Callback = Callback(object, pin(object), ctx.owner, threaded, no_layouts.freeze(), name_of(text_string(binding)), true)
+    val cb: &sync Callback = Callback(object, pin(object, threaded), ctx.owner, threaded, no_layouts.freeze(), name_of(text_string(binding)), true)
     records_lock.lock()
     val slot = free_records.pop() match
         Some(s) -> s

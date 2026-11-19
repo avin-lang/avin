@@ -19,7 +19,7 @@ the standard library — in one run.
 | Bindings | `@sysl` declarations → shim archive | Generates the Sysl shim source and its boundary signatures, and has Sysl check and build it. |
 | C unit | `@c` declarations → C unit object + measurements | Generates one C file of header checks, measurements and glue, compiles it with clang under the C libraries' flags, and reads the measurements out of the object ([stage 13](/compiler/roadmap/)). |
 | Monomorphize | typed HIR → mono HIR | Instantiates functions, types and generic trait methods for every use, and computes the dispatch for trait-typed calls over the closed world. |
-| Lower | mono HIR → MIR | Explicit control flow (a deferred statement lowered again at every edge that leaves its block), object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
+| Lower | mono HIR → MIR | Explicit control flow (a deferred statement's closure put on the thread's list where it is reached, and the block's own run from the list at every edge that leaves its block), object layouts and headers, type descriptors, vtables, closures and environments, allocation, GC root slots, traps. |
 | Emit | MIR → LLVM IR | Spelling only: no typing, layout or semantic decisions. |
 | Link | `.ll` + runtime + shim → executable | The module cut into codegen units, each compiled by its own clang at once and its object cached by its text; then clang links the objects, the runtime library, the cached shim library, the C unit's object and the C libraries' link flags. |
 
@@ -84,7 +84,30 @@ machine with no cache directory (no `HOME`, no `XDG_CACHE_HOME`, no `AVIN_CACHE`
 `.avin/build/` in the program's directory instead, or beside the file for a program of one file.
 `avin clean [<program>]` removes the program's cache, and the `.avin/build/` beside it if there is
 one; `avin clean --all` removes every program's cache this version keeps, and leaves the fetched
-packages, the runtime's archives and the shims. `avin build` is not a cache: it writes the
+packages, the runtime's archives and the shims.
+
+The cache keeps itself within a limit, with nothing for a person to do. Each program's directory
+under `build/` (and under `test-builds/`, where the compiler's own tests build) is an entry, and so
+is each object or archive under `units/`, `runtime/`, `shims/` and `cunit/`; an entry's modification
+time is its last use, since every build touches what it takes from the cache, a program's directory
+when its build starts and again before each test `avin test` runs. Every command that builds sweeps
+the cache at most once in ten minutes, whichever process does it (a `last-sweep` stamp in the
+cache): it evicts entries least recently used first until the cache is within `AVIN_CACHE_LIMIT`
+(`5G` unless it is set; `500M`, `20G`, a number of bytes, or `off` for no limit), never one used
+within the last hour, and renames an entry aside and looks at it again before removing it, putting
+it back if a build touched it in between, so nothing a running build uses goes; a shim archive and
+the record of what it links beside it are one entry. An entry gone from under a build anyway, the
+cache emptied by hand while it ran, is a miss: the link looks again at what it takes from the cache,
+and the build compiles once more, which builds the entry anew, rather than handing clang a path to
+nothing. The same sweep
+removes what interrupted builds left (anything whose name holds `.pending-`, an hour after the last
+write to it), the temporary directories a killed build worked in (`avin-link…`, `avin-shims…`,
+`avin-c-unit…` in `TMPDIR`, a day after the last write), and the caches of other versions of Avin
+three days after their last use. Fetched packages are not counted against the limit and a sweep
+never evicts one. `avin cache info` shows each kind's size, the limit, the oldest and newest use,
+debris, the packages and other versions' caches; `avin cache trim` sweeps now; `avin cache clean`
+removes all of it, `--older-than 30m`/`12h`/`7d` only what no build has used for that long, and
+`--packages` the fetched packages too. `avin build` is not a cache: it writes the
 executable where `-o` says, or in the working directory. Beside each
 executable, `<name>-O2` or `<name>-tests-O2`, a record holds the key it was built for: a hash over the
 compiler's version and its executable's modification time, the kind of build and its optimization,
@@ -329,6 +352,47 @@ every program's warm build is compared with its clean one; the warm build is the
 test` of the library's and the packages' tests runs in `verify` mode the same way. Unset, the gate
 builds the corpus once, with no cache.
 
+## Debug information
+
+`avin build -g` and `avin emit-llvm -g` build a program a debugger can read in its Avin source
+(`debug_info.sysl`). Nothing else changes: the code is the code the same build makes without `-g`,
+and a build without it carries no debug information at all.
+
+- **Lowering places the code.** In a program built with `-g`, every function the source declares is
+  lowered with a `Locate` instruction before each run of instructions that comes from one place:
+  the line and column, counted from 1, where the innermost expression being lowered begins. The
+  places are the document's, so a literate program's are the lines of its `.lavin` file, the code
+  margin included ([positions are the document's](/spec/declarations/#positions-are-the-documents)).
+  A `Locate` never comes between a call and the words of its result. The code before the body's first
+  expression, which takes the parameters in, is placed nowhere, so a debugger that stops at a
+  function's first line finds its parameters already there. A `Variable` instruction names each
+  parameter and each local that lives in a slot of its own, with its Avin type; a local a closure
+  shares lives in a box and is left out, as is one the compiler made. Neither instruction makes code,
+  and neither counts toward the size that decides inlining. A function inlined into another takes
+  the place of the call, since the inlined body's own places are in another function and maybe
+  another file.
+- **Emission writes LLVM's debug metadata.** One compile unit; a file for each source file, by its
+  full path; a subprogram for each function the source declares, named as Avin spells it (`fact`,
+  `twice[int]`, `main.lambda#1`, and a library function by its module, `avin.…`) with its symbol as the linkage name
+  and the line of its name; a location on every instruction from the body's first expression on, and
+  on every call; and a local variable for each `Variable`: a parameter with its place among the
+  parameters, a scalar of a basic type (`int`, `long` and the other integers signed, `byte`
+  unsigned, `char` a UTF-32 code point, `bool`, `real`), and a reference as a pointer to a structure
+  named by its type, which the debugger shows as an address. A parameter is copied to a slot of its
+  own at the entry so it can be read wherever the function stops; a local in a root of the frame is
+  found in the frame. A function lowering makes, which no source declares, has no subprogram.
+- **On macOS the build gathers the DWARF.** The linker leaves it in the objects, which a build
+  removes, so `avin build -g` runs `dsymutil` on the executable once it is published, writing
+  `<executable>.dSYM` beside it, where lldb looks. Elsewhere the executable carries it.
+- **Builds and caches.** A function's text is never taken from the instance cache in a `-g` build,
+  nor kept in it, since its locations follow lines its key does not cover; its lowered code is, in a
+  directory of its own (`program-O2-g`), each `Locate` kept counted from the start of the
+  declaration it is in, as a trap site is, and placed again where the declaration is now when it is
+  read back. Codegen units carry every metadata line, as they carry every other module-level line,
+  and a function declared in a unit that does not define it carries no subprogram. Both `-O0` and
+  `-O2` keep the information valid: clang's verifier, which drops debug information it finds
+  invalid with a warning, accepts every unit.
+
 ## Sysl bindings and the shim cache
 
 A [binding](/spec/sysl-bindings/) is checked as a top-level function without a body: its
@@ -411,7 +475,7 @@ each named by its path in the runtime, and the source files of each Sysl package
 a package's source files are its Sysl, manifest, sum and C files, outside its `.sysl` working
 directory. The executables `avin run` and `avin test` cache are keyed by the same Sysl packages. A build with
 the same bindings finds it there and runs no Sysl build; it is built under a temporary name and
-published by rename, so concurrent builds never see a partial archive. The `check` command stops after type checking and builds no shims, so it is fast; `check --bindings`
+published by rename, so concurrent builds never see a partial archive. The `check` command stops after type checking and the C unit, which is cached and cheap, and builds no shims, so it is fast; `check --bindings`
 builds them too, since only Sysl can say whether a binding is right.
 
 ## C bindings and the C unit
@@ -524,6 +588,13 @@ The heap is one block reserved when the program starts: 8 GiB, or `AVIN_HEAP_LIM
 operating system commits its pages as they are first used, so the heap grows within the reservation
 and costs nothing until then. A program whose live data outgrows the limit stops with a message
 naming it.
+
+After each collection the heap may allocate as much again as survived before the next one, and
+never less than 8 MiB, so it stays within about twice what is live and a collection's cost, which
+grows with what is live, is spread over that much allocation. `AVIN_GC_PERCENT` changes the
+proportion: 200 lets the heap allocate twice what survived between collections, halving what
+marking costs per byte allocated for a heap that much larger; 0 collects at every 8 MiB whatever is
+live. It is a whole number in decimal digits, at most 100000; any other value is ignored.
 
 The collector owns each object's header, which sits just before the object: the word 16 bytes
 before an object's address holds its **kind**, the collector's record of how to trace it, and the
@@ -1258,9 +1329,26 @@ which take and give back one spin lock every such operation shares. `add`, `sub`
 library code, a loop of `load` and `compareAndSet`, so an integer that would overflow traps before
 anything is stored.
 
-**Locks and conditions.** The synchronization library reaches eight intrinsics, each a runtime
-entry: `lock_new`, `lock_acquire`, `lock_release`, `condition_new`, `condition_wait`,
-`condition_wait_for`, `condition_notify` and `condition_notify_all`. A lock is an object on the
+**Locks and conditions.** The synchronization library reaches eleven intrinsics, each a runtime
+entry: `lock_new`, `lock_acquire`, `lock_release`, `lock_release_holding`, `condition_new`,
+`condition_new_kind` (a condition whose waiters the thread dump and the deadlock report name as a
+channel's receive or send, a future or an executor's work), `condition_wait`, `condition_wait_for`,
+`condition_wait_settling`, `condition_notify` and `condition_notify_all`.
+`condition_wait_settling` is the wait of a waiter with state of its own (a read-write lock's
+waiting writers, a barrier's arrivals): it takes a limit in milliseconds or none, and answers
+woken, out of time, or cancelled, a cancellation ending it with the lock held again instead of
+stopping the thread, so the library takes the waiter's mark back, lets the lock go and reaches
+`cancel_point`, which stops it. A mutex's condition waits the settling way too, and on a
+cancellation reaches `cancel_point_held`, which stops the thread still holding the lock: the
+deferred statements it runs as it stops (`defers.sysl`) include `with`'s own, which lets the lock go
+last. A share others wait for (a read-write lock's read or write, a
+semaphore's permit in `withPermit`) is taken under the library's lock, which `lock_release_holding`
+lets go while staying in the region in doubt taking it entered; `cancel_guarded_held` then runs the
+body and the closure giving the share back, and leaves the region. Nothing can stop the thread
+between taking the share and giving it back, and a trap there stops the program; where the body
+is cancellable (a read, a permit's body), it runs at a cancellation point of its own inside the
+region, so a cancellation returns to it, the share is given back, and the cancellation goes on. A
+lock is an object on the
 collected heap holding whether a thread holds it and a queue of the threads waiting for it, and a
 condition one holding a queue alone; neither holds a reference, and the collector never moves
 either, so a waiter may be linked from one. Each queue has a guard, a futex lock held for a few
@@ -1444,13 +1532,19 @@ out, dispatched through the trait. `loop_tests.sysl` holds the counts of calls a
 form makes.
 
 **`for` with `yield`** is parsed as `ForYield`, its generators each holding their pattern, source and
-guards, and checked as the calls it means (`for_yield_expr`). The first source is checked; each of
-its guards becomes a `withFilter` call on what came before, and the whole is called with `map` (the
+guards, and checked as the calls it means (`for_yield_expr`). The first source is checked, then
+admitted for its roles by conformance (`admitted_source`): an `Iterable` takes every role, and any
+other source's constructor must implement `Functor` (or `SendableFunctor`) as the last generator's,
+`Monad` (or `SendableMonad`) where a generator or a guarded definition follows, and `Filter` where
+a guard does, a constructor parameter by its bounds (`implements_role`, through `bound_constructor`
+and `applied_meets`). Each guard becomes a `withFilter` call on an `Iterable`, whose views are
+`Iterable`s too, and a `filter` call on any other source; the whole is called with `map` (the
 last generator) or `flatMap`, each given a lambda of one hidden parameter whose body binds it by the
 generator's pattern, as a loop's element is bound, and goes on with the guard, the yielded value or
 a `ForYield` of the remaining generators. Each call goes through the method resolution a written call
-uses, overloads included, with the comprehension's expected type passed to the outermost one; a
-receiver without the method is reported at the generator's source. The lambdas are named apart so a
+uses, overloads included, with the comprehension's expected type passed to the outermost one. While
+a `flatMap`'s function is checked, what its overloads take is held in `yield_frames`, so a later
+generator whose source makes none of it is reported at that generator (`taken_by_frame`). The lambdas are named apart so a
 diagnostic says "this guard" rather than "this lambda", and `return`, `break`, `continue` and `?`
 in them are reported as unable to leave the comprehension.
 

@@ -1,13 +1,14 @@
 ---
 title: Collections
-summary: A rich collection library without higher-kinded types, where Iterator is Iterable and arrays are ordinary collections.
+summary: A rich collection library with precise result types from first-order generics, where Iterator is Iterable and arrays are ordinary collections.
 weight: 18
 ---
 
 The standard library's collections are a rich, immutable-by-default family with shared operation
 families, written in Avin. Each transformation returns the most precise collection type the caller
-can know, and the structure below achieves that without higher-kinded types, which Avin does not
-have.
+can know, and the structure below achieves that with first-order generics alone. The collections
+also implement the [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse)
+through their own methods, so code generic over any `Monad` takes them unchanged.
 
 ## Hierarchy
 
@@ -135,13 +136,15 @@ iterable by conforming to `Iterable[A]` and returning an `Iterator[A]` of its ow
 ## Methods every Iterable has
 
 `Iterable` itself gives `head`, `last` and their `Option` forms, which a sequence and a sorted
-collection override to reach the end at once. Impls add the rest to `Iterable`, each written once
+collection override to reach the end at once, and `foldLeft`, by which every `Iterable[A]` is a
+[`Foldable[A]`](/spec/generics/#functor-applicative-monad-traverse) and a list or a vector, overriding
+it, walks itself. Impls add the rest to `Iterable`, each written once
 over `iterator()`, so every collection has them:
 lists, vectors, arrays, buffers, deques, ranges, sets, maps (whose elements are their entries, as
 `(key, value)` pairs), the mutable sets and maps, iterators, and a class of the program's own that
 conforms to `Iterable`. They visit the elements in iteration order. On an iterator they consume it.
 A type with a faster way to answer one keeps its own method of the same name and parameter types,
-which is found first wherever the type is known: a list walks itself for `foldLeft`, `find` and the
+which is found first wherever the type is known: a list walks itself for `find` and the
 rest, a set and a range know at once whether they are empty, a vector is its own `toVector`.
 Collections they make are vectors, maps and sets; n is the number of elements.
 
@@ -528,7 +531,9 @@ and the default is never stored. Everything else sees only the real entries: `ge
 those of the wrapped map. `updated`, `removed`, `++`, `--`, `updatedWith` and `filter` answer a map
 with the same default, and `transform` and `mapValues` the wrapped map's own, with none. The wrapper
 is equal to the map it wraps, and to every map of the same entries whatever its default, and hashes
-and displays as it does. A default of a supertype of the values makes a map of that type. A
+and displays as it does. A default of a supertype of the values makes a map of that type. The
+wrapper is sendable where the map it wraps and `v` are, so the function `f` is `@sendable`, using
+only sendable values from around it: a default that counts its calls does so through an `Atomic`. A
 counter reads `val counts = HashMap.empty[string, int]().withDefaultValue(0)` and then
 `counts.updated(w, counts(w) + 1)`.
 
@@ -884,7 +889,7 @@ initialized (without a lock, since only one thread reaches it), and a cell whose
 `lazy val e: LazyList[int] = LazyList.empty[int]() ++ e`) traps at that read:
 ``avin: trap: a LazyList cell is read while it is being evaluated``.
 
-A list that refers to itself is a `lazy val`, at module level or in a class: a module-level `val`
+A list that refers to itself is a `lazy val`, at module level, in a class or in a block: a module-level `val`
 initializes before `main` and may not need its own value at all, even inside a delayed expression,
 so `val fibs = 0 #:: fibs` is an error naming `fibs` as needed by its own initializer.
 
@@ -974,7 +979,12 @@ each literal a `byte`), and otherwise from the elements themselves, which agree 
 branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A number
 literal among them takes the type the others decide, wherever it is written
 ([generics](/spec/generics/#inference)): `[long(1), 2]` and `[2, long(1)]` are `Vector[long]`, and
-`[1.5, 2]` is a `Vector[real]`. A map
+`[1.5, 2]` is a `Vector[real]`. So does a number literal in a literal given as an argument, from
+what the receiver and the other arguments decide of its parameter, an overloaded method's included:
+with `v: Vector[long]`, `v ++ [400]` and `v ++ [5_000_000_000]` are `Vector[long]`, `l ++ List(400)`
+on a `List[long]` is a `List[long]`, and beside a `Vector[BigInt]` or a `Vector` of a type that
+[takes integers](/spec/types/#integers-meet-a-type-that-takes-them) the literal's numbers are that
+type's values; `v ++ ["a"]` is still an error. A map
 literal's keys agree on one type and its values on another, so `{a: dog, b: cat}` is a
 `Map[string, Animal]`. A literal in braces is all elements or all entries; `{1, b: 2}` is an
 error. Set and map literals nest inside one another and inside sequence literals, and like them may
@@ -1319,17 +1329,23 @@ r.contains(3000000000)   // true
 ## for comprehensions
 
 A `for` with `yield` is sugar over collection methods: generators become `flatMap`/`map` and guards
-become lazy filters, so any type with those methods works in it. Scope and the order of evaluation
-follow the source. A `for` without `yield` is a loop over the source's `iterator()`, described next.
+become lazy filters. A source is admitted by what it is, nominally: an `Iterable`, or a type
+implementing the [standard constructor traits](/spec/generics/#functor-applicative-monad-traverse)
+(below). Scope and the order of evaluation follow the source. A `for` without `yield` is a loop over the source's `iterator()`, described next.
 
 `for pattern in xs` followed by an indented body, or `for pattern in xs do body` on one line, runs the
 body once per element, binding each by the pattern: a name, `_`, a tuple or a variant pattern that
 every element matches. Each element is a new binding, so a closure made in the body keeps the
 element it saw. `break` and `continue` work as in `while`. A range written in place (`0..<n`, of any
-integer type) is counted without making a `Range`, and an array is indexed; anything else is
-traversed through its `iterator()`, which is what `foreach` does for the library's collections, and
-lets `break`, `continue` and `return` leave the body directly. A source with no iterator, such as an
-`int`, is an error.
+integer type) is counted without making a `Range`, and an array is indexed; anything else must
+conform to `Iterable` and is traversed through its `iterator()`, which is what `foreach` does for
+the library's collections, and lets `break`, `continue` and `return` leave the body directly.
+Conformance is by name, as everywhere: a class or data type declaring `Iterable[A]` among its
+parents or given it by an impl, an `Iterator`, a type parameter bounded by `Iterable` or by a trait
+requiring it, or a union whose every member is one. A type that merely has an `iterator()` method is
+not a source until it conforms, and neither is an `Option` or an `Either`, which have `iterator()`
+but are not `Iterable`s (`toList` makes one of an option's value). Any other source, such as an
+`int`, is an error that names its type.
 
 ```text
 for i in 0 ..< n do total += i
@@ -1404,9 +1420,39 @@ other `Seq`, a sequence of the program's own among them, a `Vector`, through the
 yields pairs and makes a `Map`. Over a mutable `Set` or `Map` the result is a new mutable set or map,
 as over an `Array`, a `Buffer` or a `Deque` it is a new one of those, and the source is unchanged. `flatMap` on the library's collections takes any `Iterable` from its
 function, so a later generator may draw from another kind of collection than the first; an
-`Option`'s `flatMap` takes an `Option`. A type of the program's own works in a comprehension by
-having the methods it calls: `map` for one generator, `flatMap` for more, and `withFilter` for a
-guard. A source without the method it is asked for is an error at that source.
+`Option`'s `flatMap` takes an `Option`.
+
+**Which sources a comprehension takes is decided by conformance, never by the methods a type
+happens to have.** Each source is checked for the role the desugaring gives it, then its calls are
+checked as written out:
+
+- **The last generator's source** is an `Iterable`, or its type's constructor implements `Functor`
+  or `SendableFunctor`.
+- **A generator followed by another**, or by a definition a guard follows, is an `Iterable`, a
+  `Monad` or a `SendableMonad`, so a comprehension over futures is a future, as before.
+- **A guard** filters an `Iterable` through `withFilter`, lazily as below, and any other source
+  through `Filter`'s `filter`. The views `withFilter` makes are `Iterable`s themselves, so the calls
+  after a guard are on an `Iterable` too.
+- **In generic code** the bounds decide: `fa: F[A]` with `F[_]: Monad & Filter` takes every role,
+  and with `F[_]: Functor` alone only the last generator's.
+
+So `Option`, `Result[_, E]` and `Either[L, _]` draw in a comprehension as the collections do, and so
+does a type of the program's own that implements `Monad` (and `Filter`, for guards). A type with a
+`map` and a `flatMap` and no such impl is no source:
+
+```text
+for x in box, y in other yield x + y
+// error: `box` is a `Box[int]`, which is neither an `Iterable` nor a `Monad`, and a generator
+// followed by another draws only from those: declare `impl Monad for Box`
+```
+
+A source admitted for its role whose call still fails is reported at the generator that caused it:
+in `for p in parser, n in maybeInt yield …` where `parser` is a `Parser[int]`, the error names the
+second generator, an `Option[int]` where `Parser`'s `flatMap` takes a function yielding a `Parser`.
+A guard on a source that is neither an `Iterable` nor a `Filter` names the guard and the bound it
+needs. A refused source is told what to declare where the module can declare it: the impl, for a
+type of its own, or the bound, for a constructor parameter (add `Monad` to the bounds of `F`);
+another module's type, such as `Result`, which is no `Filter`, is only refused.
 
 `withFilter` is lazy. It returns a view of the collection that tests each element just before
 `map`, `flatMap` or `foreach` uses it, and another `withFilter` on the view combines the tests. So

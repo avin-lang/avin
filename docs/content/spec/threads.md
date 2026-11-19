@@ -69,25 +69,41 @@ one it starts from then on; the scope still returns only once all of them have e
 goes on running after the call. What a program can rely on:
 
 - **A cancelled thread stops at its next cancellation point** and ends with no result: nothing of its
-  body runs after that point. Its `result() -> Option[T]` answers `None`, and its `join()` traps,
+  body runs after that point but its [deferred statements](/spec/operators-and-control-flow/#defer),
+  which run there, innermost first, as its frames are dropped. A deferred statement runs to its end
+  once begun: its own waits are not cancellation points while it runs, and a cancellation that comes
+  meanwhile stops the thread at its next cancellation point after. Its `result() -> Option[T]` answers `None`, and its `join()` traps,
   since there is no value to give back; a thread that finished before its cancellation reached it
   keeps its result, and `join` answers it as before. A thread started in a cancelled scope runs
   nothing.
 - **Every wait is a cancellation point**: a `sleep`, a join, a channel's `receive` or a full channel's
-  `send`, a future's `await`, a promise's future, a condition's `wait` (plain or timed), a socket's
-  `accept`, `connect`, read or write that waits for its connection. A thread
+  `send`, timed or not, a `select`, a `withTimeout`'s wait for its body, a future's `await`, a
+  promise's future, a condition's `wait` (plain or timed), a wait group's `wait` (plain or timed), a
+  semaphore's `acquire` (plain, timed or in `withPermit`), a read-write lock's `read` and `write`
+  waiting to go in, a barrier's `wait`, a [pool](#pools)'s `use` or `lease` waiting for a resource, a socket's
+  `accept`, `connect`, read or write that waits for its connection, and the lookup of a host's name
+  that a `connect` or a `bind` makes, however long the resolver takes to answer. A thread
   parked in one is woken at once, however long the wait. **So is every safepoint poll**, which
   compiled code makes on every back edge of a loop and before every call that may recur, so a thread
   that computes without waiting stops too, within a loop's turn.
 - **A thread is never stopped where others may be waiting on what it is doing**: while it holds a
-  lock (inside a `Mutex`'s `with`, for one), while it initializes a `lazy val`, while it runs what
+  lock (inside a `Mutex`'s `with`, for one), while it writes a `RwLock`, while it runs a barrier's
+  action, while it initializes a `lazy val`, while it runs what
   waits for a future it completed. It goes on to the end of that region and stops at its first
   cancellation point after, so a cancelled thread never leaves a mutex held or a value half made. Waiting
-  for a lock is not a cancellation point; waiting on a condition is, and a thread stopped there does
-  not take its mutex again.
+  for a lock is not a cancellation point; waiting on a condition is, and a thread stopped there takes
+  its mutex again, so the deferred statements of the `with` body run under it, and `with` lets it go
+  after them. A wait that left a mark on what it waits for takes it back as it stops:
+  a writer or a reader waiting for a `RwLock` no longer holds back those behind it, and a party
+  waiting at a `Barrier` withdraws its arrival. A thread stopped inside a `RwLock`'s read body or a
+  semaphore's `withPermit` body gives its share of the lock, or its permit, back as it stops, as one
+  inside a pool's `use` or `lease` body gives its resource back; what
+  such a body was doing is its own, as any cancelled code's is.
 - **Cancellation reaches down through scopes.** A cancelled thread that is running a scope of its own,
-  in that scope's body or waiting for its threads, stops first at that scope: the inner scope cancels
-  its threads and waits for them to end, and only then does the thread go on stopping. So every
+  in that scope's body or waiting for its threads, stops first at that scope: the scope body's
+  deferred statements run, the inner scope cancels its threads and waits for them to end, each
+  running its own, and only then does the thread go on stopping, running those of the functions
+  around the scope. So every
   thread below a cancelled scope has ended once that scope returns. Cancelling an inner scope cancels
   only its own threads. A scope opened while its thread holds a lock is not cancelled with that
   thread, since nothing stops the thread there: its threads finish, and the thread stops once it has
@@ -233,6 +249,15 @@ Inside the function, a parameter so marked that holds a function may be passed o
 with the same mark or a weaker one; an unmarked one may not, and the error says to mark it. A
 method that overrides or implements another marks no parameter more strongly than the method it
 overrides does, since a call through that method would not check what is passed.
+A function type carries no marks either, so a function, a constructor or a method whose parameter
+is marked is a value only where the value's type gives that parameter a sendable type, a `@sendable`
+function type for one that takes a function: `spawn` is a `(@sendable () -> T, long) -> Thread[T]`,
+and as a `(() -> unit, long) -> Thread[unit]` it is refused, as `Mutex` as an `(Array[int]) ->
+Mutex[Array[int]]` is. Where no function type is expected, the value takes the `@sendable` form of
+each marked parameter that takes a function, so `val sp = spawn[int]` holds it and what is passed
+through `sp` is checked where it is written. A by-name parameter so marked has no such type, so
+`isolate` is not a value. A class or a data type that is a function has an `apply` that marks a
+parameter only where its function type makes that parameter sendable likewise.
 
 **A parameter marked `@sendable` is sendable inside its function, whatever its type**, since what
 is passed for it was checked where it was passed: a `@sendable` lambda captures it, and it is passed
@@ -299,9 +324,13 @@ So what is passed for a `@sendable` parameter, directly or through every functio
 read and write no module-level `var`, and may read no module-level `val`, `lazy val` or `object`
 whose type is not sendable. Avin compiles the whole program, so every function a body can reach is
 known: the one a call names, every implementation a call through a trait method or an operator may
-reach, every closure made on the way, and an extractor a pattern calls. A module-level `val` of an
+reach, every closure made on the way, an extractor a pattern calls, and the initializer of every
+`lazy val`, module-level or a field, that it reads, since its first read runs the initializer on
+whichever thread makes it. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
-`lazy val` of a sendable type is initialized once whichever threads read it. The error names the
+`lazy val` of a sendable type is initialized once whichever threads read it. A local `lazy val` a
+body captures brings its initializer along, so what that initializer captures and reaches is held to
+these rules too. The error names the
 module-level item and the functions it is reached through:
 
 ```text
@@ -319,7 +348,9 @@ error: what is passed for `body` of `spawn` may run on another thread, which sha
 
 With `val hits = Atomic(0)` and `record() = hits.add(1)` the program is legal. Printing is legal from any
 thread: `print`, `println` and `eprintln` reach the runtime's streams, which keep no state of the
-program's. What is passed for an `@isolating` parameter is held to it too, though it runs at once on
+program's, and each call's output goes out whole: a line one thread prints is never split by
+another's (system-library.md § Standard input). Reading standard input is legal from any thread
+too: threads read it one at a time, and a line goes whole to exactly one of them. What is passed for an `@isolating` parameter is held to it too, though it runs at once on
 the calling thread: a module-level value is where it could leave what it isolates for code that
 does not take the lock. What is passed for an `@isolated` one is not.
 
@@ -373,22 +404,69 @@ will own its handles across every message, whichever thread runs it.
   loaded, trying again where another thread changed it in between. The kind is known for each
   `T`, so a scalar or a class reference costs one hardware compare-and-set. `update(f)` retries by
   the same rule.
-- **`Channel[T](capacity = 0)`**, a queue between threads, unbounded when the capacity is zero and
-  bounded otherwise, where `send` waits while the channel is full. `receive()` waits for a value and
-  gives `Some` of it, or `None` once the channel is closed and every value sent before is received.
-  `close()` wakes every waiting thread, and a send to a closed channel traps; closing twice does
-  nothing. `trySend(x) -> bool` and `tryReceive() -> Option[T]` never wait, and `isClosed()` asks.
-  A channel is `Iterable`: `for x in ch` receives until it is closed and drained.
+- **`Channel[T](capacity = unbounded)`**, a queue between threads: unbounded with no capacity
+  (`unbounded` is the largest `int`), bounded with a positive one, where `send` waits while the
+  channel is full, and a [rendezvous](#rendezvous) with a capacity of zero; a negative capacity
+  traps. `receive()` waits for a value and gives `Some` of it, or `None` once the channel is closed
+  and every value sent before is received. `close()` wakes every waiting thread, and a send to a
+  closed channel traps; closing twice does nothing. `trySend(x) -> bool` and
+  `tryReceive() -> Option[T]` never wait, and `isClosed()` asks. A channel is `Iterable`:
+  `for x in ch` receives until it is closed and drained. The waits have
+  [timed forms](#timers-and-deadlines), `receive(timeout)` and `send(x, timeout)`.
 - **`Once`**, whose `run(body)` runs its body exactly once, whichever threads call it and however
   many at once: every other call waits until that body has returned, and returns without running its
   own. `isDone()` says whether it has run. A body that runs its own `Once` again traps, as a mutex
   taken twice does.
-- **`lazy val`s**, module-level and fields alike ([Initialization](declarations.md#initialization)),
+- **`WaitGroup()`**, a count of work under way. `add(n)` counts `n` more pieces (or `-n` finished,
+  where `n` is negative), `done()` counts one finished, and `wait()` sleeps until the count is zero,
+  returning at once where it is. `waitFor(timeoutMillis: long) -> bool` and
+  `waitFor(timeout: Duration) -> bool` wait at most that long and answer whether the count reached
+  zero; a time that is not positive only asks. `pending()` reads the count. It counts work, not
+  threads, so the pieces may be finished by threads started anywhere (a scope, an executor, an
+  actor) or by no new thread at all; threads a body starts and waits for itself are a
+  [scope](#starting-and-joining)'s to count, so a wait group has no `spawn` of its own. A count taken
+  below zero traps, since a piece was finished twice or never added. A wait group is sendable.
+- **`Semaphore(permits: int, capacity: int = permits)`**, a count of permits. `acquire()` takes one,
+  sleeping while there is none; `tryAcquire() -> bool` takes one only where one is free now;
+  `acquireFor(timeoutMillis: long) -> bool` and `acquireFor(timeout: Duration) -> bool` wait at most
+  that long; `release()` gives one back, waking a waiter. `withPermit(body)` takes a permit for its
+  body and gives it back when the body returns, giving back what it returned; a cancellation that
+  stops the thread inside the body gives the permit back too, and a trap inside it stops the
+  program even in an [actor](/spec/actors/), since the permit would never come back. A semaphore holds at most `capacity`
+  permits, `permits` of them at first, so `Semaphore(0, capacity = 1)` starts empty and signals. A
+  release that would hold more than the capacity traps, since it gives back a permit nobody took, as
+  does a semaphore made with negative permits, a capacity below one, or more permits than its
+  capacity. Permits belong to no thread: one thread may take a permit another gives back. Waiters
+  take no place in a queue, so a thread that asks just as a permit comes back may take it before one
+  that has waited longer. A semaphore is sendable.
+- **`RwLock[T](value)`**, a value many threads may read at once and one at a time may write. It owns
+  its value as a `Mutex` does, made in the argument, and its bodies are `@isolating` and give back a
+  sendable value: `read[R: Sendable](@isolating body: (T) -> R) -> R` runs alongside any other
+  readers, `write[R: Sendable](@isolating body: (T) -> R) -> R` alone. A read body only reads; one
+  that changes a value other readers are reading races with them, which nothing checks. For a
+  sendable value `get()` reads, `set(v)` writes and `update(f)` replaces the value with `f` of it,
+  giving back the new value. **Writers come first**: once a writer waits, a thread that asks to read
+  waits behind it, so a stream of overlapping readers never keeps a writer out; and when a write
+  ends, every reader that was waiting goes in before the next writer, so a stream of writers never
+  keeps those readers out. A write body runs to its end once begun, as a mutex's does; a read body is
+  stopped by a cancellation like any other code, and its share of the lock is given back as it stops.
+  A trap inside either body stops the program, even in an actor, as one under a mutex does.
+  It is not reentrant: reading or writing inside one's own write traps, and writing inside one's own
+  read, or reading inside it while a writer waits, waits for ever. It is sendable whatever `T` is.
+- **`Barrier(parties: int, action: () -> unit = () -> ())`**, a meeting point for `parties` threads.
+  `wait() -> bool` sleeps until that many have called it, then all go on and the barrier is ready for
+  the next round; the last to arrive runs the `@sendable` `action` first, once a round, with the
+  others still waiting, and its `wait` answers `true`, every other `false`. The action runs to its
+  end once begun, and one that waits on its own barrier traps. A party whose thread is cancelled while
+  it waits takes its arrival back, so the round still waits for `parties` threads. `parties` reads the
+  number and `waiting()` how many wait now. A barrier has at least one party, and is sendable.
+- **`lazy val`s**, module-level, fields and locals alike ([Initialization](declarations.md#initialization)),
   initialized by exactly one thread, as a `Once` is run: a thread that reads one while another runs
   its initializer waits, safe for the collector, and the stored value is published with a release
   store that every read pairs with an acquire load, so no thread sees it half made. A read by the
   initializing thread itself traps, as a `Once` run again from its body does, and a trap in the
-  initializer stops the program.
+  initializer stops the program; a read that the initializer's own code reaches, not through a
+  function it hands on, is a compile error instead.
 
 ```avin
 import avin.threads.{Channel, scope}
@@ -409,10 +487,466 @@ main() -> int
 ```
 
 Every operation that can wait marks its thread safe for the collector while it waits, so a thread
-parked on a lock, a condition, a channel or a join, or blocked on input, never holds up a collection.
+parked on a lock, a condition, a channel or a join, blocked on standard input, or writing to standard
+output or standard error where they lead to a full pipe, its own trap report included, never holds up
+a collection. A lightweight thread waiting for standard input from a pipe, a socket or a terminal
+parks and leaves its worker to the others; that wait is not a cancellation point.
 A Sysl binding [declared `blocking`](/spec/sysl-bindings/#calls-that-wait) does the same. A thread
-waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. **A deadlock is not detected**, apart from a thread
-taking a lock it already holds: threads that each wait for another sleep for ever.
+waiting for a mutex takes it in turn: the mutex goes to the thread that has waited longest. A thread
+taking a lock it already holds traps at once. A program whose threads, `main` among them, all wait for
+each other stops with a [deadlock report](#deadlock); threads that wait for each other while another
+still runs sleep for ever.
+
+### Rendezvous
+
+A channel made with a capacity of zero holds no value at all: each send hands its value straight to a
+receiver, so the two threads meet.
+
+```avin
+import avin.threads.{Channel, spawn}
+
+main() -> int
+  val handoff = Channel[string](0)
+  val worker = spawn(() ->
+    var n = 0
+    for job in handoff do n += job.charCount
+    n)
+  for job in ["parse", "check", "emit"] do handoff.send(job)
+  handoff.close()
+  worker.join()
+```
+
+What a program can rely on:
+
+- **A send returns only once a receiver has the value.** `send(x)` waits until a receiver takes `x`,
+  and a receive waits until a sender hands it one. Everything the receiving thread did before its
+  receive happens before the send returns, as everything the sender did before its send happens
+  before the receive returns, so each side knows the other has reached the meeting point.
+- **The `try` forms need a partner waiting now.** `trySend(x)` hands `x` over only where a receiver is
+  already waiting, a plain `receive` or a `select` waiting on a receive arm, and answers whether it
+  did; `tryReceive()` takes a value only from a sender already waiting. Neither waits. A thread that
+  has not yet begun to wait is not waiting.
+- **The timed forms give up cleanly.** `send(x, timeout)` answers `false` where no receiver took `x`
+  within the time, and then `x` is received by nobody; `receive(timeout)` answers `None` where no
+  sender came. A timeout of zero or less is the `try` form.
+- **A `select` arm hands a value over only when it is paired.** A send arm runs once a receiver has
+  taken its value, a receive arm once a sender has handed it one, and the partner may be a plain
+  `send` or `receive` or another select's arm, waiting first or coming while the select waits. Every
+  arm that does not run hands nothing over, so a value meant for a send arm that lost is never
+  received. A select never pairs with itself: a send and a receive arm on one channel wait for other
+  threads. With `else`, a select pairs only with a partner already waiting.
+- **A close ends every hand-off.** A sender waiting when the channel is closed traps, as any send to a
+  closed channel does, its value handed to nobody; a receiver waiting gets `None`, and so does every
+  receive after, since a closed rendezvous has nothing to drain. A select's send arm traps and its
+  `None` arm runs, as on any closed channel.
+- **Its waits are waits like any other.** A thread waiting to hand a value over, or to take one, parks
+  only itself, is safe for the collector, and is a cancellation point: cancelled, it leaves nothing
+  on the channel, and the next sender's value goes to the next receiver. A cancellation that comes
+  after a value was handed over stops a receiver that has it. The wait counts for the
+  [deadlock check](#deadlock), whose report names a sender as *waiting to hand a value to a
+  receiver*. Which of several waiting receivers gets a value is not specified.
+- **Sendable as any channel.** A channel of capacity zero is sendable where its values are, as every
+  channel is.
+
+### Pools
+
+A **`Pool[T, E]`** holds resources that are costly to make, connections to a database or a server
+for one, and lends them again and again. `use(f)` lends one for the call of `f`, takes it back when
+`f` returns, and answers `Ok` of what `f` returned, or the `PoolError[E]` that kept the call from
+getting one:
+
+```avin
+class Pool[T, E](
+    create: @sendable () -> Result[T, E],
+    maxSize: int,
+    minIdle: int = 0,
+    validate: Option[@sendable (T) -> bool] = None,
+    destroy: Option[@sendable (T) -> unit] = None,
+    idleTimeout: Option[Duration] = None,
+    acquireTimeout: Option[Duration] = None,
+    maxLifetime: Option[Duration] = None,
+    jitter: Option[Duration] = None,
+    maxWaiting: Option[int] = None
+): Sendable
+
+data PoolError[+E]
+  AcquireTimedOut
+  QueueFull
+  PoolClosed
+  CreateFailed(error: E)
+
+data PoolStats(size: int, idle: int, lent: int, waiting: int)
+
+data PoolCounters(
+    acquires: long,
+    waited: long,
+    waitTime: Duration,
+    timeouts: long,
+    rejected: long,
+    created: long,
+    destroyed: long
+)
+```
+
+- **A resource is made when it is wanted.** A call that finds a resource idle takes the one given
+  back last; one that finds none, with fewer than `maxSize` made, makes one with `create`; one that
+  finds all `maxSize` lent waits for one to come back. A `create` that fails makes the call fail with
+  `CreateFailed`, carrying the error, and gives up its place, so the pool holds nothing more than
+  before and the next call tries again. `warm()` makes resources until the pool holds `minIdle`, each
+  left idle, answering the first failure of `create`.
+- **Waiters are served in the order they came.** A resource given back goes straight to the call that
+  has waited longest, and so does the place a destroyed resource gives up, where that call then makes
+  a resource of its own; a call that comes while others wait queues behind them.
+- **A call waits for at most its timeout.** `use(timeout, f)` waits at most `timeout`, `use(f)` the
+  pool's `acquireTimeout`, or for ever where there is none, and a call whose time runs out fails
+  with `AcquireTimedOut`, leaving the queue as if it had never come. A timeout of zero or less takes
+  a resource only where one is idle, or can be made, now.
+- **The queue may be bounded.** Where `maxWaiting` calls already wait, a call that would join them
+  fails at once with `QueueFull`, so a server can turn a request away instead of letting it queue;
+  a call that finds a resource idle, or a place to make one, is never turned away, and a zero
+  `maxWaiting` means no call ever waits. With no `maxWaiting` the queue has no bound. A negative
+  `maxWaiting` traps where the pool is made.
+- **A broken resource is destroyed, not lent again.** `lease(f)` and `lease(timeout, f)` lend the
+  resource as a `Lease[T]`, whose `resource` is the resource and whose `markBroken()` says it is no
+  good any more: the pool destroys it, with `destroy` where one is given, when the body returns.
+  `validate` checks an idle resource before it is lent again, never one just made: one it answers
+  `false` for is destroyed and the call looks again.
+- **Idle resources expire.** A resource idle for longer than `idleTimeout` is destroyed the next time
+  a call looks for one, oldest first, keeping at least `minIdle`; `evictIdle()` does the same at once
+  and answers how many it destroyed. With no `idleTimeout` nothing expires.
+- **Old resources retire.** A resource older than `maxLifetime` is never lent again: one found idle
+  is destroyed instead of being lent, and the call looks again; one given back is destroyed instead
+  of being kept; and `evictIdle()` destroys the idle ones however few that leaves, `warm()` making
+  up `minIdle` again. `jitter` lengthens each resource's `maxLifetime` and `idleTimeout` by its own
+  random part of `jitter`, from none up to all of it, drawn when the resource is made, so resources
+  made together do not all expire together; it never shortens either limit.
+- **The resource always comes back.** It is taken back when `f` returns and when the thread running
+  `f` is cancelled inside it. A cancellation anywhere else in the call puts back what the call held:
+  its place among the waiters, a resource handed to it there, the place it held while `create` ran,
+  a resource `validate` was checking, which goes back as one given back does (destroyed only where
+  the pool is closed by then or the resource has outlived `maxLifetime`) and is checked again before it is next lent, so a deadline passing
+  during a check never destroys a good resource. A trap inside `f`, `create`, `validate` or
+  `destroy` stops the program, even in an [actor](/spec/actors/), as one inside a semaphore's
+  `withPermit` does, since what the pool counts would otherwise never come right.
+- **`close()` ends the pool.** Every call waiting fails with `PoolClosed`, as does every call after,
+  the idle resources are destroyed, and `close` waits for the lent ones to come back, destroying each
+  as it does; a resource whose make finishes after the close is destroyed too. Closing a closed pool
+  waits for the same, and a thread that closes a pool while a resource is lent to it waits for ever.
+  `isClosed()` says whether it was closed.
+- **`stats()`** answers what the pool holds now: `size` resources in all, of which `idle` wait to be
+  lent and `lent` are lent, and `waiting` calls waiting for one; the rest are being made or checked.
+  `maxSize` below one, and `minIdle` below zero or above `maxSize`, trap where the pool is made.
+  **`counters()`** answers running totals since the pool was made: `acquires` calls lent a resource,
+  `waited` of them after waiting in the queue, and `waitTime` all of them took from the call to the
+  lending, making or checking a resource included; `timeouts` calls whose time ran out; `rejected`
+  calls turned away with `QueueFull`; and `created` resources made and `destroyed` let go, for
+  whatever reason. A `create` that fails makes nothing.
+- **A resource belongs to one call at a time**, so a pool of any type is sendable, as a `Mutex` is,
+  and its resources may be mutable connections. So that nothing else reaches one, `create`,
+  `validate` and `destroy` are `@sendable`, and a body is `@isolating` and gives back only a sendable
+  value: it may not keep the resource, or its lease, or hand it to the body of another pool's call.
+  Each resource given back has its [Sysl handles](/spec/sysl-bindings/#handles) put in transit, so
+  the thread or actor it is lent to next uses them as its own.
+
+```avin run
+import avin.threads.{Atomic, Pool, scope}
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val db = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2)
+  val total = Atomic(0)
+  scope(s ->
+    for n in 1 .. 10 do s.spawn(() -> _ = db.use(c -> total.add(n))))
+  println(s"total ${total.load()}, made at most 2: ${made.load() <= 2}")
+  val st = db.stats()
+  println(s"lent ${st.lent}, all idle: ${st.idle == st.size}")
+  db.close()
+  println(db.use(c -> c.id))
+```
+
+```text output
+total 55, made at most 2: true
+lent 0, all idle: true
+Err(the pool is closed)
+```
+
+## select
+
+A `select` block waits on several channels at once, and on connections, and runs exactly one of its
+arms: the first whose channel operation can complete or whose connection has bytes to read.
+`select` ending its line opens the block of its arms, written as a match's are; elsewhere `select`
+is an ordinary name.
+
+```avin
+import avin.threads.Channel
+import avin.time.millis
+
+step(jobs: Channel[int], results: Channel[int], r: int) -> string = select
+  jobs.receive() as Some(j) -> s"job $j"
+  jobs.receive() as None -> "no more jobs"
+  results.send(r) -> "sent"
+  after 100.millis -> "idle"
+```
+
+What a program can rely on:
+
+- **The arms.** `ch.receive()` receives, with an optional `as` pattern: `Some(p)` runs for a value
+  and binds it by `p`, any pattern a `val` takes; `None` runs once the channel is closed and every
+  value sent before is received; a name runs for either and binds the `Option` received; `_`, or no
+  pattern, runs for either and binds nothing. `ch.send(x)` sends, and binds nothing.
+  `stream.readable()` runs once a read of `stream` would answer without waiting, and binds nothing:
+  its body reads. `sink.writable()` runs once a write to `sink` would send something without
+  waiting, and binds nothing: its body writes, with `writeSome` to send only what goes at once.
+  `after d` runs
+  where no other arm became ready within the [`Duration`](/spec/time/) `d`; `else` runs where no
+  arm is ready now, and is written as a match's `else` is, with no arrow. A select has at most one
+  `after` and one `else`, and not both, since a select with `else` never waits. Any other arm, a
+  guard or an `as` pattern on a `readable()` or `writable()` arm among them, is an error.
+- **Evaluation.** Every channel, every stream, every value sent and the `after`'s duration are
+  evaluated once, in the order the arms are written, before any arm is tried. Only the arm that runs
+  receives or sends: every other channel keeps its values, and a value meant for an arm that does not
+  run is never sent. A `readable()` arm reads nothing and a `writable()` arm writes nothing,
+  whether it runs or not.
+- **Streams.** A `readable()` arm's stream is any `Readiness` (`avin.threads`), which every
+  [connection](/spec/system-library/#avin-net), a `ByteStream`, is: TCP, Unix and TLS. It is ready
+  where the stream's `readable()` answers `true` when the arm is tried: bytes already buffered, those
+  a `readLine` read beyond its line or plaintext TLS has decrypted and not yet handed over, or bytes
+  arrived on the socket, and also the other end having finished sending or reset the connection, or
+  the connection closed, each of which its read then answers. A TLS stream counts only whole records
+  of plaintext, so bytes of a record still arriving do not make it ready. Where it is not ready, a
+  select that waits watches the stream's descriptor on the runtime's poller under the same one wait
+  as its channel arms, and whichever comes first, bytes, a channel's value, the `after`'s time or a
+  cancellation, ends it. The arm uses its stream as a read does, so only the thread a connection
+  belongs to may name it in a select; any other traps. This is how a thread that owns a connection
+  waits both for its peer and for work other threads send it: it does all of the connection's reads
+  and writes, which only it may. A connection [split](/spec/system-library/#tcp) into a reading and
+  a writing half gives each half to a thread of its own, the reader's select naming its half's
+  `readable()` and the writer's its half's `writable()`.
+- **Sinks.** A `writable()` arm's sink is any `Writability` (`avin.threads`): every connection, and
+  the writing half of a split one. It is ready where the sink's `writable()` answers `true` when the
+  arm is tried: the socket has room, or the connection has failed or is closed, which its write then
+  answers. A TLS sink is ready once the record an earlier `writeSome` began has gone, `writable()`
+  sending what of it there is room for; the writing half of a split TLS connection sends each
+  record whole before its `writeSome` answers, so the loop below leaves nothing behind when it ends. Where it is not ready, a select that waits watches the
+  descriptor for room on the poller as a `readable()` arm watches it for bytes, and a reading and a
+  writing half of one connection may each wait on it at once, each woken by its own direction.
+- **Choosing.** Of several arms ready at once, each is as likely to run as any other: the arms are
+  tried in an order drawn at random each time. Where none is ready, a select with `else` runs it, and
+  one without waits, parking only its thread, until an arm can complete and runs it, or until its
+  `after`'s time runs out. An `after` of zero or less tries the arms once, as `else` does. A select of
+  `after` alone waits its duration; one of `else` alone runs it.
+- **Closed channels behave as `receive` and `send` do.** The values sent before a close are received
+  first; then a `None` arm, a name and `_` run, every time after. `Some(p)` is never ready on a
+  closed and drained channel, so a select whose only arms want values from closed channels waits for
+  its `after`, runs its `else`, or waits for ever. A send arm on a closed channel traps when it is
+  tried, as `send` does.
+- **Its value.** A select is an expression whose value is the arm that ran, the arms' types unified as
+  a match's are. Its bodies are code of the function it is in: `return`, `break` and `continue` leave
+  an arm as they leave a match's, and a select may be nested in another's arm. `end select` may close
+  one.
+- **Waiting.** A select that waits is a wait like a channel's own: safe for the collector, and a
+  cancellation point, so a scope's `cancel` stops a thread parked in it at once. Nothing of a
+  select that has ended, by an arm, its time or a cancellation, is left on the channels or the
+  poller it waited on, and a notification a select was woken by and could not use is passed on to the next thread
+  waiting on that channel, so no other waiter, a plain `receive` or another select, misses it.
+
+```avin
+import avin.threads.Channel
+
+// Workers take jobs until told to stop; each result is sent where there is room for it.
+work(jobs: Channel[int], stop: Channel[unit], results: Channel[int])
+  var going = true
+  while going
+    select
+      jobs.receive() as Some(j) -> results.send(j * j)
+      jobs.receive() as None -> going = false
+      stop.receive() as None -> going = false
+```
+
+```avin
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.threads.Channel
+
+// The thread that owns a connection echoes each line its peer sends and forwards each message other
+// threads put on `pushed`, until the peer finishes sending.
+serve(conn: TcpStream, pushed: Channel[string]) -> Result[unit, IoError]
+  var open = true
+  while open
+    select
+      conn.readable() -> conn.readLine()? match
+        Some(line) -> conn.writeText(s"echo $line\n")?
+        None -> open = false
+      pushed.receive() as Some(m) -> conn.writeText(s"push $m\n")?
+  conn.close()
+```
+
+```avin
+import avin.io.IoError
+import avin.net.StreamWriter
+import avin.threads.Channel
+
+// The writing half of a split connection sends `data` a part at a time, as room comes, and stops
+// early where `stop` is closed. Answers how much went.
+send(w: StreamWriter, data: Array[byte], stop: Channel[unit]) -> Result[int, IoError]
+  var at = 0
+  while at < data.length
+    select
+      w.writable() -> at += w.writeSome(data.slice(at, data.length))?
+      stop.receive() as None -> return Ok(at)
+  Ok(at)
+```
+
+## Timers and deadlines
+
+Time reaches threads as channels and as limits on their waits, all in `avin.threads`, each taking a
+[`Duration`](/spec/time/). Every one of them waits as the other waits do: parking its lightweight
+thread on the runtime's timers, holding no worker, safe for the collector, and a cancellation point.
+
+```avin
+import avin.threads.{Channel, Ticker, after}
+import avin.time.seconds
+
+// Reports progress every second, and gives up on a result after five.
+watch(results: Channel[int]) -> Option[int]
+  val progress = Ticker(seconds(1))
+  val deadline = after(seconds(5))
+  var got: Option[int] = None
+  var waiting = true
+  while waiting
+    select
+      results.receive() as r ->
+        got = r
+        waiting = false
+      progress.ticks.receive() -> println("still waiting")
+      deadline.receive() -> waiting = false
+  progress.stop()
+  got
+```
+
+What a program can rely on:
+
+- **`after(d) -> Channel[Instant]`** gives a channel that delivers one value once `d` has passed from
+  the call, at once for a duration of zero or less: the [`Instant`](/spec/time/) at which the time
+  fell due, however late it is received. It is never delivered sooner. Only that one value ever
+  comes; a receive after it waits for ever, as on any channel nobody sends to, unless the channel is
+  closed, which ends it: nothing is delivered after a close. Of several threads receiving from one,
+  one gets the value. It is an ordinary channel to receive from, alone, with a timeout, or as a
+  `select` arm (`after(d).receive() -> …`, beside the `after d` arm, which it does not replace).
+- **An `after` nobody receives from costs nothing but itself.** The channel holds the time its value
+  falls due, a number, and no timer, thread or registration anywhere: the value is delivered by the
+  first receive or select that looks once the time has come, and a thread waiting on the channel waits
+  on its condition until that time at the most, its timer going with its wait. So an `after` that is
+  dropped, lost in a select to another arm, or waited on by a thread that is cancelled leaves nothing
+  behind and is collected like any object once nothing reaches it, however long its duration.
+- **`Ticker(period)`** delivers a tick on its channel `ticks` every `period`, the first a period after
+  it is made, each tick the instant it fell due, so each later than the one before. The channel holds
+  one tick at the most: **a tick that falls due while one is waiting to be received is dropped**, so a
+  slow receiver gets the oldest tick it has not received and then the ticks from its next period on,
+  never a backlog to catch up on. `stop()` ends the ticks: none is received after it, not even one
+  that fell due before and was waiting; stopping twice is stopping once, and a thread waiting on
+  `ticks` goes on waiting. A ticker, like `after`, holds no timer or thread, so one dropped without
+  `stop` is collected as any object is. A period of zero or less traps. A `Ticker` is sendable.
+- **Nothing sends to these channels but their clocks.** A `send`, `trySend`, timed send or `select`
+  send arm on a channel `after` or a `Ticker` made traps.
+- **`receive(timeout: Duration) -> Option[T]`** waits at most `timeout` for a value: `Some` of one, as
+  soon as it comes, or `None` where the time ran out first or once the channel is closed and every
+  value sent before is received; `isClosed()` tells the two apart where it matters. **`send(x,
+  timeout: Duration) -> bool`** waits at most `timeout` for room in a bounded channel, or for a
+  receiver to take `x` from a [rendezvous](#rendezvous), and answers whether it sent `x`, at once on
+  an unbounded one; a value whose time ran out is not sent. A send to
+  a closed channel traps, as `send` does, rather than answering `false`. A timeout of zero or less is
+  the `try` form, `tryReceive` or `trySend`. Neither waits less than its timeout where nothing comes,
+  a part of a millisecond waited for as a whole one.
+- **`withTimeout(timeout, s -> …) -> Option[T]`** runs its body with a new [scope](#starting-and-joining)
+  for at most `timeout`: `Some` of what the body returns where it returns in time, `None` where the time
+  runs out first. Then the body is cancelled where it is, waiting or computing, with every thread its
+  scope started and everything below them, as a scope's [`cancel`](#cancellation) cancels them, and
+  `withTimeout` answers once they have all ended. A body that has returned keeps its result, however
+  close to the time it did. A timeout of zero or less runs nothing and answers `None`. Timeouts nest:
+  an inner one ends at its own time or when an outer one's runs out, whichever is sooner, and a
+  `withTimeout` on a thread a scope cancels stops with that thread, its body first.
+- **The body of a `withTimeout` runs on a lightweight thread of its own**, so that it can be stopped
+  wherever it is, even when `withTimeout` is called from `main`, whose own thread no cancellation
+  reaches. The calling thread waits for it, so the body reads and assigns the caller's variables, uses
+  the Sysl handles the caller owns and those it makes are the caller's after it, as a closure the
+  caller ran itself would. What tells the threads apart still does: `isMainThread()` answers `false` in
+  the body, and a lock the caller holds is not the body's, so a body that takes it waits for ever, and
+  one that waits on a condition of it traps.
+
+## Request context
+
+A piece of work, a request a server handles above all, carries a deadline and values that every call
+it makes may need: the time left for a query, the request's id for a log line. They live in the
+running thread's **request context**, in `avin.threads`, which code reads where it is rather than
+being handed it through every signature on the way. A scope sets it for the code it runs:
+
+```avin
+import avin.threads.{Context, Key, withDeadline, withValue}
+import avin.time.{now, seconds}
+
+val requestId = Key[string]("request id")
+
+handle(id: string, request: Request) -> Reply
+  withValue(requestId, id, () ->
+    withDeadline(now() + seconds(5), s -> respond(request)) match
+      Ok(reply) -> reply
+      Err(e) -> Reply.unavailable(e.message))
+
+// Far below, with no parameter for either.
+log(line: string) = println(s"[${Context.current().value(requestId).getOrElse("-")}] $line")
+```
+
+- **`Context.current() -> Context`** is the calling thread's context: what the scopes around the
+  running code set, or one with no deadline and no values. A `Context` is an immutable snapshot, and
+  sendable: the scopes the code opens after reading it change the thread's context, not the snapshot.
+  It answers **`deadline -> Option[Instant]`**, the instant the work must be done by, and
+  **`remaining() -> Option[Duration]`**, the time left on the monotonic clock, never less than zero;
+  both `None` where no scope set a deadline. `main` and every thread begin with an empty context.
+- **`Key[T](name)`** names a value of type `T`. **Keys are told apart by identity**, not by name, so
+  two keys of one name are two keys: a module makes each of its keys once, as a module-level value, and
+  what it sets is reached by that key alone. `key.name` is for showing.
+- **`withValue[K: Sendable, T](key: Key[K], value: K, body: () -> T) -> T`** runs `body` on the
+  calling thread with `value` under `key`, and puts the context back however the body ends, by
+  returning or by a cancellation. Inside, **`value[T](key: Key[T]) -> Option[T]`** answers `Some(value)`,
+  in the body, everything it calls and the threads it starts, until a scope inside sets the key again,
+  which shadows it for its own body. A value of another type is not set under a key, and a lookup
+  answers the key's own type, so nothing is cast; the value is sendable, since other threads read it.
+- **`withDeadline[T](deadline: Instant, body: (Scope) -> T) -> Result[T, DeadlineExceeded]`** is
+  [`withTimeout`](#timers-and-deadlines) at an instant: `Ok` of what the body returns before
+  `deadline`, and `Err(DeadlineExceeded(deadline))` where the deadline passes first. Then the body is
+  cancelled where it is, with every thread its scope started and everything below them, and
+  `withDeadline` answers once they have all ended. A deadline already past runs nothing. The wall clock
+  is read once, as the scope opens; from then on the deadline runs on the monotonic clock, so setting
+  the wall clock moves nothing. **`DeadlineExceeded(deadline: Instant)`** is an
+  [`Error`](/spec/errors/#the-error-trait) whose message is `deadline exceeded`.
+- **`withTimeout` sets the deadline too**, `timeout` from the call, so code below either reads the
+  time it has left the same way.
+- **A nested deadline tightens and never loosens.** The context keeps the sooner of a scope's deadline
+  and the one around it, so the code inside a later deadline still reads the earlier one, and the
+  outer scope's cancellation ends the inner one with its body: no scope can buy its body more time than
+  the scope around it has.
+- **Blocking calls observe the deadline through cancellation.** Since a deadline that passes cancels
+  its body, every [cancellation point](#cancellation) below it ends at once: a socket's `accept`,
+  `connect`, read or write, a [pool](#pools)'s `use` or `lease` waiting for a resource, a channel's
+  `receive` or `send`, a `select`, a `sleep`, a join, a future's `await`, and the safepoint poll of
+  code that computes without waiting. Nothing inside sees an error value: the body stops, its deferred
+  statements run, and the error is `withDeadline`'s answer. Code that must tidy up when it is stopped,
+  a database driver telling its server to drop a query, does it in a `defer`, whose waits run to their
+  end.
+- **What a new thread takes follows what can cancel it.** A thread a scope starts, through `s.spawn`
+  or as the body of a `withTimeout` or `withDeadline`, takes the starter's whole context, its deadline
+  with its values, since a cancellation of the scope reaches it. A plain `spawn`, the code of a future
+  (`Future(…)`, `executor.future`, `map`, `flatMap`, `onComplete`) and an executor's `execute` task take
+  the values with no deadline, since nothing cancels them when it passes; a future's callback takes the
+  context of the code that attached it, not of the thread that completed the future. **An actor's turn
+  takes nothing**, neither from the code that told the actor nor from the worker it runs on: an actor
+  outlives any one request, and its turns are not a scope's threads. A value that should cross a
+  `tell` goes in the message.
+- **Siblings share nothing.** A value a thread sets is its own and its children's: the thread that
+  started it, and the threads beside it, do not see it.
 
 ## Futures
 
@@ -534,8 +1068,12 @@ main() -> int
 Starting a thread happens before its body; its end happens before `join` returns; releasing a
 `Mutex` happens before the next thread takes it; a `send` happens before the `receive` that gets the
 value; an `Atomic` store happens before every load that reads it; and completing a future happens
-before every `await` that gives its value and before every combinator's function runs with it. A
-program whose shared
+before every `await` that gives its value and before every combinator's function runs with it.
+In the rest of the kit: a wait group's `add` and `done` happen before every `wait` they let return;
+a semaphore's `release` happens before the acquire that takes the permit it gave back; the end of a
+`RwLock`'s write happens before every read and write after it, and the end of a read before the
+write after it; and every party's arrival at a barrier happens before that round's action, which
+happens before every party's `wait` of the round returns. A program whose shared
 mutable state is reached only under those edges sees sequentially consistent behaviour.
 
 **A data race on a plain field or `var` is not undefined behaviour.** A racing read returns some
@@ -575,3 +1113,74 @@ handles one message at a time, so its own state needs no lock; its mailbox is a 
 heap, and a message is a reference to a heap value. A message holds only values no other actor can
 change, or hands over the ownership of what it carries, and the compiler checks every message type
 for it ([what may be sent](/spec/actors/#what-may-be-sent)).
+
+## Diagnostics
+
+The runtime says what a program's threads are doing in two cases: when every one of them waits for
+something nothing can end, and when the program is asked for a thread dump.
+
+### Deadlock
+
+A program whose threads all wait for each other stops, as a trap does, with a list of its threads
+and what each waits on:
+
+```
+avin: trap: deadlock: all threads are waiting
+  main: waiting for a thread to end
+  thread 1: waiting for a lock
+  thread 2: waiting for a lock
+```
+
+The program is deadlocked when `main` waits without a limit (for a lock, a condition, a join, a
+channel, a future, a [`select`](#select) with no `after`, or anything built on them) and at that
+moment
+
+- no lightweight thread is running or ready, so every one waits too, and
+- nothing outside the threads can end a wait: no timer is set (a sleep, a wait with a limit, an
+  `ask`'s limit, an actor's timer, a signal watch's `wait`), no thread waits on a socket, no thread
+  the program did not start is attached, and no callback that such a thread may call
+  ([`@threaded`](/spec/sysl-bindings/#callbacks)) is held.
+
+A thread in a blocking call (a [`blocking`](/spec/sysl-bindings/#calls-that-wait) binding, reading
+input, waiting for a command to end) is running, so a program with one is never deadlocked, and
+neither is a `main` that runs its own work, a window's frame loop among it. An `ask` that nobody
+answers is not a deadlock either: its limit ends it with `TimedOut`. An actor waiting for mail
+nobody can send has no thread at all, so `main` awaiting its end is deadlocked once everything else
+waits.
+
+The report lists `main` first, then each lightweight thread still there in the order the threads
+started, numbered from 1 by that order; a thread that has ended is not listed. A pool's idle workers,
+which wait for work by design and are as many as the machine has processors, are left out. What a
+thread waits on is one of: a lock (a mutex's), a condition, a thread to end (a join), receiving from
+a channel, sending to a full channel, a future, or a select, `waiting in a select on 2 channels`,
+which counts its arms that name a channel. A select with an `after` is a wait with a limit, whose
+timer can always end it, so it is never part of a deadlock. The report goes to standard error after what the
+program had printed is flushed, the exit hooks run after it, and the program ends as a trap ends it.
+
+**Only a deadlock of the whole program is found.** Threads that wait for each other while another
+thread still runs, or while `main` computes or sleeps, are not reported: the program goes on, and
+ends when `main` returns.
+
+### Thread dump
+
+The quit signal (Ctrl-\ at a terminal, `kill -QUIT`) writes every thread's state to standard error,
+and the program goes on as it was:
+
+```
+avin: thread dump
+  main: running
+  thread 1: waiting to receive from a channel, 250 ms
+  thread 2: sleeping, 1200 ms
+  thread 3: waiting on a condition with a time limit, 3 ms
+  thread 4: running
+  thread 5: idle, waiting for work, 40 ms
+```
+
+Each thread is `running` (`running, in a blocking call` while it is in one), `ready` for a worker,
+`ending`, or waiting, with what it waits on as in the deadlock report, `sleeping`, `waiting on a
+socket`, or, for a pool's worker with no work, `idle, waiting for work`; a wait with a limit says so,
+and every wait says how long it has lasted, in milliseconds. Idle workers are listed here. A dump
+names no functions: a thread's frames do not record which function they belong to.
+
+A program that [watches](/spec/system-library/#avinsignal) the quit signal hears of it instead, and no
+dump is written while the watch lasts. A program started with the signal ignored keeps it ignored.

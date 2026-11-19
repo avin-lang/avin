@@ -2,8 +2,12 @@ module avin.rt
 @tests
 
 import sysl.net.{Socket, resolve, socket, timed_out, would_block}
+import sysl.io.poll.{Event, Poller}
 import sysl.io.wait.{Readable, Writable}
-import sysl.time.monotonic
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import sysl.threads.spawn
+import sysl.time.{millis, monotonic, sleep}
 
 // The poller's tokens, and the waits and operations of a thread that is not lightweight, which waits
 // on the descriptor alone. A lightweight thread's parking is exercised by the programs that serve
@@ -70,6 +74,82 @@ send_and_receive()
     c.close().unwrap()
     assert_eq(socket_recv(e.served, into[..], 1000).unwrap(), 0usize)
 
+@test("a receive answers exactly the bytes that arrived, at most `max`, whatever `max` is, and none at the end")
+receive_answers_what_arrived()
+    val e = ends()
+    socket_send_all(e.client, "ping".bytes, 0).unwrap()
+    val got = socket_receive(e.served, 65536, 1000).unwrap()
+    assert_eq(got.len, 4usize)
+    assert_eq(got[0], u8('p'))
+    assert_eq(got[3], u8('g'))
+    socket_send_all(e.client, "abcdef".bytes, 0).unwrap()
+    val first = socket_receive(e.served, 4, 1000).unwrap()
+    assert_eq(first.len, 4usize)
+    assert_eq(first[3], u8('d'))
+    val rest = socket_receive(e.served, 65536, 1000).unwrap()
+    assert_eq(rest.len, 2usize)
+    assert_eq(rest[1], u8('f'))
+    socket_receive(e.served, 1, 20) match
+        Ok(_) -> panic("nothing was sent")
+        Err(err) -> assert(timed_out(err))
+    var c = e.client
+    c.close().unwrap()
+    assert_eq(socket_receive(e.served, 65536, 1000).unwrap().len, 0usize)
+
+// What a second thread sees of a carrier while the carrier's thread waits in a receive: how many
+// shares its receiving buffer has, and then the bytes that end the wait, sent on `client`.
+private struct Watch
+    carrier: *Carrier
+    client: Option[Socket]
+    shares: Atomic[u64]
+
+private var watch: Watch = Watch(null, None, Atomic(0))
+
+// How many shares the storage of `k`'s receiving buffer has: the count is the first word of the
+// storage the slice's owner word names.
+private receiving_shares(k: *Carrier) -> u64
+    val owner: **u64 = ptr_cast(&k.receiving)
+    if owner[0] == null then 0 else owner[0][0]
+
+// Waits until the receiving thread has grown its buffer, and a while more, by which time the thread
+// is waiting; counts the buffer's shares, then sends the bytes that end the wait.
+private watch_receive(w: *Watch) -> unit
+    while w.carrier.receiving.len < 65536 do sleep(millis(1))
+    sleep(millis(200))
+    w.shares.store(receiving_shares(w.carrier))
+    socket_send_all(w.client.unwrap(), "late".bytes, 0).unwrap()
+
+@test("a receive that waits holds no share of its carrier's buffer meanwhile, since a lightweight thread let go of one on whichever carrier it resumed on; the buffer is kept for the next receive")
+receive_waits_sharing_nothing()
+    val me = thread_attach()
+    val e = ends()
+    watch.carrier = me.carrier
+    watch.client = Some(e.client)
+    watch.shares.store(0)
+    val t = spawn(&watch_receive, &watch).unwrap()
+    val got = socket_receive(e.served, 65536, 10000).unwrap()
+    assert(t.join())
+    watch.client = None
+    assert_eq(got.len, 4usize)
+    assert_eq(got[3], u8('e'))
+    assert_eq(watch.shares.load(), 1u64)
+    assert_eq(receiving_shares(me.carrier), 1u64)
+    // A smaller receive takes the same buffer rather than a new one.
+    val before: **u8 = ptr_cast(&me.carrier.receiving)
+    val storage = before[0]
+    socket_send_all(e.client, "again".bytes, 0).unwrap()
+    val small = socket_receive(e.served, 16, 1000).unwrap()
+    assert_eq(small.len, 5usize)
+    assert_eq(small[4], u8('n'))
+    assert(before[0] == storage)
+    assert_eq(receiving_shares(me.carrier), 1u64)
+    // A receive whose wait times out leaves no share behind either.
+    socket_receive(e.served, 65536, 20) match
+        Ok(_) -> panic("nothing was sent")
+        Err(err) -> assert(timed_out(err))
+    assert_eq(receiving_shares(me.carrier), 1u64)
+    thread_detach(me)
+
 @test("an accepted connection is non-blocking, so a receive with nothing to read answers would-block rather than waiting")
 accepted_is_non_blocking()
     val e = ends()
@@ -88,3 +168,157 @@ connect_refused()
     socket_connect(socket(to).unwrap(), to) match
         Ok(_) -> panic("nobody listens")
         Err(err) -> assert(net_failure(err) is Refused)
+
+private var waiting: [2]Waiter = [new_waiter(); 2]
+
+// A report of `fd`, as the poller's thread reads one.
+private report(fd: int, readable: bool, writable: bool, hangup: bool, error: bool) -> Event
+    var e = Event.none
+    e.token = u64(fd)
+    e.readable = readable
+    e.writable = writable
+    e.hangup = hangup
+    e.error = error
+    e
+
+// Under `io_lock`: a slot for each direction of `fd`, both waited for at once.
+private both_ways(p: Poller, fd: int) -> (u64, u64)
+    val r = take_slot(&waiting[0])
+    val w = take_slot(&waiting[1])
+    begin_fd_wait(p, fd, Readable, r).unwrap()
+    begin_fd_wait(p, fd, Writable, w).unwrap()
+    assert_eq(io_fds[usize(fd)].reading, r)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    (r, w)
+
+@test("a descriptor waited on for reading and for writing at once keeps both waiters, and a report of one direction wakes that direction's alone")
+two_directions_on_one_descriptor()
+    val e = ends()
+    val fd = e.served.fd().unwrap()
+    io_lock.lock()
+    val p = poller().unwrap()
+    val (r, w) = both_ways(p, fd)
+    reported(p, report(fd, true, false, false, false))
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    // The report let the reader's slot go, and the writer's is still taken.
+    assert(give_slot(r) == null)
+    reported(p, report(fd, false, true, false, false))
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    assert(give_slot(w) == null)
+    // Writable first, the other way round.
+    val (r2, w2) = both_ways(p, fd)
+    reported(p, report(fd, false, true, false, false))
+    assert_eq(io_fds[usize(fd)].reading, r2)
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    assert(give_slot(w2) == null)
+    reported(p, report(fd, true, false, false, false))
+    assert(give_slot(r2) == null)
+    io_lock.unlock()
+
+@test("a hang-up with one direction named wakes that direction alone, a hang-up naming neither or a failure wakes both, and a report for a descriptor nobody waits on wakes nobody")
+hangups_and_failures()
+    val e = ends()
+    val fd = e.served.fd().unwrap()
+    io_lock.lock()
+    val p = poller().unwrap()
+    // A peer that has only finished sending leaves the descriptor writable: the writer waits on.
+    val (r, w) = both_ways(p, fd)
+    reported(p, report(fd, true, false, true, false))
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    assert(give_slot(w) != null)
+    end_fd_wait(fd, w)
+    // A hang-up naming neither direction.
+    val (r2, w2) = both_ways(p, fd)
+    reported(p, report(fd, false, false, true, false))
+    assert(give_slot(r2) == null)
+    assert(give_slot(w2) == null)
+    // A failure, with the readable direction named.
+    val (r3, w3) = both_ways(p, fd)
+    reported(p, report(fd, true, false, false, true))
+    assert(give_slot(r3) == null)
+    assert(give_slot(w3) == null)
+    // Nobody waits now, and a report for a descriptor beyond any waited on is dropped.
+    reported(p, report(fd, true, true, false, false))
+    reported(p, report(fd + 100000, true, true, false, false))
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    io_lock.unlock()
+
+@test("a wait that ends by itself takes its direction's waiter off the descriptor and leaves the other's")
+ended_wait_leaves_the_other_direction()
+    val e = ends()
+    val fd = e.served.fd().unwrap()
+    io_lock.lock()
+    val p = poller().unwrap()
+    val (r, w) = both_ways(p, fd)
+    _ = give_slot(r)
+    end_fd_wait(fd, r)
+    assert_eq(io_fds[usize(fd)].reading, 0u64)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    // Ending it again, or under a token it never had, changes nothing.
+    end_fd_wait(fd, r)
+    end_fd_wait(fd, 12345)
+    assert_eq(io_fds[usize(fd)].writing, w)
+    _ = give_slot(w)
+    end_fd_wait(fd, w)
+    assert_eq(io_fds[usize(fd)].writing, 0u64)
+    // A descriptor that is not one is refused, and leaves nothing waiting.
+    val t = take_slot(&waiting[0])
+    assert(begin_fd_wait(p, -1, Readable, t).is_err())
+    assert(give_slot(t) == &waiting[0])
+    io_lock.unlock()
+
+@test("a socket is writable until its buffers fill, a send of some sends at least one byte while it is, and then waits at most its limit; a send of nothing sends nothing at once; once the peer has read everything, a send goes through again")
+send_some_until_full()
+    val e = ends()
+    val fd = e.client.fd().unwrap()
+    val block = [7u8; 65536]
+    assert_eq(socket_send_some(e.client, block[0..<0], 0).unwrap(), 0usize)
+    assert(socket_writable(e.client))
+    assert(descriptor_writable(fd))
+    // The kernel moves queued bytes on to the peer, and takes them out of the sender's buffer, after the
+    // send that queued them has returned, so a socket found without room can have room again a moment
+    // later, until the peer's receive buffer has filled as well. Room only grows while nothing is sent:
+    // the descriptor looked at between two looks at the socket that both find no room has none either.
+    // Filling goes on until a send with a limit finds no room for its whole limit.
+    var sent: usize = 0
+    var full = false
+    while !full
+        while socket_writable(e.client)
+            val n = socket_send_some(e.client, block[..], 0).unwrap()
+            assert(n >= 1)
+            sent += n
+        val between = descriptor_writable(fd)
+        if socket_writable(e.client) then continue
+        assert(!between)
+        socket_send_some(e.client, block[..], 20) match
+            Ok(n) ->
+                assert(n >= 1)
+                sent += n
+            Err(err) ->
+                assert(timed_out(err))
+                full = true
+    assert(sent > 0)
+    // The peer reads every byte sent, and the connection has room again.
+    var into: [65536]u8 = [0; 65536]
+    var got: usize = 0
+    while got < sent
+        val n = socket_recv(e.served, into[..], 5000).unwrap()
+        assert(n >= 1)
+        assert(into[0] == 7)
+        got += n
+    assert_eq(got, sent)
+    assert(socket_send_some(e.client, block[..], 5000).unwrap() >= 1)
+    // A descriptor that is not one counts as writable, so the write that follows answers why.
+    assert(descriptor_writable(-1))
+
+@test("a socket shared for the other half of a connection names its descriptor, and closing either closes both")
+shared_socket_is_one_descriptor()
+    val e = ends()
+    var shared = socket_share(e.client)
+    assert_eq(shared.fd().unwrap(), e.client.fd().unwrap())
+    shared.close().unwrap()
+    assert(e.client.fd().is_err())
+    assert(socket_writable(e.client))

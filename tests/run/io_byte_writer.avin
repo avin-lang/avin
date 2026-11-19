@@ -1,0 +1,200 @@
+// expect: exit 0
+// `io.ByteWriter` is anything bytes are written to: a file, a connection over TCP, a Unix socket or
+// TLS, the writing half of each split connection, and a sink of the program's own. Each takes the
+// same writes through the trait as a value and through a generic `[W: ByteWriter]`: an empty write,
+// a short one and a large one, and the other end reads back exactly what was written. A write after
+// `close` is an `Err` through the trait as it is directly, and so is a write to a file opened only
+// for reading; a file opened to append adds to its end. A sink's own `Err` reaches the caller as it
+// was made.
+import avin.fs
+import avin.io
+import avin.io.{ByteWriter, IoError}
+import avin.net.{ByteStream, StreamWriter, TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+// How many bytes the large write holds: more than one read of a connection takes at once.
+val Large = 200000
+
+// The byte at `i` of the large write.
+patternAt(i: int) -> byte = byte((i * 7 + 3) % 251)
+
+// What every writer below is written: `hello `, nothing, nothing, `world`, then the large write.
+expected() -> Array[byte]
+  val all = Buffer[byte]()
+  all.addAll(bytesOf("hello world"))
+  all.addAll(Array.tabulate(Large, patternAt))
+  all.toArray()
+
+// Whether `got` is what every writer is written, or where it differs.
+summary(got: Array[byte]) -> string
+  val want = expected()
+  if got.length != want.length then return s"${got.length} bytes, not ${want.length}"
+  for k in 0 ..< got.length
+    if got(k) != want(k) then return s"differs at byte $k"
+  s"all ${got.length} bytes"
+
+// The first writes, through the trait as a value.
+viaValue(w: ByteWriter) -> Result[unit, IoError]
+  w.write(bytesOf("hello "))?
+  w.write(Array.empty[byte]())
+
+// The rest, through a generic bounded by the trait.
+viaGeneric[W: ByteWriter](w: W) -> Result[unit, IoError]
+  w.write(Array.empty[byte]())?
+  w.write(bytesOf("world"))?
+  w.write(Array.tabulate(Large, patternAt))
+
+// What a write came to: `ok`, or the kind of its failure.
+outcome(r: Result[unit, IoError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(e) -> e.kind.description
+
+// A sink of the program's own, which keeps what is written for the test to read back.
+class Kept: ByteWriter
+  val bytes = Buffer[byte]()
+  var writes = 0
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    writes += 1
+    self.bytes.addAll(bytes)
+    Ok(())
+
+// A sink that takes `room` writes and refuses every one after.
+class Full(private val room: int): ByteWriter
+  var writes = 0
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    writes += 1
+    if writes > room then Err(IoError(io.Other("the sink is full"), "write to", "the sink")) else Ok(())
+
+own()
+  val k = Kept()
+  ok(viaValue(k))
+  ok(viaGeneric(k))
+  println("own", summary(k.bytes.toArray()), "in", k.writes, "writes")
+  val full = Full(1)
+  // The second write, an empty one, is past its room.
+  println("full, value", outcome(viaValue(full)), "after", full.writes, "writes")
+  val w: ByteWriter = full
+  w.write(bytesOf("more")) match
+    Err(e) -> println("full, then", e.message, "after", full.writes, "writes")
+    Ok(_) -> println("full took a write past its room")
+  println("full, generic", outcome(viaGeneric(full)), "after", full.writes, "writes")
+
+file(dir: string)
+  val name = dir + "/out"
+  val f = ok(fs.create(name))
+  ok(viaValue(f))
+  ok(viaGeneric(f))
+  ok(f.close())
+  println("file", summary(ok(fs.readBytes(name))))
+  // After `close`, through the trait and directly, an empty write included.
+  val w: ByteWriter = f
+  println("file closed", outcome(w.write(bytesOf("x"))), outcome(viaGeneric(f)), outcome(f.write(Array.empty[byte]())))
+  w.write(bytesOf("x")) match
+    Err(e) -> println("file closed says", e.operation, e.subject == name, e.message.endsWith(": the file is closed"))
+    Ok(_) -> println("a closed file took a write")
+  // Opened only to read: no write is taken, and the file is unchanged.
+  val r = ok(fs.open(name))
+  val rw: ByteWriter = r
+  rw.write(bytesOf("x")) match
+    Err(e) -> println("read-only says", e.kind.description, e.message.endsWith("not open for writing"))
+    Ok(_) -> println("a read-only file took a write")
+  ok(r.close())
+  // Opened to append: the writes go after what is there.
+  val a = ok(fs.append(name))
+  ok(viaGeneric(a))
+  ok(a.close())
+  println("appended", ok(fs.readBytes(name)).length == 2 * (Large + 5) + 6)
+
+// The peer: reads until the client finishes sending, then answers what it received.
+drain(s: ByteStream)
+  val got = ok(s.readAll())
+  ok(s.writeText(summary(got) + "\n"))
+  _ = s.close()
+
+// The client: writes through the trait to the connection, or to its writing half, ends its sending,
+// and prints the peer's answer; then a write after `close`.
+client[S: ByteStream](name: string, c: S, splitting: bool)
+  if splitting
+    val (r, w) = c.split()
+    ok(viaValue(w))
+    ok(viaGeneric(w))
+    ok(w.close())
+    println(name, "split", ok(r.readLine()).getOrElse("nothing"))
+    println(name, "split closed", outcome(viaValue(w)), outcome(viaGeneric(w)))
+    _ = r.close()
+  else
+    ok(viaValue(c))
+    ok(viaGeneric(c))
+    ok(c.shutdownOutput())
+    println(name, ok(c.readLine()).getOrElse("nothing"))
+    ok(c.close())
+    println(name, "closed", outcome(viaValue(c)), outcome(viaGeneric(c)))
+
+tcp(splitting: bool)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val peer = spawn(() ->
+    drain(ok(l.accept()))
+    _ = l.close())
+  client("tcp", ok(TcpStream.connect("127.0.0.1", port)), splitting)
+  peer.join()
+
+unix(dir: string, splitting: bool)
+  val at = dir + (if splitting then "/split" else "/whole")
+  val l = ok(UnixListener.bind(at))
+  val peer = spawn(() ->
+    drain(ok(l.accept()))
+    _ = l.close())
+  client("unix", ok(UnixStream.connect(at)), splitting)
+  peer.join()
+
+secure(splitting: bool)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val peer = spawn(() ->
+    drain(tls(TlsStream.server(ok(l.accept()), server)))
+    _ = l.close())
+  client("tls", tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem")))), splitting)
+  peer.join()
+
+// Each kind of writer as a value of the trait, and as a generic's type argument the trait itself.
+asValues(dir: string)
+  val f = ok(fs.create(dir + "/values"))
+  val k = Kept()
+  val writers: Vector[ByteWriter] = [f, k]
+  for w in writers
+    ok(viaValue(w))
+    ok(viaGeneric[ByteWriter](w))
+  ok(f.close())
+  println("values", summary(ok(fs.readBytes(dir + "/values"))), summary(k.bytes.toArray()))
+
+main()
+  val dir = ok(fs.createTempDir("avin-byte-writer"))
+  own()
+  file(dir)
+  tcp(false)
+  tcp(true)
+  unix(dir, false)
+  unix(dir, true)
+  secure(false)
+  secure(true)
+  asValues(dir)
+  ok(fs.removeDirAll(dir))

@@ -1,0 +1,59 @@
+// expect: exit 0
+// A `readable()` arm takes any `Readiness`, not only a connection. One with no descriptor is found
+// readable only when the select tries its arms: ready, it runs; not ready, the select's `after` or
+// `else` runs, or another arm. One that passes a connection's descriptor on, wrapping it, waits on
+// the poller as the connection would. The arm's source is evaluated once, before any arm is tried.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Atomic, Readiness, sleep, spawn}
+import avin.time.{millis, seconds}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Readable while its flag is up; it has no descriptor.
+class Flag(var up: bool): Readiness
+  override readable() -> bool = up
+  override readinessDescriptor() -> int = -1
+
+// A connection seen through a wrapper, which counts how often it is asked.
+class Counted(private val conn: TcpStream): Readiness
+  val asked = Atomic(0)
+  override readable() -> bool
+    asked.add(1)
+    conn.readable()
+  override readinessDescriptor() -> int = conn.readinessDescriptor()
+
+main()
+  val f = Flag(false)
+  println(select
+    f.readable() -> "up"
+    after millis(20) -> "timed out")
+  println(select
+    f.readable() -> "up"
+    else "down")
+  f.up = true
+  println(select
+    f.readable() -> "up"
+    after seconds(5) -> "timed out")
+
+  var made = 0
+  val source = () ->
+    made += 1
+    f
+  println(select
+    source().readable() -> "up", made)
+
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val s = ok(l.accept())
+  val w = Counted(c)
+  val writer = spawn(() ->
+    sleep(millis(20))
+    ok(s.writeText("wrapped\n")))
+  println(select
+    w.readable() -> ok(c.readLine()).getOrElse("(end)")
+    after seconds(5) -> "timed out")
+  println(w.asked.load() >= 2)
+  writer.join()

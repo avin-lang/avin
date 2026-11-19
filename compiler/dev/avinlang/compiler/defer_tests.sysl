@@ -1,0 +1,50 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+
+// How a deferred statement is compiled: reaching a `defer` puts its closure on the thread's list of
+// deferred statements, and leaving its block runs the block's own from that list, so that a
+// cancellation that drops the frame runs them too. A function that defers nothing touches the list
+// nowhere.
+
+private defer_ir(text: string) -> string = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> emit_llvm(p)
+    Err(d) -> panic(d)
+
+/** The LLVM text of the program's function `name` in `ir`. */
+private defer_function(ir: string, name: string) -> string
+    val head = "@\"<program>." + name + "\"("
+    var out = ""
+    var inside = false
+    for line in ir.split("\n")
+        if line.starts_with("define ") && line.contains(head) then inside = true
+        if inside
+            out = out + line + "\n"
+            if line == "}" then return out
+    out
+
+/** How many times `needle` occurs in `text`. */
+private occurrences(text: string, needle: string) -> usize
+    var n: usize = 0
+    for line in text.split("\n")
+        if line.contains(needle) then n += 1
+    n
+
+const Deferring: string = "plain(n: int) -> int\n    var total = 0\n    for i in 0 ..< n\n        total += i\n    total\n\ncleaned(n: int) -> int\n    defer println(\"outer\")\n    if n > 0\n        defer println(\"inner\")\n        return n\n    0\n\nmain()\n    println(plain(3))\n    println(cleaned(2))\n"
+
+@test("a function that defers nothing never touches the thread's list of deferred statements")
+test_no_defer_no_cost()
+    val f = defer_function(defer_ir(Deferring), "plain")
+    assert(f != "", "the function is emitted")
+    assert(!f.contains("avin_rt_defer_push"), "nothing is put on the list")
+    assert(!f.contains("avin_rt_defers_run"), "nothing is run from the list")
+
+@test("each `defer` reached puts its closure on the list, and each way out of a block runs that block's from it")
+test_defer_pushes_and_runs()
+    val f = defer_function(defer_ir(Deferring), "cleaned")
+    assert(occurrences(f, "call void @avin_rt_defer_push(") == 2, "one push for each `defer`")
+    // The `return` inside the `if` runs both deferred statements at once; the end of the function
+    // runs the outer one; leaving the `if` block normally is never reached, since it returns.
+    assert(f.contains("@avin_rt_defers_run(ptr %ctx, i64 2)"), "the return runs both")
+    assert(f.contains("@avin_rt_defers_run(ptr %ctx, i64 1)"), "the function's end runs its own")

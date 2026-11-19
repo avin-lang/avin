@@ -347,7 +347,7 @@ private index_local(c: *Checker, unit: usize, at: Span, index: usize, ty: &Type)
         None -> return
     if ix.locals.get(local_key(c, index)) is Some(place)
         val l = c.body.locals[index]
-        index_note(c, unit, at, place.unit, place.span, place.span.start, ValueTarget(if l.mutable then "var " else "val ", l.name, ty, LocalRole))
+        index_note(c, unit, at, place.unit, place.span, place.span.start, ValueTarget(local_keyword(c, l), l.name, ty, LocalRole))
 
 /** A module, at its first file's header. */
 index_module(c: *Checker, unit: usize, at: Span, name: string)
@@ -363,8 +363,10 @@ index_type_param(c: *Checker, unit: usize, at: Span, p: TypeParam)
     if c.index is None then return
     val declared = name_in(c.units[unit].src, p.span, p.name)
     if declared.end <= declared.start then return
-    index_note(c, unit, at, unit, declared, p.span.start, TypeParamTarget(p.name))
-    index_note(c, unit, declared, unit, declared, p.span.start, TypeParamTarget(p.name))
+    // Hover shows the parameter as declared, its holes and bounds included: `F[_]: Monad`.
+    val shown = show_type_param(p)
+    index_note(c, unit, at, unit, declared, p.span.start, TypeParamTarget(shown))
+    index_note(c, unit, declared, unit, declared, p.span.start, TypeParamTarget(shown))
 
 /** A new local, declared by a statement or a pattern spanning `at`: where its name is written, kept
  * for the reads of it, and recorded as a reference to itself. */
@@ -376,7 +378,10 @@ index_declared_local(c: *Checker, at: Span, name: string, index: usize, ty: &Typ
     val unit = current_unit(c)
     val written = name_in(c.units[unit].src, at, name)
     ix.locals.put(local_key(c, index), LocalPlace(unit, written))
-    index_note(c, unit, written, unit, written, written.start, ValueTarget(if c.body.locals[index].mutable then "var " else "val ", name, ty, LocalRole))
+    index_note(c, unit, written, unit, written, written.start, ValueTarget(local_keyword(c, c.body.locals[index]), name, ty, LocalRole))
+
+/** How a local is declared, as hover shows it: `var`, `val`, or `lazy val` for one kept in a cell. */
+private local_keyword(c: *Checker, l: TLocal) -> string = if is_lazy_cell(c, l.ty) then "lazy val " elif l.mutable then "var " else "val "
 
 /** Records what an expression that names something resolved to, from what checking it produced. */
 index_expr(c: *Checker, e: &Expr, t: &TExpr)
@@ -413,6 +418,7 @@ private index_typed(c: *Checker, unit: usize, at: Span, t: &TExpr)
     t.kind match
         Box(v) -> index_typed(c, unit, at, v)
         NoneAs(v) -> index_typed(c, unit, at, v)
+        Reveal(v) -> index_typed(c, unit, at, v)
         Block(items) -> if items.len() > 0 then index_typed(c, unit, at, items[items.len() - 1])
         Collection(_, built) -> index_typed(c, unit, at, built)
         CallValue(callee, _) -> index_typed(c, unit, at, callee)
@@ -422,11 +428,13 @@ private index_typed(c: *Checker, unit: usize, at: Span, t: &TExpr)
         Dispatch(f, _, _, _) -> index_function(c, unit, at, f)
         BoundCall(f, _, _, _) -> index_function(c, unit, at, f)
         FunctionValue(f, _) -> index_function(c, unit, at, f)
-        Construct(variant, _) -> *solve(c.vars, t.ty) match
+        Construct(variant, _, _) -> *solve(c.vars, t.ty) match
             Data(id, _, _) -> index_variant(c, unit, at, id, variant)
             _ -> ()
         Field(value, index) -> index_field(c, unit, at, value, index, t.ty)
         LazyField(object, index, _, _) -> index_field(c, unit, at, object, index, t.ty)
+        // A local `lazy val` is shown as the value it holds, not the cell it is kept in.
+        LazyLocal(cell, _, _, _) -> if cell.kind is Local(i) then index_local(c, unit, at, i, t.ty)
         Global(g) -> index_global(c, unit, at, g, t.ty)
         LazyGlobal(g, _, _) -> index_global(c, unit, at, g, t.ty)
         TypeReceiver -> index_type(c, unit, at, t.ty)
@@ -453,7 +461,7 @@ index_pattern(c: *Checker, p: &Pattern, t: &TPattern)
         Constructor(path, _, _) -> path
         _ -> return
     val index = t.kind match
-        PVariant(i, _) -> i
+        PVariant(i, _, _) -> i
         _ -> return
     *solve(c.vars, t.ty) match
         Data(id, _, _) -> index_variant(c, current_unit(c), Span(p.span.start, p.span.start + name.bytes.len), id, index)
@@ -653,7 +661,7 @@ private parent_text(e: &Expr) -> string = e.kind match
     _ -> show_expr(e)
 
 /** An alias as its declaration would be written: `type Parsed[T] = Result[T, ParseError]`. */
-private alias_header(d: &AliasDecl) -> string = "type " + d.name + type_params_text(d.type_params) + " = " + show_type(d.body)
+private alias_header(d: &AliasDecl) -> string = (if d.opaque then "opaque type " else "type ") + d.name + type_params_text(d.type_params) + " = " + show_type(d.body)
 
 private data_header(c: *Checker, id: usize) -> string
     val d = c.data[id].decl
@@ -666,30 +674,22 @@ private data_header(c: *Checker, id: usize) -> string
     out.finish()
 
 private variant_header(v: Variant) -> string
-    if v.fields.len() == 0 then return v.name
-    var out = v.name + "("
-    for i in 0..<v.fields.len()
-        if i > 0 then out = out + ", "
-        out = out + param_text(v.fields[i])
-    out + ")"
+    val head = v.name + type_params_text(v.type_params)
+    var out = head
+    if v.fields.len() > 0
+        out = out + "("
+        for i in 0..<v.fields.len()
+            if i > 0 then out = out + ", "
+            out = out + param_text(v.fields[i])
+        out = out + ")"
+    if v.result is Some(r) then out = out + " -> " + show_type(r)
+    out
 
 private param_text(p: Param) -> string =
     pattern_name(p.pattern) + ": " + (if p.by_name then "-> " else "") + show_type(p.ty) + (if p.variadic then "*" else "")
 
-private type_params_text(params: Buf[TypeParam]) -> string
-    if params.len() == 0 then return ""
-    var out = "["
-    for i in 0..<params.len()
-        if i > 0 then out = out + ", "
-        val tp = params[i]
-        out = out + (tp.variance match
-            Invariant -> ""
-            Covariant -> "+"
-            Contravariant -> "-") + tp.name
-        if tp.lower is Some(l) then out = out + " >: " + show_type(l)
-        for j in 0..<tp.bounds.len()
-            out = out + (if j == 0 then ": " else " + ") + show_type(tp.bounds[j])
-    out + "]"
+// A declaration's type parameters as they are written, a constructor parameter's holes included.
+private type_params_text(params: Buf[TypeParam]) -> string = show_type_params(params)
 
 private pattern_name(p: &Pattern) -> string = p.kind match
     Name(n) -> n

@@ -71,7 +71,8 @@ a shim would add a compile step, a cache and a Sysl dependency and check nothing
 4. **Link** passes the C unit's object and the libraries' link flags to clang with the program.
 
 The C unit is cached by a hash of its source, the include and link flags `pkg-config` answers, and
-`clang --version`. Nothing about a C binding needs the `sysl` command.
+`clang --version`. Nothing about a C binding needs the `sysl` command. `avin check` builds the C
+unit too, so a binding its headers refuse is refused by `check` exactly as by a build.
 
 ## C libraries
 
@@ -127,6 +128,46 @@ c-libraries {
 program that never names MLT itself. A package whose bindings name a [handle of another
 package](#handles-of-another-package) is checked with that package's headers too.
 
+### Linking statically
+
+**A program whose manifest says `static-c-libraries = true` links its C libraries from their static
+archives**, so the machine it runs on needs none of them installed
+([settled](/spec/decisions/#proposed)):
+
+```hocon
+package { name = "tend", version = "0.1.0" }
+
+static-c-libraries = true
+
+dependencies {
+  ssh { git = "github.com/avin-lang/ssh", version = "0.0.1" }
+}
+```
+
+- **The program decides, for every package in it.** Only the root package's key is read: a library
+  package that says it is built dynamically into a program that does not, and a program that says
+  it links the C libraries of its dependencies statically too. Without the key, or with `false`,
+  every library is linked as `pkg-config --libs` answers.
+- For each library a `pkg-config` module finds, the build asks `pkg-config --static --libs`, which
+  adds the libraries it links privately (`Libs.private`: libssh2's OpenSSL), and replaces each
+  `-l<name>` whose `lib<name>.a` is in one of the answer's `-L` directories by the archive's path, the
+  first directory holding one winning. **The path, because on macOS the linker takes a `.dylib` over
+  a `.a` in the same directory**, and Homebrew installs both side by side. The `-L` and run-path flags
+  are dropped; every other flag (`-framework`, `-pthread`) is kept.
+- **The system's own libraries stay dynamic.** A name none of the `-L` directories holds is one the
+  linker finds by itself, in the system (libSystem and libz on macOS), and stays `-l<name>`. A library
+  named by `link` is passed as `-l` as always.
+- **A library with no archive stops the build.** A name whose shared library is in one of the `-L`
+  directories but whose archive is in none would be linked dynamically, the very program the key is
+  there to prevent, so it is an error naming what is missing; `avin check` reports it too:
+
+  ```text
+  error: the C library `libssh2` of package `ssh` is linked statically (`static-c-libraries = true`), but `-lcrypto`, which `pkg-config --static --libs libssh2` names, has no static archive: `/opt/homebrew/opt/openssl@4/lib/libcrypto.dylib` has no `libcrypto.a` beside it
+  ```
+
+`otool -L` is the check: a program binding libssh2 and built this way lists only
+`/usr/lib/libSystem.B.dylib` and `/usr/lib/libz.1.dylib`.
+
 ## Prototypes
 
 The prototype is C's declaration with three words of its own, which say what C's types cannot. They
@@ -137,6 +178,7 @@ are written before the parameter's type and removed before the header check:
 | `out` | A pointer C writes a value through; the value is part of the binding's [result](#arrays-and-out-parameters), and the parameter is not an Avin parameter |
 | `inout` | A pointer C reads a value through and writes one back; an Avin parameter and part of the result |
 | `userdata` | The `void *` that travels beside a [callback](#callbacks); not an Avin parameter |
+| `null` | A pointer, a function pointer among them, the binding [passes null](#arrays-and-out-parameters); not an Avin parameter |
 
 `length(data)` before an integer parameter says it is the length of the array parameter `data`, and
 it is filled in from the array rather than written by the caller. It is written first, before the
@@ -201,6 +243,25 @@ avin: trap: value out of range for long at main.avin:13:13
   checks that the headers declare it taking the string or any pointer and answering nothing; it is
   not called for null. A binding with `free:` whose result is `unit` frees what C answered and
   discards it ([proposed](/spec/decisions/#proposed)).
+- **A string C answers through an `out` pointer is freed by an entry of `free:` naming it**
+  ([proposed](/spec/decisions/#proposed)): `"name: how"`, `how` a C function of the string or a C
+  expression in its name, compiled in the C unit's glue and called once the copy is made, never for
+  null; where a status fails, a string C answered is freed unread. A method's expression may also use
+  `self`, its receiver's `kept:` name and the values the receiver [holds](#values-a-handle-holds), as
+  its class's `release:` does. libssh2 answers a channel's exit signal and its message in strings
+  freed by `libssh2_free(session, p)`, and the session is the one the channel keeps:
+
+  ```avin
+  @c(
+    "int libssh2_channel_get_exit_signal(LIBSSH2_CHANNEL *self, out char **exitsignal, out size_t *exitsignal_len, out char **errmsg, out size_t *errmsg_len, null char **langtag, null size_t *langtag_len)",
+    free: ["exitsignal: libssh2_free(session, exitsignal)", "errmsg: libssh2_free(session, errmsg)"]
+  )
+  private exitSignalRaw() -> Result[(Option[string], long, Option[string], long), int]
+  ```
+
+  `free:` names each out string once, an `out` one answering a string or its bytes, never `inout`,
+  since C may answer the copy it was passed; an entry without a name frees the result as before, and a
+  binding whose `array:` names arrays frees them by position and no out string besides.
 - **A typedef of either pointer crosses as the header's type is**: as a result a `char *` or a
   `const char *` typedef, as a parameter only a `const char *` one, which the C unit checks.
 - **So does one pointer to a typedef of `char`** ([proposed](/spec/decisions/#proposed)), as
@@ -234,9 +295,9 @@ C reports most failures as an integer. A C integer result bound as `Result[unit,
 when it is zero and `Err(code)` otherwise. The code may be any integer type, converted with the check
 a scalar result has (`Result[unit, long]` for a `long long` status). With [out parameters](#arrays-and-out-parameters), a status result
 bound as `Result[T, int]` holds the out values in its `Ok`, and they are read only when the status is
-zero. Other conventions — a negative error number, `-1` beside `errno` — are written in Avin over the
-integer, and a public function maps the code to the library's own error type. Whether `errno` is read
-by the binding is [proposed](/spec/decisions/#proposed).
+zero. A function that answers -1 and says why in `errno` is bound [with `errno`](#errno); other
+conventions, a negative error number among them, are written in Avin over the integer, and a public
+function maps the code to the library's own error type.
 
 A status that is a C enum may be bound as `Result[unit, E]` with `E` its [mirror](#enums-and-constants):
 `Ok(())` for the enumerator whose value is zero, `Err` of the variant otherwise. The mirror keeps its
@@ -246,6 +307,44 @@ zero variant, since the same type is what a [callback](#callbacks) answers C wit
 ```avin
 @c("cairo_status_t cairo_surface_write_to_png(cairo_surface_t *self, const char *filename)")
 private writePngRaw(filename: string) -> Result[unit, Status]
+```
+
+### errno
+
+**A binding marked `errno` answers `Err` of `errno` where C answers -1** ([settled](/spec/decisions/#settled)).
+The word is written among `@c`'s arguments, as `blocking` is, and the binding answers a `Result`:
+`Ok` of what the C result and the out values make, by the rules for a result that is
+[not a status](#arrays-and-out-parameters) (the C result kept as an integer or left out, followed by
+the out values), and `Err` of why. The error is an `avin.c.Errno`, each POSIX error number by its
+own name, `ENOENT`, `ESRCH`, `EACCES`, whatever value it has on the machine the program is built for,
+which the C unit measures, and `Other(code)` for a number no named case is; or it is the number
+itself, any integer type. An `Errno` is an `Error`, whose message is the number's sentence, the same
+on every platform (`no such process`).
+
+```avin
+import avin.c.{Errno, ENOENT, EACCES}
+
+@c("int access(const char *path, int mode)", errno)
+private access(path: string, mode: int) -> Result[unit, Errno]
+
+describe(path: string) -> string = access(path, 4) match
+  Ok(()) -> "readable"
+  Err(ENOENT) -> "missing"
+  Err(EACCES) -> "forbidden"
+  Err(e) -> e.message
+```
+
+`errno` is read by the binding's glue in the C unit straight after the call, before anything else
+runs, a `length:` expression and a `blocking` call's return among them, so what it holds is what the
+function left. It is read only where the C result is -1, which is the failure, whatever `errno`
+holds; a function that sets `errno` and answers anything else has not failed, and the out values are
+read only where it has not, as a status's are. A C result of an unsigned type fails at its greatest
+value, which -1 converts to. A binding marked `errno` answers a `Result` whose error is an `Errno` or
+an integer, over a C integer result, and its `Ok` holds no status of its own; each is refused at the
+binding otherwise:
+
+```text
+error: the result of the C binding `text` is `Result[string, Errno]` in Avin and `const char *` in C: `errno` marks a C function that answers -1 where it fails, so its result is a C integer
 ```
 
 ### Errors kept on the object
@@ -414,8 +513,9 @@ keeping a face keeps the face's library too, so when the face's own handle is co
 gives back its reference to the library, the library still outlives the face the descriptor's
 `release` reaches through.
 
-A kept handle with no `retain`, a `ByteBlock` and a callback's closure are held as the Avin object, as
-before, and the holder's `release` must not use them: that is taken on [trust](#soundness).
+A kept handle with no `retain` that no `kept:` names, a `ByteBlock` and a callback's closure are held
+as the Avin object, as before, and the holder's `release` must not use them: that is taken on
+[trust](#soundness). One a `kept:` names is kept for the holder's release, as below.
 
 **A holder's `release` may name what it keeps.** A class declaring `kept: "face: Face"` is made only
 by bindings that keep exactly one `Face`, and its `release:` and `retain:` may use `face` as that
@@ -432,12 +532,66 @@ private mmVar(face: Face) -> Result[MMVar, int]
 ```
 
 A class with `kept:` made by a binding that does not keep one handle of that class is refused at the
-binding, as is a `kept:` name that `release:` and `retain:` never use. The class `kept:` names is one
-of the holder's module, or one written with its module (`freetype.Face`), and it declares `retain`
-and no `kept:` of its own, since its pointer is valid only while a C reference holds it. `retain:`
-sees the name where it takes the reference of a `borrowed` result, as the pointer of the handle the
-binding keeps; a holder keeping a handle of a class with `kept:` holds it as the Avin object
-([proposed](/spec/decisions/#proposed)).
+binding, as is a `kept:` name that `release:` and `retain:` never use. The class `kept:` names is a C
+handle of the holder's module, or one written with its module (`freetype.Face`). `retain:` sees the
+name where it takes the reference of a `borrowed` result, as the pointer of the handle the binding
+keeps ([proposed](/spec/decisions/#proposed)).
+
+**A kept handle no C reference can hold is kept from the collector until the holder's `release` has
+run** ([proposed](/spec/decisions/#proposed)): one whose class declares no `retain`, or a `kept:` of its
+own. libssh2 counts no references: a channel belongs to its session, `libssh2_session_free` frees
+every channel still open, and `libssh2_channel_free` reaches through the channel to its session. So
+the channel's class names its session with `kept:`, and the session's handle is held as its Avin
+object, a root of every collection while the channel's handle holds it; the collector may find both
+dead at once, and finalizes the channel then and the session in a later collection. **The name is the
+kept handle's pointer, or null once that handle was closed**, so a release that must not run after
+the kept object's own says so:
+
+```avin
+@c(type: "LIBSSH2_CHANNEL *", kept: "session: Session", release: "session ? libssh2_channel_free(self) : 0")
+class Channel
+```
+
+A chain is given back in its order: a handle keeping a channel this way is finalized first, the
+channel in the next collection and the session in the one after. What the closed handle freed with
+it is the release's to know; only its own pointer is passed. **A cycle through such a kept handle is
+never collected**: a session whose handle keeps, as its Avin object, a channel that keeps the session
+this way is reachable from the channel's root for as long as both are open, and both are given back
+once either is closed ([proposed](/spec/decisions/#proposed)). The handle is kept by one root for each
+holder, and a holder closed lets go of its own at once.
+
+### Values a handle holds
+
+**A handle may hold C integers for its `release:`** ([proposed](/spec/decisions/#proposed)), declared by
+its class with `holds:`, a C declaration or a list of them, each starting at the value written
+(`= -1`) or zero. A binding names with `hold:` the parameters whose values the handle it answers, or
+for a method answering none its receiver, holds, when the call succeeds, converted to the declared
+type; a later `hold:` of the same name replaces the value. `release:` uses each by its name.
+
+libssh2 is handed the socket of a session and never closes it, and `libssh2_session_free` writes to
+it. An Avin `TcpStream` closes its socket when it is closed or collected, and its descriptor's number
+goes to the next one opened, so a session given the stream's own descriptor could write its farewell
+into an unrelated connection. Given a descriptor of its own, `dup`ed from the stream's, the session
+owns what its release writes to, whichever is collected first and whether or not the stream was
+closed before it:
+
+```avin
+@c(
+  type: "LIBSSH2_SESSION *",
+  holds: "int sock = -1",
+  release: "(libssh2_session_set_blocking(self, 1), libssh2_session_free(self), sock >= 0 ? close(sock) : 0)"
+)
+class Session
+  @c("int libssh2_session_handshake(LIBSSH2_SESSION *self, int sock)", hold: "sock")
+  private handshakeRaw(sock: int) -> Result[unit, int]
+```
+
+A value held is a C integer, no wider than a pointer, never a reference: what it names is the
+release's to give back, and a holder holds nothing for another. A class with `holds:` is not `shared`,
+since only the handle's owner sets what it holds, and declares no `retain:`, since what it holds is the
+one handle's. Each name is used by `release:`, and is neither `self` nor the `kept:` name; `hold:`
+names integer parameters, on a binding answering a handle or a method of one whose class declares
+each name.
 
 ### Handles of another package
 
@@ -856,8 +1010,26 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   private glyphsRaw(x: real, y: real, utf8: string, length: int) -> Result[(Array[Glyph], int), Status]
   ```
 
-  `null` is never `out`, `inout` or `userdata` besides, never an array a length is filled in from, and
-  never a callback's parameter.
+  `null` is never `out`, `inout` or `userdata` besides, never written twice, never an array a length
+  is filled in from, and never a callback's parameter; a struct passed by value or a scalar is no
+  pointer, and is refused.
+
+  **A function pointer marked `null` is passed null too** ([proposed](/spec/decisions/#proposed)), for C
+  that takes optional hooks and uses its own where it is given none. libssh2 makes a session only
+  through `libssh2_session_init_ex`, which takes an allocator, a free function, a reallocator and the
+  `void *` they share, `libssh2_session_init()` being a macro that passes four nulls:
+
+  ```avin
+  @c(
+    "LIBSSH2_SESSION *libssh2_session_init_ex(null void *(*my_alloc)(size_t count, void **abstract), null void (*my_free)(void *ptr, void **abstract), null void *(*my_realloc)(void *ptr, size_t count, void **abstract), null void *abstract)"
+  )
+  private sessionInit() -> Option[Session]
+  ```
+
+  C never calls a function it is passed null for, so its parameters are read only as C's types, for the
+  header check: it is named, as every function pointer is, takes no `userdata` or `length` among its
+  parameters, and may answer any type, a string too. A function pointer passed null sits beside a
+  callback C does call, and beside every other kind of parameter.
 
 - **An out parameter is part of the result.** The Avin result is the C result followed by each
   `out` and `inout` value in order, as a tuple; a C result bound as `unit` leaves the tuple without
@@ -874,6 +1046,95 @@ constant, and holds NaN, the infinities and minus zero as C defines them.
   @c("int mlt_service_get_frame(mlt_service self, out mlt_frame *frame, int index)")
   private getFrame(index: int) -> Result[Frame, int]
   ```
+
+### Memory of no type
+
+**A `void *` or `const void *` parameter takes an array of any element type an array crosses as, or
+a `ByteBlock`, and its length counts bytes** ([settled](/spec/decisions/#settled)). C's untyped
+buffers are memory whose type the caller chooses: `sysctlbyname` writes an `int` or a `long`, `write`
+reads any bytes. So an `Array[byte]`, `Array[int]`, `Array[long]` or `Array[real]` goes to the pointer
+as it is, its elements where they are, and the header has no element type to check. The parameter
+marked `length(p)` is told the array's length times the size of its element, as a `long`, converted
+to the parameter's C type as any `long` argument is; an `inout` length C writes back through is in
+bytes too, and stops the program where it exceeds the array's bytes. C writes through `void *`, and
+what it wrote is in the array after the call, and only reads through `const void *`. An `Option` of
+the array passes null and a length of zero for `None`, and a `void *` marked `null` is passed null.
+A `ByteBlock` is passed as a pointer to its bytes, as to any pointer.
+
+```avin
+@c(
+  "int sysctlbyname(const char *name, void *oldp, length(oldp) inout size_t *oldlenp, null void *newp, size_t newlen)"
+)
+private sysctlRaw(name: string, into: Array[int], newlen: long) -> (int, long)
+
+// The `int` the kernel holds under `name`, where it holds one.
+sysctlInt(name: string) -> Option[int] =
+  val v = Array.fill(1, 0)
+  sysctlRaw(name, v, 0) match
+    (0, 4) -> Some(v(0))
+    _ -> None
+```
+
+`sysctlInt("kern.maxfilesperproc")` answers the limit; the same binding over an `Array[long]` reads
+`hw.memsize`, and asked with `None` for the array (bound as an `Option`), C answers the size it
+needs. The header check holds a `void *` to the header's type as it holds every pointer, so a binding
+saying `const void *` where the header writes `void *` is refused, and so is one saying `void *`
+where the header writes a typed pointer.
+
+**A pointer to an opaque pointer points at memory of no type too** ([settled](/spec/decisions/#settled)):
+`void **`, and a pointer to a typedef the headers make `void *` or `const void *`, as Apple's
+`rusage_info_t *` is. Headers write one where C writes whatever the caller's flavour says through it.
+Passed in, it takes what `void *` takes, its length in bytes. Only the headers say what a typedef
+is, so the C unit measures it, and checks the elements of an array passed to a pointer to a typedef
+are either what the typedef is or the typedef is `void *`; a typedef of an integer type points at
+elements, which its length counts. The header check still holds the prototype to the header's own
+type, so the binding writes `rusage_info_t *`, as the header does, never `void *` or the struct.
+
+**C fills memory of no type through `out`**: through `out void *` or a pointer to a typedef that is
+`void *`, `out rusage_info_t *buffer`, it fills [an array the binding allocates](#arrays-and-out-parameters),
+named with `array:`, its `length:` counting **bytes**, as many elements of the array's type as hold
+them, the last zero past what C writes; or a struct mirror, which `out void **` takes as well, the
+C unit checking a typedef is the mirror's struct or `void *`. `proc_pid_rusage` writes a
+`struct rusage_info_v2` through its `rusage_info_t *`, sixteen bytes of `ri_uuid`, which no mirror's
+field holds, then eighteen `uint64_t` fields, so its bytes are answered as `long`s:
+
+```avin
+import avin.c.Errno
+
+@c(
+  "int proc_pid_rusage(int pid, int flavor, out rusage_info_t *buffer)",
+  array: "buffer",
+  length: "sizeof(struct rusage_info_v2)",
+  errno
+)
+private rusage(pid: int, flavor: int) -> Result[Array[long], Errno]
+
+@c(const: "RUSAGE_INFO_V2")
+val rusageInfoV2: int
+
+// The physical footprint of the process `pid`, in bytes: the ninth `uint64_t` after `ri_uuid`'s
+// two `long`s. A process that does not exist is `Err(ESRCH)`.
+footprintBytes(pid: int) -> Result[long, Errno] = rusage(pid, rusageInfoV2).map(info -> info(9))
+```
+
+Memory of no type C allocates and answers through `out void **`, named with `bytes:` or `array:`, is
+an `Array[byte]`, as long as its `length:` says in bytes, which need not be a whole number of wider
+elements. What is still refused:
+
+- **an array whose length no parameter carries**, as everywhere: `memcmp(const void *a, const void
+  *b, size_t n)` carries one length for two, and its second array is refused;
+- **a value through `out void *`, and `inout void *`**: C writes no value of a type through one
+  (`` C writes no value through `out void *p`, which points at memory of no type ``), so the memory is
+  an array or a block passed in, or an array or a struct mirror C fills;
+- **an array of anything but bytes for memory of no type C allocates** (`` C allocates memory of no
+  type for `p`, whose length in bytes need not be a whole number of `long`s, so it is answered as an
+  `Array[byte]` ``);
+- **anything else for a `void *` parameter**: a scalar, a string or an array of strings (`` `const
+  void *` points at memory of no type, so it takes an `Array[byte]`, `Array[int]`, `Array[long]` or
+  `Array[real]`, its length in bytes carried by the parameter marked `length(buf)`, or a
+  `ByteBlock` ``);
+- **a `void *` result**, whose length nothing says, except that a binding answering `unit`
+  discards it.
 
 ## Buffers
 
@@ -1059,7 +1320,8 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
   ([proposed](/spec/decisions/#proposed)). A string or a handle is never a callback's answer: it
   would have to outlive the call, with nothing to free it. A binding takes one function per
   `userdata`, which the function pointer's own `userdata` names (`listener`'s `data` above), and a
-  function pointer with no `userdata` beside it is refused: there is nowhere to find the closure.
+  function pointer with no `userdata` beside it is refused: there is nowhere to find the closure. One
+  C allows null is [marked `null`](#arrays-and-out-parameters) and passed null instead.
   libc's `qsort` and `bsearch` are such functions; a binding reaches them through a C function that
   passes a `userdata` of its own, as `qsort_r` does.
 - **Memory C lends a callback is a view** ([proposed](/spec/decisions/#proposed)). In a function
@@ -1137,7 +1399,7 @@ on(event: string, @threaded listener: (Properties, EventData) -> unit)
 | Refused | Instead |
 | --- | --- |
 | A variadic function (`...`) | A fixed-arity function the library offers, or a C wrapper the package carries ([proposed](/spec/decisions/#proposed)) |
-| `void *` other than a callback's `userdata` | A handle on a typed pointer |
+| `void *` other than a callback's `userdata` or a parameter taking an array or a `ByteBlock` ([memory of no type](#memory-of-no-type)) | A handle on a typed pointer |
 | A pointer type in Avin code | Handles, arrays, out parameters and views |
 | A function pointer C answers | Bind the C functions it would point at |
 | `long double`, `_Complex`, vector types, `va_list` | — |
@@ -1165,7 +1427,9 @@ result is owned or `borrowed`, that a function `keeps` or `consumes` a pointer, 
 `length` or `bound:` is right, that C calls a function only from the thread a missing `@threaded`
 implies, that `forget` stops the callbacks, that `attach:`'s `destroy` is called only once C has
 finished with what it keeps, that a holder's `release` does not use a kept object held as the Avin
-object (a handle with no `retain`, a `ByteBlock`), which the collector may free first, and that C
+object (a handle with no `retain` that no `kept:` names, a `ByteBlock`), which the collector may free
+first, that a value a handle `holds:` is its own to use in its release (a descriptor `dup`ed for it,
+not one another object closes), that what a closed `kept:` handle freed with it is not touched, and that C
 reads no more of a `ByteBlock` than the library checked. A wrong `borrowed` or `length` is a binding bug of the kind a wrong
 `extern` is in C.
 

@@ -1,0 +1,279 @@
+// expect: exit 0
+// WebSockets between the library's server and its client, in one process: text and binary messages
+// echoed, empty ones, Unicode, and lengths taking each of the three length forms; pings both ways,
+// answered with pongs that are passed over; a receive with a limit that passes, then one that gets
+// its message; subprotocols chosen by the server's order; the close handshake begun by the client and
+// by the server, with codes and reasons, and the same error from every use after; a session returning
+// with its WebSocket open closing it with 1000; a server stopping closing a session waiting to receive
+// and one sending with 1001. The handshake's refusals, each answered without a session (405, 426 twice,
+// 400 for HTTP/1.0, a missing `Connection: Upgrade` and a key that is not sixteen bytes), the RFC's
+// sample handshake answered byte for byte, and a client refused, given a bad handshake or unable to
+// reach its URL.
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.net.http
+
+import avin.net.http.{
+  BadHandshake, Binary, Broken, Closed, Message, Refused, Response, Route, Router, ServerRequest, Text, Unreachable,
+  WebSocket, WebSocketError, acceptKey, webSocket
+}
+
+import avin.net.http.{BadUrl, Io, Unsupported}
+import avin.threads.{Channel, sleep, spawn}
+import avin.time
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A message, said briefly.
+said(m: Message) -> string = m match
+  Text(t) -> s"text `$t`"
+  Binary(b) -> s"binary of ${b.length} bytes, last ${if b.length > 0 then int(b(b.length - 1)) else -1}"
+
+// What a receive or a send answered, said briefly.
+got(r: Result[Message, WebSocketError]) -> string = r match
+  Ok(m) -> said(m)
+  Err(e) -> failure(e)
+
+failure(e: WebSocketError) -> string = e match
+  Closed(code, reason) -> s"closed $code `$reason`"
+  Broken(_) -> "broken"
+  Refused(status, reason) -> s"refused $status $reason"
+  BadHandshake(text) -> s"bad handshake: $text"
+  Unreachable(BadUrl(_)) -> "unreachable: bad URL"
+  Unreachable(Io(_)) -> "unreachable: io"
+  Unreachable(Unsupported(t)) -> s"unreachable: $t"
+  Unreachable(_) -> "unreachable"
+
+sent(r: Result[unit, WebSocketError]) -> string = r match
+  Ok(_) -> "sent"
+  Err(e) -> failure(e)
+
+connected(url: string, protocols: Vector[string] = Vector.empty[string]()) -> WebSocket =
+  WebSocket.connect(url, protocols = protocols) match
+    Ok(ws) -> ws
+    Err(e) -> fail(e.message)
+
+// Echoes every message until the WebSocket closes, then says why it did on `heard`.
+echo(ws: WebSocket, heard: Channel[string])
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(Binary(b)) -> _ = ws.send(b)
+      Err(e) ->
+        _ = heard.send(s"echo ended: ${failure(e)}")
+        return
+
+// The status line of the answer to `request`, sent raw, with its headers joined by `|` where `all`.
+answer(server: TcpServer, request: string, all: bool = false) -> string
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  ok(c.writeText(request))
+  val lines = Buffer[string]()
+  loop
+    val line = ok(c.readLine()).getOrElse("")
+    if line.isEmpty then break
+    lines.addOne(line)
+  _ = c.close()
+  if all then lines.toVector.mkString("|") else lines.toVector.filter(l -> !l.startsWith("Content-")).mkString("|")
+
+handshake(target: string, extra: string, version: string = "HTTP/1.1", method: string = "GET") -> string =
+  s"$method $target $version\r\nHost: t\r\n$extra\r\n"
+
+main()
+  val heard = Channel[string]()
+  val router = Router(
+    [
+      Route.get("/echo", r -> webSocket(r, ws -> echo(ws, heard))),
+      Route("POST", "/echo", r -> webSocket(r, ws -> echo(ws, heard))),
+      Route.get(
+        "/closer",
+        r -> webSocket(r, ws ->
+          _ = ws.send("closing soon")
+          _ = heard.send(s"closer: ${sent(ws.close(4000, "done"))}, open ${ws.isOpen()}")
+          _ = heard.send(s"closer after: ${sent(ws.send("late"))}, ${sent(ws.close())}"))
+      ),
+      Route.get("/returns", r -> webSocket(r, ws -> _ = ws.send("one"))),
+      Route.get(
+        "/proto",
+        r -> webSocket(r, ws -> _ = ws.send(ws.protocol.getOrElse("none")), protocols = ["chat", "superchat"])
+      ),
+      Route.get(
+        "/pinger",
+        r -> webSocket(r, ws ->
+          _ = ws.ping("p?".utf8)
+          _ = ws.send("go")
+          _ = heard.send(s"pinger: ${got(ws.receive())}"))
+      ),
+      Route.get(
+        "/patient",
+        r -> webSocket(r, ws ->
+          val first = ws.receive(millis(100))
+          _ = heard.send(s"patient first: ${first.map(m -> m.map(said))}")
+          _ = ws.send("ready")
+          val second = ws.receive(time.seconds(10))
+          _ = heard.send(s"patient second: ${second.map(m -> m.map(said))}")
+          _ = heard.send(s"patient now: ${ws.receive(millis(0)).map(m -> m.map(said))}"))
+      ),
+      Route.get("/fake", _ -> Response.upgrade("websocket", _ -> ())),
+      Route.get("/h2c", r -> Response.upgrade("h2c", _ -> ()).withHeader(
+          "Sec-WebSocket-Accept",
+          acceptKey(r.header("Sec-WebSocket-Key").getOrElse(""))
+      )),
+      Route.get("/stranger", r -> Response.upgrade("websocket", _ -> ()).withHeader(
+          "Sec-WebSocket-Accept",
+          acceptKey(r.header("Sec-WebSocket-Key").getOrElse(""))
+        ).withHeader("Sec-WebSocket-Protocol", "x"))
+    ]
+  )
+  val server = http.serve("127.0.0.1", 0, router.handle).ok.get
+  val base = s"ws://127.0.0.1:${server.port()}"
+
+  // Messages echoed: text, binary, empty ones, Unicode, and lengths of 125, 126, 65535 and 65536
+  // bytes, which take the short, the 16-bit and the 64-bit length.
+  val ws = connected(s"$base/echo")
+  println(ws.protocol)
+  for text in ["hello", "", "日本語 ✓", "x".repeat(125), "y".repeat(126)]
+    _ = ws.send(text)
+    println(got(ws.receive()).replace("x".repeat(125), "x*125").replace("y".repeat(126), "y*126"))
+  for n in [0, 1, 200, 65535, 65536, 70000]
+    _ = ws.send(Array.tabulate(n, i -> byte(i % 251)))
+    println(got(ws.receive()))
+  // A ping, whose pong is passed over: the next message is the echo.
+  println(sent(ws.ping()))
+  println(sent(ws.ping(Array.fill(125, byte(7)))))
+  _ = ws.send("after the pings")
+  println(got(ws.receive()))
+  // The client closes: the server's session hears its code and reason, and every use after answers
+  // the same.
+  println(sent(ws.close(1000, "bye")))
+  println(heard.receive().getOrElse("?"))
+  println(ws.isOpen())
+  println(sent(ws.send("more")))
+  println(got(ws.receive()))
+  println(sent(ws.close(3000, "again")))
+  println(sent(ws.ping()))
+
+  // The server closes, with a code of the application's range and a reason.
+  val closed = connected(s"$base/closer")
+  println(got(closed.receive()))
+  println(got(closed.receive()))
+  println(heard.receive().getOrElse("?"))
+  println(heard.receive().getOrElse("?"))
+  println(got(closed.receive()))
+
+  // A session returning with its WebSocket open closes it with 1000 and no reason.
+  val returns = connected(s"$base/returns")
+  println(got(returns.receive()))
+  println(got(returns.receive()))
+
+  // Subprotocols: the server's first that the client offers, whatever the client's order; none where
+  // the client offers none of them, or none at all.
+  for offered in [["superchat", "chat"], ["superchat"], ["other"], Vector.empty[string]()]
+    val p = connected(s"$base/proto", offered)
+    println(s"$offered: ${p.protocol} ${got(p.receive())}")
+    _ = p.close()
+
+  // The server pings: the client's receive answers the pong and gives the message after.
+  val pinged = connected(s"$base/pinger")
+  println(got(pinged.receive()))
+  _ = pinged.send("done")
+  println(heard.receive().getOrElse("?"))
+  _ = pinged.close()
+
+  // A receive with a limit: nothing arrives within it, then a message does, then nothing is waiting.
+  val patient = connected(s"$base/patient")
+  println(heard.receive().getOrElse("?"))
+  println(got(patient.receive()))
+  println(patient.receive(millis(50)).map(m -> m.map(said)))
+  _ = patient.send("at last")
+  println(heard.receive().getOrElse("?"))
+  println(heard.receive().getOrElse("?"))
+  _ = patient.close()
+
+  // The handshake's refusals, each answered without a session.
+  val key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+  val upgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+  val v13 = "Sec-WebSocket-Version: 13\r\n"
+  println(answer(server, handshake("/echo", upgrade + key + v13), all = true))
+  println(answer(server, handshake("/echo", "Upgrade: WebSocket\r\nConnection: keep-alive, upgrade\r\n" + key + v13)))
+  println(answer(server, handshake("/echo", upgrade + key + v13, method = "POST")))
+  println(answer(server, handshake("/echo", "")))
+  println(answer(server, handshake("/echo", "Upgrade: h2c\r\nConnection: Upgrade\r\n" + key + v13)))
+  println(answer(server, handshake("/echo", upgrade + key + v13, version = "HTTP/1.0")))
+  println(answer(server, handshake("/echo", "Upgrade: websocket\r\nConnection: keep-alive\r\n" + key + v13)))
+  println(answer(server, handshake("/echo", upgrade + key + "Sec-WebSocket-Version: 8\r\n")))
+  println(answer(server, handshake("/echo", upgrade + key)))
+  println(answer(server, handshake("/echo", upgrade + v13)))
+  // Fifteen and seventeen bytes, text that is not base64, and sixteen bytes other than the RFC's.
+  println(answer(server, handshake("/echo", upgrade + "Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2Rl\r\n" + v13)))
+  println(answer(server, handshake("/echo", upgrade + "Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZmc=\r\n" + v13)))
+  println(answer(server, handshake("/echo", upgrade + "Sec-WebSocket-Key: not base64!\r\n" + v13)))
+  println(
+    answer(
+      server,
+      handshake("/echo", upgrade + "Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\n" + v13)
+    ) == "HTTP/1.1 101 Switching Protocols|Upgrade: websocket|Connection: Upgrade|Sec-WebSocket-Accept: " + acceptKey(
+      "MDEyMzQ1Njc4OWFiY2RlZg=="
+    )
+  )
+  for _ in 0 ..< 3
+    println(heard.receive().getOrElse("?"))
+
+  // A client that cannot open its WebSocket.
+  for url in [
+    s"$base/nothing",
+    s"$base/fake",
+    s"$base/h2c",
+    s"$base/stranger",
+    s"http://127.0.0.1:${server.port()}/echo",
+    "ws:///echo",
+    "ws://[bad/",
+    "ws://127.0.0.1:1/echo"
+  ]
+    println(WebSocket.connect(url, protocols = ["y"]) match
+      Ok(_) -> "opened"
+      Err(e) -> failure(e))
+  println(Refused(404, "Not Found").message)
+  println(Closed(1000, "").message)
+  println(Closed(1001, "going").message)
+  println(BadHandshake("x").message)
+  server.shutdown()
+
+  // A server stopping closes with 1001 a session waiting to receive and one sending, each closing
+  // after the client answers its close.
+  val stopping = Router(
+    [
+      Route.get(
+        "/waiting",
+        r -> webSocket(r, ws ->
+          _ = ws.send("waiting")
+          _ = heard.send(s"waiting: ${got(ws.receive())}"))
+      ),
+      Route.get(
+        "/sending",
+        r -> webSocket(r, ws ->
+          var r = ws.send("tick")
+          while r.isOk
+            sleep(millis(10))
+            r = ws.send("tick")
+          _ = heard.send(s"sending: ${sent(r)}, stopping ${ws.isStopping()}"))
+      )
+    ]
+  )
+  val second = http.serve("127.0.0.1", 0, stopping.handle).ok.get
+  val waiting = connected(s"ws://127.0.0.1:${second.port()}/waiting")
+  val sending = connected(s"ws://127.0.0.1:${second.port()}/sending")
+  println(got(waiting.receive()))
+  println(got(sending.receive()))
+  second.stop()
+  println(got(waiting.receive()))
+  var last = sending.receive()
+  while last is Ok(_)
+    last = sending.receive()
+  println(got(last))
+  second.join()
+  val ends = [heard.receive().getOrElse("?"), heard.receive().getOrElse("?")]
+  println(ends.sorted)

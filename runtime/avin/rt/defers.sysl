@@ -1,0 +1,71 @@
+module avin.rt
+
+import sh.sysl.gc
+import sysl.raw.ptr_cast
+
+// Deferred statements. Compiled code makes each `defer` it reaches a closure and puts it on its
+// thread's list, the newest last; leaving the block runs the block's own from the list, newest first,
+// and takes them off. A cancellation that stops the thread runs every one reached since the point it
+// returns to before it drops their frames (`cancel.sysl`), so a cancelled thread cleans up as a
+// returning one does; a trap runs none, and the ones it passes are dropped with their frames
+// (`recovery.sysl`). A function that defers nothing never touches the list.
+//
+// A deferred statement runs to its end once begun: the thread's cancellation does not stop it inside
+// one, and one that comes meanwhile stops it at its next cancellation point after.
+
+private extern "realloc" defer_realloc(p: *u8, size: usize) -> *u8
+private extern "free" defer_free(p: *u8) -> unit
+
+/** The program's closure runner, kept from the first deferred statement any thread reaches, so that
+ * a cancellation can run deferred statements wherever it stops a thread. */
+private var defer_runner: *u8 = null
+
+/** Puts `run`, the closure of a deferred statement just reached, a closure that takes nothing and
+ * returns nothing, on the calling thread's list. `runner` is the program's closure runner. */
+@export("avin_rt_defer_push")
+defer_push(ctx: *Context, run: *u8, runner: *u8)
+    defer_runner = runner
+    if ctx.defer_count == ctx.defer_room
+        val room = if ctx.defer_room == 0 then 8 else ctx.defer_room * 2
+        ctx.defers = ptr_cast(defer_realloc(ptr_cast(ctx.defers), room * sizeof(*u8)))
+        ctx.defer_room = room
+    ctx.defers[ctx.defer_count] = run
+    ctx.defer_count += 1
+
+/** Runs the newest `n` deferred statements of the calling thread, the newest first, and takes each off
+ * once it has run, as their blocks are left. */
+@export("avin_rt_defers_run")
+defers_run(ctx: *Context, n: long)
+    var i: long = 0
+    while i < n && ctx.defer_count > 0
+        run_newest(ctx)
+        i += 1
+
+/** Runs the deferred statements of the calling thread reached past the first `keep`, the newest
+ * first, as a cancellation drops their frames. */
+run_defers_to(ctx: *Context, keep: usize)
+    while ctx.defer_count > keep
+        run_newest(ctx)
+
+// The closure stays on the list while it runs, which keeps it alive; the deferred statements it
+// reaches go above it and are gone again when it returns.
+private run_newest(ctx: *Context)
+    val entry: *extern(@lets_out *Context, *u8) -> unit = ptr_cast(defer_runner)
+    val site = ctx.caller
+    uncancellable_enter(ctx)
+    entry(ctx, ctx.defers[ctx.defer_count - 1])
+    uncancellable_leave(ctx)
+    ctx.caller = site
+    ctx.defer_count -= 1
+
+/** Marks the deferred statements of `c` not yet run. */
+mark_defers(h: *gc.Heap, c: *Context)
+    for i in 0..<c.defer_count
+        gc.mark(h, c.defers[i])
+
+/** Gives back the storage of `c`'s list where it is empty, as its thread detaches. */
+drop_defers(c: *Context)
+    if c.defer_count != 0 || c.defers == null then return
+    defer_free(ptr_cast(c.defers))
+    c.defers = null
+    c.defer_room = 0

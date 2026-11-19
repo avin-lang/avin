@@ -25,7 +25,7 @@ equal when their elements are equal in order whatever their classes (`Any` holdi
 elsewhere in Avin.
 
 `==` is `Eq`'s `equals(other: Self) -> bool` and the hash is `Hash`'s `hash() -> long`. Every type
-conforms to both without declaring it, so `[K: Eq + Hash]` admits any key type, and `x.equals(y)`
+conforms to both without declaring it, so `[K: Eq & Hash]` admits any key type, and `x.equals(y)`
 and `x.hash()` may be called on any value. A type that implements `Eq` in an impl, or in a class's
 header, compares by its own `equals` wherever it is compared: written directly, through a bound, as a
 field of a data value or a part of a tuple, and as an `Any`.

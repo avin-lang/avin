@@ -1,10 +1,11 @@
 module dev.avinlang.compiler
 
 import sysl.fs.IoError
-import sysl.process.{Group, Output, Stdio, Var, start}
+import sysl.buf.{Buf, buf}
+import sysl.process.{Group, Output, Status, Stdio, Var, foreground_group, pid, process_group, spawn, start}
 import sysl.signal
 import sysl.sync.SpinLock
-import sysl.time.{millis, sleep}
+import sysl.time.{millis, monotonic, sleep}
 
 // The programs the runners start -- a test of `avin test`, a program of the execution corpus -- and
 // how none of them outlives its runner. Each is started as the leader of a process group of its own,
@@ -85,10 +86,83 @@ stop_group(pgid: int) -> bool
  * started that is still running is stopped with `stop_group`. While it runs its group is recorded, so
  * a runner that is interrupted kills it. */
 run_contained(program: string, args: []const string, env: []const Var, stdin: Stdio, timeout: int) -> Result[Output, IoError]
-    var child = start(program, args, env = env, stderr = true, timeout = timeout, stdin = stdin, group = Group.New)?
+    val watched = runner_env(env)
+    var child = start(program, args, env = watched.view(), stderr = true, timeout = timeout, stdin = stdin, group = Group.New)?
     val pgid = child.group()
     val slot = track_group(pgid)
     val waited = child.wait()
     _ = stop_group(pgid)
     untrack_group(slot)
     waited
+
+/** The variable a runner names itself in, by process id, for the programs it starts. An Avin program
+ * started with it, by the process it names, watches that process and ends -- with everything in its
+ * process group, when it leads one -- as soon as it is gone, even killed by `SIGKILL`, which the runner
+ * cannot answer. The program takes the variable out of its environment as it starts, so what it starts
+ * in turn does not watch a process that is not its parent; and one started with it by any other
+ * process does not watch at all. */
+const RunnerVariable: string = "AVIN_RUNNER_PID"
+
+/** `env` with `RunnerVariable` naming this process added. */
+runner_env(env: []const Var) -> Buf[Var]
+    var out: Buf[Var] = buf()
+    for v in env do out.push(v)
+    out.push(Var(RunnerVariable, pid().to_string()))
+    out
+
+/** How long, in milliseconds, a program `avin run` is running has to end once the signal that stopped
+ * `avin run` has been passed on to it, before it is killed. */
+const RunGrace: int = 2000
+
+/** Runs `program` with `args` for `avin run`, its output going where `stdout` and `stderr` say, and
+ * answers how it ended. Started from a terminal, as the terminal's foreground job, it stays in that job,
+ * so the terminal's keys and the shell's job control reach it as they reach `avin run`; started any
+ * other way it leads a process group of its own. Either way it watches this process
+ * (`RunnerVariable`). `SIGTERM` or `SIGHUP` sent to `avin run` is passed on to it -- to its whole
+ * group, when it leads one -- and so is `SIGINT` away from the terminal (at it, Ctrl-C reaches the
+ * program already, and `avin run` waits for it); a program still running `RunGrace` milliseconds after
+ * the first is killed. Once it has ended, whatever is left of a group it led is stopped with
+ * `stop_group`. */
+run_attended(program: string, args: []const string, stdout: Stdio, stderr: Stdio) -> Result[Status, IoError]
+    val own_group = !at_the_terminal()
+    val term = signal.watch(signal.TERM)
+    val interrupt = signal.watch(signal.INT)
+    val hangup = signal.watch(signal.HUP)
+    if term is Err(e) then return Err(e)
+    if interrupt is Err(e) then return Err(e)
+    if hangup is Err(e) then return Err(e)
+    var t = term.unwrap()
+    var i = interrupt.unwrap()
+    var h = hangup.unwrap()
+    val env = runner_env([])
+    var child = spawn(program, args, env = env.view(), stdout = stdout, stderr = stderr, group = if own_group then Group.New else Group.Inherit)?
+    val target = if own_group then -i64(child.group()) else i64(child.pid())
+    var asked_at = monotonic().us / 1000
+    var asked = false
+    loop
+        child.try_wait() match
+            Ok(Some(status)) ->
+                if own_group then _ = stop_group(child.group())
+                return Ok(status)
+            Ok(None) -> ()
+            Err(e) -> return Err(e)
+        val now = monotonic().us / 1000
+        var sig = 0
+        if t.take() then sig = signal.TERM
+        // At the terminal, Ctrl-C reaches the program from the terminal itself, and the program decides
+        // what it means.
+        if i.take() && own_group then sig = signal.INT
+        if h.take() then sig = signal.HUP
+        if sig != 0
+            _ = signal.send(target, sig)
+            if !asked
+                asked = true
+                asked_at = now
+        if asked && now - asked_at >= RunGrace then _ = signal.send(target, signal.KILL)
+        sleep(millis(5))
+end run_attended
+
+// Whether this program is the foreground job of the terminal it belongs to.
+private at_the_terminal() -> bool = foreground_group() match
+    Ok(g) -> g == process_group()
+    Err(_) -> false

@@ -1,0 +1,54 @@
+// expect: exit 0
+// A call waits for a resource for at most its timeout. With the one resource held: a timed `use`
+// fails with `AcquireTimedOut` once its time is up, a timeout of zero or less fails at once, the
+// pool's own `acquireTimeout` applies to `use` and `lease` alike, and a call that timed out leaves
+// no waiter behind. With a resource idle, or a place free, a timeout of zero still gets one.
+import avin.threads.{AcquireTimedOut, Channel, Pool, sleep, spawn}
+import avin.time.{Duration, millis, monotonic}
+
+class Conn(val id: int): Sendable
+
+timed(pool: Pool[Conn, string], timeout: Duration) -> string
+  val start = monotonic().micros
+  val r = pool.use(timeout, c -> c.id)
+  val waited = (monotonic().micros - start) / 1000
+  s"$r waited at least ${timeout.micros / 1000}: ${waited >= timeout.micros / 1000}"
+
+main()
+  val pool = Pool[Conn, string](() -> Ok(Conn(1)), maxSize = 1, acquireTimeout = Some(millis(30)))
+  println(pool.use(millis(0), c -> c.id))
+  val hold = Channel[int](1)
+  val holding = Channel[int](1)
+  val holder = spawn(() ->
+    pool.use(c ->
+      holding.send(c.id)
+      _ = hold.receive()
+      c.id))
+  _ = holding.receive()
+  println(timed(pool, millis(40)))
+  println(pool.use(millis(0), c -> c.id))
+  println(pool.use(millis(-5), c -> c.id))
+  println(pool.use(c -> c.id))
+  println(pool.lease(l -> l.resource.id))
+  println(pool.lease(millis(10), l -> l.resource.id) == Err(AcquireTimedOut))
+  println(pool.stats())
+  hold.send(0)
+  println(holder.join())
+  println(pool.use(millis(0), c -> c.id))
+  println(pool.stats())
+
+  // A timed call that is served before its time is up gets the resource.
+  val later = spawn(() -> pool.use(c ->
+    holding.send(c.id)
+    _ = hold.receive()
+    c.id))
+  _ = holding.receive()
+  val waiter = spawn(() -> pool.use(millis(60000), c -> c.id * 10))
+  while pool.stats().waiting < 1 do sleep(millis(1))
+  hold.send(0)
+  println(s"${later.join()} ${waiter.join()}")
+  println(pool.stats())
+
+  // A pool with no idle resource and a free place makes one for a timeout of zero.
+  val fresh = Pool[Conn, string](() -> Ok(Conn(7)), maxSize = 2)
+  println(fresh.use(millis(0), c -> c.id))

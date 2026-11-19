@@ -1,6 +1,6 @@
 ---
 title: Packages
-summary: avin.hocon, dependencies by git, path and workspace, version selection, avin.sum, workspaces, features, members of a repository, vendoring, a program of one file's dependencies header, the standard library's modules, and the commands that make and keep them.
+summary: avin.hocon, dependencies by git, path and workspace, version selection, avin.sum, workspaces, features, machines and files for one machine, members of a repository, vendoring, a program of one file's dependencies header, the standard library's modules, and the commands that make and keep them.
 weight: 24
 ---
 
@@ -40,9 +40,11 @@ was, and needs no ceremony.
 
 ## The manifest
 
-`package` names the package and gives its version; both are required, and `description` and `avin`
-are optional. Beside it a manifest holds `dependencies`, [`features`](#features) and
-[`workspace`](#workspaces).
+`package` names the package and gives its version; both are required, and `description`, `avin`
+and [`targets`](#which-machines-a-package-builds-for) are optional. Beside it a manifest holds
+`dependencies`, [`features`](#features),
+[`workspace`](#workspaces), and for its C bindings [`c-libraries`](#c-libraries) and
+[`static-c-libraries`](/spec/c-bindings/#linking-statically).
 
 - **A name** begins with a lowercase letter and holds lowercase letters, digits, `_` and `-`
   (`geom-tools`). It names the package, not a module: modules are named by their directories.
@@ -173,7 +175,10 @@ c-libraries {
 ```
 
 A program links the C libraries of every package in it, asking `pkg-config` at every build. They are
-the machine's, not fetched: they get no line in `avin.sum`.
+the machine's, not fetched: they get no line in `avin.sum`. A program whose manifest says
+`static-c-libraries = true` links them from their static archives, so the machine it runs on needs
+none of them; only the root package's key is read ([C
+bindings](/spec/c-bindings/#linking-statically)).
 
 ### What a dependency brings in
 
@@ -345,6 +350,28 @@ error: `shapes.server` exists only while the feature `server` is on, and `shapes
 Because the check is made against the manifest and not against one build's selection, a package that
 checks with every feature on also builds with any set of them off.
 
+**The package's tests may import any of its modules, whatever its gate, and any of its optional
+dependencies.** `avin test` turns every feature on, so a test of `shapes.server` can sit in `tests`
+beside the rest. A test module is read only while every module it imports is: one importing a module
+that is off, or importing a test module that is not read, is passed over by that build as a gated
+module is, so the package still builds, checks and tests with any set of features off, running the
+tests that remain. The module is still the unit: a file of `tests` importing `shapes.server` takes
+the whole of `tests` with it when `server` is off, so tests that should run without a feature go in a
+module of their own, `tests/plain/`, which nothing gated reaches.
+
+```avin
+module tests
+
+import shapes.server.{serve, port}
+
+@test
+servesOnItsPort()
+  assertEq(serve() + port(), 284)
+```
+
+An import refused for the module it names is refused once for the whole import, however many names
+it brings in: `import shapes.server.{serve, port}` in an ungated module is one error.
+
 **A feature only adds.** It adds modules and dependencies; it cannot remove or change a declaration,
 because nothing in a file depends on which features are on. A gated module's conformances are about
 its own types and traits, and its extensions are seen only by the modules that import it, which are
@@ -388,6 +415,241 @@ and the language server turn every feature on unless a flag says otherwise**, si
 compiles is a module nothing checks. `avin tidy` resolves with every feature on, so `avin.sum` does not
 depend on which flags the last build was given. A build's reuse of an executable is keyed by the
 features it was built with.
+
+### What a feature does not do
+
+**A feature has no value a function can test.** There is no `feature("server")` constant and no
+line-level gate: the module stays the only unit a feature turns on. The parts a feature turns on are
+modules and optional dependencies, which are *absent* from a build with the feature off, so a branch
+testing a constant would have to type-check against modules that are not there; folding the branch
+away after checking cannot help, since the check is what fails. A function that behaves differently
+with a feature on is two functions: the plain one in an ungated module, and the other in the
+feature's module, which the program reaches through the feature's own entry point.
+
+**A module is listed by one feature only.** A part two features share is a feature of its own, which
+both `enables`:
+
+```hocon
+features {
+  codec  { modules = [media.codec] }
+  record { modules = [media.record], enables = [codec] }
+  play   { modules = [media.play],   enables = [codec] }
+}
+```
+
+That keeps every gate a single feature, so whether a module may import another is one question --
+does this module's feature turn that one on -- answered the same way however many features a package
+has.
+
+**A feature may exist only on some machines.** `if` on a feature, in the condition language of
+[machines](#machines), says where the feature exists; it never turns the feature on. Asking for it on
+a machine where it does not exist is refused, naming the machine; a `default` feature that does not
+exist on the machine is simply not part of the default there, and `--all-features`, `avin test` and
+`avin check` turn on every feature that exists on the machine being built for.
+
+```hocon
+features {
+  journal { doc = "logging to the systemd journal", modules = [probe.journal], if = "linux" }
+}
+```
+
+## Machines
+
+A program is built **for a machine**: an operating system and a processor. Avin builds for three:
+
+| target | the machine |
+|---|---|
+| `aarch64-macos` | macOS on Apple silicon |
+| `x86_64-linux` | Linux on 64-bit Intel and AMD, with glibc |
+| `aarch64-linux` | Linux on 64-bit Arm, with glibc |
+
+**The machine is the one being built for**: `--target <name>` where a command takes it, and
+otherwise the machine the compiler runs on. Most packages never say anything about it: the standard
+library answers the same way everywhere, and a package written against it builds for every target.
+What follows is for the package that cannot, because it reaches something only one system has.
+
+### Which machines a package builds for
+
+`package.targets` lists the targets a package supports. Left out, it is every target Avin builds for.
+
+```hocon
+package {
+  name    = "probe"
+  version = "0.2.0"
+  targets = ["x86_64-linux", "aarch64-linux", "aarch64-macos"]
+}
+```
+
+Building a package for a target its manifest leaves out is refused, naming the package and the
+targets it lists; so is depending on it from a package whose own `targets` reach further. A target
+name Avin does not know is an error at its value, listing the ones it does.
+
+### The condition language
+
+A condition is a string naming machines: **symbols** joined by `!`, `&&`, `||` and parentheses. The
+symbols are a closed set:
+
+| symbol | holds on |
+|---|---|
+| `macos` | macOS |
+| `linux` | Linux |
+| `posix` | every system Avin builds for, today `macos` or `linux` |
+| `aarch64` | 64-bit Arm |
+| `x86_64` | 64-bit Intel and AMD |
+
+```hocon
+if = "linux"
+if = "linux && x86_64"
+if = "!macos"
+```
+
+**A condition is checked when the manifest is read**, every symbol of it, whichever machine the
+build is for, so a misspelling cannot read as false and quietly leave something out of every
+build:
+
+```text
+error: `lunix` is not something a condition can ask about the machine: the symbols are macos, linux, posix, aarch64 and x86_64
+ --> probe/avin.hocon:9:68
+```
+
+A target's name is refused with the condition it means (`"x86_64-linux"` is written
+`"x86_64 && linux"`), and so is an empty condition, which is an entry every machine takes, written
+without `if`.
+
+### Conditions in the manifest
+
+`if` may sit on an entry of `dependencies`, `sysl-dependencies` and `c-libraries`, and on a
+feature. The entry is part of a build only on a machine where its condition holds:
+
+```hocon
+package { name = "probe", version = "0.2.0", targets = ["x86_64-linux", "aarch64-linux", "aarch64-macos"] }
+
+dependencies {
+  inotify { git = "github.com/owner/inotify", version = "0.1.0", if = "linux" }
+  fsevent { git = "github.com/owner/fsevent", version = "0.1.0", if = "macos" }
+}
+
+sysl-dependencies {
+  seccomp { git = "github.com/owner/seccomp", version = "0.3.0", if = "linux" }
+}
+
+c-libraries {
+  ssh {
+    pkg-config = "libssh2"
+    headers    = ["libssh2.h"]
+    install { macos = "brew install libssh2", linux = "apt install libssh2-1-dev" }
+  }
+  security {
+    link-flags = ["-framework", "Security"]
+    headers    = ["<Security/Security.h>"]
+    if         = "macos"
+  }
+}
+```
+
+- **A dependency left out by its condition is not in the build at all**: not fetched, not resolved,
+  not linked. A dependency's own conditional dependencies are handed on with it, so what a program
+  is made of on a machine is what every manifest in it takes there.
+- **`avin tidy` and `avin vendor` answer for every machine** in the root's `targets`, as they answer
+  for every feature, so `avin.sum` and `vendor/` do not depend on the machine the last command ran
+  on.
+- **`if` and `optional = true` compose**: such a dependency is taken where a feature turns it on
+  *and* the condition holds. A condition cannot name a feature, and a feature cannot name a machine
+  except through its own `if`.
+- **`install` is a sentence or a block of them by condition**, so a library is installed by the words
+  each system uses. The first condition that holds is the one shown; a machine none of them holds
+  for is shown none.
+- **`link-flags`** passes flags to the link exactly as written, for what is not a library `-l` names:
+  a macOS framework (`["-framework", "Security"]`), a linker option. It sits beside `pkg-config` or
+  `link`, or alone.
+
+### Files for one machine
+
+Inside a module, **a file whose name carries a condition symbol between its name and `.avin` is read
+only on the machines the symbol holds on**: `watch.linux.avin` on Linux, `watch.macos.avin` on macOS,
+`stack.aarch64.avin` on 64-bit Arm. A file with no such part is read everywhere. The part is one
+symbol from the table above; a name whose part is not one (`watch.lunix.avin`) is an error naming the
+symbols.
+
+```text
+probe/probe/watch.avin          module probe.watch, on every machine
+probe/probe/watch.linux.avin    module probe.watch, on Linux
+probe/probe/watch.macos.avin    module probe.watch, on macOS
+```
+
+```avin
+// probe/probe/watch.avin
+module probe.watch
+
+// Reports each file that changes under `dir`, as the system tells of it.
+changes(dir: string, report: (string) -> unit) -> unit = start(dir, report)
+```
+
+```avin
+// probe/probe/watch.linux.avin
+module probe.watch
+
+import inotify.{Inotify, Mask}
+
+private start(dir: string, report: (string) -> unit) -> unit =
+  Inotify.open().add(dir, Mask.Modify | Mask.Create, report)
+```
+
+The module is the same module on every machine; its files on one machine are the ones read there.
+So a private helper in one machine's file is seen by the module's other files on that machine, and
+the shared file above calls `start`, which each machine's file supplies.
+
+**A module exists on a machine where at least one of its files is read.** A module whose every file
+carries `linux` exists only on Linux, and that is how a whole module belongs to one system.
+
+**Every file is checked on every machine it is read on.** `avin check` type-checks the package once
+for each of its `targets` on which anything differs: a file with a condition, an entry with an `if`.
+A shared file calling `start` on a machine whose file does not supply it is an error there, naming
+the machine:
+
+```text
+error: no function `start` is declared in `probe.watch` on `aarch64-macos`: `watch.linux.avin` supplies it on Linux, and no file read on this machine does -- add it to a file read there, or leave the machine out of `targets`
+ --> probe/probe/watch.avin:4:67
+```
+
+That check needs no other machine's tools: it reads and type-checks, and builds nothing. `avin build`
+and `avin test` check only the machine they build for, and the language server checks the machine
+it runs on.
+
+**An import of a module that does not exist everywhere is allowed only from a file that exists no
+more widely.** `import inotify` in `watch.linux.avin` is allowed, since `inotify` is taken on Linux
+and the file is read only there; the same import in `watch.avin` is an error at the import, naming
+the machines where the module is missing. The check is made against the manifest, for every machine
+in `targets`, whichever one is being built.
+
+### The machine in an expression
+
+Where the difference between machines is a value rather than a call only one system has, it is
+written as an ordinary `if` over **`avin.target`**, whose two values are compile-time constants:
+
+```avin
+import avin.target
+import avin.process.MacOS
+
+configDir(home: string) -> string = target.os match
+  MacOS -> s"$home/Library/Application Support/probe"
+  _     -> s"$home/.config/probe"
+```
+
+`target.os` is an `avin.process.Os` and `target.arch` an `avin.target.Arch` (`Aarch64`, `X86_64`).
+Both are known when the program is compiled, so the branches not taken are folded away, at every
+optimization level; and both branches are type-checked on every machine, so one cannot rot unseen
+on the machine that does not take it. A branch may therefore call only what exists everywhere; a
+call only one system has belongs in that system's file. `avin.process.os()` answers the same value
+at run time.
+
+### What a manifest does not say about machines
+
+There is no per-machine linker, linker script, entry point or layout: an Avin program is linked by
+the platform's own linker, started at `main` by its C runtime, on a hosted system. There is no
+`choices` block (exactly one of a set of features): the cases it serves are a machine's, and a
+machine is already exactly one. And there is no line-level gate inside a file; the file is the
+smallest thing a machine selects, as the module is the smallest thing a feature selects.
 
 ## Members of a repository
 
@@ -605,6 +867,10 @@ names its dependencies.
   in the user's cache directory, a directory per package and keyed by where the package is, so two
   checkouts of it never share one ([running and testing](/compiler/#running-and-testing)).
   `avin clean --all` removes every program's builds this version of Avin keeps; fetched packages stay.
+- Fetched packages are not counted against the build cache's limit and a sweep of the cache never
+  evicts one ([running and testing](/compiler/#running-and-testing)); `avin cache clean --packages`
+  removes them, with `--older-than` only those no build has read for that long, and the next build
+  that needs one fetches it again.
 - `avin add <coordinate>[@<version>|@<rev>] [<package>]` adds a git dependency to the package's
   manifest: the version given, the commit given (written to the manifest as its full id), or the
   highest release the repository has tagged. It fetches the package, lists

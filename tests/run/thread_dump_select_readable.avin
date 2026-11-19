@@ -1,0 +1,46 @@
+// expect: exit 0
+// stderr: times vary
+// The quit signal's thread dump counts a select's `readable()` arms as sockets beside its channels:
+// a thread parked on a connection and a channel waits in a select on one of each, and one parked on
+// two connections with an `after` waits on two sockets with a time limit. Both go on once the dump is
+// written: bytes arriving end each select.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.process
+import avin.signal
+import avin.threads.{Channel, spawn}
+import avin.time.hours
+
+@sysl("avin.rt.thread_dumps")
+dumps() -> long
+
+@sysl("avin.rt.lightweight_parked")
+parked() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  val d = ok(TcpStream.connect("127.0.0.1", port))
+  val e = ok(TcpStream.connect("127.0.0.1", port))
+  val peers = Vector.tabulate(3, _ -> ok(l.accept()))
+  val a = Channel[int]()
+  val first = spawn(() ->
+    select
+      c.readable() -> ok(c.readLine()).getOrElse("(end)")
+      a.receive() as Some(x) -> s"$x")
+  val second = spawn(() ->
+    select
+      d.readable() -> ok(d.readLine()).getOrElse("(end)")
+      e.readable() -> ok(e.readLine()).getOrElse("(end)")
+      after hours(1) -> "an hour")
+  while parked() != 2 do ()
+  _ = process.signal(process.pid(), signal.Quit)
+  while dumps() < 1 do ()
+  println("dump written")
+  for p in peers do ok(p.writeText("bytes\n"))
+  println(first.join(), second.join())

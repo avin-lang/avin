@@ -1,0 +1,49 @@
+// expect: exit 0
+// A router's routees are supervised by the router's `onFailure`: a routee that traps under `Restart`
+// starts again with fresh state, keeps its place in the pool and its reference, and handles the
+// messages still in its mailbox; the router goes on routing to it. A routee that would restart more
+// than its limit allows escalates to the router, which is covered by actor_router_escalate.
+import avin.actors.{ActorRef, Router, RoundRobin, Restart}
+import avin.time
+
+data Job
+  Add(n: int)
+  Fail
+  Total(replyTo: ActorRef[string])
+
+actor Counter receives Job
+  var total = 0
+
+  receive
+    Add(n) -> total += n
+    Fail -> total = total / (total - total)
+    Total(replyTo) -> replyTo.tell(s"$self holds $total")
+
+total(router: ActorRef[Job]) -> string = router.ask(r -> Total(r), timeout = time.seconds(5)).await() match
+  Ok(s) -> s
+  Err(e) -> e.message
+
+main()
+  val router = Router.pool(2, Counter(), RoundRobin, onFailure = Restart(5, time.minutes(1)))
+  router.tell(Add(1))
+  router.tell(Add(2))
+  router.tell(Add(10))
+  router.tell(Add(20))
+  println(total(router))
+  println(total(router))
+  // The fifth message goes to the first routee, which traps and restarts with a fresh total; the
+  // adds queued behind the failure are handled by the fresh state.
+  router.tell(Fail)
+  router.tell(Add(100))
+  router.tell(Add(5))
+  router.tell(Add(200))
+  println(total(router))
+  println(total(router))
+  // Still two routees: a restart is not an ending.
+  // The other routee restarts as well; each answers once its restart is done, so the reports come in
+  // order.
+  router.tell(Add(1))
+  router.tell(Fail)
+  println(total(router))
+  println(total(router))
+  println(router.ended().isCompleted())

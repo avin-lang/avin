@@ -1,0 +1,84 @@
+// expect: exit 0
+// A started command's CPU time. A shell whose sub-processes burn CPU and exit answers their time
+// once waited for; before then a running program counts nothing. A pipeline's stages and a
+// sequence's parts add, and a part never started adds nothing. A program stopped for outstaying its
+// time limit is `TimedOut` with the time it used; one that ends before its limit answers its own
+// status. A program seen to end by `isAlive` or reaped by `close` counts too; a sleeper counts next
+// to nothing; a detached command counts nothing. Exit codes and signals come through unchanged, and
+// a command handed to a thread answers its time there.
+import avin.process
+import avin.process.{Child, Command}
+import avin.threads
+import avin.time
+
+private val Burn = "i=0; while [ $i -lt 3 ]; do sh -c 'j=0; while [ $j -lt 40000 ]; do j=$((j+1)); done'; i=$((i+1)); done"
+
+burn() -> Command = Command("/bin/sh", "-c", Burn)
+
+millis(c: Child) -> long = c.cpuTime().total.toMillis
+
+main()
+  // One program, before and after its wait.
+  val one = burn().start().ok.get
+  println(millis(one) == 0)
+  println(one.waitFor())
+  val first = one.cpuTime()
+  println(millis(one) >= 150)
+  println(one.cpuTime() == first)
+  println(one.waitFor())
+  println(one.cpuTime() == first)
+  println(first.total == first.user + first.system)
+  // A pipeline's stages add.
+  val piped = (burn() | Command("/bin/sh", "-c", "cat > /dev/null; " + Burn)).start().ok.get
+  println(piped.waitFor())
+  println(millis(piped) >= 300)
+  // A sequence's parts add; a part never started adds nothing.
+  val both = burn().andThen(burn()).start().ok.get
+  println(both.waitFor())
+  println(millis(both) >= 300)
+  val firstOnly = burn().orElse(Command("/bin/sh", "-c", "exit 9")).start().ok.get
+  println(firstOnly.waitFor())
+  val seq = burn().followedBy(Command("/bin/sleep", "0.1")).start().ok.get
+  println(seq.waitFor())
+  println(millis(seq) >= 150)
+  // A program past its limit is stopped and counted; one within it answers its own status.
+  val looping = Command("/bin/sh", "-c", "while :; do :; done").withTimeout(time.millis(300)).start().ok.get
+  println(looping.waitFor())
+  println(!looping.cpuTime().total.isZero)
+  val ignoring = Command(
+    "/bin/sh",
+    "-c",
+    "trap '' TERM; while :; do :; done"
+  ).withTimeout(time.millis(200)).start().ok.get
+  println(ignoring.waitFor())
+  println(!ignoring.cpuTime().total.isZero)
+  val quick = burn().withTimeout(time.seconds(600)).start().ok.get
+  println(quick.waitFor())
+  println(millis(quick) >= 150)
+  // Seen to end by `isAlive`, and reaped by `close`.
+  val polled = burn().start().ok.get
+  while polled.isAlive() do threads.sleep(time.millis(10))
+  println(millis(polled) >= 150)
+  val closed = burn().start().ok.get
+  threads.sleep(time.millis(50))
+  println(closed.close())
+  println(millis(closed) < 100000)
+  // A sleeper, a detached command, an exit code and a signal.
+  val sleeper = Command("/bin/sleep", "0.2").start().ok.get
+  println(sleeper.waitFor())
+  println(millis(sleeper) < 100)
+  val gone = burn().start().ok.get
+  _ = gone.detach()
+  println(millis(gone) == 0)
+  println(process.waitPid(gone.pid()))
+  println(millis(gone) == 0)
+  val code = Command("/bin/sh", "-c", "exit 3").start().ok.get
+  println(code.waitFor())
+  val killed = Command("/bin/sh", "-c", "kill -9 $$").start().ok.get
+  println(killed.waitFor())
+  // A command handed to a thread is waited for, and its time read, there.
+  val handed = burn().start().ok.get
+  val t = threads.spawn(() ->
+    _ = handed.waitFor()
+    handed.cpuTime().total.toMillis >= 150)
+  println(t.join())

@@ -344,11 +344,15 @@ shim_cache()
     val first = compiled_in(tc, text)
     assert_eq(first.diagnostics, "")
     val archive = first.archive.unwrap()
-    val built = metadata(archive).unwrap().modified
-    // The same bindings in another program are the same shims, which are not built again.
+    val built = metadata(archive).unwrap()
+    // The same bindings in another program are the same shims, which are not built again: the file
+    // is the one published first (a build publishes a new one by rename), touched as it is found, so
+    // a sweep of the cache sees it in use.
     val second = compiled_in(tc, "// another program with the same binding\n" + text)
     assert_eq(second.archive.unwrap(), archive)
-    assert(metadata(archive).unwrap().modified == built)
+    val found = metadata(archive).unwrap()
+    assert_eq(found.inode, built.inode)
+    assert(found.modified.us >= built.modified.us)
     // Another binding is another archive.
     val other = compiled_in(tc, "@sysl(\"sysl.text.to_upper\")\nlower(s: string) -> string\n\nmain() = 0\n")
     assert(other.archive.unwrap() != archive)
@@ -589,3 +593,79 @@ fingerprint_through_a_link()
     assert(grown.contains("two.sysl"))
     assert(grown != direct)
     assert_eq(tree_fingerprint(dir + "/real"), grown)
+
+// A program that reaches every library binding able to wait on something outside the program, and a
+// few that cannot.
+private val WaitingProgram =
+    "import avin.fs\n" +
+    "import avin.net.{TcpStream, UnixStream}\n" +
+    "import avin.process.Command\n" +
+    "import avin.time\n" +
+    "\n" +
+    "main() -> int\n" +
+    "  println(TcpStream.connect(\"db.example\", 5432).isOk)\n" +
+    "  println(UnixStream.connect(\"/probe/socket\").isOk)\n" +
+    "  println(fs.readText(\"/probe/a\").isOk)\n" +
+    "  println(fs.readBytes(\"/probe/a\").isOk)\n" +
+    "  println(fs.writeText(\"/probe/a\", \"t\").isOk)\n" +
+    "  println(fs.appendText(\"/probe/a\", \"t\").isOk)\n" +
+    "  println(fs.writeBytes(\"/probe/a\", Array.empty[byte]()).isOk)\n" +
+    "  println(fs.appendBytes(\"/probe/a\", Array.empty[byte]()).isOk)\n" +
+    "  println(fs.open(\"/probe/a\").map(f -> f.readLine().isOk).isOk)\n" +
+    "  println(fs.create(\"/probe/a\").map(f -> f.write(Array.empty[byte]()).isOk).isOk)\n" +
+    "  println(fs.append(\"/probe/a\").map(f -> f.flush().isOk).isOk)\n" +
+    "  println(fs.openUpdate(\"/probe/a\").isOk)\n" +
+    "  println(fs.createUpdate(\"/probe/a\").isOk)\n" +
+    "  println(Command(\"cat\").fromFile(\"/probe/a\").toFile(\"/probe/b\").run().isOk)\n" +
+    "  println(Command(\"cat\").appendTo(\"/probe/b\").run().isOk)\n" +
+    "  println(Command(\"cat\").output().isOk)\n" +
+    "  println(Command(\"cat\").lines().map(ls -> ls.toVector).isOk)\n" +
+    "  println(time.zone(\"Europe/Paris\").isOk)\n" +
+    "  println(fs.exists(\"/probe/a\"))\n" +
+    "  println(fs.listDir(\"/probe\").isOk)\n" +
+    "  println(\"a\".toUpper)\n" +
+    "  0\n"
+
+// A binding as the test names it: its Sysl function, or its handle's Sysl type and method.
+private binding_key(b: MirBinding) -> string = b.reach match
+    Method(m) -> b.target + "." + m
+    ValueMethod(m) -> b.target + "." + m
+    _ -> b.target
+
+// Every binding `program` reaches, by its key, for a failure to name what was reached instead.
+private reached(program: MirProgram) -> string
+    var all = ""
+    for b in program.bindings do all = all + " " + binding_key(b)
+    all
+
+@test("every library binding that can wait on something outside the program is blocking, and one that cannot is not")
+library_waiting_bindings_block()
+    val program = lower_source(repository_toolchain(), source_of("/probe/waiting.avin", WaitingProgram)).unwrap()
+    // Connecting a Unix socket, reading, writing and opening a file (which may be a pipe, a FIFO or a
+    // device), and waiting for a child or its output. Name resolution is not among them: the runtime
+    // makes a lookup on a helper thread and waits for it as it waits on a socket, so that a
+    // cancellation can end the wait, and the binding the program reaches is the runtime's, which
+    // never blocks.
+    val waiting = ["sysl.net.unix_connect", "sysl.fs.read_text", "sysl.fs.read_bytes",
+        "sysl.fs.write_text", "sysl.fs.append_text", "sysl.fs.write_bytes", "sysl.fs.append_bytes", "sysl.fs.open",
+        "sysl.fs.create", "sysl.fs.append", "sysl.fs.open_update", "sysl.fs.create_update", "sysl.fs.File.read",
+        "sysl.fs.File.write", "sysl.fs.File.flush", "avin.rt.reap_usage", "sysl.io.FdReader.read",
+        "avin.rt.zone_file_bytes"]
+    val prompt = ["sysl.fs.exists", "sysl.fs.entries", "sysl.text.to_upper", "sysl.net.socket", "sysl.process.spawn",
+        "avin.rt.resolve_host"]
+    for b in program.bindings
+        assert(binding_key(b) != "sysl.net.resolve", "the library binds the system's resolver directly")
+    for name in waiting
+        var found = false
+        for b in program.bindings
+            if binding_key(b) == name
+                found = true
+                assert(b.blocking, s"$name is not blocking")
+        assert(found, s"the program does not reach $name; it reaches${reached(program)}")
+    for name in prompt
+        var found = false
+        for b in program.bindings
+            if binding_key(b) == name
+                found = true
+                assert(!b.blocking, s"$name is blocking")
+        assert(found, s"the program does not reach $name; it reaches${reached(program)}")

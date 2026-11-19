@@ -37,6 +37,9 @@ struct CancelPoint
     recovery: *Recovery
     doubt: u32
     previous: *CancelPoint
+    /** How many deferred statements the thread had reached when the point was set: a cancellation
+     * that returns here runs the ones reached since (`defers.sysl`). */
+    defers: usize
 
 /** The bit of `requested` raised while a cancelled thread has not yet ended. */
 const Cancel: u32 = 4
@@ -79,13 +82,38 @@ cancel_guarded(ctx: *Context, run: *u8, runner: *u8) -> bool
         return false
     guarded_run(ctx, run, entry)
 
+/** Runs `run` and then `give_back`, closures that take nothing and return nothing, for a caller that
+ * holds a share of something other threads wait for (a share of a read-write lock, a semaphore's
+ * permit), taken in a region in doubt it entered with `lock_release_holding`: `give_back` gives the
+ * share back, and this leaves the region once it has. The share is held from the moment it is taken
+ * until it is given back with nothing able to stop the thread in between, and a trap inside `run`
+ * stops the program, as one under a lock does, rather than returning to an actor's turn, which would
+ * leave the share held for ever. Where `cancellable`, and the thread could be stopped but for this
+ * region, a cancellation may stop `run`, returning here: `give_back` still runs, and this answers
+ * `true`, leaving the thread as one returning to `cancel_guarded` is, not to be stopped again until
+ * it calls `cancel_resume`. Otherwise `run` runs to its end. */
+@export("avin_rt_cancel_guarded_held")
+cancel_guarded_held(ctx: *Context, run: *u8, give_back: *u8, cancellable: bool, runner: *u8) -> bool
+    val entry: *extern(@lets_out *Context, *u8) -> unit = ptr_cast(runner)
+    var stopped = false
+    if cancellable && may_cancel(ctx, 1)
+        // The point is set inside the region, so the waits and polls in `run` may stop it; a return
+        // from a cancellation leaves the context one region deeper than the point.
+        stopped = guarded_run(ctx, run, entry)
+        if stopped then leave_doubt(ctx)
+    else
+        entry(ctx, run)
+    entry(ctx, give_back)
+    if !stopped then leave_doubt(ctx)
+    stopped
+
 /** The cancellation point a lightweight thread runs its closure at. */
 run_cancellable(ctx: *Context, run: *u8, runner: *u8) -> bool
     val entry: *extern(@lets_out *Context, *u8) -> unit = ptr_cast(runner)
     guarded_run(ctx, run, entry)
 
 private guarded_run(ctx: *Context, run: *u8, entry: *extern(@lets_out *Context, *u8) -> unit) -> bool
-    var pt = CancelPoint([0u64; 64], ctx.top, ctx.caller, ctx.owner, ctx.recovery, ctx.doubt, ctx.cancel_point)
+    var pt = CancelPoint([0u64; 64], ctx.top, ctx.caller, ctx.owner, ctx.recovery, ctx.doubt, ctx.cancel_point, ctx.defer_count)
     ctx.cancel_point = &pt
     if save_point(&pt.env[0]) == 0
         entry(ctx, run)
@@ -181,13 +209,21 @@ disarm_cancel(p: *Lwt)
 cancel_point(ctx: *Context)
     cancel_at_poll(ctx)
 
+/** `cancel_point` for a thread holding one lock, which a settling wait on a condition took again: the
+ * thread stops holding it, and the deferred statement that lets it go runs as it stops. */
+@export("avin_rt_cancel_point_held")
+cancel_point_held(ctx: *Context)
+    if is_cancelled(ctx) && may_cancel(ctx, 1) then unwind_cancelled(ctx)
+
 /** At a safepoint poll: stops the thread of `c` where it is cancelled and may be stopped here. */
 cancel_at_poll(c: *Context)
     if is_cancelled(c) && may_cancel(c, 0) then unwind_cancelled(c)
 
-/** Stops the thread of `ctx`, which is cancelled and running: returns to its innermost cancellation
- * point, with every frame since dropped, and nothing to stop it again until it resumes. */
+/** Stops the thread of `ctx`, which is cancelled and running: runs the deferred statements reached
+ * since its innermost cancellation point, the newest first, and returns to that point, with every
+ * frame since dropped, and nothing to stop it again until it resumes. */
 unwind_cancelled(ctx: *Context) -> never
+    run_defers_to(ctx, ctx.cancel_point.defers)
     val pt = ctx.cancel_point
     ctx.top = pt.top
     ctx.caller = pt.caller

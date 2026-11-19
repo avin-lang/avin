@@ -11,7 +11,8 @@ module avin.net.tls
 
 import avin.io
 import avin.io.IoError
-import avin.net.{ByteStream, ReadAhead, TcpStream}
+import avin.net.{ByteStream, ReadAhead, StreamReader, StreamWriter, TcpStream}
+import avin.threads.{Atomic, Semaphore}
 import avin.time.Duration
 
 // Why a TLS connection could not be made.
@@ -111,6 +112,48 @@ private class ClientContext
 @sysl("sh.sysl.openssl.Server", named: "TlsServer")
 private class ServerContext
 
+// Who a `TlsStream` belongs to: a Sysl handle holding nothing else, which moves between threads with
+// the stream, so the code that handed the stream over traps at its next use. Its traps name the
+// `TlsStream`.
+@sysl("avin.rt.Token", named: "TlsStream")
+private class Owner
+  // Does nothing: calling it checks the stream belongs to the code running.
+  held() -> unit
+
+@sysl("avin.rt.token")
+private newOwner() -> Owner
+
+// Who the reading half of a split `TlsStream` belongs to, as `Owner` is the stream's.
+@sysl("avin.rt.Token", named: "StreamReader")
+private class ReaderOwner
+  held() -> unit
+
+@sysl("avin.rt.token")
+private newReaderOwner() -> ReaderOwner
+
+// Who the writing half of a split `TlsStream` belongs to.
+@sysl("avin.rt.Token", named: "StreamWriter")
+private class WriterOwner
+  held() -> unit
+
+@sysl("avin.rt.token")
+private newWriterOwner() -> WriterOwner
+
+// The owner of the code running.
+@intrinsic("owner_current")
+private ownerNow() -> long
+
+// Gives every Sysl handle `value` reaches that `from` owns to `to`.
+@intrinsic("hand_over")
+private handOver(value: Any, from: long, to: long)
+
+// The owner a handle in transit has: the next code to use it takes it.
+private val InTransit: long = 0
+
+// Whether a write to descriptor `fd` would send something without waiting, never waiting itself.
+@sysl("avin.rt.descriptor_writable")
+private descriptorWritable(fd: int) -> bool
+
 // One end of a TLS connection, between the plaintext and the ciphertext buffers.
 @sysl("sh.sysl.openssl.Stream", named: "TlsStream")
 private class Engine
@@ -199,6 +242,7 @@ private serverContext(server: TlsServer) -> Result[ServerContext, TlsError] =
 // failure of TLS itself after the handshake is an `IoError` of kind `Other` beginning `TLS:`, naming the peer. The connection
 // ends where the peer closes TLS or the TCP connection beneath. It may be handed to another thread
 // or actor, which takes it over, as a `TcpStream` is.
+@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps")
 class TlsStream(
     private val tcp: TcpStream,
     private val engine: Engine,
@@ -207,26 +251,102 @@ class TlsStream(
     private var closed: bool,
     private val peer: string
 ): Sendable, ByteStream
+  // Who the connection belongs to, checked before every operation, one served from the bytes read
+  // ahead included: handed over, the connection moves with it.
+  private val owner = newOwner()
+  // A failure `readable()` met while it looked, which the next read answers.
+  private var failure: Option[IoError] = None
+  // Whether `split` has given the connection to its halves.
+  private var halved = false
+  // Ciphertext of a record a `writeSome` made that the connection had no room for yet, which goes
+  // before anything else is sent.
+  private var pending = Array.empty[byte]()
+  // Where TLS puts the plaintext of a read, kept from one read to the next.
+  private var room = Array.empty[byte]()
+
+  // Whether a read would answer now, without waiting: plaintext is buffered, TLS holds decrypted
+  // plaintext or has a whole record of it among what has arrived, the peer has closed TLS or the
+  // connection, or the connection has failed or is closed. It reads whatever ciphertext has already
+  // arrived, so a partial record is not mistaken for plaintext, and never waits for more.
+  override readable() -> bool
+    owner.held()
+    if closed || halved || buffered.pending || failure is Some(_) then return true
+    room = plaintextRoom(room, MaxPlaintext)
+    val into = room
+    while true
+      val got = engine.receive(into)
+      val sent = readerFlush()
+      if sent is Err(e)
+        failure = Some(e)
+        return true
+      got match
+        Ok(Data(n)) ->
+          buffered.keep(into.slice(0, int(n)))
+          return true
+        Ok(Closed) -> return true
+        Ok(Wants) ->
+          if !tcp.readable() then return false
+          pull() match
+            Ok(true) -> ()
+            Ok(false) -> return true
+            Err(e) ->
+              failure = Some(e)
+              return true
+        Err(f) ->
+          failure = Some(streamError(f, "read from", peer))
+          return true
+    true
+
+  // The descriptor of the TCP connection beneath, which a select's `readable()` arm watches; -1 once
+  // closed.
+  override readinessDescriptor() -> int
+    owner.held()
+    if closed || halved then -1 else tcp.readinessDescriptor()
+
+  // Whether a write would send something now, without waiting: the TCP connection beneath has room
+  // and every record an earlier `writeSome` made has gone, or the connection has failed or is closed.
+  // It sends what of those records the connection has room for, and never waits.
+  override writable() -> bool
+    owner.held()
+    if closed || halved then return true
+    if !tcp.writable() then return false
+    if pending.length == 0 then return true
+    if pushedSome().isErr then return true
+    pending.length == 0 && tcp.writable()
+
+  // The descriptor of the TCP connection beneath, which a select's `writable()` arm watches; -1
+  // once closed.
+  override writabilityDescriptor() -> int
+    owner.held()
+    if closed || halved then -1 else tcp.writabilityDescriptor()
+
+  // The address of the other end of the TCP connection beneath.
+  override remoteAddress -> Option[string] = tcp.remoteAddress
+
   // Up to `max` bytes, waiting for at least one; an empty array once the other end has finished
   // sending. `max` is at least one.
   override read(max: int) -> Result[Array[byte], IoError]
-    if closed then return Err(closedError("read from", peer))
+    owner.held()
+    if closed || halved then return Err(unusable("read from", peer))
     buffered.read(max, received)
 
   // The next line, without its terminator, or `None` once the other end has finished sending and
   // every line has been read, as a `TcpStream` reads one.
   override readLine() -> Result[Option[string], IoError]
-    if closed then return Err(closedError("read from", peer))
+    owner.held()
+    if closed || halved then return Err(unusable("read from", peer))
     buffered.readLine(received)
 
   // Everything the other end sends until it finishes, after what earlier reads left.
   override readAll() -> Result[Array[byte], IoError]
-    if closed then return Err(closedError("read from", peer))
+    owner.held()
+    if closed || halved then return Err(unusable("read from", peer))
     buffered.readAll(received)
 
   // Sends all of `bytes`.
   override write(bytes: Array[byte]) -> Result[unit, IoError]
-    if closed then return Err(closedError("write to", peer))
+    owner.held()
+    if closed || halved then return Err(unusable("write to", peer))
     var at = 0
     while at < bytes.length
       val part = if at == 0 then bytes else bytes.slice(at, bytes.length)
@@ -240,19 +360,44 @@ class TlsStream(
         Err(f) -> return Err(streamError(f, "write to", peer))
     Ok(())
 
+  // Hands TLS at most one record's worth of `bytes`, sends what of the record the connection has
+  // room for, and answers how much plaintext the record holds. The rest of the record goes before
+  // anything else is sent: `writable()` sends it as room comes, and answers `true` once it has gone,
+  // and a read that has to wait for input sends it as room comes while it waits, so a caller that
+  // only reads after its last `writeSome` still has its record sent. So after `writable()` answered
+  // `true` this does not wait; called without asking, it first waits for what an earlier one left.
+  override writeSome(bytes: Array[byte]) -> Result[int, IoError]
+    owner.held()
+    if closed || halved then return Err(unusable("write to", peer))
+    if bytes.length == 0 then return Ok(0)
+    flush()?
+    val part = firstRecordOf(bytes)
+    while true
+      engine.send(part) match
+        Ok(Took(n)) ->
+          pushedSome()?
+          return Ok(int(n))
+        Ok(Wants) ->
+          flush()?
+          if !pull()? then return Err(IoError(io.ConnectionReset, "write to", peer))
+        Err(f) -> return Err(streamError(f, "write to", peer))
+    Ok(0)
+
   // Sends `text` as UTF-8.
   override writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
 
   // A wait on the connection beneath longer than `d` fails with `TimedOut` from now on, as a
   // `TcpStream`'s does; zero or less takes the limit away.
   override setTimeout(d: Duration) -> Result[unit, IoError]
-    if closed then return Err(closedError("set the timeout of", peer))
+    owner.held()
+    if closed || halved then return Err(unusable("set the timeout of", peer))
     tcp.setTimeout(d)
 
   // Tells the other end nothing more will be sent, closing TLS and then the TCP connection's
   // sending side; reading goes on.
   override shutdownOutput() -> Result[unit, IoError]
-    if closed then return Err(closedError("shut down", peer))
+    owner.held()
+    if closed || halved then return Err(unusable("shut down", peer))
     engine.notifyClose()
     flush()?
     tcp.shutdownOutput()
@@ -260,8 +405,10 @@ class TlsStream(
   // Closes TLS, as far as the peer can be told without waiting, and the connection; closing again
   // does nothing. A read or write afterwards answers an error. The `Err` is a failure to send the
   // peer the notice that TLS is closing; the connection is closed either way.
+  // A connection that has been split is its halves' to close, and closing it does nothing.
   override close() -> Result[unit, IoError]
-    if closed then return Ok(())
+    owner.held()
+    if closed || halved then return Ok(())
     closed = true
     engine.notifyClose()
     val told = flush()
@@ -270,6 +417,33 @@ class TlsStream(
     // closed either way.
     _ = tcp.close()
     told
+
+  // The reading and writing halves of the connection. They share its TLS state, which each reaches
+  // only under a lock and never while it waits for the connection, so a reader parked for the
+  // peer's records never holds up a writer, and the reverse. The TCP connection beneath is split
+  // too: the reading half reads its reader, and its writer is shared, under a lock of its own, so
+  // that whatever TLS has to send goes out in order whichever half produced it.
+  override split() -> (StreamReader, StreamWriter)
+    owner.held()
+    if halved then fail("a connection is split once, and this one has been split already")
+    if closed then fail("a closed connection cannot be split")
+    halved = true
+    val fd = tcp.writabilityDescriptor()
+    val (r, w) = tcp.split()
+    // The TLS state and the TCP writer belong to whichever half holds their lock, and to nobody
+    // between.
+    val me = ownerNow()
+    handOver(engine, me, InTransit)
+    handOver(w, me, InTransit)
+    val shared = TlsShared(engine, w, fd, peer, pending)
+    val reader: StreamReader = TlsReader(r, shared, buffered, failure, peer, tcp.remoteAddress)
+    val writer: StreamWriter = TlsWriter(shared, peer, tcp.remoteAddress)
+    (reader, writer)
+
+  // What an operation on the connection answers once it is closed or split.
+  private unusable(operation: string, subject: string) -> IoError =
+    if halved then IoError(io.Other("the connection has been split into a reader and a writer"), operation, subject)
+    else closedError(operation, subject)
 
   // Drives the handshake: each step is asked for first and what it wrote sent after, since nothing
   // is written before a step asks for it, and what arrives is handed over where a step wants more.
@@ -288,12 +462,42 @@ class TlsStream(
         return Err(Handshake("the connection ended during the handshake"))
     Ok(())
 
-  // Writes on the connection whatever ciphertext TLS has to send.
+  // Writes on the connection what an earlier `writeSome` left, then whatever ciphertext TLS has to
+  // send, waiting for room as long as it takes.
+  // What TLS has to send joins `pending` before any of it is written, and goes a part at a time, so
+  // that a wait that fails leaves exactly what did not go kept, in order, to go first next time.
   private flush() -> Result[unit, IoError]
     while true
-      val n = engine.outgoing(scratch)
-      if n == 0 then return Ok(())
-      tcp.write(if n == long(scratch.length) then scratch else scratch.slice(0, int(n)))?
+      takeOutgoing()
+      if pending.length == 0 then return Ok(())
+      while pending.length > 0
+        val k = tcp.writeSome(pending)?
+        pending = if k == pending.length then Array.empty[byte]() else pending.slice(k, pending.length)
+    Ok(())
+
+  // Moves the ciphertext TLS has to send to the end of `pending`.
+  private takeOutgoing()
+    var n = engine.outgoing(scratch)
+    if n == 0 then return
+    val all = Buffer[byte]()
+    all.addAll(pending)
+    while n > 0
+      all.addAll(scratch.slice(0, int(n)))
+      n = engine.outgoing(scratch)
+    pending = all.toArray()
+
+  // `flush` for a read, which leaves what TLS has to send where a `writeSome` left some unsent, to go
+  // after that, so a read never waits for room alone: a read that has to wait sends it as room comes
+  // (`pulledSending`), and otherwise the next write, `writable()` or close does.
+  private readerFlush() -> Result[unit, IoError] = if pending.length > 0 then Ok(()) else flush()
+
+  // What an earlier `writeSome` left and whatever ciphertext TLS has to send, sent as far as the
+  // connection has room, waiting only where it has none at all; the rest is kept.
+  private pushedSome() -> Result[unit, IoError]
+    takeOutgoing()
+    if pending.length == 0 then return Ok(())
+    val k = tcp.writeSome(pending)?
+    pending = if k == pending.length then Array.empty[byte]() else pending.slice(k, pending.length)
     Ok(())
 
   // Hands TLS the next ciphertext the connection receives; false where the connection has ended.
@@ -306,20 +510,436 @@ class TlsStream(
   // Up to `max` bytes of plaintext, waiting for at least one; empty once the peer has closed TLS
   // or the connection.
   private received(max: int) -> Result[Array[byte], IoError]
-    val into = Array.fill(max, byte(0))
+    if failure is Some(e)
+      failure = None
+      return Err(e)
+    room = plaintextRoom(room, max)
+    val into = room
     while true
       engine.receive(into) match
         Ok(Data(n)) ->
-          flush()?
-          return Ok(if n == long(max) then into else into.slice(0, int(n)))
+          val got = into.slice(0, int(n))
+          readerFlush()?
+          return Ok(got)
         Ok(Closed) ->
-          flush()?
+          readerFlush()?
           return Ok(Array.empty[byte]())
         Ok(Wants) ->
-          flush()?
-          if !pull()? then return Ok(Array.empty[byte]())
+          readerFlush()?
+          if !pulledSending()? then return Ok(Array.empty[byte]())
         Err(f) -> return Err(streamError(f, "read from", peer))
     Ok(Array.empty[byte]())
+
+  // `pull` for a read that has to wait. Where a `writeSome` left part of a record unsent, the read
+  // waits for input or room, whichever comes first, and sends the rest as room comes: a peer that
+  // answers only once it has the whole record would otherwise wait for it while this waits for the
+  // answer. Waiting for both, it never waits for room alone, so a peer that is itself waiting to
+  // send is still read from.
+  private pulledSending() -> Result[bool, IoError]
+    while pending.length > 0 && !tcp.readable()
+      if !inputOrRoom() then return Err(IoError(io.TimedOut, "read from", peer))
+      if tcp.writable() then pushedSome()?
+    pull()
+
+  // Waits for the TCP connection to have input or room, at most the limit `setTimeout` set; false
+  // where that ran out first.
+  private inputOrRoom() -> bool
+    val t = tcp
+    val limit = t.timeout
+    if limit.micros <= 0
+      select
+        t.readable() -> ()
+        t.writable() -> ()
+      return true
+    select
+      t.readable() -> true
+      t.writable() -> true
+      after limit -> false
+
+// The most plaintext one TLS record carries.
+private val MaxPlaintext = 16384
+
+// An array for TLS to put up to `max` bytes of plaintext in, never more than one record's: `room`
+// itself where it is that long, so a connection read with one size again and again allocates only
+// what each read answers, or a new one. TLS fills at most the array's length, so it is never longer
+// than the read asked for.
+private plaintextRoom(room: Array[byte], max: int) -> Array[byte]
+  val want = if max > MaxPlaintext then MaxPlaintext else max
+  if room.length == want then room else Array.fill(want, byte(0))
+
+// The first record's worth of `bytes`.
+private firstRecordOf(bytes: Array[byte]) -> Array[byte] =
+  if bytes.length <= MaxPlaintext then bytes else bytes.slice(0, MaxPlaintext)
+
+// What the two halves of a split TLS connection share. The TLS state is reached only holding
+// `state`, which nothing holds while it waits for the connection; the writer of the TCP connection
+// beneath only holding `sending`, so the ciphertext either half has TLS make goes out whole and in
+// order. Each handle is in transit between uses, taken by the code holding its lock and handed back
+// before the lock goes, a cancellation of that code included.
+@trusted_sendable("its TLS state is reached only holding `state`, and its TCP writer only holding `sending`, each handed back to no owner before the lock goes")
+@keeps_owners
+private class TlsShared(
+    private val engine: Engine,
+    private val out: StreamWriter,
+    // The descriptor of the TCP connection, for `writable()` to look at without `sending`.
+    val descriptor: int,
+    val peer: string,
+    // Ciphertext that did not go when it was sent, its wait having run out of time or failed, which
+    // goes before anything else is sent. Holding `sending`.
+    private var pending: Array[byte]
+): Sendable
+  private val state = Semaphore(1)
+  private val sending = Semaphore(1)
+  private val scratch = Array.fill(RecordSize, byte(0))
+  // Whether a reader has left TLS holding ciphertext to send, having found another sending.
+  private val owed = Atomic(false)
+  // A permit the reader gives once it has handed TLS more of what arrived, for a writer TLS has told
+  // to wait for the peer.
+  private val fed = Semaphore(0, capacity = 1)
+  // The halves not yet closed; the second to close lets TLS go.
+  private val open = Atomic(2)
+  // How sending to the connection failed, by whichever half sent, other than by running out of time.
+  // Every later send answers it, so the writer learns of a failure the reader met sending for it,
+  // and a TLS close notice the reader tried to send counts as not sent. Holding `sending`.
+  private var broken: Option[IoError] = None
+
+  // `body` with the TLS state, holding `state`.
+  engaged[R](body: (Engine) -> R) -> R = state.withPermit(() -> lent(body))
+
+  private lent[R](body: (Engine) -> R) -> R
+    defer handOver(engine, ownerNow(), InTransit)
+    body(engine)
+
+  // `body` with the TCP writer, holding `sending`.
+  private writing[R](body: (StreamWriter) -> R) -> R = sending.withPermit(() -> lentOut(body))
+
+  private lentOut[R](body: (StreamWriter) -> R) -> R
+    defer handOver(out, ownerNow(), InTransit)
+    body(out)
+
+  // The ciphertext TLS has to send, taken from it, record by record. Holding `state`.
+  private outgoingOf(e: Engine) -> Vector[Array[byte]]
+    var chunks = Vector.empty[Array[byte]]()
+    while true
+      val n = e.outgoing(scratch)
+      if n == 0 then return chunks
+      chunks = chunks :+ scratch.slice(0, int(n))
+    chunks
+
+  // Sends what a `writeSome` left, then whatever ciphertext TLS has to send, holding `sending`,
+  // until it has none.
+  private pushed(o: StreamWriter) -> Result[unit, IoError]
+    owed.store(false)
+    if broken is Some(e) then return Err(e)
+    kept(pushedNow(o))
+
+  // A failure to send, kept in `broken` unless it is a timeout. Holding `sending`.
+  private kept(r: Result[unit, IoError]) -> Result[unit, IoError]
+    r match
+      Err(IoError(io.TimedOut, _, _)) -> ()
+      Err(e) -> broken = Some(e)
+      Ok(_) -> ()
+    r
+
+  // What TLS has to send joins `pending` before any of it is written, and goes a part at a time, so
+  // that a wait that fails leaves exactly what did not go kept, in order, to go first next time.
+  private pushedNow(o: StreamWriter) -> Result[unit, IoError]
+    while true
+      takeOutgoing()
+      if pending.length == 0 then return Ok(())
+      while pending.length > 0
+        val k = o.writeSome(pending)?
+        pending = if k == pending.length then Array.empty[byte]() else pending.slice(k, pending.length)
+    Ok(())
+
+  // Moves the ciphertext TLS has to send to the end of `pending`. Holding `sending`.
+  private takeOutgoing()
+    val chunks = engaged(e -> outgoingOf(e))
+    if chunks.length == 0 then return
+    val all = Buffer[byte]()
+    all.addAll(pending)
+    for c in chunks do all.addAll(c)
+    pending = all.toArray()
+
+  // What a `writeSome` left and whatever ciphertext TLS has to send, holding `sending`, sent as far
+  // as the connection has room, waiting only where it has none at all; the rest is kept.
+  private pushedSome(o: StreamWriter) -> Result[unit, IoError]
+    owed.store(false)
+    if broken is Some(e) then return Err(e)
+    kept(pushedSomeNow(o))
+
+  private pushedSomeNow(o: StreamWriter) -> Result[unit, IoError]
+    takeOutgoing()
+    if pending.length == 0 then return Ok(())
+    val k = o.writeSome(pending)?
+    pending = if k == pending.length then Array.empty[byte]() else pending.slice(k, pending.length)
+    Ok(())
+
+  // For the writing half's `write`: hands TLS all of `bytes` and sends every record, waiting for room
+  // as long as it takes.
+  sendAll(bytes: Array[byte]) -> Result[unit, IoError]
+    var at = 0
+    while at < bytes.length
+      val part = if at == 0 then bytes else bytes.slice(at, bytes.length)
+      engaged(e -> e.send(part)) match
+        Ok(Took(n)) ->
+          at += int(n)
+          flush()?
+        Ok(Wants) ->
+          flush()?
+          awaitFed()
+        Err(f) -> return Err(streamError(f, "write to", peer))
+    Ok(())
+
+  // For the writing half's `writeSome`: hands TLS `part`, at most one record, sends the whole record,
+  // waiting for room for its rest where the connection has too little, and answers how much
+  // plaintext TLS took. A record left part sent would go only at the writer's next use, and a writer
+  // whose last write it was never makes one, so its peer would wait for the rest for ever. Where the
+  // writer's time limit runs out first, the rest is kept, to go before anything else, and the answer
+  // is still what TLS took.
+  sendSome(part: Array[byte]) -> Result[int, IoError]
+    flush()?
+    while true
+      engaged(e -> e.send(part)) match
+        Ok(Took(n)) ->
+          flush() match
+            Err(IoError(io.TimedOut, _, _)) -> ()
+            Err(e) -> return Err(e)
+            Ok(_) -> ()
+          return Ok(int(n))
+        Ok(Wants) ->
+          flush()?
+          awaitFed()
+        Err(f) -> return Err(streamError(f, "write to", peer))
+    Ok(0)
+
+  // For the writing half: whether the connection has room and nothing a `writeSome` left, or a reader
+  // owed, is still to go, sending what of that there is room for. Never waits: where the reader is
+  // sending, it answers `false`, and the select's watch of the descriptor tries again.
+  writable() -> bool
+    if !descriptorWritable(descriptor) then return false
+    if !sending.tryAcquire() then return false
+    room()
+
+  private room() -> bool
+    defer sending.release()
+    lentOut(o -> roomIn(o))
+
+  private roomIn(o: StreamWriter) -> bool
+    if pending.length == 0 && !owed.load() then return true
+    if pushedSome(o).isErr then return true
+    pending.length == 0 && descriptorWritable(descriptor)
+
+  // Sends the ciphertext TLS has to send, waiting for the connection as long as it takes, and again
+  // where a reader left some owed meanwhile.
+  flush() -> Result[unit, IoError]
+    while true
+      writing(o -> pushed(o))?
+      if !owed.load() then return Ok(())
+    Ok(())
+
+  // For the reading half: sends the ciphertext TLS has to send where no other code is sending and no
+  // `writeSome` has left a record part sent, and otherwise leaves it owed to the writer, which sends
+  // it before it lets `sending` go, or after that record. So a reader never waits for a writer that
+  // waits for the peer, nor for room for the writer's record. A failure to send is not the reader's
+  // to answer: it is kept, and the writer answers it at its next use.
+  offer()
+    while true
+      owed.store(true)
+      if !sending.tryAcquire() then return
+      if offered() is Ok(true)
+        if !owed.load() then return
+      else
+        return
+
+  // Holding `sending`: sends what TLS has to send and answers `true`, or answers `false`, leaving it
+  // owed, where a `writeSome` has left part of a record.
+  private offered() -> Result[bool, IoError]
+    defer sending.release()
+    if pending.length > 0 then return Ok(false)
+    lentOut(o -> pushed(o)).map(_ -> true)
+
+  // Says TLS has been handed more of what arrived, for a writer waiting on it.
+  fedMore()
+    if fed.availablePermits() == 0 then fed.release()
+
+  // Waits until the reading half has handed TLS more of what arrived.
+  awaitFed() = fed.acquire()
+
+  // A limit for the waits of the TCP writer.
+  outTimeout(d: Duration) -> Result[unit, IoError] = writing(o -> o.setTimeout(d))
+
+  // Closes TLS's sending side, telling the peer, and the TCP connection's.
+  closeOut() -> Result[unit, IoError]
+    _ = engaged(e -> e.notifyClose())
+    val told = flush()
+    _ = writing(o -> o.close())
+    told
+
+  // A half has closed; the second lets TLS go.
+  left()
+    if open.sub(1) == 0 then _ = engaged(e -> e.close())
+
+// The reading half of a split `TlsStream`.
+@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its writing half is reached under locks")
+private class TlsReader(
+    private val tcp: StreamReader,
+    private val shared: TlsShared,
+    private val buffered: ReadAhead,
+    private var failure: Option[IoError],
+    private val peer: string,
+    private val other: Option[string]
+): Sendable, StreamReader
+  private val owner = newReaderOwner()
+  private var closed = false
+  // Where TLS puts the plaintext of a read, kept from one read to the next.
+  private var room = Array.empty[byte]()
+
+  override remoteAddress -> Option[string] = other
+
+  // Whether a read would answer now, without waiting, as a `TlsStream`'s `readable()` says.
+  override readable() -> bool
+    owner.held()
+    if closed || buffered.pending || failure is Some(_) then return true
+    room = plaintextRoom(room, MaxPlaintext)
+    val into = room
+    while true
+      val got = shared.engaged(e -> e.receive(into))
+      shared.offer()
+      got match
+        Ok(Data(n)) ->
+          buffered.keep(into.slice(0, int(n)))
+          return true
+        Ok(Closed) -> return true
+        Ok(Wants) ->
+          if !tcp.readable() then return false
+          pull() match
+            Ok(true) -> ()
+            Ok(false) -> return true
+            Err(e) ->
+              failure = Some(e)
+              return true
+        Err(f) ->
+          failure = Some(streamError(f, "read from", peer))
+          return true
+    true
+
+  override readinessDescriptor() -> int
+    owner.held()
+    if closed then -1 else tcp.readinessDescriptor()
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    owner.held()
+    if closed then return Err(closedError("read from", peer))
+    buffered.read(max, received)
+
+  override readLine() -> Result[Option[string], IoError]
+    owner.held()
+    if closed then return Err(closedError("read from", peer))
+    buffered.readLine(received)
+
+  override readAll() -> Result[Array[byte], IoError]
+    owner.held()
+    if closed then return Err(closedError("read from", peer))
+    buffered.readAll(received)
+
+  override setTimeout(d: Duration) -> Result[unit, IoError]
+    owner.held()
+    if closed then return Err(closedError("set the timeout of", peer))
+    tcp.setTimeout(d)
+
+  // Stops reading; closing again does nothing. TLS and the connection close once the writing half
+  // is closed too.
+  override close() -> Result[unit, IoError]
+    owner.held()
+    if !closed
+      closed = true
+      _ = tcp.close()
+      shared.left()
+    Ok(())
+
+  // Hands TLS the next ciphertext the connection receives; false where the connection has ended.
+  private pull() -> Result[bool, IoError]
+    val got = tcp.read(RecordSize)?
+    if got.length == 0 then return Ok(false)
+    shared.engaged(e -> e.incoming(got)).mapErr(f -> streamError(f, "read from", peer))?
+    shared.fedMore()
+    Ok(true)
+
+  // Up to `max` bytes of plaintext, waiting for at least one; empty once the peer has closed TLS
+  // or the connection.
+  private received(max: int) -> Result[Array[byte], IoError]
+    if failure is Some(e)
+      failure = None
+      return Err(e)
+    room = plaintextRoom(room, max)
+    val into = room
+    while true
+      val got = shared.engaged(e -> e.receive(into))
+      shared.offer()
+      got match
+        Ok(Data(n)) -> return Ok(into.slice(0, int(n)))
+        Ok(Closed) -> return Ok(Array.empty[byte]())
+        Ok(Wants) -> if !pull()? then return Ok(Array.empty[byte]())
+        Err(f) -> return Err(streamError(f, "read from", peer))
+    Ok(Array.empty[byte]())
+
+// The writing half of a split `TlsStream`. Where TLS must hear from the peer before it can send
+// more, which only a renegotiation asks, a write waits for the reading half to read.
+@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its reading half is reached under locks")
+private class TlsWriter(
+    private val shared: TlsShared,
+    private val peer: string,
+    private val other: Option[string]
+): Sendable, StreamWriter
+  private val owner = newWriterOwner()
+  private var closed = false
+
+  override remoteAddress -> Option[string] = other
+
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    owner.held()
+    if closed then return Err(closedError("write to", peer))
+    shared.sendAll(bytes)
+
+  // Hands TLS at most one record's worth of `bytes` and sends the whole record, waiting for room for
+  // its rest where the connection has too little, so what it answers has gone even where the writer
+  // writes nothing after it; where the writer's time limit runs out first, the rest goes before
+  // anything else, and `writable()` sends it as room comes. Its reading half reads meanwhile, so the
+  // wait never holds up the peer's answers.
+  override writeSome(bytes: Array[byte]) -> Result[int, IoError]
+    owner.held()
+    if closed then return Err(closedError("write to", peer))
+    if bytes.length == 0 then return Ok(0)
+    shared.sendSome(firstRecordOf(bytes))
+
+  override writeText(text: string) -> Result[unit, IoError] = write(utf8Of(text))
+
+  // Whether a write would send something now: the connection has room and nothing a `writeSome` whose
+  // time ran out, or a reader, left is still to go. Never waits.
+  override writable() -> bool
+    owner.held()
+    closed || shared.writable()
+
+  override writabilityDescriptor() -> int
+    owner.held()
+    if closed then -1 else shared.descriptor
+
+  override setTimeout(d: Duration) -> Result[unit, IoError]
+    owner.held()
+    if closed then return Err(closedError("set the timeout of", peer))
+    shared.outTimeout(d)
+
+  // Closes TLS's sending side, telling the peer, and the TCP connection's sending side; closing
+  // again does nothing. The `Err` is a failure to send the peer that notice. TLS and the connection
+  // close once the reading half is closed too.
+  override close() -> Result[unit, IoError]
+    owner.held()
+    if closed then return Ok(())
+    closed = true
+    val told = shared.closeOut()
+    shared.left()
+    told
 
 object TlsStream
   // A TLS connection to `host` and `port`, its certificate checked for `host` against what

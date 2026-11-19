@@ -1,0 +1,87 @@
+// expect: exit 0
+// A router is a child of the actor that starts it: `stop(router)` ends it, its routees first, each
+// running its `stopping` block, and its end is `Stopped`; an ask of a router that has ended answers
+// `Ended`. A router ends with its parent too. A routee that stops itself leaves the pool, the
+// others take its messages, and the router stops once no routee is left.
+import avin.actors.{ActorRef, Router, SmallestMailbox, spawn}
+import avin.threads.Atomic
+import avin.threads as threads
+import avin.time
+
+data Job
+  Who(replyTo: ActorRef[string])
+  Quit
+
+actor Worker(stopped: Atomic[int]) receives Job
+  receive
+    Who(replyTo) -> replyTo.tell(s"$self")
+    Quit -> stop()
+  stopping
+    stopped.add(1)
+
+data Cmd
+  Start(size: int, replyTo: ActorRef[ActorRef[Job]])
+  End(router: ActorRef[Job])
+  Children(replyTo: ActorRef[string])
+  Leave
+
+actor Owner(stopped: Atomic[int]) receives Cmd
+  receive
+    Start(size, replyTo) -> replyTo.tell(Router.pool(size, Worker(stopped)))
+    End(router) -> stop(router)
+    Children(replyTo) -> replyTo.tell(s"${children()}")
+    Leave -> stop()
+
+who(router: ActorRef[Job]) -> string = router.ask(r -> Who(r), timeout = time.seconds(5)).await() match
+  Ok(s) -> s
+  Err(e) -> s"Err: ${e.message}"
+
+start(owner: ActorRef[Cmd], size: int) -> ActorRef[Job] =
+  owner.ask(r -> Start(size, r), timeout = time.seconds(5)).await().ok.get
+
+children(owner: ActorRef[Cmd]) -> string = owner.ask(r -> Children(r), timeout = time.seconds(5)).await().ok.get
+
+main()
+  val stopped = Atomic[int](0)
+  val owner = spawn(Owner(stopped))
+  val router = start(owner, 3)
+  println(router)
+  println(who(router))
+  println(children(owner))
+  // Stopped by its parent: the routees end first, so all three have run `stopping` by the time the
+  // router's end is known.
+  owner.tell(End(router))
+  println(router.ended().await())
+  println(stopped.load())
+  println(who(router))
+  println(children(owner))
+
+  // Routees that stop themselves leave the pool one by one; the last one leaving stops the router.
+  stopped.store(0)
+  val shrinking = start(owner, 3)
+  shrinking.tell(Quit)
+  // Once it is ending, the other two answer every ask, whichever the router chooses: a message the
+  // router finds no longer accepted goes to another routee.
+  while stopped.load() == 0 do threads.sleep(time.millis(1))
+  val names = Buffer[string]()
+  for _ in 0 ..< 6 do names.append(who(shrinking))
+  println(names.distinct.length)
+  shrinking.tell(Quit)
+  while stopped.load() == 1 do threads.sleep(time.millis(1))
+  shrinking.tell(Quit)
+  println(shrinking.ended().await())
+  println(stopped.load())
+  println(who(shrinking))
+
+  // A router ends with its parent, and its routees before it.
+  stopped.store(0)
+  val last = start(owner, 4)
+  println(who(last))
+  owner.tell(Leave)
+  println(owner.ended().await())
+  println(last.ended().isCompleted())
+  println(stopped.load())
+
+  // A top-level router, made where no actor runs, routes with the other strategies too.
+  val top = Router.pool(2, Worker(stopped), SmallestMailbox)
+  println(who(top))

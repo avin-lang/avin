@@ -1,0 +1,146 @@
+// expect: exit 0
+// The router's composition, tried without a connection: route groups under a prefix, nested, with
+// parameters in the prefix and a route of `/` becoming the prefix itself; middleware as plain
+// functions, per route and per group, run outside in; an error page rendering the router's `404`
+// and `405` as JSON, keeping the status it is given; handlers answering a `Result`, `?` ending them
+// early with a converted error; and typed query and route parameters, valid, invalid and missing,
+// at every type, with defaults and options.
+import avin.net.http
+
+import avin.net.http.{
+  FromParam, Handler, Invalid, Missing, ParamError, Response, Route, Router, ServerRequest, ToResponse, fromResult,
+  plainError
+}
+
+// A middleware that adds its name to the `X-Trail` header the response carries, before the inner
+// handler's own: the outermost name comes first.
+traced(name: string, next: Handler) -> Handler = r ->
+  val inner = next(r)
+  val before = inner.header("X-Trail").map(t -> s"$name>$t").getOrElse(name)
+  Response(inner.status, inner.reason, inner.headers.filter(h -> h.0 != "X-Trail") :+ ("X-Trail", before), inner.body)
+
+// A middleware that answers `401` without calling the handler where no token is given.
+guarded(next: Handler) -> Handler = r -> if r.header("Token").isDefined then next(r) else Response.text(401, "no token")
+
+jsonError(status: int) -> Response = Response.json(status, s"{\"error\": ${status}}").withHeader("X-Rendered", "yes")
+
+// The status a misbehaving page asks for is not the one sent.
+wrongStatus(_: int) -> Response = Response.text(200, "page")
+
+data Problem(status: int, why: string)
+
+impl ToResponse for Problem
+  toResponse() -> Response = Response.json(status, s"{\"problem\": \"${why}\"}")
+
+evenOf(n: int) -> Result[int, Problem] = if n % 2 == 0 then Ok(n) else Err(Problem(422, "odd"))
+
+// A handler written as a function answering a `Result`, each failure converted by `?`.
+half(r: ServerRequest) -> Result[Response, ToResponse]
+  val n = r.paramAs[int]("n")?
+  val even = evenOf(n)?
+  Ok(Response.text(200, s"${even / 2}"))
+
+show(label: string, response: Response)
+  val trail = response.header("X-Trail").map(t -> s" trail=$t").getOrElse("")
+  val allow = response.header("Allow").map(a -> s" allow=$a").getOrElse("")
+  val rendered = response.header("X-Rendered").map(_ -> " rendered").getOrElse("")
+  println(s"$label -> ${response.status} ${response.reason}$trail$allow$rendered ${response.text}")
+
+ask(router: Router, method: string, target: string, headers: Vector[(string, string)] = []) -> Response =
+  router.handle(ServerRequest(method, target, headers))
+
+// Every typed reading of `target`'s query and its route's `:v`.
+typed(target: string)
+  val r = ServerRequest("GET", target, params = [("v", "12")])
+  println(s"$target")
+  println(s"  int ${r.queryAs[int]("n")} long ${r.queryAs[long]("n")} real ${r.queryAs[real]("n")}")
+  println(s"  bool ${r.queryAs[bool]("b")} text ${r.queryAs[string]("s")}")
+  println(s"  default ${r.queryAs("n", 50)} option ${r.queryOption[int]("n")} absent ${r.queryOption[int]("zz")}")
+  println(s"  route ${r.paramAs[int]("v")} ${r.paramAs[bool]("v")}")
+
+main()
+  val router = Router(
+    Route.group(
+      "/api",
+      Route.group(
+        "/users/:user",
+        [
+          Route.get("/", r -> Response.text(200, s"user ${r.param("user")}")),
+          Route.get("/posts/:post", r -> Response.text(200, s"${r.param("user")}/${r.param("post")}")).wrap(n ->
+            traced("route", n))
+            ],
+            n -> traced("inner", n)
+            ) ++ [Route.post("/admin", _ -> Response.text(200, "admin")).wrap(guarded)],
+            n -> traced("outer", n)
+            ) ++ [
+            Route.get("/half/:n", half),
+            Route.get("/inline/:n", r ->
+              val n = r.paramAs[int]("n")?
+              if n < 0 then return Err(Response.text(400, "negative"))
+              Ok(Response.text(200, s"${n * 2}"))),
+              Route.put("/wrapped", fromResult(r -> Ok(Response.text(200, r.method)))),
+              Route.delete("/gone", r -> Err(Response.text(410, "gone"))),
+              Route.patch("/fine", r -> Ok(Response.text(200, "patched"))),
+              Route.get("/plain", _ -> Response.text(200, "plain"))
+              ],
+              jsonError
+              )
+  show("group root", ask(router, "GET", "/api/users/ann"))
+  show("group nested", ask(router, "GET", "/api/users/ann/posts/7"))
+  show("group unicode", ask(router, "GET", "/api/users/%C3%A9/posts/%E2%9C%93"))
+  show("group trailing slash", ask(router, "GET", "/api/users/ann/"))
+  show("guarded without token", ask(router, "POST", "/api/admin"))
+  show("guarded with token", ask(router, "POST", "/api/admin", [("Token", "t")]))
+  show("not found", ask(router, "GET", "/api"))
+  show("method not allowed", ask(router, "POST", "/api/users/ann"))
+  show("head of a grouped get", ask(router, "HEAD", "/api/users/ann"))
+  show("result ok", ask(router, "GET", "/half/8"))
+  show("result converted error", ask(router, "GET", "/half/7"))
+  show("result param error", ask(router, "GET", "/half/x"))
+  show("inline ok", ask(router, "GET", "/inline/21"))
+  show("inline return", ask(router, "GET", "/inline/-1"))
+  show("inline param error", ask(router, "GET", "/inline/2.5"))
+  show("fromResult", ask(router, "PUT", "/wrapped"))
+  show("result err", ask(router, "DELETE", "/gone"))
+  show("result patch", ask(router, "PATCH", "/fine"))
+  show("plain", ask(router, "GET", "/plain"))
+
+  // The default page, and a page whose own status is replaced by the one given.
+  show("plain page", Router([]).handle(ServerRequest("GET", "/")))
+  show(
+    "page status kept",
+    Router([Route.get("/x", _ -> Response.empty(204))], wrongStatus).handle(ServerRequest("POST", "/x"))
+  )
+  show("plainError", plainError(503))
+
+  // A group with no middleware, and an empty group.
+  show(
+    "bare group",
+    Router(
+      Route.group("/v1", [Route.get("/ping", _ -> Response.text(200, "pong"))])
+    ).handle(ServerRequest("GET", "/v1/ping"))
+  )
+  println(s"empty group: ${Route.group("/v1", []).length}")
+  // Wrapping twice puts the second outside.
+  val twice = Route.get("/t", _ -> Response.text(200, "t")).wrap(n -> traced("first", n)).wrap(n -> traced("second", n))
+  show("wrapped twice", twice.handler(ServerRequest("GET", "/t")))
+  println(
+    s"under: ${Route.get("/", _ -> Response.empty(204)).under("/p").pattern} ${Route.get("/q", _ -> Response.empty(204)).under("/p/:x").pattern}"
+  )
+
+  // Typed parameters.
+  typed("/t?n=42&b=true&s=caf%C3%A9")
+  typed("/t?n=-2147483648&b=false&s=")
+  typed("/t?n=2147483648&b=yes")
+  typed("/t?n=abc&n=1")
+  typed("/t?n=&s=%E2%9C%93")
+  typed("/t")
+  val missing: ParamError = Missing("query parameter", "limit")
+  val invalid: ParamError = Invalid("route parameter", "id", "x", "an int")
+  println(s"${missing.message}; ${invalid.message}")
+  val answered: Response = invalid.toResponse()
+  show("param error response", answered)
+  println(s"kinds: ${string.kind()}, ${int.kind()}, ${long.kind()}, ${real.kind()}, ${bool.kind()}")
+  println(
+    s"parse: ${int.parse("7")} ${long.parse("9223372036854775807")} ${real.parse("1.5")} ${bool.parse("true")} ${string.parse("")}"
+  )

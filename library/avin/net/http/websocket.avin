@@ -1,0 +1,686 @@
+module avin.net.http
+
+// WebSockets (RFC 6455): a connection upgraded from HTTP that carries messages both ways, each a text
+// or a binary one. A server's handler answers `webSocket(request, session)`, which checks the
+// request's handshake and answers `101`, then runs `session` with the `WebSocket`; a client opens one
+// with `WebSocket.connect(url)`. Both ends send and receive messages the same way: a message arriving
+// in fragments is put back together, a ping is answered with a pong as it arrives, and either end may
+// close the connection with a code and a reason, the other answering in kind. A frame breaking the
+// protocol closes the connection with `1002`, a text message that is not UTF-8 with `1007` and one over
+// the size limit with `1009`. A server's sockets close with `1001` when it stops.
+//
+// A WebSocket belongs to one thread, the one that reads and writes its connection. Other threads send
+// on it through its `sender()`, which queues whole messages for that thread to write the next time it
+// waits in `receive` (or `serve`), in the one wait that also watches the connection, so every frame on
+// the wire, theirs, its own, pongs and the close handshake, is written by it, one message at a time.
+
+import avin.crypto.sha1
+import avin.encoding.{fromBase64, toBase64}
+import avin.io.{IoError, TimedOut}
+import avin.net.{ByteStream, TcpServer, TcpStream, Url}
+import avin.net.tls.{TlsClient, TlsStream, Transport}
+import avin.random.SecureRandom
+import avin.threads.{Atomic, Channel}
+import avin.time.{Duration, days, monotonic, seconds}
+
+// A message: text, which is UTF-8 on the wire, or bytes.
+data Message
+  Text(text: string)
+  Binary(bytes: Array[byte])
+
+// Why a WebSocket can no longer be used, or could not be opened.
+data WebSocketError
+  // The connection is closed: by the close handshake, begun by either end, with its `code` and
+  // `reason`; by this end, for a frame breaking the protocol (`1002`), a text message that is not
+  // UTF-8 (`1007`) or one over the size limit (`1009`), or for a server that stops (`1001`); or with
+  // `1006` where the other end went without closing. `1005` is a close that gave no code.
+  Closed(code: int, reason: string)
+  // The connection failed: it broke, or a write timed out.
+  Broken(error: IoError)
+  // `connect`: the server answered the handshake with `status`, not `101`.
+  Refused(status: int, reason: string)
+  // `connect`: the server answered `101`, but not as a WebSocket server does.
+  BadHandshake(text: string)
+  // `connect`: the URL is not a WebSocket's, or the connection or its TLS could not be made.
+  Unreachable(error: HttpError)
+
+impl Error for WebSocketError
+  // A sentence saying what went wrong, for a message to a person.
+  message -> string = self match
+    Closed(
+      code,
+      reason
+    ) -> if reason.isEmpty then s"the WebSocket closed with $code" else s"the WebSocket closed with $code: $reason"
+    Broken(e) -> e.message
+    Refused(status, reason) -> s"the server refused the WebSocket: $status $reason"
+    BadHandshake(text) -> s"not a WebSocket handshake: $text"
+    Unreachable(e) -> e.message
+
+// A connection switched away from HTTP by an `Upgrade` response: the `stream` it goes on over, with the
+// bytes the client sent after its request that the server had already read, `ahead`, and the limit a
+// write waits. Its server says when it is stopping.
+class Upgraded(
+    val stream: ByteStream,
+    val ahead: Array[byte],
+    private val server: TcpServer,
+    val writeTimeout: Duration
+)
+  // Whether the server is stopping, so the code carrying the connection should end it.
+  isStopping() -> bool = server.isStopping()
+
+  // Waits by `wait`, on a thread of its own, and answers its result, or `None` where the server stops
+  // first, cancelling `wait` wherever it waits, as `TcpServer.idle` does.
+  untilStopped[T: Sendable](@sendable wait: () -> T) -> Option[T] = server.idle(wait)
+
+  // A channel closed once the server is asked to stop, as `TcpServer.stopped` is.
+  stopped() -> Channel[unit] = server.stopped()
+
+// The text `Sec-WebSocket-Accept` answers a handshake's `key` with: the base64 of the SHA-1 of the key
+// and the protocol's fixed GUID.
+acceptKey(key: string) -> string = toBase64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+
+// The answer to `request`, a WebSocket handshake: a `101` that runs `session` with the WebSocket once it
+// is sent, and closes it with `1000` if `session` returns leaving it open. Of `protocols`, the
+// subprotocols the server speaks, the first the client offers in `Sec-WebSocket-Protocol` is chosen
+// and answered; none is where the client offers none of them. A message longer than `maxMessageBytes`
+// closes the WebSocket with `1009`, and the close handshake waits `closeTimeout` for the other end's
+// answer. Its senders queue at most `outboxSize` messages for it to write. A request that is not a
+// handshake is answered without `session` running: `405` for a method other than `GET`, `426` with
+// `Upgrade: websocket` for one that does not ask to upgrade to a WebSocket, `426` with
+// `Sec-WebSocket-Version: 13` for a version other than 13, and `400` for one in HTTP/1.0, without
+// `upgrade` in its `Connection`, or whose `Sec-WebSocket-Key` is not sixteen bytes in base64. A
+// negative `maxMessageBytes` or `outboxSize` traps.
+webSocket(
+    request: ServerRequest,
+    session: (WebSocket) -> unit,
+    protocols: Vector[string] = Vector.empty[string](),
+    maxMessageBytes: int = 1048576,
+    closeTimeout: Duration = seconds(5),
+    outboxSize: int = 64
+) -> Response
+  if maxMessageBytes < 0 then fail(s"a message limit of $maxMessageBytes bytes: it is at least zero")
+  if outboxSize < 0 then fail(s"an outbox of $outboxSize messages: it holds at least zero")
+  if request.method != "GET" then return Response.text(
+    405,
+    "a WebSocket is opened with GET\n"
+  ).withHeader("Allow", "GET")
+  if !listed(request.headers, "Upgrade").exists(w -> w.toLower == "websocket")
+    return Response.text(426, "this resource is a WebSocket\n").withHeader("Upgrade", "websocket")
+  if request.version != "HTTP/1.1" then return Response.text(400, "a WebSocket is opened in HTTP/1.1\n")
+  if !listed(request.headers, "Connection").exists(w -> w.toLower == "upgrade")
+    return Response.text(400, "the handshake has no `Connection: Upgrade`\n")
+  if request.header("Sec-WebSocket-Version") != Some("13")
+    return Response.text(426, "WebSocket version 13 is spoken here\n").withHeader("Sec-WebSocket-Version", "13")
+  val key = request.header("Sec-WebSocket-Key").getOrElse("")
+  val sixteen = fromBase64(key) match
+    Ok(bytes) -> bytes.length == 16
+    Err(_) -> false
+  if !sixteen then return Response.text(400, "the handshake's `Sec-WebSocket-Key` is not sixteen bytes in base64\n")
+  val offered = listed(request.headers, "Sec-WebSocket-Protocol")
+  val chosen = protocols.find(p -> offered.contains(p))
+  val answer = Response.upgrade(
+    "websocket",
+    u ->
+      val ws = WebSocket(
+        u.stream,
+        u.ahead,
+        Some(u),
+        false,
+        chosen,
+        maxMessageBytes,
+        u.writeTimeout,
+        closeTimeout,
+        outboxSize
+      )
+      session(ws)
+      if ws.isOpen() then _ = ws.close()
+  ).withHeader("Sec-WebSocket-Accept", acceptKey(key))
+  chosen match
+    Some(p) -> answer.withHeader("Sec-WebSocket-Protocol", p)
+    None -> answer
+
+// One end of a WebSocket, made by `webSocket` on a server and `WebSocket.connect` on a client. It
+// belongs to the code it was given to, as its connection does. `protocol` is the subprotocol the
+// handshake chose. Each send and receive answers `Err` once the WebSocket is closed, the same error
+// every time after. A message longer than 65536 bytes is sent in fragments of that many, one after
+// another with nothing between them.
+class WebSocket(
+    private val stream: ByteStream,
+    ahead: Array[byte],
+    private val upgraded: Option[Upgraded],
+    private val masks: bool,
+    val protocol: Option[string],
+    val maxMessageBytes: int,
+    private val writeTimeout: Duration,
+    private val closeTimeout: Duration,
+    outboxSize: int
+)
+  // The bytes received and not yet read as frames.
+  private val input = Buffer[byte]()
+  input.addAll(ahead)
+  // What the WebSocket's senders share with it.
+  private val box = Outbox(outboxSize, writeTimeout)
+  // Closed once the server stops; a client's is never closed.
+  private val stops = upgraded match
+    Some(u) -> u.stopped()
+    None -> Channel[unit]()
+  // The payloads of a fragmented message so far, and its opcode, zero where none is in progress.
+  private val pieces = Buffer[byte]()
+  private var kind = 0
+  // Whether this end has sent its close frame.
+  private var closeSent = false
+  // Why the WebSocket can no longer be used, once it cannot.
+  private var ended: Option[WebSocketError] = None
+
+  // Sends `text` as one text message.
+  send(text: string) -> Result[unit, WebSocketError] = message(1, text.utf8)
+
+  // Sends `bytes` as one binary message.
+  send(bytes: Array[byte]) -> Result[unit, WebSocketError] = message(2, bytes)
+
+  // Sends a ping carrying `payload`, which the other end answers with a pong; a pong that arrives is
+  // passed over. A payload over 125 bytes traps.
+  ping(payload: Array[byte] = Array.empty[byte]()) -> Result[unit, WebSocketError]
+    if payload.length > 125 then fail(s"a ping of ${payload.length} bytes: a ping carries at most 125")
+    message(9, payload)
+
+  // The next message, waiting for it as long as it takes. Pings are answered while it waits, and a
+  // close from the other end is answered and gives `Err(Closed(code, reason))`. While it waits, it
+  // writes the messages its senders queued, each whole and in the order each sender queued them, and
+  // carries out a close a sender asked for once those queued before it are written. On a server, the
+  // wait is through its stopping, so a server that stops closes the WebSocket with `1001`. A thread
+  // cancelled while it receives closes the connection, the WebSocket then closed with `1006`.
+  receive() -> Result[Message, WebSocketError] = guarded(None) match
+    Ok(Some(m)) -> Ok(m)
+    Ok(None) -> fail("a receive without a limit waits for a message")
+    Err(e) -> Err(e)
+
+  // As `receive()`, waiting at most `limit`, and answering `Ok(None)` where no whole message has
+  // arrived by then; a message arriving in part is kept for the next receive. A limit of zero or less
+  // answers at once with what has already arrived, and writes what the senders have queued.
+  receive(limit: Duration) -> Result[Option[Message], WebSocketError] = guarded(Some(monotonic() + limit))
+
+  // Receives until the WebSocket closes, running `onMessage` for every message, and answers why it
+  // closed: the loop of a session whose thread only answers what arrives, or whose messages all come
+  // from senders, since it is while the WebSocket receives that their messages are written.
+  serve(onMessage: (Message) -> unit) -> WebSocketError
+    loop
+      receive() match
+        Ok(m) -> onMessage(m)
+        Err(e) -> return e
+    fail("unreachable")
+
+  // The sending half of the WebSocket, for other threads: its messages are queued for this one to
+  // write while it receives. Every call answers one sharing the same queue.
+  sender() -> WebSocketSender = WebSocketSender(box)
+
+  // Closes the WebSocket with `code` and `reason`: the close frame is sent, the other end's answer
+  // awaited for the close timeout, and the connection closed. A code is 1000 to 1003, 1007 to 1014 or
+  // 3000 to 4999, and a reason at most 123 bytes of UTF-8; either traps where it is not. Closing a
+  // WebSocket already closed answers why it was. Messages its senders queued and it has not written
+  // are not written.
+  close(code: int = 1000, reason: string = "") -> Result[unit, WebSocketError]
+    checkClose(code, reason)
+    if ended is Some(e) then return Err(e)
+    closing(code, reason) match
+      Closed(_, _) -> Ok(())
+      other -> Err(other)
+
+  // Whether messages can still be sent and received.
+  isOpen() -> bool = ended.isEmpty
+
+  // Whether the server is stopping, so the session should end; a client's never is.
+  isStopping() -> bool = upgraded.exists(u -> u.isStopping())
+
+  // Waits by `wait` as `Upgraded.untilStopped` does, on a server; a client's runs `wait` as it is.
+  untilStopped[T: Sendable](@sendable wait: () -> T) -> Option[T] = upgraded match
+    Some(u) -> u.untilStopped(wait)
+    None -> Some(wait())
+
+  // Sends one frame of `opcode`, unless the WebSocket is closed or the server is stopping, which
+  // closes it with `1001` first.
+  private message(opcode: int, payload: Array[byte]) -> Result[unit, WebSocketError]
+    if ended is Some(e) then return Err(e)
+    if isStopping() then return Err(closing(1001, "the server is stopping"))
+    if opcode >= 8 then frame(true, opcode, payload) else frames(opcode, payload)
+
+  // Sends a data message, in fragments where it is longer than one.
+  private frames(opcode: int, payload: Array[byte]) -> Result[unit, WebSocketError]
+    val n = payload.length
+    if n <= fragmentBytes then return frame(true, opcode, payload)
+    var at = 0
+    while at < n
+      val upto = if n - at > fragmentBytes then at + fragmentBytes else n
+      frame(upto == n, if at == 0 then opcode else 0, payload.slice(at, upto))?
+      at = upto
+    Ok(())
+
+  // Sends one whole frame, masked by a client, and answers `Broken` where the write fails, which
+  // closes the connection.
+  private frame(fin: bool, opcode: int, payload: Array[byte]) -> Result[unit, WebSocketError]
+    if opcode == 8 then closeSent = true
+    val mask = if masks then Some(SecureRandom.nextBytes(4)) else None
+    val s = stream
+    s.setTimeout(writeTimeout).flatMap(_ -> s.write(frameOf(fin, opcode, payload, mask))) match
+      Ok(_) -> Ok(())
+      Err(e) -> Err(broke(e))
+
+  // `next`, the connection closed where the thread is cancelled while it runs.
+  private guarded(deadline: Option[Duration]) -> Result[Option[Message], WebSocketError]
+    var finished = false
+    defer
+      if !finished then _ = ends(Closed(1006, "the thread the WebSocket belongs to was cancelled"))
+    val r = next(deadline)
+    finished = true
+    r
+
+  // The next message, or `None` where `deadline` passes first.
+  private next(deadline: Option[Duration]) -> Result[Option[Message], WebSocketError]
+    if ended is Some(e) then return Err(e)
+    if isStopping() then return Err(closing(1001, "the server is stopping"))
+    loop
+      frameIn() match
+        Err(Violation(code, text)) -> return Err(failing(code, text))
+        Ok(None) ->
+          val limit = deadline match
+            Some(d) -> d - monotonic()
+            None -> days(1)
+          if !waited(limit)? && deadline.isDefined then return Ok(None)
+        Ok(Some(f)) ->
+          if handled(f)? is Some(m) then return Ok(Some(m))
+    fail("unreachable")
+
+  // Waits at most `limit` for whichever comes first, bytes arriving or the server stopping, which are
+  // read or answered, or a sender's message or close, which is written or carried out; and answers
+  // whether one came. A limit of zero or less looks once.
+  private waited(limit: Duration) -> Result[bool, WebSocketError]
+    val s = stream
+    val queued = box.queued
+    val asked = box.asked
+    select
+      s.readable() -> fill()?
+      queued.receive() as Some(m) -> frames(m.opcode, m.payload.toArray())?
+      asked.receive() as Some((code, reason)) -> return Err(carriedOut(code, reason))
+      stops.receive() -> return Err(closing(1001, "the server is stopping"))
+      after limit -> return Ok(false)
+    Ok(true)
+
+  // A close a sender asked for: the messages queued before it are written, then the WebSocket closed.
+  private carriedOut(code: int, reason: string) -> WebSocketError
+    loop
+      box.queued.tryReceive() match
+        Some(m) -> if frames(m.opcode, m.payload.toArray()) is Err(e) then return e
+        None -> break
+    closing(code, reason)
+
+  // What a frame read does: a control frame is answered, a data frame's payload kept, and a message
+  // completed by it answered.
+  private handled(f: Frame) -> Result[Option[Message], WebSocketError]
+    if f.opcode == 8 then return Err(closedByPeer(f.payload))
+    if f.opcode == 9
+      frame(true, 10, f.payload)?
+      return Ok(None)
+    if f.opcode == 10 then return Ok(None)
+    if f.opcode != 0 then kind = f.opcode
+    pieces.addAll(f.payload)
+    if !f.fin then return Ok(None)
+    val bytes = pieces.toArray()
+    pieces.clear()
+    val k = kind
+    kind = 0
+    if k == 2 then return Ok(Some(Binary(bytes)))
+    string.fromUtf8(bytes) match
+      Ok(t) -> Ok(Some(Text(t)))
+      Err(_) -> Err(failing(1007, "a text message is not UTF-8"))
+
+  // Reads what has arrived on the connection, which is readable, so the read does not wait.
+  private fill() -> Result[unit, WebSocketError]
+    stream.read(65536) match
+      Ok(bytes) ->
+        if bytes.length == 0 then return Err(gone())
+        input.addAll(bytes)
+        Ok(())
+      Err(IoError(TimedOut, _, _)) -> Ok(())
+      Err(e) -> Err(broke(e))
+
+  // The next whole frame of `input`, taken out of it, or `None` where it has not all arrived; a frame
+  // breaking the protocol, or one that would make a message too long, is the violation it is.
+  private frameIn() -> Result[Option[Frame], Violation]
+    val n = input.length
+    if n < 2 then return Ok(None)
+    val b0 = int(input(0))
+    val b1 = int(input(1))
+    if (b0 & 0x70) != 0 then return Err(Violation(1002, "a reserved bit is set"))
+    val opcode = b0 & 0x0f
+    val fin = (b0 & 0x80) != 0
+    val masked = (b1 & 0x80) != 0
+    if masked && masks then return Err(Violation(1002, "a frame from the server is masked"))
+    if !masked && !masks then return Err(Violation(1002, "a frame from the client is not masked"))
+    var length: long = long(b1 & 0x7f)
+    var at = 2
+    if length == 126
+      if n < 4 then return Ok(None)
+      length = long((int(input(2)) << 8) | int(input(3)))
+      at = 4
+    elif length == 127
+      if n < 10 then return Ok(None)
+      if (int(input(2)) & 0x80) != 0 then return Err(Violation(1002, "a frame's length has its top bit set"))
+      length = 0
+      for i in 2 ..< 10
+        length = (length << 8) | long(int(input(i)))
+      at = 10
+    if !(opcode <= 2 || 8 <= opcode <= 10) then return Err(Violation(1002, s"the unknown opcode $opcode"))
+    if opcode >= 8
+      if !fin then return Err(Violation(1002, "a control frame is fragmented"))
+      if length > 125 then return Err(Violation(1002, "a control frame carries over 125 bytes"))
+    elif opcode == 0
+      if kind == 0 then return Err(Violation(1002, "a continuation with no message to continue"))
+    elif kind != 0 then return Err(Violation(1002, "a new message in the middle of a fragmented one"))
+    if opcode < 8 && long(pieces.length) + length > long(maxMessageBytes)
+      return Err(Violation(1009, s"a message over $maxMessageBytes bytes"))
+    val maskAt = at
+    if masked then at += 4
+    if long(n - at) < length then return Ok(None)
+    val size = int(length)
+    val payload = Array.fill(size, byte(0))
+    for i in 0 ..< size
+      val b = input(at + i)
+      payload(i) = if masked then b ^ input(maskAt + i % 4) else b
+    input.trimStart(at + size)
+    Ok(Some(Frame(fin, opcode, payload)))
+
+  // The other end's close frame: answered with its code, the connection then closed.
+  private closedByPeer(payload: Array[byte]) -> WebSocketError
+    if payload.length == 1 then return failing(1002, "a close frame of one byte")
+    var code = 1005
+    var reason = ""
+    if payload.length >= 2
+      code = (int(payload(0)) << 8) | int(payload(1))
+      if !validCode(code) then return failing(1002, s"the close code $code")
+      reason = string.fromUtf8(payload.slice(2, payload.length)) match
+        Ok(t) -> t
+        Err(_) -> return failing(1007, "a close reason that is not UTF-8")
+    if !closeSent then _ = frame(true, 8, if code == 1005 then Array.empty[byte]() else closePayload(code, ""))
+    ends(Closed(code, reason))
+
+  // Begins the close handshake with `code` and `reason`, waits for the other end's answer, and closes.
+  // Its senders are refused from the start of the handshake.
+  private closing(code: int, reason: string) -> WebSocketError
+    box.refuse(Closed(code, reason))
+    if frame(true, 8, closePayload(code, reason)) is Err(e) then return e
+    awaitClose()
+    ends(Closed(code, reason))
+
+  // Fails the WebSocket for a violation: the close frame is sent, and the connection closed at once.
+  private failing(code: int, text: string) -> WebSocketError
+    if !closeSent then _ = frame(true, 8, closePayload(code, text))
+    ends(Closed(code, text))
+
+  // Reads until the other end's close frame arrives, it goes, or the close timeout passes, passing over
+  // whatever else arrives.
+  private awaitClose()
+    val s = stream
+    if s.setTimeout(closeTimeout).isErr then return
+    loop
+      frameIn() match
+        Ok(Some(f)) ->
+          if f.opcode == 8 then return
+          if f.opcode < 8
+            pieces.clear()
+            if f.fin then kind = 0 elif f.opcode != 0 then kind = f.opcode
+        Ok(None) ->
+          s.read(65536) match
+            Ok(got) ->
+              if got.length == 0 then return
+              input.addAll(got)
+            Err(_) -> return
+        Err(_) -> return
+
+  // The other end went without closing.
+  private gone() -> WebSocketError = ends(Closed(1006, "the connection ended without a close"))
+
+  // A write or read failed.
+  private broke(e: IoError) -> WebSocketError = ends(Broken(e))
+
+  // Closes the connection, the WebSocket ended by `e`, and ends its outbox: what its senders queued
+  // is dropped, and each of them waiting answers `Err`.
+  private ends(e: WebSocketError) -> WebSocketError
+    if ended is Some(first) then return first
+    _ = stream.close()
+    ended = Some(e)
+    box.ends(e)
+    e
+
+object WebSocket
+  // A client's WebSocket to `url`, `ws://` or `wss://`, the latter over TLS checked as an `https`
+  // request's is with `tls`. The handshake sends `headers` beside its own, offers `protocols` in
+  // `Sec-WebSocket-Protocol` where there are any, and is answered within `timeout`, which also limits
+  // each write after it. A message longer than `maxMessageBytes` closes the WebSocket with `1009`,
+  // and its senders queue at most `outboxSize` messages. A server answering other than `101` is
+  // `Refused`, and one answering `101` with an accept key not its key's, an upgrade to another
+  // protocol or a subprotocol not offered is `BadHandshake`. A negative `maxMessageBytes` or
+  // `outboxSize` traps.
+  connect(
+      url: string,
+      headers: Vector[(string, string)] = Vector.empty[(string, string)](),
+      protocols: Vector[string] = Vector.empty[string](),
+      tls: TlsClient = TlsClient(),
+      timeout: Duration = seconds(30),
+      maxMessageBytes: int = 1048576,
+      outboxSize: int = 64
+  ) -> Result[WebSocket, WebSocketError]
+    if maxMessageBytes < 0 then fail(s"a message limit of $maxMessageBytes bytes: it is at least zero")
+    if outboxSize < 0 then fail(s"an outbox of $outboxSize messages: it holds at least zero")
+    for (name, value) in headers
+      checkHeader(name, value)
+    val u = Url.parse(url).mapErr(e -> Unreachable(BadUrl(e)))?
+    val secure = u.scheme == "wss"
+    if !secure && u.scheme != "ws" then return Err(Unreachable(Unsupported(s"the scheme `${u.scheme}`")))
+    val host = u.host.getOrElse("")
+    if host.isEmpty then return Err(Unreachable(Unsupported(s"a URL without a host: $url")))
+    val port = u.portOrDefault.getOrElse(if secure then 443 else 80)
+    val tcp = TcpStream.connect(addressOf(host), port).mapErr(e -> Unreachable(Io(e)))?
+    if tcp.setTimeout(timeout) is Err(e)
+      _ = tcp.close()
+      return Err(Unreachable(Io(e)))
+    val stream: ByteStream = if !secure then tcp else TlsStream.client(tcp, addressOf(host), tls) match
+      Ok(s) -> s
+      Err(e) ->
+        _ = tcp.close()
+        return Err(Unreachable(e match
+          Transport(io) -> Io(io)
+          other -> Tls(other)))
+    shaken(stream, u, host, headers, protocols) match
+      Ok(chosen) -> Ok(
+        WebSocket(
+          stream,
+          Array.empty[byte](),
+          None,
+          true,
+          chosen,
+          maxMessageBytes,
+          timeout,
+          timeout,
+          outboxSize
+        )
+      )
+      Err(e) ->
+        _ = stream.close()
+        Err(e)
+
+  // The client's handshake on `stream`, answering the subprotocol the server chose.
+  private shaken(
+      stream: ByteStream,
+      u: Url,
+      host: string,
+      headers: Vector[(string, string)],
+      protocols: Vector[string]
+  ) -> Result[Option[string], WebSocketError]
+    val key = toBase64(SecureRandom.nextBytes(16).toVector)
+    val out = StringWriter()
+    val target = (if u.path.isEmpty then "/" else u.path) + u.query.map(q -> "?" + q).getOrElse("")
+    out.write(s"GET $target HTTP/1.1\r\n")
+    if headerIn(headers, "Host").isEmpty then out.write(s"Host: $host${u.port.map(p -> s":$p").getOrElse("")}\r\n")
+    out.write(s"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n")
+    if protocols.nonEmpty then out.write(s"Sec-WebSocket-Protocol: ${protocols.mkString(", ")}\r\n")
+    for (name, value) in headers
+      out.write(s"$name: $value\r\n")
+    out.write("\r\n")
+    stream.write(utf8(out.text)).mapErr(e -> Broken(e))?
+    val statusLine = stream.readLine().mapErr(e -> Broken(e))? match
+      Some(line) -> line
+      None -> return Err(BadHandshake("the connection closed before an answer"))
+    val (status, reason) = parseStatus(statusLine).mapErr(_ -> BadHandshake(s"not a status line: `$statusLine`"))?
+    val answered = Buffer[(string, string)]()
+    loop
+      val line = stream.readLine().mapErr(e -> Broken(e))? match
+        Some(l) -> l
+        None -> return Err(BadHandshake("the connection closed in the headers"))
+      if line.isEmpty then break
+      val colon = line.indexOf(':')
+      if colon <= 0 then return Err(BadHandshake(s"not a header: `$line`"))
+      answered.addOne((line.slice(0, colon).trim, line.slice(colon + 1, line.byteLength).trim))
+    val all = answered.toVector
+    if status != 101 then return Err(Refused(status, reason))
+    if !listed(all, "Upgrade").exists(w -> w.toLower == "websocket") then return Err(
+      BadHandshake("no `Upgrade: websocket`")
+    )
+    if !listed(all, "Connection").exists(w -> w.toLower == "upgrade") then return Err(
+      BadHandshake("no `Connection: Upgrade`")
+    )
+    if headerIn(all, "Sec-WebSocket-Accept") != Some(acceptKey(key)) then return Err(
+      BadHandshake("the accept key is not the key's")
+    )
+    val chosen = headerIn(all, "Sec-WebSocket-Protocol")
+    if chosen is Some(p)
+      if !protocols.contains(p) then return Err(BadHandshake(s"the subprotocol `$p` was not offered"))
+    Ok(chosen)
+
+// A frame as read: its FIN bit, its opcode and its payload, unmasked.
+private data Frame(fin: bool, opcode: int, payload: Array[byte])
+
+// A frame that breaks the protocol, and the code and reason the WebSocket closes with for it.
+private data Violation(code: int, text: string)
+
+// The sending half of a WebSocket, made by `WebSocket.sender()`, which any thread may hold and use.
+// Each send queues one whole message in the WebSocket's outbox, for the thread it belongs to to write
+// while it receives, each sender's in the order it queued them, and a message never interleaved with
+// another. `Ok` says the message was queued while the WebSocket was open; one the WebSocket closes
+// before writing is dropped. A full outbox, as a peer that reads slowly leaves it, makes a send wait
+// up to the WebSocket's write timeout, and then answer `Err(Broken(IoError(TimedOut, _, _)))`, the
+// message not queued and the WebSocket still open. Once the WebSocket is closed, or a close of it asked
+// for, every call answers why, `Err(Closed(code, reason))` for a close, and so does every send waiting
+// for room.
+class WebSocketSender(private val box: Outbox): Sendable
+  // Queues `text` as one text message.
+  send(text: string) -> Result[unit, WebSocketError] = box.offer(Outgoing(1, text.utf8.toVector))
+
+  // Queues `bytes` as one binary message.
+  send(bytes: Array[byte]) -> Result[unit, WebSocketError] = box.offer(Outgoing(2, bytes.toVector))
+
+  // Asks the thread the WebSocket belongs to to close it with `code` and `reason`, as its `close`
+  // does, once the messages queued before are written; it does so while it receives. Every call after
+  // answers `Err(Closed(code, reason))`. The code and reason trap as `close`'s do, and asking to close
+  // a WebSocket closed, or already asked to close, answers why.
+  close(code: int = 1000, reason: string = "") -> Result[unit, WebSocketError]
+    checkClose(code, reason)
+    box.ask(code, reason)
+
+  // Whether messages can still be queued: the WebSocket is open and no close of it is asked for.
+  isOpen() -> bool = box.isOpen()
+
+// A message a sender queued: its opcode and its payload.
+private data Outgoing(opcode: int, payload: Vector[byte])
+
+// What a WebSocket shares with its senders: the messages queued for it, at most `capacity`; a close
+// asked of it; a channel closed once it has ended, which wakes the senders waiting for room; and why
+// it can no longer be sent on, set once.
+private class Outbox(capacity: int, private val writeTimeout: Duration): Sendable
+  val queued = Channel[Outgoing](capacity)
+  val asked = Channel[(int, string)](1)
+  private val gone = Channel[unit]()
+  private val state = Atomic[Option[WebSocketError]](None)
+
+  // Queues `m`, waiting for room up to the write timeout.
+  offer(m: Outgoing) -> Result[unit, WebSocketError]
+    if state.load() is Some(e) then return Err(e)
+    val q = queued
+    val g = gone
+    select
+      q.send(m) -> Ok(())
+      g.receive() -> Err(why())
+      after writeTimeout -> Err(Broken(IoError(TimedOut, "send", "a WebSocket whose outbox stayed full")))
+
+  // Asks for the WebSocket to be closed, where nothing has closed it or asked to.
+  ask(code: int, reason: string) -> Result[unit, WebSocketError]
+    if !state.compareAndSet(None, Some(Closed(code, reason))) then return Err(why())
+    _ = asked.trySend((code, reason))
+    Ok(())
+
+  isOpen() -> bool = state.load().isEmpty
+
+  // Refuses every send from now on with `e`, where nothing has been refused before.
+  refuse(e: WebSocketError) = _ = state.compareAndSet(None, Some(e))
+
+  // The WebSocket has ended by `e`: sends are refused, the senders waiting woken, the queue emptied.
+  ends(e: WebSocketError)
+    refuse(e)
+    gone.close()
+    while queued.tryReceive().isDefined do ()
+
+  private why() -> WebSocketError = state.load().getOrElse(Closed(1006, "the connection ended without a close"))
+
+// The longest a data frame sent is: a message longer goes in fragments of this many bytes.
+private val fragmentBytes = 65536
+
+// Traps where `code` is not a close code a WebSocket may send, or `reason` is too long.
+private checkClose(code: int, reason: string)
+  if !validCode(code) then fail(s"the close code $code: a close code is 1000 to 1003, 1007 to 1014 or 3000 to 4999")
+  if reason.byteLength > 123 then fail(s"a close reason of ${reason.byteLength} bytes: it is at most 123")
+
+// A frame: its first byte of FIN and opcode, its length in the fewest bytes that hold it, and its
+// payload, masked by `mask` where there is one.
+private frameOf(fin: bool, opcode: int, payload: Array[byte], mask: Option[Array[byte]]) -> Array[byte]
+  val out = Buffer[byte]()
+  out.addOne(byte((if fin then 0x80 else 0) | opcode))
+  val m = if mask.isDefined then 0x80 else 0
+  val n = payload.length
+  if n < 126 then out.addOne(byte(m | n))
+  elif n < 65536
+    out.addOne(byte(m | 126))
+    out.addOne(byte(n >> 8))
+    out.addOne(byte(n & 0xff))
+  else
+    out.addOne(byte(m | 127))
+    val big = long(n)
+    for i in 0 ..< 8
+      out.addOne(byte(int((big >> long(56 - 8 * i)) & 0xff)))
+  mask match
+    Some(k) ->
+      out.addAll(k)
+      for i in 0 ..< n
+        out.addOne(payload(i) ^ k(i % 4))
+    None -> out.addAll(payload)
+  out.toArray()
+
+// A close frame's payload: `code` in two bytes, then `reason`.
+private closePayload(code: int, reason: string) -> Array[byte]
+  val out = Buffer[byte]()
+  out.addOne(byte(code >> 8))
+  out.addOne(byte(code & 0xff))
+  out.addAll(utf8(reason))
+  out.toArray()
+
+// Whether `code` may be sent and received in a close frame: the protocol's own codes that mean a
+// reason to close, and the ones registered for libraries and applications.
+private validCode(code: int) -> bool = 1000 <= code <= 1003 || 1007 <= code <= 1014 || 3000 <= code <= 4999
+
+// The comma-separated words of every header of `name`, trimmed, empty ones left out.
+private listed(headers: Vector[(string, string)], name: string) -> Vector[string]
+  val out = Buffer[string]()
+  for (n, value) in headers
+    if n.equalsIgnoreCase(name)
+      for w in value.split(",")
+        val t = w.trim
+        if t.nonEmpty then out.addOne(t)
+  out.toVector

@@ -1,0 +1,49 @@
+// expect: exit 0
+// The shape a connection's owner takes when other threads have things to send on it: the thread that
+// owns the socket does all of its reads and writes, and waits in one select for whichever comes first,
+// bytes arriving or a message on a channel. Lines that arrive are echoed; messages are forwarded. Two
+// lines arriving together are both echoed: the second is read ahead by the first `readLine`, and the
+// stream is readable while it waits there.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Channel, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Serves `conn` until its peer finishes sending.
+serve(conn: TcpStream, pushed: Channel[string]) -> int
+  var echoed = 0
+  var open = true
+  while open
+    select
+      conn.readable() -> ok(conn.readLine()) match
+        Some(line) ->
+          ok(conn.writeText(s"echo $line\n"))
+          echoed += 1
+        None -> open = false
+      pushed.receive() as Some(m) -> ok(conn.writeText(s"push $m\n"))
+  ok(conn.close())
+  echoed
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val pushed = Channel[string]()
+  val server = spawn(() -> serve(ok(l.accept()), pushed))
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  ok(c.writeText("one\n"))
+  println(ok(c.readLine()))
+  pushed.send("a")
+  println(ok(c.readLine()))
+  ok(c.writeText("two\nthree\n"))
+  println(ok(c.readLine()))
+  println(ok(c.readLine()))
+  pushed.send("b")
+  pushed.send("c")
+  println(ok(c.readLine()))
+  println(ok(c.readLine()))
+  ok(c.shutdownOutput())
+  println(ok(c.readLine()))
+  println(server.join())

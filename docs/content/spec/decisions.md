@@ -123,7 +123,9 @@ a decision changes, this page and the chapter change together.
 - A generic impl of a trait writes the type's parameters, in order, as its own:
   `impl[T] Show for Box[T]`. An impl without `for` may also name a type built from its parameters
   (settled 2026-11-04, below).
-- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A + B]`.
+- Settled 2026-11-03: [bounds](/spec/generics/#bounds) are traits or classes, written `[T: A & B]`
+  (spelled `+` until the intersection-bounds entry under [Proposed](#proposed) made `&` the one
+  spelling).
   A value of a bounded `T` has its bounds' methods, `val`s and visible fields, and is a value of
   each bound's type; type arguments are held to their bounds where written and where inferred, and
   a bound's own type arguments are inferred from the argument. A call through a bound is direct in
@@ -548,9 +550,38 @@ a decision changes, this page and the chapter change together.
 - A class and its companion object use each other's private members, in both directions.
 - An initializer's dependencies count every lambda it makes as if it were called, and every function
   it calls in full, whatever branch is taken, so a cycle that no run could follow is still rejected.
-- An impl for particular type arguments of a generic type (`impl Show for Box[int]`) is not allowed:
-  an impl covers every instance of its type. Allowing one needs a rule for its overlap with a generic
-  impl of the same trait.
+- Settled on the user's delegation 2026-11-15 (built on branch `concrete-impls`; replaces the
+  earlier rule that an impl covers every instance of its type): **An impl of a trait may be for an
+  instance of a generic data type or class**, `impl FromPg for Vector[byte]`, or for a partly applied
+  one, `impl[K] Show for Map[K, int]` or `impl[T] Show for Box[Option[T]]`, since the rule for the
+  concrete case covers those unchanged: the type conforms where it is such an instance, its parts
+  matched exactly (no variance: a `Vector[Nothing]` is not a `Vector[byte]` here) and seen through
+  its superclasses, the impl's parameters taking the parts and then held to their bounds. Its
+  members, static ones included, are the type's at those instances, found by every path that finds
+  an impl: a call on the value or the type, a call through a bound, a bound held where a type
+  argument is written, a trait value and its method table, a type pattern on an `Any`, and a
+  template walking a field of that type; a member of the type's own of the same parameter types is
+  hidden there. The impl belongs in the module of the type or of the trait, as any impl of a trait
+  does (the core library's `Vector` takes one in the trait's module). **No overlap**: two impls of
+  one trait may not both hold of any instance, so an instance impl beside the type's own impl of the
+  trait is allowed only where the instance misses that impl's bounds (`byte` is no `FromPg`), and two
+  instance impls only where no instance matches both; there is no specialization, no "more specific
+  wins". A missed bound keeps the two apart only if it is missed for good: where a module other than
+  the impl's own and the core library could still write the impl meeting it, one that names both
+  the bound and the type without importing a module that imports it, the two overlap and the
+  diagnostic names that module. A parameter of a partly applied instance may be any type, so it
+  meets every bound. `Eq`, `Hash`, `Sendable` and `Boundary` are a type's at every instance alike and
+  take no instance impl. An instance impl of `Display` or `Debug` for a data type is an impl of the
+  trait of its own, so the type has no automatic one at its other instances, as with any impl of
+  the trait. Why: a PostgreSQL client needs `bytea` as `Vector[byte]` beside a generic
+  impl for arrays, and every domain with a byte string, a matrix of reals or a map of strings meets
+  the same need; refusing overlap keeps a conformance one answer everywhere, decided where the impls
+  are written. Alternatives weighed: specialization, the most specific impl winning (complex, with
+  unsound corners where a generic body relies on the general impl); a library byte-string type for
+  `bytea` (does not help the next domain); leaving it (forces `bytea` through `byte: FromPg`, element
+  by element). Review with the user: whether the core library should stay fixed in the overlap
+  rule (it could in principle add a conformance later, but it changes with the compiler), and
+  whether a module of the instance's arguments should also be allowed to declare such an impl.
 - The singleton declaration keeps the keyword `object`.
 - A program's binding shims are one Sysl package that depends on the runtime's, built into one
   archive the program links in place of the runtime's, so all of a program's Sysl code shares one
@@ -616,8 +647,9 @@ a decision changes, this page and the chapter change together.
   no left projection (`swap` serves), no `?` on an `Either`, and no conversion between `Either` and
   `Result`, which stays the type for failure. See [errors](/spec/errors/#either).
 - `?` returns from the function or lambda it is written in, so that one's result type must be
-  declared or, for a lambda, known where it is written. It cannot leave a delayed argument or a class
-  body.
+  declared or, for a lambda, known where it is written, at least in shape (an `Option`, or a `Result`
+  with its error type known; see the `lambda-question-shape` entry). It cannot leave a delayed
+  argument or a class body.
 - Builders are the trait `Builder[-A, +C]` (`addOne`, `addAll`, `result`, and, as the reference
   library's, `clear`, which every builder defines and which readies a spent one for a new
   collection, `sizeHint`, a hint that changes no result, and `knownSize`, -1 where a builder does not
@@ -769,8 +801,8 @@ Settled by the user on 2026-11-03:
   to a line in a block after `for`, a line starting with `if` guarding the generator above, with
   `yield` on the line after the block. `yield` is a keyword. A `for` without `yield` keeps one
   generator and no guards.
-- A guard is `withFilter`, a lazy view each collection provides (`Option`'s is its `filter`); a type
-  of the program's own needs `withFilter` for a guard, with no fallback to `filter`. `flatMap` on
+- A guard is `withFilter`, a lazy view each collection provides; on a source that is no `Iterable`
+  it is `Filter`'s `filter` (see the entry on comprehensions by conformance). `flatMap` on
   the library's collections takes any `Iterable` from its function, or an `Option` (see the
   entry on `flatMap` with options, branch `map-flatmap`); a `Range` maps to a `Vector`;
   a `Map`'s entries reach a comprehension as pairs, through `map` and `flatMap` overloads taking
@@ -790,7 +822,7 @@ Settled by the user on 2026-11-04:
   otherwise through `F.from`: at `From[E]`, or else at the one conformance `From[X]` with `E` an `X`
   that is more specific than every other such. Neither is an error naming `From[E]`; several equally
   specific ones are an error naming them. On a type parameter the conformances are its bounds',
-  `F: From[IoError] + From[ParseError]`. See [errors](/spec/errors/) and
+  `F: From[IoError] & From[ParseError]`. See [errors](/spec/errors/) and
   [declarations](/spec/declarations/#impl).
 - **One formatting style, applied by `avin fmt [--check] [<path>...]` and the language server's
   `textDocument/formatting`.** Each block level is indented two spaces; a literate file keeps its
@@ -920,7 +952,8 @@ Settled by the user on 2026-11-04:
   learned parameters to the impl's bounds; a receiver that does not match is an error saying what
   it would need to be. Two impls that both match a receiver and add a method of one name and
   parameter types make the call an error, as does such a method clashing with the type's own. An
-  impl of a trait still names its type's parameters in order, so conformances never overlap. The
+  impl of a trait for such a type is an impl for instances of it, whose overlap with another impl of
+  the trait is an error (see the impl for instances of a generic type, 2026-11-15). The
   core library adds `flatten` to `Option[Option[T]]`, `Result[Result[T, E], E]` and `Seq[Seq[T]]`
   (a `Vector[T]`), `toMap()` to `Iterable[(K, V)]` (keys bounded as a map's) and `unzip()` to
   `Seq[(A, B)]`.
@@ -929,13 +962,15 @@ Settled by the user on 2026-11-04:
 - Details of [synchronization](/spec/threads/#synchronization): `Mutex[T].with` hands its body the
   value itself, and an immutable value is read with `get`, replaced with `set` and changed with
   `update(f)` under the lock. A mutex is not reentrant, and a thread taking one it already holds
-  traps rather than waiting for ever; no other deadlock is detected. A `Condition` is made by its
+  traps rather than waiting for ever; otherwise only a deadlock of the whole program is detected
+  ([diagnostics](/spec/threads/#deadlock)). A `Condition` is made by its
   mutex's `condition()`, so it is waited for with that mutex only, and `wait()` from a thread not
   holding it traps. `Atomic[T]` holds any type: a value of one word lock-free, an integer wider
   than 64 bits under one runtime lock; `compareAndSet` compares identity for a reference and the
   bits for a real; `add` and `sub` give back the new value and trap on overflow before storing, and
-  `update(f)` retries `f` until its compare-and-set succeeds. `Channel[T](capacity = 0)` is
-  unbounded at zero and a negative capacity traps; a send to a closed channel traps, closing twice
+  `update(f)` retries `f` until its compare-and-set succeeds. `Channel[T](capacity = unbounded)` is
+  unbounded with no capacity, a rendezvous at zero (Proposed below, which replaced unbounded at
+  zero), and a negative capacity traps; a send to a closed channel traps, closing twice
   does nothing, and a channel is `Iterable`, receiving until it is closed and drained. `Once.run`
   makes every other caller wait for the running body; a body running its own `Once` again traps.
 - [Trailing blocks](/spec/operators-and-control-flow/#trailing-blocks): an indented block on the
@@ -965,12 +1000,15 @@ Settled by the user on 2026-11-04:
   `await` inside a body is allowed. The pool is a module's `lazy val`, so a program that makes no
   future never makes it.
 - [`lazy val`](/spec/declarations/#initialization), at module level and in class and object bodies
-  (each instance its own), is computed on its first read, exactly once, and kept; never read, never
+  (each instance its own), and in blocks (each declaration's run its own, see the entry for branch
+  `lazy-local`), is computed on its first read, exactly once, and kept; never read, never
   computed. `lazy` is a modifier only before `val`, an ordinary name elsewhere; `lazy var` and
-  `lazy` on parameters, class parameters, data fields and locals are errors. A module-level one
+  `lazy` on parameters, class parameters and data fields are errors. A module-level one
   takes no place in the eager initialization order, its readers depending on what its initializer
-  reads; an initializer that needs its own value, directly or through other lazy values, traps at
-  that read, naming the value. A field's initializer may use every field and method; the class
+  reads; an initializer whose own code needs its own value, directly, through the functions it
+  calls or through other lazy values, is a compile error naming the chain (module-level, field and
+  local ones alike; see the initialization entries), and one that reaches it through a function it hands on traps
+  at that read, naming the value. A field's initializer may use every field and method; the class
   body reads the field only where it could call a method. Concurrent first reads run the
   initializer once, the others waiting safe for the collector; the value is published with a
   release store paired with the readers' acquire load, a stored value read with one atomic load
@@ -1872,7 +1910,9 @@ their words are reserved.
   - A declaration promises `Sendable` as it conforms to any trait: after `:` in a class's or a
     trait's header, or in an impl for a data type. The promise is checked against the structure,
     outside the standard library, and an `open` or `abstract` class that promises it is sendable,
-    each subclass being checked. The standard library's promises are taken as made, since they are
+    each subclass being checked. (Replaced by the Proposed `@trusted_sendable` entry, branch
+    `fix-core-promises`: the library's promises are checked too, but for the classes it marks.)
+    The standard library's promises are taken as made, since they are
     for types whose structure cannot show it: `Future`, `Promise`, `Channel` and `Atomic` of a
     sendable type (impls bounded by `Sendable`), `Mutex` of any type and `Once` (in their headers),
     and `Vector` of sendable elements. `ArraySeq`, `List`, `Range`, the hash and tree maps and sets,
@@ -3158,8 +3198,9 @@ their words are reserved.
     generate) are the whole trusted surface.** *Why*: soundness in safe code, and one grep finds
     everything to review. *Alternative*: an `unsafe` region with a raw pointer type, which would let
     a binding's pleasant layer be written in Avin but makes every Avin file a possible hole.
-  - **`errno`** is not read by a binding yet; an `errno` flag answering `Result[T, int]` from a `-1`
-    result is the likely form when a POSIX library needs it.
+  - **`errno`** was not read by a binding at first; an `errno` flag answering `Result[T, int]` from a
+    `-1` result was the likely form, and is what was built, with `Errno` besides (settled 2026-11-15,
+    branch `c-opaque-errno`).
   - **Review with the user**: the prototype-string form of `@c`, the largest syntax choice here; whether a
     package may carry C sources, which widens the trusted surface beyond the `@c` lines; the two
     parser additions (`val` with no initializer for `@c(const:)`, list-valued annotation
@@ -3859,7 +3900,7 @@ spelling is better, as each entry says.
   derivation declares it. Each call's type arguments are held to it as to any bound, a generic
   function passes its own type parameter on only where that one is bounded by it too, and every
   instantiation gets a shim of its own that Sysl checks, so a Sysl bound the instance does not meet is
-  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary + Ord]`) is Avin's to
+  reported at the binding in Sysl's words; an Avin bound beside it (`[T: Boundary & Ord]`) is Avin's to
   check, with no mapping between Sysl's traits and Avin's. A generic handle class,
   `@sysl("m.Signal") class Signal[T: Boundary]`, names the generic type without arguments, its type
   parameters invariant and the Sysl type's in order; each instance the program uses is a handle of its
@@ -4430,12 +4471,25 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   the same literal to a reader. Two limits, chosen as the smallest rule: of two arguments that
   both hold literals, the first written decides for the second (`same((1, x), (x, 2))` for
   `x: long` is an error, where a part-by-part solution would type it); and choosing an overload
-  checks a nested literal once at its own type where the candidates' parameters differ (`kind(Some(1))`
-  beside `kind(o: Option[long])` and `kind(o: Option[string])` fits neither), as only a bare literal
-  is tried against each candidate. Alternatives: leaving each literal unknown until its use settles
-  it, as a type argument is (solves both limits, but makes every literal an inference variable);
-  trying each candidate's parameter on a nested literal by its structure (collection, tuple and
-  constructor shapes). Review with the user: whether either limit is worth lifting.
+  checked a nested literal once at its own type where the candidates' parameters differ. Review
+  with the user: whether the first limit is worth lifting.
+
+  **Proposed (branch `fix-literal-expected`, 2026-11-14): the second limit is lifted.** Choosing an
+  overload checks a value built around number literals by itself first, as before; where that
+  leaves no candidate fitting (or it does not check by itself, as `[5_000_000_000]` does not), it is
+  checked against each candidate's parameter instead, with the type arguments the receiver, the
+  lower bounds and the other arguments decide, as a bare literal is. So `kind(Some(1))` beside
+  `kind(o: Option[long])` and `kind(o: Option[string])` is the `long` one, and `longs ++ [400]`,
+  which met two overloads of `++` (`Vector[W]` and `Iterable[W]` with `W >: long`), is a
+  `Vector[long]` (found writing marshal). Where the literal fits candidates at its own type, the
+  choice is unchanged, so `own([1])` beside `Vector[int]` and `Vector[long]` stays the `int` one.
+  With it, a reference type that takes integers or decimals (`BigInt`, `BigDecimal`, a type
+  implementing `FromInteger`) is kept in the expected type a literal argument gets, as a number is,
+  so `pair(cents, [3])` for `pair[T](a: Vector[T], b: Vector[T])` builds `Cents` where it had built
+  an `int`. Why: a literal one level down is the same literal to a reader, and an operator method
+  on a collection is the commonest place it meets overloads. Alternatives: checking against each
+  candidate first (would change which overload `own([1])` picks, and is ambiguous where both
+  take it); trying candidates by the literal's structure only (more code, same result).
 
 - Settled on the user's delegation 2026-11-06 (branch `stdout-flush-isnan`): **standard output gets an explicit `flush()`; reading flushes it; `real` gets `isNaN`, `isInfinite` and `isFinite`.** `flush()` is a prelude function and a method on `StandardOutput` and `StandardError` (a no-op beyond flushing output, as error keeps no buffer); a read of standard input that must wait flushes output first. The classifiers are methods on `real` in `avin`, written in Avin (`self != self`; comparison with the infinities; `self - self == 0.0`); `real.NaN`, `real.PositiveInfinity` and `real.NegativeInfinity` already existed, and `real` is the only floating type. WHY: a drawing program must push a frame without a newline, and a prompt must be seen before the wait; the methods read as `char`'s do, where the `avin.math` functions are not methods. ALTERNATIVES: a `Writer.flush` on the trait (every writer would need a meaning); flushing only on `print` (defeats buffering); `math.isNaN(x)` functions (the spec keeps `avin.math` for elementary functions). Review with the user if a `Writer`-level `flush` is wanted.
 
@@ -4699,10 +4753,29 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   lambda checked last let the `0` fix `T = int` first, so the lambda and a named function of the
   same type behaved differently (marshal met it). Alternatives: deferring the literal instead of
   advancing the lambda (the same order in effect, but it reaches only literals, not the lambda's own
-  literal result); checking a lambda with `?` early against a result type known only in shape (a
-  larger change to how `?` finds the type it returns, left for when a program needs
-  `pick(s -> Some(s.toLongOption()? + 1), 0)` to be a `long`). Review with the user: whether a
-  lambda that uses `?` should also take part, which needs `?` to work from a result known in shape.
+  literal result); checking a lambda with `?` against a result type known only in shape, deferred
+  here and since built (next paragraph).
+
+  **Settled on the user's delegation 2026-11-15 (branch `lambda-question-shape`): a lambda using `?`
+  or `return` checks against a result known only in shape.** Where the function type expected for
+  a lambda yields an `Option[T]`, or a `Result[T, E]` with `E` known, and `T` is still to be
+  inferred (wholly or in part), the lambda's result is that shape: `?` passes a `None`, or an `Err`
+  converted to `E` as in any function, and the body's value solves `T`, so
+  `inside(n -> Ok(half(n + 1)? + 1))` for `inside[T](f: (int) -> Result[T, string])` takes
+  `T = int`. A `Result` whose `E` is itself unknown, and any other shape, stay refused with "this
+  lambda uses `?`, so its result type must be known where it is written". WHY: the pg package
+  needs it for every `c.transaction(tx -> { tx.execute(…)?; Ok(x) })` and `pool.use` body, where
+  the transaction's value type is the caller's and the error type is the library's; the error
+  type is what `?` needs, and it is known. Only a lambda that exits by `?` or `return` takes the
+  shape as its declared result; any other lambda still infers from the body against the shape as a
+  hint, so nothing it accepted changes. ALTERNATIVES: inferring `E` from the first `?` too (makes a
+  lambda's error type depend on which failure is written first, and a later `?` of another error
+  type then fails to convert rather than widen); making a `?` lambda take part in the literal tiers
+  as well (it is still checked after the other arguments, so
+  `pick(s -> Some(s.toLongOption()? + 1), 0)` still fixes `T = int` from the `0` and is refused:
+  checking it earlier would refuse a `?` lambda whose result is a bare `T` that only a later
+  argument decides). Review with the user: whether a `?` lambda should also join the literal tiers
+  when its expected result has the shape, which would make the `pick` example a `long`.
 - **Settled on the user's delegation 2026-11-07 (branch `hash-digest`): `avin.crypto`, digests over `sysl.crypto`.**
   The module is `avin.crypto`; it has `sha256`, `sha512`, `sha1` and `md5` (each taking a
   `Vector[byte]` or a `string`, hashed as UTF-8, answering a `Vector[byte]`), `hmacSha256` and
@@ -6935,7 +7008,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **A tuple with a union part is not answered as words** by `val (a, b) = f(x)`: the call makes the
     tuple, and the parts are read from it. *Why*: a result's words do not nest a union's words yet.
     *Alternatives*: flattening the union's words into the result's (a later optimization).
-- Proposed (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
+- Settled on the user's delegation 2026-11-15 (built on branch `union-tag-payload`): **Tuple type patterns by their parts' layouts.**
   A tuple type pattern matches a tuple whose type as made is seen as the target with no conversion,
   part by part: a part that is an object (a string, a tuple, a data value, an object of a class, a
   function, or a union of references) is seen as an `Any` part, so a `(string, string)` and a
@@ -7471,10 +7544,45 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     one-line branch or in a class body it is refused. While one waits, nothing is in tail position,
     so `@tailrec` refuses a self-call there. `defer` becomes a keyword (one test function named
     `defer` was renamed).
-  - **A trap, a cancelled thread and `process.exit` run no deferred statement.** There is no
-    unwinding; files and connections left open are closed by the collector's finalizers.
-  - **Lowering emits each deferred statement at every edge that leaves its block** (`lower.sysl`'s
-    `run_defers`), as Sysl does: no run-time list, no cost where nothing is deferred.
+  - **A trap and `process.exit` run no deferred statement.** There is no unwinding; files and
+    connections left open are closed by the collector's finalizers.
+  - Settled on the user's delegation 2026-11-15 (built on branch `defer-on-cancel`): **a cancelled
+    thread runs its deferred statements**, innermost first, as at any other way out of their blocks,
+    wherever its cancellation stops it (a wait, a safepoint poll), and then its frames are dropped
+    as before. A thread running a scope stops first at that scope: the scope body's deferred
+    statements run, the scope cancels its threads and waits for them (each running its own), then the
+    functions around the scope run theirs. **A deferred statement runs to its end once begun**: the
+    thread's cancellation does not stop it inside one (its own waits are not cancellation points
+    while it runs, as while a lock is held), and one that comes meanwhile stops the thread at its next
+    cancellation point after; one that traps stops the program, as any trap. **A cancelled wait on a
+    mutex's condition stops the thread holding the lock again**, so a `with` body's deferred
+    statements run under it and `with`'s own `defer` lets it go; the library's internal conditions
+    still stop without the lock, as their code expects. `Pool`'s putting back what a cancelled call
+    held is now a `defer`.
+    *Why*: cancellation stops a thread at a known point, a wait or a poll, in a consistent state,
+    unlike a trap. Without it no library or package can clean up after a cancelled task: found
+    writing a PostgreSQL client, where a cancelled query must send a CancelRequest, a cancelled
+    `transaction(f)` must roll back, and a pool lease or a `Mutex.with` must be given back.
+    *Alternatives weighed*: a public `onCancel(cleanup)(body)` in `avin.threads` (a second mechanism
+    beside `defer`, and lambdas again, with the `return`/`?`/`break` problem `defer` was chosen to
+    avoid); leaving it (no cleanup at all after a cancellation); running a deferred statement with
+    cancellation live (a cleanup that waits could itself be cut off half done).
+  - **Each deferred statement is its closure, put on the thread's list where the `defer` is
+    reached** (`lower.sysl`'s `Defer`, `runtime/avin/rt/defers.sysl`): every way out of the block runs
+    the block's own from the list, newest first, and a cancellation runs every one reached since the
+    cancellation point it returns to before it drops their frames; a trap in an actor's turn drops
+    the ones it passes unrun. A function that defers nothing never touches the list. The checker
+    checks the statement as a lambda of no parameters that no jump may leave, so a `var` it reads is
+    shared as a captured one is. *Why*: the cancellation unwinds by returning to the cancellation
+    point past every frame between, so what those frames deferred must be reachable from the thread
+    itself; a list costs a closure and two runtime calls per deferred statement and nothing anywhere
+    else. *Alternatives weighed*: emitting each deferred statement inline at every exit, as before,
+    and a landing pad per function that defers (a `setjmp` in every such call, with the locals it
+    reads unreliable after the return); a frame-local record pointing at a compiled cleanup function
+    (no allocation, but a new kind of stack object for the collector and the code generator).
+    **Review with the user**: deferred statements now allocate a closure where they capture
+    anything, a cost on the ordinary path (`Mutex.with` among them); a later pass could emit them
+    inline again where no cancellation point can be reached between the `defer` and its block's end.
   - **`trait io.Close { close() -> Result[unit, IoError] }`**, closing twice answering `Ok`:
     `fs.File` (unchanged), the new `fs.TempDir` from `fs.tempDir(prefix)` (`close` removes the tree),
     every `net.ByteStream`, `TcpListener` and `UnixListener` (their `close` now answers `Ok(())`
@@ -7495,9 +7603,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     statements on a trap (unwinding through a broken state); a `Close` whose `close` answers `unit`
     (would drop `File.close`'s flush error and a `TempDir`'s removal error); `use x = e` binding sugar
     over `defer x.close()` (left for later; `defer` covers it in one more line).
-  - **Review with the user**: whether a cancelled lightweight thread should run its deferred
-    statements (it needs cancellation points compiled as exits); whether discarding a `close`'s
-    `Result` in `defer` deserves a warning; whether `use x = e` sugar is wanted.
+  - **Review with the user**: whether discarding a `close`'s `Result` in `defer` deserves a warning;
+    whether `use x = e` sugar is wanted.
 
 - Settled on the user's delegation 2026-11-12 (built on branch `numeric`): **`Numeric`, the numbers' bound.** A core trait
   `Numeric: Add, Sub, Mul, Div, Rem, Neg, Ord, Display, Debug` declaring `toReal -> real`; `Integer`
@@ -7507,7 +7614,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Integer` excludes `real`); taking every operator the integers and `real` share (`Div` and `Rem`
   included, though their meaning differs: integer division truncates and traps on zero) gives the
   most generic code, and `zero`/`one` are already `Add`'s and `Mul`'s. Alternatives: only
-  `Add + Sub + Mul + Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
+  `Add & Sub & Mul & Ord` (the audit's sketch), which leaves `/` out of generic numeric code; a
   `Numeric` that also offered `fromInt`/`T(n)` construction, left out since `zero`/`one` cover the
   identities and a conversion from integers is lossy at narrow widths; a separate `Fractional` for
   `real`, not needed while `real` is the one non-integer. **Review with the user**: whether `Div`
@@ -7732,15 +7839,14 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   argument list or parenthesized group meeting a token other than `,` or `)` reports it once and
   skips to its `)`. `->` there says "write a map as `{"a": 1}`" when the callee's name ends in `Map`
   and "`->` does not pair two values: write a pair as `(a, b)`, and a map as `{"a": 1}`" otherwise;
-  `x: T` says "give the type argument instead, as in `f[T](x, …)`" (Avin has no expression
-  ascription: a value takes its type from where it is used, or from a declared `val`'s type), "a
-  lambda's parameter with a type is written in parentheses" when `->` follows the type, and "declare
-  the value with it, as in `val x: T = …`" in a group. WHY: one mistake made five to ten errors,
+  and "a lambda's parameter with a type is written in parentheses" when `: T ->` follows a name.
+  WHY: one mistake made five to ten errors,
   each naming a token rather than the mistake, and the token shows exactly which mistake it is.
   ALTERNATIVES: suppressing every error after the first in a statement (panic mode), which also
   hides a genuinely separate mistake on the same line; accepting `k -> v` as a pair (a second
-  spelling of a tuple, and `x -> body` is a lambda); accepting `x: T` as an ascription (a second way
-  to state a type the language deliberately gives through declarations and type arguments).
+  spelling of a tuple, and `x -> body` is a lambda). The hints this entry first gave for `x: T` in
+  an argument or a group ("give the type argument instead", "declare the value with it") are gone:
+  `x: T` there is now a [type ascription](#proposed) (the user approved ascription 2026-11-13).
 - Settled on the user's delegation 2026-11-13 (built on branch `diag-spans-recovery`): **A member's mistake is shown at the member** (branch `diag-spans-recovery`). The checker reports
   a missing or private member, an argument-count mistake and `()` on a parameterless member at the
   member's name and argument list; the call's own span, used for a type mismatch and for traps,
@@ -7847,7 +7953,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `--all` removing the whole `avin/<version>` (it would also drop fetched packages, which a build
   then fetches again over the network); a lock around a program's cache (the content-addressed,
   rename-published entries need none). Review with the user: whether a cache of a deleted project
-  should ever be trimmed on its own (today only `avin clean --all` removes it, as with Sysl's).
+  should ever be trimmed on its own (answered by the cache's limit: least recently used first, see
+  the Proposed entries of branch `cache-trim`).
 
 - Settled on the user's delegation 2026-11-13 (built on branch `variant-test-open`): **A variant with fields named alone in a pattern
   tests for the variant and binds none of its fields.** `o.status is Shipped`, `Shipped -> …` in a
@@ -8163,8 +8270,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 **Deferred**
 
-- Higher-kinded, path-dependent and intersection types; inferred unions; implicit parameters;
-  macros.
+- Path-dependent and intersection types; inferred unions; implicit parameters; macros.
+- Settled by the user 2026-11-13: **Avin has higher-kinded types and a standard Functor, Monad and
+  Traverse family**, reversing their deferral; the design's choices are under
+  [Proposed](#proposed) (branch `hkt-design`), and the guiding rule the user gave with it is that
+  Avin is the ultimate *sound, nominally typed*, compiled, garbage-collected high-level language:
+  every rule is sound with no unchecked escape, the traits are nominal, and `for` comprehensions
+  admit their sources by conformance.
 
 - Settled on the user's delegation 2026-11-12 (built on branch `library-version`): **the standard library carries the compiler's version, and
   the compiler refuses a library of any other.** `library/library.hocon`'s `package.version` is
@@ -8182,7 +8294,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   than the compiler" (a newer library declares what an older compiler cannot check, which is the
   failure being fixed). Review with the user: whether a pre-release suffix should be accepted in the
   library's stamp; manifests accept three numbers only, as `sysl.hocon`'s version does.
-- Proposed (built on branch `c1-diagnostics`): **A method declared `m()` and named bare where a
+- Settled on the user's delegation 2026-11-15 (built on branch `c1-diagnostics`): **A method declared `m()` and named bare where a
   value is expected is reported as "`m` is called with `()`: write `c.m()`, or `() -> c.m()` for a
   function value"**, the call first, written on the receiver as the program named it (a local or
   parameter by name, `self`, a type for a static member, nothing for a bare name's implicit `self`),
@@ -8214,12 +8326,638 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatter is meant to settle exactly this); a blank line between clauses only around a
   multi-line one (it still splits one function in two); a blank line between every clause
   (it spreads a short definition over twice its lines).
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **A streamed response is a `Response` whose body a
+  function writes through a `BodyWriter`** (`Response.stream(status, contentType, write)`, with a
+  `length` overload, and `Response.events` for server-sent events through an `EventWriter`). The
+  head says `Transfer-Encoding: chunked`, or `Content-Length` where the length is given, or to an
+  HTTP/1.0 client neither, the body ending with the connection. Each write answers `Result[unit,
+  IoError]`, `Err` once the client has gone or the server is stopping and for every later write;
+  a write past a given length traps; a handler trapping once the head is sent has its connection
+  closed with no `500`. Why: one `Response` type keeps routers, middleware and error pages working
+  on streamed answers unchanged, and a `Result` per write makes the end of a stream the program's
+  ordinary control flow. Alternatives weighed: a separate `StreamedResponse` type beside `Response`
+  (every handler type and middleware doubled); a handler handed the connection (the server loses
+  its framing and keep-alive); writes that trap when the client has gone (a client leaving is not a
+  bug). Review with the user: whether `Response.events`'s fifteen-second keep-alive default suits.
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Typed parameters through a `FromParam` trait of
+  static methods**, `paramAs[T]`, `queryAs[T]` (with a default overload) and `queryOption[T]`
+  answering `Result[_, ParamError]`, `Missing` or `Invalid`; `string`, `int`, `long`, `real` and
+  `bool` implement it. Why: a static `parse` makes a program's own type a parameter type by one
+  `impl`, and a `Result` lets `?` answer the client `400`. Alternatives weighed: separate
+  `queryInt`/`queryLong` methods (closed to a program's own types); trapping on bad input (a client
+  error is not a server bug).
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Handlers that fail answer `Result[Response,
+  ToResponse]`**: `ToResponse` is a trait with `toResponse()`, implemented by `Response` itself and
+  `ParamError`, `fromResult` turns such a function into a `Handler`, and each `Route.get` … `patch`
+  has an overload taking one. Why: `?` then ends a handler with any failure the program's own error
+  types can render, and a plain `Response` handler is untouched. Alternatives weighed: one
+  `Result`-only handler type (every simple handler would wrap in `Ok`); an `Error`-bounded error
+  rendered as `500` (hides the status the program meant). Making the overloads work needed two
+  compiler fixes: a lambda tried against several overloads is compiled only for the one chosen, and
+  an argument checked before the overload was chosen is made `@sendable` where the chosen one's
+  parameter is (tests `overload_lambda_return`, `overload_sendable`, `overload_sendable_capture`).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-request-values`): **A middleware
+  hands values on through the request, keyed by their exact type**: `ServerRequest.withValue[T:
+  Sendable](value: T) -> ServerRequest` and `value[T: Sendable]() -> Option[T]`. `withValue`
+  answers a new request; a second value of one type replaces the first; the key is the type
+  `withValue` was given, compared exactly as a type pattern compares a generic type's arguments
+  (each value is held in an invariant private `Carried[T]` as an `Any`), so a value handed on as a
+  trait is not read as its class nor the reverse, and `int` is not `long`. Parameters a router
+  binds keep the values. Why: the type is a key no two middlewares collide on by accident and that
+  needs no cast to read, reified type patterns make it sound with no new language feature, and a
+  request id or a span from a logging middleware fits the same API as a user from an auth one.
+  The names follow `withParams` and `header(name)` beside it. Both take `Sendable` because a
+  handler may move what it reads onto another thread (`untilStopped`), and a non-sendable `T` is
+  refused at `value` too rather than silently answering `None`. Alternatives weighed: a key
+  object (`RequestKey[T]`) for two values of one type — not built, since a program wraps each in
+  its own `data` type, which also names what the value is, and the library has no key-object
+  idiom elsewhere; subtype matching on read (`value[Role]()` finding an `Admin`) — refused, since
+  which of two values answers would depend on their order; route parameters or headers as the
+  carrier — strings only, and spoofable from the client; the names `with`/`get` — `with` already
+  means running a body on a `Mutex`, and `withX` is the request's and the response's existing
+  form. Review with the user: whether a key-object form is wanted after all.
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Route groups and middleware are plain functions**:
+  `type Handler`, a middleware `(Handler) -> Handler`, `Route.wrap`, `Route.under` and
+  `Route.group(prefix, routes, middleware)` answering a `Vector[Route]`, nesting with the inner
+  middleware inside the outer. A prefix must begin with `/` and not end with one, else it traps.
+  Why: groups flatten into the router's one ordered list, so matching, `405` and `HEAD` stay as they
+  were. Alternatives weighed: a nested router type (two matching rules); a prefix tolerating a
+  trailing `/` (two spellings of one path, and `//` after joining).
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **Error pages are an `ErrorPage = @sendable (int) ->
+  Response`**, given to `Router` (its `404` and `405`) and `http.serve` (every status it answers
+  itself), defaulting to `plainError`, the reason phrase as text; the status sent is always the one
+  given, and a `405` keeps its `Allow`. Why: one function covers JSON or HTML pages without a
+  table of statuses. Alternatives weighed: a `Map[int, Response]` (every status listed by hand, and
+  none computed); letting the page change the status (a `404` page answering `200` misleads clients).
+- Settled on the user's delegation 2026-11-15 (built on branch `http-stream`): **`isStopping()` and `untilStopped(wait)` on a
+  `ServerRequest`, `BodyWriter` and `EventWriter`**, `untilStopped` running `wait` on its own thread
+  through `TcpServer.idle`, so stopping cancels it and the handler gets `None`. Why: a long poll or
+  an event stream otherwise holds `join()` until its client goes. Alternatives weighed: a
+  cancellation token passed to every handler (every handler signature changes); leaving shutdown
+  to the write timeout (a quiet stream would hold it for `writeTimeout`).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-websocket`): **An upgrade is a
+  `Response` too**: `Response.upgrade(protocol, take)` is a `101` carrying an `Upgrade`, and the
+  server, seeing one, writes the head with `Upgrade: protocol` and `Connection: Upgrade` and hands
+  `take` an `Upgraded` (the stream, the bytes it had read ahead past the request, the write limit,
+  and the server's `isStopping`/`untilStopped`), reading no more requests and closing the connection
+  once `take` returns; a trap in `take` closes it with no `500`. Why: routes, groups and middleware
+  apply to a WebSocket route unchanged, as they do to a streamed one, and the bytes read ahead are
+  not lost when a client sends its first frame with the handshake. Alternatives weighed: a separate
+  upgrade handler type on `Route` (middleware written twice); handing the raw `ByteStream` alone
+  (a frame read ahead with the request would vanish).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-websocket`): **WebSockets in
+  `avin.net.http`**: `webSocket(request, session, protocols, maxMessageBytes = 1 MiB, closeTimeout
+  = 5 s) -> Response` checks the handshake and answers `101`, `405` (not `GET`), `426` with
+  `Upgrade: websocket` (no upgrade to a WebSocket asked), `426` with `Sec-WebSocket-Version: 13`
+  (another version) or `400` (HTTP/1.0, no `Connection: Upgrade`, a key not sixteen bytes of
+  base64); the subprotocol chosen is the server's first that the client offers. `WebSocket.connect(url,
+  headers, protocols, tls, timeout, maxMessageBytes)` is the client, `ws` and `wss`. Both ends share
+  one `WebSocket`: `send(text)`, `send(bytes)`, `ping`, `receive()`, `receive(limit)`, `close(code,
+  reason)`, `isOpen`, `isStopping`, `untilStopped`, answering `Result[_, WebSocketError]` (`Closed(code,
+  reason)`, `Broken`, and for `connect` `Refused`, `BadHandshake`, `Unreachable`). Why: one module
+  with the HTTP server it upgrades from, and errors the program's control flow handles, as a
+  `BodyWriter`'s are. Alternatives weighed: an `avin.net.websocket` module (it needs the server's
+  private connection loop); a callback per message (`onText`, `onClose`; the session's own loop
+  reads more plainly and keeps its state in locals).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-websocket`): **What a WebSocket
+  does by itself**: a ping is answered with a pong as it arrives and a pong is passed over; a
+  fragmented message is put back together, control frames between its fragments answered; the size
+  limit is checked against a frame's declared length before its payload is read, so an oversized
+  message is refused without being buffered (`1009`); text is checked to be UTF-8 once the message
+  is whole (`1007`), and so is a close reason; a frame breaking the protocol (`1002`) — a client's
+  frame not masked or a server's masked, a reserved bit, an unknown opcode, a fragmented or long
+  control frame, a continuation with nothing to continue or a new message inside one, a close of
+  one byte or with a code no endpoint may send, a 64-bit length with its top bit set — fails the
+  connection: the close frame is sent and the connection closed at once. A close from the other end
+  is answered with its code (none for none, heard as `1005`) and the connection closed; this end's
+  `close` waits `closeTimeout` for the answer. A session returning with its WebSocket open closes it
+  with `1000`; a server stopping closes it with `1001` at its next receive (the wait being through
+  `idle`) or send; a peer going without a close is `Closed(1006, …)`. A frame's length need not be
+  in its fewest bytes, though this end writes it so; every message is sent as one frame; a client
+  masks each frame with four bytes from `SecureRandom`. Why: these are RFC 6455's rules where it
+  gives them, and where it leaves a choice (validating UTF-8 at the end rather than as fragments
+  arrive, accepting a longer-than-needed length) the simpler one that still refuses what it must.
+  Alternatives weighed: surfacing pings and pongs as messages (every session would answer them by
+  hand); validating UTF-8 per fragment (fails a bad message sooner, at more code). **Review with the
+  user:** a `WebSocket` belongs to one thread, as its stream does (a TLS stream checks its owner), so
+  a session that must send what another thread produces while also receiving polls with
+  `receive(limit)`; a `select`-like receive over a channel, or a sendable sending half, would be the
+  next step if a program needs one.
+- Settled on the user's delegation 2026-11-15 (built on branch `lazy-local`): **A local `lazy val`, in a block, is the value of a
+  cell made where it is declared**, the core library's private `LazyCell[T]`, holding the value, its
+  state word and the closure computing it, so a read is that cell's lazy field read: once on the
+  first read, under the same protocol as a field's between threads, with the same trap for a read
+  made while it is being computed. The choices the request left open:
+  - *Closures share it.* A closure capturing the name captures the cell, so a first read inside
+    the closure computes it for the enclosing scope too, and the reverse; it outlives its block. A
+    declaration in a loop body makes a new cell on every pass. *Alternatives*: copying the value
+    into the closure at capture (would force it where the closure is made, defeating the point);
+    one cell per declaration site (wrong for loops and recursion).
+  - *The initializer sees the locals as they are at the first read*, a captured `var` included,
+    since it is a lambda run then; fields see their object at the first read in the same way.
+    *Alternative*: snapshotting the locals at the declaration (would need a copy of every captured
+    `var`, and differs from what a lambda written in the same place does).
+  - *Across threads, sendable where its type is and its initializer would be.* A `@sendable`
+    closure (a thread's body, a future's) may capture a local `lazy val` only where the value's
+    type is sendable and every local and parameter the initializer captures passes the rules that
+    closure is held to, a `var` refused, through each lazy value the initializer reads in turn; what
+    the initializer reaches is held to the module-level state rule too. *Why*: the initializer may
+    run on whichever thread reads first, so it is code the closure carries; a field's initializer
+    captures only its object, which the object's own sendability covers. *Alternatives*: refusing
+    every capture of a lazy local by a `@sendable` closure (simpler, but refuses the plain case of
+    a sendable value computed from sendable `val`s); checking the value's type alone (unsound: an
+    initializer capturing a `Buffer` or a `var` would run on another thread).
+  - *A self-read follows the other lazy values*: today it traps at run time, ``avin: trap: `x` is
+    read while it is being initialized``, as a field's and a module-level value's do, and a lazy
+    list may refer to itself through its cells. The sound-initialization design (`### lazy val` in
+    declarations) makes a read the initializer's own code reaches a compile error; a local is held
+    to it in the same way when that is built, and its run tests `lazy_local_self_direct` (a direct
+    read, which becomes a reject test) and `lazy_local_self` (a read through a closure the
+    initializer calls, which stays a trap) say which side each falls on. A trap in the initializer
+    stops the program as any trap does.
+  - *The type must be known where it is declared*: an initializer whose type is not settled there
+    (one reading only its own value) is refused with "cannot infer the type of `x`", as a field's
+    is, rather than settled by later uses as a plain `val`'s may be. An initializer that never
+    finishes gives the type `Nothing`. A mismatch with a declared type is reported as "the
+    initializer of `x` yields …".
+  - *One name per declaration*: `lazy val (a, b) = …` and `lazy val a, b = …` are refused ("take
+    the value apart where it is read"), as is a `lazy val` without an initializer; an assignment, a
+    compound assignment and a step are refused as for a module-level `lazy val`.
+  - *Cost*: a declaration allocates the cell and the initializer's closure, both kept until the cell
+    is unreachable. *Alternative weighed*: storing the value, state and closure in boxed locals
+    without an object (saves one allocation but needs a layout of its own in the lowering and a
+    separate sendability rule); clearing the closure after the first read (frees its captures early,
+    but fields keep theirs, and a race-free clear needs another store on the hot path).
+  Review with the user: the cross-thread rule (the more permissive of the two sound choices).
 
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `WaitGroup` counts work and has no `spawn`.** `add`,
+  `done`, `wait`, a timed `waitFor` and `pending`; a count below zero traps. Why: a scope already
+  starts threads and waits for them structurally, so a spawning wait group would be a second way to
+  do what `scope` does; what a wait group adds is counting work finished by threads started
+  elsewhere (an executor, an actor, another scope) or by no thread at all. Alternatives weighed:
+  `wg.spawn(body)` starting and counting a thread (duplicates `Scope.spawn`, and an unscoped spawn
+  escapes cancellation); answering a negative count by clamping at zero (hides a double `done`).
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `Semaphore` has a capacity, and a release beyond it
+  traps.** `Semaphore(permits, capacity = permits)`; negative permits, a capacity below one or more
+  permits than the capacity trap too. Permits belong to no thread, and waiters are not queued (one
+  arriving as a permit comes back may take it first). Why: an over-release is the same bug as a
+  wait group's double `done`, a permit given back that nobody took, and a trap finds it where it
+  happens; the separate capacity keeps the signalling use (`Semaphore(0, capacity = 1)`) that an
+  "at most the initial permits" rule would forbid. Alternatives weighed: an unbounded count (a
+  silent over-release grows the limit for good); permits owned by the thread that took them (rules
+  out a permit taken by one thread and given back by another, which hand-offs need); a FIFO queue
+  of waiters (a cancelled waiter would have to take its place back, for a fairness the condition's
+  oldest-first wake mostly gives already). Review with the user: trap or ignore an over-release.
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **`withPermit` and a `RwLock`'s read give back what they
+  hold when a cancellation stops their body; a `RwLock`'s write runs to its end; a trap in any of
+  them stops the program.** The share is taken under the library's lock and held in a region in
+  doubt from that moment until it is given back (the runtime's new `lock_release_holding` and
+  `cancel_guarded_held`), so no cancellation can come between taking it and the body. A read body
+  or a permit's body runs at a cancellation point of its own inside that region, so a cancelled scope stops
+  a long download inside `withPermit` at once and the permit goes back, while a trap there, even in
+  an actor, stops the program as one under a lock does, since recovering the actor's turn would
+  leave the share held for ever. A write body is also uncancellable, as a `Mutex`'s body is, since
+  stopping it could leave the value half changed. Why: a semaphore guards no value, and a reader
+  changes nothing, so nothing is left in doubt by stopping them; a writer does change the value.
+  Alternatives weighed: every body uncancellable, as a mutex's (a scope's cancellation would wait
+  for every permit holder's whole body); every body cancellable (a write could leave the value
+  torn); a trap in an actor's body failing only the actor (needs a give-back chain run by the
+  actor's recovery, which the runtime does not have).
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `RwLock` lets writers in first, and lets in the readers
+  a write kept waiting before the next writer.** A reader that arrives while a writer waits waits
+  behind it; when a write ends, every reader then waiting is admitted ahead of the writers waiting.
+  Why: writers do not starve under overlapping readers, and readers do not starve under back-to-back
+  writers, with no tuning. Alternatives weighed: pure writer preference (readers starve while
+  writers keep coming); reader preference (writers starve); a strict FIFO of both (serialises
+  readers that could share). Review with the user: a read body is trusted only to read; nothing
+  stops it changing a mutable value other readers share, which races with them (a race is not
+  undefined behaviour in Avin, but the type system does not rule it out here as it does elsewhere).
+  A read-only view of a value would close it and is a language feature, not a library one.
+- Settled on the user's delegation 2026-11-15 (built on branch `sync-kit`): **A `Barrier`'s action runs under its lock, and a party
+  cancelled while waiting withdraws.** The last arrival runs the action holding the barrier's lock,
+  so the action is uncancellable and one that waits on its own barrier traps as a lock taken twice
+  does; `wait` answers whether the caller arrived last. A cancelled waiter takes its arrival back
+  (it is not counted for the round), through the runtime's settling condition wait, which answers a
+  cancellation with the lock held again rather than stopping at once. Why: a scope cancelled
+  mid-round leaves the barrier as if the stopped parties had never come, ready for new ones.
+  Alternatives weighed: a cancelled party staying counted (the round could trip with a party
+  missing); "breaking" the barrier for every party (a state each `wait` would have to answer);
+  running the action outside the lock (waiting on its own barrier would then deadlock instead of
+  trapping).
 
-## Proposed
+- Settled by the user 2026-11-14 (built on branch `contextual-keywords`, from the user's decision of 2026-11-14 that
+  `data` keeps its spelling and becomes contextual): **the words that begin a top-level declaration
+  are keywords only there, before the name they declare, and ordinary names everywhere else**:
+  `data`, `class`, `object`, `trait`, `impl`, `import` and `module` join `type`, `opaque`, `export`,
+  `derive`, `actor` and `machine`, and `open` and `abstract` are keywords only before `class`. So
+  `val data = readFile(p)`, a field `class`, a method `object()`, a parameter `import`, a named
+  argument `module = 2`, a type parameter, a variant, a module named `data` and `r.type` are all
+  legal, and `data(x: int)` at the top level declares a function called `data`. **The reserved
+  words stay**: `as`, `is`, `match`, `then`, `else`, `elif`, `do`, `yield` and `derives`, because each
+  follows a complete operand on its line (`x as T`, `if c then a`, `Base(x) derives Eq`), where a
+  name is an infix call; `if`, `while`, `for`, `loop`, `defer`, `return`, `break`, `continue`, `val`,
+  `var` and `def`, because each begins a statement or a declaration inside a block, where a line may
+  equally be an expression starting with a name (`loop` and an indented block would read as a call
+  of `loop` with a trailing block; `return (x)` as a call); `private`, `static` and `override`,
+  because they begin a member of a class body, where a line may be a statement, and `private + (o:
+  T)` would be both a method named by a symbol and an expression on a value; `true`, `false`,
+  `self` and `super`, which are values. `end` keeps its rule (a keyword only before a name), and
+  `not` and `with` theirs. Why: the test is whether the keyword's every position can be told from a
+  name's by the next token alone. A top-level line holds only declarations, never a statement, so a
+  declaration word followed by a name can mean nothing else, and none of these words begins
+  anything inside a block or a class body. Alternatives weighed: renaming `data` (the user kept the
+  spelling); making every word contextual by look-ahead over whole lines (`loop`, `return` and the
+  modifiers would each need a rule of their own that a reader cannot see at a glance); keeping
+  `class` and `object` reserved as the most declaration-like (they are common field names, and
+  nothing about them is less decidable than `data`). The user
+  settled 2026-11-14 that `private`, `static` and `override` stay reserved: a modifier used as a
+  variable name would read strangely.
 
-- Proposed 2026-11-13 (branch `given-design`; design approved by the user 2026-11-13, the
-  choices below on the delegation): **contextual parameters are for context values, never for
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **a trait for types whose
+  members never write `Self` bounds constructors too**
+  ([generics](/spec/generics/#constructor-traits)). A trait with parameters, no static member, no
+  member naming `Self` beyond the receiver, and requiring only such traits (`Foldable[A]`, any
+  `Countable[A]` of a program's own) is a trait for types everywhere it is one, and also a bound of
+  a constructor parameter of its arity: `impl Foldable for Option` makes each `Option[T]` a
+  `Foldable[T]`, so `Option` is a constructor for `[F[_]: Foldable]`, and a constructor trait may
+  require it at its own parameters (`trait Traverse[A]: Functor[A], Foldable[A]`). A type conforms
+  as a constructor only where a conformance states the trait's parameters as its own parameters,
+  so `impl Foldable[int] for Ints` makes no constructor; a type whose parameter is bounded is one
+  only for a hole promising that bound (`TreeSet` for `F[_: Ord]`), as for a constructor trait; a
+  trait naming `Self` otherwise or declaring a static member bounds types only, and one writing
+  `Self[X]` stays a constructor trait, never a type. Why: `Foldable`'s method mentions no `Self`,
+  so what it promises of an `F[X]` is exactly what the type conformance promises of that type; one
+  trait serves both uses, generic code over constructors reads the conformances the collections
+  already have, and nothing new is needed at run time (each instance's call is the ordinary call on
+  its type). Alternatives weighed: a constructor trait requiring a trait for types at its holes (a
+  constraint on every application `Self[A]`, a second notion with its own rules, where the dual
+  reading needs none); giving `Foldable` a method that writes `Self` (an artificial member, and it
+  would stop `Foldable[int]` being a type). This supersedes the Proposed "a constructor trait
+  requires only constructor traits" (branch `hkt-3`) for traits that bound constructors.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **every `Iterable[A]` is a
+  `Foldable[A]`.** `Iterable` requires `Foldable` and gives `foldLeft` as its default, moved from the
+  impl adding methods to every `Iterable`; `List` gives its own walk in its impl of `Seq` and
+  `Vector` overrides it, so every collection of one parameter is a constructor for `[F[_]:
+  Foldable]` with no impl of its own, and `Option`, `Result` and `Either` gain `foldLeft` in their
+  impls of `Traverse`. A class of a program's own conforming to `Iterable` that declares its own
+  `foldLeft` now marks it `override`. Why: the fold is what every collection already has, and the
+  nominal rule needs a conformance; one in `Iterable` gives it to all of them at once. Alternatives
+  weighed: `impl Foldable for` each collection (an impl per type, each restating `foldLeft`, since
+  a method an impl adds to a trait does not implement another trait's); leaving the collections
+  out of `Foldable` (generic folds would not take a `Vector`).
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **`Seq` and `Set` leave
+  the table of the standard constructor traits; the impls are for concrete types only**
+  ([generics](/spec/generics/#functor-applicative-monad-traverse)): `List`, `Vector`, `ArraySeq`,
+  `Queue`, `LazyList`, `Array`, `Buffer`, `Deque`, `Option`, `Result`, `Either`, and the sets and
+  sorted collections as `Foldable` only, since their `map` answers a `Set` and needs `Eq & Hash` or
+  `Ord` of its result. Generic code over sequences takes an `F[_]: Monad` (or the trait it needs).
+  No impl is for a trait type. Why: an impl is for a type's own constructor, and a trait's `map`
+  answers the trait's type for every implementing class, so `Seq` could meet `Functor` only through
+  an impl for a trait, which the language does not have. Alternatives weighed: impls for trait
+  types, a future language feature, added only if a library need appears.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **`traverse` and
+  `sequence` through `Applicative.map2` apply `f` to every element and answer the first failure.**
+  The spec's "stops at the first failure" means the result, not evaluation: a sequence's
+  `traverse` folds through `map2`, which runs `f` on each element in order, and the first `None`,
+  `Err` or `Left` decides what is answered. Why: `traverse` is written once for every applicative,
+  and `map2` is all an applicative gives; stopping early would need a short-circuiting fold the
+  trait does not have. Alternatives weighed: a stopping `traverse` per constructor of the result
+  (`Option`'s, `Result`'s), which generic code at a program's own applicative would not have.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-7`): **a constructor trait's
+  parameter bounds ask nothing of the conforming type's parameters**: `impl SendableMonad for
+  Future`, whose `T` has no bound, conforms, since the trait applies the constructor only to
+  types meeting `Sendable`; a type whose parameter is bounded by more than the trait's parameter
+  promises is still refused, and a trait requiring the trait bounds its own parameter as it does.
+  A conformance had held `T` to `Sendable` as an ordinary trait argument, against the spec's
+  "bounded by no more than `Sendable`". Alternatives: none that keep `Future` a `SendableMonad`
+  with its parameter unbounded.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-8`): **a value bounded by two
+  traits that reach one method, one of them overriding it, has the override alone**: with
+  `F[_]: Monad & Filter`, `fa.map` is `Monad`'s default, not also the `Functor` method `Filter`
+  requires; with `T: Loud & Quiet` over `Base`, `describe` is `Loud`'s override. The calls had
+  been reported ambiguous, so the spec's `F[_]: Monad & Filter` took no comprehension. Why: a
+  type conforming to both has the override as its one method, so the bound has it too, as a type
+  inheriting both already did (`unreplaced`). Alternatives: none; the ambiguity was a bug.
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-8`): **the views
+  `withFilter` makes conform to `Iterable`**, each by an `iterator()` that tests the source's
+  elements as they are reached; their own `map`, `flatMap`, `withFilter` and `foreach` are
+  kept, so a comprehension's result is the collection's as before. Why: the spec says the calls
+  after a guard are on an `Iterable`; a view may now be held as one, looped over and folded.
+  Alternatives: leaving the views outside the hierarchy (a guard's result could not be passed
+  where an `Iterable` is wanted).
+- Settled on the user's delegation 2026-11-14 (built on branch `hkt-8`): **a refused
+  comprehension source names the fix only where the module can make it**: `declare impl Monad for
+  Box` for a type of one parameter declared in the module being checked, "declare an impl of
+  `Monad` for `Pair` at the parameter it holds its elements in" for one of more, "a type of no
+  parameters is a source only as an `Iterable`" for one of none, "add `Monad` to the bounds of
+  `F`" in generic code, and nothing for another module's type (`Result`'s missing `Filter`), whose
+  impl the module rule puts out of reach. The source is named where it is a name (`` `box` is a
+  `Box[int]` ``), "this source" otherwise; a guard's refusal is reported at the guard. A source
+  is checked for its roles before any call on it, and a refused one checks nothing after it.
+  Alternatives: always suggesting an impl (wrong advice for a library type).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a resource pool is
+  `avin.threads.Pool[T, E]`, lending through a body** ([pools](/spec/threads/#pools)). `use(f)`
+  and `lease(f)` lend a resource for the call of `f` and always take it back, answering
+  `Result[R, PoolError[E]]`; there is no `acquire`/`release` pair. Why: the scope of the body is
+  what makes "always returned" true by construction, on a return, a cancellation inside it, and a
+  trap (which stops the program); a resource handed out by `acquire` comes back only if every path
+  remembers to give it back. It sits in `avin.threads` beside the semaphore it resembles, built on
+  the same lock and cancellation machinery; the executor's private worker pool, which was also
+  called `Pool`, is renamed `WorkerPool`. Alternatives weighed: an `acquire()` answering a lease to
+  `release()` by hand (an actor holding a connection across messages would want it; it can be added
+  beside the body form later); a module of its own (`avin.pool`), which would need the threads
+  module's private machinery made public. **Review with the user:** whether an explicit
+  acquire/release form is wanted for resources held across an actor's messages.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a pool's resources
+  are isolated rather than sendable.** A `Pool` is sendable whatever `T` is, as a `Mutex` is:
+  `create`, `validate` and `destroy` are `@sendable`, so a resource is made from sendable values
+  alone, and `use`'s and `lease`'s bodies are `@isolating` and give back a sendable `R`, so the
+  resource never leaves the call it is lent to. Why: the resources worth pooling are mutable
+  (a connection's buffers and state), and a program's mutable class cannot promise `Sendable` (the
+  `@trusted_sendable` mark is the standard library's), so a pool that asked `T: Sendable` could not
+  hold the database client it exists for. The cost: a body may not capture a mutable value from
+  around it, and two mutable resources cannot be used in one nested body (`db.use(c ->
+  cache.use(r -> … c …))` is refused, since the inner body captures `c`). Alternatives weighed:
+  `T: Sendable` (sound, and too narrow, as above); unrestricted bodies (a resource kept past its
+  call would be used by two threads at once). **Review with the user:** the nested-body
+  restriction, which a borrow form the language does not have would lift.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a pool's waiters
+  are served first come, first served, by direct hand-off.** A resource given back goes straight
+  to the call that has waited longest, and so does the place a destroyed resource or a failed make
+  gives up; a new call queues behind any waiter even when it comes just as a resource is given
+  back, so no call is overtaken. Idle resources are lent most recently used first, so the oldest
+  expire under `idleTimeout`. Why: fairness the brief asks for, and an `AcquireTimedOut` under
+  load then means the pool is too small rather than unlucky. Alternatives weighed: waking any
+  waiter and letting it race (the semaphore's way; cheaper, and unfair); oldest idle first (keeps
+  every connection warm, and none ever expires on a quiet server).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **every function a
+  pool runs for a call runs where a trap cannot be contained.** A trap inside `f`, `create`,
+  `validate` or `destroy` stops the program even in an actor, as one inside `withPermit` does.
+  Why: an actor that survived the trap would leave the pool counting a resource or a place that is
+  never given back, shrinking it for good. `f` and `create` stay cancellable; `destroy` runs to its
+  end. Alternatives weighed: containing the trap and leaking the place (a pool that slowly loses
+  capacity in a long-running server). **Review with the user:** a server whose handlers are actors
+  may prefer the handler's failure to the program's.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **idle resources
+  expire when the pool is next used, not on a timer of their own.** A call looking for a resource,
+  and `evictIdle()`, destroy those idle longer than `idleTimeout`, keeping `minIdle`; `minIdle`
+  also sets what `warm()` makes, and is not kept topped up as resources are destroyed. Why: a pool
+  then starts no thread and holds no timer, and a program that wants eviction on a quiet pool calls
+  `evictIdle` from a `Ticker`. Alternatives weighed: a reaper thread per pool (a thread that
+  outlives every call and must be stopped by `close`); refilling to `minIdle` after each eviction
+  (a `create` failing in the background has nobody to report to).
+- Settled on the user's delegation 2026-11-15 (built on branch `api-pool`): **a pool's failure is
+  `PoolError[E]`: `AcquireTimedOut`, `PoolClosed`, `CreateFailed(error: E)`.** It is an `Error`
+  where `E` is, `CreateFailed` having `error` as its `cause`, and shows the same sentence wherever
+  `E` has a `Display`. The case names carry `Acquire`/`Pool` so that they do not clash with
+  `avin.io`'s `TimedOut` in a program importing both. Timeouts are `Option[Duration]`, `None` for
+  waiting for ever. Alternatives weighed: a `string` error (loses the database's own error);
+  `Option[T]` from `use` (a caller could not tell a timeout from a closed pool).
+- Settled on the user's delegation 2026-11-15 (built on branch `pool-production`, for the PostgreSQL
+  driver's pool): **a `Pool` takes `maxWaiting: Option[int]`, and a call that would wait while that
+  many already wait fails at once with a new case, `QueueFull`.** A server on lightweight threads
+  under overload otherwise queues every request behind the pool until each one's timeout, holding a
+  thread and a socket for each; failing at once lets it answer 503. The bound is checked under the
+  pool's lock where the call would join the queue, so it is exact under any number of threads; a
+  call that finds a resource idle or a place to make one is never refused, and a call already
+  queued that has to look again (its resource failed `validate`) is not refused either. It lives in
+  `Pool` rather than in a wrapper because only the lock knows the queue's length: a count kept
+  outside overshoots by every caller racing past the check. Alternatives weighed: a separate
+  admission `Semaphore` in front of the pool (bounds callers inside, not callers waiting, so it
+  refuses while resources are idle); reusing `AcquireTimedOut` (a server cannot tell overload from
+  a slow database). **Review with the user**: `QueueFull` is a new case of a public `data`, so an
+  exhaustive `match` on `PoolError` elsewhere needs an arm.
+- Settled on the user's delegation 2026-11-15 (branch `pool-production`): **`maxLifetime` and
+  `jitter` retire old resources, and `jitter` lengthens limits, never shortens them.** A resource
+  older than `maxLifetime` is destroyed rather than lent (looked at in the lending, before
+  `validate`) or kept (looked at as it comes back), and `evictIdle` destroys idle ones however
+  few that leaves, `minIdle` being `warm`'s to make up, since an aged connection is replaced, not
+  kept. Each resource draws its part of `jitter`, from 0 up to `jitter`, once when it is made, and
+  both its lifetime and its idle limit are lengthened by it; the draw comes from a SplitMix64
+  generator of the pool's own under its lock, since `avin.random` builds on `avin.threads`. Adding
+  rather than subtracting follows the PostgreSQL driver pgx (`MaxConnLifetimeJitter`), keeps
+  every limit a true minimum, and needs no clamp when `jitter` exceeds a limit. Alternatives
+  weighed: subtracting the jitter (a limit becomes a ceiling, which suits a server-side cutoff,
+  but a jitter longer than the limit would need clamping); a jitter as a fraction of each limit;
+  jitter on the lifetime only. **Review with the user**: subtracting is the other common choice.
+- Settled on the user's delegation 2026-11-15 (branch `pool-production`): **`counters()` answers a
+  `PoolCounters` of running totals beside `stats()`, rather than widening `PoolStats`.** `acquires`,
+  `waited`, `waitTime`, `timeouts`, `rejected`, `created` and `destroyed` are what a server exports as
+  metrics (pgx's `Stat`, a pool's usual gauges); `PoolStats` stays the deterministic snapshot of what
+  is held now, which tests and programs print, while `waitTime` varies run to run. `waitTime` runs
+  from the call to the lending, so it includes making or checking a resource, as pgx's
+  `AcquireDuration` does. Alternatives weighed: one wider `PoolStats` (its printed form would stop
+  being stable); counting in each user's wrapper (`waited` and `timeouts` are only known under the
+  lock).
+- Settled on the user's delegation 2026-11-15 (built on branch `select-readable`): **a thread waits
+  for a connection's bytes OR a channel's value with a `select` arm, `stream.readable() -> body`,
+  not with a second waiting mechanism.** A connection belongs to one thread (its reference counts
+  are not atomic, and OpenSSL is single-threaded per connection), so the thread that owns a
+  WebSocket must do all of its reads and writes, and so must wait for "bytes arrived or another
+  thread queued a frame". The arm fits the others' shape, an operation on its operand
+  (`ch.receive()`, `ch.send(x)`), so it composes with channel arms, `after` and `else`, and the
+  select's one-park, wake-once token covers it: where the stream is not readable when tried, its
+  descriptor is registered with the runtime's poller for one report under the select's own waiter,
+  and every ending withdraws it under the poller's lock, as channel links are withdrawn. The arm
+  binds nothing and reads nothing (its body reads), since a read's size and form (`read(max)`,
+  `readLine`) are the body's choice. Ready means a read would answer without waiting: buffered
+  read-ahead, TLS plaintext already decrypted or a whole record arrived (TLS's `readable()` hands
+  the engine the ciphertext already on the socket, so part of a record does not count, and keeps
+  any failure it meets for the next read), the end, a reset or a closed connection. Its operand is
+  the trait `avin.threads.Readiness` (`readable() -> bool`, `readinessDescriptor() -> int`), which
+  `ByteStream` extends, so `avin.threads` needs nothing of `avin.net`, and a source of one's own,
+  with `-1` for no descriptor, can be named too. The thread dump counts the arms as sockets ("in a
+  select on 1 channel and 1 socket"). Alternatives weighed: an interruptible socket wait rung by a
+  waker (smaller, but a second way to wait beside select, composing with neither `after` nor several
+  channels); an arm that reads and binds the bytes, `conn.read(n) as bytes` (fixes the read's form
+  in the arm, and a `readLine` could not use it); waking on socket readiness alone for TLS (a partial
+  record would wake a select whose read then blocks). Review with the user: the spelling
+  `readable()` and the name `Readiness`; whether the descriptor should stay a public method.
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **a WebSocket's other
+  threads send through `ws.sender()`, a sendable `WebSocketSender` that queues whole messages in a
+  bounded outbox the owning thread writes while it receives.** The owner's `receive` waits in one
+  `select` on the stream's `readable()`, the outbox, a sender's close request, the server's
+  `stopped()` channel and the limit, so every frame (senders', its own, pongs, the close handshake)
+  is written by the thread the connection belongs to, a message at a time, never interleaved.
+  Alternatives weighed: a mutex around the socket shared by every writer (impossible: a TLS stream
+  and a socket's handles belong to one thread); a writer thread per WebSocket (a second owner of the
+  connection, the same impossibility); an unbounded outbox (a slow client would hold every message
+  ever sent to it).
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **the outbox is bounded
+  in messages, `outboxSize = 64` on `webSocket` and `WebSocket.connect`, not in bytes; a send to a
+  full one waits up to the WebSocket's write timeout and answers `Err(Broken(IoError(TimedOut, _,
+  _)))`, the WebSocket left open.** A message bound is one bounded channel, and the owner's write to
+  a client that does not read fails at the same write timeout, closing it, so a slow client holds at
+  most 64 messages and its senders at most one write timeout each. Zero is a hand-over: each send
+  waits for the owner to take it. Alternatives weighed: a byte bound (needs a second counter beside
+  the channel, and one huge message would still have to be admitted); failing at once when full
+  (a burst would lose messages a healthy client reads a moment later); closing the WebSocket when a
+  send times out (the owner's write timeout already does, for a client that really stopped).
+  Review with the user: whether a byte bound is wanted beside the message bound, and the default 64.
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **`Ok` from a sender
+  means queued while open; the close is a request, and the senders are refused from the start of
+  any close.** A sender's `close(code, reason)` sets the shared state at once (every sender call
+  after answers `Err(Closed(code, reason))`) and the owner carries it out while it receives, after
+  writing what was queued before it. The owner's close refuses senders from the start of its
+  handshake, and its end (close, peer close, failure, server stopping, cancellation) drops what is
+  queued and wakes every sender waiting for room. A message queued in the instant the WebSocket
+  ends may answer `Ok` and be dropped, as a write accepted by a socket that then breaks is.
+  Alternatives weighed: an `Ok` only once written (every send would wait for the owner's next
+  receive); closing from the sender's thread (it does not own the connection).
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **a session that only
+  answers what arrives loops in `ws.serve(onMessage) -> WebSocketError`**, which receives until the
+  WebSocket closes and answers why, beside `receive()`, which a session may loop on itself; it is
+  while the owner receives that its senders' messages are written, so a session must be in one or
+  the other. Alternatives weighed: a background writer started by `sender()` (a second owner); no
+  helper, documenting the `receive()` loop (the chat server's loop is written once in every app).
+- Settled on the user's delegation 2026-11-15 (built on branch `ws-sender`): **data messages over
+  65536 bytes are sent in fragments of 65536, written back to back**, by the owner's `send` and by
+  senders alike, so a peer limiting frame sizes still takes large messages; a pong waits for the end
+  of the message being written. A thread cancelled while it receives closes the connection with no
+  close frame (a frame may have been half written) and ends the WebSocket with `1006`.
+  `TcpServer.stopped()` is a channel closed by `stop`, which the owner's select watches in place of
+  running each wait on a thread of its own through `idle`. Review with the user: the fragment size,
+  and whether `stopped()` should be a receive-only view rather than a `Channel[unit]`.
+- Settled on the user's delegation 2026-11-15 (built on branch `stdio-blocking`): **standard input
+  and output wait safe for the collector.** Every read of standard input and every write to standard
+  output or standard error, a flush and a trap's report included, marks its thread safe for the
+  collector while it waits, the string being written kept in a frame of the runtime's own. A
+  lightweight thread reading standard input from a stream with no position (a pipe, a socket, a
+  terminal where the platform answers so) parks on the poller first; one reading a file or a device
+  reads at once, since the poller does not report a file at its end as ready. Writes do not park: the
+  output goes through the C library's buffer, shared with any C code the program calls, so a thread
+  held up writing keeps its worker, counted as blocked, and the monitor runs another in its place.
+  **The wait for standard input is not a cancellation point**, as it was not before: a cancelled
+  thread goes on waiting for its line. *Why*: the smallest fix that keeps the behaviour the program
+  sees; making it one would add a failure path to `readLine`, which answers no error. *Alternatives*:
+  parking writes too (needs non-blocking standard output, which a pipe shared with the parent
+  process cannot be given safely); a cancellable input wait that unwinds the thread as a sleep does.
+  Review with the user: whether waiting for standard input should be a cancellation point.
+- Settled on the user's delegation 2026-11-15 (built on branch `net-split-writable`): **a
+  connection splits into a reader and a writer for two threads at once.** `ByteStream.split() ->
+  (StreamReader, StreamWriter)`, for `TcpStream`, `UnixStream` and `TlsStream`; both halves are
+  sendable traits, each half its own thread's, so a driver pipelines a batch of any size without
+  stopping at windows for the send/receive buffer deadlock (found by the pg driver's batch item).
+  Closing the writer half-closes (shutdown write; TLS sends its close notice first); closing the
+  reader only stops reading; the connection closes once both halves are closed or unreachable.
+  The split connection is used up (every operation answers an error naming the split; closing it
+  does nothing); splitting it again, or splitting a closed connection, traps. **No `reunite`**: a
+  protocol that wants one owner again keeps both halves on one thread, and a reunite would have to
+  check that the two halves are of one connection and that neither has pending state. A TCP or Unix
+  writer's `close` answers `Ok` where the peer has gone, as a connection's does; a TLS writer's answers
+  whether the close notice went out, as `TlsStream.close` does. Each half holds its own handle on the
+  socket (`avin.rt.socket_share`), so each is owner-checked on its own. The runtime's poller keeps,
+  per descriptor, the waiter of each direction and registers the union of the two
+  (`runtime/avin/rt/sockets.sysl`), so a reader parked for bytes and a writer parked for room wait
+  on one descriptor at once; before this a second registration replaced the first under epoll. A TLS
+  stream's halves share one session in a `@keeps_owners` object: the engine and the TCP writer are
+  reached only holding a lock of their own, each handle taken from transit by the code holding the
+  lock and handed back before it goes (a cancellation included, by `defer`), and nothing is held
+  while waiting for the connection, so the reader decrypts while the writer waits for room. A reader
+  that has ciphertext of its own to send sends it only where nobody else is sending (`tryAcquire`),
+  and otherwise leaves it owed to the writer. Alternatives weighed: concurrent reads and writes on
+  one connection value, with no halves (no owner check could then tell a misuse from a use);
+  `dup`ing the descriptor for the writer (Sysl's `Socket` cannot adopt one, and the poller would
+  still need two registrations under kqueue's filters); a TLS writer that waits for the reader on
+  every record (a renegotiation alone needs that, and the writer does wait for it then).
+  **Review with the user:** whether a reunite is wanted, and that a writer told by TLS to wait for
+  the peer (a renegotiation) waits for its reader to read.
+- Settled on the user's delegation 2026-11-15 (built on branch `net-split-writable`): **`writable()`
+  is a select arm beside `readable()`, with a partial write `writeSome(bytes) -> Result[int,
+  IoError]`.** `threads.Writability` (`writable()`, `writabilityDescriptor()`) beside `Readiness`;
+  every `ByteStream` and every `StreamWriter` is one, and `select` reads `sink.writable()` into a
+  `SelectWritable` arm, watched on the poller for room. `writeSome` is added because the arm needs
+  it to be useful: `write` sends everything and so waits again after the arm said there was room.
+  It waits for room for the first byte only where there is none, sends what fits, and answers at
+  least one unless given nothing. Over TLS it hands TLS at most one record (16384 bytes of
+  plaintext) and sends what of the record fits; the rest is kept and goes before anything else, and
+  `writable()` sends it as room comes and answers `true` only once it has gone, so `writeSome` after
+  `writable()` never waits; a read meanwhile leaves its own ciphertext queued behind that record
+  rather than waiting for room. Alternatives weighed: no `writeSome`, the arm for `write` (waits
+  again on a large write, as above); a TLS `writeSome` that sends its whole record (waits for room
+  for a record after the arm said there was some); a `writable()` that ignores the kept record (a
+  select that finds the socket writable and the arm not, round after round, spinning).
+  **Review with the user:** the TLS record bound of `writeSome`, and the names `writeSome` and
+  `writabilityDescriptor`.
+
+- **Linux as a target, and machines in packages** (branch `linux-plan`, 2026-11-19; the user,
+  2026-11-19: Avin is "for anyone who would enjoy using it"). The plan is
+  [Linux](/compiler/linux/); the package surface is [machines](/spec/packages/#machines).
+  - Settled on the user's delegation 2026-11-19: **Avin's targets are `aarch64-macos`,
+    `x86_64-linux` and `aarch64-linux`**, glibc on Linux, named as Sysl's target registry names
+    them. WHY: they are Sysl's release platforms, so the toolchain Avin drives at every build
+    exists on each; servers and CI are overwhelmingly x86_64 Linux, and aarch64 Linux is what a
+    Mac's containers run natively. ALTERNATIVES: x86_64 Linux alone (leaves out Arm servers and
+    makes every local Linux test an emulated one); musl (static executables, but Sysl's registry
+    and its library are glibc's); Intel macOS and Windows (Sysl ships neither).
+  - Settled on the user's delegation 2026-11-19: **Avin is built natively on each target, not
+    cross-compiled from the Mac.** WHY: an installed Avin runs `sysl build-c` and clang at every
+    user's build, so Linux needs Sysl and clang on Linux whatever the release does, and a native
+    build is the configuration users run; cross-building would add a sysroot to manage for no
+    user. Local Linux work runs in a colima VM (aarch64, native speed on Apple silicon) through
+    marshal; CI runs GitHub's x86_64 and arm64 Ubuntu runners. ALTERNATIVES: cross-compiling from
+    the Mac with a glibc sysroot (Sysl cannot yet: the probe of `sysl build --target x86_64-linux`
+    fails building its standard module, `stdio.h` not found, and Sysl has no way to name a sysroot);
+    both (cross kept for `avin build --target`, a later item once Sysl has sysroots).
+  - Settled on the user's delegation 2026-11-19: **a Linux release ships a tarball per target**
+    (`avin-<v>-linux-x86_64.tar.gz`, `avin-<v>-linux-arm64.tar.gz`, the same prefix layout as the
+    macOS one) **and an install script** that installs Avin and the Sysl it needs into a prefix
+    and names the distribution's packages for clang, lld, llvm-ar and pkg-config; the Homebrew
+    formula gains `on_linux` once Sysl's formula has it. No `.deb`. WHY: a tarball is what every
+    other route is built from, and an install script reaches every distribution with no
+    repository to host or sign. ALTERNATIVES: Linuxbrew only (needs Sysl's formula on Linux first,
+    and many servers have no brew); a `.deb` and an apt repository (hosting and signing, one
+    distribution family); a static single binary (Avin needs Sysl and clang beside it anyway).
+    **Review with the user:** whether a `.deb` is wanted later.
+  - Settled on the user's delegation 2026-11-19: **machine conditions in the manifest are Sysl's
+    condition language** (symbols, `!`, `&&`, `||`, parentheses), over the closed set `macos`,
+    `linux`, `posix`, `aarch64`, `x86_64`, as `if` on an entry of `dependencies`,
+    `sysl-dependencies` and `c-libraries` and on a feature (where it says only where the feature
+    exists), checked symbol by symbol when the manifest is read; `package.targets` lists the
+    targets a package supports (all by default); `install` may be a block of sentences by
+    condition; `link-flags` passes flags such as `-framework Security` as written. `avin tidy` and
+    `avin vendor` answer for every target. WHY: one condition language across Avin's manifest,
+    Sysl's manifests and the Sysl dependencies Avin hands to Sysl; checking every symbol at read
+    keeps a misspelling from silently dropping a dependency. ALTERNATIVES: per-target blocks
+    (`targets.x86_64-linux { dependencies { … } }`, which repeat a dependency per target and
+    cannot say "every Linux"); a target name as the condition (`if = "x86_64-linux"`, which cannot
+    say "every Linux" either); Sysl's `choices` and per-target linker keys (machine and image
+    configuration Avin's hosted programs do not have).
+  - Settled on the user's delegation 2026-11-19: **in source, the file is the unit a machine
+    selects**: `name.<symbol>.avin` is read only where the symbol holds, a module exists on a
+    machine where any of its files is read, an import of a module that is not everywhere is allowed
+    only from a file that is read no more widely, and `avin check` type-checks once per target
+    where anything differs. Values that differ by machine are written over `avin.target.os` and
+    `avin.target.arch`, compile-time constants whose untaken branches fold away, both branches
+    checked on every machine. WHY: it keeps the rule features follow (a whole unit is in or out,
+    nothing in a file changes with the build), so every file means one thing; a module keeps one
+    name and one surface on every machine, and the per-target check proves the surface is there.
+    ALTERNATIVES: Sysl's `#if` lines (a file reads differently per machine and the untaken lines
+    are never checked); a constant alone (cannot hold a call only one system declares, since both
+    branches are checked); whole modules per machine in the manifest (a `machines { linux { modules
+    = […] } }` block, which forces shared code to import a different module per machine);
+    `name_linux.avin` with an underscore (collides with ordinary file names that end in a system's
+    name). **Review with the user:** the surface syntax: the `.linux.avin` infix,
+    `package.targets`, the `if` key, the `install` block and `avin.target`.
+  - Settled on the user's delegation 2026-11-19 (closing two Open items): **a feature has no
+    compile-time constant**, the module staying the only unit a feature gates. WHY: a feature's
+    modules and optional dependencies are absent with it off, so a branch on `feature("x")` could
+    not type-check against them; a machine constant works only because every machine's standard
+    library is whole. ALTERNATIVES: a `feature("x")` constant folded away (fails to check, as
+    above); line gates (the conditional compilation the features design refused). **A module is
+    listed by one feature only**; a part two features share becomes a feature both `enables`.
+    WHY: every gate stays one feature, so the import check stays one question. ALTERNATIVES: a
+    module on while any of its features is on (the import check would have to reason about
+    disjunctions, and a module's presence would depend on combinations).
+  - Found while surveying, not fixed here (no runtime run is allowed on this branch): the DNS
+    lookup's pipe sets descriptor flag `2` (`runtime/avin/rt/lookup.sysl`, `CloseOnExecFlag`), but
+    `FD_CLOEXEC` is `1` on macOS and on Linux, so the pipe is inherited by a child started during a
+    lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
+    It is the first item of the [plan](/compiler/linux/).
+
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`, the
+  design approved by the user 2026-11-13 and its build approved 2026-11-19; built from branch
+  `given-1` on): **contextual parameters are for context values, never for
   conformances** ([contextual parameters](/spec/contextual-parameters/)). A `using` parameter is
   filled from a `given` in scope; a bound is met only by the type's `impl`, a given never overrides
   or adds to one, a contextual parameter's type names no type parameter, and a given has none. Why:
@@ -8233,21 +8971,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   impl (two ways to do one thing, and incoherent across values built under different scopes);
   givens for bounds only with priorities (the search and ambiguity rules that cost compile time and
   predictability); no contextual parameters at all (every layer threads a logger by hand).
-  **Review with the user**: this is the central choice.
-- Proposed 2026-11-13 (branch `given-design`): **every given is named; no anonymous givens.**
+  **Review with the user.** This is the central choice.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **every given is named; no anonymous givens.**
   `given tx = db.begin()`, `given log: Logger = …`. Why: one way to declare one; the name is what a
   call passes explicitly (`tx = …`), what a diagnostic names and what another file imports.
   Alternatives weighed: anonymous `given RequestContext(id)` (a second form for the same thing, and
   an import with nothing to name); `given existingName` to make a value a given (a second way to
   make a lambda's parameter one, beside `using`). Review with the user: anonymous givens are the
   likeliest to be missed.
-- Proposed 2026-11-13 (branch `given-design`): **`using` is a trailing section of the one parameter
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **`using` is a trailing section of the one parameter
   list**, `f(a: A, using tx: Tx, log: Logger)`, passed explicitly only by name. Why: Avin has one
   parameter list per function and named arguments already; positional passing would let an
   argument meant for an ordinary parameter land on a contextual one. Alternatives weighed: a second
   parameter list `f(a)(using tx)` (Avin has no curried lists); `using` on each parameter (repetition);
   positional explicit passing (ambiguous next to defaults).
-- Proposed 2026-11-13 (branch `given-design`): **resolution is lexical, nearest level wins, two fits
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 3 of the [plan](/compiler/roadmap/#contextual-parameters-build-plan)): **resolution is lexical, nearest level wins, two fits
   at one level are an error**: blocks, then enclosing functions' and lambdas' `using` parameters,
   the class constructor's or actor's, the object's givens, then the module's own givens with the
   file's imported ones; fit is nominal conformance; then the parameter's default. Why: one
@@ -8255,23 +8996,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   specificity, so no rule a reader must simulate. Alternatives weighed: exact-type matching only (a
   given `FileLogger` could not fill a `Logger`); most-specific ranking across levels (search, and
   surprising winners); one flat scope (a block could not narrow a module's given).
-- Proposed 2026-11-13 (branch `given-design`): **a given is seen in another file only when imported
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 4 of the plan): **a given is seen in another file only when imported
   by name** (directly or through an export); importing the module whole does not bring its givens.
   Why: a given changes what a call receives with nothing written at the call, so the file says
   which; a library adding a given then cannot change an existing call elsewhere. Alternatives
   weighed: givens seen through any import of their module, as extensions are (silent changes of
   meaning); a `.given` wildcard import (Avin has no wildcard import). Review with the user.
-- Proposed 2026-11-13 (branch `given-design`): **a given's type is a nominal type of the program**
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **a given's type is a nominal type of the program**
   (a class, an object's type, a trait used as a type, a `data` type, closed type arguments); built-in
   types, tuples, function types and unions are refused, and a given is a `val`. Why: nominal typing
   — a value fills a parameter because its type declares what it is, not because a common shape such
   as `int` fits; and a `var` given would share a box across closures and threads.
-- Proposed 2026-11-13 (branch `given-design`): **givens are declared in blocks, at a module's top
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **givens are declared in blocks, at a module's top
   level and in object bodies; classes and actors take context as `using` parameters of their
   constructors** (private fields, givens in their bodies). No `given` in class, trait or `data`
   bodies, and none of `data` variants, `main`, tests, hooks or bindings take a `using` section. Why:
   one place per kind of declaration; a class's context comes from whoever makes it.
-- Proposed 2026-11-13 (branch `given-design`): **lambdas and function values.** A lambda resolves
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 5 of the plan): **lambdas and function values.** A lambda resolves
   where it is written and captures the givens it uses; its parameters after `using` are givens in
   its body but positional in its type; function types have no `using` section; a function taken as a
   value has its section filled where it is taken. Why: a function value is called with positional
@@ -8279,11 +9024,13 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Alternatives weighed: contextual function types (`(using Tx) -> R`, a new kind of type); a
   `given tx` statement in the lambda's body (a second way). Review with the user: contextual
   function types are what would make `db.transaction { insert(row) }` need no parameter.
-- Proposed 2026-11-13 (branch `given-design`): **a given does not cross `spawn` by itself**; a
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 5 of the plan): **a given does not cross `spawn` by itself**; a
   closure that uses one captures it and is checked as any capture (sendability, no `var`). Why: a
   given is a lexical value, not thread-local state, so the sharing rules see it. Alternatives
   weighed: an inherited per-thread context (dynamic scoping, invisible in the source).
-- Proposed 2026-11-13 (branch `given-design`): **contextual parameters may have defaults**, used
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; the
+  section built on branch `given-1`, its filling at step 3 of the plan): **contextual parameters may have defaults**, used
   where no given fits, and every default of the function sees the contextual parameters, which are
   filled first. The section takes no part in choosing an overload. Why: a default is the natural
   fallback (`using clock: Clock = SystemClock`), and resolving after the overload is chosen keeps
@@ -8291,7 +9038,2087 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   contextual parameters in this design; adopting one (an `Executor` for `Future(body)`) is its own
   item, since `ex.future(body)` already exists and the two would be two ways.
 
+## Proposed
+
+- Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
+  wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
+  whichever comes first, and sends that rest as room comes**; its wait keeps the connection's time
+  limit (`TimedOut` where it runs out, the unsent rest kept in order for the next read or write).
+  `TcpStream` gains `timeout -> Duration`, the limit `setTimeout` set, which that wait needs since
+  the limit may have been set on the TCP connection before TLS began (spec system-library.md, TCP
+  and TLS). This settles the review question of the `pg-flake-0032` entry below. Why: a whole
+  connection's `writeSome` that sent part of a record left the rest for its next write,
+  `writable()` or close, so a caller that ended a request with `writeSome` and then only read left
+  its peer waiting for the rest while it waited for the peer's answer, a hang until the time limit.
+  The one wait cannot be for room alone, since a peer that is itself sending and not reading would
+  then never be read from (two full connections, each end waiting to write); it cannot be for input
+  alone, which is the hang. A select over the TCP connection's `readable()` and `writable()` waits
+  for both on the one thread that owns the connection; the runtime's poller keeps one waiter per
+  descriptor and direction, and an unsplit connection has only this thread, so the two watches
+  never meet another waiter (the obstacle that ruled this out for a split connection's reader).
+  Alternatives weighed: a whole connection's `writeSome` sending its whole record as the split
+  writer's now does (it would break "after `writable()` answered `true`, `writeSome` does not wait",
+  which single-threaded select loops rely on, and could deadlock one thread reading and writing a
+  busy peer); flushing the rest in full before a read waits (the same deadlock, the read waiting for
+  room while the peer waits for room too); a flush the caller must call (every caller, a generic
+  `StreamWriter` one included, would have to know it). Not covered: a program that, after a
+  `writeSome` left a rest, waits in a `select` with only a `readable()` arm on the connection; a
+  select watches one direction per arm, so such a loop keeps a `writable()` arm while `writable()`
+  answers `false`, as the threads chapter's write loop does. Review with the user: whether that
+  select case deserves more (a `readable()` that also sends what room allows).
+- Settled on the user's delegation 2026-11-18 (built on branch `pg-flake-0032`): **the writing half of a split TLS
+  connection sends the whole record each `writeSome` makes before it answers, waiting for room for
+  the rest where the connection has too little**, refining the 2026-11-15 `writeSome` entry for that
+  half (spec system-library.md, TLS). Why: a `writeSome` that kept the rest of its record for a later
+  call left it unsent where the writer made no later call, and its peer waited for that rest for
+  ever. pg's batch writer hit exactly this: its thread sends a batch with the `writable()` and
+  `writeSome` loop the threads chapter shows, then ends; when the last `writeSome` met a full
+  connection, the end of the batch never left, the server waited for it, and the reader waited for
+  the server (about one TLS batch in ten under load). A split writer has a thread of its own and its
+  reading half reads meanwhile, so waiting there cannot hold up the peer's answers, which is the
+  deadlock the 2026-11-15 entry avoided by never waiting. Where the writer's time limit runs out
+  first, `writeSome` still answers the plaintext TLS took (it has been taken and will go), the rest
+  kept to go before anything else and `writable()` sending it as room comes, as before. With it,
+  ciphertext a wait that failed did not send is kept in order rather than dropped, on both the
+  connection and its halves (a timed-out `write` used to lose the part of a record it had begun,
+  breaking the TLS session). Unchanged: a whole `TlsStream`'s `writeSome` still never waits after
+  `writable()`, since one thread may be both reading and writing it; its kept rest goes at the
+  connection's next write, `writable()` or close. Alternatives weighed: the reading half sending the
+  kept rest while it waits for input (it would wait for room on the descriptor the writer's select
+  watches, and the runtime's poller keeps one waiter a direction, so one of them would never be
+  woken); a flush the caller must call after its last `writeSome` (every caller would have to know
+  it, and a generic `StreamWriter` caller cannot); a low-water mark of a whole record on the socket
+  so a record always fits after `writable()` (not settable on every system); the whole connection's
+  `writeSome` waiting too (a single thread reading and writing a busy peer could deadlock). Its review
+  question, whether a whole `TlsStream`'s kept rest should also go while a read waits, is settled by
+  the `tls-strand` entry above: it does.
+- Settled on the user's delegation 2026-11-17 (built on branch `println-atomic`): **`println(x)` and
+  `print(x)` render all their arguments (and `println` its new line) first, into a string, and add
+  that to standard output in ONE write, so a line printed is never split by another thread's
+  output** (spec system-library.md, beside `eprintln`'s same promise). Found when two threads'
+  `println(99)` came out `9999\n\n`: `println` wrote each value and then the new line as separate
+  writes. The one write is a single `fwrite` on the C stream, which holds the stream's lock for the
+  whole call, so another thread's write lands before or after it and a flush sends it out whole, in
+  order, however long it is. Rendering happens before the write, outside any lock, so a value slow
+  or large to render holds no other thread up. Consequences: a value rendered for `println` is now
+  built as a string first (one allocation and copy per call; the digits of `println(n)` no longer go
+  out from the stack); a `Display` that itself prints puts its own output before the line rather
+  than inside it, and one that traps part way leaves none of the line rather than a part. Output
+  built from several calls, or written to `StandardOutput` piece by piece, is still several pieces.
+  Alternatives weighed: hold the stream's lock across the whole render (a slow render, or one that
+  parks the thread or waits on a collection, would stall every printing thread, and a `Display`
+  that prints would deadlock); keep separate writes and promise nothing (the spec already promises
+  whole lines for standard error, and interleaved lines from threads are the commonest complaint);
+  a per-thread line buffer in the runtime (more machinery for the same guarantee). Review with the
+  user: only if the extra allocation per `println` shows up in a benchmark that prints heavily.
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **opaque types are spelled `opaque type Name[T…] =
+  Repr`** at the top level, `opaque` a declaration word only before `type` and a name. Why: an
+  opaque type reads as the alias it resembles, with one word saying the difference, and the parser
+  and formatter treat it as an alias. Alternatives weighed: `newtype Name = Repr` (a new keyword for
+  a small feature); `data Name(value: Repr)` with an annotation (a data value is an object, and the
+  layout is the point); `type Name = new Repr` (a modifier inside the body reads as part of the
+  type).
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **the representation is seen only in the declaring
+  module, through `Name(r)` and `x.repr` (and bare `repr` in its impls), with no implicit
+  conversion either way even inside the module.** Why: an explicit wrap and unwrap keep every
+  crossing between the type and its representation visible in the source, which is what the type
+  exists for, and one rule holds everywhere; `repr` is one short name that cannot be confused with
+  a field of the representation. Alternatives weighed: the type transparent inside its module (the
+  module's own code could mix `UserId` and `long` unnoticed, and the type checker would need two
+  views of every type); a `.value` accessor (a common field name of representations, so it would
+  shadow or be shadowed); an unwrapping pattern `Name(n)` (it reads as a constructor pattern of a
+  data type, which an opaque type is not, and `x.repr` covers it). Review with the user: whether the
+  module that declares the type should see it as its representation.
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **an opaque type is nominal, `Type.Opaque(id, name,
+  args, repr)`, a value type that is boxed only where it becomes an `Any` or a trait's value, and
+  its box names the opaque type over a reference too.** Its parameters are invariant and take no
+  bounds; a phantom parameter is allowed. The representation may not be `Nothing`, `unit`, a union,
+  a bare type parameter or name the type. Why: laid out as its representation, a `Vector[UserId]`
+  holds the `long`s themselves and the type costs nothing; a box naming the opaque type is what lets
+  `x: Any` be matched as `UserId` and never as `long` or `string`, so the abstraction holds through
+  `Any`. Variance would expose the representation's own variance, which only the module sees;
+  bounds have nothing to bound, since the representation's types hold their own. `Nothing`, `unit`,
+  unions and a bare parameter have no single layout to share. Alternatives weighed: reusing the
+  representation's box for a reference representation (cheaper, but `x is _: string` would find an
+  `Email`); covariant parameters (unsound for a mutable representation); refusing phantom
+  parameters as an alias does (they are a main use: typed identifiers).
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **an opaque type is no type constructor**: a generic
+  one is refused for a constructor parameter `F[_]`, and an opaque type declares no constructor
+  parameter of its own; it is an ordinary type argument of `F[A]`. Why: every instance of a
+  constructor parameter's application is laid out as an object, which an opaque type over `long`
+  is not, and a representation `F[int]` would leave the opaque type's layout to each use. Refusing
+  both is the sound position that can be loosened later. Alternatives weighed: accepting an opaque
+  type over a reference type as a constructor (sound for the layout, but it would make the rule
+  depend on the representation, which outside code should not see); accepting `opaque type W[F[_]]`
+  (the layout question is only deferred, to every use).
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **a refined variant's result does not name an opaque
+  type** (`Newest -> Query[UserId]`, `Query[Id[User]]`, `Query[Vector[UserId]]` are refused); a
+  variant's fields may be of opaque types and the type's own argument may be one. Why: a `match`
+  on a refined variant will learn type equalities from the result, and whether one learning
+  `R = UserId` should see the representation inside the opaque type's module is not decided; keeping
+  opaque types out of results is sound and can be loosened once matching on refined variants is
+  built. Alternatives weighed: accepting them as nominal types now (sound for values and layouts,
+  but it fixes the answer to the open question before the matching it affects exists).
+- Settled on the user's delegation 2026-11-15 (built on branch `opaque-types`): **equality and hashing are the representation's;
+  every other trait comes from an impl, which takes the trait's default bodies; an opaque type
+  derives nothing and has no supertype.** Why: every Avin type has `==` and a hash, so an opaque
+  type is a `Map` key and a `Set` element without ceremony, while order and printing are choices the
+  module makes for its type (an `Email` may print as `<…>`, a `UserId` may have no order). Default
+  bodies run on the boxed value, so `compare` gives `<`, `less`, `max` and sorting. Alternatives
+  weighed: `derives Ord, Display` forwarding to the representation (convenient, but it would show
+  the representation's text and order outside the module by default); inheriting every trait of the
+  representation (the opaque type would leak its representation's whole interface).
+
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **`-g` is asked for, never implied, and only `build` and `emit-llvm`
+  take it.** Not even `-O0` turns it on. Why: a `-g` build is slower and larger (every unit carries
+  the metadata, function text is never cached, macOS runs `dsymutil`), and `run`/`test` executables
+  live in the cache where no one points a debugger; a flag keeps every existing build exactly as it
+  was. Alternatives: `-O0` implying `-g` (the usual "debug build"; costs every `-O0` corpus and test
+  build), `run -g`/`test -g` (useful for a test under lldb, but the cached executable is not where a
+  user expects it; easy to add later). Review with the user: whether `-O0` should mean "debug build".
+
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **what the debugger is told.** Functions are named by their symbols
+  (`<program>.fact`, `<program>.twice[int]`, `<program>.main.lambda#1`) as the linkage name, with
+  the program's own module prefix left off the readable name; lldb shows the linkage name. The
+  compile unit says `DW_LANG_C`, so lldb reads the basic types in its own words (`double`,
+  `char32_t`). `char` is a UTF-32 code point, `byte` unsigned, `bool` a byte; a reference is a
+  pointer to an opaque structure named by its Avin type. A local a lambda shares (boxed) is not
+  described, nor is a local the compiler made. DWARF version 4. Why: each is the smallest choice that
+  makes `b`, `bt` and `frame variable` work with no lldb plugin. Alternatives: a vendor language code
+  (lldb then treats frames as unknown language), describing objects' fields as DWARF structures
+  (a larger item: layouts per descriptor, unions, generics), showing strings as text (needs an lldb
+  data formatter shipped with avin), describing boxed locals through `DW_OP_deref` (small, later).
+
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **the code taking parameters in has no line**, so lldb's breakpoint at a
+  function's first line lands after the parameters are stored where their variables are read (a
+  lambda's parameter otherwise read a stale slot). A call there still gets the function's own
+  location, which LLVM's verifier asks of every call in a function with debug information.
+  Alternative: placing that code at the function's name, as it was first built: lldb then stopped
+  before the stores and showed the slot's previous value.
+
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **a `-g` build never reads or writes function text in the instance
+  cache, and keeps its lowered code apart (`program-O2-g`)**; each `Locate` in a cached entry is kept
+  counted from its declaration's start, as trap sites are. Why: metadata is numbered across the module
+  and locations follow lines no function key covers, so cached text would carry stale lines; the
+  lowered code is still reused, and `AVIN_INCREMENTAL=verify` matches a clean build. Alternatives:
+  per-function metadata numbering with a renumbering pass (the text cache would then work under
+  `-g`), or a key over absolute positions (every edit above a function would relower it).
+
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **codegen units carry all of the module's debug metadata**, as every
+  other module-level line, so any line moved anywhere changes every unit's text and recompiles every
+  unit of a `-g` build. Plan to do better when it matters: the splitter follows `!N` references from
+  each unit's definitions through the metadata lines and renders only the nodes reached (plus the
+  compile unit and the flags), which also shrinks each unit.
+
+- Settled on the user's delegation 2026-11-15 (branch `dwarf`): **the stack overflow report stays without a place.** The handler runs on
+  its own stack inside a signal, where reading DWARF (or running `atos`, a process) is not safe, and a
+  build without `-g` has no line table at all. Plan: in a `-g` build the handler writes the faulting
+  program counter and the image's load address (`avin: trap: stack overflow at pc 0x… (image 0x…)`),
+  and `avin` (or a user with `atos -o prog.dSYM -l <image> <pc>`) turns it into `file:line` after the
+  process has stopped; a table of function start addresses with their names, emitted as a constant,
+  would let the handler name the function itself, without lines, at any `-g` level. Neither is
+  built: the first needs a runtime change and a symbolizing step, the second a table the emitter does
+  not make yet.
+- **A package's tests import its gated modules; a test module is read only while every module it
+  imports is** ([packages](/spec/packages/#how-a-feature-gates-modules); branch `gated-tests`).
+  The tests were fenced as an always-compiled module, so a test of a gated module had to live inside
+  that module, and a `tests` file importing it was refused even under `avin test`, which turns every
+  feature on. Now `tests` and the modules under it have no fences: they may import every module of
+  the package and its optional dependencies. A build with a feature off passes over each test module
+  importing a module that is off, and, repeated to the end, each test module importing one passed
+  over; the rest are read and run. The module stays the unit, so a file of `tests` importing a gated
+  module takes all of `tests` with it when that feature is off. *Why*: the spec already says
+  `avin test` has every feature on, so the tests see the whole package; and the package's own
+  `tests` are compiled by `build` and `run` too, so a selection-independent refusal was the only
+  thing keeping a build with features off working; deriving each test module's gate from its imports
+  keeps that guarantee with no annotation to write. *Alternatives*: allowing `tests` to import gated
+  modules only under `avin test` (a build or `avin test --no-default-features` would then fail at
+  the import, so the minimal configuration could not be tested); letting a feature list
+  `tests.server` explicitly (works, but repeats in the manifest what the imports already say);
+  skipping single files rather than modules (finer, but a file of `tests` could then lose a helper
+  another file of it uses, breaking only the build with the feature off). Not covered: a test
+  importing an optional dependency's module directly while that dependency is not taken is reported
+  as an unknown module, since a dependency not taken is not read and its modules are unknown; such a
+  test reaches the dependency through the package's gated module. Review with the user: whether a
+  test module passed over should be named in `avin test`'s output rather than silently absent.
+- **An import refused for its module is one error per import declaration**, not one per name it
+  imports (branch `gated-tests`): `import a.b.{c, d}` refused as gated, as an optional dependency's,
+  or as a standard-library module that does not exist, is reported once, at the first name;
+  two import lines are two errors. *Why*: the error is about the module, which the declaration names
+  once. *Alternatives*: one per module per file (hides the second line's error).
+- Settled on the user's delegation 2026-11-15 (built on branch `intersection-bounds`): **several bounds on one type parameter are
+  joined with `&`, the one spelling, and an intersection is a bound only, never a type.**
+  `[T: Ord & Display]` replaces `[T: Ord + Display]` everywhere type parameters are declared
+  (functions, methods, classes, data types, traits, actors, impl headers, after a lower bound);
+  `+` between bounds is a parse error that says to write `&`, and the library, tests and docs are
+  rewritten. Each operand is a trait or a class, **at most one a class** (a second class is an
+  error naming both, a subclass of the first included), and **each written once** (the same trait
+  at the same type arguments twice is an error; `Make[int] & Make[long]` are two). **Name clashes**:
+  methods of one name from two bounds are overloads, resolved by parameter types; two of the same
+  parameter types are not an error to declare, only a call both accept is, as the existing
+  ambiguous-call error at the generic definition. **`A & B` is not a type**: written as a
+  parameter's, a field's, a `val`'s, a result's, a type argument's or a lower bound's type it is a
+  parse error that shows `[T: A & B](x: T)` instead. Why: `&` reads as "and", which is what
+  conformance to every bound means, and makes the bound read as the intersection it is, where `+`
+  reads as arithmetic and was the only use of `+` in a type; one spelling, since two ways to write
+  one thing is the kind of choice the language avoids. Bounds only, because a type parameter
+  already gives a value of two traits everything an intersection type would, with each instance
+  calling its type argument's methods directly; an intersection *type* would need a new value
+  representation (a pair of method tables, or a table per combination), subtyping rules against
+  unions and variance, and reification for `is` — a large addition the language's programs have
+  not asked for, and a nominal type system with declared traits covers it by declaring a trait
+  that requires both (`trait Shown: Named, Sized`). At most one class, because a class extends one
+  superclass, so two unrelated classes can never both be met and a subclass already implies its
+  superclass. Alternatives weighed: keeping `+` (the existing spelling, no source change, but reads
+  as addition, and the user asked for `&`); accepting both (two spellings of one thing);
+  intersection types in annotations, with `A & B <: A`, commutativity, distribution over unions and
+  a dual-table layout (left out for the reasons above; this decision leaves room to add it, since
+  `A & B` in a type position is an error today, not something else); allowing redundant bounds
+  silently (a repeated bound is always a slip). Review with the user: whether `A & B` should become
+  a type in annotations later, and whether to keep the `+` diagnostic once existing code has moved
+  (it costs nothing and helps code written before the change). Packages outside this repository
+  that still write `+` (the `json` package's tests) move to `&` with the release that carries this.
+
+**Byte offsets inside a character** ([types](/spec/types/#string), branch `fix-charat-boundary`)
+
+- Settled on the user's delegation 2026-11-15: **`charAt` at an offset inside a character's encoding traps, `charAt offset is not a
+  character boundary`, as slicing there does; the searches never trap on such an offset and never
+  answer one.** `indexOf(p, from)` and `indexWhere(f, from)` from inside a character start at the
+  next one, so `"café".indexOf("", 4)` is 5; `lastIndexOf(p, end)` and `lastIndexWhere(f, end)` from
+  inside one search back from the character it belongs to, so `"café".lastIndexOf("", 4)` is 3; and
+  `startsWith("", at)` is false inside a character, since the empty string occurs only where a
+  character begins or at the end. Why: `charAt` and `slice` read the text at the offset given, so an
+  offset that is not a place in the text is the caller's mistake, the trap the spec gives slicing;
+  a search is asked "where at or after (before) this", which has an exact answer from any offset,
+  and answering only offsets where a character begins means every result can be fed to `charAt` or
+  `slice` again. The cost on a character boundary is one comparison on a lead byte, none on ASCII.
+  Alternatives weighed: trapping in the searches too (a search from `i + 1` over text with
+  characters beyond ASCII would then trap where the same search over ASCII succeeds); answering the
+  offset itself for an empty needle, as before (a result that traps when sliced at).
+
+**Initialization** ([declarations](/spec/declarations/#initialization), branch `init-design`)
+
+
+- Settled on the user's delegation 2026-11-15 (built on branch `deadlock-dump`): **A deadlock of the whole program is a trap; a partial
+  one is not found** ([diagnostics](/spec/threads/#deadlock)). The main thread checks when it begins
+  a wait with no limit, and again each time a worker finds no lightweight thread running or ready
+  while it waits: the program is deadlocked where no lightweight thread is running or ready, no
+  timer is set, no thread waits on a socket, no thread the program did not start is attached and no
+  `@threaded` callback is held. Every wake goes through one counter, so a check whose count did not
+  move between its first look and its last saw one moment of the program and cannot report a
+  thread that ran meanwhile. The report is `avin: trap: deadlock: all threads are waiting` and a line
+  per thread, the trap's exit status, and the exit hooks run after it as after any trap. Why: it is
+  the case a program can never leave, it costs nothing until `main` waits (one counter increment
+  per wake, one clock read per wait for the dump), and a check made only from `main`'s own wait
+  needs no thread of its own. Alternatives weighed: a monitor that looks periodically (a thread or a
+  tick for every program, and latency); finding cycles of lock holders (catches partial deadlocks,
+  but needs owner tracking on every lock and misses channels and conditions, which have no owner);
+  reporting a held `@threaded` callback or an attached foreign thread as deadlocked too (a C thread
+  may call back at any time, so that would be a false report). Review with the user: whether a
+  partial deadlock, found by cycles among lock holders and joins, is wanted later.
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **What a thread waits on is named by the runtime's own queue**:
+  a lock, a condition, a join, a sleep, a socket; a condition the library makes for a channel's
+  receive or send, a future or an executor's work says so, through the intrinsic
+  `condition_new_kind`, which `Condition`'s constructor reaches with a second parameter the library
+  alone can pass (a `Condition` needs the library's private `Lock`). A channel's own lock is "a
+  lock". Threads are numbered from 1 in the order they started, not by their identity. A pool's
+  idle workers are left out of the deadlock report, whose length would otherwise follow the
+  machine's processors, and listed in the dump. Alternatives weighed: a label set around each wait
+  by the library (a call on every wait); naming waits only by the runtime primitive ("a condition"
+  for every channel and future, which says little).
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **The quit signal writes a thread dump and the program goes
+  on.** A handler in C writes a byte to a pipe; a thread started with the program, with every signal
+  blocked, reads it and writes the dump, since a handler may not take the scheduler's locks. A
+  program that watches the signal hears it instead; one started with it ignored keeps it ignored.
+  Why: the program under inspection keeps running, which is what a dump is for. Alternatives
+  weighed: writing the dump from the handler (not safe there); starting the thread only on first
+  use (a handler cannot start one); ending the program after the dump (loses the program being
+  looked at). Cost: one thread and one pipe for every program.
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **A thread dump names no functions.** A frame of the shadow
+  stack holds its previous frame and its count of slots, nothing naming its function, and walking
+  the native stack would need a table from code addresses to Avin names, which the compiler does
+  not emit (the stack-overflow trap has no place for the same reason). Alternatives weighed: a
+  function's descriptor stored in each frame (a store on every call); emitting an address table
+  and unwinding the native stack (a table per program and an unwinder for each platform). Review
+  with the user: which of the two, if a stack in the dump is wanted.
+- Settled on the user's delegation 2026-11-15 (branch `deadlock-dump`): **A corpus program's `// stderr: times vary` shows every number
+  before ` ms` in its standard error as `n`**, so a thread dump's durations do not make the test
+  depend on the machine. Alternative: a dump without durations (loses what a dump is for).
+
+- **CPU time is read from the kernel's accounting: `getrusage` and `wait4`** (branch `cpu-time`,
+  [CPU time](/spec/system-library/#cpu-time)). `CpuTime(user: Duration, system: Duration)` with
+  `total` and `Add`; `process.cpuTime()` and `process.childrenCpuTime()` (`RUSAGE_SELF`,
+  `RUSAGE_CHILDREN`) answer it plainly, not in a `Result`, since `getrusage` fails only for a `who`
+  it does not know; `waitPidCpu` / `tryWaitPidCpu` beside `waitPid` / `tryWaitPid`; and
+  `Child.cpuTime()`, a pipeline's stages and a sequence's parts added. Why: a job manager that
+  samples its jobs with `ps` cannot see the CPU of sub-processes that have already exited, and the
+  kernel folds each reaped process's time into its parent's, so a wait that reads it gives a whole
+  tree's. Alternatives weighed: changing `waitPid` to answer the pair (breaks every caller; a
+  return type cannot be overloaded); a `ProcessUsage` record with the other `rusage` counters (peak
+  memory, faults, context switches — memory is in different units per platform, and nothing asks
+  for them yet, so they can join later without breaking `CpuTime`); `Child.cpuTime()` as an
+  `Option` empty before the wait (a running command's reaped parts would then be invisible, and
+  "nothing reaped yet" is already `Zero`). Review with the user: the names `waitPidCpu` /
+  `tryWaitPidCpu`.
+
+- **A started program is reaped by the library with `wait4`, not by its Sysl `Spawned`** (branch
+  `cpu-time`). Sysl's `Spawned.wait` and `try_wait` reap with `waitpid` and drop the usage, so the
+  runtime (`runtime/avin/rt/cpu.sysl`) reaps the program itself and the `Spawned` is then let go of
+  with `detach`. A time limit is kept by the library in consequence, as Sysl kept it: polled with a
+  backoff to 16 ms up to the deadline, then signal 15, a 200 ms grace, signal 9, and a final wait,
+  the status `TimedOut` with the CPU time it used. Why: the alternative that keeps Sysl as the
+  reaper, reading `RUSAGE_CHILDREN` before and after a wait, is wrong whenever two threads reap at
+  once, which a job manager's do. Alternatives weighed: asking Sysl for a `wait` that answers usage
+  (the better home; reported to the sysl session as a gap, and this binding moves to it when it
+  exists); reaping through Sysl and leaving `cpuTime()` empty for commands (no answer to the item).
+  Review with the user: two reapers of one kind in the stack until Sysl grows the call.
+
+- **Initialization is proved at compile time, by order and by withholding `self`** (branch
+  `init-design`, [Initialization](/spec/declarations/#initialization)). No field, module-level
+  value or `lazy val` is read before it is set: an object's fields are set in the order written and
+  `self` is withheld from everything that could read one later until the last is set; module values
+  are computed in the order their initializers' reach requires, a cycle an error; a `lazy val` is
+  the explicit opt-out, its own cycles an error where its code reaches them, a trap only through a
+  function it hands on. Why: it is sound with no annotation and no cost per read, it keeps the rules
+  Avin already enforces (every probe of them held), and each rule's proof is a short argument a
+  reader can check. Alternatives weighed: a checker of object states (an object cold, then warm,
+  then hot, a parameter or a method declared to accept a cold object) accepts more, such as passing
+  a half-made object to a helper that only stores it, but needs those annotations and a far larger
+  analysis, and the code it would admit is rare; a default value in every field before its
+  initializer (a wrong value read silently, and Avin has no value every type can hold); a check on
+  every field read (a cost on every read, and a trap where an error was possible); ordering
+  modules by their imports (an import cycle would be an error, or the order a guess); making every
+  module value lazy (a gate on every read, and cycles found only when they run).
+
+- **A superclass's arguments use nothing of the object, functions made there included** (branch
+  `init-design`). A lambda, an argument passed by name, a local function or a method value in them
+  that uses a field, a method or `self` is an error; class parameters and module values are read
+  freely. Why: avin 0.0.21 lets such a function through, and a superclass calling it in its body
+  reads a field before it is set: `0` for a number, a crash for a string, a vector or a generic
+  field (a soundness hole, the build plan's first item). Alternatives weighed: allowing a function
+  that reads only inherited fields of a class whose constructor finished before (it needs the
+  superclass chain's timing at each read, for code no library or example writes); a mark on a
+  parameter the constructor may call during construction (an annotation for a rare shape).
+
+- **An object's own name in its body is `self`** (branch `init-design`). `O.k` obeys the rule `k`
+  does; in a method, a lambda made after the last field or a lazy initializer, it makes the object
+  need nothing more. Why: today the name counts as the module value, so a lazy field or a late
+  lambda naming its own object is refused as a cycle while the bare name is accepted, a false error
+  with no unsoundness behind it. Alternatives weighed: keeping the refusal (sound, but the two
+  spellings of one read disagree); counting only code the body runs (the same result, reached by
+  the module order rather than by the object rules, which then speak of the name twice).
+
+- **A `lazy val` cycle its own code reaches is a compile error; a read through a handed-on function
+  traps** (branch `init-design`). The reach is the module order's (calls, every implementation a
+  dispatched call or an operator may reach, other lazy values' initializers), without the lambdas,
+  by-name arguments and method values the initializer makes; for a field, only reads of the same
+  object (bare name, `self.`, methods called on `self`) count. Why: a cycle the code always makes
+  is found where it is written rather than when it runs, while a value referring to itself through
+  a function it hands on (`lazy val ones = LazyList.cons(1, ones)`, a handler naming its button) is
+  the reason `lazy` exists and stays legal; a reach that followed handed-on functions would refuse
+  those, and one through another instance's field would refuse recursion over a structure (a
+  node's depth). Alternatives weighed: the trap alone (today's: a cycle anyone could see waits for
+  a run to reach it); following every function value to every lambda of its type in the program
+  (sound without a trap, but it refuses the knots and the handlers). **Review with the user:**
+  through dispatch the reach counts every override, so a lazy value calling a trait method one of
+  whose implementations reads the value is refused even where that implementation never runs, as
+  module values already are.
+
+- Settled on the user's delegation 2026-11-14 (branch `init-3`): **the module-level part of the
+  `lazy val` rule, and making a lazy field needs nothing.** `Uses` keeps the functions code calls
+  (with every implementation a call through a method table or an operator may reach, and the
+  initializers of the lazy values it reads) apart from those it makes; the lazy reach follows only
+  the first, stopping at another module-level lazy value's initializer and naming that value, so
+  the error is ``the `lazy val` `first` needs its own value to initialize: `first` → `second` →
+  `first` ``, a value on its own as `` `l` → `l` ``, reported from the chain's earliest-declared
+  member, and a value that only reaches a chain is not named. The module order still follows both,
+  except a `lazy val` field's initializer where a constructor makes it: only a read of the field
+  runs it, and every read is a call of it, which the order follows. Why: it follows from the
+  chapter (the order needs what the body runs while the object is made), and it removes a false
+  cycle — two objects whose lazy fields read each other, or a module value holding an object whose
+  lazy field reads that value, were refused. Alternatives weighed: the self-cycle worded as the
+  module order's (`is needed by its own initializer`), which would give one rule two shapes of
+  message; dropping every made function from the order (unsound: a lambda the initializer makes
+  and calls reads what it reads).
+
+- Settled on the user's delegation 2026-11-14 (branch `init-4`): **the field and local parts of
+  the `lazy val` rule.** A field's initializer is followed with the object located where its code
+  holds it: the class body's `self` it captures, a local given it (`val me = self`), the parameter
+  a called function or method receives it in, and, for an object, every read through the object's
+  name anywhere in the program. A call through a method table on the object reaches the override of
+  every class descending from the one declaring the field; an operator applied to it, the core
+  trait method of those classes; a local function, the object where its caller sees it. A read of
+  the same field of the object is a node of the chain, a read of another instance's is not
+  followed, and the chain, worded and placed as the module-level one, names lazy fields only. A
+  local `lazy val` is followed through its block's code and the local functions it calls, the
+  other local lazy values it reads being the chain's nodes. A cycle through a module-level lazy
+  value that reads an object's field is the module-level value's cycle as well and is reported for
+  both. Why: it follows from the chapter's "only a read of the same object counts", which a function
+  given `self` or a read through an object's one name is as much as a method called on `self`;
+  anything less leaves the same cycle to the run-time trap by a change of spelling. Alternatives
+  weighed: only bare names, `self.` and methods called on `self` (the chapter's examples, but
+  `helper(self)` would then trap at run time); following every value of the object's class (it
+  would refuse the recursion over a structure, a node's depth, that the chapter keeps legal).
+
+- **A lazy initializer waiting for a thread that reads the same value is not detected** (branch
+  `init-design`). It waits for ever, as threads waiting for one another do
+  ([threads](/spec/threads/)). Why: Avin detects no deadlock but a lock taken twice, and a cycle
+  through two lazy values' own code is now a compile error, which leaves only a read through a
+  function handed to the other thread. Alternative weighed: the runtime following a waiting read
+  through the initializing thread's own wait (a `join`, another lazy value) and trapping when the
+  chain returns to the reader, cheap on the slow path. **Review with the user:** it is liveness, not
+  soundness, but it is the one way a lazy read can still hang.
+
+**The security primitives an API server needs** (branch `security`; [`avin.encoding`](/spec/system-library/#avinencoding), [`avin.crypto`](/spec/system-library/#avincrypto), [`avin.random`](/spec/system-library/#avinrandom))
+
+- Settled on the user's delegation 2026-11-15: **a new module `avin.encoding` holds hexadecimal, base64 and base64url** (`toHex`,
+  `fromHex`, `toBase64`, `fromBase64`, `toBase64Url`, `fromBase64Url`, `DecodeError`), and
+  `toHex` moved there from `avin.crypto`, which keeps offering it with `export avin.encoding.toHex`,
+  so `import avin.crypto.toHex` still works. Why: base64 is not cryptography (data URLs, Basic
+  authentication, binary in JSON all use it), and hexadecimal in one module and its decoder in
+  another would split one encoding. Alternatives weighed: everything in `avin.crypto` (one import for
+  a server, but a module named for secrets would hold plain encodings); `fromHex` beside `toHex` in
+  `avin.crypto` and base64 alone in `avin.encoding` (hexadecimal split across two modules).
+- Settled on the user's delegation 2026-11-15: **decoding is strict, one function per alphabet**: `fromBase64` takes only the standard
+  alphabet with its `=` padding, `fromBase64Url` only the URL-safe one with no `=`; whitespace and
+  line breaks are refused, and so is a last digit whose unused bits are not zero (RFC 4648 §3.5
+  allows a decoder to refuse it). Each byte sequence then has exactly one spelling, so a token or a
+  signature cannot be sent in a second form that compares unequal as text but decodes equal.
+  `fromHex` takes either case (a digit's case carries no bits). Errors are checked in order:
+  characters, then padding, then length, then unused bits, so the first offset named is the first
+  character wrong. Why: the module exists for an API server reading untrusted text, where
+  malleability is a defect. Alternatives weighed: Sysl's forgiving decoder (either alphabet, optional
+  padding, unused bits ignored), which is friendlier to sloppy writers but accepts many spellings of
+  one value; a `lenient` flag (two behaviours to test and document for no current need). Review with
+  the user: a reader of MIME-wrapped base64 must strip its line breaks first.
+- Settled on the user's delegation 2026-11-15: **`DecodeError` has four cases**, `BadCharacter(at)`, `BadPadding(at)`, `Truncated(at)`
+  (where `at` is the text's length) and `UnusedBits(at)`, all byte offsets, and is an `Error`. Why:
+  the cases are what a caller would report differently, as `UrlError`'s are; `Truncated` carries the
+  length so every case has a position. Alternative weighed: binding Sysl's `DecodeError`, whose
+  `BadLength` has no position and whose `Short` and `Utf8` cannot occur here.
+- Settled on the user's delegation 2026-11-15: **the encoders are written in Avin**, while the digests stay bound to Sysl. Why:
+  Avin's decoder is stricter than Sysl's (above), and encoding is a few lines of byte arithmetic with
+  no platform behind it. Alternative weighed: binding `sysl.encoding`'s encoders and writing only the
+  checks in Avin (two passes over the text, and a second implementation of the alphabet anyway).
+- Settled on the user's delegation 2026-11-15: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
+  (compared as UTF-8 bytes, so `"é"` and `"e\u{301}"` differ), bound to Sysl's `sysl.crypto.verify`,
+  which reads every byte and branches only on the lengths. Why: Sysl pins that function's
+  branch-free code with its own codegen tests, which an Avin loop would not have; different lengths
+  answering `false` at once leaks only a length, which a token's or a tag's is not secret. Alternatives
+  weighed: an Avin loop accumulating `xor`s (its constant time would rest on the optimizer); a method
+  on `Vector[byte]` (a security property should be found where the secrets are).
+- Settled on the user's delegation 2026-11-15: **`SecureRandom`, an object in `avin.random`**, with `Random`'s drawing methods
+  (`nextBytes`, `nextInt`, `nextLong`, both bounded, `between` for `int` and `long`, `nextReal`,
+  `nextBoolean`, `alphanumeric`, `shuffle`, `choose`) and two token functions, `hexToken(byteCount
+  = 32)` and `urlToken(byteCount = 32)`. Every draw reads `getentropy` through Sysl's
+  `sysl.posix.rand.entropy_from_os`, which is on macOS, glibc Linux and the BSDs and loops past the
+  256-byte request limit. A refusal from the operating system traps. Why: one name beside `Random`
+  is found by whoever reads that module's warning; an object, not a class, because there is no seed
+  and no state; trapping because a program wanting key material has no safe fallback. 32 bytes is
+  256 bits, past any guessing. `nextGaussian`, `chooseWeighted` and `setSeed` are left out: no
+  secret is drawn from a normal or weighted distribution, and there is no seed. Alternatives
+  weighed: a class `SecureRandom()` sharing a trait with `Random` (an instance holds nothing, and the
+  trait would add a dispatch to every PCG draw); a buffered pool of entropy (fewer system calls, but
+  secret bytes kept in the heap and a lock); `secureBytes` and token functions in `avin.crypto`
+  (randomness split across two modules); `Result` instead of a trap (a caller of `nextInt` would
+  match on every draw).
+
+**Refined variants** ([chapter](/spec/refined-variants/), branch `gadt-design`; designed, not built)
+
+- **Spelling: a variant's result after `->`, its own type parameters after its name.**
+  `IntLit(value: int) -> Expr[int]`, `Balance -> Query[long]`, `Pair[A, B](…) -> Expr[(A, B)]`; the
+  data type's parameter names are every variant's parameters, so a variant with no result keeps
+  meaning `-> D[T…]`. Why: a variant is a constructor, and `(fields) -> Type` is exactly how Avin
+  writes a function's signature, so the line reads as the constructor it declares; nothing else is
+  written after a variant's fields. Alternatives weighed: `IntLit(value: int): Expr[int]` (`:` already
+  types each field on the same line and begins an inheritance list, which a variant is not); a
+  `where T = int` clause (names the equality instead of the instance, and needs a second syntax for
+  hidden parameters); a separate keyword per refined variant (a second kind of variant where there
+  is one with an optional result).
+- **A variant fixes only invariant parameters.** Where the type's parameter is `+T` or `-T`, a
+  variant's result has `T` there. Why: an invariant argument is exact, so the equality an arm learns
+  is true; a covariant one is an upper bound, and taking it as an equality is unsound (the chapter's
+  `asDog` makes a cat a `Dog`). Alternatives weighed: refining a covariant place by a bound
+  (`Dog <: T`) and a contravariant one by the opposite bound (sound, but it gives one-directional
+  facts that are hard to read in an error, and no motivating example needs it); forbidding variance
+  on any type with a refined variant (needlessly strict: unfixed places keep their variance soundly).
+  Review with the user: whether bound refinement at variance places is wanted later.
+- **Hidden type parameters are allowed, and compiled per pack.** A variant parameter its result does
+  not name is a fresh type in each arm, never leaving it; each list of hidden types the program makes
+  a variant with has its own descriptor, and an arm on it is compiled once per pack and selected by
+  the descriptor. Why: a typed protocol (a request and its reply address agreeing on a type the
+  message type does not mention) and a chained plan (`Then[Mid]`) need one, and the whole-program
+  compiler already knows every pack, as it knows every implementer of a trait for dynamic generic
+  methods, so nothing is boxed and the value-type fields stay unboxed. Alternatives weighed: refusing
+  hidden parameters (the protocol could then only erase `R` behind a trait, losing the type the
+  design exists to keep); boxing a hidden field behind `Any` (a run-time test where none is needed).
+  Review with the user: code size, since an arm is copied per pack.
+- **Equalities hold exactly where the pattern's names are in scope, and nowhere outside.** An arm's
+  result is checked against the expected type under them; with none expected, arms yield their types
+  as written; an inference variable settled in an arm settles to the type as written; a hidden type
+  in an arm's result is an error. Why: a fact true only in the arm cannot leak to code that runs
+  without it, and "as written" is the one reading that does not guess whether an `int` was meant as
+  `T`. Alternatives weighed: mapping an arm's type back through its equalities (ambiguous: `int` and
+  `T` are one type there and two outside); inferring the result type of a refining `match` (needs a
+  search the local inference does not do).
+- **Only variants refine.** Extractors and type patterns learn no equalities. Why: an extractor's
+  answer type is its signature's; a type pattern's could refine an invariant generic's arguments by
+  the same header argument, but it widens the feature to every generic type and every type test.
+  Alternative weighed: refining by type patterns on invariant instances (sound; deferred). Review
+  with the user.
+- **A union in a result names no variant parameter**, since a value would not say which member a
+  parameter is; closed unions (`-> Expr[int | string]`) are allowed. Alternative weighed: deciding the
+  parameter by normal-form order (arbitrary, and wrong for a value made at another member).
+- **An arm no value can reach because its equalities contradict is an error**, as every unreachable
+  arm is, and coverage counts only the variants possible at the matched type, carrying each row's
+  equalities; a `match` on an instance with no possible variant is an error. Alternatives weighed: a
+  warning for an impossible arm (Avin has no warnings for unreachable code); pruning per column
+  without carrying equalities along a row (simpler, but demands arms for combinations no value has).
+- **Bounds on a variant's parameters** are checked where a value is made and held in the arm, and an
+  enclosing type parameter equated with a bounded one gains the bound there; a copy at a type
+  without the bound compiles no such arm. Why: it is what makes a hidden type useful (`Sendable` for
+  a reply, `Ord` for a sorted payload), and it costs one more test when an arm is decided at a copy.
+  Alternative weighed: no bounds on variant parameters (the protocol could not name `ActorRef[R]`,
+  whose parameter is bounded by `Sendable`).
+- **The nested-data-type rule is measured against the variant's result**, and a larger part made of
+  a hidden parameter is allowed, since its instances exist only where the program makes a pack.
+  Alternative weighed: measuring against the plain instance `D[T…]` (refuses `First[A, B](pair:
+  Expr[(A, B)]) -> Expr[A]`, which has finitely many copies).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`, the declaration step): **a refined variant's parameters, the type's
+  included, are the variant's own in the expansion check.** An instance reaches them through the
+  result (`Expr[X]` holding a `Pair` has `X = (A, B)`, so `A` and `B` lie one level down), and a type
+  argument of a field that names a hidden parameter adds no edge, since its instances are the packs
+  the program makes, which step 5's check of growing packs counts. A growing cycle through a refined
+  variant names the field and the result it is measured against. Why: it is rule 6 exactly, and it
+  reuses the one polymorphic-recursion check rather than a second one for variants. Alternatives
+  weighed: a separate syntactic comparison of each field with the result (misses growth through a
+  second type, which the flow check already follows).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`): **a variant's own type parameter takes bounds and no variance and no
+  lower bound**, and a name reused from the type's parameters or twice among the variant's own is an
+  error. Why: a variant is a constructor, a generic function, whose parameters take no variance; a
+  lower bound asks of a call's argument something a `match` could not hand back. Alternatives
+  weighed: allowing `>:` (sound at the call, but it gives the arm a one-directional fact, the kind
+  [Variance](/spec/refined-variants/#variance) declines).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`): **a result written as the type at its own parameters, `If(…) ->
+  Expr[T]`, with no parameters of the variant's own, is a plain variant**, the same declaration as
+  one with no result. A data parameter a refined variant's result does not name is hidden there like
+  any other (`IntLit(value: T) -> Expr[int]` hides `T`). Why: the chapter says the type's names are
+  every variant's parameters, and a written-out plain result changes nothing a value carries.
+  Alternative weighed: treating any written result as refined (a type would lose its plain uses for
+  a redundant spelling).
+- Settled on the user's delegation 2026-11-15 (built on branches `gadt-1` and `gadt-2`): **a type
+  with refined variants is named, made and matched like any other**, and the code the derived
+  templates write (`Display`, `Debug`, `Ord`, any `walk`) matches every variant, its copies compiled
+  only for the variants possible at each instance, each arm at the arguments it reads back from the
+  instance. The declaration step (`gadt-1`) and the values-and-layouts step (`gadt-2`) first
+  refused the type's uses with "yet" messages; patterns and field reads came with `gadt-3`, hidden
+  parameters with `gadt-5` and bounded parameters with `gadt-6` (the entries below). Why: lowering
+  lays out every variant at every instance, so the derived code needs only what lowering knows at a
+  copy. Alternatives weighed: accepting patterns on plain variants before coverage over the
+  possible variants existed (it would demand arms for impossible variants that `gadt-4` then made
+  errors).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-2`): **a parameter of the data type that a refined variant names in neither
+  its fields nor its result is fixed in its signature** (to `Nothing`, which nothing observes), so it
+  is never inferred and never written: `Pair[int, bool](…)` writes `Pair`'s `A` and `B`, `Done[S]`
+  of `Done -> Plan[From, From]` writes `From`, and `IntLit[int](1)` takes no type argument. On the
+  type, `Expr[(int, bool)].Pair(…)` names the instance the value makes: the variant's parameters are
+  inferred from it and the value is held to it. Why: the chapter says a variant is called as a
+  generic function, and such a parameter is no parameter of that function; leaving it to inference
+  would make every call of `IntLit` an unsolvable "cannot infer `T`". Alternatives weighed: dropping
+  the parameter from the variant's list (its field defaults are functions of the whole list);
+  reading `T[A].V` as written arguments of `V` (they are the type's, and need not match `V`'s own in
+  number or meaning).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-2`): **a derived trait holds of a refined variant's own parameter where the
+  trait on the instance implies it**: the parameter sits in the result under constructors whose
+  trait needs their argument's (a tuple's, `Vector`'s), tested by whether the constructor at the
+  parameter has the trait where every other argument does and the parameter alone has none. Where
+  it is not implied (`Hold[A](x: A) -> Odd[Wrap[A]]`, with `Wrap` showing itself whatever `A` is),
+  the field falls short and the type has no automatic `Display`, as any type with such a field. A
+  hidden parameter is decided per pack, by the parameter's bounds (step 5, branch `gadt-5`, the
+  entry below). **Review with the user**: whether a refined type's `Display` should rather
+  be decided per instance, at the instance's own arguments. Why: a derived impl is checked once, over
+  its type's parameters, and this is the most that check can know of a variant's own; it is sound,
+  since the trait at an instance gives it to the parameter read back there. Alternatives weighed:
+  no trait for own parameters (every type with `Pair` would lose `Display`); the trait
+  unconditionally (unsound for `Odd`).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-2`, where refined variants meet higher-kinded types): **a variant's own
+  type parameters are types, and a constructor parameter of the type keeps its place in a result**:
+  `V[G[_]](…)` is refused with ``"a variant's own type parameters stand for types, not type
+  constructors: `G` of `V` takes type arguments; declare a constructor parameter on the type, as in
+  `data D[G[_]]`"``, and `W(…) -> D[Vector, T]` with ``"a variant fixes no constructor parameter: `W`
+  makes `D[Vector, T]`, and `F` of `D` is a constructor parameter, so its place holds `F`"``, while
+  `Y(x: F[int]) -> D[F, int]`, keeping `F` and fixing `T`, is accepted (step 1 refused it as "no type
+  a `match` can take apart", which was a mistake). Why: the `gadt-1` entry below settles that no
+  constructor parameter is fixed, and keeping one in its place fixes nothing. Alternatives weighed: refusing any
+  refined variant of a type with a constructor parameter (needlessly narrow).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-1`), **for constructor parameters ([higher-kinded
+  types](/spec/generics/#higher-kinded-types)), the conservative reading: a
+  variant fixes no constructor parameter of its type, its own type parameters are no constructor
+  parameters, and a result's argument never applies a constructor parameter** (`-> D[F, F[A]]` is
+  refused, since `F[A]` against a known instance cannot be taken apart where `F` is itself a
+  parameter of the code matching). The declaration step enforces the last two through one rule: a
+  result's arguments are built of data types, classes, tuples, function types and the variant's
+  parameters, and any other form, a constructor or its application among them, is refused with
+  ``"`F[A]` in the result of `V` is no type a `match` can take apart: the result's arguments are
+  built of data types, classes, tuples and function types"``; a constructor parameter among a
+  variant's own (`V[G[_]]`) is refused since the two branches met (branch `gadt-2`, the entry
+  above). Fields name constructor applications freely, as any variant's do. Why: refinement
+  solves equalities by decomposition, which needs every parameter under a constructor that the
+  instance's head determines; an applied parameter is not one. Alternatives weighed: solving `F[A] =
+  X` by matching `X`'s head (unsound when `F` is a partial application, whose holes may sit anywhere
+  among `X`'s arguments). Review with the user: whether refinement over constructors is wanted.
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`, the refinement step): **each pattern on a refined variant gives the
+  variant's parameters fresh types of its own**, so two `Pair` patterns, nested or one after the
+  other, give two unrelated sets, and **the equalities are solved with those fresh types first, then
+  the enclosing code's type parameters**: `Vector[A] = Vector[T]` makes `A` the `T` around the arm,
+  so a field reads as a type the code can name, and `T = (A, B)` keeps `T` as the pair of the fresh
+  types. A union or a type constructor that names a type parameter is not taken apart and teaches
+  nothing (`T | string = int | string` has two solutions); any other two different types, and a
+  cyclic `T = Vector[T]`, are a contradiction, which step 4 (branch `gadt-4`) makes an error at the
+  pattern; the arm's body is then checked with no equalities, and is not compiled at any copy. The equalities hold where a marker local the pattern declares beside its names is in
+  scope, which carries them exactly where the names go: an arm, a clause, an `is` test's branch,
+  the right operand of `&&` and `||`, the rest of a block after an early return or a binding. At a
+  copy where a pattern is impossible, lowering leaves out what holds its equalities: the arm, the
+  branch an `is` test then cannot take, the right operand of `&&` and `||`, a `while` body, and the
+  rest of a block whose taken branch never finishes. Why: the chapter's "fresh types known only by
+  these equalities", and a substitution the arm's code can read. Alternatives weighed: naming the
+  fresh types by the data type's own parameters (two nested patterns would share them); stopping
+  with an error at an equality not taken apart (refuses sound programs).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **a variant's own parameter that the equalities leave a fresh type
+  never leaves its arm**, as a hidden one does not (the chapter states it for hidden parameters
+  only): with no type expected, an arm, a clause, an `is` branch or a block whose result names one is
+  refused with ``"this arm's result is an `Expr[A]`, and `A` is a type `Pair` takes from the value it
+  matches, which is not known outside its arm"``, and an inference variable made before the pattern
+  settled to one with ``"a type declared outside this arm cannot be settled to an `Expr[A]`: …"``,
+  reported at the pattern. Why: such a type is known only through the value matched, so no copy can
+  compile code outside the arm that names it. Alternatives weighed: settling the escaped type as
+  `Nothing` (lays out a value at the wrong type); allowing it (no copy could compile it).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **inside an arm a value of a type an equality fixes is used at what
+  it is there** for operators, members and comparisons (`x + n` with `x: T` and `T = int` is an
+  `int`), the type expected of an expression is the one under the equalities (a literal where a `T`
+  that is an `int` is expected is an `int`, a value where a `T` that is `Any` is expected is boxed),
+  while **an inference variable still settles to the type as written** where it meets one. An arm
+  that refines, with a type expected, is checked against it under its equalities and **yields the
+  expected type itself**; one that does not fit it is refused with ``"this arm yields int, not the T
+  expected of the `match`"``. Clauses with no declared result that agree on no type are reported as
+  the chapter reports arms: ``"the clauses of `f` agree on no type: `IntLit`'s yields an `int`, which
+  is `T` only inside that clause; declare the result type"``. Why: the chapter's "a type and
+  anything it equals are one type" and its "as written" rule for inference variables, each where it
+  can apply. Alternatives weighed: rewriting every type in the arm to its refined form (would settle
+  variables outside the arm to refined types, against the chapter).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **`val V = x`, where `V` is a variant of `x`'s type and that type has
+  refined variants, takes the value apart** as the chapter's `val Refl = proof` does; anywhere else
+  `val Name = x` binds a name, as before. **Review with the user**: whether `val V = x` should take
+  apart a value whenever `V` is a variant in scope, as a bare name in a pattern does. Why: the
+  chapter's example, with no change for any program written before refined variants. Alternatives
+  weighed: requiring `val V() = x` (not the chapter's spelling); the general rule (changes what
+  existing bindings mean).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-3`): **a field of a refined type's one variant is read by name where the
+  instance says the field's type**: `o.value` on `One[T]` with `Mk(value: int) -> One[int]` is an
+  `int`; an instance the variant cannot make is refused with ``"`One[bool]` has no values: no
+  variant of `One` makes one"``, and a field whose type keeps a parameter the instance does not say
+  with ``"the field `items` of `Hold` has a type a `Holder[T]` does not determine; take the value
+  apart with `match`"``. Why: every value of the instance is the variant's, so the read is the arm
+  of a one-arm `match`, and only its result type must be one known outside. Alternatives weighed:
+  refusing every such read (the chapter's single-variant types would lose field access).
+
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`, the coverage step): **coverage counts the variants possible at the
+  type matched as the equalities in scope see it**, splitting a column on a refined type's variant
+  only where the variant's result has a solution with the column's instance, the variant's own
+  parameters given types of their own for that split; **the solution carries to the other columns**,
+  so a row's equalities travel along it, and an instance no variant makes is a column with no
+  values. Why: the chapter's Coverage, and the same solving the checker does for a pattern, so the
+  two agree on what is possible. Alternatives weighed: carrying the equalities as a substitution
+  beside the columns (the same, with every function of the coverage check threading it; applying
+  them to the columns at each split needs no more state).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`): **an impossible pattern is reported at the pattern, by the checker,
+  with the chapter's three reasons**, chosen by re-solving: against the equalities in scope before
+  its row alone it fails (`` `Eq` makes an `Expr[bool]`, and the value matched is an `Expr[int]` ``,
+  or the empty-instance message where no variant is possible), a cyclic equality
+  (`` `Wrap` needs `T` to be `Vector[T]`, which no type is ``), or the first equality of an earlier
+  pattern of its row that leaves it none (`` `IntLit` needs `T` to be `int`, and `BoolLit` in the
+  same pattern needs it to be `bool` ``). A row is an arm's pattern, a clause's arguments (`in the
+  same clause`), an `is` test's pattern, a binding's pattern. **The lead says what never happens**:
+  `this arm is never reached`, `this clause is never reached`, and `this pattern never matches` for
+  an `is` test, a binding and one of a set of alternatives, which the chapter does not word. An
+  impossible pattern on the right of `&&`, under the left's equalities, is an error the same way.
+  **A `match` on an empty instance is an error at the value matched even when no arm names a
+  variant** (`_ -> 0` on a `Same[int, string]`). Why: the pattern is where the contradiction is,
+  and a test that can never succeed is dead code as an arm is. Alternatives weighed: reporting
+  impossible arms from the coverage check (it sees rows, not which equality failed, and would say
+  only "never reached"); leaving an impossible `is` test legal (it folds to `false` at every copy,
+  which hides a mistake). **Review with the user:** the wording for tests, bindings and alternatives.
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`): **each alternative of a pattern matches on its own: the equalities an
+  alternative learns hold neither in the alternatives after it nor in the arm**, and lowering tests
+  each alternative at what its own patterns read back from the value. A step-3 bug: an alternative's
+  equalities stayed in scope, so `IntLit(_) | BoolLit(_) -> 5` on an `Expr[T]` was checked as if
+  `T` were `int`, and its `bool` copy answered `false` for the `5`; and an alternative was compiled
+  without its patterns' arguments, so `Pair(IntLit(3), _) | …` never matched. Why: the arm runs for
+  whichever alternative matched, so only what all of them imply could hold, and alternatives bind
+  no names. Alternatives weighed: keeping the equalities every alternative implies (sound, but needs
+  a meet of substitutions the chapter does not describe; no program has needed it).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-4`): **two types that read the same in a message are named apart by the
+  refining patterns that took them**: ``expected Expr[A of `Pair` on line 4], found Expr[A of `Pair`
+  on line 5]``, with the column too where both patterns are on one line, in the expected/found,
+  operator-operand, `cannot compare` and declared-result messages. Only where the two names would
+  otherwise be identical; every other message is unchanged. Why: two patterns on one variant give
+  two unrelated sets of fresh types with the variant's parameter names. Alternatives weighed:
+  numbering the fresh types (`A1`, `A2`), which every message would show, even where nothing
+  clashes.
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`, the hidden-parameters step): **a hidden parameter has exactly the
+  bounds its variant declares, and a trait derived for its type holds of it only by them**:
+  `Hold[A](value: A)` gives `Box` no automatic `Display`, `Debug`, `Eq`, `Hash` nor `Sendable`, and
+  `Hold[A: Display](value: A)` gives it `Display`. A parameter of the type that a refined variant
+  hides (`Hide(value: T) -> Tagged[int]`) is the value's own, so the impl's bound on the instance's
+  `T` does not give it the trait either. The reason a type has no automatic trait names the variant,
+  its field and the hidden parameter (`` `Tagged` has no `Display` because its field `Hide.value`
+  names `T`, which the variant hides and a value may hold at any type; bound it, as in `[T:
+  Display]` ``), and an explicit `derives` says the same. This settles step 2's "the trait for now"
+  per pack: the derived code's arm is compiled once per pack, and only the bounds hold at every
+  pack. `==` and the hash still compare and hash every value, a pack at a time. Consequence: the
+  chapter's `Expr`, whose `First` hides `B`, has no automatic `Display` unless `First` writes `[A,
+  B: Display & Debug]`. Why: a derived impl is checked once and must hold wherever any value is,
+  and a pack's types are known only where the value is made; deciding by bounds keeps the type's
+  traits a fact of its declaration. Alternatives weighed: giving the trait unconditionally (unsound:
+  a value of a pack without it reaches the derived code); requiring the trait of the hidden types
+  where each value is made, whenever the type derives it (every `Box` made of a class without
+  `Display` would be an error, though the program never shows one, and generic code could not know
+  whether its instance derives it); rendering a hidden field through its type record (`Display` and
+  `Debug` only, and a change to the derive templates). **Review with the user**: whether `Display`
+  and `Debug` should rather render a hidden field through its run-time type, so `Expr` prints
+  without the bound.
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **a bound on a hidden parameter is allowed, `T: A & B` included**;
+  a bound on a variant's own parameter that its result names was left to step 6 (branch `gadt-6`,
+  the entries below). A hidden parameter's bounds are checked where a value is made, as a
+  call's are, and the fresh type an arm gives it has them. Why: the chapter states them for hidden
+  parameters in their own section ("a fresh type, with the bounds its declaration gives it"), and
+  the typed protocol needs `Ask[R: Sendable]`; what step 6 adds, an enclosing type parameter gaining
+  a bound by equality, does not arise for a hidden one. Alternatives weighed: leaving every bound to
+  step 6 (the protocol could not be written in step 5).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **an `is` test or a binding takes apart no field of a hidden type**:
+  `if b is Hold(v, _)` with `value: A` hidden is refused with ``"`Hold` hides `A`, and its field
+  `value` names it: an `is` test or a binding takes apart no field of a hidden type; take the value
+  apart with `match`, whose arm is compiled for each type the value hides"``; `b is Hold(_, _, t)`,
+  testing or binding only fields whose type every pack shares, is accepted and tries each pack. A
+  `match` arm, a clause, a match function and an actor's or machine's arm take any field. Why: an
+  arm is one expression, compiled once per pack; an `is` test's equalities reach the rest of a block
+  after an early return or the right operand of `&&`, code that would have to be copied per pack
+  as far as the names reach. Alternatives weighed: copying the reached code per pack (a block's
+  rest, an `&&` chain and a `while` condition each need their own copying); refusing every hidden
+  pattern in a test (the tag test and the shared fields are sound and useful).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **an arm on a variant with hidden parameters is compiled inline,
+  once per pack, and chosen by comparing the value's descriptor with each pack's**, not as a
+  function called through the descriptor's method table as the build plan said. Lowering finds the
+  packs as it reaches the code making them; an instance compiled for fewer packs than the program
+  has made by the end is lowered again, until none is stale, and such instances are not kept in the
+  instance cache. Why: an arm compiled inline keeps `return`, `break`, `continue`, a `var` of the
+  function and a tail call behaving as in any arm, which a separate function would have to pass
+  back across a call; the run-time cost is one compare per pack before the arm, against a call
+  through a table. Alternatives weighed: the plan's function per pack through the table (each arm
+  would need its locals captured and its exits returned as codes); boxing hidden fields behind `Any`
+  (the chapter's alternative, a run-time test where none is needed).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-5`): **in the polymorphic-recursion check, a refining pattern's fresh types
+  are its variant's parameter nodes, a value made with hidden types reaches them, and a type
+  argument holding a hidden type grows no parameter of the code that the value matched holds**: so
+  `eval(First(p)) = … eval(p)` at `(T, B)` is ordinary, as the chapter says, while a pack built
+  from ever larger hidden types (`Hold(v) -> grow(Hold([v]))`), a generic function making a pack of
+  its parameter whose arm calls it larger, and a parameter grown beside a hidden type of a value not
+  holding it, are refused as polymorphic recursion naming the variant. Why: an instance at a hidden
+  type exists only for a pack, which a value made somewhere holds, and a matched value holding the
+  parameter can be of a larger pack only where the program made one; growth through the values made
+  is counted by the construction edges. Alternatives weighed: counting every type argument as
+  before (refuses the chapter's `eval`); dropping every edge of an argument naming a hidden type
+  (accepts `pairUp((x, y), b)`, which never ends).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-6`, the bounds step): **an enclosing type parameter gains a variant
+  parameter's bounds only where an equality in scope equates the two as wholes**: with
+  `Sorted[A: Ord](items: Vector[A]) -> Coll[A]`, `T` of `smallest[T](c: Coll[T])` is `Ord` in the
+  `Sorted` arm, a parameter equated in a tuple place (`Conv2[A: Into[B], B](…) -> Conv[(A, B)]` on
+  a `Conv[(X, Y)]`, where `X` gains `Into[Y]`) too; `U` of a `Coll[Vector[U]]` gains nothing, though
+  `Vector[U]` is `Ord`. The bound holds where the arm's equalities do: not among alternatives, not
+  after the arm, not in the other branch of an `is` test. Why: the chapter states it for "a fixed
+  parameter equated with a type parameter", and inferring `U: Ord` from `Vector[U]: Ord` would
+  invert an impl's condition, which holds only where no other impl gives the trait. Alternatives
+  weighed: inverting conditional impls (unsound wherever a type has the trait unconditionally);
+  rewriting `T` to the variant's fresh type in the arm (the arm's result would then be checked as a
+  type that leaves its scope).
+- Settled on the user's delegation 2026-11-15 (branch `gadt-6`): **a variant's bounds do not prune coverage**: a `match` on a
+  `Coll[Thing]`, with `Thing` not `Ord`, still needs a `Sorted` arm (or a wildcard), whose code is
+  checked at `Thing` without the bound, as the chapter's coverage rule counts equalities alone.
+  Lowering does leave the variant out of the instance: `Coll[Thing]`'s layout has no descriptor for
+  `Sorted`, and an arm, an `is` test or the derived code on it is not compiled there, as for a
+  variant whose equalities fail. Why: coverage stays a fact of the types' shapes, unchanged by which
+  impls the program declares (an impl added in another module would otherwise make a covering
+  `match` incomplete). **Review with the user**: whether an arm on a variant whose bounds a concrete
+  instance fails should rather be "never reached", as an impossible arm is.
+- Settled on the user's delegation 2026-11-15 (branch `gadt-6`): **whether a refined type is sendable is decided at its instance**: a
+  variant's own parameters are read back from the instance's arguments, so `Coll[string]` is
+  sendable though `Sorted`'s `A` is bounded by `Ord` alone, and a variant whose result is another
+  concrete instance holds nothing there (`Msg[int]` is sendable though `Log`, making only a
+  `Msg[string]`, holds a `Buffer`). Where generic arguments do not say what a parameter is, one
+  bounded by `Sendable` is sendable, as a hidden one is, and any other may be any type. A hidden
+  parameter is still decided by its bounds alone, per the `gadt-5` entry: every pack the program
+  makes was checked where its value was made. Why: before, a refined variant's own parameters were
+  read by position, so every instance of a type with `Sorted` was unsendable, and an actor could not
+  receive one. Alternatives weighed: requiring `Sendable` on every own parameter (a bound the instance
+  already decides).
+
+- Settled on the user's delegation 2026-11-15 (branch `ascription`; ascription itself approved by the user 2026-11-13):
+  **Type ascription `(value: T)`, written as an item of a parenthesized list** ([types](/spec/types/#type-ascription)).
+  (1) *Where it parses*: a group, a tuple's part or a call's argument (a named one's value
+  included), never a bare `value: T` elsewhere. WHY: inside parentheses `:` has no other meaning
+  (named arguments use `=`, a map literal's `:` is inside braces, a field's or parameter's type is
+  in a declaration), so the grammar stays unambiguous with no new token; at a statement's level
+  `x: T` would read as half of a declaration. ALTERNATIVES: bare `value: T` anywhere (collides with
+  `val x: T`, clause signatures and a match arm's type pattern `n: int -> …`); a keyword
+  (`value as T`, a word read as a conversion, which this is not); parentheses only for a group, not
+  for arguments (`f((None: Option[string]))` doubles every bracket).
+  (2) *What it accepts*: exactly what `val x: T = value` accepts — literals taking `T`, `None`,
+  empty collections and lambdas typed by `T`, a subtype's value, a union's member — and the
+  expression is of type `T`. WHY: one rule a reader already knows, and no conversion hides in a
+  form that looks like a type. ALTERNATIVES: also converting numbers (`(n: long)` of an `int`),
+  which is the implicit widening the spec refuses; accepting narrowing as a checked downcast, which
+  is a `match`'s job.
+  (3) *The refusal* says what to write: `long(n)` for a numeric conversion, `BigInt(k)` /
+  `T.fromInteger(k)` for an integer variable to a type that takes integers, the explicit
+  `BigDecimal.fromReal…` for a `real`, and `is`/`match` for a narrowing.
+  (4) *Ambiguities settled*: `(n: long) -> …` stays a lambda; `x: int -> body` whose rest is not
+  type-shaped keeps its hint "a lambda's parameter with a type is written in parentheses", while
+  `(f: int -> int)` is an ascription to a function type; at the start of a block's line
+  `name(x: T)` followed by `=`, `->`, an indented block or a clause line still declares a local
+  function, and a clause signature now needs its next line to be a clause (followed by `=`, `|` or
+  guards), so two `show(n: long)` calls on consecutive lines are calls; a parameter counts as typed
+  only when a name precedes its `:`, so `show(1: long)` is never a declaration.
+  (5) `(_: T)` in a placeholder lambda is a parameter of type `T`. WHY: it is the one place a
+  placeholder's type can be written. ALTERNATIVES: leaving `_` untyped inside an ascription (the
+  ascription would still constrain it, but a mismatch would read as the ascription's error rather
+  than the parameter's). Review with the user: (1)'s rule that a statement-level `retry(n: long)`
+  followed by an indented block is a declaration (write `retry((n: long))` to call it).
+
+**Actor patterns** ([actors](/spec/actors/#routers), branch `actor-patterns`)
+
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **Routers are `Router.pool(size, behaviour,
+  routing, onFailure, executor)`, giving back a plain `ActorRef[M]`.** The router is an actor of its
+  own, the routees its children, so the lifecycle and supervision of actors cover it with nothing
+  new: `stop(router)` ends the routees first, a routee's `onFailure` is the router's argument, a
+  routee that ends leaves the pool and the router stops with the last one, and a routee's
+  escalation fails the router, which always escalates (the router's own supervision is not a
+  parameter). The routings are the `data Routing[M]`: `RoundRobin` (the default), `AtRandom`,
+  `SmallestMailbox`, `ByKey(key: @sendable (M) -> long)`. *Why*: one reference that accepts the
+  routees' own messages is what a caller wants, and asks through it work unchanged; a hop through
+  the router keeps one sender's order per routee and keeps the pool's state in one actor's turns,
+  with no lock. *Alternatives*: a reference whose `tell` picks a routee in the sender's thread (no
+  hop, but the pool's changing membership shared between threads); a `Router[M]` object with its
+  own `stop` (a second lifecycle beside the actor's); a supervision parameter for the router itself
+  (rarely wanted: it holds no state worth restarting). `Random` was not taken as a variant name since
+  `avin.random.Random` is a common import; `Router` shares its name with `avin.net.http.Router`, in
+  a different module. **Review with the user:** the names (`AtRandom`, `ByKey`) and the router's
+  fixed `Escalate`.
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **`SmallestMailbox` counts the messages waiting,
+  and `ByKey` hashes by highest weight.** A routee's mailbox alone keeps a count (an atomic add on
+  each send and take; other actors' mailboxes pay nothing), the message being handled not counted,
+  ties going to the next in turn. `ByKey` weighs each routee against the key by mixing the key with
+  the routee's number and takes the heaviest, so a key keeps its routee while it lives and a routee
+  that ends moves only its own keys. *Why*: the count is exact and cheap where it is needed; the
+  weighting needs no ring and stays consistent as the pool shrinks. *Alternatives*: counting every
+  mailbox (a cost to every actor); counting a message until its handling ends (a second atomic per
+  message); the key modulo the pool's size (every key moves when one routee leaves); a hash ring
+  (more state for pools that are small).
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **A message a router finds refused goes to another
+  routee.** A routee that has begun to end refuses a message, and the router chooses again among the
+  rest, before it has heard of the end; a message a routee accepted and then dropped as it stopped
+  is lost, as with any actor that stops. *Why*: the window between a routee ending and the router
+  hearing of it would otherwise lose messages for no reason. *Alternative*: dropping them.
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **A `Stash` is a bounded object of the actor's state,
+  `Stash(self, capacity)`, and adding to a full one traps.** `unstashAll` puts its messages in front of
+  every message waiting, in the order added, in a queue the actor's turn reads before its mailbox, so
+  a restart keeps them as it keeps the mailbox, while what is still stashed is lost with the state.
+  *Why*: the actor's own state is where an actor's choices live, and a stash made from the actor's
+  own reference cannot be given another actor's messages; a full stash means the actor's design did
+  not foresee the load, which is a bug for supervision to handle, and an actor that wants another
+  policy checks `isFull` first. *Alternatives* for overflow: dropping the newest or the oldest
+  silently (a lost question looks like a timeout with no report), `add` answering a `bool` (easily
+  ignored); for the shape: `stash(message)` and `unstashAll()` on `ActorContext` with a capacity
+  given to `spawn` (state outside the actor's fields, and a parameter every actor carries);
+  unstashed messages put at the back of the mailbox (behind messages that arrived later, losing
+  order). **Review with the user:** trapping on overflow.
+- Settled on the user's delegation 2026-11-15 (branch `actor-patterns`): **A `Topic[E]` is a sendable object, not an actor.**
+  `publish` tells each subscriber in the publisher's own thread, so one publisher's events reach
+  each subscriber in order with no hop; subscriptions live in one atomic value; a subscriber's end
+  is watched through its `ended()` future from its first subscription, which drops it. An actor is
+  subscribed once, by its number, the later reference (an adapter, say) replacing the earlier in
+  its place. *Why*: any thread may publish, nothing needs stopping, and no actor's mailbox sits
+  between publisher and subscriber. *Alternatives*: a topic actor that subscribers and publishers
+  message, watching subscribers with `watch` (an extra hop per event, a lifecycle to manage, and a
+  count that is only known by asking); topics named in a global registry (shared mutable state by
+  name).
+
+**Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
+
+- Settled on the user's delegation 2026-11-15: **a constructor parameter is spelled `F[_]`**, `F[_, _]` for two holes, and a partial
+  application of a type writes `_` for each argument left open: `Result[_, ParseError]`,
+  `Map[string, _]`. Why: the same mark at the declaration and at the use, the `_` the language
+  already uses for "something left out" in patterns and lambdas, and the spelling other chapters'
+  prose already used for "a `Result` of any value with this error". Alternatives weighed: a kind
+  annotation (`F: * -> *`, notation with no other use in the language); a type-lambda form
+  (`[X] => Result[X, E]`, general but a second way to write types, and lambdas make constructor
+  equality undecidable in general); declaring the constructor by an alias only (every partial
+  application would need a named alias). Review with the user: the spelling is the most visible
+  choice of the design.
+- Settled on the user's delegation 2026-11-15: **holes are direct arguments of one nominal type; no nested `_`, no constructors of
+  constructors (`F[_[_]]`), no tuple or function constructors.** A generic alias whose parameters
+  are each one direct argument of its expansion is a constructor too. Why: a constructor is then a
+  nominal type with places left open, so equality is structural and inference has one answer, the
+  core of the soundness argument; composition (`Option[List[_]]`) is a data type of the program's
+  own. Alternatives: general type lambdas (undecidable equality, inference with many answers);
+  allowing any alias as a lambda (the same problem behind a name). Review with the user: whether
+  composed constructors are wanted soon.
+- Settled on the user's delegation 2026-11-15: **a hole may declare variance (`F[+_]`) and bounds (`F[_: Sendable]`)**, a demand on the
+  constructor passed: `+_` lets `F[Dog]` be an `F[Animal]` inside the declaration and takes only
+  constructors covariant there; a bounded hole is applied only to types meeting the bound, checked
+  at each `F[X]` written, and takes constructors whose parameter's bounds the hole's imply. A plain
+  `_` is invariant and unbounded, and refuses a type with a bounded parameter at the hole
+  (`TreeSet`). Why: each is checked at the definition, so no instance can fail; bounded holes are
+  what let `Future` (`Sendable`) and sorted collections (`Ord`) be constructors at all.
+  Alternatives: always invariant (loses `F[Dog]` as `F[Animal]` where code wants it, at no gain in
+  simplicity); always covariant (unsound for `Array`); refusing bounded types outright (excludes
+  `Future` from comprehensions).
+- Settled on the user's delegation 2026-11-15: **constructor traits are spelled with `Self[…]`, the trait's parameters being the
+  holes**: `trait Functor[A]` with `map[B](f: (A) -> B) -> Self[B]`, bounds written `[F[_]: Monad]`.
+  Why: it reads like every other Avin trait (`Iterable[+A]` with `map[B]`), keeps `impl Trait for
+  Type` as the one form of conformance, and the common case (calling `fa.map`, writing
+  `impl Monad for Parser`) needs no new notation beyond `Self[B]`. Alternatives: a type-class-style
+  trait over an explicit parameter (`trait Functor[F[_]]` with `map[A, B](fa: F[A], …)`, which puts
+  the receiver in a parameter and makes every call `F.map(fa, f)` or needs a second rule for method
+  syntax); marking constructor traits with a keyword (redundant: `Self[B]` already says it). Review
+  with the user.
+- Settled on the user's delegation 2026-11-15: **a constructor trait is a bound and never a type, its parameters take no variance, and
+  its static members name none of them.** Why: no object of unknown constructor exists, so no dynamic
+  dispatch over constructors and no existential is needed; every call is direct in a monomorphized
+  instance. Alternatives: trait objects of `Monad` (need a run-time constructor witness and type
+  erasure of the element, which reification refuses).
+- Settled on the user's delegation 2026-11-15: **an impl gives the trait the type's parameters it leaves open** (`impl[T, E] Monad[T]
+  for Result[T, E]`), **and both may be left off where all are open, in order** (`impl Monad for
+  Option`). Why: the partial application needs no new syntax at the impl, and the common
+  one-parameter case reads as plainly as `impl Ord for Money`. Alternatives: writing the constructor
+  (`impl Monad for Result[_, E]`, which needs `E` declared somewhere); requiring the full form always
+  (noise in the common case). The bare form is the only impl of a generic type without its
+  parameters, a narrow exception.
+- Settled on the user's delegation 2026-11-15: **a type implements a constructor trait once, at one choice of holes, and the
+  conformance is not inherited by subclasses or through traits.** Why: coherence gives each argument
+  one constructor; an inherited `map` answers the superclass's type, so inheriting would be unsound.
+  A subclass instance is matched as its nearest superclass with a conformance, then the one trait
+  with one. Alternatives: a conformance per hole (`Either` a functor on both sides, at the cost of
+  ambiguous inference); inheritance with a check that every method is overridden at the subclass's
+  type (a long tail of overrides in the library).
+- Settled on the user's delegation 2026-11-15: **a type's own methods implement a constructor trait's where the trait's call is a call
+  of them** with no conversion, no extra bound, their own type parameters decided by the call (a
+  lower bound by its bound) and a result conforming to the trait's. Why: `List`, `Vector`,
+  `Option`, `Result` and `Either` meet the family with their existing overloaded and lower-bounded
+  `flatMap`s, so no collection method is duplicated or changed. This is still nominal: the impl
+  declares the conformance, and the rule only says which declared method serves. Alternatives:
+  exact signatures (forces a second `flatMap` on every collection, an overload clash); adapters
+  generated per mismatch (hidden code and conversions). Review with the user: it is a looser
+  meeting than a class's override, which takes the parameter types exactly.
+- Settled on the user's delegation 2026-11-15: **inference of a constructor goes through its bound's conformance**; without a bound
+  only a type of exactly the parameter's arity is inferred, anything wider needs `F` written; the
+  written-out arguments join by the type's variance (`Ok(1)` beside a `Result[int, E]`); two
+  different heads never join. Why: the impl is the one place that says which argument varies, and
+  joining the fixed arguments keeps `Nothing`-typed literals pleasant. Alternatives: the last
+  argument always the hole (wrong for `Result`, whose value is first); unification over every
+  choice of holes (ambiguous, order-dependent).
+- Settled on the user's delegation 2026-11-15: **a constructor trait's default bodies are compiled once per implementing constructor
+  and may call its static members on `Self`.** Why: `Monad`'s `map` and `map2` from `flatMap` and
+  `pure`, so a program's own monad gives two members. Alternatives: no defaults (every monad writes
+  four members); defaults shared through a method table, as other traits' are (no `Self` to call
+  `pure` on).
+- Settled on the user's delegation 2026-11-15: **impls may add to applications of a bounded constructor parameter**
+  (`impl[F[_]: Traverse, G[_]: Applicative, A] F[G[A]]`), matched through the conformance, with the
+  rules of impls adding to types built from parameters. Why: `xs.sequence()` reads as a method, and
+  a package can extend every monad at once. Alternatives: free functions only (`sequence(xs)`).
+- Settled on the user's delegation 2026-11-15: **the standard traits are `Functor`, `Foldable`, `Applicative`, `Monad`, `Filter`,
+  `Traverse`, and the sendable pair `SendableFunctor`/`SendableMonad`, in module `avin`**, with
+  `Applicative`'s second member `map2` and `Foldable` holding `foldLeft` alone. Why: `Foldable` is
+  warranted because `Option`, `Result` and `Either` are no `Iterable`s and `Traverse` needs a fold;
+  `map2` reads better than an `ap` over functions; `Filter` is the nominal home of a comprehension's
+  guard; the sendable pair is how `Future`, whose combinators need `Sendable` values and `@sendable`
+  functions, meets a family. Alternatives: `ap` (the classic, harder to read); `zip`/`product` as
+  the second member (`zip` already pairs sequences by position and `product` multiplies); no
+  `Foldable` (no fold over an option in generic code); `Future` left out (breaks comprehensions over
+  futures). Review with the user: the names, and whether the sendable pair should rather be a hole
+  bound on the ordinary traits.
+- Settled on the user's delegation 2026-11-15: **which library types implement what**: `Option`, `Result[_, E]`, `Either[L, _]` and
+  the immutable sequences (`List`, `Vector`, `ArraySeq`, `Queue`, `Seq`) the whole family, `Filter`
+  except on `Result` and `Either`; `LazyList` all but `Traverse`; `Array`, `Buffer`, `Deque` and
+  `Set` `Functor`, `Foldable` and `Filter`; `Future` the sendable pair; `Map`, the sorted
+  collections, `Iterator` and `Range` none, each for the reason its signatures show. A sequence's
+  `map2` is cartesian, as its `flatMap`. Why: each impl is lawful, and the laws are tested.
+  Alternatives: `Monad` for the mutable collections (lawful, but `pure` making a mutable array
+  surprises); `Map` as a functor over its values (its `map` takes entries, so it needs a method of
+  another name).
+- Settled on the user's delegation 2026-11-15: **`for` comprehensions admit their sources by conformance**: the last generator an
+  `Iterable` or a `Functor` (or `SendableFunctor`), an earlier one an `Iterable` or a `Monad` (or
+  `SendableMonad`), a guard an `Iterable` (through its lazy `withFilter`, whose views become
+  `Iterable`s) or a `Filter` (through `filter`); in generic code the bounds decide; the calls are
+  then checked as written out, so mixed sources (`for w in words, n in parse(w)`) keep working
+  through the collections' own overloads. A type with `map` and `flatMap` and no impl is no
+  longer a source: the error says which impl to declare. Why: the user's rule that Avin is nominal;
+  the structural rule admitted any type with methods of those names. Alternatives: keeping the
+  structural rule (contradicts the rule); desugaring every comprehension through the traits'
+  members only (loses the collections' precise mixed-source results and `withFilter`'s laziness, a
+  visible change in the order of evaluation). Built on branch `hkt-8` (`admitted_source` in
+  `check.sysl`; `tests/run/for_yield_conformance{,_gc}.avin`, `tests/reject/for_yield_roles{,_more}.avin`,
+  `tests/reject/for_yield_generator_mismatch.avin`), with a definition a guard follows asking
+  `Monad` of its source, as the collections chapter says, though its `map` and `filter` would
+  need only `Functor` and `Filter`. Review with the user: it breaks programs whose own
+  types relied on the structural rule, each fixed by one `impl`; and whether a guarded definition
+  should ask only `Functor`.
+- Decided by the user 2026-11-14: **a built-in type's name in a pattern is a type pattern**:
+  `x is int` tests the type and an arm `int ->` matches an int, for every name in the table of
+  built-in types, the sized integers `iN` included; generic forms stay `_: Vector[int]`; a name
+  with a binding is `n: int`. Built on branch `is-type-name`, where `x is int` had bound a new
+  `int` and was always true (`tests/run/operands_for_traits.avin` tested nothing). Proposed with it:
+  - **Such a name never names a value**: a local (`val`, `var`), a function's, a lambda's or a
+    class's parameter, a data field, and a pattern binding it (`int: T`, `int @ p`, `int + 1`, a
+    comparison pattern, `int*`) are errors, `` `int` is a built-in type, so it cannot name a value
+    `` and `` …, so a pattern cannot bind it: alone it tests for the type, and `n: int` binds the
+    value as one ``. Why: with the names type patterns, `val (a, int) = p` would test where `val int
+    = 3` binds, and `int(x)` in an expression would mean the conversion or the local by context;
+    refusing them everywhere keeps one meaning per name. It also settles the hiding rule for built-in
+    statics: `val string = …; string.byteLength` no longer arises. The library and tests renamed
+    their locals (`unit` → `identity`/`scale`, the vector tree's `i1`–`i6` → `d1`–`d6`, `long`,
+    `real`, `int` locals in tests). Alternatives: allowing them as `val`/parameter names and
+    refusing them only in patterns (two meanings for one name, and destructuring differs from a
+    plain binding); allowing only the eight word names and leaving `iN` free (the user listed the
+    sized integers). Review with the user: `i1`, `i2`, … are common index names, and they are
+    refused too.
+  - **Every type's name in a pattern is its type pattern** (the same decision, extended by the
+    director 2026-11-14 after `a is Cell` was found binding too): a bare or dotted name with no
+    parentheses that is no variant but resolves to a class, trait, `object`, `data` type, alias,
+    `Any`, `Nothing` or type parameter is `_: T`. A variant wins where both exist, so
+    `data Cell(value: int)`'s `Cell` stays the variant's pattern and every variant pattern is
+    unchanged. A local, a parameter (of a function, local function or lambda) or a pattern binding
+    named after a type in scope is refused: `` `Cell` is a type, so it cannot name a value: in a
+    pattern it tests for the type, and `x: Cell` binds a value of it ``. Fields named after a user
+    type are not refused (they are reached as members, and a data field's pattern is positional).
+    Why: one meaning per name in a pattern; a capitalised name quietly binding was the same defect.
+    Alternatives: only refusing capitalised bindings that shadow a type (keeps the always-true test
+    as an error rather than a feature); including field names (more renames for no pattern
+    ambiguity).
+  - **A generic type's name alone in a pattern is refused**, `` `Box` is a generic type, and a type
+    pattern names its type arguments, as in `_: Box[int]` ``. Why: a type pattern compares type
+    arguments exactly, and the run-time test of "a `Box` at any arguments" would be a new kind of
+    test with no sound meaning for variance and value-type arguments yet. Alternatives: testing the
+    class at any arguments (needs a class-only run-time test and a binding type, `Box[?]`, Avin
+    lacks); inferring the arguments from the matched type (works only where they are known, and
+    reads differently by context). Review with the user if a "any instance of `Box`" test is wanted.
+  - A type alias in a constructor pattern, `P(a, b)`, stays refused as before.
+  - **Functions and methods may still be named so** (`cli`'s `int(name)` and `string(name)`
+    options): a function is called, never matched, so no pattern can mean it. A missing-member
+    witness still reads `_: string`, which is the same pattern.
+- Settled on the user's delegation 2026-11-15 (branch `fix-core-promises`): **the standard library's `Sendable` promises are checked
+  against the structure, except where `@trusted_sendable("why")` marks a class**
+  ([actors](/spec/actors/#what-may-be-sent)). This replaces the 2026-11-05 settlement's "the
+  standard library's promises are taken as made", under which `Map.withDefault(f)` answered a
+  sendable map holding a plain function and a thread raced on what it captured. The mark is a
+  class annotation (it trusts the class whether its header or an impl makes the promise), takes one
+  non-empty string saying why the class is safe, is refused outside the standard library, and is
+  an error on a class that promises nothing. Seventeen classes carry it: `Lock`, `Condition`,
+  `Mutex`, `Atomic`, `Channel`, `Thread`, and the futures' `Cell`, `Pool` and `Registry`
+  (synchronization the runtime does); the running `Actor` (its turns are serial) and `Isolated`
+  (an atomic state arbitrates its objects); `TcpStream`, `TcpListener`, `UnixStream`,
+  `UnixListener`, `TlsStream` and `Child` (one owner at a time, checked by every operation).
+  `Future`, `Promise`, `Executor` and `Once` became sendable by their structure, `Cell` gained an
+  `impl[T: Sendable] Sendable` and `Lock` a `: Sendable` for it. Why: the trust is greppable and
+  each entry says its reason; trusting the innermost synchronized class rather than each composite
+  keeps the list short and checks the rest. Alternatives weighed: a list of names in the compiler
+  (invisible at the type, drifts from the library); trusting every class of `avin.threads` (too
+  wide: it hid nothing here, but would hide the next `DefaultMap`); marking the composites
+  (`Future`, `Promise`) instead of `Cell` (more entries, fewer types checked).
+- Settled on the user's delegation 2026-11-15 (branch `fix-core-promises`): **`withDefault`'s function is `@sendable`**, and the
+  `DefaultMap` holds its default as a private `MapDefault` data value, `Fixed(v)` or
+  `Computed(f)`, so `withDefaultValue(v)` takes any value and the wrapper is sendable wherever the
+  map and `v` are. Why: `Map` promises `Sendable` and every map is one, so the default must be
+  sendable for the wrapper to keep the promise; most defaults (`k -> 0`, `k -> k.length`) capture
+  nothing mutable and are unchanged. Alternatives weighed: `Map` not promising `Sendable` (every
+  immutable map would stop being sendable); `DefaultMap` alone not being a `Map` (breaks
+  `val m: Map[K, V] = ….withDefault(f)`); keeping a plain function and making the wrapper not
+  sendable (a trait's implementers cannot opt out). Review with the user: a default that mutated a
+  captured local (a call counter) now uses an `Atomic`.
+- Settled on the user's delegation 2026-11-15 (branch `fix-core-promises`): **a `TlsStream` checks its owner before every operation**,
+  through a token handle as `Child` does, so a stream handed to another thread traps its previous
+  owner at a read served from the bytes read ahead; before, only a read that reached the socket
+  checked, and a buffered read raced. Why: the same rule a `TcpStream` keeps. Alternative: none
+  sound.
+
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **the build cache keeps itself within a limit, least recently
+  used first, with no index**: an entry is a program's build directory (`build/`, `test-builds/`) or
+  one object or archive (`units/`, `runtime/`, `shims/`, `cunit/`), and its modification time is its
+  last use, touched by every build that takes it from the cache (a program's directory when its
+  build starts and before each test `avin test` runs). Every command that builds sweeps the cache at
+  most once in ten minutes, a stamp file in the cache shared by every process, and evicts the
+  oldest entries until the cache is within `AVIN_CACHE_LIMIT` (a size with `K`/`M`/`G`/`T`, `off`
+  for none, default 5G; a value that is neither is an error from every command). Why: builds run in
+  many worktrees and sessions at once, so a shared index would need a lock Sysl's library does not
+  offer, while a touch is one system call and the existing unit-object trim already worked by
+  modification time. Alternatives: an index file of use times (a lock, and a writer killed halfway
+  through it); access times (`noatime` mounts, and macOS updates them lazily); a sweep after every
+  build (the size walk on every build); an hourly sweep (24G had grown within hours). Review with
+  the user: the 5G default and the ten-minute interval.
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **nothing used within the hour is evicted, and an entry is renamed
+  aside, looked at again and put back if a build touched it in between**, before it is removed.
+  Why: no build reading or writing an entry loses it, without a lock; a cache whose fresh entries
+  alone pass the limit stays past it until they age. Alternatives: lease files naming the process
+  (Sysl's library has no way to ask whether a process is alive); `flock` (not in Sysl's library);
+  no grace (a sweep could take the executable `avin test` starts once per test). A shim archive and
+  the record of the libraries it needs beside it are one entry, the archive evicted first and a
+  record newer than the sweep's choice kept, so no build finds the record without its archive.
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **an entry gone from under a build is a miss, never a link
+  error**: every object and archive a build takes from the cache is touched first, and one missing
+  (or a shim archive without its record) is built again; the link looks again at everything it takes
+  from the cache before clang runs and after clang fails, answers an entry gone in between as such
+  rather than as clang's error, and the build then compiles again, which builds the entry anew, and
+  links once more. Why: a cache emptied by hand, or by a disk being cleared, while builds ran made two
+  gates fail to link a shim archive that had been there when the program compiled (2026-11-13).
+  Alternatives: holding the entries open across the link (clang opens them by name); copying them
+  out of the cache first (the copying costs every build).
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **another version's cache is removed three days after its last
+  use**, judged by the newest time on it, its kinds and their entries, and only beside the default
+  cache (never beside a directory `AVIN_CACHE` names), and only for a name that is a version's. Why:
+  no compiler of this version can read it, and three days spares a user switching back. Alternatives:
+  removing every other version at once (an older installed compiler still in use would rebuild each
+  time); never (the unreachable caches are what filled the disk).
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **fetched packages are outside the limit and never evicted by a
+  sweep**; a sweep removes only the debris of interrupted fetches, and `avin cache clean --packages`
+  removes packages (with `--older-than`, those no build has read for that long; a build touches the
+  package it reads). Why: a package is source pinned by `avin.sum`, small beside a build, and
+  fetching it again needs the network and a tag that may since have been removed, so evicting one
+  could break an offline or archived build. Alternatives: counting packages in the limit (evicted
+  first, being rarely touched, for a few hundred kilobytes saved).
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **a sweep removes debris**: anything in the cache whose name holds
+  `.pending-` (a write that was never renamed into place) that nothing has written to for an hour,
+  and in the temporary directory the directories a build works in (`avin-link`, `avin-shims`,
+  `avin-c-unit` and the six characters `make_temp_dir` adds) that nothing has written to for a day,
+  and the `avin-test-builds` ones the compiler's tests left before their builds moved into the
+  cache's `test-builds/`. Why: a killed or out-of-space build leaves these behind, and on this
+  machine its tests had left 8,673 such directories. A program's own temporary directories are never
+  touched, whatever they are called. Alternatives: every `avin-` directory (a program may name its
+  own so); none (the debris is unbounded).
+- Settled on the user's delegation 2026-11-15 (branch `cache-trim`): **`avin cache info | trim | clean`**: `info` shows the cache, the
+  limit, each kind's entries and size, the total with its oldest and newest use, debris, fetched
+  packages and other versions' caches; `trim` sweeps now; `clean` removes every entry, the debris and
+  other versions' caches, `--older-than <n>m|h|d` only what no build has used for that long, and
+  `--packages` the fetched packages too. `avin clean` keeps its meaning (one program's builds, or
+  `--all` every program's). Why: the user sees what the cache holds and can empty it without
+  knowing its layout. Alternatives: folding these into `avin clean` (whose argument is a program).
+- Settled on the user's delegation 2026-11-15: **a marked parameter survives a function becoming a value only through its type**
+  (branch `fix-fn-value-marks`): a function, constructor or method whose parameter is `@sendable`,
+  `@isolating` or `@isolated` is a value only where the value's type gives that parameter a sendable
+  type, which for a function is a `@sendable` function type; with no function type expected, the
+  value takes that form of each marked function parameter (`val sp = spawn[int]` is a
+  `(@sendable () -> int, long) -> Thread[int]`). A type that is a function (a class naming it, or an
+  impl of it for a data type) has an `apply` that marks a parameter only where its function type
+  makes that parameter sendable, and a `@sendable` parameter matches a `@sendable` function type's.
+  Why: function types carry no parameter marks, so `val sp: (() -> unit, long) -> Thread[unit] =
+  spawn` ran a buffer-capturing closure on four threads, and `Isolated`/`Mutex` as values kept an
+  object the caller still used. Alternatives: marks in function types (`(@sendable f: () -> unit) ->
+  unit`; a second way to say what `@sendable () -> unit` says for functions, and for a non-function
+  `@isolating` value a new kind of type); refusing every such function as a value, as a `@threaded`
+  one is (also sound, but `spawn` and `onExit` could never be held or passed). A by-name marked
+  parameter has no sendable type, so `isolate` and `Future.apply` are never values; an `@isolated`
+  function parameter takes the `@sendable` form, which asks a little more than the mark (no
+  captured `var`). Method values keep their own wording, from the call inside the closure they are.
+- Settled on the user's delegation 2026-11-15: **inside brackets a comma ends a `match` arm's one-line body and the `match`** (branch
+  `fix-match-arg`): in call arguments, tuple, collection literals and `with` changes, the comma after
+  an arm (indented arms included) ends the arm, the `match` and the item, so `f(x match` … `_ -> 0,
+  "a")` passes two arguments; a tuple body there is parenthesized; a one-line `yield` value stops
+  at the comma the same way. A comma after an arm when the next line at the arms' depth reads as
+  another arm (it starts with `else` or holds an `->` outside brackets) is reported as a tuple that
+  needs parentheses. Why: the indented arms were read as lines of a block, so the last arm's body
+  swallowed the following arguments as a tuple, a type error far from the cause; a `return` value,
+  a lambda's and a one-line `if`'s bodies already stop at the comma. Alternatives: keep the arms a
+  line context (the spec's "an indented block starts a line again"), which makes `_ -> 0, "a")` a
+  tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
+  line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
+  lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
+  writes. An indented arm body stays a block, where a comma list is a tuple.
+
+**Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
+
+- Settled on the user's delegation 2026-11-15: **a type with a constructor parameter derives nothing through a template, and has no
+  automatic `Display` or `Debug`**: `derives Eq` on a class, `Hash`, `Ord` or a library trait is
+  refused with the parameter named, and a value is shown by its type, as a value of no `Display`
+  is. A data type keeps its built-in structural `==`. Why: a template's impl bounds each of the
+  type's parameters by the trait, a bound for types that no constructor parameter takes, and what
+  displays an `F[A]` is unknown where `F` is any constructor. Reviewed once step 2 landed (branch
+  `hkt-2`) and kept: a hole's bounds (`F[_: Eq]`) say what `F` is applied to, never what an
+  `F[A]` meets, so they give a derivation nothing to call. Alternatives: deriving through a bounded
+  hole (unsound for the reason above: `F[_: Eq]` admits a constructor whose values have no `Eq`
+  of their own beyond identity); requiring `F[A]: Display` per field (a constraint on
+  applications, which impls over constructor parameters, step 6, are the place for). Review with
+  the user: whether step 6's impls over constructor parameters should now give a bounded hole's
+  types a derivation.
+- Settled on the user's delegation 2026-11-15: **`F[-_]` is parsed alongside `F[+_]`**, as the spec writes only `+_`. Why: variance
+  is written the same way everywhere else, and a contravariant hole is the dual demand
+  (`Ordering`-like constructors). Alternatives: refusing `-_` until a use appears.
+- Settled on the user's delegation 2026-11-15: **a type whose parameter is bounded is a constructor only for a hole whose bounds imply
+  that bound** (step 2, branch `hkt-2`, replacing step 1's refusal of every such type at any hole):
+  a hole's bound implies a parameter's where it is the same trait or class, or one that is an
+  instance of it (a trait requiring it, a subclass), as `Ord` implies `Eq`; `Eq` and `Hash` need
+  no hole bound, since every Avin type has them (which is what lets `Map[_, V]` and `Set` be
+  constructors for a plain `_`); a parameter's bound that names the parameter itself is implied by
+  no hole bound. A constructor parameter passed for another is held the same way by its own holes'
+  bounds. The check is made where the type arguments are held to their bounds, so a constructor
+  written and one inferred are refused alike, with one message. Why: an `F[_]` may be applied to
+  any type, so a constructor with a bounded parameter could otherwise be instantiated at a type its
+  bound refuses; implication is the least the hole must promise. Alternatives: checking each
+  application at instantiation (an instance could then fail, against the design); entailment
+  through impls with bounds of their own (no case needs it yet).
+- Settled on the user's delegation 2026-11-15: **every `F[X]` a declaration writes is held to the bounds of `F`'s holes where it is
+  written**, once per application, with the message "`X` does not conform to `B`, the bound of
+  `F`'s argument in `F[_: B]`": a signature naming `F[A]` twice for an `A` without the bound reports
+  both. Why: the spec's rule is "checked wherever the declaration writes `F[X]`"; each place is a
+  separate mistake to fix. Alternatives: one report per declaration (hides the second place).
+- Settled on the user's delegation 2026-11-15: **a hole's variance is what makes `F[A]` variant** (step 2, replacing step 1's
+  invariance of every applied argument): inside the declaration an argument of `F[A]` is at the
+  position its hole gives it, kept at `+_`, flipped at `-_`, invariant at `_`, so `+A` in a field
+  `F[A]` is accepted for `F[+_]` and refused for `F[_]`; `F[Dog]` is an `F[Animal]` only at `+_`
+  (and `F[Animal]` an `F[Dog]` at `-_`), where the arguments are references, as for any type. At
+  each constructor passed, written or inferred, the type's parameter at a `+_` hole must be
+  covariant and at a `-_` hole contravariant; a constructor parameter passed must declare that
+  variance on its own hole. Why: the subtyping assumed inside the declaration is then exactly what
+  each instance grants. Alternatives: none sound that keep `F[+_]` useful.
+- Settled on the user's delegation 2026-11-15: **a constructor parameter has no `Nothing` default**: one that is neither written nor
+  inferred is an error, where a plain type parameter left unconstrained defaults to `Nothing`.
+  Why: there is no "empty constructor" to default to. Alternatives: defaulting to a constructor
+  of `Nothing` (meaningless as a constructor).
+- Settled on the user's delegation 2026-11-15: **with overloads, the first candidate's type parameters decide which written argument
+  is resolved as a constructor**, before a candidate is chosen. Why: written type arguments are
+  resolved once, before overload resolution, and overloads differing in the kinds of their type
+  parameters are rare; resolving per candidate would need resolution repeated per overload.
+  Alternatives: resolving the arguments once per candidate (correct for mixed kinds, more work in
+  the hottest path); refusing overloads whose type parameters differ in kind. Review with the user
+  if overloads of mixed kinds turn up.
+- Settled on the user's delegation 2026-11-15: **`_` alone as a written argument at a call is read as a hole**, so that the checker
+  says what the argument takes (`_` alone names no type, or `_` is no type at a type parameter)
+  instead of `unknown type`.
+
+- Settled on the user's delegation 2026-11-15: **a `for` loop admits its source by conformance to `Iterable`** (branch
+  `nominal-for-in`): besides a range written in place, a `Range` and an array, the source's type
+  conforms to `Iterable` at some element type through its class's or data type's parents and impls,
+  a type parameter's bounds, a built-in type's impls, or, for a union, every member's. A type with
+  an `iterator()` method and no conformance is refused, the error naming the type and the impl to
+  declare; `Option` and `Either`, which have `iterator()` but are not `Iterable`s, are refused too,
+  an option pointed at `toList`. Why: the user's rule that Avin is nominal, and collections.md
+  already said a class is iterable by conforming; the structural check admitted any type with a
+  method of that name. Alternatives: admitting `Option` as a loop source (it is not an `Iterable`
+  anywhere else, so a loop would be the one place it acted as one); refusing unions (each member
+  conforms, and the loop's `iterator()` call is answered by every member).
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **A `select` block's syntax** ([Threads](/spec/threads/#select)).
+  `select` ending its line opens a block of arms written as a match's: `ch.receive() as P -> body`,
+  `ch.send(x) -> body`, `after d -> body`, and `else body` with no arrow; `end select` may close it.
+  `select` is a contextual word, a name anywhere else, as `actor` and `export` are. Why: the arms
+  read as the match arms they are compiled into, `->` is Avin's one arrow (`=>` is rejected
+  everywhere), and `else` is spelled as a match's is. Alternatives weighed: `=>` arms as in the
+  item's sketch (refused by the lexer and by the settled rule on arrows); a reserved keyword (breaks
+  every program naming something `select`, and the library's own prose); a library function taking
+  lambdas (no binding by pattern, no `return`/`break` from an arm, every arm a closure).
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **What a receive arm's pattern means.** `Some(p)` waits for
+  a value and binds it by `p`, any irrefutable pattern a `val` takes; `None` waits for the channel
+  closed and drained; a name waits for either and binds the `Option`; `_` or no pattern waits for
+  either. Any other pattern (a literal, a tuple, alternatives, a type pattern) is an error. So
+  `Some(p)` alone is never ready on a closed, drained channel: a select whose only arms want values
+  from closed channels takes its `after` or `else`, or waits for ever, as a select over a channel no
+  one sends to does. Why: the pattern says what the arm waits for, so an arm never takes a value it
+  then cannot match, and the common loop (`Some(j)` and `None` arms) reads as a match on what
+  `receive` returns. Alternatives weighed: trapping where a closed channel's `None` matches no arm
+  (turns a finished producer into a crash), any pattern with an unmatched receive dropped (loses
+  values). **Review with the user**: whether `Some(p)` alone on a closed channel should wait or trap.
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **Choosing and evaluating.** Every channel, value sent and
+  `after` duration is evaluated once, in the order written, before any arm is tried; the arms are
+  tried in an order drawn at random each select (a Fisher–Yates shuffle from one shared
+  split-mix sequence), so of several ready arms each is equally likely. `after` and `else` together
+  are an error (a select with `else` never waits); two of either is an error. An `after` of zero or
+  less tries the arms once, as `else` does. A send arm on a closed channel traps when it is tried,
+  as `send` does. Why: the order of evaluation is the order of reading; a random order is the only
+  fair one that needs no state per select site. Alternatives weighed: round-robin per select site
+  (needs a hidden mutable per site, shared between threads); trying in written order (starves the
+  later arms); a send arm on a closed channel never ready (hides the program's mistake).
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **How a select waits.** It waits on the very conditions a
+  channel's `receive` and `send` wait on: in one pass, each arm is tried under its channel's lock and,
+  where it cannot complete, a link of the select is enlisted on that condition's queue before the
+  lock goes; the thread then parks once. The runtime wakes a link as it wakes any waiter, and the
+  select's one token decides, by compare-and-set, whether a notification, the timer or a
+  cancellation ended the wait; a notification reaching an ended select's link is passed by to the
+  next waiter. Woken through an arm, the select tries that arm first and, where it cannot complete
+  while the channel still holds a value (or room), notifies the next waiter, so no notification is
+  lost to a select that could not use it; every link is withdrawn when the wait ends. Why: a
+  channel's own operations are unchanged, a select costs one park, and a plain `receive` and a select
+  share one queue in arrival order. Alternatives weighed: a list of selects on each channel woken on
+  every change (wakes every waiting select for each value, a herd of thousands where workers share a
+  channel); passing every unused notification on whatever the channel holds (idle selects hand one
+  notification round for ever: two thousand workers ran forty times slower); a select polling with
+  sleeps (latency and wasted work).
+- Settled on the user's delegation 2026-11-15 (built on branch `select`): **The library names a select is read into are public**:
+  `avin.threads.SelectArm`, `SelectReceive`, `SelectSend`, `selectWaiting`, `selectOrElse`,
+  `selectWithin`, and `Channel`'s `offerReceive`, `offerSend` and `passOn`. Their wait parameter is
+  of a type private to `avin.threads`, so no program can call an arm's operations. Why: the code a
+  `select` is read into is checked in the program's file, so what it names is public, as the
+  actor's `ActorContext` is; members have no module-wide visibility. Alternatives weighed: a member
+  visibility private to the module (a language change of its own); intrinsics the compiler calls
+  directly (the arms are generic, and the channel logic belongs in Avin).
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **`after` and `Ticker` are channels holding a clock, not a
+  timer** ([Threads](/spec/threads/#timers-and-deadlines)). `after(d) -> Channel[Instant]` and
+  `Ticker(period)` with its channel `ticks` give ordinary `Channel[Instant]`s whose next value's due
+  time is kept in the channel; the first receive, `tryReceive` or select arm that looks once it is
+  due delivers it, a waiting receive waits on its condition until then at the most, and a select
+  parks until the soonest due time among its arms' channels, then tries them again. The value is the
+  instant the time fell due (the wall clock, offset by the monotonic clock's lateness), not when it
+  was received. Why: an `after` nobody receives from, the common loser of a select, then leaves
+  nothing behind (no timer in the runtime's heap, no thread, no registration) and is collected as
+  any object is, whatever its duration; a channel is what a select arm takes, so no new arm kind or
+  receive-only type is needed. Alternatives weighed: a thread per `after` that sleeps and sends (lives
+  for the whole duration, ten thousand hour-long `after`s holding ten thousand stacks); a runtime
+  timer that sends when it fires (needs the runtime to run Avin code from its timer thread, and a
+  timer to cancel by finalizer when the channel is dropped); a receive-only `Timer` type (a second
+  kind of select arm for the same wait). `Channel`'s `wakeAt`, `startClock` and `stopClock`, which
+  the select and the clocks call, are public as the select's names are, each taking a type private to
+  `avin.threads`, so no program can call them.
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **Nothing sends to a channel `after` or a `Ticker` made.** A
+  `send`, `trySend`, timed send or select send arm on one traps; `close` is allowed and ends it, no
+  value delivered after. Why: the channel is the clock's; a value sent into it would take the tick's
+  place or sit beside it, and Avin has no receive-only channel type to make the mistake a compile
+  error. Alternatives weighed: letting sends through (a receiver could not trust a value to be a
+  tick); a receive-only channel type (a language feature of its own, which a later decision could
+  still add, making this a compile error). Review with the user if a receive-only view of `Channel`
+  is wanted.
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **A ticker drops the ticks a slow receiver misses, and `stop`
+  drops a waiting one.** The channel holds one tick; one falling due while it is held is dropped, and
+  the ticker moves on to its first period after now. The held tick is the oldest missed. `stop()`
+  also drops a tick fallen due and not received, so none is received after it; a period of zero or
+  less traps; the first tick comes a period after the ticker is made; there is no `reset`. Why: a
+  ticker paces work, and a backlog delivered at once to a receiver that fell behind is the opposite
+  of pacing; after `stop`, a stale tick is a surprise. Alternatives weighed: an unbounded backlog;
+  the newest missed tick held rather than the oldest (needs a write into a value the receiver may be
+  taking); keeping the waiting tick after `stop`.
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **Timed channel waits are `receive(timeout: Duration)` and
+  `send(x, timeout: Duration)`**, overloads beside the plain forms, as `Future.await(timeout)` and
+  `Condition.waitFor(timeout)` are. `receive(timeout)` answers `Option[T]`: `None` for a time that ran
+  out and for a closed, drained channel alike (`isClosed()` tells them apart); `send(x, timeout)`
+  answers whether it sent, and traps on a closed channel as `send` does. A timeout of zero or less is
+  `tryReceive`/`trySend`. Why: the shape of `Future.await(timeout)`, and a loop over a channel's values
+  ends the same way whichever ended it. Alternatives weighed: a three-way result (a value, closed,
+  timed out), heavier at every call for a distinction rarely needed; a `within:` named argument (Avin
+  overloads by type already, and no other timed wait is named so); a millisecond `long` overload (the
+  migration below goes the other way). **Proposed migration, not made here**: the
+  millisecond overloads `Condition.waitFor(timeoutMillis: long)` and `Future.await(timeoutMillis:
+  long)` duplicate their `Duration` forms and could be retired in a release that breaks source, their
+  callers moved to `millis(n)`.
+- Settled on the user's delegation 2026-11-15 (built on branch `timing`): **A scope with a time limit is `withTimeout(timeout, s -> …)
+  -> Option[T]`**, `None` where the time ran out. The body runs with a new scope on a lightweight thread
+  of its own while the caller waits in a select with an `after`; when the time runs out the body's
+  thread is cancelled, which cancels its scope's threads and all below them, and `withTimeout` answers
+  once every one has ended. A result the body returned is kept, however close to the time; a timeout of
+  zero or less runs nothing and answers `None`; nested timeouts end at the sooner time. Why: `Option` is
+  what `Future.await(timeout)` answers, and a timeout is not an error the body made; running the body
+  on a thread of its own is what lets it be stopped wherever it is, `main` included, whose thread no
+  cancellation reaches, with no new runtime mechanism: a timeout is a scope's cancellation. Its cost
+  is that the body is on another thread: `isMainThread()` answers `false` there, and a lock or a
+  condition's mutex the caller holds is not the body's. Alternatives weighed: `Result[T, TimedOut]`
+  (a new error type for a case with nothing to say); `scope(timeout = d, …)` (an overload of `scope`
+  whose result type changes with an argument); a deadline at an `Instant` (the wall clock moves, and a
+  monotonic instant type does not exist yet; one could be added as `withDeadline`); cancelling the
+  calling thread itself from a timer and catching it at the timeout (a new runtime mechanism, an
+  un-cancellable `main`, and a cancellation that must tell its own timeout from an outer cancel).
+  Review with the user: the body running on another thread is visible to code that asks which
+  thread it is on.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **The request
+  context is ambient: it belongs to the running thread, not to an argument.** `Context.current()`
+  reads it (`deadline`, `remaining()`, `value(key)`); `withValue(key, v, body)` and
+  `withDeadline(t, s -> …)` / `withTimeout(d, s -> …)` set it for a dynamic scope, and it is put back
+  as the scope ends. Why: the API server and the pg driver need a deadline and request values to reach
+  every call a request makes, and threading a parameter through every signature on the way (the
+  explicit-argument design) taxes every library in between that does not care, and is lost the first
+  time one forgets it; Avin already has a thread-shaped structure, the scope, that a cancellation
+  follows down, so the context follows the same tree. Alternatives weighed: an explicit `ctx`
+  parameter (the tax above); a general thread-local facility (wider than needed, and a thread-local
+  does not say what a new thread takes, which is the whole question here). The context lives in one
+  slot of the thread's runtime context, marked by every collection. Review with the user: ambient
+  state is invisible at the call site, which is its point and its cost.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **What a new
+  thread takes follows what can cancel it.** A scope's threads (`s.spawn`, and a `withTimeout` or
+  `withDeadline` body) take the whole context, deadline and values, since a cancellation of their
+  scope reaches them. A plain `spawn`, a future's code (`Future(…)`, `map`, `flatMap`, `onComplete`,
+  `executor.future`) and an executor's task (`execute`) take the values with no deadline: nothing
+  cancels them when it passes, so a deadline there would be a number nothing keeps; a future's
+  callback takes the context of the code that attached it, not of the thread that completed the
+  future. An actor's turn takes nothing, from the code that told it or from a worker: an actor
+  outlives any request, and its turns are not a scope's threads, as for cancellation. A pool worker
+  runs between tasks with none. Alternatives weighed: everything takes everything (a deadline readable
+  where it is never enforced, `remaining()` reading zero in a thread still running); nothing but a
+  scope's threads takes anything (a request id lost at the first `Future`); an actor's turn taking the
+  teller's values (a context then travels with a message, which no other message property does).
+  Review with the user: the actor rule means a request id does not cross a `tell`, so tracing across
+  actors needs it in the message.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **A deadline is
+  kept by cancellation, and its error is `withDeadline`'s.** `withDeadline(t, s -> …) ->
+  Result[T, DeadlineExceeded]` is `withTimeout` with an instant: the body runs on a thread of its own
+  and is cancelled when the time comes, so every existing cancellation point observes it (a socket's
+  accept, connect, read and write, a pool's `use` and `lease`, a channel's send and receive, `select`,
+  `sleep`, a future's `await`, a safepoint poll) and no blocking call gained a new error. Its error is
+  `DeadlineExceeded(deadline: Instant)`, an `Error` whose message is `deadline exceeded`. A nested
+  deadline can tighten the context's deadline and never loosen it: the context keeps the sooner one,
+  and an outer deadline cancels an inner later one with its body. The wall clock is read once, as the
+  scope opens; the deadline then runs on the monotonic clock, and `deadline` reports the instant asked
+  for, `remaining()` the monotonic time left, never below zero. Why: a deadline is a cancellation at a
+  time, and the cancellation machinery already reaches every wait, unwinds with deferred statements
+  run, and gives pooled resources back; `Result` because request code returns `Result` and `?`s it
+  (`withTimeout` keeps its `Option`). Alternatives weighed: each blocking call checking the context and
+  answering an error (every wait's signature and every caller change, and code that computes is never
+  stopped); cancelling the calling thread itself (rejected for `withTimeout` above). Review with the
+  user: inside the body the deadline is never an error value, it is a stop; code that must tidy up
+  (pg sending a CancelRequest) does it in a `defer`, whose waits are not cancellation points.
+- Settled on the user's delegation 2026-11-16 (built on branch `request-context`): **Keys are typed
+  and told apart by identity: `Key[T](name)`.** `withValue[K: Sendable, T](key: Key[K], value: K,
+  body: () -> T)` takes only a value of the key's type, and `value[T](key: Key[T]) -> Option[T]`
+  answers that type; the value is held as an `Any` and recovered by a type pattern inside the library,
+  which reification makes exact, so no lookup casts. Two keys of one name are two keys, so a module's
+  values are reached by its own key alone. The value must be sendable, since the threads a scope starts
+  read it. Alternatives weighed: string keys (a lookup that must name its type and can be wrong);
+  keys compared by name (two modules' `"id"` would collide).
+
+**Higher-kinded types, inference without bounds, hole variance and hole bounds** (build plan step
+2, branch `hkt-2`)
+
+- Settled on the user's delegation 2026-11-15: **an unbounded constructor parameter is inferred from the type an argument or the
+  expected type gives `F[X]`, named bare**: a data type, class or trait with exactly as many type
+  parameters as `F` has holes, a subclass by its own name (`Crate[A]` passed as `F[A]` is `Crate`,
+  not its superclass), or another constructor parameter in scope applied to as many arguments.
+  Once `F` is known, the rest of the argument is held to the type it makes with that type's own
+  variance, so a covariant argument still widens (`both(Some(dog), Some(cat))` for
+  `both[F[_], A](x: F[A], y: F[A])` takes `A` as `Animal`, since `Option` is covariant). A type
+  of more parameters, of fewer, a type whose parameter takes a constructor, or one that is no
+  data type, class or trait decides nothing and is reported as "cannot infer `F` from `T`: …;
+  write it, as in `f[…](arguments)`", the example leaving open the arguments that match the
+  application's own known ones (`Either[string, _]` for an `F[int]` given an
+  `Either[string, int]`), else the first ones. Why: the spec's rule ("a type of more is an error
+  asking for `F` to be written"); the example is the likeliest constructor meant. Alternatives:
+  always leaving the first arguments open in the example (wrong for `Either[string, int]`);
+  holding the arguments invariantly once `F` is decided (refuses calls every instance accepts).
+- Settled on the user's delegation 2026-11-15: **a function's or method's type arguments taken as a value (`k.pick[Dog]`) are held
+  to their bounds, as at a call** (a fix found in step 2: a method value checked no bound at all,
+  so a bounded method could be instantiated at a type its bound refuses, a constructor at a hole
+  it may not fill among them).
+
+**Higher-kinded types, constructor traits and their impls** (build plan step 3, branch `hkt-3`)
+
+- Settled on the user's delegation 2026-11-15 (branch `hkt-3`): **a constructor trait's default
+  bodies are compiled once per implementing constructor**: each instance of a constructor trait's
+  method takes the constructor after its type arguments, and `Self` stands for it there (the
+  static members `Self.pure` and `F.pure` come with step 5, the entry above). Why: a body shared by
+  every conforming type sees `Self` as an object, but a `Self[B]` may be an option or another value
+  laid out as no object is, and a shared `mapTwice` built that way crashed at run time.
+  Alternatives: refusing default bodies in constructor traits (needlessly narrow, and `Monad`'s
+  `map` and `map2` come from them).
+- Settled on the user's delegation 2026-11-15: **the methods that meet a constructor trait's are the type's own: those its
+  declaration and its impls declare, never a superclass's.** Why: the spec's rule names "the
+  type's own methods", and a superclass's method answers the superclass's type, the reason a
+  subclass inherits no conformance. Alternatives: also meeting with inherited methods whose
+  results happen to fit (a `foldLeft` would; a `map` never does). Review with the user if a class
+  hierarchy wants an inherited `foldLeft` to meet `Foldable`.
+- Settled on the user's delegation 2026-11-15: **two overloads that both meet one trait method are an error at the impl**, naming
+  the method. Why: a call through the bound would have two methods to call, and choosing the
+  more specific is a second overload resolution no call site shows. Alternatives: the more
+  specific overload, as a written call would pick (more code, and a choice the reader cannot
+  see); the first declared (arbitrary).
+- Settled on the user's delegation 2026-11-15: **the meeting decides a method's own type parameters from where they first appear in
+  its parameter types, against the trait's, then in its result; one still undecided takes its
+  lower bound, and one with none is an error naming it.** Every parameter and the result are then
+  checked with what was decided, each seen as the other's with no conversion (a reference seen as
+  a supertype, as a covariant part is; never a box). Why: the spec's "whose own type parameters
+  that call decides (a lower bound by its bound)"; the order makes `List`'s `flatMap(f: (T) ->
+  Iterable[U])` take `U` from the trait's `List[B]` seen as an `Iterable`. Alternatives: full
+  inference by the call checker (heavier, and its tiers of defaults would decide what the trait's
+  call does not).
+- Settled on the user's delegation 2026-11-15: **a constructor trait requires only constructor traits**, each at its own parameters
+  in order; `trait Shown[A]: Functor[A], Display` is an error. (Widened by the settled entry of
+  2026-11-14, branch `hkt-7`: it may also require a trait for types that bounds constructors.) Why: a trait for types bounds what
+  a value is, and the constructor trait's `Self` is no value's type, so what the requirement would
+  promise is unclear. Alternatives: reading it as a bound on every application `Self[A]` (a
+  constraint on applications, which impls over constructor parameters, step 6, are the place for).
+- Settled on the user's delegation 2026-11-15: **a constructor trait's arguments are no position of a variance** for the conforming
+  type: `List[+T]` and `Result[+T, +E]` conform to `Monad[T]`, an invariant parameter. Why: no
+  value has the trait as its type, so `Monad[Dog]` and `Monad[Animal]` are never compared; the
+  subtyping of `F[Dog]` is the hole's (`F[+_]`). Alternatives: none that let a covariant type
+  conform.
+- Settled on the user's delegation 2026-11-15: **a class may state a conformance to a constructor trait in its header**, `class
+  Crate[A]: Functor[A]`, held as an impl's is; the form leaving the trait's arguments off is an
+  impl's only. A class's methods meeting the trait's need no `override`, and may write it. Why:
+  a header conformance is one an impl could state, and the meeting methods are the class's own,
+  which override nothing. Alternatives: requiring an impl for constructor traits (no reason a
+  header could not say the same).
+- Settled on the user's delegation 2026-11-15: **the conformance's errors are reported at the impl, a meeting's at the method where
+  the impl declares it and at the impl otherwise**: a library type's method that does not meet is
+  reported where the program's impl names the trait. Why: the impl is what the program wrote; the
+  library's method is not the mistake.
+
+**Higher-kinded types, inferring a constructor through its bound** (build plan step 4, branch
+`hkt-4`)
+
+- Settled on the user's delegation 2026-11-15: **the spec's third place to look, "the one trait among those it conforms to that has
+  one", is left out, since no type can reach it.** An impl is never for a trait, and a trait that
+  requires a constructor trait is itself one, so a type conforming to it conforms to what it
+  requires at the same holes, as its own; a type conforming to it at fixed arguments
+  (`class Digits: Bag[int]`) is refused at the declaration. A type is therefore matched as itself,
+  then as its superclasses nearest first, and a type with no conformance there is an error naming
+  the bound and the type. Why: code for a case no program can write would be untested. Review
+  with the user: it returns, with its "several such traits" error, if traits come to implement
+  constructor traits by impls (`impl Monad for Seq`), which the spec's `pairUp[Seq, …]` example
+  presumes and the library step will want.
+- Settled on the user's delegation 2026-11-15: **with several constructor-trait bounds, each conformance the type (or the superclass
+  matched) has decides; two that leave different arguments open are an error naming both**
+  (`Pair` implements `Mappable` as `Pair[int, _]` and `Lefty` as `Pair[_, int]`), and a bound the
+  type lacks is reported as for a written constructor. Why: the bounds are one demand on one
+  constructor, so the nearest type with any of them is the answer the others are checked against.
+  Alternatives: the first bound written decides (order-dependent); the nearest type with all of
+  them (skips a subclass's own conformance for a superclass's, which the spec's no-inheritance rule
+  forbids).
+- Settled on the user's delegation 2026-11-15: **an argument written out of a constructor joins only where the type's parameter is
+  covariant and the argument a reference type known at that argument; the expected type, checked
+  first, fixes it.** `second(dogs, cats)` makes `F` `Result[_, Animal]`; with
+  `val r: Result[int, Dog] = second(dogs, cats)` the expected type has made `F` `Result[_, Dog]` and
+  the cats are refused. Why: the expected type decides type arguments before the arguments do for
+  every generic call. An argument the first argument leaves unknown (`Ok(1)`'s error type) is
+  decided by the next, as an invariant one is.
+- Settled on the user's delegation 2026-11-15: **inference sees a subclass as its superclass, or a type as a trait, only where a value
+  is read out** (a fix found in step 4, which matching through a superclass's conformance meets):
+  at an invariant argument or a function's parameter, inference held a `Box[TallShelf[int]]` to be
+  a `Box[Shelf[A]]`, and a `(Dog) -> int` an `(Animal) -> B`, so generic code could store a `Shelf`
+  in the box or pass a cat to the function, reading memory that was never a `TallShelf`'s or a
+  `Dog`'s. Both are now refused; a type that is the class itself is still taken there.
+
+**Higher-kinded types, static members on constructors** (build plan step 5, branch `hkt-5`)
+
+- Settled on the user's delegation 2026-11-15: **a constructor named bare, or with `_` for the arguments it leaves open, has as its
+  static members those of the constructor traits it implements at exactly those holes**, each
+  conformance held as a constructor argument's is (the holes the impl leaves open, the arguments
+  written out meeting the impl's bounds): `Option.pure`, `Result[_, E].pure`, `Parsed.pure` for an
+  alias that is a constructor, and `Box[_].pure`, the same as `Box`. `Result[int, _].pure` is an
+  error saying `Result` implements the trait as `Result[_, E]`. Why: a static member of a
+  constructor trait names no parameter of the trait, so the constructor is all a call needs, and
+  the conformance says which constructor it is. Alternatives: look the member up on the type at
+  any arguments (would let `Result[int, _]` reach a member of the conformance at the other hole).
+- Settled on the user's delegation 2026-11-15: **a static member of a type's own conformance to an ordinary trait is not reached on
+  the type named bare**: `Box.make()` for `impl[T] Make for Box[T]` is an error asking for the type
+  arguments (`Box[A].make(…)`), as before. Why: that member's types name the type's parameters,
+  which a bare name leaves unknown. Alternative weighed: inferring them from the call as a generic
+  function's are (a separate feature, not part of constructors).
+- Settled on the user's delegation 2026-11-15: **a constructor trait's static member still takes no default body**, as every trait's
+  static member does: defaults that call `Self.pure` are its methods'. Why: the rule for static
+  members is one rule for every trait; the per-constructor compilation would allow it, so it can be
+  added later without changing anything written now. Review with the user if the library wants a
+  derived static member (a `Monad.unit` from `pure`).
+- Settled on the user's delegation 2026-11-15: **two bounds that each declare a static member of one name and parameter types make a
+  call of it on the parameter ambiguous**, by the ordinary overloading rule, rather than one bound
+  being preferred. Why: nothing says which constructor's member is meant beyond the bounds.
+- Settled on the user's delegation 2026-11-15: **a static member called on a value of `F[X]` is an error pointing at `F.pure(…)`**;
+  on a value of a known type, `Some(1).pure(2)`, the existing message names the type. Why: the
+  member is the constructor's, and the constructor is what the call writes.
+- In each instance a static member called on a constructor is compiled once per constructor: the
+  type's own member at `Nothing` for the holes, which it never names, so `Option.pure` and
+  `F.pure` at `Option` are one instance.
+
+**Higher-kinded types, impls over constructor parameters** (build plan step 6, branch `hkt-6`)
+
+- Settled on the user's delegation 2026-11-15: **an impl adding to `F[A]` belongs to the trait bounding `F`**: written in the module
+  of one of `F`'s bounds (or in the core library) it is that trait's own and seen everywhere, and
+  written anywhere else it is an extension. With `F[G[A]]` it is `F`'s bounds, the head's, that
+  count. Why: such an impl adds to every type the bound's conformance reaches, as `impl[T] Seq[T]`
+  adds to every sequence, and that impl's home is the trait's module. Alternatives: always an
+  extension (would make the library's own `impl[F[_]: Monad, A] F[A]` need an import of its own
+  module); any module of any bound named in the impl (blurs which module owns it).
+- Settled on the user's delegation 2026-11-15: **such methods are found after the type's own, wherever the impl is written**: a
+  type's own method, or the bound's, of the name and parameter types is called, and a call that
+  sees only the bound, in generic code, calls the added one. Why: the impl adds to a family of
+  types as an impl adding to a trait does, and that is the trait rule; the rule for impls adding to
+  one type built from parameters, which makes a clash with the type's own method ambiguous, would
+  make every type that has, say, its own `twice` unusable once the library adds one. An extension
+  adding a method the bound already declares is an error where it is declared (`map` on
+  `Mappable`).
+- Settled on the user's delegation 2026-11-15: **the constructor parameter need not be bounded**: unbounded, `F` is matched as
+  inference matches it without a bound, a type of exactly as many arguments as `F` has holes,
+  named bare. Why: it is the inference rule, unchanged, and refusing it would add a rule; such an
+  impl's methods reach nothing of `F[A]` but can pass it on. Alternative: require a constructor
+  trait bound (an error naming the bound to add). Review with the user if the unbounded form should
+  rather be an error.
+- Settled on the user's delegation 2026-11-15: **a receiver whose type no such impl matches is told why**: `twice` on a
+  `Plain[int]` says the method is for `F[A]` where `F` implements `Mappable` and that `Plain` does
+  not implement it, the reason inference gives; an `F[int]` whose `F` lacks the bound says its
+  constructor is bounded by no `Pointed`. Of several such impls adding the name, only one is named,
+  since every generic type is an instance of each; an impl adding to a type the receiver is an
+  instance of, `Option[Option[T]]`, is named first.
+- Settled on the user's delegation 2026-11-15: **a function value of an extension method the file does not see, or of a private
+  added method, is reported as a call of it is** ("`shout` is added to `string` by module
+  `extras`, which this file does not import"), where it said only that the type has no member. This
+  holds for every extension, not only those over constructor parameters.
+- No impl of a trait is for `F[A]`: a conformance is a type's, stated once for it, and an
+  application of a constructor parameter is no type of its own. The impl declares no static member,
+  as no impl adding to a type built from parameters does.
+- Settled on the user's delegation 2026-11-15 (built on branch `rendezvous`): **a [rendezvous](/spec/threads/#rendezvous) is
+  `Channel[T](0)`, and a channel with no capacity stays unbounded through a default of `unbounded`,
+  a public `val` in `avin.threads` holding the largest `int`.** This replaces the settled "unbounded
+  at zero". Why: zero is the capacity that holds nothing, so reading it as a hand-off says what it
+  is; `Channel[T]()` keeps its meaning, so no program changes (none in the tree passed `0`); and an
+  unbounded channel is the bounded one at a bound it can never reach, so it needs no case of its
+  own. Alternatives weighed: keeping zero unbounded and adding `Channel.rendezvous[T]()` or a
+  `rendezvous` flag (a second spelling of capacity, and zero would still read wrongly);
+  `capacity: Option[int] = None` (every bounded channel would write `Some(n)`); a negative sentinel
+  such as `-1` for unbounded (a capacity that is not one, and a negative one traps). Review with the
+  user: it changes what an explicit `Channel[T](0)` means, from unbounded to a rendezvous.
+- Settled on the user's delegation 2026-11-15 (built on branch `rendezvous`): **a rendezvous hands values to waiting parties directly,
+  and a select's arm is a party that a partner claims.** A plain sender or receiver waits on a
+  condition of its own until a partner completes it; a select's arm on a rendezvous stands on the
+  channel while it waits, and a partner completes the arm only by first ending the select's wait
+  through that arm (`select_claim` in `runtime/avin/rt/select.sysl`), so no select runs two arms.
+  A select can be claimed only once every arm of its round is tried and enlisted; a partner that
+  meets one still trying its arms wakes it (a poke), and the select, trying that arm again, waits
+  out a partner select still mid-round rather than missing it. Why: it keeps the one-lock-at-a-time
+  select of buffered channels, and the claim is the one atomic step that decides an arm. The
+  receiver "has the value" once a sender completes it, so a receiver cancelled after that stops with
+  the value. Alternatives weighed: a sender depositing its value and waiting for it to be taken (a
+  select's send arm cannot deposit without committing to it); locking every channel of a select at
+  once (a lock order across channels, and a different design for every select). The sender's wait
+  is its own kind in the thread dump and deadlock report, "waiting to hand a value to a receiver".
+- Settled on the user's delegation 2026-11-15 (built on branch `hkt-9`): **a diagnostic's article follows how a type's name is read.**
+  A capital letter standing alone at the start of a name (`F[int]`, `T`, `X2`) is read as the letter,
+  so it takes `an` before A, E, F, H, I, L, M, N, O, R, S and X and `a` otherwise (`an F[int]`,
+  `a T`, `a U`); any other name takes `an` before a, e, i, o in either case and `a` before `u`
+  (`a unit`, `a usize`, `a Unicorn`), one helper (`article` in `check.sysl`) for every message. Why:
+  constructor and type parameters are single letters, and "a `F[int]`" read wrongly; the type names
+  that begin with `u` mostly sound a consonant. Alternatives weighed: treating `u` as a vowel, as
+  three of the four old helpers did ("an `unit`"); reading every all-capital name as letters
+  (`an HTTP`, but `a NASA` reads as a word, and no type name in the library is one).
+- Settled on the user's delegation 2026-11-15 (built on branch `c-void-ptr`): **a C binding's
+  [`void *` or `const void *` parameter](/spec/c-bindings/#memory-of-no-type) takes an array of any
+  element type an array crosses as, or a `ByteBlock`, and its length counts bytes.** The array's
+  elements go to C where they are, as for a typed pointer, with no element type checked against the
+  header (there is none to check); the parameter marked `length(p)` is told the array's length times
+  its element size, a `long`, and an `inout` length C writes back is bytes too, bounded by the
+  array's bytes. `None`, or the word `null`, passes null. C writes through `void *` and only reads
+  through `const void *`. Still refused: `out` or `inout` on a `void *` (C writes no value of a type
+  through one), a `void *` result other than one discarded by a `unit` binding, and an array whose
+  length no parameter carries, so `memcmp`'s second pointer is refused. Why: the gap was met by
+  marshal's `sysctlbyname`, the shape of the C library's every untyped buffer (`read`, `write`,
+  `getentropy`, `sysctl`); an array and a block are already the binding layer's memory, so this adds
+  no new kind of value, only drops the element check, and counting bytes is what every such C
+  function means by its length. Alternatives weighed: an `Array[byte]` only, decoded in Avin (sound,
+  but reading an `int` or a `long` would need a byte decoder in every program, and no such helper
+  exists); `out int *p` written in the prototype where the header says `void *` (breaks the rule
+  that a prototype is the header's, and needs a size for the length); a length in elements (wrong
+  for every `void *` function, which counts bytes); a shared `length(a, b)` for `memcmp`-shaped
+  functions (useful, but a separate feature). **Review with the user**: whether a shared length is
+  wanted, and whether a callback's `const void *` should lend a `ByteView`, which is still refused.
+- Settled on the user's delegation 2026-11-15 (built on branch `c-opaque-errno`): **a pointer to an
+  opaque pointer is [memory of no type](/spec/c-bindings/#memory-of-no-type)**: `void **`, and a pointer
+  to a typedef the headers make `void *` or `const void *` (`rusage_info_t *`), take what `void *`
+  takes, their length in bytes; C fills an array through `out void *` or `out T *` with `T` such a
+  typedef, its `length:` counting bytes, rounded up to whole elements, the rest zero; and C fills a
+  struct mirror through `out void *`, `out void **` or a pointer to a typedef. The prototype is still
+  the header's: `rusage_info_t *`, held to the header exactly. Only the headers say what a typedef
+  is, so the C unit checks an array's elements through a pointer to a typedef as the typedef's
+  elements *or* the typedef being `void *`, and measures which, beside the integer measurements, for
+  lowering to count the length in bytes or in elements; a mirror's typedef is checked to be its
+  struct or `void *`. Memory of no type C *allocates* (`out void **` with `array:` or `bytes:`) is an
+  `Array[byte]`, since its length in bytes need not be a whole number of wider elements, and copying
+  a rounded-up count would read past C's allocation. Why: marshal's `proc_pid_rusage` needed a
+  process's physical footprint, and every form it tried was refused; the typedef's kind is decided
+  where the spec decides every typedef's, by the Avin type and the C unit's check. `length:` counts
+  bytes for memory of no type as `length(p)` does, so `sizeof(struct rusage_info_v2)` is written as
+  the header says it. Alternatives weighed: a word in the prototype marking the pointer untyped, or a
+  cast (`(void *) rusage_info_t *buffer`), which the C unit's measurement makes unnecessary; a
+  `length:` in elements for memory C fills (consistent with typed arrays, but the binding would divide
+  the struct's size itself); a mirror field for a fixed array (`uint8_t ri_uuid[16]`), which would make
+  the struct mirrorable, left for when a program needs a field after one rather than the array form.
+  **Review with the user**: fixed-array fields in struct mirrors.
+- Settled on the user's delegation 2026-11-15 (built on branch `c-opaque-errno`): **a binding marked
+  [`errno`](/spec/c-bindings/#errno) answers `Err` of `errno` where C answers -1**, `Result[T, Errno]`
+  or `Result[T, <integer>]`, its `Ok` split as a result that is not a status is (the C result kept
+  as an integer or left out, then the out values). The bare word follows `blocking`'s form. `errno`
+  is read by the C unit's glue straight after the call, written through a pointer the binding passes
+  after the arrays' lengths, so nothing — a `length:` expression, a `blocking` call's return to the
+  scheduler, a collection — runs between the call and the read; the binding is always called through
+  glue. The failure is the -1, not `errno` (a function may set `errno` and succeed); a C result of an
+  unsigned type fails at all ones. `avin.c.Errno` is a data type of the standard library with a case
+  per POSIX error number both macOS and Linux define, named as C names them (`ESRCH`, `ENOENT`), and
+  `Other(code)`; its `message` is the number's sentence, the same on every platform. The C unit
+  measures each case's value by its macro (`<errno.h>` is included for a program with an `errno`
+  binding), and lowering compares the number against them. Why: the C bindings' first decisions named
+  an `errno` flag answering `Result[T, int]` from a `-1` result as the likely form;
+  named cases let a program match `Err(ESRCH)` without knowing a platform's numbers, and C's own
+  names are what a reader of a man page looks for. Alternatives weighed: mapping to `io.IoError`
+  (loses `ESRCH` and `EPERM`, which it has no kinds for); an enum mirror in the library (needs a C
+  unit for every program and traps on a number no variant holds); PascalCase descriptive names
+  (`NoSuchProcess`), which a man page does not use; a null pointer result as the failure too (not
+  built: a handle or string answered with `errno` is still refused, the C result being an integer).
+  **Review with the user**: the C names as variant names, and `errno` on pointer results.
+- Settled on the user's delegation 2026-11-15 (built on branch `c-opaque-errno`): **`avin check`
+  builds the C unit**, revising `check-stops-early` (2026-11-06) for C: a binding the headers refuse
+  (a prototype the header contradicts, an array's elements, a typedef's kind, a constant) is refused
+  by `check` as by `build`, `run` and `test`. Why: marshal met a binding `check` passed and `test`
+  refused; the C unit is one clang compile, cached by its source's hash, far cheaper than the shims
+  and the lowering `check` gave up, and only C bindings make one. The Sysl shims stay behind
+  `--bindings`. Alternatives weighed: keeping `check` silent and documenting it (the disagreement
+  marshal met); moving the checks into the checker (impossible: only the headers know a typedef).
+- Settled on the user's delegation 2026-11-15 (built on branch `test-orphans`): **a program `avin
+  run` or `avin test` starts watches its runner and ends when the runner does, even one killed
+  with `SIGKILL`; and `avin run` contains its program too**, closing the known limit of
+  `runner-orphans` (2026-11-12). The runner names itself in `AVIN_RUNNER_PID`; the runtime, as a
+  program starts, takes the variable out of its environment and, only when the process it names is
+  the program's parent, starts a thread that waits for that process to exit (a kqueue
+  `EVFILT_PROC`/`NOTE_EXIT` on macOS; elsewhere a check of the parent every 100 ms). When the runner
+  is gone the program sets its own `SIGTERM` aside, sends `SIGTERM` to the group it leads (or to
+  itself when it leads none), waits 200 ms, and sends `SIGKILL`. A program started any other way, or
+  with the variable naming a process that is not its parent, watches nothing. `avin run` started
+  away from a terminal now starts its program as the leader of a group of its own, passes `SIGTERM`,
+  `SIGINT` and `SIGHUP` on to the group, kills it 2 s after the first if it is still running, exits
+  with the program's status, and stops whatever is left of the group once the program has ended.
+  Started at a terminal as its foreground job, `avin run` keeps the program in that job, so the
+  terminal's Ctrl-C and Ctrl-Z and the shell's job control reach both as before; it passes on
+  `SIGTERM` and `SIGHUP` to the program alone and lets the program decide what Ctrl-C means. Why: four
+  test programs of 0.0.21 runs were found alive after 37 h at PPID 1, one still holding a port
+  another project's tests then collided with: runners killed outright (a deadline, a stopped
+  agent) cannot act, and `avin run` did not contain its program at all. Alternatives weighed: a
+  thread in every program that polls its parent (a cost for programs nobody runs under a runner,
+  and on macOS a kqueue waits for free); Linux's `PR_SET_PDEATHSIG` (fires when the parent
+  *thread* that started the child ends, and runners start programs from worker threads; macOS has
+  none); keeping the terminal case in a group of its own given the terminal (`foreground`), which
+  would leave a Ctrl-Z stopping the program alone while `avin run` waits for it, wedging the shell;
+  a longer grace for the watch (the runner that would have waited is gone). Known limits: at a
+  terminal, a program's own children are not reached when `avin run` is killed outright, only the
+  program; a program that ignores the runner's death by leaving its group or session is beyond
+  reach. **Review with the user**: the terminal case keeping the program in the shell's job.
+
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **a request knows its
+  client's address and its route** ([system library](/spec/system-library/#http-server)).
+  `ServerRequest` gains `remote` (the peer's IP address, numeric, without its port) and `route` (the
+  pattern of the route a router chose, set by `Router` as it binds the parameters), and `ByteStream`
+  gains `remoteAddress`, `None` by default, which `TcpStream` (accepted and connected) and `TlsStream`
+  answer. Why: a rate limiter keys by client by default and a metric labels by route; a path as a
+  label would grow without bound, and the address was being dropped at `accept`. The address is
+  without its port, since a client opens many connections and is one client. Alternatives weighed:
+  wrapping `Route`s in a metrics-specific function that knows each pattern (no help for the access log
+  or a program's own middleware); taking the address from `X-Forwarded-For` (anyone can send it; a
+  program behind a proxy gives the limiter a `key` that reads it). Review with the user: whether
+  `remote` should also carry the port.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **the access log.**
+  `http.accessLog(sink, format, clock, ids)` is a middleware, writing after the handler answers, in
+  two formats, `PlainLines` and `JsonLines`, with method, decoded path (escaped so the line stays one
+  line of fields), status, body length, duration, request id and address. No timestamp: whatever
+  collects standard error stamps lines, and a test's lines stay fixed. The query is left out, as it
+  can hold secrets. A client's `X-Request-Id` is kept when it is 1 to 128 characters of letters,
+  digits and `-._:+/=@`, else replaced by 16 `SecureRandom` bytes in hex; the handler reads it from
+  the request's own header, which `withHeaderReplaced` sets, and the response echoes it unless the
+  handler set one. A streamed body of unknown length logs `-`/`null` and not the bytes written,
+  since the line is written when the handler returns, before the body is. Alternatives weighed: a
+  common/combined log format (no request id, timestamp in brackets, request line quoted with the
+  query); counting a streamed body as it is written (the line would wait for the stream to end); a
+  request-scoped value in place of the header (that mechanism is a separate branch,
+  `api-request-values`; the header is what clients and proxies already read). Review with the user:
+  a handler that traps writes no line, since Avin has no unwinding; logging the server's `500` would
+  need a hook in `serve`.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **request metrics.**
+  `Metrics` holds per-(method, route, status class) counters and per-(method, route) histograms of
+  fixed buckets in one `Mutex`, plus an atomic in-flight gauge, rendered as Prometheus text format
+  0.0.4 with the names `http_requests_total`, `http_request_duration_seconds` and
+  `http_requests_in_flight`; times are whole microseconds, written as seconds without trailing
+  zeros. Default buckets are the usual 5 ms to 10 s. A request with no route is labelled `""`. Why: one
+  lock per `Metrics` is simple and exact, and a request does a few map updates under it; the format is
+  what every scraper reads. Alternatives weighed: per-route atomics (route series are created on
+  demand, so a map and a lock are still needed); a metrics registry of general counters and gauges
+  (more than this item needs; `observe` covers counting another way); labelling by status code rather
+  than class (more series for little gain). Review with the user: a handler that traps leaves the
+  in-flight gauge one too high, for the same lack of unwinding.
+- Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **rate limiting.**
+  `RateLimiter(rate, per, burst, key, maxKeys, clock, errors)` is a token bucket per key, computed as
+  each bucket's next-token time in integer microseconds (the generic cell rate algorithm, exactly a
+  token bucket), so a bucket is one `long` and needs no floating point. A full bucket equals a new
+  one, so forgetting it loses nothing; at `maxKeys`, making a bucket forgets every full one, or where
+  none is full the one nearest to full. A `429` carries `Retry-After` in whole seconds, rounded up and
+  at least one. Alternatives weighed: refusing a new key when the table is full (a flood of
+  addresses would lock every new client out); a periodic sweep on a timer thread (a thread per
+  limiter; sweeping when room is needed bounds memory the same); a sliding-window counter (less
+  smooth, more state). Review with the user: evicting a bucket that is not full forgives that
+  client's debt, which an attacker cycling more than `maxKeys` addresses can use; and the default
+  key, the client's address, puts every client behind one proxy in one bucket.
+- Settled on the user's delegation 2026-11-15 (built on branch `resolve-blocking`): **which library
+  bindings are [blocking](/spec/sysl-bindings/#calls-that-wait).** Name resolution
+  (`sysl.net.resolve`, which `TcpStream.connect` calls; since 2026-11-16 made on a helper thread
+  instead, below) and connecting a Unix socket are, as are
+  reading, writing and opening a file in `avin.fs` and `avin.process`'s redirections (the whole-file
+  calls, `File`'s `read`, `write` and `flush`, and every open), and reading a time zone's file: each
+  can wait on a pipe, a FIFO, a device or the network. Asking about a path, listing a directory,
+  creating, removing and renaming entries are not, nor are closing a file, spawning a process,
+  reading the OS's entropy or the in-memory TLS engine. A test in `shim_tests.sysl` names each
+  waiting binding a program reaches and asserts it blocking. Alternatives weighed: binding every
+  file-system call blocking (the metadata calls do not wait on another party, and each blocking call
+  is copied across); only the calls that touch the network (a FIFO open or read held its worker and
+  every collection, which `tests/run/fs_fifo_blocking.avin` shows). Review with the user: a
+  directory operation on a network file system can also wait, and standard input and output, which
+  the runtime reads and writes through intrinsics rather than bindings, are not yet safe for the
+  collector while they wait.
+- Settled on the user's delegation 2026-11-16 (built on branch `resolve-cancel`): **a host-name
+  lookup is a [cancellation point](/spec/threads/#cancellation).** As a blocking call it was not: a
+  `withTimeout` waits for what it cancelled to end, so a slow resolver held a connect's time limit
+  past its deadline (a 100 ms `withTimeout` around a connect whose lookup took 3 s answered after
+  3009 ms). The runtime (`runtime/avin/rt/lookup.sysl`) makes each lookup on a helper thread and the
+  caller waits for a byte on a pipe as it waits on a socket, so a cancellation ends the wait at once;
+  an abandoned lookup runs on to the resolver's answer, which its helper throws away before closing
+  the pipe. The host, port and answer are copied into a slot and out again under one lock, so
+  nothing either thread holds is shared. Helpers are detached, take the oldest queued lookup, and end
+  once none is queued; at most 64 run at once, which bounds how many abandoned lookups can still be
+  running. Past the bound a new lookup waits in the queue, and a cancellation drops it from there. A
+  numeric address is resolved inline. A lightweight thread waiting on a lookup shows in a thread dump
+  as "looking up a host name". Tests hold the helpers through a runtime hook (`resolve_hold`), since
+  no resolver that never answers can be stood up without system configuration on every platform.
+  Alternatives weighed: one detached thread per lookup with no bound (abandoned threads pile up
+  without limit while the resolver is down); failing a lookup at once past the bound (fails lookups
+  of hosts that would answer); the platform's asynchronous resolver (`getaddrinfo_a` is glibc's
+  alone, and macOS's is a different API); a resolver of Avin's own speaking DNS (loses
+  `/etc/hosts`, NSS and the system's configuration). Review with the user: whether lookups of the
+  same host and port in flight at once should share one helper, which would keep repeated retries
+  during a resolver outage from filling the 64.
+
+- Settled on the user's delegation 2026-11-17 (built on branch `byte-writer`, for the PostgreSQL
+  package's `COPY … TO STDOUT`): **`avin.io.ByteWriter` is the byte sink beside `Reader`**
+  ([`ByteWriter`](/spec/system-library/#bytewriter)): one method, `write(bytes: Array[byte]) ->
+  Result[unit, IoError]`, writing all of `bytes`. `fs.File`, every `net.ByteStream` (`TcpStream`,
+  `UnixStream`, `TlsStream`), `net.StreamWriter` and `http.BodyWriter` implement it by the `write`
+  they already had, so no call changes; `ByteStream` and `StreamWriter` now take `write` from the
+  trait instead of declaring it. **The name**: the pair of `Reader` would be `Writer`, but the
+  prelude's `Writer` (`module avin`, seen by every program unqualified) is the text sink values
+  render into, so `avin.io.Writer` would make `Writer` mean two things in any program importing it,
+  and `Display`'s `display(out: Writer, …)` would read as the wrong one. Alternatives weighed:
+  `Write` (a verb, as `Close` is; but `avin.net` already has a `Write` case of how a socket is shut
+  down, and `Write`/`Writer` side by side invite the wrong one); `Sink` (short, but `avin.io`'s
+  `Source` is a TEXT source, so `Sink` reads as its text pair); `Output` (says nothing of bytes,
+  and reads as a command's output); `ByteSink`. `ByteWriter` says what it takes and pairs with
+  `ByteStream`. **No `flush()`**: files buffer and sockets do not, so a flush on the trait would be
+  a no-op for most implementations, and TLS keeps a private `flush` of its own that a public one
+  would collide with; whoever opened a file closes it, which flushes. **Not a `Close`**, as `Reader`
+  is not: a `BodyWriter` is ended by its response, not closed; code holding a resource that is
+  both bounds it by both. **`io.copy(from: Reader, to: ByteWriter) -> Result[long, IoError]`**
+  copies in pieces of at most 64 KiB, answering the count or the first `Err`, closing, flushing and
+  rewinding nothing. Standard output and standard error stay text-only `Writer`s: they have no byte
+  path to write through. No in-memory byte sink is added: a `Buffer[byte]` is filled by
+  `addAll`, and a sink of the program's own is a five-line class. Review with the user: the name
+  `ByteWriter` (against `Write` or `Sink`), and whether standard output should gain a byte path
+  and be a `ByteWriter` too.
+
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`, for the libssh2
+  binding): **a function pointer marked `null` is passed null**
+  ([C bindings](/spec/c-bindings/#arrays-and-out-parameters)). `libssh2_session_init_ex` is the only
+  way to make a session (`libssh2_session_init()` is a macro passing four nulls), and a function
+  pointer without a `userdata` was refused with no way to pass null. The prototype word `null`,
+  which already passed null for any other pointer, now takes a function pointer too; its parameters
+  are read only as C's types for the header check (named, no `userdata` or `length`, any result),
+  since C never calls it. Refused: `null` twice, after `out`, on a struct by value or a scalar, and an
+  unnamed function pointer. *Alternatives*: an `Option[function]` parameter with only `None` legal (a
+  parameter whose one value is written at every call, and an `Option` that never holds `Some`);
+  binding a header macro (`libssh2_session_init`), which the C unit cannot type-check as a function
+  and which most hooks have no macro for.
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`): **a kept handle no C
+  reference can hold is kept from the collector until its holder's `release` has run**
+  ([C bindings](/spec/c-bindings/#kept-handles-and-the-order-they-are-given-back)). libssh2 counts no
+  references, frees every channel in `libssh2_session_free`, and reaches the session from
+  `libssh2_channel_free`; a channel and its session found dead in one collection were finalized in
+  address order, so the session could go first and the channel's release free it again. `kept:` may
+  now name a class with no `retain` (or with a `kept:` of its own): the holder pins the kept handle's
+  Avin object in a runtime table, a root of every collection, and lets go of the pin after its own
+  `release`, by `close()` or its finalizer; the kept one is finalized in a later collection. Its
+  `kept:` name is the kept handle's pointer, or null once that handle was closed, so the release
+  can tell (`session ? libssh2_channel_free(self) : 0`). A chain is finalized one link per
+  collection, holder first. **A cycle through a pin is never collected** (a session keeping, as its
+  Avin object, a channel that pins it): both are given back once either is closed. *Why*: the
+  collector finalizes in address order and a finalizer cannot resurrect, so ordering can only come
+  from keeping the kept object reachable until the holder is done; a root held per holder does that
+  with no change to the collector. *Alternatives*: collector-ordered finalization (topological, as
+  some collectors offer; the gc library has none, and Avin does not change it); the holder's release
+  given back without its kept object, on trust (the unsound state this replaces); a `retain:` of the
+  package's own (libssh2 has no count to take). **Review with the user**: that a cycle through a
+  pin leaks until closed, rather than being refused.
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`): **a handle holds C
+  integers for its `release:`, `holds:` on the class and `hold:` on a binding**
+  ([C bindings](/spec/c-bindings/#values-a-handle-holds)). libssh2 is given the socket of an Avin
+  `TcpStream` and writes to it in `libssh2_session_free`; a stream finalized first, or closed by
+  the program first, gives its descriptor's number to the next one opened, so the session's
+  farewell could reach an unrelated connection, and a release that sees only `self` cannot say which
+  socket it used. A class declares `holds: "int sock = -1"`, a C declaration of an integer and the
+  value it starts as; a binding's `hold: "sock"` makes the handle it answers, or its receiver, hold
+  the value of that integer parameter when the call succeeds, replacing one held before; the release
+  uses it by name. The value is an entry on the list the glue keeps of what the handle holds, beside
+  its C references, so the layout of a handle does not change. The package holds a descriptor of its
+  own, `dup`ed from the stream's, which makes the session's release sound whichever object the
+  collector finalizes first and whether the stream was closed before. Refused: `holds:` on a
+  `shared` class or one with `retain:` (one reference of many), a name `release:` does not use, `self`
+  or the `kept:` name, a declaration that is no integer; `hold:` naming no integer parameter, or a
+  name the holder's class does not declare, or on a binding answering no handle and no method of
+  one. *Alternatives*: the kept stream pinned until the session's release, as kept handles now are
+  (the release still could not read the descriptor from an Avin object, finalizers running no Avin
+  code, and a stream the program closed first would hand the release a number already reused);
+  holding the stream's own descriptor without `dup` (the same reuse); a C handle over the descriptor
+  (a handle is on a pointer). **Review with the user**: whether `holds:` should also take pointers.
+- Settled on the user's delegation 2026-11-17 (built on branch `cbind-gaps`): **`free:` frees a
+  string C answers through an `out` pointer by an entry `"name: how"`**
+  ([C bindings](/spec/c-bindings/#strings)). `libssh2_channel_get_exit_signal` answers three strings
+  freed by `libssh2_free(session, p)`, and `free:` covered only a result. `how` is a C function of the
+  string or a C expression in its name, compiled in a glue function per string that a method passes
+  its receiver's object: the expression may use `self`, the receiver class's `kept:` name and the
+  values it `holds:` (here the channel's kept session). It is called once the copy is made, never
+  for null, and on a failed status for each string C answered, unread. Refused: a name that is no
+  `out` parameter answering a string or its bytes, `inout` (C may answer the copy it was passed), a
+  name freed twice, an expression not in the name, and named entries beside arrays `array:` frees by
+  position. *Why the spelling*: `free:` already says how what C answers is freed, and `name:` reads
+  as the `kept: "face: Face"` entries do; a name is needed because a binding answers several strings.
+  *Alternatives*: a separate key (`frees:`), a second word for one idea; any parameter of the call in
+  the expression (the strings C was passed are freed once converted, before the outs are, so only
+  the receiver's own names are offered); copying the string in the call's glue and freeing it there
+  (a second copy of every string).
+
+- Settled on the user's delegation 2026-11-17 (built on branch `pool-check-cancel`, for the
+  PostgreSQL package's pool under deadlines): **a `Pool` call cancelled while `validate` checks a
+  resource puts the resource back as one given back is put back** ([Pool](/spec/threads/)): idle, or
+  to the first call waiting, destroyed only where the pool was closed meanwhile or the resource has
+  outlived `maxLifetime`. It was destroyed. A deadline (`withDeadline`, `withTimeout`) cancels a
+  thread, and a function entry or a loop's back edge is a cancellation point, so a deadline passing
+  just as an idle resource was taken stopped its check even where `validate` never waits, and good
+  resources were destroyed: up to 5 of a pool of 4 in a round of 100 calls under short deadlines.
+  *Why it is sound*: every resource is checked before it is lent, one handed to a waiter included,
+  so one a stopped check left in a bad state (a ping half sent) is caught and destroyed at its next
+  lend. *Alternatives weighed*: running `validate` where cancellation cannot stop it (a check that
+  blocks, a ping to a server that does not answer, would then hold the caller past its own deadline
+  until the check's own timeout); destroying the resource only where `validate` had begun to wait
+  (the pool cannot see inside the check, and a resource cut off mid-exchange is caught at its next
+  check either way). Of the pool's other cancellable steps, a cancelled `create` already gives its
+  place up, or keeps what it made, and a cancelled `f` already gives the resource back; destroying
+  outlived and closed resources runs where nothing stops it.
+
+- Settled on the user's delegation 2026-11-18 (built on branch `static-link`, for tend's one
+  self-contained binary): **a program links its C libraries from their static archives when its
+  manifest says `static-c-libraries = true`** ([C bindings](/spec/c-bindings/#linking-statically)).
+  The user decided that static linking is avin's own item; the shape is this branch's. One
+  top-level key of the root package, a boolean; a dependency's is not read, since how a program is
+  linked is decided once for the whole of it, and a library package deciding it would decide for
+  programs it never sees (Sysl's `link` key, root-only for the same reason). For every library a
+  `pkg-config` module finds, of every package in the program, the build asks `pkg-config --static
+  --libs`, which adds what the library links privately (`Libs.private`), and replaces each `-l<name>`
+  whose `lib<name>.a` is in one of the answer's `-L` directories by **the archive's path**, the only
+  spelling that reaches an archive on macOS, where the linker takes a `.dylib` over a `.a` in the
+  same directory. A name none of those directories holds is the system's own (libSystem, libz) and
+  stays dynamic. **A name whose shared library is in one of them but whose archive is in none stops
+  the build** with an error naming the shared library and the archive it lacks, where Sysl's
+  `link = "static"` links such a library dynamically and says so only under `--verbose`: a program
+  asking for static libraries exists so that the machine running it needs nothing installed, and a
+  silent `.dylib` is the very program the key is there to prevent. A library named by `link` is
+  passed as `-l` as before. *Alternatives weighed*: a per-library `static = true` in `c-libraries`
+  (the library's author would decide for every program, and a program could not ask for a
+  dependency's library); Sysl's `link = "static" | [names]` with a `--link` flag (a top-level `link`
+  beside the `link` of a C library meaning `-l` names would read as one key with two meanings; a list
+  of names and a flag can come later without changing this one); a `--static-libs` build flag alone
+  (how the program must be linked is a property of the program, and a release built without the flag
+  would quietly need Homebrew). **Review with the user**: the key's name and its boolean shape against
+  Sysl's `link`; that it is stricter than Sysl's `"static"`; that a library `pkg-config` gives no
+  `-L` directory for counts as the system's, which on Linux leaves a distribution's `/usr/lib`
+  libraries dynamic; and that the C libraries of a program's Sysl packages (`requires { pkg_config }`)
+  are not covered.
+- Settled on the user's delegation 2026-11-18 (branch `contra-infer`): **inference holds an argument to its parameter by
+  each type argument's variance, and a type argument named at a contravariant argument is decided as
+  the type given there.** `take[T](b: Box[B, T])` for `Box[-I, +T]` accepts a `Box[A, int]` where
+  `B` is an `A` and takes `T` as `int`, as the non-generic `takeInt(b: Box[B, int])` always did; the
+  same holds for a function type's parameters (`(A) -> int` given for `(B) -> T`) and a constructor
+  parameter's contravariant hole. `feed[T](b: Box[T, int], x: T)` given a `Box[A, int]` takes `T` as
+  `A`, the largest type the box accepts, and a later argument must be an instance of it; an earlier
+  argument that widened `T` beyond it is an error. *Why*: the spec says constraints are subtype
+  constraints, and the checker unified a contravariant argument for equality, refusing calls the
+  same signature accepts without type parameters (it blocked the parsing library's `Rule[-I, +T]`).
+  *Alternatives weighed*: collecting upper bounds and solving to their meet, so two boxes of `A`s and
+  of `B`s given for one `Box[T, int]` in either order take `B` (more complete, but needs a meet the
+  checker has nowhere else; with the order as written the box of `B`s first is accepted today, the
+  other order is refused); deciding such a type argument from the other arguments only (would refuse
+  the probe above whenever `T` is named nowhere else). A type argument named at a contravariant
+  argument nested in another contravariant one is still held whole. **Review with the user**: whether
+  the meet is worth adding when a program meets the order-dependent case.
+- Settled on the user's delegation 2026-11-18 (branch `stdin-serialize`): **threads read standard input one at a time, and
+  each read is whole** ([system library](/spec/system-library/#standard-input)). A `readLine`, an
+  iterator's step, a character and `readAll` each hold the input from their look at whether it has
+  ended to their taking of what they read, so a line goes to exactly one reader, never split
+  between two or given to both, and a reader past the end gets `None`, never a stray empty line.
+  Found because nothing serialized the one buffer: two lightweight threads reading at once hung
+  (both parked on the descriptor) or trapped out of range in the runtime. The lock is a runtime lock
+  of the library's kind (`ParkLock`, held across the reader's wait for input): a lightweight thread
+  waiting for it, or waiting for input while holding it, parks, so neither holds up a carrier; it is
+  a region a trap is not contained in, as any lock's is, so a contained trap never leaves it held.
+  **An iterator over standard input takes the line (or character) `hasNext` answers for and keeps it
+  until `next`**, since otherwise another thread could take that line between the two and `next`
+  would fail on a `hasNext` that said `true`. On one thread this is seen only by code that asks
+  `hasNext` and then reads by another way: the other read gets the line after the one the iterator
+  holds. Alone, a reader pays two uncontended lock operations per read (2M lines: 0.136 s before,
+  0.139 s after). *Alternatives weighed*: a lock taken inside each runtime call only (the library's
+  look at the end and its take are two calls, so a reader could still get `Some("")` past the end);
+  an OS lock (held across the wait for input it would block a carrier, and a thread parked holding
+  it would resume on another carrier and let go of a lock it does not own there); a `Mutex` in
+  `avin.io` (the same lock, with an object to keep alive and the module made to depend on
+  `avin.threads`); an iterator whose `hasNext` takes nothing (racy across threads, as above).
+  **Review with the user**: the iterator's taking of its line at `hasNext`.
+- Settled on the user's delegation 2026-11-18 (built on branch `typaram-bound`, for the parsing library's
+  `Rule[-I: Reader, +T]`): **a function's or a method's own type parameter may be bounded by a type
+  parameter declared before it, `[J: I]`** ([generics](/spec/generics/#bounds-by-a-type-parameter)),
+  the twin of the lower bound `[W >: T]`. A `J` is an `I` with no conversion and has `I`'s bounds; each
+  type argument must be the bounding one's or be seen as it as a covariant part is (so a value type
+  never stands for a trait there); the bound is a position where a value is passed in, so a `-I` may
+  bound one and a `+T` may not; an override writes the overridden method's bound or none. Choices this
+  branch made: **only a function's or a method's own parameters** take one, as only they take a lower
+  bound (a type's own `[A, B: A]` would need its own variance rule, the opposite of a method's, and no
+  program needs it yet); **the bounding parameter is declared before it** (the enclosing type's or
+  impl's, or earlier in the list), which rules out cycles by construction and makes `[A: B, B: A]` an
+  error at its first bound, where lower bounds allow a later parameter and check for a chain leading
+  back; **one at most** per parameter (two would be an intersection of two unknowns, which no
+  instance needs); **inference takes the narrower**: a type argument decided where a value is passed
+  in takes the bounding argument when that is a subtype of the type given and not the other way round
+  (`digit() | success(4)` is a `Rule[Input, long]`, not an error), and a bounding parameter nothing
+  else decides is taken from the one it bounds. *Alternatives weighed*: refusing `digit() | success(4)`
+  and making the caller write `|[Input]` (correct but unpleasant at the most common call shape);
+  allowing a later parameter with a cycle check, as lower bounds do (more to say for no program that
+  needs it); a type's own parameters bounded too (sound only for a covariant or invariant bounding
+  parameter, a rule that can come when a program asks). **Review with the user**: the
+  declared-before rule, which differs from the lower bound's.
+- Settled on the user's delegation 2026-11-18 (branch `contra-join`, for the parsing library's token streams): **branches
+  join at a contravariant argument to the meet of the two arguments, and a fully known expected type
+  wins over a join that misses it** ([generics](/spec/generics/#variance)). `In[A]` and `In[B]` for
+  `In[-T]` agree on `In[B]` (they fell back to a trait both share, `Display` where an impl gave one,
+  and then missed an expected `In[B]`); a function type's parameters join the same way and its
+  result as a covariant argument, so `(A) -> int` and `(B) -> int` agree on `(B) -> int` (they
+  agreed on nothing). Choices this branch made: **the meet is one of the two arguments**, the one
+  that is a subtype of the other (`Nothing` included); where neither is, no type is named as the meet
+  and the class join does not exist for the pair, so the fallback to a shared trait stands, as for
+  two classes with no common superclass. **Where the expected type is fully known (no inference
+  variable left in it), a reference type, and what the branches agree on is not an instance of it
+  while both branches are, the branches agree on the expected type**: a `Dog` and a `Cat` that are
+  `Animal`s and `Pet`s agree on `Pet` where a `Pet` is expected (they agreed on `Animal` and failed).
+  **Where neither the agreement nor a branch is an instance of that expected type, the branch (or
+  `match` arm) is reported**, "this branch yields Sink[string], not the Sink[B] expected of the
+  `if`", rather than the fallback trait at the result. Why: the expected type is what the program
+  asked for, and a join that misses it while every branch meets it is a wrong answer, not an
+  ambiguity; naming the branch says what to change. *Alternatives weighed*: the expected type
+  always winning where both branches fit (testing a branch against an expected type still being
+  inferred settles its inference variables, so the rule is held to fully known types and leaves
+  inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
+  (none can be named in general, and an intersection type is not a type Avin writes); keeping the
+  result-level message (it names a trait the program never mentioned).
+
 ## Open
+
+- Whether constructor traits may carry parameters that are not holes (an error type fixed per
+  trait, `MonadError[A, E]`), and whether composed constructors (`Option[List[_]]`) are wanted; both
+  are left out of the higher-kinded design and need no change to it to add later.
 
 - Member forwarding inside a class (`export field.method`, presenting a member's methods as the
   class's own), a later possibility beside module exports; and exporting a whole module as a member
@@ -8305,17 +11132,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   transformations).
 
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
-  - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a
-    function could test (folded away when false), or nothing, the module being the only gate.
-  - Whether a module may be listed by more than one feature (on while any is on), or by one only, as
-    proposed.
   - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
     vendored package, or trust the hash recorded beside each package as it trusts the cache's.
   - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
     the standard library's modules arrive with the compiler and a package using a new one fails on an
     older compiler with "no module" rather than a version message.
-  - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
-    for more than one target.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
   [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
@@ -8342,4 +11163,113 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   this fixes); dropping binding validation from `check` with no flag (leaves no command that
   reports a bad binding without linking). The language server already stops at checking, so it
   matches the new `check`. Review with the user: whether `--bindings` should instead be the
-  default for packages that have bindings.
+  default for packages that have bindings. (Revised 2026-11-15, branch `c-opaque-errno`: `check`
+  builds the C unit too, so what clang rejects of it is reported without `--bindings`.)
+
+- Settled on the user's delegation 2026-11-15 (branch `crypto-pbkdf2-uuid`): **`avin.crypto` gains
+  `pbkdf2HmacSha256` and `pbkdf2HmacSha512`**, taking `Vector[byte]` or `string` for password and
+  salt as `hmacSha256` takes its key and message. Bound to `sysl.crypto.pbkdf2_hmac256`/`512` through
+  a runtime shim (`avin.rt.digest_pbkdf2_*`), since Sysl's takes an unsigned count and an output
+  slice; no OpenSSL involved, as the other digests. A count below 1 and a length below 1 or over 255
+  digests (8160, 16320) trap in Avin with the library's message style, so the shim never sees them.
+  Alternatives weighed: returning a `Result` (a bad count is the caller's bug, as `between`'s bad
+  bounds are); OpenSSL's `PKCS5_PBKDF2_HMAC` (adds a dependency for a digest Sysl has).
+- Settled on the user's delegation 2026-11-15 (branch `crypto-pbkdf2-uuid`): **`Uuid` lives in its own
+  module `avin.uuid`** (`library/avin/uuid/uuid.avin`), as `avin.random` and `avin.crypto` each have
+  a directory; it is a `data Uuid(high: long, low: long)` so equality, hashing and sending come from
+  the structure, with `Ord` implemented as the unsigned order of the sixteen bytes. `parse` and
+  `fromBytes` answer `Option` (the input comes from outside); only the canonical text is accepted,
+  because braces and `urn:uuid:` are other formats, not spellings of this one. The constants are
+  `Uuid.Nil` and `Uuid.Max`, PascalCase like `Duration.Zero`, not `nil`. `variant()` answers 2 for
+  RFC 9562's layout (the value of its bits `10`), 0, 6 and 7 for the others, as other platforms
+  number them. `FromParam` is implemented in `avin.net.http`'s `params.avin`, which imports
+  `avin.uuid` (which imports nothing from `avin.net`, so no cycle). Review with the user: the
+  `Nil`/`Max` spelling and the variant numbering.
+
+- Settled on the user's delegation 2026-11-15 (branch `real-bits-normalize`): **`real` reaches its
+  IEEE 754 encodings through `toBits -> long`, `real.fromBits(bits: long)`, `toBits32 -> int` and
+  `real.fromBits32(bits: int)`, and there is still no 32-bit float type** ([types](/spec/types/#real-and-char)).
+  A binary protocol (PostgreSQL's `float4`/`float8`) or file format needs the encodings, and a
+  program that needs binary32 needs it only at that edge, so the 32-bit forms convert at the
+  boundary rather than adding a type every arithmetic rule would have to cover. The members are
+  parameterless accessors and statics, as `isNaN` and `real.PositiveInfinity` are; the encoding is
+  signed (`long`, `int`) because there are no unsigned integers, so `(-0.0).toBits` is
+  `long.MinValue`. Narrowing is the hardware's conversion: round to nearest, ties to even,
+  overflow to an infinity, and a NaN quieted with the top of its payload kept (ARM64 and x86-64
+  agree), so a signaling binary32 NaN does not survive a round trip; binary64 bits pass unchanged.
+  Bound to `sysl`'s `FloatBits` through four runtime functions (`avin.rt.real_to_bits` and its
+  siblings). Alternatives weighed: a `float` type (the size of the language change, for an edge
+  need); returning `Vector[byte]` (every protocol orders bytes its own way, and the integer is what
+  shifting code wants); names `doubleToLongBits`-style (Avin names members by what they answer).
+  Review with the user: whether `toBits32` should trap rather than give an infinity on overflow.
+
+- Settled on the user's delegation 2026-11-15 (branch `real-bits-normalize`): **Unicode
+  normalization is `string.normalize(form: NormalizationForm)` and `isNormalized(form)`, the forms
+  `Nfc`, `Nfd`, `Nfkc`, `Nfkd`** ([types](/spec/types/#normalization)). `NormalizationForm` mirrors
+  `sysl.unicode.Form`, so the data is utf8proc's Unicode 17.0.0, the database `char`'s methods and
+  `avin.regex` already answer from, and no table is generated or carried for it; a mirror's
+  variants must have the Sysl names, and `Nfc` is also how Avin spells an acronym in a name
+  (`Utf8Error`, `TlsStream`), so the brief's `NFC` became `Nfc`. A code point unassigned in 17.0.0
+  is left alone (utf8proc's `STABLE`). A string of ASCII characters only is answered without
+  crossing into Sysl, since it is in every form; `isNormalized` normalizes and compares rather than
+  using the quick-check property, which utf8proc does not expose. Tested against every line of
+  `NormalizationTest.txt` 17.0.0 (committed as `tests/fixtures/unicode/NormalizationTest.txt`,
+  1 MB with the character-name comments removed; the original's SHA-256 is in the test) and every
+  code point its part 1 does not list. Alternatives weighed: variants `NFC` … (refused by the
+  mirror, and against the naming rule); four methods `toNfc` … (four names for one operation with
+  a parameter); a table of Avin's own (a second copy of the database to keep in step). Review with
+  the user: the variant spelling `Nfc` over `NFC`, which every other platform writes in capitals.
+
+- Settled on the user's delegation 2026-11-15 (branch `real-bits-normalize`): **`saslPrep(text) ->
+  Option[string]` in `avin.crypto`**, RFC 4013 over RFC 3454's tables B.1, C.1.2–C.9, A.1, D.1 and
+  D.2 ([system library](/spec/system-library/#avin-crypto)). It lives beside PBKDF2 and HMAC because
+  its one use is preparing a SCRAM password. The tables are generated from the RFC's text by
+  `scripts/stringprep_tables.avin` into `library/avin/crypto/stringprep_tables.avin` (8 KB of
+  hexadecimal runs, decoded on first use into a sorted array searched by halves), since stringprep
+  fixes them at Unicode 3.2 and the current database would answer differently. Unassigned code
+  points are prohibited, as for a stored string (RFC 3454 §7), the stricter of the two forms, which
+  PostgreSQL's own SASLprep also applies; normalization is the current NFKC, which differs from 3.2's only for
+  the few CJK compatibility ideographs Unicode corrected since. U+200B, in both C.1.2 and B.1, is
+  mapped to a space, the C.1.2 mapping being applied first; the two orders differ only for it.
+  Prohibition and the bidirectional rule are checked on the normalized string, as RFC 3454 §3
+  orders the steps, so U+0340 (prohibited) normalizes to U+0300 and is accepted. `None` carries no
+  reason, since a client's only response is to fall back to the password as written. Alternatives
+  weighed: `Result[string, SaslPrepError]` naming the step that refused (no caller acts on the
+  reason); an `allowUnassigned` flag for the query form (no SCRAM use needs it); a generic
+  `stringprep(profile)` (no second profile is wanted). Review with the user: whether a reason
+  should be returned after all.
+
+- Settled on the user's delegation 2026-11-16 (branch `gc-pacing`): **`AVIN_GC_PERCENT` paces the
+  collector** ([runtime](/compiler/#runtime)). After a collection the heap may allocate that
+  percentage of what survived before it collects again, and never less than the 8 MiB floor; the
+  default stays 100, so the heap keeps within about twice what is live, as before. The value is
+  decimal digits; one that is not, or is longer than 15 digits, is ignored; 0 paces by the floor
+  alone, and anything above 100000 is taken as 100000. Measured on a program keeping 200k small
+  objects (37 MB live) while discarding ~800 bytes per element: collection time falls from 3.79 s
+  to 2.06 s at 200 and 1.12 s at 400, for a heap 1.2× and 1.5× as large. The pacing itself was
+  already proportional to what is live, so the cost per element allocated levels off once the live
+  heap passes the floor; what remains is that every collection traces the whole live heap (about
+  30 ns an object) and walks every block the sweep can reach. Alternatives weighed: a larger default
+  (faster, but a program's memory would grow with no setting of its own; left for the user); a
+  library call to set it at run time (no program needs to change it mid-run yet); a floor that
+  scales (it only matters below 8 MiB live). Review with the user: whether the default should be
+  above 100, since the collector stops every thread and marks on one, so the trade favours memory
+  less than it would for a concurrent collector.
+
+- Settled on the user's delegation 2026-11-16 (branch `read-alloc`): **a stream's `read(max)`
+  allocates what it answers, not `max`.** A TCP, Unix or split socket read receives into a buffer
+  the runtime keeps per operating system thread (on its carrier), grown to the largest read asked
+  for up to 256 KiB, and copies out exactly the bytes that arrived; a read asking for more than
+  256 KiB answers at most that much, which the contract ("up to `max`") already allows. A TLS read
+  decrypts into a plaintext array the connection keeps, of `max` bytes up to one record's 16 KiB,
+  reused while reads ask for the same size and replaced when they do not. The contract and API are
+  unchanged. Alternatives weighed: asking the kernel how many bytes are readable (`FIONREAD`; one
+  more system call per read, and no binding for it); a buffer kept per stream on the Avin side
+  (the binding still copies the whole buffer in and out at every call, and an idle server would
+  hold one per connection); reading ahead into the stream's buffered bytes (changes what a
+  select's descriptor says). Review with the user: the 256 KiB ceiling on one socket read.
+  Each try at a receive ends its view of the carrier's buffer before the thread can wait (branch
+  `pool-trap`, 2026-11-17): a view held across a park was let go on whichever carrier the thread
+  resumed on, changing the buffer's count there while the buffer's own carrier used it, which
+  freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
+  reading at once).

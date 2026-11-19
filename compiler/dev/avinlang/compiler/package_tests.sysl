@@ -1,7 +1,7 @@
 module dev.avinlang.compiler
 @tests
 
-import sh.sysl.parsing.source_of
+import sh.sysl.parsing.{Span, source_of}
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, write_text}
 import sysl.path.parent
@@ -1557,7 +1557,61 @@ c_library_manifest_errors()
     assert(manifest_error(manifest("a", "c-libraries = [\"zlib\"]\n")).contains("`c-libraries` is a block naming each C library"))
     assert(manifest_error(manifest("a", "c-libraries {\n  Zlib { }\n}\n")).contains("`Zlib` is not a C library's name"))
     assert(manifest_error("workspace = [\"app\"]\nc-libraries {\n  z { headers = [\"zlib.h\"] }\n}\n").contains("so it has no C bindings to call its C libraries"))
-    assert(manifest_error(manifest("a", "c-library {\n}\n")).contains("which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `features` and `workspace`"))
+    assert(manifest_error(manifest("a", "c-library {\n}\n")).contains("which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `static-c-libraries`, `features` and `workspace`"))
+
+@test("static-c-libraries is true or false, false when unsaid, and a workspace with no package says none")
+static_c_libraries_read()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", manifest("app", "")).unwrap()
+    assert(!read_manifest(dir).unwrap().static_c_libraries)
+    write_text(dir + "/avin.hocon", manifest("app", "static-c-libraries = true\n")).unwrap()
+    assert(read_manifest(dir).unwrap().static_c_libraries)
+    write_text(dir + "/avin.hocon", manifest("app", "static-c-libraries = false\n")).unwrap()
+    assert(!read_manifest(dir).unwrap().static_c_libraries)
+    // It may come before the `package` block, as every key may.
+    write_text(dir + "/avin.hocon", "static-c-libraries = true\n" + manifest("app", "")).unwrap()
+    assert(read_manifest(dir).unwrap().static_c_libraries)
+    // A library read from a manifest is never linked statically until a program asks for it.
+    write_text(dir + "/avin.hocon", manifest("app", "static-c-libraries = true\nc-libraries {\n  z { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n")).unwrap()
+    assert(!read_manifest(dir).unwrap().c_libraries[0].linked_statically)
+    for wrong in ["\"true\"", "1", "[true]", "{ }"]
+        val e = manifest_error(manifest("a", s"static-c-libraries = $wrong\n"))
+        assert(e.contains("`static-c-libraries` is `true` or `false`"), e)
+        assert(e.contains("avin.hocon:5:"), e)
+    // A per-library `static` is not a key: the program decides how it is linked.
+    assert(manifest_error(manifest("a", "c-libraries {\n  z { pkg-config = \"zlib\", static = true }\n}\n")).contains("`static` is not a key of a C library"))
+    val workspace = manifest_error("workspace = [\"app\"]\nstatic-c-libraries = true\n")
+    assert(workspace.contains("a workspace with no `package` block builds no program of its own, so it has nothing to link statically"), workspace)
+    // A workspace root that is a package too may say it.
+    write_text(dir + "/avin.hocon", manifest("app", "workspace = [\"member\"]\nstatic-c-libraries = true\n")).unwrap()
+    assert(read_manifest(dir).unwrap().static_c_libraries)
+    // A program of one file has no manifest to say it in: its header holds `dependencies` only.
+    val script = script_manifest("/nowhere", source_of("main.avin", ""), ScriptHeader(source_of("main.avin", "static-c-libraries = true\n"), Span(0, 0)))
+    assert(script is Err(_))
+
+@test("the root package's static-c-libraries reaches every package's C libraries; a dependency's is not read")
+static_c_libraries_of_a_graph()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/app/avin.hocon", manifest("app", "static-c-libraries = true\ndependencies {\n  zip { path = \"../zip\" }\n}\nc-libraries {\n  libc { headers = [\"<stdlib.h>\"] }\n}\n"))
+    put(dir + "/app/main.avin", "import zip\n\nmain() = zip.one()\n")
+    put(dir + "/zip/avin.hocon", manifest("zip", "c-libraries {\n  zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n"))
+    put(dir + "/zip/zip/zip.avin", "module zip\n\none() -> int = 1\n")
+    val program = load_package(dir + "/app", default_fetching()).unwrap()
+    assert_eq(program.c.len(), 2)
+    assert(program.c[0].linked_statically)
+    assert(program.c[1].linked_statically)
+    // The dependency asking for it does not make the program static.
+    put(dir + "/app/avin.hocon", manifest("app", "dependencies {\n  zip { path = \"../zip\" }\n}\n"))
+    put(dir + "/zip/avin.hocon", manifest("zip", "static-c-libraries = true\nc-libraries {\n  zlib { pkg-config = \"zlib\", headers = [\"zlib.h\"] }\n}\n"))
+    val dynamic = load_package(dir + "/app", default_fetching()).unwrap()
+    assert_eq(dynamic.c.len(), 1)
+    assert(!dynamic.c[0].linked_statically)
+    // The dependency built as a program of its own takes its own word.
+    put(dir + "/zip/main.avin", "import zip\n\nmain() = zip.one()\n")
+    val own = load_package(dir + "/zip", default_fetching()).unwrap()
+    assert(own.c[0].linked_statically)
 
 @test("a package's C libraries reach the program, every package's in it, its own first")
 c_libraries_of_a_graph()
@@ -1914,9 +1968,103 @@ feature_gates_imports()
     // A gate whose `enables` reach the other feature implies it.
     put(shapes + "/avin.hocon", manifest("shapes", "features {\n  server {\n    default = true\n    modules = [shapes.server]\n    enables = [http]\n  }\n  desktop = [webview]\n  fancy { modules = [shapes.fancy], enables = [server, desktop] }\n}\ndependencies {\n  http { path = \"../http\", optional = true }\n  webview { path = \"../webview\", optional = true }\n}\n"))
     assert_eq(avin(dir, ["avin", "check", shapes]).noted, "")
-    // The tests and the root module are always compiled, and are never listed.
-    put(shapes + "/tests/shapes_tests.avin", "module tests\n\nimport shapes.server.serve\n\n@test\nserves()\n    assertEq(serve(), 204)\n")
-    assert(avin(dir, ["avin", "check", shapes]).noted.contains("`shapes.server` exists only while the feature `server` is on, and `tests` is always compiled: import it from a module listed under a feature that enables `server`"))
+    // The package's tests may import any of its modules, whatever its gate.
+    put(shapes + "/tests/shapes_tests.avin", "module tests\n\nimport shapes.server.serve\nimport shapes.fancy.fancy\nimport webview.open\n\n@test\nserves()\n    assertEq(serve() + fancy() + open(), 219)\n")
+    assert_eq(avin(dir, ["avin", "check", shapes]).noted, "")
+    // The root module is always compiled, and is never listed.
+    put(shapes + "/main.avin", "import shapes.server.serve\n\nmain()\n    println(serve())\n")
+    assert(avin(dir, ["avin", "check", shapes]).noted.contains("`shapes.server` exists only while the feature `server` is on, and the package's root module is always compiled: import it from a module listed under a feature that enables `server`"))
+
+// The number of times `part` is in `text`.
+private times(text: string, part: string) -> usize = text.split(part).len - 1
+
+@test("the package's tests import its gated modules, and a test module is read only while every module it imports is")
+tests_import_gated_modules()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    featured(dir, "")
+    val shapes = dir + "/shapes"
+    put(shapes + "/shapes/server/server.avin", "module shapes.server\n\nimport http.get\nimport shapes.area\n\nserve() -> int = get() + area()\nport() -> int = 80\n")
+    // One file of `tests` imports a gated module with several names; another file of it is a helper.
+    put(shapes + "/tests/server_tests.avin", "module tests\n\nimport shapes.server.{serve, port}\n\n@test\nservesOnItsPort()\n    assertEq(serve() + port(), 284)\n")
+    put(shapes + "/tests/helpers.avin", "module tests\n\ntwice(n: int) -> int = n * 2\n")
+    // A test module importing a declaration of `tests` is read only while `tests` is.
+    put(shapes + "/tests/uses/uses.avin", "module tests.uses\n\nimport tests.twice\n\n@test\ndoublesTwo()\n    assertEq(twice(2), 4)\n")
+    // A test module importing from `tests.plain`, a module of its own, does not depend on `tests`.
+    put(shapes + "/tests/plain/plain.avin", "module tests.plain\n\nimport shapes.area\n\nthree() -> int = area() - 1\n\n@test\nareaIsStillFour()\n    assertEq(area(), 4)\n")
+    put(shapes + "/tests/other/other.avin", "module tests.other\n\nimport tests.plain.three\n\n@test\nthreeIsThree()\n    assertEq(three(), 3)\n")
+    put(shapes + "/tests/whole/whole.avin", "module tests.whole\n\nimport tests.plain\n\n@test\nthreeThroughItsModule()\n    assertEq(plain.three(), 3)\n")
+    // A test module under a gated module's feature that is off, through a module under it.
+    put(shapes + "/tests/admin/admin.avin", "module tests.admin\n\nimport shapes.server.admin.admin\n\n@test\nadminIsOneMore()\n    assertEq(admin(), 205)\n")
+    val all = avin(dir, ["avin", "test", shapes, "-O0"])
+    assert_eq(all.noted, "")
+    assert_eq(all.status, 0)
+    for name in ["servesOnItsPort", "doublesTwo", "areaIsStillFour", "threeIsThree", "threeThroughItsModule", "adminIsOneMore", "areaIsFour"]
+        assert(all.said.contains(name), name)
+    // With `server` off, the test modules needing it are not read, and the rest still run.
+    val without = avin(dir, ["avin", "test", shapes, "-O0", "--no-default-features"])
+    assert_eq(without.noted, "")
+    assert_eq(without.status, 0)
+    for name in ["servesOnItsPort", "doublesTwo", "adminIsOneMore", "areaIsFour"]
+        assert(!without.said.contains(name), name)
+    assert(without.said.contains("areaIsStillFour"))
+    assert(without.said.contains("threeIsThree"))
+    assert(without.said.contains("threeThroughItsModule"))
+    // A check and a build with the feature off pass over them too, so the package builds with any set off.
+    assert_eq(avin(dir, ["avin", "check", shapes, "--no-default-features"]).noted, "")
+    put(shapes + "/main.avin", "import shapes.area\n\nmain()\n    println(area())\n")
+    val run = avin(dir, ["avin", "run", shapes, "--no-default-features"])
+    assert_eq(run.noted, "")
+    assert_eq(run.out, "4\n")
+    // Another feature off leaves the tests that need only `server` alone.
+    assert(avin(dir, ["avin", "test", shapes, "-O0", "--features", "server"]).said.contains("servesOnItsPort"))
+    // An error in a test module that is not read is not reported, and one in a test module that is, is.
+    put(shapes + "/tests/admin/admin.avin", "module tests.admin\n\nimport shapes.server.admin.admin\n\nbroken() -> int = \"no\"\n")
+    assert_eq(avin(dir, ["avin", "check", shapes, "--no-default-features"]).status, 0)
+    assert_eq(avin(dir, ["avin", "check", shapes]).status, 1)
+
+@test("an import refused for its module is refused once, however many names it imports")
+refused_imports_are_reported_once()
+    val dir = make_temp_dir("avin-pkg").unwrap()
+    defer _ = remove_dir_all(dir)
+    featured(dir, "")
+    val shapes = dir + "/shapes"
+    put(shapes + "/shapes/server/server.avin", "module shapes.server\n\nimport http.get\nimport shapes.area\n\nserve() -> int = get() + area()\nport() -> int = 80\nhost() -> int = 1\npath() -> int = 2\nquery() -> int = 3\n")
+    val gated = "`shapes.server` exists only while the feature `server` is on"
+    // One import of five names from a gated module, from an ungated module: one error.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server.{serve, port, host, path, query}\n\narea() -> int = 4\n")
+    val five = avin(dir, ["avin", "check", shapes]).noted
+    assert_eq(times(five, gated), 1)
+    assert(five.contains("shapes/shapes/shapes.avin:3:8"))
+    // A name imported twice in one import: one error.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server.{serve, serve}\n\narea() -> int = 4\n")
+    assert_eq(times(avin(dir, ["avin", "check", shapes]).noted, gated), 1)
+    // Two imports from one gated module: an error at each.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server.serve\nimport shapes.server.{port, host}\n\narea() -> int = 4\n")
+    val two = avin(dir, ["avin", "check", shapes]).noted
+    assert_eq(times(two, gated), 2)
+    assert(two.contains("shapes/shapes/shapes.avin:3:8"))
+    assert(two.contains("shapes/shapes/shapes.avin:4:8"))
+    // The whole module imported, and a name of it, in one file: an error at each.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport shapes.server\nimport shapes.server.serve\n\narea() -> int = 4\n")
+    assert_eq(times(avin(dir, ["avin", "check", shapes]).noted, gated), 2)
+    // From a module gated by another feature: one error for one import.
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\narea() -> int = 4\n")
+    put(shapes + "/shapes/fancy/fancy.avin", "module shapes.fancy\n\nimport shapes.server.{serve, port, host}\n\nfancy() -> int = serve()\n")
+    val fancy = avin(dir, ["avin", "check", shapes]).noted
+    assert_eq(times(fancy, gated), 1)
+    assert(fancy.contains("and `shapes.fancy` exists only while `fancy` is on"))
+    // An optional dependency's module imported with several names: one error.
+    put(shapes + "/shapes/fancy/fancy.avin", "module shapes.fancy\n\nfancy() -> int = 1\n")
+    put(dir + "/http/http/http.avin", "module http\n\nget() -> int = 200\npost() -> int = 201\n")
+    put(shapes + "/shapes/shapes.avin", "module shapes\n\nimport http.{get, post}\n\narea() -> int = 4\n")
+    assert_eq(times(avin(dir, ["avin", "check", shapes]).noted, "`http` is a module of the optional dependency `http`"), 1)
+    // A module of the standard library that does not exist, imported with several names: one error.
+    put(dir + "/loose/main.avin", "import avin.nosuch.{a, b, c}\nimport avin.nosuch.d\n\nmain()\n    println(1)\n")
+    val missing = avin(dir, ["avin", "check", dir + "/loose/main.avin"]).noted
+    assert_eq(times(missing, "the standard library has no module `avin.nosuch`"), 2)
+    assert(missing.contains("main.avin:1:8"))
+    assert(missing.contains("main.avin:2:8"))
 
 @test("avin test and avin check turn every feature on unless a flag says otherwise, and build and run take the defaults and the flags")
 feature_flags()

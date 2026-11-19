@@ -5,6 +5,8 @@ module avin.process
 
 import avin.io
 import avin.io.IoError
+import avin.time
+import avin.time.Duration
 
 @intrinsic("argument_count")
 private argumentCount() -> int
@@ -164,6 +166,73 @@ waitPid(pid: long) -> Result[ExitStatus, IoError]
 tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]
   if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.NotFound, "wait for", s"process $pid"))
   polledPid(int(pid)).mapErr(waitError(pid))
+
+// CPU time: how long a processor ran a process's own code, `user`, and the kernel's code on its
+// behalf, `system`, each counted in whole microseconds as the kernel accounts for it.
+data CpuTime(user: Duration, system: Duration)
+
+impl CpuTime
+  // The two together: all the processor time the process took.
+  total -> Duration = user + system
+
+object CpuTime
+  // No CPU time at all: what a program that never ran, or only slept, has used.
+  val Zero: CpuTime = CpuTime(Duration.Zero, Duration.Zero)
+
+impl Add for CpuTime
+  add(other: CpuTime) -> CpuTime = CpuTime(user + other.user, system + other.system)
+  static zero() -> CpuTime = CpuTime.Zero
+
+@sysl("avin.rt.CpuReading")
+private class CpuReading
+  userMicros() -> long
+  systemMicros() -> long
+
+@sysl("avin.rt.cpu_self")
+private ownCpu() -> CpuReading
+
+@sysl("avin.rt.cpu_children")
+private reapedCpu() -> CpuReading
+
+private cpuOf(r: CpuReading) -> CpuTime = CpuTime(time.micros(r.userMicros()), time.micros(r.systemMicros()))
+
+// The CPU time the program has used so far, every thread's together. It only grows.
+cpuTime() -> CpuTime = cpuOf(ownCpu())
+
+// The CPU time of the program's children that have ended and been reaped, by a `Child`'s wait, by
+// `waitPid` or by anything else that waited for them, each with the time of the children it reaped
+// in turn: a shell's loop of programs that have all exited counts in full once the shell itself is
+// reaped. A child still running, or ended and not yet waited for, counts nothing, and neither does
+// one that is never waited for.
+childrenCpuTime() -> CpuTime = cpuOf(reapedCpu())
+
+@sysl("avin.rt.Reaped")
+private class Reaped
+  ended() -> bool
+  status() -> ExitStatus
+  userMicros() -> long
+  systemMicros() -> long
+
+@sysl("avin.rt.reap_usage", blocking)
+private reapedWithCpu(pid: int) -> Result[Reaped, SyslError]
+
+@sysl("avin.rt.poll_usage")
+private polledWithCpu(pid: int) -> Result[Reaped, SyslError]
+
+private cpuOfReaped(r: Reaped) -> CpuTime = CpuTime(time.micros(r.userMicros()), time.micros(r.systemMicros()))
+
+// `waitPid`, answering with how the child ended the CPU time it used: its own, and that of every
+// descendant it reaped in turn. A child that only slept used next to none: what starting it took.
+waitPidCpu(pid: long) -> Result[(ExitStatus, CpuTime), IoError]
+  if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.NotFound, "wait for", s"process $pid"))
+  reapedWithCpu(int(pid)).map(r -> (r.status(), cpuOfReaped(r))).mapErr(waitError(pid))
+
+// `tryWaitPid`, answering with how the child ended the CPU time it used, as `waitPidCpu` does.
+tryWaitPidCpu(pid: long) -> Result[Option[(ExitStatus, CpuTime)], IoError]
+  if !(0 < pid <= long(int.MaxValue)) then return Err(IoError(io.NotFound, "wait for", s"process $pid"))
+  polledWithCpu(int(pid))
+    .map(r -> if r.ended() then Some((r.status(), cpuOfReaped(r))) else None)
+    .mapErr(waitError(pid))
 
 // The platform's "no child process" (10 on every platform the library runs on) is the child not
 // being there to wait for.

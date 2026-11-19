@@ -1,0 +1,121 @@
+// expect: exit 0
+// A channel's `receive(timeout)` and `send(x, timeout)`: each waits at most its timeout, never less
+// where nothing comes, and answers as soon as a value or room does. A timeout of zero or less is the
+// `try` form. A receive answers `None` for a time that ran out and for a closed, drained channel
+// alike, and takes the values sent before a close first. A send that finds room answers `true`, on an
+// unbounded channel at once. Both wait on lightweight threads by the thousand without holding a
+// worker, and a thread parked in one is cancelled at once. Upper bounds are generous so a loaded
+// machine cannot fail the test.
+import avin.threads.{Atomic, Channel, scope, sleep, spawn}
+import avin.time.{hours, micros, millis, monotonic, seconds}
+
+@sysl("avin.rt.scheduler_timers")
+timers() -> long
+
+main() -> int
+  val timersBefore = timers()
+
+  // A receive that times out waits its time, and no longer than it must.
+  val empty = Channel[string]()
+  val t0 = monotonic()
+  val missed = empty.receive(millis(30))
+  val waited = monotonic() - t0
+  println(s"receive miss: $missed, waited: ${waited >= millis(30)}, ${waited < seconds(20)}")
+
+  // A receive that a value ends answers it, long before its time.
+  val c = Channel[string]()
+  val sender = spawn(() ->
+    sleep(millis(10))
+    c.send("héllo, wörld"))
+  val r0 = monotonic()
+  val hit = c.receive(hours(1))
+  sender.join()
+  println(s"receive hit: $hit, early: ${monotonic() - r0 < seconds(60)}")
+
+  // A value waiting is taken at once, whatever the timeout, zero and negative too.
+  val full = Channel[int]()
+  for i in 1 .. 4 do full.send(i)
+  println(
+    s"waiting: ${full.receive(millis(10))}, ${full.receive(millis(0))}, ${full.receive(millis(-1))}, ${full.receive(micros(1))}"
+  )
+  println(s"none now: ${full.receive(millis(0))}, ${full.receive(millis(-1))}")
+
+  // Closed: the values sent before come first, then `None` at once.
+  val closing = Channel[int](4)
+  closing.send(1)
+  closing.send(2)
+  closing.close()
+  val c0 = monotonic()
+  println(
+    s"closed: ${closing.receive(hours(1))}, ${closing.receive(hours(1))}, ${closing.receive(hours(1))}, at once: ${monotonic() - c0 < seconds(60)}"
+  )
+
+  // A close wakes a receiver waiting with a timeout.
+  val toClose = Channel[int]()
+  val closer = spawn(() ->
+    sleep(millis(10))
+    toClose.close())
+  println(s"woken by close: ${toClose.receive(hours(1))}")
+  closer.join()
+
+  // A send to a bounded, full channel waits its time and answers `false`; the value is not sent.
+  val bounded = Channel[int](1)
+  println(s"room: ${bounded.send(1, millis(10))}")
+  val s0 = monotonic()
+  val noRoom = bounded.send(2, millis(30))
+  val sendWaited = monotonic() - s0
+  println(
+    s"send miss: $noRoom, waited: ${sendWaited >= millis(30)}, kept: ${bounded.tryReceive()}, ${bounded.tryReceive()}"
+  )
+
+  // Room made by a receiver ends the send's wait.
+  bounded.send(3)
+  val taker = spawn(() ->
+    sleep(millis(10))
+    bounded.receive())
+  println(s"send hit: ${bounded.send(4, hours(1))}, took: ${taker.join()}, then: ${bounded.tryReceive()}")
+
+  // Zero and negative are `trySend`; an unbounded channel always has room.
+  val one = Channel[int](1)
+  println(s"try: ${one.send(1, millis(0))}, ${one.send(2, millis(-5))}, ${one.tryReceive()}, ${one.tryReceive()}")
+  val unbounded = Channel[int]()
+  var all = true
+  for i in 0 ..< 1000 do if !unbounded.send(i, millis(1)) then all = false
+  println(s"unbounded: $all")
+
+  // A thousand lightweight threads, each waiting with a timeout, half of them given a value.
+  val shared = Channel[int]()
+  val got = Atomic(0)
+  val timedOut = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 1000
+      s.spawn(() ->
+        if shared.receive(millis(200)).isDefined then got.add(1) else timedOut.add(1))
+    for i in 0 ..< 500 do shared.send(i))
+  var rest = 0
+  while shared.tryReceive() is Some(_) do rest++
+  println(s"many: ${got.load() + timedOut.load() == 1000}, ${got.load() + rest == 500}")
+
+  // A thread parked in a timed receive or send is cancelled at once, and leaves no timer behind.
+  val stuck = Channel[int](1)
+  stuck.send(0)
+  val ran = Atomic(0)
+  val results = scope(s ->
+    val a = s.spawn(() ->
+      Channel[int]().receive(hours(1))
+      ran.add(1))
+    val b = s.spawn(() ->
+      stuck.send(1, hours(1))
+      ran.add(1))
+    sleep(millis(20))
+    s.cancel()
+    [a.result(), b.result()])
+  println(s"cancelled: $results, ran: ${ran.load()}, timers: ${timers() - timersBefore}")
+
+  // A generic element: a value type and an option of one.
+  val pairs = Channel[(int, Option[string])](2)
+  println(
+    s"pairs: ${pairs.send((1, Some("a")), millis(5))}, ${pairs.send((2, None), millis(5))}, ${pairs.send((3, None), millis(5))}"
+  )
+  println(s"${pairs.receive(millis(5))}, ${pairs.receive(millis(5))}, ${pairs.receive(millis(5))}")
+  0

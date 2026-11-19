@@ -171,20 +171,23 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 userdata = true
                 *at = *at + 1
             val p = c_declaration(tokens, at)?
-            if nulled && (*at < tokens.len() && tokens[*at] == "(" || !p.text.ends_with("*"))
+            val function = *at < tokens.len() && tokens[*at] == "("
+            if nulled && !function && !p.text.ends_with("*")
                 return Err(s"`null` marks a pointer the binding passes null, as in `null int *num_clusters`, and `${p.text}` is not one")
-            if *at < tokens.len() && tokens[*at] == "("
+            if function
                 if inner then return Err("a callback's parameter taking a function cannot cross a C binding: a function crosses only as a binding's own parameter")
                 if userdata || length_of != "" || !(mode is CIn) then return Err("a parameter taking a function is passed in, with no `userdata`, `out`, `inout` or `length` of its own")
                 if p.name is Some(n) then return Err(s"a parameter taking a function is written `${p.text} (*$n)(...)`, its name in parentheses after a `*`")
-                val f = c_function_pointer(tokens, at, p)?
+                val f = c_function_pointer(tokens, at, p, nulled)?
                 var shown = ""
                 for q in f.params
                     shown = shown + (if shown == "" then "" else ", ") + q.text
                 if shown == "" then shown = "void"
+                // A function pointer passed null is never called, so it carries no closure and no
+                // trampoline: it is a pointer like any other marked `null`.
                 var own: Buf[CPrototype] = buf()
-                own.push(f)
-                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own, false))
+                if !nulled then own.push(f)
+                params.push(CParam(CPointerType, s"${p.text} (*)($shown)", f.symbol, CIn, CVoidType, "", "", false, own, nulled))
                 if *at < tokens.len() && tokens[*at] == ","
                     *at = *at + 1
                     continue
@@ -202,6 +205,11 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
                 if pointee_text.starts_with("const ") && !pointee_text.ends_with("*") || pointee_text.ends_with("const")
                     return Err(s"C cannot write through the `$word` parameter `${p.text}`: what it points at is `const`")
                 pointee = parse_c_type(pointee_text)?.ty
+                // C fills memory of no type through `out void *`, as an array or a struct mirror the
+                // binding names, which the checker holds it to; it writes no value it is passed.
+                if pointee is CVoidType && mode is CInOut
+                    val name = p.name.unwrap_or("p")
+                    return Err(s"C writes no value through `$word void *$name`, which points at memory of no type: pass an array or a `ByteBlock` for C to write, as in `void *$name, length($name) size_t n`")
             elif p.text.ends_with(" *")
                 // What a pointer passed in points at, which an array's elements are.
                 val inner_text = p.text[..<p.text.bytes.len - 2]
@@ -220,7 +228,8 @@ private c_param_list(tokens: Buf[string], at: *usize, inner: bool) -> Result[Buf
 
 // A function pointer's declarator from `tokens[*at]`, after its result type `result`: `(*name)` and
 // its parameter list, read as the prototype of the function C calls, named by the parameter.
-private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared) -> Result[CPrototype, string]
+// One marked `null` is never called, so C's types alone are read: no `userdata`, and any result.
+private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared, nulled: bool) -> Result[CPrototype, string]
     val shape = "a parameter taking a function is written as C declares a function pointer, as in `void (*listener)(userdata void *data, int value)`"
     *at = *at + 1
     if *at >= tokens.len() || tokens[*at] != "*" then return Err(shape)
@@ -234,6 +243,11 @@ private c_function_pointer(tokens: Buf[string], at: *usize, result: CDeclared) -
     if *at >= tokens.len() || tokens[*at] != "(" then return Err(shape)
     *at = *at + 1
     val params = c_param_list(tokens, at, true)?
+    if nulled
+        if name == "" then return Err(s"a parameter taking a function is named, as in `null ${result.text} (*callback)(...)`")
+        for q in params
+            if q.userdata || q.length_of != "" then return Err(s"`$name` is passed `null`, so C never calls it, and its parameters carry no `userdata` or `length`")
+        return Ok(CPrototype(name, result.ty, result.text, params))
     // A byte pointer with `length(p)` beside it is memory C lends the function, crossing as a view.
     c_check_lengths(params)?
     if result.ty is CText(_) then return Err("a callback answers C a scalar or an enum mirror; a string it answered would have to outlive the call, which nothing frees")
@@ -315,6 +329,83 @@ c_length_param(p: CPrototype, name: string) -> Option[usize]
  * carries. */
 c_is_array_param(p: CPrototype, k: usize) -> bool = p.params[k].mode is CIn && c_length_param(p, p.params[k].name) is Some(_)
 
+/** Whether the pointer `q` passed in points at memory of no type the prototype shows: `void *` or
+ * `const void *`, or a pointer to one, `void **`, which a header writes where it takes any memory
+ * through a pointer to an opaque pointer. It takes an array of any element type an array crosses as,
+ * or a `ByteBlock`, its length counted in bytes. */
+c_points_at_void(q: CParam) -> bool = q.mode is CIn && q.pointee_text != "" && (q.pointee is CVoidType || c_is_void_pointer(q.pointee_text))
+
+/** Whether the C type written `text` is `void *` or `const void *`. */
+c_is_void_pointer(text: string) -> bool
+    val t = text.trim()
+    t == "void *" || t == "const void *" || t == "void const *"
+
+/** Whether the C type written `text` is `void` itself, as what a pointer points at. */
+c_is_void_text(text: string) -> bool
+    val t = text.trim()
+    t == "void" || t == "const void" || t == "void const"
+
+/** Whether the C type written `text` is a pointer to memory of no type the prototype shows: `void *`,
+ * `const void *` or `void **`. */
+c_is_untyped_pointer(text: string) -> bool
+    if c_is_void_pointer(text) then return true
+    val t = text.trim()
+    t.ends_with(" *") && c_is_void_pointer(t[..<t.bytes.len - 2])
+
+/** Whether what the pointer `q` passed in points at is a typedef, which the headers may make `void *`,
+ * as `rusage_info_t` is: then the pointer points at memory of no type, which the C unit measures. */
+c_points_at_typedef(q: CParam) -> bool = q.mode is CIn && (q.pointee match
+    CTypedef(name) -> !c_standard_integer_typedef(name)
+    _ -> false)
+
+/** Whether `name` is an integer typedef C's own headers define, `uint8_t` or `size_t`, which is never
+ * `void *`. */
+c_standard_integer_typedef(name: string) -> bool
+    for n in ["int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "intptr_t", "uintptr_t", "intmax_t", "uintmax_t", "size_t", "ssize_t", "ptrdiff_t", "off_t", "wchar_t", "char16_t", "char32_t"]
+        if n == name then return true
+    false
+
+/** The name the C unit's measure of whether the typedef `name` is a pointer to `void` is kept under. */
+c_untyped_key(name: string) -> string = "void " + name
+
+/** Whether the pointer `q` passed in points at memory of no type: one the prototype shows, or a pointer
+ * to a typedef the C unit measured as `void *` or `const void *`. With no measures, before the C unit is
+ * built, only the first. */
+c_points_at_no_type(q: CParam, measures: Map[string, CMeasure]) -> bool
+    if c_points_at_void(q) then return true
+    if !(q.mode is CIn) then return false
+    q.pointee match
+        CTypedef(name) -> measures.get(c_untyped_key(name)) match
+            Some(m) -> m.bits > 0
+            None -> false
+        _ -> false
+
+/** Why a parameter `q` of a `void *` type takes nothing but an array or a block. */
+c_void_param_problem(q: CParam) -> string
+    val name = if q.name == "" then "p" else q.name
+    s"`${q.text.trim()}` points at memory of no type, so it takes an `Array[byte]`, `Array[int]`, `Array[long]` or `Array[real]`, its length in bytes carried by the parameter marked `length($name)`, or a `ByteBlock`"
+
+/** Whether C may fill a struct mirror through the `out` parameter `q`: a pointer to memory of no type
+ * the prototype shows, `out void *` or `out void **`, or a pointer to a typedef, which the C unit
+ * checks is the struct or `void *`. */
+c_out_untyped(q: CParam) -> bool = q.mode is COut && (q.pointee is CVoidType || c_is_void_pointer(q.pointee_text) || q.pointee is CTypedef(_))
+
+/** Why the `out` parameter `q`, a pointer to memory of no type, answers nothing but an array or a
+ * struct mirror C fills. */
+c_void_out_problem(q: CParam) -> string
+    val name = if q.name == "" then "p" else q.name
+    s"C writes no value through `out ${q.text.trim()}$name`, which points at memory of no type: pass an array or a `ByteBlock` for C to write, as in `void *$name, length($name) size_t n`, or answer what C fills, an array named with `array: \"$name\"` and its length in bytes given with `length:`, or a struct mirror"
+
+/** Why a `void *` result is not bound. */
+c_void_result_problem() -> string = "C answers a pointer to memory of no type, whose length nothing says, so a `void *` result crosses as nothing: a binding whose result is `unit` discards it"
+
+/** The Avin type of the length the parameter `q`, marked `length(p)`, carries: a `long` counting bytes
+ * for a pointer to memory of no type, an `int` counting elements otherwise. */
+c_length_type(p: CPrototype, q: CParam, measures: Map[string, CMeasure]) -> &Type
+    for r in p.params
+        if r.name == q.length_of && c_points_at_no_type(r, measures) then return Int(64)
+    Int(32)
+
 // A type and the name after it, as a declaration writes them.
 private struct CDeclared
     ty: CType
@@ -343,6 +434,9 @@ private c_declaration(tokens: Buf[string], at: *usize) -> Result[CDeclared, stri
             return Err(s"`$t` is written first, before the parameter's type, as in `$t int *x`")
         if t == "userdata"
             return Err("`userdata` is written first, before the parameter's type, as in `userdata void *data`")
+        // A parameter may be named `null`; the word before its type is the marker.
+        if t == "null" && words.len() == 0 && base is None && !signed && !unsigned && !short && longs == 0 && !char_word && !int_word
+            return Err("`null` is written once, first, before the parameter's type, as in `null int *p`")
         if t == "length" && *at + 1 < tokens.len() && tokens[*at + 1] == "("
             return Err("`length(data)` is written first, before the parameter's type and before `inout`, as in `length(data) size_t n`")
         if t == "static" || t == "inline" || t == "register" || t == "typedef"
@@ -549,6 +643,120 @@ c_class_kept(d: &ClassDecl) -> Option[CKept]
     val class_name = parts[1].trim()
     if !is_c_identifier(name) || class_name == "" then return None
     Some(CKept(name, class_name))
+
+/** Whether the class a handle class's `kept:` names is held as its Avin object, kept from the
+ * collector until the holder's `release` has run, rather than by a C reference: it declares no
+ * `retain`, or a `kept:` of its own. */
+c_kept_pinned(classes: Buf[ClassSymbol], holder: usize) -> bool
+    val k = c_kept_class(classes, holder) match
+        Some(k) -> k
+        None -> return false
+    val d = classes[k].decl
+    c_class_text(d, "retain") is None || c_class_kept(d) is Some(_)
+
+/** A C value a handle class's `holds:` declares: its C type as written, its name, which `release:`
+ * uses, and the C expression it is until a binding's `hold:` gives it one, "0" where none is written. */
+struct CHolds
+    ty: string
+    name: string
+    init: string
+
+/** Reads one `holds:` entry, a C declaration of an integer, `"int sock = -1"`: a type, a name and
+ * perhaps `=` and the value it starts as. */
+c_holds_entry(text: string) -> Result[CHolds, string]
+    val shape = s"`holds:` declares a C integer the handle holds for its `release:`, as in `holds: \"int sock = -1\"`, and `$text` is not one"
+    var declared = text
+    var init = "0"
+    val b = text.bytes
+    for i in 0..<b.len
+        if b[i] == u8('=')
+            declared = text[..<i]
+            init = text[i + 1..].trim()
+            if init == "" then return Err(shape)
+            break
+    val words = declared.trim()
+    val d = words.bytes
+    var end = d.len
+    var start = end
+    while start > 0 && is_c_word_byte(d[start - 1])
+        start -= 1
+    if start == end then return Err(shape)
+    val name = words[start..]
+    val ty = words[..<start].trim()
+    if ty == "" || !is_c_identifier(name) || is_c_keyword(name) then return Err(shape)
+    val parsed = parse_c_type(ty) match
+        Ok(t) -> t.ty
+        Err(_) -> return Err(shape)
+    val integer = parsed match
+        CKeyword(n) -> !n.starts_with("enum ")
+        CTypedef(_) -> true
+        _ -> false
+    if !integer then return Err(s"`holds:` declares a C integer, such as a descriptor, and `$ty` is not one")
+    Ok(CHolds(ty, name, init))
+
+/** The C values a handle class's `holds:` declares, read; those not well formed are left out. */
+c_class_holds(d: &ClassDecl) -> Buf[CHolds]
+    var out: Buf[CHolds] = buf()
+    for t in c_class_texts(d, "holds")
+        if c_holds_entry(t) is Ok(h) then out.push(h)
+    out
+
+/** The strings of an annotation's value: the string, or each string of a list. */
+c_string_items(e: &Expr) -> Buf[string]
+    var out: Buf[string] = buf()
+    e.kind match
+        StringLit(t) -> out.push(t)
+        ListLit(items) ->
+            for item in items
+                if item.kind is StringLit(t) then out.push(t)
+        _ -> ()
+    out
+
+/** The C unit's glue that frees the string the binding numbered `symbol` answers through its
+ * parameter `k`, an `out` one `free:` names. */
+c_out_free_glue(symbol: usize, k: usize) -> string = s"avin_c_out_free_${symbol}_$k"
+
+/** The C unit's glue that makes a handle of class `k` hold its `j`th `holds:` value. */
+c_hold_glue(k: usize, j: usize) -> string = s"avin_c_hold_${k}_$j"
+
+/** The parameters a C binding's `hold:` names, whose values the handle it makes, or its receiver,
+ * holds for its class's `release:`. */
+c_binding_holds(f: &Function) -> Buf[string]
+    var out: Buf[string] = buf()
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name is Some(n) && n == "hold" then out = c_string_items(arg.value)
+    out
+
+/** How a C binding frees a string C answered through an `out` parameter: the parameter's name, and
+ * a C function of the string or a C expression in its name. */
+struct COutFree
+    name: string
+    how: string
+
+/** Reads one `free:` entry naming an out string, `"errmsg: libssh2_free(session, errmsg)"`: the out
+ * parameter's name, `:`, and how it is freed; `None` for an entry naming no parameter. */
+c_out_free_entry(text: string) -> Option[COutFree]
+    val b = text.bytes
+    for i in 0..<b.len
+        if b[i] == u8(':')
+            val name = text[..<i].trim()
+            val how = text[i + 1..].trim()
+            if !is_c_identifier(name) || how == "" then return None
+            return Some(COutFree(name, how))
+    None
+
+/** Every out string a C binding's `free:` frees, by name. */
+c_out_frees(f: &Function) -> Buf[COutFree]
+    var out: Buf[COutFree] = buf()
+    for a in f.annotations
+        if a.name != "c" then continue
+        for arg in a.args
+            if arg.name != Some("free") then continue
+            for t in c_string_items(arg.value)
+                if c_out_free_entry(t) is Some(e) then out.push(e)
+    out
 
 /** The class a handle class's `kept:` names, by its index: a class of the holder's own module, or one
  * named with its module, `freetype.Face`. */
@@ -796,6 +1004,58 @@ c_status_error(t: &Type, data: Buf[DataSymbol]) -> Option[&Type] = *t match
         val error = data[d].module_name == "avin" && data[d].name == "Result" && args.len() == 2 && (*args[1] is Int(_) || c_mirror_of(args[1], data) is Some(_))
         if error then Some(args[1]) else None
     _ -> None
+
+/** Whether `t` is `avin.c.Errno`, the error numbers a binding marked `errno` answers by name. */
+c_errno_type(t: &Type, data: Buf[DataSymbol]) -> bool = *t match
+    Data(d, _, args) -> args.len() == 0 && data[d].module_name == "avin.c" && data[d].name == "Errno"
+    _ -> false
+
+/** For a binding marked `errno` answering `t`: the type of its `Ok`, where `t` is a `Result` whose
+ * error is an integer type or an `Errno`. */
+c_errno_ok(t: &Type, data: Buf[DataSymbol]) -> Option[&Type] = *t match
+    Data(d, _, args) ->
+        val shaped = data[d].module_name == "avin" && data[d].name == "Result" && args.len() == 2 && (*args[1] is Int(_) || c_errno_type(args[1], data))
+        if shaped then Some(args[0]) else None
+    _ -> None
+
+/** The error type of a `Result`. */
+c_result_error(t: &Type) -> &Type = *t match
+    Data(_, _, args) -> if args.len() == 2 then args[1] else t
+    _ -> t
+
+/** The error numbers the named cases of the `Errno` data type `t` are: each but `Other`, by its name,
+ * which is the C macro's. */
+c_errno_names(t: &Type, data: Buf[DataSymbol]) -> Buf[string]
+    var out: Buf[string] = buf()
+    if *t is Data(d, _, _)
+        for v in data[d].decl.variants
+            if v.name != "Other" then out.push(v.name)
+    out
+
+/** What is wrong with `r`, the result of a binding marked `errno` with prototype `p`, `view` saying it
+ * lends its result, or "": a `Result` whose error is an `Errno` or an integer type, over a C integer
+ * result, its `Ok` the C result, kept as an integer or left out, and the out values. */
+c_errno_problem(r: &Type, p: CPrototype, view: bool, data: Buf[DataSymbol]) -> string
+    val ok = c_errno_ok(r, data) match
+        Some(t) -> t
+        None -> return "a binding marked `errno` answers a `Result`: `Ok` of what C answers where it does not answer -1, and `Err` of why where it does, an `Errno` or an integer, as in `Result[int, Errno]`"
+    val integer = p.result match
+        CKeyword(_) -> true
+        CTypedef(_) -> true
+        _ -> false
+    if view || !integer then return "`errno` marks a C function that answers -1 where it fails, so its result is a C integer"
+    if c_status_error(ok, data) is Some(_) then return "the `Ok` of a binding marked `errno` holds what C answers, which is no status of its own: C answers -1 where it fails"
+    val parts = c_result_parts(p, ok, data) match
+        Ok(x) -> x
+        Err(why) -> return why
+    if !(*parts.result is Unit || *parts.result is Int(_) || *parts.result is ErrorType) then return "the C result of a binding marked `errno` is kept as an integer, or left out"
+    ""
+
+/** The result a binding's C result and out values make: for one marked `errno`, the `Ok` of the
+ * `Result` it answers, and otherwise what it answers. */
+c_answered_type(f: &Function, t: &Type, data: Buf[DataSymbol]) -> &Type
+    if !c_binding_flag(f, "errno") then return t
+    c_errno_ok(t, data).unwrap_or(t)
 
 /** How a binding's Avin result is made of what C answers: the Avin type of the C result (`unit`
  * where it is no part of the result) and of each `out` and `inout` value, in order. A status's `Ok`
@@ -1193,10 +1453,12 @@ c_array_out_element(q: CParam) -> string = if q.pointee_text.ends_with(" *") the
 c_array_out_filled(q: CParam) -> bool = !q.pointee_text.ends_with("*")
 
 /** Whether the binding `f` with prototype `p`, whose Avin parameter and result types are `params`
- * and `result`, calls through the C unit's glue: it passes or answers a struct by value, or copies
- * an array C answers, whose length the glue computes. */
+ * and `result`, calls through the C unit's glue: it passes or answers a struct by value, copies an
+ * array C answers, whose length the glue computes, or reads `errno`, which the glue keeps. */
 c_binding_glued(f: &Function, p: CPrototype, params: Buf[&Type], result: &Type, data: Buf[DataSymbol], classes: Buf[ClassSymbol]) -> bool
     if c_array_out_of(f) is Some(_) then return true
+    // `errno` is read by the glue straight after the call, before anything else can set it.
+    if c_binding_flag(f, "errno") then return true
     if c_by_value(p.result, result, data, classes) then return true
     val positions = c_avin_positions(p)
     for i in 0..<positions.len()
@@ -1247,11 +1509,13 @@ c_names_handle(text: string, handle: string, result: bool) -> bool
 c_free_text(f: &Function) -> Option[string]
     // With `array:`, `free:` frees the array.
     if c_array_out_of(f) is Some(_) then return None
+    // An entry `name: how` frees an out string, and the one entry without a name the result.
     for a in f.annotations
         if a.name != "c" then continue
         for arg in a.args
             if arg.name is Some(n) && n == "free"
-                if arg.value.kind is StringLit(text) then return Some(text)
+                for text in c_string_items(arg.value)
+                    if c_out_free_entry(text) is None then return Some(text)
     None
 
 /** Whether a C binding's call may wait: its `@c` says `blocking`, or it takes a function marked

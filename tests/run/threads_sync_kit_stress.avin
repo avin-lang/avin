@@ -1,0 +1,77 @@
+// expect: exit 0
+// The synchronization kit under contention from thousands of lightweight threads at once, each
+// waiting parked, with values made inside the bodies so collections run while threads wait: a
+// semaphore never lets more than its permits through, a wait group counts every thread's `done`, a
+// read-write lock never lets a writer overlap anyone and loses no write, and a barrier of a thousand
+// parties goes round several times with one action a round.
+import avin.threads.{Atomic, Barrier, RwLock, Semaphore, WaitGroup, scope, sleep}
+import avin.time
+
+main()
+  val threads = 2000
+
+  // A semaphore of eight permits, every thread through it once.
+  val permits = Semaphore(8)
+  val inside = Atomic(0)
+  val most = Atomic(0)
+  val done = WaitGroup()
+  done.add(threads)
+  scope(s ->
+    for i in 0 ..< threads
+      s.spawn(() ->
+        permits.withPermit(() ->
+          val now = inside.add(1)
+          most.update(m -> if now > m then now else m)
+          val made = s"thread $i".byteLength
+          if i % 7 == 0 then sleep(time.micros(50))
+          inside.sub(1)
+          made)
+        done.done())
+    done.wait()
+    println(s"semaphore within ${1 <= most.load() <= 8} pending ${done.pending()} free ${permits.availablePermits()}"))
+
+  // A read-write lock: readers and writers interleaved, each writer adding to two counters that
+  // readers check stay equal, and no writer ever overlapping a reader or another writer.
+  val counters = RwLock(Buffer[int]())
+  counters.write(b -> b.appendAll([0, 0]))
+  val writing = Atomic(0)
+  val readingNow = Atomic(0)
+  val bad = Atomic(0)
+  val reads = Atomic(0)
+  scope(s ->
+    for i in 0 ..< threads
+      if i % 10 == 0
+        s.spawn(() ->
+          counters.write(b ->
+            if writing.add(1) != 1 || readingNow.load() != 0 then bad.add(1)
+            b(0) = b(0) + 1
+            val made = [i, i + 1].map(x -> x * 2)
+            b(1) = b(1) + made.length / 2
+            writing.sub(1)))
+      else
+        s.spawn(() ->
+          counters.read(b ->
+            readingNow.add(1)
+            if writing.load() != 0 || b(0) != b(1) then bad.add(1)
+            val made = s"read $i"
+            readingNow.sub(1)
+            if !made.startsWith("read ") then bad.add(1)
+            reads.add(1))))
+  println(s"rw writes ${counters.read(b -> b(0))} reads ${reads.load()} bad ${bad.load()}")
+
+  // A barrier of a thousand parties, five rounds.
+  val parties = 1000
+  val rounds = 5
+  val actions = Atomic(0)
+  val lasts = Atomic(0)
+  val behind = Atomic(0)
+  val step = Barrier(parties, () -> actions.add(1))
+  scope(s ->
+    for _ in 0 ..< parties
+      s.spawn(() ->
+        for r in 0 ..< rounds
+          if actions.load() != r then behind.add(1)
+          val made = (0 ..< 3).map(x -> x + r).toVector
+          if made.length != 3 then behind.add(1)
+          if step.wait() then lasts.add(1)))
+  println(s"barrier actions ${actions.load()} lasts ${lasts.load()} behind ${behind.load()}")

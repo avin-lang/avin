@@ -1,0 +1,67 @@
+// expect: exit 0
+// stderr: times vary
+// The quit signal (Ctrl-\ at a terminal) writes a thread dump to standard error and the program goes
+// on: the main thread first, then each lightweight thread in the order it started, with what it waits
+// on and for how long, or that it runs. A second signal writes a second dump, without the thread that
+// ended between them and with the future's worker, idle once its work is done. While the program watches the signal itself, the watch hears it and no dump is written.
+import avin.process
+import avin.signal
+import avin.threads.{Atomic, Channel, Future, Mutex, sleep, spawn}
+import avin.time.{hours, seconds}
+
+@sysl("avin.rt.thread_dumps")
+dumps() -> long
+
+@sysl("avin.rt.lightweight_parked")
+parked() -> long
+
+// Waits, running, until `n` lightweight threads are parked.
+untilParked(n: long)
+  while parked() != n do ()
+
+// Sends this program the quit signal and waits, running, until the dump numbered `n` is written.
+dump(n: long)
+  _ = process.signal(process.pid(), signal.Quit)
+  while dumps() < n do ()
+
+main()
+  val gate = Channel[int]()
+  val first = spawn(() -> gate.receive().getOrElse(0))
+  spawn(() -> sleep(hours(1)))
+  val m = Mutex(0)
+  val held = Channel[int]()
+  val hold = Channel[int]()
+  spawn(() ->
+    m.with(n ->
+      held.send(1)
+      hold.receive().getOrElse(n)))
+  println(held.receive())
+  spawn(() -> m.with(n -> n + 1))
+  val other = Mutex(0)
+  val waits = other.condition()
+  spawn(() -> other.with(n -> waits.waitFor(3600000)))
+  val spinning = Atomic(false)
+  val stop = Atomic(false)
+  val spinner = spawn(() ->
+    spinning.store(true)
+    var turns = 0
+    while !stop.load() do turns +%= 1
+    turns > -1)
+  while !spinning.load() do ()
+  untilParked(5)
+  dump(1)
+  println("first dump written")
+
+  gate.send(1)
+  println(first.join())
+  println(Future(6 * 7).await())
+  untilParked(5)
+  dump(2)
+  println("second dump written")
+  stop.store(true)
+  println(spinner.join())
+
+  val w = signal.watch(signal.Quit).ok.get
+  _ = process.signal(process.pid(), signal.Quit)
+  println(w.wait(seconds(10)))
+  println(dumps())

@@ -1,0 +1,122 @@
+// expect: exit 0
+// `after(d)` gives a channel that delivers one instant once `d` has passed: never sooner, at once for
+// a duration of zero or less, the instant the time fell due however late it is received, and only
+// once. It works as a `select` arm beside a channel receive, beside the `after` arm, beside other
+// `after` channels, and on many lightweight threads at once; a close ends it. The upper bounds are
+// generous, so a loaded machine cannot fail the test; only the bounds the library promises are tight.
+import avin.threads.{Atomic, Channel, after, scope, sleep, spawn}
+import avin.time.{Instant, hours, micros, millis, monotonic, now, seconds}
+
+main() -> int
+  // Never sooner than asked, and soon enough.
+  val t0 = monotonic()
+  val got = after(millis(40)).receive()
+  val took = monotonic() - t0
+  println("one value:", got.isDefined, "not early:", took >= millis(40), "not late:", took < seconds(20))
+
+  // A duration of zero or less is due at once.
+  println("zero:", after(millis(0)).tryReceive().isDefined, "negative:", after(millis(-5)).tryReceive().isDefined)
+
+  // Not before its time: a look before it is due finds nothing.
+  val later = after(hours(1))
+  println("not yet:", later.tryReceive(), later.receive(millis(5)))
+
+  // The value is the instant the time fell due, not when it was received.
+  val w0 = now()
+  val early = after(millis(5))
+  sleep(millis(100))
+  val at = early.receive() match
+    Some(i) -> i
+    None -> w0
+  println("due instant:", at >= w0, now() - at >= millis(50))
+
+  // Only one value, ever: a second receive finds none, however long it waits.
+  val once = after(millis(1))
+  println("first:", once.receive().isDefined, "second:", once.receive(millis(30)), once.tryReceive())
+
+  // A close ends it: a thread waiting on it wakes with `None`, and nothing is delivered after.
+  val closing = after(hours(1))
+  val waiter = spawn(() -> closing.receive())
+  sleep(millis(20))
+  closing.close()
+  println("closed:", waiter.join(), closing.isClosed())
+  val shut = after(millis(1))
+  shut.close()
+  sleep(millis(10))
+  println("closed before due:", shut.receive())
+
+  // In a select: the receive wins where its value comes first, the `after` channel where it does not.
+  val c = Channel[int]()
+  val sender = spawn(() ->
+    sleep(millis(10))
+    c.send(7))
+  val first = select
+    c.receive() as Some(x) -> s"value $x"
+    after(seconds(30)).receive() -> "timed out"
+  sender.join()
+  val second = select
+    c.receive() as Some(x) -> s"value $x"
+    after(millis(20)).receive() as Some(i) -> s"timed out, an instant: ${i <= now()}"
+  println(first, "|", second)
+
+  // Two `after` channels and the `after` arm: the soonest runs, whichever is written first.
+  val soonest = (0 ..< 3).map(k -> select
+    after(millis(if k == 0 then 10 else 2000)).receive() -> "a"
+    after(millis(if k == 1 then 10 else 2000)).receive() -> "b"
+    after millis(if k == 2 then 10 else 2000) -> "c").toVector
+  println("soonest:", soonest)
+
+  // A channel `after` made, waited on by a select with `else`: `else` until it is due, then the arm.
+  val due = after(millis(15))
+  var elses = 0
+  var done = false
+  while !done
+    select
+      due.receive() -> done = true
+      else
+        elses++
+        sleep(millis(1))
+  println("else first:", elses > 0)
+
+  // Racing a value sent at about the same time, many times over: exactly one arm runs each round, and
+  // a value the select timed out before is still in the channel.
+  val race = Channel[int]()
+  var received = 0
+  var timeouts = 0
+  for i in 0 ..< 200
+    val s = spawn(() ->
+      sleep(micros(long(i % 5) * 200))
+      race.send(i))
+    select
+      race.receive() as Some(_) -> received++
+      after(micros(500)).receive() -> timeouts++
+    s.join()
+  var left = 0
+  while race.tryReceive() is Some(_) do left++
+  println("race:", received + timeouts == 200, received + left == 200)
+
+  // A thousand lightweight threads, each in a select with an `after` of its own, half of them
+  // given a value first.
+  val values = Channel[int]()
+  val gotValue = Atomic(0)
+  val timedOut = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 1000
+      s.spawn(() ->
+        select
+          values.receive() as Some(_) -> gotValue.add(1)
+          after(millis(long(50 + i % 7))).receive() -> timedOut.add(1))
+    for i in 0 ..< 500 do values.send(i))
+  var rest = 0
+  while values.tryReceive() is Some(_) do rest++
+  println("threads:", gotValue.load() + timedOut.load() == 1000, gotValue.load() + rest == 500)
+
+  // Shared between threads: one `after`, many receivers, exactly one gets the value.
+  val shared = after(millis(20))
+  val winners = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 8
+      s.spawn(() ->
+        if shared.receive(millis(300)).isDefined then winners.add(1)))
+  println("one winner:", winners.load())
+  0

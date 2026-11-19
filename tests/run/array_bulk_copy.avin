@@ -1,0 +1,101 @@
+// expect: exit 0
+// The library copies runs of elements in one move rather than one at a time: an array sequence's
+// `toArray`, an array's `copyTo` and `toArraySeq`, a buffer's growth, `sizeHint`, `insert`,
+// `insertAll` and `remove`, and a deque's growth and `toArray`, across its wrap. Each is checked
+// for every element type an array stores unboxed (bytes, ints, longs, reals, characters, booleans),
+// for references, and for elements of several words that mix the two, at lengths empty, one, small
+// and large. A copy is the elements as they were, in order; a copy is the copy's own, so writing
+// to it leaves the original as it was; and a copy within one array whose ranges overlap, in either
+// direction, lands the elements as they were before it.
+// Every way of copying, over `n` elements, the element at `i` being `f(i)`; the problems found.
+check[T: Eq](n: int, f: (int) -> T) -> Vector[string]
+  val problems = Buffer[string]()
+  val expect = (what: string, ok: bool) -> if !ok then problems.addOne(s"$what at $n")
+  val same = (a: Seq[T], from: int) -> a.length == n - from && (0 ..< a.length).forall(i -> a(i) == f(from + i))
+
+  val seq = ArraySeq.tabulate(n, f)
+  val array = seq.toArray()
+  expect("ArraySeq.toArray", same(array, 0))
+  if n > 1
+    array(0) = f(1)
+    expect("ArraySeq.toArray is its own", seq(0) == f(0))
+    array(0) = f(0)
+
+  val back = array.toArraySeq
+  expect("Array.toArraySeq", same(back, 0))
+  if n > 1
+    array(0) = f(1)
+    expect("Array.toArraySeq is its own", back(0) == f(0))
+    array(0) = f(0)
+
+  // Into another array, at an offset, and within one array both ways.
+  val other = Array.tabulate(n + 3, i -> f(0))
+  array.copyTo(other, 3)
+  expect("copyTo another", (0 ..< n).forall(i -> other(i + 3) == f(i)))
+  if n > 2
+    val forward = Array.tabulate(n, f)
+    forward.copyTo(forward, 1, 0, n - 1)
+    expect("copyTo forward over itself", forward(0) == f(0) && (1 ..< n).forall(i -> forward(i) == f(i - 1)))
+    val backward = Array.tabulate(n, f)
+    backward.copyTo(backward, 0, 1, n - 1)
+    expect(
+      "copyTo backward over itself",
+      backward(n - 1) == f(n - 1) && (0 ..< n - 1).forall(i -> backward(i) == f(i + 1))
+    )
+
+  // A buffer grown an element at a time, then with elements put in and taken out at its front.
+  val b = Buffer[T]()
+  for i in 0 ..< n do b.addOne(f(i))
+  expect("Buffer growth", same(b, 0))
+  expect("Buffer.toArray", same(b.toArray(), 0))
+  b.sizeHint(n * 2 + 1)
+  expect("Buffer.sizeHint", same(b, 0))
+  if n > 0
+    b.insert(0, f(0))
+    expect("Buffer.insert", b.length == n + 1 && b(0) == f(0) && (1 ..< n + 1).forall(i -> b(i) == f(i - 1)))
+    b.remove(0)
+    expect("Buffer.remove", same(b, 0))
+    b.insertAll(0, Vector(f(0), f(0)))
+    expect("Buffer.insertAll", b.length == n + 2 && (2 ..< n + 2).forall(i -> b(i) == f(i - 2)))
+    b.remove(0, 2)
+    expect("Buffer.remove of several", same(b, 0))
+    b.remove(n - 1)
+    expect("Buffer.remove of the last", b.length == n - 1 && (0 ..< n - 1).forall(i -> b(i) == f(i)))
+
+  // A deque whose elements wrap around its array's end.
+  val d = Deque[T]()
+  for i in 0 ..< n do d.append(f(i))
+  for _ in 0 ..< n / 2 do d.removeHead()
+  for i in 0 ..< n / 2 do d.append(f(i))
+  val wrapped = d.toArray()
+  expect(
+    "Deque.toArray across its wrap",
+    wrapped.length == n - n / 2 + n / 2 && (0 ..< n - n / 2).forall(
+      i -> wrapped(i) == f(n / 2 + i)
+    ) && (0 ..< n / 2).forall(i -> wrapped(n - n / 2 + i) == f(i))
+  )
+  for i in 0 ..< n do d.append(f(i))
+  expect("Deque growth across its wrap", d.length == n * 2 && (0 ..< n).forall(i -> d(n + i) == f(i)))
+  problems.toVector
+
+data Pair(name: string, weight: real)
+
+// Elements stored unboxed, at every length, a large one included.
+unboxed(n: int) -> Vector[string] = check(n, i -> byte(i % 256))
+  ++ check(n, i -> i * 7)
+  ++ check(n, i -> long(i) * 1000000007)
+  ++ check(n, i -> real(i) / 3.0)
+  ++ check(n, i -> char(int('a') + i % 26))
+  ++ check(n, i -> i % 3 == 0)
+
+// Elements that are references or mix references with other words. Each element is an object of
+// its own, so the large length is smaller, which keeps the run short under a stressed collector.
+referring(n: int) -> Vector[string] = check(n, i -> s"s$i")
+  ++ check(n, i -> (i, s"t$i"))
+  ++ check(n, i -> Pair(s"p$i", real(i)))
+  ++ check(n, i -> if i % 2 == 0 then Some(i) else None)
+
+main()
+  for n in [0, 1, 7, 100000]
+    val found = unboxed(n) ++ referring(if n > 1000 then 1000 else n)
+    println(n, if found.isEmpty then "ok" else found.mkString("; "))

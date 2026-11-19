@@ -17,6 +17,21 @@ private replaceText(s: string, old: string, new: string) -> string
 @sysl("sysl.unicode.is_space")
 private isSpace(c: char) -> bool
 
+// The four Unicode normalization forms (UAX #15), NFC, NFD, NFKC and NFKD. Composing (`Nfc`,
+// `Nfkc`) or decomposing (`Nfd`, `Nfkd`) is one question; applying the compatibility mappings (`K`),
+// which turn `ﬁ` into `fi`, `①` into `1` and a fullwidth `Ａ` into `A`, is the other. `Nfc` is the
+// form for storing and sending text; the `K` forms are for matching, since they discard
+// distinctions.
+@sysl("sysl.unicode.Form")
+data NormalizationForm
+  Nfc
+  Nfd
+  Nfkc
+  Nfkd
+
+@sysl("sysl.unicode.normalize")
+private normalizeText(form: NormalizationForm, s: string) -> string
+
 // Why bytes are not UTF-8: `offset` is where the first sequence that is not a character begins, and
 // `truncated` says the bytes end inside a sequence, which more bytes could complete, rather than
 // holding one that no continuation could make a character.
@@ -75,7 +90,8 @@ impl string
   indexOf(needle: string) -> int = find(needle, 0)
 
   // The offset of the first `needle` at or after `from`, or -1 when there is none. A `from` below 0
-  // starts at 0, and one past the end finds nothing; an empty needle is found at `from` itself.
+  // starts at 0, and one past the end finds nothing; an empty needle is found at `from` itself, or
+  // at the next character when `from` is inside one.
   indexOf(needle: string, from: int) -> int = find(needle, from)
 
   // The offset of the last `needle`, or -1 when there is none. An empty needle is found at the end
@@ -96,10 +112,11 @@ impl string
   indexWhere(p: (char) -> bool) -> int = indexWhere(p, 0)
 
   // The offset of the first character at or after offset `from` that satisfies `p`, or -1 when none
-  // does. A `from` below 0 starts at 0; otherwise it is the offset where a character begins.
+  // does. A `from` below 0 starts at 0, and one inside a character's encoding at the next character.
   indexWhere(p: (char) -> bool, from: int) -> int
     val n = byteLength
     var i = if from < 0 then 0 else from
+    while i < n && (byteAt(i) & 0xc0) == 0x80 do i += 1
     while i < n
       val c = charAt(i)
       if p(c) then return i
@@ -195,7 +212,8 @@ impl string
 
   startsWith(prefix: string) -> bool = occursAt(prefix, 0)
 
-  // Whether `prefix` occurs at byte offset `at`: false when it would reach outside the string.
+  // Whether `prefix` occurs at byte offset `at`: false when it would reach outside the string, and
+  // for the empty prefix, false inside a character.
   startsWith(prefix: string, at: int) -> bool = occursAt(prefix, at)
 
   endsWith(suffix: string) -> bool = occursAt(suffix, byteLength - suffix.byteLength)
@@ -218,6 +236,25 @@ impl string
   toUpper -> string = upperText(self)
 
   toLower -> string = lowerText(self)
+
+  // The string in normalization form `form`, by the Unicode Character Database 17.0.0, which the
+  // library's character classification also answers from: canonical decomposition (and, for `Nfkc`
+  // and `Nfkd`, compatibility decomposition), combining marks put in canonical order, and, for `Nfc`
+  // and `Nfkc`, canonical composition, Hangul syllables included. A code point unassigned in that database is
+  // left as it is. Text all of whose characters are ASCII is in every form and is returned as it is.
+  normalize(form: NormalizationForm) -> string = if isAscii then self else normalizeText(form, self)
+
+  // Whether the string is already in normalization form `form`: whether `normalize(form)` gives the
+  // same characters.
+  isNormalized(form: NormalizationForm) -> bool = isAscii || normalizeText(form, self) == self
+
+  private isAscii -> bool
+    val n = byteLength
+    var i = 0
+    while i < n
+      if (byteAt(i) & 0x80) != 0 then return false
+      i += 1
+    true
 
   // Every occurrence of `old`, left to right and not overlapping, replaced by `new`. An empty `old`
   // occurs nowhere, so the string is returned as it is.
@@ -629,10 +666,12 @@ impl string
       start -= 1
     start
 
-  // Whether `part` occurs at byte offset `at`.
+  // Whether `part` occurs at byte offset `at`. The empty string occurs only where a character begins
+  // or at the end; any other part begins with a character, so its bytes match only at one.
   private occursAt(part: string, at: int) -> bool
     val n = part.byteLength
     if at < 0 || at > byteLength - n then return false
+    if n == 0 then return at == byteLength || (byteAt(at) & 0xc0) != 0x80
     var i = 0
     while i < n
       if byteAt(at + i) != part.byteAt(i) then return false
@@ -661,10 +700,11 @@ impl string
     0
 
   // The character whose encoding begins at byte offset `at`, which traps when `at` is not inside
-  // the string.
+  // the string or falls inside a character's encoding, as slicing there does.
   charAt(at: int) -> char
     val b = int(byteAt(at))
     if b < 0x80 then return char(b)
+    if b < 0xc0 then fail("charAt offset is not a character boundary")
     if b < 0xe0 then return char(((b & 0x1f) << 6) | following(at + 1))
     if b < 0xf0 then return char(((b & 0x0f) << 12) | (following(at + 1) << 6) | following(at + 2))
     char(((b & 0x07) << 18) | (following(at + 1) << 12) | (following(at + 2) << 6) | following(at + 3))

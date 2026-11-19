@@ -1,0 +1,49 @@
+// expect: exit 0
+// The thread a WebSocket belongs to, cancelled while it waits in `receive`: its deferred statements
+// run, nothing after the receive does, the connection is closed (the server sees it go without a
+// close), and its sender answers `Err` from then on.
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Closed, Route, Router, WebSocket, WebSocketError, WebSocketSender, webSocket}
+import avin.threads.{Channel, scope, sleep}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+answer(r: Result[unit, WebSocketError]) -> string = r match
+  Ok(_) -> "ok"
+  Err(Closed(code, reason)) -> s"closed $code `$reason`"
+  Err(e) -> e.message
+
+main()
+  val heard = Channel[string]()
+  val router = Router([Route.get("/", r -> webSocket(r, ws -> heard.send(ws.receive() match
+    Err(e) -> s"session: ${e.message}"
+    Ok(m) -> s"session: $m")))])
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+  val url = s"ws://127.0.0.1:${server.port()}/"
+  val log = Channel[string]()
+  val senders = Channel[WebSocketSender]()
+  val snd = scope(s ->
+    s.spawn(() ->
+      val ws = WebSocket.connect(url, outboxSize = 1) match
+        Ok(w) -> w
+        Err(e) -> fail(e.message)
+      defer log.send("deferred ran")
+      senders.send(ws.sender())
+      _ = ws.receive()
+      log.send("receive returned"))
+    val got = senders.receive().getOrElse(fail("no sender"))
+    sleep(millis(100))
+    s.cancel()
+    got)
+  println(log.receive().getOrElse("?"))
+  println(s"nothing ran after the receive: ${log.tryReceive().isEmpty}")
+  println(answer(snd.send("late")))
+  println(answer(snd.close()))
+  println(s"open: ${snd.isOpen()}")
+  println(heard.receive().getOrElse("?"))
+  server.stop()
+  server.join()

@@ -246,6 +246,15 @@ private argument_text(k: *Keys, out: *StrBuilder, t: &Type)
         Union(members) ->
             for a in members
                 argument_text(k, out, a)
+        // An opaque type's impls are among the built-in types', and it is laid out as its
+        // representation.
+        Opaque(_, _, args, repr) ->
+            out.push(k.builtins)
+            for a in args
+                argument_text(k, out, a)
+            argument_text(k, out, repr)
+        // A constructor argument is read as the type it names, wherever its holes are filled.
+        Constructor(body, _) -> argument_text(k, out, body)
         _ -> out.push(k.builtins)
 
 /** What a function lowering makes for type `t` reads of it: its layout, supertypes and method table,
@@ -520,9 +529,11 @@ private expr(k: *Keys, p: *KeyPrinter, e: &TExpr)
             callee(k, p, function)
             types(k, p, type_args)
             exprs(k, p, args)
-        Construct(variant, args) ->
+        Construct(variant, args, hidden) ->
             p.out.push("construct " + variant.to_string())
             layout_read(k, p, e.ty)
+            // A value of a variant hiding types is made at the pack they are.
+            if hidden.len() > 0 then types(k, p, hidden)
             exprs(k, p, args)
         Collection(elements, built) ->
             p.out.push("collection ")
@@ -559,6 +570,11 @@ private expr(k: *Keys, p: *KeyPrinter, e: &TExpr)
             p.out.push(s"lazy field $index $name")
             layout_read(k, p, object.ty)
             expr(k, p, object)
+            expr(k, p, initialize)
+        LazyLocal(cell, initialize, _, name) ->
+            p.out.push(s"lazy local $name")
+            layout_read(k, p, cell.ty)
+            expr(k, p, cell)
             expr(k, p, initialize)
         StoreGlobal(index, value, yields) ->
             p.out.push(s"store global $yields ")
@@ -607,6 +623,9 @@ private expr(k: *Keys, p: *KeyPrinter, e: &TExpr)
             expr(k, p, value)
         NoneAs(value) ->
             p.out.push("none as")
+            expr(k, p, value)
+        Reveal(value) ->
+            p.out.push("reveal")
             expr(k, p, value)
         Logic(and, left, right) ->
             p.out.push(s"logic $and")
@@ -700,7 +719,7 @@ private pattern_text(k: *Keys, p: *KeyPrinter, pattern: &TPattern)
         PNamed(local, inner) ->
             p.out.push("named " + local.to_string())
             pattern_text(k, p, inner)
-        PVariant(variant, fields) ->
+        PVariant(variant, fields, _) ->
             p.out.push("variant " + variant.to_string())
             layout_read(k, p, pattern.ty)
             for f in fields
@@ -757,6 +776,12 @@ private type_text(k: *Keys, p: *KeyPrinter, t: &Type)
             p.out.push((if c.decl.object then "object " else "class ") + module_prefix(c.module_name) + "." + c.name)
             types(k, p, args)
         TypeVar(_, index, name) -> p.out.push(s"$name#$index")
+        // An opaque type is its own, laid out as its representation, so both are in its spelling.
+        Opaque(id, _, args, repr) ->
+            p.out.push("opaque " + k.program.opaques[id])
+            types(k, p, args)
+            p.out.push(" = ")
+            type_text(k, p, repr)
         // A union is one type whatever order its members were written in.
         Union(members) ->
             var keys: Buf[string] = buf()
@@ -849,6 +874,10 @@ private record_read(k: *Keys, p: *KeyPrinter, t: &Type)
         Tuple(items) ->
             for a in items
                 record_read(k, p, a)
+        Opaque(_, _, args, repr) ->
+            for a in args
+                record_read(k, p, a)
+            record_read(k, p, repr)
         _ -> ()
 
 /** The layout of a data type or a class: its variants or fields, each field's type, in the order
@@ -906,8 +935,25 @@ private header_of(k: *Keys, kind: string, id: usize) -> string
         types(k, &p, c.functions)
         table_text(k, &p, c.table)
         if c.call is Some(f) then p.out.push(" call " + symbol_spelling(k.program, k.inputs.ordinals, f, buf()))
+    // An impl for instances of a type adds to the conformances and tables of the type and its
+    // subclasses at those instances.
+    if k.program.instances.len() > 0 then p.out.push(instances_text(k))
     val text = p.out.finish()
     k.interfaces.put(what, text)
+    text
+
+/** Every impl for instances of a type: the type, the trait and the table, in one text. */
+private instances_text(k: *Keys) -> string
+    if k.interfaces.get("instances") is Some(t) then return t
+    var p = printer(0, true)
+    for x in k.program.instances
+        p.out.push(" instance ")
+        type_text(k, &p, x.ty)
+        p.out.push(" ")
+        type_text(k, &p, x.trait_type)
+        table_text(k, &p, x.table)
+    val text = p.out.finish()
+    k.interfaces.put("instances", text)
     text
 
 private table_text(k: *Keys, p: *KeyPrinter, table: Buf[Option[usize]])

@@ -1,0 +1,251 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.{MacOS, os}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, remove_file, set_permissions, write_text}
+import sysl.process.capture
+
+// Linking a program's C libraries from their static archives (`static-c-libraries`): how the flags
+// `pkg-config --static --libs` answers become archives, and a program built both ways from a C
+// library that is installed as an archive and as a shared library.
+
+private library_named(label: string) -> CLibrary = CLibrary("app", label, Some(label), buf(), buf(), "", true)
+
+private touch(file: string) = write_text(file, "").unwrap()
+
+private flags_text(flags: Buf[string]) -> string
+    var out = ""
+    for f in flags
+        out = out + (if out == "" then "" else " ") + f
+    out
+
+@test("a -l name whose archive is in a -L directory is linked from that archive, and the -L and run-path flags are dropped")
+archives_replace_names()
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/a").unwrap()
+    make_dir_all(dir + "/b").unwrap()
+    touch(dir + "/a/libssh2.a")
+    touch(dir + "/a/libssh2.dylib")
+    touch(dir + "/b/libcrypto.a")
+    val answer = s"-L$dir/a -lssh2 -L$dir/b -R$dir/b -Wl,-rpath,$dir/b -lcrypto -lz"
+    val flags = static_link_flags(library_named("libssh2"), "libssh2", answer).unwrap()
+    // libz is in neither directory: the system's own, which stays dynamic.
+    assert_eq(flags_text(flags), s"$dir/a/libssh2.a $dir/b/libcrypto.a -lz")
+
+@test("the first -L directory holding an archive wins, as the linker searches them, wherever the -L stands")
+first_directory_wins()
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/a").unwrap()
+    make_dir_all(dir + "/b").unwrap()
+    touch(dir + "/a/libx.a")
+    touch(dir + "/b/libx.a")
+    touch(dir + "/b/liby.a")
+    // A -L after the -l still names a directory the linker searches for it.
+    val flags = static_link_flags(library_named("x"), "x", s"-lx -ly -L$dir/a -L$dir/b").unwrap()
+    assert_eq(flags_text(flags), s"$dir/a/libx.a $dir/b/liby.a")
+
+@test("a library whose shared library is in a -L directory but whose archive is in none is an error naming it")
+missing_archive_is_an_error()
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    for suffix in [".dylib", ".tbd", ".so"]
+        val lib = dir + "/lib" + suffix[1..]
+        make_dir_all(lib).unwrap()
+        touch(lib + "/libssh2.a")
+        touch(lib + "/libcrypto" + suffix)
+        val e = static_link_flags(library_named("libssh2"), "libssh2", s"-L$lib -lssh2 -lcrypto")
+        assert(e is Err(_))
+        val message = e match
+            Err(m) -> m
+            Ok(_) -> ""
+        assert(message.starts_with("error: the C library `libssh2` of package `app` is linked statically (`static-c-libraries = true`), but `-lcrypto`, which `pkg-config --static --libs libssh2` names, has no static archive: "), message)
+        assert(message.contains(s"`$lib/libcrypto$suffix` has no `libcrypto.a` beside it"), message)
+    // An archive in another directory is found, so the shared library beside nothing is no error.
+    make_dir_all(dir + "/archives").unwrap()
+    touch(dir + "/archives/libcrypto.a")
+    val found = static_link_flags(library_named("libssh2"), "libssh2", s"-L$dir/lib/dylib -L$dir/archives -lcrypto").unwrap()
+    assert_eq(flags_text(found), s"$dir/archives/libcrypto.a")
+
+@test("flags that name no library are kept as they are, and an empty answer links nothing")
+other_flags_kept()
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    touch(dir + "/libq.a")
+    assert_eq(static_link_flags(library_named("q"), "q", "").unwrap().len(), 0)
+    assert_eq(static_link_flags(library_named("q"), "q", "   ").unwrap().len(), 0)
+    val flags = static_link_flags(library_named("q"), "q", s"-pthread -L$dir -lq -framework Security -framework CoreFoundation -l -Wl,-dead_strip").unwrap()
+    assert_eq(flags_text(flags), s"-pthread $dir/libq.a -framework Security -framework CoreFoundation -l -Wl,-dead_strip")
+    // With no -L at all, every name is the system's.
+    assert_eq(flags_text(static_link_flags(library_named("q"), "q", "-lz -lm").unwrap()), "-lz -lm")
+
+@test("link flags are added once each, and a flag taking the word after it is one flag with that word")
+link_flags_added_once()
+    var flags: Buf[string] = buf()
+    var first: Buf[string] = buf()
+    for w in ["-lz", "-framework", "Security", "-framework", "CoreFoundation", "-lz"]
+        first.push(w)
+    add_link_flags(&flags, first)
+    assert_eq(flags_text(flags), "-lz -framework Security -framework CoreFoundation")
+    var second: Buf[string] = buf()
+    for w in ["-framework", "CoreFoundation", "-framework", "IOKit", "-lm", "-Xlinker", "-x", "-Xlinker", "-x"]
+        second.push(w)
+    add_link_flags(&flags, second)
+    assert_eq(flags_text(flags), "-lz -framework Security -framework CoreFoundation -framework IOKit -lm -Xlinker -x")
+    // A paired flag with nothing after it is kept alone.
+    var alone: Buf[string] = buf()
+    var last: Buf[string] = buf()
+    last.push("-lz")
+    last.push("-framework")
+    add_link_flags(&alone, last)
+    assert_eq(flags_text(alone), "-lz -framework")
+
+// The program tests.
+
+/** A C library `static-fix`, installed in `dir/lib` both as archives and as shared libraries:
+ * `libstaticfix` calls `libstaticdep`, which its module names only under `Libs.private`, with the
+ * system's libz beside it. Answers the repository's toolchain whose `pkg-config` also knows it. */
+private static_fixture(dir: string) -> Toolchain
+    val tc = repository_toolchain()
+    make_dir_all(dir + "/include").unwrap()
+    make_dir_all(dir + "/lib").unwrap()
+    make_dir_all(dir + "/pkgconfig").unwrap()
+    write_text(dir + "/include/static_fix.h", "int static_fix_twice(int n);\n").unwrap()
+    write_text(dir + "/static_fix.c", "int static_dep_add(int a, int b);\nint static_fix_twice(int n) { return static_dep_add(n, n); }\n").unwrap()
+    write_text(dir + "/static_dep.c", "int static_dep_add(int a, int b) { return a + b; }\n").unwrap()
+    for name in ["static_fix", "static_dep"]
+        clang_ok(tc, ["-c", "-O1", dir + "/" + name + ".c", "-o", dir + "/" + name + ".o"])
+    ar_ok(dir + "/lib/libstaticdep.a", dir + "/static_dep.o")
+    ar_ok(dir + "/lib/libstaticfix.a", dir + "/static_fix.o")
+    clang_ok(tc, ["-dynamiclib", dir + "/static_dep.o", "-install_name", dir + "/lib/libstaticdep.dylib", "-o", dir + "/lib/libstaticdep.dylib"])
+    clang_ok(tc, ["-dynamiclib", dir + "/static_fix.o", "-L" + dir + "/lib", "-lstaticdep", "-install_name", dir + "/lib/libstaticfix.dylib", "-o", dir + "/lib/libstaticfix.dylib"])
+    write_text(dir + "/pkgconfig/static-fix.pc", "Name: static-fix\nDescription: a C library installed as an archive and as a shared library\nVersion: 1.0.0\nCflags: -I" + dir + "/include\nLibs: -L" + dir + "/lib -lstaticfix\nLibs.private: -lstaticdep -lz\n").unwrap()
+    val wrapper = dir + "/pkg-config"
+    write_text(wrapper, "#!/bin/sh\nPKG_CONFIG_PATH=\"" + dir + "/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\" exec pkg-config \"$@\"\n").unwrap()
+    set_permissions(wrapper, 493u32).unwrap()
+    Toolchain(tc.root, tc.cache, tc.clang, tc.sysl, wrapper, tc.builds)
+
+private clang_ok(tc: Toolchain, args: []const string)
+    val r = capture(tc.clang, args, stderr = true, timeout = 120000).unwrap()
+    if !r.status.ok() then panic("clang failed: " + r.err.unwrap_or("") + r.text)
+
+private ar_ok(archive: string, object: string)
+    val r = capture("ar", ["rcs", archive, object], stderr = true, timeout = 60000).unwrap()
+    if !r.status.ok() then panic("ar failed: " + r.err.unwrap_or("") + r.text)
+
+// The package `name` at `dir/name`, binding `static_fix_twice` and printing it of 21, whose manifest
+// holds `rest` after its `package` block.
+private fix_app(dir: string, name: string, rest: string)
+    make_dir_all(dir + "/" + name).unwrap()
+    write_text(dir + "/" + name + "/avin.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n$rest").unwrap()
+    write_text(dir + "/" + name + "/main.avin", "@c(\"int static_fix_twice(int n)\")\ntwice(n: int) -> int\n\nmain()\n  println(twice(21))\n").unwrap()
+
+private const FixLibrary: string = "c-libraries {\n  staticfix { pkg-config = \"static-fix\", headers = [\"static_fix.h\"] }\n}\n"
+
+private struct Built
+    status: int
+    noted: string
+
+private build(tc: Toolchain, args: []const string) -> Built
+    var noted = ""
+    val status = run_cli(args, Some(tc), s -> (), s -> noted = noted + s + "\n")
+    Built(status, noted)
+
+// What `otool -L` lists for `program`, the program's own path left out.
+private linked_libraries(program: string) -> string
+    val r = capture("otool", ["-L", program], stderr = true, timeout = 60000).unwrap()
+    assert(r.status.ok(), r.text)
+    r.text
+
+private runs_and_prints_42(program: string)
+    val r = capture(program, [], stderr = true, timeout = 60000).unwrap()
+    assert(r.status.ok(), r.err.unwrap_or("") + r.text)
+    assert_eq(r.text, "42\n")
+
+@test("a program saying static-c-libraries links its C library and the library's private dependencies from their archives, at -O0 and -O2, and keeps the system's dynamic")
+static_program_links_archives()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = static_fixture(dir)
+    fix_app(dir, "app", "static-c-libraries = true\n" + FixLibrary)
+    for level in ["-O0", "-O2"]
+        val program = dir + "/program" + level
+        val built = build(tc, ["avin", "build", dir + "/app", "-o", program, level])
+        assert_eq(built.status, 0, built.noted)
+        val libraries = linked_libraries(program)
+        assert(!libraries.contains("libstaticfix"), libraries)
+        assert(!libraries.contains("libstaticdep"), libraries)
+        assert(libraries.contains("/usr/lib/libSystem"), libraries)
+        assert(libraries.contains("/usr/lib/libz"), libraries)
+        runs_and_prints_42(program)
+    // Built, the program needs nothing of the library's directory: with its shared libraries gone,
+    // it still runs.
+    remove_file(dir + "/lib/libstaticfix.dylib").unwrap()
+    remove_file(dir + "/lib/libstaticdep.dylib").unwrap()
+    runs_and_prints_42(dir + "/program-O2")
+
+@test("a program not saying static-c-libraries, or saying false, links its C library dynamically")
+dynamic_is_the_default()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = static_fixture(dir)
+    fix_app(dir, "plain", FixLibrary)
+    fix_app(dir, "unsaid", "static-c-libraries = false\n" + FixLibrary)
+    for name in ["plain", "unsaid"]
+        val program = dir + "/" + name + "-program"
+        val built = build(tc, ["avin", "build", dir + "/" + name, "-o", program])
+        assert_eq(built.status, 0, built.noted)
+        val libraries = linked_libraries(program)
+        // The temporary directory's path may be written with a doubled `/`; the name is what counts.
+        assert(libraries.contains("/lib/libstaticfix.dylib"), libraries)
+        runs_and_prints_42(program)
+
+@test("a static build whose library, or a private dependency of it, has no archive stops with the error naming it; a dynamic build does not need the archive")
+missing_archive_stops_the_build()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = static_fixture(dir)
+    fix_app(dir, "app", "static-c-libraries = true\n" + FixLibrary)
+    fix_app(dir, "plain", FixLibrary)
+    remove_file(dir + "/lib/libstaticdep.a").unwrap()
+    val program = dir + "/program"
+    val private_missing = build(tc, ["avin", "build", dir + "/app", "-o", program])
+    assert_eq(private_missing.status, 1)
+    assert(private_missing.noted.contains("error: the C library `staticfix` of package `app` is linked statically (`static-c-libraries = true`), but `-lstaticdep`, which `pkg-config --static --libs static-fix` names, has no static archive: `" + dir + "/lib/libstaticdep.dylib` has no `libstaticdep.a` beside it"), private_missing.noted)
+    // `check` builds the C unit and asks for the same flags, so it says the same.
+    val checked = build(tc, ["avin", "check", dir + "/app"])
+    assert_eq(checked.status, 1)
+    assert(checked.noted.contains("has no static archive"), checked.noted)
+    remove_file(dir + "/lib/libstaticfix.a").unwrap()
+    val own_missing = build(tc, ["avin", "build", dir + "/app", "-o", program])
+    assert_eq(own_missing.status, 1)
+    assert(own_missing.noted.contains("but `-lstaticfix`, which `pkg-config --static --libs static-fix` names, has no static archive"), own_missing.noted)
+    val dynamic = build(tc, ["avin", "build", dir + "/plain", "-o", program])
+    assert_eq(dynamic.status, 0, dynamic.noted)
+    runs_and_prints_42(program)
+
+@test("a C library a dependency names is linked statically when the program says so, and dynamically when only the dependency does")
+static_reaches_dependencies()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = static_fixture(dir)
+    make_dir_all(dir + "/fix/fix").unwrap()
+    write_text(dir + "/fix/avin.hocon", "package { name = \"fix\", version = \"0.1.0\" }\nstatic-c-libraries = true\n" + FixLibrary).unwrap()
+    write_text(dir + "/fix/fix/fix.avin", "module fix\n\n@c(\"int static_fix_twice(int n)\")\ntwice(n: int) -> int\n").unwrap()
+    for name in ["app", "plain"]
+        val says = if name == "app" then "static-c-libraries = true\n" else ""
+        make_dir_all(dir + "/" + name).unwrap()
+        write_text(dir + "/" + name + "/avin.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n${says}dependencies {\n  fix { path = \"../fix\" }\n}\n").unwrap()
+        write_text(dir + "/" + name + "/main.avin", "import fix\n\nmain()\n  println(fix.twice(21))\n").unwrap()
+        val program = dir + "/" + name + "-program"
+        val built = build(tc, ["avin", "build", dir + "/" + name, "-o", program])
+        assert_eq(built.status, 0, built.noted)
+        val libraries = linked_libraries(program)
+        assert_eq(libraries.contains("libstaticfix"), says == "", libraries)
+        runs_and_prints_42(program)

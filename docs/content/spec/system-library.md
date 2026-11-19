@@ -137,6 +137,10 @@ knows is asked for by name, and a program's own settings are its own values.
 | `exec(program: string, args: Vector[string], environment: Map[string, string]) -> Result[Nothing, IoError]` | The same, with `environment` as the whole of the new program's environment. |
 | `waitPid(pid: long) -> Result[ExitStatus, IoError]` | Waits for this program's child `pid` to end and answers how it ended, reaping it; see [becoming another program](#becoming-another-program). |
 | `tryWaitPid(pid: long) -> Result[Option[ExitStatus], IoError]` | Whether the child `pid` has ended, without waiting: `None` while it runs, its status (reaping it) once it has. |
+| `waitPidCpu(pid: long) -> Result[(ExitStatus, CpuTime), IoError]` | `waitPid`, answering with the status the [CPU time](#cpu-time) the child used, its reaped descendants' included. |
+| `tryWaitPidCpu(pid: long) -> Result[Option[(ExitStatus, CpuTime)], IoError]` | `tryWaitPid`, answering with the status the child's CPU time. |
+| `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the program has used so far, every thread's together. |
+| `childrenCpuTime() -> CpuTime` | The CPU time of the program's children that have ended and been reaped, each with the children it reaped in turn. |
 | `os() -> Os` | The operating system the program was compiled for: `MacOS`, `Linux`, `Windows`, `Android`, `Wasi` or `Freestanding`. |
 
 Listing a group replaces a `pgrep -g` subprocess, for instance to signal or count everything a
@@ -199,6 +203,32 @@ program's own pid, and a pid of zero or less or past the largest process id are 
 `Err(NotFound)`. A thread waiting in `waitPid` leaves its worker to the program's other threads, as
 every [blocking](/spec/threads/#lightweight-threads) wait does. A child a `Child` still holds is
 its `Child`'s to wait for: one reaped by `waitPid` first is no longer there for `waitFor`.
+
+### CPU time
+
+`CpuTime(user: Duration, system: Duration)` is how long a processor ran a process's own code and
+the kernel's code on its behalf, each in whole microseconds as the kernel accounts for them; `total`
+is the two added, and `CpuTime` is `Add`, with `CpuTime.Zero` its zero. The kernel keeps the count
+per process, and **a process's count is handed to its parent when the parent reaps it**, folded into
+the parent's own children's count. So the CPU of a whole tree reaches the program through the one
+child it started, once every process in the tree was reaped by its own parent: a shell running a
+loop of programs that each exit has their time as well as its own.
+
+```avin
+match Command("/bin/sh", "-c", "make -j4").start()
+  Ok(job) ->
+    _ = job.waitFor()
+    println(s"${job.cpuTime().total.toSecondsReal} s of CPU")   // make, the compilers it ran, theirs
+  Err(e) -> eprint(e.message)
+```
+
+**Only what was reaped counts.** A program still running counts nothing, and so does one that has
+ended and not been waited for, and a grandchild that outlives its parent, or that its parent never
+waited for, never reaches it. `cpuTime()` is the program's own, every thread's, and only grows;
+`childrenCpuTime()` is every reaped child's added. `waitPidCpu` and `tryWaitPidCpu` answer one
+child's, as `waitPid` and `tryWaitPid` answer its status, with the same errors; a `Child`'s
+`cpuTime()` answers its command's. A program that only slept used next to none: what starting it
+took.
 
 ### Commands
 
@@ -270,6 +300,7 @@ it.
 | `signalGroup(sig: int) -> Result[unit, IoError]` | Sends `sig` to every process in the command's group, the programs those programs started that stayed in it among them, however the command ended; an empty group is `Err(Other("No such process"))`, also while its last member has ended but is not yet waited for, and a command not started `inNewGroup` `Err(Other("the command has no group of its own"))`. |
 | `detach() -> long` | Lets go of the command without stopping it, so it outlives its `Child` and the program, and answers `pid()`. |
 | `residentBytes() -> Result[long, IoError]` | The memory the program `pid()` names holds in RAM now, as `process.residentBytes(pid())` answers it; a command seen to have ended, or with no program started, is `Err(NotFound)`. |
+| `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the command's programs used, each with its reaped descendants', a pipeline's stages and a sequence's parts added. After `waitFor` it is the whole command's; before, what the programs seen to have ended used. A detached program counts nothing. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
@@ -531,7 +562,8 @@ belonging to one thread at a time as a connection does, so a thread of its own m
 
 ## `avin.io`
 
-Standard input, read as text, and the error every module that reads or writes shares. Standard
+Standard input, read as text, the error every module that reads or writes shares, and the traits
+that let one function read bytes from, or write them to, a file and a connection alike. Standard
 output and standard error need no import: `print`, `println`, `eprint` and `eprintln` are in the prelude, beside the
 writers `StandardOutput` and `StandardError`; each is one function taking `Any*` (see
 [Strings and formatting](/spec/strings-and-formatting/)).
@@ -637,6 +669,14 @@ has read ahead, so `readLine`, `lines()` and `readAll` can be mixed: each takes 
 stopped, and nothing read ahead is lost. Reading blocks until a line is complete or the input ends,
 so a program reading a terminal sees each line as it is entered.
 
+**Threads read standard input one at a time, and each read is whole.** A `readLine`, a step of an
+iterator and `readAll` each take what they read in one step: a line goes whole to exactly one reader,
+never split between two or given to both, and a reader that finds the input ended gets `None`. A
+lightweight thread waiting for its turn, or for the input itself, parks and leaves its worker to the
+others. An iterator over standard input takes the line (or character) `hasNext` answers for and keeps
+it for `next`, so a `true` from `hasNext` is never undone by another thread; a `readLine` after
+`hasNext` reads the line after the one the iterator holds.
+
 **Input is text, and reading it does not fail.** Bytes that are not UTF-8 become U+FFFD, one for each
 ill-formed run, as they are read; a line is always a valid string, and a program reading text is
 never stopped by a stray byte. A read that fails ends the input, as its end does. Standard input is a
@@ -648,6 +688,15 @@ flushed when the program ends, exits or traps; standard error is not buffered. E
 standard error first flushes what the program has written to standard output, so when both go to one
 terminal or one file they arrive in the order the program wrote them. `eprintln(x)` renders `x` (or all its arguments) and its
 new line first and writes them in one write, so a line is never split.
+
+**A line printed is never split, whichever threads print.** `println(x)` (with any number of
+arguments) renders all its arguments and its new line first, then adds them to standard output's
+buffer in one step, and `print(x)` does the same with no new line: one call, one piece of output.
+Another thread's output lands before the piece or after it, never inside it, however long the piece
+is and wherever standard output leads (a terminal, a pipe, a file); a flush sends the buffer's
+pieces out whole and in order. Rendering is done before the step, so a value slow or large to render
+holds no other thread up. Output built from several calls (`print(a)` then `println(b)`, or writes
+to `StandardOutput` piece by piece) is several pieces, and another thread's may land between them.
 
 **`flush()` sends a partial line on its way.** `flush()` in the prelude (and `StandardOutput.flush()`,
 and `StandardError.flush()`, which has nothing to send) sends everything written to standard output so
@@ -670,10 +719,48 @@ trait Reader
 ```
 
 `read(max)` gives up to `max` bytes, `max` being at least one, waiting for at least one where the
-source is still going, and an empty array once it has ended. `fs.File` is a reader by its own
+source is still going, and an empty array once it has ended. A stream's read allocates the bytes
+it answers, not `max`, so a small message read with a large `max` costs what the message does.
+`fs.File` is a reader by its own
 `read`, and so is every `net.ByteStream`: `TcpStream`, `UnixStream` and `TlsStream`; a class of the program's own is one by
 naming `io.Reader` (or `Reader`, imported) after `:` and overriding `read`. The
 JSON package's `JsonReader` ([`dev.avinlang.json`](/spec/json/)) reads JSON from any reader.
+
+### `ByteWriter`
+
+A `ByteWriter` is somewhere bytes are written, so one function can write to a file, a connection,
+a streamed HTTP body, or a sink the program makes itself:
+
+```text
+trait ByteWriter
+  write(bytes: Array[byte]) -> Result[unit, IoError]
+```
+
+`write(bytes)` writes all of `bytes` or answers why it could not; an empty array writes nothing.
+`fs.File` is a byte writer by its own `write`, and so are every `net.ByteStream` (`TcpStream`,
+`UnixStream` and `TlsStream`), the `StreamWriter` half of a [split connection](#split-connections)
+and a streamed response's `BodyWriter`; a write to any of them once it is closed is an `Err`. A
+class of the program's own is one by naming `io.ByteWriter` after `:` and overriding `write`, and a
+generic function takes any of them as `[W: ByteWriter]`.
+
+It writes bytes, and the prelude's [`Writer`](/spec/strings-and-formatting/) is where values render
+as text; the two names differ, so a program sees both unqualified and one class may be both, its two
+`write`s told apart by what they take. A byte writer is not a `Close`, as a `Reader` is not: a
+streamed body is ended by its response, not closed, and code holding a resource that is both bounds
+it by both. Nor does it flush: a file's `flush()` is the file's own, and whoever opened the file
+closes it, which flushes it.
+
+`io.copy(from: Reader, to: ByteWriter) -> Result[long, IoError]` reads `from` to its end and writes
+everything it gives to `to`, a piece of at most 64 KiB at a time, so a copy of any length holds no
+more than one piece. It answers how many bytes it copied, or the first read's or write's `Err`, after
+which nothing more is read or written. It neither closes, flushes nor rewinds either side:
+
+```text
+upload(name: string, to: TcpStream) -> Result[long, IoError]
+  val f = fs.open(name)?
+  defer f.close()
+  io.copy(f, to)
+```
 
 ### `Close`
 
@@ -953,7 +1040,7 @@ follow(log: string) -> Result[unit, IoError]
 | `read(max)` | Up to `max` bytes, fewer only at the end of the file; empty at the end. Negative `max` traps. |
 | `readAll()`, `readText()` | The rest of the file as bytes, or as text (`InvalidUtf8`, the offset counted from the position the read began at). |
 | `readLine()`, `readCompleteLine()` | The next line, `None` at the end. `readLine` also answers a last line with no `\n`; `readCompleteLine` answers only a line ended by `\n`, and leaves later bytes unread, so a line another program is still writing arrives whole. |
-| `write(bytes)`, `writeText(text)` | Writes at the position, buffered. |
+| `write(bytes)`, `writeText(text)` | Writes at the position, buffered. A file is an [`io.ByteWriter`](#bytewriter) by `write`, and an [`io.Reader`](#reader) by `read`. |
 | `flush()`, `close()` | `flush` hands what is written to the platform, so other handles and programs see it. `close` flushes and releases, answering the flush's `Err`; closing twice is fine and answers `Ok`. A file is an [`io.Close`](#close). |
 
 **One position serves reading and writing**, and lines, `read` and `position` agree on it: bytes the
@@ -1086,12 +1173,40 @@ reference implementation's stream 54, seeded as the reference seeds it, so a see
 against the published algorithm: `Random(42).nextInt()` is its first published output, `0xa15c02b7`,
 which as an `int` is `-1587805513`. A `long` is two draws, the first the high half. A bound is reached without bias, by rejection rather
 than a remainder. **None of this is fit for secrets**: anyone who sees a few outputs can compute the
-rest, so a key, a token or a password is never taken from it.
+rest, so a key, a token or a password is never taken from it. Those come from `SecureRandom`.
+
+### `SecureRandom`
+
+```text
+import avin.random.SecureRandom
+
+main()
+  val session = SecureRandom.urlToken()
+  val key = SecureRandom.nextBytes(32)
+  println(SecureRandom.between(0, 10000))
+```
+
+**`SecureRandom` is random numbers fit for secrets.** Every draw is read from the operating system's
+cryptographic generator (`getentropy`, on macOS, Linux and the BSDs), so no number of outputs says
+anything about the next. It is an object, not a class: there is no seed, nothing to replay, and no
+state, so any thread may call it at once. Where the operating system gives no bytes, the draw traps,
+since nothing could stand in for them.
+
+| Function | Meaning |
+| --- | --- |
+| `nextBytes(n: int) -> Array[byte]` | A new array of `n` bytes, any count, past the system's 256-byte request limit included; a negative `n` traps. |
+| `hexToken(byteCount: int = 32) -> string` | `byteCount` random bytes as lower-case hexadecimal, two digits a byte: 64 characters by default. |
+| `urlToken(byteCount: int = 32) -> string` | `byteCount` random bytes as unpadded base64url, which a URL, a header, a cookie and a file name carry as it is: 43 characters by default. |
+| `nextInt()`, `nextLong()`, `nextInt(bound)`, `nextLong(bound)`, `between(min, max)` for `int` and `long`, `nextReal()`, `nextBoolean()`, `alphanumeric()`, `shuffle(xs)`, `choose(items)` | As `Random`'s, with the same bounds, the same traps and no bias. |
+
+32 bytes is 256 bits, beyond any guessing. `SecureRandom` has no `nextGaussian`, `chooseWeighted` or
+`setSeed`: no secret is drawn from those distributions, and there is no seed to set.
 
 ## `avin.crypto`
 
-Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two, and
-hexadecimal text for any digest.
+Content digests and keyed digests: SHA-256, SHA-512, SHA-1 and MD5, HMAC over the first two,
+PBKDF2, comparison of secrets in constant time, SASLprep for passwords, and hexadecimal text for any
+digest.
 
 ```text
 import avin.crypto.{sha256, hmacSha256, toHex, Sha256}
@@ -1113,7 +1228,9 @@ or a cache, and is written as text only on request. Text is hashed as its UTF-8 
 | `sha256(x)`, `sha512(x)` | The 32-byte and 64-byte digest of `x`, a `Vector[byte]` or a `string`. |
 | `sha1(x)`, `md5(x)` | The 20-byte and 16-byte digest of `x`. **Broken for security** (below). |
 | `hmacSha256(key, message)`, `hmacSha512(key, message)` | The 32-byte and 64-byte HMAC (RFC 2104) of `message` under `key`, both `Vector[byte]` or both `string`. Any key length is allowed, the empty key included; one longer than the algorithm's block is hashed first, as the RFC says. |
-| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte. |
+| `pbkdf2HmacSha256(password, salt, iterations, length)`, `pbkdf2HmacSha512(...)` | `length` bytes of key (RFC 8018 PBKDF2 over HMAC-SHA-256 or -SHA-512) as a `Vector[byte]`; `password` and `salt` both `Vector[byte]` or both `string` (UTF-8), either empty. `iterations` below 1, `length` below 1, or `length` over 8160 (SHA-256) or 16320 (SHA-512) trap. |
+| `constantTimeEquals(a, b) -> bool` | Whether `a` and `b`, both `Vector[byte]` or both `string` (compared as UTF-8 bytes), are the same, taking as long wherever they first differ. Different lengths answer `false` at once. |
+| `toHex(bytes) -> string` | Lower-case hexadecimal, two digits for each byte: [`avin.encoding`](#avinencoding)'s, which this module offers too. |
 
 **A hasher takes its input in pieces**, for data too large to hold whole, such as a file read in
 chunks. `Sha256()`, `Sha512()`, `Sha1()` and `Md5()` each have `update(bytes)` and `update(text)`,
@@ -1124,10 +1241,140 @@ one-shot digest. A hasher belongs to the thread that made it, as a handle does.
 **`sha1` and `md5` are for formats that already use them**: a checksum in a listing, a cache key
 nobody attacks. Two different inputs with the same digest can be made for both, so neither signs,
 authenticates or names untrusted content; use `sha256` or `sha512` for those. HMAC does not rest on
-collision resistance, but only the SHA-2 variants are offered. Comparing a received tag with a
-computed one is a comparison of two `Vector[byte]`, which is not constant-time.
+collision resistance, but only the SHA-2 variants are offered.
 
-The digests are bound to Sysl's `sysl.crypto`, so they are the same code Sysl programs use.
+**A secret someone sent is compared with `constantTimeEquals`, never with `==`.** `==` stops at the
+first byte that differs, so how long a rejection takes tells a patient attacker how much of a guessed
+MAC tag, bearer token or password digest was right, and lets the guess be built a byte at a time.
+`constantTimeEquals` reads every byte and decides once, at the end. A length is not the secret, so
+different lengths answer at once. For two digests of public data, `==` is fine.
+
+```text
+val expected = hmacSha256(key, body)
+val ok = fromBase64(header) match
+  Ok(sent) -> constantTimeEquals(sent, expected)
+  Err(_) -> false
+```
+
+**The iteration count belongs to the protocol**: SCRAM-SHA-256 (PostgreSQL, MongoDB) sends it, and a
+client using its own derives a different key. It buys the cost of guessing a password and nothing
+else.
+
+```text
+val salted = pbkdf2HmacSha256(password, salt, iterations, 32)
+val clientKey = hmacSha256(salted, "Client Key")
+```
+
+**SCRAM prepares the password with SASLprep before deriving its key**, so that the same password
+typed on two machines, as two sequences of characters, gives one key. `saslPrep(text) ->
+Option[string]` is RFC 4013's profile of stringprep (RFC 3454): each space other than U+0020
+becomes U+0020 and the characters mapped to nothing (the soft hyphen, the zero-width joiners, the
+variation selectors) are removed; the result is put in normalization form
+[NFKC](/spec/types/#normalization); and it is `None` where that holds a prohibited character
+(controls, private use, non-characters, the characters that change the display direction, tags),
+a code point unassigned in Unicode 3.2 (the RFC's version, as for a stored string), or right-to-left
+text that also holds a left-to-right character or does not begin and end with a right-to-left one.
+The tables are the RFC's, held as Unicode 3.2 fixed them; normalization is by the current Unicode
+Character Database, which differs from 3.2's only for a few CJK compatibility ideographs Unicode
+has corrected since.
+
+```text run
+import avin.crypto.saslPrep
+
+main()
+  println(saslPrep("I\u{ad}X")) // Some(IX)
+  println(saslPrep("\u{2168}")) // Some(IX)
+  println(saslPrep("pass\u{a0}word")) // Some(pass word)
+  println(saslPrep("\u{7}")) // None
+  println(saslPrep("\u{627}1")) // None
+```
+
+```text output
+Some(IX)
+Some(IX)
+Some(pass word)
+None
+None
+```
+
+PostgreSQL's client falls back to the password as it was written where SASLprep refuses it, and so
+may a client written with this: `saslPrep(password).getOrElse(password)`.
+
+The digests, the key derivation and the comparison are bound to Sysl's `sysl.crypto`, so they are the
+same code Sysl programs use.
+
+## `avin.uuid`
+
+Universally unique identifiers (RFC 9562), 128 bits written as 32 hexadecimal digits in groups of
+8-4-4-4-12.
+
+```text
+import avin.uuid.Uuid
+
+main()
+  val id = Uuid.random()
+  println(id)
+  assertEq(Uuid.parse(id.toString()), Some(id))
+```
+
+`Uuid` is a value: it compares and hashes by its bits, orders by them as sixteen unsigned bytes
+(the first most significant), is a `Map` key as it stands, and is `Sendable`.
+
+| Member | Meaning |
+| --- | --- |
+| `Uuid.random()` | A version 4 identifier from `SecureRandom`, with the version and variant bits set. |
+| `Uuid.parse(text) -> Option[Uuid]` | The canonical 8-4-4-4-12 form in either case; `None` for anything else (braces, a `urn:uuid:` prefix, missing hyphens and white space are not accepted). |
+| `Uuid.fromBytes(bytes) -> Option[Uuid]` | Sixteen bytes, the first most significant; `None` for any other length. |
+| `Uuid.Nil`, `Uuid.Max` | All zero bits and all one bits. |
+| `bytes()`, `toString()` | The sixteen bytes, and the lower-case canonical text. |
+| `version()`, `variant()` | The version (0 to 15), and the variant: 2 for RFC 9562's layout, 0, 6 and 7 for the reserved ones. |
+
+A `Uuid` implements `FromParam` in [`avin.net.http`](#avinnethttp), so `paramAs[Uuid]` and
+`queryAs[Uuid]` read one from a route or query parameter, an invalid one answering `400`.
+
+## `avin.encoding`
+
+Bytes written as text and read back, as RFC 4648 defines them: hexadecimal, base64 with its `=`
+padding, and base64url, the URL- and filename-safe alphabet written without padding.
+
+```text
+import avin.encoding.{toBase64, fromBase64, toBase64Url, fromHex}
+
+main()
+  println(toBase64("hello"))
+  println(toBase64Url("hello"))
+  println(fromBase64("aGVsbG8="))
+  println(fromHex("68656c6c6f"))
+```
+
+| Function | Meaning |
+| --- | --- |
+| `toHex(x) -> string` | `x`, a `Vector[byte]` or the UTF-8 bytes of a `string`, as lower-case hexadecimal, two digits a byte. |
+| `fromHex(text) -> Result[Vector[byte], DecodeError]` | The bytes the digits spell, two a byte, upper or lower case. |
+| `toBase64(x) -> string` | `x` in base64: `A`–`Z`, `a`–`z`, `0`–`9`, `+` and `/`, padded with `=` to a multiple of four characters. |
+| `fromBase64(text) -> Result[Vector[byte], DecodeError]` | The bytes padded, standard base64 spells. |
+| `toBase64Url(x) -> string` | `x` in base64url: `-` and `_` in place of `+` and `/`, and no padding. |
+| `fromBase64Url(text) -> Result[Vector[byte], DecodeError]` | The bytes unpadded base64url spells. |
+
+Encoding never fails, and the empty input encodes as the empty text and decodes back from it.
+
+**Decoding is strict, so each byte sequence has exactly one spelling.** A decoder refuses whitespace
+and line breaks, the other alphabet's characters, a missing, extra or misplaced `=`, any `=` in
+base64url, and a last digit with bits set below the last whole byte, which an encoder always leaves
+zero (`Zh==` is refused; `Zg==` is `f`). Two different texts therefore never decode to the same
+bytes, which matters for a token or a signature carried as text. Text wrapped across lines has its
+line breaks taken out before it is decoded.
+
+**A refusal is a `DecodeError`**, an `Error` whose `at` is a byte offset in the text. The checks run
+in order, the characters first, then the padding, the length and the unused bits, so the offset
+named is of the first thing wrong.
+
+| Case | Meaning |
+| --- | --- |
+| `BadCharacter(at)` | A character the encoding does not use. |
+| `BadPadding(at)` | An `=` where padding cannot stand: before the last two characters, followed by a character that is not `=`, more than two of them, or any in base64url. |
+| `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one. `at` is the text's length. |
+| `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
 
 ## `avin.net`
 
@@ -1160,8 +1407,15 @@ uses it again.
 | `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
 | `s.write(bytes: Array[byte])`, `s.writeText(text: string)` `-> Result[unit, IoError]` | Sends all of it. |
 | `s.setTimeout(d: Duration) -> Result[unit, IoError]` | A read or write that waits longer for the other end fails with `TimedOut`; zero or less takes the limit away. Each wait has the whole limit, so a write that waits for room several times fails only where one wait runs out. |
+| `s.timeout -> Duration` | The limit `setTimeout` set, in whole milliseconds, a part of one counting as one; zero where there is none. |
 | `s.shutdownOutput() -> Result[unit, IoError]` | Tells the other end nothing more will be sent; reading goes on. |
 | `s.close() -> Result[unit, IoError]` | Ends the connection and answers `Ok`; closing again does nothing. Every connection and listener is an [`io.Close`](#close). |
+| `s.readable() -> bool` | Whether a read would answer now, without waiting: bytes a `readLine` read ahead are still to be read, bytes have arrived, the other end has finished sending or reset the connection, or the connection is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.readable()` arm waits for it. |
+| `s.readinessDescriptor() -> int` | The socket's descriptor, which that arm watches on the runtime's poller; `-1` once closed. |
+| `s.writeSome(bytes: Array[byte]) -> Result[int, IoError]` | Sends what of `bytes` goes without waiting, after waiting for room for the first byte where there is none, and answers how many: at least one, unless `bytes` is empty. After `writable()` answered `true` it does not wait. |
+| `s.writable() -> bool` | Whether a write would send something now, without waiting: the socket has room, or the connection has failed or is closed. Never waits. A [`select`](/spec/threads/#select)'s `s.writable()` arm waits for it. |
+| `s.writabilityDescriptor() -> int` | The descriptor that arm watches; `-1` once closed. |
+| `s.split() -> (StreamReader, StreamWriter)` | The connection divided into a reading half and a writing half, for two threads to use at once; see [split connections](#split-connections). |
 | `TcpListener.bind(host: string, port: int) -> Result[TcpListener, IoError]` | Listens on the host's first address (`127.0.0.1` for this machine alone, `0.0.0.0` for all of its addresses); port `0` lets the platform choose. |
 | `l.port() -> int` | The port it listens on. |
 | `l.accept() -> Result[TcpStream, IoError]` | Waits for the next connection. |
@@ -1186,7 +1440,7 @@ main()
 
 A `UnixStream` and a `UnixListener` connect two programs on one machine by a path in the file system
 rather than a host and port. A `UnixStream` has every reading and writing operation of a `TcpStream`
-(`read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout`, `shutdownOutput`, `close`) with the
+(`read`, `readLine`, `readAll`, `write`, `writeSome`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable`, `readinessDescriptor`, `writable`, `writabilityDescriptor`, `split`) with the
 same meanings, including the bytes `readLine` reads beyond its line, and a `UnixListener` accepts
 them as a `TcpListener` does. Both are sendable and owned by one thread at a time, and every wait is
 safe for the collector, as TCP's are.
@@ -1226,6 +1480,16 @@ closed fails with `ConnectionReset`, never ending the program. Nothing else can 
 since a connection [belongs to one thread](#tcp): another thread that tries to close a connection or
 listener a thread is parked on traps, as any use of it from there does.
 
+**Looking up a host's name waits the same way, and a cancellation ends it.** The system's resolver
+cannot be stopped halfway, so the runtime makes each lookup on a helper thread of its own, and the
+`connect` or `bind` that asked waits for the answer as it waits on a socket: a lightweight thread
+parks, `main` waits safe for the collector, and a [cancellation](/spec/threads/#cancellation) or a
+`withTimeout`'s deadline stops the thread at once, so a connect's time limit covers the lookup too.
+The lookup it abandoned runs on to the resolver's answer, which is thrown away. At most 64 helpers
+run at once, which bounds how many abandoned lookups can still be running; a lookup asked for while
+all 64 are busy waits for one to come free, and that wait too is ended by a cancellation. A numeric
+address (`127.0.0.1`, `::1`) asks the network nothing and is resolved where it is asked.
+
 **A connection belongs to one thread at a time**, as every [handle](/spec/sysl-bindings/#handles)
 does: a server accepts a connection and hands it to the thread or future that serves it, the bytes
 read ahead going with it, and the code that handed it over traps at any operation on it while the
@@ -1238,13 +1502,99 @@ avin: trap: `TcpStream` belongs to another thread at main.avin:16:25
 ```
 
 **`ByteStream` is what the three connections share**: a trait with `read`, `readLine`, `readAll`,
-`write`, `writeText`, `setTimeout`, `shutdownOutput` and `close`, which `TcpStream`, `UnixStream` and
-`TlsStream` implement, so code that speaks a protocol, as the HTTP client and server do, takes a
-`ByteStream` and runs over any of them. It is [sendable](/spec/actors/#what-may-be-sent), and it is
-an [`io.Reader`](#reader) by its `read`, so whatever reads a `Reader` reads any connection, a TLS one
-included. `ReadAhead`,
-the bytes a connection has read beyond what its caller asked for and the line reading over them, is
-public for a connection of one's own.
+`write`, `writeSome`, `writeText`, `setTimeout`, `shutdownOutput`, `close`, `readable`,
+`readinessDescriptor`, `writable`, `writabilityDescriptor` and `split`, which `TcpStream`,
+`UnixStream` and `TlsStream` implement, so code that speaks
+a protocol, as the HTTP client and server do, takes a `ByteStream` and runs over any of them. It is
+[sendable](/spec/actors/#what-may-be-sent), and it is an [`io.Reader`](#reader) by its `read`, so
+whatever reads a `Reader` reads any connection, a TLS one included, and an
+[`io.ByteWriter`](#bytewriter) by its `write`, so whatever writes to a `ByteWriter` writes to any
+connection. It is a `threads.Readiness` by
+`readable` and `readinessDescriptor`, so a [`select`](/spec/threads/#select) waits on any connection
+beside its channels: the thread that owns a connection waits in one select for its peer's bytes
+and for what other threads send it, and does every read and write itself. It is a
+`threads.Writability` by `writable` and `writabilityDescriptor`, so a select's `writable()` arm waits
+for room as a `readable()` arm waits for bytes. `Readiness` and `Writability` are traits of
+their own, for a source or sink that is not a connection: its descriptor may be `-1`, and a select
+then finds it ready only when it tries its arms.
+
+#### Split connections
+
+**`split()` divides a connection into a `StreamReader` and a `StreamWriter`**, each sendable and
+each its own thread's, so one thread sends while another receives over the same connection. A
+connection used by one thread at a time must stop writing to read: two ends that each send more
+than the buffers between them hold before they read would both wait for ever. Split, the writer
+waits for room and the reader for bytes at the same time, each parking only its own lightweight
+thread on the poller, both on the connection's one descriptor.
+
+```text
+import avin.io.IoError
+import avin.net.{StreamWriter, TcpStream}
+import avin.threads.spawn
+
+sendAll(w: StreamWriter, queries: Vector[string]) -> Result[unit, IoError]
+  for q in queries do w.writeText(q + "\n")?
+  w.close()
+
+// Sends every query and reads every answer at once, so a long batch never waits for itself.
+pipeline(c: TcpStream, queries: Vector[string]) -> Result[Vector[string], IoError]
+  val (r, w) = c.split()
+  val sending = spawn(() -> sendAll(w, queries))
+  val answers = Buffer[string]()
+  while answers.length < queries.length
+    answers.addOne(r.readLine()?.getOrElse(""))
+  sending.join()?
+  r.close()?
+  Ok(answers.toVector)
+```
+
+- **The halves.** A `StreamReader` is an `io.Reader`, an `io.Close` and a `threads.Readiness`, with
+  `readLine`, `readAll`, `setTimeout` and `remoteAddress`; a `StreamWriter` is an `io.ByteWriter`,
+  an `io.Close` and a `threads.Writability`, with `write`, `writeSome`, `writeText`, `setTimeout` and `remoteAddress`.
+  Bytes the connection had read ahead go to the reader, and each half starts with the connection's
+  timeout, then keeps its own.
+- **Closing.** Closing the writer tells the other end nothing more will be sent, as
+  `shutdownOutput` does; the reader reads on, and the other end reads the end of its input. Closing
+  the reader stops its reading and leaves the writer sending. The connection closes once both halves
+  are closed, or once both are unreachable. A closed half answers an error to every use but closing
+  again, which does nothing and answers `Ok`; a TCP or Unix writer's close answers `Ok` even where
+  the other end has gone, and a TLS writer's answers whether TLS's close notice went out. There is
+  no way to join the halves again.
+- **The connection split.** It is used up: every operation on it answers an error saying it has
+  been split, it is readable and writable so that a select's arm runs and finds that out, its
+  descriptors are `-1`, and closing it does nothing. Splitting it again, or splitting a closed
+  connection, traps.
+- **Each half belongs to one thread at a time**, as the connection did, its traps naming
+  `StreamReader` or `StreamWriter`. After the peer resets the connection, each half answers
+  `ConnectionReset`, or the reader the end of its input, at every use, and a parked half's wait ends
+  with it. A half's thread may be cancelled while it waits, and the other half works on.
+- **TLS.** The halves of a `TlsStream` share one TLS session. Each reaches it only under a lock that
+  nothing holds while it waits for the connection, so the reader decrypts records as they arrive
+  while the writer waits for room; what TLS has to send goes out in order, a record whole, whichever
+  half made it, and a reader never waits for room to send anything of its own while the writer is
+  sending. A failure to send is the writer's to answer whichever half was sending: the reader reads
+  on, and the writer answers it at every use after, its close included, so a close notice the reader
+  tried and failed to send is one that did not go out. A cancellation that stops a half inside an
+  operation lets the locks go.
+
+A `writeSome` hands a `TlsStream`, or its writer, at most one TLS record of plaintext. A
+`TlsStream` sends what of the record the connection has room for; the rest goes before anything
+else is sent, and `writable()` sends it as room comes and answers `true` once it has gone. So after
+`writable()` answered `true`, its `writeSome` does not wait. A read of a `TlsStream` that has to
+wait for input while such a rest is still to go waits for input or room, whichever comes first,
+sending the rest as room comes, so a caller that only reads after its last `writeSome` still has
+the whole record sent, and its peer's answer, given once that record has come, still arrives;
+waiting for both, the read takes input while the peer is itself waiting to send. Its wait has the
+connection's time limit, and a rest it did not send is kept for the next read or write. The writing half of a split one sends
+the whole record before it answers, waiting for room for the rest where there is too little, so what
+it answers has gone even where the writer writes nothing after it; its reading half reads
+meanwhile, so the wait never holds up the peer's answers. Where the writer's time limit runs out
+first, it still answers the plaintext TLS took, and the rest goes before anything else, `writable()`
+sending it as room comes. Ciphertext a wait that failed did not send is kept, in order, to go first,
+never dropped. `ReadAhead`, the bytes a connection has read
+beyond what its caller asked for and the line reading over them, is public for a connection of
+one's own: `pending` says whether any are still to be read, and `keep(bytes)` adds bytes that
+arrived before anything asked for them.
 
 ### TLS
 
@@ -1274,6 +1624,7 @@ main() -> Result[unit, TlsError | IoError]
 | `TlsStream.client(tcp: TcpStream, host, settings = TlsClient()) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, its handshake waiting with `tcp`'s limit. Where it fails, `tcp` is the caller's to close. |
 | `TlsStream.server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate. |
 | `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
+| `s.readable() -> bool`, `s.readinessDescriptor() -> int` | Whether a read of plaintext would answer now: plaintext is buffered or TLS holds some decrypted, a whole record of it has arrived, or the peer has closed TLS or the connection. It hands TLS the ciphertext already on the socket, so part of a record is not taken for plaintext, and never waits for more; a failure it meets is answered by the next read. The descriptor is the TCP connection's. |
 | `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
 | `s.close() -> Result[unit, IoError]` | Closes TLS as far as the peer can be told without waiting, then the connection; the `Err` is a failure to send that notice, the connection being closed either way. Again does nothing and answers `Ok`. |
 | `TlsClient(trusted = [])`, `c.trust(pem: string) -> TlsClient` | The machine's trusted authorities and those added: `trust` answers a client that also trusts the certificates in `pem`. |
@@ -1327,6 +1678,7 @@ main()
 | `s.connections() -> int` | How many connections it holds now. |
 | `s.isStopping() -> bool` | Whether it has been asked to stop, for code serving a connection to finish early. |
 | `s.idle[T: Sendable](@sendable wait: () -> T) -> Option[T]` | Runs `wait`, a connection's wait for its next piece of work, on a thread of its own; `Some` of its result, or `None` where the server stops first, which cancels `wait`. |
+| `s.stopped() -> Channel[unit]` | A channel closed once the server is asked to stop and never sent on, so a `select` waiting for a connection's bytes or other work ends at once with an arm `s.stopped().receive()`, with no thread of its own. |
 | `s.stop()` | Stops accepting and returns at once, cancelling the parked `accept` and every wait in `idle`; stopping again does nothing. |
 | `s.join()` | Waits until it has stopped and every connection it held has ended. |
 | `s.shutdown()` | `stop()`, then `join()`. |
@@ -1382,9 +1734,11 @@ main()
   http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
 ```
 
-`http.serve(host, port, handler: @sendable (ServerRequest) -> Response, maxConnections = 1024,
+`type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
+`http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError) ->
+Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
 `writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
 takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The
@@ -1407,7 +1761,8 @@ to case, its `body` with `text` reading it as UTF-8, and the `params` its route 
 escapes decoded, `segments`, the path's segments each decoded (so `/a%2Fb` is the one segment
 `a/b`, and `/` one empty one), `query` as written, and `queryParams` as `Url.queryParams` reads
 them. A target is a path beginning with `/` or an absolute `http` URL; `ServerRequest(method,
-target)` traps on any other, so a handler can be tried without a connection.
+target)` traps on any other, so a handler can be tried without a connection. A request also carries
+the values a middleware handed on, read by `value[T]()` (below).
 
 A `Response` is the client's: `Response.text(status, text)` (`text/plain; charset=utf-8`),
 `Response.json(status, text)` (`application/json`, the text sent as given and not checked to be
@@ -1423,6 +1778,174 @@ route whether escaped or not. A `GET` route answers `HEAD` too where no `HEAD` r
 no route matches is answered `404`, and one that routes match for other methods only `405`, with
 `Allow` naming those methods, `HEAD` beside `GET`.
 
+**Typed parameters.** `paramAs[T](name)` reads a route parameter as a `T` and `queryAs[T](name)` a
+query parameter, its first where it is given more than once, each answering `Result[T,
+ParamError]`: `Missing(place, name)` where the query has none of that name, `Invalid(place, name,
+text, kind)` where its text does not read as a `T` (`paramAs` traps on a name the route lacks, as
+`param` does). `queryAs(name, default)` answers `default` for a missing one and `queryOption[T](name)`
+`None`. A `T` is any `FromParam`, a trait of two static methods, `parse(text) -> Option[Self]` and
+`kind()`, the words naming it in an error ("an int"); `string`, `int`, `long`, `real` and `bool`
+implement it, and a program's own type may. A `ParamError`'s `message` is the sentence for the
+client, as in ``the query parameter `n` is `x`, which is not an int``.
+
+**Handlers that fail.** `ToResponse` is a failure a handler can answer with, its `toResponse()` the
+response telling the client. `Response` implements it as itself and `ParamError` as a `400` with its
+message; a program's own error type may too. `fromResult(answer)` makes a `Handler` of a function
+answering `Result[Response, ToResponse]`, an `Err` answered with its failure's response, and each of
+`Route.get`, `post`, `put`, `delete` and `patch` has an overload taking such a function, so `?` ends a
+handler early:
+
+```text
+half(r: ServerRequest) -> Result[Response, ToResponse]
+  val n = r.paramAs[int]("n")?
+  if n % 2 != 0 then return Err(Response.text(422, "odd\n"))
+  Ok(Response.text(200, s"${n / 2}\n"))
+
+val route = Route.get("/half/:n", half)
+```
+
+**Groups and middleware.** `type Handler = @sendable (ServerRequest) -> Response`; a middleware is a
+`(Handler) -> Handler`. `route.wrap(middleware)` passes a route's handler through one, wrapping again
+putting the newer outside, so it runs first; `route.under(prefix)` puts a route's pattern after
+`prefix`, a pattern of `/` becoming the prefix itself. `Route.group(prefix, routes, middleware = h ->
+h)` answers each of `routes` under `prefix` and wrapped by `middleware`, and groups nest, an inner
+group's middleware running inside the outer's. A prefix begins with `/`, does not end with one and
+may bind parameters as a pattern does; one that does not hold traps.
+
+**Values a middleware hands on.** `request.withValue(value)` answers the request carrying `value`,
+and `request.value[T]()` answers `Some` of the value the request carries as its `T`, `None` where it
+carries none; both take a `T: Sendable`, since a request may be answered on any thread. A request is
+a value: `withValue` answers a new one and leaves the request it was called on as it was. The type is
+the key, compared exactly, as a type pattern compares a generic type's arguments: handing on a
+second value of one type replaces the first, a value handed on as an `int` is no `long`, one handed
+on as a trait's type is read as that trait and not as its class, and `Vector[int]` is not
+`Vector[string]`. Two values of one type are handed on as two types of the program's own, a
+`data RequestId(value: string)` beside a `data TraceId(value: string)`. The values go wherever the
+request goes: through a router's binding of parameters, groups, nested middleware (an inner one
+replacing what an outer one handed on, if it hands on the same type) and the streamed and
+event-stream handlers, whose `write` reads the request it was made from. An authenticating
+middleware hands its user to the handlers inside it:
+
+```text
+import avin.net.http
+import avin.net.http.{Handler, Response, Route, Router, ServerRequest}
+
+data User(name: string)
+
+// Answers `401` without a token, and hands the token's user to the handler with one.
+auth(next: Handler) -> Handler = r -> r.header("Authorization") match
+  Some(token) -> next(r.withValue(User(token)))
+  None -> Response.text(401, "who are you?")
+
+me(r: ServerRequest) -> Response = r.value[User]() match
+  Some(u) -> Response.text(200, s"hello, ${u.name}\n")
+  None -> Response.text(500, "the route is outside `auth`\n")
+
+main()
+  val router = Router(Route.group("/api", [Route.get("/me", me)], auth) :+ Route.get("/me", me))
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+```
+
+`GET /api/me` with an `Authorization` header is answered `hello` and the token; `/me`, outside the
+group, finds no `User`.
+
+**Error pages.** `type ErrorPage = @sendable (int) -> Response` renders the responses a router and a
+server make themselves for an error status: `Router(routes, errors)` its `404` and `405`, and
+`http.serve(…, errors)` every status of the table below. The status sent is the one given, whatever
+the page answered, and a `405` still carries its `Allow` header. `http.plainError`, the default, answers the
+status's reason phrase as plain text.
+
+**What a middleware sees of a request.** `request.remote: Option[string]` is the client's IP address,
+written numerically without its port (`127.0.0.1`, `::1`), over TCP and over TLS alike; `None` for a
+request made without a connection. `request.route: Option[string]` is the whole pattern of the route
+a router chose (`/api/users/:id` under its groups; a `GET` route's for a `HEAD` it answers), `None`
+until one has, so a middleware wrapped around a whole router's `handle` sees `None`.
+`request.withHeaderReplaced(name, value)` is the request with every header of `name`, any case,
+replaced by one, added last, a name that is not a token or a value holding a line break trapping. A
+`ByteStream`'s `remoteAddress` is where `remote` comes from: the other end's address for a
+`TcpStream`, accepted or connected, and a `TlsStream`, and `None` for a `UnixStream`.
+
+**Access log.** `http.accessLog(sink = standardError, format = PlainLines, clock = monotonic, ids =
+newRequestId)` is a middleware writing one line to `sink`, a `@sendable (string) -> unit` called once
+a line with no line end, for each request once its handler has answered:
+
+```text
+GET /items/7 200 12 1.5ms id=4f1c…e2 remote=127.0.0.1
+{"id":"4f1c…e2","method":"GET","path":"/items/7","status":200,"bytes":12,"micros":1500,"remote":"127.0.0.1"}
+```
+
+The first is `PlainLines`, the second `JsonLines`. The path is the decoded one, its spaces, quotes,
+backslashes and control characters written `%XX` in a plain line and escaped as JSON in a JSON one;
+`bytes` is the body's length, or a streamed body's length said beforehand, `-` or `null` where it is
+not known, as is an address. The request id is the client's `X-Request-Id` where
+`http.isRequestId` takes it (1 to 128 ASCII letters, digits and `-._:+/=@`), and a new one from `ids`
+otherwise, 32 hexadecimal digits from `SecureRandom` by default; the handler reads it in the request's
+`X-Request-Id`, which replaces any the client sent, and the response carries it back unless the
+handler set its own. The default sink writes each line to standard error in one write, so lines from
+several connections never interleave. The time is read from `clock`, a `@sendable () -> Duration`,
+before and after the handler. A handler that traps writes no line.
+
+**Metrics.** `Metrics(buckets = defaultBuckets, clock = monotonic)` counts the requests its
+`middleware` passes on, shared by every connection's actor under a lock of its own:
+`http_requests_total` by `method`, `route` (the route's pattern, `""` where none was chosen) and
+`status` class (`2xx`); `http_request_duration_seconds`, a histogram of `buckets` (5 ms to 10 s by
+default), a time equal to a bound counted in that bound's bucket, with its `_sum` and `_count`; and
+the gauge `http_requests_in_flight`. `render` is the Prometheus text format, series ordered by route,
+method and status class; `handler` answers it as `200` of the type `MetricsContentType`
+(`text/plain; version=0.0.4; charset=utf-8`), and `route(pattern = "/metrics")` mounts it.
+`observe(method, route, status, took)` counts a request answered another way, and `inFlight` is the
+gauge's value. Buckets not in increasing order, or one not above zero, trap.
+
+```text
+val metrics = Metrics()
+val router = Router(Route.group("/api", routes, metrics.middleware) :+ metrics.route())
+```
+
+Wrapping a group or a route labels each request by its route; wrapping a router's `handle` counts the
+`404`s and `405`s too, every request labelled `""`. A handler that traps is not counted, and leaves the
+gauge one higher.
+
+**Rate limiting.** `RateLimiter(rate, per, burst = rate, key = clientAddress, maxKeys = 10000, clock =
+monotonic, errors = plainError)` gives each key a token bucket of `burst` tokens filled again at
+`rate` every `per`. Its `middleware` takes a token for each request, keyed by `key` (the client's
+address by default, `""` for a request with none), and answers one finding its bucket empty `429`,
+rendered by `errors`, with `Retry-After` the seconds until the next token, rounded up and at least
+one. `admit(key) -> Result[unit, Duration]` takes a token directly, `Err` saying how long until the
+next. At most `maxKeys` buckets are held (`size` says how many): making one more forgets every bucket
+full again, which a new one would equal, and where none is, the one nearest to full. A rate, burst
+or `maxKeys` below one traps, and so does a `per` too short to give each token a whole microsecond.
+The three middlewares compose as any do: `h -> metrics.middleware(limiter.middleware(h))` counts the
+`429`s the limiter answers.
+
+**Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
+`write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
+once; its `body` is empty. Its head says `Transfer-Encoding: chunked` and each write is a chunk, the
+body ended by the empty one once `write` returns; to an HTTP/1.0 client it says neither, and the
+body ends with the connection. `Response.stream(status, contentType, length, write)` says
+`Content-Length: length` beforehand instead: a write past it traps, a negative length traps, and a
+body ending short closes the connection. `BodyWriter.write(bytes)` and `write(text)` answer
+`Result[unit, IoError]`: `Err` once the client has gone or the server is stopping, and for every
+write after one that failed, so the code writing a stream ends there; a failed write closes the
+connection. A `BodyWriter` is an [`io.ByteWriter`](#bytewriter) by `write(bytes)`, so
+`io.copy(reader, w)` streams a file or any other `Reader` into a body. No body is written for
+`HEAD`, `204` or `304`, and `write` is not run.
+
+`Response.events(write)` is a stream of server-sent events, `200` of the type `text/event-stream`,
+written through an `EventWriter`: `send(text, event = None, id = None)` sends an event, each line of
+`text` (split at `\r\n`, `\r` or `\n`) a `data:` line after its `event:` and `id:` lines, a type or an
+id holding a line break trapping; `comment(text)` sends a comment, which a client passes over; and
+`retry(delay)` tells the client how long to wait before reconnecting. `Response.events(keepAlive,
+write)` sets how often a comment is sent while `untilStopped` waits, fifteen seconds by default and
+none for zero, so a client that has gone is noticed and one still there keeps the stream open.
+
+**Waiting in a handler.** `request.isStopping()` says whether the server that read the request is
+stopping, and `request.untilStopped(wait)` runs `wait`, a `@sendable () -> T`, on a thread of its own
+and answers `Some` of its result, or `None` where the server stops first, cancelling `wait` wherever
+it waits as `TcpServer.idle` does: a long poll answers at once rather than holding the shutdown. Where
+the server is already stopping `wait` is not run. `BodyWriter` and `EventWriter` have both too, the
+`EventWriter`'s sending its keep-alive comments while it waits and answering `None` once one cannot
+be sent. A request made without a server never stops, and `wait` is then run as it is.
+
 **The connection.** Requests are read one after another, so several are kept alive on one
 connection and pipelined ones are answered in order: in HTTP/1.1 unless either side says
 `Connection: close`, in HTTP/1.0 only on `Connection: keep-alive`, which the response then repeats.
@@ -1430,8 +1953,8 @@ Empty lines before a request line are passed over, and a line may end in a bare 
 by `Content-Length` or chunked (extensions and trailers passed over); an `Expect: 100-continue` is
 answered `100 Continue` once the body is known to fit. The server writes `Content-Length` and
 `Connection` itself, in place of any the handler gave, every response as `HTTP/1.1`, and no body for
-`HEAD`, `204` and `304`. A handler's status outside 200 to 599, or a header the response cannot
-carry, traps.
+`HEAD`, `204` and `304`; a streamed response's framing is its own, as above. A handler's status
+outside 200 to 599, or a header the response cannot carry, traps.
 
 **A request the server cannot take is answered and the connection closed**, gently: its side is shut
 and what the client still sends read and dropped for a moment, so the answer is not lost to a reset.
@@ -1444,7 +1967,7 @@ and what the client still sends read and dropped for a moment, so the answer is 
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
 | `431` | The request line and headers together, or a chunked body's trailers, longer than `maxHeaderBytes` |
-| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS the connection is closed unanswered) |
+| `500` | The handler traps: it fails its connection alone, as a `TcpServer`'s `serve` does (over TLS, or once a streamed response's head is sent, the connection is closed unanswered) |
 | `501` | A transfer coding besides `chunked` |
 | `503` | A request read once the server is stopping |
 | `505` | A version other than 1.0 and 1.1 |
@@ -1453,6 +1976,143 @@ A connection waiting for a first request waits `readTimeout`, and for a later on
 then is closed without an answer. **Shutting down**, the server answers the request in flight with
 `Connection: close`, and one arriving on a kept-alive connection `503`; a connection waiting for its
 next request ends when its idle limit runs out, and `join()` waits for that.
+
+**Upgrades.** `Response.upgrade(protocol, take)` answers `101 Switching Protocols` with `Upgrade:
+protocol` and `Connection: Upgrade` (the protocol a token, else it traps), and once that head is
+sent the connection is no longer HTTP's: `take` is given an `Upgraded`, with its `stream`, the bytes
+the client sent after its request that the server had already read (`ahead`), the `writeTimeout`, and
+`isStopping()` and `untilStopped(wait)` as a request has them. No request is read after it, the
+connection is closed when `take` returns, and a `take` that traps closes it with nothing written.
+
+### WebSockets
+
+`webSocket(request, session)` answers a WebSocket handshake (RFC 6455) from a handler, and
+`WebSocket.connect(url)` opens one as a client; each end holds a `WebSocket` and the two speak alike:
+
+```text
+import avin.net.http
+import avin.net.http.{Binary, Route, Router, Text, WebSocket, webSocket}
+
+echo(ws: WebSocket)
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(Binary(b)) -> _ = ws.send(b)
+      Err(_) -> return
+
+main()
+  val router = Router([Route.get("/echo", r -> webSocket(r, echo))])
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+```
+
+`webSocket(request, session, protocols = [], maxMessageBytes = 1048576, closeTimeout = seconds(5),
+outboxSize = 64) -> Response` checks the handshake and answers `101` with its `Sec-WebSocket-Accept`
+(`acceptKey(key)`, the base64 of the SHA-1 of the key and the protocol's GUID), then runs
+`session` with the WebSocket, closing it with `1000` if `session` returns leaving it open. Of
+`protocols`, the subprotocols the server speaks, the first the client offers in
+`Sec-WebSocket-Protocol` is chosen, answered and found in `ws.protocol`; none where the client
+offers none of them. A request that is not a handshake is answered without `session` running:
+`405` for a method other than `GET`; `426` with `Upgrade: websocket` where it does not ask to
+upgrade to a WebSocket; `426` with `Sec-WebSocket-Version: 13` for another version; `400` in
+HTTP/1.0, without `upgrade` in `Connection`, or with a `Sec-WebSocket-Key` that is not sixteen bytes
+of base64. A negative `maxMessageBytes` or `outboxSize` traps. A route is otherwise an ordinary route, under groups
+and middleware alike, and it works over TLS as every route does.
+
+`WebSocket.connect(url, headers = [], protocols = [], tls = TlsClient(), timeout = seconds(30),
+maxMessageBytes = 1048576, outboxSize = 64) -> Result[WebSocket, WebSocketError]` opens `ws://` and `wss://` URLs,
+the latter over TLS checked as an `https` request's is, sending `headers` and offering `protocols`
+in the handshake; `timeout` limits each wait of the handshake and each write after it.
+
+A `WebSocket` sends `send(text)` and `send(bytes)` as one message each, a message over 65536 bytes in
+fragments of that many written one after another, `ping(payload = [])` (at most
+125 bytes, else it traps), and `close(code = 1000, reason = "")`, which sends the close frame, waits
+the close timeout for the other end's answer and closes the connection; a code is 1000 to 1003, 1007
+to 1014 or 3000 to 4999 and a reason at most 123 bytes of UTF-8, either trapping where it is not.
+`receive()` answers the next `Message`, `Text(text)` or `Binary(bytes)`, waiting as long as it
+takes; `receive(limit)` answers `Ok(None)` where no whole message has arrived by then, keeping a
+message that arrived in part. `isOpen()` says whether it can still be used, and `isStopping()` and
+`untilStopped(wait)` are the server's, a client's never stopping. A `WebSocket` belongs to the code
+it was given to, as its connection does.
+
+While it receives, a WebSocket keeps the protocol by itself: a ping is answered with a pong at once
+and a pong passed over, a message arriving in fragments is put back together with control frames
+answered between them, and a close from the other end is answered with its code, the connection
+closed, and the receive answers `Err(Closed(code, reason))` (`1005` for a close giving no code).
+Every send and receive after the WebSocket is closed answers the same error. A server stopping
+closes its WebSockets with `1001` at their next send, or at once where one is waiting in a receive,
+which watches the server's `stopped()` channel. A thread cancelled while it receives closes the
+connection, the WebSocket then closed with `1006`.
+
+#### Sending from other threads
+
+A `WebSocket` belongs to one thread, which does all of its connection's reads and writes. Other
+threads send on it through `ws.sender()`, a sendable `WebSocketSender` with `send(text)`,
+`send(bytes)`, `close(code = 1000, reason = "")` and `isOpen()`. A send queues one whole message in
+the WebSocket's outbox, at most `outboxSize` messages; the owning thread writes them while it
+receives, in the one wait that also watches its connection, so its senders' messages, its own, the
+pongs and the close handshake all go on the wire from it, each message whole and never interleaved
+with another, and each sender's in the order it queued them. A thread whose session only answers
+what arrives, or whose messages all come from senders, loops in `ws.serve(onMessage) ->
+WebSocketError`, which receives until the WebSocket closes, runs `onMessage` for every message and
+answers why it closed. A broadcast chat server puts each session's sender in a room:
+
+```text
+import avin.net.http
+import avin.net.http.{Route, Router, Text, WebSocket, WebSocketSender, webSocket}
+import avin.threads.Mutex
+
+class Room(): Sendable
+  private val members = Mutex(Vector.empty[(int, WebSocketSender)]())
+  private val count = Mutex(0)
+
+  join(s: WebSocketSender) -> int
+    val n = count.update(c -> c + 1)
+    _ = members.update(v -> v :+ (n, s))
+    n
+
+  leave(n: int) = _ = members.update(v -> v.filter((k, _) -> k != n))
+
+  broadcast(from: int, text: string)
+    for (n, s) in members.get()
+      if n != from then _ = s.send(text)
+
+chat(ws: WebSocket, room: Room)
+  val me = room.join(ws.sender())
+  defer room.leave(me)
+  _ = ws.serve(m -> m match
+    Text(t) -> room.broadcast(me, t)
+    _ -> ())
+
+main()
+  val room = Room()
+  val router = Router([Route.get("/chat", r -> webSocket(r, ws -> chat(ws, room)))])
+  http.serve("0.0.0.0", 8080, router.handle).ok.get.join()
+```
+
+A send answers `Ok` once its message is queued while the WebSocket is open; one the WebSocket closes
+before writing is dropped. A full outbox, as a client that reads slowly leaves it, makes a send wait
+up to the WebSocket's write timeout and then answer `Err(Broken(IoError(TimedOut, _, _)))`, the
+message not queued and the WebSocket still open, so a slow client never holds up the threads
+sending to every other one; the owner's own write to such a client fails at the same timeout and
+closes it. A sender's `close` asks the owner to close the WebSocket, which it does, as its own
+`close` would, once the messages queued before are written; every sender call from then on answers
+`Err(Closed(code, reason))`. The owner's `close`, a close from the other end, a failure and a server
+stopping end the outbox: what is queued is dropped, and every sender call, a send waiting for room
+among them, answers why. Messages queued while the owner is not receiving wait until it next is.
+
+| Close | When this end closes with it |
+| --- | --- |
+| `1002` | A client's frame not masked or a server's masked; a reserved bit set; an unknown opcode; a control frame fragmented or over 125 bytes; a continuation with no message to continue, or a new message inside a fragmented one; a close frame of one byte or with a code no endpoint may send; a 64-bit length with its top bit set |
+| `1007` | A text message, or a close reason, that is not UTF-8, checked once the message is whole |
+| `1009` | A message longer than `maxMessageBytes`, refused by its frames' lengths before their payloads are read |
+| `1001` | The server is stopping |
+
+A frame breaking the protocol fails the connection: the close frame is sent and the connection
+closed at once. A `WebSocketError` is `Closed(code, reason)`, which also reports `1006` where the
+other end went without a close; `Broken(error)`, the connection having failed; and, from `connect`,
+`Refused(status, reason)` for an answer other than `101`, `BadHandshake(text)` for a `101` that is
+not a WebSocket server's (an accept key not the key's, no `Upgrade: websocket`, a subprotocol not
+offered), and `Unreachable(error)`, the URL, the connection or its TLS failing as an `HttpError`.
 
 ### `Url`
 
@@ -1555,6 +2215,7 @@ with futures reaches for is there, under these names:
 | Run on threads of one's own | `Executor.fixed(n)`, a pool of `n` workers, and `ex.future(body)`; `Executor.shared()` is the pool `Future(body)` uses. A future's `map`, `flatMap` and `onComplete` run on the executor it was made on. `ex.shutdown()` lets its workers end once the queued work is done. |
 | Say a body will wait on something other than a future | `threads.blocking(body)`: the pool starts a worker in its place while it waits, as it does for `await` |
 | Pause a thread | `threads.sleep(d: Duration)`, safe for the collector while it sleeps |
+| Share costly resources, connections for one | [`Pool(create, maxSize)`](/spec/threads/#pools) and `pool.use(c -> …)`, which lends one for the call and always takes it back |
 
 ## JSON
 

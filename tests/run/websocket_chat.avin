@@ -1,0 +1,113 @@
+// expect: exit 0
+// A broadcast chat server: each session puts its WebSocket's sender in the room, and every message a
+// client sends is fanned out to all the others through their senders, which the threads owning those
+// sockets write while they receive. Eight clients over `ws` and eight over `wss`; each hears every
+// other one's message, whole, and its own never. The server stopping closes every session with 1001,
+// and a sender of a closed session answers why.
+import avin.fs
+import avin.io.IoError
+import avin.net.http
+import avin.net.http.{Closed, Message, Route, Router, Text, WebSocket, WebSocketError, WebSocketSender, webSocket}
+import avin.net.tls.{TlsClient, TlsServer}
+import avin.threads.{Channel, Mutex}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+said(r: Result[Message, WebSocketError]) -> string = r match
+  Ok(Text(t)) -> t
+  Ok(m) -> s"unexpected $m"
+  Err(Closed(code, reason)) -> s"closed $code `$reason`"
+  Err(e) -> e.message
+
+// The senders of every session in the room, by number.
+class Room(): Sendable
+  private val members = Mutex(Vector.empty[(int, WebSocketSender)]())
+  private val counter = Mutex(0)
+
+  join(s: WebSocketSender) -> int
+    val n = counter.update(c -> c + 1)
+    _ = members.update(v -> v :+ (n, s))
+    n
+
+  leave(n: int) = _ = members.update(v -> v.filter((k, _) -> k != n))
+
+  // Sends `text` to every member but `from`.
+  broadcast(from: int, text: string)
+    for (n, s) in members.get()
+      if n != from then _ = s.send(text)
+
+  size() -> int = members.get().length
+
+chat(ws: WebSocket, room: Room, left: Channel[string])
+  val me = room.join(ws.sender())
+  _ = ws.send("joined")
+  val why = ws.serve(m -> m match
+    Text(t) -> room.broadcast(me, t)
+    _ -> ())
+  room.leave(me)
+  left.send(said(Err(why)))
+
+// Eight clients join, each says who it is, and each hears the seven others.
+round(url: string, tls: TlsClient, label: string)
+  val clients = Buffer[WebSocket]()
+  for i in 0 ..< 8
+    val c = WebSocket.connect(url, tls = tls) match
+      Ok(w) -> w
+      Err(e) -> fail(e.message)
+    if said(c.receive()) != "joined" then fail("no welcome")
+    clients.addOne(c)
+  for i in 0 ..< 8
+    _ = clients(i).send(s"from $i ✓")
+  var all = true
+  for i in 0 ..< 8
+    val heard = Buffer[string]()
+    for _ in 0 ..< 7
+      heard.addOne(said(clients(i).receive()))
+    val expected = (0 ..< 8).filter(j -> j != i).map(j -> s"from $j ✓").toVector
+    if heard.toVector.sorted != expected
+      all = false
+      println(s"$label client $i heard ${heard.toVector.sorted}")
+    // Nothing more is waiting.
+    if clients(i).receive(time.millis(50)) != Ok(None) then all = false
+  println(s"$label: every client heard the seven others: $all")
+  for c in clients
+    _ = c.close()
+
+main()
+  val room = Room()
+  val left = Channel[string]()
+  val router = Router([Route.get("/chat", r -> webSocket(r, ws -> chat(ws, room, left)))])
+  val plain = ok(http.serve("127.0.0.1", 0, router.handle))
+  round(s"ws://127.0.0.1:${plain.port()}/chat", TlsClient(), "ws")
+  for _ in 0 ..< 8
+    if left.receive().getOrElse("?") != "closed 1000 ``" then println("a session ended otherwise")
+  println(s"room empty: ${room.size() == 0}")
+
+  val identity = TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")) match
+    Ok(s) -> s
+    Err(e) -> fail(e.message)
+  val secure = ok(http.serve("127.0.0.1", 0, router.handle, tls = Some(identity)))
+  val trusting = TlsClient().trust(fixture("ca.pem"))
+  round(s"wss://localhost:${secure.port()}/chat", trusting, "wss")
+  for _ in 0 ..< 8
+    if left.receive().getOrElse("?") != "closed 1000 ``" then println("a session ended otherwise")
+
+  // The server stopping ends sessions waiting in `serve`; their senders then answer why.
+  val a = WebSocket.connect(s"ws://127.0.0.1:${plain.port()}/chat") match
+    Ok(w) -> w
+    Err(e) -> fail(e.message)
+  println(said(a.receive()))
+  plain.stop()
+  println(said(a.receive()))
+  println(left.receive().getOrElse("?"))
+  plain.join()
+  secure.stop()
+  secure.join()
+  println(s"room empty: ${room.size() == 0}")

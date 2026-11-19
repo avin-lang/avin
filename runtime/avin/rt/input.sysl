@@ -2,6 +2,7 @@ module avin.rt
 
 import sysl.buf.{Buf, buf}
 import sysl.io.{Reader, fd_reader, find_byte}
+import sysl.io.wait.Readable
 import sysl.slices.copy
 import sysl.text.{chars_of, from_utf8_lossy}
 
@@ -12,6 +13,28 @@ import sysl.text.{chars_of, from_utf8_lossy}
 // A line ends at `\n`, and a `\r` just before it goes with it; the last line of input needs no
 // terminator. Bytes that are not UTF-8 become U+FFFD, one for each maximal ill-formed run, as they are
 // turned into a string. A read that fails ends the input, as its end does.
+//
+// Threads read standard input one at a time. A reader holds `input_readers` across the whole of one
+// read, the library's look at whether the input has ended and its taking of a line included, so a line
+// goes whole to one reader and is never split or taken twice. The lock is the kind the library's own
+// locks are: a lightweight thread waiting for it parks, as one waiting for input while it holds it
+// does, so neither holds up a carrier. Every function below that reads the buffer is called holding it.
+
+/** Held by the thread reading standard input, from `input_hold` to `input_release`. */
+var input_readers: ParkLock = ParkLock(new_wait_queue_for(WaitsOnInput), false)
+
+/** Takes the lock over standard input, waiting while another thread reads it. A trap while the lock
+ * is held is not contained, as one holding any other lock is not, so it is never left held. */
+@export("avin_rt_input_hold")
+input_hold(ctx: *Context)
+    enter_doubt(ctx)
+    hold_park_lock(ctx, &input_readers)
+
+/** Lets the lock over standard input go, which the calling thread holds. */
+@export("avin_rt_input_release")
+input_release(ctx: *Context)
+    leave_doubt(ctx)
+    let_park_lock_go(&input_readers)
 
 /** Bytes read and not yet taken: those of `input` from `input_at` on. */
 var input: Buf[u8] = buf()
@@ -23,20 +46,48 @@ var input_done: bool = false
 /** How many bytes one read asks for. */
 const input_chunk: usize = 65536
 
-/** Reads more of standard input onto the end of `input`; false when there was no more. The bytes not
- * yet taken are moved to the front first, so `input` holds at most the line being gathered and one
- * read past it. */
-private read_more() -> bool
+/** Whether standard input is a stream with no position, a pipe, a socket or a terminal, which the
+ * poller can wait on: 0 not yet asked, 1 it is, 2 it is not. A file or a device that can be read at
+ * any time is read at once instead, since the poller would not report a file at its end as ready. */
+var input_streams: u32 = 0
+
+private extern "lseek" c_lseek(fd: i32, offset: i64, whence: i32) -> i64
+
+/** Whether standard input is a stream the poller can wait on, asked once. */
+private input_is_stream() -> bool
+    if input_streams == 0 then input_streams = if c_lseek(0, 0, 1) < 0 then 1 else 2
+    input_streams == 1
+
+/** Waits until standard input has something to read, or has ended, from the thread of `ctx`, which is
+ * running. A lightweight thread reading a stream parks on the poller and leaves its worker to the
+ * others; any other wait happens in the read itself, made safe for the collector. The wait is no
+ * cancellation point: a cancelled thread goes on reading, as it did before the input came. */
+private await_input(ctx: *Context)
+    if !runs_lightweight(ctx) || !input_is_stream() then return
+    ctx.uncancellable += 1
+    // A poller that cannot take the descriptor leaves the wait to the read.
+    _ = wait_for_fd(0, Readable, 0)
+    ctx.uncancellable -= 1
+
+/** Reads more of standard input onto the end of `input`, from the thread of `ctx`; false when there
+ * was no more. The bytes not yet taken are moved to the front first, so `input` holds at most the line
+ * being gathered and one read past it. A thread waiting for input does not hold up a collection. */
+private read_more(ctx: *Context) -> bool
     if input_done then return false
     // What the program has written, a prompt most of all, is out before it waits for an answer.
-    flush()
+    flush_safely(ctx)
+    // Parking lets another thread run, so the buffer is rearranged only once the wait is over.
+    await_input(ctx)
+    if input_done then return false
     if input_at > 0
         val kept = copy(input.view_mut(), input.view()[input_at..])
         input.truncate(kept)
         input_at = 0
     input.reserve(input_chunk)
     var reader = fd_reader(0)
+    enter_safe(ctx)
     val got = reader.read(input.spare())
+    leave_safe(ctx)
     if got.len == 0
         input_done = true
         return false
@@ -48,7 +99,33 @@ private text_from(ctx: *Context, b: []const u8) -> *u8 = text_of(ctx, from_utf8_
 
 /** Whether standard input has nothing left to take, reading to find out when the buffer is empty. */
 @export("avin_rt_input_ended")
-input_ended(ctx: *Context) -> bool = input_at == input.len() && !read_more()
+input_ended(ctx: *Context) -> bool = input_at == input.len() && !read_more(ctx)
+
+// The functions below look at the buffer through views that end with them. A reader calls them
+// between its calls of `read_more`, never holding a view across one: `read_more` can park a
+// lightweight thread, which may resume on another carrier, and a view's share of the buffer let go
+// there would race the threads using the buffer on this one.
+
+/** How far past `input_at` the next `\n` is, searching from `searched` bytes past it. */
+private newline_from(searched: usize) -> Option[usize]
+    find_byte(input.view()[input_at + searched..], 10) match
+        Some(i) -> Some(searched + i)
+        None -> None
+
+/** The `until` bytes past `input_at` as a new string, a `\r` ending them left out, taking them and the
+ * `\n` after them. */
+private take_line(ctx: *Context, until: usize) -> *u8
+    val have = input.view()[input_at..]
+    val trimmed = if until > 0 && have[until - 1] == 13 then until - 1 else until
+    val line = text_from(ctx, have[..<trimmed])
+    input_at += until + 1
+    line
+
+/** Every byte not yet taken, as a new string, taking them. */
+private take_rest(ctx: *Context) -> *u8
+    val rest = text_from(ctx, input.view()[input_at..])
+    input_at = input.len()
+    rest
 
 /** The next line of standard input, without its terminator, as a new string. Past the end it is the
  * empty string; the library asks only after `input_ended` has said there is more. */
@@ -57,20 +134,11 @@ read_line(ctx: *Context) -> *u8
     // How far past `input_at` has been searched for a `\n` already, so a long line is scanned once.
     var searched: usize = 0
     while true
-        val have = input.view()[input_at..]
-        find_byte(have[searched..], 10) match
-            Some(i) ->
-                val until = searched + i
-                val trimmed = if until > 0 && have[until - 1] == 13 then until - 1 else until
-                val line = text_from(ctx, have[..<trimmed])
-                input_at += until + 1
-                return line
-            None -> searched = have.len
-        if !read_more()
-            val last = text_from(ctx, input.view()[input_at..])
-            input_at = input.len()
-            return last
-    text_from(ctx, input.view()[0..<0])
+        newline_from(searched) match
+            Some(until) -> return take_line(ctx, until)
+            None -> searched = input.len() - input_at
+        if !read_more(ctx) then return take_rest(ctx)
+    take_rest(ctx)
 
 /** The next character of standard input. Bytes that are not UTF-8 are one U+FFFD for each maximal
  * ill-formed run, as a line or the rest of the input would decode them: four bytes hold any character
@@ -80,7 +148,7 @@ read_line(ctx: *Context) -> *u8
 read_char(ctx: *Context) -> char
     var more = true
     while more && input.len() - input_at < 4
-        more = read_more()
+        more = read_more(ctx)
     val have = input.view()[input_at..]
     val window = if have.len < 4 then have else have[..<4]
     var cursor = chars_of(window)
@@ -93,7 +161,5 @@ read_char(ctx: *Context) -> char
 read_rest(ctx: *Context) -> *u8
     var more = true
     while more
-        more = read_more()
-    val rest = text_from(ctx, input.view()[input_at..])
-    input_at = input.len()
-    rest
+        more = read_more(ctx)
+    take_rest(ctx)

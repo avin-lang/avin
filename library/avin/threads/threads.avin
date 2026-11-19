@@ -9,7 +9,7 @@ module avin.threads
 // in any thread stops the whole program, and the program ends when `main` returns, whatever other
 // threads are still running.
 
-import avin.time.Duration
+import avin.time.{Duration, Instant, now}
 
 // Waits until `micros` microseconds have passed, safe for the collector while it waits: the runtime
 // parks the lightweight thread on a timer, freeing its worker, rather than blocking it.
@@ -79,6 +79,7 @@ private class Outcome[T]()
 impl[T: Sendable] Sendable for Thread[T]
 
 // A running or finished thread whose body yields a `T`.
+@trusted_sendable("its joint is the runtime's thread, and its outcome is written once, before the join that reads it")
 @keeps_owners
 class Thread[T](private val joint: Any, private val outcome: Outcome[T])
   // Waits for the thread to finish and gives back what its body returned. Joining again gives the
@@ -100,13 +101,24 @@ class Thread[T](private val joint: Any, private val outcome: Outcome[T])
 // and committed only as the thread touches it, and 64 KiB at the least. The
 // Sysl handles `body` reaches that the calling code owns are the new thread's until its body
 // returns; then they, and those in what it returns, are in transit, for the next code to use them.
-spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T] = launch(body, stack).0
+// The thread takes the values of the calling thread's request context and no deadline, since nothing
+// cancels it when one passes.
+spawn[T: Sendable](
+    @sendable body: () -> T,
+    stack: long = 8388608
+) -> Thread[T] = launch(body, stack, currentState().detached).0
 
 // `spawn`, giving back too what a scope keeps of the thread: its joint, which the scope cancels it
 // by, and what hands back the Sysl handles its body reaches once it has ended, which a thread
-// cancelled before its body returned did not do itself. Where `runs` is false the thread is one a
-// cancelled scope starts: it runs nothing, and ends with no result.
-private launch[T: Sendable](@sendable body: () -> T, stack: long, runs: bool = true) -> (Thread[T], Any, () -> unit)
+// cancelled before its body returned did not do itself. The thread runs with `context` as its request
+// context state. Where `runs` is false the thread is one a cancelled scope starts: it runs nothing, and
+// ends with no result.
+private launch[T: Sendable](
+    @sendable body: () -> T,
+    stack: long,
+    context: ContextState,
+    runs: bool = true
+) -> (Thread[T], Any, () -> unit)
   val outcome = Outcome[T]()
   if !runs
     val joint = start(() -> (), stack)
@@ -114,6 +126,7 @@ private launch[T: Sendable](@sendable body: () -> T, stack: long, runs: bool = t
   val owner = newOwner()
   handOver(body, currentOwner(), owner)
   val run = () ->
+    contextSet(context)
     runAs(owner)
     val v = body()
     handOver(body, owner, inTransit)
@@ -132,6 +145,24 @@ private cancelThread(joint: Any)
 // The thread is then still cancelled, but nothing stops it again until it calls `resumeCancel`.
 @intrinsic("cancel_guarded")
 private cancelGuarded(run: () -> unit) -> bool
+
+// Runs `run` holding a share of something other threads wait for (a share of a read-write lock, a
+// semaphore's permit), taken under a lock let go with `releaseHolding`, then `giveBack`, which gives
+// the share back, and answers whether a cancellation stopped `run`. Nothing stops the thread between
+// taking the share and giving it back but, where `cancellable`, a cancellation inside `run`, which
+// returns here; a trap inside `run` stops the program, as one under a lock does, rather than leaving
+// the share held for ever.
+@intrinsic("cancel_guarded_held")
+private cancelGuardedHeld(run: () -> unit, giveBack: () -> unit, cancellable: bool) -> bool
+
+// Runs `body` holding a share that `giveBack` gives back, and gives back what the body returns; a
+// cancellation that stopped a `cancellable` body goes on once the share is given back.
+private holding[R](body: () -> R, giveBack: () -> unit, cancellable: bool) -> R
+  val out = Outcome[R]()
+  if cancelGuardedHeld(() -> out.finish(body()), giveBack, cancellable) then resumeCancel()
+  out.value match
+    Some(v) -> v
+    None -> fail("a body holding a share left no result")
 
 // Goes on with the calling thread's cancellation, which returned to `cancelGuarded`: to the scope
 // around this one, or to the end of the thread.
@@ -180,14 +211,15 @@ private class Started()
 class Scope(private val started: Started)
   // Starts `body` on a new thread with a stack of `stack` bytes, as `spawn` does, which the scope
   // waits for before it returns. In a cancelled scope the thread starts cancelled, and ends before
-  // its body runs.
+  // its body runs. The thread takes the calling thread's whole request context, its deadline with
+  // its values, since a cancellation of the scope reaches it.
   spawn[T: Sendable](@sendable body: () -> T, stack: long = 8388608) -> Thread[T]
     started.use("started")
     // A cancellation of the calling thread does not come between starting the thread and
     // recording it, so the scope always waits for it.
     // A thread started in a cancelled scope runs nothing, and ends with no result.
     enterUncancellable()
-    val (t, joint, handBack) = launch(body, stack, !started.cancelled)
+    val (t, joint, handBack) = launch(body, stack, currentState(), !started.cancelled)
     started.joints = joint :: started.joints
     started.handBacks = handBack :: started.handBacks
     leaveUncancellable()
@@ -219,3 +251,52 @@ scope[T](body: (Scope) -> T) -> T
   out.value match
     Some(v) -> v
     None -> fail("a scope's body left no result")
+
+// Runs `body` with a new scope, as `scope` does, for at most `timeout`: `Some` of what it returns
+// where it returns in time, and `None` where the time runs out first. Then the body is cancelled where
+// it is, with every thread the scope started and everything below them, as a scope's `cancel` cancels
+// them, and `withTimeout` answers once they have all ended. A body that has returned keeps its
+// result, however close to the time it did. A timeout of zero or less runs nothing and answers
+// `None`. Timeouts nest: an inner one ends at its own time or when the outer one's runs out, whichever
+// comes first, and so does a `scope` inside.
+//
+// So that it can be stopped wherever it is, even when `withTimeout` is called from `main`, the body
+// runs on a lightweight thread of its own while the calling thread waits for it; it reaches what the
+// calling code reaches, its Sysl handles among them, and returns to it. Its waits, and the waits of
+// the threads it starts, park on the runtime's timers as every wait does, holding no worker.
+//
+// The body's request context has the deadline `timeout` from now, where it is sooner than the one
+// around it, so the code below reads how long it has left (`Context.current().remaining()`).
+//
+//     val page = withTimeout(seconds(5), s -> fetch(url)) match
+//       Some(p) -> p
+//       None -> "timed out"
+withTimeout[T](timeout: Duration, body: (Scope) -> T) -> Option[T] = timed(timeout, now() + timeout, body)
+
+// `withTimeout`, its deadline the instant `wall` on the wall clock.
+private timed[T](timeout: Duration, wall: Instant, body: (Scope) -> T) -> Option[T]
+  if timeout.micros <= 0 then return None
+  val started = Started()
+  val out = Outcome[T]()
+  val ended = Channel[unit](1)
+  val owner = currentOwner()
+  val context = currentState().bounded(timeout, wall)
+  val runBody = () ->
+    contextSet(context)
+    runAs(owner)
+    out.finish(scope(body))
+    ended.send(())
+  val run = () ->
+    // A cancellation of the calling thread does not come between starting the body and recording
+    // it, so its scope always waits for the body.
+    enterUncancellable()
+    val joint = start(runBody, 8388608)
+    started.joints = joint :: started.joints
+    leaveUncancellable()
+    if selectWithin(timeout, SelectReceive(ended, ReceiveEither)) != 0 then started.cancelAll()
+    started.close()
+  if cancelGuarded(run)
+    started.cancelAll()
+    started.close()
+    resumeCancel()
+  out.value

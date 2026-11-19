@@ -1,0 +1,730 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, set_modified, symlink, write_text}
+import sysl.process.{Exited, Stdio, Var, capture, spawn}
+import sysl.time.{Instant, micros, now}
+
+// Keeping the build cache within its limit (`cache.sysl`): the sweep's eviction order, what it never
+// takes, the debris it clears, other versions' caches, `avin cache`, and builds running while it does.
+
+private const Hour: long = 3600000000
+
+/** The time `hours` hours ago. */
+private ago(hours: long) -> Instant = now() - micros(hours * Hour)
+
+/** A layout over `dir`: this version's cache in `dir/avin/<version>`, the others beside it, the
+ * packages in `dir/pkg` and the temporary directory `dir/tmp`. */
+private layout_in(dir: string) -> CacheLayout
+    val layout = CacheLayout(dir + "/avin/9.9.9", dir + "/avin", "9.9.9", dir + "/pkg", dir + "/tmp")
+    make_dir_all(layout.dir).unwrap()
+    make_dir_all(layout.packages).unwrap()
+    make_dir_all(layout.temp).unwrap()
+    layout
+
+/** A file of `size` bytes at `p`, last used `hours` hours ago. */
+private file_at(p: string, size: usize, hours: long)
+    make_dir_all(parent_of(p)).unwrap()
+    write_text(p, "x".repeat(size)).unwrap()
+    set_modified(p, ago(hours)).unwrap()
+
+/** A program's build directory at `p` holding `size` bytes, last used `hours` hours ago. */
+private program_at(p: string, size: usize, hours: long)
+    make_dir_all(p + "/incremental/program-O2").unwrap()
+    write_text(p + "/prog-O2", "x".repeat(size / 2)).unwrap()
+    write_text(p + "/incremental/program-O2/manifest", "x".repeat(size - size / 2)).unwrap()
+    set_modified(p + "/prog-O2", ago(hours)).unwrap()
+    set_modified(p, ago(hours)).unwrap()
+
+private parent_of(p: string) -> string
+    var i = p.bytes.len
+    while i > 0 && p.bytes[i - 1] != u8('/')
+        i -= 1
+    p[0..<i - 1]
+
+private used_of(p: string) -> long = metadata(p).unwrap().modified.us
+
+// --- the settings ----------------------------------------------------------------------------------
+
+@test("AVIN_CACHE_LIMIT is a size in bytes with K, M, G or T, off for none, and five gibibytes unset")
+limit_settings()
+    assert_eq(cache_limit_of(None).unwrap(), Some(DefaultCacheLimit))
+    assert_eq(cache_limit_of(Some("")).unwrap(), Some(DefaultCacheLimit))
+    assert_eq(cache_limit_of(Some("  ")).unwrap(), Some(DefaultCacheLimit))
+    assert_eq(DefaultCacheLimit, 5 * 1073741824)
+    assert_eq(cache_limit_of(Some("off")).unwrap(), None)
+    assert_eq(cache_limit_of(Some("0")).unwrap(), Some(0))
+    assert_eq(cache_limit_of(Some("123")).unwrap(), Some(123))
+    assert_eq(cache_limit_of(Some("12K")).unwrap(), Some(12 * 1024))
+    assert_eq(cache_limit_of(Some("500M")).unwrap(), Some(500 * 1048576))
+    assert_eq(cache_limit_of(Some("500m")).unwrap(), Some(500 * 1048576))
+    assert_eq(cache_limit_of(Some("5G")).unwrap(), Some(5 * 1073741824))
+    assert_eq(cache_limit_of(Some("1t")).unwrap(), Some(1099511627776))
+    assert_eq(cache_limit_of(Some("1048576T")).unwrap(), Some(1048576 * 1099511627776))
+    for bad in ["5x", "G", "-1", "1.5G", "5 G", "five", "1048577T", "99999999999999999999", "Off"]
+        val e = cache_limit_of(Some(bad))
+        assert(e.is_err(), bad)
+        assert_eq(e.unwrap_err(), s"avin: AVIN_CACHE_LIMIT is `$bad`; it is a size such as `5G`, `500M` or `0`, or `off`")
+
+@test("an age is minutes, hours or days, and nothing else")
+ages()
+    assert_eq(age_of("30m"), Some(30 * 60000000))
+    assert_eq(age_of("12h"), Some(12 * Hour))
+    assert_eq(age_of("7d"), Some(7 * 24 * Hour))
+    assert_eq(age_of("0d"), Some(0))
+    for bad in ["", "7", "d", "7w", "-1d", "1.5h", "7D", "99999999999999999d"]
+        assert(age_of(bad) is None, bad)
+
+@test("sizes and ages are shown as a person reads them, at each boundary")
+shown_sizes_and_ages()
+    assert_eq(size_text(0), "0B")
+    assert_eq(size_text(1023), "1023B")
+    assert_eq(size_text(1024), "1.0K")
+    assert_eq(size_text(1536), "1.5K")
+    assert_eq(size_text(10 * 1024), "10K")
+    assert_eq(size_text(1048575), "1023K")
+    assert_eq(size_text(1048576), "1.0M")
+    assert_eq(size_text(5 * 1073741824), "5.0G")
+    assert_eq(size_text(3 * 1099511627776), "3.0T")
+    assert_eq(size_text(2048 * 1099511627776), "2048T")
+    assert_eq(age_text(0), "just now")
+    assert_eq(age_text(59999999), "just now")
+    assert_eq(age_text(60000000), "1 min ago")
+    assert_eq(age_text(Hour - 1), "59 min ago")
+    assert_eq(age_text(Hour), "1 h ago")
+    assert_eq(age_text(47 * Hour), "47 h ago")
+    assert_eq(age_text(48 * Hour), "2 days ago")
+
+@test("names: a version's, a pending write's, and the temporary directories a build works in")
+names()
+    for v in ["0.0.21", "0.1.0", "1.2.3-rc.1", "10"]
+        assert(is_version_name(v), v)
+    for v in ["pkg", "", "notes", "0.0.21.pending-1-2", ".0", "0.0.21/x", "0.0.21 old", "Ü"]
+        assert(!is_version_name(v), v)
+    assert(is_pending_name("x.o.pending-12-3"))
+    assert(!is_pending_name("x.o"))
+    for t in ["avin-linkbx4f8Y", "avin-shims0hwG6Q", "avin-c-unitZZZZZZ", "avin-test-builds01OyZ2"]
+        assert(is_temp_debris_name(t), t)
+    for t in ["avin-link", "avin-linkbx4f8", "avin-linkbx4f8Yq", "avin-cairoVzBBoK", "avin-release.ahec", "avin-link.x4f8Y", "link-bx4f8Y", "avin-mylinkabcdef"]
+        assert(!is_temp_debris_name(t), t)
+
+@test("the layout: versions beside the default cache, none beside one AVIN_CACHE names, and packages in the machine's cache")
+layouts()
+    val usual = cache_layout_of(None, Some("/c"), Some("/t"), "0.0.21")
+    assert_eq(usual.dir, "/c/avin/0.0.21")
+    assert_eq(usual.versions, "/c/avin")
+    assert_eq(usual.packages, "/c/avin/pkg")
+    assert_eq(usual.temp, "/t")
+    val named = cache_layout_of(Some("/mine"), Some("/c"), None, "0.0.21")
+    assert_eq(named.dir, "/mine")
+    assert_eq(named.versions, "")
+    assert_eq(named.packages, "/c/avin/pkg")
+    assert_eq(named.temp, "/tmp")
+    // An empty AVIN_CACHE is unset.
+    assert_eq(cache_layout_of(Some(""), Some("/c/"), None, "1.0.0").versions, "/c/avin")
+    val bare = cache_layout_of(None, None, Some("/t"), "0.0.21")
+    assert_eq(bare.dir, "/t/avin/0.0.21")
+    assert_eq(bare.versions, "/t/avin")
+    assert_eq(bare.packages, "")
+    // A toolchain's cache that is not the environment's own has nothing beside it swept.
+    assert_eq(cache_layout_at("/somewhere/else").versions, "")
+    assert_eq(cache_layout_at("/somewhere/else").dir, "/somewhere/else")
+    assert_eq(cache_layout_at(cache_layout().dir).versions, cache_layout().versions)
+
+// --- eviction ----------------------------------------------------------------------------------------
+
+@test("past the limit, entries of every kind go least recently used first, until the cache is within it")
+eviction_order()
+    val dir = make_temp_dir("avin-cache-order").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val c = layout.dir
+    program_at(c + "/build/a-111111111111", 1000, 9)
+    file_at(c + "/units/b.o", 1000, 8)
+    program_at(c + "/test-builds/c-222222222222", 1000, 7)
+    file_at(c + "/shims/d.a", 1000, 6)
+    file_at(c + "/runtime/libavinrt-e.a", 1000, 5)
+    file_at(c + "/cunit/f.o", 1000, 4)
+    file_at(c + "/units/g.o", 1000, 3)
+    // Seven thousand bytes against a limit of 3500: the four oldest go, the three newest stay.
+    val swept = sweep_cache(layout, Some(3500), now().us)
+    assert_eq(swept.evicted, 4)
+    assert_eq(swept.freed, 4000)
+    assert(!exists(c + "/build/a-111111111111"))
+    assert(!exists(c + "/units/b.o"))
+    assert(!exists(c + "/test-builds/c-222222222222"))
+    assert(!exists(c + "/shims/d.a"))
+    assert(exists(c + "/runtime/libavinrt-e.a"))
+    assert(exists(c + "/cunit/f.o"))
+    assert(exists(c + "/units/g.o"))
+    // Within the limit, nothing goes; no limit, nothing goes.
+    assert_eq(sweep_cache(layout, Some(3000), now().us).evicted, 0)
+    assert_eq(sweep_cache(layout, None, now().us).evicted, 0)
+    assert_eq(sweep_cache(layout, Some(0), now().us).evicted, 3)
+    // What is left are the kinds' directories, and no debris of the evictions.
+    for kind in cache_kinds()
+        if is_dir(c + "/" + kind) then assert_eq(entries(c + "/" + kind).unwrap().len(), 0, kind)
+
+@test("an entry used within the hour is never evicted, however far past the limit the cache is")
+fresh_entries_stay()
+    val dir = make_temp_dir("avin-cache-fresh").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val c = layout.dir
+    file_at(c + "/units/old.o", 100, 2)
+    file_at(c + "/units/new.o", 5000, 0)
+    program_at(c + "/build/now-333333333333", 5000, 0)
+    // Just inside the hour, and just past it.
+    write_text(c + "/units/edge.o", "x").unwrap()
+    set_modified(c + "/units/edge.o", now() - micros(CacheFresh - 60000000)).unwrap()
+    write_text(c + "/units/past.o", "x").unwrap()
+    set_modified(c + "/units/past.o", now() - micros(CacheFresh + 60000000)).unwrap()
+    val swept = sweep_cache(layout, Some(0), now().us)
+    assert_eq(swept.evicted, 2)
+    assert(!exists(c + "/units/old.o"))
+    assert(!exists(c + "/units/past.o"))
+    assert(exists(c + "/units/edge.o"))
+    assert(exists(c + "/units/new.o"))
+    assert(exists(c + "/build/now-333333333333/prog-O2"))
+
+@test("an entry a build touches between the sweep's choice and its rename is put back whole")
+touched_entry_is_put_back()
+    val dir = make_temp_dir("avin-cache-race").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val c = layout.dir
+    program_at(c + "/build/p-444444444444", 100, 0)
+    file_at(c + "/units/u.o", 100, 0)
+    val before = now().us - CacheFresh
+    assert(!evict_entry(c + "/build/p-444444444444", before))
+    assert(!evict_entry(c + "/units/u.o", before))
+    assert(exists(c + "/build/p-444444444444/prog-O2"))
+    assert(exists(c + "/build/p-444444444444/incremental/program-O2/manifest"))
+    assert(exists(c + "/units/u.o"))
+    assert_eq(entries(c + "/build").unwrap().len(), 1)
+    assert_eq(entries(c + "/units").unwrap().len(), 1)
+    // Untouched, it goes, and leaves nothing of itself.
+    set_modified(c + "/units/u.o", ago(2)).unwrap()
+    assert(evict_entry(c + "/units/u.o", before))
+    assert_eq(entries(c + "/units").unwrap().len(), 0)
+    // An entry that is not there is not evicted.
+    assert(!evict_entry(c + "/units/missing.o", before))
+
+@test("after many builds the cache is within its limit, the most recently used programs kept")
+cap_after_many_builds()
+    val dir = make_temp_dir("avin-cache-many").unwrap()
+    defer _ = remove_dir_all(dir)
+    val cache = shared_cache(dir)
+    val tc = repository_toolchain().building_in(cache + "/build")
+    val layout = CacheLayout(cache, "", Version, "", "")
+    var programs: Buf[string] = buf()
+    for i in 0..<6
+        val source = dir + s"/p$i.avin"
+        write_text(source, s"main() -> int = $i\n").unwrap()
+        val built = cached_build(tc, source, single_file(source_of(source, s"main() -> int = $i\n")), false, "-O0", buf(), buf()).unwrap()
+        assert(built.built)
+        // Each build is an hour older than the next, the last built the newest.
+        set_modified(build_cache(tc.builds, source), ago(long(12 - i))).unwrap()
+        programs.push(build_cache(tc.builds, source))
+    var sizes: Buf[long] = buf()
+    for it in scan_cache(cache, now().us - CacheFresh, false).items
+        sizes.push(it.size)
+    assert_eq(sizes.len(), 6)
+    // Room for about two and a half programs: the three oldest builds go first, then a fourth.
+    val each = sizes[0]
+    val cap = each * 5 / 2
+    val swept = sweep_cache(layout, Some(cap), now().us)
+    assert_eq(swept.evicted, 4)
+    var total: long = 0
+    for it in scan_cache(cache, now().us - CacheFresh, false).items
+        total += it.size
+    assert(total <= cap, s"$total > $cap")
+    for i in 0..<4
+        assert(!exists(programs[i]), programs[i])
+    for i in 4..<6
+        assert(exists(programs[i]), programs[i])
+    // A program evicted is built again, as from an empty cache.
+    val source = dir + "/p0.avin"
+    assert(cached_build(tc, source, single_file(source_of(source, "main() -> int = 0\n")), false, "-O0", buf(), buf()).unwrap().built)
+
+@test("a build taking a program's executable from the cache touches its directory, and so does every test it runs")
+builds_touch_their_entries()
+    val dir = make_temp_dir("avin-cache-touch").unwrap()
+    defer _ = remove_dir_all(dir)
+    val cache = shared_cache(dir)
+    val tc = repository_toolchain().building_in(cache + "/build")
+    val source = dir + "/t.avin"
+    val text = "main() -> int = 3\n\n@test\nthree()\n    assertEq(main(), 3)\n"
+    write_text(source, text).unwrap()
+    val program = build_cache(tc.builds, source)
+    _ = cached_build(tc, source, single_file(source_of(source, text)), false, "-O0", buf(), buf()).unwrap()
+    set_modified(program, ago(5)).unwrap()
+    val again = cached_build(tc, source, single_file(source_of(source, text)), false, "-O0", buf(), buf()).unwrap()
+    assert(!again.built)
+    assert(used_of(program) > now().us - Hour)
+    // `avin test` touches it again before each test.
+    var said = ""
+    val status = run_cli_in(dir, ["avin", "test", source, "-O0"], Some(tc), s -> said = said + s + "\n", s -> said = said + s + "\n", Stdio.ToPath(dir + "/out"), Stdio.ToPath(dir + "/err"))
+    assert_eq(status, 0, said)
+    set_modified(program, ago(5)).unwrap()
+    val built = cached_build(tc, source, single_file(source_of(source, text)), true, "-O0", buf(), buf()).unwrap()
+    set_modified(program, ago(5)).unwrap()
+    _ = run_tests(built, dir, "", false, s -> ())
+    assert(used_of(program) > now().us - Hour)
+
+@test("the runtime's archive, found in the cache, is touched")
+runtime_archive_is_touched()
+    val dir = make_temp_dir("avin-cache-runtime").unwrap()
+    defer _ = remove_dir_all(dir)
+    val real = repository_toolchain()
+    val tc = Toolchain(real.root, dir + "/cache", real.clang, real.sysl, real.pkg_config, dir + "/cache/build")
+    if exists(tc.prebuilt_runtime(runtime_key(tc))) then return
+    val archive = tc.runtime_cache() + "/libavinrt-" + runtime_key(tc) + ".a"
+    file_at(archive, 10, 5)
+    assert_eq(ensure_runtime(tc).unwrap(), archive)
+    assert(used_of(archive) > now().us - Hour)
+
+// --- debris, other versions, packages, temporary directories -----------------------------------------
+
+@test("a sweep removes what interrupted builds left, once nothing has written to it for an hour")
+debris_is_removed()
+    val dir = make_temp_dir("avin-cache-debris").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val c = layout.dir
+    file_at(c + "/units/k.o.pending-7-1", 300, 2)
+    file_at(c + "/runtime/libavinrt-k.a.pending-7-2.h", 30, 2)
+    file_at(c + "/shims/k.a.pending-7-3", 30, 0)
+    program_at(c + "/build/q-555555555555", 100, 0)
+    file_at(c + "/build/q-555555555555/q-O2.pending-7-4", 500, 3)
+    file_at(c + "/build/q-555555555555/q-O0.pending-7-5", 500, 0)
+    file_at(c + "/build/r-666666666666.pending-7-6/r-O2", 50, 3)
+    set_modified(c + "/build/r-666666666666.pending-7-6", ago(3)).unwrap()
+    // `avin cache info` counts the debris without removing it.
+    var said = ""
+    cache_info(layout, Some(DefaultCacheLimit), now().us, s -> said = said + s + "\n")
+    assert(said.contains("debris       4 left      "), said)
+    assert(exists(c + "/units/k.o.pending-7-1"))
+    val swept = sweep_cache(layout, None, now().us)
+    assert_eq(swept.junk, 4)
+    assert(!exists(c + "/units/k.o.pending-7-1"))
+    assert(!exists(c + "/runtime/libavinrt-k.a.pending-7-2.h"))
+    assert(!exists(c + "/build/q-555555555555/q-O2.pending-7-4"))
+    assert(!exists(c + "/build/r-666666666666.pending-7-6"))
+    // A write in progress stays, and so does the program it is in.
+    assert(exists(c + "/shims/k.a.pending-7-3"))
+    assert(exists(c + "/build/q-555555555555/q-O0.pending-7-5"))
+    assert(exists(c + "/build/q-555555555555/prog-O2"))
+    // A kind that is a link is another cache's, and is never looked into.
+    make_dir_all(dir + "/elsewhere").unwrap()
+    file_at(dir + "/elsewhere/z.o", 10, 50)
+    remove_dir_all(c + "/cunit").unwrap_or(())
+    symlink(dir + "/elsewhere", c + "/cunit").unwrap()
+    _ = sweep_cache(layout, Some(0), now().us)
+    assert(exists(dir + "/elsewhere/z.o"))
+
+@test("other versions' caches go three days after their last use; this version's, packages and other names stay")
+other_versions_go()
+    val dir = make_temp_dir("avin-cache-versions").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    file_at(dir + "/avin/0.0.20/units/a.o", 10, 100)
+    set_modified(dir + "/avin/0.0.20/units", ago(100)).unwrap()
+    set_modified(dir + "/avin/0.0.20", ago(100)).unwrap()
+    // Used two days ago, deep down: kept.
+    file_at(dir + "/avin/0.0.19/units/a.o", 10, 48)
+    set_modified(dir + "/avin/0.0.19/units", ago(48)).unwrap()
+    set_modified(dir + "/avin/0.0.19", ago(100)).unwrap()
+    file_at(dir + "/avin/notes/n", 10, 100)
+    set_modified(dir + "/avin/notes", ago(100)).unwrap()
+    file_at(layout.dir + "/units/mine.o", 10, 100)
+    // Information first: each version, its size and its last use.
+    var said = ""
+    cache_info(layout, Some(DefaultCacheLimit), now().us, s -> said = said + s + "\n")
+    assert(said.contains("version 0.0.20"), said)
+    assert(said.contains("version 0.0.19"), said)
+    assert(!said.contains("notes"), said)
+    val swept = sweep_cache(layout, None, now().us)
+    assert_eq(swept.versions, 1)
+    assert(!exists(dir + "/avin/0.0.20"))
+    assert(exists(dir + "/avin/0.0.19/units/a.o"))
+    assert(exists(dir + "/avin/notes/n"))
+    assert(exists(layout.dir + "/units/mine.o"))
+    // Beside a cache AVIN_CACHE names, nothing is the compiler's.
+    file_at(dir + "/avin/0.0.18/units/a.o", 10, 100)
+    set_modified(dir + "/avin/0.0.18/units", ago(100)).unwrap()
+    set_modified(dir + "/avin/0.0.18", ago(100)).unwrap()
+    val named = CacheLayout(layout.dir, "", layout.version, "", "")
+    assert_eq(sweep_cache(named, None, now().us).versions, 0)
+    assert(exists(dir + "/avin/0.0.18/units/a.o"))
+
+@test("a sweep removes interrupted fetches' debris and never a fetched package, which the limit does not count")
+packages_stay()
+    val dir = make_temp_dir("avin-cache-packages").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val repo = layout.packages + "/github.com/someone/thing"
+    file_at(repo + "/@v1.0.0/avin.hocon", 4000, 500)
+    set_modified(repo + "/@v1.0.0", ago(500)).unwrap()
+    file_at(repo + "/@v1.0.0.hash", 10, 500)
+    file_at(repo + "/@v1.0.0/inside.pending-1-1", 10, 500)
+    file_at(repo + "/@v1.1.0.pending-3-4/avin.hocon", 10, 5)
+    set_modified(repo + "/@v1.1.0.pending-3-4", ago(5)).unwrap()
+    file_at(repo + "/@r0123.pending-3-5/avin.hocon", 10, 0)
+    file_at(repo + "/@v1.0.0.hash.pending-3-6", 10, 5)
+    val swept = sweep_cache(layout, Some(0), now().us)
+    assert_eq(swept.junk, 2)
+    assert_eq(swept.evicted, 0)
+    assert(exists(repo + "/@v1.0.0/avin.hocon"))
+    assert(exists(repo + "/@v1.0.0/inside.pending-1-1"))
+    assert(!exists(repo + "/@v1.1.0.pending-3-4"))
+    assert(!exists(repo + "/@v1.0.0.hash.pending-3-6"))
+    assert(exists(repo + "/@r0123.pending-3-5"))
+    val fetched = fetched_packages(layout.packages)
+    assert_eq(fetched.len(), 1)
+    assert_eq(fetched[0].path, repo + "/@v1.0.0")
+
+@test("the temporary directories killed builds leave go after a day without a write; a program's own stay")
+temporary_debris()
+    val dir = make_temp_dir("avin-cache-temp").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val t = layout.temp
+    file_at(t + "/avin-linkAbC123/prog.ll", 10, 30)
+    set_modified(t + "/avin-linkAbC123", ago(30)).unwrap()
+    file_at(t + "/avin-test-builds01OyZ2/x", 10, 30)
+    set_modified(t + "/avin-test-builds01OyZ2", ago(30)).unwrap()
+    // Written to an hour ago, inside: kept.
+    file_at(t + "/avin-shimsQwErTy/shims.sysl", 10, 1)
+    set_modified(t + "/avin-shimsQwErTy", ago(30)).unwrap()
+    file_at(t + "/avin-c-unit000000/c.c", 10, 2)
+    file_at(t + "/avin-mineAbC123/keep", 10, 30)
+    set_modified(t + "/avin-mineAbC123", ago(30)).unwrap()
+    file_at(t + "/avin-linkZZZZZZ", 10, 30)
+    val swept = sweep_cache(layout, None, now().us)
+    assert_eq(swept.temps, 2)
+    assert(!exists(t + "/avin-linkAbC123"))
+    assert(!exists(t + "/avin-test-builds01OyZ2"))
+    assert(exists(t + "/avin-shimsQwErTy/shims.sysl"))
+    assert(exists(t + "/avin-c-unit000000/c.c"))
+    assert(exists(t + "/avin-mineAbC123/keep"))
+    assert(exists(t + "/avin-linkZZZZZZ"))
+
+@test("a sweep is due once per interval, the stamp shared by every process")
+sweeps_are_spaced()
+    val dir = make_temp_dir("avin-cache-stamp").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = CacheLayout(dir + "/cache", "", Version, "", "")
+    file_at(layout.dir + "/units/old.o", 10, 5)
+    assert(sweep_if_due(layout, Some(0), now().us) is Some(_))
+    assert(!exists(layout.dir + "/units/old.o"))
+    file_at(layout.dir + "/units/old.o", 10, 5)
+    assert(sweep_if_due(layout, Some(0), now().us) is None)
+    assert(exists(layout.dir + "/units/old.o"))
+    // Ten minutes on, it is due again.
+    assert(sweep_if_due(layout, Some(0), now().us + SweepInterval + 1) is Some(_))
+    assert(!exists(layout.dir + "/units/old.o"))
+    set_modified(layout.dir + "/" + SweepStamp, now() - micros(SweepInterval + 1)).unwrap()
+    assert(sweep_due(layout, now().us))
+    assert(!sweep_due(layout, now().us))
+
+// --- avin cache --------------------------------------------------------------------------------------
+
+private struct Said
+    status: int
+    said: string
+    noted: string
+
+private cache_cli(layout: CacheLayout, limit: Option[long], args: []const string) -> Said
+    var said = ""
+    var noted = ""
+    val status = cache_command(args, layout, limit, now().us, s -> said = said + s + "\n", s -> noted = noted + s + "\n")
+    Said(status, said, noted)
+
+@test("avin cache info shows the cache, its limit, each kind, the total with its oldest and newest use, and the packages")
+cache_info_lines()
+    val dir = make_temp_dir("avin-cache-info").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val c = layout.dir
+    program_at(c + "/build/a-111111111111", 2048, 3)
+    file_at(c + "/units/b.o", 1024, 0)
+    file_at(c + "/units/c.o", 1024, 50)
+    file_at(layout.packages + "/github.com/x/y/@v0.1.0/avin.hocon", 512, 1)
+    val info = cache_cli(layout, Some(DefaultCacheLimit), ["avin", "cache", "info"])
+    assert_eq(info.status, 0, info.noted)
+    val lines = info.said.split("\n")
+    assert_eq(lines[0], "cache        " + c)
+    assert_eq(lines[1], "limit        5.0G (AVIN_CACHE_LIMIT)")
+    assert_eq(lines[2], "build        1 entry       2.0K")
+    assert_eq(lines[3], "test-builds  0 entries     0B")
+    assert_eq(lines[4], "units        2 entries     2.0K")
+    assert_eq(lines[5], "runtime      0 entries     0B")
+    assert_eq(lines[6], "shims        0 entries     0B")
+    assert_eq(lines[7], "cunit        0 entries     0B")
+    assert_eq(lines[8], "total        3 entries     4.0K, oldest used 2 days ago, newest just now")
+    assert_eq(lines[9], "packages     1 fetched     512B in " + layout.packages + ", not counted against the limit")
+    assert_eq(lines.len, 11)
+    assert_eq(cache_cli(layout, None, ["avin", "cache", "info"]).said.split("\n")[1], "limit        none (AVIN_CACHE_LIMIT)")
+    // An empty cache, or none at all yet.
+    val empty = cache_cli(CacheLayout(dir + "/none", "", Version, "", ""), Some(0), ["avin", "cache", "info"])
+    assert_eq(empty.status, 0)
+    assert(empty.said.contains("total        0 entries     0B\n"), empty.said)
+    assert(!empty.said.contains("oldest"), empty.said)
+
+@test("avin cache clean removes everything, --older-than what has not been used for that long, --packages the packages")
+cache_clean()
+    val dir = make_temp_dir("avin-cache-clean").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val c = layout.dir
+    program_at(c + "/build/a-111111111111", 100, 30)
+    file_at(c + "/units/b.o", 100, 0)
+    file_at(c + "/units/c.o", 100, 10)
+    file_at(c + "/units/d.o.pending-1-1", 100, 0)
+    file_at(dir + "/avin/0.0.1/units/x.o", 10, 1)
+    file_at(layout.packages + "/github.com/x/y/@v0.1.0/avin.hocon", 10, 30)
+    set_modified(layout.packages + "/github.com/x/y/@v0.1.0", ago(30)).unwrap()
+    file_at(layout.packages + "/github.com/x/y/@v0.1.0.hash", 10, 30)
+    file_at(layout.packages + "/github.com/x/y/@v0.2.0/avin.hocon", 10, 0)
+    val older = cache_cli(layout, None, ["avin", "cache", "clean", "--older-than", "1d"])
+    assert_eq(older.status, 0, older.noted)
+    assert_eq(older.said, "removed 1 entry (100B)\n")
+    assert(!exists(c + "/build/a-111111111111"))
+    assert(exists(c + "/units/c.o"))
+    assert(exists(dir + "/avin/0.0.1/units/x.o"))
+    assert(exists(layout.packages + "/github.com/x/y/@v0.1.0"))
+    val packages = cache_cli(layout, None, ["avin", "cache", "clean", "--packages", "--older-than", "1d"])
+    assert_eq(packages.said, "removed 1 entry (10B)\n")
+    assert(!exists(layout.packages + "/github.com/x/y/@v0.1.0"))
+    assert(!exists(layout.packages + "/github.com/x/y/@v0.1.0.hash"))
+    assert(exists(layout.packages + "/github.com/x/y/@v0.2.0"))
+    assert_eq(cache_cli(layout, None, ["avin", "cache", "clean", "--older-than", "1d"]).said, "nothing to clean\n")
+    // All of it: every entry, the debris however new, and other versions' caches; the packages stay.
+    val all = cache_cli(layout, None, ["avin", "cache", "clean"])
+    assert_eq(all.said, "removed 2 entries (200B), 1 left by interrupted builds, 1 other version's cache\n")
+    assert_eq(entries(c + "/units").unwrap().len(), 0)
+    assert(!exists(dir + "/avin/0.0.1"))
+    assert(exists(layout.packages + "/github.com/x/y/@v0.2.0"))
+    assert_eq(cache_cli(layout, None, ["avin", "cache", "clean"]).said, "nothing to clean\n")
+
+@test("avin cache trim sweeps now, whenever the last sweep was")
+cache_trim()
+    val dir = make_temp_dir("avin-cache-trimmed").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    file_at(layout.dir + "/units/a.o", 2048, 3)
+    file_at(layout.dir + "/units/b.o", 2048, 0)
+    assert(sweep_due(layout, now().us))
+    val trimmed = cache_cli(layout, Some(1024), ["avin", "cache", "trim"])
+    assert_eq(trimmed.status, 0, trimmed.noted)
+    assert_eq(trimmed.said, "removed 1 entry (2.0K)\n")
+    assert(exists(layout.dir + "/units/b.o"))
+    assert(!sweep_due(layout, now().us))
+    assert_eq(cache_cli(layout, Some(1024), ["avin", "cache", "trim"]).said, "removed 0 entries (0B)\n")
+
+private refused_as_usage(layout: CacheLayout, args: []const string)
+    val r = cache_cli(layout, None, args)
+    assert_eq(r.status, 2, args[args.len - 1])
+    assert_eq(r.noted, CacheUsage + "\n")
+    assert_eq(r.said, "")
+
+@test("avin cache with no subcommand, an unknown one, an extra argument or a bad age is an incorrect invocation")
+cache_usage()
+    val dir = make_temp_dir("avin-cache-usage").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    refused_as_usage(layout, ["avin", "cache"])
+    refused_as_usage(layout, ["avin", "cache", "size"])
+    refused_as_usage(layout, ["avin", "cache", "info", "x"])
+    refused_as_usage(layout, ["avin", "cache", "trim", "x"])
+    refused_as_usage(layout, ["avin", "cache", "clean", "--packages", "--packages"])
+    refused_as_usage(layout, ["avin", "cache", "clean", "--older-than"])
+    refused_as_usage(layout, ["avin", "cache", "clean", "--older-than", "1d", "--older-than", "2d"])
+    refused_as_usage(layout, ["avin", "cache", "clean", "x"])
+    val bad = cache_cli(layout, None, ["avin", "cache", "clean", "--older-than", "7w"])
+    assert_eq(bad.status, 2)
+    assert_eq(bad.noted, "avin: `7w` is not an age: it is minutes, hours or days, such as `30m`, `12h` or `7d`\n")
+
+@test("avin cache is a command, and through the command line reads the toolchain's cache, leaving what is beside it")
+cache_through_the_command_line()
+    val dir = make_temp_dir("avin-cache-cli").unwrap()
+    defer _ = remove_dir_all(dir)
+    val real = repository_toolchain()
+    val tc = Toolchain(real.root, dir + "/avin/0.0.21", real.clang, real.sysl, real.pkg_config, dir + "/avin/0.0.21/build")
+    file_at(tc.cache + "/units/a.o", 10, 3)
+    file_at(dir + "/avin/0.0.1/units/a.o", 10, 300)
+    assert(is_command("cache"))
+    var said = ""
+    var noted = ""
+    val status = run_cli_in(dir, ["avin", "cache", "clean"], Some(tc), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.Inherit, Stdio.Inherit)
+    assert_eq(status, 0, noted)
+    assert_eq(said, "removed 1 entry (10B)\n")
+    assert(exists(dir + "/avin/0.0.1/units/a.o"))
+    said = ""
+    assert_eq(run_cli_in(dir, ["avin", "cache", "info"], Some(tc), s -> said = said + s + "\n", s -> (), Stdio.Inherit, Stdio.Inherit), 0)
+    assert(said.starts_with("cache        " + tc.cache + "\n"), said)
+    said = ""
+    assert_eq(run_cli_in(dir, ["avin", "--help"], Some(tc), s -> said = said + s + "\n", s -> (), Stdio.Inherit, Stdio.Inherit), 0)
+    assert(said.contains("avin cache info | trim | clean [--older-than <age>] [--packages]"), said)
+    assert(said.contains("AVIN_CACHE_LIMIT"), said)
+
+@test("a shim archive and the record beside it are one entry, evicted together, a newer record kept")
+shim_pairs_go_together()
+    val dir = make_temp_dir("avin-cache-shims").unwrap()
+    defer _ = remove_dir_all(dir)
+    val layout = layout_in(dir)
+    val s = layout.dir + "/shims"
+    file_at(s + "/old.a", 1000, 5)
+    file_at(s + "/old.a.link", 24, 5)
+    file_at(s + "/redone.a", 1000, 4)
+    file_at(s + "/redone.a.link", 24, 0)
+    file_at(s + "/orphan.a.link", 24, 6)
+    file_at(s + "/new.a", 1000, 0)
+    file_at(s + "/new.a.link", 24, 0)
+    val scan = scan_cache(layout.dir, now().us - CacheFresh, false)
+    assert_eq(scan.items.len(), 4)
+    for it in scan.items
+        if it.path == s + "/old.a" then assert_eq(it.size, 1024)
+        assert(it.path != s + "/old.a.link", it.path)
+    val swept = sweep_cache(layout, Some(0), now().us)
+    assert_eq(swept.evicted, 3)
+    assert(!exists(s + "/old.a"))
+    assert(!exists(s + "/old.a.link"))
+    assert(!exists(s + "/orphan.a.link"))
+    assert(!exists(s + "/redone.a"))
+    // A record written since the sweep chose the archive is another build's, and stays.
+    assert(exists(s + "/redone.a.link"))
+    assert(exists(s + "/new.a"))
+    assert(exists(s + "/new.a.link"))
+
+/** The repository's toolchain with a cache of its own in `dir`, so what a test removes from it is
+ * nothing another test is using. */
+private own_toolchain(dir: string) -> Toolchain
+    val real = repository_toolchain()
+    Toolchain(real.root, dir + "/cache", real.clang, real.sysl, real.pkg_config, dir + "/cache/build")
+
+private shim_files(tc: Toolchain, suffix: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    for n in entries(tc.shim_cache()).unwrap_or(buf())
+        if n.ends_with(suffix) then out.push(tc.shim_cache() + "/" + n)
+    out
+
+@test("a shim archive or its record deleted behind the cache's back is built again, before the link or during it, never handed to clang")
+vanished_shims_are_built_again()
+    val dir = make_temp_dir("avin-cache-vanish").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = own_toolchain(dir)
+    val file = dir + "/bound.avin"
+    val text = "@sysl(\"sysl.text.to_lower\")\nlower(s: string) -> string\n\nmain()\n  println(lower(\"AbC\"))\n"
+    write_text(file, text).unwrap()
+    var noted = ""
+    val build: &Fn() -> int = () -> run_cli_in(dir, ["avin", "build", file, "-O0", "-o", dir + "/bound"], Some(tc), s -> (), s -> noted = noted + s + "\n", Stdio.Inherit, Stdio.Inherit)
+    assert_eq(build(), 0, noted)
+    assert_eq(shim_files(tc, ".a").len(), 1)
+    // Deleted between builds: the next build finds it missing and builds it again.
+    for f in shim_files(tc, ".a")
+        remove_file(f).unwrap()
+    assert_eq(build(), 0, noted)
+    assert_eq(shim_files(tc, ".a").len(), 1)
+    assert_eq(capture(dir + "/bound", [], timeout = 60000).unwrap().text, "abc\n")
+    // Its record alone deleted: the archive is not whole, and is built again too.
+    for f in shim_files(tc, ".a.link")
+        remove_file(f).unwrap()
+    assert_eq(build(), 0, noted)
+    assert_eq(shim_files(tc, ".a.link").len(), 1)
+    // Deleted after the program compiled and before it linked: the link says the entry is gone,
+    // naming it, rather than handing clang a path to nothing, and a link that compiles again succeeds.
+    val files = single_file(source_of(file, text))
+    for gone in [".a", ".a.link"]
+        val compiled = compile_program(tc, files, false, buf(), buf())
+        assert_eq(compiled.diagnostics, "")
+        val archive = compiled.archive.unwrap()
+        remove_file(if gone == ".a" then archive else link_needs_file(archive)).unwrap()
+        val linked = link(tc, compiled.llvm.unwrap(), compiled.archive, dir + "/late", "-O0", compiled.c_link)
+        assert(linked.is_err())
+        assert(linked.unwrap_err().starts_with(VanishedEntry), linked.unwrap_err())
+        val recovered = link_compiled(tc, compiled, () -> compile_program(tc, files, false, buf(), buf()), dir + "/late", "-O0")
+        if recovered is Err(message) then panic(message)
+        assert_eq(capture(dir + "/late", [], timeout = 60000).unwrap().text, "abc\n")
+        assert(exists(archive))
+        assert(exists(link_needs_file(archive)))
+    // Any other failure of the link is the link's own, and is not compiled again.
+    val compiled = compile_program(tc, files, false, buf(), buf())
+    val failed = link_compiled(tc, compiled, () -> Compilation("compiled again", None, None, buf(), buf()), dir + "/no/such/dir/out", "-O0")
+    assert(failed.is_err())
+    assert(!failed.unwrap_err().starts_with(VanishedEntry), failed.unwrap_err())
+    assert(failed.unwrap_err() != "compiled again")
+
+// --- builds at the same time as a sweep ------------------------------------------------------------
+
+/** A cache in `dir` whose programs' builds are its own and whose runtime, shims and objects are the
+ * user's cache's, by symbolic links a sweep passes over, so the runtime is not built again. */
+private shared_cache(dir: string) -> string
+    val cache = dir + "/cache"
+    if exists(cache) then return cache
+    make_dir_all(cache).unwrap()
+    val real = repository_toolchain()
+    for (name, shared) in [("runtime", real.runtime_cache()), ("shims", real.shim_cache()), ("cunit", real.c_unit_cache()), ("units", real.unit_cache())]
+        make_dir_all(shared).unwrap()
+        symlink(shared, cache + "/" + name).unwrap()
+    cache
+
+/** The environment of the compiler these tests start: this tree, the cache `cache`, the limit `limit`. */
+private env_of(cache: string, limit: string) -> Buf[Var]
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env.push(Var("AVIN_CACHE", cache))
+    env.push(Var("AVIN_CACHE_LIMIT", limit))
+    env
+
+@test("two builds into one cache while it is swept to nothing: both succeed and nothing they use disappears; AVIN_CACHE_LIMIT is read")
+builds_while_sweeping()
+    val dir = make_temp_dir("avin-cache-busy").unwrap()
+    defer _ = remove_dir_all(dir)
+    val bin = dir + "/avin"
+    val made = capture(repository_toolchain().sysl, ["build", "compiler", "-o", bin], stderr = true, timeout = 900000).unwrap()
+    assert(made.status.ok(), made.err.unwrap_or(""))
+    val cache = shared_cache(dir)
+    val env = env_of(cache, "0")
+    for name in ["a", "b"]
+        make_dir_all(dir + "/" + name).unwrap()
+        write_text(dir + "/" + name + "/main.avin", "main()\n  var total = 0\n  for i in 0 ..< 1000\n    total = total + i\n  println(total)\n\n@test\nadds()\n  assertEq(1 + 1, 2)\n").unwrap()
+    for round in 0..<3
+        // Everything the last round built is made old, so only a build's own touch keeps it.
+        for name in entries(cache + "/build").unwrap_or(buf())
+            set_modified(cache + "/build/" + name, ago(5)).unwrap()
+        val a = spawn(bin, ["test", dir + "/a", "-O0"], env = env.view(), stdout = Stdio.ToPath(dir + "/a.out"), stderr = Stdio.ToPath(dir + "/a.err")).unwrap()
+        val b = spawn(bin, ["run", dir + "/b", "-O0"], env = env.view(), stdout = Stdio.ToPath(dir + "/b.out"), stderr = Stdio.ToPath(dir + "/b.err")).unwrap()
+        for i in 0..<4
+            val t = capture(bin, ["cache", "trim"], env = env.view(), stderr = true, timeout = 60000).unwrap()
+            assert(t.status.ok(), t.err.unwrap_or(""))
+        val ea = a.wait().unwrap()
+        val eb = b.wait().unwrap()
+        assert(ea is Exited(0), s"round $round: " + read_text(dir + "/a.out").unwrap_or("") + read_text(dir + "/a.err").unwrap_or(""))
+        assert(eb is Exited(0), s"round $round: " + read_text(dir + "/b.err").unwrap_or(""))
+        assert_eq(read_text(dir + "/b.out").unwrap(), "499500\n")
+        // Both are in use within the hour, so a sweep to nothing leaves them, and nothing pending.
+        val t = capture(bin, ["cache", "trim"], env = env.view(), stderr = true, timeout = 60000).unwrap()
+        assert(t.text.starts_with("removed 0 entries"), t.text)
+        val names = entries(cache + "/build").unwrap()
+        assert_eq(names.len(), 2)
+        for n in names
+            assert(!n.contains(".pending-"), n)
+    // The variable is read: a size and `off` are shown, a bad one refused by every command.
+    val sized = env_of(cache, "2G")
+    assert(capture(bin, ["cache", "info"], env = sized.view(), timeout = 60000).unwrap().text.contains("limit        2.0G (AVIN_CACHE_LIMIT)\n"))
+    val none = env_of(cache, "off")
+    assert(capture(bin, ["cache", "info"], env = none.view(), timeout = 60000).unwrap().text.contains("limit        none (AVIN_CACHE_LIMIT)\n"))
+    val wrong = env_of(cache, "lots")
+    for args in [["run", dir + "/b", "-O0"], ["cache", "info", "-O0"]]
+        val refused = capture(bin, args, env = wrong.view(), stderr = true, timeout = 600000).unwrap()
+        assert(refused.status is Exited(1), args[0])
+        assert(refused.err.unwrap_or("").contains("AVIN_CACHE_LIMIT is `lots`"), refused.err.unwrap_or(""))
+    // With the limit at nothing and the programs old, a sweep takes them both.
+    for name in entries(cache + "/build").unwrap()
+        set_modified(cache + "/build/" + name, ago(5)).unwrap()
+    _ = capture(bin, ["cache", "trim"], env = env.view(), timeout = 60000).unwrap()
+    assert_eq(entries(cache + "/build").unwrap().len(), 0)

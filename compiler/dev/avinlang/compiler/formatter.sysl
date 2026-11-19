@@ -291,6 +291,11 @@ private fmt_measure(lines: *Buf[FmtLine], toks: Buf[FmtToken], n: usize) -> Resu
     var head_next = true
     var prev_indent = 0usize
     var owner = 0usize
+    // For each open block, the head line that owned the lines before it: a block opened inside
+    // brackets and closed by one hands its lines back to that head, so the bracket's later items
+    // are measured from where its earlier ones were.
+    var owners: Buf[usize] = buf()
+    owners.push(0)
     var waiting: Buf[usize] = buf()
     var heads: Buf[usize] = buf()
     for l in 1..n
@@ -310,8 +315,11 @@ private fmt_measure(lines: *Buf[FmtLine], toks: Buf[FmtToken], n: usize) -> Resu
                     // A block opened inside brackets starts from the line that opened it.
                     val base = if lay.brackets > 0 && prev_indent > top then prev_indent else top
                     stack.push(base + FormatIndent)
+                    owners.push(owner)
                 Shallower(k) ->
-                    for i in 0..<k do stack.pop()
+                    for i in 0..<k
+                        stack.pop()
+                        owners.pop()
                 Ragged(_) -> return Err(s"line $l: indentation does not match an enclosing block")
             lines[l].indent = stack[stack.len() - 1]
             lines[l].level = stack.len() - 1
@@ -334,8 +342,10 @@ private fmt_measure(lines: *Buf[FmtLine], toks: Buf[FmtToken], n: usize) -> Resu
             if is_opener(t.text) then lay.open_bracket()
             elif is_closer(t.text)
                 val closed = lay.close_bracket()
-                for i in 0..<closed do stack.pop()
-            if (t.kind == MatchKeyword || t.text == "->") && k == last then lay.opens_block()
+                for i in 0..<closed
+                    stack.pop()
+                    owner = owners.pop().unwrap()
+            if (t.kind == MatchKeyword || t.text == "->" || opens_select(toks, k)) && k == last then lay.opens_block()
         head_next = lay.significant()
     for c in waiting
         lines[c].indent = fmt_comment_indent(lay, stack, lines[c].column, 0)
@@ -350,6 +360,11 @@ private fmt_measure(lines: *Buf[FmtLine], toks: Buf[FmtToken], n: usize) -> Resu
     Ok(())
 end fmt_measure
 
+// Whether token `k` is a `select` that opens the block of its arms, as the lexer reads it: any
+// `select` but the label of `end select`; the caller asks only of a line's last token.
+private opens_select(toks: Buf[FmtToken], k: usize) -> bool =
+    toks[k].text == "select" && !(k > 0 && toks[k - 1].text == "end")
+
 // The indentation of a comment on a line of its own: that of the block whose margin it sits at or
 // inside, or, deeper than every open block, of the block the next line opens.
 private fmt_comment_indent(lay: Layout, stack: Buf[usize], column: usize, next: usize) -> usize
@@ -363,9 +378,10 @@ private fmt_comment_indent(lay: Layout, stack: Buf[usize], column: usize, next: 
 
 // ---- spaces between tokens ----
 
-// Whether the token can end an operand, so that an operator after it stands between two.
+// Whether the token can end an operand, so that an operator after it stands between two. `end` closes
+// a form only before a name, so before an operator it is a name itself (`end - 1`).
 private fmt_operand_end(t: FmtToken) -> bool = t.kind match
-    Word -> !is_keyword(t.text) || t.text == "self" || t.text == "true" || t.text == "false" || t.text == "super"
+    Word -> !is_keyword(t.text) || t.text == "self" || t.text == "true" || t.text == "false" || t.text == "super" || t.text == "end"
     Number | RealNumber | Quoted | Interpolated | CharQuoted -> true
     Symbol -> is_closer(t.text)
     Postfix -> t.text == "?" || t.text == "++" || t.text == "--"

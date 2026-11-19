@@ -66,7 +66,8 @@ location, and is only for development: an installed `avin` needs no setting.
 
 The program writes to the terminal as it runs, and `avin run` exits with the program's own status;
 when a trap stops the program, the status is 128 and the signal's number, as a shell reports it.
-Everything after `--` is passed to the program as its arguments. The executable is kept in the
+The program, and whatever it starts, ends with `avin run`: a signal that stops `avin run` is passed
+on to it, and even an `avin run` killed outright takes it along. Everything after `--` is passed to the program as its arguments. The executable is kept in the
 program's own directory in the cache ([running and testing](/compiler/#running-and-testing)), and the
 next run of an unchanged program starts it without building it again. Any change to the program's
 sources, the standard library, the runtime or the compiler builds it again, and every build, `avin
@@ -75,9 +76,16 @@ edit makes again only what the edit can change ([incremental builds](/compiler/#
 `AVIN_INCREMENTAL=off` turns it off). `avin clean` removes the program's cache and `avin clean --all`
 every program's; either is always safe.
 
+The cache looks after its own size: builds keep it within 5G, removing what was used longest ago
+first, and clear away what interrupted builds and older versions of Avin left. `AVIN_CACHE_LIMIT`
+sets another limit (`20G`, `500M`, or `off` for none). `avin cache info` shows what it holds, `avin
+cache trim` trims it now, and `avin cache clean` empties it (`--older-than 7d` for only what has not
+been used for a week, `--packages` for the fetched packages too).
+
 A program is a source file or a directory: `avin run my-program` builds every `.avin` and `.lavin`
 file under `my-program/`. `build`, `run` and `test` all take `-O0` or `-O2`, and build at `-O2` by
-default.
+default. `build` and `emit-llvm` also take `-g`, which builds the program with debug information
+for a debugger such as lldb: [Debugging](/getting-started/debugging/) shows a session.
 
 `run` is the default command and the current directory the default program, so inside a package
 (or a directory of `.avin` files) these are all the same:
@@ -146,7 +154,8 @@ leavesInRange()
 reports the place of the assertion itself.
 
 `avin test` builds the program's tests into one executable and runs each test in a process of its
-own, so a test that traps stops only itself:
+own, so a test that traps stops only itself. A test's process, and whatever it starts, ends with the
+test — passed, failed, trapped or timed out — and with `avin test` itself, however that is stopped:
 
 ```sh
 ./compiler/avin test my-program

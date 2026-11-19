@@ -85,11 +85,15 @@ struct Manifest
     /** The C libraries the package's C bindings call, in the order its `c-libraries` block lists
      * them. */
     c_libraries: Buf[CLibrary]
+    /** Whether `static-c-libraries = true`: a program this package is the root of links each C
+     * library a `pkg-config` module finds from its static archive. A dependency's is not read. */
+    static_c_libraries: bool
 
 /** A C library a package's manifest names under `c-libraries`: its name there; the `pkg-config`
  * module that finds it, or the libraries `link` names directly; the headers the package's bindings
  * are checked against, as written; and what a build that cannot find it says to do. `package` is the
- * name of the package whose manifest names it. */
+ * name of the package whose manifest names it. `linked_statically` is whether the program it is
+ * linked into asks for its static archive (`static-c-libraries` in the root package's manifest). */
 struct CLibrary
     package: string
     label: string
@@ -97,6 +101,7 @@ struct CLibrary
     link: Buf[string]
     headers: Buf[string]
     install: string
+    linked_statically: bool
 
 /** The file that makes a directory a Sysl package. */
 const SyslManifestName: string = "sysl.hocon"
@@ -118,7 +123,7 @@ read_manifest_named(dir: string, name: string) -> Result[Manifest, string]
 manifest_from(dir: string, src: Source, running: string) -> Result[Manifest, Diagnostic]
     val doc = parse_hocon(src)?
     if later_avin_required(doc.root, running) is Some(d) then return Err(d)
-    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf())
+    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false)
     read_fields(&m, doc.root)?
     Ok(m)
 
@@ -154,6 +159,7 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
     var sysl_dependencies = Span(0, 0)
     var features = Span(0, 0)
     var c_libraries = Span(0, 0)
+    var static_c_libraries = Span(0, 0)
     for f in root.fields()
         if f.key == "package"
             m.has_package = true
@@ -172,8 +178,13 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
         elif f.key == "features"
             features = f.key_span
             read_features(f, &m.features)?
+        elif f.key == "static-c-libraries"
+            static_c_libraries = f.key_span
+            m.static_c_libraries = f.value.as_bool() match
+                Some(b) -> b
+                None -> return Err(error(f.value.span, "`static-c-libraries` is `true` or `false`: with `true`, the program links each C library a `pkg-config` module finds from its static archive"))
         else
-            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `features` and `workspace`"))
+            return Err(error(f.key_span, s"`${f.key}` is not a key of $ManifestName, which holds `package`, `dependencies`, `sysl-dependencies`, `c-libraries`, `static-c-libraries`, `features` and `workspace`"))
     if !m.has_package && !m.has_workspace
         return Err(error(Span(0, 0), s"$ManifestName has no `package` block: a package is named and versioned, `package { name = \"geom\", version = \"0.1.0\" }`"))
     if !m.has_package && m.dependencies.len() > 0
@@ -182,6 +193,8 @@ private read_fields(m: *Manifest, root: Value) -> Result[unit, Diagnostic]
         return Err(error(sysl_dependencies, "a workspace with no `package` block compiles nothing of its own, so its Sysl dependencies would reach nothing: name each in the member whose bindings reach it"))
     if !m.has_package && m.c_libraries.len() > 0
         return Err(error(c_libraries, "a workspace with no `package` block compiles nothing of its own, so it has no C bindings to call its C libraries: name each in the member whose bindings call it"))
+    if !m.has_package && static_c_libraries.end > 0usize
+        return Err(error(static_c_libraries, "a workspace with no `package` block builds no program of its own, so it has nothing to link statically: say `static-c-libraries` in the member that is the program"))
     for i in 0..<m.c_libraries.len()
         m.c_libraries[i].package = m.name
     if !m.has_package && m.features.len() > 0
@@ -325,7 +338,7 @@ private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnos
     for d in f.value.fields()
         if !valid_package_name(d.key) then return Err(error(d.key_span, s"`${d.key}` is not a C library's name: ${PackageNameRule}"))
         if !d.value.is_obj() then return Err(error(d.value.span, s"the C library `${d.key}` is a block saying how to find it and which headers declare it: `{ pkg-config = \"zlib\", headers = [\"zlib.h\"] }`"))
-        var library = CLibrary("", d.key, None, buf(), buf(), "")
+        var library = CLibrary("", d.key, None, buf(), buf(), "", false)
         var linked = false
         for g in d.value.fields()
             if g.key == "pkg-config"
@@ -1015,6 +1028,8 @@ private fetch_package(r: *Resolver, coordinate: string, version: string) -> Resu
     val hash_file = dir + ".hash"
     var hash = ""
     if is_dir(dir)
+        // Touched, so `avin cache clean --packages --older-than` knows when a build last read it.
+        _ = touch_entry(dir)
         hash = read_text(hash_file) match
             Ok(t) -> t.trim()
             Err(_) -> return Err(s"avin: $dir holds $repository v$version and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
@@ -1089,6 +1104,7 @@ private fetch_revision(r: *Resolver, coordinate: string, rev: string) -> Result[
     var hash = ""
     if sha != ""
         val dir = cached_revision_dir(r.fetching.cache, repository, sha)
+        _ = touch_entry(dir)
         hash = read_text(dir + ".hash") match
             Ok(t) -> t.trim()
             Err(_) -> return Err(s"avin: $dir holds $repository at $sha and no record of what it hashed to, so $SumName cannot be checked against it; remove that directory and build again")
@@ -1674,7 +1690,7 @@ private blanks(n: usize) -> string
  * always: a program of one file is in no workspace and has no features to turn one on. */
 script_manifest(dir: string, src: Source, h: ScriptHeader) -> Result[Manifest, Diagnostic]
     val doc = parse_hocon(h.hocon)?
-    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf())
+    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false)
     for f in doc.root.fields()
         if f.key != "dependencies"
             return Err(error(f.key_span, s"`${f.key}` is not a key of a dependencies header, which holds only `dependencies`: a program that needs more is a package, with an $ManifestName"))
@@ -1757,8 +1773,11 @@ private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]]) -
         if i == 0 && own is Some(_)
             read = own.unwrap()
         else
-            read = package_files_skipping(if i == 0 then root else p.dir, i > 0, gated_off(p.manifest.features, p.features)).map_err(message -> "avin: " + message)?
-            if i == 0 then refuse_headers(read, s"is in the package `${p.name}`, whose dependencies are named in its $ManifestName: name them there")?
+            val off = gated_off(p.manifest.features, p.features)
+            read = package_files_skipping(if i == 0 then root else p.dir, i > 0, off).map_err(message -> "avin: " + message)?
+            if i == 0
+                refuse_headers(read, s"is in the package `${p.name}`, whose dependencies are named in its $ManifestName: name them there")?
+                read = without_unread_tests(read, off)
         var names: Buf[string] = buf()
         for f in read
             val n = f.module_name.unwrap_or("")
@@ -1797,11 +1816,15 @@ private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]]) -
                 modules.push(module_name)
                 holders.push(owners[i])
     val sysl = sysl_packages(res)?
-    // Every package's C libraries, the package's own first, are the program's.
+    // Every package's C libraries, the package's own first, are the program's, linked statically
+    // when the root package, the program, asks for it.
+    val statically = res.packages[0].manifest.static_c_libraries
     var c: Buf[CLibrary] = buf()
     for p in res.packages
         for library in p.manifest.c_libraries
-            c.push(library)
+            var linked = library
+            linked.linked_statically = statically
+            c.push(linked)
     Ok(LoadedProgram(root, files, if own is Some(_) then None else Some(res.packages[0].name), sysl, c))
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a

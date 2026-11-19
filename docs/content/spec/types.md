@@ -7,7 +7,9 @@ weight: 12
 ## Built-in types
 
 Built-in type names are lowercase and belong to the language itself: they have no module path and
-cannot be shadowed by an import. Their methods are defined in the core standard library with
+cannot be shadowed by an import. In a pattern each is a
+[type pattern](/spec/operators-and-control-flow/#match) by itself, `x is int`, so none names a
+local, a parameter or a field. Their methods are defined in the core standard library with
 ordinary `impl` blocks.
 
 | Type | Meaning |
@@ -316,9 +318,39 @@ literal in a `byte` context must be in 0–255: `val mask: byte = 0xf0`.
 except `!=`. `x.isNaN`, `x.isInfinite` (either infinity) and `x.isFinite` (neither) classify a
 value, and each value is exactly one of NaN, infinite or finite. `x.toInt` and `x.toLong` are
 `int(x)` and `long(x)`, truncating toward zero, saturating at the bounds and mapping NaN to zero;
-`x.toReal` is `x`. There is no implicit fused multiply-add. The square root, logarithms, trigonometry and
-the other elementary functions are in the module [`avin.math`](/spec/system-library/#avin-math):
-`math.sqrt(x)`. `char` supports ordering and equality but no
+`x.toReal` is `x`. There is no implicit fused multiply-add. The square root, logarithms,
+trigonometry and the other elementary functions are in the module
+[`avin.math`](/spec/system-library/#avin-math): `math.sqrt(x)`.
+
+`x.toBits` is the IEEE 754 binary64 encoding of `x` as a `long`, sign bit highest, and
+`real.fromBits(bits)` the number of an encoding: `1.0.toBits` is `0x3FF0000000000000`, `(-0.0).toBits`
+is `long.MinValue`, and the two are inverses for every encoding, a NaN's payload included. Since
+there is no single-precision type, binary32 is reached through its encoding, for a file format or a
+wire protocol that carries one: `real.fromBits32(bits: int)` widens a binary32 exactly, and
+`x.toBits32` rounds `x` to the nearest binary32, ties to even, a magnitude past binary32's greatest
+finite value becoming an infinity and one below half its least subnormal a zero of the same sign.
+A NaN narrows to a quiet NaN, keeping as much of its payload as the platform's conversion does (on
+ARM64 and x86-64, the top 22 bits), so a signaling binary32 NaN comes back from
+`real.fromBits32(b).toBits32` with its quiet bit set; every other binary32 comes back as it was.
+
+```text run
+main()
+  println(1.0.toBits == 0x3FF0000000000000) // true
+  println(real.fromBits(0x4000000000000000)) // 2
+  println(real.fromBits32(0x3DCCCCCD)) // 0.10000000149011612
+  println(0.1.toBits32 == 0x3DCCCCCD) // true
+  println(1e39.toBits32 == 0x7F800000) // true
+```
+
+```text output
+true
+2
+0.10000000149011612
+true
+true
+```
+
+`char` supports ordering and equality but no
 arithmetic; `int(c)` and `char(n)` convert.
 
 A `char` has these methods, classifying by the Unicode Character Database:
@@ -353,7 +385,10 @@ conforms to traits through `impl` (`Eq`, `Hash`, `Ord`, `Display`). A type patte
 - Ordering is by code point, which for UTF-8 is byte order.
 
 The library's methods on `string`. Offsets and lengths count bytes and are `int`; a string holds at
-most the largest `int` bytes.
+most the largest `int` bytes. Every offset a search answers is one where a character begins, or the
+end, so it can be given to `charAt` or `slice` again, and a search from an offset inside a
+character never traps: it starts from the next character, or searching back, from the one the
+offset is inside.
 
 | Method | Result |
 | --- | --- |
@@ -361,16 +396,17 @@ most the largest `int` bytes.
 | `charCount` | The number of characters, O(n) |
 | `isEmpty`, `nonEmpty` | Whether it has no bytes, or some |
 | `startsWith(p)`, `endsWith(p)`, `contains(p)` | Whether `p` occurs at the start, the end, anywhere; the empty string occurs in every string |
-| `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string |
-| `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string |
+| `startsWith(p, at)` | Whether `p` occurs at byte offset `at`; false when it would reach outside the string, and the empty string occurs only where a character begins or at the end |
+| `byteAt(at)`, `charAt(at)` | The byte at offset `at`, and the character whose encoding begins there; each traps when `at` is outside the string, and `charAt` also when `at` is inside a character's encoding |
 | `slice(from, until)` | The bytes from `from` up to `until`; traps unless `0 <= from <= until <= byteLength()` and both offsets are character boundaries |
 | `toUpper`, `toLower` | Each character's simple case mapping, one character for one, as `char`'s methods of the same names map it: `"straße".toUpper` is `STRAßE` |
+| `normalize(form)`, `isNormalized(form)` | The string in a Unicode normalization form, `Nfc`, `Nfd`, `Nfkc` or `Nfkd`, and whether it is in it already ([Normalization](#normalization)) |
 | `strip`, `stripLeading`, `stripTrailing` | Without the Unicode `White_Space` characters at both ends, the start, the end |
 | `trim` | Without the characters up to U+0020, the ASCII controls and the space, at both ends |
 | `repeat(n)` | `n` copies joined; empty for zero; traps when `n` is negative |
 | `replace(old, new)` | Every occurrence of `old`, left to right and not overlapping, replaced by `new`; an empty `old` occurs nowhere |
-| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, a string or a `char`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from` |
-| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength`); -1 when there is none. The empty string is found at `end`, or at `byteLength` when `end` is past it |
+| `indexOf(p)`, `indexOf(p, from)` | The byte offset of the first `p`, a string or a `char`, at or after `from` (default 0; below 0 counts as 0); -1 when there is none or `from` is past the end. The empty string is found at `from`, or at the next character when `from` is inside one |
+| `lastIndexOf(p)`, `lastIndexOf(p, end)` | The byte offset of the last `p`, a string or a `char`, beginning at or before `end` (default `byteLength`); -1 when there is none. The empty string is found at `end`, at the start of the character `end` is inside, or at `byteLength` when `end` is past it |
 | `indexWhere(f)`, `indexWhere(f, from)` | The byte offset of the first character satisfying `f`, at or after `from`; -1 when none does |
 | `lastIndexWhere(f)`, `lastIndexWhere(f, end)` | The byte offset of the last character satisfying `f` that begins at or before `end` (default: the whole string); -1 when none does or `end` is below 0 |
 | `head`, `last` | The first and the last character; each traps on the empty string |
@@ -452,6 +488,48 @@ println(string.fromUtf8(cut))                            // Err(Utf8Error(1, tru
 println(string.fromUtf8Lossy(cut))                       // a�
 ```
 
+### Normalization
+
+The same text can be more than one sequence of characters: `é` is one character, U+00E9, or two,
+`e` and the combining acute accent U+0301, and `==` compares characters, so the two are not equal.
+`s.normalize(form)` puts a string in one of the four Unicode normalization forms (UAX #15), the
+values of `NormalizationForm`, and `s.isNormalized(form)` says whether it is in that form already,
+by the Unicode Character Database 17.0.0, the one `char`'s methods answer from:
+
+| Form | Meaning |
+|---|---|
+| `Nfc` | NFC: canonical decomposition, then canonical composition. The form for storing and sending text |
+| `Nfd` | NFD: canonical decomposition, the combining marks in canonical order |
+| `Nfkc` | NFKC: compatibility decomposition, then canonical composition: `ﬁ` is `fi`, `①` is `1`, a fullwidth `Ａ` is `A` |
+| `Nfkd` | NFKD: compatibility decomposition, the combining marks in canonical order |
+
+Hangul syllables compose and decompose by their algorithm; a code point unassigned in the database
+is left as it is. A string of ASCII characters only is in all four forms and is returned at once,
+unexamined. The compatibility forms discard distinctions, so they are for comparing and matching
+rather than for storing. [`avin.crypto.saslPrep`](/spec/system-library/#avin-crypto) applies NFKC
+as part of preparing a password.
+
+```text run
+main()
+  val composed = "caf\u{e9}"
+  val decomposed = "cafe\u{301}"
+  println(composed == decomposed) // false
+  println(decomposed.normalize(Nfc) == composed) // true
+  println(composed.normalize(Nfd).charCount) // 5
+  println("\u{fb01}le \u{2460}".normalize(Nfkc)) // file 1
+  println(composed.isNormalized(Nfc)) // true
+  println(decomposed.isNormalized(Nfc)) // false
+```
+
+```text output
+false
+true
+5
+file 1
+true
+false
+```
+
 ## unit
 
 `unit` has the single value `()`. It is an ordinary type: it can be a type argument, a field, a
@@ -472,7 +550,8 @@ tuples with an [impl](/spec/declarations/#impl) naming a tuple type built from i
 Where a value fills the rest of a line, a tuple needs no parentheses: after `=` in a function, clause
 or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
 last. Inside brackets and in the body of a one-line `if` or `while`, a comma separates other things,
-so a tuple there is parenthesized.
+so a tuple there is parenthesized, a `match` arm's one-line body inside brackets
+[included](/spec/operators-and-control-flow/#match).
 
 ```text
 divmod(a: int, b: int) -> (int, int) = a / b, a % b
@@ -767,6 +846,53 @@ chapter, [union types](/spec/unions/).
 describe(x: int | string) -> string = x match
   n: int -> s"number $n"
   s: string -> s"text $s"
+```
+
+## Type ascription
+
+`(value: T)` gives a value the type `T` where it is written, with no conversion and no `val` to
+hold it. It is checked exactly as the value of `val x: T = value` is, and the expression is of type
+`T`:
+
+- **A literal takes `T`**: `(3_000_000_000: long)`, `(255: byte)`, `(2.5: real)`, `(1: real)`, and
+  any integer literal of any size for a type that
+  [takes integers](#integers-meet-a-type-that-takes-them) (`(123456789012345678901234567890:
+  BigInt)`, `(7: Cents)`) and any decimal literal for one that
+  [takes decimals](#decimals-meet-a-type-that-takes-them) (`(0.1: BigDecimal)`). In an operation
+  the ascribed operand decides the other's type: `(1: long) + 2147483647` is a `long`.
+- **A value whose type its context decides is decided by `T`**: `(None: Option[string])`,
+  `([]: List[int])`, `({}: Map[string, int])`, `(Ok(3): Result[int, string])`, and a lambda,
+  `((x -> x * 2): int -> int)`, whose parameters take `T`'s.
+- **A value of a subtype stands as one of `T`**: `(dog: Animal)`, `(Square(3): Shape)`,
+  `([1, 2]: Iterable[int])`, `(Some(dog): Option[Animal])`, and a member of a union as the union,
+  `(n: int | string)` ([union types](/spec/unions/)). `(x: Any)` is the value as an `Any`.
+- **Nothing else is accepted.** An ascription never narrows (`(animal: Dog)`, `(u: int)` of an
+  `int | string`: test the value with `is` or `match`) and never converts: `(n: long)` of an `int`
+  `n` is an error that says to write `long(n)`, `(k: BigInt)` of an integer variable says
+  `BigInt(k)`, a `real` is no `BigDecimal`, and a value of an unrelated type is refused. A literal
+  that does not fit is refused as it is in a declaration: `(300: byte)`.
+
+It is written as an item of a parenthesized list, so the `:` never meets another meaning: a group,
+`(n: long)`; a tuple's part, `(1: long, "a")`; a call's argument, `f(None: Option[string], x)`, the
+value of a named one included, `f(k = 1: long)`. The value before `:` is a whole expression and the
+type after it a whole type, a function type included: `(a + b: long)`, `(f: int -> int)`. A
+parenthesized list followed by `->` is a lambda's parameters, `(n: long) -> n`. A name followed by
+`: int -> body` whose rest is no type is a lambda whose typed parameter lacks its parentheses, and
+is reported so. At the start of a block's line, `name(x: T)` followed by `=`, `->`, an indented
+block or a line of clauses declares a local function, as it always has; a call there with a name
+ascribed is written with the ascription grouped, `retry((n: long))`, and a call followed by nothing
+is a call, so `show(n: long)` on two lines calls `show` twice.
+
+In a [placeholder lambda](#placeholder-lambdas), `(_: T)` is a parameter of type `T`:
+`twice((_: long) * 3, 1)` passes `(x: long) -> x * 3`.
+
+```text
+val big = (123456789012345678901234567890: BigInt) * 2
+val none = (None: Option[string])
+println(total(([1, 2, 3]: Iterable[int])))
+println(describe((7: int | string)))
+val n = 3
+val m = (n: long)        // error: an ascription converts nothing; write `long(n)`
 ```
 
 ## Reference types and value types

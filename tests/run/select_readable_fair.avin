@@ -1,0 +1,63 @@
+// expect: exit 0
+// A readable arm and a channel arm ready at once are each as likely to run as the other: over 1000
+// selects on a connection that always has bytes waiting and a channel that always has a value, each
+// arm runs between 400 and 600 times, which a fair choice misses about once in ten billion runs. So
+// does each of two readable arms on two connections, and the same connection named by two arms.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Channel, sleep, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A connection with bytes waiting on it, never read, and its peer, kept open.
+waiting() -> (TcpStream, TcpStream)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val s = ok(l.accept())
+  _ = l.close()
+  ok(s.writeText("x"))
+  while !c.readable() do sleep(millis(1))
+  (c, s)
+
+fair(n: int) -> bool = 400 <= n <= 600
+
+run()
+  val (c, s) = waiting()
+  val ch = Channel[int](1)
+  ch.send(0)
+  var bytes = 0
+  var values = 0
+  for _ in 0 ..< 1000
+    select
+      c.readable() -> bytes += 1
+      ch.receive() as Some(v) ->
+        values += 1
+        ch.send(v)
+  println(fair(bytes), fair(values), bytes + values)
+
+  val (d, t) = waiting()
+  var first = 0
+  var second = 0
+  for _ in 0 ..< 1000
+    select
+      c.readable() -> first += 1
+      d.readable() -> second += 1
+  println(fair(first), fair(second))
+
+  var once = 0
+  var twice = 0
+  for _ in 0 ..< 1000
+    select
+      c.readable() -> once += 1
+      c.readable() -> twice += 1
+  println(fair(once), fair(twice))
+  // The bytes are still there: no arm read them.
+  println(string.fromUtf8Lossy(ok(c.read(10))), string.fromUtf8Lossy(ok(d.read(10))))
+  for x in [c, s, d, t] do _ = x.close()
+
+main()
+  run()
+  spawn(run).join()

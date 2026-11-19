@@ -107,10 +107,20 @@ private struct Site
     generic: bool
 
 // Node keys: a function's type parameter `i` is `function * 256 + i`; a data type's and a class's
-// are tagged above every function's.
+// are tagged above every function's. A data type's keys leave room after its own parameters for the
+// parameters of each of its refined variants, 256 to a variant.
 private function_base(id: usize) -> usize = id * 256
 
-private data_base(id: usize) -> usize = (1usize << 62) + id * 256
+private data_base(id: usize) -> usize = (1usize << 62) + (id << 20)
+
+/** The key of parameter 0 of variant `index` of data type `id`: its type's parameters, then its own. */
+private variant_base(id: usize, index: usize) -> usize = data_base(id) + 256 * (index + 1)
+
+/** The data type a data key belongs to. */
+private data_of_key(key: usize) -> usize = (key - (1usize << 62)) >> 20
+
+/** A data key's place within its type: its parameter's index, plus 256 for each variant before it. */
+private data_slot(key: usize) -> usize = (key - (1usize << 62)) & ((1usize << 20) - 1)
 
 private class_base(id: usize) -> usize = (1usize << 61) + id * 256
 
@@ -125,12 +135,82 @@ check_expansion(c: *Checker)
     for d in 0..<c.data.len()
         val data = c.data[d]
         val site = Site(data_base(d), data_owner(d), data.unit, data.decl.type_params.len() > 0)
-        for v in data.variants
-            for t in v.fields
-                mention(c, &f, site, v.span, t)
+        for vi in 0..<data.variants.len()
+            val v = data.variants[vi]
+            if v.result is Some(_) || v.params.len() > data.decl.type_params.len() then refined_edges(c, &f, d, vi)
+            else
+                for t in v.fields
+                    mention(c, &f, site, v.span, t)
     connect_methods(c, &f)
     connect_bounds(c, &f)
     report_cycles(c, &f)
+
+// A refined variant's parameters are nodes of their own, since its `T` need not be its type's `T`.
+// An instance of the type reaches them through the variant's result: an instance `Expr[X]` holding
+// a `Pair[A, B]`, whose result is `Expr[(A, B)]`, has `X = (A, B)`, so `A` and `B` each hold a part
+// of `X` one level down, an edge of weight -1 from the type's `T`. The fields then reach the types
+// they name from the variant's parameters, as a plain variant's do from its type's. A parameter the
+// result does not name is hidden: each value carries its own, so an instance a field names through
+// one is not one every value of the type needs, and the field adds no edge for it.
+private refined_edges(c: *Checker, f: *Flow, d: usize, vi: usize)
+    val data = c.data[d]
+    val v = data.variants[vi]
+    val owner = data_owner(d)
+    val base = variant_base(d, vi)
+    val site = Site(base, owner, data.unit, true)
+    var args: Buf[&Type] = buf()
+    v.result match
+        Some(r) ->
+            if *r is Data(_, _, made) then args = made
+        None ->
+            for i in 0..<data.decl.type_params.len()
+                args.push(TypeVar(owner, i, data.decl.type_params[i].name))
+    var hidden: Buf[usize] = buf()
+    for i in 0..<v.params.len()
+        var shown = false
+        for a in args
+            if names_type_var(a, owner, i) then shown = true
+        if !shown then hidden.push(i)
+    for i in 0..<args.len()
+        if i >= 256 then break
+        var params: Buf[usize] = buf()
+        params_in(c, args[i], owner, &params)
+        for p in params
+            if p < 256 then connect(f, data_base(d) + i, base + p, 0 - depth_of(c, args[i], owner, p), data.unit, v.span, args[i])
+    var decl_fields: Buf[Param] = buf()
+    for written in data.decl.variants
+        if written.name == v.name
+            decl_fields = written.fields
+            break
+    for j in 0..<v.fields.len()
+        val at = if j < decl_fields.len() then decl_fields[j].span else v.span
+        variant_mention(c, f, site, at, v.fields[j], hidden)
+
+/** The edges of the types a refined variant's field `t` names, leaving out each type argument that
+ * names one of the variant's hidden parameters. */
+private variant_mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type, hidden: Buf[usize])
+    *resolved(c, t) match
+        Data(id, _, args) -> variant_args(c, f, site, span, args, data_base(id), hidden)
+        Class(id, _, args) -> variant_args(c, f, site, span, args, class_base(id), hidden)
+        Tuple(items) ->
+            for x in items
+                variant_mention(c, f, site, span, x, hidden)
+        Function(params, result, _) ->
+            for x in params
+                variant_mention(c, f, site, span, x, hidden)
+            variant_mention(c, f, site, span, result, hidden)
+        ByName(inner) -> variant_mention(c, f, site, span, inner, hidden)
+        _ -> ()
+
+private variant_args(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type], target: usize, hidden: Buf[usize])
+    for j in 0..<args.len()
+        var hides = false
+        for i in hidden
+            if names_type_var(args[j], site.owner, i) then hides = true
+        if hides then continue
+        var one: Buf[&Type] = buf()
+        one.push(args[j])
+        flow_into(c, f, site, span, one, target, j)
 
 // The methods by name and the generic local functions by top-level function, read once.
 private index_symbols(c: *Checker, f: *Flow)
@@ -213,6 +293,10 @@ private resolved(c: *Checker, t: &Type) -> &Type = *t match
     Var(id) -> c.vars[id] match
         Some(bound) -> resolved(c, bound)
         None -> t
+    // An application whose constructor is known is the type it makes.
+    Applied(head, args) -> *resolved(c, head) match
+        Constructor(body, _) -> resolved(c, substitute(body, hole_owner(), args))
+        _ -> t
     _ -> t
 
 /** The indices of the type parameters of `owner` that `t` names. */
@@ -237,13 +321,30 @@ private params_in(c: *Checker, t: &Type, owner: usize, out: *Buf[usize])
         Class(_, _, args) ->
             for x in args
                 params_in(c, x, owner, out)
+        Opaque(_, _, args, _) ->
+            for x in args
+                params_in(c, x, owner, out)
+        Constructor(body, _) -> params_in(c, body, owner, out)
+        Applied(head, args) ->
+            params_in(c, head, owner, out)
+            for x in args
+                params_in(c, x, owner, out)
         _ -> ()
 
 /** How deep in `t` its deepest mention of type parameter `i` of `owner` is: 0 for the parameter
- * itself, one more for each type around it; -1 where `t` does not name it. */
+ * itself, one more for each type around it; -1 where `t` does not name it. A constructor is as deep
+ * as the type it makes, so a constructor parameter passed bare, `F`, is at 0, and `Wrap[F, _]` at 1;
+ * the head of an application `F[A]` is at the application's own depth, its arguments one deeper. */
 private depth_of(c: *Checker, t: &Type, owner: usize, i: usize) -> i64
     val parts: Buf[&Type] = *resolved(c, t) match
         TypeVar(o, j, _) -> return if o == owner && j == i then 0 else -1
+        Constructor(body, _) -> return depth_of(c, body, owner, i)
+        Applied(head, args) ->
+            var deepest = depth_of(c, head, owner, i)
+            for x in args
+                val d = depth_of(c, x, owner, i)
+                if d >= 0 && d + 1 > deepest then deepest = d + 1
+            return deepest
         Tuple(items) -> items
         Function(params, result, _) ->
             var all: Buf[&Type] = buf()
@@ -257,6 +358,7 @@ private depth_of(c: *Checker, t: &Type, owner: usize, i: usize) -> i64
             one
         Data(_, _, args) -> args
         Class(_, _, args) -> args
+        Opaque(_, _, args, _) -> args
         _ -> return -1
     var deepest: i64 = -1
     for x in parts
@@ -277,11 +379,23 @@ private deepest_param(c: *Checker, t: &Type, owner: usize) -> i64
 /** Edges from the code at `site` to the type parameters from `offset` on of the code or type whose
  * parameter 0 has key `target`, given `args`; and the edges of the types `args` name. */
 private flow_into(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type], target: usize, offset: usize)
-    if !site.generic then return
     for j in 0..<args.len()
         if offset + j >= 256 then break
+        val hiding = fresh_edges(c, f, site, span, args[j], target + offset + j)
+        if !site.generic then continue
         var params: Buf[usize] = buf()
         params_in(c, args[j], site.owner, &params)
+        // A type argument holding a type a value hides is needed only for the packs the program makes:
+        // at a copy, the arm it is written in runs at an instance its matched value says, so where
+        // that instance names a parameter, the parameter's growth here is the growth of the values
+        // the program makes, which their own edges count.
+        var shown: Buf[usize] = buf()
+        for i in params
+            var kept = true
+            for k in hiding
+                if names_type_var(c.sites[k].matched, site.owner, i) then kept = false
+            if kept then shown.push(i)
+        params = shown
         val head: usize = *resolved(c, args[j]) match
             Data(id, _, _) -> data_base(id)
             Class(id, _, _) -> class_base(id)
@@ -294,6 +408,62 @@ private flow_into(c: *Checker, f: *Flow, site: Site, span: Span, args: Buf[&Type
         if params.len() > 0 && head != 0 then add_head(f, target + offset + j, head)
         mention(c, f, site, span, args[j])
 
+// The fresh types of refining patterns a type argument `t` names are nodes of their variant's own,
+// one for each of the variant's parameters, which every pattern on the variant shares: the fresh type
+// stands for what a value of the variant holds there. Each reaches the target `to` with the depth it
+// has in `t`, and the type a pattern matches reaches its variant's parameters (`refined_edges`) from
+// the code it is matched in. The result is the patterns whose hidden types `t` names.
+private fresh_edges(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type, to: usize) -> Buf[usize]
+    var hiding: Buf[usize] = buf()
+    var keys: Buf[usize] = buf()
+    fresh_in(c, t, &keys)
+    for key in keys
+        val k = key / 256
+        val i = key % 256
+        val s = c.sites[k]
+        connect(f, variant_base(s.data, s.variant) + i, to, depth_of(c, t, pattern_owner(k), i), site.unit, span, t)
+        mention(c, f, site, span, s.matched)
+        for h in hidden_positions(c.data[s.data], s.data, s.variant)
+            if h == i
+                var known = false
+                for x in hiding
+                    if x == k then known = true
+                if !known then hiding.push(k)
+    hiding
+
+/** The fresh types of refining patterns `t` names, each as its pattern's site times 256 plus its
+ * index among the variant's parameters. */
+private fresh_in(c: *Checker, t: &Type, out: *Buf[usize])
+    *resolved(c, t) match
+        TypeVar(o, i, _) ->
+            if !is_pattern_owner(o) || i >= 256 then return
+            val key = (o - pattern_owner(0)) * 256 + i
+            for x in *out
+                if x == key then return
+            out.push(key)
+        Tuple(items) ->
+            for x in items
+                fresh_in(c, x, out)
+        Function(params, result, _) ->
+            for x in params
+                fresh_in(c, x, out)
+            fresh_in(c, result, out)
+        ByName(inner) -> fresh_in(c, inner, out)
+        Data(_, _, args) ->
+            for x in args
+                fresh_in(c, x, out)
+        Class(_, _, args) ->
+            for x in args
+                fresh_in(c, x, out)
+        Opaque(_, _, args, _) ->
+            for x in args
+                fresh_in(c, x, out)
+        Applied(head, args) ->
+            fresh_in(c, head, out)
+            for x in args
+                fresh_in(c, x, out)
+        _ -> ()
+
 private add_head(f: *Flow, key: usize, head: usize) -> bool
     var heads = f.heads.get(key).unwrap_or(buf())
     for h in heads
@@ -304,7 +474,6 @@ private add_head(f: *Flow, key: usize, head: usize) -> bool
 
 /** The edges of the data types and classes `t` names, from the code at `site`. */
 private mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type)
-    if !site.generic then return
     *resolved(c, t) match
         Data(id, _, args) -> flow_into(c, f, site, span, args, data_base(id), 0)
         Class(id, _, args) -> flow_into(c, f, site, span, args, class_base(id), 0)
@@ -316,6 +485,12 @@ private mention(c: *Checker, f: *Flow, site: Site, span: Span, t: &Type)
                 mention(c, f, site, span, x)
             mention(c, f, site, span, result)
         ByName(inner) -> mention(c, f, site, span, inner)
+        // An opaque type's code is its representation's.
+        Opaque(_, _, _, repr) -> mention(c, f, site, span, repr)
+        Constructor(body, _) -> mention(c, f, site, span, body)
+        Applied(_, args) ->
+            for x in args
+                mention(c, f, site, span, x)
         _ -> ()
 
 /** A direct call or function value of `id`. A local function or lambda with no type parameters of
@@ -408,7 +583,17 @@ private walk(c: *Checker, f: *Flow, site: Site, e: &TExpr)
             else call_edges(c, f, site, e.span, id, type_args)
             walk_all(c, f, site, args)
         FunctionValue(id, type_args) -> call_edges(c, f, site, e.span, id, type_args)
-        Construct(_, args) -> walk_all(c, f, site, args)
+        Construct(variant, args, hidden) ->
+            // A value of a variant hiding types makes a pack: the types reach the variant's own.
+            if hidden.len() > 0
+                if *resolved(c, e.ty) is Data(id, _, _)
+                    val positions = hidden_positions(c.data[id], id, variant)
+                    for i in 0..<hidden.len()
+                        if i < positions.len()
+                            var one: Buf[&Type] = buf()
+                            one.push(hidden[i])
+                            flow_into(c, f, site, e.span, one, variant_base(id, variant), positions[i])
+            walk_all(c, f, site, args)
         Collection(elements, built) ->
             walk_all(c, f, site, elements)
             walk(c, f, site, built)
@@ -422,6 +607,9 @@ private walk(c: *Checker, f: *Flow, site: Site, e: &TExpr)
         LazyGlobal(_, initialize, _) -> walk(c, f, site, initialize)
         LazyField(object, _, initialize, _) ->
             walk(c, f, site, object)
+            walk(c, f, site, initialize)
+        LazyLocal(cell, initialize, _, _) ->
+            walk(c, f, site, cell)
             walk(c, f, site, initialize)
         StoreGlobal(_, value, _) -> walk(c, f, site, value)
         Block(items) -> walk_all(c, f, site, items)
@@ -437,6 +625,7 @@ private walk(c: *Checker, f: *Flow, site: Site, e: &TExpr)
         Convert(x, _) -> walk(c, f, site, x)
         Box(x) -> walk(c, f, site, x)
         NoneAs(x) -> walk(c, f, site, x)
+        Reveal(x) -> walk(c, f, site, x)
         Arith(_, a, b, _) ->
             walk(c, f, site, a)
             walk(c, f, site, b)
@@ -486,7 +675,7 @@ private walk_pattern(c: *Checker, f: *Flow, site: Site, p: &TPattern)
             for x in options
                 walk_pattern(c, f, site, x)
         PNamed(_, inner) -> walk_pattern(c, f, site, inner)
-        PVariant(_, fields) ->
+        PVariant(_, fields, _) ->
             for x in fields
                 walk_pattern(c, f, site, x)
         PType(target, _, _) -> mention(c, f, site, p.span, target)
@@ -587,6 +776,7 @@ private undecided(c: *Checker, self_type: &Type, owner: usize, g: usize) -> bool
     val count = *self_type match
         Data(_, _, a) -> a.len()
         Class(_, _, a) -> a.len()
+        Opaque(_, _, a, _) -> a.len()
         _ -> 0
     var named: Buf[usize] = buf()
     params_in(c, view, owner, &named)
@@ -607,6 +797,7 @@ private view_edges(c: *Checker, f: *Flow, self_type: &Type, site: Site, span: Sp
             Some(r) -> *r match
                 Data(_, _, args) -> args
                 Class(_, _, args) -> args
+                Opaque(_, _, args, _) -> args
                 _ -> return
             None -> return
         for j in 0..<receiver_args.len()
@@ -680,6 +871,7 @@ private impl_conditions(c: *Checker, self_type: &Type, owner: usize, m: usize) -
     val count = *self_type match
         Data(_, _, a) -> a.len()
         Class(_, _, a) -> a.len()
+        Opaque(_, _, a, _) -> a.len()
         _ -> 0
     for _ in 0..<count do any.push(ErrorType)
     var out: Buf[Buf[&Type]] = buf()
@@ -742,7 +934,7 @@ private connect_guarded(c: *Checker, f: *Flow, conformances: Conformances)
  * meet every one of `bounds`. */
 private head_may_meet(c: *Checker, f: Conformances, h: usize, bounds: Buf[&Type]) -> bool
     if h == unknown_head() then return true
-    val t = if h >= (1usize << 62) then data_type_of(c, (h - (1usize << 62)) / 256) else class_type_of(c, (h - (1usize << 61)) / 256)
+    val t = if h >= (1usize << 62) then data_type_of(c, data_of_key(h)) else class_type_of(c, (h - (1usize << 61)) / 256)
     may_meet(c, f, t, bounds)
 
 /** Whether a type argument `t`, its type parameters taken as any type, may meet every one of
@@ -766,6 +958,7 @@ private any_params(c: *Checker, t: &Type) -> &Type = *resolved(c, t) match
     ByName(inner) -> ByName(any_params(c, inner))
     Data(id, name, args) -> Data(id, name, all_any(c, args))
     Class(id, name, args) -> Class(id, name, all_any(c, args))
+    Opaque(id, name, args, repr) -> Opaque(id, name, all_any(c, args), any_params(c, repr))
     _ -> resolved(c, t)
 
 private all_any(c: *Checker, items: Buf[&Type]) -> Buf[&Type]
@@ -779,7 +972,7 @@ private all_any(c: *Checker, items: Buf[&Type]) -> Buf[&Type]
 // The guarded edges are connected here too, from the outermost types that reach them, and each
 // step can bring another a new one, so the steps repeat until none adds a node or an edge.
 private connect_bounds(c: *Checker, f: *Flow)
-    val conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.core, c.bounds, None, c.lowers)
+    val conformances = Conformances(c.classes, c.data, c.builtins, c.conditional, c.instances, c.core, c.bounds, None, c.lowers, None, buf())
     var size = 0usize
     while f.edges.len() + f.keys.len() != size
         size = f.edges.len() + f.keys.len()
@@ -820,12 +1013,20 @@ private bound_targets(c: *Checker, f: *Flow)
             // The parameter as it holds this type, so only the paths that bring the type reach
             // its implementation.
             val from = f.head_nodes.get(s"$key/$h").unwrap_or(node(f, key))
+            // An impl for instances of the type implements the call where the instance it holds
+            // matches, so each such impl's implementation is reached too.
             if h >= (1usize << 62)
-                val d = (h - (1usize << 62)) / 256
+                val d = data_of_key(h)
                 bound_target(c, f, from, data_type_of(c, d), data_owner(d), c.data[d].table, slot)
+                for x in c.instances
+                    if *x.ty is Data(e, _, _)
+                        if e == d then bound_target(c, f, from, data_type_of(c, d), data_owner(d), x.table, slot)
             else
                 val k = (h - (1usize << 61)) / 256
                 bound_target(c, f, from, class_type_of(c, k), class_owner(k), c.classes[k].table, slot)
+                for x in c.instances
+                    if *x.ty is Class(j, _, _)
+                        if j == k || ancestor_type(c.classes, c.data, class_type_of(c, k), j) is Some(_) then bound_target(c, f, from, class_type_of(c, k), class_owner(k), x.table, slot)
 
 /** Whether node `n` is a parameter's own node rather than one for an outermost type it holds. */
 private plain(f: *Flow, n: usize) -> bool = f.nodes.get(f.keys[n]).unwrap_or(n + 1) == n
@@ -845,6 +1046,7 @@ private bound_target_edges(c: *Checker, f: *Flow, from: usize, self_type: &Type,
             Some(r) -> *r match
                 Data(_, _, args) -> args
                 Class(_, _, args) -> args
+                Opaque(_, _, args, _) -> args
                 _ -> return
             None -> return
         for j in 0..<receiver_args.len()
@@ -900,7 +1102,7 @@ private report_cycles(c: *Checker, f: *Flow)
     for cycle in cycles
         if !only_data(f, cycle) then continue
         for x in cycle
-            nested.put((f.keys[f.edges[x].from] - (1usize << 62)) / 256, true)
+            nested.put(data_of_key(f.keys[f.edges[x].from]), true)
         report_cycle(c, f, cycle)
     for cycle in cycles
         if only_data(f, cycle) then continue
@@ -917,6 +1119,7 @@ private only_data(f: *Flow, cycle: Buf[usize]) -> bool
 private names_data(c: *Checker, t: &Type, ids: *Map[usize, bool]) -> bool = *resolved(c, t) match
     Data(id, _, args) -> ids.get(id) is Some(_) || any_names_data(c, args, ids)
     Class(_, _, args) -> any_names_data(c, args, ids)
+    Opaque(_, _, args, repr) -> any_names_data(c, args, ids) || names_data(c, repr, ids)
     Tuple(items) -> any_names_data(c, items, ids)
     Function(params, result, _) -> any_names_data(c, params, ids) || names_data(c, result, ids)
     ByName(inner) -> names_data(c, inner, ids)
@@ -942,7 +1145,26 @@ private report_cycle(c: *Checker, f: *Flow, cycle: Buf[usize])
         path.push(f.edges[cycle[(best + i) % cycle.len()]].from)
     path.push(e.from)
     val shown = type_name(solve(c.vars, e.arg))
-    c.note(e.unit, e.span, s"polymorphic recursion: each round of the cycle ${cycle_text(c, f, path)} passes `$shown` for `${param_name(c, f, e.to)}`, so its type arguments grow without end and the code has no finite set of copies")
+    c.note(e.unit, e.span, s"polymorphic recursion: each round of the cycle ${cycle_text(c, f, path)} passes `$shown` for `${param_name(c, f, e.to)}`, so its type arguments grow without end and the code has no finite set of copies${refined_field_text(c, f, e)}")
+
+// Where a cycle grows through a refined variant's field, the field and the variant's result, which
+// the growth is measured against.
+private refined_field_text(c: *Checker, f: *Flow, e: FlowEdge) -> string
+    val key = f.keys[e.from]
+    if key < (1usize << 62) then return ""
+    val d = c.data[data_of_key(key)]
+    val block = data_slot(key) / 256
+    if block == 0 || block - 1 >= d.variants.len() then return ""
+    val v = d.variants[block - 1]
+    val made = v.result match
+        Some(r) -> type_name(r)
+        None -> type_name(data_type_of(c, data_of_key(key)))
+    for written in d.decl.variants
+        if written.name != v.name then continue
+        for j in 0..<written.fields.len()
+            if j < v.fields.len() && written.fields[j].span.start == e.span.start && written.fields[j].span.end == e.span.end
+                return s": the field `${v.field_names[j]}` of `${v.name}` has type `${type_name(v.fields[j])}`, and `${v.name}` makes `$made`"
+    ""
 
 private in_library(c: *Checker, unit: usize) -> bool
     val m = c.units[unit].file.module_name
@@ -1085,7 +1307,12 @@ private cycle_text(c: *Checker, f: *Flow, path: Buf[usize]) -> string
 
 private node_label(c: *Checker, f: *Flow, n: usize) -> string
     val key = f.keys[n]
-    if key >= (1usize << 62) then return c.data[(key - (1usize << 62)) / 256].name
+    if key >= (1usize << 62)
+        val d = c.data[data_of_key(key)]
+        val block = data_slot(key) / 256
+        // A refined variant's parameters are its own nodes, named by the variant.
+        if block > 0 && block - 1 < d.variants.len() then return d.variants[block - 1].name
+        return d.name
     if key >= (1usize << 61) then return c.classes[(key - (1usize << 61)) / 256].name
     val symbol = c.symbols[key / 256]
     if symbol.owner_class is Some(k)
@@ -1101,9 +1328,10 @@ private node_label(c: *Checker, f: *Flow, n: usize) -> string
 private param_name(c: *Checker, f: *Flow, n: usize) -> string
     val key = f.keys[n]
     if key >= (1usize << 62)
-        val d = (key - (1usize << 62)) / 256
-        val i = (key - (1usize << 62)) % 256
-        val params = c.data[d].decl.type_params
+        val d = c.data[data_of_key(key)]
+        val block = data_slot(key) / 256
+        val i = data_slot(key) % 256
+        val params = if block > 0 && block - 1 < d.variants.len() then d.variants[block - 1].params else d.decl.type_params
         return if i < params.len() then params[i].name else "_"
     if key >= (1usize << 61)
         val k = (key - (1usize << 61)) / 256

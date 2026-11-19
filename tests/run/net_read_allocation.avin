@@ -1,0 +1,177 @@
+// expect: exit 0
+// A read of up to `max` bytes allocates what it answers, not `max`: a 40-byte message read with
+// `read(65536)` costs about what the message does, over TCP, a Unix socket, TLS and the reading
+// half of each split connection. The thread's own allocation is counted across fifty such reads
+// and compared with one `max`. The bytes are what was sent whatever the read's size: a read smaller
+// than the message takes it in parts, a read exactly the message's size takes it whole, a message
+// larger than `max` comes in reads of at most `max`, the end of the input is an empty read every
+// time it is asked for, and a reset ends a read with `ConnectionReset` or the end of the input.
+import avin.fs
+import avin.io
+import avin.io.{IoError, Reader}
+import avin.net.{ByteStream, TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.spawn
+
+@sysl("avin.rt.allocated_bytes")
+allocatedBytes() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// The size of the message the peer answers each command with.
+sizeOf(command: int) -> int = [40, 10, 64, 100000](command)
+
+// The byte at `i` of the answer to `command`.
+byteAt(command: int, i: int) -> byte = byte((i * 3 + command * 11) % 251)
+
+// The peer: answers each command byte with its message, and closes at a command of 255 or the end
+// of the input.
+serve(s: ByteStream)
+  while true
+    val got = ok(s.read(1))
+    if got.length == 0 || got(0) == byte(255) then break
+    val c = int(got(0))
+    ok(s.write(Array.tabulate(sizeOf(c), i -> byteAt(c, i))))
+  _ = s.close()
+
+// What a read's answer is: its length when it holds what the command's message has from `at`, or
+// where it differs.
+checked(bytes: Array[byte], command: int, at: int) -> string
+  for k in 0 ..< bytes.length
+    if bytes(k) != byteAt(command, at + k) then return s"wrong at ${at + k}"
+  s"${bytes.length}"
+
+// Reads the answer to `command` with reads of `max`, and says what each read answered.
+answer(r: Reader, command: int, max: int) -> Vector[string]
+  val parts = Buffer[string]()
+  var at = 0
+  while at < sizeOf(command)
+    val bytes = ok(r.read(max))
+    if bytes.length == 0 then fail("the end of the input in the middle of a message")
+    if bytes.length > max then fail(s"a read of $max answered ${bytes.length}")
+    parts.addOne(checked(bytes, command, at))
+    at += bytes.length
+  parts.toVector
+
+// The client: small messages read with a large `max`, then each of the other shapes.
+client(name: string, r: Reader, send: (int) -> unit)
+  send(0)
+  answer(r, 0, 65536)
+  val before = allocatedBytes()
+  for _ in 0 ..< 50
+    send(0)
+    answer(r, 0, 65536)
+  val each = (allocatedBytes() - before) / 50
+  println(name, "small reads allocate little", each < 8192)
+  send(1)
+  println(name, "parts", answer(r, 1, 4))
+  send(2)
+  println(name, "boundary", answer(r, 2, 64))
+  send(3)
+  val big = answer(r, 3, 65536)
+  println(name, "larger than max", big.forall(p -> !p.startsWith("wrong")))
+  send(255)
+  println(name, "end", ok(r.read(65536)).length, ok(r.read(1)).length)
+
+// One byte at a time, from an array made once.
+sender(write: (Array[byte]) -> Result[unit, IoError]) -> (int) -> unit =
+  val one = Array.fill(1, byte(0))
+  c ->
+    one(0) = byte(c)
+    ok(write(one))
+
+tcp(splitting: bool)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val peer = spawn(() ->
+    serve(ok(l.accept()))
+    _ = l.close())
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  if splitting
+    val (r, w) = c.split()
+    client("tcp split", r, sender(w.write))
+    _ = r.close()
+    _ = w.close()
+  else
+    client("tcp", c, sender(c.write))
+    _ = c.close()
+  peer.join()
+
+unix()
+  val dir = ok(fs.createTempDir("avin-read-allocation"))
+  val at = dir + "/s"
+  val l = ok(UnixListener.bind(at))
+  val peer = spawn(() ->
+    serve(ok(l.accept()))
+    _ = l.close())
+  val c = ok(UnixStream.connect(at))
+  client("unix", c, sender(c.write))
+  _ = c.close()
+  peer.join()
+  _ = fs.removeDirAll(dir)
+
+secure(splitting: bool)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val peer = spawn(() ->
+    serve(tls(TlsStream.server(ok(l.accept()), server)))
+    _ = l.close())
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  if splitting
+    val (r, w) = c.split()
+    client("tls split", r, sender(w.write))
+    _ = r.close()
+    _ = w.close()
+  else
+    client("tls", c, sender(c.write))
+    _ = c.close()
+  peer.join()
+
+// What a read came to once the peer has reset the connection.
+readOutcome(r: Result[Array[byte], IoError]) -> string = r match
+  Err(IoError(io.ConnectionReset, _, _)) -> "ended"
+  Ok(bytes) -> if bytes.length == 0 then "ended" else s"read ${bytes.length}"
+  Err(e) -> e.kind.description
+
+// The peer closes with bytes it has not read, which resets the connection; the client's reads end.
+reset(secured: bool)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val peer = spawn(() ->
+    val s = ok(l.accept())
+    if secured
+      val t = tls(TlsStream.server(s, server))
+      _ = t.read(1)
+      _ = t.close()
+    else
+      _ = s.read(1)
+      _ = s.close()
+    _ = l.close())
+  val c: ByteStream = if secured then tls(
+    TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem")))
+  ) else ok(TcpStream.connect("127.0.0.1", port))
+  ok(c.write(Array.fill(1000, byte(1))))
+  peer.join()
+  println(if secured then "tls" else "tcp", "reset", readOutcome(c.read(65536)), readOutcome(c.read(65536)))
+  _ = c.close()
+
+main()
+  tcp(false)
+  tcp(true)
+  unix()
+  secure(false)
+  secure(true)
+  reset(false)
+  reset(true)

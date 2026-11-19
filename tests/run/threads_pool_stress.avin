@@ -1,0 +1,62 @@
+// expect: exit 0
+// Many lightweight threads share a pool of three resources: no more than three are ever lent at
+// once, no more than three are made, every call gets one, and once they are all done the pool holds
+// what it made, all idle, and nothing lent or waiting. Each body yields while it holds its resource,
+// so the calls usually overlap and wait, but how many overlap at once is the schedule's, not the
+// pool's: a resource is made only when a call finds none idle, so the pool may make fewer than
+// three, and the round checks the bounds rather than the number. A second round with a timeout on
+// each call and a body that marks every seventh resource broken keeps the counts right too. How
+// many resources the pool holds after that round is the schedule's too: a broken resource given
+// back while no call waits leaves its place empty, so the round checks what the pool promises:
+// what was made and not destroyed is what it holds, never more than three.
+import avin.threads.{Atomic, Pool, scope, sleep}
+import avin.time.{millis, seconds}
+
+class Conn(val id: int): Sendable
+
+main()
+  val made = Atomic(0)
+  val destroyed = Atomic(0)
+  val inUse = Atomic(0)
+  val most = Atomic(0)
+  val served = Atomic(0)
+  val pool = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 3, destroy = Some(_ -> _ = destroyed.add(1)))
+  scope(s ->
+    for i in 0 ..< 200
+      s.spawn(() ->
+        val r = pool.use(c ->
+          val now = inUse.add(1)
+          var seen = most.load()
+          while now > seen && !most.compareAndSet(seen, now) do seen = most.load()
+          sleep(millis(1))
+          inUse.add(-1)
+          c.id)
+        if r is Ok(id) && 1 <= id <= 3 then served.add(1)))
+  val m = made.load()
+  val peak = most.load()
+  println(
+    s"served ${served.load()} made at most 3 ${m <= 3} most within 1 to 3 ${1 <= peak <= 3} destroyed ${destroyed.load()}"
+  )
+  val first = pool.stats()
+  println(
+    s"size is made ${first.size == m} idle ${first.idle == first.size} lent ${first.lent} waiting ${first.waiting}"
+  )
+
+  val broken = Atomic(0)
+  val timedOut = Atomic(0)
+  scope(s ->
+    for i in 0 ..< 140
+      s.spawn(() ->
+        val r = pool.lease(seconds(30), l ->
+          if i % 7 == 0
+            l.markBroken()
+            broken.add(1)
+          sleep(millis(1))
+          l.resource.id)
+        if r.isErr then timedOut.add(1)))
+  val st = pool.stats()
+  println(s"broken ${broken.load()} timed out ${timedOut.load()} destroyed ${destroyed.load()}")
+  val held = made.load() - destroyed.load()
+  println(s"held is size ${held == st.size} at most 3 ${st.size <= 3} lent ${st.lent} waiting ${st.waiting}")
+  pool.close()
+  println(s"after close ${pool.stats()} made minus destroyed ${made.load() - destroyed.load()}")

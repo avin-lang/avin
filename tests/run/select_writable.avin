@@ -1,0 +1,134 @@
+// expect: exit 0
+// A select's `writable()` arm runs once a write would send something without waiting. Toward a peer
+// that reads nothing, a connection is writable until the buffers between them fill, `writeSome`
+// sending what fits each time and never waiting after the arm said so; then the arm waits, a channel
+// arm beside it or an `after` running instead, and runs again once the peer reads. A `writeSome` that
+// must wait waits at most the connection's timeout, and one of no bytes sends none at once. The
+// writing half of a split connection has the arm too, waited for while its reading half is parked on
+// the same descriptor on another thread, each woken by its own direction: the reader by the peer's
+// line, the select by the peer's reading. A TLS connection's `writeSome` hands TLS one record and
+// sends what of it fits, `writable()` sending the rest as room comes; its writing half's sends the
+// whole record, waiting for room up to its time limit, and keeps what that left for `writable()`
+// likewise. Nothing is left on the poller.
+import avin.fs
+import avin.io
+import avin.io.IoError
+import avin.net.{ByteStream, TcpListener, TcpStream}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Channel, Writability, sleep, spawn}
+import avin.time.{millis, seconds}
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+block() -> Array[byte] = Array.fill(65536, byte(42))
+
+// Sends with `some` while `sink` is writable, and answers how much went. Every `writeSome` after the
+// arm said so sends at least one byte at once. The connection counts as full once it has stayed
+// unwritable for a while: for a moment after the sending side's buffer fills, the system goes on
+// moving what it holds into the peer's, making room again with nothing read.
+filled(sink: Writability, some: (Array[byte]) -> Result[int, IoError]) -> int
+  var sent = 0
+  while true
+    val more = select
+      sink.writable() -> true
+      after millis(250) -> false
+    if !more then return sent
+    val n = ok(some(block()))
+    if n < 1 then fail("a writeSome after writable() sent nothing")
+    sent += n
+  sent
+
+// Reads `n` bytes from `s`, or what comes before its end.
+drain(s: ByteStream, n: int) -> int
+  var got = 0
+  while got < n
+    val bytes = ok(s.read(65536))
+    if bytes.length == 0 then return got
+    got += bytes.length
+  got
+
+run(name: string, c: ByteStream, s: ByteStream)
+  println(name, "empty writeSome", ok(c.writeSome(Array.empty[byte]())))
+  // The connection itself, its peer reading nothing.
+  val sent = filled(c, b -> c.writeSome(b))
+  println(name, "filled", sent > 0, c.writable())
+  val stop = Channel[string]()
+  val stopping = spawn(() -> stop.send("stopped by the channel"))
+  println(name, select
+    c.writable() -> "writable"
+    stop.receive() as Some(word) -> word)
+  stopping.join()
+  println(name, select
+    c.writable() -> "writable"
+    after millis(50) -> "timed out")
+  ok(c.setTimeout(millis(50)))
+  c.writeSome(block()) match
+    Err(IoError(io.TimedOut, _, _)) -> println(name, "writeSome timed out")
+    Ok(_) -> println(name, "writeSome sent at once")
+    Err(e) -> println(name, e.message)
+  ok(c.setTimeout(seconds(0)))
+  // The peer reads what was sent, and the arm runs.
+  val draining = spawn(() -> (drain(s, sent), s))
+  println(name, select
+    c.writable() -> "writable once the peer reads"
+    after seconds(30) -> "timed out")
+  val (read, t) = draining.join()
+  println(name, "peer read all", read == sent)
+
+  // The halves: the reader parked on the descriptor the writer's select watches. The writing half
+  // fills the connection before the reading half starts, since a TLS writer's `writable()` answers
+  // `false` while its reader is sending, which every read begins by offering to do.
+  val (r, w) = c.split()
+  val counted = Channel[int](1)
+  val writing = spawn(() ->
+    // A TLS writer's `writeSome` sends its whole record, waiting for room for the rest; toward a peer
+    // that reads nothing, its time limit ends that wait, the rest kept for `writable()` to send.
+    ok(w.setTimeout(millis(250)))
+    counted.send(filled(w, b -> w.writeSome(b)))
+    ok(w.setTimeout(seconds(0)))
+    select
+      w.writable() -> "writable once the peer reads"
+      after seconds(30) -> "timed out")
+  val halfSent = counted.receive().get
+  if halfSent < 1 then fail("the writing half sent nothing before it filled")
+  val reading = spawn(() -> ok(r.readLine()).getOrElse("(end)"))
+  while socketWaiters() < 2 do sleep(millis(1))
+  ok(t.writeText("a line\n"))
+  println(name, "reader", reading.join())
+  println(name, "peer read all", drain(t, halfSent) == halfSent)
+  println(name, "writer", writing.join())
+  ok(w.close())
+  println(name, "end", drain(t, 1))
+  ok(r.close())
+  ok(t.close())
+  println(name, "waiters", socketWaiters())
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val accepting = spawn(() ->
+    val a = ok(l.accept())
+    val b = ok(l.accept())
+    _ = l.close()
+    (a, b))
+  val c = ok(TcpStream.connect("127.0.0.1", port))
+  val d = ok(TcpStream.connect("127.0.0.1", port))
+  val (s, t) = accepting.join()
+  run("tcp", c, s)
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val handshaking = spawn(() -> tls(TlsStream.server(t, server)))
+  val secure = tls(TlsStream.client(d, "localhost", TlsClient().trust(fixture("ca.pem"))))
+  run("tls", secure, handshaking.join())

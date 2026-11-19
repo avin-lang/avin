@@ -1,0 +1,76 @@
+// expect: exit 0
+// A streamed response's `BodyWriter` is an `io.ByteWriter`: a body is written through the trait as a
+// value and through a generic, chunked and of a length given beforehand, and `io.copy` streams a
+// `Reader` into it, nothing, more than one piece, and exactly a length given beforehand; the client
+// reads back exactly what was written.
+import avin.io
+import avin.io.{ByteWriter, IoError, Reader}
+import avin.net.http
+import avin.net.http.{Response, Route, Router}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+patternAt(i: int) -> byte = byte((i * 7 + 3) % 251)
+
+// A source of `total` bytes of the pattern.
+class Pattern(private val total: int): Reader
+  var at = 0
+
+  override read(max: int) -> Result[Array[byte], IoError]
+    val from = at
+    val end = if total - at > max then at + max else total
+    at = end
+    Ok(Array.tabulate(end - from, i -> patternAt(from + i)))
+
+viaValue(w: ByteWriter) -> Result[unit, IoError]
+  w.write(bytesOf("hello "))?
+  w.write(Array.empty[byte]())
+
+viaGeneric[W: ByteWriter](w: W) -> Result[unit, IoError]
+  w.write(Array.empty[byte]())?
+  w.write(bytesOf("world"))
+
+// Whether `got` is the first `got.length` bytes of the pattern, or where it is not.
+checked(got: Array[byte]) -> string
+  for k in 0 ..< got.length
+    if got(k) != patternAt(k) then return s"differs at byte $k"
+  s"${got.length} bytes"
+
+fetch(port: int, path: string) -> http.Response = http.get(s"http://127.0.0.1:$port$path") match
+  Ok(r) -> r
+  Err(e) -> fail(s"$e")
+
+main()
+  val router = Router(
+    [
+      Route.get("/chunked", _ -> Response.stream(200, "text/plain", w ->
+        ok(viaValue(w))
+        ok(viaGeneric(w)))),
+      Route.get("/sized", _ -> Response.stream(200, "text/plain", 11, w ->
+        ok(viaValue(w))
+        ok(viaGeneric(w)))),
+      Route.get("/copied", _ -> Response.stream(200, "application/octet-stream", w ->
+        _ = ok(io.copy(Pattern(300000), w)))),
+      Route.get("/copied-sized", _ -> Response.stream(200, "application/octet-stream", 70000, w ->
+        _ = ok(io.copy(Pattern(70000), w)))),
+      Route.get("/empty", _ -> Response.stream(200, "application/octet-stream", w ->
+        _ = ok(io.copy(Pattern(0), w))))
+    ]
+  )
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+  val port = server.port()
+  val chunked = fetch(port, "/chunked")
+  println("chunked", chunked.status, chunked.header("Transfer-Encoding"), chunked.text)
+  val sized = fetch(port, "/sized")
+  println("sized", sized.status, sized.header("Content-Length"), sized.text)
+  val copied = fetch(port, "/copied")
+  println("copied", copied.status, checked(copied.body))
+  val copiedSized = fetch(port, "/copied-sized")
+  println("copied, sized", copiedSized.status, copiedSized.header("Content-Length"), checked(copiedSized.body))
+  val empty = fetch(port, "/empty")
+  println("empty", empty.status, checked(empty.body))
+  server.shutdown()

@@ -1,0 +1,128 @@
+// expect: exit 0
+// A scope's `cancel` wakes a thread parked in each wait of the synchronization kit: a wait group's
+// wait (plain and timed), a semaphore's acquire (plain, timed and inside `withPermit`), a read-write
+// lock's read and write, and a barrier's wait. Each thread ends with no result and nothing after its
+// wait runs, and each primitive is left as if the cancelled waiter had never come: the semaphore's
+// permits are all there, readers and writers go in, and the barrier's round waits for all its parties
+// again. A read body is stopped and gives its share of the lock back; a write body runs to its end.
+// Waits of an hour would hold the test for an hour if the cancellation did not end them.
+import avin.threads.{Atomic, Barrier, Channel, RwLock, Semaphore, WaitGroup, scope, sleep, spawn}
+import avin.time.{hours, millis}
+
+main()
+  val started = Atomic(0)
+  val after = Atomic(0)
+  val group = WaitGroup()
+  group.add(1)
+  val empty = Semaphore(0, capacity = 2)
+  val pool = Semaphore(2)
+  val meet = Barrier(3)
+  val results = scope(s ->
+    val ts = [
+      s.spawn(() ->
+        started.add(1)
+        group.wait()
+        after.add(1)),
+        s.spawn(() ->
+          started.add(1)
+          group.waitFor(hours(1))
+          after.add(1)),
+          s.spawn(() ->
+            started.add(1)
+            empty.acquire()
+            after.add(1)),
+            s.spawn(() ->
+              started.add(1)
+              empty.acquireFor(hours(1))
+              after.add(1)),
+              s.spawn(() ->
+                started.add(1)
+                empty.withPermit(() -> after.add(1))
+                after.add(1)),
+                s.spawn(() ->
+                  pool.withPermit(() ->
+                    started.add(1)
+                    sleep(hours(1))
+                    after.add(1))
+                  after.add(1)),
+                  s.spawn(() ->
+                    started.add(1)
+                    meet.wait()
+                    after.add(1)),
+                    s.spawn(() ->
+                      started.add(1)
+                      meet.wait()
+                      after.add(1))]
+    while started.load() < ts.length || meet.waiting() < 2 do sleep(millis(1))
+    sleep(millis(20))
+    s.cancel()
+    ts.map(t -> t.result()))
+  for r in results do println(r)
+  println(s"after ${after.load()}")
+  println(
+    s"pool ${pool.availablePermits()} empty ${empty.availablePermits()} group ${group.pending()} barrier ${meet.waiting()}"
+  )
+  // The barrier's next round waits for all three parties again.
+  val lasts = Atomic(0)
+  scope(s ->
+    for _ in 0 ..< 3 do s.spawn(() -> if meet.wait() then lasts.add(1)))
+  println(s"next round lasts ${lasts.load()}")
+
+  // A writer waiting behind a reader, and a reader waiting behind a writer, each cancelled.
+  val value = RwLock(0)
+  val holding = Channel[int](1)
+  val finish = Channel[int](1)
+  val reader = spawn(() -> value.read(v ->
+    holding.send(1)
+    finish.receive()
+    v))
+  holding.receive()
+  val stoppedWriter = scope(s ->
+    val w = s.spawn(() ->
+      value.set(1)
+      after.add(1))
+    sleep(millis(20))
+    s.cancel()
+    w.result())
+  // With the cancelled writer gone, a new reader goes in beside the one still reading.
+  println(s"writer $stoppedWriter read beside ${value.get()}")
+  finish.send(0)
+  reader.join()
+  val writer = spawn(() -> value.write(_ ->
+    holding.send(1)
+    finish.receive()))
+  holding.receive()
+  val stoppedReader = scope(s ->
+    val r = s.spawn(() ->
+      value.get()
+      after.add(1))
+    sleep(millis(20))
+    s.cancel()
+    r.result())
+  finish.send(0)
+  writer.join()
+  // With the cancelled reader gone, a write goes in at once.
+  println(s"reader $stoppedReader then ${value.update(v -> v + 2)}")
+
+  // A read body is stopped and gives its share back; a write body runs to its end.
+  val box = RwLock(Buffer[int]())
+  val bodyStarted = Atomic(0)
+  scope(s ->
+    s.spawn(() -> box.read(b ->
+      bodyStarted.add(1)
+      sleep(hours(1))
+      after.add(1)))
+    while bodyStarted.load() < 1 do sleep(millis(1))
+    s.cancel())
+  scope(s ->
+    s.spawn(() ->
+      box.write(b ->
+        bodyStarted.add(1)
+        sleep(millis(50))
+        b.append(7))
+      // The thread stops at its first cancellation point after the write.
+      sleep(hours(1))
+      after.add(1))
+    while bodyStarted.load() < 2 do sleep(millis(1))
+    s.cancel())
+  println(s"box ${box.write(b -> b.length)} after ${after.load()}")

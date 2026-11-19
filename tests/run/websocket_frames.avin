@@ -1,0 +1,304 @@
+// expect: exit 0
+// stderr: actor numbers vary
+// WebSocket frames byte for byte. A raw client against the server: the handshake and the first frame
+// in one write; RFC 6455's sample frames (a masked `Hello`, a fragmented one); a ping in the middle of
+// a fragmented message answered at once; a frame arriving in pieces; a character split between
+// fragments; the close handshake with and without a code. Every violation closes the connection with
+// its code and reason: a frame not masked, a reserved bit, an unknown opcode, a continuation with
+// nothing to continue, a new message inside a fragmented one, a fragmented or long control frame, a
+// close of one byte or with a code no one may send, a length with its top bit set (1002); text or a
+// close reason that is not UTF-8, whole or split (1007); a message over the limit, whole or in
+// fragments (1009). A session that traps closes its connection with no HTTP answer. A raw server
+// against the client: the sample unmasked frames, 16-bit and 64-bit lengths, the client's pong masked,
+// a masked frame from the server (1002), a close answered, and a server going without one (1006).
+import avin.encoding.toHex
+import avin.io.IoError
+import avin.net.{ByteStream, TcpServer, TcpStream}
+import avin.net.http
+
+import avin.net.http.{
+  Binary, Closed, Message, Response, Route, Router, ServerRequest, Text, Upgraded, WebSocket, WebSocketError, acceptKey,
+  webSocket
+}
+
+import avin.threads.{Channel, sleep}
+import avin.time
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+bytes(codes: Vector[int]) -> Array[byte] = Array.tabulate(codes.length, i -> byte(codes(i)))
+
+// A client's frame: its first byte, its payload masked by `key`, the length in the fewest bytes.
+masked(first: int, payload: Array[byte], key: Vector[int] = [0x37, 0xfa, 0x21, 0x3d]) -> Array[byte]
+  val out = Buffer[byte]()
+  out.addOne(byte(first))
+  val n = payload.length
+  if n < 126 then out.addOne(byte(0x80 | n))
+  else
+    out.addOne(byte(0x80 | 126))
+    out.addOne(byte(n >> 8))
+    out.addOne(byte(n & 0xff))
+  for k in key
+    out.addOne(byte(k))
+  for i in 0 ..< n
+    out.addOne(payload(i) ^ byte(key(i % 4)))
+  out.toArray()
+
+said(r: Result[Message, WebSocketError]) -> string = r match
+  Ok(Text(t)) -> s"text `$t`"
+  Ok(Binary(b)) -> s"binary of ${b.length} bytes"
+  Err(Closed(code, reason)) -> s"closed $code `$reason`"
+  Err(e) -> e.message
+
+echo(ws: WebSocket, heard: Channel[string])
+  loop
+    ws.receive() match
+      Ok(Text(t)) -> _ = ws.send(t)
+      Ok(Binary(b)) -> _ = ws.send(b)
+      Err(e) ->
+        _ = heard.send(said(Err(e)))
+        return
+
+val key = "dGhlIHNhbXBsZSBub25jZQ=="
+
+opening(target: string) -> Array[byte] =
+  s"GET $target HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n\r\n".utf8
+
+// A raw connection to `target`, its handshake sent with `first` in the same write and its answer's
+// head read.
+opened(server: TcpServer, target: string, first: Array[byte] = Array.empty[byte]()) -> TcpStream
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  val all = Buffer[byte]()
+  all.addAll(opening(target))
+  all.addAll(first)
+  ok(c.write(all.toArray()))
+  loop
+    val line = ok(c.readLine()).getOrElse("")
+    if line.isEmpty then break
+  c
+
+// Exactly `n` bytes from `c`, in hex.
+take(c: TcpStream, n: int) -> string
+  val got = Buffer[byte]()
+  while got.length < n
+    val more = ok(c.read(n - got.length))
+    if more.length == 0 then break
+    got.addAll(more)
+  toHex(got.toVector)
+
+// The close frame `c` receives and then its end: the code and the reason.
+closing(c: TcpStream) -> string
+  val all = ok(c.readAll())
+  _ = c.close()
+  if all.length < 2 || int(all(0)) != 0x88 then return s"not a close: ${toHex(all.toVector)}"
+  val n = int(all(1))
+  if n < 2 then return s"close with ${n} bytes"
+  val code = (int(all(2)) << 8) | int(all(3))
+  s"close $code `${string.fromUtf8Lossy(all.slice(4, 2 + n))}`"
+
+// A violation sent on a fresh connection to `target`: what the server closes with, and what its
+// session heard.
+violation(server: TcpServer, heard: Channel[string], target: string, frames: Vector[Array[byte]]) -> string
+  val c = opened(server, target)
+  for f in frames
+    ok(c.write(f))
+  val seen = closing(c)
+  s"$seen; session: ${heard.receive().getOrElse("?")}"
+
+// A raw server's side of a WebSocket: it writes `frames`, then reports on `heard` what the client sent
+// back until it went, each frame unmasked.
+raw(u: Upgraded, frames: Vector[Vector[byte]], heard: Channel[string])
+  for f in frames
+    _ = u.stream.write(f.toArray())
+  if frames.isEmpty
+    _ = u.stream.close()
+    _ = heard.send("server went")
+    return
+  _ = u.stream.setTimeout(time.seconds(10))
+  val back = Buffer[byte]()
+  back.addAll(u.ahead)
+  loop
+    u.stream.read(4096) match
+      Ok(more) ->
+        if more.length == 0 then break
+        back.addAll(more)
+      Err(_) -> break
+  _ = heard.send(s"client sent: ${unmasked(back.toArray())}")
+
+// Each frame of `all`, which a client sent, as its first byte, whether it was masked, and its payload.
+unmasked(all: Array[byte]) -> string
+  val out = Buffer[string]()
+  var at = 0
+  while at + 2 <= all.length
+    val first = int(all(at))
+    val n = int(all(at + 1)) & 0x7f
+    val isMasked = (int(all(at + 1)) & 0x80) != 0
+    val payload = Array.tabulate(n, i -> all(at + 6 + i) ^ all(at + 2 + i % 4))
+    out.addOne(s"${toHex(Vector(byte(first)))} masked $isMasked ${toHex(payload.toVector)}")
+    at += 6 + n
+  out.toVector.mkString(", ")
+
+// A route answering the handshake by hand, then writing `frames` as a server would not check them.
+rawRoute(target: string, frames: Vector[Array[byte]], heard: Channel[string]) -> Route
+  val kept = frames.map(f -> f.toVector)
+  Route.get(
+    target,
+    r -> Response.upgrade("websocket", u -> raw(u, kept, heard)).withHeader(
+      "Sec-WebSocket-Accept",
+      acceptKey(r.header("Sec-WebSocket-Key").getOrElse(""))
+    )
+  )
+
+val hello = "Hello".utf8
+
+// The server's close with 1000, which ends each raw server's frames.
+val done = bytes([0x88, 0x02, 0x03, 0xe8])
+
+main()
+  val heard = Channel[string]()
+  val big = Array.tabulate(65536, i -> byte(i % 256))
+  val bigFrame = Buffer[byte]()
+  bigFrame.addAll(bytes([0x82, 0x7f, 0, 0, 0, 0, 0, 1, 0, 0]))
+  bigFrame.addAll(big)
+  val mid = Buffer[byte]()
+  mid.addAll(bytes([0x82, 0x7e, 0x01, 0x00]))
+  mid.addAll(Array.fill(256, byte(9)))
+  val router = Router(
+    [
+      Route.get("/echo", r -> webSocket(r, ws -> echo(ws, heard))),
+      Route.get("/small", r -> webSocket(r, ws -> echo(ws, heard), maxMessageBytes = 16)),
+      Route.get("/none", r -> webSocket(r, ws -> echo(ws, heard), maxMessageBytes = 0)),
+      Route.get("/trap", r -> webSocket(r, ws ->
+        _ = ws.receive()
+        fail("the session gave up"))),
+      rawRoute("/raw/hello", [bytes([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]), done], heard),
+      rawRoute(
+        "/raw/fragments",
+        [
+          bytes([0x01, 0x03, 0x48, 0x65, 0x6c]),
+          bytes([0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]),
+          bytes([0x80, 0x02, 0x6c, 0x6f]),
+          done
+        ],
+        heard
+      ),
+      rawRoute("/raw/lengths", [mid.toArray(), bigFrame.toArray(), done], heard),
+      rawRoute("/raw/masked", [masked(0x81, hello)], heard),
+      rawRoute("/raw/close", [bytes([0x88, 0x03, 0x03, 0xe8, 0x78])], heard),
+      rawRoute("/raw/gone", Vector.empty[Array[byte]](), heard)
+    ]
+  )
+  val server = http.serve("127.0.0.1", 0, router.handle).ok.get
+
+  // The handshake and RFC 6455's masked `Hello` in one write: the server reads the frame it had read
+  // ahead with the request, and echoes it unmasked.
+  val c = opened(server, "/echo", bytes([0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]))
+  println(take(c, 7))
+  // A fragmented `Hello` with a ping between its fragments: the pong comes at once, then the message.
+  ok(c.write(masked(0x01, "Hel".utf8)))
+  ok(c.write(masked(0x89, hello)))
+  println(take(c, 7))
+  ok(c.write(masked(0x80, "lo".utf8)))
+  println(take(c, 7))
+  // A binary message in three fragments, one of them empty, and a pong the server passes over.
+  ok(c.write(masked(0x8a, "unasked".utf8)))
+  ok(c.write(masked(0x02, bytes([1, 2]))))
+  ok(c.write(masked(0x00, Array.empty[byte]())))
+  ok(c.write(masked(0x80, bytes([3]))))
+  println(take(c, 5))
+  // A frame arriving in pieces, its header split too.
+  val whole = masked(0x81, "pieces".utf8, [1, 2, 3, 4])
+  for i in 0 ..< whole.length
+    ok(c.write(whole.slice(i, i + 1)))
+    sleep(millis(2))
+  println(take(c, 8))
+  // `é` split between two fragments, put back together before it is read as UTF-8.
+  ok(c.write(masked(0x01, bytes([0x63, 0x61, 0x66, 0xc3]))))
+  ok(c.write(masked(0x80, bytes([0xa9]))))
+  println(take(c, 7))
+  // A 200-byte message, its length in 16 bits each way.
+  ok(c.write(masked(0x82, Array.fill(200, byte(5)))))
+  println(take(c, 4))
+  _ = take(c, 200)
+  // The client closes with a code and a reason: the server answers with the code and closes.
+  ok(c.write(masked(0x88, bytes([0x03, 0xe8, 0x62, 0x79, 0x65]))))
+  println(closing(c))
+  println(heard.receive().getOrElse("?"))
+
+  // A close with no code is answered with none, and heard as 1005.
+  val quiet = opened(server, "/echo")
+  ok(quiet.write(masked(0x88, Array.empty[byte]())))
+  println(toHex(ok(quiet.readAll()).toVector))
+  _ = quiet.close()
+  println(heard.receive().getOrElse("?"))
+
+  // Violations, each closing the connection with its code.
+  val violations = [
+    [bytes([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f])],
+    [masked(0xc1, hello)],
+    [masked(0xa1, hello)],
+    [masked(0x91, hello)],
+    [masked(0x83, hello)],
+    [masked(0x8b, hello)],
+    [masked(0x80, hello)],
+    [masked(0x00, hello)],
+    [masked(0x01, hello), masked(0x81, hello)],
+    [masked(0x01, hello), masked(0x02, hello)],
+    [masked(0x09, hello)],
+    [masked(0x89, Array.fill(126, byte(0)))],
+    [masked(0x88, bytes([0x03]))],
+    [masked(0x88, bytes([0x03, 0xed]))],
+    [masked(0x88, bytes([0x03, 0xe7]))],
+    [masked(0x88, bytes([0x03, 0xee]))],
+    [masked(0x88, bytes([0x13, 0x88]))],
+    [masked(0x88, bytes([0x07, 0xcf]))],
+    [bytes([0x82, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])],
+    [masked(0x81, bytes([0xff]))],
+    [masked(0x81, bytes([0xe6, 0x97]))],
+    [masked(0x81, bytes([0xed, 0xa0, 0x80]))],
+    [masked(0x01, bytes([0xc3])), masked(0x80, bytes([0x28]))],
+    [masked(0x88, bytes([0x03, 0xe8, 0xff]))]
+  ]
+  for frames in violations
+    println(violation(server, heard, "/echo", frames))
+  // The limit: sixteen bytes pass, seventeen close, whole or in fragments; a limit of zero passes only
+  // empty messages.
+  val small = opened(server, "/small")
+  ok(small.write(masked(0x81, "sixteen bytes!!!".utf8)))
+  println(take(small, 18))
+  _ = small.close()
+  println(heard.receive().getOrElse("?"))
+  println(violation(server, heard, "/small", [masked(0x81, "seventeen bytes!!".utf8)]))
+  println(violation(server, heard, "/small", [masked(0x01, "ten bytes!".utf8), masked(0x80, "seven!!".utf8)]))
+  val none = opened(server, "/none")
+  ok(none.write(masked(0x82, Array.empty[byte]())))
+  println(take(none, 2))
+  _ = none.close()
+  println(heard.receive().getOrElse("?"))
+  println(violation(server, heard, "/none", [masked(0x81, "x".utf8)]))
+
+  // A session that traps closes its connection with nothing written after the `101`.
+  val trapped = opened(server, "/trap")
+  ok(trapped.write(masked(0x81, hello)))
+  println(toHex(ok(trapped.readAll()).toVector))
+  _ = trapped.close()
+
+  // The client against a raw server.
+  val base = s"ws://127.0.0.1:${server.port()}"
+  for target in ["/raw/hello", "/raw/fragments", "/raw/lengths", "/raw/masked", "/raw/close", "/raw/gone"]
+    val ws = WebSocket.connect(base + target) match
+      Ok(w) -> w
+      Err(e) -> fail(e.message)
+    var r = ws.receive()
+    val seen = Buffer[string]()
+    while r.isOk
+      seen.addOne(said(r))
+      r = ws.receive()
+    seen.addOne(said(r))
+    println(s"$target: ${seen.toVector.mkString(", ")}")
+    println(heard.receive().getOrElse("?"))
+  server.shutdown()

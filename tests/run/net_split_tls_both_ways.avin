@@ -1,0 +1,82 @@
+// expect: exit 0
+// Both ends of a TLS connection split it and send each other far more than the socket buffers hold
+// at the same time, as `net_split_tcp_both_ways` does over TCP. The halves of one end share one TLS
+// session, which each reaches under a lock and never while it waits, so the reader decrypts records
+// as they arrive while the writer is parked waiting for room, and every record either half makes
+// goes out whole. Each side gets every byte, in order, and the end of the input once the other's
+// writer has closed, which sends TLS's close notice. Writes are of every size, from one byte to
+// several records, so records of every length cross. Nothing is left on the poller after.
+import avin.fs
+import avin.io.IoError
+import avin.net.{StreamReader, StreamWriter, TcpListener}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.spawn
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// Far more than a loopback socket's send and receive buffers together.
+val Total = 2097152
+
+// The byte at `i` of what `side` sends.
+byteAt(side: int, i: int) -> byte = byte((i + side * 7) % 251)
+
+// The size of the `n`th write: one byte, then sizes growing past a record's to several records'.
+sizeOf(n: int) -> int = [1, 2, 100, 16383, 16384, 16385, 40000, 65536](n % 8)
+
+// Sends `Total` bytes of `side`'s pattern in writes of every size, then closes the writer.
+pour(w: StreamWriter, side: int) -> int
+  var at = 0
+  var n = 0
+  while at < Total
+    val size = if Total - at < sizeOf(n) then Total - at else sizeOf(n)
+    ok(w.write(Array.tabulate(size, k -> byteAt(side, at + k))))
+    at += size
+    n += 1
+  ok(w.close())
+  at
+
+// Reads until the end of the input, checking every byte against `side`'s pattern.
+drain(r: StreamReader, side: int) -> (int, int)
+  var got = 0
+  var wrong = 0
+  while true
+    val bytes = ok(r.read(65536))
+    if bytes.length == 0 then break
+    for k in 0 ..< bytes.length
+      if bytes(k) != byteAt(side, got + k) then wrong += 1
+    got += bytes.length
+  ok(r.close())
+  (got, wrong)
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  val serving = spawn(() ->
+    val (r, w) = tls(TlsStream.server(ok(l.accept()), server)).split()
+    _ = l.close()
+    val sending = spawn(() -> pour(w, 1))
+    val received = spawn(() -> drain(r, 0))
+    (sending.join(), received.join()))
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  val (r, w) = c.split()
+  val sending = spawn(() -> pour(w, 0))
+  val (got, wrong) = drain(r, 1)
+  println("client sent", sending.join(), "received", got, "wrong", wrong)
+  val (sent, (theirs, bad)) = serving.join()
+  println("server sent", sent, "received", theirs, "wrong", bad)
+  println("waiters", socketWaiters())

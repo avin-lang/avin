@@ -1,0 +1,82 @@
+// expect: exit 0
+// `maxWaiting` bounds the calls waiting: a call that would wait while that many already wait fails at
+// once with `QueueFull`, and one that finds a resource idle, or a place to make one, never does. A
+// zero `maxWaiting` means no call ever waits. With no `maxWaiting` the queue has no bound. Many
+// threads at once: exactly `maxWaiting` of those that find every resource lent wait, the rest fail,
+// and every one that waited is served once the resources come back.
+import avin.threads.{Atomic, Channel, Pool, PoolError, QueueFull, scope, sleep}
+import avin.time.millis
+
+class Conn(val id: int): Sendable
+
+// Waits until `ready` answers true, looking every millisecond.
+waitFor(ready: () -> bool)
+  while !ready() do sleep(millis(1))
+
+isFull(r: Result[int, PoolError[string]]) -> bool = r match
+  Err(QueueFull) -> true
+  _ -> false
+
+main()
+  val made = Atomic(0)
+  // One resource, at most one call waiting.
+  val one = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 1, maxWaiting = Some(1))
+  println(one.use(c -> c.id))
+  val gate = Channel[unit]()
+  scope(s ->
+    val holder = s.spawn(() -> one.use(c ->
+      _ = gate.receive()
+      c.id))
+    waitFor(() -> one.stats().lent == 1)
+    val waiter = s.spawn(() -> one.use(c -> c.id + 100))
+    waitFor(() -> one.stats().waiting == 1)
+    val full = one.use(c -> c.id)
+    println(full)
+    println(isFull(full))
+    println(one.use(millis(500), c -> c.id))
+    println(s"waiting ${one.stats().waiting} rejected ${one.counters().rejected}")
+    gate.send(())
+    println(s"${holder.join()} ${waiter.join()}"))
+  // The resource is idle again, so a call takes it at once whatever the bound.
+  println(one.use(c -> c.id))
+  one.close()
+
+  // A zero bound: calls never wait, but an idle resource or a place to make one is still taken.
+  val none = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2, maxWaiting = Some(0))
+  println(none.use(a -> none.use(b -> s"${a.id < b.id}")))
+  println(none.use(a -> none.use(b -> none.use(c -> c.id))))
+  val c = none.counters()
+  println(s"acquires ${c.acquires} waited ${c.waited} rejected ${c.rejected} created ${c.created}")
+  none.close()
+
+  // Fifty threads at once on two resources held, five may wait.
+  val many = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 2, maxWaiting = Some(5))
+  val release = Channel[unit]()
+  val served = Atomic(0)
+  val outcomes = scope(s ->
+    val holders = (0 ..< 2).map(_ -> s.spawn(() -> isFull(many.use(c ->
+      _ = release.receive()
+      _ = served.add(1)
+      c.id))))
+    waitFor(() -> many.stats().lent == 2)
+    val callers = (0 ..< 48).map(_ -> s.spawn(() -> isFull(many.use(c ->
+      _ = served.add(1)
+      c.id))))
+    waitFor(() -> many.counters().rejected == 43)
+    println(s"waiting ${many.stats().waiting}")
+    release.send(())
+    release.send(())
+    (holders ++ callers).map(t -> t.join()))
+  println(s"rejected ${outcomes.count(f -> f)} served ${served.load()}")
+  val counted = many.counters()
+  println(s"acquires ${counted.acquires} waited ${counted.waited} rejected ${counted.rejected}")
+  println(many.stats())
+  many.close()
+
+  // No bound: every caller waits its turn.
+  val open = Pool[Conn, string](() -> Ok(Conn(made.add(1))), maxSize = 1)
+  val total = Atomic(0)
+  scope(s ->
+    for n in 1 .. 40 do s.spawn(() -> _ = open.use(c -> total.add(n))))
+  println(s"total ${total.load()} rejected ${open.counters().rejected}")
+  open.close()

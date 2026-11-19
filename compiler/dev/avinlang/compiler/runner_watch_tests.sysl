@@ -1,0 +1,225 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, exists, make_dir_all, read_text, remove_dir_all, write_text}
+import sysl.net.{resolve as resolve_host, socket}
+import sysl.process.{Exited, Group, Signalled, Spawned, Stdio, Var, capture, pid, spawn}
+import sysl.signal
+import sysl.time.{millis, monotonic, sleep}
+
+// Nothing `avin test` or `avin run` starts outlives it: not a test that times out or traps while it
+// holds a listener and a child, not a program whose runner is stopped by a signal, and not one whose
+// runner is killed outright, which the program notices itself. A program started any other way is left
+// alone. The executable is built once for the module and run as a process, since a signal can only be
+// sent to one; each test program writes the process ids, and the port, to check to a file of its own.
+
+/** Where the module's executable is built, under the repository's ignored scratch directory. */
+private const WatchDir: string = ".scratch/runner-watch-tests"
+
+@setup_all
+build_watch_compiler()
+    make_dir_all(WatchDir).unwrap()
+    val built = capture(repository_toolchain().sysl, ["build", "compiler", "-o", WatchDir + "/avin"], stderr = true, timeout = 900000).unwrap()
+    assert(built.status.ok(), built.err.unwrap_or(""))
+
+@teardown_all
+remove_watch_compiler()
+    _ = remove_dir_all(WatchDir)
+
+private struct Place
+    dir: string
+    bin: string
+
+// A directory of the test's own, beside the module's executable.
+private place(name: string) -> Place
+    val root = current_dir().unwrap() + "/" + WatchDir
+    val dir = root + "/" + name
+    _ = remove_dir_all(dir)
+    make_dir_all(dir).unwrap()
+    assert(exists(root + "/avin"), "the module's executable was not built")
+    Place(dir, root + "/avin")
+
+private watch_env() -> Buf[Var]
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env
+
+// Waits up to `limit` milliseconds for `file` to hold `count` numbers.
+private written(file: string, count: usize, limit: int) -> Buf[int]
+    var waited = 0
+    while pids_in(file).len() < count && waited < limit
+        sleep(millis(50))
+        waited += 50
+    pids_in(file)
+
+/** Whether process `pid` is gone within `limit` milliseconds; one still there is killed, so that a
+ * failing check leaves nothing behind. A process that has ended but has not been reaped still answers,
+ * so a zombie counts as still there. */
+private gone_within(pid: int, limit: int) -> bool
+    var waited = 0
+    loop
+        if signal.send(i64(pid), 0) is Err(_) then return true
+        if waited >= limit then break
+        sleep(millis(20))
+        waited += 20
+    _ = signal.send(i64(pid), signal.KILL)
+    false
+
+// Whether nothing is listening on `port` of the loopback address any more.
+private port_closed(port: int) -> bool
+    val at = resolve_host("127.0.0.1", port).unwrap()
+    var s = socket(at[0]).unwrap()
+    val refused = s.connect(at[0]).is_err()
+    _ = s.close()
+    refused
+
+// What a program writes to `pids` once it holds a listener and a child that sleeps for ever: its own
+// process id, the child's and the listener's port.
+private holding(pids: string) -> string =
+    "  val l = TcpListener.bind(\"127.0.0.1\", 0).ok.get\n" +
+    "  val g = Command(\"/bin/sleep\", \"100000\").start().ok.get.detach()\n" +
+    "  fs.writeText(\"" + pids + "\", s\"${process.pid()} $g ${l.port()}\\n\").ok.get\n"
+
+private const Imports: string = "import avin.fs\nimport avin.net.TcpListener\nimport avin.process\nimport avin.process.Command\nimport avin.signal\nimport avin.threads.sleep\nimport avin.time\n\n"
+
+// A program that holds a listener and a child and then sleeps for ever.
+private sleeper(pids: string) -> string = Imports + "main()\n" + holding(pids) + "  sleep(time.millis(1000000))\n"
+
+/** How long, in milliseconds, a process the runner has already stopped is given to be reaped by the
+ * system once the runner has reported or exited: the runner waits for what it stopped, but a child of
+ * the stopped program is the init process's to reap. */
+private const Reaped: int = 1000
+
+// Checks that the program, its child and its listener named in `pids` are all gone.
+private all_gone(pids: Buf[int], what: string, limit: int)
+    assert(pids.len() == 3, s"$what: the program never wrote its process ids")
+    assert(gone_within(pids[0], limit), s"$what: the program outlived its runner")
+    assert(gone_within(pids[1], limit), s"$what: the child the program started outlived its runner")
+    assert(port_closed(pids[2]), s"$what: the program's listener is still open")
+
+@test("a test that times out while it holds a listener and a sleeping child leaves neither, nor the port, once the runner reports it")
+timed_out_test_with_a_listener()
+    val p = place("timeout")
+    val pids = p.dir + "/pids"
+    write_text(p.dir + "/hang.avin", Imports + "@test(\"holds a listener\", timeout: 1)\nholds()\n" + holding(pids) + "  sleep(time.millis(1000000))\n").unwrap()
+    val ran = capture(p.bin, ["test", p.dir + "/hang.avin"], env = watch_env().view(), stderr = true, timeout = 600000).unwrap()
+    assert(ran.text.contains("timed out after 1s"), ran.text + ran.err.unwrap_or(""))
+    all_gone(pids_in(pids), "timed out", Reaped)
+
+@test("a test that traps with a listener open and a child running leaves neither, nor the port")
+trapped_test_with_a_listener()
+    val p = place("trap")
+    val pids = p.dir + "/pids"
+    write_text(p.dir + "/trap.avin", Imports + "@test(\"traps holding a listener\")\ntraps()\n" + holding(pids) + "  val v = [1]\n  println(v(3))\n").unwrap()
+    for level in ["-O0", "-O2"]
+        val ran = capture(p.bin, ["test", p.dir + "/trap.avin", level], env = watch_env().view(), stderr = true, timeout = 600000).unwrap()
+        assert(ran.text.contains("FAIL  traps holding a listener"), ran.text + ran.err.unwrap_or(""))
+        all_gone(pids_in(pids), "trapped at " + level, Reaped)
+
+@test("a passing test that leaves a child running has it stopped, and the test's process reaped")
+passing_test_is_reaped()
+    val p = place("pass")
+    val pids = p.dir + "/pids"
+    write_text(p.dir + "/pass.avin", Imports + "@test(\"passes holding a listener\")\npasses()\n" + holding(pids) + "  assert(process.env(\"AVIN_RUNNER_PID\").isEmpty)\n").unwrap()
+    val ran = capture(p.bin, ["test", p.dir + "/pass.avin"], env = watch_env().view(), stderr = true, timeout = 600000).unwrap()
+    assert(ran.text.contains("1 passed, 0 failed"), ran.text + ran.err.unwrap_or(""))
+    all_gone(pids_in(pids), "passed", Reaped)
+
+// Starts `avin run` on a program that holds a listener and a child and sleeps, or with `ignoring`,
+// also keeps `SIGTERM` from ending it; answers the run and the ids it wrote.
+private started_run(p: Place, ignoring: bool) -> (&Spawned, Buf[int])
+    val pids = p.dir + "/pids"
+    val body = if ignoring then "  val w = signal.watch(15).ok.get\n" else ""
+    write_text(p.dir + "/sleeper.avin", Imports + "main()\n" + holding(pids) + body + "  sleep(time.millis(1000000))\n").unwrap()
+    // In a group of its own, `avin run` is never a terminal's foreground job, wherever this runs.
+    val child = spawn(p.bin, ["run", p.dir + "/sleeper.avin"], env = watch_env().view(), stdout = Stdio.ToPath(p.dir + "/run.out"), stderr = Stdio.ToPath(p.dir + "/run.err"), group = Group.New).unwrap()
+    val ids = written(pids, 3, 300000)
+    assert(ids.len() == 3, "the program never wrote its process ids: " + read_text(p.dir + "/run.err").unwrap_or(""))
+    (child, ids)
+
+@test("`avin run` sent SIGTERM passes it on to the program and its group, and exits as the program did")
+run_stopped_by_term()
+    val p = place("run-term")
+    val (child, ids) = started_run(p, false)
+    child.kill(signal.TERM).unwrap()
+    assert_eq(child.wait().unwrap(), Exited(143))
+    all_gone(ids, "avin run stopped by SIGTERM", Reaped)
+
+@test("`avin run` sent SIGINT or SIGHUP away from a terminal passes it on the same way")
+run_stopped_by_int_and_hup()
+    val signals = [signal.INT, signal.HUP]
+    val codes = [130, 129]
+    for k in 0..<2
+        val p = place(s"run-${signals[k]}")
+        val (child, ids) = started_run(p, false)
+        child.kill(signals[k]).unwrap()
+        assert_eq(child.wait().unwrap(), Exited(codes[k]))
+        all_gone(ids, s"avin run stopped by signal ${signals[k]}", Reaped)
+
+@test("a program that keeps SIGTERM from ending it is killed once the grace `avin run` gives it has passed")
+run_kills_a_program_that_ignores_term()
+    val p = place("run-ignores")
+    val (child, ids) = started_run(p, true)
+    val sent = monotonic().us / 1000
+    child.kill(signal.TERM).unwrap()
+    assert_eq(child.wait().unwrap(), Exited(137))
+    val took = monotonic().us / 1000 - sent
+    assert(took >= RunGrace, s"killed after ${took}ms, inside the grace")
+    assert(took < RunGrace + 5000, s"took ${took}ms")
+    all_gone(ids, "avin run, program ignoring SIGTERM", Reaped)
+
+@test("`avin run` killed outright leaves nothing behind: the program sees its runner go and ends with its child")
+run_killed_outright()
+    val p = place("run-kill")
+    val (child, ids) = started_run(p, false)
+    child.kill(signal.KILL).unwrap()
+    assert_eq(child.wait().unwrap(), Signalled(9))
+    all_gone(ids, "avin run killed by SIGKILL", 3000)
+
+@test("`avin test` killed outright leaves nothing behind either")
+test_killed_outright()
+    val p = place("test-kill")
+    val pids = p.dir + "/pids"
+    write_text(p.dir + "/hang.avin", Imports + "@test(\"holds a listener\", timeout: 600)\nholds()\n" + holding(pids) + "  sleep(time.millis(1000000))\n").unwrap()
+    val child = spawn(p.bin, ["test", p.dir + "/hang.avin"], env = watch_env().view(), stdout = Stdio.ToPath(p.dir + "/run.out"), stderr = Stdio.ToPath(p.dir + "/run.err"), group = Group.New).unwrap()
+    val ids = written(pids, 3, 300000)
+    child.kill(signal.KILL).unwrap()
+    assert_eq(child.wait().unwrap(), Signalled(9))
+    all_gone(ids, "avin test killed by SIGKILL", 3000)
+
+// Builds the sleeper and starts it from a shell, which is killed outright once the program is running;
+// `runner` is what `AVIN_RUNNER_PID` is set to, or "" for no variable at all. Answers the program's ids.
+private orphaned_directly(p: Place, runner: string) -> Buf[int]
+    val pids = p.dir + "/pids"
+    write_text(p.dir + "/sleeper.avin", sleeper(pids)).unwrap()
+    val built = capture(p.bin, ["build", p.dir + "/sleeper.avin", "-o", p.dir + "/sleeper"], env = watch_env().view(), stderr = true, timeout = 600000).unwrap()
+    assert(built.status.ok(), built.text + built.err.unwrap_or(""))
+    var env: Buf[Var] = buf()
+    if runner != "" then env.push(Var("AVIN_RUNNER_PID", runner))
+    // With no runner named, the shell starts from an empty environment, so nothing inherited names one.
+    val shell = spawn("/bin/sh", ["-c", p.dir + "/sleeper & wait"], env = env.view(), inherit_env = runner != "", stdin = Stdio.FromPath("/dev/null")).unwrap()
+    val ids = written(pids, 3, 60000)
+    assert(ids.len() == 3, "the program never wrote its process ids")
+    shell.kill(signal.KILL).unwrap()
+    _ = shell.wait()
+    ids
+
+// Checks that the program named in `ids` is still running well after the shell that started it was
+// killed, and then stops it and its child.
+private still_running(ids: Buf[int], what: string)
+    sleep(millis(1500))
+    val alive = signal.send(i64(ids[0]), 0) is Ok(_)
+    _ = signal.send(i64(ids[0]), signal.KILL)
+    _ = signal.send(i64(ids[1]), signal.KILL)
+    assert(alive, s"$what: the program ended when the shell that started it was killed")
+
+@test("a program started directly, with no runner named, keeps running when what started it is killed")
+direct_program_is_not_watched()
+    val p = place("direct")
+    still_running(orphaned_directly(p, ""), "no runner named")
+
+@test("a program started with a runner named that is not its parent watches nothing")
+inherited_runner_is_not_watched()
+    val p = place("inherited")
+    still_running(orphaned_directly(p, pid().to_string()), "a runner that is not its parent")

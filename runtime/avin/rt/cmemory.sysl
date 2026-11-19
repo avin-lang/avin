@@ -195,9 +195,40 @@ c_attach_failed(ctx: *Context, id: i64)
     let_go(usize(id), true)
     let_go(usize(id), false)
 
-/** Marks what every record C holds keeps. The collector calls it with every attached thread stopped. */
+/** Marks what every record C holds keeps, and every pinned handle. The collector calls it with every
+ * attached thread stopped. */
 mark_attached(h: *gc.Heap)
     attached_lock.lock()
     for a in attached
         if a.by_c && a.kept != null then gc.mark(h, a.kept)
     attached_lock.unlock()
+    pinned_lock.lock()
+    for p in pinned_handles
+        gc.mark(h, p)
+    pinned_lock.unlock()
+
+// The handles a holder's `kept:` names that no C reference holds: each is a root of every collection
+// while its holder lives, so it is finalized only after the holder's `release` has run, which may use
+// it. A handle kept by several holders is here once for each.
+private var pinned_handles: Buf[*u8] = buf()
+private var pinned_lock: SleepLock = SleepLock.new()
+
+/** Pins the handle `object`, kept by a holder whose `release` may use it, until `avin_rt_c_unpin`. */
+@export("avin_rt_c_pin")
+c_pin(object: *u8)
+    pinned_lock.lock()
+    pinned_handles.push(object)
+    pinned_lock.unlock()
+
+/** Lets go of one pin of `object`, once its holder's `release` has run: from `close()` or from the
+ * holder's finalizer, with no context. It runs no Avin code and allocates nothing. */
+@export("avin_rt_c_unpin")
+c_unpin(object: *u8)
+    pinned_lock.lock()
+    val n = pinned_handles.len()
+    for i in 0..<n
+        if pinned_handles[i] == object
+            pinned_handles[i] = pinned_handles[n - 1]
+            pinned_handles.pop()
+            break
+    pinned_lock.unlock()

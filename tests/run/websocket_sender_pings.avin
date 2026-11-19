@@ -1,0 +1,117 @@
+// expect: exit 0
+// A ping answered while the session's senders keep its owner busy, byte for byte from a raw client:
+// forty queued messages of 70000 bytes each go on the wire as a first frame of 65536 bytes and a
+// final continuation of 4464, unmasked; the pong carries the ping's payload and comes between two
+// messages, never inside one. The close handshake follows the messages queued before it.
+import avin.io.IoError
+import avin.net.TcpStream
+import avin.net.http
+import avin.net.http.{Route, Router, WebSocket, webSocket}
+import avin.threads.{Channel, spawn}
+import avin.time
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(s"unexpected error: ${e.message}")
+
+// A client's frame: its first byte, its payload masked.
+masked(first: int, payload: Array[byte]) -> Array[byte]
+  val key = [0x37, 0xfa, 0x21, 0x3d]
+  val out = Buffer[byte]()
+  out.addOne(byte(first))
+  out.addOne(byte(0x80 | payload.length))
+  for k in key
+    out.addOne(byte(k))
+  for i in 0 ..< payload.length
+    out.addOne(payload(i) ^ byte(key(i % 4)))
+  out.toArray()
+
+// Exactly `n` bytes from `c`.
+exact(c: TcpStream, n: int) -> Array[byte]
+  val got = Buffer[byte]()
+  while got.length < n
+    val more = ok(c.read(n - got.length))
+    if more.length == 0 then fail("the connection ended")
+    got.addAll(more)
+  got.toArray()
+
+// A server's frame: FIN, opcode, whether it is masked, and its payload.
+data Frame(fin: bool, opcode: int, masked: bool, payload: Array[byte])
+
+frameFrom(c: TcpStream) -> Frame
+  val head = exact(c, 2)
+  var n = int(head(1)) & 0x7f
+  if n == 126
+    val b = exact(c, 2)
+    n = (int(b(0)) << 8) | int(b(1))
+  elif n == 127
+    val b = exact(c, 8)
+    n = 0
+    for i in 4 ..< 8
+      n = (n << 8) | int(b(i))
+  Frame((int(head(0)) & 0x80) != 0, int(head(0)) & 0x0f, (int(head(1)) & 0x80) != 0, exact(c, n))
+
+busy(ws: WebSocket)
+  val snd = ws.sender()
+  val t = spawn(() ->
+    var sent = 0
+    for i in 0 ..< 40
+      if snd.send(Array.fill(70000, byte(i))).isOk then sent += 1
+    sent)
+  _ = ws.serve(_ -> ())
+  _ = t.join()
+
+main()
+  val router = Router([Route.get("/", r -> webSocket(r, ws -> busy(ws)))])
+  val server = ok(http.serve("127.0.0.1", 0, router.handle))
+  val c = ok(TcpStream.connect("127.0.0.1", server.port()))
+  ok(c.setTimeout(time.seconds(10)))
+  ok(
+    c.write(
+      "GET / HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".utf8
+    )
+  )
+  loop
+    if ok(c.readLine()).getOrElse("").isEmpty then break
+  var messages = 0
+  var shaped = true
+  var pongs = 0
+  var pongAtBoundary = true
+  var inMessage = false
+  var pingSent = false
+  var last = -1
+  while messages < 40 || pongs == 0
+    val f = frameFrom(c)
+    if f.masked then shaped = false
+    f.opcode match
+      10 ->
+        pongs += 1
+        if inMessage then pongAtBoundary = false
+        if string.fromUtf8Lossy(f.payload) != "busy?" then shaped = false
+      2 ->
+        if f.fin || f.payload.length != 65536 || inMessage then shaped = false
+        inMessage = true
+        val v = int(f.payload(0))
+        if v != last + 1 then shaped = false
+        last = v
+        if !pingSent
+          ok(c.write(masked(0x89, "busy?".utf8)))
+          pingSent = true
+      0 ->
+        if !f.fin || f.payload.length != 4464 || !inMessage then shaped = false
+        inMessage = false
+        messages += 1
+      other ->
+        println(s"unexpected opcode $other")
+        shaped = false
+        break
+  println(
+    s"40 messages, each a 65536-byte frame and a 4464-byte continuation, unmasked, in order: ${messages == 40 && shaped}"
+  )
+  println(s"one pong, between messages: ${pongs == 1 && pongAtBoundary}")
+  ok(c.write(masked(0x88, Array.tabulate(2, i -> byte(if i == 0 then 0x03 else 0xe8)))))
+  val close = frameFrom(c)
+  println(s"close answered: ${close.opcode == 8 && int(close.payload(0)) == 0x03 && int(close.payload(1)) == 0xe8}")
+  _ = c.close()
+  server.stop()
+  server.join()

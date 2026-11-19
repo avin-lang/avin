@@ -1,0 +1,130 @@
+module avin.threads
+
+// The request context: a deadline and request-scoped values that every call a piece of work makes can
+// reach without being handed them. A context belongs to the running thread. A scope sets it for the
+// code it runs, `withValue` adding a value and `withDeadline` or `withTimeout` bounding the time, and
+// the code below reads it with `Context.current()`. The threads a scope starts take their starter's
+// whole context; every other thread, and every future's code, takes its values only; an actor's turns
+// take nothing. The deadline is kept by cancellation: when it passes, the body that set it is cancelled
+// as a `withTimeout` body is, so every wait below it, a socket's read, a pool's `use`, a channel's
+// `receive` among them, ends at once.
+
+import avin.time.{Duration, Instant, monotonic, now}
+
+// The calling thread's context state, or `none` where it has not been given one.
+@intrinsic("context_get")
+private contextGet(none: Any) -> Any
+
+// Makes `s` the calling thread's context state.
+@intrinsic("context_set")
+private contextSet(s: Any)
+
+// The key of a request-scoped value of type `T`. Keys are told apart by identity, so two keys of one
+// name are two keys: a module makes each of its keys once, as a module-level value, and a value set
+// under a key is reached by that key alone.
+//
+//     val requestId = Key[string]("request id")
+class Key[T](val name: string)
+
+// One value a context holds: its key and the value, which `withValue` checked against each other.
+private class ContextEntry(val key: Any, val value: Any)
+
+// What a thread's context holds: the deadline on the monotonic clock and on the wall clock, and the
+// values, the innermost first. It is immutable; a scope that changes it makes a new one for the code
+// it runs.
+@trusted_sendable("it is immutable, and every value it holds was sendable when a scope put it there")
+private class ContextState(
+    val until: Option[Duration],
+    val at: Option[Instant],
+    val entries: List[ContextEntry]
+): Sendable
+  // This state with `value` under `key`, before every value set earlier.
+  adding[T](key: Key[T], value: T) -> ContextState = ContextState(until, at, ContextEntry(key, value) :: entries)
+
+  // This state bounded by a deadline `timeout` from now, the instant `wall` on the wall clock, where
+  // that is sooner than its own.
+  bounded(timeout: Duration, wall: Instant) -> ContextState
+    val u = monotonic() + timeout
+    until match
+      Some(mine) -> if mine <= u then self else ContextState(Some(u), Some(wall), entries)
+      None -> ContextState(Some(u), Some(wall), entries)
+
+  // The values of this state with no deadline: what a thread outside the work's scope takes.
+  detached -> ContextState = if until.isEmpty then self else ContextState(None, None, entries)
+
+// The state of a thread no scope has given one.
+private val emptyState: ContextState = ContextState(None, None, [])
+
+// The calling thread's context state.
+private currentState() -> ContextState = contextGet(emptyState) match
+  s: ContextState -> s
+  _ -> emptyState
+
+// What the thread running a piece of work may know about it: when it must be done by, and the values
+// the scopes around it set. A context is a snapshot: the scopes the code goes on to open change the
+// thread's context, not one already read.
+class Context(private val state: ContextState)
+  // The instant the work must be done by, read off the wall clock when the scope that set it opened;
+  // `None` where no scope set one.
+  deadline -> Option[Instant] = state.at
+
+  // How long is left before the deadline, on the monotonic clock, and never less than zero; `None`
+  // where there is no deadline.
+  remaining() -> Option[Duration] = state.until.map(u ->
+    val left = u - monotonic()
+    if left.isNegative then Duration.Zero else left)
+
+  // The value set under `key` by the innermost scope that set one, or `None`.
+  value[T](key: Key[T]) -> Option[T]
+    for e in state.entries
+      if e.key === key
+        return e.value match
+          v: T -> Some(v)
+          _ -> None
+    None
+
+object Context
+  // The context of the calling thread: the one the scopes around the running code set, or one with no
+  // deadline and no values.
+  current() -> Context = Context(currentState())
+
+// Runs `body` with `s` as the calling thread's context state, and puts the one it had back however
+// the body ends.
+private within[T](s: ContextState, body: () -> T) -> T
+  val outer = currentState()
+  contextSet(s)
+  defer contextSet(outer)
+  body()
+
+// Runs `body` with `value` set under `key` in the calling thread's context, and gives back what it
+// returns. Inside, `Context.current().value(key)` answers `Some(value)`, in the body, in what it calls
+// and in the threads it starts, until a scope inside sets the key again; outside, the context is as it
+// was. The body runs on the calling thread.
+//
+//     withValue(requestId, "r-17", () -> handle(request))
+withValue[K: Sendable, T](key: Key[K], value: K, body: () -> T) -> T = within(currentState().adding(key, value), body)
+
+// The error `withDeadline` answers when its deadline passes before its body returns.
+data DeadlineExceeded(deadline: Instant)
+
+impl Error for DeadlineExceeded
+  message -> string = "deadline exceeded"
+
+// Runs `body` with a new scope, as `withTimeout` does, until `deadline`: `Ok` of what it returns in
+// time, and `Err(DeadlineExceeded)` where the deadline passes first. Then the body is cancelled where
+// it is, with every thread its scope started and everything below them, and `withDeadline` answers once
+// they have all ended. The wall clock is read once, as the scope opens; from then on the deadline runs
+// on the monotonic clock, so setting the wall clock moves nothing. Inside, `Context.current()` has the
+// sooner of this deadline and the one around it: a nested deadline can tighten the bound and never
+// loosen it, and a later one is still ended by the earlier around it. A deadline already past runs
+// nothing.
+//
+//     withDeadline(now() + seconds(5), s -> handle(request)) match
+//       Ok(reply) -> reply
+//       Err(e) -> errorReply(e.message)
+withDeadline[T](
+    deadline: Instant,
+    body: (Scope) -> T
+) -> Result[T, DeadlineExceeded] = timed(deadline - now(), deadline, body) match
+  Some(v) -> Ok(v)
+  None -> Err(DeadlineExceeded(deadline))

@@ -1,0 +1,65 @@
+// expect: exit 0
+// Both ends of a TCP connection split it and send each other far more than the socket buffers hold
+// at the same time, each writing half on its own thread while its reading half reads on another. A
+// connection used by one thread at a time cannot do this: each end would block writing, with the
+// other end's bytes piling up unread. Each side gets every byte, in order, and reads the end of the
+// input after the other's writer closes. The client's reader is `main`, which waits on the socket
+// itself, and every other half is a lightweight thread, parked on the poller while it waits; both
+// halves of one connection wait on its descriptor at once. Nothing is left on the poller after.
+import avin.io.IoError
+import avin.net.{StreamReader, StreamWriter, TcpListener, TcpStream}
+import avin.threads.spawn
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Far more than a loopback socket's send and receive buffers together.
+val Total = 4194304
+val Chunk = 65536
+
+// The byte at `i` of what `side` sends.
+byteAt(side: int, i: int) -> byte = byte((i + side * 7) % 251)
+
+// Sends `Total` bytes of `side`'s pattern, then closes the writer.
+pour(w: StreamWriter, side: int) -> int
+  var at = 0
+  while at < Total
+    ok(w.write(Array.tabulate(Chunk, k -> byteAt(side, at + k))))
+    at += Chunk
+  ok(w.close())
+  at
+
+// Reads until the end of the input, checking every byte against `side`'s pattern: the count, and the
+// number of bytes out of place.
+drain(r: StreamReader, side: int) -> (int, int)
+  var got = 0
+  var wrong = 0
+  while true
+    val bytes = ok(r.read(Chunk))
+    if bytes.length == 0 then break
+    for k in 0 ..< bytes.length
+      if bytes(k) != byteAt(side, got + k) then wrong += 1
+    got += bytes.length
+  ok(r.close())
+  (got, wrong)
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val serving = spawn(() ->
+    val (r, w) = ok(l.accept()).split()
+    _ = l.close()
+    val sending = spawn(() -> pour(w, 1))
+    val received = spawn(() -> drain(r, 0))
+    (sending.join(), received.join()))
+  val (r, w) = ok(TcpStream.connect("127.0.0.1", port)).split()
+  val sending = spawn(() -> pour(w, 0))
+  val (got, wrong) = drain(r, 1)
+  println("client sent", sending.join(), "received", got, "wrong", wrong)
+  val (sent, (theirs, bad)) = serving.join()
+  println("server sent", sent, "received", theirs, "wrong", bad)
+  println("waiters", socketWaiters())

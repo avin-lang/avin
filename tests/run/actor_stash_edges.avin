@@ -1,0 +1,168 @@
+// expect: exit 0
+// A stash at its edges: its length, `isEmpty`, `isFull` and `clear`; giving back nothing; giving back
+// more messages than a turn handles, all in order; giving back twice, the later messages in front of
+// the earlier ones still waiting; a message given back and stashed again; a stash in a generic actor
+// and in a behaviour made from a start; and a restart, which loses what is stashed and keeps what
+// was given back, since that is in the mailbox. A full stash traps where `add` is called, failing
+// the actor alone under `Stop`.
+import avin.actors.{ActorRef, Behaviour, Restart, Stash, Stop, spawn}
+import avin.threads.Channel
+import avin.time
+
+data Msg
+  Keep(n: int)
+  Release
+  Drop
+  Report(replyTo: ActorRef[string])
+  Fail
+  ReleaseThenFail
+
+// Keeps each `Keep(n)` of a number not below zero as `Keep(-n - 1)`, and handles the ones below.
+actor Keeper(capacity: int) receives Msg
+  val stash = Stash(self, capacity)
+  val handled = Buffer[int]()
+
+  receive
+    Keep(n) ->
+      if n < 0 then handled.append(n) else stash.add(Keep(-n - 1))
+    Release -> stash.unstashAll()
+    Drop -> stash.clear()
+    ReleaseThenFail ->
+      stash.unstashAll()
+      handled.append(1 / (handled.length - handled.length))
+    Report(replyTo) -> replyTo.tell(
+      s"handled $handled, holding ${stash.length}, empty ${stash.isEmpty}, full ${stash.isFull}, capacity ${stash.capacity}"
+    )
+    Fail -> handled.append(1 / (handled.length - handled.length))
+
+report(a: ActorRef[Msg]) -> string = a.ask(r -> Report(r), timeout = time.seconds(5)).await().ok.getOrElse("none")
+
+data Twice
+  Hold(n: int)
+  Back
+  Show(replyTo: ActorRef[string])
+
+// Two rounds given back: the second round goes in front of what is left of the first.
+actor Shuffler receives Twice
+  val stash = Stash(self, 10)
+  val order = Buffer[string]()
+  var rounds = 0
+
+  receive
+    Hold(n) ->
+      if rounds == 0 then stash.add(Hold(n))
+      else
+        order.append(s"$n")
+        if n == 2 && rounds == 1
+          // While handling a message given back, set more aside and give them back at once.
+          rounds = 2
+          stash.add(Hold(20))
+          stash.add(Hold(21))
+          stash.unstashAll()
+    Back ->
+      rounds = 1
+      stash.unstashAll()
+    Show(replyTo) -> replyTo.tell(s"$order")
+
+data Gen[T: Sendable]
+  Put(value: T)
+  Flush(replyTo: ActorRef[Vector[T]])
+  Open
+
+actor Collector[T: Sendable] receives Gen[T]
+  val stash = Stash(self, 4)
+  val items = Buffer[T]()
+  var open = false
+
+  receive
+    Put(v) -> if open then items.append(v) else stash.add(Put(v))
+    Open ->
+      open = true
+      stash.unstashAll()
+    Flush(replyTo) -> replyTo.tell(items.toVector)
+
+main()
+  val k = spawn(Keeper(40))
+  println(report(k))
+  // Giving back an empty stash does nothing.
+  k.tell(Release)
+  println(report(k))
+  // Forty stashed, more than the sixteen a turn handles: all come back, in order.
+  for i in 0 ..< 40 do k.tell(Keep(i))
+  println(report(k))
+  k.tell(Release)
+  println(report(k))
+  k.tell(Keep(-100))
+  k.tell(Keep(5))
+  println(report(k))
+  // `clear` drops what is held, and the stash takes messages again.
+  k.tell(Drop)
+  k.tell(Release)
+  println(report(k))
+  k.tell(Keep(6))
+  k.tell(Release)
+  println(report(k))
+
+  // The second round given back goes in front of what is left of the first.
+  val s = spawn(Shuffler())
+  s.tell(Hold(1))
+  s.tell(Hold(2))
+  s.tell(Hold(3))
+  s.tell(Back)
+  s.tell(Hold(4))
+  println(s.ask(r -> Show(r), timeout = time.seconds(5)).await())
+
+  // A generic actor's stash, at two type arguments.
+  val strings = spawn(Collector[string]())
+  strings.tell(Put("é"))
+  strings.tell(Put(""))
+  strings.tell(Open)
+  strings.tell(Put("z"))
+  println(strings.ask(r -> Flush(r), timeout = time.seconds(5)).await())
+  val longs = spawn(Collector[long]())
+  longs.tell(Put(-9223372036854775808))
+  longs.tell(Open)
+  println(longs.ask(r -> Flush(r), timeout = time.seconds(5)).await())
+
+  // A behaviour made from a start makes its stash from the reference it is given.
+  val out = Channel[string]()
+  val b = spawn(Behaviour[string]("Lines", me ->
+    val stash = Stash(me, 3)
+    var ready = false
+    line ->
+      if line == "go"
+        ready = true
+        stash.unstashAll()
+      elif ready then out.send(line)
+      else
+        stash.add(line)
+        if stash.isFull then out.send("full")))
+  b.tell("a")
+  b.tell("b")
+  b.tell("c")
+  println(out.receive().get)
+  b.tell("go")
+  b.tell("d")
+  for _ in 0 ..< 4 do println(out.receive().get)
+
+  // A restart loses what was stashed and keeps what was given back, which is in the mailbox.
+  val r = spawn(Keeper(3), onFailure = Restart(2, time.minutes(1)))
+  r.tell(Keep(1))
+  r.tell(Keep(2))
+  println(report(r))
+  // Given back, then a trap in the same message: the fresh state handles the two given back.
+  r.tell(ReleaseThenFail)
+  println(report(r))
+  // Stashed, then a trap: the fresh state has an empty stash.
+  r.tell(Keep(3))
+  println(report(r))
+  r.tell(Fail)
+  println(report(r))
+
+  // A full stash traps in `add`, failing the actor; under `Stop` it ends alone.
+  val full = spawn(Keeper(2), onFailure = Stop)
+  full.tell(Keep(1))
+  full.tell(Keep(2))
+  println(report(full))
+  full.tell(Keep(3))
+  println(full.ended().await())

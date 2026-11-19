@@ -1,0 +1,44 @@
+// expect: exit 0
+// Scopes cancelled while hundreds of threads go round the synchronization kit, so cancellations land
+// in every state: waiting, just woken, admitted ahead of a writer, holding a permit or a share of a
+// read-write lock. After each round every primitive is whole again: all the semaphore's permits are
+// back, a writer and a reader both go in at once, no write was half done, and the barrier waits for no
+// party that is gone.
+import avin.threads.{Atomic, Barrier, RwLock, Semaphore, WaitGroup, scope, sleep}
+import avin.time
+
+main()
+  val permits = Semaphore(4)
+  val value = RwLock(Buffer[int]())
+  value.write(b -> b.appendAll([0, 0]))
+  val torn = Atomic(0)
+  val parties = 16
+  val meet = Barrier(parties)
+  for round in 0 ..< 12
+    val group = WaitGroup()
+    group.add(1)
+    scope(s ->
+      for i in 0 ..< 200
+        s.spawn(() ->
+          loop
+            i % 5 match
+              0 -> value.write(b ->
+                b(0) = b(0) + 1
+                b(1) = b(1) + 1)
+              1 -> value.read(b -> if b(0) != b(1) then torn.add(1))
+              2 -> permits.withPermit(() -> sleep(time.micros(20)))
+              3 -> if permits.acquireFor(time.millis(1))
+                permits.release()
+              _ -> group.waitFor(time.micros(100)))
+      for _ in 0 ..< parties
+        s.spawn(() ->
+          loop do meet.wait())
+      sleep(time.millis(long(2 + round % 4)))
+      s.cancel())
+    if permits.availablePermits() != 4 then println(s"round $round permits ${permits.availablePermits()}")
+    if meet.waiting() != 0 then println(s"round $round barrier ${meet.waiting()}")
+    value.write(b ->
+      b(0) = b(0) + 1
+      b(1) = b(1) + 1)
+    if value.read(b -> b(0) != b(1)) then torn.add(1)
+  println(s"torn ${torn.load()} permits ${permits.availablePermits()} barrier ${meet.waiting()}")

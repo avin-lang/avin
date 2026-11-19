@@ -1,0 +1,544 @@
+module avin.threads
+
+import avin.time.{Duration, micros, monotonic}
+
+// The time a wait with no deadline waits until.
+private val forever: long = long.MaxValue
+
+// Why a pool lent no resource: no resource came free before the time to wait ran out, the queue of
+// calls waiting was full, the pool is closed, or making a new resource failed with the error the
+// pool's `create` answered. A pool whose
+// `create` fails with an `Error` fails with an `Error` too, which shows as
+// `cannot create a pooled resource: connection refused` and has that failure as its `cause`.
+data PoolError[+E]
+  // No resource came free before the time to wait ran out.
+  AcquireTimedOut
+  // Every resource was lent and `maxWaiting` calls were already waiting, so the call failed at once
+  // instead of joining them.
+  QueueFull
+  // The pool is closed, or was closed while the call waited.
+  PoolClosed
+  // The pool's `create` failed with `error`.
+  CreateFailed(error: E)
+
+impl[E: Error] Error for PoolError[E]
+  message -> string = poolErrorMessage(self)
+
+  cause -> Option[Error] = self match
+    CreateFailed(e) -> Some(e)
+    _ -> None
+
+// A pool's failure whose `create` fails with any error that has a `Display`, shown as an `Error` is:
+// the sentence, then `: ` and the error `create` answered.
+impl[E: Display] Display for PoolError[E]
+  display(out: Writer, spec: FormatSpec) = self match
+    CreateFailed(e) -> out.writeField(s"${poolErrorMessage(self)}: $e", spec)
+    _ -> out.writeField(poolErrorMessage(self), spec)
+
+private poolErrorMessage[E](e: PoolError[E]) -> string = e match
+  AcquireTimedOut -> "timed out waiting for a pooled resource"
+  QueueFull -> "too many calls are waiting for a pooled resource"
+  PoolClosed -> "the pool is closed"
+  CreateFailed(_) -> "cannot create a pooled resource"
+
+// What a pool holds at one moment: `size` resources in all, made or being made, of which `idle` wait
+// to be lent and `lent` are lent now, and `waiting` calls waiting for one. Those neither idle nor lent
+// are being made or checked.
+data PoolStats(size: int, idle: int, lent: int, waiting: int)
+
+// What a pool has done since it was made, each a running total: `acquires` calls lent a resource, of
+// which `waited` first waited for one to come back, all of them together taking `waitTime` from the
+// call to the lending, making or checking a resource included; `timeouts` calls whose time ran out,
+// `rejected` calls that found the queue full; and `created` resources made and `destroyed` let go.
+data PoolCounters(
+    acquires: long,
+    waited: long,
+    waitTime: Duration,
+    timeouts: long,
+    rejected: long,
+    created: long,
+    destroyed: long
+)
+
+// A resource lent for the body of `lease`. `markBroken` says the resource is no good any more, a
+// connection that has failed for one: the pool destroys it when the body returns instead of lending
+// it again. The lease, and the resource, belong to the body: neither is used after it returns.
+class Lease[T](val resource: T)
+  private var broken = false
+
+  // Marks the resource broken, so that the pool destroys it once the body returns.
+  markBroken() = broken = true
+
+  // Whether the body has marked the resource broken.
+  isBroken -> bool = broken
+
+// Resources that are costly to make, connections to a database or a server for one, made once and
+// lent again and again. `use(f)` lends one for the call of `f` and takes it back when `f` returns:
+//
+//     val db = Pool(() -> connect(address), maxSize = 8)
+//     val rows = db.use(c -> c.query("select 1"))?
+//
+// A pool makes a resource with `create` when one is asked for and none is idle, and holds at most
+// `maxSize` resources at once; a call that finds them all lent waits for one to come back, and the
+// calls waiting are served in the order they came, a resource given back going straight to the first
+// of them. `validate`, where it is given, checks an idle resource before it is lent again, and one it
+// answers `false` for is destroyed and another found; `destroy`, where it is given, is how a
+// resource is let go. A resource idle for longer than `idleTimeout` is destroyed when the pool is next
+// used or `evictIdle` is called, keeping at least `minIdle` resources; one older than `maxLifetime`
+// is destroyed instead of being lent or kept, however many that leaves, and `warm` makes resources
+// until the pool holds `minIdle` again. `jitter` lengthens each resource's two limits by its own
+// random part of it, drawn when it is made, so resources made together do not all expire together.
+// A call waits for a resource for at most `acquireTimeout`, or for ever where none is given, and
+// `use(timeout, f)` sets the time for one call; where `maxWaiting` calls already wait, a call that
+// would wait fails at once with `QueueFull`.
+//
+// A resource is lent for the whole call, and comes back however the call ends: when `f` returns,
+// and when the thread running it is cancelled, inside `f` or while it waits. A trap inside `f`, or
+// inside `create`, `validate` or `destroy`, stops the program, even in an actor, since what the pool
+// counts would otherwise never come right. A call that fails answers a `PoolError`: the time ran
+// out, the pool is closed, or `create` failed, whose error it carries.
+//
+// `close` ends the pool: the calls waiting fail with `PoolClosed`, the idle resources are destroyed,
+// and it waits for the lent ones to come back, destroying each as it does.
+//
+// A pool of resources of any type may be shared between threads and actors, as a `Mutex` may: a
+// resource is reached by one call at a time, and by nothing outside the pool. So that nothing else
+// reaches it, `create`, `validate` and `destroy` are `@sendable`, and a body is `@isolating` and gives
+// back only a sendable value, so a mutable connection is pooled as it is. Every resource lent is
+// given to the code that borrows it: the Sysl handles it reaches go with it to the thread or actor
+// that uses it next.
+@trusted_sendable(
+  "every field but its lock and its settings is read and written only while its lock is held; its resources are made by `@sendable` functions and lent to one `@isolating` body at a time"
+)
+@keeps_owners
+class Pool[T, E](
+    private val create: @sendable () -> Result[T, E],
+    val maxSize: int,
+    val minIdle: int = 0,
+    private val validate: Option[@sendable (T) -> bool] = None,
+    private val destroy: Option[@sendable (T) -> unit] = None,
+    val idleTimeout: Option[Duration] = None,
+    val acquireTimeout: Option[Duration] = None,
+    val maxLifetime: Option[Duration] = None,
+    val jitter: Option[Duration] = None,
+    val maxWaiting: Option[int] = None
+): Sendable
+  private val checkedLimits = poolLimits(maxSize, minIdle, maxWaiting)
+  private val lock = Lock()
+  private val drained = Condition(lock)
+  private val idle = Deque[Entry[T]]()
+  private val waiters = Deque[Waiter[T]]()
+  // Every resource the pool holds, idle, lent, or being made or checked.
+  private var size = 0
+  private var lent = 0
+  private var closed = false
+  // The state of the generator each resource's part of `jitter` is drawn from.
+  private var draws: long = monotonicMillis()
+  // The running totals `counters` answers; `destroyed` is counted where the lock is not held.
+  private var acquires: long = 0
+  private var waited: long = 0
+  private var waitMicros: long = 0
+  private var timeouts: long = 0
+  private var rejected: long = 0
+  private var created: long = 0
+  private val destroyed = Atomic[long](0)
+
+  // Runs `f` with a resource lent to it, and answers what it returns, waiting for a resource for at
+  // most `acquireTimeout`.
+  use[R: Sendable](@isolating f: (T) -> R) -> Result[R, PoolError[E]] = lend(
+    deadlineOf(acquireTimeout),
+    l -> f(l.resource)
+  )
+
+  // `use(f)`, waiting for a resource for at most `timeout`; a time that is not positive takes one
+  // only where it is there now, idle or made at once.
+  use[R: Sendable](timeout: Duration, @isolating f: (T) -> R) -> Result[R, PoolError[E]] = lend(
+    deadlineAfter(timeout),
+    l -> f(l.resource)
+  )
+
+  // `use(f)` with the resource as a `Lease`, which the body may mark broken.
+  lease[R: Sendable](@isolating f: (Lease[T]) -> R) -> Result[R, PoolError[E]] = lend(deadlineOf(acquireTimeout), f)
+
+  // `lease(f)`, waiting for a resource for at most `timeout`.
+  lease[R: Sendable](
+      timeout: Duration,
+      @isolating f: (Lease[T]) -> R
+  ) -> Result[R, PoolError[E]] = lend(deadlineAfter(timeout), f)
+
+  // Makes resources until the pool holds `minIdle`, each idle once made, and answers the first
+  // failure of `create`, or `PoolClosed` where the pool is closed.
+  warm() -> Result[unit, PoolError[E]] = guarded(t ->
+    lock.acquire()
+    while !closed && size < minIdle && waiters.isEmpty
+      size += 1
+      t.reserved = true
+      made(t) match
+        Ok(r) ->
+          lent -= 1
+          handOn(r)
+        Err(e) -> return Err(e)
+    val shut = closed
+    lock.release()
+    if shut then Err(PoolClosed) else Ok(()))
+
+  // Destroys every idle resource older than `maxLifetime`, and every one idle for longer than
+  // `idleTimeout`, oldest first, keeping at least `minIdle` of those, and answers how many it destroyed.
+  evictIdle() -> int
+    lock.acquire()
+    val doomed = expired()
+    destroyAll(doomed)
+    doomed.length
+
+  // Ends the pool: every call waiting fails with `PoolClosed`, as does every call after, the idle
+  // resources are destroyed, and `close` waits for the lent ones to come back, each destroyed as it
+  // does. Closing a closed pool waits for the same. A thread that closes a pool while a resource is
+  // lent to it waits for ever.
+  close()
+    lock.acquire()
+    closed = true
+    for w in waiters do conditionNotify(w.condition)
+    waiters.clear()
+    var doomed: List[Entry[T]] = []
+    while !idle.isEmpty
+      doomed = idle.removeHead() :: doomed
+      size -= 1
+    if size == 0 then drained.notifyAll()
+    destroyAll(doomed)
+    lock.acquire()
+    while size > 0 do drained.wait()
+    lock.release()
+
+  // Whether the pool has been closed.
+  isClosed() -> bool
+    lock.acquire()
+    val c = closed
+    lock.release()
+    c
+
+  // What the pool holds now, which other threads may change at once.
+  stats() -> PoolStats
+    lock.acquire()
+    val s = PoolStats(size, idle.length, lent, waiters.length)
+    lock.release()
+    s
+
+  // What the pool has done since it was made, which other threads may change at once.
+  counters() -> PoolCounters
+    lock.acquire()
+    val c = PoolCounters(acquires, waited, micros(waitMicros), timeouts, rejected, created, destroyed.load())
+    lock.release()
+    c
+
+  // Lends a resource to `f` until `deadline` on the monotonic clock in milliseconds, and takes it
+  // back when `f` returns or its thread is cancelled inside it.
+  private lend[R: Sendable](deadline: long, @isolating f: (Lease[T]) -> R) -> Result[R, PoolError[E]] = guarded(t ->
+    val began = monotonic().micros
+    obtain(t, deadline) match
+      Ok(e) ->
+        acquires += 1
+        if t.queued then waited += 1
+        waitMicros = waitMicros +| (monotonic().micros - began)
+        val l = Lease(e.resource)
+        lock.releaseHolding()
+        Ok(holding(() -> f(l), () -> giveBack(e, l.isBroken), true))
+      Err(e) -> Err(e))
+
+  // Runs `body` with a ticket recording what the call holds of the pool, so that a cancellation of the
+  // thread anywhere in it, outside the lock, puts back what the ticket holds as it stops: a deferred
+  // statement, which only a call that did not return finds unfinished.
+  private guarded[X](body: (Ticket[T, E]) -> X) -> X
+    val t = Ticket[T, E]()
+    var finished = false
+    defer if !finished then settle(t)
+    val v = body(t)
+    finished = true
+    v
+
+  // A resource for the call `t` until `deadline`: `Ok` with the lock held and the resource counted as
+  // lent, or the failure with the lock let go.
+  private obtain(t: Ticket[T, E], deadline: long) -> Result[Entry[T], PoolError[E]]
+    lock.acquire()
+    if !closed
+      val doomed = expired()
+      if !doomed.isEmpty
+        destroyAll(doomed)
+        lock.acquire()
+    while true
+      if t.waiter is Some(w)
+        if w.given is Some(r)
+          t.waiter = None
+          w.given = None
+          t.held = Some(r)
+          if checked(t, r) is Some(out) then return out
+        elif w.permit
+          t.waiter = None
+          t.reserved = true
+          return made(t)
+        elif closed
+          t.waiter = None
+          lock.release()
+          return Err(PoolClosed)
+        else
+          val left = deadline - monotonicMillis()
+          if left <= 0
+            withdraw(w)
+            t.waiter = None
+            timeouts += 1
+            lock.release()
+            return Err(AcquireTimedOut)
+          if deadline == forever then lock.await(w.condition) else _ = lock.awaitFor(w.condition, left)
+      elif closed
+        lock.release()
+        return Err(PoolClosed)
+      elif waiters.isEmpty && !idle.isEmpty
+        val r = idle.removeLast()
+        t.held = Some(r)
+        if checked(t, r) is Some(out) then return out
+      elif waiters.isEmpty && size < maxSize
+        size += 1
+        t.reserved = true
+        return made(t)
+      elif deadline <= monotonicMillis()
+        timeouts += 1
+        lock.release()
+        return Err(AcquireTimedOut)
+      elif !t.queued && maxWaiting is Some(m) && waiters.length >= m
+        rejected += 1
+        lock.release()
+        return Err(QueueFull)
+      else
+        val w = Waiter[T]()
+        waiters.append(w)
+        t.waiter = Some(w)
+        t.queued = true
+    fail("a pool's wait ends only by returning")
+
+  // Checks `r`, which the call `t` holds and the pool counts, before it is lent, under the lock: `Some`
+  // of the outcome, `Ok` with the lock held and `r` counted as lent, or a failure with the lock let
+  // go; or `None`, with the lock held, where `r` failed its check, or had outlived `maxLifetime`, and
+  // was destroyed.
+  private checked(t: Ticket[T, E], r: Entry[T]) -> Option[Result[Entry[T], PoolError[E]]]
+    if !closed && outlived(r, monotonicMillis())
+      t.held = None
+      shrink()
+      destroyAll([r])
+      lock.acquire()
+      return None
+    if !closed && validate is Some(v)
+      t.valid = false
+      outside(() -> t.valid = v(r.resource), true)
+      lock.acquire()
+    t.held = None
+    if closed
+      shrink()
+      destroyAll([r])
+      return Some(Err(PoolClosed))
+    if validate.isDefined && !t.valid
+      shrink()
+      destroyAll([r])
+      lock.acquire()
+      return None
+    lent += 1
+    Some(Ok(r))
+
+  // Makes a resource for the call `t`, which holds a place in the pool for it, under the lock: `Ok`
+  // with the lock held and the resource counted as lent, or the failure with the lock let go and the
+  // place given up.
+  private made(t: Ticket[T, E]) -> Result[Entry[T], PoolError[E]]
+    outside(() -> t.made = Some(create()), true)
+    lock.acquire()
+    val m = t.made
+    t.made = None
+    t.reserved = false
+    m match
+      Some(Ok(made)) ->
+        val r = entryOf(made)
+        if closed
+          shrink()
+          destroyAll([r])
+          return Err(PoolClosed)
+        lent += 1
+        Ok(r)
+      Some(Err(e)) ->
+        shrink()
+        lock.release()
+        Err(CreateFailed(e))
+      None -> fail("a pool's create left no result")
+
+  // Takes back `r`, lent until now, destroying it where it is broken, has outlived `maxLifetime` or
+  // the pool is closed; with the lock let go.
+  private giveBack(r: Entry[T], broken: bool)
+    lock.acquire()
+    lent -= 1
+    if broken || closed || outlived(r, monotonicMillis())
+      shrink()
+      lock.release()
+      destroyOne(r)
+      return
+    handOn(r)
+    lock.release()
+
+  // Gives `r`, which the pool counts, to the first call waiting, or keeps it idle where none is;
+  // under the lock. Its handles are given up for the code that uses it next.
+  private handOn(r: Entry[T])
+    handOver(r.resource, currentOwner(), inTransit)
+    if waiters.isEmpty
+      r.since = monotonicMillis()
+      idle.append(r)
+      return
+    val w = waiters.removeHead()
+    w.given = Some(r)
+    conditionNotify(w.condition)
+
+  // Gives up a place in the pool, under the lock: to the first call waiting, which may then make a
+  // resource, where the pool is open; once it is closed, the last place given up ends `close`.
+  private shrink()
+    size -= 1
+    if closed
+      if size == 0 then drained.notifyAll()
+      return
+    if waiters.isEmpty then return
+    val w = waiters.removeHead()
+    size += 1
+    w.permit = true
+    conditionNotify(w.condition)
+
+  // The idle resources that have outlived `maxLifetime`, and those past their `idleTimeout`, oldest
+  // first, so that at least `minIdle` of those stay, taken off the pool; under the lock.
+  private expired() -> List[Entry[T]]
+    var doomed: List[Entry[T]] = []
+    if idleTimeout.isEmpty && maxLifetime.isEmpty then return doomed
+    val now = monotonicMillis()
+    idle.filterInPlace(r ->
+      val gone = outlived(r, now) || size > minIdle && idledOut(r, now)
+      if gone
+        doomed = r :: doomed
+        shrink()
+      !gone)
+    doomed
+
+  // Whether `r` has lived longer than `maxLifetime` and its part of `jitter`, at `now`.
+  private outlived(r: Entry[T], now: long) -> bool = maxLifetime match
+    Some(d) -> now - r.born >= waitMillis(d) +| r.slack
+    None -> false
+
+  // Whether `r` has been idle longer than `idleTimeout` and its part of `jitter`, at `now`.
+  private idledOut(r: Entry[T], now: long) -> bool = idleTimeout match
+    Some(d) -> now - r.since >= waitMillis(d) +| r.slack
+    None -> false
+
+  // A resource just made, as the pool keeps it: born now, with its own part of `jitter`; under the
+  // lock.
+  private entryOf(r: T) -> Entry[T]
+    created += 1
+    val now = monotonicMillis()
+    val slack = jitter match
+      Some(j) if waitMillis(j) > 0 -> drawBelow(waitMillis(j))
+      _ -> long(0)
+    Entry(r, now, slack, now)
+
+  // A number from 0 up to but not including `bound`, from the pool's own generator (SplitMix64);
+  // under the lock.
+  private drawBelow(bound: long) -> long
+    draws = draws +% -7046029254386353131
+    var z = draws
+    z = (z ^ unsignedShift(z, 30)) *% -4658895280553007687
+    z = (z ^ unsignedShift(z, 27)) *% -7723592293110705685
+    z = z ^ unsignedShift(z, 31)
+    val m = z % bound
+    if m < 0 then m + bound else m
+
+  // Takes `w` off the calls waiting; under the lock.
+  private withdraw(w: Waiter[T]) = waiters.filterInPlace(q -> q !== w)
+
+  // Destroys `doomed`, which the pool no longer counts, with the lock let go; nothing stops the thread
+  // while it does.
+  private destroyAll(doomed: List[Entry[T]]) = outside(() -> for r in doomed do destroyOne(r), false)
+
+  private destroyOne(r: Entry[T])
+    _ = destroyed.add(1)
+    if destroy is Some(d) then d(r.resource)
+
+  // Lets the lock go and runs `body`, which a cancellation of the thread may stop where `cancellable`;
+  // a trap inside it stops the program, since the pool's counts would otherwise be left in doubt.
+  // Returns with the lock let go, and goes on with a cancellation that stopped `body`.
+  private outside(body: () -> unit, cancellable: bool)
+    lock.releaseHolding()
+    if cancelGuardedHeld(body, () -> (), cancellable) then resumeCancel()
+
+  // Puts back what the call `t` held of the pool when its thread was cancelled: its place among the
+  // calls waiting, what was handed to it there, the place it held to make a resource, or the resource
+  // it made or was checking. A resource whose check was stopped goes back as one given back does: it
+  // is checked again before it is next lent, so a check cut off part way never destroys a good one.
+  private settle(t: Ticket[T, E])
+    lock.acquire()
+    var doomed: List[Entry[T]] = []
+    if t.waiter is Some(w)
+      if w.given is Some(r)
+        if closed
+          shrink()
+          doomed = r :: doomed
+        else handOn(r)
+      elif w.permit then shrink()
+      else withdraw(w)
+      t.waiter = None
+    if t.reserved
+      t.made match
+        Some(Ok(made)) ->
+          val r = entryOf(made)
+          if closed
+            shrink()
+            doomed = r :: doomed
+          else handOn(r)
+        _ -> shrink()
+      t.reserved = false
+      t.made = None
+    if t.held is Some(r)
+      if closed || outlived(r, monotonicMillis())
+        shrink()
+        doomed = r :: doomed
+      else handOn(r)
+      t.held = None
+    lock.release()
+    for r in doomed do destroyOne(r)
+
+// A resource the pool holds, with when it was made and when it was last given back, on the monotonic
+// clock in milliseconds, and the milliseconds its part of the pool's `jitter` adds to its limits.
+private class Entry[T](val resource: T, val born: long, val slack: long, var since: long)
+
+// A call waiting for a resource, on a condition of its own: what the pool handed it, a resource or a
+// place to make one in; all of it read and written under the pool's lock.
+private class Waiter[T]()
+  val condition: Any = conditionNewKind(PlainWait)
+  var given: Option[Entry[T]] = None
+  var permit = false
+
+// What one call holds of a pool, for putting back where the call's thread is cancelled: its place among
+// the calls waiting, a place held to make a resource and what making it answered, and a resource taken
+// to be checked and what the check answered; and whether it has ever joined the calls waiting.
+private class Ticket[T, E]()
+  var waiter: Option[Waiter[T]] = None
+  var queued = false
+  var reserved = false
+  var made: Option[Result[T, E]] = None
+  var held: Option[Entry[T]] = None
+  var valid = false
+
+// The monotonic time in milliseconds a wait of at most `timeout` ends at, `forever` for none.
+private deadlineOf(timeout: Option[Duration]) -> long = timeout match
+  Some(d) -> deadlineAfter(d)
+  None -> forever
+
+private deadlineAfter(timeout: Duration) -> long = monotonicMillis() +| waitMillis(timeout)
+
+// A pool's limits, checked: a size of at least one, a number kept idle between none and the size,
+// and a number of calls waiting of at least none.
+private poolLimits(maxSize: int, minIdle: int, maxWaiting: Option[int]) -> int
+  if maxSize < 1 then fail("a pool's maxSize is at least one")
+  if !(0 <= minIdle <= maxSize) then fail("a pool's minIdle is between 0 and its maxSize")
+  if maxWaiting is Some(m) && m < 0 then fail("a pool's maxWaiting is at least zero")
+  maxSize
+
+// `x` shifted right by `k` bits with zeros coming in at the top, for `k` from 1 to 63.
+private unsignedShift(x: long, k: long) -> long = (x >> k) & ((long(1) << (64 - k)) -% 1)

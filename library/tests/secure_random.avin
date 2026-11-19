@@ -1,0 +1,94 @@
+// `avin.random.SecureRandom`: byte counts across the operating system's 256-byte request limit,
+// draws that do not repeat, tokens of the right length and alphabet, every bounded draw inside its
+// bounds at the extremes of `int` and `long`, and the collection draws.
+import avin.random.SecureRandom
+import avin.encoding.{fromHex, fromBase64Url}
+import avin.threads.{Atomic, scope}
+
+@test("nextBytes gives exactly the count asked, empty and past the 256-byte request limit included")
+secureByteCounts()
+  for n in [0, 1, 2, 31, 32, 255, 256, 257, 512, 1000, 4097]
+    assertEq(SecureRandom.nextBytes(n).length, n)
+
+@test("random bytes do not repeat and are not all one value")
+secureBytesDiffer()
+  val a = SecureRandom.nextBytes(32).toVector
+  val b = SecureRandom.nextBytes(32).toVector
+  assert(a != b)
+  val big = SecureRandom.nextBytes(4096)
+  val seen = Array.fill(256, false)
+  for x in big do seen(int(x)) = true
+  var distinct = 0
+  for s in seen do if s then distinct += 1
+  assert(distinct > 200)
+  val draws = Vector.tabulate(100, i -> SecureRandom.nextLong()).toSet
+  assertEq(draws.size, 100)
+
+@test("tokens are 32 bytes unless asked, as lower-case hexadecimal or unpadded base64url")
+secureTokens()
+  val hex = SecureRandom.hexToken()
+  assertEq(hex.byteLength, 64)
+  assert(hex.forall(c -> '0' <= c <= '9' || 'a' <= c <= 'f'))
+  assertEq(fromHex(hex).map(b -> b.length), Ok(32))
+  val url = SecureRandom.urlToken()
+  assertEq(url.byteLength, 43)
+  assert(url.forall(c -> 'A' <= c <= 'Z' || 'a' <= c <= 'z' || '0' <= c <= '9' || c == '-' || c == '_'))
+  assertEq(fromBase64Url(url).map(b -> b.length), Ok(32))
+  assertEq(SecureRandom.hexToken(4).byteLength, 8)
+  assertEq(SecureRandom.urlToken(16).byteLength, 22)
+  assertEq(SecureRandom.hexToken(0), "")
+  assertEq(SecureRandom.urlToken(0), "")
+  assert(SecureRandom.urlToken() != SecureRandom.urlToken())
+  assert(SecureRandom.hexToken() != SecureRandom.hexToken())
+
+@test("bounded draws stay inside their bounds, at one, at the extremes of int and long, and across zero")
+secureBounds()
+  for i in 0 ..< 200
+    assert(0 <= SecureRandom.nextInt(10) < 10)
+    assert(0 <= SecureRandom.nextLong(long(1) << 40) < (long(1) << 40))
+    assert(-5 <= SecureRandom.between(-5, 5) < 5)
+    assert(0.0 <= SecureRandom.nextReal() < 1.0)
+    assert(0 <= SecureRandom.nextInt(int.MaxValue) < int.MaxValue)
+    assert(int.MinValue <= SecureRandom.between(int.MinValue, int.MaxValue) < int.MaxValue)
+    assert(long.MinValue <= SecureRandom.between(long.MinValue, long.MaxValue) < long.MaxValue)
+    assert(0 <= SecureRandom.nextLong(long.MaxValue))
+  assertEq(SecureRandom.nextInt(1), 0)
+  assertEq(SecureRandom.nextLong(1), 0)
+  assertEq(SecureRandom.between(7, 8), 7)
+  assertEq(SecureRandom.between(long.MaxValue - 1, long.MaxValue), long.MaxValue - 1)
+  assertEq(SecureRandom.between(int.MinValue, int.MinValue + 1), int.MinValue)
+
+@test("every value of a small range is reached, and booleans take both values")
+secureCoverage()
+  val hits = Array.fill(6, 0)
+  for i in 0 ..< 600 do hits(SecureRandom.between(1, 7) - 1) += 1
+  for h in hits do assert(h > 0)
+  var trues = 0
+  for i in 0 ..< 200 do if SecureRandom.nextBoolean() then trues += 1
+  assert(0 < trues < 200)
+  var negative = false
+  for i in 0 ..< 64 do if SecureRandom.nextInt() < 0 then negative = true
+  assert(negative)
+
+@test("choose, shuffle and alphanumeric draw from what they are given")
+secureCollections()
+  val items = ["a", "b", "c"]
+  for i in 0 ..< 50 do assert(items.contains(SecureRandom.choose(items)))
+  assertEq(SecureRandom.choose(["only"]), "only")
+  assertEq(SecureRandom.shuffle([5, 3, 1, 4, 2]).sorted, [1, 2, 3, 4, 5])
+  assertEq(SecureRandom.shuffle(Vector[int]()), Vector[int]())
+  assertEq(SecureRandom.shuffle(["x"]), ["x"])
+  val letters = SecureRandom.alphanumeric().take(200).toVector
+  assertEq(letters.length, 200)
+  assert(letters.forall(c -> 'A' <= c <= 'Z' || 'a' <= c <= 'z' || '0' <= c <= '9'))
+
+@test("SecureRandom may be called from several threads at once")
+secureThreads()
+  val bad = Atomic(0)
+  scope(s ->
+    for t in 0 ..< 4
+      s.spawn(() ->
+        for i in 0 ..< 500
+          if SecureRandom.nextBytes(16).length != 16 || !(0 <= SecureRandom.nextInt(3) < 3) then bad.add(1)
+        ()))
+  assertEq(bad.load(), 0)

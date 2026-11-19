@@ -1,0 +1,89 @@
+// expect: exit 0
+// The end of a connection is readable, so a select waiting on it wakes and its read answers the end:
+// the peer finishing sending (the read answers no bytes), the peer resetting the connection by
+// closing with bytes it never read (the read fails, or answers no bytes where the platform reports
+// the reset as an end), and the connection closed by its own side (the read fails as closed, and
+// there is no descriptor left to watch). A Unix connection's arm waits as a TCP one's does. A select
+// woken by an end after waiting, from `main` and from a lightweight thread, leaves nothing on the
+// poller.
+import avin.fs
+import avin.io.IoError
+import avin.net.{ByteStream, TcpListener, TcpStream, UnixListener, UnixStream}
+import avin.threads.{Channel, sleep, spawn}
+import avin.time.{millis, seconds}
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Waits for `s` to be readable, at most five seconds, and says what its read then answers.
+ending(s: ByteStream) -> string = select
+  s.readable() -> s.read(64) match
+    Ok(b) if b.length == 0 -> "ended"
+    Ok(b) -> string.fromUtf8Lossy(b)
+    Err(_) -> "failed"
+  after seconds(5) -> "timed out"
+
+pair() -> (TcpStream, TcpStream)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val c = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val s = ok(l.accept())
+  _ = l.close()
+  (c, s)
+
+// Runs `f` on a thread of its own after a short pause, so the select has begun to wait.
+later(@sendable f: () -> unit) = spawn(() ->
+  sleep(millis(20))
+  f())
+
+run(where: string, dir: string)
+  // The peer finishes sending: a byte first, then the end.
+  val (c, s) = pair()
+  val finishing = later(() ->
+    ok(s.writeText("x"))
+    ok(s.shutdownOutput()))
+  println(where, ending(c), ending(c))
+  finishing.join()
+  _ = s.close()
+  _ = c.close()
+
+  // The peer resets: it closes with bytes it never read.
+  val (c2, s2) = pair()
+  ok(c2.writeText("never read"))
+  sleep(millis(20))
+  val resetting = later(() -> ok(s2.close()))
+  val reset = ending(c2)
+  println(where, reset == "failed" || reset == "ended")
+  resetting.join()
+  _ = c2.close()
+
+  // Closed by its own side: readable at once, with nothing to watch.
+  val (c3, s3) = pair()
+  ok(c3.close())
+  println(where, c3.readable(), c3.readinessDescriptor(), ending(c3))
+  _ = s3.close()
+
+  // A Unix connection: bytes, then the peer's close.
+  val l = ok(UnixListener.bind(dir + "/" + where))
+  val u = ok(UnixStream.connect(dir + "/" + where))
+  val v = ok(l.accept())
+  println(where, u.readable(), u.readinessDescriptor() >= 0)
+  val unixPeer = later(() ->
+    ok(v.writeText("unix"))
+    sleep(millis(20))
+    ok(v.close()))
+  println(where, ending(u), ending(u))
+  unixPeer.join()
+  ok(u.close())
+  println(where, u.readable(), u.readinessDescriptor(), ending(u))
+  _ = l.close()
+  println(where, socketWaiters())
+
+main()
+  val dir = ok(fs.createTempDir("avsel"))
+  run("main", dir)
+  spawn(() -> run("thread", dir)).join()
+  ok(fs.removeDirAll(dir))

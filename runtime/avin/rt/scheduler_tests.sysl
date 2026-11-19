@@ -267,6 +267,79 @@ blocked_workers_are_replaced()
     assert_eq(blocking.other_first.load(), 1u32)
     assert(releases.load() > before)
 
+// Lightweight threads, one on every worker, whose blocking calls return while a collection holds every
+// thread, and sleepers whose timers make them ready meanwhile.
+private struct HeldByCollector
+    started: Atomic[u32]
+    entered: Atomic[u32]
+    returned: Atomic[u32]
+    done: Atomic[u32]
+    slept: Atomic[u32]
+
+private var held: HeldByCollector = HeldByCollector(Atomic(0), Atomic(0), Atomic(0), Atomic(0), Atomic(0))
+
+// Takes a worker of its own: polls until every blocker has started, so none is still waiting to run
+// once they block, then makes a blocking call that returns when the test says, during a collection.
+private return_during_collection(c: *Context, run: *u8) -> unit
+    val s: *HeldByCollector = ptr_cast(run)
+    _ = s.started.add(1)
+    while s.started.load() < u32(processors())
+        safepoint(c)
+        os_yield()
+    enter_safe(c)
+    _ = s.entered.add(1)
+    while s.returned.load() == 0 do os_yield()
+    leave_safe(c)
+    _ = s.done.add(1)
+
+private sleep_through_collection(c: *Context, run: *u8) -> unit
+    val s: *HeldByCollector = ptr_cast(run)
+    sleep_for(c, 50000)
+    _ = s.slept.add(1)
+
+@test("a worker whose blocking call has returned and that waits for a collection is not replaced, while threads are ready")
+waiting_for_the_collector_is_not_blocking()
+    held.started.store(0)
+    held.entered.store(0)
+    held.returned.store(0)
+    held.done.store(0)
+    held.slept.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    val n = usize(processors())
+    val sleepers = 4usize
+    // The sleepers park first, so the ready queue is empty while the blockers take every worker.
+    for i in 0..<sleepers
+        joints.slots[n + i] = thread_start(me, ptr_cast(&held), LeastStack, ptr_cast(&sleep_through_collection))
+    var ms = 0
+    while timers_pending() < sleepers && ms < 10000
+        sleep(millis(1))
+        ms += 1
+    start_n(me, n, &return_during_collection, ptr_cast(&held))
+    ms = 0
+    while held.entered.load() < u32(n) && ms < 10000
+        sleep(millis(1))
+        ms += 1
+    assert_eq(held.entered.load(), u32(n))
+    // A collection that lasts many ticks: every blocker's call returns at its start, and the sleepers'
+    // timers make them ready while every worker waits for it. The monitor replaces no worker while a
+    // collection holds every thread; once it has finished, the blockers are held back a while longer,
+    // as on a busy system, and the monitor sees their workers still waiting with threads ready.
+    lock_heap(me)
+    assert(stop_others(me))
+    val before = releases.load()
+    held.returned.store(1)
+    sleep(millis(100))
+    resume_others_late(20000)
+    val during = releases.load() - before
+    heap_lock.unlock()
+    join_n(me, n + sleepers)
+    without_joints(me)
+    thread_detach(me)
+    assert_eq(held.done.load(), u32(n))
+    assert_eq(held.slept.load(), u32(sleepers))
+    assert_eq(during, 0u64)
+
 // Threads that spin, polling as compiled code does, until one more thread has run: with more spinners
 // than workers, it runs only if the spinners are made to yield.
 private struct Spinning

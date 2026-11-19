@@ -1,0 +1,467 @@
+module avin.rt
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import sysl.threads.{Thread, spawn}
+import sysl.time.{millis, sleep}
+
+// Standard input read by a lightweight thread while it waits: a pipe stands in for it, and a second
+// thread writes to the pipe only once the reader has parked on the poller for more, counting the
+// shares of the input buffer's storage first. A parked reader has no read in progress, so any share
+// beyond the buffer's own is a view the reader holds across the park; it would let go of it on
+// whichever carrier it resumed on, racing the threads using the buffer there. So the count while it
+// waits must be the count once it has finished.
+
+private extern "pipe" input_test_pipe(fds: *i32) -> int
+private extern "dup" input_test_dup(fd: int) -> int
+private extern "dup2" input_test_dup2(from: int, to: int) -> int
+private extern "close" input_test_close(fd: int) -> int
+private extern "write" input_test_write(fd: int, bytes: *u8, len: usize) -> isize
+
+/** Held by the test using standard input, so two never swap it at once. */
+private var input_test_held: Atomic[u64] = Atomic(0)
+
+/** The most chunks a writing thread writes. */
+private const FeedMost: usize = 4
+
+// What the writing thread does: the first `n` chunks in turn, each `lengths[i]` bytes at `starts[i]`,
+// once the reader has waited a while for it, then the end of the input where `closes`; `most` is the
+// most shares it counted while the reader waited. The chunks are bytes of strings the test holds
+// until the thread has finished, so the thread shares nothing counted.
+private struct Feed
+    fd: int
+    n: usize
+    starts: [4]*u8
+    lengths: [4]usize
+    closes: bool
+    most: Atomic[u64]
+
+private var feed: Feed = Feed(-1, 0, [null; 4], [0; 4], false, Atomic(0))
+
+/** Every one of the `n` bytes at `p` to `fd`. */
+private write_all(fd: int, p: *u8, n: usize)
+    var at: usize = 0
+    while at < n
+        val wrote = input_test_write(fd, &p[at], n - at)
+        assert(wrote > 0)
+        at += usize(wrote)
+
+private bytes_of(s: string) -> *u8 = ptr_cast(&s.bytes[0])
+
+// How many shares the storage of the input buffer has, besides the one this count takes: the count is
+// the first word of the storage a slice's owner word names.
+private input_shares() -> u64
+    var s = input.elems
+    val owner: **u64 = ptr_cast(&s)
+    if owner[0] == null then 0 else owner[0][0] - 1
+
+private note_shares(f: *Feed)
+    // By now the reader is parked, waiting for what comes next.
+    sleep(millis(200))
+    val n = input_shares()
+    if n > f.most.load() then f.most.store(n)
+
+private write_feed(f: *Feed) -> unit
+    for i in 0..<f.n
+        note_shares(f)
+        write_all(f.fd, f.starts[i], f.lengths[i])
+    if f.closes
+        note_shares(f)
+        _ = input_test_close(f.fd)
+
+private forget_input()
+    input = buf()
+    input_at = 0
+    input_done = false
+    input_streams = 0
+
+// The reading thread's joint, in a frame of one slot so a collection while it runs keeps it.
+private struct ReaderJoint
+    frame: Frame
+    slots: [1]*u8
+
+@assert(offsetof(ReaderJoint, slots) == sizeof(Frame), "a frame's slots follow its header")
+
+private var reader_joint: ReaderJoint = ReaderJoint(Frame(null, 1), [null; 1])
+
+/** Raised by a reading thread once every read it made gave what it should, and it ran lightweight. */
+private var reads_ok: Atomic[u32] = Atomic(0)
+
+// Standard input made a pipe holding `first`, with the thread writing `chunks` after it, and the
+// end of the input after them where `closes`; `finish` puts standard input back. The caller holds the
+// chunks until then.
+private struct Piped
+    saved: int
+    me: *Context
+    writer: Thread
+
+// Makes standard input a pipe, the writing end of which `feed.fd` holds, answering the descriptor
+// standard input was, to be put back.
+private pipe_input() -> int
+    while input_test_held.swap(1) != 0 do sleep(millis(1))
+    var ends: [2]i32 = [-1, -1]
+    assert_eq(input_test_pipe(&ends[0]), 0)
+    val saved = input_test_dup(0)
+    assert(saved >= 0)
+    assert(input_test_dup2(int(ends[0]), 0) == 0)
+    _ = input_test_close(int(ends[0]))
+    forget_input()
+    feed.fd = int(ends[1])
+    saved
+
+private piped(first: string, chunks: []const string, closes: bool) -> Piped
+    val saved = pipe_input()
+    write_all(feed.fd, bytes_of(first), first.bytes.len)
+    assert(chunks.len <= FeedMost)
+    feed.n = chunks.len
+    for i in 0..<chunks.len
+        feed.starts[i] = bytes_of(chunks[i])
+        feed.lengths[i] = chunks[i].bytes.len
+    feed.closes = closes
+    feed.most.store(0)
+    reads_ok.store(0)
+    Piped(saved, thread_attach(), spawn(&write_feed, &feed).unwrap())
+
+/** Runs `body` as a lightweight thread reading standard input, then waits for it and the writing
+ * thread, and checks the reads were right and the reader held nothing of the buffer while it waited. */
+private read_lightweight(p: Piped, body: *extern(@lets_out *Context, *u8) -> unit)
+    reader_joint.frame.prev = p.me.top
+    p.me.top = &reader_joint.frame
+    reader_joint.slots[0] = thread_start(p.me, null, LeastStack, ptr_cast(body))
+    thread_join(p.me, reader_joint.slots[0])
+    reader_joint.slots[0] = null
+    p.me.top = reader_joint.frame.prev
+    assert(p.writer.join())
+    assert_eq(reads_ok.load(), 1u32)
+    val idle = input_shares()
+    assert_eq(feed.most.load(), idle)
+    thread_detach(p.me)
+    if !feed.closes then _ = input_test_close(feed.fd)
+    assert(input_test_dup2(p.saved, 0) == 0)
+    _ = input_test_close(p.saved)
+    forget_input()
+    feed.n = 0
+    input_test_held.store(0)
+
+/** Whether the string `p` holds exactly the bytes of `want`. */
+private same(p: *u8, want: string) -> bool
+    val n = text_length(p)
+    if n != want.bytes.len then return false
+    val b = text_bytes(p)
+    for i in 0..<n
+        if b[i] != want.bytes[i] then return false
+    true
+
+/** Raises `reads_ok` where `ok` holds and the reader `c` ran lightweight, so it parked to wait. */
+private reads_were(c: *Context, ok: bool)
+    if ok && runs_lightweight(c) then reads_ok.store(1)
+
+private two_lines(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "first") && same(read_line(c), "second"))
+
+@test("a line that waits for its end holds no share of the input buffer meanwhile, where the buffer already has storage from a line before it")
+line_waits_sharing_nothing()
+    read_lightweight(piped("first\n", ["second\n"], false), &two_lines)
+
+private half_and_half(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "x") && same(read_line(c), "half and half"))
+
+@test("a line part of which has arrived waits for the rest holding no share, and is whole when it ends")
+line_part_waits_sharing_nothing()
+    read_lightweight(piped("x\nhalf", [" and half\n"], false), &half_and_half)
+
+private three_a(c: *Context, run: *u8) -> unit
+    val a = "a".repeat(40000)
+    reads_were(c, same(read_line(c), "x") && same(read_line(c), a + a + a))
+
+@test("a line longer than one read gathers over several waits, holding no share during any of them")
+long_line_waits_sharing_nothing()
+    val a = "a".repeat(40000)
+    val ended = a + "\n"
+    read_lightweight(piped("x\n", [a, a, ended], false), &three_a)
+
+private split_crlf(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "x") && same(read_line(c), "split") && same(read_line(c), "next"))
+
+@test("a \\r\\n split between two reads ends the line, the \\r going with the terminator")
+crlf_split_waits_sharing_nothing()
+    read_lightweight(piped("x\r\nsplit\r", ["\nnext\r\n"], false), &split_crlf)
+
+private unterminated(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "x") && same(read_line(c), "last") && input_ended(c))
+
+@test("a last line with no terminator ends with the input, after a wait that holds no share")
+last_line_waits_sharing_nothing()
+    read_lightweight(piped("x\nlast", [], true), &unterminated)
+
+private two_chars(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "x") && read_char(c) == 'a' && read_char(c) == 'b')
+
+@test("a character read with fewer than four bytes buffered waits for more, holding no share of the input buffer meanwhile")
+char_waits_sharing_nothing()
+    read_lightweight(piped("x\nab", ["cd"], true), &two_chars)
+
+private late_chars(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "x") && read_char(c) == 'é' && read_char(c) == 'z' && input_ended(c))
+
+@test("a character whose bytes all come after a wait is decoded whole, holding no share meanwhile")
+char_after_wait_sharing_nothing()
+    read_lightweight(piped("x\n", ["é", "z"], true), &late_chars)
+
+private line_then_rest(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "one") && same(read_rest(c), "two\r\nthree") && input_ended(c))
+
+@test("the rest of the input gathers over several waits, holding no share during any of them")
+rest_waits_sharing_nothing()
+    read_lightweight(piped("one\ntw", ["o\r\n", "three"], true), &line_then_rest)
+
+private ended_after_wait(c: *Context, run: *u8) -> unit
+    reads_were(c, same(read_line(c), "x") && !input_ended(c) && same(read_line(c), "y") && input_ended(c))
+
+@test("whether the input has ended waits for a read, holding no share meanwhile")
+ended_waits_sharing_nothing()
+    read_lightweight(piped("x\n", ["y"], true), &ended_after_wait)
+
+// Standard input read by several lightweight threads at once, each read holding the input as the
+// library's reads do: the lines `line_text` makes, written to the pipe in four pieces that each end
+// inside a line, so readers park part way through a line while others wait their turn. Every byte
+// written must be taken by exactly one reader, and every line taken by a reader of lines must be whole.
+
+/** How many lines the input of a test of several readers has. */
+private const ManyLines: usize = 3000
+
+/** The most threads a test of several readers starts. */
+private const ManyReaders: usize = 6
+
+/** The input of a test of several readers, held until its writing thread has finished. */
+private var many_text: Buf[u8] = buf()
+
+/** How many times each line was taken, by its number. */
+private var seen: [3000]Atomic[u32] = [Atomic(0); 3000]
+
+/** How many lines taken were not a line written: part of one, two run together, or garbled. */
+private var torn: Atomic[u32] = Atomic(0)
+
+/** How many lines a reader alone took in the order they were written. */
+private var in_order: Atomic[u32] = Atomic(0)
+
+/** How many readers ran lightweight. */
+private var lightweight_readers: Atomic[u32] = Atomic(0)
+
+/** How many times each byte value was taken, by any reader. */
+private var taken: [256]Atomic[u32] = [Atomic(0); 256]
+
+/** Line `i` of the input, without its terminator: a number to tell it by, a length that varies, and
+ * now and then a character of two bytes. */
+private line_text(i: usize) -> string = "line-" + i.to_string() + "-" + "x".repeat(i % 50) + (if i % 7 == 0 then "é" else "")
+
+/** Makes `many_text` the lines `line_text` makes, each ended by `\r\n` where `crlf` and `i` is a
+ * multiple of three, and by `\n` otherwise. */
+private make_many_text(crlf: bool)
+    many_text = buf()
+    for i in 0..<ManyLines
+        val line = line_text(i)
+        for j in 0..<line.bytes.len
+            many_text.push(line.bytes[j])
+        if crlf && i % 3 == 0 then many_text.push(13)
+        many_text.push(10)
+
+/** Clears every count a test of several readers keeps. */
+private clear_counts()
+    for i in 0..<ManyLines
+        seen[i].store(0)
+    for b in 0..<256
+        taken[b].store(0)
+    torn.store(0)
+    in_order.store(0)
+    lightweight_readers.store(0)
+
+/** Standard input made a pipe that the writing thread fills with `many_text` in four pieces, each
+ * ending inside a line, then ends. */
+private piped_many() -> Piped
+    val saved = pipe_input()
+    val n = many_text.len()
+    var from: usize = 0
+    for i in 0..<FeedMost
+        val to = if i + 1 == FeedMost then n else n * (i + 1) / FeedMost + 3
+        feed.starts[i] = ptr_cast(&many_text.view_mut()[from])
+        feed.lengths[i] = to - from
+        from = to
+    feed.n = FeedMost
+    feed.closes = true
+    feed.most.store(0)
+    clear_counts()
+    Piped(saved, thread_attach(), spawn(&write_feed, &feed).unwrap())
+
+// The reading threads' joints, in a frame of their slots so a collection while they run keeps them.
+private struct ManyJoints
+    frame: Frame
+    slots: [6]*u8
+
+@assert(offsetof(ManyJoints, slots) == sizeof(Frame), "a frame's slots follow its header")
+
+private var many_joints: ManyJoints = ManyJoints(Frame(null, 6), [null; 6])
+
+/** Runs each of `bodies` as a lightweight thread reading standard input at once, then waits for them
+ * and the writing thread, and puts standard input back. */
+private read_at_once(p: Piped, bodies: []const *extern(@lets_out *Context, *u8) -> unit)
+    assert(bodies.len <= ManyReaders)
+    many_joints.frame.prev = p.me.top
+    p.me.top = &many_joints.frame
+    for i in 0..<bodies.len
+        many_joints.slots[i] = thread_start(p.me, null, LeastStack, ptr_cast(bodies[i]))
+    for i in 0..<bodies.len
+        thread_join(p.me, many_joints.slots[i])
+        many_joints.slots[i] = null
+    p.me.top = many_joints.frame.prev
+    assert(p.writer.join())
+    assert_eq(lightweight_readers.load(), u32(bodies.len))
+    thread_detach(p.me)
+    assert(input_test_dup2(p.saved, 0) == 0)
+    _ = input_test_close(p.saved)
+    forget_input()
+    feed.n = 0
+    input_test_held.store(0)
+
+/** Counts the bytes `b`, `n` of them, as taken. */
+private count_taken(b: *u8, n: usize)
+    for i in 0..<n
+        _ = taken[usize(b[i])].add(1)
+
+/** Counts the line `p` as taken: its number seen once more where it is a line written, and torn
+ * otherwise. Its bytes and the `\n` that ended it are counted as taken where `counting`. */
+private note_line(p: *u8, counting: bool) -> Option[usize]
+    val b = text_bytes(p)
+    val n = text_length(p)
+    if counting
+        count_taken(b, n)
+        _ = taken[10].add(1)
+    var at: usize = 5
+    var k: usize = 0
+    while at < n && u8('0') <= b[at] <= u8('9')
+        k = k * 10 + usize(b[at] - u8('0'))
+        at += 1
+    if at == 5 || k >= ManyLines || !same(p, line_text(k))
+        _ = torn.add(1)
+        return None
+    _ = seen[k].add(1)
+    Some(k)
+
+/** Reads lines until the input ends, each read holding the input as `readLine` does. */
+private lines_until_end(c: *Context, counting: bool)
+    if runs_lightweight(c) then _ = lightweight_readers.add(1)
+    while true
+        input_hold(c)
+        if input_ended(c)
+            input_release(c)
+            return
+        val line = read_line(c)
+        input_release(c)
+        _ = note_line(line, counting)
+
+private take_lines(c: *Context, run: *u8) -> unit
+    lines_until_end(c, false)
+
+private take_lines_counting(c: *Context, run: *u8) -> unit
+    lines_until_end(c, true)
+
+/** Whether every line was taken exactly once, whole. */
+private each_line_once() -> bool
+    if torn.load() != 0 then return false
+    for i in 0..<ManyLines
+        if seen[i].load() != 1 then return false
+    true
+
+@test("lines read by several lightweight threads at once each go whole to exactly one of them")
+lines_read_at_once_go_whole_to_one()
+    make_many_text(false)
+    read_at_once(piped_many(), [&take_lines, &take_lines, &take_lines, &take_lines, &take_lines, &take_lines])
+    assert(each_line_once())
+
+@test("lines ended by \\r\\n read by several threads at once lose the \\r, each line going whole to one")
+crlf_lines_read_at_once_go_whole_to_one()
+    make_many_text(true)
+    read_at_once(piped_many(), [&take_lines, &take_lines, &take_lines, &take_lines])
+    assert(each_line_once())
+
+@test("two threads reading lines at once each take some, and between them every line once")
+two_readers_share_the_lines()
+    make_many_text(false)
+    read_at_once(piped_many(), [&take_lines, &take_lines])
+    assert(each_line_once())
+
+/** Counts the character `c`, as UTF-8, as taken. */
+private count_char(c: char)
+    val code = u32(c)
+    if code < 0x80
+        _ = taken[usize(code)].add(1)
+    else
+        _ = taken[usize(0xC0 | (code >> 6))].add(1)
+        _ = taken[usize(0x80 | (code & 0x3F))].add(1)
+
+/** Reads characters, each read holding the input, a thousand of them or until the input ends; then
+ * everything left, holding it again. */
+private chars_then_rest(c: *Context, run: *u8) -> unit
+    if runs_lightweight(c) then _ = lightweight_readers.add(1)
+    var n = 0
+    while n < 1000
+        input_hold(c)
+        if input_ended(c)
+            input_release(c)
+            return
+        val ch = read_char(c)
+        input_release(c)
+        count_char(ch)
+        n += 1
+    input_hold(c)
+    val rest = read_rest(c)
+    input_release(c)
+    count_taken(text_bytes(rest), text_length(rest))
+
+/** Whether the bytes taken, by every reader together, are those of `many_text`, each once. */
+private every_byte_once() -> bool
+    var want: [256]u32 = [0; 256]
+    for i in 0..<many_text.len()
+        want[usize(many_text[i])] += 1
+    for b in 0..<256
+        if taken[b].load() != want[b] then return false
+    true
+
+@test("characters and the rest read by one thread while another reads lines take every byte once between them")
+chars_and_rest_beside_lines_take_each_byte_once()
+    make_many_text(false)
+    read_at_once(piped_many(), [&chars_then_rest, &take_lines_counting, &take_lines_counting])
+    assert(every_byte_once())
+
+/** Asks whether the input has ended, each time holding the input, until it has. */
+private ask_until_ended(c: *Context, run: *u8) -> unit
+    if runs_lightweight(c) then _ = lightweight_readers.add(1)
+    var ended = false
+    while !ended
+        input_hold(c)
+        ended = input_ended(c)
+        input_release(c)
+
+/** Reads lines until the input ends, counting those that come in the order they were written. */
+private lines_in_order(c: *Context, run: *u8) -> unit
+    if runs_lightweight(c) then _ = lightweight_readers.add(1)
+    var next: usize = 0
+    while true
+        input_hold(c)
+        if input_ended(c)
+            input_release(c)
+            return
+        val line = read_line(c)
+        input_release(c)
+        note_line(line, false) match
+            Some(k) -> if k == next then _ = in_order.add(1)
+            None -> ()
+        next += 1
+
+@test("threads asking whether the input has ended while one reads lines take nothing from it")
+ended_asked_beside_a_reader_takes_nothing()
+    make_many_text(false)
+    read_at_once(piped_many(), [&ask_until_ended, &lines_in_order, &ask_until_ended])
+    assert(each_line_once())
+    assert_eq(in_order.load(), u32(ManyLines))
