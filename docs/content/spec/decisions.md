@@ -8955,6 +8955,60 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
 
+- **A symbol method may declare its precedence and grouping** (branch `declared-precedence`,
+  2026-11-19; the user approved "perhaps declared precedence" in the missing-features list,
+  2026-11-19). The surface is [A declared precedence](/spec/operators-and-control-flow/#a-declared-precedence).
+  **Review with the user:** the whole surface, the annotation names `@precedence` and
+  `@groupsRight`, naming a level by an operator's string, and the program-wide rule.
+  - Settled on the user's delegation 2026-11-19: **`@precedence("|")` names a row of the existing
+    level table by any operator in it, and `@groupsRight` makes calls group to the right with the
+    receiver kept on the left.** The rows a method may take are the symbol levels plus `&&`'s and
+    `||`'s, which a pipe looser than every comparison needs. WHY: no level is added, so the table
+    stays the whole account of how an expression reads, and a reader who knows how `|` binds knows
+    how a call declared as `|` binds; naming the row by its operator needs no new vocabulary.
+    ALTERNATIVES: numeric levels (refused: a reader cannot place `infixl 6` without a table of
+    every declaration in scope, and two libraries' numbers interleave in ways neither author
+    saw); identifier level names such as `@precedence(additive)` (a second set of names for rows
+    the operators already name); one annotation with a grouping argument,
+    `@precedence("^", right)` (a positional flag reads worse than a word of its own); `@groups(left)`
+    as well (a name ending in `:` would then take its receiver on the right yet group left, a
+    combination nothing needs); nothing new, with documentation (the user approved the feature).
+  - Settled on the user's delegation 2026-11-19: **a declaration belongs to the method's name
+    across the whole program**, and every method of that name in the program reads alike: an
+    overload, another type's method, a trait's declaration and each implementation either declare
+    the same reading or one that comes to the same (a method declaring nothing agrees only where
+    the declaration restates what its name gives); any other is an error naming both, reported at
+    the program's method where the other is the standard library's. WHY: the parse runs before
+    any type is known, so `a <|> b` cannot be read by `a`'s type; a module holding a value of the
+    type without importing it must read its calls as the declaring module does, which only a
+    program-wide reading guarantees; and a module's code cannot change meaning silently when an
+    unrelated library joins the program, because that is an error instead. ALTERNATIVES: by the
+    receiver's type at each call (needs types at parse time, or a second parse after checking,
+    and makes `a op b op2 c` unreadable without knowing every operand's type); visible through
+    imports only, as some languages scope fixity (a module that reaches the type through a
+    function's result, without importing its module, would read the calls differently from the
+    declaring module); undeclared methods silently following a declaration (another library's
+    `<|>`, written for the default reading, would be re-read by a declaration it never saw).
+  - Settled on the user's delegation 2026-11-19: **the compiler reads declarations after parsing
+    every unit with the default levels, then parses again, at the declared levels, only the units
+    that write a declared name**, a program with no declaration that changes a reading being parsed
+    once as before. WHY: the declarations are on methods inside the files, so they are known only
+    after a first parse; re-parsing keeps the parser the one place precedence lives, with no tree
+    rewriting pass to keep in step with it. ALTERNATIVES: a fixity-resolution pass over the parsed
+    trees (a second implementation of the precedence rules over every expression form); a lexical
+    pre-scan for declarations (a second, partial parser of class and impl bodies).
+  - Settled on the user's delegation 2026-11-19: **only a method named by a symbol the language
+    does not use declares**: `@precedence` or `@groupsRight` on one of the language's operators
+    (`+`, `|`, `<`), an assignment (`++=`), a method named by a word, or a function is an error;
+    `~`, `++` and `--` between two operands may declare. `@groupsRight` on a name ending in `:` is an
+    error (it groups right already). A comparison and `is` take part in the rule against mixing
+    groupings now that a right-grouping method can share their level. WHY: the language's own
+    operators keep one reading everywhere, and every named call binds alike.
+  - `avin parse`, `avin fmt` and the LSP's single-file views read one file at a time and so parse
+    it at the default levels; `avin check`, `run`, `build`, `test` and the LSP's diagnostics load
+    the whole program and read the declarations. `avin fmt` keeps the file's tokens, so a default
+    reading changes only where it chooses to break a long line.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
