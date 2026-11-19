@@ -1130,6 +1130,8 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   It may have parameters, defaults and type parameters as a method does.
 - **A trait with a static member is a bound and not a type**, as one mentioning `Self` is: a value of
   the trait's type would have no type to give the member.
+- **A trait has no static members of its own**, except those of an impl stating its own conformance
+  to a trait whose members are all static ([impl](#impl)): `Set[int].newBuilder()`.
 - **A static member named without a call is a function value** of its parameters, as a method of a
   value is: `xs.map(string.fromUtf8Lossy)`, `val zero = Point.zero`. Where the member is overloaded,
   the function type expected says which, and without one the value is an error.
@@ -1199,6 +1201,17 @@ the arguments' types: `AppError.from(e)` as any overloaded method, and on a type
 by several instances, `T: Make[int] & Make[string]`, the instance whose member the arguments fit.
 Each conformance gives every member of the trait at its own type arguments. Any other trait is
 implemented once, at one list of type arguments.
+
+**A trait type may implement a trait whose members are all static** (with those of the traits it
+requires), as its **own** conformance: `impl[A] Buildable[A] for Set[A]`, with `static
+newBuilder() -> Builder[A, Set[A]]`. It holds of the trait type itself, where `Set[A]` is the type
+a call names (`Set[int].newBuilder()`) or a bound's argument (`build[Set[int], int](…)`), and of no
+type implementing the trait: a `HashSet[A]` does not get `Set`'s impl, but has its own or none, and
+a type parameter bounded by `Set[A]` does not reach it, since its argument may be any set. It lives
+in the module of the trait type or of the static trait, as any conformance does. An impl of a trait
+with a member of a value for a trait type is an error: every value of the trait type is of some
+implementing type, whose methods the trait's are. A conformance to such a trait is also no
+[variance](/spec/generics/#variance) position of a class or `data` type.
 
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a

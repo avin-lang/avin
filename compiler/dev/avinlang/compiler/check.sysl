@@ -2159,6 +2159,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
             if d.trait_name is None then resolve_trait_impl(c, unit, module_name, d, id)
+            elif names_static_only_trait(c, unit, d) then resolve_instance_impl(c, unit, module_name, d, path, c.classes[id].module_name, true)
             else c.note(unit, d.target.span, s"`$path` is a trait; an impl of a trait is for a data type, a class, an object or a built-in type")
             return invalid
         owner = class_owner(id)
@@ -2186,7 +2187,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     // adding methods to a type of another module is matched the same way: its methods are not the
     // type's, so they reach no private member and no method table.
     if !in_order && d.trait_name is Some(_)
-        resolve_instance_impl(c, unit, module_name, d, path, home)
+        resolve_instance_impl(c, unit, module_name, d, path, home, false)
         return invalid
     if !in_order || (d.trait_name is None && module_name != home)
         c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != home, None))
@@ -2509,8 +2510,9 @@ private declared_at(c: *Checker, unit: usize, at: Span) -> string
 // giving the impl's parameters, which then meet their bounds. Its methods are functions over the
 // impl's parameters whose first parameter is the value, as those of an impl adding to a type built
 // from its parameters are; its table places them at the trait's positions. Whether it overlaps
-// another impl of the trait is decided once every conformance is known.
-private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, path: string, home: string)
+// another impl of the trait is decided once every conformance is known. `own` marks a trait type's
+// own conformance to a trait whose members are all static (see `InstanceConformance`).
+private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, path: string, home: string, own: bool)
     val n = c.instances.len()
     val owner = instance_owner(n)
     val outer_generic = c.generic
@@ -2556,7 +2558,7 @@ private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: 
             if is_class_named(c, k, qualified(CoreModule, name))
                 c.note(unit, written_trait_span(d), s"`$name` holds of a type at every instance alike, so its impl is for the type at the impl's type parameters, in order, as in `impl[T] $name for Box[T]`")
                 return
-    c.instances.push(InstanceConformance(target, t, d.type_params, unit, d.target.span, module_name, buf(), buf()))
+    c.instances.push(InstanceConformance(target, t, d.type_params, unit, d.target.span, module_name, buf(), buf(), own))
     c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, false, Some(n)))
 
 // Each method an impl adds to a trait is a generic function over the impl's parameters, then `Self`,
@@ -3293,6 +3295,99 @@ several_conformances(d: &ClassDecl) -> bool
                 any = true
             _ -> return false
     any
+
+/** Whether class `k` is a trait whose members, with those of the traits it requires, are all static,
+ * at least one: `trait Buildable[A]` with only `static newBuilder()`. A value of it has nothing to
+ * call, and no value of it exists (a trait with a static member is a bound and not a type), so a
+ * conformance to it is no variance position of the conforming type, and a trait type may state one
+ * of its own. Read from the traits each trait requires, so once headers are resolved. */
+static_only_trait(classes: Buf[ClassSymbol], k: usize) -> bool = static_members_only(classes, k, 0) > 0
+
+/** The static members trait `k` and the traits it requires declare, or -1 where any member is not
+ * static or `k` is not a trait. */
+private static_members_only(classes: Buf[ClassSymbol], k: usize, depth: usize) -> i64
+    if depth > classes.len() || classes[k].decl.modifier != "trait" then return -1
+    var count: i64 = 0
+    for m in classes[k].decl.members
+        m match
+            MethodMember(_, _, _, static_member) ->
+                if !static_member then return -1
+                count += 1
+            _ -> return -1
+    for t in classes[k].traits
+        val r = *t match
+            Class(r, _, _) -> r
+            _ -> return -1
+        val more = static_members_only(classes, r, depth + 1)
+        if more < 0 then return -1
+        count += more
+    count
+
+/** Whether `t` is an instance of a trait whose members are all static. */
+private static_only_conformance(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> static_only_trait(c.classes, k)
+    _ -> false
+
+/** Whether impl `d` names a trait whose members are all static, as `static_only_trait` says, read from
+ * the traits' declarations, since impls are resolved before any header. */
+private names_static_only_trait(c: *Checker, unit: usize, d: &ImplDecl) -> bool
+    val written = d.trait_name match
+        Some(t) -> t
+        None -> return false
+    val path = written.kind match
+        Named(p, _) -> p
+        _ -> return false
+    c.class_types.get(resolve_name(c, unit, path)) match
+        Some(k) -> declared_static_only(c, k, 0) > 0
+        None -> false
+
+private declared_static_only(c: *Checker, k: usize, depth: usize) -> i64
+    if depth > c.classes.len() || !is_trait(c, k) then return -1
+    var count: i64 = 0
+    for m in c.classes[k].decl.members
+        m match
+            MethodMember(_, _, _, static_member) ->
+                if !static_member then return -1
+                count += 1
+            _ -> return -1
+    for parent in c.classes[k].decl.parents
+        val r = parent_trait(c, c.classes[k].unit, parent) match
+            Some(r) -> r
+            None -> return -1
+        val more = declared_static_only(c, r, depth + 1)
+        if more < 0 then return -1
+        count += more
+    count
+
+/** Whether a type parameter bounded by `b` may stand for a type seen as `b` only through variance: `b`
+ * is an instance of a class or data type with a covariant or contravariant parameter, so an argument
+ * `Box[Cat]` meets the bound `Box[Animal]`. The type's static members and its conformances to traits
+ * whose members are all static are the argument's own, at its own type arguments, and are not
+ * reached through such a bound, since they are no variance positions. */
+widening_bound(classes: Buf[ClassSymbol], data: Buf[DataSymbol], b: &Type) -> bool
+    val params = *b match
+        Class(k, _, _) ->
+            if classes[k].decl.modifier == "trait" then return false
+            classes[k].decl.type_params
+        Data(d, _, _) -> data[d].decl.type_params
+        _ -> return false
+    for tp in params
+        if !(tp.variance is Invariant) then return true
+    false
+
+/** `b`, a bound of a type parameter, as an instance of trait `k`, as `holding_ancestor` finds it, but
+ * without the conformances that hold only of a type itself: a trait type's own, and, for a trait
+ * whose members are all static, a widening bound's (see `widening_bound`). */
+bound_ancestor(f: Conformances, b: &Type, k: usize) -> Option[&Type]
+    if static_only_trait(f.classes, k) && widening_bound(f.classes, f.data, b) then return None
+    holding_ancestor_from(f, b, k, false)
+
+/** Every instance of trait `k` that bound `b` is, as `bound_ancestor` finds one. */
+bound_ancestors(f: Conformances, b: &Type, k: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    if static_only_trait(f.classes, k) && widening_bound(f.classes, f.data, b) then return out
+    collect_ancestors(f, b, k, &out, 0, false)
+    out
 
 private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
     Some(t) -> t.span
@@ -5132,7 +5227,7 @@ private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
     val f = conformances(c)
     if *known is TypeVar(_, _, _)
         for b in bounds_of(c, known)
-            if holding_ancestor(f, b, k) is Some(up) then return Some(up)
+            if bound_ancestor(f, b, k) is Some(up) then return Some(up)
         return None
     holding_ancestor(f, known, k)
 
@@ -7063,9 +7158,15 @@ private check_class_variance(c: *Checker, id: usize)
     val at = k.decl.name_span
     if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
     // A constructor trait's arguments are holes, which no value's type fills, so they are no
-    // position of a variance.
+    // position of a variance. Nor is a class's conformance to a trait whose members are all static:
+    // no value of the trait exists, and its members are reached through a type, never through an
+    // instance seen at a wider type (see `widening_bound`). A trait requiring one keeps the position,
+    // since every type implementing the trait is seen as the trait through its variance.
+    val is_trait_type = k.decl.modifier == "trait"
     for t in k.traits
-        if !names_constructor_trait(c, t) then variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+        if names_constructor_trait(c, t) then continue
+        if !is_trait_type && static_only_conformance(c, t) then continue
+        variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
     for f in k.functions
         variance_in(c, k.unit, params, owner, f, 1, at, s"the function type ${type_name(f)}")
     for i in k.inherited..<k.fields.len()
@@ -7100,6 +7201,11 @@ private check_class_variance(c: *Checker, id: usize)
         if exempt && contains_id(c.impl_methods, m) then continue
         // The method assigning a trait's `var` field is the field, checked above.
         if contains_id(c.trait_setters, m) then continue
+        // A class's static member is called on the type at the type arguments the call names, or
+        // through a bound at the argument's own, never through an instance seen at a wider type, so
+        // it is no position. A trait's static member is one: a type conforming to the trait at one
+        // argument conforms to it at a wider one through the trait's variance.
+        if !is_trait_type && c.symbols[m].static_member then continue
         val symbol = c.symbols[m]
         val name = symbol.decl.name
         for j in 1..<symbol.params.len()
@@ -7140,7 +7246,7 @@ private check_data_variance(c: *Checker, id: usize)
             val name = if i < v.field_names.len() then v.field_names[i] else "_"
             variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
     for t in d.traits
-        if !names_constructor_trait(c, t) then variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+        if !names_constructor_trait(c, t) && !static_only_conformance(c, t) then variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
     for f in d.functions
         variance_in(c, d.unit, params, owner, f, 1, d.decl.span, s"the function type ${type_name(f)}")
 
@@ -8734,7 +8840,7 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
         Var(_) -> true
         TypeVar(_, _, _) ->
             for b in type_var_bounds(f, x)
-                if holding_ancestor(f, b, k) is Some(up)
+                if bound_ancestor(f, b, k) is Some(up)
                     if conforms(up, bound) then return true
             false
         _ ->
@@ -9884,15 +9990,20 @@ rendered_at_run_time(classes: Buf[ClassSymbol], t: &Type) -> bool = *t match
 /** `t` as an instance of the class or trait `target`, as `ancestor_type` finds it, through only the
  * conformances that hold at `t`'s type arguments: one an impl with bounds of its own states holds
  * where the arguments meet them. */
-holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
+holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type] = holding_ancestor_from(f, t, target, true)
+
+/** `holding_ancestor`, where `own` says whether a trait type's own conformances count: they do for
+ * the type asked about, and not for the traits and superclasses it is seen as on the way. */
+private holding_ancestor_from(f: Conformances, t: &Type, target: usize, own: bool) -> Option[&Type]
     if f.instances.len() > 0 && (*t is Data(_, _, _) || *t is Class(_, _, _))
         for n in 0..<f.instances.len()
+            if f.instances[n].own && !own then continue
             if instance_args(f, n, t) is Some(args)
-                if holding_ancestor(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target) is Some(found) then return Some(found)
+                if holding_ancestor_from(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, false) is Some(found) then return Some(found)
     if *t is Data(d, _, xs)
         for required in f.data[d].traits
             if !conformance_holds(f, data_owner(d), required, xs) then continue
-            if holding_ancestor(f, substitute(required, data_owner(d), xs), target) is Some(found) then return Some(found)
+            if holding_ancestor_from(f, substitute(required, data_owner(d), xs), target, false) is Some(found) then return Some(found)
         return None
     val k = *t match
         Class(k, _, _) -> k
@@ -9903,22 +10014,23 @@ holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
         _ -> buf()
     for required in f.classes[k].traits
         if !conformance_holds(f, class_owner(k), required, args) then continue
-        if holding_ancestor(f, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
-    holding_ancestor(f, substitute(f.classes[k].superclass?, class_owner(k), args), target)
+        if holding_ancestor_from(f, substitute(required, class_owner(k), args), target, false) is Some(found) then return Some(found)
+    holding_ancestor_from(f, substitute(f.classes[k].superclass?, class_owner(k), args), target, false)
 
 /** Every instance of the class or trait `target` that `t` is through the conformances holding at its
  * type arguments: one at most, except for a trait a type implements at several type arguments. */
 holding_ancestors(f: Conformances, t: &Type, target: usize) -> Buf[&Type]
     var out: Buf[&Type] = buf()
-    collect_ancestors(f, t, target, &out, 0)
+    collect_ancestors(f, t, target, &out, 0, true)
     out
 
-private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
+// `own` says whether a trait type's own conformances count, as in `holding_ancestor_from`.
+private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize, own: bool)
     if depth > f.classes.len() then return
-    collect_instance_ancestors(f, t, target, out, depth)
+    collect_instance_ancestors(f, t, target, out, depth, own)
     if *t is Data(d, _, xs)
         for required in f.data[d].traits
-            if conformance_holds(f, data_owner(d), required, xs) then collect_ancestors(f, substitute(required, data_owner(d), xs), target, out, depth + 1)
+            if conformance_holds(f, data_owner(d), required, xs) then collect_ancestors(f, substitute(required, data_owner(d), xs), target, out, depth + 1, false)
         return
     val k = *t match
         Class(k, _, _) -> k
@@ -9932,8 +10044,8 @@ private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&T
         Class(_, _, a) -> a
         _ -> buf()
     for required in f.classes[k].traits
-        if conformance_holds(f, class_owner(k), required, args) then collect_ancestors(f, substitute(required, class_owner(k), args), target, out, depth + 1)
-    if f.classes[k].superclass is Some(sup) then collect_ancestors(f, substitute(sup, class_owner(k), args), target, out, depth + 1)
+        if conformance_holds(f, class_owner(k), required, args) then collect_ancestors(f, substitute(required, class_owner(k), args), target, out, depth + 1, false)
+    if f.classes[k].superclass is Some(sup) then collect_ancestors(f, substitute(sup, class_owner(k), args), target, out, depth + 1, false)
 
 /** Whether the type whose parameters `owner` owns, at type arguments `args`, has the conformance to
  * `required` its declaration or an impl states: at once, unless an impl with bounds of its own
@@ -9952,8 +10064,14 @@ conformance_holds(f: Conformances, owner: usize, required: &Type, args: Buf[&Typ
  * hold. The parts are matched exactly, so `Vector[byte]`'s conformance is not a `Vector[Nothing]`'s. */
 instance_args(f: Conformances, n: usize, t: &Type) -> Option[Buf[&Type]]
     val x = f.instances[n]
+    // A trait type's own conformance holds of the trait type itself, not of its implementers.
     val seen = *x.ty match
-        Class(k, _, _) -> ancestor_type(f.classes, f.data, t, k)?
+        Class(k, _, _) ->
+            if x.own
+                *t match
+                    Class(j, _, _) -> if j == k then t else return None
+                    _ -> return None
+            else ancestor_type(f.classes, f.data, t, k)?
         Data(d, _, _) -> *t match
             Data(e, _, _) -> if d == e then t else return None
             _ -> return None
@@ -10006,11 +10124,12 @@ private match_instance_parts(ps: Buf[&Type], owner: usize, xs: Buf[&Type], binds
 
 /** The instances of trait `target` that `t` is through the instance conformances holding of it and
  * the traits theirs require. */
-private collect_instance_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
+private collect_instance_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize, own: bool)
     if f.instances.len() == 0 then return
     if !(*t is Data(_, _, _) || *t is Class(_, _, _)) then return
     for n in 0..<f.instances.len()
-        if instance_args(f, n, t) is Some(args) then collect_ancestors(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, out, depth + 1)
+        if f.instances[n].own && !own then continue
+        if instance_args(f, n, t) is Some(args) then collect_ancestors(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, out, depth + 1, false)
 
 /** Whether type arguments `args` meet the bounds of conditional conformance `x`. */
 conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool = unmet_condition(f, x.owner, x.conditions, args) is None
@@ -15337,9 +15456,23 @@ bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
     var out: Buf[usize] = buf()
     for b in bounds_of(c, t)
         if *b is Class(k, _, _)
+            // An argument meeting a widening bound may be the type at other type arguments, whose
+            // static members are its own (see `widening_bound`).
+            val widening = widening_bound(c.classes, c.data, b)
             for m in methods_named(c, k, name)
+                if widening && c.symbols[m].static_member then continue
                 if !contains_id(out, m) then out.push(m)
     unreplaced(c, out)
+
+/** A bound of type parameter `t` that has a static member `name` which `bound_methods` leaves out,
+ * since the bound is a widening one. */
+private widening_bound_with_static(c: *Checker, t: &Type, name: string) -> Option[&Type]
+    for b in bounds_of(c, t)
+        if *b is Class(k, _, _)
+            if !widening_bound(c.classes, c.data, b) then continue
+            for m in methods_named(c, k, name)
+                if c.symbols[m].static_member then return Some(b)
+    None
 
 // The bounds of type parameter `t`, as a diagnostic names them.
 private bound_names(c: *Checker, t: &Type) -> string
@@ -19268,7 +19401,7 @@ private viewed(c: *Checker, x: &Type, to: &Type) -> &Type
     if *x is TypeVar(_, _, _)
         if *zonk(c, to) is Class(k, _, _)
             for b in bounds_of(c, x)
-                if holding_ancestor(conformances(c), b, k) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
+                if bound_ancestor(conformances(c), b, k) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
         if *zonk(c, to) is Function(_, _, _)
             for b in bounds_of(c, x)
                 if function_ancestor(c.classes, c.data, b) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
@@ -19850,7 +19983,7 @@ private iterable_at(f: Conformances, x: &Type, k: usize) -> bool = *x match
         members.len() > 0
     TypeVar(_, _, _) ->
         for b in type_var_bounds(f, x)
-            if holding_ancestor(f, b, k) is Some(_) then return true
+            if bound_ancestor(f, b, k) is Some(_) then return true
         false
     _ ->
         if is_builtin(x) || *x is Tuple(_)
@@ -20361,7 +20494,7 @@ private from_sources(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     if *t is TypeVar(_, _, _)
         for b in bounds_of(c, t)
-            for up in holding_ancestors(f, b, k)
+            for up in bound_ancestors(f, b, k)
                 out.push(up)
         return out
     if is_builtin_or_opaque(t) || *t is Tuple(_)
@@ -21252,6 +21385,17 @@ private param_type_text(t: &Type, repeated: bool) -> string
 // The type `target` names where it is the receiver of a call, as `int` in `int.zero()`, `T` in
 // `T.zero()` and `Box[int]` in `Box[int].zero()`; `None` where it is a value, a value of the name
 // hiding the type. A trait names no type with static members of its own, which is reported.
+/** Whether trait `k` has a static member `name` of its own, through an impl stating its own
+ * conformance to a trait whose members are all static: `impl[A] Buildable[A] for Set[A]`. */
+private owns_static(c: *Checker, k: usize, name: string) -> bool
+    for x in c.instances
+        if !x.own then continue
+        if *x.ty is Class(j, _, _)
+            if j != k then continue
+            for m in x.methods
+                if c.symbols[m].decl.name == name && c.symbols[m].static_member then return true
+    false
+
 static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
     var name = ""
     var written: Buf[&TypeExpr] = buf()
@@ -21278,7 +21422,7 @@ static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
     val key = resolve_name(c, unit, name)
     if c.types.get(key) is Some(_) then names_type = true
     if c.class_types.get(key) is Some(k)
-        if is_trait(c, k)
+        if is_trait(c, k) && !owns_static(c, k, member)
             if is_constructor_trait(c, k)
                 c.note(unit, target.span, s"`$name` is a trait, which has no static members of its own: call one on a constructor implementing it, as in `F.$member(…)` with `F[${hole_marks(c.classes[k].decl.type_params.len())}]: $name`")
                 return Some(ErrorType)
@@ -21431,6 +21575,10 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
     for m in ms
         if c.symbols[m].static_member then statics.push(m)
     if statics.len() == 0
+        val widening = if *t is TypeVar(_, _, _) && !reported then widening_bound_with_static(c, t, name) else None
+        if widening is Some(b)
+            c.note(unit, name_span, s"`$name` is a static member of `${type_name(b)}`, which is not reached through the bound of `${type_name(t)}`: a type argument meeting `${type_name(b)}` may be the type at other type arguments, through its variance, and its static members are its own; bound `${type_name(t)}` by the trait declaring `$name`")
+            reported = true
         if !reported
             if ms.len() > 0 then c.note(unit, name_span, s"`$name` is a method of a value of `${type_name(t)}`, not of the type; call it on a value")
             elif !(scalar_builtin(t) && refuse_private_trait_method(c, name_span, t, name)) then c.note(unit, name_span, s"`${type_name(t)}` has no static member `$name`")

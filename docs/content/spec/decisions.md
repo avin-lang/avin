@@ -145,7 +145,43 @@ a decision changes, this page and the chapter change together.
   function results are covariant and function parameters contravariant on the same terms.
 - A variance error is reported in private members as in public ones; there is no escape for a
   private `var`. The methods an impl adds to a `data` type are not variance positions; the traits
-  its impls name are.
+  its impls name are, except a trait whose members are all static (revised 2026-11-19, below).
+- Settled on the user's delegation 2026-11-19 (branch `static-traits`): **static members are not
+  variance positions of a class or `data` type, and neither is a conformance to a trait whose
+  members are all static** (with those of the traits it requires, at least one); the entry above
+  read "the traits its impls name are" without exception, which refused `abstract class Vector[+T]`
+  stating `impl[T] Buildable[T] for Vector[T]` with `static newBuilder() -> Builder[T, Vector[T]]`.
+  Why it is sound: a static member is reached through a type, never a value. On the type, the call
+  names the arguments (`Vector[Animal].newBuilder()` is that instance's own impl); through a bound
+  `C: Buildable[A]`, `C`'s own impl at `C`'s own arguments runs, and a `Vector[Cat]` is a
+  `Buildable[Cat]`, not a `Buildable[Animal]`, so `build[Vector[Cat], Animal](dog)` is refused. No
+  value of the trait exists (a trait with a static member is a bound, not a type), so no value path
+  from `Vector[Cat]` to `Buildable[Animal]` exists either. The one path left is a type parameter
+  bounded by a widened instance, `U: Box[Animal]` with `U = Box[Cat]`: **a bound whose class or
+  `data` type has a covariant or contravariant parameter reaches neither the type's static members
+  nor its conformances to all-static traits** (`U.make(dog)` is an error saying to bound `U` by the
+  trait). Kept as positions: a trait's own static members (a type conforming to `Take[Cat]`
+  conforms to `Take[Animal]` through the trait's variance, so `trait Take[+A]` with `static take(x:
+  A)` is refused), a trait requiring an all-static trait, and a conformance to a trait with any
+  member of a value. Alternatives: exempting every trait's statics (unsound as shown); exempting
+  only `impl` statics and not the trait argument (still refuses `Buildable[T]` on `Vector[+T]`);
+  refusing static calls through every class bound (narrower than needed: an invariant class's
+  bound widens nothing). Tests: `static_trait_variance`, `static_trait_variance_attacks`,
+  `static_trait_variance_kept`, `programs/run/static_trait_modules`. Review with the user: the
+  widening-bound rule is new and visible ("bound `U` by the trait declaring `make`").
+- Settled on the user's delegation 2026-11-19 (branch `static-traits`): **a trait type may implement
+  a trait whose members are all static, as its own conformance**: `impl[A] Buildable[A] for
+  Set[A]`. It holds of the trait type itself, as the type a call names (`Set[int].newBuilder()`) or
+  a bound's argument, and is not inherited by the trait's implementers (a `HashSet[A]` has its own
+  or none) nor reached through a type parameter bounded by the trait type, whose argument may be
+  any implementer. An impl of a trait with a member of a value for a trait type is still refused
+  with the old message. Why: a collection literal typed by a trait (`val s: Set[int] = {1, 2}`)
+  needs a builder the trait type names, and a trait's conformance cannot be its implementers'
+  (each builds its own collection). It is built on the impls for instances of a type, matched
+  against the trait type exactly rather than through its subtypes. Alternatives: inheriting it
+  (wrong: `HashSet`'s literal would build through `Set`'s builder); a companion object's
+  `newBuilder` reached by name (the convention `Buildable` replaces). Tests:
+  `trait_own_static_conformance`, `trait_own_static_refusals`, `programs/run/static_trait_modules`.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
 - Settled by the user 2026-11-04: [lower bounds](/spec/generics/#lower-bounds) on a function's or a
