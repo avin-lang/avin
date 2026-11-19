@@ -565,8 +565,8 @@ block and starts a line again. Patterns include:
 - a variant with fields named alone, bare or qualified (`Shipped`, `Status.Shipped`), which tests
   for the variant and binds none of its fields, as `Shipped(_, _)` does with one `_` per field;
   `Shipped()`, with parentheses, is matched against the fields by number;
-- [extractor patterns](#extractor-patterns), `Name(p1, p2)` where `Name` is a value with
-  `unapply` or `unapplySeq`;
+- [extractor patterns](#extractor-patterns), `Name(p1, p2)` where `Name` is a value implementing
+  `Extractor`, `BoolExtractor` or `SeqExtractor`;
 - list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
   (`first :: second :: rest`);
 - [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
@@ -704,38 +704,52 @@ arm's name starts with a capital letter.
 ### Extractor patterns
 
 A pattern `Name(p1, p2)` whose `Name` is not a variant is an **extractor**: a value, such as an
-object, a class's companion or a local, whose type has an `unapply` or `unapplySeq` method. The
-matched value is passed to the method, and its answer decides the match:
+object, a class's companion, a local or a parameter, whose type implements one of the core
+library's extractor traits. The conformance makes the extractor; a method merely named `unapply`
+does not. The matched value is passed to the trait's method, and its answer decides the match:
 
-- `unapply(x) -> bool` matches where it answers `true`, and is written with no patterns, `Even()`;
-- `unapply(x) -> Option[U]` matches its `Some`: one pattern matches the value whole, and several
-  match the parts of a tuple of as many, `Split(key, value)` for an `Option[(string, string)]`;
-- `unapplySeq(x) -> Option[S]`, `S` a sequence, matches its `Some` as a
-  [sequence pattern](/spec/collections/#sequence-patterns) does, so `Words(first, second)` needs
-  exactly two elements and `Words(first, rest*)` one or more.
+- `BoolExtractor[A]`, with `unapply(value: A) -> bool`, matches where it answers `true`, and is
+  written with no patterns, `Even()`;
+- `Extractor[A, B]`, with `unapply(value: A) -> Option[B]`, matches its `Some`: one pattern
+  matches the value whole, and several match the parts of a tuple of as many,
+  `Split(key, value)` for an `Extractor[string, (string, string)]`;
+- `SeqExtractor[A, S]`, with `unapplySeq(value: A) -> Option[S]`, `S` a sequence, matches its
+  `Some` as a [sequence pattern](/spec/collections/#sequence-patterns) does, so
+  `Words(first, second)` needs exactly two elements and `Words(first, rest*)` one or more.
 
 ```text
-object Twice
-    unapply(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+object Twice: Extractor[int, int]
+  override unapply(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
 
-object Even
-    unapply(n: int) -> bool = n % 2 == 0
+object Even: BoolExtractor[int]
+  override unapply(n: int) -> bool = n % 2 == 0
 
 describe(n: int) -> string = n match
-    Twice(Twice(q)) -> s"four times $q"
-    Twice(h) if h > 100 -> "a large double"
-    Even() -> "even"
-    _ -> "odd"
+  Twice(Twice(q)) -> s"four times $q"
+  Twice(h) if h > 100 -> "a large double"
+  Even() -> "even"
+  _ -> "odd"
 
 val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
 "2024-06-30" match
-    date(year, month, day) -> …
+  date(year, month, day) -> …
 ```
 
-A variant of the name is always the variant, so a data type's companion declares an `unapply` to be
-called by name, not to change what its variant's pattern means. Where the type has both methods,
-`unapply` is the one called. The method's parameter accepts the matched value's type, as any call's
-argument would, and a generic method infers its type arguments from it. The method is called once
+The traits are ordinary ones: `A` is contravariant and `B` and `S` covariant, so an
+`Extractor[Animal, string]` takes a `Dog`; an extractor may be held in a value of the trait's type,
+passed as a parameter, `e: Extractor[string, int]`, or bound on a type parameter,
+`[E: BoolExtractor[int]]`; a data type implements one through an `impl`; and a subclass keeps its
+superclass's conformance. A generic extractor is a value of a generic class,
+`class Pair[A]: Extractor[List[A], (A, A)]` matched as `pair(a, b)` with `val pair = Pair[A]()`. A
+type implements each trait at one type argument; the trait whose `A` takes the matched value
+serves, and where an `unapply` trait and `SeqExtractor` both take it, the `unapply` one does. A
+type's name is no value, so it is no extractor whatever static members it has. A pattern naming a
+value whose type implements no extractor trait is an error that names the trait to implement, from
+the type's own `unapply` or `unapplySeq` where it has one.
+
+A variant of the name is always the variant, so a data type's companion implements an extractor
+trait to be matched by name, not to change what its variant's pattern means. The method's parameter
+accepts the matched value's type, as any call's argument would. The method is called once
 each time the pattern is tested, the patterns inside it are matched against its answer, and its
 names are bound like any pattern's; extractors nest, take guards, and appear in `is`, alternatives,
 clauses and match functions. An extractor may answer that it does not match, so it never counts
