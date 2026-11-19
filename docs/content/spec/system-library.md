@@ -741,8 +741,10 @@ cancelled thread's stop and a signal. Ctrl-C, a hangup, terminate or quit signal
 the read puts the terminal back first and then reaches the program as it would have: the program
 ends, or, where it watches the signal, sees the read fail with `Other("interrupted")` and the signal
 in its watch. Typed-ahead input is discarded when the read starts, so nothing typed before the prompt
-is taken for the secret. A stop signal (Ctrl-Z) is not caught: the program stops with echo off until
-it is continued.
+is taken for the secret. A stop from the terminal (Ctrl-Z) puts the terminal back before the program
+stops, so a stopped program leaves the user's shell with echo on; when it is continued, echo goes off
+again, the prompt is written again and the read goes on; what was typed before the Ctrl-Z is
+discarded by the terminal, as it is for any signal character.
 
 **The line has no terminator.** A trailing `\n` and a `\r` before it are dropped. A line ended by the
 terminal's end-of-file character counts if it has bytes in it; the end of input before any byte is

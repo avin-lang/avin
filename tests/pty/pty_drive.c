@@ -1,7 +1,10 @@
 /* Runs a program with a pseudo-terminal as its controlling terminal (or with no terminal at all) and
  * plays a script against it, so a test can type at a program and look at what the terminal shows.
  *
- *     pty_drive [--notty] ACTION... -- PROGRAM [ARGUMENT...]
+ *     pty_drive [--notty | --job] ACTION... -- PROGRAM [ARGUMENT...]
+ *
+ * With --job the program runs as a shell's job would, in its own foreground process group, so that
+ * a typed Ctrl-Z (`send:\x1a`) stops it; the driver then prints `[stopped]`.
  *
  * Everything the program writes to the terminal is copied to standard output as it arrives, followed
  * by one marker line for each `report` and a last one for how the program ended. The actions run in
@@ -12,6 +15,7 @@
  *     report        write `[echo=E icanon=C isig=S]`, the terminal's state at that moment
  *     sleep:MS      wait that many milliseconds, copying what arrives
  *     kill:N        send signal N to the program
+ *     cont          with --job, continue the program after it was stopped
  *     eof           type the terminal's end-of-file character, or with --notty close the program's input
  *
  * With --notty the program starts in a session of its own with no controlling terminal, its input
@@ -144,6 +148,49 @@ static void send_text(const char *text) {
     }
 }
 
+static pid_t member = -1;
+
+static void continue_member(int sig) {
+    (void) sig;
+    kill(-member, SIGCONT);
+}
+
+/* Runs in the child of the pseudo-terminal, which leads its session: starts the program in a process
+ * group of its own that is the terminal's foreground group, as a shell does a job, and stays as that
+ * group's parent. A group whose parent is outside it is not orphaned, so Ctrl-Z stops it. Says
+ * `[stopped]` each time the program is stopped, continues it on SIGUSR1, and ends as it did. */
+static void run_as_job(char **program) {
+    member = fork();
+    if (member == 0) {
+        setpgid(0, 0);
+        signal(SIGTTOU, SIG_IGN);
+        tcsetpgrp(0, getpid());
+        signal(SIGTTOU, SIG_DFL);
+        execv(program[0], program);
+        _exit(127);
+    }
+    setpgid(member, member);
+    signal(SIGTTOU, SIG_IGN);
+    tcsetpgrp(0, member);
+    signal(SIGUSR1, continue_member);
+    for (;;) {
+        int st = 0;
+        pid_t r = waitpid(member, &st, WUNTRACED);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            _exit(126);
+        }
+        if (WIFSTOPPED(st)) {
+            (void) !write(1, "\n[stopped]\n", 11);
+            continue;
+        }
+        if (WIFEXITED(st)) _exit(WEXITSTATUS(st));
+        signal(WTERMSIG(st), SIG_DFL);
+        kill(getpid(), WTERMSIG(st));
+        _exit(128 + WTERMSIG(st));
+    }
+}
+
 static void report(void) {
     char line[100];
     struct termios t;
@@ -163,9 +210,13 @@ static void report(void) {
 
 int main(int argc, char **argv) {
     int notty = 0;
+    int job = 0;
     int i = 1;
     if (i < argc && strcmp(argv[i], "--notty") == 0) {
         notty = 1;
+        i++;
+    } else if (i < argc && strcmp(argv[i], "--job") == 0) {
+        job = 1;
         i++;
     }
     int first = i;
@@ -200,6 +251,7 @@ int main(int argc, char **argv) {
     } else {
         child = forkpty(&master, NULL, NULL, NULL);
         if (child == 0) {
+            if (job) run_as_job(program);
             execv(program[0], program);
             _exit(127);
         }
@@ -213,6 +265,7 @@ int main(int argc, char **argv) {
         else if (strncmp(a, "send:", 5) == 0) send_text(a + 5);
         else if (strcmp(a, "report") == 0) report();
         else if (strncmp(a, "kill:", 5) == 0) kill(child, atoi(a + 5));
+        else if (strcmp(a, "cont") == 0) kill(child, SIGUSR1);
         else if (strncmp(a, "sleep:", 6) == 0) {
             long end = now_ms() + atol(a + 6);
             while (now_ms() < end) pump(20);

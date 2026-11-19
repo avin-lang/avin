@@ -13,7 +13,8 @@
  * is typed, so the signals that would end it (interrupt, hangup, terminate, quit) are caught for the
  * length of the read: the handler puts the terminal back, gives the signal its previous action again
  * and sends it to the process once more, so the program dies or handles it as it would have, with
- * echo on. A program that survives the signal sees its read fail as interrupted. A normal exit while
+ * echo on. A stop from the terminal (Ctrl-Z) puts the terminal back, stops the program, and when it
+ * is continued hides the terminal again and reads on. A program that survives the signal sees its read fail as interrupted. A normal exit while
  * echo is off, which only a program that exits from another thread can reach, puts it back as well.
  */
 
@@ -37,8 +38,40 @@ static volatile sig_atomic_t hidden_fd = -1;
 static volatile sig_atomic_t arrived = 0;
 static int exit_hook_set = 0;
 
+/* What the terminal is set to while the secret is read, and what the terminal-stop signal did before. */
+static struct termios hidden_mode;
+static struct sigaction before_stop;
+/* Set when the program was stopped and continued during the read. */
+static volatile sig_atomic_t resumed = 0;
+
+static void on_stop(int sig);
+
 static void give_back_signals(void) {
     for (int i = 0; i < SECRET_SIGNALS; i++) sigaction(guarded[i], &before[i], NULL);
+    sigaction(SIGTSTP, &before_stop, NULL);
+}
+
+/* A stop from the terminal (Ctrl-Z): puts the terminal back, stops the program as the signal would
+ * have, and once it is continued hides the terminal again and tells the read to write its prompt
+ * again. The read's own descriptor stays open throughout. */
+static void on_stop(int sig) {
+    int fd = hidden_fd;
+    if (fd >= 0) tcsetattr(fd, TCSANOW, &saved);
+    struct sigaction dfl, mine;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, &mine);
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, sig);
+    sigprocmask(SIG_UNBLOCK, &s, NULL);
+    kill(getpid(), sig);
+    /* Continued. */
+    sigprocmask(SIG_BLOCK, &s, NULL);
+    sigaction(sig, &mine, NULL);
+    if (hidden_fd >= 0) tcsetattr(hidden_fd, TCSADRAIN, &hidden_mode);
+    resumed = 1;
 }
 
 static void on_signal(int sig) {
@@ -89,6 +122,13 @@ int avin_rt_secret_hide(int fd) {
     act.sa_handler = on_signal;
     sigemptyset(&act.sa_mask);
     for (int i = 0; i < SECRET_SIGNALS; i++) sigaction(guarded[i], &act, &before[i]);
+    struct sigaction stop;
+    memset(&stop, 0, sizeof stop);
+    stop.sa_handler = on_stop;
+    sigemptyset(&stop.sa_mask);
+    sigaction(SIGTSTP, &stop, &before_stop);
+    hidden_mode = t;
+    resumed = 0;
     hidden_fd = fd;
     if (tcsetattr(fd, TCSAFLUSH, &t) != 0) {
         int e = errno;
@@ -124,13 +164,18 @@ int avin_rt_secret_write(int fd, const unsigned char *p, long n) {
 }
 
 /* Reads up to `n` bytes into `p`: how many, zero at the end of input, or -errno. A signal that
- * arrived during the read, and that the program survived, answers -EINTR. */
+ * arrived during the read, and that the program survived, answers -EINTR. A stop and continue answers
+ * -4097: the terminal is hidden again and the caller writes its prompt again and reads on. */
 long avin_rt_secret_read(int fd, unsigned char *p, long n) {
     for (;;) {
         ssize_t r = read(fd, p, (size_t) n);
         if (r >= 0) return (long) r;
         if (errno == EINTR) {
             if (arrived != 0) return -EINTR;
+            if (resumed) {
+                resumed = 0;
+                return -4097;
+            }
             continue;
         }
         return -errno;

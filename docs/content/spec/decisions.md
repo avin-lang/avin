@@ -8893,7 +8893,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   side (`runtime/avin/rt/__posix__/secret_tty.c`) catches interrupt, hangup, terminate and quit: its
   handler restores the terminal, gives the signal its previous action back and sends it again, so
   the program dies or handles the signal with echo on; a program that survives sees the read fail
-  as `Other("interrupted")`. A stop signal is not caught. (3) **Concurrency**: the read holds
+  as `Other("interrupted")`. A terminal stop (Ctrl-Z) is caught too: the handler restores the
+  terminal, stops the program with the default action, and on continue hides the terminal again
+  and the read writes its prompt again and goes on (as `sudo` and `getpass` do); what was typed before
+  the Ctrl-Z is discarded by the terminal. SIGTTIN and SIGTTOU are not caught: they stop a program before the terminal has been
+  changed. (3) **Concurrency**: the read holds
   `input_readers`, the lock of every standard input reader, so a secret and a `readLine` never
   read the terminal at once; a lightweight thread waiting for the line is not cancellable, as one
   waiting for standard input is, so a cancel takes effect once the line has been read and the
