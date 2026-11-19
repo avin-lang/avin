@@ -9631,6 +9631,17 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
+  after a `select`'s one-line arm ends the arm, the `select` and the item, as it does a match's**,
+  and a `select` on a block's last line that closes a bracket ends at that line's comma. Why: the
+  select chapter says its arms are written as a match's are, and with the 2026-11-19 rule that a
+  block's last line ends at its comma the old reading (the comma list a tuple the arm yields) no
+  longer parsed at all, failing `select_readable_custom`; the rule makes `f(select` … `-> v, x)`
+  mean what `f(m match` … `-> v, x)` means. Alternatives: keeping the tuple reading for `select`
+  alone (one construct reading commas unlike its sibling); an error asking for parentheses either
+  way. It changes code that compiled before: `println(select` … `-> "up", made)` printed a tuple and
+  now passes two arguments, so that test writes `println((select` … `-> "up", made))`.
+
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
   whichever comes first, and sends that rest as room comes**; its wait keeps the connection's time

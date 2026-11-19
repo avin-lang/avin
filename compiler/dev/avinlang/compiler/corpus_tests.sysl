@@ -6,6 +6,7 @@ import sysl.buf.{Buf, buf}
 import sysl.env.get
 import sysl.fs.{create, current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, set_permissions, write_text}
 import sysl.process.{Exited, FromPath, Signalled, Stdio, ToFile, Var, capture, run}
+import sysl.slices.sort
 import sysl.text.from_utf8_unchecked
 
 // The execution corpus: Avin programs under `tests/` with their expected behaviour.
@@ -170,7 +171,11 @@ private struct Case
 // own files hold its expectations.
 private case_at(path: string) -> Case
     if is_dir(path)
-        val files = program_files(path).unwrap()
+        val files = program_files(path) match
+            Ok(found) -> found
+            // A file the loader refuses, by its name, still holds the case's expectations, and the
+            // loader's message is the diagnostic the case is checked against.
+            Err(message) -> return Case(buf(), expectations_under(path), buf(), buf(), message)
         var text = ""
         for f in files
             text = text + expectation_text(f.src) + "\n"
@@ -188,6 +193,19 @@ private case_at(path: string) -> Case
     load_script(path, src, Fetching(fetching.cache, fetching.base, false)) match
         Ok(p) -> Case(p.files, expectation_text(src), p.sysl, p.c, "")
         Err(message) -> Case(single_file(src), expectation_text(src), buf(), buf(), message)
+
+/** The expectation lines of every source file under `dir`, whatever its name, in name order: a
+ * case whose files the loader refuses is still checked against them. */
+private expectations_under(dir: string) -> string
+    var names = entries(dir).unwrap_or(buf())
+    sort(names.view_mut())
+    var text = ""
+    for name in names
+        if name.starts_with(".") then continue
+        val full = dir + "/" + name
+        if is_dir(full) then text = text + expectations_under(full)
+        elif is_source_name(name) then text = text + expectation_text(source_of(full, read_text(full).unwrap_or(""))) + "\n"
+    text
 
 // Compiles a case as the command line would, or answers why its package could not be loaded.
 //
@@ -930,6 +948,26 @@ corpus_ignored_program()
     val rejected = reject_all(tc, program_cases_in(dir))
     assert(rejected.failures == "")
     assert(rejected.ignored.len() == 1)
+
+@test("a program of many files whose file name the loader refuses is checked as a reject against that refusal, its expectations read from every file")
+corpus_refused_file_name()
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-corpus-refused-name").unwrap()
+    defer _ = remove_dir_all(dir)
+    make_dir_all(dir + "/one/plat").unwrap()
+    write_text(dir + "/one/main.avin", "// error: `lunix` is not something a file's name can ask about the machine\nimport plat\n\nmain() = plat.size()\n").unwrap()
+    write_text(dir + "/one/plat/plat.lunix.avin", "module plat\n\nsize() -> int = 1\n").unwrap()
+    val refused = case_at(dir + "/one")
+    assert(refused.refused.contains("plat.lunix.avin"), refused.refused)
+    assert(refused.text.contains("// error: `lunix`"), refused.text)
+    val rejected = reject_all(tc, program_cases_in(dir))
+    assert(rejected.failures == "", rejected.failures)
+    assert(rejected.passed == 1)
+    // An expectation in the refused file itself is read too, and a wrong one fails the case.
+    write_text(dir + "/one/plat/plat.lunix.avin", "// error: some other message\nmodule plat\n\nsize() -> int = 1\n").unwrap()
+    val wrong = reject_all(tc, program_cases_in(dir))
+    assert(wrong.failed == 1)
+    assert(wrong.failures.contains("no `some other message`"), wrong.failures)
 
 @test("an ignore line with no reason is an error in both kinds of directory")
 corpus_ignore_needs_reason()

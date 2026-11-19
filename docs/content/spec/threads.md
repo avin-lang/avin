@@ -686,7 +686,10 @@ Err(the pool is closed)
 A `select` block waits on several channels at once, and on connections, and runs exactly one of its
 arms: the first whose channel operation can complete or whose connection has bytes to read.
 `select` ending its line opens the block of its arms, written as a match's are; elsewhere `select`
-is an ordinary name.
+is an ordinary name. As with a match, inside brackets whose commas separate items a comma after a
+one-line arm's body ends the arm, the `select` and the item, so in `f(select` …
+`ch.receive() as v -> v, "a")` the `select` is the first argument and `"a"` the second; a tuple
+body there is written in parentheses.
 
 ```avin
 import avin.threads.Channel

@@ -75,14 +75,25 @@ parse_select(p: *Parser, at: Span) -> &Expr
     var arms: Buf[WrittenArm] = buf()
     val lines = p.open_lines
     p.open_lines = 0
+    // Whether a comma ended the last arm, the `select` and the item it stands in, as a match's.
+    var ended_at_comma = false
     loop
         if p.toks.at_end() || p.accept_kind(Dedent) then break
         if p.accept_kind(Newline) then continue
         val before = p.toks.position
         arms.push(select_arm(p))
         if p.toks.position == before then break
+        if p.at(",") && (p.in_list || closes_bracket_ahead(p))
+            // Inside brackets whose commas separate items, or on a line that closes a bracket opened
+            // before the block the `select` stands in, the comma ends the arm, the `select` and the
+            // item; the block's Dedent comes before the closing bracket.
+            if p.in_list && next_line_is_arm(p)
+                p.report.add(error(p.toks.here(), "a comma inside brackets ends the `select`, so this arm's body is one value; write a tuple in parentheses, `(a, b)`"))
+            p.owed_dedents += 1
+            ended_at_comma = true
+            break
     p.open_lines = lines
-    optional_end(p, "select", true)
+    if !ended_at_comma then optional_end(p, "select", true)
     val span = at.to(p.ended())
     checked_arms(p, at, arms)
     select_code(span, at, number, arms)
@@ -93,7 +104,7 @@ parse_select(p: *Parser, at: Span) -> &Expr
 private select_arm(p: *Parser) -> WrittenArm
     val start = p.toks.here()
     if p.accept("else")
-        val body = parse_line_body(p, false)
+        val body = arm_body(p)
         return WrittenArm(start.to(p.ended()), ElseArm, None, body)
     if p.at("if")
         p.report.add(error(start, MalformedArmText + "; a guard follows the arm's operation"))
@@ -118,8 +129,13 @@ private select_arm(p: *Parser) -> WrittenArm
         skip_line(p)
         return WrittenArm(start, MalformedArm, None, Expr(start, UnitLit))
     p.expect("->")
-    val body = parse_line_body(p, false)
+    val body = arm_body(p)
     WrittenArm(start.to(p.ended()), kind, guard, body)
+
+// An arm's body. Inside brackets whose commas separate items a comma ends a one-line body, as it
+// ends a match arm's, so a tuple there is written in parentheses.
+private arm_body(p: *Parser) -> &Expr
+    if p.in_list && !p.at_kind(Indent) then expression(p, 0) else parse_line_body(p, false)
 
 /** What an arm that is none of a select's arms is told. */
 private const MalformedArmText: string =
