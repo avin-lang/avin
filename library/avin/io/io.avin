@@ -5,6 +5,8 @@ module avin.io
 // a program reads or writes files, directories and connections. Each failure is a
 // value a correct program can meet and handle.
 
+import avin.threads.Readiness
+
 // Why an input or output operation failed: what kind of failure it was, what was being done, and
 // what it was done to, a path, a program or an address. It shows as a sentence naming all three,
 // `cannot read app.conf: no such file or directory`, and a program tells failures apart by the kind:
@@ -227,11 +229,32 @@ private stdioError(operation: string, subject: string) -> (StdioFailure) -> IoEr
   Closed -> IoError(ConnectionReset, operation, subject)
   Failed(m) -> IoError(Other(m), operation, subject)
 
+@sysl("avin.rt.read_input_available")
+private takeAvailableInput(max: int) -> Result[Option[Array[byte]], StdioFailure]
+
+@sysl("avin.rt.input_readable")
+private inputReadable() -> bool
+
 // Standard input as bytes: what `stdin()` answers. See there.
-object StandardInputBytes: Reader
+object StandardInputBytes: Reader, Readiness
   override read(max: int) -> Result[Array[byte], IoError]
     if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
     takeInputBytes(max).mapErr(stdioError("read", "standard input"))
+
+  // Up to `max` bytes, `max` being at least one, of what `read(max)` would answer without waiting:
+  // `Some` of the bytes already read ahead, or of what one read gives where standard input has bytes
+  // now, an empty array once it has ended; `None` where a read would wait, standard input having
+  // nothing yet or another thread being in the middle of reading it. Never waits.
+  readAvailable(max: int) -> Result[Option[Array[byte]], IoError]
+    if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
+    takeAvailableInput(max).mapErr(stdioError("read", "standard input"))
+
+  // Whether a read would answer now, without waiting: bytes are already read ahead, a `readLine`'s
+  // beyond its line among them, or have arrived, or the input has ended or failed, which the read then
+  // answers, or standard input is a file. False while another thread is reading it. Never waits.
+  override readable() -> bool = inputReadable()
+
+  override readinessDescriptor() -> int = 0
 
 // Standard output as bytes: what `stdout()` answers. See there.
 object StandardOutputBytes: ByteWriter
@@ -255,6 +278,10 @@ object StandardErrorBytes: ByteWriter
 // it is asked. A read that fails answers `Err`, with the platform's sentence, where the text readers
 // see the end. Standard input may be a terminal, a pipe or a file. A `max` below one traps, as a
 // connection's read does. The answer is `Sendable`.
+//
+// It is a `Readiness` (`avin.threads`), so a `select` waits on it beside channels and an `after`
+// (`stdin().readable() -> …`), and a `Selector` among connections; any thread may, since standard
+// input belongs to none. `readAvailable(max)` reads only what is there, never waiting for more.
 stdin() -> StandardInputBytes = StandardInputBytes
 
 // Standard output as a `ByteWriter`. Each write goes out whole before it returns: behind whatever

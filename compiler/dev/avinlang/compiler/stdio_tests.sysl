@@ -190,6 +190,119 @@ closed_descriptors()
         val error = stdio_shell(level, dir, "$P write 2>&-")
         assert(error.starts_with("x"), level + ":\n" + error)
 
+// Standard input waited on in a `select` and a `Selector` (`tests/stdio/stdin_select.avin`).
+
+/** The select test program at `level`. */
+private stdin_select_program(level: string) -> string = stdio_built("tests/stdio/stdin_select.avin", "stdin_select", level)
+
+/** Runs `script` with `sh`, `$P` the select test program at `level` and `$D` the directory `dir`:
+ * what it wrote to standard output and standard error. */
+private stdin_select_shell(level: string, dir: string, script: string) -> string
+    val all = "P='" + stdin_select_program(level) + "'; D='" + dir + "'; " + script
+    val ran = capture("sh", ["-c", all], stderr = true, timeout = 300000).unwrap()
+    assert(ran.status.ok(), level + ": the script failed: " + script + "\n" + ran.text + ran.err.unwrap_or(""))
+    ran.text + "--- err\n" + ran.err.unwrap_or("")
+
+@test("a select on standard input, a channel and an after runs whichever is ready first: standard input, the channel or the time")
+stdin_select_first()
+    val dir = stdio_scratch("select-first")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val input = stdin_select_shell(level, dir, "printf 'xy' | $P first -1 5000")
+        assert(input.starts_with("stdin\navailable: Some(xy)\n"), level + ":\n" + input)
+        val channel = stdin_select_shell(level, dir, "(sleep 2; printf x) | $P first 100 5000")
+        assert(channel.starts_with("channel 1\n"), level + ":\n" + channel)
+        val timeout = stdin_select_shell(level, dir, "(sleep 2; printf x) | $P first -1 200")
+        assert(timeout.starts_with("after\n"), level + ":\n" + timeout)
+        // Bytes coming while the select waits end it, on the main thread and on any other.
+        val later = stdin_select_shell(level, dir, "(sleep 0.3; printf q) | $P first -1 5000")
+        assert(later.starts_with("stdin\navailable: Some(q)\n"), level + ":\n" + later)
+        val thread = stdin_select_shell(level, dir, "(sleep 0.3; printf q) | $P first-thread -1 5000")
+        assert(thread.starts_with("stdin\navailable: Some(q)\n"), level + ":\n" + thread)
+        // A file is ready at once, as its read never waits.
+        val filed = stdin_select_shell(level, dir, "printf 'from file' > $D/f; $P first 5000 5000 < $D/f")
+        assert(filed.starts_with("stdin\navailable: Some(from file)\n"), level + ":\n" + filed)
+
+@test("bytes a readLine read past its line make standard input ready at once, with nothing more on the descriptor")
+stdin_select_buffered()
+    val dir = stdio_scratch("select-buffered")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdin_select_shell(level, dir, "(printf 'a\\nb\\n'; sleep 3) | $P buffered")
+        assert(out.starts_with("line: Some(a)\nreadable: true\nstdin at once: true\navailable: Some(b\\n)\nthen: None\n"), level + ":\n" + out)
+
+@test("the end of standard input makes it ready, every time: read answers empty and readAvailable an empty Some")
+stdin_select_ended()
+    val dir = stdio_scratch("select-ended")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val expected = "stdin, read 0, available Some()\nstdin, read 0, available Some()\n"
+        val nothing = stdin_select_shell(level, dir, "$P ended < /dev/null")
+        assert(nothing.starts_with("drained: \n" + expected), level + ":\n" + nothing)
+        val piped = stdin_select_shell(level, dir, "printf abc | $P ended")
+        assert(piped.starts_with("drained: abc\n" + expected), level + ":\n" + piped)
+        val filed = stdin_select_shell(level, dir, "printf abc > $D/f; $P ended < $D/f")
+        assert(filed.starts_with("drained: abc\n" + expected), level + ":\n" + filed)
+        val closed = stdin_select_shell(level, dir, "$P ended <&-")
+        assert(closed.starts_with("drained: \n" + expected), level + ":\n" + closed)
+
+@test("readAvailable on an empty pipe answers None at once, then what has come, then an empty Some at the end")
+stdin_read_available()
+    val dir = stdio_scratch("select-available")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdin_select_shell(level, dir, "(sleep 1; printf hello; sleep 0.3; printf ' world') | $P available")
+        assert(out.starts_with("now: None, at once: true\ngot: hello world\nafter the end: Some()\n"), level + ":\n" + out)
+
+@test("a select loop reading standard input three bytes at a time beside a ticking channel takes it whole, from a file or a pipe")
+stdin_select_loop()
+    val dir = stdio_scratch("select-loop")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val filed = stdin_select_shell(level, dir, "printf abcdefghij > $D/f; $P loop < $D/f")
+        assert(filed.starts_with("got: abcdefghij\n"), level + ":\n" + filed)
+        val piped = stdin_select_shell(level, dir, "(printf abc; sleep 0.2; printf defg) | $P loop")
+        assert(piped.starts_with("got: abcdefg\n"), level + ":\n" + piped)
+        val big = stdin_select_shell(level, dir, "head -c 30000 /dev/zero | tr '\\0' z | $P loop | wc -c | tr -d ' '")
+        assert(big.starts_with("30006\n"), level + ":\n" + big)
+
+@test("a Selector holds standard input among connections: whichever has bytes first runs, and standard input still runs later")
+stdin_selector()
+    val dir = stdio_scratch("selector")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val socket = stdin_select_shell(level, dir, "(sleep 1; printf zz) | $P selector socket")
+        assert(socket.starts_with("first: Some(socket 1)\nread: hi\nthen: Some(stdin), available: Some(zz)\n"), level + ":\n" + socket)
+        val input = stdin_select_shell(level, dir, "(sleep 0.3; printf zz) | $P selector stdin")
+        assert(input.starts_with("first: Some(stdin)\navailable: Some(zz)\n"), level + ":\n" + input)
+
+@test("any thread may wait on standard input while others read it: bytes another thread's readLine left in the buffer end a select's wait, and two selecting threads share every byte once")
+stdin_select_threads()
+    val dir = stdio_scratch("select-threads")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val shared = stdin_select_shell(level, dir, "(sleep 1; printf 'l1\\nl2\\n'; sleep 4) | $P reader-and-select")
+        assert(shared.starts_with("reader: Some(l1)\nselect: stdin, Some(l2\\n)\n"), level + ":\n" + shared)
+        val two = stdin_select_shell(level, dir, "(printf abc; sleep 0.2; printf def; sleep 0.2; printf ghi) | $P two")
+        assert(two.starts_with("total: 9, letters: 511\n"), level + ":\n" + two)
+
+@test("a scope's cancel stops threads waiting on standard input in a select and a Selector, and the input is read whole afterwards")
+stdin_select_cancelled()
+    val dir = stdio_scratch("select-cancel")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdin_select_shell(level, dir, "(sleep 1; printf later) | $P cancelled")
+        assert(out.starts_with("cancelled: [None, None], ran on: 0\nthen: None\nstdin: Some(later)\n"), level + ":\n" + out)
+
+@test("a terminal as standard input in a select beside a ticking channel: each typed line is taken when entered, and the end of input ends the loop")
+stdin_select_terminal()
+    for level in stdio_levels()
+        val bin = stdio_built("tests/pty/stdin_select_tty.avin", "stdin_select_tty", level)
+        val ran = capture(stdio_driver(), ["expect:ready", "send:héllo\\n", "expect:[7]", "sleep:200", "send:x\\n", "expect:[2]", "eof", "expect:ended, ticked: true", "--", bin], stderr = true, timeout = 180000).unwrap()
+        assert(ran.status.ok(), ran.text + ran.err.unwrap_or(""))
+        assert(!ran.text.contains("[timeout]"), level + ":\n" + ran.text)
+        assert(ran.text.contains("[exit 0]"), level + ":\n" + ran.text)
+
 /** The pty driver, compiled the first time it is asked for. */
 private stdio_driver() -> string
     val bin = current_dir().unwrap() + "/" + StdioDir + "/stdio_pty_drive"

@@ -736,6 +736,12 @@ What a program can rely on:
   and writes, which only it may. A connection [split](/spec/system-library/#tcp) into a reading and
   a writing half gives each half to a thread of its own, the reader's select naming its half's
   `readable()` and the writer's its half's `writable()`.
+  [Standard input](/spec/system-library/#standard-streams-as-bytes), `io.stdin()`, is a
+  `Readiness` too: ready where bytes are in the buffer every reader of it shares, those a
+  `readLine` read past its line among them, or have arrived, or the input has ended or failed, or it
+  is a file. It belongs to no thread, so any thread may name it, and several at once; a select
+  waits on it while another thread reads it, and bytes that read leaves in the buffer end the wait
+  as arriving bytes do.
 - **Sinks.** A `writable()` arm's sink is any `Writability` (`avin.threads`): every connection, and
   the writing half of a split one. It is ready where the sink's `writable()` answers `true` when the
   arm is tried: the socket has room, or the connection has failed or is closed, which its write then

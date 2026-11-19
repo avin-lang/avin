@@ -730,7 +730,7 @@ main()
 
 | Function | Meaning |
 | --- | --- |
-| `stdin() -> StandardInputBytes` | Standard input as a [`Reader`](#reader) of bytes. |
+| `stdin() -> StandardInputBytes` | Standard input as a [`Reader`](#reader) of bytes and a `Readiness`, with `readAvailable(max)`. |
 | `stdout() -> StandardOutputBytes` | Standard output as a [`ByteWriter`](#bytewriter). |
 | `stderr() -> StandardErrorBytes` | Standard error as a `ByteWriter`. |
 
@@ -750,6 +750,41 @@ runtime's poller, leaving its worker to the others.
 a pipe, a file or `/dev/null`. A read that fails answers `Err(IoError(Other(m), "read", "standard
 input"))` with the platform's sentence (standard input that is a directory: `is a directory`), where
 the text readers see the end. A `max` below one traps, as a connection's read does.
+
+**Standard input can be waited on with channels, timers and connections.** `stdin()` is a
+[`Readiness`](/spec/threads/#select), so `stdin().readable() -> …` is an arm of a `select` beside
+channel arms and an `after`, and `Selector.readable(stdin(), key)` puts it among connections. Its
+`readable()` answers at once whether a read would answer without waiting: bytes are in the shared
+buffer, those a `readLine` read past its line among them, or have arrived on the descriptor, or the
+input has ended or failed, or it is a file, whose read never waits; it answers `false` while
+another thread is in the middle of reading it. `readAvailable(max) -> Result[Option[Array[byte]],
+IoError]` reads only what is there and never waits: `Some` of what `read(max)` would answer now,
+an empty array once the input has ended, or `None` where a read would wait, so a loop that is
+also drawing a screen or keeping time takes what has come and goes on.
+
+```text
+import avin.io
+import avin.threads.Channel
+import avin.time.millis
+
+// Echoes what is typed, a piece at a time as it comes, and says each tick, until the input ends.
+run(ticks: Channel[int])
+  var open = true
+  while open
+    select
+      io.stdin().readable() -> io.stdin().readAvailable(4096) match
+        Ok(Some(b)) -> if b.length == 0 then open = false else io.stdout().write(b).getOrElse(())
+        Ok(None) -> ()
+        Err(_) -> open = false
+      ticks.receive() as Some(t) -> println(s"tick $t")
+      after millis(500) -> println("idle")
+```
+
+Standard input belongs to no thread, so any thread may wait on it, where a connection may be named
+in a select only by the thread it belongs to. Waiting takes no lock: a select waits while another
+thread reads, and bytes that read leaves in the buffer end the wait as bytes arriving do. Several
+threads may wait on it at once; each is woken, and the reads that follow share the bytes, each byte
+going to one of them.
 
 **A byte write goes out whole before it returns.** Standard output's buffer, what `print` and
 `println` have written so far, is sent on first, so the bytes land after it; the write holds

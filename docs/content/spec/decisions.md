@@ -9076,6 +9076,39 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     answering the entry, a send entry taken out once it ran), and whether `select` should gain a
     `for` arm as sugar over it.
 
+- Settled on the user's delegation 2026-11-19 (branch `stdin-readiness`): **`io.stdin()` is a
+  `Readiness`, any thread may wait on it, and `readAvailable(max)` reads only what is there.**
+  Source: the `stdio-bytes` branch found that the tui package could not move off its own Sysl
+  binding of descriptor 0 (`sysl.io.wait.ready` with a time limit, then a raw read), because
+  `io.stdin()` had no timed wait and bytes in the runtime's shared buffer would never show as the
+  descriptor's readiness; any interactive program (a TUI, a REPL, a language server with timers)
+  needs standard input in one wait with channels and timers. Details settled: (1) **Ready** means
+  bytes are in the shared buffer (a `readLine`'s read-ahead among them), the input has ended or
+  failed, standard input is a file (whose read never waits), or descriptor 0 polls readable;
+  `readable()` never waits, and answers `false` while another thread holds the input lock.
+  (2) **Ownership: none.** Standard input is process-global, so any thread may name it in a
+  select or a `Selector`, and several at once; a connection keeps its owner rule. (3) **The lock**:
+  a select never takes `input_readers` to wait. Every select arm on standard input is enlisted on
+  a runtime queue (`input_changed`) that every reader notifies as it lets the lock go, so bytes
+  another thread's `readLine` left in the buffer end the wait; one select at a time watches
+  descriptor 0 on the poller (which holds one waiter per descriptor and direction), and hands the
+  watch on, waking the others, when its wait ends; a reader parked on descriptor 0 takes the
+  watch's place and tells the selects when it lets go. The library is unchanged: the runtime's
+  `select_watch` takes descriptor 0 by this path. (4) **`readAvailable(max) ->
+  Result[Option[Array[byte]], IoError]`**: `Some` of what `read(max)` would answer without
+  waiting, an empty array at the end, `None` where a read would wait or another thread is
+  reading; it is a method of `StandardInputBytes`, not of `Reader`. WHY: one wait path for every
+  source; the queue closes the one gap readiness on the descriptor alone leaves (bytes already
+  buffered) without polling; `Option` keeps "nothing yet" apart from "ended", which a TUI must
+  tell apart. ALTERNATIVES: only the thread that first waits on standard input may wait on it,
+  trapping others (a rule a program could not see, for a resource that has no owner); taking the
+  input lock to look (a select would then wait behind a thread parked in `readLine`, past its
+  `after`); a select re-trying standard input on a timer (`wakeAt`) while another thread reads
+  (polling, and a delay); `readAvailable` answering an empty array for both "nothing yet" and the
+  end (ambiguous); `readSome`/`readAvailable` on the `Reader` trait (every reader would owe it,
+  and files and connections have no use for it yet). tui switched in its branch `stdin-api`.
+  **Review with the user:** the name `readAvailable` and its `Option` answer.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to

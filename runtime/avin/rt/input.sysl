@@ -2,9 +2,10 @@ module avin.rt
 
 import sysl.buf.{Buf, buf}
 import sysl.io.find_byte
-import sysl.io.wait.Readable
+import sysl.io.wait.{Readable, ready}
 import sysl.slices.{as_mut_ptr, copy}
 import sysl.text.{chars_of, from_utf8_lossy}
+import sysl.time.micros
 
 // Standard input, read as text. The runtime holds the one buffer every reader of it shares, so a
 // line, an iterator of lines and the rest of the input all take from the same place, and nothing read
@@ -30,11 +31,80 @@ input_hold(ctx: *Context)
     enter_doubt(ctx)
     hold_park_lock(ctx, &input_readers)
 
-/** Lets the lock over standard input go, which the calling thread holds. */
+/** Lets the lock over standard input go, which the calling thread holds, and lets every select waiting
+ * on standard input look at it again: the read may have left bytes in the buffer, or ended the input. */
 @export("avin_rt_input_release")
 input_release(ctx: *Context)
+    input_release_quietly(ctx)
+    input_changed.guard.lock()
+    wake_all(&input_changed)
+    input_changed.guard.unlock()
+
+/** Takes the lock over standard input where no other thread holds it, answering whether it did; never
+ * waits. */
+input_try_hold(ctx: *Context) -> bool
+    if !try_hold_park_lock(&input_readers) then return false
+    enter_doubt(ctx)
+    true
+
+/** Lets the lock over standard input go having changed nothing of it, so no select is told to look. */
+input_release_quietly(ctx: *Context)
     leave_doubt(ctx)
     let_park_lock_go(&input_readers)
+
+// Waiting on standard input in a `select` (`select.sysl`). Standard input belongs to no thread, so any
+// thread may wait on it, while other threads read it. A select's arm for it is on `input_changed`,
+// which every reader notifies as it lets the lock go, so bytes another thread's read left in the buffer
+// end the wait as bytes on the descriptor do; and one select at a time, `input_watcher`, also watches
+// descriptor 0 on the poller, which holds one waiter for each descriptor and direction. A thread
+// reading standard input watches the descriptor itself, under the lock, in place of the select's
+// watch, and lets the select know when it lets the lock go. When the watching select's wait ends,
+// every other is told, so one of them watches in its place.
+
+/** The selects waiting on standard input, and the guard over `input_watcher`. */
+var input_changed: WaitQueue = new_wait_queue_for(WaitsOnInput)
+
+/** The link of the select that watches descriptor 0 for standard input, or null; under
+ * `input_changed`'s guard. */
+var input_watcher: *SelectLink = null
+
+/** Makes `l` the select link that watches descriptor 0, where no other does, answering whether it is
+ * that link. */
+input_watch_take(l: *SelectLink) -> bool
+    input_changed.guard.lock()
+    if input_watcher == null then input_watcher = l
+    val mine = input_watcher == l
+    input_changed.guard.unlock()
+    mine
+
+/** Ends the watch of descriptor 0 by `l`, where it is the watching link, and tells every other select
+ * waiting on standard input, so that one of them watches in its place. */
+input_watch_give(l: *SelectLink)
+    input_changed.guard.lock()
+    if input_watcher == l
+        input_watcher = null
+        wake_all(&input_changed)
+    input_changed.guard.unlock()
+
+/** Whether a read of standard input would answer now, holding the lock over it: bytes are buffered,
+ * the input has ended, it is a file, which is read at once, or the descriptor has bytes, has reached
+ * its end or has failed. A descriptor whose readiness cannot be read counts as ready, so the read
+ * answers why. */
+input_ready_held() -> bool
+    if input_at < input.len() || input_done || !input_is_stream() then return true
+    ready(0, Readable, micros(0)) match
+        Ok(b) -> b
+        Err(_) -> true
+
+/** Whether a read of standard input would answer now, without waiting; false while another thread
+ * holds the lock over it. Never waits. */
+input_readable() -> bool
+    val ctx = current_context
+    if ctx == null then return true
+    if !input_try_hold(ctx) then return false
+    val answer = input_ready_held()
+    input_release_quietly(ctx)
+    answer
 
 /** Bytes read and not yet taken: those of `input` from `input_at` on. */
 var input: Buf[u8] = buf()
