@@ -662,6 +662,22 @@ main()
 | `readLine() -> Option[string]` | The next line without its terminator, `None` at the end of the input. An empty line is `Some("")`. |
 | `lines() -> Iterator[string]` | The lines left, each as `readLine` gives it, read as the iterator advances. |
 | `readAll() -> string` | Everything left, terminators and all; empty when nothing is left. |
+| `inputs(paths: Vector[string]) -> Iterator[Result[(string, string), IoError]]` | The files `paths` names, or standard input when it is empty, each as its name and all its text. |
+| `inputLines(paths: Vector[string]) -> Iterator[Result[(string, string), IoError]]` | The same a line at a time: an input's name and one of its lines. |
+
+**`inputs` and `inputLines` are for a tool that reads the files it is given, or standard input.** A
+path of `-` names standard input wherever it stands, and no paths at all is one input, standard
+input; a name comes back as it was written, so standard input is `"-"`. An input is read when the
+iterator reaches it, and one that cannot be read is an `Err` naming it in its place: the iterator
+goes on, so a tool reports each failure and carries on. Standard input is read to its end, so a
+second `-` finds it empty; it shares the buffer of `readLine`, `lines()` and `readAll`.
+
+```avin
+for r in io.inputLines(args)
+  r match
+    Ok((name, line)) -> println(s"$name:$line")
+    Err(e) -> eprintln(e.message)
+```
 
 **A line ends at `\n`, and a `\r` just before it belongs to the terminator**, so input written with
 either convention reads the same. A `\r` anywhere else is part of the line. The last line needs no

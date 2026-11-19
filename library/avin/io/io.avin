@@ -5,6 +5,7 @@ module avin.io
 // a program reads or writes files, directories and connections. Each failure is a
 // value a correct program can meet and handle.
 
+import avin.fs
 import avin.threads.Readiness
 
 // Why an input or output operation failed: what kind of failure it was, what was being done, and
@@ -294,6 +295,75 @@ stdout() -> StandardOutputBytes = StandardOutputBytes
 // Standard error as a `ByteWriter`: each write goes out whole before it returns, after standard
 // output has been flushed, as `eprint` does; a reader that has gone is `Err` as for `stdout()`.
 stderr() -> StandardErrorBytes = StandardErrorBytes
+
+// The standard input's name in a list of inputs, as a command-line tool is given it.
+private val StdinName = "-"
+
+// The inputs a command-line tool was told to read, in order, each as its name and all its text: the
+// files `paths` names, or standard input when `paths` is empty, and `-` among them names standard
+// input too. A name is given as it was written, so standard input is `"-"`. An input is read when the
+// iterator reaches it, and one that cannot be read is an `Err` naming it (`cannot read a.txt: no such
+// file or directory`, or not UTF-8 at a byte) in its place: the iterator goes on to the next, so a
+// tool reports what failed and carries on. Standard input is read once, to its end; a second `-`
+// finds it empty.
+inputs(paths: Vector[string]) -> Iterator[Result[(string, string), IoError]] =
+  NamedInputs(if paths.isEmpty then Vector(StdinName) else paths)
+
+// `inputs` a line at a time: each element is an input's name and one of its lines, without its
+// terminator, as `lines` and `readLine` give them. An input with no lines gives nothing, and one that
+// cannot be read gives one `Err` and no lines. Standard input's lines are read as the iterator
+// advances, a file is read whole when the iterator reaches it.
+inputLines(paths: Vector[string]) -> Iterator[Result[(string, string), IoError]] =
+  NamedInputLines(if paths.isEmpty then Vector(StdinName) else paths)
+
+private readInput(name: string) -> Result[string, IoError] =
+  if name == StdinName then Ok(readAll()) else fs.readText(name)
+
+private class NamedInputs(private val names: Vector[string]): Iterator[Result[(string, string), IoError]]
+  private var index = 0
+
+  override hasNext() -> bool = index < names.length
+
+  override next() -> Result[(string, string), IoError]
+    if index >= names.length then fail("next on an exhausted iterator")
+    val name = names(index)
+    index += 1
+    readInput(name).map(text -> (name, text))
+
+private class NamedInputLines(private val names: Vector[string]): Iterator[Result[(string, string), IoError]]
+  private var index = 0
+  private var name = ""
+  private var current: Option[Iterator[string]] = None
+  private var pending: Option[Result[(string, string), IoError]] = None
+
+  // Fills `pending` with the next line or error, or leaves it empty when every input is done.
+  private fill()
+    while pending is None
+      current match
+        Some(it) ->
+          if it.hasNext() then pending = Some(Ok((name, it.next())))
+          else current = None
+        None ->
+          if index >= names.length then return
+          name = names(index)
+          index += 1
+          if name == StdinName then current = Some(lines())
+          else
+            fs.readText(name) match
+              Ok(text) -> current = Some(text.lines.iterator())
+              Err(e) -> pending = Some(Err(e))
+
+  override hasNext() -> bool
+    fill()
+    pending is Some(_)
+
+  override next() -> Result[(string, string), IoError]
+    fill()
+    pending match
+      Some(r) ->
+        pending = None
+        r
+      None -> fail("next on an exhausted iterator")
 
 // The lines of standard input. `hasNext` takes the next line when it has none in hand, so a line it
 // answers for is this iterator's even while other threads read.
