@@ -10955,6 +10955,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
+- Settled on the user's delegation 2026-11-19 (branch `prefix-ops`; the user approved the feature
+  that day): **a data type, a class or a trait may define the prefix `!`, `~` and `+` as methods
+  taking no argument, as it defines `-`** ([operator methods](/spec/operators-and-control-flow/#operator-methods)).
+  `!a`, `~a` and `+a` call `a`'s method of that name where its type, or a type parameter's bound, has
+  one taking no argument; each yields any type, binds at the prefix level, and is resolved by the one
+  path the prefix `-` already took. Choices this branch made: **a `!` yielding something other than
+  `bool` is allowed**, as a method `<` may yield a `Cond`, so a query builder's `!cond` is a
+  condition object. **In a condition (`if`, `while`, an operand of `&&` or `||`) the `!` call must
+  yield `bool`**, and one that does not is "expected bool, found Cond", the same message any
+  non-`bool` condition gets; the condition then binds no names, since an `is` test is never the
+  operand of a method `!`. **A method `!` takes no argument at all**, a defaulted one included: `!`
+  has no binary form, and an `a ! b` reading would be a new infix operator nobody asked for. `~` and
+  `+` keep their one-argument overloads for `a ~ b` and `a + b`. **Generic code reaches them through
+  a user trait that declares them** (`trait Flip` with `!() -> Self`); there is no core trait for
+  them, since no built-in type's `!`, `~` or `+` is anything generic code over user types needs, and
+  `Neg` stays the only prefix core trait. **Where the type has no such method the operator keeps its
+  meaning**: on a data type or a class `!a`, `~a` and `+a` are the errors they were ("expected bool",
+  "`~` needs an integer or a byte", "`+` needs a number"). **The built-in types stay closed**: a
+  method `!`, or `~` or `+` taking no argument, on `int`, `real`, `byte`, `char`, `string`, `bool` or
+  a tuple, in an extension or a trait's implementation, is an error ("a prefix `!` on bool is the
+  language's own…"); `!` is no longer among the reserved method spellings. **Two prefix operators
+  written together stay one name** (`!!x` and `-~x` are the existing "a symbol method has no prefix
+  form" error), so nesting is written `! !x` and `- ~x`, as the operator-run rule already said.
+  *Alternatives weighed*: requiring `bool` from every method `!` (rules out the query builder the
+  feature is for); core traits `Not`, `Complement` and `Positive` (no program asks for them, and
+  each would need an impl for every built-in type); splitting a run of prefix characters such as
+  `!!` into nested operators (it breaks the one longest-run rule the lexer and `++`/`--` rely on).
+  **Review with the user**: whether `!!x` should read as `! !x` without the space.
 
 ## Open
 

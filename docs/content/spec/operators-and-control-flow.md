@@ -139,7 +139,7 @@ class Bag(val items: Vector[int])
 `a ++ b` is `a.++(b)`, and `a.++(b)` may be written as such. A function outside a type cannot be
 named by a symbol. Some of the language's own operators are not method names: declaring a method
 named `==` is an error that says to implement `Eq`. The reserved spellings are the wrapping and
-saturating `+%` `-%` `*%` `+|` `-|` `*|`, `!` `&&` `||`, `==` `!=` `===` `!==`, `::`, `=` `:=`
+saturating `+%` `-%` `*%` `+|` `-|` `*|`, `&&` `||`, `==` `!=` `===` `!==`, `::`, `=` `:=`
 `:` `?` `->` `=>`, and each yielding compound form such as `+:=` and `<<:=`. Every other run is
 free, `++`, `--`, `>>>` and the plain compound spellings `+=` and `-=` among them.
 
@@ -148,7 +148,8 @@ but the integers and bytes, whose bitwise and shift operators are the machine's:
 these names on `int` or `byte`, in an extension too, is an error. On any other type, `a | b` calls
 `a`'s method `|` and `a >> b` its method `>>`, each at its operator's own level, so a parser
 combinator (`p >> f`), a set of flags, a stream or a query builder can be written with them. Prefix
-`~` stays the integers' and bytes' complement, and `~a` on another type is an error.
+`~` stays the integers' and bytes' complement, and `~a` on another type calls its method `~` taking
+no argument, an [operator method](#operator-methods), and is an error where it has none.
 
 ```text
 data Flags(bits: int)
@@ -187,7 +188,38 @@ val scaled = v * 2.0
 val flipped = -v
 ```
 
-A prefix `-a` calls a method `-` taking no argument. Where a type has no method of an operator's
+A prefix `-a` calls a method `-` taking no argument, and so do the other prefix operators: `!a` calls
+a method `!`, `~a` a method `~` and `+a` a method `+`, each taking no argument and yielding whatever
+it is declared to, at the prefix level, so `!a.b` is `!(a.b)` and `~a + b` is `(~a) + b`. A method
+`!` takes no argument at all, since `!` has no binary form; `~` and `+` may also be overloaded with
+one argument for `a ~ b` and `a + b`, which a prefix operator never calls. A query builder's `!cond`
+builds the negated condition and a bit set's `~bits` its complement:
+
+```text
+data Cond(sql: string)
+
+impl Cond
+  !() -> Cond = Cond(s"NOT ($sql)")
+
+class Bits(val word: int)
+  ~() -> Bits = Bits(~word & 255)
+  +() -> int = word
+
+trait Flip
+  !() -> Self
+
+twice[T: Flip](x: T) -> T = ! !x
+```
+
+A trait may declare them, so a type parameter bounded by it has them, and a value of the trait
+dispatches on its class. Two prefix operators written together are one name, so nested ones are
+written apart: `! !x`, `- ~x`. In an `if`, a `while` or an operand of `&&` and `||`, `!a` is a
+condition only where it is a `bool`: `if !stack` reads where the method `!` yields `bool`, and is an
+error where it yields a `Cond`. A prefix `!`, `~` or `+` on a type with no method of its name keeps
+its own meaning, so it is an error on a data type or a class: `!` needs a `bool`, `~` an integer or a
+byte, and `+` a number. No core trait stands behind them, as `Neg` stands behind `-`.
+
+Where a type has no method of an operator's
 name, the operator is its core trait's, `Add`'s `add` for `+`, as it always is in generic code: a
 type with both a method `+` and an `impl Add` has its method called by `a + b` and `add` called
 by a function bounded by `Add`. `a < b` alone calls the method `<`, whatever it yields, so a query
@@ -198,7 +230,8 @@ the other compound forms assign through the method: `deadline += grace` is
 
 The built-in types keep their operators: a method of one of these names on `int`, `real`, `byte`,
 `char`, `string`, `bool` or a tuple, in an extension or a trait implementation, is an error, so `+`
-on two `int`s is always the machine's addition. `==` and `!=` stay `Eq`'s.
+on two `int`s is always the machine's addition, and so is a method `!`, or `~` taking no argument,
+there: `!` on a `bool` is always its negation. `==` and `!=` stay `Eq`'s.
 
 A symbol method's call binds at the level of the language's operator its name's first character
 belongs to, so a name reads with the operator it resembles. One character overrides the first: a
@@ -269,8 +302,8 @@ endless(n: int) -> Chain = s"c$n" #:: endless(n + 1) // returns; each next() mak
 - A companion's `op:` with a strict second parameter is not called infix; it is an ordinary function
   of the object.
 
-There are no prefix or postfix symbol methods, beyond the [method `-`](#operator-methods) taking no
-argument that a prefix `-` calls. `++` and `--` keep their update meaning when no
+There are no prefix or postfix symbol methods, beyond the [methods `-`, `!`, `~` and
+`+`](#operator-methods) taking no argument that the prefix operators call. `++` and `--` keep their update meaning when no
 operand follows them on the line: `i++` and `++i` update `i`, and `xs ++ ys` calls `++`. An operand
 here is a name, a literal or an opening bracket on the same line, or an indented block on the next;
 so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (-b)` to join.
