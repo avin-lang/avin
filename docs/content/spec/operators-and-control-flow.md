@@ -348,7 +348,13 @@ sign(x: int) -> int
 
 Inside brackets a line break is not significant, so a line in a call's arguments may start with any
 operator at any depth, a method named by a symbol included. A block opened inside the brackets, a
-lambda's body, starts its own lines again.
+lambda's body, starts its own lines again, where a comma list is a tuple, until its last line: a
+line that closes a bracket opened before the block ends the block at its first comma, and the
+items after that comma are the bracket's own. So `spawn(() ->` … `a + f(n), 67108864)` passes the
+lambda yielding `a + f(n)` and `67108864`, as `spawn(() -> a + f(n), 67108864)` does; a tuple the
+block yields there is written in parentheses, `(a, b))`, and a closing bracket on a line of its own
+leaves the line above a tuple. Blocks nested in the same brackets, an `if`'s, a `match`'s or an
+inner lambda's, all end at that comma.
 
 ### Trailing blocks
 
@@ -552,7 +558,8 @@ one-line arm's body ends the arm, the `match` and the item, as it ends a `return
 `f(x match` … `_ -> 0, "a")` the `match` is the first argument and `"a"` the second, which may also
 stand on the line after the arms. A tuple body there is written in parentheses, `_ -> (0, 1)`; a
 comma after an arm that more arms follow is an error that says so. An arm's indented body is a
-block and starts a line again. Patterns include:
+block and starts a line again, up to a last line that closes the brackets, which
+[ends at its comma](#continuation-lines) as any block's does. Patterns include:
 
 - literals, including negative numbers;
 - inclusive and exclusive literal ranges (`'a'..'z'`, `0..<10`);

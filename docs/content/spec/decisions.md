@@ -430,7 +430,8 @@ a decision changes, this page and the chapter change together.
 - Inside brackets whose commas separate items (call arguments, tuple and collection literals), a
   `return` or `break` value stops at the comma, so `f(a = return 1, b = 2)` has two arguments; a
   parenthesised `return 1, 2` is two tuple items, and `return (1, 2)` returns a tuple. An indented
-  block inside the brackets starts a line again, and a one-line lambda body never takes a comma list.
+  block inside the brackets starts a line again, up to a last line that closes the brackets, whose
+  comma ends the block; a one-line lambda body never takes a comma list.
 - Actors are built into the language: `actor` declares one.
 - State machines are built into the language: `machine` declares one, and `state` declares each of
   its states.
@@ -10157,7 +10158,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
   line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
   lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
-  writes. An indented arm body stays a block, where a comma list is a tuple.
+  writes. An indented arm body stays a block, where a comma list is a tuple (up to a last line that
+  closes the brackets, below).
+- Settled on the user's delegation 2026-11-19 (branch `lambda-trailing-arg`): **a block's last line
+  that closes a bracket opened before the block ends the block at its first comma**: in
+  `spawn(() ->` … `a + f(n), 67108864)` the lambda yields `a + f(n)` and `67108864` is `spawn`'s
+  second argument, as on one line. The items after the comma are the bracket's own (positional or
+  named arguments, collection elements, map entries); every block opened in the same brackets on the
+  way (an `if`'s or `match`'s, an inner lambda's) ends there too, and a trailing block the line itself
+  opens and closes is stepped over. A tuple the block yields on that line is written in parentheses,
+  `(a, b))`; a `)` on a line of its own, a tuple on an earlier line and `a, b = b, a` on an earlier
+  line are unchanged. Why: the block's lines read the trailing items as a tuple the block yields, so
+  the call silently lost its argument (the thread got the default stack and yielded a tuple), and the
+  spec's "a block inside brackets starts a line again" said nothing about the line that leaves the
+  brackets; the rule makes the multi-line form mean what the one-line form means, as the
+  `match`-arm rule above did for arms. Alternatives: an error for an unparenthesized tuple on such a
+  line, asking for parentheses either way (safe, but rejects the natural way to write a trailing
+  argument); keeping the tuple (silent wrong code). It changes code that compiled before; a scan of
+  every `.avin` file in the avin-lang repos found none relying on the old reading, and code that did
+  now fails to compile (an argument count or a lambda's type). **Review with the user**: it changes
+  the meaning of code that compiled before.
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
