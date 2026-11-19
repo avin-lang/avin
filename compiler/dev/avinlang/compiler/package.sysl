@@ -892,6 +892,9 @@ struct ResolvedPackage
     absent_c: Buf[string]
     /** The labels of its dependencies whose `if` does not hold on the machine resolved for. */
     absent_dependencies: Buf[string]
+    /** Whether its manifest takes anything by a condition: a dependency, a Sysl dependency, a C
+     * library or a feature with an `if`. */
+    conditional: bool
 
 /** What resolving a package found: the packages, the one resolved first and then every package it
  * depends on, directly or through another; the sum file; the lines it holds; and a line for every
@@ -904,6 +907,8 @@ struct Resolution
     /** Each repository cloned into the cache while resolving, as its coordinate and its version or `r`
      * and commit, `github.com/owner/json v1.4.0`. */
     cloned: Buf[string]
+    /** The machine it was resolved for. */
+    target: string
 
 private struct Selected
     coordinate: string
@@ -1102,7 +1107,7 @@ private walk_roots(r: *Resolver, roots: Buf[string], walked: Buf[string], sum_fi
         visit(r, root, None, root, &seen, &packages)?
     for p in packages
         if unmet_requirement(p.manifest.features, p.features) is Some(d) then return Err(d.render(p.manifest.src))
-    Ok(Resolution(packages, sum_file, r.sums, r.read, r.cloned))
+    Ok(Resolution(packages, sum_file, r.sums, r.read, r.cloned, r.target))
 
 /** Resolves the program of one file `file`, whose header `m` names its dependencies, as a package is
  * resolved: every package it depends on, fetching what the cache has not got, each fetched one held to
@@ -1138,7 +1143,7 @@ private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen:
     var absent_dependencies: Buf[string] = buf()
     for d in written.dependencies
         if !condition_holds(d.condition, r.target) then absent_dependencies.push(d.label)
-    out.push(ResolvedPackage(m.name, dir, m, from is Some(_), on, buf(), buf(), absent_c, absent_dependencies))
+    out.push(ResolvedPackage(m.name, dir, m, from is Some(_), on, buf(), buf(), absent_c, absent_dependencies, takes_by_condition(written)))
     var optional: Buf[string] = buf()
     var optional_dirs: Buf[string] = buf()
     for d in m.dependencies
@@ -1199,6 +1204,18 @@ private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen:
     out[at].optional = optional
     out[at].optional_dirs = optional_dirs
     Ok(())
+
+// Whether the manifest `m` takes anything by a condition.
+private takes_by_condition(m: Manifest) -> bool
+    for d in m.dependencies
+        if d.condition != "" then return true
+    for d in m.sysl_dependencies
+        if d.condition != "" then return true
+    for l in m.c_libraries
+        if l.condition != "" then return true
+    for f in m.features
+        if f.condition != "" then return true
+    false
 
 // The first target a package listing `targets` builds for where `condition` takes a dependency
 // listing `dependency_targets` that does not build for it, if any.
@@ -1762,6 +1779,12 @@ struct LoadedProgram
     sysl: Buf[SyslPackage]
     /** The C libraries of every package in it, which its C bindings call. */
     c: Buf[CLibrary]
+    /** The machine it was read for: its files are those read there. */
+    target: string
+    /** The machines `avin check` checks it for, where anything in it differs by machine: the targets
+     * its root lists, each set of machines that read it alike once, in the order listed; empty where
+     * nothing differs, and it is checked for `target` alone. */
+    machines: Buf[Buf[string]]
 
 /** A Sysl package a program's bindings may reach: its name in the shim package's manifest, and where
  * it comes from, a directory made absolute. */
@@ -1872,10 +1895,17 @@ load_program_with(path: string, fetching: Fetching, choice: FeatureChoice, linki
     if choice.names.len() > 0
         return Err(s"avin: `--features` names features of a package, and $path is in none")
     if is_dir(path)
-        val files = program_files(path).map_err(message -> "avin: " + message)?
-        if files.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
-        refuse_headers(files, s"is one of the files of the program at $path, and only a program of one file names its dependencies in a header: give the program an $ManifestName and name them there")?
-        return Ok(LoadedProgram(path, files, None, buf(), buf()))
+        val every = program_files(path).map_err(message -> "avin: " + message)?
+        if every.len() == 0 then return Err(s"avin: $path: no `.avin` or `.lavin` files in the program")
+        refuse_headers(every, s"is one of the files of the program at $path, and only a program of one file names its dependencies in a header: give the program an $ManifestName and name them there")?
+        var program = LoadedProgram(path, files_on(every, choice.target), None, buf(), buf(), choice.target, buf())
+        // A program with no manifest builds for every target, each reading the files read there.
+        if any_machine_file(every)
+            var views: Buf[MachineView] = buf()
+            for t in machine_targets()
+                views.push(MachineView(t, files_on(every, t), ""))
+            with_machines(&program, views)
+        return Ok(program)
     val text = read_text(path).map_err(e -> s"avin: $path: ${e.to_string()}")?
     load_script(path, source_of(path, text), fetching, linking)
 
@@ -1972,7 +2002,7 @@ script_manifest(dir: string, src: Source, h: ScriptHeader) -> Result[Manifest, D
 load_script(path: string, src: Source, fetching: Fetching, linking: Option[bool] = None) -> Result[LoadedProgram, string]
     val res = script_resolution(path, src, fetching)? match
         Some(r) -> r
-        None -> return Ok(LoadedProgram(path, single_file(src), None, buf(), buf()))
+        None -> return Ok(LoadedProgram(path, single_file(src), None, buf(), buf(), host_target(), buf()))
     record_sums(res)?
     assemble(path, res, Some(single_file(src)), linking)
 
@@ -2022,18 +2052,55 @@ load_package(root: string, fetching: Fetching) -> Result[LoadedProgram, string] 
 load_package_with(root: string, fetching: Fetching, choice: FeatureChoice, linking: Option[bool] = None) -> Result[LoadedProgram, string]
     val res = resolve_with(root, fetching, false, choice)?
     record_sums(res)?
-    assemble(root, res, None, linking)
+    val here = assembled(root, res, None)?
+    var program = LoadedProgram(root, here.files, Some(res.packages[0].name), sysl_packages(res)?, linked_c_libraries(res, linking)?, res.target, buf())
+    // Where anything differs by machine, the package is read for each of its targets too: an import
+    // is checked against every machine its file is read on, and `avin check` checks each.
+    if here.varies
+        var views: Buf[MachineView] = buf()
+        for t in targets_or_every(res.packages[0].manifest.targets)
+            if t == res.target
+                views.push(MachineView(t, here.files, ""))
+                continue
+            val there = resolve_with(root, fetching, false, choice_for(choice, t)) match
+                Ok(r) -> r
+                Err(message) ->
+                    views.push(MachineView(t, buf(), message))
+                    continue
+            _ = record_sums(there)
+            assembled(root, there, None) match
+                Ok(a) -> views.push(MachineView(t, a.files, ""))
+                Err(message) -> views.push(MachineView(t, buf(), message))
+        with_machines(&program, views)
+    Ok(program)
 
 // The program resolution `res` reads: each dependency's modules first, then the program's own files,
 // which are `own` for a program of one file and otherwise the files of the package at `root`.
 // `linking` is the command line's word on how to link the C libraries, as `load_program_with` takes it.
 private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]], linking: Option[bool] = None) -> Result[LoadedProgram, string]
+    val files = assembled(root, res, own)?.files
+    val sysl = sysl_packages(res)?
+    val c = linked_c_libraries(res, linking)?
+    Ok(LoadedProgram(root, files, if own is Some(_) then None else Some(res.packages[0].name), sysl, c, res.target, buf()))
+
+/** The files a resolution reads on its machine, and whether anything in it differs by machine: a file
+ * read only on some machines, or a manifest taking an entry by a condition. */
+private struct Assembled
+    files: Buf[ProgramFile]
+    varies: bool
+
+// The files of the program resolution `res` reads, as `assemble` reads them, each package's files
+// those read on the machine it was resolved for.
+private assembled(root: string, res: Resolution, own: Option[Buf[ProgramFile]]) -> Result[Assembled, string]
     // Each package's files, read without the modules its features that are off list, then the modules
     // each holds, which are what an import of an optional dependency is checked against.
     var each: Buf[Buf[ProgramFile]] = buf()
     var each_modules: Buf[Buf[string]] = buf()
+    var varies = false
+    var none = false
     for i in 0..<res.packages.len()
         val p = res.packages[i]
+        if p.conditional then varies = true
         var read: Buf[ProgramFile] = buf()
         if i == 0 && own is Some(_)
             read = own.unwrap()
@@ -2043,13 +2110,16 @@ private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]], l
             if i == 0
                 refuse_headers(read, s"is in the package `${p.name}`, whose dependencies are named in its $ManifestName: name them there")?
                 read = without_unread_tests(read, off)
+                if read.len() == 0 then none = true
+            if any_machine_file(read) then varies = true
+            read = files_on(read, res.target)
         var names: Buf[string] = buf()
         for f in read
             val n = f.module_name.unwrap_or("")
             if n != "" && !contains(names, n) then names.push(n)
         each.push(read)
         each_modules.push(names)
-    if each[0].len() == 0 then return Err(s"avin: $root: no `.avin` or `.lavin` files in the package")
+    if none then return Err(s"avin: $root: no `.avin` or `.lavin` files in the package")
     var files: Buf[ProgramFile] = buf()
     var owners: Buf[string] = buf()
     // Dependencies' modules first, then the package's own files.
@@ -2080,9 +2150,7 @@ private assemble(root: string, res: Resolution, own: Option[Buf[ProgramFile]], l
             None ->
                 modules.push(module_name)
                 holders.push(owners[i])
-    val sysl = sysl_packages(res)?
-    val c = linked_c_libraries(res, linking)?
-    Ok(LoadedProgram(root, files, if own is Some(_) then None else Some(res.packages[0].name), sysl, c))
+    Ok(Assembled(files, varies))
 
 /** Every package's C libraries in the resolution `res`, the program's own first, each with how the
  * program links it. The root package, the program, decides for all of them: a library its
@@ -2172,9 +2240,9 @@ private library_names(c: Buf[CLibrary]) -> string
 
 /** The files of the program tree at `root` as `program_files` finds them, or, when `root` holds a
  * manifest, of the package with every feature on and its dependencies without fetching any: what the
- * language server reads. */
+ * language server reads, which checks the machine it runs on. */
 program_tree_files(root: string) -> Result[Buf[ProgramFile], string]
-    if !exists(root + "/" + ManifestName) then return program_files(root)
+    if !exists(root + "/" + ManifestName) then return Ok(files_on(program_files(root)?, host_target()))
     val fetching = default_fetching()
     val offline = Fetching(fetching.cache, fetching.base, false)
     load_package_with(root, offline, every_feature()) match

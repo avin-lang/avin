@@ -9002,6 +9002,59 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     following a whole condition; symbols are lowercase and `-` belongs to a word, so a target's name
     is read whole and refused with the condition it means. WHY: one place and one sentence per
     mistake, as the manifest's other errors give. ALTERNATIVES: one generic "not a condition" error.
+- Proposed (built on branch `machine-files`, 2026-11-19): **the choices
+  [files for one machine](/spec/packages/#files-for-one-machine) and
+  [the machine in an expression](/spec/packages/#the-machine-in-an-expression) left open.**
+  - **A literate file is selected as an ordinary one** (`watch.linux.lavin`), and **a file's name
+    carries one symbol**: two parts (`watch.linux.x86_64.avin`) are refused, naming each, as is a
+    part that is no symbol, on every machine, in a package, a program with no manifest, a dependency
+    and the standard library alike. A file named as a symbol alone (`linux.avin`) is ordinary. WHY:
+    the spec's "the part is one symbol"; a `.lavin` file is a module's file like any other.
+    ALTERNATIVES: a compound part as `&&` of its symbols (a second condition syntax in file names);
+    leaving `.lavin` unselected (a literate module could not differ by machine).
+  - **A program of one file is never selected**: `avin run tool.linux.avin` runs it anywhere. WHY:
+    the file is named outright, so there is nothing to choose between. ALTERNATIVES: refusing it off
+    Linux (a script would fail for its name).
+  - **The import rule asks, for each file read on this machine, every target its root lists that
+    reads the file**, each target's package read as its build reads it (resolving, and fetching what
+    the cache lacks, a dependency taken only there). A target whose package cannot be read holds no
+    file to anything in a build, and `avin check` reports it. "No more widely" is by machine: a file
+    for `x86_64` may import Linux's module. A module whose files differ per machine but exist on every
+    machine is imported from anywhere. The rule is checked only where anything differs (a file with a
+    symbol, a manifest entry with `if`), so other packages cost nothing more. Standard library modules
+    are not held to it, since none is missing on any machine. WHY: the spec's "for every machine in
+    `targets`, whichever one is being built"; a dependency's module names are known only by reading
+    it. ALTERNATIVES: mapping an import to a dependency's label without reading it (a module's name
+    need not be its package's); checking only in `avin check` (a build would accept what another
+    machine's build refuses). **Review with the user:** whether a build may fetch a dependency only
+    another machine takes.
+  - **The import's error names the module, its package where it is another's, the machines it exists
+    on and its files there, the importing file and the machines it is missing on**, and it is the only
+    error at that import (the "standard library's module is meant" hint is not added beside it).
+  - **`avin check` checks once per set of targets that read the package alike** (the same files,
+    from the same packages), in the order `targets` lists them; with nothing differing it checks the
+    machine being built for, as before, including refusing a host the package leaves out. A diagnostic
+    every check reports is told once, as it is; one some report gets ` (on `x86_64-linux` and
+    `aarch64-linux`)` after its message; a name that a file of the same module read on another machine
+    declares is told as the spec's `no function `start` is declared in … on …` (also `no value`,
+    `no type`). A machine whose package cannot be read is told as `on `…`:` and its error. The C unit
+    is built only for the machine the compiler runs on. WHY: one sentence per mistake with the
+    machines it is for, and no other machine's tools. ALTERNATIVES: a check per target always (the
+    arch-only difference of `avin.target` would check every package three times); a prefix
+    `on `…`: ` on every machine-specific diagnostic (moves the headline off what is wrong).
+  - **`avin.target`'s values are declared in the library by its own files** (`target.macos.avin`,
+    `target.linux.avin`, `target.aarch64.avin`, `target.x86_64.avin`), and **folding is a lowering of a
+    read of a value of `avin.target`**: a `match` whose arms up to the taken one are decided by their
+    patterns (variants, alternatives, `_`, names) compiles that arm alone; an `is` test against a
+    variant and `==`/`!=` with a variant or the other value are decided and fold the `if` or the
+    left of `&&`/`||` over them, as an `is` test a pattern refutes already does. A guard before the
+    taken arm keeps the whole `match`. WHY: the values are ordinary declarations checked like any
+    other, and folding reuses the decided-condition path. ALTERNATIVES: a compiler intrinsic for
+    `os` and `arch` (a second way to make a value per machine); folding every compile-time constant
+    (changes the code of every program reading a constant, beyond what was decided).
+  - **The language server checks the files of the machine it runs on**, so a file for another machine
+    open in an editor is not analyzed as part of its package. A later item may check it for a machine
+    that reads it.
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
