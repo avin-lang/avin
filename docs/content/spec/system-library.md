@@ -1332,6 +1332,38 @@ main()
 A `Uuid` implements `FromParam` in [`avin.net.http`](#avinnethttp), so `paramAs[Uuid]` and
 `queryAs[Uuid]` read one from a route or query parameter, an invalid one answering `400`.
 
+## `avin.diff`
+
+The differences between two sequences, found with Myers' O(ND) algorithm in its linear-space form
+(the search runs from both ends until the paths meet in a middle snake, which splits the problem in
+two), so the memory used is proportional to the sizes of the inputs and the time to their sizes times
+the number D of differences. The script is a shortest one; a run of changes lists its deletes before
+its inserts, as `diff -u` prints them.
+
+```text
+import avin.diff.{diff, apply, unifiedDiff}
+
+main()
+  val edits = diff([1, 2, 3, 4], [1, 3, 4, 5])
+  assertEq(apply([1, 2, 3, 4], edits), [1, 3, 4, 5])
+  print(unifiedDiff("a\nb\n", "a\nc\n", "old.txt", "new.txt"))
+```
+
+| Member | Meaning |
+| --- | --- |
+| `Edit[T]` | `Keep(value)`, `Insert(value)` or `Delete(value)`; a `Keep` holds the element of the first sequence. |
+| `diff[T: Eq](a, b) -> Vector[Edit[T]]` | The shortest script turning `a` into `b`. |
+| `apply(a, edits) -> Vector[T]` | The sequence the edits make of `a`; traps, naming the edit, where a `Keep` or `Delete` does not match the next element of `a`, or where `a` is not used up. |
+| `changes(edits) -> int` | The number of inserts and deletes. |
+| `Line(text, terminated)` | A line without its `\n`, and whether one ended it; only a text's last line can be unterminated. A `\r` stays in the line. |
+| `splitLines(text)`, `joinLines(lines)` | Text to lines and back; `joinLines(splitLines(t))` is `t`. |
+| `LineOptions(ignoreTrailingSpace = false, finalNewline = true)` | Ignore white space (a `\r` too) at the ends of lines; with `finalNewline` a last line with no `\n` differs from the same line with one, as in `diff`. |
+| `diffLines(a, b, options) -> Vector[Edit[Line]]` | The shortest script over the lines of two texts. |
+| `Hunk(aStart, aCount, bStart, bCount, edits)` | A hunk, the starts 0-based. |
+| `hunks(edits, context) -> Vector[Hunk[T]]` | Each run of changes with `context` unchanged elements on either side; runs with no more than `2 * context` unchanged elements between them share a hunk. Traps on a negative `context`. |
+| `renderUnified(edits, fromName, toName, context = 3) -> string` | The edits of lines as `diff -u` writes them: `---` and `+++` headers, `@@ -a,b +c,d @@` (a count of 1 left out, an empty range named by the line before it), ` `, `-` and `+` lines and `\ No newline at end of file`; empty when there are no changes. |
+| `unifiedDiff(a, b, fromName, toName, context = 3, options)` | `renderUnified(diffLines(a, b, options), …)`, byte for byte `diff -u`'s output (with `--label`) for files holding the texts. |
+
 ## `avin.encoding`
 
 Bytes written as text and read back, as RFC 4648 defines them: hexadecimal, base64 with its `=`
