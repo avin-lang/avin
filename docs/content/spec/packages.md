@@ -43,7 +43,8 @@ was, and needs no ceremony.
 `package` names the package and gives its version; both are required, and `description`, `avin`
 and [`targets`](#which-machines-a-package-builds-for) are optional. Beside it a manifest holds
 `dependencies`, [`features`](#features),
-[`workspace`](#workspaces), and for its C bindings [`c-libraries`](#c-libraries) and
+[`workspace`](#workspaces), and for its C bindings [`c-libraries`](#c-libraries),
+[`c-linking`](/spec/c-bindings/#how-a-program-links-its-c-libraries) and its shorthand
 [`static-c-libraries`](/spec/c-bindings/#linking-statically).
 
 - **A name** begins with a lowercase letter and holds lowercase letters, digits, `_` and `-`
@@ -175,10 +176,11 @@ c-libraries {
 ```
 
 A program links the C libraries of every package in it, asking `pkg-config` at every build. They are
-the machine's, not fetched: they get no line in `avin.sum`. A program whose manifest says
-`static-c-libraries = true` links them from their static archives, so the machine it runs on needs
-none of them; only the root package's key is read ([C
-bindings](/spec/c-bindings/#linking-statically)).
+the machine's, not fetched, unless a package vendors one by its path: they get no line in
+`avin.sum`. A program whose manifest says `static-c-libraries = true` links them from their static
+archives, so the machine it runs on needs none of them, and its `c-linking` block chooses library by
+library; only the root package's keys are read ([C
+bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)).
 
 ### What a dependency brings in
 

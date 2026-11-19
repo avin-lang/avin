@@ -8983,6 +8983,16 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`link-flags` are passed exactly as written, in order, with no flag merged with another**, after
     the flags of `pkg-config` or `link`. WHY: the spec's "as written"; `-framework` repeated before
     two frameworks must stay two pairs. ALTERNATIVES: removing repeats (breaks `-framework` pairs).
+  - **`c-linking`'s `static` and `dynamic` may name a C library the machine leaves out**, which does
+    nothing there: a library of a package in the build whose `if` does not hold, or,
+    `<package>/<library>`, a library of a dependency whose `if` leaves it out, named by the
+    dependency's label (its libraries are not read on that machine, so an unqualified name of one is
+    still refused there). A name that is no library at all is refused on every machine.
+    `static-system`'s checks stay per machine. WHY: one program manifest serves every target, so a
+    name meant for one machine must not fail the others, while a typo still fails everywhere.
+    ALTERNATIVES: an `if` on `c-linking`'s entries (a second place to say what the library's own
+    `if` already says); resolving every target to check each name (a build would resolve three
+    times).
   - **`--target` is taken by `avin check` alone** for now, reading every manifest as that machine's
     build does; `avin build --target` is the cross-build item. WHY: checking builds nothing, so it
     needs no other machine's tools. ALTERNATIVES: every command (a build for another machine needs
@@ -11066,6 +11076,53 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
+- Settled on the user's delegation 2026-11-19 (branch `link-control`; the user: *"It should be as
+  flexible as possible. Avin isn't just for me, it's for anyone who would enjoy using it."*): **a
+  program chooses how each C library is linked in its root manifest's `c-linking` block, and a C
+  library's own block says what else links it** ([C
+  bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)). The program's block holds
+  `default` (`"static"` or `"dynamic"`), `static` and `dynamic` lists of libraries (`<library>` or
+  `<package>/<library>`), `static-system` (`-l` names the system provides, linked from their archives)
+  and `search` (where those archives are, absolute or root-relative). `static-c-libraries = true`
+  keeps its meaning as the shorthand of `default = "static"`; saying both is an error, so nothing
+  that builds today changes. A C library gains `files` (archives and shared libraries by path),
+  `search` (`-L` directories, searched for archives when static), `include` (`-I` directories, since a
+  vendored library's headers are not where `pkg-config` would say), `frameworks` and `link-flags`
+  (raw, the escape hatch); their paths are relative to the package and may not be absolute or hold a
+  `..` segment, so a fetched package builds wherever it lands. **Static is a promise, dynamic is "as
+  named"**: a library linked statically takes no shared library from a search directory (an error
+  names the missing archive, as before, now for `link` names and `files` too), while one linked
+  dynamically is linked from the flags as given, so a vendored `.a` is static either way. *Why one
+  block*: one place says how the program links, and a `static`/`dynamic` pair reads as the program's
+  sentence ("all static except mlt"). *Alternatives weighed*: a per-library `static = true` in the
+  library's block (the author would decide for every program; refused before and still refused, its
+  test kept); per-library keys inside the program's own `dependencies` entries (a library of a
+  dependency's dependency has no entry to put it in); a top-level `link` key as Sysl writes it (reads
+  as one key with the `-l` meaning of a library's `link`); `static-c-libraries` taking a list (one key
+  with two types, and no room for `dynamic`). **The command line** (`--static-c-libraries`,
+  `--dynamic-c-libraries` on build, run, test and check) stands in for the manifest's default only;
+  a library the manifest names keeps its way, since such a name usually records a reason (a licence,
+  a missing archive) a one-off flag should not erase. *Alternative*: the flag overruling everything
+  (simpler to state, but `--static-c-libraries` would then trip over every `dynamic-only` library
+  the program had already answered for). A cached `run`/`test` build is keyed by how each library is
+  linked and by its files, which also fixed the cache reusing a static build after the manifest
+  changed. **A library package may say `dynamic-only = "<why>"`**, one key for both "must be dynamic"
+  (licence) and "has no archive": both mean the same to a build and differ only in the reason, which
+  the error quotes. A program that would link it statically, by its default, the flag or its
+  `static` list, is refused with that reason and told to name it in `dynamic`; it is never made
+  dynamic silently, because a program asking to be static would then ship needing the library
+  installed. *Alternatives*: the requirement silently winning over the program's default (quiet,
+  and breaks the static promise); a requirement the program could override by `static` (a licence
+  is not the program's to waive); two keys, `dynamic-only` and `no-archive` (two names for one
+  effect). **System libraries stay dynamic unless `static-system` names them**; a named one with no
+  archive in the searched directories, or named but linked by no library, is an error. **On Linux**
+  (not built yet) an archive is still linked by its path; a `-l` kept dynamic stays `-l`; a
+  `static-system` name maps onto `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`; `frameworks` are macOS's.
+  A package cannot yet compile vendored C sources (there is no `c-sources`); it links a prebuilt
+  archive by `files`. **Review with the user**: the surface syntax (`c-linking` and its five keys,
+  `<package>/<library>` naming, the library keys `files`/`search`/`include`/`frameworks`/`link-flags`,
+  the two flags' names), and the library-requirement rule (`dynamic-only` refusing a static program
+  rather than yielding to it, and the program's `static` list not overriding it).
 
 ## Open
 

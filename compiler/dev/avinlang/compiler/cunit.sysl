@@ -3,7 +3,7 @@ module dev.avinlang.compiler
 import sh.sysl.parsing.{Source, Span, error, report}
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
-import sysl.fs.{exists, make_dir_all,make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
+import sysl.fs.{exists, is_dir, make_dir_all,make_temp_dir, pending_name, publish_file, read_bytes, remove_dir_all, remove_file, write_text}
 import sysl.process.capture
 import sysl.text.{StrBuilder, from_utf8, str_builder}
 
@@ -570,7 +570,14 @@ ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sou
     var cflags: Buf[string] = buf()
     var link: Buf[string] = buf()
     var answered = ""
+    var system_used: Buf[string] = buf()
     for library in libraries
+        for d in library.include
+            add_flag(&cflags, "-I" + library_path(library, d))
+        for d in library.search
+            if !is_dir(library_path(library, d)) then return Err(s"error: the search directory `$d` of the C library `${library.label}` of package `${library.package}` is not a directory: `${library_path(library, d)}`\n")
+        for file in library.files
+            add_flag(&link, linked_file(library, file)?)
         library.pkg_config match
             Some(m) ->
                 val c = ask_pkg_config(tc, library, m, "--cflags")?
@@ -578,13 +585,24 @@ ensure_c_unit_of(tc: Toolchain, parts: CUnitParts, libraries: Buf[CLibrary], sou
                 answered = answered + m + "\n" + c + "\n" + l + "\n"
                 for flag in c.fields()
                     add_flag(&cflags, flag)
-                val flags = if library.linked_statically then static_link_flags(library, m, l)? else words_of(l)
-                add_link_flags(&link, flags)
+                add_link_flags(&link, linked_flags(library, words_of(l), s"`pkg-config --static --libs $m`", &system_used)?)
             None ->
+                var names: Buf[string] = buf()
+                for d in library.search
+                    if !library.linked_statically then names.push("-L" + library_path(library, d))
                 for name in library.link
-                    add_flag(&link, "-l" + name)
+                    names.push("-l" + name)
+                add_link_flags(&link, linked_flags(library, names, "`link`", &system_used)?)
+        for name in library.frameworks
+            var pair: Buf[string] = buf()
+            pair.push("-framework")
+            pair.push(name)
+            add_link_flags(&link, pair)
         for flag in library.flags
             link.push(flag)
+    if libraries.len() > 0
+        for name in libraries[0].static_system
+            if !contains_text(system_used, name) then return Err(s"error: `c-linking`'s `static-system` names `$name`, which none of the program's C libraries links as `-l$name`\n")
     if bindings.len() == 0 && handles.len() == 0 && parts.enums.len() == 0 && parts.constants.len() == 0 && parts.structs.len() == 0 && parts.values.len() == 0 then return Ok(CUnit(None, false, map(), map(), link))
     val unit = c_unit_source_of(parts, libraries)
     val version = capture(tc.clang, ["--version"], timeout = 60000) match
@@ -686,22 +704,80 @@ private is_paired_link_flag(w: string) -> bool = w == "-framework" || w == "-wea
  * flags are dropped: no shared library is taken from those directories. Every other flag
  * (`-framework`, `-pthread`) is kept as it is. */
 static_link_flags(library: CLibrary, module_name: string, answer: string) -> Result[Buf[string], string]
+    var used: Buf[string] = buf()
+    var statically = library
+    statically.linked_statically = true
+    if statically.linked_why == "" then statically.linked_why = StaticByDefault
+    linked_flags(statically, words_of(answer), s"`pkg-config --static --libs $module_name`", &used)
+
+/** The link flags `words` of `library`, which `source` names (its `pkg-config` answer or its `link`),
+ * as the program links the library. Linked statically, each `-l<name>` whose `lib<name>.a` is in one
+ * of the library's search directories (its `search`, then the `-L` directories of `words`) is
+ * replaced by that archive's path, the first directory holding one winning; a name whose shared
+ * library is in one of them but whose archive is in none is an error naming it; and the `-L` and
+ * run-path flags are dropped. Linked dynamically, the flags are kept as they are. Either way a name
+ * none of those directories holds is the system's, kept as `-l<name>`, unless the program's
+ * `static-system` names it: then its archive is taken from the library's search directories or the
+ * program's `c-linking` `search`, and a name with none is an error. Each such name is added to
+ * `used`. Every other flag (`-framework`, `-pthread`) is kept as it is. */
+linked_flags(library: CLibrary, words: Buf[string], source: string, used: *Buf[string]) -> Result[Buf[string], string]
     var dirs: Buf[string] = buf()
-    for flag in answer.fields()
+    for d in library.search
+        dirs.push(library_path(library, d))
+    for flag in words
         if flag.starts_with("-L") && flag.bytes.len > 2usize then dirs.push(flag[2..])
     var out: Buf[string] = buf()
-    for flag in answer.fields()
-        if flag.starts_with("-L") || flag.starts_with("-R") || flag.starts_with("-Wl,-rpath") then continue
+    for flag in words
+        if flag.starts_with("-L") || flag.starts_with("-R") || flag.starts_with("-Wl,-rpath")
+            if !library.linked_statically then out.push(flag)
+            continue
         if !flag.starts_with("-l") || flag.bytes.len <= 2usize
             out.push(flag)
             continue
         val name = flag[2..]
-        if archive_in(dirs, "lib" + name + ".a") is Some(a)
-            out.push(a)
-        elif shared_library_in(dirs, name) is Some(shared)
-            return Err(s"error: the C library `${library.label}` of package `${library.package}` is linked statically (`static-c-libraries = true`), but `$flag`, which `pkg-config --static --libs $module_name` names, has no static archive: `$shared` has no `lib$name.a` beside it\n")
-        else out.push(flag)
+        val system = contains_text(library.static_system, name)
+        if system then used.push(name)
+        if library.linked_statically || system
+            if archive_in(dirs, "lib" + name + ".a") is Some(a)
+                out.push(a)
+                continue
+        if library.linked_statically && shared_library_in(dirs, name) is Some(shared)
+            return Err(s"error: the C library `${library.label}` of package `${library.package}` is linked statically (${library.linked_why}), but `$flag`, which $source names, has no static archive: `$shared` has no `lib$name.a` beside it\n")
+        if system
+            if archive_in(library.system_search, "lib" + name + ".a") is Some(a)
+                out.push(a)
+                continue
+            var searched = ""
+            for d in dirs
+                searched = searched + (if searched == "" then "" else ", ") + "`" + d + "`"
+            for d in library.system_search
+                searched = searched + (if searched == "" then "" else ", ") + "`" + d + "`"
+            if searched == "" then searched = "none: give `c-linking` a `search` directory holding it"
+            return Err(s"error: `c-linking`'s `static-system` links `$flag` of the C library `${library.label}` of package `${library.package}` from its archive, but no `lib$name.a` is in the directories searched: $searched\n")
+        out.push(flag)
     Ok(out)
+
+/** The absolute path of `path`, which `library`'s package names relative to its directory. */
+library_path(library: CLibrary, path: string) -> string = if library.dir == "" then path else library.dir + "/" + path
+
+/** What the link is given for the file `file` that `library` links by its path: the file itself,
+ * relative to its package's directory, or, for a shared library (`.dylib`, `.tbd`, `.so`) of a library
+ * linked statically, the archive of the same name beside it. A file that is not there, and a shared
+ * library linked statically with no archive beside it, are errors naming the file. */
+linked_file(library: CLibrary, file: string) -> Result[string, string]
+    val full = library_path(library, file)
+    if !exists(full) then return Err(s"error: the file `$file` of the C library `${library.label}` of package `${library.package}` is not there: `$full`\n")
+    if !library.linked_statically then return Ok(full)
+    for suffix in [".dylib", ".tbd", ".so"]
+        if full.ends_with(suffix)
+            val archive = full[0..<full.bytes.len - suffix.bytes.len] + ".a"
+            if exists(archive) then return Ok(archive)
+            return Err(s"error: the C library `${library.label}` of package `${library.package}` is linked statically (${library.linked_why}), but `$file`, which `files` names, is a shared library with no archive beside it: `$full` has no `${base_name(archive)}` beside it\n")
+    Ok(full)
+
+private base_name(file: string) -> string
+    val parts = file.split("/")
+    parts[parts.len - 1]
 
 private archive_in(dirs: Buf[string], file: string) -> Option[string]
     for d in dirs

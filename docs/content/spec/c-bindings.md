@@ -122,6 +122,34 @@ c-libraries {
   ```text
   error: the C library `mlt` of package `mlt` was not found: `pkg-config --cflags mlt-framework-7` failed. MLT 7: `brew install mlt`; Debian's libmlt-dev
   ```
+- **What else links it** ([settled](/spec/decisions/#proposed)), each optional and added to what
+  `pkg-config` or `link` gives:
+  - `files` names archives and shared libraries by their paths, linked as named;
+  - `search` names the directories its `link` names are searched in, passed as `-L` when it is
+    linked dynamically;
+  - `include` names the directories its headers are included from, passed to the C unit as `-I`;
+  - `frameworks` names macOS frameworks, each passed as `-framework <name>`;
+  - `link-flags` are passed to the linker as they are, the way out for anything else.
+
+  **The paths of `files`, `search` and `include` are relative to the package's directory**, and
+  none may be absolute or leave it (a `..` segment), so a package that vendors its library builds
+  wherever it is fetched:
+
+  ```hocon
+  c-libraries {
+    foo {
+      files   = ["vendor/libfoo.a"]
+      include = ["vendor/include"]
+      headers = ["foo.h"]
+    }
+  }
+  ```
+
+  A file that is not there, or a search directory that is not one, stops the build with the
+  library, the package and the path; `avin check` says the same.
+- `dynamic-only` says why the library is never linked statically, for a licence that asks for it or
+  an installation that has no archive. It is a requirement, not a choice: how a program meets it is
+  in [How a program links its C libraries](#how-a-program-links-its-c-libraries).
 
 **A program builds with the C libraries of every package in it**, as it does with their
 [Sysl dependencies](/spec/packages/#sysl-dependencies), so a library that binds MLT works in a
@@ -155,18 +183,92 @@ dependencies {
   a `.a` in the same directory**, and Homebrew installs both side by side. The `-L` and run-path flags
   are dropped; every other flag (`-framework`, `-pthread`) is kept.
 - **The system's own libraries stay dynamic.** A name none of the `-L` directories holds is one the
-  linker finds by itself, in the system (libSystem and libz on macOS), and stays `-l<name>`. A library
-  named by `link` is passed as `-l` as always.
-- **A library with no archive stops the build.** A name whose shared library is in one of the `-L`
-  directories but whose archive is in none would be linked dynamically, the very program the key is
-  there to prevent, so it is an error naming what is missing; `avin check` reports it too:
+  linker finds by itself, in the system (libSystem and libz on macOS), and stays `-l<name>`, unless
+  the program names it in [`static-system`](#the-system-s-libraries).
+- **A library `link` names is linked the same way**, from its library's `search` directories: each
+  `-l<name>` whose `lib<name>.a` is in one of them becomes the archive's path, and a name none of them
+  holds is the system's.
+- **A library with no archive stops the build.** A name whose shared library is in one of the
+  search directories but whose archive is in none would be linked dynamically, the very program the
+  key is there to prevent, so it is an error naming what is missing; `avin check` reports it too:
 
   ```text
   error: the C library `libssh2` of package `ssh` is linked statically (`static-c-libraries = true`), but `-lcrypto`, which `pkg-config --static --libs libssh2` names, has no static archive: `/opt/homebrew/opt/openssl@4/lib/libcrypto.dylib` has no `libcrypto.a` beside it
   ```
+- **A file named by its path is linked as named**, an archive always statically. A shared library
+  (`.dylib`, `.tbd`, `.so`) of a library linked statically is replaced by the archive of the same
+  name beside it, and is an error without one.
 
 `otool -L` is the check: a program binding libssh2 and built this way lists only
 `/usr/lib/libSystem.B.dylib` and `/usr/lib/libz.1.dylib`.
+
+### How a program links its C libraries
+
+**The program chooses library by library in its `c-linking` block** ([settled](/spec/decisions/#proposed)),
+read from the root package only, as `static-c-libraries` is:
+
+```hocon
+c-linking {
+  default       = "static"            # or "dynamic", the default when unsaid
+  dynamic       = ["mlt"]              # linked dynamically whatever the default
+  static        = ["ssh/libssh2"]      # linked statically whatever the default
+  static-system = ["z"]                # the system's libz, from its archive
+  search        = ["/opt/homebrew/opt/zlib/lib"]
+}
+```
+
+- **A library is named as its package's `c-libraries` names it**, `mlt`, or with its package,
+  `ssh/libssh2`, where two packages name libraries alike; a bare name names each library of that
+  name. A name that is no C library of the program is an error at the name, listing the program's
+  libraries, and so is one name in both lists.
+- **`default` is how every library neither list names is linked.** `static-c-libraries = true` is
+  `default = "static"`, kept as its shorthand; a manifest saying both is refused, so there is never
+  a question which wins.
+- **Linked dynamically means as named**: the flags `pkg-config --libs` answers, `-L` and `-l` for
+  `link` and `search`, and `files` as they are, so a vendored archive is linked statically either
+  way. **Linked statically is a promise**: no shared library of a search directory is taken, and
+  one that would be is an error.
+
+**The command line overrides the default for one build.** `avin build`, `run`, `test` and `check`
+take `--static-c-libraries` or `--dynamic-c-libraries`, which stand in for the manifest's `default`:
+
+1. a library `c-linking` names in `static` or `dynamic` is linked that way;
+2. any other is linked as the command line says, when it says;
+3. and otherwise by the manifest's `default` (or `static-c-libraries`), dynamically when it says none.
+
+A name in the manifest is the program saying something about one library, often for a reason (a
+licence, an archive that does not exist), so a flag about all of them does not overrule it. A build
+cached by `avin run` or `avin test` is kept apart for each way of linking.
+
+**A library package may require being linked dynamically**, never statically, with
+`dynamic-only = "<why>"`. A program that would link it statically, by its `default`, by
+`--static-c-libraries` or by naming it in `static`, is refused with the package's reason:
+
+```text
+error: the C library `mlt` of package `mlt` is never linked statically, as its package says (`dynamic-only`): LGPL-2.1: its users may replace it; the program links it statically by `static-c-libraries = true`: name it in `c-linking { dynamic = ["mlt"] }` to link it dynamically
+```
+
+Naming it in `dynamic` is how the program says it has seen the requirement; the rest of the program
+stays static. The library is not linked dynamically silently: a program asking to be static would
+otherwise ship needing the library installed, and learn it on another machine.
+
+#### The system's libraries
+
+**`static-system` names `-l` names the program links from their archives although the system
+provides them**, an opt-in; without it the system's libraries stay dynamic. Each name is looked for
+as `lib<name>.a` in the search directories of the library that links it, then in `c-linking`'s
+`search`, each absolute or relative to the root package's directory (the program's own machine is
+its business, so absolute paths are allowed here and nowhere else). It applies however the library
+is linked. A name found in none of them is an error listing the directories searched, and a name no
+library of the program links is an error too.
+
+#### On Linux
+
+Linux is not built yet. The surface maps onto its linker as follows: an archive is still linked by
+its path, which needs no flag; a `-l<name>` kept for the system stays `-l<name>`; and a name
+`static-system` asks for may equally be written `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`, which takes
+`lib<name>.a` from the linker's own path. `frameworks` are macOS's alone, and a package for Linux
+names none.
 
 ## Prototypes
 
