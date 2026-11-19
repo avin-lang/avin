@@ -551,7 +551,9 @@ Where a value fills the rest of a line, a tuple needs no parentheses: after `=` 
 or binding, after `return`, after `->` in a `match` arm, and as a line of a block, including its
 last. Inside brackets and in the body of a one-line `if` or `while`, a comma separates other things,
 so a tuple there is parenthesized, a `match` arm's one-line body inside brackets
-[included](/spec/operators-and-control-flow/#match).
+[included](/spec/operators-and-control-flow/#match), and so is the last line of a block, a lambda's
+body, when that line closes a bracket opened before the block
+([continuation lines](/spec/operators-and-control-flow/#continuation-lines)).
 
 ```text
 divmod(a: int, b: int) -> (int, int) = a / b, a % b
