@@ -48,7 +48,8 @@ enum Origin
 
 /** A dependency as a manifest lists it: its name there, where it comes from, and where it was written;
  * whether it is taken only while a feature turns it on; and which of its package's features it asks
- * for: its defaults unless `default_features` is false, less those in `without`, and `features`. */
+ * for: its defaults unless `default_features` is false, less those in `without`, and `features`.
+ * `condition` is the machines it is taken on, as its `if` writes them, or empty for every machine. */
 struct Dependency
     label: string
     origin: Origin
@@ -57,6 +58,7 @@ struct Dependency
     default_features: bool
     features: Buf[string]
     without: Buf[string]
+    condition: string
 
 /** A package's manifest, read and checked. Its `sysl-dependencies` block names the Sysl packages,
  * other than Sysl's standard library, its bindings reach; they are written as Avin dependencies are,
@@ -88,12 +90,21 @@ struct Manifest
     /** Whether `static-c-libraries = true`: a program this package is the root of links each C
      * library a `pkg-config` module finds from its static archive. A dependency's is not read. */
     static_c_libraries: bool
+    /** The targets the package builds for, as `package.targets` lists them, and where; empty for
+     * every target. */
+    targets: Buf[string]
+    targets_span: Span
 
 /** A C library a package's manifest names under `c-libraries`: its name there; the `pkg-config`
  * module that finds it, or the libraries `link` names directly; the headers the package's bindings
  * are checked against, as written; and what a build that cannot find it says to do. `package` is the
  * name of the package whose manifest names it. `linked_statically` is whether the program it is
- * linked into asks for its static archive (`static-c-libraries` in the root package's manifest). */
+ * linked into asks for its static archive (`static-c-libraries` in the root package's manifest).
+ *
+ * `flags` are passed to the link as they are written (`link-flags`). `condition` is the machines the
+ * library is linked on, as its `if` writes them, or empty for every machine. `installs` are the
+ * sentences of an `install` block, each with its condition; once the library is in a program for a
+ * machine, `install` is the first of them that holds there. */
 struct CLibrary
     package: string
     label: string
@@ -102,6 +113,15 @@ struct CLibrary
     headers: Buf[string]
     install: string
     linked_statically: bool
+    flags: Buf[string]
+    condition: string
+    installs: Buf[MachineText]
+
+/** A C library of `package` named `label`, found by `pkg_config` or linked by `link`, checked against
+ * `headers`, with `install` to say where it is missing, linked statically when `statically` (as
+ * `static-c-libraries = true` asks), and nothing else said of it. */
+c_library(package: string, label: string, pkg_config: Option[string], link: Buf[string], headers: Buf[string], install: string, statically: bool) -> CLibrary =
+    CLibrary(package, label, pkg_config, link, headers, install, statically, buf(), "", buf())
 
 /** The file that makes a directory a Sysl package. */
 const SyslManifestName: string = "sysl.hocon"
@@ -123,7 +143,7 @@ read_manifest_named(dir: string, name: string) -> Result[Manifest, string]
 manifest_from(dir: string, src: Source, running: string) -> Result[Manifest, Diagnostic]
     val doc = parse_hocon(src)?
     if later_avin_required(doc.root, running) is Some(d) then return Err(d)
-    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false)
+    var m = Manifest(dir, src, false, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false, buf(), Span(0, 0))
     read_fields(&m, doc.root)?
     Ok(m)
 
@@ -221,8 +241,11 @@ private read_package(m: *Manifest, f: Field) -> Result[unit, Diagnostic]
             m.avin = text_of(g)?
             if !valid_version(m.avin) then return Err(error(g.value.span, s"`${m.avin}` is not a version of Avin: `avin` names the least Avin the package builds with, three numbers such as `$Version`"))
             m.avin_span = g.value.span
+        elif g.key == "targets"
+            m.targets = read_targets(g)?
+            m.targets_span = g.value.span
         else
-            return Err(error(g.key_span, s"`${g.key}` is not a key of `package`, which holds `name`, `version`, `description` and `avin`"))
+            return Err(error(g.key_span, s"`${g.key}` is not a key of `package`, which holds `name`, `version`, `description`, `avin` and `targets`"))
     if !named then return Err(error(f.key_span, "the `package` block has no `name`: every package is named, `name = \"geom\"`"))
     if !versioned then return Err(error(f.key_span, "the `package` block has no `version`: every package has one, `version = \"0.1.0\"`"))
     Ok(())
@@ -248,8 +271,11 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
         var features: Buf[string] = buf()
         var without: Buf[string] = buf()
         var without_spans: Buf[Span] = buf()
+        var condition = ""
         for g in d.value.fields()
-            if g.key == "git"
+            if g.key == "if"
+                condition = read_condition(g)?
+            elif g.key == "git"
                 val c = text_of(g)?
                 if !valid_coordinate(c) then return Err(error(g.value.span, s"`$c` is not a git coordinate: a coordinate names a repository as `host/owner/name`, such as `github.com/owner/json`, with no `https://` and no `.git`"))
                 git = Some(c)
@@ -266,13 +292,13 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
                 if p == "" then return Err(error(g.value.span, "a dependency's `path` names a directory"))
                 local = Some(p)
             elif g.key == "workspace" && sysl
-                return Err(error(g.key_span, s"`workspace` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`: a workspace's members are Avin packages"))
+                return Err(error(g.key_span, s"`workspace` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`, and `if`: a workspace's members are Avin packages"))
             elif g.key == "workspace"
                 g.value.as_bool() match
                     Some(true) -> in_workspace = true
                     _ -> return Err(error(g.value.span, "a dependency's `workspace` is `true`: the dependency is the member of the workspace with its name"))
             elif sysl
-                return Err(error(g.key_span, s"`${g.key}` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`"))
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a Sysl dependency, which holds `git` with `version` or `rev`, or `path`, and `if`"))
             elif g.key == "member"
                 val dir = text_of(g)?
                 if !valid_member(dir) then return Err(error(g.value.span, s"`$dir` is not a member's directory: ${MemberRule}"))
@@ -298,7 +324,7 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
                         without_spans.push(v.span)
                     else features.push(name)
             else
-                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev` and optionally `member`, `path`, or `workspace`, and `optional`, `features` and `default_features`"))
+                return Err(error(g.key_span, s"`${g.key}` is not a key of a dependency, which holds `git` with `version` or `rev` and optionally `member`, `path`, or `workspace`, and `optional`, `features`, `default_features` and `if`"))
         if !default_features && without.len() > 0
             return Err(error(without_spans[0], s"`-${without[0]}` takes away a default, and `default_features = false` leaves every default off already"))
         var sources = 0
@@ -319,16 +345,16 @@ private read_dependencies(f: Field, sysl: bool, into: *Buf[Dependency]) -> Resul
             if version is Some(_) && rev is Some(_)
                 return Err(error(d.key_span, s"the dependency `${d.key}` has a `version` and a `rev`: a git dependency is read at a release or at a commit, not both"))
             if rev is Some(x)
-                into.push(Dependency(d.key, Rev(c, x), d.key_span, optional, default_features, features, without))
+                into.push(Dependency(d.key, Rev(c, x), d.key_span, optional, default_features, features, without, condition))
                 continue
             version match
-                Some(v) -> into.push(Dependency(d.key, Git(c, v), d.key_span, optional, default_features, features, without))
+                Some(v) -> into.push(Dependency(d.key, Git(c, v), d.key_span, optional, default_features, features, without, condition))
                 None -> return Err(error(d.key_span, s"the dependency `${d.key}` names a repository and no version: a git dependency is read at a release, `version = \"1.0.0\"` being the tag `v1.0.0`, or at a commit, `rev = \"3f9a2c1\"`"))
             continue
         if rev is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `rev`, which belongs with `git`: a directory is read as it stands"))
         if version is Some(_) then return Err(error(d.key_span, s"the dependency `${d.key}` has a `version`, which belongs with `git`: a directory is read as it stands"))
-        if local is Some(p) then into.push(Dependency(d.key, Local(p), d.key_span, optional, default_features, features, without))
-        else into.push(Dependency(d.key, Member, d.key_span, optional, default_features, features, without))
+        if local is Some(p) then into.push(Dependency(d.key, Local(p), d.key_span, optional, default_features, features, without, condition))
+        else into.push(Dependency(d.key, Member, d.key_span, optional, default_features, features, without, condition))
     Ok(())
 
 // The C libraries a `c-libraries` block names: each a block with `pkg-config` or `link`, or neither
@@ -338,9 +364,18 @@ private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnos
     for d in f.value.fields()
         if !valid_package_name(d.key) then return Err(error(d.key_span, s"`${d.key}` is not a C library's name: ${PackageNameRule}"))
         if !d.value.is_obj() then return Err(error(d.value.span, s"the C library `${d.key}` is a block saying how to find it and which headers declare it: `{ pkg-config = \"zlib\", headers = [\"zlib.h\"] }`"))
-        var library = CLibrary("", d.key, None, buf(), buf(), "", false)
+        var library = c_library("", d.key, None, buf(), buf(), "", false)
         var linked = false
         for g in d.value.fields()
+            if g.key == "if"
+                library.condition = read_condition(g)?
+                continue
+            if g.key == "link-flags"
+                library.flags = word_list(g, "`link-flags` is a list of flags passed to the linker as they are, one flag a string, `link-flags = [\"-framework\", \"Security\"]`")?
+                continue
+            if g.key == "install" && g.value.is_obj()
+                library.installs = read_machine_texts(g)?
+                continue
             if g.key == "pkg-config"
                 val module_name = text_of(g)?
                 if module_name == "" || module_name.contains(" ") then return Err(error(g.value.span, "`pkg-config` names one module, as `pkg-config --list-all` lists it"))
@@ -352,11 +387,34 @@ private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnos
                 library.headers = word_list(g, "`headers` is a list of the headers the bindings are checked against, `headers = [\"zlib.h\"]` or `[\"<stdlib.h>\"]`")?
             elif g.key == "install"
                 library.install = text_of(g)?
-            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `headers` and `install`"))
+            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `link-flags`, `headers`, `install` and `if`"))
         if library.pkg_config is Some(_) && linked
             return Err(error(d.key_span, s"the C library `${d.key}` names both `pkg-config` and `link`: `pkg-config` answers the flags it links with, so it is one or the other"))
         into.push(library)
     Ok(())
+
+/** The manifest `m` as a build for the machine `target` reads it: the entries of `dependencies`,
+ * `sysl-dependencies` and `c-libraries` whose condition holds there, each C library's `install` the
+ * first sentence of its block that holds there. Its features are all kept, since a feature's gate is
+ * checked against the manifest whatever the machine; which exist there is `feature_absent`'s answer. */
+on_machine(m: Manifest, target: string) -> Manifest
+    var out = m
+    var dependencies: Buf[Dependency] = buf()
+    for d in m.dependencies
+        if condition_holds(d.condition, target) then dependencies.push(d)
+    var sysl: Buf[Dependency] = buf()
+    for d in m.sysl_dependencies
+        if condition_holds(d.condition, target) then sysl.push(d)
+    var libraries: Buf[CLibrary] = buf()
+    for l in m.c_libraries
+        if !condition_holds(l.condition, target) then continue
+        var library = l
+        if l.installs.len() > 0 then library.install = first_holding(l.installs, target)
+        libraries.push(library)
+    out.dependencies = dependencies
+    out.sysl_dependencies = sysl
+    out.c_libraries = libraries
+    out
 
 // A list of strings none of which is empty or holds a space, or `wrong` at the list.
 private word_list(f: Field, wrong: string) -> Result[Buf[string], Diagnostic]
@@ -730,6 +788,9 @@ private struct Resolver
      * path, which is the key it is resolved under; or none. */
     script: Option[Manifest]
     script_file: string
+    /** The target of the machine the resolution is for: each manifest's entries are taken where their
+     * condition holds on it. */
+    target: string
 
 // The manifest of the package at `dir`: a program of one file's header when `dir` is that file, and
 // otherwise the manifest in the directory.
@@ -769,8 +830,17 @@ private add_request(r: *Resolver, q: FeatureRequest)
 // it adds, with what those turn on.
 private selected_features(r: Resolver, key: string, m: Manifest) -> Result[Buf[string], string]
     var on: Buf[string] = buf()
+    // A feature that does not exist on the machine is refused where it is asked for by name, is not one
+    // of the defaults there, and is not among every feature.
+    val absent = absent_features(m.features, r.target)
     for q in r.requests
         if q.key != key then continue
+        for n in q.names
+            if contains(absent, n)
+                val message = absent_feature(m.name, m.features, n, r.target)
+                return Err(q.place match
+                    Some(s) -> error(s, message).render(q.src)
+                    None -> "avin: " + message)
         val added = requested_features(m.features, q.all, q.defaults, q.names, q.without) match
             Ok(a) -> a
             Err(asked) ->
@@ -780,7 +850,7 @@ private selected_features(r: Resolver, key: string, m: Manifest) -> Result[Buf[s
                     None -> "avin: " + message)
         for n in added
             if !contains(on, n) then on.push(n)
-    Ok(feature_closure(m.features, on))
+    Ok(feature_closure_without(m.features, on, absent))
 
 // The key a dependency's feature requests are made under: its coordinate, or its directory.
 private package_key(origin: Origin, dir: string) -> string = origin match
@@ -840,8 +910,15 @@ private resolve_from(dir: string, fetching: Fetching, whole: bool, vendored: boo
     val vendor = sum_dir + "/" + VendorName
     val from_vendor = vendored && is_dir(vendor)
     val source = if from_vendor then Fetching(vendor, "", false) else fetching
-    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf(), buf(), buf(), None, "")
+    var r = Resolver(source, ws, sums, buf(), buf(), buf(), false, from_vendor, buf(), buf(), buf(), None, "", choice.target)
     val all_roots = whole && (m.has_workspace || !m.has_package)
+    // A whole workspace on a machine is the members that build for it.
+    if all_roots
+        var here: Buf[string] = buf()
+        for root in roots
+            val member = read_manifest(root)?
+            if builds_for(member.targets, choice.target) then here.push(root)
+        roots = here
     // The command line chooses the root's features; in a whole workspace, each member takes the names
     // it declares, and a name no member declares is refused.
     var declared: Buf[string] = buf()
@@ -894,7 +971,7 @@ private walk_roots(r: *Resolver, roots: Buf[string], walked: Buf[string], sum_fi
 resolve_script(file: string, m: Manifest, fetching: Fetching) -> Result[Resolution, string]
     val sum_file = file + ScriptSumSuffix
     val sums = read_sums(sum_file)?
-    var r = Resolver(fetching, None, sums, buf(), buf(), buf(), false, false, buf(), buf(), buf(), Some(m), file)
+    var r = Resolver(fetching, None, sums, buf(), buf(), buf(), false, false, buf(), buf(), buf(), Some(m), file, host_target())
     add_request(&r, FeatureRequest(file, false, true, buf(), buf(), None, m.src))
     var roots: Buf[string] = buf()
     roots.push(file)
@@ -907,8 +984,12 @@ resolve_script(file: string, m: Manifest, fetching: Fetching) -> Result[Resoluti
 private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen: *Buf[string], out: *Buf[ResolvedPackage]) -> Result[unit, string]
     if contains(*seen, dir) then return Ok(())
     seen.push(dir)
-    val m = manifest_at(*r, dir)?
-    if !m.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
+    val written = manifest_at(*r, dir)?
+    if !written.has_package then return Err(s"avin: $dir is a workspace's root with no `package` block, which no package can depend on")
+    if !builds_for(written.targets, r.target)
+        return Err(error(written.targets_span, s"`${written.name}` builds for ${targets_listing(written.targets)}, and this build is for ${r.target}: build it for one of those, or add ${r.target} to its `targets`").render(written.src))
+    // What the package is made of on this machine: the entries whose condition holds here.
+    val m = on_machine(written, r.target)
     val on = selected_features(*r, key, m)?
     val at = out.len()
     out.push(ResolvedPackage(m.name, dir, m, from is Some(_), on, buf(), buf()))
@@ -965,10 +1046,20 @@ private visit(r: *Resolver, dir: string, from: Option[Clone], key: string, seen:
         if d.optional
             optional.push(d.label)
             optional_dirs.push(reached.dir)
+        val taken = manifest_at(*r, reached.dir)?
+        if reach_beyond(written.targets, d.condition, taken.targets) is Some(t)
+            return Err(error(d.span, s"`${d.label}` builds for ${targets_listing(taken.targets)}, and `${m.name}` builds for $t too: take `${d.label}` only where it builds with `if`, or leave $t out of the `targets` of `${m.name}`").render(m.src))
         visit(r, reached.dir, reached.clone, dep_key, seen, out)?
     out[at].optional = optional
     out[at].optional_dirs = optional_dirs
     Ok(())
+
+// The first target a package listing `targets` builds for where `condition` takes a dependency
+// listing `dependency_targets` that does not build for it, if any.
+private reach_beyond(targets: Buf[string], condition: string, dependency_targets: Buf[string]) -> Option[string]
+    for t in targets_or_every(targets)
+        if condition_holds(condition, t) && !builds_for(dependency_targets, t) then return Some(t)
+    None
 
 // The origin of the dependency `d` of the fetched package at `dir`, read from the clone `c`: a path or
 // workspace dependency is the package of the same repository it names, at the version or commit the
@@ -1192,7 +1283,32 @@ record_sums(res: Resolution) -> Result[unit, string]
  * removed and added. With `check`, it writes nothing and fails when the file is not already that.
  * Answers whether the file was tidy. The resolution, with every feature of the root on, is read from
  * the cache, whatever the project's `vendor/` holds. */
-tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string] = tidy_resolution(resolve_from(dir, fetching, true, false, every_feature())?, check, say)
+tidy(dir: string, fetching: Fetching, check: bool, say: string -> unit) -> Result[bool, string] = tidy_resolution(resolve_every_target(dir, fetching, every_feature())?, check, say)
+
+/** The whole resolution of the package or workspace at `dir`, from the cache, for every target its
+ * manifest lists (every target where it lists none, and for a workspace's root): each fetched package
+ * any of those machines reads, so what `avin tidy` and `avin vendor` answer does not depend on the
+ * machine they run on. The root's features are chosen by `choice` on each machine. */
+resolve_every_target(dir: string, fetching: Fetching, choice: FeatureChoice) -> Result[Resolution, string]
+    val m = read_manifest(dir)?
+    var merged: Option[Resolution] = None
+    for t in targets_or_every(m.targets)
+        val res = resolve_from(dir, fetching, true, false, choice_for(choice, t))?
+        merged = merged match
+            None -> Some(res)
+            Some(so_far) -> Some(joined(so_far, res))
+    Ok(merged.unwrap())
+
+// The resolution `a` with what `b` read and cloned that it did not.
+private joined(a: Resolution, b: Resolution) -> Resolution
+    var out = a
+    for l in b.read
+        if find_sum(out.read, l.coordinate, l.version) is None then out.read.push(l)
+    for l in b.sums
+        if find_sum(out.sums, l.coordinate, l.version) is None then out.sums.push(l)
+    for c in b.cloned
+        if !contains(out.cloned, c) then out.cloned.push(c)
+    out
 
 /** Rewrites, as `tidy` does, the sum file of the program of one file `path` to exactly the fetched
  * packages its dependencies header reads. A file with no header reads none. */
@@ -1249,7 +1365,7 @@ vendor(dir: string, fetching: Fetching, say: string -> unit) -> Result[unit, str
 
 /** Vendors as `vendor` does, the root package's features chosen by `choice`. */
 vendor_with(dir: string, fetching: Fetching, choice: FeatureChoice, say: string -> unit) -> Result[unit, string]
-    val res = resolve_from(dir, fetching, true, false, choice)?
+    val res = resolve_every_target(dir, fetching, choice)?
     record_sums(res)?
     for c in res.cloned
         say(s"fetching $c")
@@ -1397,7 +1513,7 @@ add_dependency(dir: string, source: string, fetching: Fetching, say: string -> u
     else
         version = latest_version(fetching, repository)?
     // Fetch it alone first: the name it gives itself is what the manifest lists it under.
-    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf(), buf(), buf(), None, "")
+    var fetcher = Resolver(fetching, None, buf(), buf(), buf(), buf(), false, false, buf(), buf(), buf(), None, "", host_target())
     var fetched = ""
     var shown = s"v$version"
     val within = if member == "" then "" else s", member = \"$member\""
@@ -1690,7 +1806,7 @@ private blanks(n: usize) -> string
  * always: a program of one file is in no workspace and has no features to turn one on. */
 script_manifest(dir: string, src: Source, h: ScriptHeader) -> Result[Manifest, Diagnostic]
     val doc = parse_hocon(h.hocon)?
-    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false)
+    var m = Manifest(dir, src, true, "", "", "", "", Span(0, 0), buf(), buf(), false, buf(), buf(), buf(), false, buf(), Span(0, 0))
     for f in doc.root.fields()
         if f.key != "dependencies"
             return Err(error(f.key_span, s"`${f.key}` is not a key of a dependencies header, which holds only `dependencies`: a program that needs more is a package, with an $ManifestName"))

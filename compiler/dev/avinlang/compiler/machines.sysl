@@ -1,0 +1,236 @@
+module dev.avinlang.compiler
+
+import sh.sysl.hocon.Field
+import sh.sysl.parsing.{Diagnostic, Span, error}
+import sysl.{Linux, X86_64, cpu, os}
+import sysl.buf.{Buf, buf}
+
+// Machines. A program is built for a machine, an operating system and a processor, named by its
+// target: `aarch64-macos`, `x86_64-linux` or `aarch64-linux`. A manifest says which targets a package
+// builds for (`package.targets`), and where an entry of `dependencies`, `sysl-dependencies` or
+// `c-libraries`, or a feature, exists, by a condition: the symbols `macos`, `linux`, `posix`,
+// `aarch64` and `x86_64` joined by `!`, `&&`, `||` and parentheses. A condition is checked symbol by
+// symbol when the manifest is read, whichever machine the build is for, so a misspelling cannot read
+// as false and quietly leave an entry out of every build.
+
+/** The targets Avin builds for, in the order its errors list them. */
+machine_targets() -> Buf[string]
+    var out: Buf[string] = buf()
+    out.push("aarch64-macos")
+    out.push("x86_64-linux")
+    out.push("aarch64-linux")
+    out
+
+/** The target of the machine the compiler runs on, which a build is for when nothing names another. */
+host_target() -> string
+    val arch = if cpu() == X86_64 then "x86_64" else "aarch64"
+    val system = if os() == Linux then "linux" else "macos"
+    arch + "-" + system
+
+/** Whether `name` is a target Avin builds for. */
+known_target(name: string) -> bool
+    for t in machine_targets()
+        if t == name then return true
+    false
+
+/** The error for a target name Avin does not know, listing the ones it does. */
+unknown_target(name: string) -> string = s"`$name` is not a target Avin builds for: the targets are ${targets_listing(machine_targets())}"
+
+/** `a`, `a and b`, `a, b and c`, of target names. */
+targets_listing(targets: Buf[string]) -> string
+    var out = ""
+    for i in 0..<targets.len()
+        if i > 0 then out = out + (if i + 1 == targets.len() then " and " else ", ")
+        out = out + targets[i]
+    out
+
+/** The symbols a condition can ask about the machine. */
+private const SymbolsListing: string = "macos, linux, posix, aarch64 and x86_64"
+
+/** Whether the symbol `symbol` holds on the machine `target`. */
+private symbol_holds(symbol: string, target: string) -> bool
+    val parts = target.split("-")
+    val system = parts[parts.len - 1]
+    val arch = parts[0]
+    if symbol == "macos" || symbol == "linux" then return system == symbol
+    if symbol == "posix" then return system == "macos" || system == "linux"
+    arch == symbol
+
+private is_symbol(word: string) -> bool = word == "macos" || word == "linux" || word == "posix" || word == "aarch64" || word == "x86_64"
+
+/** What is wrong with a condition: the message, and where in the condition's text, by byte offset and
+ * length; a length of 0 is the whole condition. */
+struct ConditionError
+    message: string
+    start: usize
+    len: usize
+
+private struct ConditionReader
+    text: string
+    at: usize
+    target: string
+
+/** Whether the condition `text` holds on the machine `target`, or the first thing wrong with it. The
+ * whole condition is read whatever its value, so every symbol in it is checked on every machine. */
+condition_on(text: string, target: string) -> Result[bool, ConditionError]
+    if text.trim() == "" then return Err(ConditionError("an empty condition holds on every machine: an entry every machine takes is written without `if`", 0, 0))
+    var r = ConditionReader(text, 0, target)
+    val value = read_either(&r)?
+    skip_space(&r)
+    if r.at < text.bytes.len
+        val word = token_at(r)
+        return Err(ConditionError(s"`$text` is not a condition: `$word` follows a whole condition, and two are joined by `&&` or `||`", r.at, word.bytes.len))
+    Ok(value)
+
+/** Whether the condition `text`, already checked, holds on `target`; an empty one holds everywhere. */
+condition_holds(text: string, target: string) -> bool
+    if text == "" then return true
+    condition_on(text, target).unwrap_or(false)
+
+// `a || b || …`
+private read_either(r: *ConditionReader) -> Result[bool, ConditionError]
+    var value = read_both(r)?
+    loop
+        skip_space(r)
+        if !at_text(*r, "||") then break
+        r.at += 2
+        val next = read_both(r)?
+        value = value || next
+    Ok(value)
+
+// `a && b && …`
+private read_both(r: *ConditionReader) -> Result[bool, ConditionError]
+    var value = read_one(r)?
+    loop
+        skip_space(r)
+        if !at_text(*r, "&&") then break
+        r.at += 2
+        val next = read_one(r)?
+        value = value && next
+    Ok(value)
+
+// `!a`, `(a)` or a symbol.
+private read_one(r: *ConditionReader) -> Result[bool, ConditionError]
+    skip_space(r)
+    val text = r.text
+    if r.at >= text.bytes.len
+        return Err(ConditionError(s"`$text` is not a condition: a symbol, `!` or `(` is wanted at its end", text.bytes.len, 0))
+    val b = text.bytes[r.at]
+    if b == u8('!')
+        r.at += 1
+        val inner = read_one(r)?
+        return Ok(!inner)
+    if b == u8('(')
+        val open = r.at
+        r.at += 1
+        val inner = read_either(r)?
+        skip_space(r)
+        if r.at >= text.bytes.len || text.bytes[r.at] != u8(')')
+            return Err(ConditionError(s"`$text` is not a condition: its `(` is never closed by a `)`", open, 1))
+        r.at += 1
+        return Ok(inner)
+    if !is_condition_byte(b)
+        val word = token_at(*r)
+        return Err(ConditionError(s"`$text` is not a condition: a symbol, `!` or `(` is wanted where `$word` stands", r.at, word.bytes.len))
+    val start = r.at
+    while r.at < text.bytes.len && is_condition_byte(text.bytes[r.at])
+        r.at += 1
+    val word = text[start..<r.at]
+    if known_target(word)
+        val parts = word.split("-")
+        return Err(ConditionError(s"`$word` is a target, and a condition asks about the machine by its symbols: write `${parts[0]} && ${parts[1]}`", start, word.bytes.len))
+    if !is_symbol(word)
+        return Err(ConditionError(s"`$word` is not something a condition can ask about the machine: the symbols are $SymbolsListing", start, word.bytes.len))
+    Ok(symbol_holds(word, r.target))
+
+private is_condition_byte(b: u8) -> bool = b >= u8('a') && b <= u8('z') || b >= u8('A') && b <= u8('Z') || b >= u8('0') && b <= u8('9') || b == u8('_') || b == u8('-')
+
+private at_text(r: ConditionReader, s: string) -> bool
+    if r.at + s.bytes.len > r.text.bytes.len then return false
+    for k in 0..<s.bytes.len
+        if r.text.bytes[r.at + k] != s.bytes[k] then return false
+    true
+
+private skip_space(r: *ConditionReader)
+    while r.at < r.text.bytes.len && (r.text.bytes[r.at] == u8(' ') || r.text.bytes[r.at] == u8('\t'))
+        r.at += 1
+
+// The word, or the single character, at the reader's place.
+private token_at(r: ConditionReader) -> string
+    var end = r.at
+    while end < r.text.bytes.len && is_condition_byte(r.text.bytes[end])
+        end += 1
+    if end == r.at
+        end = r.at + 1
+        // A character of several bytes is taken whole.
+        while end < r.text.bytes.len && r.text.bytes[end] >= u8(0x80) && r.text.bytes[end] < u8(0xC0)
+            end += 1
+    r.text[r.at..<end]
+
+/** The diagnostic for `e`, a fault in the condition `text` written at `span`: at the fault itself where
+ * the span is the text in quotes or bare, and otherwise at the whole value. */
+condition_diagnostic(span: Span, text: string, e: ConditionError) -> Diagnostic
+    val width = span.end - span.start
+    val n = text.bytes.len
+    if e.len == 0 || width != n && width != n + 2 then return error(span, e.message)
+    val first = span.start + (if width == n then 0usize else 1usize) + e.start
+    error(Span(first, first + e.len), e.message)
+
+/** The condition the `if` key `f` holds, checked; an error at it where it is not a string or not a
+ * condition. */
+read_condition(f: Field) -> Result[string, Diagnostic]
+    val text = f.value.as_text() match
+        Some(s) -> s
+        None -> return Err(error(f.value.span, "`if` is a condition written as a string, in quotes, such as `if = \"linux\"`"))
+    condition_on(text, host_target()) match
+        Ok(_) -> Ok(text)
+        Err(e) -> Err(condition_diagnostic(f.value.span, text, e))
+
+/** A text that holds where its condition does: one sentence of an `install` block. */
+struct MachineText
+    condition: string
+    text: string
+
+/** The sentences of an `install` block, each keyed by a condition, in the order written; an error at
+ * a key that is not a condition or a value that is not a string. */
+read_machine_texts(f: Field) -> Result[Buf[MachineText], Diagnostic]
+    var out: Buf[MachineText] = buf()
+    for g in f.value.fields()
+        condition_on(g.key, host_target()) match
+            Ok(_) -> ()
+            Err(e) -> return Err(condition_diagnostic(g.key_span, g.key, e))
+        val text = g.value.as_text() match
+            Some(s) -> s
+            None -> return Err(error(g.value.span, s"each sentence of `install` is written as a string, in quotes, `${g.key} = \"brew install zlib\"`"))
+        out.push(MachineText(g.key, text))
+    Ok(out)
+
+/** The text of the first of `texts` whose condition holds on `target`, or "" where none does. */
+first_holding(texts: Buf[MachineText], target: string) -> string
+    for t in texts
+        if condition_holds(t.condition, target) then return t.text
+    ""
+
+/** The targets `f`, a package's `targets`, lists; an error at the list or at a name Avin does not know. */
+read_targets(f: Field) -> Result[Buf[string], Diagnostic]
+    val wrong = "`targets` is a list of the targets the package builds for, `targets = [\"x86_64-linux\", \"aarch64-macos\"]`"
+    if !f.value.is_arr() then return Err(error(f.value.span, wrong))
+    var out: Buf[string] = buf()
+    for v in f.value.items()
+        val name = v.as_text() match
+            Some(s) -> s
+            None -> return Err(error(v.span, wrong))
+        if !known_target(name) then return Err(error(v.span, unknown_target(name)))
+        out.push(name)
+    if out.len() == 0 then return Err(error(f.value.span, "`targets` lists no target, and a package builds for at least one: leave `targets` out to build for every target"))
+    Ok(out)
+
+/** The targets a package listing `targets` builds for: those, or every target where it lists none. */
+targets_or_every(targets: Buf[string]) -> Buf[string] = if targets.len() == 0 then machine_targets() else targets
+
+/** Whether a package listing `targets` builds for `target`. */
+builds_for(targets: Buf[string], target: string) -> bool
+    if targets.len() == 0 then return true
+    for t in targets
+        if t == target then return true
+    false

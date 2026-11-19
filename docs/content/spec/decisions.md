@@ -8957,6 +8957,42 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `machine-conditions`, 2026-11-19): **the choices
+  [machines](/spec/packages/#machines) left open in the manifest.**
+  - **A feature that does not exist on a machine turns nothing on there**, even when a feature that
+    does exist `enables` it: the selection leaves it out, and what only it would turn on stays off.
+    A feature that `requires` it is refused there as requiring a feature that is off. WHY: "does not
+    exist" means the same whichever way the feature is reached; turning its modules on through
+    another feature would make it exist after all. ALTERNATIVES: refusing a feature that enables an
+    absent one (makes a cross-machine package spell its enables twice); taking it through `enables`
+    anyway (contradicts its `if`).
+  - **`targets = []` is refused**; a package builds for at least one target. WHY: an empty list is
+    a package nothing can build, and is more likely a slip than an intent. ALTERNATIVES: reading it
+    as every target (the opposite of what it says).
+  - **Whether a dependency "reaches further" is asked over the dependent's targets where the entry's
+    condition holds**, so `lib { …, if = "macos" }` may name a package that builds only for
+    `aarch64-macos`. The check runs whatever machine the build is for, against the manifests.
+    WHY: an entry the condition leaves out is not in those machines' builds at all.
+    ALTERNATIVES: refusing on every target of the dependent (forces `targets` where `if` already says
+    it).
+  - **A whole workspace resolved for a machine is the members that build for it**, so `avin tidy`
+    and `avin vendor` of a workspace answer each target with the members that list it. A
+    workspace's root, and a package listing no `targets`, answer for every target. WHY: a member
+    built for Linux alone has nothing to resolve on macOS. ALTERNATIVES: refusing the workspace on
+    the machines some member leaves out.
+  - **`link-flags` are passed exactly as written, in order, with no flag merged with another**, after
+    the flags of `pkg-config` or `link`. WHY: the spec's "as written"; `-framework` repeated before
+    two frameworks must stay two pairs. ALTERNATIVES: removing repeats (breaks `-framework` pairs).
+  - **`--target` is taken by `avin check` alone** for now, reading every manifest as that machine's
+    build does; `avin build --target` is the cross-build item. WHY: checking builds nothing, so it
+    needs no other machine's tools. ALTERNATIVES: every command (a build for another machine needs
+    a sysroot Sysl does not have yet).
+  - **A condition's syntax errors** name the condition and what is wrong at the place: a symbol,
+    `!` or `(` wanted (at the end or where a character stands), a `(` never closed, or a word
+    following a whole condition; symbols are lowercase and `-` belongs to a word, so a target's name
+    is read whole and refused with the condition it means. WHY: one place and one sentence per
+    mistake, as the manifest's other errors give. ALTERNATIVES: one generic "not a condition" error.
+
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
   whichever comes first, and sends that rest as room comes**; its wait keeps the connection's time

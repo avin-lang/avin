@@ -1,0 +1,549 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.path.parent
+import sysl.process.{Stdio, capture}
+
+// Machines in the manifest: `package.targets`, the condition language and its errors, `if` on
+// dependencies, Sysl dependencies, C libraries and features, `install` by condition and `link-flags`,
+// each selected for a machine the test names rather than the one it runs on.
+
+private const Mac: string = "aarch64-macos"
+private const Intel: string = "x86_64-linux"
+private const Arm: string = "aarch64-linux"
+
+private const Symbols: string = "the symbols are macos, linux, posix, aarch64 and x86_64"
+
+private struct Said
+    status: int
+    noted: string
+
+private avin_check(dir: string, args: []const string) -> Said
+    var noted = ""
+    val status = run_cli_with(args, Some(repository_toolchain()), _ -> (), s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/run.out"), Stdio.Inherit)
+    Said(status, noted)
+
+private write(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+private package_text(name: string, rest: string) -> string = s"package {\n  name = \"$name\"\n  version = \"0.1.0\"\n}\n$rest"
+
+private read_error(text: string) -> string
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", text).unwrap()
+    read_manifest(dir) match
+        Ok(_) -> "read"
+        Err(message) -> message
+
+private holds(text: string, target: string) -> bool = condition_on(text, target).unwrap()
+
+private refusal(text: string) -> ConditionError = condition_on(text, Mac).unwrap_err()
+
+private on(target: string) -> FeatureChoice = choice_for(default_features(), target)
+
+private every_on(target: string) -> FeatureChoice = choice_for(every_feature(), target)
+
+private offline(dir: string) -> Fetching = Fetching(dir + "/cache", "", false)
+
+// The names of a loaded program's files, one a line.
+private file_names(p: LoadedProgram) -> string
+    var out = ""
+    for f in p.files
+        out = out + f.src.name + "\n"
+    out
+
+@test("the targets are aarch64-macos, x86_64-linux and aarch64-linux, and the compiler's own machine is one of them")
+targets_known()
+    assert_eq(targets_listing(machine_targets()), "aarch64-macos, x86_64-linux and aarch64-linux")
+    assert(known_target(host_target()))
+    assert(known_target(Mac) && known_target(Intel) && known_target(Arm))
+    assert(!known_target("x86_64-macos"))
+    assert(!known_target("linux"))
+    assert(!known_target(""))
+    assert_eq(unknown_target("riscv64-linux"), "`riscv64-linux` is not a target Avin builds for: the targets are aarch64-macos, x86_64-linux and aarch64-linux")
+
+@test("each symbol holds on the machines it names, and on no other")
+symbols_hold()
+    assert(holds("macos", Mac) && !holds("macos", Intel) && !holds("macos", Arm))
+    assert(!holds("linux", Mac) && holds("linux", Intel) && holds("linux", Arm))
+    assert(holds("posix", Mac) && holds("posix", Intel) && holds("posix", Arm))
+    assert(holds("aarch64", Mac) && !holds("aarch64", Intel) && holds("aarch64", Arm))
+    assert(!holds("x86_64", Mac) && holds("x86_64", Intel) && !holds("x86_64", Arm))
+
+@test("`!`, `&&` and `||` negate, join and choose, and spaces between them are free")
+condition_operators()
+    assert(!holds("!macos", Mac) && holds("!macos", Intel))
+    assert(holds("!!macos", Mac))
+    assert(holds("linux && x86_64", Intel) && !holds("linux && x86_64", Arm) && !holds("linux && x86_64", Mac))
+    assert(holds("macos || x86_64", Mac) && holds("macos || x86_64", Intel) && !holds("macos || x86_64", Arm))
+    assert(holds("linux&&aarch64", Arm))
+    assert(holds("  macos\t||linux ", Intel))
+    assert(holds("!(linux)", Mac))
+    assert(holds("posix && aarch64 && macos", Mac) && !holds("posix && aarch64 && macos", Arm))
+    assert(holds("x86_64 || aarch64 || linux", Arm))
+
+@test("`!` binds tightest and `&&` before `||`, and parentheses group")
+condition_precedence()
+    // `macos || linux && x86_64` is `macos || (linux && x86_64)`.
+    assert(holds("macos || linux && x86_64", Mac))
+    assert(!holds("macos || linux && x86_64", Arm))
+    assert(!holds("(macos || linux) && x86_64", Mac))
+    // `linux && x86_64 || macos` is `(linux && x86_64) || macos`.
+    assert(holds("linux && x86_64 || macos", Mac))
+    assert(!holds("linux && (x86_64 || macos)", Mac))
+    // `!macos && linux` is `(!macos) && linux`.
+    assert(!holds("!macos && linux", Mac))
+    assert(holds("!(macos && linux)", Mac))
+    assert(holds("!(macos || x86_64) && (aarch64)", Arm))
+    assert(holds("((((linux))))", Intel))
+
+@test("an unknown symbol is refused, every symbol checked on every machine, whatever the rest decides")
+unknown_symbols()
+    val lunix = refusal("lunix")
+    assert_eq(lunix.message, "`lunix` is not something a condition can ask about the machine: " + Symbols)
+    assert_eq(lunix.start, 0usize)
+    assert_eq(lunix.len, 5usize)
+    // Checked past a side that already decides the value, on each machine.
+    for t in machine_targets()
+        assert(condition_on("macos || lunix", t).is_err())
+        assert(condition_on("linux && lunix", t).is_err())
+    val far = refusal("linux && lunix")
+    assert_eq(far.start, 9usize)
+    assert_eq(far.len, 5usize)
+    // Symbols are written in lowercase, and nothing else is one.
+    assert(refusal("Linux").message.starts_with("`Linux` is not something a condition can ask about"))
+    assert(refusal("windows").message.starts_with("`windows` is not something"))
+    assert(refusal("unix").message.starts_with("`unix` is not something"))
+    assert(refusal("arm64").message.starts_with("`arm64` is not something"))
+    assert(refusal("true").message.starts_with("`true` is not something"))
+
+@test("a target's name is refused with the condition it means")
+target_names_refused()
+    assert_eq(refusal("x86_64-linux").message, "`x86_64-linux` is a target, and a condition asks about the machine by its symbols: write `x86_64 && linux`")
+    assert_eq(refusal("aarch64-macos").message, "`aarch64-macos` is a target, and a condition asks about the machine by its symbols: write `aarch64 && macos`")
+    val inside = refusal("macos || aarch64-linux")
+    assert_eq(inside.message, "`aarch64-linux` is a target, and a condition asks about the machine by its symbols: write `aarch64 && linux`")
+    assert_eq(inside.start, 9usize)
+    assert_eq(inside.len, 13usize)
+
+@test("an empty condition is refused, since an entry every machine takes is written without `if`")
+empty_condition()
+    for text in ["", " ", "\t  "]
+        val e = refusal(text)
+        assert_eq(e.message, "an empty condition holds on every machine: an entry every machine takes is written without `if`")
+        assert_eq(e.len, 0usize)
+
+@test("a condition that is not well formed says where it goes wrong")
+condition_syntax_errors()
+    val ends = refusal("linux &&")
+    assert_eq(ends.message, "`linux &&` is not a condition: a symbol, `!` or `(` is wanted at its end")
+    assert_eq(refusal("linux ||").message, "`linux ||` is not a condition: a symbol, `!` or `(` is wanted at its end")
+    assert_eq(refusal("!").message, "`!` is not a condition: a symbol, `!` or `(` is wanted at its end")
+    val two = refusal("linux macos")
+    assert_eq(two.message, "`linux macos` is not a condition: `macos` follows a whole condition, and two are joined by `&&` or `||`")
+    assert_eq(two.start, 6usize)
+    assert_eq(two.len, 5usize)
+    val single = refusal("linux & macos")
+    assert_eq(single.message, "`linux & macos` is not a condition: `&` follows a whole condition, and two are joined by `&&` or `||`")
+    assert_eq(refusal("linux | macos").message, "`linux | macos` is not a condition: `|` follows a whole condition, and two are joined by `&&` or `||`")
+    val leading = refusal("&& linux")
+    assert_eq(leading.message, "`&& linux` is not a condition: a symbol, `!` or `(` is wanted where `&` stands")
+    assert_eq(leading.start, 0usize)
+    val open = refusal("(linux || macos")
+    assert_eq(open.message, "`(linux || macos` is not a condition: its `(` is never closed by a `)`")
+    assert_eq(open.start, 0usize)
+    assert_eq(open.len, 1usize)
+    assert_eq(refusal("linux)").message, "`linux)` is not a condition: `)` follows a whole condition, and two are joined by `&&` or `||`")
+    assert_eq(refusal("()").message, "`()` is not a condition: a symbol, `!` or `(` is wanted where `)` stands")
+    assert_eq(refusal("linux = macos").message, "`linux = macos` is not a condition: `=` follows a whole condition, and two are joined by `&&` or `||`")
+    // A character of several bytes is named whole.
+    val unicode = refusal("linux && é")
+    assert_eq(unicode.message, "`linux && é` is not a condition: a symbol, `!` or `(` is wanted where `é` stands")
+    assert_eq(unicode.len, 2usize)
+
+@test("a condition's error is reported at the symbol in the manifest, the line and column of the fault")
+condition_error_placed()
+    val far = read_error(package_text("a", "dependencies {\n  b { path = \"../b\", if = \"linux && lunix\" }\n}\n"))
+    assert(far.contains("`lunix` is not something a condition can ask about the machine: " + Symbols), far)
+    assert(far.contains("avin.hocon:6:37"), far)
+    val target = read_error(package_text("a", "sysl-dependencies {\n  s { path = \"../s\", if = \"x86_64-linux\" }\n}\n"))
+    assert(target.contains("write `x86_64 && linux`"), target)
+    assert(target.contains("avin.hocon:6:28"), target)
+    // An empty condition is at the whole value.
+    val empty = read_error(package_text("a", "c-libraries {\n  z { link = [\"z\"], if = \"\" }\n}\n"))
+    assert(empty.contains("an empty condition holds on every machine"), empty)
+    assert(empty.contains("avin.hocon:6:26"), empty)
+    val feature = read_error(package_text("a", "features {\n  f { if = \"linux &&\" }\n}\n"))
+    assert(feature.contains("`linux &&` is not a condition: a symbol, `!` or `(` is wanted at its end"), feature)
+    assert(feature.contains("avin.hocon:6:"), feature)
+    // `if` is a string.
+    val number = read_error(package_text("a", "dependencies {\n  b { path = \"../b\", if = 3 }\n}\n"))
+    assert(number.contains("`if` is a condition written as a string, in quotes, such as `if = \"linux\"`"), number)
+    assert(read_error(package_text("a", "features {\n  f { if = [linux] }\n}\n")).contains("`if` is a condition written as a string"))
+
+@test("`if` is read on dependencies, Sysl dependencies, C libraries and features, and each key list names it")
+conditions_read()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/avin.hocon", package_text("probe", "dependencies {\n  inotify { path = \"../inotify\", if = \"linux\" }\n  plain { path = \"../plain\" }\n}\nsysl-dependencies {\n  seccomp { path = \"../seccomp\", if = \"linux && !aarch64\" }\n}\nc-libraries {\n  security {\n    link-flags = [\"-framework\", \"Security\"]\n    headers    = [\"<Security/Security.h>\"]\n    if         = \"macos\"\n  }\n}\nfeatures {\n  journal { if = \"linux\" }\n  any { }\n}\n"))
+    write(dir + "/journal/x.avin", "module journal\n")
+    val m = read_manifest(dir).unwrap()
+    assert_eq(m.dependencies[0].condition, "linux")
+    assert_eq(m.dependencies[1].condition, "")
+    assert_eq(m.sysl_dependencies[0].condition, "linux && !aarch64")
+    assert_eq(m.c_libraries[0].condition, "macos")
+    assert_eq(m.c_libraries[0].flags.len(), 2)
+    assert_eq(m.c_libraries[0].flags[0], "-framework")
+    assert_eq(m.c_libraries[0].flags[1], "Security")
+    assert_eq(m.features[0].condition, "linux")
+    assert_eq(m.features[1].condition, "")
+    assert(read_error(package_text("a", "dependencies {\n  b { tag = \"v1\" }\n}\n")).contains("`optional`, `features`, `default_features` and `if`"))
+    assert(read_error(package_text("a", "sysl-dependencies {\n  b { mount = \"c\", path = \"../b\" }\n}\n")).contains("which holds `git` with `version` or `rev`, or `path`, and `if`"))
+    assert(read_error(package_text("a", "c-libraries {\n  z { when = \"linux\" }\n}\n")).contains("`when` is not a key of a C library, which holds `pkg-config` or `link`, `link-flags`, `headers`, `install` and `if`"))
+    assert(read_error(package_text("a", "features {\n  b { when = \"linux\" }\n}\n")).contains("which holds `doc`, `default`, `modules`, `enables`, `requires` and `if`"))
+
+@test("`package.targets` lists the targets a package builds for; a name Avin does not know is refused at its value")
+targets_read()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/avin.hocon", "package {\n  name = \"probe\"\n  version = \"0.2.0\"\n  targets = [\"x86_64-linux\", \"aarch64-linux\"]\n}\n")
+    val m = read_manifest(dir).unwrap()
+    assert_eq(m.targets.len(), 2)
+    assert_eq(m.targets[1], Arm)
+    assert(builds_for(m.targets, Intel) && builds_for(m.targets, Arm) && !builds_for(m.targets, Mac))
+    // Left out, it is every target.
+    write(dir + "/avin.hocon", package_text("probe", ""))
+    val every = read_manifest(dir).unwrap()
+    assert_eq(every.targets.len(), 0)
+    for t in machine_targets()
+        assert(builds_for(every.targets, t))
+    assert_eq(targets_or_every(every.targets).len(), 3)
+    val unknown = read_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  targets = [\"aarch64-macos\", \"x86_64-windows\"]\n}\n")
+    assert(unknown.contains("`x86_64-windows` is not a target Avin builds for: the targets are aarch64-macos, x86_64-linux and aarch64-linux"), unknown)
+    assert(unknown.contains("avin.hocon:4:31"), unknown)
+    // A symbol is not a target.
+    assert(read_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  targets = [\"linux\"]\n}\n").contains("`linux` is not a target Avin builds for"))
+    assert(read_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  targets = \"aarch64-macos\"\n}\n").contains("`targets` is a list of the targets the package builds for"))
+    assert(read_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  targets = [3]\n}\n").contains("`targets` is a list of the targets the package builds for"))
+    assert(read_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  targets = []\n}\n").contains("`targets` lists no target, and a package builds for at least one"))
+    assert(read_error("package {\n  name = \"a\"\n  version = \"0.1.0\"\n  author = \"me\"\n}\n").contains("which holds `name`, `version`, `description`, `avin` and `targets`"))
+
+@test("`install` is a sentence or a block of them by condition, the first that holds shown and none where none holds")
+install_by_machine()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/avin.hocon", package_text("probe", "c-libraries {\n  ssh {\n    pkg-config = \"libssh2\"\n    install { macos = \"brew install libssh2\", \"linux && x86_64\" = \"apt install libssh2-1-dev\", posix = \"build libssh2 from source\" }\n  }\n  only { install { linux = \"apt install only\" } }\n  plain { install = \"get plain\" }\n  empty { install { } }\n}\n"))
+    val m = read_manifest(dir).unwrap()
+    assert_eq(m.c_libraries[0].installs.len(), 3)
+    assert_eq(m.c_libraries[0].installs[1].condition, "linux && x86_64")
+    assert_eq(on_machine(m, Mac).c_libraries[0].install, "brew install libssh2")
+    assert_eq(on_machine(m, Intel).c_libraries[0].install, "apt install libssh2-1-dev")
+    // The first that holds wins, so on Arm Linux it is the `posix` sentence.
+    assert_eq(on_machine(m, Arm).c_libraries[0].install, "build libssh2 from source")
+    assert_eq(on_machine(m, Mac).c_libraries[1].install, "")
+    assert_eq(on_machine(m, Arm).c_libraries[1].install, "apt install only")
+    for t in machine_targets()
+        assert_eq(on_machine(m, t).c_libraries[2].install, "get plain")
+        assert_eq(on_machine(m, t).c_libraries[3].install, "")
+    val bad_key = read_error(package_text("a", "c-libraries {\n  z { install { lunix = \"apt install z\" } }\n}\n"))
+    assert(bad_key.contains("`lunix` is not something a condition can ask about the machine"), bad_key)
+    assert(bad_key.contains("avin.hocon:6:17"), bad_key)
+    assert(read_error(package_text("a", "c-libraries {\n  z { install { \"\" = \"x\" } }\n}\n")).contains("an empty condition holds on every machine"))
+    assert(read_error(package_text("a", "c-libraries {\n  z { install { macos = [\"brew\"] } }\n}\n")).contains("each sentence of `install` is written as a string, in quotes, `macos = \"brew install zlib\"`"))
+    assert(read_error(package_text("a", "c-libraries {\n  z { install = [\"x\"] }\n}\n")).contains("`install` is written as a string"))
+
+@test("`link-flags` is a list of flags, each one string with no space")
+link_flags_read()
+    assert(read_error(package_text("a", "c-libraries {\n  z { link-flags = \"-framework Security\" }\n}\n")).contains("`link-flags` is a list of flags passed to the linker as they are, one flag a string"))
+    assert(read_error(package_text("a", "c-libraries {\n  z { link-flags = [\"-framework Security\"] }\n}\n")).contains("`link-flags` is a list of flags passed to the linker as they are"))
+    assert(read_error(package_text("a", "c-libraries {\n  z { link-flags = [\"\"] }\n}\n")).contains("`link-flags` is a list of flags passed to the linker as they are"))
+    // Beside `pkg-config` or `link`, or alone.
+    assert_eq(read_error(package_text("a", "c-libraries {\n  z { link = [\"z\"], link-flags = [\"-Wl,-dead_strip\"] }\n  p { pkg-config = \"zlib\", link-flags = [\"-Wl,-dead_strip\"] }\n  alone { link-flags = [\"-framework\", \"Security\"] }\n}\n")), "read")
+
+@test("`link-flags` are passed to the link exactly as written, in order, a repeated flag kept")
+link_flags_linked()
+    var flags: Buf[string] = buf()
+    for f in ["-framework", "Security", "-framework", "CoreFoundation", "-Wl,-dead_strip"]
+        flags.push(f)
+    var libraries: Buf[CLibrary] = buf()
+    var alone = c_library("app", "security", None, buf(), buf(), "", false)
+    alone.flags = flags
+    libraries.push(alone)
+    var names: Buf[string] = buf()
+    names.push("m")
+    var beside = c_library("app", "libm", None, names, buf(), "", false)
+    var one: Buf[string] = buf()
+    one.push("-Wl,-dead_strip")
+    beside.flags = one
+    libraries.push(beside)
+    val unit = ensure_c_unit(repository_toolchain(), buf(), buf(), libraries, buf()).unwrap()
+    var linked = ""
+    for f in unit.link
+        linked = linked + f + " "
+    assert_eq(linked, "-framework Security -framework CoreFoundation -Wl,-dead_strip -lm -Wl,-dead_strip ")
+
+@test("an entry is part of a build only on a machine where its condition holds")
+entries_selected()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/avin.hocon", package_text("probe", "dependencies {\n  inotify { path = \"../inotify\", if = \"linux\" }\n  fsevent { path = \"../fsevent\", if = \"macos\" }\n  both { path = \"../both\" }\n}\nsysl-dependencies {\n  seccomp { path = \"../seccomp\", if = \"linux\" }\n}\nc-libraries {\n  security { link-flags = [\"-framework\", \"Security\"], if = \"macos\" }\n  ssh { pkg-config = \"libssh2\" }\n}\n"))
+    val m = read_manifest(dir).unwrap()
+    val mac = on_machine(m, Mac)
+    assert_eq(mac.dependencies.len(), 2)
+    assert_eq(mac.dependencies[0].label, "fsevent")
+    assert_eq(mac.dependencies[1].label, "both")
+    assert_eq(mac.sysl_dependencies.len(), 0)
+    assert_eq(mac.c_libraries.len(), 2)
+    assert_eq(mac.c_libraries[0].label, "security")
+    val linux = on_machine(m, Intel)
+    assert_eq(linux.dependencies.len(), 2)
+    assert_eq(linux.dependencies[0].label, "inotify")
+    assert_eq(linux.sysl_dependencies.len(), 1)
+    assert_eq(linux.c_libraries.len(), 1)
+    assert_eq(linux.c_libraries[0].label, "ssh")
+    // The manifest as written keeps every entry.
+    assert_eq(m.dependencies.len(), 3)
+
+// A package `app` whose dependency `shared` is taken everywhere, `lin` on Linux and `mac` on macOS;
+// `shared` takes `arm` on 64-bit Arm only, so a dependency's own conditions are handed on with it.
+private machine_graph(dir: string)
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  shared { path = \"../shared\" }\n  lin { path = \"../lin\", if = \"linux\" }\n  mac { path = \"../mac\", if = \"macos\" }\n}\nsysl-dependencies {\n  seccomp { path = \"../seccomp\", if = \"linux\" }\n}\nc-libraries {\n  security { link-flags = [\"-framework\", \"Security\"], if = \"macos\" }\n  epoll { link = [\"rt\"], if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    write(dir + "/shared/avin.hocon", package_text("shared", "dependencies {\n  arm { path = \"../arm\", if = \"aarch64\" }\n}\n"))
+    write(dir + "/shared/shared/shared.avin", "module shared\n\nsize() -> int = 1\n")
+    for name in ["lin", "mac", "arm"]
+        write(dir + "/" + name + "/avin.hocon", package_text(name, ""))
+        write(dir + "/" + name + "/" + name + "/" + name + ".avin", s"module $name\n\nsize() -> int = 1\n")
+    write(dir + "/seccomp/sysl.hocon", "package {\n  name = \"seccomp\"\n  version = \"0.1.0\"\n}\n")
+
+@test("a dependency left out by its condition is not in the build, and a dependency's own conditions are handed on")
+dependencies_selected()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    machine_graph(dir)
+    val mac = load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap()
+    val mac_files = file_names(mac)
+    assert(mac_files.contains("/mac/mac.avin"), mac_files)
+    assert(mac_files.contains("/arm/arm.avin"), mac_files)
+    assert(!mac_files.contains("/lin/lin.avin"), mac_files)
+    assert_eq(mac.sysl.len(), 0)
+    assert_eq(mac.c.len(), 1)
+    assert_eq(mac.c[0].label, "security")
+    val intel = load_package_with(dir + "/app", offline(dir), on(Intel)).unwrap()
+    val intel_files = file_names(intel)
+    assert(intel_files.contains("/lin/lin.avin"), intel_files)
+    assert(!intel_files.contains("/mac/mac.avin"), intel_files)
+    assert(!intel_files.contains("/arm/arm.avin"), intel_files)
+    assert(intel_files.contains("/shared/shared.avin"), intel_files)
+    assert_eq(intel.sysl.len(), 1)
+    assert_eq(intel.sysl[0].label, "seccomp")
+    assert_eq(intel.c.len(), 1)
+    assert_eq(intel.c[0].label, "epoll")
+    val arm = file_names(load_package_with(dir + "/app", offline(dir), on(Arm)).unwrap())
+    assert(arm.contains("/lin/lin.avin") && arm.contains("/arm/arm.avin") && !arm.contains("/mac/mac.avin"), arm)
+
+@test("a dependency left out by its condition is never fetched, and a dropped C library is never linked")
+dropped_not_fetched_or_linked()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    // The repository does not exist and fetching is off: only a machine that takes it tries to fetch it.
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  inotify { git = \"example.com/owner/inotify\", version = \"0.1.0\", if = \"linux\" }\n}\nc-libraries {\n  nowhere { pkg-config = \"avin-machines-no-such-module\", if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    val mac = load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap()
+    assert_eq(mac.c.len(), 0)
+    // No `pkg-config` is asked about a library the machine does not take.
+    assert(ensure_c_unit(repository_toolchain(), buf(), buf(), mac.c, buf()).is_ok())
+    val linux = load_package_with(dir + "/app", offline(dir), on(Intel)).unwrap_err()
+    assert(linux.contains("is not fetched yet"), linux)
+
+@test("`if` and `optional` compose: the dependency is taken where a feature turns it on and the condition holds")
+optional_and_condition()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", "features {\n  watch { default = true, enables = [inotify] }\n}\ndependencies {\n  inotify { path = \"../inotify\", optional = true, if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    write(dir + "/inotify/avin.hocon", package_text("inotify", ""))
+    write(dir + "/inotify/inotify/inotify.avin", "module inotify\n\nsize() -> int = 1\n")
+    assert(file_names(load_package_with(dir + "/app", offline(dir), on(Intel)).unwrap()).contains("/inotify/inotify.avin"))
+    assert(!file_names(load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap()).contains("/inotify/inotify.avin"))
+    // With the feature off, no machine takes it.
+    val off = choice_for(FeatureChoice(false, false, buf(), Intel), Intel)
+    assert(!file_names(load_package_with(dir + "/app", offline(dir), off).unwrap()).contains("/inotify/inotify.avin"))
+
+// A package `app` with a feature `journal` that exists only on Linux and is a default, gating the
+// module `app.journal`; `base`, everywhere, which `journal` turns on; and `extra`, everywhere, which
+// turns `journal` on.
+private journal_package(dir: string)
+    write(dir + "/app/avin.hocon", package_text("app", "features {\n  journal { doc = \"logging to the systemd journal\", default = true, modules = [app.journal], enables = [base], if = \"linux\" }\n  base { modules = [app.base] }\n  extra { enables = [journal] }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    write(dir + "/app/app/journal/journal.avin", "module app.journal\n\nsize() -> int = 1\n")
+    write(dir + "/app/app/base/base.avin", "module app.base\n\nsize() -> int = 1\n")
+
+@test("a feature exists only where its condition holds: not a default elsewhere, not among every feature, and refused by name there")
+feature_on_one_machine()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    journal_package(dir)
+    // A default on Linux, with what it turns on.
+    val linux = file_names(load_package_with(dir + "/app", offline(dir), on(Intel)).unwrap())
+    assert(linux.contains("/app/journal/journal.avin") && linux.contains("/app/base/base.avin"), linux)
+    // On macOS it is simply not part of the default, and what only it turns on stays off.
+    val mac = file_names(load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap())
+    assert(!mac.contains("/app/journal/journal.avin") && !mac.contains("/app/base/base.avin"), mac)
+    // Every feature is every one that exists on the machine.
+    val every = file_names(load_package_with(dir + "/app", offline(dir), every_on(Mac)).unwrap())
+    assert(!every.contains("/app/journal/journal.avin") && every.contains("/app/base/base.avin"), every)
+    // A feature that turns it on does not bring it where it does not exist.
+    var extra: Buf[string] = buf()
+    extra.push("extra")
+    val through = file_names(load_package_with(dir + "/app", offline(dir), FeatureChoice(false, false, extra, Mac)).unwrap())
+    assert(!through.contains("/app/journal/journal.avin"), through)
+    // Asked for by name, it is refused, naming the machine.
+    var named: Buf[string] = buf()
+    named.push("journal")
+    val refused = load_package_with(dir + "/app", offline(dir), FeatureChoice(false, true, named, Mac)).unwrap_err()
+    assert_eq(refused, "avin: the feature `journal` of `app` exists only where `linux` holds, and this build is for aarch64-macos")
+    assert(load_package_with(dir + "/app", offline(dir), FeatureChoice(false, true, named, Arm)).is_ok())
+    // Taking it away where it is absent is no error.
+    write(dir + "/user/avin.hocon", package_text("user", "dependencies {\n  app { path = \"../app\", features = [-journal] }\n}\n"))
+    write(dir + "/user/main.avin", "main()\n  println(\"user\")\n")
+    assert(load_package_with(dir + "/user", offline(dir), on(Mac)).is_ok())
+
+@test("a dependency's entry asking for a feature that does not exist on the machine is refused at the entry")
+feature_asked_by_a_dependency()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    journal_package(dir)
+    write(dir + "/user/avin.hocon", package_text("user", "dependencies {\n  app { path = \"../app\", features = [journal] }\n}\n"))
+    write(dir + "/user/main.avin", "main()\n  println(\"user\")\n")
+    val refused = load_package_with(dir + "/user", offline(dir), on(Mac)).unwrap_err()
+    assert(refused.contains("the feature `journal` of `app` exists only where `linux` holds, and this build is for aarch64-macos"), refused)
+    assert(refused.contains("user/avin.hocon:6:"), refused)
+    assert(load_package_with(dir + "/user", offline(dir), on(Intel)).is_ok())
+
+@test("building a package for a target its manifest leaves out is refused, and so is depending on it from a package that reaches further")
+targets_enforced()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/probe/avin.hocon", "package {\n  name = \"probe\"\n  version = \"0.2.0\"\n  targets = [\"x86_64-linux\", \"aarch64-linux\"]\n}\n")
+    write(dir + "/probe/main.avin", "main()\n  println(\"probe\")\n")
+    val refused = load_package_with(dir + "/probe", offline(dir), on(Mac)).unwrap_err()
+    assert(refused.contains("`probe` builds for x86_64-linux and aarch64-linux, and this build is for aarch64-macos: build it for one of those, or add aarch64-macos to its `targets`"), refused)
+    assert(refused.contains("probe/avin.hocon:4:13"), refused)
+    assert(load_package_with(dir + "/probe", offline(dir), on(Intel)).is_ok())
+    assert(load_package_with(dir + "/probe", offline(dir), on(Arm)).is_ok())
+    // A package building for every target cannot depend on one that builds for some.
+    write(dir + "/lib/avin.hocon", "package {\n  name = \"lib\"\n  version = \"0.1.0\"\n  targets = [\"aarch64-macos\"]\n}\n")
+    write(dir + "/lib/lib/lib.avin", "module lib\n\nsize() -> int = 1\n")
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lib { path = \"../lib\" }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    val wider = load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap_err()
+    assert(wider.contains("`lib` builds for aarch64-macos, and `app` builds for x86_64-linux too: take `lib` only where it builds with `if`, or leave x86_64-linux out of the `targets` of `app`"), wider)
+    assert(wider.contains("app/avin.hocon:6:"), wider)
+    // Taken only where it builds, or from a package building only there, it is accepted.
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lib { path = \"../lib\", if = \"macos\" }\n}\n"))
+    assert(load_package_with(dir + "/app", offline(dir), on(Mac)).is_ok())
+    assert(load_package_with(dir + "/app", offline(dir), on(Intel)).is_ok())
+    write(dir + "/app/avin.hocon", "package {\n  name = \"app\"\n  version = \"0.1.0\"\n  targets = [\"aarch64-macos\"]\n}\ndependencies {\n  lib { path = \"../lib\" }\n}\n")
+    assert(load_package_with(dir + "/app", offline(dir), on(Mac)).is_ok())
+    // A condition that still reaches a machine the dependency leaves out is refused.
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lib { path = \"../lib\", if = \"aarch64\" }\n}\n"))
+    assert(load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap_err().contains("`app` builds for aarch64-linux too"))
+
+@test("a C library's `install` sentence in the missing-library error is the one for the machine being built for")
+install_in_missing_library_error()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", "c-libraries {\n  nope { pkg-config = \"avin-machines-no-such-module\", install { macos = \"brew install nope\", linux = \"apt install nope-dev\" } }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    val mac = load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap()
+    val mac_error = ensure_c_unit(repository_toolchain(), buf(), buf(), mac.c, buf()).unwrap_err()
+    assert(mac_error.contains("the C library `nope` of package `app` was not found"), mac_error)
+    assert(mac_error.contains(" brew install nope\n"), mac_error)
+    assert(!mac_error.contains("apt install"), mac_error)
+    val linux = load_package_with(dir + "/app", offline(dir), on(Arm)).unwrap()
+    val linux_error = ensure_c_unit(repository_toolchain(), buf(), buf(), linux.c, buf()).unwrap_err()
+    assert(linux_error.contains(" apt install nope-dev\n"), linux_error)
+    assert(!linux_error.contains("brew"), linux_error)
+    // A block naming no condition that holds shows no sentence.
+    write(dir + "/app/avin.hocon", package_text("app", "c-libraries {\n  nope { pkg-config = \"avin-machines-no-such-module\", install { linux = \"apt install nope-dev\" } }\n}\n"))
+    val none = ensure_c_unit(repository_toolchain(), buf(), buf(), load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap().c, buf()).unwrap_err()
+    assert(none.ends_with("failed.\n"), none)
+
+@test("avin check reports a manifest's condition errors, and --target reads the manifests as that machine's build does")
+check_command()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    for c in ["lunix", "x86_64-linux", "", "linux &&"]
+        write(dir + "/app/avin.hocon", package_text("app", "c-libraries {\n  z { link = [\"z\"], if = \"" + c + "\" }\n}\n"))
+        val said = avin_check(dir, ["avin", "check", dir + "/app"])
+        assert_eq(said.status, 1)
+        assert(said.noted.contains(condition_on(c, Mac).unwrap_err().message), said.noted)
+        assert(said.noted.contains("app/avin.hocon:6:"), said.noted)
+    write(dir + "/app/avin.hocon", "package {\n  name = \"app\"\n  version = \"0.1.0\"\n  targets = [\"x86_64-linux\"]\n}\n")
+    val here = avin_check(dir, ["avin", "check", dir + "/app"])
+    if host_target() != Intel
+        assert_eq(here.status, 1)
+        assert(here.noted.contains("`app` builds for x86_64-linux, and this build is for " + host_target()), here.noted)
+    val there = avin_check(dir, ["avin", "check", dir + "/app", "--target", "x86_64-linux"])
+    assert_eq(there.status, 0)
+    assert_eq(avin_check(dir, ["avin", "check", "--target", "x86_64-linux", dir + "/app"]).status, 0)
+    val wrong = avin_check(dir, ["avin", "check", dir + "/app", "--target", "x86_64-windows"])
+    assert_eq(wrong.status, 2)
+    assert(wrong.noted.contains("avin: `x86_64-windows` is not a target Avin builds for: the targets are aarch64-macos, x86_64-linux and aarch64-linux"), wrong.noted)
+    // Only `check` takes it.
+    assert_eq(avin_check(dir, ["avin", "build", dir + "/app", "--target", "x86_64-linux"]).status, 2)
+    // A Linux-only dependency is resolved by `check --target` on any machine.
+    write(dir + "/lin/avin.hocon", package_text("lin", ""))
+    write(dir + "/lin/lin/lin.avin", "module lin\n\nsize() -> int = 1\n")
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lin { path = \"../lin\", if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "import lin.size\n\nmain()\n  println(size())\n")
+    assert_eq(avin_check(dir, ["avin", "check", dir + "/app", "--target", "aarch64-linux"]).status, 0)
+    // On this machine's own reading the module is not there, so the import is refused.
+    if host_target() == Mac
+        assert_eq(avin_check(dir, ["avin", "check", dir + "/app"]).status, 1)
+
+@test("avin tidy and avin vendor answer for every target the root lists, whatever machine they run on")
+tidy_every_target()
+    val dir = make_temp_dir("avin-machines").unwrap()
+    defer _ = remove_dir_all(dir)
+    val lib = dir + "/work/lib"
+    write(lib + "/avin.hocon", package_text("lib", ""))
+    write(lib + "/lib/lib.avin", "module lib\n\nsize() -> int = 1\n")
+    git_in(lib, ["init", "-q"])
+    git_in(lib, ["add", "-A"])
+    git_in(lib, ["commit", "-q", "-m", "v0.1.0"])
+    git_in(lib, ["tag", "v0.1.0"])
+    make_dir_all(dir + "/remotes/example.com/avin").unwrap()
+    git_in(dir, ["clone", "-q", "--bare", lib, dir + "/remotes/example.com/avin/lib.git"])
+    val fetching = Fetching(dir + "/cache", "file://" + dir + "/remotes/", true)
+    // Taken on Linux only, by a package building everywhere: its line is recorded wherever tidy runs.
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lib { git = \"example.com/avin/lib\", version = \"0.1.0\", if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    assert(!tidy(dir + "/app", fetching, false, _ -> ()).unwrap())
+    val sums = read_sums(dir + "/app/avin.sum").unwrap()
+    assert_eq(sums.len(), 1)
+    assert_eq(sums[0].coordinate, "example.com/avin/lib")
+    assert(tidy(dir + "/app", fetching, true, _ -> ()).unwrap())
+    // A package listing only macOS answers for macOS alone, and the line goes.
+    write(dir + "/app/avin.hocon", "package {\n  name = \"app\"\n  version = \"0.1.0\"\n  targets = [\"aarch64-macos\"]\n}\ndependencies {\n  lib { git = \"example.com/avin/lib\", version = \"0.1.0\", if = \"linux\" }\n}\n")
+    assert(!tidy(dir + "/app", fetching, false, _ -> ()).unwrap())
+    assert(read_sums(dir + "/app/avin.sum").unwrap().len() == 0)
+    // Vendoring copies what any listed machine reads.
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lib { git = \"example.com/avin/lib\", version = \"0.1.0\", if = \"linux\" }\n}\n"))
+    vendor(dir + "/app", fetching, _ -> ()).unwrap()
+    assert(read_text(dir + "/app/vendor/example.com/avin/lib/@v0.1.0/lib/lib.avin").is_ok())
+
+private git_in(dir: string, args: []const string)
+    var all: Buf[string] = buf()
+    for a in ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+        all.push(a)
+    for a in args
+        all.push(a)
+    val result = capture("git", all.view(), stderr = true, timeout = 60000).unwrap()
+    assert(result.status.ok(), result.text)
