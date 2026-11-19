@@ -9631,7 +9631,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
-- Proposed 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
+- Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
   after a `select`'s one-line arm ends the arm, the `select` and the item, as it does a match's**,
   and a `select` on a block's last line that closes a bracket ends at that line's comma. Why: the
   select chapter says its arms are written as a match's are, and with the 2026-11-19 rule that a
@@ -9640,7 +9640,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   mean what `f(m match` … `-> v, x)` means. Alternatives: keeping the tuple reading for `select`
   alone (one construct reading commas unlike its sibling); an error asking for parentheses either
   way. It changes code that compiled before: `println(select` … `-> "up", made)` printed a tuple and
-  now passes two arguments, so that test writes `println((select` … `-> "up", made))`.
+  now passes two arguments, so that test writes `println((select` … `-> "up", made))`. Review with
+  the user: it changes the meaning of code that compiled before.
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
