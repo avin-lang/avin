@@ -362,8 +362,9 @@ a decision changes, this page and the chapter change together.
   There is no mutable list type: every collection has a builder, through one library trait, and
   `List`'s builder appends in constant time and yields an immutable `List`.
 - `..` and `..<` expressions construct iterable `Range` values.
-- An array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or
-  `Array.empty()`; Avin has no null, so no array holds an unset element, and `Array[T]()` is an error.
+- An array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)`,
+  `Array.empty()` or `Array(a, b, c)` (see "A collection is made by naming its type and listing its
+  elements" below); Avin has no null, so no array holds an unset element.
   `xs(i)` calls `xs.apply(i)`, `xs(i) = v` calls `xs.update(i, v)`, and the compound, `:=` and `++`
   forms evaluate `xs` and `i` once. A call with untyped arguments before `=` is an assignment, so a
   local function's declaration types its parameters or has none.
@@ -11190,3 +11191,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resumed on, changing the buffer's count there while the buffer's own carrier used it, which
   freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
   reading at once).
+
+- Settled on the user's delegation 2026-11-19 (branch `collection-apply`): **a collection is made by
+  naming its type and listing its elements.** `Array(1, 2, 3)` was refused; it now works, as an
+  ordinary companion `apply[T](elements: T*)` in the library (no compiler special case: the
+  repeated parameter infers `T` from the elements, from the expected type, or from type arguments
+  written at the call, and `Array()` with none is the existing "cannot infer" error). Types that
+  gained the form: `Array`, `Buffer`, `Deque`, `ArraySeq`, `LazyList`, the mutable `Set` and
+  `LinkedSet`, and `PriorityQueue` (by the elements' own order); `Vector`, `List`, `Queue`, `Set`,
+  `HashSet`, `SortedSet`, `SeqSet`, `OrderedSet`, `TreeSet` (immutable and mutable) and `BitSet`
+  already had it. `Array(1, 2.5)` widens to `Array[real]`; mismatched types are the ordinary
+  argument error. A class that keeps fields its own code fills in (`LazyList`) no longer offers
+  its constructor to a call outside that code, so `LazyList[T]()` calls the companion's `apply`
+  and makes the empty list instead of being refused. The old refusal of calling an array's constructor is removed, and the
+  literal `[1, 2, 3]` is unchanged. **Maps are excluded** (settled 2026-11-09): `Map("k" -> 7)` stays
+  refused with its hint to write `{"k": 7}`, and no pair operator is added. `Map((k, v), …)` taking
+  tuples already exists and stays; no other map gained a form. Alternatives weighed: a compiler
+  special case treating `Name(a, b)` as a literal (rejected: the library form needs none, and a
+  program's own collections get the form by declaring `apply`). Review with the user: whether the
+  tuple form `Map((1, "one"), …)` should stay beside `{1: "one"}`, since it is a second way to write
+  a map that no one needs.
