@@ -1,0 +1,108 @@
+// A pipeline of threads joined by bounded channels: a reader produces the lines of an access log,
+// three parsers turn them into events, and a tallier sums what each user did. Each channel holds at
+// most a few items, so a fast stage waits for a slow one instead of piling work up in memory: that
+// is the backpressure a bounded channel gives. Parsers stop when the lines run out; the tallier stops
+// when every parser has finished, and a watchdog arm in its `select` reports a stage that stalls.
+//
+//     avin run main.avin 2000
+//
+// expect: exit 0
+// args: 2000
+import avin.threads.{Atomic, Channel, scope}
+import avin.time
+
+data Event(user: string, action: Action, millis: int)
+
+data Action
+  View
+  Click
+  Buy
+
+// What one user did, summed over the log.
+data Tally(views: int, clicks: int, purchases: int, millis: long)
+
+impl Tally
+  add(e: Event) -> Tally
+    val time = millis + long(e.millis)
+    e.action match
+      View -> Tally(views + 1, clicks, purchases, time)
+      Click -> Tally(views, clicks + 1, purchases, time)
+      Buy -> Tally(views, clicks, purchases + 1, time)
+
+val users = ["ada", "bo", "cy", "di", "eve"]
+
+// The log line numbered `i`: the same for every run, with a malformed line every 97th.
+logLine(i: int) -> string = if i % 97 == 96 then s"garbage line $i"
+else
+  val action = ["view", "click", "buy", "view"](i * 7 % 4)
+  s"${users(i * 3 % 5)} $action ${i * 37 % 500}"
+
+actionOf(word: string) -> Option[Action] = word match
+  "view" -> Some(View)
+  "click" -> Some(Click)
+  "buy" -> Some(Buy)
+  _ -> None
+
+parse(line: string) -> Option[Event] = line.split(" ") match
+  [user, word, ms] ->
+    for
+      action in actionOf(word)
+      millis in ms.toIntOption()
+    yield Event(user, action, millis)
+  _ -> None
+
+// Sends every line, then closes the channel so the parsers know the input has ended. `ahead` keeps
+// the most lines that were sent and not yet parsed, which the bound on the channel limits.
+produce(count: int, lines: Channel[string], parsed: Atomic[int], ahead: Atomic[int])
+  for i in 0 ..< count
+    lines.send(logLine(i))
+    val waiting = i + 1 - parsed.load()
+    ahead.update(most -> max(most, waiting))
+  lines.close()
+
+// Parses lines until the reader closes its channel; malformed lines are counted, not sent.
+parseLines(lines: Channel[string], events: Channel[Event], parsed: Atomic[int], rejected: Atomic[int])
+  for line in lines
+    parse(line) match
+      Some(e) -> events.send(e)
+      None -> _ = rejected.add(1)
+    _ = parsed.add(1)
+
+// Sums the events until their channel is closed and drained, which happens once every parser has
+// finished.
+tally(events: Channel[Event]) -> Map[string, Tally]
+  var totals = Map.empty[string, Tally]()
+  var open = true
+  while open
+    select
+      events.receive() as Some(e) ->
+        totals = totals.updated(e.user, totals.getOrElse(e.user, Tally(0, 0, 0, 0)).add(e))
+      events.receive() as None -> open = false
+      after time.seconds(10) ->
+        eprintln("a stage has stalled for ten seconds")
+        open = false
+  totals
+
+main(args: Vector[string]) -> int
+  val count = args.headOption.flatMap(_.toIntOption()).getOrElse(1000)
+  val lines = Channel[string](4)
+  val events = Channel[Event](4)
+  val parsed = Atomic(0)
+  val rejected = Atomic(0)
+  val ahead = Atomic(0)
+  val totals = scope(s ->
+    s.spawn(() -> produce(count, lines, parsed, ahead))
+    val parsers = (1 .. 3).map(_ -> s.spawn(() -> parseLines(lines, events, parsed, rejected)))
+    s.spawn(() ->
+      for p in parsers do p.join()
+      events.close())
+    tally(events))
+  println(s"$count lines, ${rejected.load()} malformed")
+  for (user, t) in totals.toVector.sortBy(_.0)
+    println(f"$user%-4s ${t.views}%4d views ${t.clicks}%4d clicks ${t.purchases}%4d purchases ${t.millis}%7d ms")
+  val tallied = totals.values.map(t -> t.views + t.clicks + t.purchases).sum
+  println(s"events tallied: $tallied")
+  // The four lines the channel holds, plus the one each parser has taken and not finished, plus the
+  // one being sent: the reader never runs further ahead than that.
+  println(s"the reader stayed within the channel's bound: ${ahead.load() <= 4 + 3 + 1}")
+  0

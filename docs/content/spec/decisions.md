@@ -8955,6 +8955,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
 
+- **Examples of concurrent programs, and what they asked of the library** (branch
+  `ports-concurrent`, 2026-11-19).
+  - Settled on the user's delegation 2026-11-19: **an example of many files, `examples/NAME/`, is
+    run and checked when its output is beside it, `examples/NAME.out`**, as a program of
+    `tests/programs/run` is, its expectation lines in its files; one with no output beside it
+    opens a window and is only built. WHY: the convention the corpus already has for a program of
+    many files, so an example directory needs nothing new, and the window examples keep the check
+    they had. ALTERNATIVES: the output inside the directory (`examples/NAME/main.out`, a second
+    sidecar rule for one directory); a header line saying whether to run (the output file already
+    says it); a separate `examples/run/` directory (splits the examples a reader browses by how
+    they are tested).
+  - Settled on the user's delegation 2026-11-19: **`Response.html(status, text)`**, a response of
+    the type `text/html; charset=utf-8` with the text sent as given, beside `Response.text` and
+    `Response.json`. WHY: a server that renders a page wrote `Response.bytes(status, text.utf8,
+    "text/html; charset=utf-8")` by hand. ALTERNATIVES: none kept; escaping the text (it is markup,
+    already written).
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
