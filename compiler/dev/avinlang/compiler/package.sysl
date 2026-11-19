@@ -135,7 +135,11 @@ no_linking() -> CLinking = CLinking(buf(), buf(), buf(), buf(), buf(), buf(), bu
  *
  * `condition` is the machines the library is linked on, as its `if` writes them, or empty for every
  * machine. `installs` are the sentences of an `install` block, each with its condition; once the
- * library is in a program for a machine, `install` is the first of them that holds there. */
+ * library is in a program for a machine, `install` is the first of them that holds there.
+ *
+ * `sources` are the C files the package ships for the library, relative to its directory, each a
+ * path or a pattern whose `*` matches within one directory; they are compiled with `cflags` and
+ * linked into the program, statically. */
 struct CLibrary
     package: string
     label: string
@@ -156,12 +160,14 @@ struct CLibrary
     system_search: Buf[string]
     condition: string
     installs: Buf[MachineText]
+    sources: Buf[string]
+    cflags: Buf[string]
 
 /** A C library of `package` named `label`, found by `pkg_config` or linked by `link`, checked against
  * `headers`, with `install` to say where it is missing, linked statically when `statically` (as
  * `static-c-libraries = true` asks), and nothing else said of it. */
 c_library(package: string, label: string, pkg_config: Option[string], link: Buf[string], headers: Buf[string], install: string, statically: bool) -> CLibrary =
-    CLibrary(package, label, pkg_config, link, headers, install, statically, if statically then StaticByDefault else "", "", buf(), buf(), buf(), buf(), buf(), "", buf(), buf(), "", buf())
+    CLibrary(package, label, pkg_config, link, headers, install, statically, if statically then StaticByDefault else "", "", buf(), buf(), buf(), buf(), buf(), "", buf(), buf(), "", buf(), buf(), buf())
 
 /** What a program says to link a C library statically by, as an error about it names it. */
 const StaticByDefault: string = "`static-c-libraries = true`"
@@ -448,11 +454,43 @@ private read_c_libraries(f: Field, into: *Buf[CLibrary]) -> Result[unit, Diagnos
             elif g.key == "dynamic-only"
                 library.dynamic_only = text_of(g)?
                 if library.dynamic_only.trim() == "" then return Err(error(g.value.span, "`dynamic-only` says why the library is never linked statically, `dynamic-only = \"LGPL-2.1: its users may replace it\"`"))
-            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `files`, `search`, `include`, `frameworks`, `link-flags`, `dynamic-only`, `headers`, `install` and `if`"))
+            elif g.key == "sources"
+                library.sources = package_paths(g, "`sources` is a list of the C files compiled into the program, each relative to the package's directory, a `*` matching within one directory, `sources = [\"vendor/miniz/*.c\"]`")?
+                for v in g.value.items()
+                    val p = v.as_text().unwrap_or("")
+                    if p.contains("**") then return Err(error(v.span, s"`$p` holds `**`, and a `*` of `sources` matches within one directory: name each directory, `vendor/*/*.c`"))
+            elif g.key == "cflags"
+                library.cflags = word_list(g, "`cflags` is a list of the flags the library's `sources` are compiled with, one flag a string, `cflags = [\"-DNDEBUG\", \"-O3\"]`")?
+                for v in g.value.items()
+                    val why = refused_cflag(v.as_text().unwrap_or(""))
+                    if why != "" then return Err(error(v.span, why))
+            else return Err(error(g.key_span, s"`${g.key}` is not a key of a C library, which holds `pkg-config` or `link`, `files`, `search`, `include`, `frameworks`, `link-flags`, `dynamic-only`, `sources`, `cflags`, `headers`, `install` and `if`"))
         if library.pkg_config is Some(_) && linked
             return Err(error(d.key_span, s"the C library `${d.key}` names both `pkg-config` and `link`: `pkg-config` answers the flags it links with, so it is one or the other"))
+        if library.sources.len() > 0 && library.dynamic_only != ""
+            return Err(error(d.key_span, s"the C library `${d.key}` names both `sources` and `dynamic-only`: its sources are compiled into the program, which links them statically, always"))
+        if library.cflags.len() > 0 && library.sources.len() == 0
+            return Err(error(d.key_span, s"the C library `${d.key}` names `cflags` and no `sources`: `cflags` are what its sources are compiled with, and the C unit is compiled with its `include` and `pkg-config` flags"))
         into.push(library)
     Ok(())
+
+/** Why `flag` is not one a C library's `sources` may be compiled with, or "" when it is. A package
+ * sets what its C code means and how well it is compiled: defines (`-D`, `-U`), the optimization
+ * level (`-O`), warnings (`-W`, `-w`), the language standard (`-std=`) and code generation (`-f`).
+ * Where the files are and what they are compiled into are the build's: an include directory is the
+ * library's `include`, and the target, the output and the linker are never a package's to say. */
+refused_cflag(flag: string) -> string
+    val kinds = "`cflags` holds defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`), the language standard (`-std=`) and code generation (`-f`)"
+    if flag.starts_with("-I") || flag == "-isystem" || flag == "-iquote" || flag == "-idirafter"
+        return s"`$flag` names an include directory, which a C library names in `include`, relative to its package's directory: $kinds"
+    if flag.starts_with("-Wl,") || flag.starts_with("-Wa,") || flag.starts_with("-Wp,")
+        return s"`$flag` passes a flag to another tool, and the sources are only compiled: the linker's flags are the library's `link-flags`; $kinds"
+    if (flag.starts_with("-D") || flag.starts_with("-U")) && flag.bytes.len > 2usize then return ""
+    if flag == "-O0" || flag == "-O1" || flag == "-O2" || flag == "-O3" || flag == "-Os" || flag == "-Oz" || flag == "-O" then return ""
+    if (flag.starts_with("-W") && flag.bytes.len > 2usize) || flag == "-w" || flag == "-pedantic" then return ""
+    if flag.starts_with("-std=") && flag.bytes.len > 5usize then return ""
+    if flag.starts_with("-f") && flag.bytes.len > 2usize then return ""
+    s"`$flag` is not a flag a C library's sources may be compiled with: $kinds"
 
 /** The manifest `m` as a build for the machine `target` reads it: the entries of `dependencies`,
  * `sysl-dependencies` and `c-libraries` whose condition holds there, each C library's `install` the
@@ -725,8 +763,9 @@ private expand_members(dir: string, segments: []string, i: usize, found: *Buf[st
         if glob_matches(segment.bytes, 0, name.bytes, 0) && is_dir(dir + "/" + name)
             expand_members(dir + "/" + name, segments, i + 1, found)
 
-// Whether `name` from `j` matches `pattern` from `i`, where `*` matches any run of bytes.
-private glob_matches(pattern: []const u8, i: usize, name: []const u8, j: usize) -> bool
+/** Whether `name` from `j` matches `pattern` from `i`, where `*` matches any run of bytes: one segment
+ * of a workspace's members or of a C library's `sources`. */
+glob_matches(pattern: []const u8, i: usize, name: []const u8, j: usize) -> bool
     if i == pattern.len then return j == name.len
     if pattern[i] == u8('*')
         for k in j..name.len

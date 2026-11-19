@@ -11191,11 +11191,62 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   archive in the searched directories, or named but linked by no library, is an error. **On Linux**
   (not built yet) an archive is still linked by its path; a `-l` kept dynamic stays `-l`; a
   `static-system` name maps onto `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`; `frameworks` are macOS's.
-  A package cannot yet compile vendored C sources (there is no `c-sources`); it links a prebuilt
-  archive by `files`. **Review with the user**: the surface syntax (`c-linking` and its five keys,
+  A package's vendored C sources are compiled by the library's `sources` (the next entry); `files`
+  links a prebuilt archive. **Review with the user**: the surface syntax (`c-linking` and its five keys,
   `<package>/<library>` naming, the library keys `files`/`search`/`include`/`frameworks`/`link-flags`,
   the two flags' names), and the library-requirement rule (`dynamic-only` refusing a static program
   rather than yielding to it, and the program's `static` list not overriding it).
+- Settled on the user's delegation 2026-11-19 (branch `c-sources`; the gap is link-control's report:
+  a package could link a prebuilt archive by `files` but not compile the `.c` files it ships, so a
+  binding of a library distributed as source, sqlite3.c, miniz or stb, needed its user to build an
+  archive for each machine; only a Sysl dependency's own `.c` was compiled, by Sysl): **a C library
+  names the C files its package ships in `sources`, and the flags they are compiled with in
+  `cflags`** ([C bindings](/spec/c-bindings/#c-sources-a-package-ships)). `sources` are paths relative
+  to the package, under the rules of `files` (no absolute path, no `..` segment), and a `*` matches
+  within one directory, as a workspace's members do; `**` is refused, a pattern matching no file
+  and a path that is not there are errors, and the matches are sorted and each file taken once.
+  They are compiled by the clang the C unit is compiled with, for the build's machine, with `-O2`
+  unless `cflags` names a level (whatever the program's own `-O`, so `-O0` and `-O2` builds share
+  the objects), the library's `include` directories as `-I`, the `--cflags` of its `pkg-config`
+  module, then `cflags`, last. **`cflags` holds what a package says about its C and nothing about the
+  build**: defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`, `-pedantic`), the
+  standard (`-std=`) and code generation (`-f`). `-I` and its kin are refused with a pointer at
+  `include`, `-Wl,`/`-Wa,`/`-Wp,` with a pointer at `link-flags`, and anything else (the target, the
+  output, `-l`, `-g`) as not a package's to say; `cflags` with no `sources` is an error, since it
+  would read as flags of the C unit, which it is not. The objects are linked into the program before
+  the libraries' link flags, **statically, always**, whatever `c-linking`, the command line or
+  `static-c-libraries` say of the library: they are part of the program. So **`dynamic-only` beside
+  `sources` is an error at the entry**, and `pkg-config` or `link` beside `sources` are allowed (a
+  wrapper compiled against an installed library, a source calling libz). **The cache**: each object
+  is kept in `csources/` by a key over the source's text, its flags (an `include` directory read as
+  the package writes it, so a package keys alike wherever it is fetched), the target, the compiler's
+  version and `clang --version`, and the path (package-relative where inside it) and text of every
+  header it includes, which clang lists (`-MD`) when it compiles and a record keeps; a source with no
+  record is scanned with `clang -M` first, so two packages shipping the same file compile it once
+  and link it once. `avin run`'s cached executables are keyed by each source's and recorded header's
+  modification time. **The clangs run at once, one per processor at most**: Avin has no job count of
+  its own, and this is the bound codegen units already keep. **A source clang refuses** is reported
+  as `error: the source `<path>` of the C library `<l>` of package `<p>` does not compile:` followed
+  by clang's own output, which names the file and the line; warnings of a source that compiles are
+  not shown (a vendored library's warnings are its maintainers'; `-Werror` makes them errors).
+  **`avin check` does not compile the sources**; it checks each is there and each pattern matches,
+  as it checks `files`. **Per-machine sources are entries with an `if`**: a library whose sources
+  differ by machine is written as one entry for what is common and one per machine (`vend-macos { if
+  = "macos", sources = [...] }`), using the conditions every entry already takes, rather than a
+  condition inside `sources`. **A header-only library needs nothing new**: its package ships the
+  one-line `.c` that asks for its implementation (`#define STB_IMAGE_IMPLEMENTATION` then the
+  include) and names it in `sources`. *Alternatives weighed*: a top-level `c-sources` block apart
+  from `c-libraries` (the sources belong to the library whose headers and `include` they share, and
+  a second block would repeat them); `cflags` passing anything (a package could then name a target
+  or an output and break the build's own choices); `-I` allowed in `cflags` (two ways to say
+  `include`, one of them able to name an absolute path); the program's `-O` level (debug builds of
+  the program would rebuild and slow every vendored library, which is not what is being debugged);
+  conditions inside `sources` (`sources { macos = [...] }`, a second condition syntax where `if`
+  already serves); keying objects by the source alone (an edited header would be missed) or by its
+  preprocessed text (a preprocessing on every build, even when nothing changed); a shared library
+  built from the sources (they are the program's, and a static object needs no install). **Review
+  with the user**: the key names `sources` and `cflags`, which flags `cflags` allows, the default
+  `-O2` independent of the program's level, and silencing warnings of sources that compile.
 
 ## Open
 

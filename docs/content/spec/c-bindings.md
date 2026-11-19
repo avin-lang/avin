@@ -68,7 +68,8 @@ a shim would add a compile step, a cache and a Sysl dependency and check nothing
    (`declare i32 @mlt_properties_set(ptr, ptr, ptr)`) with the attributes the target's C convention
    asks for — `signext` or `zeroext` on an integer narrower than 32 bits, as the [Sysl
    boundary](/spec/sysl-bindings/#integer-parameters) already does.
-4. **Link** passes the C unit's object and the libraries' link flags to clang with the program.
+4. **Link** passes the C unit's object, the objects of the [C sources the packages
+   ship](#c-sources-a-package-ships) and the libraries' link flags to clang with the program.
 
 The C unit is cached by a hash of its source, the include and link flags `pkg-config` answers, and
 `clang --version`. Nothing about a C binding needs the `sysl` command. `avin check` builds the C
@@ -150,11 +151,94 @@ c-libraries {
 - `dynamic-only` says why the library is never linked statically, for a licence that asks for it or
   an installation that has no archive. It is a requirement, not a choice: how a program meets it is
   in [How a program links its C libraries](#how-a-program-links-its-c-libraries).
+- `sources` names C files the package ships, compiled into the program, and `cflags` the flags they
+  are compiled with: [C sources a package ships](#c-sources-a-package-ships).
 
 **A program builds with the C libraries of every package in it**, as it does with their
 [Sysl dependencies](/spec/packages/#sysl-dependencies), so a library that binds MLT works in a
 program that never names MLT itself. A package whose bindings name a [handle of another
 package](#handles-of-another-package) is checked with that package's headers too.
+
+### C sources a package ships
+
+**A package that ships its C library's source names the files in `sources`**, and the build compiles
+them into the program ([settled](/spec/decisions/#proposed)). Many small libraries are distributed
+this way, one `sqlite3.c` or a directory of `.c` files, and a package binding one builds wherever it
+is fetched, with nothing installed:
+
+```hocon
+c-libraries {
+  sqlite {
+    sources = ["vendor/sqlite/sqlite3.c"]
+    cflags  = ["-DSQLITE_THREADSAFE=0", "-DSQLITE_OMIT_LOAD_EXTENSION"]
+    include = ["vendor/sqlite"]
+    headers = ["sqlite3.h"]
+  }
+  miniz { sources = ["vendor/miniz/*.c"], include = ["vendor/miniz"], headers = ["miniz.h"] }
+}
+```
+
+- **`sources` are paths relative to the package's directory**, under the rules of `files`: none
+  absolute, none with a `..` segment. A `*` matches any run of characters within one name
+  (`vendor/*/*.c` reaches one directory down; `**` is refused), never a name beginning with `.` unless
+  the pattern's does, and never a directory. A pattern's matches are taken in sorted order, and a file
+  named twice is compiled once.
+- **They are compiled by the clang the C unit is compiled with**, for the machine the build is for,
+  with `-O2` unless `cflags` names a level, whatever the program's own `-O` (the library is not what a
+  debug build of the program is debugging, and both builds share one object); then the library's
+  `include` directories, as `-I`; then the `--cflags` of its `pkg-config` module, when it names one;
+  then `cflags`, last, so each of them has the last word. The C unit is not compiled with `cflags`.
+- **`cflags` says what the package's C means and how well it is compiled**: defines (`-D`, `-U`), the
+  optimization level (`-O0` to `-O3`, `-Os`, `-Oz`), warnings (`-W…`, `-w`, `-pedantic`), the language
+  standard (`-std=`) and code generation (`-f…`). Any other flag is refused where it is written: an
+  include directory is the library's `include`, a flag for the linker its `link-flags`, and the
+  target, the output and the like are the build's. `cflags` with no `sources` is an error too.
+
+  ```text
+  error: `-Ivendor` names an include directory, which a C library names in `include`, relative to its package's directory: `cflags` holds defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`), the language standard (`-std=`) and code generation (`-f`)
+  ```
+- **The objects are linked into the program, statically, always**, before the libraries' link flags,
+  whatever `c-linking`, `static-c-libraries` or the command line say of the library: they are part of
+  the program, so `otool -L` lists nothing for them. A library naming both `sources` and
+  `dynamic-only` is refused at the entry. `sources` may go with `pkg-config` or `link`, for a source
+  compiled against, or calling, a library that is installed.
+- **Each source compiles once.** Its object is kept in the build cache by a key over its text, its
+  flags, the target, the compiler's version and `clang --version`, and the path and text of every
+  header it includes; an edited source, an edited header it includes or a changed flag compiles it
+  again, and nothing else does. Two packages of a program shipping the same file, with the same
+  headers and flags, share one object, compiled once and linked once. The sources of a build compile
+  at the same time, one clang per processor at most.
+- **A source that does not compile stops the build** with clang's own words, which name the file and
+  the line, after the library and its package; a source that compiles shows no warnings:
+
+  ```text
+  error: the source `vendor/vend.c` of the C library `vend` of package `vend` does not compile:
+  /home/ana/vend/vendor/vend.c:3:38: error: expected ';' after return statement
+  ```
+
+  A source that is not there and a pattern matching no file are errors naming the path; `avin check`
+  reports those too, and compiles no source:
+
+  ```text
+  error: the sources `vendor/*.c` of the C library `vend` of package `vend` match no file: `/home/ana/vend/vendor/*.c`
+  ```
+- **Sources that differ by machine are entries with an [`if`](/spec/packages/#machines)**: what is
+  common in one entry, and each machine's own in another, each a C library of the package.
+
+  ```hocon
+  c-libraries {
+    vend       { sources = ["vendor/common.c"], include = ["vendor"], headers = ["vend.h"] }
+    vend-macos { if = "macos", sources = ["vendor/macos.c"] }
+    vend-linux { if = "linux", sources = ["vendor/linux/*.c"] }
+  }
+  ```
+- **A header-only library needs nothing more**: its package ships the one-line source that asks for
+  the implementation, and names it in `sources`.
+
+  ```c
+  #define STB_IMAGE_IMPLEMENTATION
+  #include "stb_image.h"
+  ```
 
 ### Linking statically
 
