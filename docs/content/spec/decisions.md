@@ -8882,6 +8882,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
+  wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
+  whichever comes first, and sends that rest as room comes**; its wait keeps the connection's time
+  limit (`TimedOut` where it runs out, the unsent rest kept in order for the next read or write).
+  `TcpStream` gains `timeout -> Duration`, the limit `setTimeout` set, which that wait needs since
+  the limit may have been set on the TCP connection before TLS began (spec system-library.md, TCP
+  and TLS). This settles the review question of the `pg-flake-0032` entry below. Why: a whole
+  connection's `writeSome` that sent part of a record left the rest for its next write,
+  `writable()` or close, so a caller that ended a request with `writeSome` and then only read left
+  its peer waiting for the rest while it waited for the peer's answer, a hang until the time limit.
+  The one wait cannot be for room alone, since a peer that is itself sending and not reading would
+  then never be read from (two full connections, each end waiting to write); it cannot be for input
+  alone, which is the hang. A select over the TCP connection's `readable()` and `writable()` waits
+  for both on the one thread that owns the connection; the runtime's poller keeps one waiter per
+  descriptor and direction, and an unsplit connection has only this thread, so the two watches
+  never meet another waiter (the obstacle that ruled this out for a split connection's reader).
+  Alternatives weighed: a whole connection's `writeSome` sending its whole record as the split
+  writer's now does (it would break "after `writable()` answered `true`, `writeSome` does not wait",
+  which single-threaded select loops rely on, and could deadlock one thread reading and writing a
+  busy peer); flushing the rest in full before a read waits (the same deadlock, the read waiting for
+  room while the peer waits for room too); a flush the caller must call (every caller, a generic
+  `StreamWriter` one included, would have to know it). Not covered: a program that, after a
+  `writeSome` left a rest, waits in a `select` with only a `readable()` arm on the connection; a
+  select watches one direction per arm, so such a loop keeps a `writable()` arm while `writable()`
+  answers `false`, as the threads chapter's write loop does. Review with the user: whether that
+  select case deserves more (a `readable()` that also sends what room allows).
 - Proposed 2026-11-18 (built on branch `pg-flake-0032`): **the writing half of a split TLS
   connection sends the whole record each `writeSome` makes before it answers, waiting for room for
   the rest where the connection has too little**, refining the 2026-11-15 `writeSome` entry for that

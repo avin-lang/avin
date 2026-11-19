@@ -362,9 +362,10 @@ class TlsStream(
 
   // Hands TLS at most one record's worth of `bytes`, sends what of the record the connection has
   // room for, and answers how much plaintext the record holds. The rest of the record goes before
-  // anything else is sent: `writable()` sends it as room comes, and answers `true` once it has gone.
-  // So after `writable()` answered `true` this does not wait; called without asking, it first waits
-  // for what an earlier one left.
+  // anything else is sent: `writable()` sends it as room comes, and answers `true` once it has gone,
+  // and a read that has to wait for input sends it as room comes while it waits, so a caller that
+  // only reads after its last `writeSome` still has its record sent. So after `writable()` answered
+  // `true` this does not wait; called without asking, it first waits for what an earlier one left.
   override writeSome(bytes: Array[byte]) -> Result[int, IoError]
     owner.held()
     if closed || halved then return Err(unusable("write to", peer))
@@ -485,8 +486,9 @@ class TlsStream(
       n = engine.outgoing(scratch)
     pending = all.toArray()
 
-  // `flush` for a read, which leaves what TLS has to send where a `writeSome` left some unsent, for
-  // the write that sends that to send after it, so a read never waits for room.
+  // `flush` for a read, which leaves what TLS has to send where a `writeSome` left some unsent, to go
+  // after that, so a read never waits for room alone: a read that has to wait sends it as room comes
+  // (`pulledSending`), and otherwise the next write, `writable()` or close does.
   private readerFlush() -> Result[unit, IoError] = if pending.length > 0 then Ok(()) else flush()
 
   // What an earlier `writeSome` left and whatever ciphertext TLS has to send, sent as far as the
@@ -524,9 +526,35 @@ class TlsStream(
           return Ok(Array.empty[byte]())
         Ok(Wants) ->
           readerFlush()?
-          if !pull()? then return Ok(Array.empty[byte]())
+          if !pulledSending()? then return Ok(Array.empty[byte]())
         Err(f) -> return Err(streamError(f, "read from", peer))
     Ok(Array.empty[byte]())
+
+  // `pull` for a read that has to wait. Where a `writeSome` left part of a record unsent, the read
+  // waits for input or room, whichever comes first, and sends the rest as room comes: a peer that
+  // answers only once it has the whole record would otherwise wait for it while this waits for the
+  // answer. Waiting for both, it never waits for room alone, so a peer that is itself waiting to
+  // send is still read from.
+  private pulledSending() -> Result[bool, IoError]
+    while pending.length > 0 && !tcp.readable()
+      if !inputOrRoom() then return Err(IoError(io.TimedOut, "read from", peer))
+      if tcp.writable() then pushedSome()?
+    pull()
+
+  // Waits for the TCP connection to have input or room, at most the limit `setTimeout` set; false
+  // where that ran out first.
+  private inputOrRoom() -> bool
+    val t = tcp
+    val limit = t.timeout
+    if limit.micros <= 0
+      select
+        t.readable() -> ()
+        t.writable() -> ()
+      return true
+    select
+      t.readable() -> true
+      t.writable() -> true
+      after limit -> false
 
 // The most plaintext one TLS record carries.
 private val MaxPlaintext = 16384
