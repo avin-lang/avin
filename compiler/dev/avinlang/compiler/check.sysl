@@ -2702,9 +2702,9 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
         return
     // So are the arithmetic and orderings of every built-in type: only a data type, a class or a trait
     // has methods of those names, and an impl for every type would reach the built-in ones.
-    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
         if *target is TypeVar(_, _, _) then c.note(unit, f.name_span, s"`${f.name}` names a method only of a data type, a class or a trait, and an impl for every type would redefine the built-in types' operator")
-        else c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+        else c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     var same_name: Buf[usize] = buf()
     // Two impls of a trait for one instance are an overlap, reported as one once every conformance
@@ -4946,8 +4946,8 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
                 break
     // A built-in type's arithmetic and orderings are the machine's, which no method replaces, in a
     // trait's implementation either.
-    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _))
-        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _))
+        c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
     if trait_id is Some(t)
@@ -18021,10 +18021,10 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
         return integer_literal(c, e.span, spelling, true, expected)
     if op is Negate && operand.kind is RealLit(value, spelling) then return real_literal(c, e.span, value, spelling, true, expected)
     val x = refined_operand(c, check_expr(c, operand, expected))
-    // On a data type, a class or a type parameter with a method `-` taking no argument, `-a` calls it.
-    if op is Negate && has_operator_traits(zonk(c, x.ty)) && settled(zonk(c, x.ty))
-        val ms = methods_of(c, zonk(c, x.ty), "-")
-        if takes_no_argument(c, ms) then return call_method(c, e.span, e.span, x, "-", ms, buf(), None, wanted, false)
+    // On a data type, a class or a type parameter with a method `-`, `+` or `~` taking no argument,
+    // `-a`, `+a` or `~a` calls it.
+    val by_method = prefix_method_call(c, e.span, op, x, wanted)
+    if by_method is Some(call) then return call
     // Otherwise `-` is `Neg`'s `negate` there.
     if op is Negate && has_operator_traits(zonk(c, x.ty))
         if !operator_conforms(c, e.span, "-", zonk(c, x.ty), "Neg") then return TExpr(e.span, ErrorType, UnitConst)
@@ -18043,6 +18043,24 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
         Negate -> TExpr(e.span, x.ty, Negate(x))
         Complement -> TExpr(e.span, x.ty, Complement(x))
         _ -> x
+
+// Why a built-in type cannot have a method named `name` taking `arity` arguments: its operators are
+// the machine's, and a prefix operator the type lacks belongs to no method either.
+private builtin_operator_message(name: string, arity: usize, target: &Type) -> string
+    if arithmetic_method_name(name) && !(arity == 0 && name == "+")
+        return s"`$name` is the language's operator on ${type_name(target)}, and no method can redefine it"
+    s"a prefix `$name` on ${type_name(target)} is the language's own, and no method can define it; only a data type, a class or a trait has a method `$name` taking no argument"
+
+// A prefix operator on a data type, a class or a type parameter with a method of its name taking no
+// argument is a call of that method, whatever it yields: `-a` is `a.-()`, `!a` is `a.!()`. Where the
+// type has none, `None`, and the operator keeps its own meaning.
+private prefix_method_call(c: *Checker, at: Span, op: UnaryOp, x: &TExpr, wanted: Option[&Type]) -> Option[&TExpr]
+    val known = zonk(c, x.ty)
+    if !has_operator_traits(known) || !settled(known) then return None
+    val name = unary_spelling(op)
+    val ms = methods_of(c, known, name)
+    if !takes_no_argument(c, ms) then return None
+    Some(call_method(c, at, at, x, name, ms, buf(), None, wanted, false))
 
 // The operand that is not a bare literal is checked first, so a literal on either side takes the
 // other operand's type: in `1 + x` with `x: i8`, the `1` is an `i8`.
@@ -24768,6 +24786,10 @@ private condition_parts(c: *Checker, e: &Expr) -> Condition
     if e.kind is Unary(op, operand)
         if op is Not
             val x = condition_parts(c, operand)
+            // On a type with a method `!` taking no argument, `!a` calls it, whatever it yields; a
+            // condition that is not a `bool` is reported where the condition is used.
+            val by_method = prefix_method_call(c, e.span, Not, x.expr, None)
+            if by_method is Some(call) then return Condition(call, buf(), buf())
             expect_bool(c, x.expr)
             return Condition(TExpr(e.span, if *x.expr.ty is Nothing then Nothing else Bool, Not(x.expr)), x.no, x.yes)
     Condition(check_expr(c, e, Some(Bool)), buf(), buf())
