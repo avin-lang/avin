@@ -10932,7 +10932,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   needs it); a type's own parameters bounded too (sound only for a covariant or invariant bounding
   parameter, a rule that can come when a program asks). **Review with the user**: the
   declared-before rule, which differs from the lower bound's.
-- **Proposed (branch `contra-join`, 2026-11-18, for the parsing library's token streams): branches
+- Settled on the user's delegation 2026-11-18 (branch `contra-join`, for the parsing library's token streams): **branches
   join at a contravariant argument to the meet of the two arguments, and a fully known expected type
   wins over a join that misses it** ([generics](/spec/generics/#variance)). `In[A]` and `In[B]` for
   `In[-T]` agree on `In[B]` (they fell back to a trait both share, `Display` where an impl gave one,
