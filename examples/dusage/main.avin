@@ -1,0 +1,122 @@
+// Shows how much room a directory tree takes: each directory's total, largest first, drawn as a
+// tree down to `--depth` levels, files too with `--all`. Symbolic links are shown and never
+// followed, so a link back up the tree is counted once. Names matching an `--exclude` pattern
+// (`*.tmp`, `build`) are left out with everything under them.
+//
+// With `--demo` it makes a small tree in a temporary directory, reports on it and removes it, so it
+// can be tried anywhere.
+//
+//     avin build dusage && ./dusage --depth 2 ~/Documents
+//
+// expect: exit 0
+// args: --demo --all --exclude *.tmp
+import avin.cli
+import avin.fs
+import avin.io.IoError
+
+val parser = cli.Parser("dusage", "Show how much room a directory tree takes.")
+  .int("depth", short = 'd', help = "show N levels below each root", default = 3, value = "N")
+  .flag("all", short = 'a', help = "show files as well as directories")
+  .flag("bytes", short = 'b', help = "sizes in bytes rather than KiB and MiB")
+  .string("exclude", short = 'x', help = "leave out names matching the pattern", repeated = true, value = "pattern")
+  .choice("sort", ["size", "name"], default = "size", help = "the order of each directory's entries")
+  .flag("demo", help = "report on a sample tree made for the purpose")
+  .positionals("dir", help = "the directories to measure; the current one when there are none")
+
+// A tree as measured: a file with its size, a link with its own, or a directory with its entries and
+// the reason it could not be read, if it could not.
+data Node
+  File(name: string, size: long)
+  Link(name: string, target: string)
+  Dir(name: string, entries: Vector[Node], error: Option[IoError])
+
+// What a node takes, everything under a directory included.
+total(n: Node) -> long
+total(File(_, size)) = size
+total(Link(_, _)) = 0
+total(Dir(_, entries, _)) = entries.map(total).sum
+
+name(n: Node) -> string
+name(File(n, _)) = n
+name(Link(n, _)) = n
+name(Dir(n, _, _)) = n + "/"
+
+// Reads the tree at `dir`, leaving out the names that match any of `excluded`.
+measure(dir: string, label: string, excluded: Vector[string]) -> Node
+  fs.listDir(dir) match
+    Err(e) -> Dir(label, [], Some(e))
+    Ok(names) ->
+      val entries = for
+        n in names
+        if !excluded.exists(p -> fs.matches(p, n))
+        full = fs.join(dir, n)
+      yield
+        if fs.isLink(full) then Link(n, fs.readLink(full).getOrElse("?"))
+        elif fs.isDir(full) then measure(full, n, excluded)
+        else File(n, fs.size(full).getOrElse(0))
+      Dir(label, entries, None)
+
+// `bytes` as people read them, or as a plain count with `--bytes`.
+shown(bytes: long, exact: bool) -> string
+shown(b, true) = s"$b"
+shown(b < 1024, _) = s"$b B"
+shown(b < 1048576, _) = f"${b.toReal / 1024.0}%.1f KiB"
+shown(b, _) = f"${b.toReal / 1048576.0}%.1f MiB"
+
+// The lines that draw `node` and, down to `depth` more levels, what it holds, each line's prefix
+// carrying the tree's branches from the levels above.
+draw(node: Node, prefix: string, last: bool, depth: int, opts: cli.Args, top: bool = false) -> Vector[string]
+  val branch = if top then "" elif last then "└── " else "├── "
+  val size = shown(total(node), opts.flag("bytes"))
+  val line = node match
+    Link(n, target) -> s"$prefix$branch$n -> $target"
+    Dir(_, _, Some(e)) -> s"$prefix$branch${name(node)}  (${e.message})"
+    _ -> s"$prefix$branch${name(node)}  $size"
+  val below = node match
+    Dir(_, entries, None) if depth > 0 ->
+      val visible = entries.filter(e -> opts.flag("all") || e is Dir)
+      val ordered = opts.string("sort") match
+        "name" -> visible.sortBy(name)
+        _ -> visible.sortBy(e -> (-total(e), name(e)))
+      val inner = if top then prefix elif last then prefix + "    " else prefix + "│   "
+      for (e, i) in ordered.zipWithIndex, l in draw(e, inner, i == ordered.length - 1, depth - 1, opts) yield l
+    _ -> Vector.empty[string]()
+  line +: below
+
+// Makes the sample tree `--demo` reports on, inside `root`.
+plant(root: string) -> Result[unit, IoError]
+  val files = [
+    ("README.md", 1200),
+    ("src/main.avin", 5400),
+    ("src/parse/lexer.avin", 8100),
+    ("src/parse/tree.avin", 3000),
+    ("docs/guide.md", 22000),
+    ("docs/images/logo.png", 150000),
+    ("docs/images/shot.png", 1300000),
+    ("build/out.tmp", 64000),
+    ("notes.tmp", 300)
+  ]
+  for (file, size) in files
+    fs.createDirAll(fs.join(root, fs.parent(file).getOrElse(".")))?
+    fs.writeText(fs.join(root, file), "x".repeat(size))?
+  fs.symlink("src", fs.join(root, "source"))?
+  Ok(())
+
+main(args: Vector[string]) -> int
+  val opts = parser.parseOrExit(args)
+  val excluded = opts.strings("exclude")
+  if opts.flag("demo")
+    val sample = fs.tempDir("dusage").getOrElse(fail("no temporary directory"))
+    defer _ = sample.close()
+    plant(sample.path).getOrElse(fail("the sample tree could not be made"))
+    for line in draw(measure(sample.path, "sample", excluded), "", true, opts.int("depth"), opts, top = true)
+      println(line)
+    return 0
+  val roots = if opts.strings("dir").isEmpty then ["."] else opts.strings("dir")
+  for root in roots
+    if !fs.isDir(root)
+      eprintln(s"dusage: $root is not a directory")
+      return 1
+    for line in draw(measure(root, root, excluded), "", true, opts.int("depth"), opts, top = true)
+      println(line)
+  0

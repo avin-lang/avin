@@ -1,0 +1,176 @@
+// Turns Markdown into HTML: headings (`#` to `######`), paragraphs, bulleted and numbered lists,
+// quotations (`>`), fenced code with its language, and rules (`---`); inside a line, `code`,
+// **strong**, *emphasis* and [links](url). Text is escaped for HTML everywhere, and code is shown
+// exactly as written. It reads standard input, or the file named, and writes standard output.
+//
+//     avin build markdown && ./markdown --title Notes < ../markdown.in > notes.html
+//
+// expect: exit 0
+// args: --fragment
+import avin.cli
+import avin.fs
+import avin.io
+
+val parser = cli.Parser("markdown", "Turn Markdown into HTML.")
+  .string("title", help = "the page's title", default = "Document")
+  .flag("fragment", short = 'f', help = "write only the body's contents, not a whole page")
+  .positional("file", help = "the Markdown to read; standard input when it is not given", required = false)
+
+// The blocks a document is made of.
+data Block
+  Heading(level: int, text: string)
+  Paragraph(lines: Vector[string])
+  Bullets(items: Vector[string])
+  Numbered(start: int, items: Vector[string])
+  Quote(blocks: Vector[Block])
+  Code(language: string, lines: Vector[string])
+  Rule
+
+// What one line starts, read on its own.
+data Line
+  Blank
+  Hash(level: int, text: string)
+  Fence(language: string)
+  Bullet(text: string)
+  Item(number: int, text: string)
+  Quoted(text: string)
+  Ruled
+  Plain(text: string)
+
+classify(line: string) -> Line
+  val t = line.trim
+  if t.isEmpty then return Blank
+  if t.startsWith("```") then return Fence(t.drop(3).trim)
+  if t.charCount >= 3 && (t.forall(_ == '-') || t.forall(_ == '*')) then return Ruled
+  val hashes = t.takeWhile(_ == '#').charCount
+  if 1 <= hashes <= 6 && t.drop(hashes).startsWith(" ") then return Hash(hashes, t.drop(hashes).trim)
+  if t.startsWith("- ") || t.startsWith("* ") then return Bullet(t.drop(2).trim)
+  if t.startsWith(">") then return Quoted(t.drop(1).stripLeading)
+  val digits = t.takeWhile(_.isDigit)
+  if 1 <= digits.charCount <= 9 && t.drop(digits.charCount).startsWith(". ")
+    return Item(digits.toInt(), t.drop(digits.charCount + 2).trim)
+  Plain(t)
+
+// The blocks of `lines`, read top to bottom; a paragraph runs until a line that starts something else.
+blocks(lines: Vector[string]) -> Vector[Block]
+  var out = Vector.empty[Block]()
+  var i = 0
+  // The lines from `i` on that `keep` accepts, `i` left after them.
+  run[T](keep: (Line) -> Option[T]) -> Vector[T]
+    var taken = Vector.empty[T]()
+    while i < lines.length
+      keep(classify(lines(i))) match
+        Some(x) ->
+          taken = taken :+ x
+          i += 1
+        None -> break
+    taken
+  while i < lines.length
+    classify(lines(i)) match
+      Blank -> i += 1
+      Ruled ->
+        out = out :+ Rule
+        i += 1
+      Hash(level, text) ->
+        out = out :+ Heading(level, text)
+        i += 1
+      Fence(language) ->
+        i += 1
+        val start = i
+        while i < lines.length && !lines(i).trim.startsWith("```") do i += 1
+        out = out :+ Code(language, lines.slice(start, i))
+        i += 1
+      Bullet(_) -> out = out :+ Bullets(run(l -> l match
+        Bullet(text) -> Some(text)
+        _ -> None))
+      Item(start, _) -> out = out :+ Numbered(start, run(l -> l match
+        Item(_, text) -> Some(text)
+        _ -> None))
+      Quoted(_) -> out = out :+ Quote(blocks(run(l -> l match
+        Quoted(text) -> Some(text)
+        _ -> None)))
+      Plain(_) -> out = out :+ Paragraph(run(l -> l match
+        Plain(text) -> Some(text)
+        _ -> None))
+  out
+
+escape(text: string) -> string = text.flatMap(c -> c match
+  '<' -> "&lt;"
+  '>' -> "&gt;"
+  '&' -> "&amp;"
+  '"' -> "&quot;"
+  _ -> c.toString())
+
+// The HTML of a line's text: `code` first, whose contents are only escaped, then links, strong and
+// emphasis in what is left. A marker with no partner is left as it was written.
+inline(text: string) -> string
+  val out = StringWriter()
+  var rest = text
+  while rest.nonEmpty
+    val at = rest.indexWhere(c -> c == '`' || c == '*' || c == '[')
+    if at < 0
+      out.write(escape(rest))
+      break
+    out.write(escape(rest.slice(0, at)))
+    rest = rest.slice(at, rest.byteLength)
+    val (html, used) = markup(rest)
+    out.write(html)
+    rest = rest.slice(used, rest.byteLength)
+  out.text
+
+// The HTML of the markup `text` starts with and how many bytes of it that took, or the first
+// character alone, escaped, when it starts nothing.
+markup(text: string) -> (string, int)
+  val alone = (escape(text.take(1)), text.take(1).byteLength)
+  enclosed(open: string, close: string) -> Option[(string, int)] =
+    val end = text.indexOf(close, open.byteLength)
+    if end > open.byteLength then Some((text.slice(open.byteLength, end), end + close.byteLength)) else None
+  if text.startsWith("`")
+    return enclosed("`", "`").map((code, n) -> (s"<code>${escape(code)}</code>", n)).getOrElse(alone)
+  if text.startsWith("**")
+    return enclosed("**", "**").map((inner, n) -> (s"<strong>${inline(inner)}</strong>", n)).getOrElse(alone)
+  if text.startsWith("*")
+    return enclosed("*", "*").map((inner, n) -> (s"<em>${inline(inner)}</em>", n)).getOrElse(alone)
+  // A link: [label](target).
+  val close = text.indexOf("](")
+  val end = if close > 0 then text.indexOf(")", close) else -1
+  if end > 0
+    val label = text.slice(1, close)
+    val target = text.slice(close + 2, end)
+    return (s"<a href=\"${escape(target)}\">${inline(label)}</a>", end + 1)
+  alone
+
+html(b: Block) -> string
+html(Heading(n, text)) = s"<h$n>${inline(text)}</h$n>"
+html(Paragraph(lines)) = s"<p>${inline(lines.mkString(" "))}</p>"
+html(Bullets(items)) = items.map(i -> s"  <li>${inline(i)}</li>").mkString("<ul>\n", "\n", "\n</ul>")
+html(Numbered(1, items)) = items.map(i -> s"  <li>${inline(i)}</li>").mkString("<ol>\n", "\n", "\n</ol>")
+html(Numbered(start, items)) = items.map(i -> s"  <li>${inline(i)}</li>").mkString(
+  s"<ol start=\"$start\">\n",
+  "\n",
+  "\n</ol>"
+)
+html(Quote(inner)) = inner.map(html).mkString("<blockquote>\n", "\n", "\n</blockquote>")
+html(Code("", lines)) = lines.map(escape).mkString("<pre><code>", "\n", "</code></pre>")
+html(Code(language, lines)) = lines.map(escape).mkString(
+  s"<pre><code class=\"language-$language\">",
+  "\n",
+  "</code></pre>"
+)
+html(Rule) = "<hr>"
+
+main(args: Vector[string]) -> int
+  val opts = parser.parseOrExit(args)
+  val source = if opts.given("file") then fs.readText(opts.string("file")) else Ok(io.readAll())
+  val text = source match
+    Ok(t) -> t
+    Err(e) ->
+      eprintln(s"markdown: ${e.message}")
+      return 1
+  val body = blocks(text.lines).map(html).mkString("\n")
+  if opts.flag("fragment") then println(body)
+  else
+    println("<!doctype html>")
+    println(s"<html><head><meta charset=\"utf-8\"><title>${escape(opts.string("title"))}</title></head>")
+    println(s"<body>\n$body\n</body></html>")
+  0
