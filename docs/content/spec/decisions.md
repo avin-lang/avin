@@ -5344,6 +5344,47 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
   (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
   after the interface is gone).
+- Settled on the user's delegation 2026-11-19 (built on branch `main-lwt`): **Threads pinned to the
+  main thread, on a main scheduler of its own** ([Threads](/spec/threads/#pinned-to-the-main-thread),
+  [User interfaces](/spec/ui/#threads)). What was missing: code on the main thread could not wait
+  for a future, a channel or an ask without blocking the frame loop, so a handler had no way to
+  fetch something and then set a signal. `spawnOnMain(body)` (and a scope's `spawnOnMain`) starts a
+  lightweight thread that runs on the main thread only; it parks as any thread does, whatever wakes
+  it puts it on the main scheduler's ready queue, and it carries on on the main thread. Its body is
+  not checked as sendable and runs as the main thread's owner of Sysl handles, so it reaches the
+  interface's state; only the main thread starts one (a worker that tries stops the program).
+  `isMainThread()` answers `true` in it; `isPinnedToMain()` tells it from the main thread's own code,
+  so an `ask` there parks rather than trapping, and `run` there traps.
+  - **How the loop drives it:** once a frame, from `handlePosted`, which runs `runMainThreads()`
+    after the messages and posted work; and the main thread's own waits (lock, condition, join,
+    channel, future, select, sleep) run pinned threads as they become ready, a ready one waking the
+    blocked main thread. syslui-sdl's loop polls every frame, so no wake source is needed.
+  - **With no window:** the same, so a plain `main` joining a pinned thread runs it, and a loop of
+    its own calls `runMainThreads()`.
+  - **Order against posted work:** posted work and messages first, in the order sent, then the
+    pinned threads ready by then, each once, in the order they became ready. A pinned thread that
+    posted work makes ready runs in the same call; one another pinned thread makes ready runs at the
+    next, which bounds a call as `handlePosted` already is bounded.
+  - **Cancellation and deadlock:** a scope's `spawnOnMain` is cancelled with the scope, as its other
+    threads are; the deadlock check counts a ready pinned thread as work, and its report marks each
+    pinned thread `pinned to the main thread`.
+  - **A pinned thread parked when `run` ends** stays parked and runs whenever the main thread next
+    runs the main scheduler; when `main` returns it is dropped, as every thread is.
+
+  *Why*: the interface's state belongs to the main thread, so the code that waits and then touches
+  it has to run there; a lightweight thread pinned to it reuses everything that already parks and
+  wakes a thread, and the main thread stays the only one that ever touches the state. *Alternatives
+  weighed*: `await` inside a handler, which runs on the main thread's own stack (it would have to
+  block the frame or re-enter the loop from inside the handler); running every posted piece of work
+  and every message as a pinned thread, which would give one order for all of it and let any handler
+  wait (a stack for every message, the common case paying for the rare one, and a handler's answer
+  coming frames later); a wake source the loop waits on, the runtime's poller descriptor or a
+  run-loop source on macOS (needed only by a loop that sleeps when idle, which syslui-sdl's does
+  not); letting `runMainThreads` from a pinned thread run the others (nested switching on the main
+  thread's stack for no gain); a body checked as sendable (could not reach a `State`, which is the
+  point); time-slicing pinned threads (they share the main thread with the frames, which no slice
+  makes fairer). Review with the user: the order of a pinned thread's resumption against posted work
+  (posted first, per frame, not one interleaved order) and the name `spawnOnMain`.
 - Settled on the user's delegation 2026-11-10 (built on branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
   that rounds: `f32`, `f16`, `bf16` and `real`.** A binding's own `real` parameter, a mirror's `real`
   field going into Sysl, and a callback's `real` answer are rounded into the Sysl type to the nearest
@@ -11056,9 +11097,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     older compiler with "no module" rather than a version message.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
-  [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
-  lightweight thread on the main operating system thread only, which also gives the `ui` package
-  its change from another thread); **stack size and growth** (a fixed reservation first; parked
+  [Proposed](#proposed)): **stack size and growth** (a fixed reservation first; parked
   frames moved to the heap later). The allocation chunk belongs to the carrier (proposed above), so
   thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack

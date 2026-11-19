@@ -185,8 +185,71 @@ ready. What a program can rely on:
   and its own waits block that thread while the workers run the rest. It stays free for work that
   has to run there, a window above all, which the `ui` package runs on it while other threads
   [hand it work](/spec/ui/#threads). `isMainThread()` answers whether the calling code runs on it:
-  `true` in `main` and what it calls, `false` on every lightweight thread, a pool's workers among
-  them.
+  `true` in `main` and what it calls, and on a thread [pinned to it](#pinned-to-the-main-thread),
+  `false` on every other lightweight thread, a pool's workers among them.
+
+### Pinned to the main thread
+
+Code on the main thread that waits blocks it, and with it a window's frames. A thread **pinned to the
+main thread** waits without blocking it: `spawnOnMain(body)` starts `body` on a lightweight thread
+that runs on the main thread only, on a scheduler of the main thread's own, and parks as any
+lightweight thread does. So a handler that has to wait for something hands the waiting to one:
+
+```text
+import avin.threads.{Future, spawnOnMain}
+import ui.state
+
+val shown = state("loading")
+spawnOnMain(() ->
+  val page = Future(fetch(url)).await()
+  shown.set(page))
+```
+
+| Function | |
+| --- | --- |
+| `spawnOnMain(body, stack)` | Starts `body` pinned to the main thread, and answers its `Thread[T]` |
+| `scope.spawnOnMain(body, stack)` | The same, as one of the scope's threads, which it waits for and cancels |
+| `runMainThreads()` | Runs each pinned thread ready now, until it waits or ends, and answers how many ran |
+| `isPinnedToMain()` | Whether the calling code runs on a pinned thread |
+
+- **It runs on the main thread only, and never beside the main thread's own code.** Only the main
+  thread runs a pinned thread: when it calls `runMainThreads()`, which the [frame
+  loop](/spec/ui/#threads) does once a frame, and while its own code waits, on a lock, a condition, a
+  join, a channel, a future, a select or a sleep, so the main thread joining a pinned thread runs it.
+  A pinned thread made ready while the main thread computes waits for it. A wait of the main thread
+  on a connection, or in a call that blocks it in the system, runs none.
+- **It parks, and carries on on the main thread.** A pinned thread waiting on anything parks, the
+  main thread goes on with its frame or its own wait, and whatever ends the wait, another thread, a
+  timer or the main thread itself, makes it ready for the main thread again. Ready pinned threads run
+  in the order they became ready; `runMainThreads` runs those ready when it is called, each once, so
+  one that a pinned thread makes ready runs at the next call. Nothing slices a pinned thread: it runs
+  until it waits or ends, as the main thread's own code does.
+- **It reaches what the main thread reaches.** `body` is not checked as sendable: a pinned thread may
+  capture a `State`, a `Buffer` or any other value of the main thread's, since nothing else runs it,
+  and it uses the Sysl handles the main thread owns as their owner. `isMainThread()` answers `true`
+  in it. `T` need not be sendable; the thread is, where `T` is.
+- **Only the main thread starts one**, its own code or a pinned thread; a thread on the workers that
+  calls `spawnOnMain` stops the program:
+
+  ```text
+  avin: trap: a thread pinned to the main thread is started on the main thread, and `spawnOnMain` was called on another
+  ```
+
+  `runMainThreads()` called anywhere but the main thread's own code, a pinned thread included, runs
+  nothing and answers 0.
+- **It is cancelled, joined and ended as any thread is.** A scope's `spawnOnMain` is cancelled with
+  the scope, and a pinned thread parked in a cancellable wait stops there. When `main` returns the
+  program ends, as it always does: a pinned thread still parked, or ready and not yet run, runs no
+  further. One still parked when a window's `run` returns stays parked and runs again whenever the
+  main thread next runs the main scheduler.
+- **A deadlock names it.** The main thread waiting without a limit on what only a parked pinned
+  thread could give is a deadlock like any other, and the report says which threads are pinned:
+
+  ```text
+  avin: trap: deadlock: all threads are waiting
+    main: waiting for a thread to end
+    thread 1, pinned to the main thread: waiting to receive from a channel
+  ```
 
 ## What is shared
 

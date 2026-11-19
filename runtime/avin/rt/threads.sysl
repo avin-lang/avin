@@ -37,12 +37,29 @@ thread_start(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *u8
     start_lightweight(p)
     joint
 
+/** Starts a lightweight thread pinned to the main thread, as `avin_rt_thread_start` starts one on the
+ * workers: it runs on the main thread only, whenever the main thread runs the main scheduler
+ * (`scheduler.sysl`). Only code on the main thread starts one, its own or a pinned thread's; anywhere
+ * else the program stops. */
+@export("avin_rt_thread_start_main")
+thread_start_main(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *u8
+    if !on_main_thread()
+        begin_stop(ctx)
+        eprints_safely(ctx, trap_prefix(ctx) + "a thread pinned to the main thread is started on the main thread only\n")
+        end_trapped(ctx)
+    make_main_scheduler(ctx)
+    val p = prepare_thread(ctx, run, stack, runner)
+    p.pinned = true
+    val joint = p.joint
+    start_lightweight(p)
+    joint
+
 // Makes a lightweight thread that is attached and not yet ready. The counts of its storage and its
 // stack are not atomic, and the thread may end on a worker as soon as it is ready, so every handle
 // this makes is let go here, before it is published: from then on only its worker changes them.
 private prepare_thread(ctx: *Context, run: *u8, stack: long, runner: *u8) -> *Lwt
     val size: usize = if stack < LeastStack then usize(LeastStack) else usize(stack)
-    val s: &Lwt = Lwt(new_context(), Frame(null, 2), run, null, runner, fiber.Context.new(), None, null, null, None, Atomic(0), SleepLock.new(), null, 0, null, null, Atomic(PhaseReady))
+    val s: &Lwt = Lwt(new_context(), Frame(null, 2), run, null, runner, fiber.Context.new(), None, null, null, None, Atomic(0), SleepLock.new(), null, 0, null, null, Atomic(PhaseReady), false)
     s.me = Some(s)
     val p: *Lwt = ptr_cast(&*s)
     // The new thread's frame is the caller's top frame until the thread's context is attached, so the
@@ -127,8 +144,9 @@ context_set(ctx: *Context, request: *u8)
     ctx.request = request
 
 /** Whether the calling code runs on the program's main thread, the operating system thread `main` was
- * called on: no lightweight thread and no thread a foreign callback attached is. */
-on_main_thread() -> bool = current_context == &main_context
+ * called on: its own code, or a lightweight thread pinned to it. No other lightweight thread and no
+ * thread a foreign callback attached is. */
+on_main_thread() -> bool = current_context == &main_context || on_main_scheduler()
 
 // Taken by the first thread that stops the program and never given back, so a thread that traps while
 // another is already stopping it waits for the end instead of reporting a second time.
