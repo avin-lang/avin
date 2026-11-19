@@ -8911,6 +8911,81 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   or `promptSecret`), and the no-terminal behaviour: an error by default with `readSecretOrLine`
   as the explicit fallback, rather than falling back to standard input on its own.
 
+- **Linux as a target, and machines in packages** (branch `linux-plan`, 2026-11-19; the user,
+  2026-11-19: Avin is "for anyone who would enjoy using it"). The plan is
+  [Linux](/compiler/linux/); the package surface is [machines](/spec/packages/#machines).
+  - Settled on the user's delegation 2026-11-19: **Avin's targets are `aarch64-macos`,
+    `x86_64-linux` and `aarch64-linux`**, glibc on Linux, named as Sysl's target registry names
+    them. WHY: they are Sysl's release platforms, so the toolchain Avin drives at every build
+    exists on each; servers and CI are overwhelmingly x86_64 Linux, and aarch64 Linux is what a
+    Mac's containers run natively. ALTERNATIVES: x86_64 Linux alone (leaves out Arm servers and
+    makes every local Linux test an emulated one); musl (static executables, but Sysl's registry
+    and its library are glibc's); Intel macOS and Windows (Sysl ships neither).
+  - Settled on the user's delegation 2026-11-19: **Avin is built natively on each target, not
+    cross-compiled from the Mac.** WHY: an installed Avin runs `sysl build-c` and clang at every
+    user's build, so Linux needs Sysl and clang on Linux whatever the release does, and a native
+    build is the configuration users run; cross-building would add a sysroot to manage for no
+    user. Local Linux work runs in a colima VM (aarch64, native speed on Apple silicon) through
+    marshal; CI runs GitHub's x86_64 and arm64 Ubuntu runners. ALTERNATIVES: cross-compiling from
+    the Mac with a glibc sysroot (Sysl cannot yet: the probe of `sysl build --target x86_64-linux`
+    fails building its standard module, `stdio.h` not found, and Sysl has no way to name a sysroot);
+    both (cross kept for `avin build --target`, a later item once Sysl has sysroots).
+  - Settled on the user's delegation 2026-11-19: **a Linux release ships a tarball per target**
+    (`avin-<v>-linux-x86_64.tar.gz`, `avin-<v>-linux-arm64.tar.gz`, the same prefix layout as the
+    macOS one) **and an install script** that installs Avin and the Sysl it needs into a prefix
+    and names the distribution's packages for clang, lld, llvm-ar and pkg-config; the Homebrew
+    formula gains `on_linux` once Sysl's formula has it. No `.deb`. WHY: a tarball is what every
+    other route is built from, and an install script reaches every distribution with no
+    repository to host or sign. ALTERNATIVES: Linuxbrew only (needs Sysl's formula on Linux first,
+    and many servers have no brew); a `.deb` and an apt repository (hosting and signing, one
+    distribution family); a static single binary (Avin needs Sysl and clang beside it anyway).
+    **Review with the user:** whether a `.deb` is wanted later.
+  - Settled on the user's delegation 2026-11-19: **machine conditions in the manifest are Sysl's
+    condition language** (symbols, `!`, `&&`, `||`, parentheses), over the closed set `macos`,
+    `linux`, `posix`, `aarch64`, `x86_64`, as `if` on an entry of `dependencies`,
+    `sysl-dependencies` and `c-libraries` and on a feature (where it says only where the feature
+    exists), checked symbol by symbol when the manifest is read; `package.targets` lists the
+    targets a package supports (all by default); `install` may be a block of sentences by
+    condition; `link-flags` passes flags such as `-framework Security` as written. `avin tidy` and
+    `avin vendor` answer for every target. WHY: one condition language across Avin's manifest,
+    Sysl's manifests and the Sysl dependencies Avin hands to Sysl; checking every symbol at read
+    keeps a misspelling from silently dropping a dependency. ALTERNATIVES: per-target blocks
+    (`targets.x86_64-linux { dependencies { … } }`, which repeat a dependency per target and
+    cannot say "every Linux"); a target name as the condition (`if = "x86_64-linux"`, which cannot
+    say "every Linux" either); Sysl's `choices` and per-target linker keys (machine and image
+    configuration Avin's hosted programs do not have).
+  - Settled on the user's delegation 2026-11-19: **in source, the file is the unit a machine
+    selects**: `name.<symbol>.avin` is read only where the symbol holds, a module exists on a
+    machine where any of its files is read, an import of a module that is not everywhere is allowed
+    only from a file that is read no more widely, and `avin check` type-checks once per target
+    where anything differs. Values that differ by machine are written over `avin.target.os` and
+    `avin.target.arch`, compile-time constants whose untaken branches fold away, both branches
+    checked on every machine. WHY: it keeps the rule features follow (a whole unit is in or out,
+    nothing in a file changes with the build), so every file means one thing; a module keeps one
+    name and one surface on every machine, and the per-target check proves the surface is there.
+    ALTERNATIVES: Sysl's `#if` lines (a file reads differently per machine and the untaken lines
+    are never checked); a constant alone (cannot hold a call only one system declares, since both
+    branches are checked); whole modules per machine in the manifest (a `machines { linux { modules
+    = […] } }` block, which forces shared code to import a different module per machine);
+    `name_linux.avin` with an underscore (collides with ordinary file names that end in a system's
+    name). **Review with the user:** the surface syntax: the `.linux.avin` infix,
+    `package.targets`, the `if` key, the `install` block and `avin.target`.
+  - Settled on the user's delegation 2026-11-19 (closing two Open items): **a feature has no
+    compile-time constant**, the module staying the only unit a feature gates. WHY: a feature's
+    modules and optional dependencies are absent with it off, so a branch on `feature("x")` could
+    not type-check against them; a machine constant works only because every machine's standard
+    library is whole. ALTERNATIVES: a `feature("x")` constant folded away (fails to check, as
+    above); line gates (the conditional compilation the features design refused). **A module is
+    listed by one feature only**; a part two features share becomes a feature both `enables`.
+    WHY: every gate stays one feature, so the import check stays one question. ALTERNATIVES: a
+    module on while any of its features is on (the import check would have to reason about
+    disjunctions, and a module's presence would depend on combinations).
+  - Found while surveying, not fixed here (no runtime run is allowed on this branch): the DNS
+    lookup's pipe sets descriptor flag `2` (`runtime/avin/rt/lookup.sysl`, `CloseOnExecFlag`), but
+    `FD_CLOEXEC` is `1` on macOS and on Linux, so the pipe is inherited by a child started during a
+    lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
+    It is the first item of the [plan](/compiler/linux/).
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
@@ -11005,17 +11080,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   transformations).
 
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
-  - Whether a feature needs anything finer than a module: a compile-time `feature("x")` constant a
-    function could test (folded away when false), or nothing, the module being the only gate.
-  - Whether a module may be listed by more than one feature (on while any is on), or by one only, as
-    proposed.
   - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
     vendored package, or trust the hash recorded beside each package as it trusts the cache's.
   - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
     the standard library's modules arrive with the compiler and a package using a new one fails on an
     older compiler with "no module" rather than a version message.
-  - Whether manifests gain machine conditions (Sysl's `if`, `choices`, `targets`) once Avin builds
-    for more than one target.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
   [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
