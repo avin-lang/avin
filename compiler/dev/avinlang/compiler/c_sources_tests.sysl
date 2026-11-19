@@ -282,7 +282,7 @@ sources_with_other_keys()
     val wrapper = dir + "/pkg-config"
     write_text(wrapper, "#!/bin/sh\nPKG_CONFIG_PATH=\"" + dir + "/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\" exec pkg-config \"$@\"\n").unwrap()
     set_permissions(wrapper, 493u32).unwrap()
-    val tc = Toolchain(repo.root, repo.cache, repo.clang, repo.sysl, wrapper, repo.builds)
+    val tc = Toolchain(repo.root, repo.cache, repo.clang, repo.sysl, wrapper, repo.builds, repo.target)
     vend_package(dir, "app", "pkg-config = \"vend-flags\"\n    sources = [\"vendor/vend.c\"]", "")
     put(dir + "/app/vendor/vend.c", "#include \"vend.h\"\n#include <pkg_factor.h>\n#ifndef PKG_DEFINED\n#error no pkg-config flags\n#endif\nint vend_twice(int n) { return n * PKG_FACTOR; }\n")
     val built = build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"])
@@ -310,7 +310,7 @@ sources_with_other_keys()
 // A toolchain like the repository's whose C sources are kept in a cache of their own at `dir`.
 private own_cache(dir: string) -> Toolchain
     val repo = repository_toolchain()
-    Toolchain(repo.root, dir + "/cache", repo.clang, repo.sysl, repo.pkg_config, dir + "/builds")
+    Toolchain(repo.root, dir + "/cache", repo.clang, repo.sysl, repo.pkg_config, dir + "/builds", repo.target)
 
 private loaded_c(dir: string) -> Buf[CLibrary] = load_package_with(dir, default_fetching(), default_features()).unwrap().c
 
@@ -362,6 +362,33 @@ source_cache()
     val copied = ensure_c_sources(tc, loaded_c(dir + "/elsewhere/copy")).unwrap()
     assert_eq(copied.compiled, 0)
     assert_eq(joined(copied.objects), joined(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().objects))
+
+@test("a source compiled for two targets in one cache is two objects named by their target, each found by its own target only, and an old-format entry is never read")
+source_cache_by_target()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val mac = own_cache(dir).for_target("aarch64-macos")
+    val linux = mac.for_target("x86_64-linux")
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\"]", "")
+    put(dir + "/app/vendor/vend.c", VendSource)
+    val first = ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap()
+    assert_eq(first.compiled, 1)
+    assert(first.objects[0].contains("/csources/aarch64-macos-"), first.objects[0])
+    // The other target does not reuse it.
+    val second = ensure_c_sources(linux, loaded_c(dir + "/app")).unwrap()
+    assert_eq(second.compiled, 1)
+    assert(second.objects[0].contains("/csources/x86_64-linux-"), second.objects[0])
+    assert(second.objects[0] != first.objects[0])
+    // Each finds its own again, and compiles nothing.
+    assert_eq(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    assert_eq(ensure_c_sources(linux, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    assert_eq(joined(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().objects), joined(first.objects))
+    // An object of the old format, a key with no target in its name, is never found: a stale file
+    // named as the new name without the target prefix changes nothing.
+    val stale = first.objects[0].replace_all("aarch64-macos-", "")
+    put(stale, "not an object")
+    assert_eq(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    assert_eq(joined(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().objects), joined(first.objects))
 
 @test("a source two packages of one program ship is compiled once and linked once, and the program runs")
 source_shared_by_two_packages()

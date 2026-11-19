@@ -14,7 +14,11 @@ import sysl.time.now
 // - `build/` and `test-builds/`: a directory per program (see `build_cache`), its executables, their
 //   records and its instance cache, an entry each;
 // - `units/`, `runtime/`, `shims/`, `cunit/` and `csources/`: a file per object or archive (and, in
-//   `csources/`, per record of a C source's headers), by key, an entry each.
+//   `csources/`, per record of a C source's headers), by target and key, an entry each: a name is
+//   `<target>-<key>` (`libavinrt-<target>-<key>.a` in `runtime/`, `<name>-<target>-<key>` for a
+//   program's directory in `build/`), and the key carries the target too, so builds for two machines
+//   in one cache never find each other's entries. An entry written before names carried a target
+//   is never read, and ages out as any unused entry does.
 //
 // An entry's modification time is when a build last used it: every build that takes one from the
 // cache touches it first (a program's directory when its build starts and before each of its tests
@@ -469,7 +473,7 @@ age_text(us: long) -> string
     s"${hours / 24} days ago"
 
 /** The usage of `avin cache`. */
-const CacheUsage: string = "usage: avin cache info\n       avin cache trim\n       avin cache clean [--older-than <age>] [--packages]\n<age> is minutes, hours or days: `30m`, `12h`, `7d`"
+const CacheUsage: string = "usage: avin cache info\n       avin cache trim\n       avin cache clean [--older-than <age>] [--packages] [--target <target>]\n<age> is minutes, hours or days: `30m`, `12h`, `7d`"
 
 /** `avin cache info`, `avin cache trim` and `avin cache clean`, over the caches `layout` places,
  * within `limit`, at the time `at`. */
@@ -491,10 +495,17 @@ cache_command(args: []const string, layout: CacheLayout, limit: Option[long], at
         return 2
     var older: Option[long] = None
     var packages = false
+    var target = ""
     var i = 3
     while i < args.len
         if args[i] == "--packages" && !packages
             packages = true
+        elif args[i] == "--target" && target == "" && i + 1 < args.len
+            target = args[i + 1]
+            if !known_target(target)
+                note(unknown_target(target))
+                return 2
+            i += 1
         elif args[i] == "--older-than" && older is None && i + 1 < args.len
             older = age_of(args[i + 1])
             if older is None
@@ -505,7 +516,10 @@ cache_command(args: []const string, layout: CacheLayout, limit: Option[long], at
             note(CacheUsage)
             return 2
         i += 1
-    val swept = clean_cache(layout, older, packages, at)
+    if target != "" && packages
+        note("avin: `--packages` and `--target` do not go together: fetched packages are no target's")
+        return 2
+    val swept = clean_cache_for(layout, older, packages, at, target)
     say(if swept.evicted + swept.junk + swept.versions == 0 then "nothing to clean" else sweep_text(swept))
     0
 
@@ -520,17 +534,23 @@ sweep_text(s: CacheSweep) -> string
 
 /** Removes every entry of the cache, its debris and other versions' caches, or with `older` only what
  * no build has used for that long; with `packages`, the fetched packages too, on the same terms. */
-clean_cache(layout: CacheLayout, older: Option[long], packages: bool, at: long) -> CacheSweep
+clean_cache(layout: CacheLayout, older: Option[long], packages: bool, at: long) -> CacheSweep = clean_cache_for(layout, older, packages, at, "")
+
+/** `clean_cache` over the entries built for the machine `target` only, or over all where it is "":
+ * the other targets' entries, the debris, the other versions' caches stay. */
+clean_cache_for(layout: CacheLayout, older: Option[long], packages: bool, at: long, target: string) -> CacheSweep
     val before = older match
         Some(age) -> at - age
         None -> at + 1
     var result = CacheSweep(0, 0, 0, 0, 0)
-    val scan = scan_cache(layout.dir, before, true)
-    result.junk += scan.junk
+    val scan = scan_cache(layout.dir, before, target == "")
+    if target == "" then result.junk += scan.junk
     for it in scan.items
+        if target != "" && item_target(it) != target then continue
         if it.used < before && evict_item(it, before)
             result.evicted += 1
             result.freed += it.size
+    if target != "" then return result
     result.versions += retire_versions(layout, before, older is None)
     if packages
         result.junk += package_debris(layout.packages, before)
@@ -577,6 +597,37 @@ cache_info(layout: CacheLayout, limit: Option[long], at: long, say: string -> un
         say(padded(PackagesKind, 13) + padded(s"${fetched.len()} fetched", 14) + size_text(package_bytes) + s" in ${layout.packages}, not counted against the limit")
     for v in other_versions(layout)
         say(padded("version " + v.kind, 13) + padded("", 14) + size_text(v.size) + s", last used ${age_text(at - v.used)}; removed once unused for ${OtherVersionAge / 86400000000} days")
+    // The same entries by the machine they were built for: each target names its own, and entries
+    // written before names carried one are listed apart, never taken for any target's.
+    var names = machine_targets()
+    names.push(UntargetedName)
+    for t in names
+        var count = 0usize
+        var bytes: long = 0
+        for it in scan.items
+            if item_target(it) != t then continue
+            count += 1
+            bytes += it.size
+        if count > 0 then say(s"target       $t: $count ${if count == 1 then "entry" else "entries"}, ${size_text(bytes)}")
+
+/** What `avin cache info` calls the entries whose names carry no target: those an older compiler
+ * wrote, which no build of this one reads. */
+const UntargetedName: string = "untargeted"
+
+/** The target an entry of the cache was built for, read from its name: `<target>-<key>…` in the
+ * object and archive kinds, `libavinrt-<target>-<key>.a` in `runtime/`, and `<name>-<target>-<key>`
+ * for a program's directory in `build/`; `UntargetedName` for a name with none. */
+item_target(it: CacheItem) -> string
+    val name = last_segment(it.path)
+    if it.kind == "build" || it.kind == "test-builds"
+        for t in machine_targets()
+            if name.contains("-" + t + "-") then return t
+        return UntargetedName
+    val archive = "libavinrt-"
+    val bare = if it.kind == "runtime" && name.starts_with(archive) then name[archive.bytes.len..] else name
+    for t in machine_targets()
+        if bare.starts_with(t + "-") then return t
+    UntargetedName
 
 // `text` padded with spaces to `width`, and one space past it where it is as wide.
 private padded(text: string, width: usize) -> string = if text.len >= width then text + " " else text + " ".repeat(width - text.len)

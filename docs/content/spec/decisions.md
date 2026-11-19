@@ -11247,6 +11247,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   built from the sources (they are the program's, and a static object needs no install). **Review
   with the user**: the key names `sources` and `cflags`, which flags `cflags` allows, the default
   `-O2` independent of the program's level, and silencing warnings of sources that compile.
+- Settled on the user's delegation 2026-11-19 (branch `target-keys`): **every cache entry names the
+  machine it was built for, in its name and in its key**. A toolchain has a `target` (the compiler's
+  own machine unless a build names another). Under `units/`, `shims/`, `cunit/` and `csources/` an
+  entry is `<target>-<key>`; the runtime archive is `libavinrt-<target>-<key>.a`, in the cache and
+  shipped as `share/avin/lib/<target>/libavinrt-<target>-<key>.a`; a program's directory under
+  `build/` is `<name>-<target>-<key>`, which holds its executables and its instance cache; the key
+  hashed into each entry also holds the target, and an executable's record does too. Without a cache
+  directory the compiler's own machine keeps `.avin/build` and another machine uses
+  `.avin/build/<target>`. `avin cache info` lists the entries per target and `avin cache clean
+  --target <target>` removes one target's. **Existing caches are not carried over**: an old entry has
+  no target in its name, so no build finds it (it is never misread), `avin cache info` lists it as
+  `untargeted`, and the least-recently-used sweep removes it, so the first build after the upgrade
+  rebuilds. *Why*: a cross build, or a prefix shipping archives for two machines, must never reuse an
+  object built for the other, and the name makes the target visible to `info` and `clean` without
+  opening a file. *Alternatives weighed*: the target in the hash alone (disjoint, but `info` and
+  `clean --target` could not tell targets apart); a subdirectory per target in each kind (the sweep
+  and `info` count entries one level down, and a directory would become one entry holding every
+  object of its target, evicted whole); keeping old names for the compiler's own machine (a
+  compatibility rule with no reader once a second machine exists, and the rebuild is one build). The
+  `.avin/build` fallback keeps its path for the compiler's own machine so existing programs'
+  directories do not move, which is the one place an old entry stays valid, and its executable
+  records carry the target so a stale one is rebuilt. **Left**: `avin clean` of a one-file program in
+  that fallback leaves another machine's subdirectory (the cross build, item 12, brings it).
 
 ## Open
 

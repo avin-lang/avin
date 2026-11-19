@@ -29,17 +29,31 @@ struct Toolchain
      * program (see `build_cache`), or "" on a machine with no cache directory, where each program
      * keeps its own `.avin/build` beside it. */
     builds: string
+    /** The machine the toolchain builds for, a name from `machine_targets` (`aarch64-macos`): the
+     * compiler's own by default. Every entry the toolchain keeps in the cache, and every archive it
+     * looks for beside the runtime, carries it in its name and its key, so builds for two machines in
+     * one cache never find each other's objects. */
+    target: string
 
     library_dir(self) -> string = self.root + "/library"
     /** This toolchain with the programs' builds kept under `builds`. */
-    building_in(self, builds: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, builds)
+    building_in(self, builds: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, builds, self.target)
+    /** This toolchain building for the machine `target`. */
+    for_target(self, target: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, self.builds, target)
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
-    /** The runtime's archive as a release ships it, built from the runtime's sources whose key is
-     * `key`. */
-    prebuilt_runtime(self, key: string) -> string = self.root + "/lib/libavinrt-" + key + ".a"
-    /** Where runtime archives built from the runtime's sources are kept, by key. */
+    /** The runtime's archive as a release ships it for the toolchain's target, built from the
+     * runtime's sources whose key is `key`: `lib/<target>/libavinrt-<target>-<key>.a`, so a prefix
+     * shipping archives for two targets holds both. */
+    prebuilt_runtime(self, key: string) -> string = self.root + "/lib/" + self.target + "/" + runtime_archive_name(self.target, key)
+    /** Where runtime archives built from the runtime's sources are kept, by target and key. */
     runtime_cache(self) -> string = self.cache + "/runtime"
+    /** The runtime archive built from the sources whose key is `key`, in `runtime_cache`. */
+    runtime_archive(self, key: string) -> string = self.runtime_cache() + "/" + runtime_archive_name(self.target, key)
+    /** The path of the cache entry `key` with extension `ext` in `dir` (one of the cache's kinds'
+     * directories), named after the toolchain's target: `<dir>/<target>-<key><ext>`. The target is in
+     * the name, which `avin cache info` reads, and the entries' keys carry it too. */
+    entry_in(self, dir: string, key: string, ext: string) -> string = dir + "/" + self.target + "-" + key + ext
     /** Where the archives of the runtime with a program's binding shims are kept, by key. */
     shim_cache(self) -> string = self.cache + "/shims"
     /** Where the objects of programs' C units are kept, by key. */
@@ -59,7 +73,7 @@ toolchain_at(root: string) -> Option[Toolchain]
 /** A toolchain rooted at `root` that builds into `cache`, programs' builds in its `build`, if `root`
  * holds the library and the runtime. */
 toolchain_in(root: string, cache: string) -> Option[Toolchain]
-    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config", cache + "/build")
+    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config", cache + "/build", host_target())
     if exists(tc.prelude_path()) && is_dir(tc.runtime_dir()) then Some(tc) else None
 
 /** Why the standard library of `tc` is not the one this compiler was built with, or `None` when it
@@ -824,7 +838,7 @@ ensure_runtime(tc: Toolchain) -> Result[string, string]
     val key = runtime_key(tc)
     val shipped = tc.prebuilt_runtime(key)
     if exists(shipped) then return Ok(shipped)
-    val archive = tc.runtime_cache() + "/libavinrt-" + key + ".a"
+    val archive = tc.runtime_archive(key)
     // Found, it is touched, so a sweep of the cache sees it in use.
     if touch_entry(archive) then return Ok(archive)
     make_dir_all(tc.runtime_cache()).map_err(e -> s"${tc.runtime_cache()}: ${e.to_string()}")?
@@ -837,8 +851,13 @@ ensure_runtime(tc: Toolchain) -> Result[string, string]
     publish_file(pending, archive).map_err(e -> e.to_string())?
     Ok(archive)
 
-/** The key a runtime archive is named by: the compiler's version and the runtime's sources. */
-runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + runtime_fingerprint(tc))
+/** The key a runtime archive is named by: the compiler's version, the target and the runtime's
+ * sources. */
+runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + tc.target + "\n" + runtime_fingerprint(tc))
+
+/** The file name of the runtime archive for `target` built from the sources whose key is `key`, in
+ * the cache and in a release: `libavinrt-<target>-<key>.a`. */
+runtime_archive_name(target: string, key: string) -> string = "libavinrt-" + target + "-" + key + ".a"
 
 /** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
  * program's binding shims, when there is one, together with the C libraries its Sysl packages need,
@@ -883,7 +902,7 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     parts match
         Some(texts) ->
             began = phase_done("split", began, s"units=${texts.len()}")
-            val compiled = compile_units(tc.clang, texts, dir, optimization, if keep_units then tc.unit_cache() else "")?
+            val compiled = compile_units(tc.clang, texts, dir, optimization, if keep_units then tc.unit_cache() else "", tc.target)?
             for o in compiled.objects
                 args.push(o)
                 if o.starts_with(tc.cache + "/") then cached.push(o)

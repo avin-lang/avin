@@ -107,7 +107,15 @@ three days after their last use. Fetched packages are not counted against the li
 never evicts one. `avin cache info` shows each kind's size, the limit, the oldest and newest use,
 debris, the packages and other versions' caches; `avin cache trim` sweeps now; `avin cache clean`
 removes all of it, `--older-than 30m`/`12h`/`7d` only what no build has used for that long, and
-`--packages` the fetched packages too. `avin build` is not a cache: it writes the
+`--packages` the fetched packages too, and `--target <target>` only the entries built for that
+machine. **Every entry is named by the machine it was built for**: `<target>-<key>` under `units/`,
+`shims/`, `cunit/` and `csources/`, `libavinrt-<target>-<key>.a` under `runtime/`, and
+`<name>-<target>-<key>` for a program's directory under `build/` (whose instance cache and
+executables are inside it); the key carries the target too, so builds for two machines in one cache
+never find each other's entries. A machine with no cache directory keeps the compiler's own
+machine's builds in `.avin/build/` and another machine's in `.avin/build/<target>/`. An entry an
+older compiler wrote has no target in its name, is never read and ages out like any unused entry;
+`avin cache info` lists the entries per target, those apart as `untargeted`. `avin build` is not a cache: it writes the
 executable where `-o` says, or in the working directory. Beside each
 executable, `<name>-O2` or `<name>-tests-O2`, a record holds the key it was built for: a hash over the
 compiler's version and its executable's modification time, the kind of build and its optimization,
@@ -574,8 +582,9 @@ binding is **not** a shim: it is a direct call from the program's own code.
 ## Runtime
 
 `runtime/` is a Sysl package, built into a library archive when its sources change rather than once
-per program, and linked into every executable. The archive is named by a key over the compiler's
-version and the runtime's sources: a release ships it prebuilt as `share/avin/lib/libavinrt-<key>.a`,
+per program, and linked into every executable. The archive is named by the target and a key over the compiler's
+version, the target and the runtime's sources: a release ships it prebuilt as
+`share/avin/lib/<target>/libavinrt-<target>-<key>.a`,
 and otherwise it is built into `runtime/` in the user's cache, so a program that reaches no Sysl
 binding is built without Sysl. It contains:
 
