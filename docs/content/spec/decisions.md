@@ -11203,7 +11203,12 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   already had it. `Array(1, 2.5)` widens to `Array[real]`; mismatched types are the ordinary
   argument error. A class that keeps fields its own code fills in (`LazyList`) no longer offers
   its constructor to a call outside that code, so `LazyList[T]()` calls the companion's `apply`
-  and makes the empty list instead of being refused. The old refusal of calling an array's constructor is removed, and the
+  and makes the empty list instead of being refused. An empty call with no element type to infer
+  follows the settled rule of 2026-11-04 (generics.md): the covariant collections (`Vector`,
+  `List`, `Queue`, `ArraySeq`, `LazyList`) take `Nothing`, as `[]` and `Vector.empty()` do, and an
+  invariant or bounded element type (`Array`, `Buffer`, `Deque`, every set, `PriorityQueue`) is a
+  "cannot infer" error. The refusal of an array's name with type arguments used as a value
+  (`Array[int]`) stays, its text now naming `Array(a, b)`. The old refusal of calling an array's constructor is removed, and the
   literal `[1, 2, 3]` is unchanged. **Maps are excluded** (settled 2026-11-09): `Map("k" -> 7)` stays
   refused with its hint to write `{"k": 7}`, and no pair operator is added. `Map((k, v), …)` taking
   tuples already exists and stays; no other map gained a form. Alternatives weighed: a compiler
