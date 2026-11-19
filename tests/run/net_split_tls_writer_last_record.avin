@@ -1,0 +1,92 @@
+// expect: exit 0
+// The writing half of a split TLS connection sends the whole record each `writeSome` makes before
+// it answers, so what it answers has gone even where the writer writes nothing after it. The writer
+// here stops at the first `writeSome` after which the connection is not writable, which is the one
+// that met a full connection, and then writes nothing more, holding its half open; its peer starts
+// reading only once the writer has stopped or is parked waiting for room, and must get every byte the
+// writer counted without any further call on the writer. A `writeSome` that kept the rest of its
+// record for a later call would leave the peer waiting for that rest for ever, as a database client
+// whose last batch statement never reached its server did. Four connections in turn, since a record
+// that happened to fit exactly would hide that.
+import avin.fs
+import avin.io.IoError
+import avin.net.{StreamWriter, TcpListener}
+import avin.net.tls.{TlsClient, TlsError, TlsServer, TlsStream}
+import avin.threads.{Channel, sleep, spawn}
+import avin.time.{millis, seconds}
+
+@sysl("avin.rt.socket_waiters")
+socketWaiters() -> long
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+tls[T](r: Result[T, TlsError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// A test certificate or key, from the repository root or from `compiler/`.
+fixture(name: string) -> string
+  val here = "tests/fixtures/tls/" + name
+  ok(fs.readText(if fs.exists(here) then here else "../" + here))
+
+// The most the writer sends: far more than the buffers between the two ends hold.
+val Most = 8388608
+
+// Writes records until one leaves the connection not writable or `Most` has gone, reports how much
+// plaintext went, and holds the half open, writing nothing, until `release` closes.
+pour(w: StreamWriter, reported: Channel[int], release: Channel[unit])
+  val block = Array.fill(65536, byte(42))
+  var sent = 0
+  while sent < Most
+    sent += ok(w.writeSome(block))
+    if !w.writable() then break
+  reported.send(sent)
+  _ = release.receive()
+  ok(w.close())
+
+// Reads until `total` bytes have come, learning `total` from `reported` where it is not yet known;
+// answers how many came, and the total, giving up ten seconds after the last byte.
+gather(s: TlsStream, known: int, reported: Channel[int]) -> (int, int)
+  var total = known
+  var got = 0
+  while total < 0 || got < total
+    select
+      s.readable() ->
+        val bytes = ok(s.read(65536))
+        if bytes.length == 0 then return (got, total)
+        got += bytes.length
+      reported.receive() as Some(t) -> total = t
+      after seconds(10) -> return (got, total)
+  (got, total)
+
+round(l: TcpListener, port: int, server: TlsServer, n: int)
+  val accepting = spawn(() -> tls(TlsStream.server(ok(l.accept()), server)))
+  val c = tls(TlsStream.connect("localhost", port, TlsClient().trust(fixture("ca.pem"))))
+  val s = accepting.join()
+  val (r, w) = c.split()
+  val reported = Channel[int](1)
+  val release = Channel[unit]()
+  val writing = spawn(() -> pour(w, reported, release))
+  // The peer reads nothing until the writer has stopped, or is parked waiting for room.
+  var total = -1
+  while total < 0 && socketWaiters() < 1
+    select
+      reported.receive() as Some(t) -> total = t
+      else sleep(millis(1))
+  val (got, all) = gather(s, total, reported)
+  println("round", n, "the writer sent", all > 0, "the peer got all of it", got == all)
+  release.close()
+  writing.join()
+  ok(r.close())
+  ok(s.close())
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val port = l.port()
+  val server = tls(TlsServer.of(fixture("localhost.pem"), fixture("localhost.key")))
+  for n in 1 .. 4
+    round(l, port, server, n)
+  _ = l.close()
+  println("waiters", socketWaiters())

@@ -8882,6 +8882,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed 2026-11-18 (built on branch `pg-flake-0032`): **the writing half of a split TLS
+  connection sends the whole record each `writeSome` makes before it answers, waiting for room for
+  the rest where the connection has too little**, refining the 2026-11-15 `writeSome` entry for that
+  half (spec system-library.md, TLS). Why: a `writeSome` that kept the rest of its record for a later
+  call left it unsent where the writer made no later call, and its peer waited for that rest for
+  ever. pg's batch writer hit exactly this: its thread sends a batch with the `writable()` and
+  `writeSome` loop the threads chapter shows, then ends; when the last `writeSome` met a full
+  connection, the end of the batch never left, the server waited for it, and the reader waited for
+  the server (about one TLS batch in ten under load). A split writer has a thread of its own and its
+  reading half reads meanwhile, so waiting there cannot hold up the peer's answers, which is the
+  deadlock the 2026-11-15 entry avoided by never waiting. Where the writer's time limit runs out
+  first, `writeSome` still answers the plaintext TLS took (it has been taken and will go), the rest
+  kept to go before anything else and `writable()` sending it as room comes, as before. With it,
+  ciphertext a wait that failed did not send is kept in order rather than dropped, on both the
+  connection and its halves (a timed-out `write` used to lose the part of a record it had begun,
+  breaking the TLS session). Unchanged: a whole `TlsStream`'s `writeSome` still never waits after
+  `writable()`, since one thread may be both reading and writing it; its kept rest goes at the
+  connection's next write, `writable()` or close. Alternatives weighed: the reading half sending the
+  kept rest while it waits for input (it would wait for room on the descriptor the writer's select
+  watches, and the runtime's poller keeps one waiter a direction, so one of them would never be
+  woken); a flush the caller must call after its last `writeSome` (every caller would have to know
+  it, and a generic `StreamWriter` caller cannot); a low-water mark of a whole record on the socket
+  so a record always fits after `writable()` (not settable on every system); the whole connection's
+  `writeSome` waiting too (a single thread reading and writing a busy peer could deadlock). Review
+  with the user: whether a whole `TlsStream`'s kept rest should also go while a read waits, so a
+  program that ends a request with `writeSome` and then only reads cannot hang the same way.
 - Settled on the user's delegation 2026-11-17 (built on branch `println-atomic`): **`println(x)` and
   `print(x)` render all their arguments (and `println` its new line) first, into a string, and add
   that to standard output in ONE write, so a line printed is never split by another thread's

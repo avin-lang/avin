@@ -1,0 +1,57 @@
+// expect: exit 0
+// A lightweight thread waiting for standard input holds nothing of the buffer it reads into while it
+// waits, so the thread resuming on another carrier races no one over that buffer. The program runs
+// itself as a child whose standard input is a pipe a shell writes to in pieces, pausing inside every
+// line, inside a line longer than one read, between the two bytes of a character and between a `\r`
+// and its `\n`, so the reader parks with part of what it wants already buffered, again and again.
+// Meanwhile lightweight threads allocate without pause, so the reader resumes on whichever carrier is
+// free, with collections in between. It reads by every way there is in turn: lines, characters and
+// everything left.
+import avin.io
+import avin.io.Source
+import avin.process
+import avin.process.Command
+import avin.threads
+import avin.threads.Atomic
+
+// How many lines of the form `line-N` the shell writes first.
+val numbered = 60
+
+// Allocates without pause until `done` is raised, answering how many of its strings had odd length.
+churn(done: Atomic[bool]) -> int
+  var kept = 0
+  var i = 0
+  while !done.load()
+    kept = kept + s"item $i".byteLength % 2
+    i = i + 1
+  kept
+
+// Reads what the shell writes, answering one line for each part of it.
+readAllWays() -> Vector[string]
+  var wrong = 0
+  for i in 0 ..< numbered
+    if io.readLine() != Some(s"line-$i") then wrong = wrong + 1
+  val longest = io.readLine().getOrElse("")
+  val allX = longest.byteLength == 140000 && longest.replace("x", "").isEmpty
+  val chars = Source.stdin().chars().take(2).mkString("")
+  val rest = io.readAll().replace("\r", "<cr>").replace("\n", "<lf>")
+  [s"numbered lines wrong: $wrong", s"long line: ${longest.byteLength} bytes, all x: $allX", s"chars: $chars", s"rest: $rest"]
+
+child()
+  val done = Atomic(false)
+  val allocators = (0 ..< 8).map(_ -> threads.spawn(() -> churn(done))).toVector
+  val reader = threads.spawn(() -> readAllWays())
+  val got = reader.join()
+  done.store(true)
+  for a in allocators
+    _ = a.join()
+  for line in got
+    println(line)
+
+main(args: Vector[string])
+  if args.length == 1 && args(0) == "child" then return child()
+  if !args.isEmpty then fail(s"unexpected arguments $args")
+  val program = process.executable().getOrElse("")
+  val feeder = "(i=0; while [ $i -lt 60 ]; do printf 'line-%d' $i; sleep 0.01; if [ $((i % 2)) = 0 ]; then printf '\\r'; sleep 0.01; printf '\\n'; else printf '\\n'; fi; i=$((i + 1)); done; head -c 70000 /dev/zero | tr '\\0' x; sleep 0.01; head -c 70000 /dev/zero | tr '\\0' x; sleep 0.01; printf '\\n\\303'; sleep 0.01; printf '\\251z'; sleep 0.01; printf 'rest\\r'; sleep 0.01; printf '\\nof it') | \"$0\" child"
+  val status = Command("/bin/sh", "-c", feeder, program).run()
+  if !status.map(s -> s.isSuccess).getOrElse(false) then println(s"child: $status")
