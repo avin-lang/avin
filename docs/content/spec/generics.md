@@ -37,7 +37,8 @@ class SortedPair[T: Ordered](first: T, second: T)
 ```
 
 - **A value of a bounded `T` has the members of its bounds**: their methods, those of the traits
-  they require, a trait's `val`s and a class bound's visible fields. A call on it is checked against
+  they require, a trait's `val`s and a class bound's visible fields, which are read as on an
+  instance of the class and, where `var`, assigned the same way. A call on it is checked against
   the bound's signature with the bound's `Self` as `T`, and takes every form a method call takes:
   overloads, default and named arguments, infix calls, the method's own type arguments, and the
   method as a value. A member no bound has is an error naming the bounds.
