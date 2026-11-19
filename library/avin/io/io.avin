@@ -44,6 +44,8 @@ data ErrorKind
   ConnectionReset
   // A read or write on a connection waited longer than its timeout.
   TimedOut
+  // The program has no controlling terminal to read from or write to.
+  NoTerminal
   // Any other failure, in words.
   Other(text: string)
 
@@ -61,6 +63,7 @@ impl ErrorKind
     ConnectionRefused -> "connection refused"
     ConnectionReset -> "connection reset by peer"
     TimedOut -> "timed out"
+    NoTerminal -> "there is no terminal"
     Other(m) -> m
 
 // Bytes read from somewhere a piece at a time: an open file, a connection, or a source a program
@@ -143,6 +146,54 @@ readLine() -> Option[string]
   val line = if inputEnded() then None else Some(takeLine())
   releaseInput()
   line
+
+// Why a secret could not be read, as the runtime tells the failures apart.
+@sysl("avin.rt.SecretFailure")
+private data SecretFailure
+  NoTty
+  Ended
+  Signalled
+  Failed(message: string)
+
+@sysl("avin.rt.read_secret")
+private takeSecret(prompt: string) -> Result[Array[byte], SecretFailure]
+
+private secretError(e: SecretFailure) -> IoError = e match
+  NoTty -> IoError(NoTerminal, "read", "the terminal")
+  Ended -> IoError(Other("end of input"), "read", "the terminal")
+  Signalled -> IoError(Other("interrupted"), "read", "the terminal")
+  Failed(m) -> IoError(Other(m), "read", "the terminal")
+
+// One line typed at the controlling terminal with what is typed not shown, after `prompt` is written
+// to the terminal: for a password or a passphrase. The terminal is `/dev/tty`, not standard input, so
+// a program whose input or output is a pipe can ask, as `sudo` and `ssh` do. The line comes back
+// without its terminator, as bytes the caller owns and can overwrite once it is done with them.
+//
+// The terminal is put back exactly as it was found whichever way the read ends. A line the user ends
+// with Ctrl-D, or with the terminal's end, still counts if it has bytes in it. A program that has no
+// terminal gets `Err(IoError(NoTerminal, _, _))`; the end of input before any byte, and an interrupt
+// the program survives, are `Err` of kind `Other`. A line is at most what the terminal keeps of one:
+// 1023 bytes on macOS, 4095 on Linux.
+//
+// The read takes the same lock as reading standard input, so threads never read both at once: a
+// thread that asks waits for one reading, and the other way round. A thread cancelled while it waits
+// for the line is stopped once the line has been read, as one reading standard input is.
+readSecretBytes(prompt: string) -> Result[Array[byte], IoError] = takeSecret(prompt).mapErr(secretError)
+
+// `readSecretBytes` as text; bytes that are not UTF-8 become U+FFFD.
+readSecret(prompt: string) -> Result[string, IoError] = readSecretBytes(prompt).map(bytes -> string.fromUtf8Lossy(bytes))
+
+// `readSecret`, or where the program has no terminal, `prompt` written to standard error and a line
+// read from standard input, shown as it arrives: for a tool a script runs with its password piped in.
+// A closed standard input is `Err` of kind `Other`.
+readSecretOrLine(prompt: string) -> Result[string, IoError]
+  readSecret(prompt) match
+    Err(e) if e.kind is NoTerminal ->
+      eprint(prompt)
+      readLine() match
+        Some(line) -> Ok(line)
+        None -> Err(IoError(Other("end of input"), "read", "standard input"))
+    other -> other
 
 // The lines left on standard input, each as `readLine` gives it, read as the iterator is advanced.
 lines() -> Iterator[string] = InputLines()

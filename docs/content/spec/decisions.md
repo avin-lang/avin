@@ -8880,6 +8880,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   **Review with the user:** the TLS record bound of `writeSome`, and the names `writeSome` and
   `writabilityDescriptor`.
 
+- Settled on the user's delegation 2026-11-19 (branch `read-secret`): **`io.readSecret(prompt)`,
+  `readSecretBytes` and `readSecretOrLine` read a line from the controlling terminal with echo
+  off.** fettle prompts for a sudo or ssh password, as does any tool asking for a passphrase, and
+  nothing in the library read input with echo off. The calls open `/dev/tty` (so a piped standard
+  input does not matter), write the prompt to it, turn off `ECHO` and `ECHONL` while keeping
+  `ICANON`, and restore the exact `termios` found. Details settled: (1) **no terminal** is
+  `Err(IoError(NoTerminal, "read", "the terminal"))`, a new `ErrorKind` case, since a program
+  tells it apart from a failed read; `readSecretOrLine` is the opt-in fallback, writing the prompt
+  to standard error and reading a line from standard input, as a tool run by a script with its
+  password piped in needs. (2) **Signals**: `ISIG` stays on, and for the length of the read the C
+  side (`runtime/avin/rt/__posix__/secret_tty.c`) catches interrupt, hangup, terminate and quit: its
+  handler restores the terminal, gives the signal its previous action back and sends it again, so
+  the program dies or handles the signal with echo on; a program that survives sees the read fail
+  as `Other("interrupted")`. A stop signal is not caught. (3) **Concurrency**: the read holds
+  `input_readers`, the lock of every standard input reader, so a secret and a `readLine` never
+  read the terminal at once; a lightweight thread waiting for the line is not cancellable, as one
+  waiting for standard input is, so a cancel takes effect once the line has been read and the
+  terminal is back. (4) **Bytes**: `readSecretBytes` returns an `Array[byte]` the caller can
+  overwrite; `readSecret` is a string, which has no way to be cleared, and the runtime clears its
+  own gathering buffers. (5) A trailing `\n` and a `\r` before it are dropped; the end of input
+  with bytes typed ends the line, with none it is `Other("end of input")`. Alternatives weighed:
+  turning `ISIG` off as `getpass` does (Ctrl-C then arrives as a byte only once the line ends,
+  so it would not interrupt a prompt); reading standard input when there is no terminal by default
+  (a secret would then show on the screen, and a program that means to read one must ask by
+  name); a cancellable wait (the existing standard input lock holds the thread's cancellation off,
+  and a read cut short would leave typed bytes half taken); a single `readSecret` with a
+  fallback flag. Tests drive real programs over a pseudo-terminal (`tests/pty/pty_drive.c`,
+  `secret_tests.sysl`). **Review with the user:** the name `readSecret` (against `readPassword`
+  or `promptSecret`), and the no-terminal behaviour: an error by default with `readSecretOrLine`
+  as the explicit fallback, rather than falling back to standard input on its own.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to

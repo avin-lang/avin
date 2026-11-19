@@ -587,6 +587,7 @@ data ErrorKind
   ConnectionRefused
   ConnectionReset
   TimedOut
+  NoTerminal
   Other(text: string)
 ```
 
@@ -602,6 +603,7 @@ data ErrorKind
 | `ConnectionRefused` | Nothing listens at the address a connection was made to. | `connection refused` |
 | `ConnectionReset` | The other end reset or closed a connection while it was in use. | `connection reset by peer` |
 | `TimedOut` | A read or write on a connection waited past its timeout. | `timed out` |
+| `NoTerminal` | The program has no controlling terminal to read from or write to. | `there is no terminal` |
 | `Other(text)` | Any other failure, described in words. | `text` |
 
 **An `IoError` names its subject.** `operation` is what was being done, in words that follow
@@ -707,6 +709,51 @@ the program blocks for the answer.
 
 **Tests see no input.** `avin test` gives each test an empty standard input, so a test never waits on
 the terminal it was started from. `avin run` hands the program its own standard input.
+
+### Secrets typed at the terminal
+
+```text
+import avin.io
+
+main()
+  io.readSecret("Password: ") match
+    Ok(password) -> login(password)
+    Err(e) -> eprintln(e.message)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `readSecret(prompt: string) -> Result[string, IoError]` | One line typed at the controlling terminal with echo off, after `prompt` is written to the terminal. Bytes that are not UTF-8 become U+FFFD. |
+| `readSecretBytes(prompt: string) -> Result[Array[byte], IoError]` | The same line as bytes the caller owns and can overwrite when done with them. |
+| `readSecretOrLine(prompt: string) -> Result[string, IoError]` | `readSecret`, or where the program has no terminal, `prompt` written to standard error and a line read from standard input, shown as it arrives. |
+
+**The line is read from the terminal, not from standard input.** The terminal is the one the program
+was started from (`/dev/tty`), so a program whose input or output is a pipe can still ask, as `sudo`
+and `ssh` do. The prompt goes to the terminal too, and what the program has written to standard
+output is flushed before it. A program with no controlling terminal gets
+`Err(IoError(NoTerminal, "read", "the terminal"))`; `readSecretOrLine` is the call for a program a
+script may run with its password piped in.
+
+**Echo is off and the terminal is put back exactly as it was found.** Line editing stays on, so the
+user can still correct what they type; the newline the user's Enter did not echo is written once the
+terminal is back. The terminal is put back on every way out: a line, the end of input, an error, a
+cancelled thread's stop and a signal. Ctrl-C, a hangup, terminate or quit signal arriving during
+the read puts the terminal back first and then reaches the program as it would have: the program
+ends, or, where it watches the signal, sees the read fail with `Other("interrupted")` and the signal
+in its watch. Typed-ahead input is discarded when the read starts, so nothing typed before the prompt
+is taken for the secret. A stop signal (Ctrl-Z) is not caught: the program stops with echo off until
+it is continued.
+
+**The line has no terminator.** A trailing `\n` and a `\r` before it are dropped. A line ended by the
+terminal's end-of-file character counts if it has bytes in it; the end of input before any byte is
+`Err(IoError(Other("end of input"), _, _))`. An empty line is an empty secret. A line is at most what
+the terminal itself keeps of one: 1023 bytes on macOS, 4095 on Linux.
+
+**It never runs at the same time as a read of standard input, or another secret.** The read takes
+the lock every reader of standard input takes: a thread that asks waits for a reader of either, and
+the other way round. A thread cancelled while it waits for the line is stopped once the line has
+been read, as one reading standard input is. A secret asked for with no way to clear it is still a
+`string`; `readSecretBytes` is the form to overwrite, and the runtime clears its own copies.
 
 ### `Reader`
 
