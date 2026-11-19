@@ -1,0 +1,242 @@
+import avin.io
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.process
+import avin.threads.{Atomic, Channel, Selector, scope, sleep, spawn}
+import avin.time
+import avin.time.{Duration, millis, seconds}
+
+// Standard input waited on in a `select` and a `Selector`, beside channels, an `after` and sockets,
+// driven by `stdio_tests.sysl` through the shell, which gives the program pipes, files and
+// `/dev/null`, with bytes arriving when the script says. The first argument picks what the program
+// does; each says on standard output what it found.
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Bytes as text, a newline shown as `\n`.
+text(b: Array[byte]) -> string = string.fromUtf8Lossy(b).replace("\n", "\\n")
+
+// What `readAvailable` answered.
+shown(r: Result[Option[Array[byte]], IoError]) -> string = r match
+  Ok(Some(b)) -> s"Some(${text(b)})"
+  Ok(None) -> "None"
+  Err(e) -> s"Err(${e.message})"
+
+// How long since `t0` on the monotonic clock, in whole tenths of a second, for a script to compare.
+since(t0: Duration) -> Duration = time.monotonic() - t0
+
+// Which of standard input, a channel a thread sends on after `sendMs` (never where it is negative)
+// and an `after` of `afterMs` runs first, and then what is available.
+first(sendMs: int, afterMs: int)
+  val ch = Channel[int]()
+  if sendMs >= 0
+    spawn(() ->
+      sleep(millis(long(sendMs)))
+      ch.send(1))
+  val which = select
+    io.stdin().readable() -> "stdin"
+    ch.receive() as Some(v) -> s"channel $v"
+    after millis(long(afterMs)) -> "after"
+  println(which)
+  if which == "stdin" then println(s"available: ${shown(io.stdin().readAvailable(64))}")
+  flush()
+  process.exit(0)
+
+// `first` on a thread other than the main one: any thread may wait on standard input.
+firstOnThread(sendMs: int, afterMs: int)
+  spawn(() -> first(sendMs, afterMs)).join()
+
+// A line read with more behind it in the buffer: the rest makes standard input ready at once,
+// though nothing more arrives on the descriptor.
+buffered()
+  println(s"line: ${io.readLine()}")
+  println(s"readable: ${io.stdin().readable()}")
+  val t0 = time.monotonic()
+  val which = select
+    io.stdin().readable() -> "stdin"
+    after seconds(5) -> "after"
+  println(s"$which at once: ${since(t0) < seconds(1)}")
+  println(s"available: ${shown(io.stdin().readAvailable(64))}")
+  println(s"then: ${shown(io.stdin().readAvailable(64))}")
+  flush()
+  process.exit(0)
+
+// At the end of the input: ready, `read` answers empty, `readAvailable` answers an empty `Some`, and
+// both go on doing so.
+ended()
+  val drained = Array.newBuilder[byte]()
+  var more = true
+  while more
+    val piece = ok(io.stdin().read(64))
+    for b in piece do drained.addOne(b)
+    more = piece.length > 0
+  println(s"drained: ${text(drained.result())}")
+  for i in 0 ..< 2
+    val which = select
+      io.stdin().readable() -> "stdin"
+      after seconds(5) -> "after"
+    println(s"$which, read ${ok(io.stdin().read(8)).length}, available ${shown(io.stdin().readAvailable(8))}")
+
+// `readAvailable` on input that has nothing yet answers `None` at once, then, once bytes have come,
+// those bytes, and an empty `Some` at the end.
+available()
+  val t0 = time.monotonic()
+  val now = io.stdin().readAvailable(16)
+  println(s"now: ${shown(now)}, at once: ${since(t0) < millis(500)}")
+  var got = ""
+  var done = false
+  while !done
+    select
+      io.stdin().readable() -> io.stdin().readAvailable(16) match
+        Ok(Some(b)) ->
+          if b.length == 0 then done = true else got = got + text(b)
+        Ok(None) -> ()
+        Err(e) -> fail(e.message)
+      after seconds(10) -> fail("no input came")
+  println(s"got: $got")
+  println(s"after the end: ${shown(io.stdin().readAvailable(16))}")
+
+// Reads standard input with `readAvailable` in a select loop until it ends, a `max` of 3 at a time,
+// beside a ticking channel: what came, in order. For a file, a pipe and a terminal alike.
+loopRead()
+  val ticks = Channel[int](1)
+  val ticker = spawn(() ->
+    for i in 0 ..< 1000
+      sleep(millis(5))
+      if !ticks.trySend(i) then ()
+    ())
+  var got = ""
+  var done = false
+  while !done
+    select
+      io.stdin().readable() -> io.stdin().readAvailable(3) match
+        Ok(Some(b)) ->
+          if b.length == 0 then done = true else got = got + text(b)
+        Ok(None) -> ()
+        Err(e) -> fail(e.message)
+      ticks.receive() -> ()
+      after seconds(10) -> fail("no input came")
+  println(s"got: $got")
+  flush()
+  process.exit(0)
+
+// A `Selector` with standard input among connections: `order` says which side sends first, the
+// socket ("socket") or standard input, whose bytes the script sends after a pause ("stdin").
+selector(order: string)
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val clients = Buffer[TcpStream]()
+  val served = Buffer[TcpStream]()
+  for i in 0 ..< 3
+    clients.append(ok(TcpStream.connect("127.0.0.1", l.port())))
+    served.append(ok(l.accept()))
+  val sel = Selector[string]()
+  for i in 0 ..< 3 do sel.readable(served(i), s"socket $i")
+  sel.readable(io.stdin(), "stdin")
+  if order == "socket" then ok(clients(1).write("hi".utf8))
+  val key = sel.within(seconds(10))
+  println(s"first: $key")
+  key match
+    Some("stdin") -> println(s"available: ${shown(io.stdin().readAvailable(64))}")
+    Some(_) -> println(s"read: ${text(ok(served(1).read(64)))}")
+    None -> ()
+  // Standard input is still an entry: once its bytes come, it runs.
+  if order == "socket"
+    val next = sel.within(seconds(10))
+    println(s"then: $next, available: ${shown(io.stdin().readAvailable(64))}")
+  flush()
+  process.exit(0)
+
+// One thread reads a line while standard input has nothing; another waits on it in a select. The
+// bytes come as two lines in one piece: the reader takes the first, and the second, left in the
+// buffer, ends the select's wait, though nothing more arrives on the descriptor.
+readerAndSelect()
+  val waiting = Atomic(0)
+  val reader = spawn(() ->
+    waiting.add(1)
+    io.readLine())
+  while waiting.load() < 1 do sleep(millis(1))
+  sleep(millis(100))
+  val selecting = spawn(() ->
+    val which = select
+      io.stdin().readable() -> "stdin"
+      after seconds(5) -> "after"
+    (which, shown(io.stdin().readAvailable(64))))
+  val line = reader.join()
+  val (which, got) = selecting.join()
+  println(s"reader: $line")
+  println(s"select: $which, $got")
+  flush()
+  process.exit(0)
+
+// Two threads wait on standard input in select loops at once, each taking what is available, until
+// it ends: between them every byte, once.
+twoSelecting()
+  // A bit for each letter seen, `a` the lowest.
+  val seen = Atomic(long(0))
+  val workers = [0, 1].map(w -> spawn(() ->
+    var done = false
+    var count = 0
+    while !done
+      select
+        io.stdin().readable() -> io.stdin().readAvailable(2) match
+          Ok(Some(b)) ->
+            if b.length == 0 then done = true
+            else
+              count += b.length
+              for c in b
+                val bit = long(1) << long(int(c) - int('a'))
+                seen.update(m -> m | bit)
+          Ok(None) -> ()
+          Err(e) -> fail(e.message)
+        after seconds(10) -> fail("no input came")
+    count))
+  val total = workers.map(t -> t.join()).sum
+  println(s"total: $total, letters: ${seen.load()}")
+  flush()
+  process.exit(0)
+
+// A thread waiting on standard input in a select with no `after`, and one in a `Selector`'s `wait`,
+// are stopped by their scope's `cancel`; standard input is still read whole afterwards.
+cancelled()
+  val started = Atomic(0)
+  val after = Atomic(0)
+  val results = scope(s ->
+    val inSelect = s.spawn(() ->
+      started.add(1)
+      select
+        io.stdin().readable() -> ()
+      after.add(1))
+    val inSelector = s.spawn(() ->
+      val sel = Selector[int]()
+      sel.readable(io.stdin(), 0)
+      started.add(1)
+      sel.wait()
+      after.add(1))
+    while started.load() < 2 do sleep(millis(1))
+    sleep(millis(50))
+    s.cancel()
+    [inSelect, inSelector])
+  println(s"cancelled: ${results.map(t -> t.result())}, ran on: ${after.load()}")
+  println(s"then: ${shown(io.stdin().readAvailable(64))}")
+  val which = select
+    io.stdin().readable() -> "stdin"
+    after seconds(10) -> "after"
+  println(s"$which: ${shown(io.stdin().readAvailable(64))}")
+  flush()
+  process.exit(0)
+
+main(args: Vector[string])
+  args(0) match
+    "first" -> first(args(1).toInt(), args(2).toInt())
+    "first-thread" -> firstOnThread(args(1).toInt(), args(2).toInt())
+    "buffered" -> buffered()
+    "ended" -> ended()
+    "available" -> available()
+    "loop" -> loopRead()
+    "selector" -> selector(args(1))
+    "reader-and-select" -> readerAndSelect()
+    "two" -> twoSelecting()
+    "cancelled" -> cancelled()
+    _ -> fail(s"no mode ${args(0)}")

@@ -3,14 +3,14 @@ module dev.avinlang.compiler
 
 import sysl.{MacOS, os}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, remove_file, set_permissions, write_text}
-import sysl.process.capture
+import sysl.fs.{canonicalize, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, set_permissions, write_text}
+import sysl.process.{Stdio, capture}
 
 // Linking a program's C libraries from their static archives (`static-c-libraries`): how the flags
 // `pkg-config --static --libs` answers become archives, and a program built both ways from a C
 // library that is installed as an archive and as a shared library.
 
-private library_named(label: string) -> CLibrary = CLibrary("app", label, Some(label), buf(), buf(), "", true)
+private library_named(label: string) -> CLibrary = c_library("app", label, Some(label), buf(), buf(), "", true)
 
 private touch(file: string) = write_text(file, "").unwrap()
 
@@ -125,7 +125,7 @@ private static_fixture(dir: string) -> Toolchain
     val wrapper = dir + "/pkg-config"
     write_text(wrapper, "#!/bin/sh\nPKG_CONFIG_PATH=\"" + dir + "/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\" exec pkg-config \"$@\"\n").unwrap()
     set_permissions(wrapper, 493u32).unwrap()
-    Toolchain(tc.root, tc.cache, tc.clang, tc.sysl, wrapper, tc.builds)
+    Toolchain(tc.root, tc.cache, tc.clang, tc.sysl, wrapper, tc.builds, tc.target)
 
 private clang_ok(tc: Toolchain, args: []const string)
     val r = capture(tc.clang, args, stderr = true, timeout = 120000).unwrap()
@@ -249,3 +249,239 @@ static_reaches_dependencies()
         val libraries = linked_libraries(program)
         assert_eq(libraries.contains("libstaticfix"), says == "", libraries)
         runs_and_prints_42(program)
+
+// Linking chosen per library, by path, from search directories, with frameworks and raw flags, and
+// from the command line (`c-linking`, `files`, `search`, `include`, `frameworks`, `link-flags`,
+// `dynamic-only`, `--static-c-libraries`).
+
+/** A C library `vend` the package at `app` vendors in `app/vendor`: `vend.h`, and `vend_twice` both as
+ * `libvend.a` and as `libvend.dylib`, whose install name is its path. */
+private vendor_fixture(tc: Toolchain, app: string)
+    make_dir_all(app + "/vendor").unwrap()
+    write_text(app + "/vendor/vend.h", "int vend_twice(int n);\n").unwrap()
+    write_text(app + "/vendor/vend.c", "int vend_twice(int n) { return n * 2; }\n").unwrap()
+    clang_ok(tc, ["-c", "-O1", app + "/vendor/vend.c", "-o", app + "/vendor/vend.o"])
+    ar_ok(app + "/vendor/libvend.a", app + "/vendor/vend.o")
+    clang_ok(tc, ["-dynamiclib", app + "/vendor/vend.o", "-install_name", app + "/vendor/libvend.dylib", "-o", app + "/vendor/libvend.dylib"])
+
+/** The package `name` at `dir/name`, binding `vend_twice` and printing it of 21, whose manifest holds
+ * `rest` after its `package` block; with `fix`, it binds `static_fix_twice` too and prints
+ * `vend_twice(static_fix_twice(21) / 2)`. Its `vend` is vendored. */
+private vend_app(tc: Toolchain, dir: string, name: string, rest: string, fix: bool)
+    val app = dir + "/" + name
+    make_dir_all(app).unwrap()
+    write_text(app + "/avin.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n$rest").unwrap()
+    val fix_binding = if fix then "@c(\"int static_fix_twice(int n)\")\ntwice(n: int) -> int\n\n" else ""
+    val printed = if fix then "vtwice(twice(21) / 2)" else "vtwice(21)"
+    write_text(app + "/main.avin", s"${fix_binding}@c(\"int vend_twice(int n)\")\nvtwice(n: int) -> int\n\nmain()\n  println($printed)\n").unwrap()
+    vendor_fixture(tc, app)
+
+// A `vend` C library block holding `keys`, with its header from `vendor`.
+private vend_library(keys: string) -> string = s"c-libraries {\n  vend { $keys, include = [\"vendor\"], headers = [\"vend.h\"] }\n}\n"
+
+private noted_error(b: Built, wanted: string)
+    assert_eq(b.status, 1, b.noted)
+    assert(b.noted.contains(wanted), b.noted)
+
+@test("a library `link` names is linked from its archive in its search directories when the program links it statically, and from its shared library otherwise")
+link_libraries_static()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    val library = vend_library("link = [\"vend\"], search = [\"vendor\"]")
+    vend_app(tc, dir, "plain", library, false)
+    vend_app(tc, dir, "app", "c-linking { default = \"static\" }\n" + library, false)
+    val dynamic = dir + "/dynamic"
+    assert_eq(build(tc, ["avin", "build", dir + "/plain", "-o", dynamic]).status, 0)
+    assert(linked_libraries(dynamic).contains("/vendor/libvend.dylib"), linked_libraries(dynamic))
+    runs_and_prints_42(dynamic)
+    for level in ["-O0", "-O2"]
+        val program = dir + "/static" + level
+        val built = build(tc, ["avin", "build", dir + "/app", "-o", program, level])
+        assert_eq(built.status, 0, built.noted)
+        assert(!linked_libraries(program).contains("libvend"), linked_libraries(program))
+        runs_and_prints_42(program)
+    // Built, it needs no shared library.
+    remove_file(dir + "/app/vendor/libvend.dylib").unwrap()
+    runs_and_prints_42(dir + "/static-O2")
+
+@test("a library `link` names with a shared library and no archive in its search directories stops a static build, which check reports too; a search directory that is not there is an error")
+link_libraries_missing_archive()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_app(tc, dir, "app", "c-linking { default = \"static\" }\n" + vend_library("link = [\"vend\"], search = [\"vendor\"]"), false)
+    remove_file(dir + "/app/vendor/libvend.a").unwrap()
+    // A package's directory is named as the file system resolves it (`/private/var` on macOS).
+    val real = canonicalize(dir).unwrap()
+    val wanted = "error: the C library `vend` of package `app` is linked statically (`c-linking`'s `default = \"static\"`), but `-lvend`, which `link` names, has no static archive: `" + real + "/app/vendor/libvend.dylib` has no `libvend.a` beside it"
+    noted_error(build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"]), wanted)
+    noted_error(build(tc, ["avin", "check", dir + "/app"]), wanted)
+    // Linked dynamically, it needs no archive.
+    val dynamic = build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program", "--dynamic-c-libraries"])
+    assert_eq(dynamic.status, 0, dynamic.noted)
+    runs_and_prints_42(dir + "/program")
+    vend_app(tc, dir, "lost", vend_library("link = [\"vend\"], search = [\"nolib\"]"), false)
+    val lost = "error: the search directory `nolib` of the C library `vend` of package `lost` is not a directory: `" + real + "/lost/nolib`"
+    noted_error(build(tc, ["avin", "build", dir + "/lost", "-o", dir + "/program"]), lost)
+    noted_error(build(tc, ["avin", "check", dir + "/lost"]), lost)
+
+@test("an archive or a shared library named by its path in the package is linked as named, and linked statically a shared library is replaced by the archive beside it")
+files_by_path()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_app(tc, dir, "archive", vend_library("files = [\"vendor/libvend.a\"]"), false)
+    vend_app(tc, dir, "shared", vend_library("files = [\"vendor/libvend.dylib\"]"), false)
+    vend_app(tc, dir, "forced", "c-linking { static = [\"vend\"] }\n" + vend_library("files = [\"vendor/libvend.dylib\"]"), false)
+    for name in ["archive", "shared", "forced"]
+        val program = dir + "/" + name + "-program"
+        val built = build(tc, ["avin", "build", dir + "/" + name, "-o", program])
+        assert_eq(built.status, 0, built.noted)
+        assert_eq(linked_libraries(program).contains("libvend.dylib"), name == "shared", linked_libraries(program))
+        runs_and_prints_42(program)
+
+@test("a file named by its path that is not there, or a shared library linked statically with no archive beside it, is an error naming it")
+files_by_path_errors()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_app(tc, dir, "missing", vend_library("files = [\"vendor/libnone.a\"]"), false)
+    val real = canonicalize(dir).unwrap()
+    val missing = "error: the file `vendor/libnone.a` of the C library `vend` of package `missing` is not there: `" + real + "/missing/vendor/libnone.a`"
+    noted_error(build(tc, ["avin", "build", dir + "/missing", "-o", dir + "/program"]), missing)
+    noted_error(build(tc, ["avin", "check", dir + "/missing"]), missing)
+    vend_app(tc, dir, "app", "static-c-libraries = true\n" + vend_library("files = [\"vendor/libvend.dylib\"]"), false)
+    remove_file(dir + "/app/vendor/libvend.a").unwrap()
+    val shared = "error: the C library `vend` of package `app` is linked statically (`static-c-libraries = true`), but `vendor/libvend.dylib`, which `files` names, is a shared library with no archive beside it: `" + real + "/app/vendor/libvend.dylib` has no `libvend.a` beside it"
+    noted_error(build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"]), shared)
+    noted_error(build(tc, ["avin", "check", dir + "/app"]), shared)
+
+@test("a program links one C library statically and another dynamically, all static but one or all dynamic but one")
+mixed_per_library()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = static_fixture(dir)
+    val libraries = "c-libraries {\n  staticfix { pkg-config = \"static-fix\", headers = [\"static_fix.h\"] }\n  vend { link = [\"vend\"], search = [\"vendor\"], include = [\"vendor\"], headers = [\"vend.h\"] }\n}\n"
+    vend_app(tc, dir, "but-vend", "c-linking {\n  default = \"static\"\n  dynamic = [\"vend\"]\n}\n" + libraries, true)
+    vend_app(tc, dir, "only-vend", "c-linking { static = [\"only-vend/vend\"] }\n" + libraries, true)
+    for name in ["but-vend", "only-vend"]
+        for level in ["-O0", "-O2"]
+            val program = dir + "/" + name + level
+            val built = build(tc, ["avin", "build", dir + "/" + name, "-o", program, level])
+            assert_eq(built.status, 0, built.noted)
+            val linked = linked_libraries(program)
+            assert_eq(linked.contains("libstaticfix"), name == "only-vend", linked)
+            assert_eq(linked.contains("libvend"), name == "but-vend", linked)
+            runs_and_prints_42(program)
+
+@test("a library its package says is dynamic-only stops a program linking it statically, and links dynamically when the program names it so")
+dynamic_only_program()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    val library = vend_library("link = [\"vend\"], search = [\"vendor\"], dynamic-only = \"LGPL-2.1: its users may replace it\"")
+    vend_app(tc, dir, "app", "static-c-libraries = true\n" + library, false)
+    val wanted = "error: the C library `vend` of package `app` is never linked statically, as its package says (`dynamic-only`): LGPL-2.1: its users may replace it; the program links it statically by `static-c-libraries = true`: name it in `c-linking { dynamic = [\"vend\"] }` to link it dynamically"
+    noted_error(build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"]), wanted)
+    noted_error(build(tc, ["avin", "check", dir + "/app"]), wanted)
+    vend_app(tc, dir, "named", "static-c-libraries = true\nc-linking { dynamic = [\"vend\"] }\n" + library, false)
+    val built = build(tc, ["avin", "build", dir + "/named", "-o", dir + "/program"])
+    assert_eq(built.status, 0, built.noted)
+    assert(linked_libraries(dir + "/program").contains("libvend.dylib"))
+    runs_and_prints_42(dir + "/program")
+
+@test("a library's frameworks are linked, and its link-flags reach the linker as they are")
+frameworks_and_flags()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_app(tc, dir, "framed", vend_library("files = [\"vendor/libvend.a\"], frameworks = [\"CoreFoundation\"]"), false)
+    // The framework is unused, so dropping unused shared libraries drops it: the flag was passed.
+    vend_app(tc, dir, "stripped", vend_library("files = [\"vendor/libvend.a\"], frameworks = [\"CoreFoundation\"], link-flags = [\"-Wl,-dead_strip_dylibs\"]"), false)
+    for name in ["framed", "stripped"]
+        val program = dir + "/" + name + "-program"
+        val built = build(tc, ["avin", "build", dir + "/" + name, "-o", program])
+        assert_eq(built.status, 0, built.noted)
+        assert_eq(linked_libraries(program).contains("CoreFoundation.framework"), name == "framed", linked_libraries(program))
+        runs_and_prints_42(program)
+    vend_app(tc, dir, "wrong", vend_library("files = [\"vendor/libvend.a\"], link-flags = [\"-Wl,-avin-no-such-flag\"]"), false)
+    val wrong = build(tc, ["avin", "build", dir + "/wrong", "-o", dir + "/program"])
+    assert_eq(wrong.status, 1, wrong.noted)
+    assert(wrong.noted.contains("avin-no-such-flag"), wrong.noted)
+
+@test("static-system links a name no library's search directory holds from its archive in c-linking's search, and says so when it finds none")
+static_system_names()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    // `-lvend` with no search directory is a name the system would provide.
+    val library = vend_library("link = [\"vend\"]")
+    vend_app(tc, dir, "app", "c-linking {\n  static-system = [\"vend\"]\n  search = [\"vendor\"]\n}\n" + library, false)
+    val built = build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"])
+    assert_eq(built.status, 0, built.noted)
+    assert(!linked_libraries(dir + "/program").contains("libvend"))
+    runs_and_prints_42(dir + "/program")
+    // An absolute search directory is taken as it is.
+    vend_app(tc, dir, "absolute", s"c-linking {\n  static-system = [\"vend\"]\n  search = [\"$dir/app/vendor\"]\n}\n" + library, false)
+    assert_eq(build(tc, ["avin", "build", dir + "/absolute", "-o", dir + "/program"]).status, 0)
+    runs_and_prints_42(dir + "/program")
+    make_dir_all(dir + "/app/empty").unwrap()
+    write_text(dir + "/app/avin.hocon", "package { name = \"app\", version = \"0.1.0\" }\nc-linking {\n  static-system = [\"vend\"]\n  search = [\"empty\"]\n}\n" + library).unwrap()
+    val none = "error: `c-linking`'s `static-system` links `-lvend` of the C library `vend` of package `app` from its archive, but no `libvend.a` is in the directories searched: `" + canonicalize(dir).unwrap() + "/app/empty`"
+    noted_error(build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"]), none)
+    noted_error(build(tc, ["avin", "check", dir + "/app"]), none)
+    write_text(dir + "/app/avin.hocon", "package { name = \"app\", version = \"0.1.0\" }\nc-linking {\n  static-system = [\"vend\", \"nope\"]\n  search = [\"vendor\"]\n}\n" + library).unwrap()
+    noted_error(build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"]), "error: `c-linking`'s `static-system` names `nope`, which none of the program's C libraries links as `-lnope`")
+
+private session(tc: Toolchain, dir: string, args: []const string) -> Built
+    var noted = ""
+    val status = run_cli_with(args, Some(tc), s -> (), s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/run.out"), Stdio.Inherit)
+    Built(status, noted)
+
+@test("the command line's --static-c-libraries and --dynamic-c-libraries replace the manifest's default for build, run, test and check, and a library c-linking names keeps its way")
+command_line_linking()
+    if os() != MacOS then return
+    val dir = make_temp_dir("avin-static").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = static_fixture(dir)
+    fix_app(dir, "old", "static-c-libraries = true\n" + FixLibrary)
+    fix_app(dir, "plain", FixLibrary)
+    fix_app(dir, "kept", "c-linking { dynamic = [\"staticfix\"] }\n" + FixLibrary)
+    val program = dir + "/program"
+    assert_eq(build(tc, ["avin", "build", dir + "/old", "-o", program, "--dynamic-c-libraries"]).status, 0)
+    assert(linked_libraries(program).contains("libstaticfix.dylib"), linked_libraries(program))
+    runs_and_prints_42(program)
+    assert_eq(build(tc, ["avin", "build", "--static-c-libraries", dir + "/plain", "-o", program]).status, 0)
+    assert(!linked_libraries(program).contains("libstaticfix"), linked_libraries(program))
+    runs_and_prints_42(program)
+    assert_eq(build(tc, ["avin", "build", dir + "/kept", "-o", program, "--static-c-libraries"]).status, 0)
+    assert(linked_libraries(program).contains("libstaticfix.dylib"), linked_libraries(program))
+    // Both, or one twice, is a usage error.
+    for pair in [["--static-c-libraries", "--dynamic-c-libraries"], ["--static-c-libraries", "--static-c-libraries"]]
+        assert_eq(build(tc, ["avin", "build", dir + "/plain", "-o", program, pair[0], pair[1]]).status, 2)
+    // Commands that link nothing do not take it.
+    assert_eq(build(tc, ["avin", "parse", dir + "/plain", "--static-c-libraries"]).status, 2)
+    // `run` and `test` take it, and a cached build is not reused across it: with the private
+    // dependency's archive gone, the static run fails where the dynamic one, built first, ran.
+    val ran = session(tc, dir, ["avin", "run", dir + "/plain"])
+    assert_eq(ran.status, 0, ran.noted)
+    assert_eq(read_text(dir + "/run.out").unwrap(), "42\n")
+    val ran_static = session(tc, dir, ["avin", "run", dir + "/plain", "--static-c-libraries"])
+    assert_eq(ran_static.status, 0, ran_static.noted)
+    assert_eq(read_text(dir + "/run.out").unwrap(), "42\n")
+    remove_file(dir + "/lib/libstaticdep.a").unwrap()
+    val dynamic_again = session(tc, dir, ["avin", "run", dir + "/plain"])
+    assert_eq(dynamic_again.status, 0, dynamic_again.noted)
+    noted_error(session(tc, dir, ["avin", "run", dir + "/plain", "--static-c-libraries"]), "but `-lstaticdep`, which `pkg-config --static --libs static-fix` names, has no static archive")
+    noted_error(session(tc, dir, ["avin", "test", dir + "/plain", "--static-c-libraries"]), "has no static archive")
+    noted_error(build(tc, ["avin", "check", dir + "/plain", "--static-c-libraries"]), "has no static archive")
+    assert_eq(build(tc, ["avin", "check", dir + "/old", "--dynamic-c-libraries"]).status, 0)

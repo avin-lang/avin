@@ -1,0 +1,104 @@
+// expect: exit 0
+// A bounded mailbox holds at most its capacity of the messages references send. A `tell` to a full
+// one never waits: `DropNewest` drops the message told, `DropOldest` the oldest message waiting, and
+// either way `dropped()` counts it. Each policy at exactly the capacity, one over it, far over it, and
+// with a capacity of one. `offer` puts a message in only where there is room, answering `Err(Full)`
+// otherwise, which is not a drop; `Err(Ended)` where the actor has ended, a tell to which is not a drop
+// either. An unbounded mailbox keeps every message, as it always has.
+import avin.actors.{ActorRef, Bounded, DropNewest, DropOldest, Mailbox, SendError, Unbounded, spawn}
+import avin.threads.{Future, Promise}
+import avin.time
+
+data Msg
+  Hold(started: Promise[unit], release: Future[unit])
+  Note(n: int)
+  Show(seen: Promise[string])
+  Quit
+
+actor Recorder receives Msg
+  val seen = Buffer[int]()
+  receive
+    Hold(started, release) ->
+      started.complete(())
+      release.await()
+    Note(n) -> seen.append(n)
+    Show(p) -> p.complete(s"$seen")
+    Quit -> stop()
+
+// Keeps `r` handling a message until the promise it gives back is completed, so what is told meanwhile
+// waits in its mailbox, which is empty when this returns.
+hold(r: ActorRef[Msg]) -> Promise[unit]
+  val started = Promise[unit]()
+  val release = Promise[unit]()
+  r.tell(Hold(started, release.future))
+  started.future.await()
+  release
+
+// What `r` has handled, once it has handled everything sent before.
+show(r: ActorRef[Msg]) -> string
+  val p = Promise[string]()
+  _ = r.send(Show(p))
+  p.future.await()
+
+said(r: Result[unit, SendError]) -> string = r match
+  Ok(()) -> "ok"
+  Err(e) -> s"${e.message}"
+
+// Tells `n` notes to a held actor of `mailbox`, then lets it go.
+fill(label: string, mailbox: Mailbox, n: int)
+  val r = spawn(Recorder(), mailbox = mailbox)
+  val release = hold(r)
+  for i in 1 .. n do r.tell(Note(i))
+  val dropped = r.dropped()
+  release.complete(())
+  println(s"$label, told $n: ${show(r)}, dropped $dropped")
+
+main()
+  fill("newest 3", Bounded(3, DropNewest), 0)
+  fill("newest 3", Bounded(3, DropNewest), 3)
+  fill("newest 3", Bounded(3, DropNewest), 4)
+  fill("newest 3", Bounded(3, DropNewest), 10)
+  fill("newest 1", Bounded(1, DropNewest), 1)
+  fill("newest 1", Bounded(1, DropNewest), 2)
+  fill("newest 1", Bounded(1, DropNewest), 5)
+  fill("oldest 3", Bounded(3, DropOldest), 3)
+  fill("oldest 3", Bounded(3, DropOldest), 4)
+  fill("oldest 3", Bounded(3, DropOldest), 10)
+  fill("oldest 1", Bounded(1, DropOldest), 1)
+  fill("oldest 1", Bounded(1, DropOldest), 2)
+  fill("oldest 1", Bounded(1, DropOldest), 5)
+  // Far over the capacity, the dropped messages are swept out of the mailbox as they pile up.
+  fill("oldest 2", Bounded(2, DropOldest), 1000)
+  fill("unbounded", Unbounded, 5)
+
+  // `offer`: room, then none. A refused offer is not a drop, and leaves the message out.
+  val r = spawn(Recorder(), mailbox = Bounded(2, DropNewest))
+  val release = hold(r)
+  println(said(r.offer(Note(1))))
+  println(said(r.offer(Note(2))))
+  println(said(r.offer(Note(3))))
+  println(r.dropped())
+  release.complete(())
+  println(show(r))
+  // Room again once the actor has taken its messages.
+  println(said(r.offer(Note(4))))
+  println(show(r))
+
+  // An unbounded mailbox is never full.
+  val u = spawn(Recorder())
+  val held = hold(u)
+  var ok = 0
+  for i in 1 .. 1000
+    if u.offer(Note(i)) is Ok(_) then ok += 1
+  held.complete(())
+  println(s"unbounded offers $ok, dropped ${u.dropped()}")
+
+  // An ended actor: `offer` and `send` answer `Ended`, and a tell is dropped without counting.
+  val e = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  e.tell(Quit)
+  e.ended().await()
+  println(said(e.offer(Note(1))))
+  println(said(e.send(Note(1))))
+  println(said(e.send(Note(1), time.seconds(1))))
+  e.tell(Note(1))
+  println(e.dropped())

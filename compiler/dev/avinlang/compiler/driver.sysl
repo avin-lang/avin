@@ -29,17 +29,31 @@ struct Toolchain
      * program (see `build_cache`), or "" on a machine with no cache directory, where each program
      * keeps its own `.avin/build` beside it. */
     builds: string
+    /** The machine the toolchain builds for, a name from `machine_targets` (`aarch64-macos`): the
+     * compiler's own by default. Every entry the toolchain keeps in the cache, and every archive it
+     * looks for beside the runtime, carries it in its name and its key, so builds for two machines in
+     * one cache never find each other's objects. */
+    target: string
 
     library_dir(self) -> string = self.root + "/library"
     /** This toolchain with the programs' builds kept under `builds`. */
-    building_in(self, builds: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, builds)
+    building_in(self, builds: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, builds, self.target)
+    /** This toolchain building for the machine `target`. */
+    for_target(self, target: string) -> Toolchain = Toolchain(self.root, self.cache, self.clang, self.sysl, self.pkg_config, self.builds, target)
     prelude_path(self) -> string = self.root + "/library/avin/prelude.avin"
     runtime_dir(self) -> string = self.root + "/runtime"
-    /** The runtime's archive as a release ships it, built from the runtime's sources whose key is
-     * `key`. */
-    prebuilt_runtime(self, key: string) -> string = self.root + "/lib/libavinrt-" + key + ".a"
-    /** Where runtime archives built from the runtime's sources are kept, by key. */
+    /** The runtime's archive as a release ships it for the toolchain's target, built from the
+     * runtime's sources whose key is `key`: `lib/<target>/libavinrt-<target>-<key>.a`, so a prefix
+     * shipping archives for two targets holds both. */
+    prebuilt_runtime(self, key: string) -> string = self.root + "/lib/" + self.target + "/" + runtime_archive_name(self.target, key)
+    /** Where runtime archives built from the runtime's sources are kept, by target and key. */
     runtime_cache(self) -> string = self.cache + "/runtime"
+    /** The runtime archive built from the sources whose key is `key`, in `runtime_cache`. */
+    runtime_archive(self, key: string) -> string = self.runtime_cache() + "/" + runtime_archive_name(self.target, key)
+    /** The path of the cache entry `key` with extension `ext` in `dir` (one of the cache's kinds'
+     * directories), named after the toolchain's target: `<dir>/<target>-<key><ext>`. The target is in
+     * the name, which `avin cache info` reads, and the entries' keys carry it too. */
+    entry_in(self, dir: string, key: string, ext: string) -> string = dir + "/" + self.target + "-" + key + ext
     /** Where the archives of the runtime with a program's binding shims are kept, by key. */
     shim_cache(self) -> string = self.cache + "/shims"
     /** Where the objects of programs' C units are kept, by key. */
@@ -59,7 +73,7 @@ toolchain_at(root: string) -> Option[Toolchain]
 /** A toolchain rooted at `root` that builds into `cache`, programs' builds in its `build`, if `root`
  * holds the library and the runtime. */
 toolchain_in(root: string, cache: string) -> Option[Toolchain]
-    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config", cache + "/build")
+    val tc = Toolchain(root, cache, "clang", "sysl", "pkg-config", cache + "/build", host_target())
     if exists(tc.prelude_path()) && is_dir(tc.runtime_dir()) then Some(tc) else None
 
 /** Why the standard library of `tc` is not the one this compiler was built with, or `None` when it
@@ -228,10 +242,26 @@ private collect_files(root: string, rel: string, module_name: string, dependency
             collect_files(root, child, inner, dependency, skip, modules, root_files)?
         elif is_source_name(name)
             if dependency && rel == "" then continue
+            // Every file is kept whichever machine it is read on; `files_on` takes a machine's.
+            file_machine(name).map_err(message -> s"$full: $message")?
             val text = read_text(full).map_err(e -> s"$full: ${e.to_string()}")?
             val file = ProgramFile(source_of(full, text), Some(module_name), dependency, buf(), "")
             if rel == "" then root_files.push(file) else modules.push(file)
     Ok(())
+
+/** The files of `files` read on the machine `target`: each with no condition symbol in its name, and
+ * each whose symbol holds there. */
+files_on(files: Buf[ProgramFile], target: string) -> Buf[ProgramFile]
+    var out: Buf[ProgramFile] = buf()
+    for f in files
+        if file_read_on(f.src.name, target) then out.push(f)
+    out
+
+/** Whether any of `files` is read only on some machines. */
+any_machine_file(files: Buf[ProgramFile]) -> bool
+    for f in files
+        if file_machine(f.src.name).unwrap_or("") != "" then return true
+    false
 
 /** Compiles a program of one file to LLVM IR against the toolchain's library. */
 compile(tc: Toolchain, src: Source) -> Compilation = compile_files(tc, single_file(src))
@@ -339,14 +369,15 @@ struct LibraryFile
     path: string
     module_name: string
 
-/** Every file of the standard library in the directory `library`, unread, in the order the library's
- * modules are compiled in: the order of their paths, as `library_files` finds them. */
-library_index(library: string) -> Result[Buf[LibraryFile], string]
+/** Every file of the standard library in the directory `library` read on the machine `target` (the
+ * compiler's own where it is ""), unread, in the order the library's modules are compiled in: the
+ * order of their paths, as `library_files` finds them. */
+library_index(library: string, target: string = "") -> Result[Buf[LibraryFile], string]
     var out: Buf[LibraryFile] = buf()
-    index_files(library, "", "", &out)?
+    index_files(library, "", "", if target == "" then host_target() else target, &out)?
     Ok(out)
 
-private index_files(root: string, rel: string, module_name: string, out: *Buf[LibraryFile]) -> Result[unit, string]
+private index_files(root: string, rel: string, module_name: string, target: string, out: *Buf[LibraryFile]) -> Result[unit, string]
     val dir = if rel == "" then root else root + "/" + rel
     var names = entries(dir).map_err(e -> s"$dir: ${e.to_string()}")?
     sort(names.view_mut())
@@ -357,9 +388,10 @@ private index_files(root: string, rel: string, module_name: string, out: *Buf[Li
         if is_dir(full)
             if exists(full + "/" + ManifestName) then continue
             if rel == "" && name == "tests" then continue
-            index_files(root, child, qualified(module_name, name), out)?
+            index_files(root, child, qualified(module_name, name), target, out)?
         elif is_source_name(name) && rel != ""
-            out.push(LibraryFile(full, module_name))
+            file_machine(name).map_err(message -> s"$full: $message")?
+            if file_read_on(name, target) then out.push(LibraryFile(full, module_name))
     Ok(())
 
 /** The units of a compilation, each parsed and placed in its module: the standard library's that it
@@ -377,9 +409,10 @@ struct LoadedUnits
  * of the library is read, as when a file of the library is itself the one analyzed. `held` gives each
  * file's source as it is to be read, which an editor's text may stand in for. An import of a module
  * under `avin` the library does not have is an error at the import; with the whole library read, as
- * for a completion whose import is half written, the check reports such an import itself. */
-load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: Source -> Source) -> Result[LoadedUnits, string]
-    val index = library_index(library)?
+ * for a completion whose import is half written, the check reports such an import itself. The library's
+ * files are those read on the machine `target`, the compiler's own where it is "". */
+load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: Source -> Source, target: string = "") -> Result[LoadedUnits, string]
+    val index = library_index(library, target)?
     var modules: Map[string, bool] = map()
     for f in index
         modules.put(f.module_name, true)
@@ -426,11 +459,16 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
     val library_units = units.len()
     for u in program
         units.push(u)
+    var program_modules: Map[string, bool] = map()
+    for j in 0..<files.len()
+        if files[j].module_name is Some(m) then program_modules.put(m, true)
     for k in 0..<units.len()
         var report = units[k].report
         var said: Buf[string] = buf()
         for i in units[k].file.imports
             if whole_library then break
+            // An import a fence refuses is told about by the fence alone.
+            if k >= library_units && fenced_any(files[k - library_units].fences, i.path, program_modules) then continue
             if k >= library_units && package_module_meant(i.path, units) is Some(message)
                 if refuse_import_once(&report, &said, i, message) then broken = true
             elif missing_library_module(i.path, modules, units) is Some(message)
@@ -440,7 +478,8 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
                     if refuse_import_once(&report, &said, i, message) then broken = true
         units[k].report = report
     // An import a feature's gate does not allow is refused whichever features are on, so a module that
-    // is off is told about by name rather than as missing.
+    // is off is told about by name rather than as missing; so is an import of a module that is not on
+    // every machine the file is read on, whichever machine this build is for.
     for j in 0..<files.len()
         val fences = files[j].fences
         if fences.len() == 0 then continue
@@ -449,11 +488,25 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
         var said: Buf[string] = buf()
         for i in units[k].file.imports
             for fence in fences
-                if i.path == fence.prefix || i.path.starts_with(fence.prefix + ".")
+                if fenced(fence, i.path, program_modules)
                     if refuse_import_once(&report, &said, i, fence.message) then broken = true
                     break
         units[k].report = report
     Ok(LoadedUnits(units, library_units, root_module, broken))
+
+// Whether any of `fences` refuses an import of `path`.
+private fenced_any(fences: Buf[Fence], path: string, program_modules: Map[string, bool]) -> bool
+    for fence in fences
+        if fenced(fence, path, program_modules) then return true
+    false
+
+// Whether `fence` refuses an import of `path`: of its module or one under it, or for a fence of one
+// module alone, of that module or a declaration of it, a module of the program by that path being
+// another module.
+private fenced(fence: Fence, path: string, program_modules: Map[string, bool]) -> bool
+    if path == fence.prefix then return true
+    if !fence.exact then return path.starts_with(fence.prefix + ".")
+    enclosing_module(path) == fence.prefix && program_modules.get(path) is None
 
 // Refuses the import `i` with `message`, once for the declaration it is part of: the names of
 // `import a.b.{c, d}` are one import each and share the path written, `said` holding each declaration
@@ -534,7 +587,7 @@ private missing_library_module(path: string, modules: Map[string, bool], units: 
     val under = modules_under(modules, deepest)
     // A module with no modules under it is told about by the check: it declares no such name.
     if under == "" then return None
-    Some(s"the standard library has no module `$missing`; the modules under `$deepest` are $under")
+    Some(s"the standard library has no module `$missing`; the modules under `$deepest` are $under; if the program was written for a later Avin than this one ($Version), upgrade Avin, and let its package say which it needs with `avin = \"…\"` in its `package` block")
 
 // An import whose first name is no module of the program but is one of the standard library's under
 // `avin`, as `import fs` for `avin.fs`: the import it means, written out. None where the program
@@ -626,11 +679,16 @@ private lower_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Bu
         tests.push(TestEntry(t.name, src.name, src.locate(f.decl.name_span.start).line, t.module_name, t.should_trap, t.ignore, t.timeout, hook_name(program, t.setup), hook_name(program, t.teardown), hook_name(program, t.setup_all), hook_name(program, t.teardown_all)))
     var began = phase_start()
     val c_unit = ensure_c_unit_of(tc, c_parts(program, files, loaded.library), c, program.sources)?
+    // The C sources the program's packages ship, linked before the libraries' flags, which may need
+    // what they define.
+    val c_sources = ensure_c_sources(tc, c)?
     began = phase_done("cunit", began)
     program.c_measures = c_unit.measures
     program.c_values = c_unit.values
     var c_link: Buf[string] = buf()
     if c_unit.object is Some(o) then c_link.push(o)
+    for o in c_sources.objects
+        c_link.push(o)
     for flag in c_unit.link
         c_link.push(flag)
     val store = if caching then read_instance_store(incremental_directory()) else instance_store_at("")
@@ -666,11 +724,48 @@ private struct FrontEnd
     units: Buf[SourceUnit]
     program: TProgram
 
+/** What checking a program for one machine reported, unrendered: the units whose reports hold its
+ * diagnostics, and what can only be said as text (a file that cannot be read, the C unit's errors). */
+struct MachineReport
+    units: Buf[SourceUnit]
+    text: string
+
+    /** Whether it reported nothing wrong. */
+    clean(self) -> bool
+        if self.text != "" then return false
+        for u in self.units
+            if u.report.has_errors() then return false
+        true
+
+    /** Every diagnostic, rendered against its own source, then the text. */
+    render(self) -> string
+        var out = ""
+        for u in self.units
+            if u.report.has_errors() then out = out + u.report.render(u.src)
+        out + self.text
+end MachineReport
+
+/** A program through checking for the machine `target`, with the standard library's files read there,
+ * as `check_only` checks it for the machine the compiler runs on. The C unit is built only for that
+ * machine: checking for another reads and type-checks, and needs no other machine's tools. */
+check_for(tc: Toolchain, files: Buf[ProgramFile], testing: bool, c: Buf[CLibrary], target: string) -> MachineReport
+    val front = check_units_for(tc, files, testing, target) match
+        Ok(f) -> f
+        Err(r) -> return r
+    if target != host_target() then return MachineReport(buf(), "")
+    ensure_c_unit_of(tc, c_parts(front.program, files, front.loaded.library), c, front.program.sources) match
+        Ok(_) -> MachineReport(buf(), "")
+        Err(diagnostics) -> MachineReport(buf(), diagnostics)
+
 // A program loaded, checked, and with the tests of its dependencies and of the core library taken
 // out, since they are theirs.
-private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[FrontEnd, string]
+private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Result[FrontEnd, string] = check_units_for(tc, files, testing, "").map_err(r -> r.render())
+
+// A program checked as `check_units` checks it, with the standard library's files read on the machine
+// `target` (the compiler's own where it is ""), and what is wrong with it unrendered.
+private check_units_for(tc: Toolchain, files: Buf[ProgramFile], testing: bool, target: string) -> Result[FrontEnd, MachineReport]
     var began = phase_start()
-    val loaded = load_units(tc.library_dir(), files, false, src -> src).map_err(message -> s"avin: $message\n")?
+    val loaded = load_units(tc.library_dir(), files, false, src -> src, target).map_err(message -> MachineReport(buf(), s"avin: $message\n"))?
     val units = loaded.units
     val modules = units.len()
     began = phase_done("load", began, s"modules=$modules")
@@ -678,14 +773,10 @@ private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Re
     // A file with syntax errors is not checked: its tree is a recovery, and checking it would
     // report the recovery rather than the program. A file in the wrong module is not checked either,
     // since every name it declares would be reported in a module it does not mean.
-    if loaded.broken
-        var diagnostics = ""
-        for u in units
-            if u.report.has_errors() then diagnostics = diagnostics + u.report.render(u.src)
-        return Err(diagnostics)
+    if loaded.broken then return Err(MachineReport(units, ""))
     val checked = check_program(units, root_module, testing)
     _ = phase_done("check", began, s"modules=$modules")
-    if checked.has_errors() then return Err(checked.render())
+    if checked.has_errors() then return Err(MachineReport(checked.units, ""))
     checked.program match
         Some(checked_program) ->
             var program = checked_program
@@ -695,7 +786,7 @@ private check_units(tc: Toolchain, files: Buf[ProgramFile], testing: bool) -> Re
                 if unit >= loaded.library && !files[unit - loaded.library].dependency then own.push(t)
             program.tests = own
             Ok(FrontEnd(loaded, checked.units, program))
-        None -> Err("avin: checking produced no program\n")
+        None -> Err(MachineReport(buf(), "avin: checking produced no program\n"))
 
 private c_parts(program: TProgram, files: Buf[ProgramFile], library: usize) -> CUnitParts
     CUnitParts(c_unit_bindings(program, files, library), c_unit_handles(program, files, library), c_unit_enums(program, files, library), c_unit_constants(program, files, library), c_unit_structs(program, files, library), c_unit_values(program, files, library))
@@ -747,7 +838,7 @@ ensure_runtime(tc: Toolchain) -> Result[string, string]
     val key = runtime_key(tc)
     val shipped = tc.prebuilt_runtime(key)
     if exists(shipped) then return Ok(shipped)
-    val archive = tc.runtime_cache() + "/libavinrt-" + key + ".a"
+    val archive = tc.runtime_archive(key)
     // Found, it is touched, so a sweep of the cache sees it in use.
     if touch_entry(archive) then return Ok(archive)
     make_dir_all(tc.runtime_cache()).map_err(e -> s"${tc.runtime_cache()}: ${e.to_string()}")?
@@ -760,8 +851,13 @@ ensure_runtime(tc: Toolchain) -> Result[string, string]
     publish_file(pending, archive).map_err(e -> e.to_string())?
     Ok(archive)
 
-/** The key a runtime archive is named by: the compiler's version and the runtime's sources. */
-runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + runtime_fingerprint(tc))
+/** The key a runtime archive is named by: the compiler's version, the target and the runtime's
+ * sources. */
+runtime_key(tc: Toolchain) -> string = content_key("avin " + Version + "\n" + tc.target + "\n" + runtime_fingerprint(tc))
+
+/** The file name of the runtime archive for `target` built from the sources whose key is `key`, in
+ * the cache and in a release: `libavinrt-<target>-<key>.a`. */
+runtime_archive_name(target: string, key: string) -> string = "libavinrt-" + target + "-" + key + ".a"
 
 /** Links LLVM IR with the runtime into an executable at `output`: with `shims`, the runtime with a
  * program's binding shims, when there is one, together with the C libraries its Sysl packages need,
@@ -806,7 +902,7 @@ link(tc: Toolchain, llvm: string, shims: Option[string], output: string, optimiz
     parts match
         Some(texts) ->
             began = phase_done("split", began, s"units=${texts.len()}")
-            val compiled = compile_units(tc.clang, texts, dir, optimization, if keep_units then tc.unit_cache() else "")?
+            val compiled = compile_units(tc.clang, texts, dir, optimization, if keep_units then tc.unit_cache() else "", tc.target)?
             for o in compiled.objects
                 args.push(o)
                 if o.starts_with(tc.cache + "/") then cached.push(o)

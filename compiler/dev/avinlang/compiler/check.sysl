@@ -589,6 +589,36 @@ struct TraitMethod
     target: &Type
     extension: bool
 
+/** One name a member export presents, or one wildcard export, of a class (`class_id`) or of a data
+ * type an impl of it exports from (`data_id`): `x.name` on a value of the type is `x.via.member`.
+ * `via` is a field, by its index among the class's fields or the one variant's (`field`), or a method
+ * of no parameter list (`method`); `via_type` is what it holds, in the type's own parameters. One that
+ * failed its checks where it is declared is kept, `valid` false, and never followed. */
+struct Forward
+    unit: usize
+    class_id: Option[usize]
+    data_id: Option[usize]
+    decl: MemberExport
+    /** The place of the name in `decl.names`; `None` for the wildcard. */
+    item: Option[usize]
+    field: Option[usize]
+    method: Option[usize]
+    via_type: &Type
+    valid: bool
+
+/** A method a class has because export `forward` implements trait method `implements` with it. */
+struct Forwarder
+    symbol: usize
+    forward: usize
+    implements: usize
+
+/** What a member name finds among a type's exports: nothing, the export a use goes through, or a
+ * mistake already reported. */
+enum ForwardFound
+    NoForward
+    Through(forward: usize)
+    ForwardRefused
+
 /** An unknown type argument of a call, open until a later use settles it: where it was made, and
  * what to report if nothing does. One the call's result names only where a value is read out
  * (`R` in `Left(1)`, an `Either[int, R]`) is `Nothing` if nothing settles it, as `None` alone is an
@@ -808,6 +838,10 @@ struct Checker
     /** The inference variables of type arguments bounded by a type parameter, `J` for `[J: I]`, each
      * with the type the call gives that parameter: see `lower_bound`. */
     capped: Buf[CappedVar]
+    /** The member exports of every class and data type: see `Forward`. */
+    forwards: Buf[Forward]
+    /** The methods exports by name implement traits' methods with: see `forward_trait_methods`. */
+    forwarders: Buf[Forwarder]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1233,7 +1267,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf(), buf(), buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -1281,6 +1315,10 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     for _ in c.classes
         linked.push(false)
     break_trait_cycles(&c)
+    // Member exports are checked once every field and method is declared, and implement the traits'
+    // methods they name before methods are linked.
+    declare_forwards(&c)
+    forward_trait_methods(&c)
     for id in 0..<c.classes.len()
         link_methods(&c, id, &linked)
     place_traits(&c)
@@ -2114,6 +2152,8 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _, _) -> ()
+            // Where an export may stand in an impl is decided once the impl's type is known.
+            ExportMember(_) -> ()
     // An impl without `for` adds methods to the tuples or the functions its type matches, as one adds
     // to any other type built from its parameters: `impl[A, B] (A, B)`, `impl[A, B] (A) -> B`. The
     // tuple and function types are the core library's, so written elsewhere it is an extension.
@@ -2704,9 +2744,9 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
         return
     // So are the arithmetic and orderings of every built-in type: only a data type, a class or a trait
     // has methods of those names, and an impl for every type would reach the built-in ones.
-    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
         if *target is TypeVar(_, _, _) then c.note(unit, f.name_span, s"`${f.name}` names a method only of a data type, a class or a trait, and an impl for every type would redefine the built-in types' operator")
-        else c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+        else c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     var same_name: Buf[usize] = buf()
     // Two impls of a trait for one instance are an overlap, reported as one once every conformance
@@ -3824,6 +3864,7 @@ private declare_fields(c: *Checker, unit: usize)
                         if f.mutable then c.note(unit, f.span, s"`${f.name}` has no value, so it is a trait's `val`, which is never assigned through the trait; write `val ${f.name}`, or give the `var` a value")
                         elif !f.public then c.note(unit, f.span, s"`${f.name}` is declared in a trait, so it cannot be private")
                     StatementMember(s) -> c.note(unit, s.span, "a trait has no constructor, so its body declares only methods")
+                    ExportMember(x) -> c.note(unit, x.span, "a trait holds no value to export members of; a class conforming to it may, and an export it names implements the trait's method of that name")
                     _ -> ()
         else
             for m in d.members
@@ -5041,8 +5082,8 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
                 break
     // A built-in type's arithmetic and orderings are the machine's, which no method replaces, in a
     // trait's implementation either.
-    if arithmetic_method_name(f.name) && !(*target is Data(_, _, _))
-        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _))
+        c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
     if trait_id is Some(t)
@@ -9688,7 +9729,10 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
         Logic(_, a, b) ->
             out.push(a)
             out.push(b)
-        Compare(operands, _) -> push_all(&out, operands)
+        Compare(operands, _, methods) ->
+            push_all(&out, operands)
+            for m in methods
+                if m is Some(link) then out.push(link.call)
         If(condition, yes, no) ->
             out.push(condition)
             out.push(yes)
@@ -12281,6 +12325,7 @@ private check_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
             FieldMember(f) -> c.note(unit, f.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
             AbstractFieldMember(f) -> c.note(unit, f.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
             StatementMember(s) -> c.note(unit, s.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
+            ExportMember(x) -> c.note(unit, x.span, "a Sysl handle holds its Sysl value and nothing else, so its body declares only methods")
             MethodMember(f, _, _, static_member) ->
                 if f.name == "close" then c.note(unit, f.name_span, "every Sysl handle has `close()`, which gives back its Sysl value; bind the Sysl type's own `close` under another name, with `@sysl(\"close\")`")
                 val bodyless = f.body is None && f.clauses.len() == 0
@@ -12599,6 +12644,7 @@ private check_c_handle_declaration(c: *Checker, unit: usize, d: &ClassDecl)
             FieldMember(f) -> c.note(unit, f.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
             AbstractFieldMember(f) -> c.note(unit, f.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
             StatementMember(s) -> c.note(unit, s.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
+            ExportMember(x) -> c.note(unit, x.span, "a C handle holds its C pointer and nothing else, so its body declares only methods")
             MethodMember(f, _, _, static_member) ->
                 if f.name == "close" then c.note(unit, f.name_span, "every C handle has `close()`, which gives its object back through `release:`; bind a C function of that name under another")
                 val bodyless = f.body is None && f.clauses.len() == 0
@@ -12660,6 +12706,7 @@ private check_c_value_declaration(c: *Checker, unit: usize, d: &ClassDecl)
             FieldMember(f) -> c.note(unit, f.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
             AbstractFieldMember(f) -> c.note(unit, f.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
             StatementMember(s) -> c.note(unit, s.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
+            ExportMember(x) -> c.note(unit, x.span, "an opaque value holds its C value and nothing else, so its body declares only methods")
             MethodMember(f, _, _, static_member) ->
                 val bodyless = f.body is None && f.clauses.len() == 0
                 if bodyless && static_member then c.note(unit, f.name_span, s"`${f.name}` is static, so it needs a body: an opaque value's methods without one are C bindings")
@@ -13715,8 +13762,16 @@ private check_function(c: *Checker, id: usize)
         for i in 0..<symbol.params.len()
             subjects.push(TExpr(symbol.decl.name_span, symbol.params[i], Param(i)))
         val mark = c.unknowns.len()
+        // The method an export implements a trait's method with reports what went wrong in it as one
+        // mismatch, at the export.
+        val forwarding = forwarder_of(c, id)
+        val muted_before = c.muted_notes
+        if forwarding is Some(_) then c.muted += 1
         if symbol.constructor then check_constructor(c, id, None)
         else check_definition(c, id, subjects)
+        if forwarding is Some(w)
+            c.muted -= 1
+            if c.muted_notes > muted_before then report_forwarder_mismatch(c, w)
         // The body is over, so what its uses did not settle cannot be inferred.
         settle_unknowns(c, mark)
         c.derived_context = outer_derived
@@ -14022,6 +14077,7 @@ private construct(c: *Checker, k: usize, upto: Option[usize])
                 made.items.push(t)
             AbstractFieldMember(_) -> ()
             MethodMember(_, _, _, _) -> ()
+            ExportMember(_) -> ()
     if upto is Some(_)
         made.body = c.body
         c.constructions[k] = Some(made)
@@ -15656,7 +15712,7 @@ private abstract_constructor(c: *Checker, id: usize, at: Span) -> bool
     if !symbol.constructor then return false
     val k = symbol.owner_class.unwrap()
     if is_array_class(c.classes[k])
-        c.note(unit_of(c), at, "an array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or `Array.empty()`")
+        c.note(unit_of(c), at, "an array is made by calling it with its elements, `Array(a, b)`, or with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or `Array.empty()`; its name alone is not a function")
         return true
     if handle_target(c.classes[k].decl) is Some(target)
         c.note(unit_of(c), at, s"`${c.classes[k].name}` is a handle on the Sysl type `$target`, so only a Sysl binding that returns one makes it")
@@ -15828,6 +15884,8 @@ private member_of(c: *Checker, e: &Expr, given: &TExpr, name: string, expected: 
     *ty match
         Data(id, _, args) ->
             val d = c.data[id]
+            if !one_variant_field(c, ty, name)
+                if forward_read(c, e.span, value, name, expected) is Some(read) then return read
             if d.variants.len() > 1
                 // Only a name some variant has as a field is one that `match` would reach.
                 var a_field = false
@@ -15979,8 +16037,726 @@ private class_member_value(c: *Checker, at: Span, object: &TExpr, k: usize, name
     if ms.len() > 1 then return overloaded_method_value(c, at, object, name, ms, None, expected)
     if method_named(c, k, name) is Some(m) then return member_method_value(c, at, object, m, None, expected)
     if ms.len() == 1 then return member_method_value(c, at, object, ms[0], None, expected)
+    if forward_read(c, at, object, name, expected) is Some(read) then return read
     c.note(unit_of(c), at, s"`${cls.name}` has no member `$name`")
     TExpr(at, ErrorType, UnitConst)
+
+// ---- member exports ----
+//
+// `export f.m` in a type's body presents a member of what `f` holds as the type's own: a use of `m`
+// that the type's own members do not answer is the use of `x.f.m`, written for the checker with `x`
+// already checked, so it is checked as that code is, overloads, defaults, named arguments, generic
+// instances and diagnostics included. Only a trait's method a named export implements is a method
+// of the type's own, written by `forward_trait_methods`.
+
+/** The member exports a class (`k`) or a data type (`id`) declares itself, by their place in
+ * `c.forwards`. */
+private own_forwards(c: *Checker, k: Option[usize], id: Option[usize]) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for i in 0..<c.forwards.len()
+        val f = c.forwards[i]
+        if k is Some(x)
+            if f.class_id == Some(x) then out.push(i)
+        elif id is Some(x)
+            if f.data_id == Some(x) then out.push(i)
+    out
+
+/** The name a member export presents: its alias or the member's own name; empty for a wildcard. */
+forward_binding(c: *Checker, f: usize) -> string = c.forwards[f].item match
+    Some(j) -> c.forwards[f].decl.names[j].binding
+    None -> ""
+
+/** Whether export `f` names the member `name` of what it reads; a wildcard names every one. */
+forward_presents_member(c: *Checker, f: usize, name: string) -> bool = c.forwards[f].item match
+    Some(j) -> c.forwards[f].decl.names[j].name == name
+    None -> true
+
+/** The name of the member a use of export `f` under `name` reaches. */
+private forward_member(c: *Checker, f: usize, name: string) -> string = c.forwards[f].item match
+    Some(j) -> c.forwards[f].decl.names[j].name
+    None -> name
+
+/** The name of the type an export belongs to. */
+private forward_owner_name(c: *Checker, f: usize) -> string
+    if c.forwards[f].class_id is Some(k) then return c.classes[k].name
+    if c.forwards[f].data_id is Some(id) then return c.data[id].name
+    ""
+
+/** How a wildcard export is written, for a diagnostic: `export items.*`. */
+private forward_written(c: *Checker, f: usize) -> string
+    val d = c.forwards[f].decl
+    if c.forwards[f].item is Some(j) then return s"export ${d.via}.${d.names[j].name}"
+    s"export ${d.via}.*"
+
+/** The levels of exports a value of type `t` has, nearest first: a class's own, then each
+ * ancestor's; a data type's. */
+private forward_levels(c: *Checker, t: &Type) -> Buf[Buf[usize]]
+    var out: Buf[Buf[usize]] = buf()
+    if c.forwards.len() == 0 then return out
+    *t match
+        Class(k, _, _) ->
+            var id = k
+            var steps = 0usize
+            loop
+                out.push(own_forwards(c, Some(id), None))
+                steps += 1
+                if steps > c.classes.len() then break
+                val sup = c.classes[id].superclass match
+                    Some(s) -> s
+                    None -> break
+                id = *sup match
+                    Class(s, _, _) -> s
+                    _ -> break
+        Data(id, _, _) -> out.push(own_forwards(c, None, Some(id)))
+        _ -> ()
+    out
+
+/** Whether a value of type `t` has a public member `name` of its own, or through a public export of
+ * its type: what an export may present. A field, a method that is not static, a trait's `val`; never
+ * `equals` or `hash`, which every value has. `depth` stops a round of wildcard exports. */
+private forward_provides(c: *Checker, t: &Type, name: string, depth: usize) -> bool
+    if depth > c.classes.len() + c.data.len() + 1 then return false
+    if name == "equals" || name == "hash" then return false
+    val known = zonk(c, t)
+    *known match
+        Class(k, _, _) ->
+            for f in c.classes[k].fields
+                if f.name == name && f.public then return true
+            if trait_field_named(c, k, name) is Some(_) then return true
+        Data(id, _, _) ->
+            if c.data[id].variants.len() == 1
+                for n in c.data[id].variants[0].field_names
+                    if n == name then return true
+        _ -> ()
+    for m in methods_of(c, known, name)
+        val s = c.symbols[m]
+        if s.public && !s.static_member && !is_universal(c, m) then return true
+    find_forward(c, known, name, depth + 1, None) is Through(_)
+
+/** The export a use of `name` on a value of type `t` goes through, where the type's own members do
+ * not answer it: an export naming it, nearest level first, then the one wildcard at that level whose
+ * member type has it. Where `at` is given, a mistake is reported there: two wildcards reaching the
+ * name, or a private export used outside its type. Without it, only public exports are followed. */
+private find_forward(c: *Checker, t: &Type, name: string, depth: usize, at: Option[Span]) -> ForwardFound
+    if depth > c.classes.len() + c.data.len() + 1 then return NoForward
+    for level in forward_levels(c, zonk(c, t))
+        for f in level
+            if c.forwards[f].valid && c.forwards[f].item is Some(_) && forward_binding(c, f) == name then return forward_admitted(c, f, name, at)
+        var wild: Buf[usize] = buf()
+        for f in level
+            if c.forwards[f].valid && c.forwards[f].item is None
+                if at is None && !c.forwards[f].decl.public then continue
+                if forward_provides(c, c.forwards[f].via_type, name, depth + 1) then wild.push(f)
+        if wild.len() == 1 then return forward_admitted(c, wild[0], name, at)
+        if wild.len() > 1
+            if at is Some(span) then c.note(unit_of(c), span, s"`$name` is reached through two exports of `${forward_owner_name(c, wild[0])}`, `${forward_written(c, wild[0])}` and `${forward_written(c, wild[1])}`; export it by name from the one meant, as in `export ${c.forwards[wild[0]].decl.via}.$name`")
+            return ForwardRefused
+    NoForward
+
+/** Export `f`, where the code being checked may use it: a public one anywhere, a private one in its
+ * own type's code. */
+private forward_admitted(c: *Checker, f: usize, name: string, at: Option[Span]) -> ForwardFound
+    val fw = c.forwards[f]
+    if fw.decl.public then return Through(f)
+    val span = at match
+        Some(s) -> s
+        None -> return NoForward
+    var inside = false
+    if fw.class_id is Some(k) then inside = inside_class(c, k)
+    if fw.data_id is Some(id) then inside = inside_impl(c, own_type(c.data[id], id))
+    if inside then return Through(f)
+    c.note(unit_of(c), span, s"`$name` is exported privately by `${forward_owner_name(c, f)}`, so only its own code uses it")
+    ForwardRefused
+
+/** What export `f` reads from `object`: its field, or the call of its method of no parameter list.
+ * The field is read whatever its privacy: the export is what the type presents. */
+private forward_via(c: *Checker, at: Span, object: &TExpr, f: usize) -> &TExpr
+    val fw = c.forwards[f]
+    if fw.field is Some(i)
+        return *zonk(c, object.ty) match
+            Class(k, _, _) -> field_read(c, at, at, object, k, i, is_self(c, object))
+            Data(_, _, _) -> data_field_read(c, at, object, i)
+            _ -> TExpr(at, ErrorType, UnitConst)
+    if fw.method is Some(m) then return method_call(c, at, at, object, m, buf(), None, None, false, buf())
+    TExpr(at, ErrorType, UnitConst)
+
+/** `object.via`, checked, as an expression the use of an export is written on. */
+private forward_target(c: *Checker, at: Span, object: &TExpr, f: usize) -> &Expr = checked_slot(c, forward_via(c, at, object, f))
+
+/** `object.name` read through an export of `object`'s type, or `None` where none presents `name`. */
+private forward_read(c: *Checker, at: Span, object: &TExpr, name: string, expected: Option[&Type]) -> Option[&TExpr]
+    find_forward(c, object.ty, name, 0, Some(at)) match
+        NoForward -> None
+        ForwardRefused -> Some(TExpr(at, ErrorType, UnitConst))
+        Through(f) -> Some(check_expr(c, Expr(at, Member(forward_target(c, at, object, f), forward_member(c, f, name))), expected))
+
+/** Whether `a op b` on a value of type `t` calls an operator method an export presents. */
+private forwards_operator(c: *Checker, t: &Type, name: string) -> bool
+    if methods_of(c, t, name).len() > 0 then return false
+    find_forward(c, t, name, 0, None) is Through(_)
+
+/** The type export `f` holds as a value of type `t` sees it: with the type arguments of `t` where `f`
+ * is its own type's, as declared where it is an ancestor's. */
+forward_via_type(c: *Checker, f: usize, t: &Type) -> &Type
+    val fw = c.forwards[f]
+    *zonk(c, t) match
+        Class(k, _, args) -> if fw.class_id == Some(k) then substitute(fw.via_type, class_owner(k), args) else fw.via_type
+        Data(id, _, args) -> if fw.data_id == Some(id) then substitute(fw.via_type, data_owner(id), args) else fw.via_type
+        _ -> fw.via_type
+
+/** The exports a value of type `t` has, nearest level first, that the code being checked may use. */
+visible_forwards(c: *Checker, t: &Type) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for level in forward_levels(c, zonk(c, t))
+        for f in level
+            if !c.forwards[f].valid then continue
+            if c.forwards[f].decl.public then out.push(f)
+            else
+                var inside = false
+                if c.forwards[f].class_id is Some(k) then inside = inside_class(c, k)
+                if c.forwards[f].data_id is Some(id) then inside = inside_impl(c, own_type(c.data[id], id))
+                if inside then out.push(f)
+    out
+
+/** Whether export `f` presents `name`: by name, or as a wildcard whose member type has it. */
+forward_presents(c: *Checker, f: usize, name: string) -> bool
+    if c.forwards[f].item is Some(_) then return forward_binding(c, f) == name
+    forward_provides(c, c.forwards[f].via_type, name, 1)
+
+// Every member export, once every field and method is declared: what each reads, what it names, and
+// the names it presents, checked where it is written. One that fails is kept but never followed, so a
+// use of its name is reported as a missing member rather than again.
+private declare_forwards(c: *Checker)
+    for k in 0..<c.classes.len()
+        val d = c.classes[k].decl
+        // A trait, a handle and an opaque value refuse an export where their bodies are checked.
+        if is_trait(c, k) || annotated_sysl_or_c(d) then continue
+        for m in d.members
+            if m is ExportMember(x) then add_forwards(c, c.classes[k].unit, Some(k), None, x)
+    for i in 0..<c.impls.len()
+        val block = c.impls[i]
+        // An impl made from a template has the template's body, whose export is reported there.
+        if block.decl.derived is Some(_) then continue
+        for m in block.decl.members
+            if m is ExportMember(x)
+                val data_id: Option[usize] = *block.target match
+                    Data(id, _, _) -> if c.data[id].module_name == block.module_name then Some(id) else None
+                    _ -> None
+                if block.decl.template then c.note(block.unit, x.span, "a derive template writes the methods each deriving type gets; an export goes in a type's own body, or in a plain `impl` of a data type")
+                elif block.decl.trait_name is Some(_) then c.note(block.unit, x.span, "an export goes in a type's own body, or in a plain `impl` of a data type, not in an impl of a trait; one it names there implements the trait's method of that name")
+                elif data_id is Some(id) then add_forwards(c, block.unit, None, Some(id), x)
+                elif *block.target is Class(_, _, _) then c.note(block.unit, x.span, "a class declares its exports in its own body")
+                else c.note(block.unit, x.span, "an export in an impl presents members on a data type the impl's module declares")
+    val count = c.forwards.len()
+    if count == 0 then return
+    refuse_forward_cycles(c)
+    for f in 0..<count
+        if c.forwards[f].valid && c.forwards[f].item is Some(_) then check_forward_name(c, f)
+    for f in 0..<count
+        if c.forwards[f].valid && c.forwards[f].item is Some(_) then check_forward_clash(c, f)
+    refuse_shadowed_forwards(c)
+    index_forwards(c)
+
+/** Whether a class is a handle or an opaque value, marked `@sysl` or `@c`. */
+private annotated_sysl_or_c(d: &ClassDecl) -> bool
+    if d.object then return false
+    for a in d.annotations
+        if a.name == "sysl" || a.name == "c" then return true
+    false
+
+/** Adds the exports one `export` line writes: one for each name, and one for a wildcard. */
+private add_forwards(c: *Checker, unit: usize, class_id: Option[usize], data_id: Option[usize], x: MemberExport)
+    val via = if class_id is Some(k) then class_forward_via(c, unit, k, x) else data_forward_via(c, unit, data_id.unwrap(), x)
+    val (field, method, ty, valid) = via match
+        Some((f, m, t)) -> (f, m, t, true)
+        None -> (None, None, ErrorType, false)
+    for j in 0..<x.names.len()
+        c.forwards.push(Forward(unit, class_id, data_id, x, Some(j), field, method, ty, valid))
+    if x.wildcard then c.forwards.push(Forward(unit, class_id, data_id, x, None, field, method, ty, valid))
+
+/** What an export of class `k` reads: a field, its own or a public one it inherits, or a method of no
+ * parameter list; with the type it holds, in the class's own parameters. Either's type is declared,
+ * since the members the export presents are part of the class's surface, known before any body is
+ * checked. */
+private class_forward_via(c: *Checker, unit: usize, k: usize, x: MemberExport) -> Option[(Option[usize], Option[usize], &Type)]
+    val cls = c.classes[k]
+    var i = cls.fields.len()
+    while i > 0
+        i -= 1
+        val f = cls.fields[i]
+        if f.name != x.via then continue
+        if f.owner != k && !f.public
+            c.note(unit, x.via_span, s"`${x.via}` is private to `${c.classes[f.owner].name}`, so `${cls.name}` cannot export members of it")
+            return None
+        if f.ty is None
+            c.note(unit, x.via_span, s"the type of `${x.via}` is needed to export members of it; declare it, as in `val ${x.via}: Vector[int] = …`")
+            return None
+        return Some((Some(i), None, field_type(c, k, i, x.via_span)))
+    val m = any_method_named(c, k, x.via) match
+        Some(m) -> m
+        None ->
+            c.note(unit, x.via_span, s"`${cls.name}` has no field or method `${x.via}` to export members of")
+            return None
+    method_forward_via(c, unit, x, m, Some(k), own_class_type(cls, k))
+
+/** What an export of a data type reads: a field of its one variant, or a method of no parameter list
+ * an impl of it declares. */
+private data_forward_via(c: *Checker, unit: usize, id: usize, x: MemberExport) -> Option[(Option[usize], Option[usize], &Type)]
+    val d = c.data[id]
+    if d.variants.len() == 1
+        val names = d.variants[0].field_names
+        for i in 0..<names.len()
+            if names[i] == x.via then return Some((Some(i), None, d.variants[0].fields[i]))
+    for m in d.methods
+        if c.symbols[m].decl.name == x.via then return method_forward_via(c, unit, x, m, None, own_type(d, id))
+    val why = if d.variants.len() > 1 then s"; `${d.name}` has several variants, so it has no field every value holds" else ""
+    c.note(unit, x.via_span, s"`${d.name}` has no field or method `${x.via}` to export members of$why")
+    None
+
+// An export reading method `m`: one of no parameter list, not static, visible to the type, with its
+// result type declared.
+private method_forward_via(c: *Checker, unit: usize, x: MemberExport, m: usize, k: Option[usize], self_type: &Type) -> Option[(Option[usize], Option[usize], &Type)]
+    val s = c.symbols[m]
+    if !is_parameterless(c, m)
+        c.note(unit, x.via_span, s"`${x.via}` is a method with a parameter list; an export reads a field or a method of none, as in `export items.size`")
+        return None
+    if s.static_member
+        c.note(unit, x.via_span, s"`${x.via}` is static; an export reads a field or a method of a value")
+        return None
+    if k is Some(own)
+        if !s.public && s.owner_class != Some(own) && s.owner_class is Some(o)
+            if !is_trait(c, o)
+                c.note(unit, x.via_span, s"`${x.via}` is private to `${c.classes[o].name}`, so `${c.classes[own].name}` cannot export members of it")
+                return None
+    val result = s.result match
+        Some(r) -> r
+        None ->
+            c.note(unit, x.via_span, s"the result type of `${x.via}` is needed to export members of it; declare it, as in `${x.via} -> Vector[int]`")
+            return None
+    Some((None, Some(m), seen_from(c, self_type, m, result)))
+
+/** Whether a value of type `t` has a field `name`, of any privacy, or a trait's `val` of the name. */
+private has_own_field(c: *Checker, t: &Type, name: string) -> bool = *zonk(c, t) match
+    Class(k, _, _) -> class_field(c, k, name) is Some(_) || trait_field_named(c, k, name) is Some(_)
+    Data(_, _, _) -> one_variant_field(c, zonk(c, t), name)
+    _ -> false
+
+/** Whether a value of type `t` has a public member `name` of its own, not counting its exports. */
+private own_public_member(c: *Checker, t: &Type, name: string) -> bool
+    val known = zonk(c, t)
+    *known match
+        Class(k, _, _) ->
+            for f in c.classes[k].fields
+                if f.name == name && f.public then return true
+            if trait_field_named(c, k, name) is Some(_) then return true
+        Data(id, _, _) ->
+            if c.data[id].variants.len() == 1
+                for n in c.data[id].variants[0].field_names
+                    if n == name then return true
+        _ -> ()
+    for m in methods_of(c, known, name)
+        if c.symbols[m].public && !c.symbols[m].static_member then return true
+    false
+
+/** The export named `name` a value of type `t` has at its nearest level, written by name. */
+private named_forward(c: *Checker, t: &Type, name: string) -> Option[usize]
+    for level in forward_levels(c, zonk(c, t))
+        for f in level
+            if c.forwards[f].valid && c.forwards[f].item is Some(_) && forward_binding(c, f) == name then return Some(f)
+    None
+
+// Exports by name that lead round to one another without reaching a member: each is reported, and
+// none is followed.
+private refuse_forward_cycles(c: *Checker)
+    var cyclic: Buf[usize] = buf()
+    for f in 0..<c.forwards.len()
+        if !c.forwards[f].valid || c.forwards[f].item is None then continue
+        var path: Buf[usize] = buf()
+        path.push(f)
+        var current = f
+        var round = false
+        loop
+            val name = forward_member(c, current, "")
+            val ty = c.forwards[current].via_type
+            if own_public_member(c, ty, name) then break
+            val next = named_forward(c, ty, name) match
+                Some(n) -> n
+                None -> break
+            if next == f
+                round = true
+                break
+            if contains_id(path, next) then break
+            path.push(next)
+            current = next
+        if round
+            var steps: Buf[string] = buf()
+            for p in path
+                steps.push(s"`${forward_owner_name(c, p)}` exports `${forward_binding(c, p)}` from `${type_name(c.forwards[p].via_type)}`")
+            c.note(c.forwards[f].unit, c.forwards[f].decl.names[c.forwards[f].item.unwrap()].name_span, s"the exports of `${forward_binding(c, f)}` lead round without reaching a member: ${spoken_list(steps)}")
+            cyclic.push(f)
+    for f in cyclic
+        c.forwards[f].valid = false
+
+// An export by name presents a public member of what it reads, never `equals` or `hash`.
+private check_forward_name(c: *Checker, f: usize)
+    val fw = c.forwards[f]
+    val item = fw.decl.names[fw.item.unwrap()]
+    if item.name == "equals" || item.name == "hash"
+        c.note(fw.unit, item.name_span, s"every value has its own `${item.name}`, so `${item.name}` is not exported")
+        c.forwards[f].valid = false
+        return
+    if *zonk(c, fw.via_type) is ErrorType
+        c.forwards[f].valid = false
+        return
+    if forward_provides(c, fw.via_type, item.name, 0) then return
+    c.note(fw.unit, item.name_span, s"`${type_name(fw.via_type)}` has no public member `${item.name}` to export")
+    c.forwards[f].valid = false
+
+// A name an export presents is new to its type: not a member the type declares or inherits from a
+// superclass, nor a name another export of the type presents. A trait's method is the exception: an
+// export of its name implements it, and so is public.
+private check_forward_clash(c: *Checker, f: usize)
+    val fw = c.forwards[f]
+    val item = fw.decl.names[fw.item.unwrap()]
+    val name = item.binding
+    val at = item.binding_span
+    for g in 0..<f
+        if c.forwards[g].valid && c.forwards[g].item is Some(_) && c.forwards[g].class_id == fw.class_id && c.forwards[g].data_id == fw.data_id && forward_binding(c, g) == name
+            c.note(fw.unit, at, s"`$name` is exported twice by `${forward_owner_name(c, f)}`, by `${forward_written(c, g)}` and by `${forward_written(c, f)}`")
+            c.forwards[f].valid = false
+            return
+    if fw.data_id is Some(id)
+        val d = c.data[id]
+        if d.variants.len() == 1
+            for n in d.variants[0].field_names
+                if n == name
+                    c.note(fw.unit, at, s"`${d.name}` has a field `$name` of its own, so it does not export one")
+                    c.forwards[f].valid = false
+                    return
+        for m in d.methods
+            if c.symbols[m].decl.name == name
+                c.note(fw.unit, at, s"`${d.name}` declares `$name` itself, so it does not export one")
+                c.forwards[f].valid = false
+                return
+        return
+    val k = fw.class_id.unwrap()
+    val cls = c.classes[k]
+    for fld in cls.fields
+        if fld.name == name
+            val whose = if fld.owner == k then s"`${cls.name}` has a field `$name` of its own" else s"`$name` is a field `${cls.name}` inherits from `${c.classes[fld.owner].name}`"
+            c.note(fw.unit, at, s"$whose, so it does not export one")
+            c.forwards[f].valid = false
+            return
+    if own_method(c, k, name) is Some(_)
+        c.note(fw.unit, at, s"`${cls.name}` declares `$name` itself, so it does not export one; a wildcard export leaves the type's own members to it, and an export by name presents a member it does not have")
+        c.forwards[f].valid = false
+        return
+    for s in ancestors(c, k)
+        if own_method(c, s, name) is Some(_)
+            c.note(fw.unit, at, s"`$name` is already a method of `${c.classes[s].name}`, which `${cls.name}` extends, so it does not export one")
+            c.forwards[f].valid = false
+            return
+        if inherited_forward(c, s, name) is Some(g)
+            c.note(fw.unit, at, s"`$name` is already exported by `${c.classes[s].name}`, which `${cls.name}` extends, with `${forward_written(c, g)}`")
+            c.forwards[f].valid = false
+            return
+    if !fw.decl.public && trait_method(c, k, name) is Some(tm)
+        val owner = c.classes[c.symbols[tm].owner_class.unwrap()].name
+        c.note(fw.unit, at, s"`$name` implements `$owner`'s method, which is public, so it is not exported privately")
+        c.forwards[f].valid = false
+
+// A subclass's own member named like an export its superclass presents by name is an error at the
+// member: a use through the superclass would reach the export, and one through the subclass the
+// member.
+private refuse_shadowed_forwards(c: *Checker)
+    for k in 0..<c.classes.len()
+        val cls = c.classes[k]
+        if cls.superclass is None then continue
+        var names: Buf[(string, Span)] = buf()
+        for fld in cls.fields
+            if fld.owner == k then names.push((fld.name, fld.span))
+        for m in cls.methods
+            names.push((c.symbols[m].decl.name, c.symbols[m].decl.name_span))
+        for (name, at) in names
+            for s in ancestors(c, k)
+                if inherited_forward(c, s, name) is Some(g)
+                    c.note(cls.unit, at, s"`$name` is exported by `${c.classes[s].name}`, which `${cls.name}` extends, with `${forward_written(c, g)}`; name this member something else")
+                    break
+
+/** The superclasses of class `k`, nearest first. */
+private ancestors(c: *Checker, k: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    var id = k
+    loop
+        if out.len() > c.classes.len() then break
+        val sup = c.classes[id].superclass match
+            Some(t) -> t
+            None -> break
+        id = *sup match
+            Class(s, _, _) -> s
+            _ -> break
+        out.push(id)
+    out
+
+/** The export of class `s` itself that presents `name` by name. */
+private inherited_forward(c: *Checker, s: usize, name: string) -> Option[usize]
+    for g in own_forwards(c, Some(s), None)
+        if c.forwards[g].valid && c.forwards[g].item is Some(_) && forward_binding(c, g) == name then return Some(g)
+    None
+
+// A public export by name of a class conforming to a trait implements the trait's method of that
+// name, which the class does not declare itself (an export of a name it declares is refused): a
+// method of the class with the trait's signature, whose body is the forwarded call
+// `self.via.member(params)`, standing where an `override` would. Its body is checked as any method's,
+// so a member that cannot be called so is reported at the export.
+private forward_trait_methods(c: *Checker)
+    val count = c.forwards.len()
+    for f in 0..<count
+        val fw = c.forwards[f]
+        if !fw.valid || !fw.decl.public then continue
+        val item = fw.item match
+            Some(j) -> fw.decl.names[j]
+            None -> continue
+        val k = fw.class_id match
+            Some(k) -> k
+            None -> continue
+        val name = item.binding
+        val self_type = own_class_type(c.classes[k], k)
+        var conformed: Buf[&Type] = buf()
+        collect_traits(c, self_type, &conformed)
+        var targets: Buf[usize] = buf()
+        for t in conformed
+            val tid = *t match
+                Class(tid, _, _) -> tid
+                _ -> continue
+            if is_constructor_trait(c, tid) then continue
+            for tm in c.classes[tid].methods
+                val s = c.symbols[tm]
+                if s.decl.name != name || s.static_member || is_trait_field(c, tm) || is_universal(c, tm) then continue
+                var seen = false
+                for o in targets
+                    if same_method(c, self_type, o, tm) then seen = true
+                if !seen then targets.push(tm)
+        for tm in targets
+            if c.symbols[tm].decl.type_params.len() > 0
+                c.note(fw.unit, item.binding_span, s"${forward_described(c, f)}, exported as `$name`, cannot implement `${shown_method(c, self_type, tm)}`: a trait's method with type parameters of its own is implemented by a method `${c.classes[k].name}` declares")
+                continue
+            val m = forwarder(c, f, k, tm, targets.len() > 1)
+            c.classes[k].methods.push(m)
+            c.classes[k].overriding.push(true)
+            c.forwarders.push(Forwarder(m, f, tm))
+
+/** The export `f` reads and names, with the member's signatures: ``c.label` (`Counter.label(string)
+ * -> string`)`. */
+private forward_described(c: *Checker, f: usize) -> string
+    val fw = c.forwards[f]
+    val member = forward_member(c, f, "")
+    val sigs = member_signatures(c, fw.via_type, member)
+    val shown = if sigs == "" then "" else s" ($sigs)"
+    s"`${fw.decl.via}.$member`$shown"
+
+/** How the members named `name` of a value of type `t` are declared, each overload's signature
+ * quoted, joined with "or". */
+private member_signatures(c: *Checker, t: &Type, name: string) -> string
+    val known = zonk(c, t)
+    var out: Buf[string] = buf()
+    *known match
+        Class(k, _, args) ->
+            for i in 0..<c.classes[k].fields.len()
+                val fld = c.classes[k].fields[i]
+                if fld.name == name && fld.public
+                    val ty = substitute(fld.ty.unwrap_or(ErrorType), class_owner(k), args)
+                    out.push(s"`${if fld.mutable then "var" else "val"} $name: ${type_name(ty)}`")
+        Data(id, _, args) ->
+            if c.data[id].variants.len() == 1
+                val names = c.data[id].variants[0].field_names
+                for i in 0..<names.len()
+                    if names[i] == name then out.push(s"`val $name: ${type_name(variant_fields(c.data[id], id, 0, args)[i])}`")
+        _ -> ()
+    for m in methods_of(c, known, name)
+        if c.symbols[m].public && !c.symbols[m].static_member then out.push(s"`${shown_method(c, known, m)}`")
+    spoken_or(out)
+
+/** Items joined for a sentence: `a`, `a or b`, `a, b or c`. */
+private spoken_or(items: Buf[string]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + (if i == items.len() - 1 then " or " else ", ")
+        out = out + items[i]
+    out
+
+/** Method `m` as a value of `self_type` sees it: `Counter.label(string) -> string`, `Sized.size ->
+ * int`, `Counter.convert[U]((int) -> U) -> U`. */
+private shown_method(c: *Checker, self_type: &Type, m: usize) -> string
+    val s = c.symbols[m]
+    var text = s.name
+    val own = s.decl.type_params
+    if own.len() > 0
+        text = text + "["
+        for j in 0..<own.len()
+            if j > 0 then text = text + ", "
+            text = text + own[j].name
+        text = text + "]"
+    if !s.decl.parameterless
+        text = text + "("
+        for i in 1..<s.params.len()
+            if i > 1 then text = text + ", "
+            text = text + type_name(seen_from(c, self_type, m, s.params[i]))
+        text = text + ")"
+    s.result match
+        Some(r) -> text + " -> " + type_name(seen_from(c, self_type, m, r))
+        None -> text
+
+/** The forwarder method `id` is, if it is one. */
+private forwarder_of(c: *Checker, id: usize) -> Option[Forwarder]
+    for w in c.forwarders
+        if w.symbol == id then return Some(w)
+    None
+
+// A forwarder whose body did not check is reported once, at its export, as the mismatch it is: the
+// member cannot be called with the trait method's parameters, or yields something else.
+private report_forwarder_mismatch(c: *Checker, w: Forwarder)
+    val fw = c.forwards[w.forward]
+    val item = fw.decl.names[fw.item.unwrap()]
+    val s = c.symbols[w.symbol]
+    val k = fw.class_id.unwrap()
+    val self_type = own_class_type(c.classes[k], k)
+    val trait_shown = trait_method_shown(c, w)
+    val what = s"${forward_described(c, w.forward)}, exported as `${item.binding}`, implements `$trait_shown` but"
+    val member = item.name
+    var wanted: Buf[&Type] = buf()
+    for i in 1..<s.params.len()
+        wanted.push(s.params[i])
+    val wanted_text = "(" + joined_types(wanted) + ")"
+    val ms = methods_of(c, fw.via_type, member)
+    if !s.decl.parameterless
+        if ms.len() == 0
+            c.note(fw.unit, item.binding_span, s"$what is not a method, so it takes no parameters $wanted_text")
+            return
+        if !takes_params(c, fw.via_type, ms, wanted)
+            c.note(fw.unit, item.binding_span, s"$what does not take its parameters, $wanted_text")
+            return
+    var got: &Type = ErrorType
+    if c.bodies[w.symbol] is Some(b) then got = zonk(c, b.ty)
+    val declared: &Type = s.result.unwrap_or(Unit)
+    val failed = *got is ErrorType
+    if !failed && !fits(c, got, declared)
+        c.note(fw.unit, item.binding_span, s"$what yields ${type_name(got)}, not ${type_name(declared)}")
+        return
+    // A generic member is judged by what it yields at the arguments alone, since the result the trait
+    // wants may have decided its type arguments into a call that does not check.
+    if s.decl.body is Some(body)
+        c.muted += 1
+        val alone = zonk(c, check_expr(c, body, None).ty)
+        c.muted -= 1
+        if !(*alone is ErrorType) && settled(alone) && !fits(c, alone, declared)
+            c.note(fw.unit, item.binding_span, s"$what yields ${type_name(alone)}, not ${type_name(declared)}")
+            return
+    c.note(fw.unit, item.binding_span, s"$what cannot be called as it is: with $wanted_text, yielding ${type_name(declared)}")
+
+/** The trait method a forwarder implements, as the class sees it. */
+private trait_method_shown(c: *Checker, w: Forwarder) -> string
+    val s = c.symbols[w.symbol]
+    var text = c.symbols[w.implements].name
+    if !s.decl.parameterless
+        var params: Buf[&Type] = buf()
+        for i in 1..<s.params.len()
+            params.push(s.params[i])
+        text = text + "(" + joined_types(params) + ")"
+    s.result match
+        Some(r) -> text + " -> " + type_name(r)
+        None -> text
+
+private joined_types(types: Buf[&Type]) -> string
+    var out = ""
+    for i in 0..<types.len()
+        if i > 0 then out = out + ", "
+        out = out + type_name(types[i])
+    out
+
+/** Whether one of methods `ms` of a value of type `t` takes arguments of types `wanted`: as many as it
+ * has parameters, fewer where the rest have defaults or are repeated, each fitting its parameter; a
+ * method with type parameters of its own is left to its call to judge. */
+private takes_params(c: *Checker, t: &Type, ms: Buf[usize], wanted: Buf[&Type]) -> bool
+    for m in ms
+        val s = c.symbols[m]
+        val total = s.params.len() - 1
+        var required = total
+        for i in 1..<s.defaults.len()
+            if s.defaults[i] is Some(_) && required > 0 then required -= 1
+        val variadic = s.decl.params.len() > 0 && s.decl.params[s.decl.params.len() - 1].variadic
+        if variadic && required > 0 then required -= 1
+        if wanted.len() < required || (wanted.len() > total && !variadic) then continue
+        if s.decl.type_params.len() > 0 then return true
+        var all = true
+        for i in 0..<wanted.len()
+            if i + 1 >= s.params.len() then break
+            if variadic && i + 2 == s.params.len() then break
+            if !fits(c, wanted[i], seen_from(c, t, m, s.params[i + 1])) then all = false
+        if all then return true
+    false
+
+/** The method of class `k` that export `f` implements trait method `tm` with; `several` where the
+ * export implements more than one method of the name, which its parameter types tell apart. */
+private forwarder(c: *Checker, f: usize, k: usize, tm: usize, several: bool) -> usize
+    val fw = c.forwards[f]
+    val item = fw.decl.names[fw.item.unwrap()]
+    val cls = c.classes[k]
+    val self_type = own_class_type(cls, k)
+    val base = c.symbols[tm]
+    val at = item.binding_span
+    var params: Buf[&Type] = buf()
+    params.push(self_type)
+    var names: Buf[string] = buf()
+    names.push("self")
+    var defaults: Buf[Option[usize]] = buf()
+    defaults.push(None)
+    var args: Buf[Argument] = buf()
+    var overload = "("
+    for i in 1..<base.params.len()
+        val ty = seen_from(c, self_type, tm, base.params[i])
+        params.push(ty)
+        names.push(base.param_names[i])
+        defaults.push(None)
+        if i > 1 then overload = overload + ", "
+        overload = overload + type_name(ty)
+        val read = Expr(at, Name(base.param_names[i]))
+        val variadic = i - 1 < base.decl.params.len() && base.decl.params[i - 1].variadic
+        args.push(Argument(at, None, if variadic then Expr(at, Splice(read)) else read, false))
+    val via = Expr(at, Member(Expr(at, Name("self")), fw.decl.via))
+    val member = Expr(at, Member(via, item.name))
+    val body = if base.decl.parameterless then member else Expr(at, Call(member, args))
+    val result: Option[&Type] = base.result match
+        Some(r) -> Some(seen_from(c, self_type, tm, r))
+        None -> None
+    val decl = Function(buf(), at, at, item.binding, buf(), buf(), None, Some(body), buf(), base.decl.parameterless)
+    val id = c.symbols.len()
+    c.symbols.push(FunctionSymbol(cls.unit, cls.module_name, cls.name + "." + item.binding, decl, params, names, result, None, None, buf(), buf(), buf(), false, false, false, defaults, None, class_owner(k), cls.decl.type_params, Some(k), false, true, if several then overload + ")" else "", None, false))
+    c.states.push(0)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    id
+
+// For an editor: the field or method each export reads, and the member each names.
+private index_forwards(c: *Checker)
+    if c.index is None then return
+    for f in 0..<c.forwards.len()
+        val fw = c.forwards[f]
+        if fw.method is Some(m) then index_function(c, fw.unit, fw.decl.via_span, m)
+        if fw.field is Some(i)
+            if fw.class_id is Some(k) then index_class_field(c, fw.unit, fw.decl.via_span, k, i)
+            if fw.data_id is Some(id) then index_data_field(c, fw.unit, fw.decl.via_span, id, i, fw.via_type)
+        if !fw.valid then continue
+        val j = fw.item match
+            Some(j) -> j
+            None -> continue
+        val item = fw.decl.names[j]
+        val ty = zonk(c, fw.via_type)
+        if *ty is Class(k, _, _)
+            for i in 0..<c.classes[k].fields.len()
+                if c.classes[k].fields[i].name == item.name && c.classes[k].fields[i].public then index_class_field(c, fw.unit, item.name_span, k, i)
+        val ms = methods_of(c, ty, item.name)
+        if ms.len() > 0 then index_function(c, fw.unit, item.name_span, ms[0])
 
 /** Whether `t` is a data type with one variant that has a field `name`. */
 private one_variant_field(c: *Checker, t: &Type, name: string) -> bool
@@ -16566,6 +17342,9 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
                 ErrorType -> return None
                 Nothing -> return None
                 Data(_, _, _) ->
+                    // A field an export presents is assigned where it is: in the object the export reads.
+                    if !one_variant_field(c, object.ty, n)
+                        if forwarded_place(c, target.span, object, n) is Some(place) then return place
                     c.note(unit, target.span, "a field of a data value cannot be assigned; data values are immutable")
                     return None
                 Tuple(_) ->
@@ -16581,7 +17360,10 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
         None ->
             if trait_field_named(c, k, name) is Some(m) then return trait_field_place(c, target, object, m, name, s"`${cls.name}`")
             elif method_named(c, k, name) is Some(_) then c.note(unit, target.span, s"`$name` is a method of `${cls.name}`, which cannot be assigned")
-            else c.note(unit, target.span, s"`${cls.name}` has no member `$name`")
+            else
+                if target.kind is Member(_, _)
+                    if forwarded_place(c, target.span, object, name) is Some(place) then return place
+                c.note(unit, target.span, s"`${cls.name}` has no member `$name`")
             return None
     val field = cls.fields[index]
     if !field_visible(c, field)
@@ -16601,6 +17383,14 @@ private field_place(c: *Checker, target: &Expr) -> Option[FieldPlace]
     if object.kind is Local(_) || object.kind is Param(_) then return Some(FieldPlace(None, object, index, ty, 0, None))
     val held = hidden_local(c, object.ty)
     Some(FieldPlace(Some(TExpr(object.span, Unit, Let(held, object))), TExpr(object.span, object.ty, Local(held)), index, ty, 0, None))
+
+// The field an assignment to `object.name` writes through an export of `object`'s type: `None` where
+// no export presents the name, and `Some` of what assigning `object.via.member` finds otherwise.
+private forwarded_place(c: *Checker, at: Span, object: &TExpr, name: string) -> Option[Option[FieldPlace]]
+    find_forward(c, object.ty, name, 0, Some(at)) match
+        NoForward -> None
+        ForwardRefused -> Some(None)
+        Through(f) -> Some(field_place(c, Expr(at, Member(forward_target(c, at, object, f), forward_member(c, f, name)))))
 
 private assign_field(c: *Checker, e: &Expr, target: &Expr, op: Option[BinaryOp], value: &Expr, yields: bool, op_span: Span) -> &TExpr
     val place = field_place(c, target) match
@@ -17287,9 +18077,10 @@ private reach_expr(c: *Checker, r: *LazyReach, f: usize, at: *SelfAt, e: &TExpr)
                 operands.push(a)
                 operands.push(b)
                 reach_operator(c, r, f, at, om.method, operands)
-        Compare(operands, ops) ->
+        Compare(operands, ops, methods) ->
+            // A link calling an operator method is reached through its call, among the children.
             for i in 0..<ops.len()
-                if compare_operator_method(ops[i]) is Some(om)
+                if methods[i] is None && compare_operator_method(ops[i]) is Some(om)
                     var pair: Buf[&TExpr] = buf()
                     pair.push(operands[i])
                     pair.push(operands[i + 1])
@@ -18198,10 +18989,10 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
         return integer_literal(c, e.span, spelling, true, expected)
     if op is Negate && operand.kind is RealLit(value, spelling) then return real_literal(c, e.span, value, spelling, true, expected)
     val x = refined_operand(c, check_expr(c, operand, expected))
-    // On a data type, a class or a type parameter with a method `-` taking no argument, `-a` calls it.
-    if op is Negate && has_operator_traits(zonk(c, x.ty)) && settled(zonk(c, x.ty))
-        val ms = methods_of(c, zonk(c, x.ty), "-")
-        if takes_no_argument(c, ms) then return call_method(c, e.span, e.span, x, "-", ms, buf(), None, wanted, false)
+    // On a data type, a class or a type parameter with a method `-`, `+` or `~` taking no argument,
+    // `-a`, `+a` or `~a` calls it.
+    val by_method = prefix_method_call(c, e.span, op, x, wanted)
+    if by_method is Some(call) then return call
     // Otherwise `-` is `Neg`'s `negate` there.
     if op is Negate && has_operator_traits(zonk(c, x.ty))
         if !operator_conforms(c, e.span, "-", zonk(c, x.ty), "Neg") then return TExpr(e.span, ErrorType, UnitConst)
@@ -18220,6 +19011,24 @@ private unary_expr(c: *Checker, e: &Expr, op: UnaryOp, operand: &Expr, wanted: O
         Negate -> TExpr(e.span, x.ty, Negate(x))
         Complement -> TExpr(e.span, x.ty, Complement(x))
         _ -> x
+
+// Why a built-in type cannot have a method named `name` taking `arity` arguments: its operators are
+// the machine's, and a prefix operator the type lacks belongs to no method either.
+private builtin_operator_message(name: string, arity: usize, target: &Type) -> string
+    if arithmetic_method_name(name) && !(arity == 0 && name == "+")
+        return s"`$name` is the language's operator on ${type_name(target)}, and no method can redefine it"
+    s"a prefix `$name` on ${type_name(target)} is the language's own, and no method can define it; only a data type, a class or a trait has a method `$name` taking no argument"
+
+// A prefix operator on a data type, a class or a type parameter with a method of its name taking no
+// argument is a call of that method, whatever it yields: `-a` is `a.-()`, `!a` is `a.!()`. Where the
+// type has none, `None`, and the operator keeps its own meaning.
+private prefix_method_call(c: *Checker, at: Span, op: UnaryOp, x: &TExpr, wanted: Option[&Type]) -> Option[&TExpr]
+    val known = zonk(c, x.ty)
+    if !has_operator_traits(known) || !settled(known) then return None
+    val name = unary_spelling(op)
+    val ms = methods_of(c, known, name)
+    if !takes_no_argument(c, ms) then return None
+    Some(call_method(c, at, at, x, name, ms, buf(), None, wanted, false))
 
 // The operand that is not a bare literal is checked first, so a literal on either side takes the
 // other operand's type: in `1 + x` with `x: i8`, the `1` is an `i8`.
@@ -18270,16 +19079,20 @@ private operator_method(c: *Checker, op: BinaryOp, t: &Type) -> bool
     val name = binary_spelling(op)
     if op is BitAnd || op is BitOr || op is BitXor || op is ShiftLeft || op is ShiftRight
         if *known is Int(_) || *known is Byte then return false
-        return methods_of(c, known, name).len() > 0
+        return methods_of(c, known, name).len() > 0 || forwards_operator(c, known, name)
     if !arithmetic_method_name(name) || !has_operator_traits(known) then return false
-    takes_one_argument(c, methods_of(c, known, name))
+    takes_one_argument(c, methods_of(c, known, name)) || forwards_operator(c, known, name)
 
 // `a | b` on a type with a method `|` is the call `a.|(b)`, as a symbol method's infix call is, and
-// `a + b` on a type with a method `+` is `a.+(b)`.
+// `a + b` on a type with a method `+` is `a.+(b)`. One an export presents is called as an infix call
+// of it is, on the member the export reads.
 private operator_method_call(c: *Checker, at: Span, op_span: Span, left: &Expr, receiver: &TExpr, name: string, right: &Expr, expected: Option[&Type]) -> &TExpr
     val ms = methods_of(c, receiver.ty, name)
     var args: Buf[Argument] = buf()
     args.push(Argument(right.span, None, right, false))
+    if ms.len() == 0 && forwards_operator(c, receiver.ty, name)
+        val target = checked_slot(c, receiver)
+        return member_call(c, at, Expr(at, Member(target, name)), op_span, target, name, args, None, expected, true)
     if !takes_one_argument(c, ms) then return infix_arity_error(c, at, op_span, left, name, ms, args)
     call_method(c, at, op_span, receiver, name, ms, args, None, expected, false)
 
@@ -18601,6 +19414,15 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
                 elif *y is Union(_) && settled(x) && fits(c, x, y) then typed[i] = inject(c, typed[i], y)
     // `===` between a reference and an `Any` or a type parameter's value compares both as `Any`s: a
     // reference is its own `Any`, and a value of another type is boxed, never the same object.
+    // A link whose left operand has a method of the link's operator calls it. Alone it is that call,
+    // yielding whatever the method yields; in a chain it must yield a `bool`.
+    var methods: Buf[Option[LinkMethod]] = buf()
+    for i in 0..<ops.len()
+        methods.push(None)
+        if ordering_op(ops[i]) && ordering_method(c, ops[i], settle_operand(c, typed[i], typed[i + 1]).ty)
+            val left = settle_operand(c, typed[i], typed[i + 1])
+            if ops.len() == 1 then return operator_method_call(c, e.span, e.span, checked_slot(c, left), left, compare_spelling(ops[0]), checked_slot(c, typed[1]), None)
+            methods[i] = Some(link_method(c, ops[i], left, typed[i + 1]))
     var linked = false
     if ops.len() == 1 && (ops[0] is Same || ops[0] is NotSame)
         val x = zonk(c, typed[0].ty)
@@ -18613,20 +19435,39 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
             linked = true
     if !linked
         for i in 0..<ops.len()
-            compare_link(c, ops[i], typed[i], typed[i + 1])
+            if methods[i] is None then compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
     for t in typed
         if *t.ty is Nothing then ty = Nothing
-    TExpr(e.span, ty, Compare(typed, ops))
+    TExpr(e.span, ty, Compare(typed, ops, methods))
 
 private ordering_op(op: CompareOp) -> bool = op is Less || op is LessEqual || op is Greater || op is GreaterEqual
+
+/** The link `left op right` of a chain as a call of `left`'s method `op`, on two unnamed locals the
+ * chain gives the operands' values to, so each is still evaluated once. The method chosen is the
+ * overload for this link's operands; it must yield a `bool`, since the chain's value is all its links
+ * holding. */
+private link_method(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr) -> LinkMethod
+    val spelling = compare_spelling(op)
+    val x = zonk(c, left.ty)
+    val y = zonk(c, right.ty)
+    val l = hidden_local(c, x)
+    val r = hidden_local(c, y)
+    val receiver = TExpr(left.span, x, Local(l))
+    val argument = TExpr(right.span, y, Local(r))
+    val at = left.span.to(right.span)
+    val call = operator_method_call(c, at, at, checked_slot(c, receiver), receiver, spelling, checked_slot(c, argument), None)
+    val yields = zonk(c, call.ty)
+    if !(*yields is Bool || *yields is ErrorType || *yields is Nothing)
+        c.note(unit_of(c), at, s"`$spelling` is a method of ${type_name(x)} yielding ${type_name(yields)}, and a link of a comparison chain must yield `bool`; join the comparisons with `&&`, or parenthesize one")
+    LinkMethod(l, r, call)
 
 /** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`: `op` is `<`, `<=`, `>` or
  * `>=`, and `t` is a data type, a class or a type parameter with a method of that name taking one
  * argument. Where it has none, the comparison is `Ord`'s. */
 private ordering_method(c: *Checker, op: CompareOp, t: &Type) -> bool
     val known = zonk(c, t)
-    settled(known) && has_operator_traits(known) && takes_one_argument(c, methods_of(c, known, compare_spelling(op)))
+    settled(known) && has_operator_traits(known) && (takes_one_argument(c, methods_of(c, known, compare_spelling(op))) || forwards_operator(c, known, compare_spelling(op)))
 
 private is_trait_type(c: *Checker, t: &Type) -> bool = *t match
     Class(id, _, _) -> is_trait(c, id)
@@ -18744,10 +19585,6 @@ private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
 // `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes and strings have them, and a type
 // parameter, a data type or a class through `Ord`.
 private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
-    // A method `<` is a call of its own, which may yield anything, and so is not a link of a chain.
-    if has_operator_traits(x) && takes_one_argument(c, methods_of(c, x, spelling))
-        c.note(unit_of(c), at, s"`$spelling` is a method of ${type_name(x)}, and a comparison by a method does not chain; join the comparisons with `&&`")
-        return
     // A use settles what is still unknown: `Some(1) < None` compares two `Option[int]`s.
     if !same_type(x, y)
         if !((has_unknowns(x) || has_unknowns(y)) && unify(c, x, y))
@@ -20667,13 +21504,16 @@ private applying_object(c: *Checker, name: string, ids: Buf[usize]) -> Option[us
     if object_applies(c, o).len() == 0 then return None
     Some(o)
 
-/** The constructors of `ids` a call can choose: a class that is abstract, a trait or an array is
- * not made by its name, and leaves the call to the companion's `apply`. */
+/** The constructors of `ids` a call can choose: a class that is abstract, a trait, an array or one
+ * that keeps fields its own code fills in (outside that code) is not made by its name, and leaves
+ * the call to the companion's `apply`. */
 private callable_constructors(c: *Checker, ids: Buf[usize]) -> Buf[usize]
     var out: Buf[usize] = buf()
     for id in ids
         val k = c.symbols[id].owner_class.unwrap()
-        if !is_array_class(c.classes[k]) && !is_abstract_class(c, k) then out.push(id)
+        if is_array_class(c.classes[k]) || is_abstract_class(c, k) then continue
+        if has_unset_field(c, k) && !inside_class(c, k) then continue
+        out.push(id)
     out
 
 /** For a data type's companion `o` named `name`, the type's variant of that name, made by a call. */
@@ -21860,6 +22700,21 @@ private member_call(c: *Checker, at: Span, callee: &Expr, name_span: Span, targe
             return TExpr(at, ErrorType, UnitConst)
         if infix && !takes_one_argument(c, ms) then return infix_arity_error(c, at, name_span, target, name, ms, args)
         return call_method(c, at, name_span, object, name, ms, args, explicit, expected, false)
+    // A name the type's exports present, and none of its own members has, is called on the member
+    // the export reads: `x.m(args)` is `x.via.m(args)`.
+    if !has_own_field(c, object.ty, name)
+        find_forward(c, object.ty, name, 0, Some(name_span)) match
+            Through(f) ->
+                val via = forward_target(c, at, object, f)
+                val member = forward_member(c, f, name)
+                val forwarded = Expr(callee.span, Member(via, member))
+                val written = if explicit is Some(types) then Expr(callee.span, TypeApply(forwarded, types)) else forwarded
+                return member_call(c, at, written, name_span, via, member, args, explicit, expected, infix)
+            ForwardRefused ->
+                for a in args
+                    check_ignored(c, a.value)
+                return TExpr(at, ErrorType, UnitConst)
+            NoForward -> ()
     // Every value has `Eq`'s `equals` and `Hash`'s `hash`, its own or by value or identity.
     if c.core.method_named(name) is Some(m)
         if is_universal(c, m) && !(*zonk(c, object.ty) is ErrorType)
@@ -24931,6 +25786,10 @@ private condition_parts(c: *Checker, e: &Expr) -> Condition
     if e.kind is Unary(op, operand)
         if op is Not
             val x = condition_parts(c, operand)
+            // On a type with a method `!` taking no argument, `!a` calls it, whatever it yields; a
+            // condition that is not a `bool` is reported where the condition is used.
+            val by_method = prefix_method_call(c, e.span, Not, x.expr, None)
+            if by_method is Some(call) then return Condition(call, buf(), buf())
             expect_bool(c, x.expr)
             return Condition(TExpr(e.span, if *x.expr.ty is Nothing then Nothing else Bool, Not(x.expr)), x.no, x.yes)
     Condition(check_expr(c, e, Some(Bool)), buf(), buf())
@@ -26558,6 +27417,7 @@ private check_class_initialization(c: *Checker, k: usize, unsafe: *Buf[bool], re
                 deferred.push(false)
             AbstractFieldMember(_) -> ()
             MethodMember(_, _, _, _) -> ()
+            ExportMember(_) -> ()
     if items.len() < count + 1 then return
     val start = items.len() - 1 - count
     val kind = if is_open(c, k) then cls.decl.modifier else ""
@@ -26712,7 +27572,11 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Logic(_, a, b) ->
             val ok = scan_init(c, s, a, unsafe)
             scan_init(c, s, b, unsafe) && ok
-        Compare(operands, _) -> scan_init_all(c, s, operands, unsafe)
+        Compare(operands, _, methods) ->
+            var ok = scan_init_all(c, s, operands, unsafe)
+            for m in methods
+                if m is Some(link) && !scan_init(c, s, link.call, unsafe) then ok = false
+            ok
         If(condition, yes, no) ->
             var ok = scan_init(c, s, condition, unsafe)
             if !scan_init(c, s, yes, unsafe) then ok = false
