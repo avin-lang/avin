@@ -4159,6 +4159,41 @@ spelling is better, as each entry says.
   fitted in a thread would overflow); no reuse (a map and an unmap per thread). Review with the
   user: the default is the knob most likely to want a different value once servers hold many
   thousands of threads.
+- Settled on the user's delegation 2026-11-19 (branch `lwt-stacks`): **a lightweight thread's stack
+  stays one fixed reservation, 8 MiB unless `spawn`'s `stack` asks otherwise and 64 KiB at the
+  least, and the runtime gives its pages back: the monitor trims a thread it has seen parked at two
+  ticks with no run between, down to 16 KiB below where it parked, and a stack kept for reuse is
+  trimmed to its top 16 KiB as its thread ends.** This settles the Open item on stack size and
+  growth. A worker marks a parked thread settled after it has switched away and lists it; the monitor
+  raises the thread's `trimming` mark and only then looks for it parked and settled, while a worker
+  about to run it marks it running and unsettled and only then waits for `trimming` to fall, so a
+  trim never overlaps the thread's next run. The release is `madvise(MADV_DONTNEED)` on Linux; on
+  macOS that advice leaves the pages resident, so the range is mapped afresh in place
+  (`MAP_FIXED`), which frees them at once (`runtime/avin/rt/__posix__/stack_release.c`). A release
+  the system refuses leaves the range as it was, mapped and committed (a failed `madvise` changes
+  nothing, and a fixed mapping the kernel cannot make puts the old one back), so the runtime only
+  counts it (`stack_releases_refused`) and the thread goes on untrimmed; nothing traps. The
+  overflow trap is untouched: the guard and the report's low end are the stack's own, and a trimmed
+  stack still overflows at its end with `stack overflow`. *Measured* (macOS, arm64, 16 KiB pages,
+  `-O2`, resident bytes per parked thread after its recursion returned): depth 0, 17 KB before and
+  after; depth 1,000, 66 KB before, 34 KB after; depth 10,000, 493 KB before, 34 KB after (1,000
+  threads: 470 MiB before, 32 MiB after). 100,000 shallow parked threads hold 1.6 GiB either way, a
+  page and a record each. Deepest recursion, main thread and spawned thread alike, unchanged: about
+  40,000 calls at `-O0` and 50,000 at `-O2` of a one-argument function. A two-thread rendezvous
+  ping-pong (two parks a round trip) and a start-and-join churn showed no slowdown beyond the
+  machine's noise (round trip 1.0–2.1 µs after against 1.8–2.9 µs before, interleaved runs). A
+  `madvise` of an 8 MiB stack costs about 20 µs on macOS whether or not its pages are resident, and
+  the fresh mapping about 0.3 µs, which is why the release is the mapping there and why it is done
+  by the monitor after a tick rather than at every park. *Alternatives*: trimming at every park (a
+  system call a park, a third or more of a rendezvous round trip); stamping each park with the clock
+  (a clock read a park, where a run count is two stores); copying or segmented stacks that grow
+  (refused: C frames and the native frames the collector's shadow stack points into cannot move,
+  and a segment boundary in a C call has nowhere to go); a soft guard page below where a thread
+  parked, unprotected by the fault handler when the thread goes deeper (refused: a system call
+  writing into that page first gets `EFAULT` instead of a fault); moving parked frames to the heap
+  (the same objection as copying). Review with the user: the 8 MiB default and the 16 KiB kept below
+  a parked thread, and the name `stack` of `spawn`'s size parameter, which the trimming makes less
+  pressing to change but which a server author may still want to set lower to bound address space.
 - Settled on the user's delegation 2026-11-06 (branch `lwt-scheduler`): **`main` stays on the program's first operating system thread
   and is not a worker; its waits block that thread.** Every wait has two forms: a lightweight thread
   parks, and any other thread (the main thread, a thread attached for a callback) sleeps on one
@@ -11638,8 +11673,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Lightweight threads, the open parts of the settled design above (cancellation is under
   [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
   lightweight thread on the main operating system thread only, which also gives the `ui` package
-  its change from another thread); **stack size and growth** (a fixed reservation first; parked
-  frames moved to the heap later). The allocation chunk belongs to the carrier (proposed above), so
+  its change from another thread). Stack size and growth are settled above (branch
+  `lwt-stacks`). The allocation chunk belongs to the carrier (proposed above), so
   thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
   and is walked as an attached thread's is, and switching stacks happens only at the runtime's own

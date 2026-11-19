@@ -68,6 +68,25 @@ struct Lwt
     all_next: *Lwt
     /** Whether the thread is ready, running, parked or ending, for the thread dump. */
     phase: Atomic[u32]
+    /** Where the thread's stack stood when it last parked: the pages below it hold nothing it can
+     * reach while it stays parked. Written by the thread before it switches away. */
+    park_top: *u8
+    /** 1 once the thread's worker has finished parking it, 0 from the moment a worker takes it to run
+     * again. */
+    settled: Atomic[u32]
+    /** How many times a worker has taken the thread to run, and that count when the monitor last saw
+     * the thread parked: a thread seen parked at two ticks with no run between has stayed parked for
+     * a tick. */
+    runs: Atomic[u64]
+    trim_seen: u64
+    /** 1 while the monitor gives back the pages below `park_top`; a worker waits it out before it
+     * runs the thread. */
+    trimming: Atomic[u32]
+    /** 1 while the thread is on the list of parked threads whose stacks the monitor trims, linked
+     * through `trim_prev` and `trim_next` under `trim_lock`. */
+    trim_listed: Atomic[u32]
+    trim_prev: *Lwt
+    trim_next: *Lwt
 
 @assert(offsetof(Lwt, context) == 0, "a lightweight thread's context is the start of its storage")
 @assert(offsetof(Lwt, run) == offsetof(Lwt, root) + sizeof(Frame), "a frame's slots follow its header")
@@ -346,6 +365,12 @@ private next_ready(k: *Carrier, ran: bool, ended: *Lwt) -> *Lwt
 private run_on(k: *Carrier, p: *Lwt) -> *Lwt
     p.context.carrier = k
     p.phase.store(PhaseRunning)
+    // The monitor trims a stack only while it sees the thread parked with its parking finished: once
+    // it is marked running and not parked, the monitor either has not begun, and will not, or is
+    // trimming now, and this waits until it has done.
+    p.settled.store(0)
+    p.runs.store(p.runs.load() + 1)
+    while p.trimming.load() != 0 do spin_hint()
     k.slice_start.store(now_micros())
     k.yield_wanted.store(0)
     k.busy.store(1)
@@ -359,6 +384,10 @@ private run_on(k: *Carrier, p: *Lwt) -> *Lwt
     val after = k.after
     k.after = AfterNothing
     if after == AfterPark
+        // Listed for the monitor to trim its stack before anything can wake it, so the thread cannot
+        // have ended, and its storage gone, by the time it is on the list.
+        p.settled.store(1)
+        if p.trim_listed.load() == 0 then list_for_trim(p)
         // A thread already cancelled when it parks in a cancellable wait is made ready at once, its
         // wait ended as cancelled, with no timer set. Otherwise its timer is set before anything can
         // end the wait: under the guard of what it waits on, and, in a cancellable wait, under the
@@ -373,6 +402,7 @@ private run_on(k: *Carrier, p: *Lwt) -> *Lwt
     elif after == AfterYield
         make_ready(p)
     elif after == AfterEnd
+        if p.trim_listed.load() != 0 then unlist_for_trim(p)
         give_stack(p)
         return p
     null
@@ -427,6 +457,7 @@ park_as(ctx: *Context, guard: *SleepLock, w: *Waiter, deadline: long, cancel: *W
     k.after_waiter = w
     k.after_deadline = deadline
     k.after_cancel = cancel
+    p.park_top = stack_here()
     fiber.switch(&p.fiber, &k.home)
     if cancel != null then disarm_cancel(p)
     mark_running(ctx)
@@ -789,20 +820,21 @@ private wake_monitor()
     timer_wake.notify_one()
     timer_lock.unlock_raw()
 
-// The monitor's life: it sleeps a tick while any worker is busy, until the next timer is due while
-// none is, or until woken while there is nothing to watch, and then fires the timers that are due and
-// looks over the workers.
+// The monitor's life: it sleeps a tick while any worker is busy or any parked thread's stack is still
+// to be trimmed, until the next timer is due while neither is, or until woken while there is nothing
+// to watch, and then fires the timers that are due, looks over the workers and trims stacks.
 private monitor_loop(started: *Atomic[u64]) -> unit
     loop
         timer_lock.lock_raw()
-        if any_busy()
+        if any_busy() || trims_listed.load() != 0
             _ = timer_wake.wait_for(&timer_lock, Tick * 1000)
         else
             // Resting, until the next timer or for good: a worker that becomes busy after this store
             // sees it and wakes the monitor, and one that became busy before it is seen by the check
             // after it, so a thread that starts computing while a far timer is pending is still sliced.
+            // A thread listed for its stack to be trimmed is seen the same way.
             monitor_resting.store(1)
-            if !any_busy()
+            if !any_busy() && trims_listed.load() == 0
                 val soonest = earliest()
                 if soonest > 0
                     val left = soonest - now_micros()
@@ -812,6 +844,7 @@ private monitor_loop(started: *Atomic[u64]) -> unit
         fire_timers(now_micros())
         timer_lock.unlock_raw()
         oversee(now_micros())
+        trim_parked()
 
 private any_busy() -> bool
     sched.lock_raw()
@@ -897,7 +930,12 @@ take_stack(size: usize) -> Option[&fiber.Stack]
 // Keeps the stack of `p`, a thread that has ended, for another, while there are few kept. A stack's
 // count is not atomic, so once one is kept its count changes only under `stack_lock`: every handle
 // to it is let go before the lock is.
+// Its pages are given back first, all but the top `TrimKeep` bytes, so a kept stack holds no more than
+// a fresh one soon will, whatever depth its last thread reached.
 private give_stack(p: *Lwt)
+    p.stack match
+        Some(s) -> release_stack(s.low(), s.high())
+        None -> ()
     stack_lock.lock()
     keep_stack(p)
     stack_lock.unlock()
@@ -908,3 +946,121 @@ private keep_stack(p: *Lwt)
         Some(s) -> if spare_stacks.len() < SpareStacks then spare_stacks.push(s)
         None -> ()
     p.stack = None
+
+// Trimming parked threads' stacks. A page of a thread's stack, once touched, stays committed, so a
+// thread that recursed deep and then parked would hold every page it reached for as long as it waits.
+// Its worker lists it as it parks; the monitor, at each tick, gives back the pages below where the
+// thread's stack stood when it parked, all but `TrimKeep` bytes of them, once it has seen the thread
+// parked at two ticks with no run between. A thread parked only briefly, as one handing values back
+// and forth parks, has run again by then: it is taken off the list untrimmed, and its parks cost its
+// worker two stores and a load each.
+//
+// A trim races only the thread's next run. The monitor raises `trimming` and then looks for the thread
+// parked, its parking finished; a worker about to run the thread marks it running and unsettled and
+// then waits for `trimming` to fall. Each looks at the other's mark after setting its own, so either the
+// monitor sees the thread about to run and leaves it, or the worker waits out the trim.
+
+/** How much of a stack below where it stood is kept committed, for the frames it makes next. */
+const TrimKeep: usize = 16384
+
+/** The most stacks the monitor trims at one tick, and the most listed threads it looks at. */
+private const TrimBatch: usize = 1024
+private const TrimScan: usize = 8192
+
+private var trim_lock: SleepLock = SleepLock.new()
+private var trim_head: *Lwt = null
+private var trim_tail: *Lwt = null
+/** How many threads are listed for trimming. */
+private var trims_listed: Atomic[u64] = Atomic(0)
+/** The stacks the monitor trims at a tick, taken off the list under `trim_lock` and trimmed after. */
+private var trim_batch: Buf[*Lwt] = buf()
+/** How many parked threads' stacks have been trimmed. */
+var stacks_trimmed: Atomic[u64] = Atomic(0)
+/** How many releases of a stack's pages the system refused: each left its pages committed, as they
+ * were, and the thread went on as an untrimmed one does. */
+var stack_releases_refused: Atomic[u64] = Atomic(0)
+/** For the runtime's own tests: 1 has every release of a stack's pages answer as refused without
+ * asking the system, so the path a refusal takes can be run. */
+var refuse_stack_releases: Atomic[u32] = Atomic(0)
+
+extern "avin_rt_stack_release" c_release_stack(low: *u8, top: *u8, keep: usize) -> i32
+extern "avin_rt_stack_here" stack_here() -> *u8
+
+// Gives back the pages of the stack from `low` to `TrimKeep` below `top`. A refusal is counted and
+// otherwise ignored: the pages stay committed, and trimming is only a saving.
+private release_stack(low: *u8, top: *u8)
+    val refused = if refuse_stack_releases.load() != 0 then true else c_release_stack(low, top, TrimKeep) != 0
+    if refused then _ = stack_releases_refused.add(1)
+
+// Puts `p`, parked and not listed, at the back of the list, and wakes the monitor if it rests.
+private list_for_trim(p: *Lwt)
+    trim_lock.lock()
+    append_trim(p)
+    p.trim_listed.store(1)
+    _ = trims_listed.add(1)
+    trim_lock.unlock()
+    if monitor_resting.load() != 0 then wake_monitor()
+
+// Takes `p` off the list, where it is still on it: a thread that ends is taken off before its storage
+// goes.
+private unlist_for_trim(p: *Lwt)
+    trim_lock.lock()
+    if p.trim_listed.load() != 0 then drop_trim(p)
+    trim_lock.unlock()
+
+// Under `trim_lock`: links `p` at the back.
+private append_trim(p: *Lwt)
+    p.trim_next = null
+    p.trim_prev = trim_tail
+    if trim_tail == null then trim_head = p else trim_tail.trim_next = p
+    trim_tail = p
+
+// Under `trim_lock`: unlinks `p`, which is listed.
+private unlink_trim(p: *Lwt)
+    if p.trim_prev == null then trim_head = p.trim_next else p.trim_prev.trim_next = p.trim_next
+    if p.trim_next == null then trim_tail = p.trim_prev else p.trim_next.trim_prev = p.trim_prev
+    p.trim_prev = null
+    p.trim_next = null
+
+// Under `trim_lock`: unlinks `p` and marks it not listed.
+private drop_trim(p: *Lwt)
+    unlink_trim(p)
+    p.trim_listed.store(0)
+    _ = trims_listed.sub(1)
+
+// By the monitor: trims the stacks of the listed threads that have stayed parked since it last looked
+// at them, oldest listed first. A listed thread that is not parked now has run since it was listed and
+// is taken off; one seen parked for the first time goes to the back, to be looked at again.
+private trim_parked()
+    if trims_listed.load() == 0 then return
+    trim_lock.lock()
+    var p = trim_head
+    var scanned: usize = 0
+    val n = trims_listed.load()
+    while p != null && scanned < TrimScan && scanned < n && trim_batch.len() < TrimBatch
+        val next = p.trim_next
+        scanned += 1
+        if p.phase.load() != PhaseParked || p.settled.load() == 0
+            drop_trim(p)
+        else
+            p.trimming.store(1)
+            val runs = p.runs.load()
+            if p.phase.load() != PhaseParked || p.settled.load() == 0
+                p.trimming.store(0)
+                drop_trim(p)
+            elif runs != p.trim_seen
+                p.trim_seen = runs
+                p.trimming.store(0)
+                unlink_trim(p)
+                append_trim(p)
+            else
+                drop_trim(p)
+                trim_batch.push(p)
+        p = next
+    trim_lock.unlock()
+    for i in 0..<trim_batch.len()
+        val q = trim_batch[i]
+        release_stack(q.low, q.park_top)
+        _ = stacks_trimmed.add(1)
+        q.trimming.store(0)
+    trim_batch.clear()

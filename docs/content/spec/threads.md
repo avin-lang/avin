@@ -156,6 +156,15 @@ ready. What a program can rely on:
   pages only as the thread first touches them, so a thread that has not recursed deeply costs a page
   or so of memory and a small record. A program may start a hundred thousand threads and join them
   all, and a deep recursion still fits in a thread as it does in `main`.
+- **A parked thread holds only the stack it is using.** A page of a stack stays committed once
+  touched, so the runtime gives pages back: a thread that has stayed parked for about a millisecond
+  (a tick of the runtime's monitor, with no run between) returns every page below where it parked
+  but the 16 KiB just under it, and the stack of an ended thread kept for the next returns all but
+  its top 16 KiB. A
+  thread that recursed a hundred thousand calls deep and then waits costs, while it waits, what a
+  shallow one does; woken, it recurses as deep again on pages committed afresh. A thread parked
+  only briefly, as one handing values back and forth parks, has run again before its tick and is
+  not trimmed, so a park costs nothing more.
 - **A wait parks only its thread.** A thread that waits for a lock, a condition, a channel, a join, a
   future or a promise is set aside, and its worker runs another ready thread meanwhile; the thread
   that ends the wait makes it ready again. Ready threads run in the order they became ready, and a
