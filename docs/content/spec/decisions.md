@@ -10819,6 +10819,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `-L` directory for counts as the system's, which on Linux leaves a distribution's `/usr/lib`
   libraries dynamic; and that the C libraries of a program's Sysl packages (`requires { pkg_config }`)
   are not covered.
+- Proposed 2026-11-18 (branch `contra-infer`): **inference holds an argument to its parameter by
+  each type argument's variance, and a type argument named at a contravariant argument is decided as
+  the type given there.** `take[T](b: Box[B, T])` for `Box[-I, +T]` accepts a `Box[A, int]` where
+  `B` is an `A` and takes `T` as `int`, as the non-generic `takeInt(b: Box[B, int])` always did; the
+  same holds for a function type's parameters (`(A) -> int` given for `(B) -> T`) and a constructor
+  parameter's contravariant hole. `feed[T](b: Box[T, int], x: T)` given a `Box[A, int]` takes `T` as
+  `A`, the largest type the box accepts, and a later argument must be an instance of it; an earlier
+  argument that widened `T` beyond it is an error. *Why*: the spec says constraints are subtype
+  constraints, and the checker unified a contravariant argument for equality, refusing calls the
+  same signature accepts without type parameters (it blocked the parsing library's `Rule[-I, +T]`).
+  *Alternatives weighed*: collecting upper bounds and solving to their meet, so two boxes of `A`s and
+  of `B`s given for one `Box[T, int]` in either order take `B` (more complete, but needs a meet the
+  checker has nowhere else; with the order as written the box of `B`s first is accepted today, the
+  other order is refused); deciding such a type argument from the other arguments only (would refuse
+  the probe above whenever `T` is named nowhere else). A type argument named at a contravariant
+  argument nested in another contravariant one is still held whole. **Review with the user**: whether
+  the meet is worth adding when a program meets the order-dependent case.
 
 ## Open
 
