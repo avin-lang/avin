@@ -472,6 +472,26 @@ The checker verifies each declared parameter's positions:
   arguments, and an `abstract class Box[+T]` adding `with(y: T) -> Box[T]` would let a `Box[Dog]`
   seen as a `Box[Animal]` make a `Box[Dog]` holding a cat. Such a method takes an element through a
   lower bound instead: `Vector[+T]` declares `:+[W >: T](element: W) -> Vector[W]`.
+- **Static members are not positions of a class or a `data` type, and neither is a conformance to a
+  trait whose members are all static** (with those of the traits it requires). A static member is
+  reached through a type, never through a value: on the type at the arguments the call names
+  (`Vector[Animal].newBuilder()`, its own instance), or through a bound at the type argument's own.
+  No value of such a trait exists (a trait with a static member is a bound and not a type), so
+  `abstract class Vector[+T]` may state `impl[T] Buildable[T] for Vector[T]` with
+  `static newBuilder() -> Builder[T, Vector[T]]`. That a `Vector[Cat]` is a `Vector[Animal]` lets
+  one do nothing through `Buildable`: a `Vector[Cat]` is a `Buildable[Cat]` and not a
+  `Buildable[Animal]`, so `build[Vector[Cat], Animal](dog)` is refused, and a bound `C:
+  Buildable[A]` calls `C`'s own impl at `C`'s own arguments.
+- **A bound whose type has a covariant or contravariant parameter does not reach the type's static
+  members**, nor its conformances to traits whose members are all static: an argument meeting
+  `U: Box[Animal]` may be a `Box[Cat]`, whose `make` takes cats, so `U.make(dog)` is an error, and
+  `U` is no `Make[Animal]`. Bound `U` by the trait declaring the member instead.
+- A trait keeps both as positions. A trait's own static member is a position of the trait's
+  parameters, since a type conforming to `Take[Cat]` conforms to `Take[Animal]` through the trait's
+  variance: `trait Take[+A]` with `static take(x: A) -> Self` is an error. A trait requiring a
+  trait whose members are all static keeps its arguments a position, and a conformance to a trait
+  with any member of a value (`static make(x: T) -> Self` beside `size() -> int`) is a position as
+  before.
 
 An error names the parameter, its variance and the position: a `+T` in the parameter `x` of `put`
 is reported as a covariant type parameter appearing in a contravariant position.
