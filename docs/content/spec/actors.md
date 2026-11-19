@@ -278,8 +278,9 @@ connection, and a large buffer filled by one actor goes to the next.
   Its elements must be sendable, since they are shared with the receiver as they are; an array of
   buffers is refused. Only an `Array` moves this way: a slice is a copy, so one taken before the
   move stays the sender's, and a `Buffer`, a map or any other mutable object moves inside an
-  `isolate`. An array never moved, which is every array most programs make, pays one load and one
-  compare per use for the check, and eight bytes.
+  `isolate`. An array never moved, which is every array most programs make, pays eight bytes of
+  header and no check beyond its bounds check: a move rewrites the length word so that every index
+  fails that check, and only then is the owner compared.
 
 The cheapest way across stays the plainest: build with a `Buffer` or a builder, turn the result into
 an immutable collection, and send that.

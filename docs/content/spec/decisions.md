@@ -11039,6 +11039,11 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `avin.actors`; it covers every `Array` of sendable elements, bytes or not, and nothing else. An
   array's header gains an owner word beside its length (eight bytes), zero for an array never moved,
   which any code that reaches it may use as before, since an array is still not sendable. A move
+  also rewrites the length word for good: its top bit set, the length in bits 32 to 62, the low 32
+  bits zero. So an element use of an array never moved checks exactly what it did before, the index
+  against the low 32 bits, and a moved array fails that check for every index and goes on, on a
+  path the optimizer is told is cold, to compare its owner; `length`, a slice, a clear and a copy
+  test the word's sign as they read it. A move
   gives it an owner no running code is, by one compare-and-set; `take` claims it for the taker, `with`
   for the code running `f` and moves it again after; every use by other code traps with
   `` `Array` was moved to another owner ``: an element read or write, `length`, `slice`, a copy into
@@ -11064,9 +11069,18 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   declare an array-holding class sendable with nothing checking the claim, which is a data race,
   not a gap closed. A compile-time refusal of the sender's later use was weighed too: it needs
   uniqueness or alias analysis the checker does not have, and the runtime check covers every
-  alias. **Review with the user**: the eight bytes and the one compare every array use now pays,
-  and whether `Buffer` should move the same way (its length is a field of its own, so it would need
-  its own owner).
+  alias. *The cost, measured on the build that settled it*: memory, a million live arrays of 0 to
+  100 bytes take 0 or 16 more bytes each, by whether the eight cross a 16-byte allocation class
+  (56→56 bytes at 0, 1 and 8 elements; 56→72 at 9 and 16; 72→88 at 32; 104→120 at 64; 152→152 at
+  100). Time, at -O2: a read loop over an array never moved compiles to the same ten instructions
+  as before; a write loop bounded by `a.length` keeps an element bounds check the optimizer used to
+  drop, plus a sign test, three predictable instructions an iteration. A first encoding that loaded
+  the owner word at every use was measured (preliminary, eleven interleaved runs, before the
+  benchmark was cut short) at 3% to 54% slower in tight loops, which is why the owner sits behind
+  the bounds check; the encoding that settled was checked in the generated code, not timed.
+  **Review with the user**: the remaining write-loop check and the memory above, and whether
+  `Buffer` should move the same way (its length is a field of its own, so it would need its own
+  owner).
 
 ## Open
 
