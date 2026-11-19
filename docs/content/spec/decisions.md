@@ -11030,6 +11030,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
+- Settled on the user's delegation 2026-11-19 (branch `bytes-sendable`; found by the ssh package on
+  `pty-forward`, whose relay could hand read buffers to per-connection threads only by copying each
+  into a `Vector[byte]`): **an array the program holds moves to another thread with
+  `Isolated.move(items)`, with no copy, and the array carries an owner that every use checks**
+  ([handing over ownership](/spec/actors/#handing-over-ownership)).
+  `move[T: Sendable](items: Array[T]) -> Isolated[Array[T]]`, on `Isolated`'s companion in
+  `avin.actors`; it covers every `Array` of sendable elements, bytes or not, and nothing else. An
+  array's header gains an owner word beside its length (eight bytes), zero for an array never moved,
+  which any code that reaches it may use as before, since an array is still not sendable. A move
+  gives it an owner no running code is, by one compare-and-set; `take` claims it for the taker, `with`
+  for the code running `f` and moves it again after; every use by other code traps with
+  `` `Array` was moved to another owner ``: an element read or write, `length`, `slice`, a copy into
+  or out of it, an iterator's step, a C binding's argument (checked before C sees it), a Sysl
+  binding's argument (checked as its shim reads it), a `ByteBlock` write from it, and a second move.
+  **Aliases** (a field, a closure's capture, an iterator) are the same object, so their uses trap
+  as the local's does; a **slice** taken before the move is a copy and stays the sender's; frozen
+  arrays (a `Vector`'s or an `ArraySeq`'s) are the library's own, never moved, and unchecked. Why:
+  an array's elements are stored inside the object, so a move cannot hand the receiver new storage
+  and leave the sender an empty shell; the only sound zero-copy move of an array other references
+  may reach is one the array itself enforces, and an owner word read beside the length the bounds
+  check already reads keeps the common path to a load and a compare. Handles already move this
+  way, and the messages match. *Alternatives weighed*: (a) **transfer on send**, making `Array`
+  sendable and moving it implicitly at every send — then an `@isolating` body (a mutex's value,
+  `isolate`) could capture an array that was never moved and share it unchecked between threads, so
+  every array would need a real owner from birth and every mutex, pool and `Isolated` a walk to
+  re-own what it holds; far wider and slower for the same gain. (b) **`freeze()`/`toBytes()`**, an
+  immutable sendable view — still needs the array to refuse later writes (the same owner word), and
+  the relay wants a buffer the receiver can write and hand back. (c) **a separate `Transfer[T]`
+  type** — `Isolated` already is the type of "mutable, moving, taken once", with `take`, `with` and
+  its place in the handover walk; a second type would duplicate it. (d) **lifting
+  `@trusted_sendable`'s restriction** to the standard library — rejected: it would let any package
+  declare an array-holding class sendable with nothing checking the claim, which is a data race,
+  not a gap closed. A compile-time refusal of the sender's later use was weighed too: it needs
+  uniqueness or alias analysis the checker does not have, and the runtime check covers every
+  alias. **Review with the user**: the eight bytes and the one compare every array use now pays,
+  and whether `Buffer` should move the same way (its length is a field of its own, so it would need
+  its own owner).
 
 ## Open
 

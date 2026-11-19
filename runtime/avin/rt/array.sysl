@@ -3,6 +3,7 @@ module avin.rt
 import sh.sysl.gc
 import sysl.raw.ptr_cast
 import sysl.slices.copy
+import sysl.sync.Atomic
 
 // Avin's arrays. An array is a reference to an object holding its length and then its elements,
 // each its element type's width, with no gaps; its descriptor is in the header the collector keeps
@@ -22,9 +23,22 @@ import sysl.slices.copy
 // The first two are the fast paths, and the compiler uses them whenever they fit; the map is for an
 // element of several words that mixes the two, such as a union's tag, bits and reference.
 
-/** The header of an array object. `length` elements follow it. */
+/** The header of an array object: its length, and the owner of the code that may use it. `length`
+ * elements follow it. The owner is `Unowned` for an array that was never moved, which any code that
+ * reaches it may use, since an array is not sendable and so is reached only where the program made it
+ * or was handed it whole. Moving an array into an `Isolated` gives it an owner no running code is,
+ * and the code that takes it out claims it; every use of an owned array by other code stops the
+ * program. */
 struct ArrayHeader
     length: usize
+    owner: u64
+
+@assert(sizeof(ArrayHeader) == 16, "the compiler lays an array's elements out from 16")
+@assert(offsetof(ArrayHeader, owner) == 8, "the compiler reads an array's owner at 8")
+
+/** The owner of an array that was never moved. No running code is it: a context's owner is never
+ * zero. */
+const Unowned: u64 = 0
 
 /** The length of the array at `p`. */
 array_length(p: *u8) -> usize
@@ -33,6 +47,46 @@ array_length(p: *u8) -> usize
 
 /** The first element of the array at `p`. */
 array_elements(p: *u8) -> *u8 = ptr_cast(usize(p) + sizeof(ArrayHeader))
+
+/** What a use of a moved array by code that does not own it stops the program with. */
+const ArrayForeign: string = "`Array` was moved to another owner"
+
+/** Whether the code `ctx` runs may use the array `p`, or `p` is null. */
+array_usable(ctx: *Context, p: *u8) -> bool
+    if p == null then return true
+    val h: *ArrayHeader = ptr_cast(p)
+    h.owner == Unowned || h.owner == ctx.owner
+
+/** Stops the program at the call unless the code running may use the array `p`, or `p` is null:
+ * the check of an array handed to a C binding. */
+@export("avin_rt_array_check")
+array_check(ctx: *Context, p: *u8, site: *TrapSite)
+    if !array_usable(ctx, p) then stop_at_caller_with(ctx, site, text_of(ctx, ArrayForeign))
+
+/** Stops the program inside a Sysl binding unless the code running may use the array `p`: the check
+ * of an array a binding's shim reads. */
+array_held(p: *u8) -> *u8
+    val ctx = current_context
+    if ctx != null && !array_usable(ctx, p) then stop_in_binding(ctx, ArrayForeign)
+    p
+
+/** Moves the array `p` out of the running code's hands: gives it a new owner, which no running code
+ * is, and answers it, or zero where the running code may not use the array, having moved it already.
+ * One compare-and-set decides, so of two moves of one array at once, one wins. */
+@export("avin_rt_array_move")
+array_move(ctx: *Context, p: *u8) -> long
+    val word: *Atomic[u64] = ptr_cast(usize(p) + offsetof(ArrayHeader, owner))
+    val was = word.load()
+    if was != Unowned && was != ctx.owner then return 0
+    val parked = fresh_owner()
+    if word.cas(was, parked) == was then long(parked) else 0
+
+/** Claims the array `p`, moved under the owner `from`, for the running code; answers whether it
+ * did, which it does not where the array was moved on since. */
+@export("avin_rt_array_claim")
+array_claim(ctx: *Context, p: *u8, from: long) -> bool
+    val word: *Atomic[u64] = ptr_cast(usize(p) + offsetof(ArrayHeader, owner))
+    word.cas(u64(from), ctx.owner) == u64(from)
 
 /** A new array of `length` elements laid out by `d`, every byte zero, for the caller to fill before
  * anything else sees it. The compiler has checked that `length` is a non-negative `int`. Allocating

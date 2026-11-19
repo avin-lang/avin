@@ -5,11 +5,22 @@ import avin.threads.Atomic
 @intrinsic("trap")
 private refuse(reason: string) -> Nothing
 
+// Gives the array `items` an owner no running code is, and answers it: zero where the running code
+// may not use the array, which was moved away already.
+@intrinsic("move_array")
+private moveArray(items: Any) -> long
+
+// Claims the array `items`, moved under the owner `from`, for the running code; answers whether it
+// did.
+@intrinsic("claim_array")
+private claimArray(items: Any, from: long) -> bool
+
 // A mutable object graph that nothing else reaches, which may be sent between actors and threads
 // without a copy. `isolate` makes one: what its body leaves reachable from its result was made inside
 // it, since the body uses only sendable values from around it and nothing it runs reaches
-// module-level mutable state. The receiver gets the objects out with `take`, after which they are
-// ordinary objects it owns, or works on them in place with `with`, which leaves them isolated.
+// module-level mutable state. `Isolated.move` makes one of an array the program already holds,
+// taking the array out of its hands. The receiver gets the objects out with `take`, after which they
+// are ordinary objects it owns, or works on them in place with `with`, which leaves them isolated.
 //
 //     val chunk = isolate
 //         val b = Buffer[byte]()
@@ -21,30 +32,54 @@ private refuse(reason: string) -> Nothing
 // taken", one atomic compare-and-set deciding which take wins. `with` holds the objects while its
 // function runs, so a `take` or a `with` meanwhile, from another thread or from inside the function,
 // traps with "`Isolated` is in use by `with`".
-@trusted_sendable("nothing outside reaches its objects, and one atomic compare-and-set lets one `take` or `with` at a time reach them")
+@trusted_sendable("nothing outside reaches its objects, or a moved array's owner keeps every other use out, and one atomic compare-and-set lets one `take` or `with` at a time reach them")
 class Isolated[T](@isolating objects: T): Sendable
   private var held: Option[T] = Some(objects)
   private val state = Atomic[int](Held)
+  // The owner a moved array waits under until it is taken, or zero for objects `isolate` made.
+  private var parked: long = 0
 
   // The objects, which are the caller's from now on.
   take() -> T
     if !state.compareAndSet(Held, Taken) then refused()
     val out = held.get
     held = None
+    if parked != 0 then _ = claimArray(out, parked)
     out
 
   // `f` of the objects, which stay isolated: `f` uses only sendable values from around it, reaches
   // no module-level mutable state and gives back a sendable value, so nothing it leaves behind
-  // reaches them.
+  // reaches them. A moved array is the running code's while `f` runs, and moved again after.
   with[R: Sendable](@isolating f: (T) -> R) -> R
     if !state.compareAndSet(Held, InUse) then refused()
-    val result = f(held.get)
+    val objects = held.get
+    if parked != 0 then _ = claimArray(objects, parked)
+    val result = f(objects)
+    // `f` may have moved the array on itself, which leaves it nothing to move again.
+    if parked != 0 then parked = moveArray(objects)
     state.store(Held)
     result
 
   private refused() -> Nothing = if state.load() == InUse then refuse(
     "`Isolated` is in use by `with`"
   ) else refuse("`Isolated` was already taken")
+
+object Isolated
+  // The array `items`, moved out of the running code's hands without a copy: from now on every use
+  // of it, through any reference to it, traps with "`Array` was moved to another owner", until the
+  // code that takes it out of the `Isolated` uses it as its own. Its elements are sendable, so
+  // nothing they reach needs moving. Moving an array the running code may not use, one moved
+  // already, traps in the same way.
+  //
+  //     val chunk = stream.read(16384)?
+  //     relay.send(Isolated.move(chunk))
+  move[T: Sendable](items: Array[T]) -> Isolated[Array[T]]
+    val owner = moveArray(items)
+    if owner == 0 then refuse("`Array` was moved to another owner")
+    val moved = Isolated[Array[T]](Array.empty[T]())
+    moved.held = Some(items)
+    moved.parked = owner
+    moved
 
 // The states of an `Isolated`: its objects held, held by a `with` running, and taken.
 private val Held = 0

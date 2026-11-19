@@ -4403,6 +4403,15 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
         val form = c_array_form(t, l.program.data, l.program.classes).unwrap()
         val size = c_array_element_size(form.element)
         val a = if !form.optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
+        // C reads and writes the array's elements, so an array moved away from the code running stops
+        // the program at the call, as any other use of it does.
+        var check_types: Buf[MirType] = buf()
+        check_types.push(MRef)
+        check_types.push(MPtr)
+        var check_args: Buf[Operand] = buf()
+        check_args.push(a)
+        check_args.push(TrapSiteAddress(trap_site(l, "", symbol.decl.name_span)))
+        l.insts.push(Call(None, Runtime("avin_rt_array_check", mir_signature(check_types, None)), check_args))
         val write = q.ty match
             CText(constant) -> !constant
             _ -> !(" " + q.pointee_text + " ").contains(" const ")
@@ -6378,8 +6387,35 @@ private intrinsic_operation(l: *Lowering, name: string, args: Buf[Operand], at: 
         return Some(runtime_call(l, "avin_rt_string_repeat", [MRef, MInt(32)], MRef, [s, args[1]]))
     None
 
-/** The bytes of an array's header, its length, before its elements. */
-private const ArrayHeader: usize = 8
+/** The bytes of an array's header, its length and its owner, before its elements. */
+private const ArrayHeader: usize = 16
+
+/** The offset of an array's owner word: zero for an array never moved, which any code may use, and
+ * otherwise the owner of the only code that may. */
+private const ArrayOwner: usize = 8
+
+/** What a use of an array moved away from the code running stops the program with. */
+private const ArrayForeign: string = "`Array` was moved to another owner"
+
+// Stops the program where the array `a` was moved away from the code running: its owner word is
+// zero for every array never moved, so the common path is one load and one compare, and only an
+// array that has an owner is compared with the context's.
+private check_array_owner(l: *Lowering, a: Operand, at: Span)
+    val held = load_field(l, a, FieldSlot(ArrayOwner, MInt(64)))
+    val owned = compare(l, CmpNe, held, ConstInt(64, "0"))
+    val slow = new_block(l)
+    val next = new_block(l)
+    finish_into(l, Branch(owned, slow, next), slow)
+    val mine = fresh(l, MInt(64))
+    l.insts.push(Load(mine, OwnerWord))
+    trap_if(l, compare(l, CmpNe, held, Value(mine)), ArrayForeign, at)
+    finish_into(l, Jump(next), next)
+
+// Whether `array` is the core library's `Array`, rather than the frozen array a `Vector` or an
+// `ArraySeq` keeps, which the library alone makes and nothing moves.
+private movable_array(l: *Lowering, array: &Type) -> bool = *array match
+    Class(k, _, _) -> core_class(l, "Array") == Some(k)
+    _ -> false
 
 // The array operations, on an array of type `array`, whose element type decides each element's
 // width and machine type. An array's length is a 64-bit word at its start, at most the largest
@@ -6405,6 +6441,10 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     if name == "array_publish"
         l.insts.push(Publish)
         return None
+    // Every other operation reads or writes the array, so it first checks that the array was not
+    // moved away; a copy checks its target too, which is always an `Array`, whatever its source.
+    if movable_array(l, array) then check_array_owner(l, a, at)
+    if name == "array_copy" then check_array_owner(l, args[2], at)
     if name == "array_length" then return Some(byte_length(l, a))
     if name == "array_clear"
         trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)

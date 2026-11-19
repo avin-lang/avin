@@ -1,0 +1,42 @@
+// expect: exit 0
+// A relay between two threads with no copy: a reader fills one of four buffers, moves it to a
+// writer through one channel, and the writer reads it out and moves it back through another for
+// the reader to fill again. A thousand chunks pass, every buffer that comes back is one of the four
+// the reader made (the same object, not a copy), and the writer sees every byte the reader wrote.
+import avin.actors.Isolated
+import avin.threads.{Channel, spawn}
+
+main()
+  val chunks = 1000
+  val size = 4096
+  val pool = Array.tabulate[Array[byte]](4, _ -> Array.fill[byte](size, byte(0)))
+  val full = Channel[Isolated[Array[byte]]](4)
+  val empty = Channel[Isolated[Array[byte]]](4)
+  val writer = spawn(() ->
+    var total: long = 0
+    var n = 0
+    while n < chunks
+      val chunk = full.receive().get.take()
+      for b in chunk do total += long(int(b))
+      empty.send(Isolated.move(chunk))
+      n += 1
+    total)
+  var expected: long = 0
+  var foreign = 0
+  var free = 0
+  for c in 0 ..< chunks
+    val buffer =
+      if free < 4
+        free += 1
+        pool(free - 1)
+      else empty.receive().get.take()
+    var mine = false
+    for p in pool
+      if p === buffer then mine = true
+    if !mine then foreign += 1
+    val fill = byte(c % 256)
+    for i in 0 ..< size do buffer(i) = fill
+    expected += long(c % 256) * long(size)
+    full.send(Isolated.move(buffer))
+  val total = writer.join()
+  println(s"$chunks chunks, written $total, expected $expected, buffers not from the pool: $foreign")
