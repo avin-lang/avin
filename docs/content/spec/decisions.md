@@ -11268,8 +11268,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   compatibility rule with no reader once a second machine exists, and the rebuild is one build). The
   `.avin/build` fallback keeps its path for the compiler's own machine so existing programs'
   directories do not move, which is the one place an old entry stays valid, and its executable
-  records carry the target so a stale one is rebuilt. **Left**: `avin clean` of a one-file program in
-  that fallback leaves another machine's subdirectory (the cross build, item 12, brings it).
+  records carry the target so a stale one is rebuilt. `avin clean` removes a program's builds
+  for every target there, and each target's directory once it is empty.
 
 ## Open
 
