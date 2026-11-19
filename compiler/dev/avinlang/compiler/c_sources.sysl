@@ -1,0 +1,366 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.cpu_count
+import sysl.fs.{entries, exists, is_dir, make_dir_all, metadata, pending_name, publish_file, read_bytes, read_text, remove_file, write_text}
+import sysl.process.{Child, Output, capture, start}
+import sysl.slices.sort
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// **The C sources a package ships.** A C library's `sources` are C files of its package, compiled by
+// the clang the toolchain compiles the C unit with, for the machine the build is for, and linked into
+// the program as objects: statically, always, since they are part of it.
+//
+// Each object is kept under `csources/` in the user's cache, by a key over everything it is compiled
+// from: the source's text, its flags (an include directory of the package written as the package
+// writes it), the target, the compiler's version and `clang --version`, and the path and text of
+// every header the source includes. Which headers those are is what clang said the last time it
+// compiled or scanned the file, kept in a record beside the objects; a source with no record is
+// scanned first (`clang -M`), which costs a preprocessing and lets two packages shipping the same file
+// share one object. A source compiled finds its headers anew, so an edited header or an include
+// added is seen at once: the edit changes the text of a file already listed, which changes the key.
+//
+// Two sources whose keys are equal, in one package or in two, are compiled once and linked once.
+// The clangs of one build run at once, one per processor at most.
+
+/** The format of the keys of C source objects, changed when what a key covers changes. */
+const CSourceFormat: string = "avin-c-source-1"
+
+/** One C source of a program, as the build compiles it: the library it belongs to, its path as its
+ * package names it and its absolute path, the flags it is compiled with (as clang is given them, and
+ * as the key reads them), the key over what it is compiled from other than its headers, the record
+ * of its headers, those headers, and its object. */
+struct CSourceFile
+    library: usize
+    written: string
+    file: string
+    flags: Buf[string]
+    key_flags: string
+    base: string
+    record: string
+    headers: Buf[string]
+    object: string
+    /** Where clang writes the headers it lists, and the object it compiles, before they are kept. */
+    depfile: string
+    pending: string
+
+/** What building a program's C sources gave: their objects, in the order of the libraries and their
+ * sources, each once, and how many of them clang compiled rather than the cache supplied. */
+struct CSources
+    objects: Buf[string]
+    compiled: int
+
+/** The files `library`'s `sources` name, as paths relative to its package's directory, in the order
+ * they are written, a pattern's matches sorted, each file once. A path that is not there, or not a
+ * file, and a pattern matching no file, are errors naming the library, its package and the path. */
+c_source_files(library: CLibrary) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+    for written in library.sources
+        val segments = written.split("/")
+        var found: Buf[string] = buf()
+        if !written.contains("*")
+            val full = library_path(library, written)
+            if !exists(full) then return Err(s"error: the source `$written` of the C library `${library.label}` of package `${library.package}` is not there: `$full`\n")
+            if is_dir(full) then return Err(s"error: the source `$written` of the C library `${library.label}` of package `${library.package}` is a directory, and a source is a C file: `$full`\n")
+            found.push(written)
+        else
+            expand_sources(library, segments, 0, "", &found)
+            if found.len() == 0 then return Err(s"error: the sources `$written` of the C library `${library.label}` of package `${library.package}` match no file: `${library_path(library, written)}`\n")
+        for f in found
+            var seen = false
+            for o in out
+                if o == f then seen = true
+            if !seen then out.push(f)
+    Ok(out)
+
+// The files under `library`'s directory that `segments` from `i` match below `at` (a path relative
+// to it, "" for the directory itself), sorted within each directory. A `*` matches within one name,
+// and never a name beginning with `.` unless the segment does too.
+private expand_sources(library: CLibrary, segments: []string, i: usize, at: string, found: *Buf[string])
+    val here = if at == "" then library_path(library, ".") else library_path(library, at)
+    val segment = segments[i]
+    val last = i + 1 == segments.len
+    if segment == "" || segment == "."
+        if !last then expand_sources(library, segments, i + 1, at, found)
+        return
+    val joined = if at == "" then segment else at + "/" + segment
+    if !segment.contains("*")
+        if last
+            if exists(library_path(library, joined)) && !is_dir(library_path(library, joined)) then found.push(joined)
+        elif is_dir(library_path(library, joined))
+            expand_sources(library, segments, i + 1, joined, found)
+        return
+    var names = entries(here) match
+        Ok(n) -> n
+        Err(_) -> return
+    sort(names.view_mut())
+    for name in names
+        if name.starts_with(".") && !segment.starts_with(".") then continue
+        if !glob_matches(segment.bytes, 0, name.bytes, 0) then continue
+        val next = if at == "" then name else at + "/" + name
+        val full = library_path(library, next)
+        if last
+            if !is_dir(full) then found.push(next)
+        elif is_dir(full)
+            expand_sources(library, segments, i + 1, next, found)
+
+/** Checks that every source of `libraries` is there, as a build needs it, without compiling any:
+ * what `avin check` says of them. */
+check_c_sources(libraries: Buf[CLibrary]) -> Result[unit, string]
+    for library in libraries
+        _ = c_source_files(library)?
+    Ok(())
+
+/** What the build key of a program that `avin run` and `avin test` keep says of `library`'s sources:
+ * each file with its modification time, and the headers its record lists, each with theirs, so an
+ * edited source or header builds the program anew. */
+c_source_stamps(tc: Toolchain, library: CLibrary) -> string
+    if library.sources.len() == 0 then return ""
+    var out = str_builder()
+    for c in library.cflags
+        out.push("cflag " + c + "\n")
+    val files = c_source_files(library) match
+        Ok(f) -> f
+        Err(message) -> return message
+    for written in files
+        val file = library_path(library, written)
+        out.push("source " + written + " " + stamp_of(file) + "\n")
+        read_text(record_of(tc, file)) match
+            Ok(text) ->
+                for h in text.split("\n")
+                    if h != "" then out.push("header " + h + " " + stamp_of(h) + "\n")
+            Err(_) -> ()
+    out.finish()
+
+private stamp_of(file: string) -> string = metadata(file) match
+    Ok(m) -> m.modified.us.to_string()
+    Err(_) -> "-"
+
+/** Where the cache keeps the C source objects, and their records. */
+private c_source_cache(tc: Toolchain) -> string = tc.cache + "/csources"
+
+// The record of the headers `file` includes, by its absolute path and the machine.
+private record_of(tc: Toolchain, file: string) -> string = tc.entry_in(c_source_cache(tc), content_key("avin-c-source-headers\n" + tc.target + "\n" + file), ".headers")
+
+/** The objects of the C sources of `libraries`, each compiled once into the toolchain's cache, or
+ * taken from it where nothing it is compiled from has changed; the clangs run at once, one per
+ * processor at most. A source clang refuses is an error naming it, its library and package, with
+ * what clang said. */
+ensure_c_sources(tc: Toolchain, libraries: Buf[CLibrary]) -> Result[CSources, string] = ensure_c_sources_with(tc, libraries, int(cpu_count()))
+
+/** `ensure_c_sources` with at most `jobs` clangs at once. */
+ensure_c_sources_with(tc: Toolchain, libraries: Buf[CLibrary], jobs: int) -> Result[CSources, string]
+    var items: Buf[CSourceFile] = buf()
+    for k in 0..<libraries.len()
+        val library = libraries[k]
+        if library.sources.len() == 0 then continue
+        val flags = source_flags(tc, library)?
+        for written in c_source_files(library)?
+            val file = library_path(library, written)
+            val record = record_of(tc, file)
+            items.push(CSourceFile(k, written, file, flags.flags, flags.key, "", record, buf(), "", pending_name(record), ""))
+    if items.len() == 0 then return Ok(CSources(buf(), 0))
+    val version = capture(tc.clang, ["--version"], timeout = 60000) match
+        Ok(r) -> r.text
+        Err(e) -> return Err("avin: " + missing_tool(tc.clang, e.to_string()) + "\n")
+    val cache = c_source_cache(tc)
+    make_dir_all(cache).map_err(e -> s"avin: $cache: ${e.to_string()}\n")?
+    // What each is compiled from, but its headers; and its headers, as its record lists them.
+    var scans: Buf[usize] = buf()
+    for i in 0..<items.len()
+        val text = read_bytes(items[i].file).map_err(e -> s"avin: ${items[i].file}: ${e.to_string()}\n")?
+        items[i].base = CSourceFormat + "\n" + Version + "\n" + version + "\n" + tc.target + "\n" + items[i].key_flags + "--\n" + from_utf8_unchecked(text) + "\n--\n"
+        var listed = false
+        read_text(items[i].record) match
+            Ok(r) ->
+                listed = true
+                for h in r.split("\n")
+                    if h == "" then continue
+                    if !exists(h) then listed = false
+                    items[i].headers.push(h)
+            Err(_) -> ()
+        if !listed then scans.push(i)
+    // A source with no record, or one naming a header that is gone, is scanned for its headers.
+    var scan_commands: Buf[Buf[string]] = buf()
+    for i in scans
+        scan_commands.push(clang_args(items[i], "-M", items[i].depfile))
+    val scanned = run_clangs(tc.clang, scan_commands, jobs)?
+    for j in 0..<scans.len()
+        val i = scans[j]
+        val depfile = items[i].depfile
+        items[i].headers = buf()
+        if scanned[j].status.ok()
+            items[i].headers = headers_of(read_text(depfile).unwrap_or(""), items[i].file)
+            write_record(items[i].record, items[i].headers)
+        _ = remove_file(depfile)
+    for i in 0..<items.len()
+        items[i].object = object_of(tc, cache, items[i], libraries[items[i].library])
+    // Each object once: found in the cache, it is touched, so a sweep sees it in use; otherwise the
+    // first source whose key it is compiles it.
+    var compiling: Buf[usize] = buf()
+    var taken: Map[string, bool] = map()
+    for i in 0..<items.len()
+        if taken.get(items[i].object) is Some(_) then continue
+        taken.put(items[i].object, true)
+        if !touch_entry(items[i].object) then compiling.push(i)
+    var compile_commands: Buf[Buf[string]] = buf()
+    for i in compiling
+        items[i].pending = pending_name(items[i].object)
+        var args = clang_args(items[i], "-c", items[i].pending)
+        args.push("-MD")
+        args.push("-MF")
+        args.push(items[i].depfile)
+        args.push("-MT")
+        args.push("object")
+        compile_commands.push(args)
+    val compiled = run_clangs(tc.clang, compile_commands, jobs)?
+    var failure = ""
+    for j in 0..<compiling.len()
+        val i = compiling[j]
+        val pending = items[i].pending
+        val depfile = items[i].depfile
+        if failure != "" || !compiled[j].status.ok()
+            if failure == ""
+                val library = libraries[items[i].library]
+                failure = s"error: the source `${items[i].written}` of the C library `${library.label}` of package `${library.package}` does not compile:\n" + compiled[j].err.unwrap_or("") + compiled[j].text
+            _ = remove_file(pending)
+            _ = remove_file(depfile)
+            continue
+        // Compiled, the source names its headers anew, and its object is kept by the key they give.
+        val old = items[i].object
+        items[i].headers = headers_of(read_text(depfile).unwrap_or(""), items[i].file)
+        _ = remove_file(depfile)
+        write_record(items[i].record, items[i].headers)
+        items[i].object = object_of(tc, cache, items[i], libraries[items[i].library])
+        publish_file(pending, items[i].object).map_err(e -> s"avin: ${items[i].object}: ${e.to_string()}\n")?
+        for k in 0..<items.len()
+            if items[k].object == old then items[k].object = items[i].object
+    if failure != "" then return Err(failure)
+    var objects: Buf[string] = buf()
+    for item in items
+        var seen = false
+        for o in objects
+            if o == item.object then seen = true
+        if !seen then objects.push(item.object)
+    Ok(CSources(objects, int(compiling.len())))
+
+// The flags `library`'s sources are compiled with, and the text a key reads of them: clang's
+// diagnostics uncoloured; `-O2` unless `cflags` names a level; each `include` directory, which the
+// key reads as the package writes it, so the same package anywhere keys alike; the `--cflags` of its
+// `pkg-config` module; then its `cflags`, last, so each of them has the last word.
+private source_flags(tc: Toolchain, library: CLibrary) -> Result[SourceFlags, string]
+    var flags: Buf[string] = buf()
+    var key = ""
+    flags.push("-fno-color-diagnostics")
+    var level = false
+    for c in library.cflags
+        if c.starts_with("-O") then level = true
+    if !level
+        flags.push("-O2")
+        key = key + "-O2\n"
+    for d in library.include
+        flags.push("-I" + library_path(library, d))
+        key = key + "-I<package>/" + d + "\n"
+    library.pkg_config match
+        Some(m) ->
+            val answer = capture(tc.pkg_config, ["--cflags", m], stderr = true, timeout = 60000) match
+                Ok(r) -> r
+                Err(e) -> return Err(s"error: the C library `${library.label}` of package `${library.package}` was not found: `pkg-config --cflags $m` could not run (${e.to_string()}).${if library.install == "" then "" else " " + library.install}\n")
+            if !answer.status.ok() then return Err(s"error: the C library `${library.label}` of package `${library.package}` was not found: `pkg-config --cflags $m` failed.${if library.install == "" then "" else " " + library.install}\n")
+            for w in answer.text.fields()
+                flags.push(w)
+                key = key + w + "\n"
+        None -> ()
+    for c in library.cflags
+        flags.push(c)
+        key = key + c + "\n"
+    Ok(SourceFlags(flags, key))
+
+// The flags a library's sources are compiled with, and what a key reads of them.
+private struct SourceFlags
+    flags: Buf[string]
+    key: string
+
+// The arguments of a clang that `mode` (`-c` to compile, `-M` to list the headers) the source of
+// `item`, writing to `out`.
+private clang_args(item: CSourceFile, mode: string, out: string) -> Buf[string]
+    var args: Buf[string] = buf()
+    args.push(mode)
+    for f in item.flags
+        args.push(f)
+    if mode == "-M"
+        args.push("-MT")
+        args.push("object")
+        args.push("-MF")
+    else
+        args.push("-o")
+    args.push(out)
+    args.push("-x")
+    args.push("c")
+    args.push(item.file)
+    args
+
+// The object `item` is kept as in `cache`: a key over its base and each header, by its path (relative
+// to its package's directory where it is in it) and its text. A header that cannot be read keys as
+// gone, so the object is compiled again, which reports it.
+private object_of(tc: Toolchain, cache: string, item: CSourceFile, library: CLibrary) -> string
+    var text = str_builder()
+    text.push(item.base)
+    val dir = library_path(library, "")
+    for h in item.headers
+        val shown = if dir != "" && h.starts_with(dir) then "<package>/" + h[dir.bytes.len..] else h
+        text.push(shown + "\n")
+        read_bytes(h) match
+            Ok(b) -> text.push(content_key(from_utf8_unchecked(b)) + "\n")
+            Err(_) -> text.push("gone\n")
+    tc.entry_in(cache, content_key(text.finish()), ".o")
+
+private write_record(record: string, headers: Buf[string])
+    var text = str_builder()
+    for h in headers
+        text.push(h + "\n")
+    val pending = pending_name(record)
+    if write_text(pending, text.finish()).is_ok() then _ = publish_file(pending, record)
+
+/** The headers a dependency file clang wrote (`-M`, `-MD`) lists for `file`: every file it names but
+ * the target and the source itself, in order, each once. A space in a path is written `\ `, and a
+ * line continued with `\` at its end. */
+headers_of(depfile: string, file: string) -> Buf[string]
+    // An escaped space is held as a byte no path holds while the words are split at the others.
+    val text = depfile.replace_all("\\\r\n", " ").replace_all("\\\n", " ").replace_all("\\ ", "\u{1}")
+    var out: Buf[string] = buf()
+    for field in text.fields()
+        val w = field.replace_all("\u{1}", " ")
+        if w.ends_with(":") || w == file then continue
+        var seen = false
+        for o in out
+            if o == w then seen = true
+        if !seen then out.push(w)
+    out
+
+// Runs clang with each of `commands`, at most `jobs` at once, and answers what each said, in order.
+// A clang that cannot be started is the error.
+private run_clangs(clang: string, commands: Buf[Buf[string]], jobs: int) -> Result[Buf[Output], string]
+    var out: Buf[Output] = buf()
+    val at_once = if jobs < 1 then 1usize else usize(jobs)
+    var from = 0usize
+    while from < commands.len()
+        val to = if from + at_once < commands.len() then from + at_once else commands.len()
+        var children: Buf[&Child] = buf()
+        var failure = ""
+        for k in from..<to
+            start(clang, commands[k].view(), stderr = true, timeout = 600000) match
+                Ok(child) -> children.push(child)
+                Err(e) ->
+                    failure = "avin: " + missing_tool(clang, e.to_string()) + "\n"
+                    break
+        for j in 0..<children.len()
+            val ran = children[j].wait()
+            if failure != "" then continue
+            ran match
+                Ok(r) -> out.push(r)
+                Err(e) -> failure = "avin: " + missing_tool(clang, e.to_string()) + "\n"
+        if failure != "" then return Err(failure)
+        from = to
+    Ok(out)

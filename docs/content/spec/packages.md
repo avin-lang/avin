@@ -43,7 +43,8 @@ was, and needs no ceremony.
 `package` names the package and gives its version; both are required, and `description`, `avin`
 and [`targets`](#which-machines-a-package-builds-for) are optional. Beside it a manifest holds
 `dependencies`, [`features`](#features),
-[`workspace`](#workspaces), and for its C bindings [`c-libraries`](#c-libraries) and
+[`workspace`](#workspaces), and for its C bindings [`c-libraries`](#c-libraries),
+[`c-linking`](/spec/c-bindings/#how-a-program-links-its-c-libraries) and its shorthand
 [`static-c-libraries`](/spec/c-bindings/#linking-statically).
 
 - **A name** begins with a lowercase letter and holds lowercase letters, digits, `_` and `-`
@@ -72,7 +73,11 @@ error: `cairo` 0.2.0 needs Avin 0.0.19 or later, and this is Avin 0.0.18: upgrad
 
 That error comes before anything else wrong in the manifest: one written for a later Avin may hold a
 key this one does not know, and the upgrade is what it needs. An `avin` that is not a version is an
-error at its value, like any other. `avin lsp` reports both on the manifest: on `avin.hocon` itself
+error at its value, like any other. The version compared is the running Avin's own, three numbers: a
+tree between releases is the last release, so a package naming one not yet cut is refused by it. A
+program that imports a standard-library module this Avin lacks is told, with the modules it has, that
+it may have been written for a later Avin, and that its package says which it needs with `avin`.
+`avin lsp` reports both on the manifest: on `avin.hocon` itself
 when the editor opens it, and on the manifest of the package a file being edited belongs to.
 - **Every key is known.** A key the manifest does not hold (`author`, `build`, `tag`) is an error at
   the key, as are a value of the wrong kind and a block missing what it needs. Each error points at
@@ -175,10 +180,11 @@ c-libraries {
 ```
 
 A program links the C libraries of every package in it, asking `pkg-config` at every build. They are
-the machine's, not fetched: they get no line in `avin.sum`. A program whose manifest says
-`static-c-libraries = true` links them from their static archives, so the machine it runs on needs
-none of them; only the root package's key is read ([C
-bindings](/spec/c-bindings/#linking-statically)).
+the machine's, not fetched, unless a package vendors one by its path: they get no line in
+`avin.sum`. A program whose manifest says `static-c-libraries = true` links them from their static
+archives, so the machine it runs on needs none of them, and its `c-linking` block chooses library by
+library; only the root package's keys are read ([C
+bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)).
 
 ### What a dependency brings in
 
@@ -567,18 +573,28 @@ c-libraries {
 
 Inside a module, **a file whose name carries a condition symbol between its name and `.avin` is read
 only on the machines the symbol holds on**: `watch.linux.avin` on Linux, `watch.macos.avin` on macOS,
-`stack.aarch64.avin` on 64-bit Arm. A file with no such part is read everywhere. The part is one
-symbol from the table above; a name whose part is not one (`watch.lunix.avin`) is an error naming the
-symbols.
+`stack.aarch64.avin` on 64-bit Arm. A file with no such part is read everywhere, and so is a file
+named as a symbol alone (`linux.avin`). A literate file is selected the same way
+(`watch.linux.lavin`). The part is one symbol from the table above; a name whose part is not one
+(`watch.lunix.avin`, `watch.Linux.avin`), or that carries two (`watch.linux.x86_64.avin`), is an error
+on every machine, naming the symbols:
 
 ```text
-probe/probe/watch.avin          module probe.watch, on every machine
-probe/probe/watch.linux.avin    module probe.watch, on Linux
-probe/probe/watch.macos.avin    module probe.watch, on macOS
+avin: probe/probe/watch/watch.lunix.avin: `watch.lunix.avin`: `lunix` is not something a file's name can ask about the machine: a file read only on some machines is named `<name>.<symbol>.avin`, and the symbols are macos, linux, posix, aarch64 and x86_64
+```
+
+Code for one system and one processor at once is that system's file asking `avin.target.arch`
+(below). A program of one file is the file it names, whatever its name: `avin run tool.linux.avin`
+runs it on any machine.
+
+```text
+probe/probe/watch/watch.avin          module probe.watch, on every machine
+probe/probe/watch/watch.linux.avin    module probe.watch, on Linux
+probe/probe/watch/watch.macos.avin    module probe.watch, on macOS
 ```
 
 ```avin
-// probe/probe/watch.avin
+// probe/probe/watch/watch.avin
 module probe.watch
 
 // Reports each file that changes under `dir`, as the system tells of it.
@@ -586,7 +602,7 @@ changes(dir: string, report: (string) -> unit) -> unit = start(dir, report)
 ```
 
 ```avin
-// probe/probe/watch.linux.avin
+// probe/probe/watch/watch.linux.avin
 module probe.watch
 
 import inotify.{Inotify, Mask}
@@ -609,18 +625,45 @@ the machine:
 
 ```text
 error: no function `start` is declared in `probe.watch` on `aarch64-macos`: `watch.linux.avin` supplies it on Linux, and no file read on this machine does -- add it to a file read there, or leave the machine out of `targets`
- --> probe/probe/watch.avin:4:67
+ --> probe/probe/watch/watch.avin:4:67
 ```
 
-That check needs no other machine's tools: it reads and type-checks, and builds nothing. `avin build`
-and `avin test` check only the machine they build for, and the language server checks the machine
-it runs on.
+Machines that read the package alike, the same files from the same packages, are checked once
+together, so a package whose only difference is a Linux file is checked twice, for macOS and for
+Linux. A diagnostic every check reports is told once, as it is; one that only some report is told
+once, with the machines it is for:
+
+```text
+error: string has no field `length`; a string counts its characters with `charCount` and its bytes with `byteLength` (on `x86_64-linux` and `aarch64-linux`)
+ --> probe/probe/watch/watch.linux.avin:3:41
+```
+
+A machine whose package cannot be read at all (a Linux-only dependency that cannot be fetched) is
+reported with its machines, `on `x86_64-linux` and `aarch64-linux`:`, and the others are still
+checked. `avin check --target <name>` checks that machine alone, and names none. A package in which
+nothing differs is checked once, for the machine being built for, as before.
+
+That check needs no other machine's tools: it reads and type-checks, and builds nothing; the C unit of
+the package's C bindings is built only for the machine the compiler runs on. `avin build`, `avin run`
+and `avin test` read and check only the files of the machine they build for, and the language server
+checks the machine it runs on.
 
 **An import of a module that does not exist everywhere is allowed only from a file that exists no
 more widely.** `import inotify` in `watch.linux.avin` is allowed, since `inotify` is taken on Linux
 and the file is read only there; the same import in `watch.avin` is an error at the import, naming
-the machines where the module is missing. The check is made against the manifest, for every machine
-in `targets`, whichever one is being built.
+the files and the machines where the module is missing:
+
+```text
+error: `inotify`, a module of the package `inotify`, exists only on x86_64-linux and aarch64-linux, where `inotify.avin` is read, and `watch.avin` is read on aarch64-macos too: import it from a file read no more widely, or make `inotify` exist on aarch64-macos
+ --> probe/probe/watch/watch.avin:3:8
+```
+
+The check is made for every machine in `targets`, whichever one is being built: where anything in the
+package differs by machine, the build reads the package, with its dependencies, for each of its
+targets too. "No more widely" is by machine, not by symbol: a file for `x86_64` may import a module
+of Linux's, since every machine reading it is Linux, and a file for `aarch64` may not, since
+`aarch64-macos` reads it. A module that exists on every machine through a different file on each is
+imported from anywhere.
 
 ### The machine in an expression
 
@@ -642,6 +685,14 @@ optimization level; and both branches are type-checked on every machine, so one 
 on the machine that does not take it. A branch may therefore call only what exists everywhere; a
 call only one system has belongs in that system's file. `avin.process.os()` answers the same value
 at run time.
+
+What is decided as the program is compiled is a `match` on either value whose arms are variants,
+alternatives of them, `_` or a name (the first arm that takes the machine's variant is the only one
+compiled, a guard before it keeping the whole `match`), an `is` test of either against a variant, and
+`==` or `!=` between either and a variant or the other; an `if` over such a test, alone or as the left
+of `&&` or `||` that decides the whole, compiles only the branch taken. The values themselves are
+declared, each in `avin.target`'s file for the machines it is true of (`target.linux.avin`,
+`target.aarch64.avin`), as a package would declare them.
 
 ### What a manifest does not say about machines
 
@@ -810,7 +861,7 @@ source checkout. Its version is the compiler's. It is never a dependency: no man
   error at the import, listing the modules under the deepest prefix that exists:
 
 ```text
-error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cli`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.threads`, `avin.time`
+error: the standard library has no module `avin.regx`; the modules under `avin` are `avin.actors`, `avin.c`, `avin.cli`, `avin.collections`, `avin.crypto`, `avin.fs`, `avin.io`, `avin.math`, `avin.net`, `avin.process`, `avin.random`, `avin.regex`, `avin.signal`, `avin.target`, `avin.threads`, `avin.time`
  --> app/main.avin:1:8
 ```
 

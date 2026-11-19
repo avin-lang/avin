@@ -6234,6 +6234,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   with the user whether `avin new` should write the running version (it ties a new package to the
   Avin that made it, which may be later than the package needs).
 
+- Settled on the user's delegation 2026-11-19 (branch `min-avin`; completes the entry above, which
+  had left the question in § Open): **the minimum stays the whole design, the running version is the
+  stamped `Version`, and a missing library module points at the upgrade.** The key (`package.avin`),
+  its checking of every package of the graph, `avin check` and `avin new` were settled and built
+  2026-11-11; this adds only the hint: the "the standard library has no module" error ends with
+  "if the program was written for a later Avin than this one (X), upgrade Avin, and let its package
+  say which it needs with `avin = "…"`". It names no manifest state, because every declared
+  minimum has already been met by the time a module is looked up, so the error means either a typo
+  or a package that does not say what it needs. *Dev builds*: the version compared is the number
+  `scripts/release.sh` stamps into `const Version`, three numbers with no pre-release suffix, so a
+  tree between releases is the last release; a package naming a release not yet cut is refused by it
+  with the usual message. *Why no exemption*: a version has meaning only once a release stamps it,
+  and a pre-release rule would add a suffix to a version syntax that is three numbers. *`avin tidy`
+  warning on a dependency's minimum above the root's*: not added; the root's `avin` is what its
+  author tests with, and a dependency above the running Avin is already refused. *Alternatives*: a
+  hint only where the manifest has no `avin` (the driver does not see manifests, and the hint is
+  harmless where one is declared); an `AVIN_VERSION` override for dev trees. Review with the user:
+  the key's name (`avin`, after `sysl` in `sysl.hocon`) and whether ranges are wanted (refused above,
+  because Avin's versions only add).
+
 - Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
   part (identity, body fingerprint, interfaces read) and the world facts the whole-program steps
   decided for it, both made on every build after lowering** ([the instance
@@ -8957,6 +8977,105 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Proposed (built on branch `machine-conditions`, 2026-11-19): **the choices
+  [machines](/spec/packages/#machines) left open in the manifest.**
+  - **A feature that does not exist on a machine turns nothing on there**, even when a feature that
+    does exist `enables` it: the selection leaves it out, and what only it would turn on stays off.
+    A feature that `requires` it is refused there as requiring a feature that is off. WHY: "does not
+    exist" means the same whichever way the feature is reached; turning its modules on through
+    another feature would make it exist after all. ALTERNATIVES: refusing a feature that enables an
+    absent one (makes a cross-machine package spell its enables twice); taking it through `enables`
+    anyway (contradicts its `if`).
+  - **`targets = []` is refused**; a package builds for at least one target. WHY: an empty list is
+    a package nothing can build, and is more likely a slip than an intent. ALTERNATIVES: reading it
+    as every target (the opposite of what it says).
+  - **Whether a dependency "reaches further" is asked over the dependent's targets where the entry's
+    condition holds**, so `lib { …, if = "macos" }` may name a package that builds only for
+    `aarch64-macos`. The check runs whatever machine the build is for, against the manifests.
+    WHY: an entry the condition leaves out is not in those machines' builds at all.
+    ALTERNATIVES: refusing on every target of the dependent (forces `targets` where `if` already says
+    it).
+  - **A whole workspace resolved for a machine is the members that build for it**, so `avin tidy`
+    and `avin vendor` of a workspace answer each target with the members that list it. A
+    workspace's root, and a package listing no `targets`, answer for every target. WHY: a member
+    built for Linux alone has nothing to resolve on macOS. ALTERNATIVES: refusing the workspace on
+    the machines some member leaves out.
+  - **`link-flags` are passed exactly as written, in order, with no flag merged with another**, after
+    the flags of `pkg-config` or `link`. WHY: the spec's "as written"; `-framework` repeated before
+    two frameworks must stay two pairs. ALTERNATIVES: removing repeats (breaks `-framework` pairs).
+  - **`c-linking`'s `static` and `dynamic` may name a C library the machine leaves out**, which does
+    nothing there: a library of a package in the build whose `if` does not hold, or,
+    `<package>/<library>`, a library of a dependency whose `if` leaves it out, named by the
+    dependency's label (its libraries are not read on that machine, so an unqualified name of one is
+    still refused there). A name that is no library at all is refused on every machine.
+    `static-system`'s checks stay per machine. WHY: one program manifest serves every target, so a
+    name meant for one machine must not fail the others, while a typo still fails everywhere.
+    ALTERNATIVES: an `if` on `c-linking`'s entries (a second place to say what the library's own
+    `if` already says); resolving every target to check each name (a build would resolve three
+    times).
+  - **`--target` is taken by `avin check` alone** for now, reading every manifest as that machine's
+    build does; `avin build --target` is the cross-build item. WHY: checking builds nothing, so it
+    needs no other machine's tools. ALTERNATIVES: every command (a build for another machine needs
+    a sysroot Sysl does not have yet).
+  - **A condition's syntax errors** name the condition and what is wrong at the place: a symbol,
+    `!` or `(` wanted (at the end or where a character stands), a `(` never closed, or a word
+    following a whole condition; symbols are lowercase and `-` belongs to a word, so a target's name
+    is read whole and refused with the condition it means. WHY: one place and one sentence per
+    mistake, as the manifest's other errors give. ALTERNATIVES: one generic "not a condition" error.
+- Proposed (built on branch `machine-files`, 2026-11-19): **the choices
+  [files for one machine](/spec/packages/#files-for-one-machine) and
+  [the machine in an expression](/spec/packages/#the-machine-in-an-expression) left open.**
+  - **A literate file is selected as an ordinary one** (`watch.linux.lavin`), and **a file's name
+    carries one symbol**: two parts (`watch.linux.x86_64.avin`) are refused, naming each, as is a
+    part that is no symbol, on every machine, in a package, a program with no manifest, a dependency
+    and the standard library alike. A file named as a symbol alone (`linux.avin`) is ordinary. WHY:
+    the spec's "the part is one symbol"; a `.lavin` file is a module's file like any other.
+    ALTERNATIVES: a compound part as `&&` of its symbols (a second condition syntax in file names);
+    leaving `.lavin` unselected (a literate module could not differ by machine).
+  - **A program of one file is never selected**: `avin run tool.linux.avin` runs it anywhere. WHY:
+    the file is named outright, so there is nothing to choose between. ALTERNATIVES: refusing it off
+    Linux (a script would fail for its name).
+  - **The import rule asks, for each file read on this machine, every target its root lists that
+    reads the file**, each target's package read as its build reads it (resolving, and fetching what
+    the cache lacks, a dependency taken only there). A target whose package cannot be read holds no
+    file to anything in a build, and `avin check` reports it. "No more widely" is by machine: a file
+    for `x86_64` may import Linux's module. A module whose files differ per machine but exist on every
+    machine is imported from anywhere. The rule is checked only where anything differs (a file with a
+    symbol, a manifest entry with `if`), so other packages cost nothing more. Standard library modules
+    are not held to it, since none is missing on any machine. WHY: the spec's "for every machine in
+    `targets`, whichever one is being built"; a dependency's module names are known only by reading
+    it. ALTERNATIVES: mapping an import to a dependency's label without reading it (a module's name
+    need not be its package's); checking only in `avin check` (a build would accept what another
+    machine's build refuses). **Review with the user:** whether a build may fetch a dependency only
+    another machine takes.
+  - **The import's error names the module, its package where it is another's, the machines it exists
+    on and its files there, the importing file and the machines it is missing on**, and it is the only
+    error at that import (the "standard library's module is meant" hint is not added beside it).
+  - **`avin check` checks once per set of targets that read the package alike** (the same files,
+    from the same packages), in the order `targets` lists them; with nothing differing it checks the
+    machine being built for, as before, including refusing a host the package leaves out. A diagnostic
+    every check reports is told once, as it is; one some report gets ` (on `x86_64-linux` and
+    `aarch64-linux`)` after its message; a name that a file of the same module read on another machine
+    declares is told as the spec's `no function `start` is declared in … on …` (also `no value`,
+    `no type`). A machine whose package cannot be read is told as `on `…`:` and its error. The C unit
+    is built only for the machine the compiler runs on. WHY: one sentence per mistake with the
+    machines it is for, and no other machine's tools. ALTERNATIVES: a check per target always (the
+    arch-only difference of `avin.target` would check every package three times); a prefix
+    `on `…`: ` on every machine-specific diagnostic (moves the headline off what is wrong).
+  - **`avin.target`'s values are declared in the library by its own files** (`target.macos.avin`,
+    `target.linux.avin`, `target.aarch64.avin`, `target.x86_64.avin`), and **folding is a lowering of a
+    read of a value of `avin.target`**: a `match` whose arms up to the taken one are decided by their
+    patterns (variants, alternatives, `_`, names) compiles that arm alone; an `is` test against a
+    variant and `==`/`!=` with a variant or the other value are decided and fold the `if` or the
+    left of `&&`/`||` over them, as an `is` test a pattern refutes already does. A guard before the
+    taken arm keeps the whole `match`. WHY: the values are ordinary declarations checked like any
+    other, and folding reuses the decided-condition path. ALTERNATIVES: a compiler intrinsic for
+    `os` and `arch` (a second way to make a value per machine); folding every compile-time constant
+    (changes the code of every program reading a constant, beyond what was decided).
+  - **The language server checks the files of the machine it runs on**, so a file for another machine
+    open in an editor is not analyzed as part of its package. A later item may check it for a machine
+    that reads it.
+
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
   whichever comes first, and sends that rest as room comes**; its wait keeps the connection's time
@@ -11030,6 +11149,127 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
+- Settled on the user's delegation 2026-11-19 (branch `link-control`; the user: *"It should be as
+  flexible as possible. Avin isn't just for me, it's for anyone who would enjoy using it."*): **a
+  program chooses how each C library is linked in its root manifest's `c-linking` block, and a C
+  library's own block says what else links it** ([C
+  bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)). The program's block holds
+  `default` (`"static"` or `"dynamic"`), `static` and `dynamic` lists of libraries (`<library>` or
+  `<package>/<library>`), `static-system` (`-l` names the system provides, linked from their archives)
+  and `search` (where those archives are, absolute or root-relative). `static-c-libraries = true`
+  keeps its meaning as the shorthand of `default = "static"`; saying both is an error, so nothing
+  that builds today changes. A C library gains `files` (archives and shared libraries by path),
+  `search` (`-L` directories, searched for archives when static), `include` (`-I` directories, since a
+  vendored library's headers are not where `pkg-config` would say), `frameworks` and `link-flags`
+  (raw, the escape hatch); their paths are relative to the package and may not be absolute or hold a
+  `..` segment, so a fetched package builds wherever it lands. **Static is a promise, dynamic is "as
+  named"**: a library linked statically takes no shared library from a search directory (an error
+  names the missing archive, as before, now for `link` names and `files` too), while one linked
+  dynamically is linked from the flags as given, so a vendored `.a` is static either way. *Why one
+  block*: one place says how the program links, and a `static`/`dynamic` pair reads as the program's
+  sentence ("all static except mlt"). *Alternatives weighed*: a per-library `static = true` in the
+  library's block (the author would decide for every program; refused before and still refused, its
+  test kept); per-library keys inside the program's own `dependencies` entries (a library of a
+  dependency's dependency has no entry to put it in); a top-level `link` key as Sysl writes it (reads
+  as one key with the `-l` meaning of a library's `link`); `static-c-libraries` taking a list (one key
+  with two types, and no room for `dynamic`). **The command line** (`--static-c-libraries`,
+  `--dynamic-c-libraries` on build, run, test and check) stands in for the manifest's default only;
+  a library the manifest names keeps its way, since such a name usually records a reason (a licence,
+  a missing archive) a one-off flag should not erase. *Alternative*: the flag overruling everything
+  (simpler to state, but `--static-c-libraries` would then trip over every `dynamic-only` library
+  the program had already answered for). A cached `run`/`test` build is keyed by how each library is
+  linked and by its files, which also fixed the cache reusing a static build after the manifest
+  changed. **A library package may say `dynamic-only = "<why>"`**, one key for both "must be dynamic"
+  (licence) and "has no archive": both mean the same to a build and differ only in the reason, which
+  the error quotes. A program that would link it statically, by its default, the flag or its
+  `static` list, is refused with that reason and told to name it in `dynamic`; it is never made
+  dynamic silently, because a program asking to be static would then ship needing the library
+  installed. *Alternatives*: the requirement silently winning over the program's default (quiet,
+  and breaks the static promise); a requirement the program could override by `static` (a licence
+  is not the program's to waive); two keys, `dynamic-only` and `no-archive` (two names for one
+  effect). **System libraries stay dynamic unless `static-system` names them**; a named one with no
+  archive in the searched directories, or named but linked by no library, is an error. **On Linux**
+  (not built yet) an archive is still linked by its path; a `-l` kept dynamic stays `-l`; a
+  `static-system` name maps onto `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`; `frameworks` are macOS's.
+  A package's vendored C sources are compiled by the library's `sources` (the next entry); `files`
+  links a prebuilt archive. **Review with the user**: the surface syntax (`c-linking` and its five keys,
+  `<package>/<library>` naming, the library keys `files`/`search`/`include`/`frameworks`/`link-flags`,
+  the two flags' names), and the library-requirement rule (`dynamic-only` refusing a static program
+  rather than yielding to it, and the program's `static` list not overriding it).
+- Settled on the user's delegation 2026-11-19 (branch `c-sources`; the gap is link-control's report:
+  a package could link a prebuilt archive by `files` but not compile the `.c` files it ships, so a
+  binding of a library distributed as source, sqlite3.c, miniz or stb, needed its user to build an
+  archive for each machine; only a Sysl dependency's own `.c` was compiled, by Sysl): **a C library
+  names the C files its package ships in `sources`, and the flags they are compiled with in
+  `cflags`** ([C bindings](/spec/c-bindings/#c-sources-a-package-ships)). `sources` are paths relative
+  to the package, under the rules of `files` (no absolute path, no `..` segment), and a `*` matches
+  within one directory, as a workspace's members do; `**` is refused, a pattern matching no file
+  and a path that is not there are errors, and the matches are sorted and each file taken once.
+  They are compiled by the clang the C unit is compiled with, for the build's machine, with `-O2`
+  unless `cflags` names a level (whatever the program's own `-O`, so `-O0` and `-O2` builds share
+  the objects), the library's `include` directories as `-I`, the `--cflags` of its `pkg-config`
+  module, then `cflags`, last. **`cflags` holds what a package says about its C and nothing about the
+  build**: defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`, `-pedantic`), the
+  standard (`-std=`) and code generation (`-f`). `-I` and its kin are refused with a pointer at
+  `include`, `-Wl,`/`-Wa,`/`-Wp,` with a pointer at `link-flags`, and anything else (the target, the
+  output, `-l`, `-g`) as not a package's to say; `cflags` with no `sources` is an error, since it
+  would read as flags of the C unit, which it is not. The objects are linked into the program before
+  the libraries' link flags, **statically, always**, whatever `c-linking`, the command line or
+  `static-c-libraries` say of the library: they are part of the program. So **`dynamic-only` beside
+  `sources` is an error at the entry**, and `pkg-config` or `link` beside `sources` are allowed (a
+  wrapper compiled against an installed library, a source calling libz). **The cache**: each object
+  is kept in `csources/` by a key over the source's text, its flags (an `include` directory read as
+  the package writes it, so a package keys alike wherever it is fetched), the target, the compiler's
+  version and `clang --version`, and the path (package-relative where inside it) and text of every
+  header it includes, which clang lists (`-MD`) when it compiles and a record keeps; a source with no
+  record is scanned with `clang -M` first, so two packages shipping the same file compile it once
+  and link it once. `avin run`'s cached executables are keyed by each source's and recorded header's
+  modification time. **The clangs run at once, one per processor at most**: Avin has no job count of
+  its own, and this is the bound codegen units already keep. **A source clang refuses** is reported
+  as `error: the source `<path>` of the C library `<l>` of package `<p>` does not compile:` followed
+  by clang's own output, which names the file and the line; warnings of a source that compiles are
+  not shown (a vendored library's warnings are its maintainers'; `-Werror` makes them errors).
+  **`avin check` does not compile the sources**; it checks each is there and each pattern matches,
+  as it checks `files`. **Per-machine sources are entries with an `if`**: a library whose sources
+  differ by machine is written as one entry for what is common and one per machine (`vend-macos { if
+  = "macos", sources = [...] }`), using the conditions every entry already takes, rather than a
+  condition inside `sources`. **A header-only library needs nothing new**: its package ships the
+  one-line `.c` that asks for its implementation (`#define STB_IMAGE_IMPLEMENTATION` then the
+  include) and names it in `sources`. *Alternatives weighed*: a top-level `c-sources` block apart
+  from `c-libraries` (the sources belong to the library whose headers and `include` they share, and
+  a second block would repeat them); `cflags` passing anything (a package could then name a target
+  or an output and break the build's own choices); `-I` allowed in `cflags` (two ways to say
+  `include`, one of them able to name an absolute path); the program's `-O` level (debug builds of
+  the program would rebuild and slow every vendored library, which is not what is being debugged);
+  conditions inside `sources` (`sources { macos = [...] }`, a second condition syntax where `if`
+  already serves); keying objects by the source alone (an edited header would be missed) or by its
+  preprocessed text (a preprocessing on every build, even when nothing changed); a shared library
+  built from the sources (they are the program's, and a static object needs no install). **Review
+  with the user**: the key names `sources` and `cflags`, which flags `cflags` allows, the default
+  `-O2` independent of the program's level, and silencing warnings of sources that compile.
+- Settled on the user's delegation 2026-11-19 (branch `target-keys`): **every cache entry names the
+  machine it was built for, in its name and in its key**. A toolchain has a `target` (the compiler's
+  own machine unless a build names another). Under `units/`, `shims/`, `cunit/` and `csources/` an
+  entry is `<target>-<key>`; the runtime archive is `libavinrt-<target>-<key>.a`, in the cache and
+  shipped as `share/avin/lib/<target>/libavinrt-<target>-<key>.a`; a program's directory under
+  `build/` is `<name>-<target>-<key>`, which holds its executables and its instance cache; the key
+  hashed into each entry also holds the target, and an executable's record does too. Without a cache
+  directory the compiler's own machine keeps `.avin/build` and another machine uses
+  `.avin/build/<target>`. `avin cache info` lists the entries per target and `avin cache clean
+  --target <target>` removes one target's. **Existing caches are not carried over**: an old entry has
+  no target in its name, so no build finds it (it is never misread), `avin cache info` lists it as
+  `untargeted`, and the least-recently-used sweep removes it, so the first build after the upgrade
+  rebuilds. *Why*: a cross build, or a prefix shipping archives for two machines, must never reuse an
+  object built for the other, and the name makes the target visible to `info` and `clean` without
+  opening a file. *Alternatives weighed*: the target in the hash alone (disjoint, but `info` and
+  `clean --target` could not tell targets apart); a subdirectory per target in each kind (the sweep
+  and `info` count entries one level down, and a directory would become one entry holding every
+  object of its target, evicted whole); keeping old names for the compiler's own machine (a
+  compatibility rule with no reader once a second machine exists, and the rebuild is one build). The
+  `.avin/build` fallback keeps its path for the compiler's own machine so existing programs'
+  directories do not move, which is the one place an old entry stays valid, and its executable
+  records carry the target so a stale one is rebuilt. `avin clean` removes a program's builds
+  for every target there, and each target's directory once it is empty.
 
 ## Open
 
@@ -11051,9 +11291,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
   - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
     vendored package, or trust the hash recorded beside each package as it trusts the cache's.
-  - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
-    the standard library's modules arrive with the compiler and a package using a new one fails on an
-    older compiler with "no module" rather than a version message.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
   [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
