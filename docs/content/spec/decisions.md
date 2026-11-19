@@ -10932,6 +10932,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   needs it); a type's own parameters bounded too (sound only for a covariant or invariant bounding
   parameter, a rule that can come when a program asks). **Review with the user**: the
   declared-before rule, which differs from the lower bound's.
+- **Proposed (branch `contra-join`, 2026-11-18, for the parsing library's token streams): branches
+  join at a contravariant argument to the meet of the two arguments, and a fully known expected type
+  wins over a join that misses it** ([generics](/spec/generics/#variance)). `In[A]` and `In[B]` for
+  `In[-T]` agree on `In[B]` (they fell back to a trait both share, `Display` where an impl gave one,
+  and then missed an expected `In[B]`); a function type's parameters join the same way and its
+  result as a covariant argument, so `(A) -> int` and `(B) -> int` agree on `(B) -> int` (they
+  agreed on nothing). Choices this branch made: **the meet is one of the two arguments**, the one
+  that is a subtype of the other (`Nothing` included); where neither is, no type is named as the meet
+  and the class join does not exist for the pair, so the fallback to a shared trait stands, as for
+  two classes with no common superclass. **Where the expected type is fully known (no inference
+  variable left in it), a reference type, and what the branches agree on is not an instance of it
+  while both branches are, the branches agree on the expected type**: a `Dog` and a `Cat` that are
+  `Animal`s and `Pet`s agree on `Pet` where a `Pet` is expected (they agreed on `Animal` and failed).
+  **Where neither the agreement nor a branch is an instance of that expected type, the branch (or
+  `match` arm) is reported**, "this branch yields Sink[string], not the Sink[B] expected of the
+  `if`", rather than the fallback trait at the result. Why: the expected type is what the program
+  asked for, and a join that misses it while every branch meets it is a wrong answer, not an
+  ambiguity; naming the branch says what to change. *Alternatives weighed*: the expected type
+  always winning where both branches fit (testing a branch against an expected type still being
+  inferred settles its inference variables, so the rule is held to fully known types and leaves
+  inference as it was); a nominal meet of unrelated arguments, the greatest common subclass
+  (none can be named in general, and an intersection type is not a type Avin writes); keeping the
+  result-level message (it names a trait the program never mentioned).
 
 ## Open
 

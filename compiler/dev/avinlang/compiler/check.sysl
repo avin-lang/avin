@@ -18965,10 +18965,17 @@ private interpolator_call(at: Span, prefix: string, parts: Buf[string], holes: B
         args.push(Argument(h.span, None, h, false))
     Expr(at, Call(Expr(at, Member(context, prefix)), args))
 
-// The type two branches agree on; where they have none (see `join`), the type expected of them,
-// when both conform to it: two classes sharing several unrelated traits agree on one of them only
-// where it is asked for.
+// The type two branches agree on; where they have none (see `join`), or where theirs is not an
+// instance of a fully known type expected of them, the type expected of them, when both conform to
+// it: two classes sharing several unrelated traits agree on one of them only where it is asked for,
+// and a `Dog` and a `Cat` that are both `Pet`s, on `Pet` where it is asked for, not on `Animal`.
 private join_expected(c: *Checker, a: &Type, b: &Type, expected: Option[&Type]) -> Option[&Type]
+    if expected is Some(want)
+        val w = zonk(c, want)
+        if !has_unknowns(w)
+            if joined(c, a, b) is Some(t)
+                val x = zonk(c, t)
+                if is_reference(x) && !conforms(view_part(conformances(c), x, w), w) && fits(c, a, w) && fits(c, b, w) then return Some(w)
     if join(c, a, b) is Some(t) then return Some(t)
     val want = expected?
     if fits(c, a, want) && fits(c, b, want) then Some(want) else None
@@ -19003,6 +19010,7 @@ private joined(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     if forgets_sendable(zonk(c, b), current) then return Some(current)
     if *current is Data(_, _, _) then return join_args(c, current, zonk(c, b))
     if *current is Tuple(xs) then return join_parts(c, xs, zonk(c, b))
+    if *current is Function(_, _, _) then return join_functions(c, current, zonk(c, b))
     val start = current
     var climbing = true
     while climbing
@@ -19081,6 +19089,11 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
             if lower_join(c, zonk(c, xs[i]), zonk(c, ys[i])) is Some(t)
                 args.push(t)
                 continue
+        // A contravariant argument is passed in, so the instances agree on the narrower argument:
+        // `In[A]` and `In[B]` for `In[-T]` agree on `In[B]`.
+        if params[i].variance is Contravariant
+            args.push(meet(c, zonk(c, xs[i]), zonk(c, ys[i]))?)
+            continue
         if !(params[i].variance is Covariant) || !is_reference(xs[i]) || !is_reference(ys[i]) then return None
         args.push(join(c, xs[i], ys[i])?)
     *a match
@@ -19088,6 +19101,46 @@ private join_args(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
         Class(k, name, _) -> Some(Class(k, name, args))
         Opaque(k, _, _, _) -> Some(opaque_at(c, k, args))
         _ -> None
+
+// The type two contravariant arguments agree on, their meet: the one that is a subtype of the other,
+// as whatever accepts the wider type accepts the narrower one too. Of two arguments neither of which
+// is a subtype of the other, no type can be named as the meet, so there is none.
+private meet(c: *Checker, x: &Type, y: &Type) -> Option[&Type]
+    val f = conformances(c)
+    if conforms(view_part(f, x, y), y) then return Some(x)
+    if conforms(view_part(f, y, x), x) then return Some(y)
+    None
+
+// The function type two function types of as many parameters agree on: each parameter the meet of
+// theirs, and the result their results' agreement, a result of a value type only where the results
+// are one type; `@sendable` only where both are. `(A) -> int` and `(B) -> int` agree on `(B) -> int`.
+private join_functions(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
+    val (xs, r, m) = *a match
+        Function(xs, r, m) -> (xs, r, m)
+        _ -> return None
+    val (ys, s, n) = *b match
+        Function(ys, s, n) -> (ys, s, n)
+        _ -> return None
+    if xs.len() != ys.len() then return None
+    var params: Buf[&Type] = buf()
+    for i in 0..<xs.len()
+        if same_type(xs[i], ys[i])
+            params.push(xs[i])
+        elif *zonk(c, xs[i]) is Var(_) || *zonk(c, ys[i]) is Var(_)
+            if !unify(c, xs[i], ys[i]) then return None
+            params.push(zonk(c, xs[i]))
+        else params.push(meet(c, zonk(c, xs[i]), zonk(c, ys[i]))?)
+    val x = zonk(c, r)
+    val y = zonk(c, s)
+    var result = x
+    if same_type(x, y) || *y is Nothing then result = x
+    elif *x is Nothing then result = y
+    elif *x is Var(_) || *y is Var(_)
+        if !unify(c, x, y) then return None
+        result = zonk(c, x)
+    elif is_reference(x) && is_reference(y) then result = join(c, x, y)?
+    else return None
+    Some(Function(params, result, m && n))
 
 // The tuple two tuples of as many parts agree on: each part where they agree on it, as a tuple's parts
 // are read out, so `(Dog, long)` and `(Cat, long)` agree on `(Animal, long)`. Parts of value types
@@ -19240,7 +19293,32 @@ private if_expr(c: *Checker, e: &Expr, condition: &Expr, yes: &Expr, no: Option[
                 None ->
                     c.note(unit_of(c), e.span, s"the branches of this `if` agree on no type: `${type_name(y.ty)}` and `${type_name(n.ty)}`${no_single_join(c, y.ty, n.ty)}")
                     ty = ErrorType
+        val missed_yes = note_missed_expected(c, ty, y, wanted, "branch", "if")
+        val missed_no = note_missed_expected(c, ty, n, wanted, "branch", "if")
+        if missed_yes || missed_no then ty = ErrorType
     TExpr(e.span, ty, If(cond, y, Some(n)))
+
+// Whether a branch is the one that keeps branches from the fully known reference type expected of
+// them: what they agree on is not an instance of it, and neither is the branch, so the branch is
+// named rather than the type they fell back to. `if c then bIn() else cIn()` where an `In[B]` is
+// expected names `cIn()`, an `In[C]`, not the trait the two share.
+private misses_expected(c: *Checker, agreed: &Type, branch: &Type, expected: Option[&Type]) -> bool
+    val w = zonk(c, expected.unwrap_or(ErrorType))
+    if *w is ErrorType || *w is AnyType || has_unknowns(w) || !is_reference(w) then return false
+    if c.body.equalities.len() > 0 then return false
+    val t = zonk(c, agreed)
+    val x = zonk(c, branch)
+    if !is_reference(t) || !is_reference(x) || has_unknowns(t) || has_unknowns(x) then return false
+    val f = conformances(c)
+    !conforms(view_part(f, t, w), w) && !conforms(view_part(f, x, w), w)
+
+// Reports a branch or arm that misses the type expected of it (see `misses_expected`), and whether it
+// did.
+private note_missed_expected(c: *Checker, agreed: &Type, branch: &TExpr, expected: Option[&Type], what: string, keyword: string) -> bool
+    if !misses_expected(c, agreed, branch.ty, expected) then return false
+    val w = zonk(c, expected.unwrap_or(ErrorType))
+    c.note(unit_of(c), branch.span, s"this $what yields ${type_name(branch.ty)}, not the ${type_name(w)} expected of the `$keyword`")
+    true
 
 /** Where a union and a value of one of its members meet, as two branches, they agree on the union,
  * as a class and its superclass agree on the superclass. */
@@ -24430,6 +24508,9 @@ private match_expr(c: *Checker, e: &Expr, subject: &Expr, arms: Buf[Arm], expect
                         c.note(unit, arms[j].body.span, s"this arm yields ${type_name(ty)}, but the arms before it yield ${type_name(body.ty)}${no_single_join(c, body.ty, ty)}")
                     else c.note(unit, arm.body.span, s"this arm yields ${type_name(body.ty)}, but the other arms yield ${type_name(ty)}${no_single_join(c, ty, body.ty)}")
                     agreed = false
+    if agreed && used
+        for arm in typed
+            if note_missed_expected(c, ty, arm.body, wanted, "arm", "match") then agreed = false
     if !agreed then ty = ErrorType
     elif !used then ty = if never then Nothing else Unit
     // Arms that met a union they belong to yield it, each injected.

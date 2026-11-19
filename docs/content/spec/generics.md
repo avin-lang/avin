@@ -419,8 +419,22 @@ constructor passed, not a variance of the parameter.
   narrower function is expected, `dogs.map((a: Animal) -> a.name)`, and its body sees an `Animal`;
   `(x: Any) -> …` where an `(int) -> …` is expected is still an error.
 - Where two branches yield instances of one generic type, they agree on the instance whose
-  covariant arguments are their arguments' agreement: `if c then Some(dog) else Some(cat)` is an
-  `Option[Animal]`.
+  covariant arguments are their arguments' agreement and whose contravariant arguments are their
+  arguments' meet, the one of the two that is a subtype of the other: `if c then Some(dog) else
+  Some(cat)` is an `Option[Animal]`, and for `Sink[-T]`, `if c then sinkOfAnimals else
+  sinkOfDogs` is a `Sink[Dog]`, whichever is written first, and so is the `match` or the loop
+  that yields them. `Nothing` is below every type, so a `Sink[Nothing]` and a `Sink[Dog]` agree
+  on `Sink[Nothing]`. Two arguments neither of which is a subtype of the other (a `Sink[Dog]` and
+  a `Sink[string]`) have a meet no type names, so their instances agree on no instance and fall
+  back as two classes do (below): to the trait they share, or to none. An invariant argument that
+  differs has no agreement either. A function type's parameters follow the same rule as
+  contravariant arguments, its result as a covariant one: `(Animal) -> int` and `(Dog) -> int`
+  agree on `(Dog) -> int`.
+- Branches that agree on a type that is not an instance of the fully known type expected of them
+  agree on the expected type when both are instances of it: a `Dog` and a `Cat` that are both
+  `Animal`s and `Pet`s agree on `Pet` where a `Pet` is expected. Where a branch is not an instance
+  of the expected type and neither is what they agree on, that branch is the error, named as the
+  one that misses it.
 - Branches that agree on no type of their own agree on the type expected of them when both are
   instances of it, also while its type arguments are still being inferred: in
   `v.flatMap(n -> if n == 2 then List.empty[int]() else v)` the lambda is expected to yield an
@@ -555,7 +569,8 @@ infer is.
   they both conform to that every other trait they share is a parent of: a `Parrot` and a
   `Goldfish` that are both `Pet: Named` join to `Pet`. Where they share several unrelated traits,
   no one of them is chosen: the join is an error that names them, and the type is written, or
-  given by the expected type.
+  given by the expected type. Two instances of one generic type join at a contravariant argument
+  to the meet of the two arguments, where one is a subtype of the other ([Variance](#variance)).
 - Two tuples of as many parts join part by part, since a tuple's parts are read out: with `x: long`,
   `same((dog, x), (cat, x))` takes `(Animal, long)`, as do `if c then (dog, x) else (cat, x)` and
   `[(dog, x), (cat, x)]`, and so does a tuple inside a covariant argument (`Some((dog, x))` and
