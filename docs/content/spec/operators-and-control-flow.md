@@ -191,8 +191,9 @@ A prefix `-a` calls a method `-` taking no argument. Where a type has no method 
 name, the operator is its core trait's, `Add`'s `add` for `+`, as it always is in generic code: a
 type with both a method `+` and an `impl Add` has its method called by `a + b` and `add` called
 by a function bounded by `Add`. `a < b` alone calls the method `<`, whatever it yields, so a query
-builder's `age < 30` can build a condition; a comparison by a method does not chain, and
-`lo <= x < hi` through one is an error that says to join the comparisons with `&&`. `x += y` and
+builder's `age < 30` can build a condition. A comparison by a method chains when it yields `bool`:
+`lo <= x < hi` through methods `<=` and `<` is a [comparison chain](#comparison-chains), and a link
+whose method yields anything else makes the chain an error. `x += y` and
 the other compound forms assign through the method: `deadline += grace` is
 `deadline = deadline + grace`.
 
@@ -422,6 +423,15 @@ form; it is written inside the parentheses.
 `a < b <= c` is one expression. Operands are evaluated left to right, each middle operand exactly
 once, and evaluation stops at the first failing link. Parenthesizing a comparison makes it an
 ordinary `bool` operand: `(a < b) == flag`.
+
+A link may call its left operand's [operator method](#methods-named-by-symbols) `<`, `<=`, `>` or
+`>=`, and links of methods mix with built-in links, `==` and `!=` among them. Each link chooses its
+own method among the overloads, by its two operands, so `start < t <= limit` may call
+`Instant < Instant` and then `Instant <= Duration`. A chain is allowed when every link yields
+`bool`; a link whose method yields anything else, as a query builder's `age < 30` yielding a
+condition, makes the chain an error that names the link, its method and the type it yields, and says
+to join the comparisons with `&&` or to parenthesize one. The same comparison alone yields whatever
+its method yields.
 
 ## Blocks
 

@@ -9582,7 +9582,10 @@ private texpr_children(e: &TExpr) -> Buf[&TExpr]
         Logic(_, a, b) ->
             out.push(a)
             out.push(b)
-        Compare(operands, _) -> push_all(&out, operands)
+        Compare(operands, _, methods) ->
+            push_all(&out, operands)
+            for m in methods
+                if m is Some(link) then out.push(link.call)
         If(condition, yes, no) ->
             out.push(condition)
             out.push(yes)
@@ -17114,9 +17117,10 @@ private reach_expr(c: *Checker, r: *LazyReach, f: usize, at: *SelfAt, e: &TExpr)
                 operands.push(a)
                 operands.push(b)
                 reach_operator(c, r, f, at, om.method, operands)
-        Compare(operands, ops) ->
+        Compare(operands, ops, methods) ->
+            // A link calling an operator method is reached through its call, among the children.
             for i in 0..<ops.len()
-                if compare_operator_method(ops[i]) is Some(om)
+                if methods[i] is None && compare_operator_method(ops[i]) is Some(om)
                     var pair: Buf[&TExpr] = buf()
                     pair.push(operands[i])
                     pair.push(operands[i + 1])
@@ -18420,6 +18424,15 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
                 elif *y is Union(_) && settled(x) && fits(c, x, y) then typed[i] = inject(c, typed[i], y)
     // `===` between a reference and an `Any` or a type parameter's value compares both as `Any`s: a
     // reference is its own `Any`, and a value of another type is boxed, never the same object.
+    // A link whose left operand has a method of the link's operator calls it. Alone it is that call,
+    // yielding whatever the method yields; in a chain it must yield a `bool`.
+    var methods: Buf[Option[LinkMethod]] = buf()
+    for i in 0..<ops.len()
+        methods.push(None)
+        if ordering_op(ops[i]) && ordering_method(c, ops[i], settle_operand(c, typed[i], typed[i + 1]).ty)
+            val left = settle_operand(c, typed[i], typed[i + 1])
+            if ops.len() == 1 then return operator_method_call(c, e.span, e.span, checked_slot(c, left), left, compare_spelling(ops[0]), checked_slot(c, typed[1]), None)
+            methods[i] = Some(link_method(c, ops[i], left, typed[i + 1]))
     var linked = false
     if ops.len() == 1 && (ops[0] is Same || ops[0] is NotSame)
         val x = zonk(c, typed[0].ty)
@@ -18432,13 +18445,32 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
             linked = true
     if !linked
         for i in 0..<ops.len()
-            compare_link(c, ops[i], typed[i], typed[i + 1])
+            if methods[i] is None then compare_link(c, ops[i], typed[i], typed[i + 1])
     var ty: &Type = Bool
     for t in typed
         if *t.ty is Nothing then ty = Nothing
-    TExpr(e.span, ty, Compare(typed, ops))
+    TExpr(e.span, ty, Compare(typed, ops, methods))
 
 private ordering_op(op: CompareOp) -> bool = op is Less || op is LessEqual || op is Greater || op is GreaterEqual
+
+/** The link `left op right` of a chain as a call of `left`'s method `op`, on two unnamed locals the
+ * chain gives the operands' values to, so each is still evaluated once. The method chosen is the
+ * overload for this link's operands; it must yield a `bool`, since the chain's value is all its links
+ * holding. */
+private link_method(c: *Checker, op: CompareOp, left: &TExpr, right: &TExpr) -> LinkMethod
+    val spelling = compare_spelling(op)
+    val x = zonk(c, left.ty)
+    val y = zonk(c, right.ty)
+    val l = hidden_local(c, x)
+    val r = hidden_local(c, y)
+    val receiver = TExpr(left.span, x, Local(l))
+    val argument = TExpr(right.span, y, Local(r))
+    val at = left.span.to(right.span)
+    val call = operator_method_call(c, at, at, checked_slot(c, receiver), receiver, spelling, checked_slot(c, argument), None)
+    val yields = zonk(c, call.ty)
+    if !(*yields is Bool || *yields is ErrorType || *yields is Nothing)
+        c.note(unit_of(c), at, s"`$spelling` is a method of ${type_name(x)} yielding ${type_name(yields)}, and a link of a comparison chain must yield `bool`; join the comparisons with `&&`, or parenthesize one")
+    LinkMethod(l, r, call)
 
 /** Whether `a op b` with `a` of type `t` calls `a`'s method named `op`: `op` is `<`, `<=`, `>` or
  * `>=`, and `t` is a data type, a class or a type parameter with a method of that name taking one
@@ -18563,10 +18595,6 @@ private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
 // `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes and strings have them, and a type
 // parameter, a data type or a class through `Ord`.
 private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
-    // A method `<` is a call of its own, which may yield anything, and so is not a link of a chain.
-    if has_operator_traits(x) && takes_one_argument(c, methods_of(c, x, spelling))
-        c.note(unit_of(c), at, s"`$spelling` is a method of ${type_name(x)}, and a comparison by a method does not chain; join the comparisons with `&&`")
-        return
     // A use settles what is still unknown: `Some(1) < None` compares two `Option[int]`s.
     if !same_type(x, y)
         if !((has_unknowns(x) || has_unknowns(y)) && unify(c, x, y))
@@ -26521,7 +26549,11 @@ private scan_init(c: *Checker, s: InitScan, e: &TExpr, unsafe: *Buf[bool]) -> bo
         Logic(_, a, b) ->
             val ok = scan_init(c, s, a, unsafe)
             scan_init(c, s, b, unsafe) && ok
-        Compare(operands, _) -> scan_init_all(c, s, operands, unsafe)
+        Compare(operands, _, methods) ->
+            var ok = scan_init_all(c, s, operands, unsafe)
+            for m in methods
+                if m is Some(link) && !scan_init(c, s, link.call, unsafe) then ok = false
+            ok
         If(condition, yes, no) ->
             var ok = scan_init(c, s, condition, unsafe)
             if !scan_init(c, s, yes, unsafe) then ok = false
