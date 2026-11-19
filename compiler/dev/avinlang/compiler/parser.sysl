@@ -458,7 +458,16 @@ private word_prefix(t: Spanned[Token], text: string, p: *Parser) -> &Expr
     if p.lambda_boundary != Some(p.toks.position) && p.accept("->")
         var params: Buf[LambdaParam] = buf()
         refuse_builtin_name(p, t.span, text, "a parameter")
-        params.push(LambdaParam(t.span, text, None))
+        params.push(LambdaParam(t.span, text, None, false))
+        val body = parse_body(p, false)
+        return Expr(t.span.to(body.span), Lambda(params, body))
+    // `using tx -> body`: a lambda whose one parameter is a given in its body.
+    if text == "using" && p.at_kind(Word) && !is_keyword(p.ahead(0)) && p.ahead(1) == "->" && p.lambda_boundary != Some(p.toks.position + 1)
+        val name = p.toks.advance().unwrap()
+        p.toks.advance()
+        var params: Buf[LambdaParam] = buf()
+        refuse_builtin_name(p, name.span, p.spelling(name), "a parameter")
+        params.push(LambdaParam(t.span.to(name.span), p.spelling(name), None, true))
         val body = parse_body(p, false)
         return Expr(t.span.to(body.span), Lambda(params, body))
     if text == "true" then return Expr(t.span, BoolLit(true))
@@ -950,7 +959,7 @@ private with_placeholders(e: &Expr, params: *Buf[LambdaParam]) -> &Expr
         Name(n) ->
             if n != "_" then return e
             val name = "_$" + (params.len() + 1).to_string()
-            params.push(LambdaParam(e.span, name, None))
+            params.push(LambdaParam(e.span, name, None, false))
             Expr(e.span, Name(name))
         Unary(op, operand) -> Expr(e.span, Unary(op, with_placeholders(operand, params)))
         Binary(op, left, right, at) ->
@@ -978,7 +987,7 @@ private with_placeholders(e: &Expr, params: *Buf[LambdaParam]) -> &Expr
         // `(_: long)` is a parameter of that type.
         Ascribe(value, ty) ->
             val inner = with_placeholders(value, params)
-            if value.kind is Name("_") then params[params.len() - 1] = LambdaParam(value.span, params[params.len() - 1].name, Some(ty))
+            if value.kind is Name("_") then params[params.len() - 1] = LambdaParam(value.span, params[params.len() - 1].name, Some(ty), false)
             Expr(e.span, Ascribe(inner, ty))
         With(base, changes) -> Expr(e.span, With(with_placeholders(base, params), changes))
         Tuple(items) ->
@@ -1028,9 +1037,23 @@ private trailing_block(p: *Parser, parenthesized: bool) -> Option[&Expr]
         p.toks.advance()
         var params: Buf[LambdaParam] = buf()
         refuse_builtin_name(p, name.span, p.spelling(name), "a parameter")
-        params.push(LambdaParam(name.span, p.spelling(name), None))
+        params.push(LambdaParam(name.span, p.spelling(name), None, false))
         val body = parse_body(p, false)
         return Some(Expr(name.span.to(body.span), Lambda(params, body)))
+    // `call using tx ->` and an indented block: the trailing lambda's one parameter is a given.
+    if p.at("using") && p.ahead(2) == "->" && arrow_ends_line(p, 2)
+        val name_token = p.toks.peek_at(1) match
+            Some(t) -> t
+            None -> return None
+        if name_token.value != Word || is_keyword(p.ahead(1)) then return None
+        val using_at = p.toks.advance().unwrap()
+        val name = p.toks.advance().unwrap()
+        p.toks.advance()
+        var params: Buf[LambdaParam] = buf()
+        refuse_builtin_name(p, name.span, p.spelling(name), "a parameter")
+        params.push(LambdaParam(using_at.span.to(name.span), p.spelling(name), None, true))
+        val body = parse_body(p, false)
+        return Some(Expr(using_at.span.to(body.span), Lambda(params, body)))
     if parenthesized && p.at("(")
         var depth = 0
         var i = 0usize
@@ -1185,13 +1208,18 @@ private lambda_params_ahead(p: *Parser) -> bool
 
 private parse_lambda(p: *Parser, at: Span) -> &Expr
     var params: Buf[LambdaParam] = buf()
+    var contextual = false
     if !p.accept(")")
         loop
             val start = p.toks.here()
+            if using_ahead(p, 0)
+                if contextual then p.report.add(error(start, "`using` begins the contextual section once: every parameter after it is contextual already"))
+                p.toks.advance()
+                contextual = true
             val name = declared_name(p, "a parameter")
             var declared: Option[&TypeExpr] = None
             if p.accept(":") then declared = Some(parse_type(p))
-            params.push(LambdaParam(start.to(p.ended()), name, declared))
+            params.push(LambdaParam(start.to(p.ended()), name, declared, contextual))
             if !p.accept(",") || p.at(")") then break
         p.expect(")")
     p.expect("->")

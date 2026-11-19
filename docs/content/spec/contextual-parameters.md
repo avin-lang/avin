@@ -44,7 +44,8 @@ everywhere. Givens do not take part in that:
   of its argument is a bound.
 - **A given has no type parameters.** A given is a value, and no value in Avin is generic.
 - **A given's type is a type of the program's own kind**: a class, an object's type, a trait used as
-  a type, or a `data` type, with closed type arguments (`Pool[Connection]`). A built-in type, a
+  a type, a `data` type or an [opaque type](/spec/declarations/#opaque-types), with closed type
+  arguments (`Pool[Connection]`). A built-in type, a
   tuple, a function type and a union are refused: a given `int` would be given wherever any `int`
   is asked for. A trait that mentions `Self` or has static members is a bound and not a type, so it
   is no given's type either.
@@ -68,8 +69,9 @@ mutable context is an object whose own state changes.
   names it, and how another file imports it.
 - **A given is declared in a block, at a module's top level, or in an object's body.** In a block it
   is in scope from its declaration to the end of the block, as a `val` is; at the top level, in
-  every file of its module; in an object's body, in that body. A class, trait or `data` body declares
-  none: a class takes its context as `using` parameters of its constructor (below).
+  every file of its module; in an object's body, in that body. A class, actor, trait, impl or
+  `data` body declares none: a class or an actor takes its context as `using` parameters of its
+  constructor (below).
 - **A given is not in scope in its own value**, so `given reqLog = log.child(id)` reads the `log`
   given of an outer scope.
 - **One scope declares one given of a type.** A second given of the same type in one block, at one
@@ -77,8 +79,10 @@ mutable context is an object whose own state changes.
 - A module or object given is made when that module's values or that object are, in the same order.
   `private` keeps a module's given to its module.
 - **`given` is a keyword only where it begins a given**: at the start of a statement in a block, and
-  where a declaration starts at a module's top level or in an object's body. Elsewhere it is an
-  ordinary name, so `args.given("out")` and a field named `given` are unaffected.
+  where a declaration starts at a module's top level or in an object's body, before a name and its
+  `:` or `=`. Elsewhere it is an ordinary name, so `args.given("out")`, `given = 3`, a function
+  `given(x)` and a field named `given` are unaffected. `given` before `val`, `var` or a capitalized
+  name (`given Logger(…)`) is reported as a given written without a name of its own or as a `var`.
 
 ## `using` parameters
 
@@ -101,13 +105,16 @@ a parameter named `using` (`using: Mode`) is still one.
   `@c` binding, and a function with no parameter list take none.
 - **Inside the body a contextual parameter is a given**, at the level of the function's parameters,
   so calls in the body pass it on. A class constructor's contextual parameters are private fields,
-  and givens in its field initializers and methods; an actor's are givens in its body and its
-  `receive`.
+  and givens in its field initializers and methods, so they are written without `val`, `var` or
+  `private`; an actor's are givens in its body and its `receive`.
+- A contextual parameter is passed by name, so it has a name, and it is a value already made, so it
+  is neither by-name (`-> T`) nor repeated.
 - **A trait's method with a `using` section is implemented with the same section**: the same names
   and types, in order, as an override takes its method's parameter types. A call through the
   trait's type or a bound resolves the section where it is written.
 - A function written as [clauses](/spec/declarations/#clauses) writes its `using` section on its
-  signature line; the clauses match the other parameters, and each clause's body has the givens.
+  signature line; the clauses match the other parameters, and each clause's body has the givens,
+  by name too: `describe(n: int, using tx: Tx)` is followed by `describe(0) = …`.
 - A contextual parameter may have a **default**, used where a call finds no given:
   `now(using clock: Clock = SystemClock) -> Instant`. The default is evaluated where the function is
   declared, as every default is.
@@ -173,7 +180,8 @@ its module because it can only add a method a call names; a given changes what a
 - **A lambda's body resolves contextual parameters where the lambda is written**, as any name in it
   is resolved, and a given it fills a call with is captured as any value it reads is.
 - **A lambda's parameters after `using` are givens in its body**: `db.transaction(using tx ->
-  insert(row))`. They are positional parameters of the function value all the same: the lambda's
+  insert(row))`, `(a, using tx: Transaction) -> …`, and as a trailing lambda,
+  `db.transaction using tx ->` with its body indented below. They are positional parameters of the function value all the same: the lambda's
   type is `(Transaction) -> unit`, and whoever calls it passes the transaction.
 - **A function type has no `using` section**, as it has no names and no defaults: a function value is
   called with positional arguments only, all of them.

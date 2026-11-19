@@ -162,6 +162,8 @@ struct GlobalSymbol
     object: Option[usize]
     /** A `lazy val`: `init` runs on the value's first read instead of before `main`. */
     lazy: bool
+    /** `given name = value` at the top level: a value that is also a given of its module. */
+    given: bool
 
 /** A field of a class; `ty` is `None` until the constructor's check infers it from the field's
  * initializer, when the declaration has no type. */
@@ -415,8 +417,16 @@ struct BodyState
     /** Set while the lambda a deferred statement is checked as is begun: its body is a deferred
      * statement's, which no jump may leave. */
     deferring: bool
+    /** The locals that are givens, `given name = value` in a block, each with its declaration: a
+     * call fills a contextual parameter from those of them in scope. */
+    givens: Buf[GivenLocal]
 
-fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf(), false)
+fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf(), false, buf())
+
+/** A given declared in a block: its local, and where it is declared. */
+struct GivenLocal
+    local: usize
+    span: Span
 
 /** A local type equality: type parameter `index` of `owner` is `ty` wherever local `marker`, which a
  * refining pattern declares beside the names it binds, is in scope. */
@@ -1359,6 +1369,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_lazy_cycles(&c, direct)
     check_lazy_field_cycles(&c)
     check_local_lazy_cycles(&c)
+    check_givens(&c)
     val init = initializer(&c, initialization_order(&c, direct), testing)
     // A program without `main` is told so in its last file.
     var main_unit = given - 1
@@ -1382,7 +1393,9 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
                 takes_arguments = *main.params[0] match
                     Class(k, _, args) -> is_vector_class(c.classes[k]) && args.len() == 1 && *args[0] is Str
                     _ -> false
-            if main.params.len() > 1 || (main.params.len() == 1 && !takes_arguments && !(*main.params[0] is ErrorType))
+            if takes_using(main.decl)
+                c.note(main_unit, main.decl.name_span, "`main` takes no `using` section: nothing calls it to fill one, so it declares the givens it needs in its body")
+            elif main.params.len() > 1 || (main.params.len() == 1 && !takes_arguments && !(*main.params[0] is ErrorType))
                 c.note(main_unit, main.decl.name_span, "`main` is `main()` or `main(args: Vector[string])`")
             elif takes_arguments && declares_variadic(main.decl)
                 c.note(main_unit, main.decl.name_span, "`main`'s `args` is not a repeated parameter; `main` is `main()` or `main(args: Vector[string])`")
@@ -1460,7 +1473,8 @@ private check_tests(c: *Checker) -> Buf[TestCase]
                 break
             var test = TestCase(id, f.name, f.module_name, None, None, None, None, None, None, None, None)
             read_test_arguments(c, f.unit, a, f.name, &test)
-            if f.params.len() > 0
+            // A `using` section is reported where the signature is read.
+            if f.params.len() > 0 && !takes_using(f.decl)
                 c.note(f.unit, f.decl.name_span, s"a `@test` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
             if f.decl.type_params.len() > 0
                 c.note(f.unit, f.decl.name_span, s"a `@test` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
@@ -1593,7 +1607,7 @@ private check_hooks(c: *Checker) -> Map[string, TestHooks]
                 c.note(f.unit, a.span, s"`@${a.name}` marks a top-level function, which `avin test` can call by itself")
                 break
             if a.args.len() > 0 then c.note(f.unit, a.span, s"`@${a.name}` takes no arguments")
-            if f.params.len() > 0
+            if f.params.len() > 0 && !takes_using(f.decl)
                 c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function takes no parameters, and `${f.name}` takes ${count(f.params.len(), "parameter")}: `avin test` calls it with nothing")
             if f.decl.type_params.len() > 0
                 c.note(f.unit, f.decl.name_span, s"a `@${a.name}` function has no type parameters, and `${f.name}` declares `${f.decl.type_params[0].name}`: the runner supplies no type arguments")
@@ -2110,7 +2124,9 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
         if tp.lower is Some(l) then c.note(unit, l.span, s"a lower bound is written on a function's or a method's own type parameter, not on `${tp.name}`")
     for m in d.members
         m match
-            FieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
+            FieldMember(f) ->
+                if f.given then c.note(unit, f.span, s"an impl adds methods, so it declares no given; declare `${f.name}` at the module's top level or in an object")
+                else c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             AbstractFieldMember(f) -> c.note(unit, f.span, s"an impl adds methods, not state, so it cannot declare the field `${f.name}`")
             StatementMember(s) -> c.note(unit, s.span, "an impl's body declares only methods")
             MethodMember(_, _, _, _) -> ()
@@ -3786,6 +3802,7 @@ private declare_fields(c: *Checker, unit: usize)
                 _ -> "_"
             if field_named(fields, name) is Some(_) then c.note(unit, cp.param.pattern.span, s"the field `$name` is declared more than once")
             val written = resolve_type(c, unit, cp.param.ty)
+            if cp.param.contextual then check_contextual_param(c, unit, cp.param, written)
             val field_type = if cp.param.variadic then vector_of(c, written) else written
             fields.push(FieldSymbol(name, cp.param.pattern.span, Some(field_type), cp.mutable, cp.public, true, id, false, false))
         var state: Buf[TraitState] = buf()
@@ -4713,7 +4730,7 @@ private declare_methods(c: *Checker, unit: usize)
             made_from.push(None)
             if f.mutable
                 var value_params: Buf[Param] = buf()
-                value_params.push(Param(f.span, Pattern(f.span, Name("value")), declared_type, None, false, false, buf()))
+                value_params.push(Param(f.span, Pattern(f.span, Name("value")), declared_type, None, false, false, buf(), false))
                 val unit_type = TypeExpr(f.span, Named("unit", buf()))
                 val setter = Function(buf(), f.span, f.span, f.name + "=", buf(), value_params, Some(unit_type), None, buf(), false)
                 declared.push(MethodDecl(setter, true, false, unit, module_name, d.type_params, false, false, false, 1, j))
@@ -5462,7 +5479,7 @@ private declare_globals(c: *Checker, unit: usize)
                 c.locals.push(buf())
                 if file.private_items[i] then c.private_names.put(key, true)
                 c.global_names.put(key, c.globals.len())
-                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None, v.lazy))
+                c.globals.push(GlobalSymbol(unit, file.module_name, v.name, v.span, v.mutable, init, None, v.lazy, v.given))
             ClassItem(d) ->
                 if !d.object then continue
                 // A second object of one name has no class, and was reported.
@@ -5472,7 +5489,7 @@ private declare_globals(c: *Checker, unit: usize)
                         if global_name_taken(c, unit, d.name, d.name_span, true) then break
                         c.classes[k].global = Some(c.globals.len())
                         c.global_names.put(key, c.globals.len())
-                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k), false))
+                        c.globals.push(GlobalSymbol(unit, file.module_name, d.name, d.name_span, false, cls.constructor, Some(k), false, false))
             _ -> ()
 
 // A companion's `apply` overloads the constructor its name has in call position, so it cannot take
@@ -7327,6 +7344,17 @@ private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> 
                 val w = seen_from(c, self_type, base, u)
                 if !same_type(h, w) then return Some(s"whose type parameter `$name` is bounded by ${type_name(w)}, not ${type_name(h)}")
             None -> return Some(s"whose type parameter `$name` is bounded by no type parameter")
+    // A call through either method fills the same `using` section, passing its parameters by the same
+    // names.
+    val wanted = c.symbols[base].decl.params
+    val written = c.symbols[m].decl.params
+    if wanted.len() + 1 == want.len() && written.len() + 1 == have.len()
+        for i in 0..<wanted.len()
+            val name = c.symbols[base].param_names[i + 1]
+            if wanted[i].contextual != written[i].contextual
+                return Some(if wanted[i].contextual then s"whose parameter `$name` is contextual, after `using`" else s"whose parameter `$name` is not contextual")
+            if wanted[i].contextual && c.symbols[m].param_names[i + 1] != name
+                return Some(s"whose contextual parameter is named `$name`, not `${c.symbols[m].param_names[i + 1]}`: a call passes it by that name")
     // A call through either method passes the same arguments, so both repeat their last parameter or
     // neither does.
     val repeats = declares_variadic(c.symbols[base].decl)
@@ -7689,8 +7717,10 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
         if p.by_name && f.clauses.len() > 0
             c.note(unit, p.pattern.span, s"`${f.name}` is defined by clauses, which match its arguments, so its parameters cannot be by-name")
         val written = resolve_type(c, unit, p.ty)
+        if p.contextual then check_contextual_param(c, unit, p, written)
         val ty = if p.variadic then vector_of(c, written) else written
         if p.by_name && f.clauses.len() == 0 then params.push(ByName(ty)) else params.push(ty)
+    if takes_using(f) then refuse_using_section(c, unit, f)
     var result: Option[&Type] = None
     if f.result is Some(r) then result = Some(resolve_type(c, unit, r))
     elif f.body is None && f.clauses.len() == 0 then result = Some(Unit)
@@ -13653,9 +13683,13 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     // A method's clauses match its arguments, not its receiver: that of a class's, a trait's or an
     // impl's method, which only a static member lacks.
     val skip = if symbol.params.len() > decl.params.len() then symbol.params.len() - decl.params.len() else 0usize
+    // Nor its `using` section, which the clauses' bodies have as givens.
+    var contextual = 0usize
+    for p in decl.params
+        if p.contextual then contextual += 1
     var params: Buf[&Type] = buf()
     var matched: Buf[&TExpr] = buf()
-    for i in skip..<symbol.params.len()
+    for i in skip..<symbol.params.len() - contextual
         params.push(symbol.params[i])
         matched.push(subjects[i])
     var typed: Buf[TClause] = buf()
@@ -13666,7 +13700,8 @@ private check_clauses(c: *Checker, id: usize, subjects: Buf[&TExpr])
     var refined_clauses: Buf[RefinedArm] = buf()
     for clause in decl.clauses
         if clause.patterns.len() != params.len()
-            c.note(unit, clause.span, s"`${decl.name}` takes ${count(params.len(), "argument")}, but this clause matches ${clause.patterns.len()}")
+            val section = if contextual > 0 then s" besides its `using` section" else ""
+            c.note(unit, clause.span, s"`${decl.name}` takes ${count(params.len(), "argument")}$section, but this clause matches ${clause.patterns.len()}")
             continue
         val mark = c.body.visible.len()
         val outer_start = c.body.block_start
@@ -14692,7 +14727,7 @@ private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want
     var args: Buf[Argument] = buf()
     for i in 0..<arity
         val param = s"adapted $i"
-        params.push(LambdaParam(at, param, None))
+        params.push(LambdaParam(at, param, None, false))
         args.push(Argument(at, None, name_at(at, param), false))
     val body = Expr(at, Call(name_at(at, callee), args))
     lambda_expr(c, Expr(at, Lambda(params, body)), params, body, Some(want), false)
@@ -14846,6 +14881,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     InfixCall(target, name, name_span, arg) -> infix_call(c, e.span, target, name, name_span, arg, expected)
     Block(items, discard) -> block_expr(c, e, items, discard, expected, used)
     Binding(name, declared, value, mutable) -> binding_expr(c, e, name, declared, value, mutable)
+    GivenBinding(name, declared, value) -> given_binding_expr(c, e, name, declared, value)
     Destructure(pattern, declared, value, mutable) -> destructure_expr(c, e, pattern, declared, value, mutable)
     LazyBinding(name, declared, value) -> lazy_binding_expr(c, e, name, declared, value)
     Assign(target, op, value, yields, op_span) -> assign_expr(c, e, target, op, value, yields, op_span)
@@ -16099,6 +16135,177 @@ private binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&Type
     val index = declare_local(c, e.span, name, ty, mutable)
     // A binding whose value never finishes does not finish either.
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** The givens of modules and objects, once every value's type is known: each of a type a given may
+ * have, and at most one of each type at a module's top level (all its files together) and in an
+ * object's body. A class, trait or actor body declares none: its context comes as `using` parameters
+ * of its constructor. */
+private check_givens(c: *Checker)
+    for i in 0..<c.globals.len()
+        val g = c.globals[i]
+        if !g.given then continue
+        val ty = zonk(c, c.symbols[g.init].result.unwrap_or(ErrorType))
+        val problem = given_type_problem(c, ty, "a given")
+        if problem != ""
+            c.note(g.unit, g.span, problem)
+            continue
+        for j in 0..<i
+            val h = c.globals[j]
+            if !h.given || h.module_name != g.module_name then continue
+            if same_type(zonk(c, c.symbols[h.init].result.unwrap_or(ErrorType)), ty)
+                c.note(g.unit, g.span, s"`${g.name}` is a second given of type `${type_name(ty)}` at this module's top level, beside `${h.name}` (${place_of(c, h.unit, g.unit, h.span)})")
+                break
+    for k in 0..<c.classes.len()
+        val cls = c.classes[k]
+        var names: Buf[string] = buf()
+        var types: Buf[&Type] = buf()
+        var spans: Buf[Span] = buf()
+        for m in cls.decl.members
+            m match
+                FieldMember(f) ->
+                    if !f.given then continue
+                    if cls.decl.modifier == "trait"
+                        c.note(cls.unit, f.span, "a trait declares no givens: a given is a value, and a trait's state is each implementing type's; declare it at the module's top level or in an object")
+                        continue
+                    if !cls.decl.object
+                        c.note(cls.unit, f.span, "a class or an actor declares no givens in its body: it takes its context as `using` parameters of its constructor, which are givens in its body")
+                        continue
+                    var ty: &Type = ErrorType
+                    for field in cls.fields
+                        if field.owner == k && field.name == f.name
+                            ty = zonk(c, field.ty.unwrap_or(ErrorType))
+                            break
+                    val problem = given_type_problem(c, ty, "a given")
+                    if problem != ""
+                        c.note(cls.unit, f.span, problem)
+                        continue
+                    for j in 0..<names.len()
+                        if same_type(types[j], ty)
+                            c.note(cls.unit, f.span, s"`${f.name}` is a second given of type `${type_name(ty)}` in `${cls.name}`, beside `${names[j]}` (line ${c.units[cls.unit].src.locate(spans[j].start).line})")
+                            break
+                    names.push(f.name)
+                    types.push(ty)
+                    spans.push(f.span)
+                _ -> ()
+
+/** Where `span` of `unit` is, said from `from`: its line, and its file's name where that is another. */
+private place_of(c: *Checker, unit: usize, from: usize, span: Span) -> string
+    val line = c.units[unit].src.locate(span.start).line
+    if unit == from then s"line $line" else s"${c.units[unit].src.name}, line $line"
+
+/** A contextual parameter's type, `written`: a type a given may have, naming no type parameter, of the
+ * function or of an enclosing class, trait or impl, since every call resolves it the same way. */
+private check_contextual_param(c: *Checker, unit: usize, p: Param, written: &Type)
+    val name = p.pattern.kind match
+        Name(n) -> n
+        _ -> "_"
+    val t = zonk(c, written)
+    if type_parameter_named(t) is Some(tp)
+        var bound = ""
+        *t match
+            Class(_, head, _) -> bound = s": `[$tp: $head]`"
+            Data(_, head, _) -> bound = s": `[$tp: $head]`"
+            _ -> ()
+        c.note(unit, p.span, s"`$name: ${type_name(t)}` names the type parameter `$tp`; a contextual parameter's type is fixed where its function is declared, and what `$tp` needs is a bound$bound")
+        return
+    val problem = given_type_problem(c, t, "a contextual parameter")
+    if problem != "" then c.note(unit, p.span, problem)
+
+/** Whether `f` declares a `using` section. */
+takes_using(f: &Function) -> bool
+    for p in f.params
+        if p.contextual then return true
+    false
+
+/** Reports a `using` section on a function nothing calls with one: a binding to foreign code, a
+ * `@test` function or a test hook. `main` is reported where the entry point is checked. */
+private refuse_using_section(c: *Checker, unit: usize, f: &Function)
+    for a in f.annotations
+        if a.name == "sysl" || a.name == "c"
+            c.note(unit, f.name_span, s"a `@${a.name}` binding takes no `using` section: its parameters are the foreign function's")
+            return
+        if a.name == "test" || is_hook_annotation(a.name)
+            c.note(unit, f.name_span, s"a `@${a.name}` function takes no `using` section: the runner calls it with nothing, so it declares the givens it needs in its body")
+            return
+
+/** `given name = value` in a block: a `val`, held to the types a given may have, and recorded as a
+ * given of the block, which holds at most one of each type. */
+private given_binding_expr(c: *Checker, e: &Expr, name: string, declared: Option[&TypeExpr], value: &Expr) -> &TExpr
+    val unit = unit_of(c)
+    var want: Option[&Type] = None
+    if declared is Some(d) then want = Some(resolve_type(c, unit, d))
+    val typed = check_expr(c, value, want)
+    var ty = typed.ty
+    if want is Some(w)
+        if !fits(c, typed.ty, w) then c.note(unit, value.span, expected_found(c, w, typed.ty))
+        ty = w
+    ty = zonk(c, ty)
+    val problem = given_type_problem(c, ty, "a given")
+    if problem != "" then c.note(unit, e.span, problem)
+    else
+        for g in c.body.givens
+            if !local_in_block(c, g.local) then continue
+            val other = c.body.locals[g.local]
+            if same_type(zonk(c, other.ty), ty)
+                c.note(unit, e.span, s"`$name` is a second given of type `${type_name(ty)}` in this block, beside `${other.name}` (line ${c.units[unit].src.locate(g.span.start).line})")
+                break
+    val index = declare_local(c, e.span, name, ty, false)
+    c.body.givens.push(GivenLocal(index, e.span))
+    TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
+
+/** Whether local `index` is declared in the innermost block, and in scope there. */
+private local_in_block(c: *Checker, index: usize) -> bool
+    for i in c.body.block_start..<c.body.visible.len()
+        if c.body.visible[i] == index then return true
+    false
+
+/** Why a value of type `ty` cannot be `what` (a given, or a contextual parameter), or "" where it can:
+ * its type is a class, an object's type, a trait used as a type, a data type or an opaque type, and
+ * names no type parameter. A type of any other kind would be given wherever any value of it is asked
+ * for. */
+given_type_problem(c: *Checker, ty: &Type, what: string) -> string
+    val t = zonk(c, ty)
+    val shown = type_name(t)
+    var nominal = false
+    *t match
+        ErrorType -> return ""
+        Class(k, name, _) ->
+            if is_trait(c, k) && mentions_self(c, k, 0) then return s"`$name` is only a bound, since a method of it names `Self` or is static, so it is no type of $what"
+            nominal = true
+        Data(_, _, _) -> nominal = true
+        Opaque(_, _, _, _) -> nominal = true
+        _ -> ()
+    if !nominal
+        if type_parameter_named(t) is Some(p)
+            return s"`$p` is a type parameter, and $what's type is fixed where it is declared: what `$p` needs is a bound"
+        return s"$what is of a class, object, trait or data type: `$shown` would be given wherever ${article(shown)} `$shown` is asked for; give it a type of its own (`data Retries(count: int)`)"
+    if type_parameter_named(t) is Some(p)
+        return s"`$shown` names the type parameter `$p`, and $what's type is fixed where it is declared: what `$p` needs is a bound"
+    ""
+
+/** The first type parameter `t` names, if any: a bare one, or one among its arguments or parts. */
+type_parameter_named(t: &Type) -> Option[string]
+    *t match
+        TypeVar(owner, _, name) -> return if owner == hole_owner() then None else Some(name)
+        Class(_, _, args) -> return type_parameter_among(args)
+        Data(_, _, args) -> return type_parameter_among(args)
+        Opaque(_, _, args, _) -> return type_parameter_among(args)
+        Tuple(items) -> return type_parameter_among(items)
+        Union(members) -> return type_parameter_among(members)
+        Function(params, result, _) ->
+            if type_parameter_among(params) is Some(p) then return Some(p)
+            return type_parameter_named(result)
+        ByName(inner) -> return type_parameter_named(inner)
+        Applied(head, args) ->
+            if type_parameter_named(head) is Some(p) then return Some(p)
+            return type_parameter_among(args)
+        Constructor(body, _) -> return type_parameter_named(body)
+        _ -> return None
+
+private type_parameter_among(types: Buf[&Type]) -> Option[string]
+    for t in types
+        if type_parameter_named(t) is Some(p) then return Some(p)
+    None
 
 /** Whether `name` is a variant of `ty`, a data type with refined variants. */
 private names_refined_variant(c: *Checker, ty: &Type, name: string) -> bool
@@ -19712,7 +19919,7 @@ private yield_param(kind: string, start: usize, pattern: &Pattern) -> string = p
  * `body`. */
 private element_function(pattern: &Pattern, item: string, definitions: Buf[&Expr], body: &Expr) -> &Expr
     var params: Buf[LambdaParam] = buf()
-    params.push(LambdaParam(pattern.span, item, None))
+    params.push(LambdaParam(pattern.span, item, None, false))
     var items: Buf[&Expr] = buf()
     items.push(element_binding(pattern, name_at(pattern.span, item)))
     for d in definitions do items.push(d)
@@ -22994,6 +23201,7 @@ private exits_lambda(e: &Expr) -> bool = e.kind match
     MapLit(keys, values) -> any_exits_lambda(keys) || any_exits_lambda(values)
     Block(items, _) -> any_exits_lambda(items)
     Binding(_, _, value, _) -> exits_lambda(value)
+    GivenBinding(_, _, value) -> exits_lambda(value)
     Destructure(_, _, value, _) -> exits_lambda(value)
     // A local `lazy val`'s initializer is a lambda's body.
     LazyBinding(_, _, _) -> false
@@ -23523,7 +23731,7 @@ private untupled_lambda(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &
             items.push(Expr(p.span, Binding(p.name, declared[i], element, false)))
     items.push(body)
     var one: Buf[LambdaParam] = buf()
-    one.push(LambdaParam(e.span, whole, None))
+    one.push(LambdaParam(e.span, whole, None, false))
     val wrapped = Expr(body.span, Block(items, false))
     lambda_expr(c, e, one, wrapped, expected, delayed)
 
@@ -23567,7 +23775,7 @@ private matched_type_known(c: *Checker, e: &Expr, t: &Type) -> bool
 
 private match_params(at: Span) -> Buf[LambdaParam]
     var params: Buf[LambdaParam] = buf()
-    params.push(LambdaParam(at, MatchParam, None))
+    params.push(LambdaParam(at, MatchParam, None, false))
     params
 
 private match_body(at: Span, arms: Buf[Arm]) -> &Expr = Expr(at, Match(Expr(at, Name(MatchParam)), arms))

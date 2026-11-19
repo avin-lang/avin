@@ -9037,6 +9037,32 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the cost of a call linear and its errors at the chosen function. No standard-library API adopts
   contextual parameters in this design; adopting one (an `Executor` for `Future(body)`) is its own
   item, since `ex.future(body)` already exists and the two would be two ways.
+- Settled on the user's delegation 2026-11-19 (branch `given-1`): **an opaque type may be a given's
+  and a contextual parameter's type**, beside classes, objects, traits used as types and `data`
+  types. Why: the refusal of built-in types exists because a given `int` would be given wherever
+  any `int` is asked for; an opaque type is a nominal type of its own (`opaque type UserId =
+  long`), which only what asks for a `UserId` receives, so it has none of that problem, and "avin is
+  for everyone" favours the wider rule. Alternatives weighed: refusing it as the design's list did
+  (a wrapper `data` type would be needed for a value an opaque type already names). Review with
+  the user.
+- Settled on the user's delegation 2026-11-19 (branch `given-1`): **where `given` and `using`
+  begin their forms.** `given` begins a given where a name and its `:` or `=` follow it; before
+  `val`, `var` or a capitalized name it is read as a given and reported (a `val` already; never a
+  `var`; every given named); everywhere else it is a name. `using` begins a section where a name
+  (or a class parameter's modifier) follows it in a parameter list, also in a parenthesized lambda
+  and as `using tx ->`, alone or as a call's trailing lambda. Why: the smallest test that keeps
+  every existing use (`args.given(…)`, `given = 3`, `given(x)`, a parameter `using: Mode`) meaning
+  what it did; the capitalized-name case turns the likeliest mistake, an unnamed given, into its
+  own message rather than a parse error. Alternatives weighed: reserving both words (breaks
+  existing programs); reading `given` before any name as a declaration (an infix call `given max
+  b` on a value named `given` would change meaning).
+- Settled on the user's delegation 2026-11-19 (branch `given-1`): **a contextual parameter has a
+  name, is neither by-name nor repeated, and a class's is written without `val`, `var` or
+  `private`; a repeated parameter may come just before the section.** Why: it is passed explicitly
+  only by name; a given is one value already made, so by-name evaluation and repetition mean
+  nothing for it; a class's contextual parameter is a private field and a given by definition.
+  The section comes last, so a repeated parameter is last of the others (`all(xs: int*, using tx:
+  Tx)`). A data variant takes no section, reported where it is parsed.
 
 ## Proposed
 

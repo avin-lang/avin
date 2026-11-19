@@ -575,8 +575,9 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 
 ### Contextual parameters: build plan
 
-Designed in [contextual parameters](/spec/contextual-parameters/), its choices proposed in
-[decisions](/spec/decisions/#proposed). Not started. A filled argument becomes an ordinary
+Designed in [contextual parameters](/spec/contextual-parameters/), its choices
+[settled](/spec/decisions/#settled). Steps 1 and 2 are done (branch `given-1`); steps 3 to 6 are
+still to come. A filled argument becomes an ordinary
 argument in the checker's output, so lowering, emission and the runtime change nothing; every step
 is in the front end and tooling. Each step is one agent, gated on its own with the files it names.
 
@@ -589,14 +590,30 @@ is in the front end and tooling. Each step is one agent, gated on its own with t
    `syntax_show.sysl`; tests in `parse_tests.sysl` and `formatter_tests.sysl`. Proof that nothing
    existing changes meaning: `git grep -n -E "^\s*given\b"` over `library/`, `tests/`, `examples/`
    and marshal's and tui's sources prints nothing, and the corpus is unchanged (`args.given(…)`,
-   `iterable.avin`'s field `given`).
+   `iterable.avin`'s field `given`). **Done** (branch `given-1`): `given` begins a given where a
+   name and its `:` or `=` follow it, or `val`, `var` or a capitalized name (reported); `using`
+   begins the section where a name follows it, also in a parenthesized lambda's list and as
+   `using tx ->`, alone or trailing a call. The syntax tree carries `Param.contextual`,
+   `LambdaParam.contextual`, `FieldDecl.given` and the block's `GivenBinding`. Tests:
+   `parse_tests.sysl` (`given_*`, `using_*`), `formatter_tests.sysl` (`fmt_contextual_parameters`),
+   `tests/reject/given_syntax.avin`.
 2. **Declarations.** Given symbols as module values, object members and block locals; `using`
    parameters on function symbols; the refusals with their messages (a type parameter in a
    contextual type, a built-in, tuple, function or union type, a trait that is only a bound, a
    second given of one type in a scope, `given` in a class/trait/data body, a section on a variant,
    `main`, `@test`, a hook, `@sysl`/`@c`, an unnamed given, an implementation whose section differs
    from its trait method's). Files: `check.sysl`, `names.sysl`. Tests: `tests/reject/given_*.avin`,
-   one refusal per file group of at most five errors.
+   one refusal per file group of at most five errors. **Done** (branch `given-1`): a block's given
+   is a `val` recorded in `BodyState.givens`; a module's is a `GlobalSymbol` with `given` set; an
+   object's is a field its declaration marks; each is held to its type and to one of a type per
+   scope (`check_givens`, `given_binding_expr`). A function's clauses match the parameters before
+   its section. Calls are untouched: a contextual parameter is still an ordinary one at a call, so
+   explicit `tx = …` works and a missing one is the missing-argument error until step 3, which
+   also owes a call to a function whose repeated parameter is followed by a section (today the
+   repeated parameter is taken as last). Tests: `tests/reject/given_{block_types,second_of_type,
+   bodies,using_types,using_types_more,using_positions,using_implementations,using_names}.avin`,
+   `tests/run/given_{declarations,using_declared}.avin`, `tests/programs/run/given_module_files`,
+   `tests/programs/reject/given_module_second`.
 3. **Resolution at calls.** After an overload is chosen, fill each contextual parameter: a named
    argument, then the levels of the chapter's scope walk, then the default; the errors for none,
    two, and a positional argument; defaults seeing the section; class constructors, `super`
