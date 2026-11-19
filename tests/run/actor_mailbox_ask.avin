@@ -1,0 +1,79 @@
+// expect: exit 0
+// An ask of an actor whose bounded mailbox is full completes at once with `Err(Full)`, rather than
+// waiting out its timeout, whatever the overflow policy: under `DropOldest` the question drops nothing
+// to make room for itself. With room, the ask is answered as any is. An ask of an ended actor still
+// answers `Ended`, and an ask of an unbounded actor is never `Full`.
+import avin.actors.{ActorRef, AskError, Bounded, DropNewest, DropOldest, Full, Mailbox, spawn}
+import avin.threads.{Future, Promise, sleep}
+import avin.time
+
+data Msg
+  Hold(started: Promise[unit], release: Future[unit])
+  Note(n: int)
+  Get(replyTo: ActorRef[string])
+  Quit
+
+actor Recorder receives Msg
+  val seen = Buffer[int]()
+  receive
+    Hold(started, release) ->
+      started.complete(())
+      release.await()
+    Note(n) -> seen.append(n)
+    Get(replyTo) -> replyTo.tell(s"$seen")
+    Quit -> stop()
+
+hold(r: ActorRef[Msg]) -> Promise[unit]
+  val started = Promise[unit]()
+  val release = Promise[unit]()
+  r.tell(Hold(started, release.future))
+  started.future.await()
+  release
+
+show(r: Result[string, AskError]) -> string = r match
+  Ok(s) -> s
+  Err(e) -> e.message
+
+full(label: string, mailbox: Mailbox)
+  val r = spawn(Recorder(), mailbox = mailbox)
+  val release = hold(r)
+  r.tell(Note(1))
+  r.tell(Note(2))
+  val before = time.monotonic()
+  val answer = r.ask(rr -> Get(rr), timeout = time.seconds(30))
+  // Complete already, before the actor has handled anything more.
+  println(s"$label: complete at once ${answer.isCompleted()}")
+  println(s"$label: ${show(answer.await())}")
+  println(s"$label: quick ${time.monotonic() - before < time.seconds(10)}")
+  println(s"$label: is Full ${answer.await() is Err(Full)}")
+  println(s"$label: dropped ${r.dropped()}")
+  release.complete(())
+  // Once the actor has made room, the ask is answered, and the messages are those told.
+  var got = r.ask(rr -> Get(rr), timeout = time.seconds(10)).await()
+  while got is Err(Full)
+    sleep(time.millis(1))
+    got = r.ask(rr -> Get(rr), timeout = time.seconds(10)).await()
+  println(s"$label: ${show(got)}")
+
+main()
+  full("newest", Bounded(2, DropNewest))
+  full("oldest", Bounded(2, DropOldest))
+  // A capacity of one: an ask with the one message waiting is refused.
+  full("one", Bounded(1, DropNewest))
+
+  // With room, an ask of a bounded actor is answered.
+  val b = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  println(show(b.ask(rr -> Get(rr), timeout = time.seconds(10)).await()))
+
+  // An ended actor answers `Ended`.
+  b.tell(Quit)
+  b.ended().await()
+  println(show(b.ask(rr -> Get(rr), timeout = time.seconds(10)).await()))
+
+  // An unbounded actor with many messages waiting still takes a question.
+  val u = spawn(Recorder())
+  val release = hold(u)
+  for i in 1 .. 100 do u.tell(Note(i))
+  val answer = u.ask(rr -> Get(rr), timeout = time.seconds(10))
+  release.complete(())
+  println(show(answer.await()).byteLength > 0)

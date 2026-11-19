@@ -1748,7 +1748,9 @@ their words are reserved.
   `ActorRef[M]`, in `avin.actors`. Code an actor runs starts a child; code elsewhere a top-level actor.
 - Settled by the user 2026-11-04: **`tell` and the mailbox**: `tell(message)` never waits and never fails (no `!`, which is
   reserved); the mailbox is unbounded; one sender's messages to one actor arrive in order; a message
-  to an ended actor is dropped.
+  to an ended actor is dropped. (Revised 2026-11-19, branch `bounded-mailbox`: unbounded unless the
+  actor is spawned with a `Bounded` mailbox, a full one's `tell` dropping by its overflow policy, and
+  `AskError` gaining `Full`; the entry under Actor patterns.)
 - Settled by the user 2026-11-04: **`ask`** is `ask(make: ActorRef[R] -> M, timeout: Duration) -> Future[Result[R, AskError]]`, the
   timeout required, `AskError` being `TimedOut` or `Ended`; reply addresses are ordinary
   `ActorRef[R]`s; `adapter(f)` makes a reference translating another protocol into the actor's own;
@@ -9793,6 +9795,44 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   message, watching subscribers with `watch` (an extra hop per event, a lifecycle to manage, and a
   count that is only known by asking); topics named in a global registry (shared mutable state by
   name).
+- Settled on the user's delegation 2026-11-19 (branch `bounded-mailbox`): **A mailbox may be bounded,
+  given as `spawn(b, mailbox = Bounded(capacity, overflow))`; a `tell` to a full one drops by the
+  actor's `Overflow`, and senders that must know or wait use `offer` and `send`.** `data Mailbox` is
+  `Unbounded` (the default) or `Bounded(capacity: int, overflow: Overflow)`, `Overflow` being
+  `DropNewest` or `DropOldest`; a capacity less than one traps in `spawn`. `tell` keeps its settled
+  promise, never waiting and never failing, and drops as the policy says, counted by
+  `ref.dropped() -> long`. `offer(m) -> Result[unit, SendError]` never waits and answers `Err(Full)`;
+  `send(m)` and `send(m, timeout)` park the sending thread until there is room (a timed one answering
+  `Err(TimedOut)`, a timeout of zero or less being `offer`), as a cancellation point that leaves
+  nothing in the mailbox, waking with `Err(Ended)` where the actor ends; an actor's `send` to its own
+  full mailbox answers `Err(Full)` at once. `SendError` is `Full`, `TimedOut` or `Ended`; `AskError`
+  gains `Full`, and an ask of a full mailbox completes with it at once under either policy, dropping
+  nothing to make room. What the actor arranged for itself (a watch's notice, a timer's message, a
+  piped future's) goes in outside the bound and is never refused, and stop, restart and escalation
+  are not messages, so no bound holds them back; a restart keeps the mailbox and its bound; messages a
+  stash gives back do not count again. `Router.pool(…, mailbox)` bounds the router's mailbox and each
+  routee's at one capacity, and the router waits for room in the routee it chose (`SmallestMailbox`
+  only once every routee is full), so a full pool's backpressure reaches the router's own mailbox,
+  where the policy and `offer`/`send` act. A bounded mailbox is a queue under a lock, so the oldest
+  message may be dropped and senders may wait on a condition; unbounded actors keep the lock-free
+  queue and pay nothing. *Why*: the bound is a property of the actor, chosen where it is started, as
+  its supervision and executor are; separating the sender's choice (`tell` fire-and-forget, `offer`
+  to know, `send` to wait) from the actor's policy keeps `tell`'s settled meaning and gives every
+  program its backpressure path (marshal's queues, a pg pool) with no new wait inside `tell`; an ask
+  that cannot be delivered answering at once is what `Ended` already does. *Alternatives weighed*:
+  a capacity and policy on `Behaviour` or the `actor` declaration (the same actor wants different
+  bounds in different places); a third policy that fails the `tell` (`tell` answers nothing, so the
+  failure would be a trap in the sender for the receiver's slowness); a `tell` that waits (breaks the
+  settled rule, and deadlocks two actors telling each other); `offer` answering a `bool` (cannot tell
+  `Full` from `Ended`); `send` as a `Future` (the message would still be delivered after its awaiter
+  was cancelled); a dead-letters hook called with each dropped message (needs a typed callback on the
+  mailbox and runs user code inside the sender's `tell`; a counter is enough to observe overload);
+  counting the actor's own notices against the bound (a full mailbox would lose a watch's notice of
+  an end); each routee bounded but the router not (a full pool would make the router drop or block
+  with no policy of the caller's); a bounded lock-free ring (cannot drop the oldest without the
+  actor's help, and would cap the actor's own notices too). **Review with the user:** the overflow
+  surface (two policies, the policy always written out with no default, no failing policy), the names `offer`,
+  `send` and `dropped`, and the router's bound being shared by router and routees.
 
 **Higher-kinded types** ([generics](/spec/generics/#higher-kinded-types), branch `hkt-design`)
 
@@ -10995,7 +11035,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
   and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
   safepoints, so no collection sees one half done.
-- Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
 
 - Settled on the user's delegation 2026-11-06 (branch `check-stops-early`): **`avin check` stops after type checking**. Checking a
   program no longer lowers it, builds the shims of its Sysl bindings or builds its C unit: the

@@ -129,9 +129,16 @@ private val guards = Atomic[long](0)
 // One message in a mailbox, and the link to the one sent after it, which its sender sets once the
 // message is the newest. A timer's or a watch's message carries its guard. A message a watch's or a
 // pipe's function makes is made when the actor takes it, in its own turn, so a trap in the function
-// fails the actor that asked for the message.
-private class Node[M](private var message: Option[M], private var make: Option[() -> M], val guard: Option[Guard])
+// fails the actor that asked for the message. In a bounded mailbox, a message a reference sent is
+// `limited`, counting against the bound, and one dropped to make room is marked `dropped`.
+private class Node[M](
+    private var message: Option[M],
+    private var make: Option[() -> M],
+    val guard: Option[Guard],
+    val limited: bool
+)
   val next = Atomic[Option[Node[M]]](None)
+  var dropped = false
 
   // The message, which the node gives up so that the mailbox does not keep it alive.
   take() -> Option[M]
@@ -157,40 +164,267 @@ private class Node[M](private var message: Option[M], private var make: Option[(
 // messages one sender sends arrive in the order it sent them. The oldest node is always one whose
 // message was taken already; the next is the next message. A counted mailbox, a router's routee's,
 // also keeps how many messages wait in it, which any thread may read.
-private class Mailbox[M](private val counted: bool)
-  private var oldest = Node[M](None, None, None)
+private class Queue[M](private val counted: bool): Inbox[M]
+  private var oldest = Node[M](None, None, None, false)
   private val newest = Atomic[Node[M]](oldest)
   private val count = Atomic[long](0)
+  private val none = Atomic[long](0)
 
-  // Puts `m` at the back, with the guard of the timer or watch that sends it; called by any thread.
-  put(m: M, guard: Option[Guard]) = link(Node(Some(m), None, guard))
+  override put(m: M, guard: Option[Guard]) = link(Node(Some(m), None, guard, false))
 
-  // Puts at the back the message `make` makes when the actor takes it.
-  putMade(make: () -> M, guard: Option[Guard]) = link(Node[M](None, Some(make), guard))
+  override putMade(make: () -> M, guard: Option[Guard]) = link(Node[M](None, Some(make), guard, false))
+
+  // An unbounded mailbox always has room.
+  override deliver(m: M, mode: int, millis: long, owner: long, mine: bool) -> int
+    if holdsHandles(m) then handOver(m, currentOwner(), owner)
+    put(m, None)
+    sentOk
 
   private link(n: Node[M])
     if counted then count.add(1)
     newest.swap(n).next.store(Some(n))
 
-  // The node at the front, taken out, where one is there; called by the actor alone. A message
-  // whose sender has swapped its node in but not yet linked it is not there yet, and its sender
-  // schedules the actor once it is.
-  take() -> Option[Node[M]] = oldest.next.load() match
+  // A message whose sender has swapped its node in but not yet linked it is not there yet, and its
+  // sender schedules the actor once it is.
+  override take() -> Option[Node[M]] = oldest.next.load() match
     Some(n) ->
       oldest = n
       if counted then count.add(-1)
       Some(n)
     None -> None
 
-  // How many messages wait, in a counted mailbox; zero in any other.
-  waiting() -> long = count.load()
+  override waiting() -> long = count.load()
 
-  // Drops every message there.
-  clear()
+  override clear()
     while take() is Some(n) do n.drop()
 
+  override shut() = clear()
+
+  override isEmpty() -> bool = oldest.next.load().isEmpty
+
+  override drops() -> Atomic[long] = none
+
+// What an actor's mailbox is to the actor: a queue many threads put messages in and the actor alone
+// takes them from, the oldest first.
+private trait Inbox[M]
+  // Puts `m` at the back, with the guard of the timer or watch that sends it; called by any thread.
+  // The bound never refuses it: it is a message the actor arranged for itself.
+  put(m: M, guard: Option[Guard]) -> unit
+
+  // Puts at the back the message `make` makes when the actor takes it, as `put` does.
+  putMade(make: () -> M, guard: Option[Guard]) -> unit
+
+  // Puts `m`, which a reference sends, at the back where there is room, handing the Sysl handles it
+  // holds that the sending code owns to `owner`, and answers how it went (`sentOk` and the rest). A
+  // full mailbox answers as `mode` says: `byTell` keeps to the overflow policy, `byOffer` answers
+  // `sentFull`, and `bySend` waits for room for at most `millis` milliseconds, or with no limit where
+  // it is negative. `mine` says the actor itself is sending, which no wait could ever make room for.
+  deliver(m: M, mode: int, millis: long, owner: long, mine: bool) -> int
+
+  // The node at the front, taken out, where one is there; called by the actor alone.
+  take() -> Option[Node[M]]
+
+  // How many messages wait: in a counted or bounded mailbox; zero in any other.
+  waiting() -> long
+
+  // Drops every message there.
+  clear() -> unit
+
+  // Drops every message there, for good: the actor is ending, so every sender waiting for room is
+  // told so, and every message after is refused.
+  shut() -> unit
+
   // Whether a message is there to take; called by the actor alone.
-  isEmpty() -> bool = oldest.next.load().isEmpty
+  isEmpty() -> bool
+
+  // How many messages the bound has dropped.
+  drops() -> Atomic[long]
+
+// How a reference's message fared: put in the mailbox; refused, the mailbox being full; refused, the
+// actor having ended; refused, no room having come in time; dropped by the overflow policy.
+private val sentOk = 0
+private val sentFull = 1
+private val sentEnded = 2
+private val sentTimedOut = 3
+private val sentDropped = 4
+
+// How a reference sends: `tell`, keeping to the overflow policy; `offer`, never waiting; `send`,
+// waiting for room.
+private val byTell = 0
+private val byOffer = 1
+private val bySend = 2
+
+// A new runtime lock, and taking it and letting it go: the bounded mailbox's own, held only for a
+// few steps and never across the actor's or a sender's code.
+@intrinsic("lock_new")
+private lockNew() -> Any
+
+@intrinsic("lock_acquire")
+private lockAcquire(lock: Any)
+
+@intrinsic("lock_release")
+private lockRelease(lock: Any)
+
+@intrinsic("condition_new")
+private conditionNew() -> Any
+
+// Lets `lock` go and sleeps until `condition` is notified, for at most `millis` milliseconds or with
+// no limit where it is negative, and takes `lock` again, answering `waitWoken`, `waitTimedOut` or
+// `waitCancelled`; cancelled, the waiter puts its state right, lets the lock go and reaches
+// `cancelPoint`, which stops it.
+@intrinsic("condition_wait_settling")
+private conditionWaitSettling(condition: Any, lock: Any, millis: long) -> int
+
+private val waitCancelled = 2
+
+@intrinsic("cancel_point")
+private cancelPoint()
+
+@intrinsic("condition_notify")
+private conditionNotify(condition: Any)
+
+@intrinsic("condition_notify_all")
+private conditionNotifyAll(condition: Any)
+
+// A mailbox that holds at most `capacity` of the messages references send, under a lock. The
+// messages the actor arranged for itself (a watch's, a timer's, a piped future's) go in whatever it
+// holds and do not count. `all` holds every node in the order put; `limited` the nodes that count
+// and have not been dropped, in the same order, so the oldest of them is its first. A node dropped
+// to make room stays in `all`, marked, until it is taken or `all` is swept, which happens once more
+// than `capacity` of them are there, so `all` stays within twice the capacity beside what the actor
+// arranged. A sender waiting for room waits on `room`, which each take that frees room notifies;
+// a waiter that leaves without the room it was woken for passes the notification on.
+private class BoundedQueue[M](private val capacity: int, private val oldestGoes: bool): Inbox[M]
+  private val lock = lockNew()
+  private val room = conditionNew()
+  private val all = Deque[Node[M]]()
+  private val limited = Deque[Node[M]]()
+  private val count = Atomic[long](0)
+  private val dropped = Atomic[long](0)
+  private var marked = 0
+  private var waiters = 0
+  private var closed = false
+
+  override put(m: M, guard: Option[Guard]) = link(Node(Some(m), None, guard, false))
+
+  override putMade(make: () -> M, guard: Option[Guard]) = link(Node[M](None, Some(make), guard, false))
+
+  private link(n: Node[M])
+    lockAcquire(lock)
+    if !closed
+      all.append(n)
+      count.add(1)
+    lockRelease(lock)
+
+  override deliver(m: M, mode: int, millis: long, owner: long, mine: bool) -> int
+    lockAcquire(lock)
+    var outcome = sentFull
+    if closed then outcome = sentEnded
+    elif limited.length < capacity then outcome = accept(m, owner)
+    elif mode == byTell
+      dropped.add(1)
+      if oldestGoes
+        dropOldest()
+        outcome = accept(m, owner)
+      else outcome = sentDropped
+    elif mode == bySend && !mine then outcome = await(m, millis, owner)
+    lockRelease(lock)
+    outcome
+
+  // Puts `m` at the back, under the lock, with room for it.
+  private accept(m: M, owner: long) -> int
+    if holdsHandles(m) then handOver(m, currentOwner(), owner)
+    val n = Node(Some(m), None, None, true)
+    all.append(n)
+    limited.append(n)
+    count.add(1)
+    sentOk
+
+  // Drops the oldest message that counts, under the lock, the mailbox being full.
+  private dropOldest()
+    val n = limited.removeHead()
+    n.drop()
+    n.dropped = true
+    count.add(-1)
+    marked += 1
+    if marked > capacity
+      all.filterInPlace(x -> !x.dropped)
+      marked = 0
+
+  // Waits, under the lock, the mailbox being full, until there is room for `m`, the actor ends or
+  // `millis` milliseconds have passed, where it is not negative. A cancellation of the waiting
+  // thread stops it here, with nothing of `m` left in the mailbox.
+  private await(m: M, millis: long, owner: long) -> int
+    val deadline: long = if millis < 0 then -1 else nowMillis() + millis
+    waiters += 1
+    var outcome = -1
+    while outcome < 0
+      val left: long = if deadline < 0 then -1 else deadline - nowMillis()
+      if deadline >= 0 && left <= 0 then outcome = sentTimedOut
+      else
+        if conditionWaitSettling(room, lock, left) == waitCancelled
+          waiters -= 1
+          passOn()
+          lockRelease(lock)
+          cancelPoint()
+        if closed then outcome = sentEnded
+        elif limited.length < capacity then outcome = accept(m, owner)
+    waiters -= 1
+    if outcome != sentOk then passOn()
+    outcome
+
+  // Wakes another waiter where there is room that the one leaving did not take.
+  private passOn()
+    if waiters > 0 && limited.length < capacity then conditionNotify(room)
+
+  override take() -> Option[Node[M]]
+    lockAcquire(lock)
+    var found: Option[Node[M]] = None
+    while found.isEmpty && !all.isEmpty
+      val n = all.removeHead()
+      if n.dropped then marked -= 1
+      else
+        if n.limited
+          limited.removeHead()
+          if waiters > 0 then conditionNotify(room)
+        count.add(-1)
+        found = Some(n)
+    lockRelease(lock)
+    found
+
+  override waiting() -> long = count.load()
+
+  override clear()
+    lockAcquire(lock)
+    empty()
+    conditionNotifyAll(room)
+    lockRelease(lock)
+
+  override shut()
+    lockAcquire(lock)
+    closed = true
+    empty()
+    conditionNotifyAll(room)
+    lockRelease(lock)
+
+  private empty()
+    for n in all do n.drop()
+    all.clear()
+    limited.clear()
+    count.store(0)
+    marked = 0
+
+  override isEmpty() -> bool = count.load() == 0
+
+  override drops() -> Atomic[long] = dropped
+
+// Milliseconds on the monotonic clock.
+private nowMillis() -> long = time.monotonic().micros / 1000
+
+// A sender's wait for room in milliseconds, a part of a millisecond waited for as a whole one.
+private waitMillis(timeout: Duration) -> long
+  val whole = timeout.micros / 1000
+  if timeout.micros % 1000 > 0 then whole + 1 else whole
 
 // What every actor is, whatever the type of its messages: what its parent, its children and the
 // actors watching it use.
@@ -233,14 +467,17 @@ private class Actor[M: Sendable](
     private val executor: Executor,
     val parent: Option[Core],
     private val supervision: Supervision,
-    counted: bool
+    counted: bool,
+    bound: Mailbox
 ): Core
   val number: long = numbers.add(1)
   val owner: long = newOwner()
   // Whether each turn is a lightweight thread of its own, as on the shared executor.
   private val ownThreads = executor === Executor.shared()
   val end = Promise[Ending]()
-  private val mailbox = Mailbox[M](counted)
+  private val mailbox: Inbox[M] = bound match
+    Unbounded -> Queue[M](counted)
+    Bounded(capacity, overflow) -> BoundedQueue[M](capacity, overflow is DropOldest)
   // The messages a stash gave back, handled before the mailbox's, the first at the front; the
   // actor's turns alone reach it.
   private val unstashed = Deque[M]()
@@ -285,23 +522,29 @@ private class Actor[M: Sendable](
     reference = Some(ref)
     schedule()
 
-  // Puts `m` in the mailbox and queues the actor where it was neither queued nor running. A message
-  // to an actor that is ending or has ended is dropped.
+  // Puts `m`, a message the actor arranged for itself, in the mailbox, outside any bound, and queues
+  // the actor where it was neither queued nor running. A message to an actor that is ending or has
+  // ended is dropped.
   post(m: M, guard: Option[Guard])
-    offer(m, guard)
-    ()
-
-  // Puts `m` in the mailbox as `post` does, and answers whether it did: `false` where the actor is
-  // ending or has ended, and the message was dropped. The Sysl handles the message holds that the
-  // sending code owns are the actor's from then on, so the sender's next use of one traps; a
-  // dropped message leaves them the sender's. Only a message whose type can hold a handle is
-  // walked, and the walk stops at what is shared between owners, such as an actor's reference.
-  offer(m: M, guard: Option[Guard]) -> bool
-    if phase.load() != Live then return false
+    if phase.load() != Live then return ()
     if holdsHandles(m) then handOver(m, currentOwner(), owner)
     mailbox.put(m, guard)
     wake()
-    true
+
+  // Puts `m`, which a reference sends as `mode` says, in the mailbox, and answers how it went
+  // (`sentOk` and the rest): `sentEnded` where the actor is ending or has ended, and the message was
+  // dropped. The Sysl handles the message holds that the sending code owns are the actor's from then
+  // on, so the sender's next use of one traps; a message refused or dropped by the bound leaves them
+  // the sender's. Only a message whose type can hold a handle is walked, and the walk stops at what
+  // is shared between owners, such as an actor's reference.
+  deliver(m: M, mode: int, millis: long) -> int
+    if phase.load() != Live then return sentEnded
+    val outcome = mailbox.deliver(m, mode, millis, owner, running())
+    if outcome == sentOk then wake()
+    outcome
+
+  // How many messages the actor's bound has dropped.
+  drops() -> Atomic[long] = mailbox.drops()
 
   // Puts in the mailbox the message `make` makes when the actor takes it, in its own turn; dropped
   // where the actor is ending or has ended.
@@ -451,7 +694,7 @@ private class Actor[M: Sendable](
   private closing()
     phase.store(Closing)
     cancelAll()
-    mailbox.clear()
+    mailbox.shut()
     unstashed.clear()
     for c in children.load() do c.requestStop()
 
@@ -527,7 +770,7 @@ private class Actor[M: Sendable](
   private ended()
     runStoppings()
     phase.store(Gone)
-    mailbox.clear()
+    mailbox.shut()
     unstashed.clear()
     handler = None
     registry.leave(owner)
@@ -572,35 +815,70 @@ class Behaviour[M: Sendable](val name: string, val start: @sendable (ActorRef[M]
 //
 // The reference an `ask` makes for its reply is one too, which accepts one message: it is shown as
 // `Reply#1`, the replies of a program being numbered from one apart from the actors, and it ends
-// once the ask has its answer or has timed out. `send` answers whether the message was delivered.
+// once the ask has its answer or has timed out. `deliver` puts a message in the mailbox as the mode
+// it is given says (`byTell`, `byOffer`, `bySend`, waiting at most the milliseconds it is given, or
+// with no limit where they are negative) and answers how it went (`sentOk` and the rest); `drops`
+// counts what the actor's bound has dropped.
 @keeps_owners
 class ActorRef[-M: Sendable](
-    private val send: @sendable (M) -> bool,
+    private val deliver: @sendable (M, int, long) -> int,
     val name: string,
     val number: long,
-    private val end: Future[Ending]
+    private val end: Future[Ending],
+    private val drops: Atomic[long]
 ): Sendable
   // Puts `message` in the actor's mailbox and returns at once: it never waits and never fails.
   // Messages one sender tells one actor are handled in the order they were told; a message told to
-  // an actor that has ended is dropped.
+  // an actor that has ended is dropped, and one told to a full mailbox is dropped as its overflow
+  // policy says.
   tell(message: M)
-    send(message)
+    deliver(message, byTell, 0)
     ()
+
+  // Puts `message` in the actor's mailbox where there is room for it now, never waiting:
+  // `Err(Full)` where the mailbox is full and `Err(Ended)` where the actor has ended, the message
+  // then put nowhere. An unbounded mailbox is never full.
+  offer(message: M) -> Result[unit, SendError] = sent(deliver(message, byOffer, 0))
+
+  // Puts `message` in the actor's mailbox, waiting while it is full until there is room:
+  // `Err(Ended)` where the actor ends first, the message then put nowhere. The wait parks only the
+  // waiting thread, and is a cancellation point that leaves nothing in the mailbox. An actor
+  // sending to its own full mailbox, which nothing could empty while it waits, has `Err(Full)` at
+  // once.
+  send(message: M) -> Result[unit, SendError] = sent(deliver(message, bySend, -1))
+
+  // `send`, waiting at most `timeout`: `Err(TimedOut)` where no room came in time; a timeout of
+  // zero or less is `offer`.
+  send(message: M, timeout: Duration) -> Result[unit, SendError] =
+    if timeout <= Duration.Zero then offer(message) else sent(deliver(message, bySend, waitMillis(timeout)))
+
+  // How many messages told to the actor its bounded mailbox has dropped, by its overflow policy,
+  // since it started; zero for an unbounded one.
+  dropped() -> long = drops.load()
 
   // Sends the message `make` builds around a new reference that accepts one reply, and gives back
   // the future of that reply: `Ok` of the first message the reference is sent, which completes it,
   // a later one being dropped; `Err(TimedOut)` where none arrives within `timeout`; and
-  // `Err(Ended)` where the actor had ended, so the message could not be delivered. `make` runs at
-  // once, in the asking code.
+  // `Err(Ended)` where the actor had ended, so the message could not be delivered; `Err(Full)` at
+  // once where its bounded mailbox is full, the question put nowhere and nothing dropped to make
+  // room for it. `make` runs at once, in the asking code.
   //
   //     counter.ask(r -> Get(r), timeout = time.seconds(1)).await()
   ask[R: Sendable](make: (ActorRef[R]) -> M, timeout: Duration) -> Future[Result[R, AskError]]
     val answer = Promise[Result[R, AskError]]()
     val g = Guard(-1, true)
-    val reply = ActorRef[R](r -> answered(answer, g, Ok(r)), "Reply", -replies.add(1), answer.future.map(_ -> Stopped))
+    val reply = ActorRef[R](
+      (r, _, _) -> if answered(answer, g, Ok(r)) then sentOk else sentEnded,
+      "Reply",
+      -replies.add(1),
+      answer.future.map(_ -> Stopped),
+      noDrops
+    )
     // The timer is set once the question is delivered, and taken out again where the reply came
     // before it was set.
-    if !send(make(reply)) then answered(answer, g, Err(Ended))
+    val outcome = deliver(make(reply), byOffer, 0)
+    if outcome == sentEnded then answered(answer, g, Err(Ended))
+    elif outcome == sentFull then answered(answer, g, Err(Full))
     else
       clock.add(g, timeout.micros, 0, () ->
         answered(answer, g, Err(TimedOut))
@@ -613,16 +891,56 @@ class ActorRef[-M: Sendable](
   ended() -> Future[Ending] = end
 
 // Why an ask has no answer: `TimedOut` where no reply arrived within its timeout, `Ended` where the
-// actor asked had ended, so the question was never delivered.
+// actor asked had ended, so the question was never delivered, and `Full` where its bounded mailbox
+// was full, so the question was not put in it.
 data AskError
   TimedOut
   Ended
+  Full
 
 impl Error for AskError
   // A sentence saying why the ask has no answer.
   message -> string = self match
     TimedOut -> "the ask timed out before a reply arrived"
     Ended -> "the actor asked had ended"
+    Full -> "the mailbox of the actor asked was full"
+
+// Why `offer` or `send` put a message nowhere: `Full` where the bounded mailbox had no room for it,
+// `TimedOut` where no room came within a `send`'s timeout, `Ended` where the actor had ended.
+data SendError
+  Full
+  TimedOut
+  Ended
+
+impl Error for SendError
+  // A sentence saying why the message was not sent.
+  message -> string = self match
+    Full -> "the actor's mailbox was full"
+    TimedOut -> "no room came in the actor's mailbox in time"
+    Ended -> "the actor had ended"
+
+// How big an actor's mailbox may grow, given to `spawn` and `Router.pool`: `Unbounded`, the default,
+// with no limit; `Bounded` with at most `capacity` messages that references send waiting, a `tell`
+// to a full one doing as `overflow` says.
+data Mailbox
+  Unbounded
+  Bounded(capacity: int, overflow: Overflow)
+
+// What a `tell` to a full bounded mailbox does, since `tell` never waits: `DropNewest` drops the
+// message told, `DropOldest` the oldest message waiting that a reference sent, to make room for it.
+data Overflow
+  DropNewest
+  DropOldest
+
+// The answer of `offer` and `send` to how a message fared.
+private sent(outcome: int) -> Result[unit, SendError] =
+  if outcome == sentOk then Ok(())
+  elif outcome == sentEnded then Err(Ended)
+  elif outcome == sentTimedOut then Err(TimedOut)
+  else Err(Full)
+
+// The drops of a reference whose messages are never dropped by a bound: an ask's reply's.
+private val noDrops = Atomic[long](0)
 
 // The last number given to an ask's reply reference.
 private val replies = Atomic[long](0)
@@ -653,12 +971,16 @@ impl[M: Sendable] Display for ActorRef[M]
 // has finished wait behind it. Started by the code of an actor, it is that actor's child; started
 // elsewhere, it is a top-level actor. The Sysl handles `behaviour` reaches that the calling code owns
 // are the actor's from then on. `onFailure` decides what follows a trap in the actor's code; a
-// `Restart` whose limit is less than zero or whose window is not more than zero traps.
+// `Restart` whose limit is less than zero or whose window is not more than zero traps. `mailbox`
+// bounds the messages waiting, where it is `Bounded`, whose capacity less than one traps.
+//
+//     val worker = spawn(Worker(), mailbox = Bounded(100, DropOldest))
 spawn[M: Sendable](
     behaviour: Behaviour[M],
     onFailure: Supervision = Escalate,
-    executor: Executor = Executor.shared()
-) -> ActorRef[M] = launch(behaviour, onFailure, executor, false).typedRef()
+    executor: Executor = Executor.shared(),
+    mailbox: Mailbox = Unbounded
+) -> ActorRef[M] = launch(behaviour, onFailure, executor, false, mailbox).typedRef()
 
 // Starts an actor as `spawn` does and gives back the actor itself; a counted one keeps how many
 // messages wait in its mailbox.
@@ -666,17 +988,24 @@ private launch[M: Sendable](
     behaviour: Behaviour[M],
     onFailure: Supervision,
     executor: Executor,
-    counted: bool
+    counted: bool,
+    mailbox: Mailbox
 ) -> Actor[M]
   checkSupervision(onFailure)
+  checkMailbox(mailbox)
   val parent = registry.current()
-  val actor = Actor(behaviour, executor, parent, onFailure, counted)
+  val actor = Actor(behaviour, executor, parent, onFailure, counted, mailbox)
   handOver(behaviour, currentOwner(), actor.owner)
-  val ref = ActorRef[M](m -> actor.offer(m, None), behaviour.name, actor.number, actor.end.future)
+  val ref = ActorRef[M]((m, mode, millis) -> actor.deliver(m, mode, millis), behaviour.name, actor.number, actor.end.future, actor.drops())
   registry.enrol(actor.owner, actor)
   if parent is Some(p) then p.adopt(actor)
   actor.start(ref)
   actor
+
+// Traps where `mailbox` is bounded at a capacity less than one.
+private checkMailbox(mailbox: Mailbox)
+  if mailbox is Bounded(capacity, _)
+    if capacity < 1 then fail(s"a mailbox of capacity $capacity, which is less than one")
 
 // Traps where `onFailure` is a `Restart` whose limit is less than zero or whose window is not more
 // than zero.
@@ -859,7 +1188,7 @@ open class ActorContext[M: Sendable](private val actorRef: ActorRef[M])
   adapter[R: Sendable](f: @sendable (R) -> M) -> ActorRef[R]
     check("adapter")
     val a = actorCell
-    ActorRef[R](r -> a.offer(f(r), None), actorRef.name, actorRef.number, actorRef.ended())
+    ActorRef[R]((r, mode, millis) -> a.deliver(f(r), mode, millis), actorRef.name, actorRef.number, actorRef.ended(), a.drops())
 
   // Sends the actor `f` of the value of `future` once it completes, so the actor goes on handling
   // messages meanwhile. `f` runs in this actor's own turn, so a trap in it fails this actor; the
@@ -973,7 +1302,10 @@ object Router
   // none is left; a routee's escalated failure fails the router, which escalates it in turn. A
   // router that ends stops its routees first. Two messages one sender sends that go to one routee
   // arrive in the order they were sent. A size less than one traps, as does a `Restart` `spawn`
-  // would refuse.
+  // would refuse. A `Bounded` `mailbox` bounds the router's own mailbox and each routee's, and the
+  // router waits for room in the routee it chose rather than drop, so a full pool fills the router's
+  // mailbox, where the overflow policy, `offer` and `send` act as for any actor; a capacity less than
+  // one traps.
   //
   //     val workers = Router.pool(4, Resizer(), SmallestMailbox, onFailure = Restart(3, time.seconds(1)))
   //     workers tell Resize(image)
@@ -982,17 +1314,26 @@ object Router
       behaviour: Behaviour[M],
       routing: Routing[M] = RoundRobin,
       onFailure: Supervision = Escalate,
-      executor: Executor = Executor.shared()
+      executor: Executor = Executor.shared(),
+      mailbox: Mailbox = Unbounded
   ) -> ActorRef[M]
     if size < 1 then fail(s"a pool of $size routees, which is fewer than one")
     checkSupervision(onFailure)
+    checkMailbox(mailbox)
     val router = launch(
-      Behaviour[Routed[M]]("Router", routerStart(size, behaviour, routing, onFailure, executor)),
+      Behaviour[Routed[M]]("Router", routerStart(size, behaviour, routing, onFailure, executor, mailbox)),
       Escalate,
       Executor.shared(),
-      false
+      false,
+      mailbox
     )
-    ActorRef[M](m -> router.offer(Route(m), None), "Router", router.number, router.end.future)
+    ActorRef[M](
+      (m, mode, millis) -> router.deliver(Route(m), mode, millis),
+      "Router",
+      router.number,
+      router.end.future,
+      router.drops()
+    )
 
 // What a router handles: a message to route, or the end of one of its routees.
 private data Routed[M]
@@ -1000,18 +1341,20 @@ private data Routed[M]
   RouteeEnded(number: long)
 
 // The start of a router: it starts its routees and watches each, then routes each message to the
-// routee `routing` chooses, choosing again where that one has ended meanwhile.
+// routee `routing` chooses, choosing again where that one has ended meanwhile. A routee whose bounded
+// mailbox is full is waited for, the router handling nothing else meanwhile.
 private routerStart[M: Sendable](
     size: int,
     behaviour: Behaviour[M],
     routing: Routing[M],
     onFailure: Supervision,
-    executor: Executor
+    executor: Executor,
+    mailbox: Mailbox
 ) -> @sendable (ActorRef[Routed[M]]) -> (Routed[M]) -> unit = me ->
   val ctx = ActorContext(me)
   val routees = Buffer[Actor[M]]()
   for _ in 0 ..< size
-    val r = launch(behaviour, onFailure, executor, true)
+    val r = launch(behaviour, onFailure, executor, true, mailbox)
     routees.append(r)
     ctx.watch(r.ref(), RouteeEnded[M](r.number))
   val chooser = Chooser(routing)
@@ -1020,7 +1363,7 @@ private routerStart[M: Sendable](
       var sent = false
       while !sent && !routees.isEmpty
         val i = chooser.pick(routees, m)
-        sent = routees(i).offer(m, None)
+        sent = routees(i).deliver(m, bySend, -1) == sentOk
         if !sent then routees.remove(i)
     RouteeEnded(number) ->
       routees.filterInPlace(r -> r.number != number)

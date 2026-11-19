@@ -1,0 +1,97 @@
+// expect: exit 0
+// The bound counts only what references send. The messages an actor arranged for itself, a watch's
+// notice of an end, a timer's message and a piped future's, reach it through a full mailbox and drop
+// nothing. Stopping an actor whose mailbox is full ends it at once after its message, dropping what
+// waits, which is not counted as dropped by the bound. A restart keeps the mailbox and its bound: the
+// fresh state handles the messages waiting, and the bound holds after it as before.
+import avin.actors.{ActorRef, Bounded, DropNewest, DropOldest, Restart, spawn}
+import avin.threads.{Future, Promise, sleep}
+import avin.time
+import avin.time.Duration
+
+data Msg
+  Hold(started: Promise[unit], release: Future[unit], next: int)
+  Note(n: int)
+  Show(seen: Promise[string])
+  Watch(other: ActorRef[Nothing])
+  Later(delay: Duration)
+  Pipe(value: Future[int])
+  Quit
+
+// What a held message does once let go.
+val Waits = 0
+val Stops = 1
+val Traps = 2
+
+actor Recorder receives Msg
+  val seen = Buffer[int]()
+  receive
+    Hold(started, release, next) ->
+      started.complete(())
+      release.await()
+      if next == Stops then stop()
+      if next == Traps then seen(1000) = 0
+    Note(n) -> seen.append(n)
+    Show(p) -> p.complete(s"${seen.sorted}")
+    Watch(other) -> watch(other, Note(-1))
+    Later(delay) ->
+      after(delay, Note(-2))
+      ()
+    Pipe(value) -> pipeToSelf(value, n -> Note(n))
+    Quit -> stop()
+
+hold(r: ActorRef[Msg], next: int = Waits) -> Promise[unit]
+  val started = Promise[unit]()
+  val release = Promise[unit]()
+  _ = r.send(Hold(started, release.future, next))
+  started.future.await()
+  release
+
+show(r: ActorRef[Msg]) -> string
+  val p = Promise[string]()
+  _ = r.send(Show(p))
+  p.future.await()
+
+main()
+  // Notices through a full mailbox.
+  val r = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  val other = spawn(Recorder())
+  _ = r.send(Watch(other))
+  _ = r.send(Later(time.millis(150)))
+  val value = Promise[int]()
+  _ = r.send(Pipe(value.future))
+  val release = hold(r)
+  r.tell(Note(1))
+  r.tell(Note(2))
+  println(r.dropped())
+  other.tell(Quit)
+  other.ended().await()
+  value.complete(-3)
+  sleep(time.millis(300))
+  // Still full of what references sent: a tell is dropped, the notices were not.
+  r.tell(Note(3))
+  println(r.dropped())
+  release.complete(())
+  println(show(r))
+
+  // A stop with a full mailbox: what waits is dropped, and not counted as dropped by the bound.
+  val s = spawn(Recorder(), mailbox = Bounded(2, DropOldest))
+  val stopping = hold(s, next = Stops)
+  for i in 1 .. 2 do s.tell(Note(i))
+  stopping.complete(())
+  println(s.ended().await())
+  println(s.dropped())
+
+  // A restart keeps the mailbox and its bound.
+  val k = spawn(Recorder(), onFailure = Restart(3, time.seconds(30)), mailbox = Bounded(2, DropNewest))
+  val failing = hold(k, next = Traps)
+  for i in 1 .. 3 do k.tell(Note(i))
+  println(k.dropped())
+  failing.complete(())
+  // The fresh state handles the two messages kept.
+  println(show(k))
+  val again = hold(k)
+  for i in 4 .. 7 do k.tell(Note(i))
+  println(k.dropped())
+  again.complete(())
+  println(show(k))
