@@ -23879,7 +23879,7 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
             Function(ys, q, _) ->
                 if xs.len() != ys.len() then return false
                 for k in 0..<xs.len()
-                    if !constrain(c, xs[k], ys[k], open, false) then return false
+                    if !constrain_contra(c, xs[k], ys[k], open) then return false
                 return constrain(c, r, q, open, covariant)
             _ -> ()
         Data(d, _, xs) -> *v match
@@ -23905,6 +23905,9 @@ private constrain(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize], covar
                 if same_type(head, zonk(c, g)) && xs.len() == ys.len()
                     for k in 0..<xs.len()
                         val y = zonk(c, ys[k])
+                        if hole_variance(conformances(c), head, k) is Contravariant
+                            if !constrain_contra(c, xs[k], ys[k], open) then return false
+                            continue
                         val reads = covariant && hole_variance(conformances(c), head, k) is Covariant && is_reference(y)
                         if !constrain(c, xs[k], ys[k], open, reads) then return false
                     return true
@@ -23936,9 +23939,24 @@ private constrain_args(c: *Checker, params: Buf[TypeParam], xs: Buf[&Type], ys: 
         // So does it where a type parameter in scope has a lower bound, which a value of another may be
         // one of: `Cons(x, self)` for `x: W` and `self: List[T]` takes `W` where `W >: T`.
         val y = zonk(c, ys[i])
+        if params[i].variance is Contravariant
+            if !constrain_contra(c, xs[i], ys[i], open) then return false
+            continue
         val reads = covariant && params[i].variance is Covariant && (is_reference(y) || *y is TypeVar(_, _, _) && scope_has_lowers(c))
         if !constrain(c, xs[i], ys[i], open, reads) then return false
     true
+
+// Holds `actual` to `p` where the two are a contravariant argument of a generic type or a function
+// type's parameter: there the parameter's type must be an instance of the argument's, the reverse of
+// a covariant argument, so a `Box[A, int]` is a `Box[B, T]` for `Box[-I, +T]` and `B` an `A`. A type
+// argument in `open` named there takes `actual` as its upper bound and is decided as it, as at an
+// invariant argument, unless what it is already is an instance of it. Anything else naming an open
+// type argument there is held whole.
+private constrain_contra(c: *Checker, p: &Type, actual: &Type, open: *Buf[usize]) -> bool
+    val v = zonk(c, actual)
+    if !mentions_open(p, open) then return unify(c, p, view_contra(conformances(c), v, zonk(c, p)))
+    if *p is Var(i) then return lower_bound(c, i, v, open, false)
+    constrain(c, p, actual, open, false)
 
 // One argument's type `v` given to the type argument `i`. Where `i` is open and a value is read out,
 // `v` widens it to their join; elsewhere `i` is decided as `v`, or as what it already is when `v` is
