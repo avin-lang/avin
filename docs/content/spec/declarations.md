@@ -921,6 +921,69 @@ class Square(label: string, side: int): Rect(label, side, side)
   and the branches of an `if` or `match` that yield different subclasses join to their nearest
   common superclass. `===` compares an instance of a class with one of its sub- or superclasses.
 
+### Exporting members
+
+```text
+class Stack[T](private var items: Vector[T]): Sized
+  export items.{length as size, isEmpty, map}
+  push(x: T) = items = items :+ x
+
+class Logged(inner: Account)
+  export inner.*
+  describe() -> string = "logged " + inner.describe()
+
+val s = Stack([1, 2])
+s.size // 2: `s.items.length`
+s.map(x -> x * 10) // Vector(10, 20)
+```
+
+- **`export f.m` in a type's body presents a member of what `f` holds as the type's own.** A use of
+  `m` on a value `x` of the type is the use of `x.f.m`: a call `x.m(args)` is `x.f.m(args)`, with
+  every overload of `m`, its defaults, named arguments, repeated parameters and type arguments, and
+  `f`'s type arguments in place (`items` above is a `Vector[T]`, so `s.map` on a `Stack[int]` maps
+  `int`s). A read `x.m` reads the field `m` or calls the method of no parameter list; `x.m = v` and
+  `x.m += v` assign a `var` field `m`; `x.m` naming a method with parameters is its function value,
+  bound to `x.f` as read then; and an operator method is exported by its spelling, `export n.+` or
+  `export n.<`, so `a + b` is `a.n + b`. The export is written as an import is: one member, a `{…}`
+  group, `as` presenting one under another name, and `export f.*` for every public member of what
+  `f` holds that the type does not have itself.
+- **`f` is a field or a method of no parameter list**, read again at every use: a `var` field
+  reassigned between two calls sends each to the value it holds then, and a method `f` runs at each
+  use. It is the type's own or inherited, of any privacy its code may read, so a private field is
+  the usual one: the export presents what it holds without presenting it. Its type is declared, as a
+  class parameter's is: the members it presents are the type's surface, known before any body is
+  checked. A class, an object and a data type export members; a data type writes its exports in a
+  plain `impl` of it in its own module, and `f` is a field of its one variant or a method of no
+  parameter list its impls declare.
+- **An export presents public members only**: a field, a method that is not static, a trait's
+  `val`, or a member `f`'s type exports in turn, so exports chain. A private member is never
+  presented, by name or by `*`, and neither is `equals` or `hash`, which every value has of its own.
+  Exports by name that lead round to one another without reaching a member are an error at each of
+  them.
+- **The type's own members come first.** A use is forwarded only where the type, its superclasses,
+  its traits and its impls have no member of the name: `Logged` above keeps its own `describe`
+  beside `export inner.*`. An export by name of a member the type has itself, or inherits from a
+  superclass, is an error, and so is a member a subclass declares under a name its superclass
+  exports by name. Two exports of one type presenting one name by name are an error naming both;
+  an export by name comes before a wildcard, and two wildcards both reaching a name make a use of it
+  an error naming both, which naming it in one export settles.
+- **A public export by name implements a trait's method of its name** that the class does not
+  declare: the class has a method with the trait's signature whose body is `self.f.m(params)`,
+  standing where an `override` would, so a call through the trait and a call through the class reach
+  the same member. `class Stack[T](…): Sized` above meets `Sized`'s `size -> int` this way. A
+  wildcard implements nothing; nor does a private export, which is an error where it names a trait's
+  method, nor a method with type parameters of its own, nor an export of a data type, whose trait
+  impls write their methods. A member that cannot be called with the trait method's parameters, or
+  yields something else, is an error at the export.
+- **`private export` presents the members to the type's own code alone**, as a private method is;
+  elsewhere a use of one is an error saying so.
+- **An export is reached through a value**, `x.m` and `self.m`. Inside the type a bare `m` is not
+  the export, so a wildcard never hides a top-level declaration from the type's own code: there the
+  field itself is in scope, `items.length`. An export is not static, and `Type.m` does not reach one.
+- `export` begins an export only at the start of a line of a type's body and before a name and a
+  dot; everywhere else it is an ordinary name. An editor completes the presented names after a dot,
+  and a use, or the name on the export line, leads to the member's declaration.
+
 ## trait
 
 ```text

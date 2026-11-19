@@ -5065,6 +5065,84 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   go-to-definition on an exported name (at the export line or any import of it) goes to the
   declaration itself. Completion after `m.` does not yet list a module's exports (see Open).
 
+**Member exports** (branch `member-export`; [exporting members](/spec/declarations/#exporting-members))
+
+- Settled on the user's delegation 2026-11-19: **`export f.m` in a type's body is written as a
+  module export is**, one member, a `{…}` group, `as` renaming, with operators by their spelling
+  (`export n.+`), in the body of a class or an object, or in a plain `impl` of a data type of the
+  impl's own module (a data type has no body of its own). Why: one form for presenting something
+  as one's own, at the module and at the type. Alternatives weighed: a modifier on the field
+  (`delegate val items`, all or nothing); generated wrapper methods the program writes itself
+  (what the feature exists to save).
+- Settled on the user's delegation 2026-11-19: **`export f.*` presents every public member of
+  what `f` holds that the type does not have itself**, unlike module exports, which have no
+  wildcard. Why: the usual forwarding is a wrapper over one value's whole surface, with a few
+  members of its own replacing the wrapped one's; listing every member defeats it. The module rule
+  was about a declaration added to an internal module joining a public surface unseen; here the
+  wrapped type is named in the field's declared type, so what joins is visible there. Spelled `*`,
+  not `_`, since `_` is a placeholder lambda in an expression and a hole in a type. Alternatives
+  weighed: no wildcard, as for modules; `_`. Review with the user: the one place the two export
+  forms differ.
+- Settled on the user's delegation 2026-11-19: **a use is the use of `x.f.m`, checked as that
+  code**, a fallback of the checker's member lookup after the type's own members, its superclasses',
+  its traits' and its impls': calls with every overload, defaults, named and repeated arguments and
+  type arguments, reads, assignments of a `var` field (`x.m = v`, `+=`, `++`), method values bound
+  to `x.f` as read then, infix calls and operators (`a + b`, a lone `a < b`). Why: forwarding then
+  means exactly what the longer code means, with its diagnostics, and needs no copy of a member's
+  signature to drift from it. Alternatives weighed: a wrapper method per overload, generated into
+  the type (copies defaults, repeated and by-name parameters and type parameters of each member,
+  and reports mistakes against the copy).
+- Settled on the user's delegation 2026-11-19: **`f` is a field (own, or a public inherited one)
+  or a method of no parameter list, with its type declared, read again at every use.** A `var`
+  field reassigned between calls sends each to the value it then holds; a method `f` runs at each
+  use. Why: the export is part of the type's surface, which other declarations (trait conformance,
+  completion) need before any body is checked; a class parameter's type is always written, so the
+  common case costs nothing. Alternatives weighed: inferring an undeclared field's type by checking
+  the class body first, as a field read does (makes a declaration depend on a body); reading `f`
+  once at construction (a `var` field's export would go stale).
+- Settled on the user's delegation 2026-11-19: **an export presents public members only**: never
+  a private one, by name or by `*`, never a static one, never `equals` or `hash` (every value has
+  its own); a member the field's type exports in turn counts, so exports chain. Exports by name that
+  lead round without reaching a member are an error at each export of the round, and wildcards that
+  lead round present nothing (each search stops at a depth bounded by the program's types).
+- Settled on the user's delegation 2026-11-19: **the type's own members win; an export by name of
+  a member the type has is an error.** A wildcard silently leaves the type's own members (and its
+  superclasses', traits' and impls') to them, the usual way to replace a few of a wrapped value's
+  members. An export by name of a member the type declares, a field of its own or inherited, or a
+  superclass's method is an error, since naming a member and declaring it says two things; so are
+  two exports by name of one name (naming both), and a subclass member named like an export its
+  superclass makes by name (a use through the superclass would reach the export and one through the
+  subclass the member, with no override between them). An export by name comes before a wildcard,
+  and two wildcards both reaching a name make a use of it an error naming both. Alternatives
+  weighed: the type's own member silently winning over an export by name too (hides a mistake); an
+  export by name winning over the type's own member (makes the member dead code). Review with the
+  user: the conflict rule.
+- Settled on the user's delegation 2026-11-19: **a public export by name of a class implements the
+  trait's methods of its name** that the class does not declare: the class gets a method with the
+  trait's signature whose body is `self.f.m(params)`, standing as an `override` would (it replaces a
+  default too), so a call through the trait reaches the member; every overload of the trait's name
+  is implemented. A wildcard implements nothing, a private export of a trait method's name is an
+  error, a trait method with type parameters of its own is reported at the export, and a data type's
+  export implements nothing (its trait impls write their methods). A member that cannot be called
+  with the trait method's parameters, or yields another type, is reported at the export. Why:
+  delegation-based conformance is most of what forwarding is for; requiring the name keeps a class's
+  conformance readable from its declaration, and keeps it from depending on what a wrapped type
+  happens to have. Alternatives weighed: forwards never counting toward a trait (every conformance
+  written out by hand); a wildcard counting too (a trait met by a member the class never names).
+  Review with the user: trait satisfaction, its restriction to exports by name and to classes, and
+  methods with type parameters of their own.
+- Settled on the user's delegation 2026-11-19: **an export is reached through a value**, `x.m`
+  and `self.m`, never by a bare `m` inside the type nor by `Type.m`. Why: a wildcard adding bare
+  names to the type's code would hide top-level declarations whenever the wrapped type grows a
+  member; inside the type the field itself is in scope. Alternative weighed: bare names reaching
+  exports as members do.
+- Settled on the user's delegation 2026-11-19: **`private export` presents the members to the
+  type's own code** (its class and companion, or a data type's impls), as a private method is.
+- Settled on the user's delegation 2026-11-19: **the editor follows an export**: completion after
+  a dot offers the members a value's exports present, under the names presented, and
+  go-to-definition (and hover) on a use, an alias or the export line reaches the member's
+  declaration, the field read included.
+
 - Settled on the user's delegation 2026-11-09 (built on branch `regex-budget`, for `marshal grep`): [`avin.regex`'s checked
   searches](/spec/regex/#matching). A spent step budget becomes a failure the caller can handle,
   answering the review question left on the settled limits on matching:
@@ -10962,9 +11040,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   trait, `MonadError[A, E]`), and whether composed constructors (`Option[List[_]]`) are wanted; both
   are left out of the higher-kinded design and need no change to it to add later.
 
-- Member forwarding inside a class (`export field.method`, presenting a member's methods as the
-  class's own), a later possibility beside module exports; and exporting a whole module as a member
-  of another (`export a.b`), which needs modules as members.
+- Exporting a whole module as a member of another (`export a.b`), which needs modules as members.
 
 - Tooling for exports: completion after `m.` and in an import group listing a module's exports
   beside its declarations, and the IntelliJ plugin's resolution following an export to the
