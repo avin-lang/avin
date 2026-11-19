@@ -10820,6 +10820,29 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   libraries dynamic; and that the C libraries of a program's Sysl packages (`requires { pkg_config }`)
   are not covered.
 
+- Proposed 2026-11-18 (built on branch `typaram-bound`, for the parsing library's
+  `Rule[-I: Reader, +T]`): **a function's or a method's own type parameter may be bounded by a type
+  parameter declared before it, `[J: I]`** ([generics](/spec/generics/#bounds-by-a-type-parameter)),
+  the twin of the lower bound `[W >: T]`. A `J` is an `I` with no conversion and has `I`'s bounds; each
+  type argument must be the bounding one's or be seen as it as a covariant part is (so a value type
+  never stands for a trait there); the bound is a position where a value is passed in, so a `-I` may
+  bound one and a `+T` may not; an override writes the overridden method's bound or none. Choices this
+  branch made: **only a function's or a method's own parameters** take one, as only they take a lower
+  bound (a type's own `[A, B: A]` would need its own variance rule, the opposite of a method's, and no
+  program needs it yet); **the bounding parameter is declared before it** (the enclosing type's or
+  impl's, or earlier in the list), which rules out cycles by construction and makes `[A: B, B: A]` an
+  error at its first bound, where lower bounds allow a later parameter and check for a chain leading
+  back; **one at most** per parameter (two would be an intersection of two unknowns, which no
+  instance needs); **inference takes the narrower**: a type argument decided where a value is passed
+  in takes the bounding argument when that is a subtype of the type given and not the other way round
+  (`digit() | success(4)` is a `Rule[Input, long]`, not an error), and a bounding parameter nothing
+  else decides is taken from the one it bounds. *Alternatives weighed*: refusing `digit() | success(4)`
+  and making the caller write `|[Input]` (correct but unpleasant at the most common call shape);
+  allowing a later parameter with a cycle check, as lower bounds do (more to say for no program that
+  needs it); a type's own parameters bounded too (sound only for a covariant or invariant bounding
+  parameter, a rule that can come when a program asks). **Review with the user**: the
+  declared-before rule, which differs from the lower bound's.
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

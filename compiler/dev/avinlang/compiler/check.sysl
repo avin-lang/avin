@@ -805,6 +805,9 @@ struct Checker
      * generator's source takes from the rest of the comprehension, so the generator after it names
      * itself when what it gives is not that. */
     yield_frames: Buf[YieldFrame]
+    /** The inference variables of type arguments bounded by a type parameter, `J` for `[J: I]`, each
+     * with the type the call gives that parameter: see `lower_bound`. */
+    capped: Buf[CappedVar]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -820,6 +823,12 @@ struct Checker
         self.reported_count = self.reported_count + 1
         self.units[unit].report.add(error(shown_at(self.shown, at), message))
 end Checker
+
+/** An inference variable `id` of a type argument whose parameter a type parameter bounds, and `upper`,
+ * the type the call gives the bounding parameter. */
+struct CappedVar
+    id: usize
+    upper: &Type
 
 /** The `lazy val` field at `index` of class `owner`, which declares it, the function its
  * initializer is checked as, and the local of the class body that holds the object, `self`, which
@@ -1224,7 +1233,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -4401,8 +4410,9 @@ private view_as_type(f: Conformances, x: &Type, to: &Type) -> &Type = *to match
         Class(_, _, _) -> view_function(f, x, to)
         Data(_, _, _) -> view_function(f, x, to)
         _ -> x
-    // A type parameter with a lower bound is a supertype of the bound.
-    TypeVar(_, _, _) -> if below_lower(f, x, to) then to else x
+    // A type parameter with a lower bound is a supertype of the bound, and one bounding another,
+    // `I` in `[J: I]`, is a supertype of it.
+    TypeVar(_, _, _) -> if below_lower(f, x, to) || under_upper(f, x, to) then to else x
     // `F[Dog]` is an `F[Animal]` where `F`'s hole is `+_`, which only a constructor covariant there
     // is accepted for; at a plain `_` the arguments must be the same.
     Applied(h, ys) -> *x match
@@ -4463,6 +4473,9 @@ private view_part(f: Conformances, x: &Type, to: &Type) -> &Type
     // A type argument with a lower bound is given only types the bound is seen as with no
     // conversion, so a value of any type is one of it through the bound.
     if *to is TypeVar(_, _, _) && below_lower(f, x, to) then return to
+    // So is one bounded by a type parameter, `J` in `[J: I]`, given only types seen as the bounding
+    // parameter's with no conversion.
+    if under_upper(f, x, to) then return to
     if !is_reference(x) then return x
     // A union with a scalar member is laid out by its tag, so no other type is one inside another.
     if *to is Union(_) && !is_reference(to) then return x
@@ -7103,6 +7116,10 @@ private check_class_variance(c: *Checker, id: usize)
             val tp = symbol.type_params[j]
             for b in bounds_at(c, owner, symbol.type_params, j)
                 variance_in(c, k.unit, params, owner, b, -1, tp.span, s"the bound of `${tp.name}` in `$name`")
+            // So does a type parameter bounding it: a `-I` may bound one, as in
+            // `|[J: I](other: Rule[J, T]) -> Rule[J, T]`, and a `+T` may not.
+            if upper_at(c, owner, symbol.type_params, j) is Some(u)
+                variance_in(c, k.unit, params, owner, u, -1, tp.span, s"the bound of `${tp.name}` in `$name`")
             // A lower bound is what a caller's type argument widens: a `+T` may be one, as in
             // `prepended[W >: T](x: W) -> List[W]`, and a `-T` may not.
             if lower_at(c, owner, symbol.type_params, j) is Some(l)
@@ -7299,6 +7316,17 @@ private param_mismatch(c: *Checker, self_type: &Type, m: usize, base: usize) -> 
                 val w = seen_from(c, self_type, base, l)
                 if !same_type(h, w) then return Some(s"whose type parameter `$name` has the lower bound ${type_name(w)}, not ${type_name(h)}")
             None -> return Some(s"whose type parameter `$name` has no lower bound")
+    // So is a type parameter it writes as the bound of one of its own.
+    for j in 0..<own
+        val h = method_upper(c, m, j) match
+            Some(u) -> seen_from(c, self_type, m, u)
+            None -> continue
+        val name = c.symbols[base].decl.type_params[j].name
+        method_upper(c, base, j) match
+            Some(u) ->
+                val w = seen_from(c, self_type, base, u)
+                if !same_type(h, w) then return Some(s"whose type parameter `$name` is bounded by ${type_name(w)}, not ${type_name(h)}")
+            None -> return Some(s"whose type parameter `$name` is bounded by no type parameter")
     // A call through either method passes the same arguments, so both repeat their last parameter or
     // neither does.
     val repeats = declares_variadic(c.symbols[base].decl)
@@ -7312,6 +7340,12 @@ private method_lower(c: *Checker, m: usize, j: usize) -> Option[&Type]
     val symbol = c.symbols[m]
     val outer = symbol.type_params.len() - symbol.decl.type_params.len()
     lower_at(c, symbol.type_owner, symbol.type_params, outer + j)
+
+/** The type parameter bounding method `m`'s own type parameter `j`, if one does. */
+private method_upper(c: *Checker, m: usize, j: usize) -> Option[&Type]
+    val symbol = c.symbols[m]
+    val outer = symbol.type_params.len() - symbol.decl.type_params.len()
+    upper_at(c, symbol.type_owner, symbol.type_params, outer + j)
 
 /** The bounds method `m` writes on its own type parameter `j`. */
 private method_bounds(c: *Checker, m: usize, j: usize) -> Buf[&Type]
@@ -7749,6 +7783,11 @@ private declare_defaults(c: *Checker, id: usize)
                         copied.push(substitute(b, id, own))
                     c.bounds.put(bound_key(did, k, tp), copied)
                 if c.lowers.get(bound_key(id, k, tp)) is Some(lower) then c.lowers.put(bound_key(did, k, tp), substitute(lower, id, own))
+                if c.bounds.get(upper_key(id, k, tp)) is Some(upper)
+                    var copied: Buf[&Type] = buf()
+                    for u in upper
+                        copied.push(substitute(u, id, own))
+                    c.bounds.put(upper_key(did, k, tp), copied)
         var params: Buf[&Type] = buf()
         var names: Buf[string] = buf()
         var decls: Buf[Param] = buf()
@@ -8137,13 +8176,18 @@ private string_intrinsic(name: string) -> Option[&Type]
 // share an owner and positions.
 bound_key(owner: usize, index: usize, tp: TypeParam) -> string = s"$owner/$index/${tp.site}"
 
+// A function's or a method's own type parameter bounded by another type parameter in scope, `[J: I]`,
+// records that parameter, alone, under this key, beside its trait and class bounds.
+private upper_key(owner: usize, index: usize, tp: TypeParam) -> string = s"${bound_key(owner, index, tp)}/upper"
+
 /** The key of the bounds of fresh type `index` of a refining pattern's `owner`. */
 private fresh_bound_key(owner: usize, index: usize) -> string = s"$owner/$index/fresh"
 
 // Resolves the bounds of `params` from position `from` on, in the scope that declares them, and
 // records them. A bound is a trait or a class. It may name the parameters, and a trait that
 // mentions `Self`, which is a bound and never a type. A lower bound is any type; only a function's
-// or a method's own parameters, from position `own` on, have one.
+// or a method's own parameters, from position `own` on, have one, and only they may be bounded by a
+// type parameter declared before them, one at most.
 private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeParam], from: usize, own: usize)
     for i in from..<params.len()
         val tp = params[i]
@@ -8176,6 +8220,16 @@ private declare_bounds(c: *Checker, unit: usize, owner: usize, params: Buf[TypeP
                         c.note(unit, b.span, s"`${tp.name}` has one class among its bounds, and `${type_name(other)}` and `${type_name(t)}` are both classes; the others are traits")
                     else bounds.push(t)
                 ErrorType -> ()
+                TypeVar(o, j, name) ->
+                    if o != owner || j >= params.len() || params[j].holes.len() > 0 then c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
+                    elif i < own then c.note(unit, b.span, s"a type parameter bounds a function's or a method's own type parameter, not `${tp.name}`")
+                    elif j == i then c.note(unit, b.span, s"the bound of `${tp.name}` leads back to `${tp.name}`")
+                    elif j > i then c.note(unit, b.span, s"`$name` is declared after `${tp.name}`; a type parameter bounding another is declared before it, as in `[$name, ${tp.name}: $name]`")
+                    elif c.bounds.get(upper_key(owner, i, tp)) is Some(_) then c.note(unit, b.span, s"`${tp.name}` has one type parameter among its bounds, and `$name` is a second")
+                    else
+                        var upper: Buf[&Type] = buf()
+                        upper.push(t)
+                        c.bounds.put(upper_key(owner, i, tp), upper)
                 _ -> c.note(unit, b.span, s"a bound is a trait or a class, not ${type_name(t)}")
         c.bounds.put(bound_key(owner, i, tp), bounds)
 
@@ -8397,6 +8451,13 @@ private declared_scope_bounds(f: Conformances, owner: usize, params: Buf[TypePar
     if f.bounds.get(bound_key(owner, index, declared[index])) is Some(own)
         for b in own
             out.push(b)
+    // A parameter bounded by an earlier one, `[J: I]`, has that one's bounds as well.
+    if f.bounds.get(upper_key(owner, index, declared[index])) is Some(upper)
+        for u in upper
+            if *u is TypeVar(o, j, _)
+                if o == owner && j < index
+                    for b in declared_scope_bounds(f, owner, params, j)
+                        if !contains_type(out, b) then out.push(b)
     // Inside an impl with bounds of its own, its parameters have those bounds too.
     if index < params.len() && params[index].site != declared[index].site
         if f.bounds.get(bound_key(owner, index, params[index])) is Some(extra)
@@ -8438,6 +8499,37 @@ private type_var_lower(f: Conformances, t: &Type) -> Option[&Type]
     val scope = f.generic?
     if scope.owner != owner || index >= scope.params.len() then return None
     f.lowers.get(bound_key(owner, index, scope.params[index]))
+
+/** The type parameter bounding type parameter `index` of `owner`, `I` for `[J: I]`, where `params`
+ * are the parameters in scope. */
+private upper_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usize) -> Option[&Type]
+    if index >= params.len() then return None
+    val upper = c.bounds.get(upper_key(owner, index, params[index]))?
+    if upper.len() > 0 then Some(upper[0]) else None
+
+/** Whether a value of type parameter `x` is one of type parameter `to` with no conversion: `to` bounds
+ * `x`, or bounds a parameter that does, as `I` bounds `K` in `[J: I, K: J]`. */
+private under_upper(f: Conformances, x: &Type, to: &Type) -> bool
+    val (owner, index) = *x match
+        TypeVar(o, i, _) -> (o, i)
+        _ -> return false
+    if !(*to is TypeVar(_, _, _)) then return false
+    val scope = f.generic match
+        Some(s) -> s
+        None -> return false
+    if scope.owner != owner then return false
+    var i = index
+    for _ in 0..<scope.params.len()
+        if i >= scope.params.len() then return false
+        val upper = f.bounds.get(upper_key(owner, i, scope.params[i])) match
+            Some(u) -> u
+            None -> return false
+        if upper.len() == 0 then return false
+        if same_type(upper[0], to) then return true
+        i = *upper[0] match
+            TypeVar(o, j, _) -> if o == owner && j < i then j else return false
+            _ -> return false
+    false
 
 /** The lower bound of type parameter `index` of `owner`, where `params` are the parameters in scope. */
 private lower_at(c: *Checker, owner: usize, params: Buf[TypeParam], index: usize) -> Option[&Type]
@@ -10214,6 +10306,7 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
             if !conforms_to_bound(c, args[i], bound)
                 val arg = zonk(c, args[i])
                 c.note(unit, at, s"`${type_name(arg)}` does not conform to `${type_name(bound)}`, the bound of `${params[i].name}` in $what${underived_reason(c, arg, type_name(bound))}${boundary_reason(c, arg, bound)}${union_reason(c, arg, bound)}")
+        hold_to_upper(c, unit, at, what, owner, params, args, i)
         if lower_at(c, owner, params, i) is Some(l)
             val lower = zonk(c, substitute(l, owner, args))
             val arg = zonk(c, args[i])
@@ -10228,6 +10321,28 @@ private hold_to_bounds_except(c: *Checker, unit: usize, at: Span, what: string, 
             if conforms(lower, arg) || conforms(view_part(conformances(c), lower, arg), arg)
                 if !same_type(lower, arg) then c.views.push(TypeView(one_part(lower), one_part(arg)))
             else c.note(unit, at, s"`${type_name(arg)}` is not a supertype of `${type_name(lower)}`, the lower bound of `${params[i].name}` in $what")
+
+// Holds type argument `i` of a call to the type parameter bounding its parameter, `I` for `[J: I]`:
+// the generic code passes a value of the parameter as one of the bound with no conversion, as a part
+// of a tuple is, so the argument must be the bound's, or be seen as it as a covariant part is. One
+// still open is held where a later use settles it, and the view is read once the program is solved.
+private hold_to_upper(c: *Checker, unit: usize, at: Span, what: string, owner: usize, params: Buf[TypeParam], args: Buf[&Type], i: usize)
+    val u = upper_at(c, owner, params, i) match
+        Some(u) -> u
+        None -> return
+    val upper = zonk(c, substitute(u, owner, args))
+    val arg = zonk(c, args[i])
+    if *arg is ErrorType || *upper is ErrorType then return
+    if has_unknowns(arg) || has_unknowns(upper)
+        c.views.push(TypeView(one_part(arg), one_part(upper)))
+        return
+    if seen_as_part(c, arg, upper)
+        if !same_type(arg, upper) then c.views.push(TypeView(one_part(arg), one_part(upper)))
+        return
+    val name = *u match
+        TypeVar(_, _, n) -> n
+        _ -> type_name(u)
+    c.note(unit, at, s"`${type_name(arg)}` is not a subtype of `${type_name(upper)}`, the type of `$name`, which bounds `${params[i].name}` in $what")
 
 /** Why constructor `given` does not implement constructor trait `k`, said after the message that it
  * does not (empty for no more to say), or `None` where it does. A data type or class conforms by its
@@ -10507,10 +10622,12 @@ private scope_param(c: *Checker, t: &Type) -> Option[TypeParam]
     if scope.owner != owner || index >= scope.params.len() then None else Some(scope.params[index])
 
 /** Whether each of `args` decided so far, from position `from` on, is a supertype of its parameter's
- * lower bound as `hold_to_bounds` requires; one not yet known, or whose bound is not, passes. */
+ * lower bound and a subtype of the type parameter bounding it, as `hold_to_bounds` requires; one not
+ * yet known, or whose bound is not, passes. */
 private admits_lowers(c: *Checker, owner: usize, params: Buf[TypeParam], from: usize, args: Buf[&Type]) -> bool
     for i in from..<params.len()
         if i >= args.len() then break
+        if !admits_upper(c, owner, params, i, args) then return false
         if lower_at(c, owner, params, i) is Some(l)
             val lower = zonk(c, substitute(l, owner, args))
             val arg = zonk(c, args[i])
@@ -10522,6 +10639,29 @@ private admits_lowers(c: *Checker, owner: usize, params: Buf[TypeParam], from: u
                 continue
             if !conforms(lower, arg) && !conforms(view_part(conformances(c), lower, arg), arg) then return false
     true
+
+// Whether type argument `i`, where decided, is seen as the type parameter bounding its parameter as
+// `hold_to_upper` requires; one not yet known passes.
+private admits_upper(c: *Checker, owner: usize, params: Buf[TypeParam], i: usize, args: Buf[&Type]) -> bool
+    val u = upper_at(c, owner, params, i) match
+        Some(u) -> u
+        None -> return true
+    val upper = zonk(c, substitute(u, owner, args))
+    val arg = zonk(c, args[i])
+    if *arg is ErrorType || *upper is ErrorType || has_unknowns(arg) || has_unknowns(upper) then return true
+    seen_as_part(c, arg, upper)
+
+/** Whether a value of type `x` is one of type `to` with no conversion, as a covariant part is: `x` is
+ * `to` or seen as it, both references, or `x` is a type parameter a class bounds, whose arguments are
+ * the class's instances, or one bounded by a type parameter so seen. */
+private seen_as_part(c: *Checker, x: &Type, to: &Type) -> bool
+    val f = conformances(c)
+    if conforms(x, to) || conforms(view_part(f, x, to), to) then return true
+    if !(*x is TypeVar(_, _, _)) then return false
+    for b in bounds_of(c, x)
+        if *b is Class(k, _, _)
+            if !is_trait(c, k) && (conforms(b, to) || conforms(view_part(f, b, to), to)) then return true
+    false
 
 /** Whether trait `k`'s methods, or those of a trait it requires, mention `Self` other than as the
  * receiver: such a trait is only a bound. */
@@ -18964,6 +19104,9 @@ private lower_join(c: *Checker, a: &Type, b: &Type) -> Option[&Type]
     val f = conformances(c)
     if *a is TypeVar(_, _, _) && below_lower(f, b, a) then return Some(a)
     if *b is TypeVar(_, _, _) && below_lower(f, a, b) then return Some(b)
+    // So is a type parameter bounding the other, `I` for `[J: I]`.
+    if under_upper(f, b, a) then return Some(a)
+    if under_upper(f, a, b) then return Some(b)
     None
 
 /** The superclass of an instance's class, as the instance's type, if it has one. */
@@ -18980,11 +19123,13 @@ private upcast(c: *Checker, from: &Type, to: &Type) -> &Type
     up
 
 // Whether `up` differs from `x` only where a type parameter's lower bound is seen as the parameter,
-// as `self`, an `Option[T]`, is returned as an `Option[B]` for `B >: T`. Each call states that view
+// as `self`, an `Option[T]`, is returned as an `Option[B]` for `B >: T`, or a parameter as the one
+// bounding it, a `J` as an `I` for `[J: I]`. Each call states that view
 // at the type arguments it gives (see `hold_to_bounds`), so the generic code's own view says nothing
 // more about what values meet.
 private through_lowers(c: *Checker, x: &Type, up: &Type) -> bool
     if same_type(x, up) then return true
+    if under_upper(conformances(c), x, up) then return true
     if *up is TypeVar(_, _, _)
         return type_var_lower(conformances(c), up) match
             Some(l) -> same_type(x, l)
@@ -22324,6 +22469,16 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
             val bound = substitute(b, owner, type_args)
             if *bound is Class(bk, _, _)
                 if ancestor_type(c.classes, c.data, arg, bk) is Some(up) then unify(c, up, bound)
+    // So does it the type parameter bounding it, which nothing else decided: `[A: Named, B: A](b: B)`
+    // takes `A` as the type `B` is. A chain is settled from its last parameter back.
+    var k = type_params.len()
+    while k > known.len()
+        k = k - 1
+        val arg = zonk(c, type_args[k])
+        if *arg is Var(_) || has_unknowns(arg) then continue
+        if upper_at(c, owner, type_params, k) is Some(u)
+            val upper = zonk(c, substitute(u, owner, type_args))
+            if *upper is Var(_) then unify(c, upper, arg)
     // An argument of type `Nothing` never produces a value, so the call is never made and constrains
     // nothing: a type argument it alone would have decided is `Nothing`, the least type, as in
     // `identity(break 42)` or `println(fail("unreachable"))`.
@@ -22643,8 +22798,13 @@ private default_type_args(c: *Checker, s: Signature, default: usize, solved: Buf
 // arguments widen it to their join with the bound: `cats.prepended(dog)` takes `W >: Cat` as
 // `Animal`, and with no nearer common type, two references join to `Any`. One decided already, by
 // a written type argument or the expected type, is held to its bound once the call is solved.
+// An open type argument bounded by a type parameter, `J` for `[J: I]`, is capped by the type the call
+// gives `I` (see `lower_bound`).
 private constrain_lowers(c: *Checker, owner: usize, type_params: Buf[TypeParam], from: usize, type_args: Buf[&Type], open: *Buf[usize])
     for i in from..<type_params.len()
+        if upper_at(c, owner, type_params, i) is Some(u)
+            if *type_args[i] is Var(v)
+                if open_index(open, v) is Some(_) then c.capped.push(CappedVar(v, substitute(u, owner, type_args)))
         val l = lower_at(c, owner, type_params, i) match
             Some(l) -> l
             None -> continue
@@ -23607,6 +23767,9 @@ private loosen_for(c: *Checker, t: &Type, open: *Buf[usize], covariant: bool, li
         val now = zonk(c, t)
         if covariant && open_index(open, i) is Some(_) && is_reference(now)
             if literals then literal_hint(c, now) else fresh_var(c)
+        // One bounded by a type parameter is decided by `lower_bound`, which caps it, not by the type
+        // the argument is checked against.
+        elif open_index(open, i) is Some(_) && is_capped(c, i) then fresh_var(c)
         else now
     Tuple(items) ->
         var parts: Buf[&Type] = buf()
@@ -23789,11 +23952,16 @@ private lower_bound(c: *Checker, i: usize, v: &Type, open: *Buf[usize], covarian
     if !covariant
         open[at] = open[open.len() - 1]
         open.truncate(open.len() - 1)
-        if !(*now is Var(_)) && !has_unknowns(now) && !has_unknowns(v) && !same_type(now, v)
-            if conforms(upcast(c, now, v), v)
-                settle(c, i, v)
+        // A type argument bounded by a type parameter, `J` for `[J: I]`, given a type its cap is a
+        // subtype of where a value is passed in, takes the cap: a `Rule[Reader, T]` passed for a
+        // `Rule[J, T]` whose `I` is `Input` makes `J` an `Input`, which the `Rule[Reader, T]` is a
+        // `Rule[Input, T]` of. Anywhere else no type argument could meet both.
+        val given = capped_at(c, i, v)
+        if !(*now is Var(_)) && !has_unknowns(now) && !has_unknowns(given) && !same_type(now, given)
+            if conforms(upcast(c, now, given), given)
+                settle(c, i, given)
                 return true
-        return unify(c, p, v)
+        return unify(c, p, given)
     if *now is Var(_) then return unify(c, p, v)
     if !has_unknowns(now) && conforms(upcast(c, v, now), now) then return true
     join(c, now, v) match
@@ -23809,6 +23977,25 @@ private lower_bound(c: *Checker, i: usize, v: &Type, open: *Buf[usize], covarian
             c.views.push(TypeView(one_part(zonk(c, v)), one_part(AnyType)))
             settle(c, i, AnyType)
             true
+
+/** Whether inference variable `i` is a type argument bounded by a type parameter. */
+private is_capped(c: *Checker, i: usize) -> bool
+    for cap in c.capped
+        if cap.id == i then return true
+    false
+
+/** `v`, given to inference variable `i` where a value is passed in, or the cap of `i` where `i` has one
+ * that is seen as `v` with no conversion while `v` is not seen as the cap. */
+private capped_at(c: *Checker, i: usize, v: &Type) -> &Type
+    for cap in c.capped
+        if cap.id != i then continue
+        val upper = zonk(c, cap.upper)
+        val given = zonk(c, v)
+        if has_unknowns(upper) || has_unknowns(given) then return v
+        if seen_as_part(c, given, upper) then return v
+        if seen_as_part(c, upper, given) then return upper
+        return v
+    v
 
 /** A tuple of one part, `t`. */
 private one_part(t: &Type) -> &Type
