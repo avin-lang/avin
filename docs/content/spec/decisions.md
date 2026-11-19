@@ -5124,7 +5124,9 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   is implemented. A wildcard implements nothing, a private export of a trait method's name is an
   error, a trait method with type parameters of its own is reported at the export, and a data type's
   export implements nothing (its trait impls write their methods). A member that cannot be called
-  with the trait method's parameters, or yields another type, is reported at the export. Why:
+  with the trait method's parameters, or yields another type, is one error at the export naming the
+  export, the trait's method, both signatures and the mismatch, never the diagnostics of the method
+  written for it. Why:
   delegation-based conformance is most of what forwarding is for; requiring the name keeps a class's
   conformance readable from its declaration, and keeps it from depending on what a wrapped type
   happens to have. Alternatives weighed: forwards never counting toward a trait (every conformance

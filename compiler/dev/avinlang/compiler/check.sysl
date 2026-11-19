@@ -606,6 +606,12 @@ struct Forward
     via_type: &Type
     valid: bool
 
+/** A method a class has because export `forward` implements trait method `implements` with it. */
+struct Forwarder
+    symbol: usize
+    forward: usize
+    implements: usize
+
 /** What a member name finds among a type's exports: nothing, the export a use goes through, or a
  * mistake already reported. */
 enum ForwardFound
@@ -834,6 +840,8 @@ struct Checker
     capped: Buf[CappedVar]
     /** The member exports of every class and data type: see `Forward`. */
     forwards: Buf[Forward]
+    /** The methods exports by name implement traits' methods with: see `forward_trait_methods`. */
+    forwarders: Buf[Forwarder]
 
     note(*self, unit: usize, at: Span, message: string)
         if self.muted > 0
@@ -1259,7 +1267,7 @@ private export_problem(c: *Checker, own: string, e: Import) -> (string, Span)
  * `completing`, a name written in the program as a stand-in for the one being typed, the check also
  * records what could be written there, in `Checked.completions`. */
 check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexing: bool = false, completing: string = "") -> Checked
-    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf(), buf(), buf())
+    var c = Checker(units, buf(), buf(), map(), map(), buf(), map(), buf(), map(), buf(), buf(), buf(), map(), 0, fresh_body(0), buf(), buf(), None, false, false, buf(), buf(), buf(), buf(), buf(), buf(), map(), None, false, false, buf(), buf(), map(), root_module, buf(), CoreTraits(map(), map()), buf(), buf(),buf(), buf(), buf(), buf(), buf(), buf(), buf(), if indexing || completing != "" || has_tests_file(units) then Some(definition_index(completing)) else None, buf(), buf(), buf(), buf(), map(), None, None, buf(), buf(), false, buf(), buf(), None, "", 0, map(), buf(), 0, 0, buf(), buf(), false, map(), map(), buf(), false, buf(), map(), map(), buf(), buf(), buf(), map(), map(), buf(), map(), buf(), None, map(), buf(), buf(), PatternRow(0, "arm"), buf(), buf(), buf(), buf())
     // The core library's impls for tuples are a file made for the program, after the program's own:
     // see `tuples.sysl`.
     val given = c.units.len()
@@ -13632,8 +13640,16 @@ private check_function(c: *Checker, id: usize)
         for i in 0..<symbol.params.len()
             subjects.push(TExpr(symbol.decl.name_span, symbol.params[i], Param(i)))
         val mark = c.unknowns.len()
+        // The method an export implements a trait's method with reports what went wrong in it as one
+        // mismatch, at the export.
+        val forwarding = forwarder_of(c, id)
+        val muted_before = c.muted_notes
+        if forwarding is Some(_) then c.muted += 1
         if symbol.constructor then check_constructor(c, id, None)
         else check_definition(c, id, subjects)
+        if forwarding is Some(w)
+            c.muted -= 1
+            if c.muted_notes > muted_before then report_forwarder_mismatch(c, w)
         // The body is over, so what its uses did not settle cannot be inferred.
         settle_unknowns(c, mark)
         c.derived_context = outer_derived
@@ -16347,11 +16363,162 @@ private forward_trait_methods(c: *Checker)
                 if !seen then targets.push(tm)
         for tm in targets
             if c.symbols[tm].decl.type_params.len() > 0
-                c.note(fw.unit, item.binding_span, s"`${c.classes[c.symbols[tm].owner_class.unwrap()].name}`'s `$name` has type parameters of its own, which an export does not implement; declare `$name` in `${c.classes[k].name}`")
+                c.note(fw.unit, item.binding_span, s"${forward_described(c, f)}, exported as `$name`, cannot implement `${shown_method(c, self_type, tm)}`: a trait's method with type parameters of its own is implemented by a method `${c.classes[k].name}` declares")
                 continue
             val m = forwarder(c, f, k, tm, targets.len() > 1)
             c.classes[k].methods.push(m)
             c.classes[k].overriding.push(true)
+            c.forwarders.push(Forwarder(m, f, tm))
+
+/** The export `f` reads and names, with the member's signatures: ``c.label` (`Counter.label(string)
+ * -> string`)`. */
+private forward_described(c: *Checker, f: usize) -> string
+    val fw = c.forwards[f]
+    val member = forward_member(c, f, "")
+    val sigs = member_signatures(c, fw.via_type, member)
+    val shown = if sigs == "" then "" else s" ($sigs)"
+    s"`${fw.decl.via}.$member`$shown"
+
+/** How the members named `name` of a value of type `t` are declared, each overload's signature
+ * quoted, joined with "or". */
+private member_signatures(c: *Checker, t: &Type, name: string) -> string
+    val known = zonk(c, t)
+    var out: Buf[string] = buf()
+    *known match
+        Class(k, _, args) ->
+            for i in 0..<c.classes[k].fields.len()
+                val fld = c.classes[k].fields[i]
+                if fld.name == name && fld.public
+                    val ty = substitute(fld.ty.unwrap_or(ErrorType), class_owner(k), args)
+                    out.push(s"`${if fld.mutable then "var" else "val"} $name: ${type_name(ty)}`")
+        Data(id, _, args) ->
+            if c.data[id].variants.len() == 1
+                val names = c.data[id].variants[0].field_names
+                for i in 0..<names.len()
+                    if names[i] == name then out.push(s"`val $name: ${type_name(variant_fields(c.data[id], id, 0, args)[i])}`")
+        _ -> ()
+    for m in methods_of(c, known, name)
+        if c.symbols[m].public && !c.symbols[m].static_member then out.push(s"`${shown_method(c, known, m)}`")
+    spoken_or(out)
+
+/** Items joined for a sentence: `a`, `a or b`, `a, b or c`. */
+private spoken_or(items: Buf[string]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + (if i == items.len() - 1 then " or " else ", ")
+        out = out + items[i]
+    out
+
+/** Method `m` as a value of `self_type` sees it: `Counter.label(string) -> string`, `Sized.size ->
+ * int`, `Counter.convert[U]((int) -> U) -> U`. */
+private shown_method(c: *Checker, self_type: &Type, m: usize) -> string
+    val s = c.symbols[m]
+    var text = s.name
+    val own = s.decl.type_params
+    if own.len() > 0
+        text = text + "["
+        for j in 0..<own.len()
+            if j > 0 then text = text + ", "
+            text = text + own[j].name
+        text = text + "]"
+    if !s.decl.parameterless
+        text = text + "("
+        for i in 1..<s.params.len()
+            if i > 1 then text = text + ", "
+            text = text + type_name(seen_from(c, self_type, m, s.params[i]))
+        text = text + ")"
+    s.result match
+        Some(r) -> text + " -> " + type_name(seen_from(c, self_type, m, r))
+        None -> text
+
+/** The forwarder method `id` is, if it is one. */
+private forwarder_of(c: *Checker, id: usize) -> Option[Forwarder]
+    for w in c.forwarders
+        if w.symbol == id then return Some(w)
+    None
+
+// A forwarder whose body did not check is reported once, at its export, as the mismatch it is: the
+// member cannot be called with the trait method's parameters, or yields something else.
+private report_forwarder_mismatch(c: *Checker, w: Forwarder)
+    val fw = c.forwards[w.forward]
+    val item = fw.decl.names[fw.item.unwrap()]
+    val s = c.symbols[w.symbol]
+    val k = fw.class_id.unwrap()
+    val self_type = own_class_type(c.classes[k], k)
+    val trait_shown = trait_method_shown(c, w)
+    val what = s"${forward_described(c, w.forward)}, exported as `${item.binding}`, implements `$trait_shown` but"
+    val member = item.name
+    var wanted: Buf[&Type] = buf()
+    for i in 1..<s.params.len()
+        wanted.push(s.params[i])
+    val wanted_text = "(" + joined_types(wanted) + ")"
+    val ms = methods_of(c, fw.via_type, member)
+    if !s.decl.parameterless
+        if ms.len() == 0
+            c.note(fw.unit, item.binding_span, s"$what is not a method, so it takes no parameters $wanted_text")
+            return
+        if !takes_params(c, fw.via_type, ms, wanted)
+            c.note(fw.unit, item.binding_span, s"$what does not take its parameters, $wanted_text")
+            return
+    var got: &Type = ErrorType
+    if c.bodies[w.symbol] is Some(b) then got = zonk(c, b.ty)
+    val declared: &Type = s.result.unwrap_or(Unit)
+    val failed = *got is ErrorType
+    if !failed && !fits(c, got, declared)
+        c.note(fw.unit, item.binding_span, s"$what yields ${type_name(got)}, not ${type_name(declared)}")
+        return
+    // A generic member is judged by what it yields at the arguments alone, since the result the trait
+    // wants may have decided its type arguments into a call that does not check.
+    if s.decl.body is Some(body)
+        c.muted += 1
+        val alone = zonk(c, check_expr(c, body, None).ty)
+        c.muted -= 1
+        if !(*alone is ErrorType) && settled(alone) && !fits(c, alone, declared)
+            c.note(fw.unit, item.binding_span, s"$what yields ${type_name(alone)}, not ${type_name(declared)}")
+            return
+    c.note(fw.unit, item.binding_span, s"$what cannot be called as it is: with $wanted_text, yielding ${type_name(declared)}")
+
+/** The trait method a forwarder implements, as the class sees it. */
+private trait_method_shown(c: *Checker, w: Forwarder) -> string
+    val s = c.symbols[w.symbol]
+    var text = c.symbols[w.implements].name
+    if !s.decl.parameterless
+        var params: Buf[&Type] = buf()
+        for i in 1..<s.params.len()
+            params.push(s.params[i])
+        text = text + "(" + joined_types(params) + ")"
+    s.result match
+        Some(r) -> text + " -> " + type_name(r)
+        None -> text
+
+private joined_types(types: Buf[&Type]) -> string
+    var out = ""
+    for i in 0..<types.len()
+        if i > 0 then out = out + ", "
+        out = out + type_name(types[i])
+    out
+
+/** Whether one of methods `ms` of a value of type `t` takes arguments of types `wanted`: as many as it
+ * has parameters, fewer where the rest have defaults or are repeated, each fitting its parameter; a
+ * method with type parameters of its own is left to its call to judge. */
+private takes_params(c: *Checker, t: &Type, ms: Buf[usize], wanted: Buf[&Type]) -> bool
+    for m in ms
+        val s = c.symbols[m]
+        val total = s.params.len() - 1
+        var required = total
+        for i in 1..<s.defaults.len()
+            if s.defaults[i] is Some(_) && required > 0 then required -= 1
+        val variadic = s.decl.params.len() > 0 && s.decl.params[s.decl.params.len() - 1].variadic
+        if variadic && required > 0 then required -= 1
+        if wanted.len() < required || (wanted.len() > total && !variadic) then continue
+        if s.decl.type_params.len() > 0 then return true
+        var all = true
+        for i in 0..<wanted.len()
+            if i + 1 >= s.params.len() then break
+            if variadic && i + 2 == s.params.len() then break
+            if !fits(c, wanted[i], seen_from(c, t, m, s.params[i + 1])) then all = false
+        if all then return true
+    false
 
 /** The method of class `k` that export `f` implements trait method `tm` with; `several` where the
  * export implements more than one method of the name, which its parameter types tell apart. */

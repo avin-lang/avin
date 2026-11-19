@@ -973,8 +973,11 @@ s.map(x -> x * 10) // Vector(10, 20)
   the same member. `class Stack[T](…): Sized` above meets `Sized`'s `size -> int` this way. A
   wildcard implements nothing; nor does a private export, which is an error where it names a trait's
   method, nor a method with type parameters of its own, nor an export of a data type, whose trait
-  impls write their methods. A member that cannot be called with the trait method's parameters, or
-  yields something else, is an error at the export.
+  impls write their methods. A member that does not fit the trait's method is one error at the
+  export, naming the export, both signatures and the mismatch: "`t.size` (`Text.size -> string`),
+  exported as `size`, implements `Sized.size -> int` but yields string, not int"; a member that
+  does not take the method's parameters, or is a field where the method takes some, is told the
+  same way, and a generic member is judged by what it yields at the method's arguments.
 - **`private export` presents the members to the type's own code alone**, as a private method is;
   elsewhere a use of one is an error saying so.
 - **An export is reached through a value**, `x.m` and `self.m`. Inside the type a bare `m` is not
