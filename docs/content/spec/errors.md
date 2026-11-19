@@ -178,7 +178,7 @@ trait Error: Display
   of its own keeps it, and its cause, if any, is then its own to show.
 - **Every error type of the standard library is an `Error`**: `IoError`, `CommandError`,
   `HttpError`, `UrlError`, `TlsError`, `TimeParseError`, `ZoneError`, `PatternError`,
-  `MatchError`, `AskError` and `Utf8Error`, and the json package's `JsonError`.
+  `MatchError`, `AskError`, `SendError` and `Utf8Error`, and the json package's `JsonError`.
   An error that only wraps another one, as `CommandError.Io(e)` does, has `e`'s message and no
   cause of its own, so it shows once.
 - **A type of the program's own becomes one** by giving it a message:

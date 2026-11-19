@@ -362,8 +362,9 @@ a decision changes, this page and the chapter change together.
   There is no mutable list type: every collection has a builder, through one library trait, and
   `List`'s builder appends in constant time and yields an immutable `List`.
 - `..` and `..<` expressions construct iterable `Range` values.
-- An array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)` or
-  `Array.empty()`; Avin has no null, so no array holds an unset element, and `Array[T]()` is an error.
+- An array is made with every element set, by `Array.fill(n, value)`, `Array.tabulate(n, f)`,
+  `Array.empty()` or `Array(a, b, c)` (see "A collection is made by naming its type and listing its
+  elements" below); Avin has no null, so no array holds an unset element.
   `xs(i)` calls `xs.apply(i)`, `xs(i) = v` calls `xs.update(i, v)`, and the compound, `:=` and `++`
   forms evaluate `xs` and `i` once. A call with untyped arguments before `=` is an assignment, so a
   local function's declaration types its parameters or has none.
@@ -430,7 +431,8 @@ a decision changes, this page and the chapter change together.
 - Inside brackets whose commas separate items (call arguments, tuple and collection literals), a
   `return` or `break` value stops at the comma, so `f(a = return 1, b = 2)` has two arguments; a
   parenthesised `return 1, 2` is two tuple items, and `return (1, 2)` returns a tuple. An indented
-  block inside the brackets starts a line again, and a one-line lambda body never takes a comma list.
+  block inside the brackets starts a line again, up to a last line that closes the brackets, whose
+  comma ends the block; a one-line lambda body never takes a comma list.
 - Actors are built into the language: `actor` declares one.
 - State machines are built into the language: `machine` declares one, and `state` declares each of
   its states.
@@ -1068,8 +1070,9 @@ Settled by the user on 2026-11-04:
   method is just a method: on a type with both, the operator calls the method and code bounded by
   `Add` calls `add`. Prefix `-a` calls a method `-` taking no argument (`-() -> Vec`), and otherwise
   is `Neg`'s `negate`. `a < b` alone calls the method `<`, whatever it yields; a comparison by a
-  method does not chain, and `a < b < c` through one is an error saying to join the comparisons with
-  `&&`. `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
+  method chains when every link yields `bool` (amended 2026-11-19; see "a comparison chain's links
+  may call operator methods" below, among the decisions settled on the user's delegation).
+  `x += y` calls `+=` where the type has one and is otherwise `x = x + y`, the method `+`
   included. The built-in types keep their operators: a method of one of these names on `int`,
   `real`, `byte`, `char`, `string`, `bool` or a tuple, by an extension or a trait implementation, is
   an error. `==` and `!=` stay `Eq`'s, and the wrapping, saturating and yielding forms stay
@@ -1748,7 +1751,9 @@ their words are reserved.
   `ActorRef[M]`, in `avin.actors`. Code an actor runs starts a child; code elsewhere a top-level actor.
 - Settled by the user 2026-11-04: **`tell` and the mailbox**: `tell(message)` never waits and never fails (no `!`, which is
   reserved); the mailbox is unbounded; one sender's messages to one actor arrive in order; a message
-  to an ended actor is dropped.
+  to an ended actor is dropped. (Revised 2026-11-19, branch `bounded-mailbox`: unbounded unless the
+  actor is spawned with a `Bounded` mailbox, a full one's `tell` dropping by its overflow policy, and
+  `AskError` gaining `Full`; the entry under Actor patterns.)
 - Settled by the user 2026-11-04: **`ask`** is `ask(make: ActorRef[R] -> M, timeout: Duration) -> Future[Result[R, AskError]]`, the
   timeout required, `AskError` being `TimedOut` or `Ended`; reply addresses are ordinary
   `ActorRef[R]`s; `adapter(f)` makes a reference translating another protocol into the actor's own;
@@ -4154,6 +4159,41 @@ spelling is better, as each entry says.
   fitted in a thread would overflow); no reuse (a map and an unmap per thread). Review with the
   user: the default is the knob most likely to want a different value once servers hold many
   thousands of threads.
+- Settled on the user's delegation 2026-11-19 (branch `lwt-stacks`): **a lightweight thread's stack
+  stays one fixed reservation, 8 MiB unless `spawn`'s `stack` asks otherwise and 64 KiB at the
+  least, and the runtime gives its pages back: the monitor trims a thread it has seen parked at two
+  ticks with no run between, down to 16 KiB below where it parked, and a stack kept for reuse is
+  trimmed to its top 16 KiB as its thread ends.** This settles the Open item on stack size and
+  growth. A worker marks a parked thread settled after it has switched away and lists it; the monitor
+  raises the thread's `trimming` mark and only then looks for it parked and settled, while a worker
+  about to run it marks it running and unsettled and only then waits for `trimming` to fall, so a
+  trim never overlaps the thread's next run. The release is `madvise(MADV_DONTNEED)` on Linux; on
+  macOS that advice leaves the pages resident, so the range is mapped afresh in place
+  (`MAP_FIXED`), which frees them at once (`runtime/avin/rt/__posix__/stack_release.c`). A release
+  the system refuses leaves the range as it was, mapped and committed (a failed `madvise` changes
+  nothing, and a fixed mapping the kernel cannot make puts the old one back), so the runtime only
+  counts it (`stack_releases_refused`) and the thread goes on untrimmed; nothing traps. The
+  overflow trap is untouched: the guard and the report's low end are the stack's own, and a trimmed
+  stack still overflows at its end with `stack overflow`. *Measured* (macOS, arm64, 16 KiB pages,
+  `-O2`, resident bytes per parked thread after its recursion returned): depth 0, 17 KB before and
+  after; depth 1,000, 66 KB before, 34 KB after; depth 10,000, 493 KB before, 34 KB after (1,000
+  threads: 470 MiB before, 32 MiB after). 100,000 shallow parked threads hold 1.6 GiB either way, a
+  page and a record each. Deepest recursion, main thread and spawned thread alike, unchanged: about
+  40,000 calls at `-O0` and 50,000 at `-O2` of a one-argument function. A two-thread rendezvous
+  ping-pong (two parks a round trip) and a start-and-join churn showed no slowdown beyond the
+  machine's noise (round trip 1.0–2.1 µs after against 1.8–2.9 µs before, interleaved runs). A
+  `madvise` of an 8 MiB stack costs about 20 µs on macOS whether or not its pages are resident, and
+  the fresh mapping about 0.3 µs, which is why the release is the mapping there and why it is done
+  by the monitor after a tick rather than at every park. *Alternatives*: trimming at every park (a
+  system call a park, a third or more of a rendezvous round trip); stamping each park with the clock
+  (a clock read a park, where a run count is two stores); copying or segmented stacks that grow
+  (refused: C frames and the native frames the collector's shadow stack points into cannot move,
+  and a segment boundary in a C call has nowhere to go); a soft guard page below where a thread
+  parked, unprotected by the fault handler when the thread goes deeper (refused: a system call
+  writing into that page first gets `EFAULT` instead of a fault); moving parked frames to the heap
+  (the same objection as copying). Review with the user: the 8 MiB default and the 16 KiB kept below
+  a parked thread, and the name `stack` of `spawn`'s size parameter, which the trimming makes less
+  pressing to change but which a server author may still want to set lower to bound address space.
 - Settled on the user's delegation 2026-11-06 (branch `lwt-scheduler`): **`main` stays on the program's first operating system thread
   and is not a worker; its waits block that thread.** Every wait has two forms: a lightweight thread
   parks, and any other thread (the main thread, a thread attached for a callback) sleeps on one
@@ -5064,6 +5104,86 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   import clash reports `already imported, from \`inner.Widget\``, the declaring module's path, and
   go-to-definition on an exported name (at the export line or any import of it) goes to the
   declaration itself. Completion after `m.` does not yet list a module's exports (see Open).
+
+**Member exports** (branch `member-export`; [exporting members](/spec/declarations/#exporting-members))
+
+- Settled on the user's delegation 2026-11-19: **`export f.m` in a type's body is written as a
+  module export is**, one member, a `{…}` group, `as` renaming, with operators by their spelling
+  (`export n.+`), in the body of a class or an object, or in a plain `impl` of a data type of the
+  impl's own module (a data type has no body of its own). Why: one form for presenting something
+  as one's own, at the module and at the type. Alternatives weighed: a modifier on the field
+  (`delegate val items`, all or nothing); generated wrapper methods the program writes itself
+  (what the feature exists to save).
+- Settled on the user's delegation 2026-11-19: **`export f.*` presents every public member of
+  what `f` holds that the type does not have itself**, unlike module exports, which have no
+  wildcard. Why: the usual forwarding is a wrapper over one value's whole surface, with a few
+  members of its own replacing the wrapped one's; listing every member defeats it. The module rule
+  was about a declaration added to an internal module joining a public surface unseen; here the
+  wrapped type is named in the field's declared type, so what joins is visible there. Spelled `*`,
+  not `_`, since `_` is a placeholder lambda in an expression and a hole in a type. Alternatives
+  weighed: no wildcard, as for modules; `_`. Review with the user: the one place the two export
+  forms differ.
+- Settled on the user's delegation 2026-11-19: **a use is the use of `x.f.m`, checked as that
+  code**, a fallback of the checker's member lookup after the type's own members, its superclasses',
+  its traits' and its impls': calls with every overload, defaults, named and repeated arguments and
+  type arguments, reads, assignments of a `var` field (`x.m = v`, `+=`, `++`), method values bound
+  to `x.f` as read then, infix calls and operators (`a + b`, a lone `a < b`). Why: forwarding then
+  means exactly what the longer code means, with its diagnostics, and needs no copy of a member's
+  signature to drift from it. Alternatives weighed: a wrapper method per overload, generated into
+  the type (copies defaults, repeated and by-name parameters and type parameters of each member,
+  and reports mistakes against the copy).
+- Settled on the user's delegation 2026-11-19: **`f` is a field (own, or a public inherited one)
+  or a method of no parameter list, with its type declared, read again at every use.** A `var`
+  field reassigned between calls sends each to the value it then holds; a method `f` runs at each
+  use. Why: the export is part of the type's surface, which other declarations (trait conformance,
+  completion) need before any body is checked; a class parameter's type is always written, so the
+  common case costs nothing. Alternatives weighed: inferring an undeclared field's type by checking
+  the class body first, as a field read does (makes a declaration depend on a body); reading `f`
+  once at construction (a `var` field's export would go stale).
+- Settled on the user's delegation 2026-11-19: **an export presents public members only**: never
+  a private one, by name or by `*`, never a static one, never `equals` or `hash` (every value has
+  its own); a member the field's type exports in turn counts, so exports chain. Exports by name that
+  lead round without reaching a member are an error at each export of the round, and wildcards that
+  lead round present nothing (each search stops at a depth bounded by the program's types).
+- Settled on the user's delegation 2026-11-19: **the type's own members win; an export by name of
+  a member the type has is an error.** A wildcard silently leaves the type's own members (and its
+  superclasses', traits' and impls') to them, the usual way to replace a few of a wrapped value's
+  members. An export by name of a member the type declares, a field of its own or inherited, or a
+  superclass's method is an error, since naming a member and declaring it says two things; so are
+  two exports by name of one name (naming both), and a subclass member named like an export its
+  superclass makes by name (a use through the superclass would reach the export and one through the
+  subclass the member, with no override between them). An export by name comes before a wildcard,
+  and two wildcards both reaching a name make a use of it an error naming both. Alternatives
+  weighed: the type's own member silently winning over an export by name too (hides a mistake); an
+  export by name winning over the type's own member (makes the member dead code). Review with the
+  user: the conflict rule.
+- Settled on the user's delegation 2026-11-19: **a public export by name of a class implements the
+  trait's methods of its name** that the class does not declare: the class gets a method with the
+  trait's signature whose body is `self.f.m(params)`, standing as an `override` would (it replaces a
+  default too), so a call through the trait reaches the member; every overload of the trait's name
+  is implemented. A wildcard implements nothing, a private export of a trait method's name is an
+  error, a trait method with type parameters of its own is reported at the export, and a data type's
+  export implements nothing (its trait impls write their methods). A member that cannot be called
+  with the trait method's parameters, or yields another type, is one error at the export naming the
+  export, the trait's method, both signatures and the mismatch, never the diagnostics of the method
+  written for it. Why:
+  delegation-based conformance is most of what forwarding is for; requiring the name keeps a class's
+  conformance readable from its declaration, and keeps it from depending on what a wrapped type
+  happens to have. Alternatives weighed: forwards never counting toward a trait (every conformance
+  written out by hand); a wildcard counting too (a trait met by a member the class never names).
+  Review with the user: trait satisfaction, its restriction to exports by name and to classes, and
+  methods with type parameters of their own.
+- Settled on the user's delegation 2026-11-19: **an export is reached through a value**, `x.m`
+  and `self.m`, never by a bare `m` inside the type nor by `Type.m`. Why: a wildcard adding bare
+  names to the type's code would hide top-level declarations whenever the wrapped type grows a
+  member; inside the type the field itself is in scope. Alternative weighed: bare names reaching
+  exports as members do.
+- Settled on the user's delegation 2026-11-19: **`private export` presents the members to the
+  type's own code** (its class and companion, or a data type's impls), as a private method is.
+- Settled on the user's delegation 2026-11-19: **the editor follows an export**: completion after
+  a dot offers the members a value's exports present, under the names presented, and
+  go-to-definition (and hover) on a use, an alias or the export line reaches the member's
+  declaration, the field read included.
 
 - Settled on the user's delegation 2026-11-09 (built on branch `regex-budget`, for `marshal grep`): [`avin.regex`'s checked
   searches](/spec/regex/#matching). A spent step budget becomes a failure the caller can handle,
@@ -6233,6 +6353,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   checking only the root package (a dependency's need is the common case, as with `cairo`). Review
   with the user whether `avin new` should write the running version (it ties a new package to the
   Avin that made it, which may be later than the package needs).
+
+- Settled on the user's delegation 2026-11-19 (branch `min-avin`; completes the entry above, which
+  had left the question in § Open): **the minimum stays the whole design, the running version is the
+  stamped `Version`, and a missing library module points at the upgrade.** The key (`package.avin`),
+  its checking of every package of the graph, `avin check` and `avin new` were settled and built
+  2026-11-11; this adds only the hint: the "the standard library has no module" error ends with
+  "if the program was written for a later Avin than this one (X), upgrade Avin, and let its package
+  say which it needs with `avin = "…"`". It names no manifest state, because every declared
+  minimum has already been met by the time a module is looked up, so the error means either a typo
+  or a package that does not say what it needs. *Dev builds*: the version compared is the number
+  `scripts/release.sh` stamps into `const Version`, three numbers with no pre-release suffix, so a
+  tree between releases is the last release; a package naming a release not yet cut is refused by it
+  with the usual message. *Why no exemption*: a version has meaning only once a release stamps it,
+  and a pre-release rule would add a suffix to a version syntax that is three numbers. *`avin tidy`
+  warning on a dependency's minimum above the root's*: not added; the root's `avin` is what its
+  author tests with, and a dependency above the running Avin is already refused. *Alternatives*: a
+  hint only where the manifest has no `avin` (the driver does not see manifests, and the hint is
+  harmless where one is declared); an `AVIN_VERSION` override for dev trees. Review with the user:
+  the key's name (`avin`, after `sysl` in `sysl.hocon`) and whether ranges are wanted (refused above,
+  because Avin's versions only add).
 
 - Settled on the user's delegation 2026-11-11 (built on branch `instance-keys`): **An instance key is a content hash in two parts: a lowered
   part (identity, body fingerprint, interfaces read) and the world facts the whole-program steps
@@ -8880,6 +9020,77 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   **Review with the user:** the TLS record bound of `writeSome`, and the names `writeSome` and
   `writabilityDescriptor`.
 
+- Settled on the user's delegation 2026-11-19 (branch `read-secret`): **`io.readSecret(prompt)`,
+  `readSecretBytes` and `readSecretOrLine` read a line from the controlling terminal with echo
+  off.** fettle prompts for a sudo or ssh password, as does any tool asking for a passphrase, and
+  nothing in the library read input with echo off. The calls open `/dev/tty` (so a piped standard
+  input does not matter), write the prompt to it, turn off `ECHO` and `ECHONL` while keeping
+  `ICANON`, and restore the exact `termios` found. Details settled: (1) **no terminal** is
+  `Err(IoError(NoTerminal, "read", "the terminal"))`, a new `ErrorKind` case, since a program
+  tells it apart from a failed read; `readSecretOrLine` is the opt-in fallback, writing the prompt
+  to standard error and reading a line from standard input, as a tool run by a script with its
+  password piped in needs. (2) **Signals**: `ISIG` stays on, and for the length of the read the C
+  side (`runtime/avin/rt/__posix__/secret_tty.c`) catches interrupt, hangup, terminate and quit: its
+  handler restores the terminal, gives the signal its previous action back and sends it again, so
+  the program dies or handles the signal with echo on; a program that survives sees the read fail
+  as `Other("interrupted")`. A terminal stop (Ctrl-Z) is caught too: the handler restores the
+  terminal, stops the program with the default action, and on continue hides the terminal again
+  and the read writes its prompt again and goes on (as `sudo` and `getpass` do); what was typed before
+  the Ctrl-Z is discarded by the terminal. SIGTTIN and SIGTTOU are not caught: they stop a program before the terminal has been
+  changed. (3) **Concurrency**: the read holds
+  `input_readers`, the lock of every standard input reader, so a secret and a `readLine` never
+  read the terminal at once; a lightweight thread waiting for the line is not cancellable, as one
+  waiting for standard input is, so a cancel takes effect once the line has been read and the
+  terminal is back. (4) **Bytes**: `readSecretBytes` returns an `Array[byte]` the caller can
+  overwrite; `readSecret` is a string, which has no way to be cleared, and the runtime clears its
+  own gathering buffers. (5) A trailing `\n` and a `\r` before it are dropped; the end of input
+  with bytes typed ends the line, with none it is `Other("end of input")`. Alternatives weighed:
+  turning `ISIG` off as `getpass` does (Ctrl-C then arrives as a byte only once the line ends,
+  so it would not interrupt a prompt); reading standard input when there is no terminal by default
+  (a secret would then show on the screen, and a program that means to read one must ask by
+  name); a cancellable wait (the existing standard input lock holds the thread's cancellation off,
+  and a read cut short would leave typed bytes half taken); a single `readSecret` with a
+  fallback flag. Tests drive real programs over a pseudo-terminal (`tests/pty/pty_drive.c`,
+  `secret_tests.sysl`). **Review with the user:** the name `readSecret` (against `readPassword`
+  or `promptSecret`), and the no-terminal behaviour: an error by default with `readSecretOrLine`
+  as the explicit fallback, rather than falling back to standard input on its own.
+
+- Settled on the user's delegation 2026-11-19 (branch `stdio-bytes`): **`io.stdin()` is standard
+  input as a `Reader` of bytes, and `io.stdout()` and `io.stderr()` are standard output and error
+  as `ByteWriter`s**, answering the `Sendable` objects `StandardInputBytes`, `StandardOutputBytes`
+  and `StandardErrorBytes`. Source: the avin-lang/lsp package could not serve LSP over stdio, whose
+  `Content-Length` counts bytes, since `avin.io` read standard input only as text decoded with
+  U+FFFD and had no byte writer for standard output; the workaround would have bound Sysl's
+  `FdReader` directly, as the tui package does. Details settled: (1) **Mixing**: byte reads take
+  from the one buffer `readLine`, `lines()`, `readAll` and `Source.stdin()` share
+  (`runtime/avin/rt/input.sysl`), so a header read as a line and a body read as bytes go on from
+  each other with no byte lost or read twice; a read answers what the buffer holds, else one read
+  of the input. (2) **Serialization**: byte reads hold `input_readers`, the lock of every standard
+  input reader and of `readSecret`. (3) **Parking**: a lightweight thread waits on the poller, as a
+  line read does. (4) **End and failure**: the end is an empty array, every time it is asked; a
+  read that fails is `Err(Other(<platform sentence>))` for bytes, while the text readers keep seeing
+  the end. (5) **Output**: a byte write is unbuffered and goes out whole before it returns, behind
+  what `print` buffered: it holds standard output's stdio lock while flushing that buffer and
+  writing to the descriptor, and `println` writes its whole line through the same stream, so a
+  printed line is never split by a byte write (the println-atomic entry of 2026-11-15 still holds);
+  a write to standard error flushes standard output first, as `eprint` does. (6) **A reader that
+  has gone**: SIGPIPE is blocked on the writing thread for the length of a byte write, and the one
+  the write raised is taken back, so the write answers `ConnectionReset` (`EPIPE`, the kind a
+  connection's write answers) and the program goes on; `print` keeps its quiet death, which a
+  filter in a pipeline wants. (7) **Closed descriptors**: a bug met on the way, a program started
+  with standard input closed read the runtime's own pipe, which had taken descriptor 0; the runtime
+  now opens `/dev/null` on each of 0, 1 and 2 that is missing before it opens anything. Alternatives
+  weighed: an error for mixing text and byte reads (two buffers or a mode switch, and a header and
+  body protocol could not be written at all); a buffered `stdout()` with `flush` (a byte write
+  could then be overtaken by, or split, a `println`, and an LSP message must leave whole); ignoring
+  SIGPIPE for the whole program (every `print` to a closed pipe would then have to fail somewhere,
+  where today it ends the program quietly); public objects alone with no functions (a module-level
+  function reads as `io.readLine()` does). Tests: `stdio_tests.sysl`, driving
+  `tests/stdio/stdio_bytes.avin` through `sh` and `tests/pty/stdio_tty.avin` over a
+  pseudo-terminal, at -O0 and -O2. **Review with the user:** the names `stdin()`, `stdout()`,
+  `stderr()` and the object names `StandardInputBytes`, `StandardOutputBytes`,
+  `StandardErrorBytes` (beside the text writers `StandardOutput` and `StandardError`).
+
 - **Linux as a target, and machines in packages** (branch `linux-plan`, 2026-11-19; the user,
   2026-11-19: Avin is "for anyone who would enjoy using it"). The plan is
   [Linux](/compiler/linux/); the package surface is [machines](/spec/packages/#machines).
@@ -8955,7 +9166,482 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
 
+- **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
+  `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
+  `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
+  run-time condition ("watch `local.writable()` only while bytes are pending for it") and spelled
+  out twelve selects, one per combination; and nothing could wait on N connections or N tunnels,
+  which blocks a multi-connection `ssh -L` and `-R`. The surface is [select](/spec/threads/#select)
+  and [selectors](/spec/threads/#selectors).
+  - Settled on the user's delegation 2026-11-19: **any arm but `else` may end in an `if` guard**,
+    written as a match arm's is, after the operation and its `as` pattern. **A false guard makes the
+    arm absent**: not evaluated beyond its guard, not watched, never run, its value never sent. **The
+    guard is evaluated first**, with the arms' other expressions, once and in written order, before
+    any arm is tried, so it cannot name the arm's pattern's bindings, which no value has yet. WHY:
+    evaluating the guard first lets it protect the arm's own expressions (`conns(i).readable() if i
+    < n`) and keeps a value meant for an absent arm from being computed; an arm that is not there
+    should cost nothing. ALTERNATIVES: the guard after the arm's expressions (a send's value computed
+    for nothing, and a guard that cannot protect its arm); a guard that sees the received value, as
+    a match guard sees its bindings (it would have to receive before deciding, then put the value
+    back, which a channel cannot do without reordering).
+  - Settled on the user's delegation 2026-11-19: **a select whose every arm is guarded off, with no
+    `after` or `else` left, traps**, and so does `wait` on an empty `Selector`. WHY: only a
+    cancellation could end such a wait, which is almost always a loop's exit condition gone wrong;
+    the trap names it where it happens, instead of a thread that hangs or a deadlock report later.
+    A thread meant to wait for its cancellation says so with an `after` or a channel. ALTERNATIVES:
+    waiting for cancellation (as the brief offered; silent where it is a bug); a compile-time error
+    (guards are run-time values, so it can only be caught at run time).
+  - Settled on the user's delegation 2026-11-19: **`after` takes a guard; `else` does not.** A false
+    guard on `after` leaves a select that waits until an arm runs. `else`'s body follows it with no
+    arrow, so `else if c then a else b` already means an `if` there. WHY: a guarded `after` is the
+    "time out only while something is pending" case; a guarded `else` is `after 0` guarded, which
+    already exists. ALTERNATIVES: a guard on `else` (`else if` would read two ways).
+  - Settled on the user's delegation 2026-11-19: **the dynamic form is a library type,
+    `avin.threads.Selector[K: Eq]`**: entries `receive(channel, key) -> SelectReceive[T]` (whose
+    `received()` holds what was received), `send(channel, x, key)`, `readable(source, key)` and
+    `writable(sink, key)`; `remove(key)`, `removeWhere(p)`, `clear()`, `size`, `isEmpty`; waits
+    `wait() -> K`, `within(timeout)`, `until(deadline)` and `poll() -> Option[K]`. The entries stay
+    between waits; a send entry is taken out once its value has gone. Each entry is the arm object a
+    `select` block is read into, and a wait runs the same library loop and the same runtime park on
+    the poller, so there is one wait path. WHY: a set of N sources needs a value the program can
+    build, keep and change between waits, and keys of the program's choosing answer "which one"
+    without index bookkeeping; mixed kinds (channels and streams) live in one set. ALTERNATIVES: a
+    `for` arm in `select` (`for c in conns: c.readable() -> …`), which reads well for one homogeneous
+    collection but rebuilds the set every time the select is reached, needs a second arm per kind of
+    source, and adds a binding form to the select grammar; both (two ways to say the same thing, the
+    `for` arm being sugar the library type can carry later if programs want it); entries answered by
+    index (indices shift as entries are removed); a send entry that stays after it ran (it would send
+    the same value again at the next wait).
+    **Review with the user:** the `Selector` surface (its name, keys over indices, `receive`
+    answering the entry, a send entry taken out once it ran), and whether `select` should gain a
+    `for` arm as sugar over it.
+
+- Settled on the user's delegation 2026-11-19 (branch `stdin-readiness`): **`io.stdin()` is a
+  `Readiness`, any thread may wait on it, and `readAvailable(max)` reads only what is there.**
+  Source: the `stdio-bytes` branch found that the tui package could not move off its own Sysl
+  binding of descriptor 0 (`sysl.io.wait.ready` with a time limit, then a raw read), because
+  `io.stdin()` had no timed wait and bytes in the runtime's shared buffer would never show as the
+  descriptor's readiness; any interactive program (a TUI, a REPL, a language server with timers)
+  needs standard input in one wait with channels and timers. Details settled: (1) **Ready** means
+  bytes are in the shared buffer (a `readLine`'s read-ahead among them), the input has ended or
+  failed, standard input is a file (whose read never waits), or descriptor 0 polls readable;
+  `readable()` never waits, and answers `false` while another thread holds the input lock.
+  (2) **Ownership: none.** Standard input is process-global, so any thread may name it in a
+  select or a `Selector`, and several at once; a connection keeps its owner rule. (3) **The lock**:
+  a select never takes `input_readers` to wait. Every select arm on standard input is enlisted on
+  a runtime queue (`input_changed`) that every reader notifies as it lets the lock go, so bytes
+  another thread's `readLine` left in the buffer end the wait; one select at a time watches
+  descriptor 0 on the poller (which holds one waiter per descriptor and direction), and hands the
+  watch on, waking the others, when its wait ends; a reader parked on descriptor 0 takes the
+  watch's place and tells the selects when it lets go. The library is unchanged: the runtime's
+  `select_watch` takes descriptor 0 by this path. (4) **`readAvailable(max) ->
+  Result[Option[Array[byte]], IoError]`**: `Some` of what `read(max)` would answer without
+  waiting, an empty array at the end, `None` where a read would wait or another thread is
+  reading; it is a method of `StandardInputBytes`, not of `Reader`. WHY: one wait path for every
+  source; the queue closes the one gap readiness on the descriptor alone leaves (bytes already
+  buffered) without polling; `Option` keeps "nothing yet" apart from "ended", which a TUI must
+  tell apart. ALTERNATIVES: only the thread that first waits on standard input may wait on it,
+  trapping others (a rule a program could not see, for a resource that has no owner); taking the
+  input lock to look (a select would then wait behind a thread parked in `readLine`, past its
+  `after`); a select re-trying standard input on a timer (`wakeAt`) while another thread reads
+  (polling, and a delay); `readAvailable` answering an empty array for both "nothing yet" and the
+  end (ambiguous); `readSome`/`readAvailable` on the `Reader` trait (every reader would owe it,
+  and files and connections have no use for it yet). tui switched in its branch `stdin-api`.
+  **Review with the user:** the name `readAvailable` and its `Option` answer.
+
+- Settled on the user's delegation 2026-11-19 (the user asked for the change, branch
+  `method-chain`): **a comparison chain's links may call operator methods; a chain is allowed when
+  every link yields `bool`.** `lo <= x < hi` with `x`'s type defining `<=` and `<` as methods is one
+  chain, as it is for built-in comparisons, and links of methods mix with built-in links, `==` and
+  `!=` among them. The chain keeps its meaning: operands are evaluated left to right, each middle
+  operand exactly once, and evaluation stops at the first false link. Each link resolves on its own
+  left operand's type, so overloads are chosen per link (`t0 < t <= d` calls `Instant < Instant`
+  and then `Instant <= Duration`). A link whose method yields anything but `bool` (a query builder's
+  `age < 30` yielding a condition) makes the chain an error naming the link, its method and the type
+  it yields, and saying to join the comparisons with `&&` or parenthesize one; `a < b` alone still
+  yields whatever the method yields. The compiler lowers a method link through the chain's one
+  lowering: the checker records the link's resolved call on two unnamed locals, and the chain
+  gives them the operands' values it already holds. Why: chains read as the mathematics they
+  write, and the house style asks for them wherever possible; the earlier rule's reason, that a
+  method may yield anything, is kept exactly where it applies, a link that does not yield `bool`.
+  Alternatives weighed: keeping the error (forces `lo <= x && x < hi` on types with methods only);
+  allowing any result type and joining links with the result's own `&&` (no single meaning for
+  short-circuiting, and a condition builder's `&&` is a method too); desugaring method chains into
+  nested `&&` blocks in the checker (a second lowering of chains to keep in step with the first).
+  Amends "the arithmetic operators … are free method names" above.
+
+- Settled on the user's delegation 2026-11-19 (built on branch `machine-conditions`): **the choices
+  [machines](/spec/packages/#machines) left open in the manifest.**
+  - **A feature that does not exist on a machine turns nothing on there**, even when a feature that
+    does exist `enables` it: the selection leaves it out, and what only it would turn on stays off.
+    A feature that `requires` it is refused there as requiring a feature that is off. WHY: "does not
+    exist" means the same whichever way the feature is reached; turning its modules on through
+    another feature would make it exist after all. ALTERNATIVES: refusing a feature that enables an
+    absent one (makes a cross-machine package spell its enables twice); taking it through `enables`
+    anyway (contradicts its `if`).
+  - **`targets = []` is refused**; a package builds for at least one target. WHY: an empty list is
+    a package nothing can build, and is more likely a slip than an intent. ALTERNATIVES: reading it
+    as every target (the opposite of what it says).
+  - **Whether a dependency "reaches further" is asked over the dependent's targets where the entry's
+    condition holds**, so `lib { …, if = "macos" }` may name a package that builds only for
+    `aarch64-macos`. The check runs whatever machine the build is for, against the manifests.
+    WHY: an entry the condition leaves out is not in those machines' builds at all.
+    ALTERNATIVES: refusing on every target of the dependent (forces `targets` where `if` already says
+    it).
+  - **A whole workspace resolved for a machine is the members that build for it**, so `avin tidy`
+    and `avin vendor` of a workspace answer each target with the members that list it. A
+    workspace's root, and a package listing no `targets`, answer for every target. WHY: a member
+    built for Linux alone has nothing to resolve on macOS. ALTERNATIVES: refusing the workspace on
+    the machines some member leaves out.
+  - **`link-flags` are passed exactly as written, in order, with no flag merged with another**, after
+    the flags of `pkg-config` or `link`. WHY: the spec's "as written"; `-framework` repeated before
+    two frameworks must stay two pairs. ALTERNATIVES: removing repeats (breaks `-framework` pairs).
+  - **`c-linking`'s `static` and `dynamic` may name a C library the machine leaves out**, which does
+    nothing there: a library of a package in the build whose `if` does not hold, or,
+    `<package>/<library>`, a library of a dependency whose `if` leaves it out, named by the
+    dependency's label (its libraries are not read on that machine, so an unqualified name of one is
+    still refused there). A name that is no library at all is refused on every machine.
+    `static-system`'s checks stay per machine. WHY: one program manifest serves every target, so a
+    name meant for one machine must not fail the others, while a typo still fails everywhere.
+    ALTERNATIVES: an `if` on `c-linking`'s entries (a second place to say what the library's own
+    `if` already says); resolving every target to check each name (a build would resolve three
+    times).
+  - **`--target` is taken by `avin check` alone** for now, reading every manifest as that machine's
+    build does; `avin build --target` is the cross-build item. WHY: checking builds nothing, so it
+    needs no other machine's tools. ALTERNATIVES: every command (a build for another machine needs
+    a sysroot Sysl does not have yet).
+  - **A condition's syntax errors** name the condition and what is wrong at the place: a symbol,
+    `!` or `(` wanted (at the end or where a character stands), a `(` never closed, or a word
+    following a whole condition; symbols are lowercase and `-` belongs to a word, so a target's name
+    is read whole and refused with the condition it means. WHY: one place and one sentence per
+    mistake, as the manifest's other errors give. ALTERNATIVES: one generic "not a condition" error.
+- Settled on the user's delegation 2026-11-19 (built on branch `machine-files`): **the choices
+  [files for one machine](/spec/packages/#files-for-one-machine) and
+  [the machine in an expression](/spec/packages/#the-machine-in-an-expression) left open.**
+  - **A literate file is selected as an ordinary one** (`watch.linux.lavin`), and **a file's name
+    carries one symbol**: two parts (`watch.linux.x86_64.avin`) are refused, naming each, as is a
+    part that is no symbol, on every machine, in a package, a program with no manifest, a dependency
+    and the standard library alike. A file named as a symbol alone (`linux.avin`) is ordinary. WHY:
+    the spec's "the part is one symbol"; a `.lavin` file is a module's file like any other.
+    ALTERNATIVES: a compound part as `&&` of its symbols (a second condition syntax in file names);
+    leaving `.lavin` unselected (a literate module could not differ by machine).
+  - **A program of one file is never selected**: `avin run tool.linux.avin` runs it anywhere. WHY:
+    the file is named outright, so there is nothing to choose between. ALTERNATIVES: refusing it off
+    Linux (a script would fail for its name).
+  - **The import rule asks, for each file read on this machine, every target its root lists that
+    reads the file**, each target's package read as its build reads it (resolving, and fetching what
+    the cache lacks, a dependency taken only there). A target whose package cannot be read holds no
+    file to anything in a build, and `avin check` reports it. "No more widely" is by machine: a file
+    for `x86_64` may import Linux's module. A module whose files differ per machine but exist on every
+    machine is imported from anywhere. The rule is checked only where anything differs (a file with a
+    symbol, a manifest entry with `if`), so other packages cost nothing more. Standard library modules
+    are not held to it, since none is missing on any machine. WHY: the spec's "for every machine in
+    `targets`, whichever one is being built"; a dependency's module names are known only by reading
+    it. ALTERNATIVES: mapping an import to a dependency's label without reading it (a module's name
+    need not be its package's); checking only in `avin check` (a build would accept what another
+    machine's build refuses). **Review with the user:** whether a build may fetch a dependency only
+    another machine takes.
+  - **The import's error names the module, its package where it is another's, the machines it exists
+    on and its files there, the importing file and the machines it is missing on**, and it is the only
+    error at that import (the "standard library's module is meant" hint is not added beside it).
+  - **`avin check` checks once per set of targets that read the package alike** (the same files,
+    from the same packages), in the order `targets` lists them; with nothing differing it checks the
+    machine being built for, as before, including refusing a host the package leaves out. A diagnostic
+    every check reports is told once, as it is; one some report gets ` (on `x86_64-linux` and
+    `aarch64-linux`)` after its message; a name that a file of the same module read on another machine
+    declares is told as the spec's `no function `start` is declared in … on …` (also `no value`,
+    `no type`). A machine whose package cannot be read is told as `on `…`:` and its error. The C unit
+    is built only for the machine the compiler runs on. WHY: one sentence per mistake with the
+    machines it is for, and no other machine's tools. ALTERNATIVES: a check per target always (the
+    arch-only difference of `avin.target` would check every package three times); a prefix
+    `on `…`: ` on every machine-specific diagnostic (moves the headline off what is wrong).
+  - **`avin.target`'s values are declared in the library by its own files** (`target.macos.avin`,
+    `target.linux.avin`, `target.aarch64.avin`, `target.x86_64.avin`), and **folding is a lowering of a
+    read of a value of `avin.target`**: a `match` whose arms up to the taken one are decided by their
+    patterns (variants, alternatives, `_`, names) compiles that arm alone; an `is` test against a
+    variant and `==`/`!=` with a variant or the other value are decided and fold the `if` or the
+    left of `&&`/`||` over them, as an `is` test a pattern refutes already does. A guard before the
+    taken arm keeps the whole `match`. WHY: the values are ordinary declarations checked like any
+    other, and folding reuses the decided-condition path. ALTERNATIVES: a compiler intrinsic for
+    `os` and `arch` (a second way to make a value per machine); folding every compile-time constant
+    (changes the code of every program reading a constant, beyond what was decided).
+  - **The language server checks the files of the machine it runs on**, so a file for another machine
+    open in an editor is not analyzed as part of its package. A later item may check it for a machine
+    that reads it.
+- Settled on the user's delegation 2026-11-19 (branch `bounded-mailbox`): **A mailbox may be bounded,
+  given as `spawn(b, mailbox = Bounded(capacity, overflow))`; a `tell` to a full one drops by the
+  actor's `Overflow`, and senders that must know or wait use `offer` and `send`.** `data Mailbox` is
+  `Unbounded` (the default) or `Bounded(capacity: int, overflow: Overflow)`, `Overflow` being
+  `DropNewest` or `DropOldest`; a capacity less than one traps in `spawn`. `tell` keeps its settled
+  promise, never waiting and never failing, and drops as the policy says, counted by
+  `ref.dropped() -> long`. `offer(m) -> Result[unit, SendError]` never waits and answers `Err(Full)`;
+  `send(m)` and `send(m, timeout)` park the sending thread until there is room (a timed one answering
+  `Err(TimedOut)`, a timeout of zero or less being `offer`), as a cancellation point that leaves
+  nothing in the mailbox, waking with `Err(Ended)` where the actor ends; an actor's `send` to its own
+  full mailbox answers `Err(Full)` at once. `SendError` is `Full`, `TimedOut` or `Ended`; `AskError`
+  gains `Full`, and an ask of a full mailbox completes with it at once under either policy, dropping
+  nothing to make room. What the actor arranged for itself (a watch's notice, a timer's message, a
+  piped future's) goes in outside the bound and is never refused, and stop, restart and escalation
+  are not messages, so no bound holds them back; a restart keeps the mailbox and its bound; messages a
+  stash gives back do not count again. `Router.pool(…, mailbox)` bounds the router's mailbox and each
+  routee's at one capacity, and the router waits for room in the routee it chose (`SmallestMailbox`
+  only once every routee is full), so a full pool's backpressure reaches the router's own mailbox,
+  where the policy and `offer`/`send` act. A bounded mailbox is a queue under a lock, so the oldest
+  message may be dropped and senders may wait on a condition; unbounded actors keep the lock-free
+  queue and pay nothing. *Why*: the bound is a property of the actor, chosen where it is started, as
+  its supervision and executor are; separating the sender's choice (`tell` fire-and-forget, `offer`
+  to know, `send` to wait) from the actor's policy keeps `tell`'s settled meaning and gives every
+  program its backpressure path (marshal's queues, a pg pool) with no new wait inside `tell`; an ask
+  that cannot be delivered answering at once is what `Ended` already does. *Alternatives weighed*:
+  a capacity and policy on `Behaviour` or the `actor` declaration (the same actor wants different
+  bounds in different places); a third policy that fails the `tell` (`tell` answers nothing, so the
+  failure would be a trap in the sender for the receiver's slowness); a `tell` that waits (breaks the
+  settled rule, and deadlocks two actors telling each other); `offer` answering a `bool` (cannot tell
+  `Full` from `Ended`); `send` as a `Future` (the message would still be delivered after its awaiter
+  was cancelled); a dead-letters hook called with each dropped message (needs a typed callback on the
+  mailbox and runs user code inside the sender's `tell`; a counter is enough to observe overload);
+  counting the actor's own notices against the bound (a full mailbox would lose a watch's notice of
+  an end); each routee bounded but the router not (a full pool would make the router drop or block
+  with no policy of the caller's); a bounded lock-free ring (cannot drop the oldest without the
+  actor's help, and would cap the actor's own notices too). **Review with the user:** the overflow
+  surface (two policies, the policy always written out with no default, no failing policy), the names `offer`,
+  `send` and `dropped`, and the router's bound being shared by router and routees.
+- Settled on the user's delegation 2026-11-19 (branch `lambda-trailing-arg`): **a block's last line
+  that closes a bracket opened before the block ends the block at its first comma**: in
+  `spawn(() ->` … `a + f(n), 67108864)` the lambda yields `a + f(n)` and `67108864` is `spawn`'s
+  second argument, as on one line. The items after the comma are the bracket's own (positional or
+  named arguments, collection elements, map entries); every block opened in the same brackets on the
+  way (an `if`'s or `match`'s, an inner lambda's) ends there too, and a trailing block the line itself
+  opens and closes is stepped over. A tuple the block yields on that line is written in parentheses,
+  `(a, b))`; a `)` on a line of its own, a tuple on an earlier line and `a, b = b, a` on an earlier
+  line are unchanged. Why: the block's lines read the trailing items as a tuple the block yields, so
+  the call silently lost its argument (the thread got the default stack and yielded a tuple), and the
+  spec's "a block inside brackets starts a line again" said nothing about the line that leaves the
+  brackets; the rule makes the multi-line form mean what the one-line form means, as the
+  `match`-arm rule of 2026-11-15 ("inside brackets a comma ends a `match` arm's one-line body") did
+  for arms. Alternatives: an error for an unparenthesized tuple on such a
+  line, asking for parentheses either way (safe, but rejects the natural way to write a trailing
+  argument); keeping the tuple (silent wrong code). It changes code that compiled before; a scan of
+  every `.avin` file in the avin-lang repos found none relying on the old reading, and code that did
+  now fails to compile (an argument count or a lambda's type). **Review with the user**: it changes
+  the meaning of code that compiled before.
+- Settled on the user's delegation 2026-11-19 (branch `link-control`; the user: *"It should be as
+  flexible as possible. Avin isn't just for me, it's for anyone who would enjoy using it."*): **a
+  program chooses how each C library is linked in its root manifest's `c-linking` block, and a C
+  library's own block says what else links it** ([C
+  bindings](/spec/c-bindings/#how-a-program-links-its-c-libraries)). The program's block holds
+  `default` (`"static"` or `"dynamic"`), `static` and `dynamic` lists of libraries (`<library>` or
+  `<package>/<library>`), `static-system` (`-l` names the system provides, linked from their archives)
+  and `search` (where those archives are, absolute or root-relative). `static-c-libraries = true`
+  keeps its meaning as the shorthand of `default = "static"`; saying both is an error, so nothing
+  that builds today changes. A C library gains `files` (archives and shared libraries by path),
+  `search` (`-L` directories, searched for archives when static), `include` (`-I` directories, since a
+  vendored library's headers are not where `pkg-config` would say), `frameworks` and `link-flags`
+  (raw, the escape hatch); their paths are relative to the package and may not be absolute or hold a
+  `..` segment, so a fetched package builds wherever it lands. **Static is a promise, dynamic is "as
+  named"**: a library linked statically takes no shared library from a search directory (an error
+  names the missing archive, as before, now for `link` names and `files` too), while one linked
+  dynamically is linked from the flags as given, so a vendored `.a` is static either way. *Why one
+  block*: one place says how the program links, and a `static`/`dynamic` pair reads as the program's
+  sentence ("all static except mlt"). *Alternatives weighed*: a per-library `static = true` in the
+  library's block (the author would decide for every program; refused before and still refused, its
+  test kept); per-library keys inside the program's own `dependencies` entries (a library of a
+  dependency's dependency has no entry to put it in); a top-level `link` key as Sysl writes it (reads
+  as one key with the `-l` meaning of a library's `link`); `static-c-libraries` taking a list (one key
+  with two types, and no room for `dynamic`). **The command line** (`--static-c-libraries`,
+  `--dynamic-c-libraries` on build, run, test and check) stands in for the manifest's default only;
+  a library the manifest names keeps its way, since such a name usually records a reason (a licence,
+  a missing archive) a one-off flag should not erase. *Alternative*: the flag overruling everything
+  (simpler to state, but `--static-c-libraries` would then trip over every `dynamic-only` library
+  the program had already answered for). A cached `run`/`test` build is keyed by how each library is
+  linked and by its files, which also fixed the cache reusing a static build after the manifest
+  changed. **A library package may say `dynamic-only = "<why>"`**, one key for both "must be dynamic"
+  (licence) and "has no archive": both mean the same to a build and differ only in the reason, which
+  the error quotes. A program that would link it statically, by its default, the flag or its
+  `static` list, is refused with that reason and told to name it in `dynamic`; it is never made
+  dynamic silently, because a program asking to be static would then ship needing the library
+  installed. *Alternatives*: the requirement silently winning over the program's default (quiet,
+  and breaks the static promise); a requirement the program could override by `static` (a licence
+  is not the program's to waive); two keys, `dynamic-only` and `no-archive` (two names for one
+  effect). **System libraries stay dynamic unless `static-system` names them**; a named one with no
+  archive in the searched directories, or named but linked by no library, is an error. **On Linux**
+  (not built yet) an archive is still linked by its path; a `-l` kept dynamic stays `-l`; a
+  `static-system` name maps onto `-Wl,-Bstatic -l<name> -Wl,-Bdynamic`; `frameworks` are macOS's.
+  A package's vendored C sources are compiled by the library's `sources` (the next entry); `files`
+  links a prebuilt archive. **Review with the user**: the surface syntax (`c-linking` and its five keys,
+  `<package>/<library>` naming, the library keys `files`/`search`/`include`/`frameworks`/`link-flags`,
+  the two flags' names), and the library-requirement rule (`dynamic-only` refusing a static program
+  rather than yielding to it, and the program's `static` list not overriding it).
+- Settled on the user's delegation 2026-11-19 (branch `c-sources`; the gap is link-control's report:
+  a package could link a prebuilt archive by `files` but not compile the `.c` files it ships, so a
+  binding of a library distributed as source, sqlite3.c, miniz or stb, needed its user to build an
+  archive for each machine; only a Sysl dependency's own `.c` was compiled, by Sysl): **a C library
+  names the C files its package ships in `sources`, and the flags they are compiled with in
+  `cflags`** ([C bindings](/spec/c-bindings/#c-sources-a-package-ships)). `sources` are paths relative
+  to the package, under the rules of `files` (no absolute path, no `..` segment), and a `*` matches
+  within one directory, as a workspace's members do; `**` is refused, a pattern matching no file
+  and a path that is not there are errors, and the matches are sorted and each file taken once.
+  They are compiled by the clang the C unit is compiled with, for the build's machine, with `-O2`
+  unless `cflags` names a level (whatever the program's own `-O`, so `-O0` and `-O2` builds share
+  the objects), the library's `include` directories as `-I`, the `--cflags` of its `pkg-config`
+  module, then `cflags`, last. **`cflags` holds what a package says about its C and nothing about the
+  build**: defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`, `-pedantic`), the
+  standard (`-std=`) and code generation (`-f`). `-I` and its kin are refused with a pointer at
+  `include`, `-Wl,`/`-Wa,`/`-Wp,` with a pointer at `link-flags`, and anything else (the target, the
+  output, `-l`, `-g`) as not a package's to say; `cflags` with no `sources` is an error, since it
+  would read as flags of the C unit, which it is not. The objects are linked into the program before
+  the libraries' link flags, **statically, always**, whatever `c-linking`, the command line or
+  `static-c-libraries` say of the library: they are part of the program. So **`dynamic-only` beside
+  `sources` is an error at the entry**, and `pkg-config` or `link` beside `sources` are allowed (a
+  wrapper compiled against an installed library, a source calling libz). **The cache**: each object
+  is kept in `csources/` by a key over the source's text, its flags (an `include` directory read as
+  the package writes it, so a package keys alike wherever it is fetched), the target, the compiler's
+  version and `clang --version`, and the path (package-relative where inside it) and text of every
+  header it includes, which clang lists (`-MD`) when it compiles and a record keeps; a source with no
+  record is scanned with `clang -M` first, so two packages shipping the same file compile it once
+  and link it once. `avin run`'s cached executables are keyed by each source's and recorded header's
+  modification time. **The clangs run at once, one per processor at most**: Avin has no job count of
+  its own, and this is the bound codegen units already keep. **A source clang refuses** is reported
+  as `error: the source `<path>` of the C library `<l>` of package `<p>` does not compile:` followed
+  by clang's own output, which names the file and the line; warnings of a source that compiles are
+  not shown (a vendored library's warnings are its maintainers'; `-Werror` makes them errors).
+  **`avin check` does not compile the sources**; it checks each is there and each pattern matches,
+  as it checks `files`. **Per-machine sources are entries with an `if`**: a library whose sources
+  differ by machine is written as one entry for what is common and one per machine (`vend-macos { if
+  = "macos", sources = [...] }`), using the conditions every entry already takes, rather than a
+  condition inside `sources`. **A header-only library needs nothing new**: its package ships the
+  one-line `.c` that asks for its implementation (`#define STB_IMAGE_IMPLEMENTATION` then the
+  include) and names it in `sources`. *Alternatives weighed*: a top-level `c-sources` block apart
+  from `c-libraries` (the sources belong to the library whose headers and `include` they share, and
+  a second block would repeat them); `cflags` passing anything (a package could then name a target
+  or an output and break the build's own choices); `-I` allowed in `cflags` (two ways to say
+  `include`, one of them able to name an absolute path); the program's `-O` level (debug builds of
+  the program would rebuild and slow every vendored library, which is not what is being debugged);
+  conditions inside `sources` (`sources { macos = [...] }`, a second condition syntax where `if`
+  already serves); keying objects by the source alone (an edited header would be missed) or by its
+  preprocessed text (a preprocessing on every build, even when nothing changed); a shared library
+  built from the sources (they are the program's, and a static object needs no install). **Review
+  with the user**: the key names `sources` and `cflags`, which flags `cflags` allows, the default
+  `-O2` independent of the program's level, and silencing warnings of sources that compile.
+- Settled on the user's delegation 2026-11-19 (branch `target-keys`): **every cache entry names the
+  machine it was built for, in its name and in its key**. A toolchain has a `target` (the compiler's
+  own machine unless a build names another). Under `units/`, `shims/`, `cunit/` and `csources/` an
+  entry is `<target>-<key>`; the runtime archive is `libavinrt-<target>-<key>.a`, in the cache and
+  shipped as `share/avin/lib/<target>/libavinrt-<target>-<key>.a`; a program's directory under
+  `build/` is `<name>-<target>-<key>`, which holds its executables and its instance cache; the key
+  hashed into each entry also holds the target, and an executable's record does too. Without a cache
+  directory the compiler's own machine keeps `.avin/build` and another machine uses
+  `.avin/build/<target>`. `avin cache info` lists the entries per target and `avin cache clean
+  --target <target>` removes one target's. **Existing caches are not carried over**: an old entry has
+  no target in its name, so no build finds it (it is never misread), `avin cache info` lists it as
+  `untargeted`, and the least-recently-used sweep removes it, so the first build after the upgrade
+  rebuilds. *Why*: a cross build, or a prefix shipping archives for two machines, must never reuse an
+  object built for the other, and the name makes the target visible to `info` and `clean` without
+  opening a file. *Alternatives weighed*: the target in the hash alone (disjoint, but `info` and
+  `clean --target` could not tell targets apart); a subdirectory per target in each kind (the sweep
+  and `info` count entries one level down, and a directory would become one entry holding every
+  object of its target, evicted whole); keeping old names for the compiler's own machine (a
+  compatibility rule with no reader once a second machine exists, and the rebuild is one build). The
+  `.avin/build` fallback keeps its path for the compiler's own machine so existing programs'
+  directories do not move, which is the one place an old entry stays valid, and its executable
+  records carry the target so a stale one is rebuilt. `avin clean` removes a program's builds
+  for every target there, and each target's directory once it is empty.
+- Settled on the user's delegation 2026-11-19 (branch `prefix-ops`; the user approved the feature
+  that day): **a data type, a class or a trait may define the prefix `!`, `~` and `+` as methods
+  taking no argument, as it defines `-`** ([operator methods](/spec/operators-and-control-flow/#operator-methods)).
+  `!a`, `~a` and `+a` call `a`'s method of that name where its type, or a type parameter's bound, has
+  one taking no argument; each yields any type, binds at the prefix level, and is resolved by the one
+  path the prefix `-` already took. Choices this branch made: **a `!` yielding something other than
+  `bool` is allowed**, as a method `<` may yield a `Cond`, so a query builder's `!cond` is a
+  condition object. **In a condition (`if`, `while`, an operand of `&&` or `||`) the `!` call must
+  yield `bool`**, and one that does not is "expected bool, found Cond", the same message any
+  non-`bool` condition gets; the condition then binds no names, since an `is` test is never the
+  operand of a method `!`. **A method `!` takes no argument at all**, a defaulted one included: `!`
+  has no binary form, and an `a ! b` reading would be a new infix operator nobody asked for. `~` and
+  `+` keep their one-argument overloads for `a ~ b` and `a + b`. **Generic code reaches them through
+  a user trait that declares them** (`trait Flip` with `!() -> Self`); there is no core trait for
+  them, since no built-in type's `!`, `~` or `+` is anything generic code over user types needs, and
+  `Neg` stays the only prefix core trait. **Where the type has no such method the operator keeps its
+  meaning**: on a data type or a class `!a`, `~a` and `+a` are the errors they were ("expected bool",
+  "`~` needs an integer or a byte", "`+` needs a number"). **The built-in types stay closed**: a
+  method `!`, or `~` or `+` taking no argument, on `int`, `real`, `byte`, `char`, `string`, `bool` or
+  a tuple, in an extension or a trait's implementation, is an error ("a prefix `!` on bool is the
+  language's own…"); `!` is no longer among the reserved method spellings. **Two prefix operators
+  written together stay one name** (`!!x` and `-~x` are the existing "a symbol method has no prefix
+  form" error), so nesting is written `! !x` and `- ~x`, as the operator-run rule already said.
+  *Alternatives weighed*: requiring `bool` from every method `!` (rules out the query builder the
+  feature is for); core traits `Not`, `Complement` and `Positive` (no program asks for them, and
+  each would need an impl for every built-in type); splitting a run of prefix characters such as
+  `!!` into nested operators (it breaks the one longest-run rule the lexer and `++`/`--` rely on).
+  **Review with the user**: whether `!!x` should read as `! !x` without the space.
+- Settled on the user's delegation 2026-11-19 (branch `collection-apply`): **a collection is made by
+  naming its type and listing its elements.** `Array(1, 2, 3)` was refused; it now works, as an
+  ordinary companion `apply[T](elements: T*)` in the library (no compiler special case: the
+  repeated parameter infers `T` from the elements, from the expected type, or from type arguments
+  written at the call, and `Array()` with none is the existing "cannot infer" error). Types that
+  gained the form: `Array`, `Buffer`, `Deque`, `ArraySeq`, `LazyList`, the mutable `Set` and
+  `LinkedSet`, and `PriorityQueue` (by the elements' own order); `Vector`, `List`, `Queue`, `Set`,
+  `HashSet`, `SortedSet`, `SeqSet`, `OrderedSet`, `TreeSet` (immutable and mutable) and `BitSet`
+  already had it. `Array(1, 2.5)` widens to `Array[real]`; mismatched types are the ordinary
+  argument error. A class that keeps fields its own code fills in (`LazyList`) no longer offers
+  its constructor to a call outside that code, so `LazyList[T]()` calls the companion's `apply`
+  and makes the empty list instead of being refused. An empty call with no element type to infer
+  follows the settled rule of 2026-11-04 (generics.md): the covariant collections (`Vector`,
+  `List`, `Queue`, `ArraySeq`, `LazyList`) take `Nothing`, as `[]` and `Vector.empty()` do, and an
+  invariant or bounded element type (`Array`, `Buffer`, `Deque`, every set, `PriorityQueue`) is a
+  "cannot infer" error. The refusal of an array's name with type arguments used as a value
+  (`Array[int]`) stays, its text now naming `Array(a, b)`. The old refusal of calling an array's constructor is removed, and the
+  literal `[1, 2, 3]` is unchanged. **Maps are excluded** (settled 2026-11-09): `Map("k" -> 7)` stays
+  refused with its hint to write `{"k": 7}`, and no pair operator is added. `Map((k, v), …)` taking
+  tuples already exists and stays; no other map gained a form. Alternatives weighed: a compiler
+  special case treating `Name(a, b)` as a literal (rejected: the library form needs none, and a
+  program's own collections get the form by declaring `apply`). Review with the user: whether the
+  tuple form `Map((1, "one"), …)` should stay beside `{1: "one"}`, since it is a second way to write
+  a map that no one needs.
+- Settled on the user's delegation 2026-11-19 (branch `diff`): **`avin.diff`, a module of the
+  standard library for the differences between two sequences and between two texts' lines.** It is
+  `library/avin/diff/diff.avin`, a module of its own beside `avin.uuid`, not part of the prelude, so
+  a program names what it uses (`import avin.diff.{diff, unifiedDiff}`). The API: `diff[T: Eq](a, b)
+  -> Vector[Edit[T]]` with `Edit[T]` the variants `Keep(value)`, `Insert(value)` and
+  `Delete(value)`; `apply(a, edits)`, which checks every `Keep` and `Delete` against the input and
+  traps naming the edit; `changes`; `Line(text, terminated)` with `splitLines` and `joinLines`;
+  `LineOptions(ignoreTrailingSpace = false, finalNewline = true)` and `diffLines`; `Hunk`, `hunks(edits,
+  context)`; `renderUnified` and `unifiedDiff`, whose output is `diff -u`'s byte for byte (checked
+  against GNU diff's on twenty fixture pairs at context 0, 1 and 3). The algorithm is Myers' O(ND)
+  with the linear-space middle-snake refinement, so memory is proportional to the inputs (three
+  arrays of their combined size, and the script) and never to their product; a run of changes lists
+  its deletes before its inserts, as `diff -u` prints them. Choices: edits carry the elements, not
+  indices, so a script is self-describing and `apply` can verify it (a `Keep` holds the first
+  sequence's element, so a line diff that ignores trailing space keeps the original text); lines
+  split at `\n` only and keep a `\r`, as `diff` does, so CRLF is a difference unless
+  `ignoreTrailingSpace` is set (which ignores a `\r` with the rest); a last line with no `\n` differs
+  from the same line with one by default, as `diff` reports it, and `finalNewline = false` makes them
+  equal; two changes share a hunk when no more than `2 * context` unchanged lines lie between them;
+  an empty range is written `start,0` with `start` the line before, a range of one line as its
+  number alone, as `diff -u` does. Alternatives weighed: edits as index ranges
+  (`Keep(aStart, bStart, count)`, more compact for large inputs, but cannot be applied without the
+  second sequence and reads less well in a pattern match); the quadratic table of the longest common
+  subsequence (simplest, but 10,000 lines against 10,000 takes 10^8 cells); a patience or histogram
+  diff (often reads better on source code, but is not shortest and does not match `diff -u`); a
+  prelude placement (every program would carry the names `Edit`, `Keep` and `Delete`). Tests:
+  `library/tests/diff.avin`, with every pair of sequences over three values up to four long and
+  random pairs checked against the quadratic table for minimality. Review with the user: the names
+  `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
+  patience diff should join this one as `diffLines`' option.
+
 ## Proposed
+
+- Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
+  after a `select`'s one-line arm ends the arm, the `select` and the item, as it does a match's**,
+  and a `select` on a block's last line that closes a bracket ends at that line's comma. Why: the
+  select chapter says its arms are written as a match's are, and with the 2026-11-19 rule that a
+  block's last line ends at its comma the old reading (the comma list a tuple the arm yields) no
+  longer parsed at all, failing `select_readable_custom`; the rule makes `f(select` … `-> v, x)`
+  mean what `f(m match` … `-> v, x)` means. Alternatives: keeping the tuple reading for `select`
+  alone (one construct reading commas unlike its sibling); an error asking for parentheses either
+  way. It changes code that compiled before: `println(select` … `-> "up", made)` printed a tuple and
+  now passes two arguments, so that test writes `println((select` … `-> "up", made))`. Review with
+  the user: it changes the meaning of code that compiled before.
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
@@ -10157,7 +10843,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   tuple and needs parentheses around the whole `match`; or end the `match` only on the arm's own
   line, which would read a middle arm's comma silently. The arm-shaped-line check can misfire on a
   lambda argument written on its own line at the arms' depth after the `match`, a layout nothing
-  writes. An indented arm body stays a block, where a comma list is a tuple.
+  writes. An indented arm body stays a block, where a comma list is a tuple (up to a last line that
+  closes the brackets, below).
 
 **Higher-kinded types, kinds and written constructor parameters** (build plan step 1, branch `hkt-1`)
 
@@ -11088,9 +11775,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   trait, `MonadError[A, E]`), and whether composed constructors (`Option[List[_]]`) are wanted; both
   are left out of the higher-kinded design and need no change to it to add later.
 
-- Member forwarding inside a class (`export field.method`, presenting a member's methods as the
-  class's own), a later possibility beside module exports; and exporting a whole module as a member
-  of another (`export a.b`), which needs modules as members.
+- Exporting a whole module as a member of another (`export a.b`), which needs modules as members.
 
 - Tooling for exports: completion after `m.` and in an import group listing a module's exports
   beside its declarations, and the IntelliJ plugin's resolution following an export to the
@@ -11102,20 +11787,16 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 - Packages, where Sysl's choice does not transfer ([packages](/spec/packages/)):
   - Whether a build should re-hash `vendor/` on every run, catching a hand edit to a committed
     vendored package, or trust the hash recorded beside each package as it trusts the cache's.
-  - Whether a manifest names the oldest compiler it builds with (`package.avin = "0.x.y"`), since
-    the standard library's modules arrive with the compiler and a package using a new one fails on an
-    older compiler with "no module" rather than a version message.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
   [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
   lightweight thread on the main operating system thread only, which also gives the `ui` package
-  its change from another thread); **stack size and growth** (a fixed reservation first; parked
-  frames moved to the heap later). The allocation chunk belongs to the carrier (proposed above), so
+  its change from another thread). Stack size and growth are settled above (branch
+  `lwt-stacks`). The allocation chunk belongs to the carrier (proposed above), so
   thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
   and is walked as an attached thread's is, and switching stacks happens only at the runtime's own
   safepoints, so no collection sees one half done.
-- Whether mailboxes may be bounded, and what a `tell` to a full one does, since `tell` never waits.
 
 - Settled on the user's delegation 2026-11-06 (branch `check-stops-early`): **`avin check` stops after type checking**. Checking a
   program no longer lowers it, builds the shims of its Sysl bindings or builds its C unit: the

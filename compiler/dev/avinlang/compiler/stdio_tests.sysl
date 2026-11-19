@@ -1,0 +1,321 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{current_dir, exists, make_dir_all, remove_dir_all}
+import sysl.process.{Var, capture}
+
+// `avin.io.stdin()`, `stdout()` and `stderr()`: standard input, output and error as bytes, through
+// real pipes, files, `/dev/null`, closed descriptors and a terminal. `tests/stdio/stdio_bytes.avin`
+// is built at both optimization levels and run by the shell, its first argument picking what it does;
+// the terminal cases run `tests/pty/stdio_tty.avin` under `tests/pty/pty_drive.c`.
+
+/** Where the executables are built: the directory the runner-watch tests build the compiler into,
+ * which their hooks make before any test of the module and remove after the last. */
+private const StdioDir: string = ".scratch/runner-watch-tests"
+
+private stdio_levels() -> []const string = ["-O0", "-O2"]
+
+private stdio_env() -> Buf[Var]
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env
+
+/** The executable of `file` at `level`, built the first time it is asked for. */
+private stdio_built(file: string, name: string, level: string) -> string
+    val root = current_dir().unwrap() + "/" + StdioDir
+    val bin = root + "/" + name + level
+    if !exists(bin)
+        val ran = capture(root + "/avin", ["build", file, level, "-o", bin], env = stdio_env().view(), stderr = true, timeout = 600000).unwrap()
+        assert(ran.status.ok(), name + " " + level + ": " + ran.text + ran.err.unwrap_or(""))
+    bin
+
+/** The test program at `level`. */
+private stdio_program(level: string) -> string = stdio_built("tests/stdio/stdio_bytes.avin", "stdio_bytes", level)
+
+/** A directory of the test's own for files the shell makes. */
+private stdio_scratch(name: string) -> string
+    val dir = current_dir().unwrap() + "/" + StdioDir + "/stdio-" + name
+    make_dir_all(dir).unwrap()
+    dir
+
+/** Runs `script` with `sh`, `$P` the program at `level` and `$D` the directory `dir`; what it wrote
+ * to standard output, then `--- err`, then what it wrote to standard error. */
+private stdio_shell(level: string, dir: string, script: string) -> string
+    val all = "P='" + stdio_program(level) + "'; D='" + dir + "'; " + script
+    val ran = capture("sh", ["-c", all], stderr = true, timeout = 300000).unwrap()
+    assert(ran.status.ok(), level + ": the script failed: " + script + "\n" + ran.text + ran.err.unwrap_or(""))
+    ran.text + "--- err\n" + ran.err.unwrap_or("")
+
+@test("every byte value, and bytes that are not UTF-8, cross a pipe unchanged in both directions")
+all_byte_values()
+    val dir = stdio_scratch("bytes")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdio_shell(level, dir, "$P gen 256 | $P cat | $P check 256")
+        assert(out.starts_with("ok 256\n"), level + ":\n" + out)
+        assert(out.contains("copied Ok(256)"), level + ":\n" + out)
+        val odd = stdio_shell(level, dir, "printf 'a\\377\\376\\303(\\000z\\200' | $P codes")
+        assert(odd.starts_with("97 255 254 195 40 0 122 128\n"), level + ":\n" + odd)
+
+@test("10 MB through two pipes, and through a file to a file, arrive whole and in order")
+ten_megabytes()
+    val dir = stdio_scratch("large")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val piped = stdio_shell(level, dir, "$P gen 10485760 | $P cat | $P check 10485760")
+        assert(piped.starts_with("ok 10485760\n"), level + ":\n" + piped)
+        val filed = stdio_shell(level, dir, "$P gen 10485760 > $D/a; $P cat < $D/a > $D/b; cmp $D/a $D/b && echo same; $P check 10485760 < $D/b")
+        assert(filed.starts_with("same\nok 10485760\n"), level + ":\n" + filed)
+
+@test("standard input from /dev/null and from an empty file is at its end at once")
+empty_inputs()
+    val dir = stdio_scratch("empty")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val nothing = stdio_shell(level, dir, "$P read < /dev/null; $P cat < /dev/null | wc -c | tr -d ' '")
+        assert(nothing.starts_with("ok 0\n0\n"), level + ":\n" + nothing)
+        assert(nothing.contains("copied Ok(0)"), level + ":\n" + nothing)
+        val empty = stdio_shell(level, dir, ": > $D/e; $P eof < $D/e")
+        assert(empty.starts_with("total 0, then [Ok(0), Ok(0), Ok(0)], line None, all []\n"), level + ":\n" + empty)
+
+@test("after the end every read answers an empty array, and the text readers see the end too")
+stdio_end_of_input()
+    val dir = stdio_scratch("eof")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val piped = stdio_shell(level, dir, "printf 'hello world, twenty-six' | $P eof")
+        assert(piped.starts_with("total 23, then [Ok(0), Ok(0), Ok(0)], line None, all []\n"), level + ":\n" + piped)
+        val filed = stdio_shell(level, dir, "printf 'abc' > $D/f; $P eof < $D/f")
+        assert(filed.starts_with("total 3, then [Ok(0), Ok(0), Ok(0)], line None, all []\n"), level + ":\n" + filed)
+
+/** What `mix` says of `head\r\nABCDEtail line\nrest\xff`, however it arrives. */
+private const StdioMixed: string = "line: Some(head)\nbytes: Ok(65 66 67 68 69)\nline: Some(tail line)\nbytes: Ok(114 101 115 116 255)\nbytes: Ok()\nline: None\nall: []\n"
+
+@test("a line, then bytes, then a line: one buffer, so no byte is lost or read twice, from a file or a pipe")
+lines_and_bytes_mixed()
+    val dir = stdio_scratch("mix")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val filed = stdio_shell(level, dir, "printf 'head\\r\\nABCDEtail line\\nrest\\377' > $D/m; $P mix < $D/m")
+        assert(filed.starts_with(StdioMixed), level + ":\n" + filed)
+        val piped = stdio_shell(level, dir, "printf 'head\\r\\nABCDEtail line\\nrest\\377' | $P mix")
+        assert(piped.starts_with(StdioMixed), level + ":\n" + piped)
+        // Arriving in pieces, a byte read answers what has come and the line goes on from there.
+        val pieces = stdio_shell(level, dir, "(printf 'head\\r\\nAB'; sleep 0.3; printf 'CDEtail line\\nrest\\377') | $P mix")
+        assert(pieces.starts_with("line: Some(head)\nbytes: Ok(65 66)\nline: Some(CDEtail line)\nbytes: Ok(114 101 115 116 255)\n"), level + ":\n" + pieces)
+
+@test("bytes, then the lines iterator, then bytes: the iterator takes whole lines only")
+bytes_and_lines_iterator()
+    val dir = stdio_scratch("iter")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdio_shell(level, dir, "printf 'xyline one\\nabcmore\\n' | $P mix-lines")
+        assert(out.starts_with("bytes: Ok(120 121)\nnext: line one\nbytes: Ok(97 98 99)\nrest: 5\n"), level + ":\n" + out)
+
+@test("four threads reading at once are served one at a time: each gets runs of the input, and between them every byte once")
+threads_serialized()
+    val dir = stdio_scratch("threads")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdio_shell(level, dir, "$P gen 200000 | $P threads 200000")
+        assert(out.contains("threads: 200000 bytes, sum right, every thread read: true, \n"), level + ":\n" + out)
+
+@test("a thread waiting on an empty pipe parks: other threads run and finish before the input comes")
+waiting_reader_parks()
+    val dir = stdio_scratch("park")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdio_shell(level, dir, "(sleep 1; printf hello) | $P park")
+        assert(out.starts_with("others ran: 32\nreader got: Ok(5)\n"), level + ":\n" + out)
+
+@test("a write to standard output or error whose reader has gone answers ConnectionReset, again on the next write, and the program goes on")
+closed_pipe()
+    val dir = stdio_scratch("epipe")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdio_shell(level, dir, "$P epipe | head -c 10 > /dev/null")
+        // Whether a whole write went before the reader left depends on how fast it left.
+        assert(out.contains("stdout: cannot write standard output: connection reset by peer; reset true; after some "), level + ":\n" + out)
+        assert(out.contains("again: true\nexit-ok\n"), level + ":\n" + out)
+        val err = stdio_shell(level, dir, "$P epipe-err 2>&1 > $D/said | head -c 10 > /dev/null; cat $D/said")
+        assert(err.starts_with("stderr: cannot write standard error: connection reset by peer; reset true; after some "), level + ":\n" + err)
+        assert(err.contains("\nagain: true\nstderr: survived\n"), level + ":\n" + err)
+        // Gone before the program writes, or soon after: whichever, the write fails and the program goes on.
+        val gone = stdio_shell(level, dir, "$P epipe | true")
+        assert(gone.contains("stdout: cannot write standard output: connection reset by peer; reset true; after some "), level + ":\n" + gone)
+        assert(gone.contains("again: true\nexit-ok\n"), level + ":\n" + gone)
+
+@test("println from several threads interleaved with byte writes keeps every line whole and each thread's in order")
+lines_kept_whole()
+    val dir = stdio_scratch("interleave")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val piped = stdio_shell(level, dir, "$P interleave | $P verify")
+        assert(piped.starts_with("ok 1600 lines\n"), level + ":\n" + piped)
+        val filed = stdio_shell(level, dir, "$P interleave > $D/out; $P verify < $D/out")
+        assert(filed.starts_with("ok 1600 lines\n"), level + ":\n" + filed)
+
+@test("print and byte writes come out in the order they were made, standard error after the output before it")
+order_of_writes()
+    val dir = stdio_scratch("order")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdio_shell(level, dir, "$P order 2>&1 | cat")
+        assert(out.starts_with("p1 b1 p2\ne1\np3 e2\nb2 p4\nempty: Ok(())\n"), level + ":\n" + out)
+        val filed = stdio_shell(level, dir, "$P order > $D/o 2>&1; cat $D/o")
+        assert(filed.starts_with("p1 b1 p2\ne1\np3 e2\nb2 p4\nempty: Ok(())\n"), level + ":\n" + filed)
+
+@test("a read that fails answers Err with the platform's sentence; a read of fewer than one byte traps")
+failed_reads()
+    val dir = stdio_scratch("fail")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val dir_input = stdio_shell(level, dir, "$P read < /")
+        assert(dir_input.starts_with("err cannot read standard input: is a directory\n"), level + ":\n" + dir_input)
+        val zero = stdio_shell(level, dir, "printf x | $P read-zero; echo \"exit $?\"")
+        assert(zero.contains("exit 133"), level + ":\n" + zero)
+        assert(zero.contains("a read of 0 bytes: a read takes at least one"), level + ":\n" + zero)
+
+@test("a program started with standard input, output or error closed sees /dev/null there, never the runtime's own descriptors")
+closed_descriptors()
+    val dir = stdio_scratch("closed")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val input = stdio_shell(level, dir, "$P read <&-; $P line <&-")
+        assert(input.starts_with("ok 0\n"), level + ":\n" + input)
+        assert(input.contains("line: None"), level + ":\n" + input)
+        val output = stdio_shell(level, dir, "$P write >&-")
+        assert(output.contains("write: Ok(())"), level + ":\n" + output)
+        val error = stdio_shell(level, dir, "$P write 2>&-")
+        assert(error.starts_with("x"), level + ":\n" + error)
+
+// Standard input waited on in a `select` and a `Selector` (`tests/stdio/stdin_select.avin`).
+
+/** The select test program at `level`. */
+private stdin_select_program(level: string) -> string = stdio_built("tests/stdio/stdin_select.avin", "stdin_select", level)
+
+/** Runs `script` with `sh`, `$P` the select test program at `level` and `$D` the directory `dir`:
+ * what it wrote to standard output and standard error. */
+private stdin_select_shell(level: string, dir: string, script: string) -> string
+    val all = "P='" + stdin_select_program(level) + "'; D='" + dir + "'; " + script
+    val ran = capture("sh", ["-c", all], stderr = true, timeout = 300000).unwrap()
+    assert(ran.status.ok(), level + ": the script failed: " + script + "\n" + ran.text + ran.err.unwrap_or(""))
+    ran.text + "--- err\n" + ran.err.unwrap_or("")
+
+@test("a select on standard input, a channel and an after runs whichever is ready first: standard input, the channel or the time")
+stdin_select_first()
+    val dir = stdio_scratch("select-first")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val input = stdin_select_shell(level, dir, "printf 'xy' | $P first -1 5000")
+        assert(input.starts_with("stdin\navailable: Some(xy)\n"), level + ":\n" + input)
+        val channel = stdin_select_shell(level, dir, "(sleep 2; printf x) | $P first 100 5000")
+        assert(channel.starts_with("channel 1\n"), level + ":\n" + channel)
+        val timeout = stdin_select_shell(level, dir, "(sleep 2; printf x) | $P first -1 200")
+        assert(timeout.starts_with("after\n"), level + ":\n" + timeout)
+        // Bytes coming while the select waits end it, on the main thread and on any other.
+        val later = stdin_select_shell(level, dir, "(sleep 0.3; printf q) | $P first -1 5000")
+        assert(later.starts_with("stdin\navailable: Some(q)\n"), level + ":\n" + later)
+        val thread = stdin_select_shell(level, dir, "(sleep 0.3; printf q) | $P first-thread -1 5000")
+        assert(thread.starts_with("stdin\navailable: Some(q)\n"), level + ":\n" + thread)
+        // A file is ready at once, as its read never waits.
+        val filed = stdin_select_shell(level, dir, "printf 'from file' > $D/f; $P first 5000 5000 < $D/f")
+        assert(filed.starts_with("stdin\navailable: Some(from file)\n"), level + ":\n" + filed)
+
+@test("bytes a readLine read past its line make standard input ready at once, with nothing more on the descriptor")
+stdin_select_buffered()
+    val dir = stdio_scratch("select-buffered")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdin_select_shell(level, dir, "(printf 'a\\nb\\n'; sleep 3) | $P buffered")
+        assert(out.starts_with("line: Some(a)\nreadable: true\nstdin at once: true\navailable: Some(b\\n)\nthen: None\n"), level + ":\n" + out)
+
+@test("the end of standard input makes it ready, every time: read answers empty and readAvailable an empty Some")
+stdin_select_ended()
+    val dir = stdio_scratch("select-ended")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val expected = "stdin, read 0, available Some()\nstdin, read 0, available Some()\n"
+        val nothing = stdin_select_shell(level, dir, "$P ended < /dev/null")
+        assert(nothing.starts_with("drained: \n" + expected), level + ":\n" + nothing)
+        val piped = stdin_select_shell(level, dir, "printf abc | $P ended")
+        assert(piped.starts_with("drained: abc\n" + expected), level + ":\n" + piped)
+        val filed = stdin_select_shell(level, dir, "printf abc > $D/f; $P ended < $D/f")
+        assert(filed.starts_with("drained: abc\n" + expected), level + ":\n" + filed)
+        val closed = stdin_select_shell(level, dir, "$P ended <&-")
+        assert(closed.starts_with("drained: \n" + expected), level + ":\n" + closed)
+
+@test("readAvailable on an empty pipe answers None at once, then what has come, then an empty Some at the end")
+stdin_read_available()
+    val dir = stdio_scratch("select-available")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdin_select_shell(level, dir, "(sleep 1; printf hello; sleep 0.3; printf ' world') | $P available")
+        assert(out.starts_with("now: None, at once: true\ngot: hello world\nafter the end: Some()\n"), level + ":\n" + out)
+
+@test("a select loop reading standard input three bytes at a time beside a ticking channel takes it whole, from a file or a pipe")
+stdin_select_loop()
+    val dir = stdio_scratch("select-loop")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val filed = stdin_select_shell(level, dir, "printf abcdefghij > $D/f; $P loop < $D/f")
+        assert(filed.starts_with("got: abcdefghij\n"), level + ":\n" + filed)
+        val piped = stdin_select_shell(level, dir, "(printf abc; sleep 0.2; printf defg) | $P loop")
+        assert(piped.starts_with("got: abcdefg\n"), level + ":\n" + piped)
+        val big = stdin_select_shell(level, dir, "head -c 30000 /dev/zero | tr '\\0' z | $P loop | wc -c | tr -d ' '")
+        assert(big.starts_with("30006\n"), level + ":\n" + big)
+
+@test("a Selector holds standard input among connections: whichever has bytes first runs, and standard input still runs later")
+stdin_selector()
+    val dir = stdio_scratch("selector")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val socket = stdin_select_shell(level, dir, "(sleep 1; printf zz) | $P selector socket")
+        assert(socket.starts_with("first: Some(socket 1)\nread: hi\nthen: Some(stdin), available: Some(zz)\n"), level + ":\n" + socket)
+        val input = stdin_select_shell(level, dir, "(sleep 0.3; printf zz) | $P selector stdin")
+        assert(input.starts_with("first: Some(stdin)\navailable: Some(zz)\n"), level + ":\n" + input)
+
+@test("any thread may wait on standard input while others read it: bytes another thread's readLine left in the buffer end a select's wait, and two selecting threads share every byte once")
+stdin_select_threads()
+    val dir = stdio_scratch("select-threads")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val shared = stdin_select_shell(level, dir, "(sleep 1; printf 'l1\\nl2\\n'; sleep 4) | $P reader-and-select")
+        assert(shared.starts_with("reader: Some(l1)\nselect: stdin, Some(l2\\n)\n"), level + ":\n" + shared)
+        val two = stdin_select_shell(level, dir, "(printf abc; sleep 0.2; printf def; sleep 0.2; printf ghi) | $P two")
+        assert(two.starts_with("total: 9, letters: 511\n"), level + ":\n" + two)
+
+@test("a scope's cancel stops threads waiting on standard input in a select and a Selector, and the input is read whole afterwards")
+stdin_select_cancelled()
+    val dir = stdio_scratch("select-cancel")
+    defer _ = remove_dir_all(dir)
+    for level in stdio_levels()
+        val out = stdin_select_shell(level, dir, "(sleep 1; printf later) | $P cancelled")
+        assert(out.starts_with("cancelled: [None, None], ran on: 0\nthen: None\nstdin: Some(later)\n"), level + ":\n" + out)
+
+@test("a terminal as standard input in a select beside a ticking channel: each typed line is taken when entered, and the end of input ends the loop")
+stdin_select_terminal()
+    for level in stdio_levels()
+        val bin = stdio_built("tests/pty/stdin_select_tty.avin", "stdin_select_tty", level)
+        val ran = capture(stdio_driver(), ["expect:ready", "send:héllo\\n", "expect:[7]", "sleep:200", "send:x\\n", "expect:[2]", "eof", "expect:ended, ticked: true", "--", bin], stderr = true, timeout = 180000).unwrap()
+        assert(ran.status.ok(), ran.text + ran.err.unwrap_or(""))
+        assert(!ran.text.contains("[timeout]"), level + ":\n" + ran.text)
+        assert(ran.text.contains("[exit 0]"), level + ":\n" + ran.text)
+
+/** The pty driver, compiled the first time it is asked for. */
+private stdio_driver() -> string
+    val bin = current_dir().unwrap() + "/" + StdioDir + "/stdio_pty_drive"
+    if !exists(bin)
+        val made = capture("cc", ["-O1", "-o", bin, "tests/pty/pty_drive.c", "-lutil"], stderr = true, timeout = 120000).unwrap()
+        assert(made.status.ok(), made.err.unwrap_or(""))
+    bin
+
+@test("a terminal as standard input and output: each typed line is read as bytes when it is entered, and the end of input ends the reads")
+stdio_terminal()
+    for level in stdio_levels()
+        val bin = stdio_built("tests/pty/stdio_tty.avin", "stdio_tty", level)
+        val ran = capture(stdio_driver(), ["expect:ready", "send:héllo\\n", "expect:[7]", "send:x\\n", "expect:[2]", "eof", "expect:ended", "--", bin], stderr = true, timeout = 180000).unwrap()
+        assert(ran.status.ok(), ran.text + ran.err.unwrap_or(""))
+        assert(!ran.text.contains("[timeout]"), level + ":\n" + ran.text)
+        assert(ran.text.contains("[exit 0]"), level + ":\n" + ran.text)

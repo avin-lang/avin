@@ -4,7 +4,9 @@ module avin.threads
 // `writable()` arms,
 // made in the order written, and a call of `selectWaiting`, `selectOrElse` or `selectWithin` with
 // them, which answers the arm that ran, its body then chosen by that number. A program writes
-// `select` rather than calling these.
+// `select` rather than calling these. A guarded arm whose guard was false is given as an arm that is
+// never ready (`selectGuarded`), keeping the numbers of the arms after it. A `Selector`
+// (`selector.avin`) runs its entries through the same functions.
 //
 // A select tries its arms in an order drawn at random each time, so of several arms ready at once
 // each is as likely to run as any other. Where none is ready, the select waits on all of their
@@ -210,27 +212,54 @@ class SelectWritable(private val sink: Writability): SelectArm
   // A report the select could not use is its alone, as a `readable()` arm's is.
   override passOn(wait: Selecting) = ()
 
+// An arm whose guard was false: never ready, watching nothing, so the select runs as if it were not
+// written. It keeps its place, so the arms after it keep their numbers.
+private class SelectAbsent(): SelectArm
+  override offer(wait: Selecting, index: int, enlist: bool) -> bool = false
+  override passOn(wait: Selecting) = ()
+
+// A guarded arm: the arm, where its guard was true and it was made, or one that is never ready.
+selectGuarded(arm: Option[SelectArm]) -> SelectArm = arm match
+  Some(a) -> a
+  None -> SelectAbsent()
+
 // A select with no `else` and no `after`: waits until one of `arms` runs, and answers which.
 selectWaiting(arms: SelectArm*) -> int = chosen(arms, 0, false)
 
 // A select with `else`: runs one of `arms` that is ready now and answers which, or answers the number
 // of arms, the `else`, where none is.
-selectOrElse(arms: SelectArm*) -> int
+selectOrElse(arms: SelectArm*) -> int = tried(arms)
+
+// A select with `after timeout`: runs one of `arms`, waiting at most `timeout` for one to be ready,
+// and answers which, or the number of arms, the `after`, where the time ran out first. A timeout of
+// zero or less tries the arms once, as `else` does.
+selectWithin(timeout: Duration, arms: SelectArm*) -> int = timedOut(timeout, arms)
+
+// A select whose `after` has a guard: `selectWithin` where the guard was true and `timeout` holds
+// the duration, and `selectWaiting` where it was false.
+selectWithinIf(timeout: Option[Duration], arms: SelectArm*) -> int = timeout match
+  Some(t) -> timedOut(t, arms)
+  None -> chosen(arms, 0, false)
+
+// Runs one of `arms` that is ready now, or answers the number of arms where none is.
+private tried(arms: Seq[SelectArm]) -> int
   val wait = Selecting(0)
   for i in drawnOrder(arms.length)
     if arms(i).offer(wait, i, false) then return i
   arms.length
 
-// A select with `after timeout`: runs one of `arms`, waiting at most `timeout` for one to be ready,
-// and answers which, or the number of arms, the `after`, where the time ran out first. A timeout of
-// zero or less tries the arms once, as `else` does.
-selectWithin(timeout: Duration, arms: SelectArm*) -> int
-  if timeout.micros <= 0 then return selectOrElse(arms*)
+// Runs one of `arms`, waiting at most `timeout`: the arm, or the number of arms where the time ran
+// out first.
+private timedOut(timeout: Duration, arms: Seq[SelectArm]) -> int
+  if timeout.micros <= 0 then return tried(arms)
   chosen(arms, selectDeadline(timeout.micros), true)
 
 // Runs one of `arms`, waiting until `deadline` where `timed`: the arm, or the number of arms where
-// the time ran out.
-private chosen(arms: Vector[SelectArm], deadline: long, timed: bool) -> int
+// the time ran out. Untimed, with no arm that can ever be ready, every one guarded off, it traps:
+// only a cancellation could end its wait.
+private chosen(arms: Seq[SelectArm], deadline: long, timed: bool) -> int
+  if !timed && arms.forall(a -> a is SelectAbsent)
+    fail("a select has no arm to wait on: every arm is guarded off and it has no `after` or `else`")
   val wait = Selecting(arms.length)
   var woken = -1
   loop
@@ -271,7 +300,7 @@ private chosen(arms: Vector[SelectArm], deadline: long, timed: bool) -> int
     else woken = -1
 
 // Takes what every arm of a select left on its channel off it.
-private withdrawn(arms: Vector[SelectArm])
+private withdrawn(arms: Seq[SelectArm])
   for arm in arms do arm.withdraw()
 
 // The draws of every select, each a step of a sequence no two draws share.

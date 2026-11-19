@@ -139,7 +139,7 @@ class Bag(val items: Vector[int])
 `a ++ b` is `a.++(b)`, and `a.++(b)` may be written as such. A function outside a type cannot be
 named by a symbol. Some of the language's own operators are not method names: declaring a method
 named `==` is an error that says to implement `Eq`. The reserved spellings are the wrapping and
-saturating `+%` `-%` `*%` `+|` `-|` `*|`, `!` `&&` `||`, `==` `!=` `===` `!==`, `::`, `=` `:=`
+saturating `+%` `-%` `*%` `+|` `-|` `*|`, `&&` `||`, `==` `!=` `===` `!==`, `::`, `=` `:=`
 `:` `?` `->` `=>`, and each yielding compound form such as `+:=` and `<<:=`. Every other run is
 free, `++`, `--`, `>>>` and the plain compound spellings `+=` and `-=` among them.
 
@@ -148,7 +148,8 @@ but the integers and bytes, whose bitwise and shift operators are the machine's:
 these names on `int` or `byte`, in an extension too, is an error. On any other type, `a | b` calls
 `a`'s method `|` and `a >> b` its method `>>`, each at its operator's own level, so a parser
 combinator (`p >> f`), a set of flags, a stream or a query builder can be written with them. Prefix
-`~` stays the integers' and bytes' complement, and `~a` on another type is an error.
+`~` stays the integers' and bytes' complement, and `~a` on another type calls its method `~` taking
+no argument, an [operator method](#operator-methods), and is an error where it has none.
 
 ```text
 data Flags(bits: int)
@@ -187,18 +188,51 @@ val scaled = v * 2.0
 val flipped = -v
 ```
 
-A prefix `-a` calls a method `-` taking no argument. Where a type has no method of an operator's
+A prefix `-a` calls a method `-` taking no argument, and so do the other prefix operators: `!a` calls
+a method `!`, `~a` a method `~` and `+a` a method `+`, each taking no argument and yielding whatever
+it is declared to, at the prefix level, so `!a.b` is `!(a.b)` and `~a + b` is `(~a) + b`. A method
+`!` takes no argument at all, since `!` has no binary form; `~` and `+` may also be overloaded with
+one argument for `a ~ b` and `a + b`, which a prefix operator never calls. A query builder's `!cond`
+builds the negated condition and a bit set's `~bits` its complement:
+
+```text
+data Cond(sql: string)
+
+impl Cond
+  !() -> Cond = Cond(s"NOT ($sql)")
+
+class Bits(val word: int)
+  ~() -> Bits = Bits(~word & 255)
+  +() -> int = word
+
+trait Flip
+  !() -> Self
+
+twice[T: Flip](x: T) -> T = ! !x
+```
+
+A trait may declare them, so a type parameter bounded by it has them, and a value of the trait
+dispatches on its class. Two prefix operators written together are one name, so nested ones are
+written apart: `! !x`, `- ~x`. In an `if`, a `while` or an operand of `&&` and `||`, `!a` is a
+condition only where it is a `bool`: `if !stack` reads where the method `!` yields `bool`, and is an
+error where it yields a `Cond`. A prefix `!`, `~` or `+` on a type with no method of its name keeps
+its own meaning, so it is an error on a data type or a class: `!` needs a `bool`, `~` an integer or a
+byte, and `+` a number. No core trait stands behind them, as `Neg` stands behind `-`.
+
+Where a type has no method of an operator's
 name, the operator is its core trait's, `Add`'s `add` for `+`, as it always is in generic code: a
 type with both a method `+` and an `impl Add` has its method called by `a + b` and `add` called
 by a function bounded by `Add`. `a < b` alone calls the method `<`, whatever it yields, so a query
-builder's `age < 30` can build a condition; a comparison by a method does not chain, and
-`lo <= x < hi` through one is an error that says to join the comparisons with `&&`. `x += y` and
+builder's `age < 30` can build a condition. A comparison by a method chains when it yields `bool`:
+`lo <= x < hi` through methods `<=` and `<` is a [comparison chain](#comparison-chains), and a link
+whose method yields anything else makes the chain an error. `x += y` and
 the other compound forms assign through the method: `deadline += grace` is
 `deadline = deadline + grace`.
 
 The built-in types keep their operators: a method of one of these names on `int`, `real`, `byte`,
 `char`, `string`, `bool` or a tuple, in an extension or a trait implementation, is an error, so `+`
-on two `int`s is always the machine's addition. `==` and `!=` stay `Eq`'s.
+on two `int`s is always the machine's addition, and so is a method `!`, or `~` taking no argument,
+there: `!` on a `bool` is always its negation. `==` and `!=` stay `Eq`'s.
 
 A symbol method's call binds at the level of the language's operator its name's first character
 belongs to, so a name reads with the operator it resembles. One character overrides the first: a
@@ -269,8 +303,8 @@ endless(n: int) -> Chain = s"c$n" #:: endless(n + 1) // returns; each next() mak
 - A companion's `op:` with a strict second parameter is not called infix; it is an ordinary function
   of the object.
 
-There are no prefix or postfix symbol methods, beyond the [method `-`](#operator-methods) taking no
-argument that a prefix `-` calls. `++` and `--` keep their update meaning when no
+There are no prefix or postfix symbol methods, beyond the [methods `-`, `!`, `~` and
+`+`](#operator-methods) taking no argument that the prefix operators call. `++` and `--` keep their update meaning when no
 operand follows them on the line: `i++` and `++i` update `i`, and `xs ++ ys` calls `++`. An operand
 here is a name, a literal or an opening bracket on the same line, or an indented block on the next;
 so `a ++ -b`, with a prefix operator after `++`, is `(a++) - b`, written `a ++ (-b)` to join.
@@ -348,7 +382,13 @@ sign(x: int) -> int
 
 Inside brackets a line break is not significant, so a line in a call's arguments may start with any
 operator at any depth, a method named by a symbol included. A block opened inside the brackets, a
-lambda's body, starts its own lines again.
+lambda's body, starts its own lines again, where a comma list is a tuple, until its last line: a
+line that closes a bracket opened before the block ends the block at its first comma, and the
+items after that comma are the bracket's own. So `spawn(() ->` … `a + f(n), 67108864)` passes the
+lambda yielding `a + f(n)` and `67108864`, as `spawn(() -> a + f(n), 67108864)` does; a tuple the
+block yields there is written in parentheses, `(a, b))`, and a closing bracket on a line of its own
+leaves the line above a tuple. Blocks nested in the same brackets, an `if`'s, a `match`'s or an
+inner lambda's, all end at that comma.
 
 ### Trailing blocks
 
@@ -422,6 +462,15 @@ form; it is written inside the parentheses.
 `a < b <= c` is one expression. Operands are evaluated left to right, each middle operand exactly
 once, and evaluation stops at the first failing link. Parenthesizing a comparison makes it an
 ordinary `bool` operand: `(a < b) == flag`.
+
+A link may call its left operand's [operator method](#methods-named-by-symbols) `<`, `<=`, `>` or
+`>=`, and links of methods mix with built-in links, `==` and `!=` among them. Each link chooses its
+own method among the overloads, by its two operands, so `start < t <= limit` may call
+`Instant < Instant` and then `Instant <= Duration`. A chain is allowed when every link yields
+`bool`; a link whose method yields anything else, as a query builder's `age < 30` yielding a
+condition, makes the chain an error that names the link, its method and the type it yields, and says
+to join the comparisons with `&&` or to parenthesize one. The same comparison alone yields whatever
+its method yields.
 
 ## Blocks
 
@@ -552,7 +601,8 @@ one-line arm's body ends the arm, the `match` and the item, as it ends a `return
 `f(x match` … `_ -> 0, "a")` the `match` is the first argument and `"a"` the second, which may also
 stand on the line after the arms. A tuple body there is written in parentheses, `_ -> (0, 1)`; a
 comma after an arm that more arms follow is an error that says so. An arm's indented body is a
-block and starts a line again. Patterns include:
+block and starts a line again, up to a last line that closes the brackets, which
+[ends at its comma](#continuation-lines) as any block's does. Patterns include:
 
 - literals, including negative numbers;
 - inclusive and exclusive literal ranges (`'a'..'z'`, `0..<10`);

@@ -1,0 +1,499 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.{MacOS, os}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{canonicalize, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, set_permissions, write_text}
+import sysl.path.parent
+import sysl.process.{Stdio, capture}
+
+// The C sources a package ships for a C library (`sources`, `cflags`): how the manifest reads them,
+// which files they name, how they are compiled and kept, and programs built with them.
+
+private put(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+private manifest(name: string, rest: string) -> string = s"package {\n  name = \"$name\"\n  version = \"0.1.0\"\n}\n$rest"
+
+// The message reading a manifest of `text` fails with, or "read".
+private manifest_error(text: string) -> string
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", text).unwrap()
+    read_manifest(dir) match
+        Ok(_) -> "read"
+        Err(message) -> message
+
+private joined(items: Buf[string]) -> string
+    var out = ""
+    for s in items
+        out = out + (if out == "" then "" else " ") + s
+    out
+
+@test("a C library's sources are paths in its package, its cflags are read in order, and both may go with pkg-config, link and include")
+sources_and_cflags_read()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    write_text(dir + "/avin.hocon", manifest("app", "c-libraries {\n  vend {\n    sources = [\"vendor/vend.c\", \"vendor/more/*.c\", \"./x.c\", \"my dir/é.c\"]\n    cflags  = [\"-DA=1\", \"-UB\", \"-O3\", \"-Wall\", \"-Wno-unused\", \"-w\", \"-std=c11\", \"-fno-strict-aliasing\", \"-pedantic\", \"-O\"]\n    include = [\"vendor\"]\n    link    = [\"m\"]\n    headers = [\"vend.h\"]\n  }\n  zl { pkg-config = \"zlib\", sources = [\"z.c\"] }\n}\n")).unwrap()
+    val m = read_manifest(dir).unwrap()
+    val vend = m.c_libraries[0]
+    assert_eq(joined(vend.sources), "vendor/vend.c vendor/more/*.c ./x.c my dir/é.c")
+    assert_eq(joined(vend.cflags), "-DA=1 -UB -O3 -Wall -Wno-unused -w -std=c11 -fno-strict-aliasing -pedantic -O")
+    assert_eq(joined(m.c_libraries[1].sources), "z.c")
+    assert_eq(m.c_libraries[1].cflags.len(), 0)
+    // Unsaid, a library has neither.
+    write_text(dir + "/avin.hocon", manifest("app", "c-libraries {\n  z { link = [\"z\"] }\n}\n")).unwrap()
+    val plain = read_manifest(dir).unwrap().c_libraries[0]
+    assert_eq(plain.sources.len(), 0)
+    assert_eq(plain.cflags.len(), 0)
+
+@test("sources that leave the package, use `**` or are not paths, and cflags that are not a package's to give, are errors at the entry")
+sources_and_cflags_errors()
+    val absolute = manifest_error(manifest("a", "c-libraries {\n  z { sources = [\"/usr/src/z.c\"] }\n}\n"))
+    assert(absolute.contains("`/usr/src/z.c` is absolute, and a package's paths are relative to its directory"), absolute)
+    assert(absolute.contains("avin.hocon:6:"), absolute)
+    for up in ["../z.c", "vendor/../../z.c", "..", "../*.c"]
+        val e = manifest_error(manifest("a", s"c-libraries {\n  z { sources = [\"$up\"] }\n}\n"))
+        assert(e.contains(s"`$up` leaves the package's directory"), e)
+    for wrong in ["\"z.c\"", "[\"\"]", "[\" \"]", "[3]"]
+        val e = manifest_error(manifest("a", s"c-libraries {\n  z { sources = $wrong }\n}\n"))
+        assert(e.contains("`sources` is a list of the C files compiled into the program, each relative to the package's directory"), e)
+    val deep = manifest_error(manifest("a", "c-libraries {\n  z { sources = [\"vendor/**/*.c\"] }\n}\n"))
+    assert(deep.contains("`vendor/**/*.c` holds `**`, and a `*` of `sources` matches within one directory: name each directory, `vendor/*/*.c`"), deep)
+    assert(deep.contains("avin.hocon:6:"), deep)
+    for wrong in ["\"-DA\"", "[\"\"]", "[\"-D A\"]", "[1]"]
+        val e = manifest_error(manifest("a", s"c-libraries {\n  z { sources = [\"z.c\"], cflags = $wrong }\n}\n"))
+        assert(e.contains("`cflags` is a list of the flags the library's `sources` are compiled with"), e)
+    for include in ["-Ivendor", "-I/usr/include", "-isystem", "-iquote", "-idirafter"]
+        val e = manifest_error(manifest("a", s"c-libraries {\n  z { sources = [\"z.c\"], cflags = [\"$include\"] }\n}\n"))
+        assert(e.contains(s"`$include` names an include directory, which a C library names in `include`, relative to its package's directory"), e)
+        assert(e.contains("avin.hocon:6:"), e)
+    for other in ["-Wl,-dead_strip", "-Wa,-q", "-Wp,-DX"]
+        val e = manifest_error(manifest("a", s"c-libraries {\n  z { sources = [\"z.c\"], cflags = [\"$other\"] }\n}\n"))
+        assert(e.contains(s"`$other` passes a flag to another tool, and the sources are only compiled"), e)
+    for refused in ["-o", "-c", "-target", "--target=x86_64-linux", "-arch", "-D", "-U", "-W", "-f", "-std=", "-O4", "-g", "-lz", "-L.", "-include", "-x", "-E", "-M", "-shared", "-pthread", "foo"]
+        val e = manifest_error(manifest("a", s"c-libraries {\n  z { sources = [\"z.c\"], cflags = [\"$refused\"] }\n}\n"))
+        assert(e.contains(s"`$refused` is not a flag a C library's sources may be compiled with: `cflags` holds defines (`-D`, `-U`), an optimization level (`-O`), warnings (`-W`, `-w`), the language standard (`-std=`) and code generation (`-f`)"), e)
+    val dynamic = manifest_error(manifest("a", "c-libraries {\n  z {\n    sources = [\"z.c\"]\n    dynamic-only = \"LGPL\"\n  }\n}\n"))
+    assert(dynamic.contains("the C library `z` names both `sources` and `dynamic-only`: its sources are compiled into the program, which links them statically, always"), dynamic)
+    assert(dynamic.contains("avin.hocon:6:"), dynamic)
+    val flags_alone = manifest_error(manifest("a", "c-libraries {\n  z { cflags = [\"-DX\"], link = [\"z\"] }\n}\n"))
+    assert(flags_alone.contains("the C library `z` names `cflags` and no `sources`: `cflags` are what its sources are compiled with"), flags_alone)
+    val unknown = manifest_error(manifest("a", "c-libraries {\n  z { source = [\"z.c\"] }\n}\n"))
+    assert(unknown.contains("`source` is not a key of a C library, which holds `pkg-config` or `link`, `files`, `search`, `include`, `frameworks`, `link-flags`, `dynamic-only`, `sources`, `cflags`, `headers`, `install` and `if`"), unknown)
+
+@test("refused_cflag takes defines, levels, warnings, standards and code generation, and nothing else")
+cflag_kinds()
+    for ok in ["-DX", "-DX=1", "-DX=\"a\"", "-UX", "-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-O", "-Wall", "-Werror", "-Wno-error=foo", "-w", "-pedantic", "-std=c99", "-std=gnu11", "-fPIC", "-fno-common", "-fvisibility=hidden"]
+        assert_eq(refused_cflag(ok), "", ok)
+    assert(refused_cflag("-I.").contains("names an include directory"))
+    assert(refused_cflag("-Wl,-x").contains("passes a flag to another tool"))
+    assert(refused_cflag("-m64").contains("is not a flag a C library's sources may be compiled with"))
+
+private library_at(dir: string, sources: []const string) -> CLibrary
+    var library = c_library("pkg", "vend", None, buf(), buf(), "", false)
+    library.dir = dir
+    for s in sources
+        library.sources.push(s)
+    library
+
+private files_error(library: CLibrary) -> string = c_source_files(library) match
+    Ok(f) -> "found " + joined(f)
+    Err(message) -> message
+
+@test("sources name files by path and by pattern, a pattern's matches sorted, each file once, and a `*` stays in one directory and leaves hidden files out")
+source_files_by_pattern()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    for f in ["vendor/b.c", "vendor/a.c", "vendor/a.h", "vendor/.hidden.c", "vendor/sub/c.c", "vendor/sub/d.c", "vendor/other/e.c", "vendor/x.c.orig", "top.c", "üñí/ç.c"]
+        put(dir + "/" + f, "int x;\n")
+    make_dir_all(dir + "/vendor/dir.c").unwrap()
+    val found = c_source_files(library_at(dir, ["vendor/*.c", "top.c", "vendor/a.c", "vendor/*/*.c", "üñí/*.c"])).unwrap()
+    assert_eq(joined(found), "vendor/a.c vendor/b.c top.c vendor/other/e.c vendor/sub/c.c vendor/sub/d.c üñí/ç.c")
+    // A segment may hold a `*` among other letters, and a hidden file is named by a pattern that is.
+    assert_eq(joined(c_source_files(library_at(dir, ["vendor/su*/c*", "vendor/*b/*.c"])).unwrap()), "vendor/sub/c.c vendor/sub/d.c")
+    assert_eq(joined(c_source_files(library_at(dir, ["vendor/.*.c"])).unwrap()), "vendor/.hidden.c")
+    assert_eq(joined(c_source_files(library_at(dir, ["./top.c"])).unwrap()), "./top.c")
+    assert_eq(joined(c_source_files(library_at(dir, ["vendor/*"])).unwrap()), "vendor/a.c vendor/a.h vendor/b.c vendor/x.c.orig")
+
+@test("a source that is not there, a directory named as one, and a pattern matching no file are errors naming the library, its package and the path")
+source_files_errors()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/vendor/a.c", "int a;\n")
+    make_dir_all(dir + "/vendor/dir.c").unwrap()
+    assert_eq(files_error(library_at(dir, ["vendor/none.c"])), s"error: the source `vendor/none.c` of the C library `vend` of package `pkg` is not there: `$dir/vendor/none.c`\n")
+    assert_eq(files_error(library_at(dir, ["vendor/dir.c"])), s"error: the source `vendor/dir.c` of the C library `vend` of package `pkg` is a directory, and a source is a C file: `$dir/vendor/dir.c`\n")
+    for pattern in ["vendor/*.cc", "none/*.c", "*/none.c", "vendor/*/a.c"]
+        assert_eq(files_error(library_at(dir, [pattern])), s"error: the sources `$pattern` of the C library `vend` of package `pkg` match no file: `$dir/$pattern`\n")
+    // A pattern matching only a directory matches no file.
+    assert(files_error(library_at(dir, ["vendor/dir.*"])).contains("match no file"))
+    // The first wrong entry is the one reported.
+    assert(files_error(library_at(dir, ["vendor/a.c", "vendor/b.c", "vendor/c.c"])).contains("`vendor/b.c`"))
+
+@test("the headers of a dependency file are every file but the target and the source, each once, with escaped spaces and continued lines read")
+dependency_files_read()
+    val depfile = "object: /src/a.c /inc/a.h \\\n  /inc/my\\ dir/b.h /inc/a.h \\\r\n /usr/include/stdio.h\n"
+    assert_eq(joined(headers_of(depfile, "/src/a.c")), "/inc/a.h /inc/my dir/b.h /usr/include/stdio.h")
+    assert_eq(headers_of("object: /src/a.c\n", "/src/a.c").len(), 0)
+    assert_eq(headers_of("", "/src/a.c").len(), 0)
+
+// The packages of the program tests: `vend_twice` from a source the package ships, with its header.
+
+private const VendHeader: string = "int vend_twice(int n);\n"
+private const VendSource: string = "#include \"vend.h\"\nint vend_twice(int n) { return n * 2; }\n"
+
+// A package `name` at `dir/name` whose `main.avin` prints `vtwice(21)`, `vend_twice` bound from its
+// C library holding `keys`, with its header from `vendor`.
+private vend_package(dir: string, name: string, keys: string, rest: string)
+    put(dir + "/" + name + "/avin.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n${rest}c-libraries {\n  vend {\n    $keys\n    include = [\"vendor\"]\n    headers = [\"vend.h\"]\n  }\n}\n")
+    put(dir + "/" + name + "/main.avin", "@c(\"int vend_twice(int n)\")\nvtwice(n: int) -> int\n\nmain()\n  println(vtwice(21))\n")
+    put(dir + "/" + name + "/vendor/vend.h", VendHeader)
+
+private struct Built
+    status: int
+    noted: string
+
+private build(tc: Toolchain, args: []const string) -> Built
+    var noted = ""
+    val status = run_cli(args, Some(tc), s -> (), s -> noted = noted + s + "\n")
+    Built(status, noted)
+
+private session(tc: Toolchain, dir: string, args: []const string) -> Built
+    var noted = ""
+    val status = run_cli_with(args, Some(tc), s -> (), s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/run.out"), Stdio.Inherit)
+    Built(status, noted)
+
+private ran(tc: Toolchain, dir: string, package: string) -> string
+    val b = session(tc, dir, ["avin", "run", dir + "/" + package])
+    assert_eq(b.status, 0, b.noted)
+    read_text(dir + "/run.out").unwrap()
+
+private prints(program: string, wanted: string)
+    val r = capture(program, [], stderr = true, timeout = 60000).unwrap()
+    assert(r.status.ok(), r.err.unwrap_or("") + r.text)
+    assert_eq(r.text, wanted)
+
+private noted_error(b: Built, wanted: string)
+    assert_eq(b.status, 1, b.noted)
+    assert(b.noted.contains(wanted), b.noted)
+
+// What `otool -L` lists for `program`.
+private linked_libraries(program: string) -> string
+    val r = capture("otool", ["-L", program], stderr = true, timeout = 60000).unwrap()
+    assert(r.status.ok(), r.text)
+    r.text
+
+// The shared libraries an `otool -L` listing names, the program's own line left out.
+private shared_libraries(listing: string) -> string
+    var out = ""
+    for line in listing.split("\n")
+        if line.starts_with("\t") then out = out + line.trim() + "\n"
+    out
+
+@test("a package's C source and its header, bound by @c and called from Avin, build and run at -O0 and -O2, linked into the program with nothing dynamic added")
+one_source_program()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\"]", "")
+    put(dir + "/app/vendor/vend.c", VendSource)
+    // A program with no C at all, whose shared libraries are the ones any program has.
+    put(dir + "/plain/avin.hocon", "package { name = \"plain\", version = \"0.1.0\" }\n")
+    put(dir + "/plain/main.avin", "main()\n  println(42)\n")
+    val plain = build(tc, ["avin", "build", dir + "/plain", "-o", dir + "/plain-program"])
+    assert_eq(plain.status, 0, plain.noted)
+    for level in ["-O0", "-O2"]
+        val program = dir + "/program" + level
+        val built = build(tc, ["avin", "build", dir + "/app", "-o", program, level])
+        assert_eq(built.status, 0, built.noted)
+        prints(program, "42\n")
+        if os() == MacOS
+            val libraries = linked_libraries(program)
+            assert(!libraries.contains("vend"), libraries)
+            // The source is in the program: it links no shared library a program without C does not.
+            assert_eq(shared_libraries(libraries), shared_libraries(linked_libraries(dir + "/plain-program")), libraries)
+    // Built, the program needs nothing of the package: with its sources gone, it still runs.
+    remove_dir_all(dir + "/app/vendor").unwrap()
+    prints(dir + "/program-O2", "42\n")
+
+@test("sources that are several files, by pattern and in directories, are compiled and linked together, and `avin check` finds them without compiling them")
+several_sources_program()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\", \"vendor/parts/*.c\"]", "")
+    put(dir + "/app/vendor/vend.c", "#include \"vend.h\"\nint vend_add(int a, int b);\nint vend_one(void);\nint vend_twice(int n) { return vend_add(n, n) + vend_one() - 1; }\n")
+    put(dir + "/app/vendor/parts/add.c", "int vend_add(int a, int b) { return a + b; }\n")
+    put(dir + "/app/vendor/parts/one.c", "int vend_one(void) { return 1; }\n")
+    put(dir + "/app/vendor/parts/notes.txt", "not C\n")
+    val program = dir + "/program"
+    val built = build(tc, ["avin", "build", dir + "/app", "-o", program])
+    assert_eq(built.status, 0, built.noted)
+    prints(program, "42\n")
+    // `avin check` does not compile them: a source that does not compile still checks.
+    put(dir + "/app/vendor/parts/one.c", "int vend_one(void) { return }\n")
+    val checked = build(tc, ["avin", "check", dir + "/app"])
+    assert_eq(checked.status, 0, checked.noted)
+
+@test("cflags reach the sources: defines are visible, a later flag has the last word, -O2 is the level unless one is named, and the C unit is not compiled with them")
+cflags_program()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\"]\n    cflags = [\"-DVEND_FACTOR=3\", \"-DVEND_GONE\", \"-UVEND_GONE\", \"-Werror\"]", "")
+    put(dir + "/app/vendor/vend.c", "#ifdef VEND_GONE\n#error VEND_GONE is undefined by the flag after it\n#endif\n#ifndef __OPTIMIZE__\n#error compiled at -O0\n#endif\nint vend_twice(int n) { return n * VEND_FACTOR; }\n")
+    // The C unit includes the header; were it compiled with the sources' flags, this would stop it.
+    put(dir + "/app/vendor/vend.h", "#ifdef VEND_FACTOR\n#error the C unit is compiled with cflags\n#endif\nint vend_twice(int n);\n")
+    for level in ["-O0", "-O2"]
+        val program = dir + "/program" + level
+        val built = build(tc, ["avin", "build", dir + "/app", "-o", program, level])
+        assert_eq(built.status, 0, built.noted)
+        prints(program, "63\n")
+    // A level the package names is the level.
+    vend_package(dir, "zero", "sources = [\"vendor/vend.c\"]\n    cflags = [\"-O0\"]", "")
+    put(dir + "/zero/vendor/vend.c", "#include \"vend.h\"\n#ifdef __OPTIMIZE__\n#error optimized\n#endif\nint vend_twice(int n) { return n * 2; }\n")
+    val zero = build(tc, ["avin", "build", dir + "/zero", "-o", dir + "/zero-program"])
+    assert_eq(zero.status, 0, zero.noted)
+    prints(dir + "/zero-program", "42\n")
+
+@test("a header-only library is bound by a one-line source that asks for its implementation")
+header_only_library()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_package(dir, "app", "sources = [\"vendor/vend_impl.c\"]", "")
+    put(dir + "/app/vendor/vend.h", "int vend_twice(int n);\n#ifdef VEND_IMPLEMENTATION\nint vend_twice(int n) { return n * 2; }\n#endif\n")
+    put(dir + "/app/vendor/vend_impl.c", "#define VEND_IMPLEMENTATION\n#include \"vend.h\"\n")
+    val built = build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"])
+    assert_eq(built.status, 0, built.noted)
+    prints(dir + "/program", "42\n")
+
+@test("sources go with pkg-config, whose --cflags they are compiled with, and with link, whose libraries they call; c-linking's dynamic and --dynamic-c-libraries leave them in the program")
+sources_with_other_keys()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val repo = repository_toolchain()
+    make_dir_all(dir + "/pkgconfig").unwrap()
+    make_dir_all(dir + "/pkginclude").unwrap()
+    write_text(dir + "/pkginclude/pkg_factor.h", "#define PKG_FACTOR 2\n").unwrap()
+    write_text(dir + "/pkgconfig/vend-flags.pc", "Name: vend-flags\nDescription: flags for a vendored source\nVersion: 1.0.0\nCflags: -I" + dir + "/pkginclude -DPKG_DEFINED=1\nLibs:\n").unwrap()
+    val wrapper = dir + "/pkg-config"
+    write_text(wrapper, "#!/bin/sh\nPKG_CONFIG_PATH=\"" + dir + "/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\" exec pkg-config \"$@\"\n").unwrap()
+    set_permissions(wrapper, 493u32).unwrap()
+    val tc = Toolchain(repo.root, repo.cache, repo.clang, repo.sysl, wrapper, repo.builds, repo.target)
+    vend_package(dir, "app", "pkg-config = \"vend-flags\"\n    sources = [\"vendor/vend.c\"]", "")
+    put(dir + "/app/vendor/vend.c", "#include \"vend.h\"\n#include <pkg_factor.h>\n#ifndef PKG_DEFINED\n#error no pkg-config flags\n#endif\nint vend_twice(int n) { return n * PKG_FACTOR; }\n")
+    val built = build(tc, ["avin", "build", dir + "/app", "-o", dir + "/program"])
+    assert_eq(built.status, 0, built.noted)
+    prints(dir + "/program", "42\n")
+    // With `link`, the source calls the library it names: the system's libz.
+    vend_package(dir, "zipped", "link = [\"z\"]\n    sources = [\"vendor/vend.c\"]", "")
+    put(dir + "/zipped/vendor/vend.c", "#include \"vend.h\"\nconst char *zlibVersion(void);\nint vend_twice(int n) { return zlibVersion()[0] != 0 ? n * 2 : 0; }\n")
+    for extra in ["", "--dynamic-c-libraries", "--static-c-libraries"]
+        var args: Buf[string] = buf()
+        for a in ["avin", "build", dir + "/zipped", "-o", dir + "/zipped-program"]
+            args.push(a)
+        if extra != "" then args.push(extra)
+        val zipped = build(tc, args.view())
+        assert_eq(zipped.status, 0, zipped.noted)
+        prints(dir + "/zipped-program", "42\n")
+    // Named dynamic, a library's sources are still compiled into the program.
+    vend_package(dir, "kept", "sources = [\"vendor/vend.c\"]", "c-linking { default = \"static\", dynamic = [\"vend\"] }\n")
+    put(dir + "/kept/vendor/vend.c", VendSource)
+    val kept = build(tc, ["avin", "build", dir + "/kept", "-o", dir + "/kept-program"])
+    assert_eq(kept.status, 0, kept.noted)
+    prints(dir + "/kept-program", "42\n")
+    if os() == MacOS then assert(!linked_libraries(dir + "/kept-program").contains("vend"))
+
+// A toolchain like the repository's whose C sources are kept in a cache of their own at `dir`.
+private own_cache(dir: string) -> Toolchain
+    val repo = repository_toolchain()
+    Toolchain(repo.root, dir + "/cache", repo.clang, repo.sysl, repo.pkg_config, dir + "/builds", repo.target)
+
+private loaded_c(dir: string) -> Buf[CLibrary] = load_package_with(dir, default_fetching(), default_features()).unwrap().c
+
+@test("a source is compiled once and then taken from the cache, compiled again when it, a header it includes or a flag changes, and once for every package shipping it")
+source_cache()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = own_cache(dir)
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\", \"vendor/one.c\"]", "")
+    put(dir + "/app/vendor/vend.c", VendSource)
+    put(dir + "/app/vendor/one.c", "#include \"one.h\"\nint vend_one(void) { return ONE; }\n")
+    put(dir + "/app/vendor/one.h", "#define ONE 1\n")
+    val first = ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap()
+    assert_eq(first.compiled, 2)
+    assert_eq(first.objects.len(), 2)
+    // Unchanged, nothing is compiled, and the objects are the ones kept.
+    val again = ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap()
+    assert_eq(again.compiled, 0)
+    assert_eq(joined(again.objects), joined(first.objects))
+    // An edited source is compiled again, and only it.
+    put(dir + "/app/vendor/vend.c", VendSource + "int vend_more(void) { return 3; }\n")
+    val edited = ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap()
+    assert_eq(edited.compiled, 1)
+    assert(edited.objects[0] != first.objects[0])
+    assert_eq(edited.objects[1], first.objects[1])
+    // An edited header recompiles the source including it.
+    put(dir + "/app/vendor/one.h", "#define ONE (2 - 1)\n")
+    val header = ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap()
+    assert_eq(header.compiled, 1)
+    assert(header.objects[1] != first.objects[1])
+    assert_eq(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    // An include added reaches a header new to the record: editing that header recompiles.
+    put(dir + "/app/vendor/two.h", "#define TWO 2\n")
+    put(dir + "/app/vendor/one.c", "#include \"one.h\"\n#include \"two.h\"\nint vend_one(void) { return ONE + TWO - 2; }\n")
+    assert_eq(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().compiled, 1)
+    put(dir + "/app/vendor/two.h", "#define TWO (1 + 1)\n")
+    assert_eq(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().compiled, 1)
+    assert_eq(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    // A flag changed compiles every source of the library again; back, the old objects are kept.
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\", \"vendor/one.c\"]\n    cflags = [\"-DFLAGGED\"]", "")
+    val flagged = ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap()
+    assert_eq(flagged.compiled, 2)
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\", \"vendor/one.c\"]", "")
+    assert_eq(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    // The same source in a second package, anywhere, is the same object: it is compiled no more.
+    vend_package(dir + "/elsewhere", "copy", "sources = [\"vendor/vend.c\", \"vendor/one.c\"]", "")
+    for f in ["vend.c", "one.c", "one.h", "two.h"]
+        put(dir + "/elsewhere/copy/vendor/" + f, read_text(dir + "/app/vendor/" + f).unwrap())
+    val copied = ensure_c_sources(tc, loaded_c(dir + "/elsewhere/copy")).unwrap()
+    assert_eq(copied.compiled, 0)
+    assert_eq(joined(copied.objects), joined(ensure_c_sources(tc, loaded_c(dir + "/app")).unwrap().objects))
+
+@test("a source compiled for two targets in one cache is two objects named by their target, each found by its own target only, and an old-format entry is never read")
+source_cache_by_target()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val mac = own_cache(dir).for_target("aarch64-macos")
+    val linux = mac.for_target("x86_64-linux")
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\"]", "")
+    put(dir + "/app/vendor/vend.c", VendSource)
+    val first = ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap()
+    assert_eq(first.compiled, 1)
+    assert(first.objects[0].contains("/csources/aarch64-macos-"), first.objects[0])
+    // The other target does not reuse it.
+    val second = ensure_c_sources(linux, loaded_c(dir + "/app")).unwrap()
+    assert_eq(second.compiled, 1)
+    assert(second.objects[0].contains("/csources/x86_64-linux-"), second.objects[0])
+    assert(second.objects[0] != first.objects[0])
+    // Each finds its own again, and compiles nothing.
+    assert_eq(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    assert_eq(ensure_c_sources(linux, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    assert_eq(joined(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().objects), joined(first.objects))
+    // An object of the old format, a key with no target in its name, is never found: a stale file
+    // named as the new name without the target prefix changes nothing.
+    val stale = first.objects[0].replace_all("aarch64-macos-", "")
+    put(stale, "not an object")
+    assert_eq(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().compiled, 0)
+    assert_eq(joined(ensure_c_sources(mac, loaded_c(dir + "/app")).unwrap().objects), joined(first.objects))
+
+@test("a source two packages of one program ship is compiled once and linked once, and the program runs")
+source_shared_by_two_packages()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\"]", "dependencies {\n  lib { path = \"../lib\" }\n}\n")
+    put(dir + "/app/vendor/vend.c", VendSource)
+    put(dir + "/app/main.avin", "import lib\n\n@c(\"int vend_twice(int n)\")\nvtwice(n: int) -> int\n\nmain()\n  println(vtwice(lib.half()))\n")
+    put(dir + "/lib/avin.hocon", "package { name = \"lib\", version = \"0.1.0\" }\nc-libraries {\n  vend {\n    sources = [\"vendor/vend.c\"]\n    include = [\"vendor\"]\n    headers = [\"vend.h\"]\n  }\n}\n")
+    put(dir + "/lib/lib/lib.avin", "module lib\n\n@c(\"int vend_twice(int n)\")\nvtwice(n: int) -> int\n\nhalf() -> int = vtwice(21) / 2\n")
+    put(dir + "/lib/vendor/vend.h", VendHeader)
+    put(dir + "/lib/vendor/vend.c", VendSource)
+    val c = loaded_c(dir + "/app")
+    assert_eq(c.len(), 2)
+    val tc = own_cache(dir)
+    val first = ensure_c_sources(tc, c).unwrap()
+    assert_eq(first.compiled, 1)
+    assert_eq(first.objects.len(), 1)
+    // Compiled with -j1 the answer is the same.
+    assert_eq(ensure_c_sources_with(own_cache(dir + "/serial"), c, 1).unwrap().compiled, 1)
+    val built = build(repository_toolchain(), ["avin", "build", dir + "/app", "-o", dir + "/program"])
+    assert_eq(built.status, 0, built.noted)
+    prints(dir + "/program", "42\n")
+
+@test("`avin run` builds the program anew when a source, or a header it includes, is edited")
+run_sees_edits()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    vend_package(dir, "app", "sources = [\"vendor/vend.c\"]", "")
+    put(dir + "/app/vendor/vend.c", "#include \"vend.h\"\n#include \"factor.h\"\nint vend_twice(int n) { return n * FACTOR; }\n")
+    put(dir + "/app/vendor/factor.h", "#define FACTOR 2\n")
+    assert_eq(ran(tc, dir, "app"), "42\n")
+    assert_eq(ran(tc, dir, "app"), "42\n")
+    put(dir + "/app/vendor/vend.c", "#include \"vend.h\"\n#include \"factor.h\"\nint vend_twice(int n) { return n * FACTOR + 1; }\n")
+    assert_eq(ran(tc, dir, "app"), "43\n")
+    put(dir + "/app/vendor/factor.h", "#define FACTOR 3\n")
+    assert_eq(ran(tc, dir, "app"), "64\n")
+
+@test("a C library's sources differ by machine through its `if`: each machine compiles the entries that hold there")
+sources_by_machine()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    put(dir + "/app/avin.hocon", "package { name = \"app\", version = \"0.1.0\" }\nc-libraries {\n  vend { include = [\"vendor\"], headers = [\"vend.h\"], sources = [\"vendor/common.c\"] }\n  vend-macos { if = \"macos\", sources = [\"vendor/macos.c\"] }\n  vend-linux { if = \"linux\", sources = [\"vendor/linux/*.c\"] }\n}\n")
+    put(dir + "/app/main.avin", "@c(\"int vend_twice(int n)\")\nvtwice(n: int) -> int\n\nmain()\n  println(vtwice(21))\n")
+    put(dir + "/app/vendor/vend.h", VendHeader)
+    put(dir + "/app/vendor/common.c", "#include \"vend.h\"\nint vend_factor(void);\nint vend_twice(int n) { return n * vend_factor(); }\n")
+    put(dir + "/app/vendor/macos.c", "int vend_factor(void) { return 2; }\n")
+    put(dir + "/app/vendor/linux/linux.c", "int vend_factor(void) { return 3; }\n")
+    for (target, wanted) in [("aarch64-macos", "vend:vendor/common.c vend-macos:vendor/macos.c"), ("x86_64-linux", "vend:vendor/common.c vend-linux:vendor/linux/*.c"), ("aarch64-linux", "vend:vendor/common.c vend-linux:vendor/linux/*.c")]
+        val c = load_package_with(dir + "/app", default_fetching(), choice_for(default_features(), target)).unwrap().c
+        var seen = ""
+        for library in c
+            for s in library.sources
+                seen = seen + (if seen == "" then "" else " ") + library.label + ":" + s
+        assert_eq(seen, wanted, target)
+    // Built here, the machine's own source is the one in the program.
+    val built = build(repository_toolchain(), ["avin", "build", dir + "/app", "-o", dir + "/program"])
+    assert_eq(built.status, 0, built.noted)
+    prints(dir + "/program", if os() == MacOS then "42\n" else "63\n")
+
+@test("a source missing, a pattern matching nothing, C that does not compile, a flag clang refuses and sources beside dynamic-only stop the build with what is wrong")
+source_errors()
+    val dir = make_temp_dir("avin-csrc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = repository_toolchain()
+    // A package's directory is named as the file system resolves it (`/private/var` on macOS).
+    val real = canonicalize(dir).unwrap()
+    vend_package(dir, "missing", "sources = [\"vendor/vend.c\", \"vendor/none.c\"]", "")
+    put(dir + "/missing/vendor/vend.c", VendSource)
+    val missing = "error: the source `vendor/none.c` of the C library `vend` of package `missing` is not there: `" + real + "/missing/vendor/none.c`"
+    noted_error(build(tc, ["avin", "build", dir + "/missing", "-o", dir + "/program"]), missing)
+    noted_error(build(tc, ["avin", "check", dir + "/missing"]), missing)
+    vend_package(dir, "nothing", "sources = [\"vendor/*.cpp\"]", "")
+    val nothing = "error: the sources `vendor/*.cpp` of the C library `vend` of package `nothing` match no file: `" + real + "/nothing/vendor/*.cpp`"
+    noted_error(build(tc, ["avin", "build", dir + "/nothing", "-o", dir + "/program"]), nothing)
+    noted_error(build(tc, ["avin", "check", dir + "/nothing"]), nothing)
+    // C that does not compile: clang's words, naming the file and the line, after the package.
+    vend_package(dir, "broken", "sources = [\"vendor/vend.c\", \"vendor/fine.c\"]", "")
+    put(dir + "/broken/vendor/vend.c", "#include \"vend.h\"\n\nint vend_twice(int n) { return n * 2 }\n")
+    put(dir + "/broken/vendor/fine.c", "int vend_fine(void) { return 1; }\n")
+    val broken = build(tc, ["avin", "build", dir + "/broken", "-o", dir + "/program"])
+    noted_error(broken, "error: the source `vendor/vend.c` of the C library `vend` of package `broken` does not compile:")
+    assert(broken.noted.contains("/broken/vendor/vend.c:3:"), broken.noted)
+    assert(broken.noted.contains("expected ';'"), broken.noted)
+    // A missing header is clang's to say too.
+    put(dir + "/broken/vendor/vend.c", "#include \"nowhere.h\"\nint vend_twice(int n) { return n * 2; }\n")
+    val unheaded = build(tc, ["avin", "build", dir + "/broken", "-o", dir + "/program"])
+    noted_error(unheaded, "error: the source `vendor/vend.c` of the C library `vend` of package `broken` does not compile:")
+    assert(unheaded.noted.contains("'nowhere.h' file not found"), unheaded.noted)
+    // A flag of a kind a package gives, which clang refuses.
+    vend_package(dir, "flagged", "sources = [\"vendor/vend.c\"]\n    cflags = [\"-std=c77\"]", "")
+    put(dir + "/flagged/vendor/vend.c", VendSource)
+    val flagged = build(tc, ["avin", "build", dir + "/flagged", "-o", dir + "/program"])
+    noted_error(flagged, "error: the source `vendor/vend.c` of the C library `vend` of package `flagged` does not compile:")
+    assert(flagged.noted.contains("c77"), flagged.noted)
+    // A flag that is not a package's to give is refused in the manifest, at the flag.
+    vend_package(dir, "refused", "sources = [\"vendor/vend.c\"]\n    cflags = [\"-Ivendor\"]", "")
+    noted_error(build(tc, ["avin", "build", dir + "/refused", "-o", dir + "/program"]), "`-Ivendor` names an include directory, which a C library names in `include`")
+    noted_error(build(tc, ["avin", "check", dir + "/refused"]), "`-Ivendor` names an include directory")
+    vend_package(dir, "lgpl", "sources = [\"vendor/vend.c\"]\n    dynamic-only = \"LGPL-2.1\"", "")
+    noted_error(build(tc, ["avin", "build", dir + "/lgpl", "-o", dir + "/program"]), "the C library `vend` names both `sources` and `dynamic-only`")
+    // Absolute and `..` paths are refused by build and check alike.
+    vend_package(dir, "outside", "sources = [\"../elsewhere.c\"]", "")
+    noted_error(build(tc, ["avin", "build", dir + "/outside", "-o", dir + "/program"]), "`../elsewhere.c` leaves the package's directory")
+    noted_error(build(tc, ["avin", "check", dir + "/outside"]), "`../elsewhere.c` leaves the package's directory")
+    vend_package(dir, "rooted", "sources = [\"/tmp/elsewhere.c\"]", "")
+    noted_error(build(tc, ["avin", "build", dir + "/rooted", "-o", dir + "/program"]), "`/tmp/elsewhere.c` is absolute")

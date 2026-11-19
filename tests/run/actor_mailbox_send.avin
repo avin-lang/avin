@@ -1,0 +1,156 @@
+// expect: exit 0
+// `send` waits while a bounded mailbox is full: it resumes once the actor takes a message and there is
+// room, answering `Ok`; with a timeout it answers `Err(TimedOut)` where no room comes in time, with
+// nothing put in the mailbox, and a timeout of zero or less is `offer`. A sender waiting when the actor
+// ends is told `Err(Ended)`. A cancelled sender stops at once and leaves nothing in the mailbox. An
+// actor sending to its own full mailbox has `Err(Full)` at once, since nothing could make room while it
+// waits. Senders waiting in turn each get in as room frees, one sender's messages in the order sent.
+import avin.actors.{ActorRef, Bounded, DropNewest, SendError, spawn}
+import avin.threads.{Atomic, Future, Promise, scope, sleep}
+import avin.threads as threads
+import avin.time
+
+data Msg
+  Hold(started: Promise[unit], release: Future[unit], quit: bool)
+  Note(n: int)
+  Show(seen: Promise[string])
+  Itself(answer: Promise[string])
+  Check(answer: Promise[string])
+
+// How many notes `seen` holds, and whether each sender's, numbered by the hundreds, came in order.
+inOrder(seen: Buffer[int]) -> string
+  var ordered = true
+  for k in 0 ..< 4
+    val mine = seen.filter(n -> n / 100 == k)
+    for i in 1 ..< mine.length
+      if mine(i - 1) >= mine(i) then ordered = false
+  s"${seen.length} notes, in order $ordered"
+
+actor Recorder receives Msg
+  val seen = Buffer[int]()
+  receive
+    Hold(started, release, quit) ->
+      started.complete(())
+      release.await()
+      if quit then stop()
+    Note(n) -> seen.append(n)
+    Show(p) -> p.complete(s"$seen")
+    Itself(answer) ->
+      self.tell(Note(-1))
+      val first = said(self.send(Note(-2)))
+      val timed = said(self.send(Note(-3), time.seconds(5)))
+      answer.complete(s"$first, $timed")
+    Check(answer) -> answer.complete(inOrder(seen))
+
+hold(r: ActorRef[Msg], quit: bool = false) -> Promise[unit]
+  val started = Promise[unit]()
+  val release = Promise[unit]()
+  r.tell(Hold(started, release.future, quit))
+  started.future.await()
+  release
+
+show(r: ActorRef[Msg]) -> string
+  val p = Promise[string]()
+  _ = r.send(Show(p))
+  p.future.await()
+
+said(r: Result[unit, SendError]) -> string = r match
+  Ok(()) -> "ok"
+  Err(e) -> s"${e.message}"
+
+main()
+  val start = time.monotonic()
+  // A sender waits for room and resumes once the actor takes a message.
+  val r = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  var release = hold(r)
+  r.tell(Note(1))
+  val waiting = Atomic(0)
+  val sender = threads.spawn(() ->
+    waiting.store(1)
+    said(r.send(Note(2))))
+  while waiting.load() == 0 do sleep(time.millis(1))
+  sleep(time.millis(30))
+  // Still full: the waiting sender has not got in.
+  println(said(r.offer(Note(9))))
+  release.complete(())
+  println(sender.join())
+  println(show(r))
+
+  // Timed out: nothing is put in the mailbox.
+  release = hold(r)
+  r.tell(Note(3))
+  val before = time.monotonic()
+  println(said(r.send(Note(4), time.millis(50))))
+  println(time.monotonic() - before >= time.millis(50))
+  // Zero and less are `offer`.
+  println(said(r.send(Note(5), time.millis(0))))
+  println(said(r.send(Note(6), time.millis(-10))))
+  // A part of a millisecond is waited for.
+  println(said(r.send(Note(7), time.micros(1))))
+  release.complete(())
+  println(show(r))
+  // With room, a timed send gets in at once.
+  println(said(r.send(Note(8), time.seconds(5))))
+  println(show(r))
+
+  // A sender waiting when the actor ends is told so.
+  val q = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  val quitting = hold(q, quit = true)
+  q.tell(Note(1))
+  val waits = Atomic(0)
+  val enders = (0 ..< 3).toVector.map(i -> threads.spawn(() ->
+    waits.add(1)
+    said(if i == 0 then q.send(Note(2)) else q.send(Note(2), time.seconds(30)))))
+  while waits.load() < 3 do sleep(time.millis(1))
+  sleep(time.millis(30))
+  quitting.complete(())
+  for t in enders do println(t.join())
+  println(q.ended().await())
+
+  // A cancelled sender stops at once, and its message is not put in the mailbox.
+  val c = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  release = hold(c)
+  c.tell(Note(1))
+  val asking = Atomic(0)
+  val after = Atomic(0)
+  val ts = scope(s ->
+    val ts = (0 ..< 5).toVector.map(i -> s.spawn(() ->
+      asking.add(1)
+      val got = if i % 2 == 0 then c.send(Note(100 + i)) else c.send(Note(100 + i), time.seconds(30))
+      after.add(1)
+      got))
+    while asking.load() < 5 do sleep(time.millis(1))
+    sleep(time.millis(30))
+    s.cancel()
+    ts)
+  println(ts.count(t -> t.result().isEmpty))
+  println(after.load())
+  release.complete(())
+  // The room the cancelled senders left goes to the next sender.
+  println(said(c.send(Note(2), time.seconds(5))))
+  println(show(c))
+
+  // An actor sending to its own full mailbox.
+  val me = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  val answer = Promise[string]()
+  me.tell(Itself(answer))
+  println(answer.future.await())
+  println(show(me))
+
+  // Many senders waiting on a mailbox of one: each gets in, in turn, and each sender's messages
+  // arrive in the order sent.
+  val m = spawn(Recorder(), mailbox = Bounded(1, DropNewest))
+  release = hold(m)
+  val senders = (0 ..< 4).toVector.map(k -> threads.spawn(() ->
+    var oks = 0
+    for i in 0 ..< 25
+      if m.send(Note(k * 100 + i)) is Ok(_) then oks += 1
+    oks))
+  sleep(time.millis(30))
+  release.complete(())
+  println(senders.map(t -> t.join()))
+  val p = Promise[string]()
+  _ = m.send(Check(p))
+  println(p.future.await())
+  println(m.dropped())
+  println(time.monotonic() - start < time.seconds(20))

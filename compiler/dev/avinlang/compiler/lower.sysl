@@ -320,8 +320,9 @@ private struct Lowering
      * is not compiled. */
     dead: bool
     /** Set where the condition just lowered is a constant an `is` test's pattern decided at this
-     * copy, so the code holding its equalities can be left out; any other constant condition is
-     * compiled as written. */
+     * copy, so the code holding its equalities can be left out, or a test of a value of
+     * `avin.target`, the machine's, so the branch it does not take is; any other constant condition
+     * is compiled as written. */
     refuted: bool
     /** The packs of each variant with hidden type parameters at each instance of its type, by the
      * instance's and variant's key (`pack_key`), in the order the program makes them. */
@@ -7125,7 +7126,7 @@ private lower_kind(l: *Lowering, e: &TExpr, tail: bool) -> Option[Operand] = e.k
     // An opaque type and its representation are laid out alike, so the value is itself.
     Reveal(value) -> lower_expr(l, value)
     Logic(and, left, right) -> logic(l, and, left, right, tail)
-    Compare(operands, ops) -> compare_chain(l, operands, ops)
+    Compare(operands, ops, methods) -> compare_chain(l, operands, ops, methods)
     If(condition, yes, no) -> lower_if(l, e, condition, yes, no, tail)
     While(label, condition, body, otherwise) -> lower_while(l, e, label, condition, body, otherwise)
     Break(label, value) ->
@@ -7487,16 +7488,23 @@ private runtime_call(l: *Lowering, symbol: string, params: []MirType, result: Mi
     Value(dest)
 
 // A chain evaluates each operand when its link is reached, and the first false link decides.
-private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) -> Option[Operand]
+private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp], methods: Buf[Option[LinkMethod]]) -> Option[Operand]
+    // `target.os == MacOS` is decided here, as an `is` test on it is.
+    if ops.len() == 1 && (ops[0] is Equal || ops[0] is NotEqual) && same_type(operands[0].ty, operands[1].ty)
+        if target_variant(l, operands[0]) is Some(_) || target_variant(l, operands[1]) is Some(_)
+            if known_variant(l, operands[0]) is Some(a)
+                if known_variant(l, operands[1]) is Some(b)
+                    l.refuted = true
+                    return Some(ConstBool((a == b) == (ops[0] is Equal)))
     var previous = link_operand(l, operands[0])?
     if ops.len() == 1
         val next = link_operand(l, operands[1])?
-        return Some(compare_link(l, ops[0], operands[0].ty, operands[1].ty, previous, next))
+        return Some(chain_link(l, ops[0], methods[0], operands[0].ty, operands[1].ty, previous, next))
     val slot = new_slot(l, Bool)
     val done = new_block(l)
     for i in 0..<ops.len()
         val next = link_operand(l, operands[i + 1])?
-        val result = compare_link(l, ops[i], operands[i].ty, operands[i + 1].ty, previous, next)
+        val result = chain_link(l, ops[i], methods[i], operands[i].ty, operands[i + 1].ty, previous, next)
         store(l, slot, Some(result))
         if i + 1 < ops.len()
             val more = new_block(l)
@@ -7504,6 +7512,16 @@ private compare_chain(l: *Lowering, operands: Buf[&TExpr], ops: Buf[CompareOp]) 
         previous = next
     finish_into(l, Jump(done), done)
     load(l, slot)
+
+/** One link of a chain on its operands' values `a` and `b`: the operator method the link calls, given
+ * the values through its two locals, or the built-in comparison. */
+private chain_link(l: *Lowering, op: CompareOp, method: Option[LinkMethod], x: &Type, y: &Type, a: Operand, b: Operand) -> Operand
+    val m = method match
+        Some(m) -> m
+        None -> return compare_link(l, op, x, y, a, b)
+    bind_local(l, m.left, Some(a))
+    bind_local(l, m.right, Some(b))
+    lower_expr(l, m.call).unwrap_or(ConstBool(false))
 
 private lower_if(l: *Lowering, e: &TExpr, condition: &TExpr, yes: &TExpr, no: Option[&TExpr], tail: bool) -> Option[Operand]
     l.refuted = false
@@ -7625,6 +7643,10 @@ private continue_if(l: *Lowering, condition: Operand, fail: usize)
 // checker has proved the arms cover every value, so falling past the last arm traps rather than
 // continuing.
 private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm], tail: bool) -> Option[Operand]
+    // A `match` on a value of `avin.target` compiles only the arm the machine takes.
+    if target_variant(l, subject) is Some(variant)
+        if taken_arm(arms, variant) is Some(k)
+            return lower_taken_arm(l, e, subject, arms[k], tail)
     val s = lower_expr(l, subject)
     if s is None && machine(l, subject.ty) is Some(_) then return None
     val slot = new_slot(l, e.ty)
@@ -7649,6 +7671,88 @@ private lower_match(l: *Lowering, e: &TExpr, subject: &TExpr, arms: Buf[TArm], t
             finish_into(l, Jump(join), fail)
             l.refined.truncate(depth)
         l.pack_choice = outer
+    l.dead = false
+    finish_into(l, trap_at(l, "no arm of the match took the value", e.span), join)
+    load(l, slot)
+
+// The machine's values. `avin.target.os` and `avin.target.arch` are each declared in the file of
+// `avin.target` read on the machines it is true of, so the value a program reads is the machine it is
+// compiled for, known now: a `match`, an `is` test and an `==` or `!=` on one are decided as the
+// program is compiled, at every optimization level, and the branches the machine does not take are not
+// compiled. Both were checked; this only leaves out what this machine never runs.
+
+/** The module whose values are the machine's. */
+const TargetModule: string = "avin.target"
+
+/** The variant a read of a value of `avin.target` is, or `None` where `e` is no such read. */
+private target_variant(l: *Lowering, e: &TExpr) -> Option[usize]
+    val g = e.kind match
+        Global(g) -> g
+        _ -> return None
+    val global = l.program.globals[g]
+    if global.module_name != TargetModule || global.mutable || global.lazy || global.object is Some(_) then return None
+    l.program.functions[global.init].body match
+        Some(body) -> constructed_variant(body)
+        None -> None
+
+/** The variant `e` is where it is known now: a value of `avin.target`, or a variant with no fields
+ * written as it is. */
+private known_variant(l: *Lowering, e: &TExpr) -> Option[usize]
+    if target_variant(l, e) is Some(v) then return Some(v)
+    constructed_variant(e)
+
+// The variant `e` makes, where it is a variant with no fields.
+private constructed_variant(e: &TExpr) -> Option[usize] = e.kind match
+    Construct(variant, args, _) -> if args.len() == 0 then Some(variant) else None
+    Block(items) -> if items.len() == 1 then constructed_variant(items[0]) else None
+    _ -> None
+
+/** Whether `p` matches a value made by the variant `variant` with no fields, where that is known
+ * without the value: `None` for a pattern that asks more. */
+private decided_pattern(p: &TPattern, variant: usize) -> Option[bool] = p.kind match
+    PWildcard -> Some(true)
+    PBind(_) -> Some(true)
+    PVariant(v, fields, _) -> if fields.len() == 0 then Some(v == variant) else None
+    PNamed(_, inner) -> decided_pattern(inner, variant)
+    PAlternatives(options) ->
+        var unknown = false
+        for o in options
+            decided_pattern(o, variant) match
+                Some(true) -> return Some(true)
+                Some(false) -> ()
+                None -> unknown = true
+        if unknown then None else Some(false)
+    _ -> None
+
+// Whether `p` binds the value it matches to a name.
+private binds_whole(p: &TPattern) -> bool = p.kind match
+    PBind(_) -> true
+    PNamed(_, _) -> true
+    _ -> false
+
+/** The arm of `arms` a value made by `variant` takes, where every arm before it is known not to match
+ * and it is known to, with no guard; `None` where that is not known without the value. */
+private taken_arm(arms: Buf[TArm], variant: usize) -> Option[usize]
+    for k in 0..<arms.len()
+        decided_pattern(arms[k].pattern, variant) match
+            Some(true) -> return if arms[k].guard is Some(_) then None else Some(k)
+            Some(false) -> ()
+            None -> return None
+    None
+
+// The arm a `match` on a value of `avin.target` takes, alone: a pattern binding the value binds it.
+private lower_taken_arm(l: *Lowering, e: &TExpr, subject: &TExpr, arm: TArm, tail: bool) -> Option[Operand]
+    val slot = new_slot(l, e.ty)
+    if !binds_whole(arm.pattern)
+        store(l, slot, lower_at(l, arm.body, tail))
+        if *arm.body.ty is Nothing then l.dead = true
+        return load(l, slot)
+    val s = lower_expr(l, subject)
+    val join = new_block(l)
+    val fail = new_block(l)
+    test_pattern(l, arm.pattern, s, fail)
+    store(l, slot, lower_at(l, arm.body, tail))
+    finish_into(l, Jump(join), fail)
     l.dead = false
     finish_into(l, trap_at(l, "no arm of the match took the value", e.span), join)
     load(l, slot)
@@ -7708,6 +7812,13 @@ private keep_refinements(l: *Lowering, p: &TPattern) -> bool
     true
 
 private lower_is(l: *Lowering, value: &TExpr, pattern: &TPattern, negated: bool) -> Option[Operand]
+    // An `is` test on a value of `avin.target` is decided here, and the branch it does not take is
+    // not compiled (`lower_if`, `logic`).
+    if target_variant(l, value) is Some(variant)
+        if !binds_whole(pattern)
+            if decided_pattern(pattern, variant) is Some(holds)
+                l.refuted = true
+                return Some(ConstBool(holds != negated))
     val v = lower_expr(l, value)
     if v is None && machine(l, value.ty) is Some(_) then return None
     // A pattern no value of the instance can match fails at this copy, and the code that holds its

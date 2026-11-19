@@ -1,0 +1,62 @@
+// expect: exit 0
+// env: AVIN_GC_STRESS=0
+// A selector of a thousand channels waits on them all at once: whichever another thread sends on
+// wakes it, with the right key, and the others keep their values. Of several entries always ready,
+// each runs, none starved: the entries are tried in a random order each wait. Rebuilding the set each
+// wait and keeping it give the same answers. Rebuilding a thousand entries a thousand times makes a
+// million allocations, which collecting at every one takes past the corpus' minute, so this runs
+// without GC stress; selector_many_stress.avin runs the same shapes at a hundred channels under it.
+import avin.threads.{Channel, Selector, sleep, spawn}
+import avin.time.millis
+
+main()
+  val n = 1000
+  val chans = Vector.tabulate(n, i -> Channel[int](1))
+  val sel = Selector[int]()
+  val entries = Vector.tabulate(n, i -> sel.receive(chans(i), i))
+  println(sel.size, sel.poll())
+
+  // Values sent from another thread, one at a time, in an order unlike the keys'.
+  val order = Vector.tabulate(20, k -> (k * 337 + 11) % n)
+  val sender = spawn(() ->
+    for i in order
+      sleep(millis(1))
+      chans(i).send(i * 2))
+  var right = 0
+  for i in order
+    val k = sel.wait()
+    if k == i && entries(k).received() == Some(i * 2) then right += 1
+  sender.join()
+  println(right)
+
+  // Values already waiting on many channels at once: each wait takes one, and all are taken.
+  for i in 0 ..< n do chans(i).send(i)
+  var sum = 0
+  var taken = 0
+  while sel.poll() is Some(k)
+    sum += entries(k).received().getOrElse(0)
+    taken += 1
+  println(taken, sum == n * (n - 1) / 2)
+
+  // Fairness: ten entries always ready, over many waits; each runs often.
+  val always = Vector.tabulate(10, i -> Channel[int](1))
+  val fair = Selector[int]()
+  for i in 0 ..< 10 do fair.send(always(i), 0, i)
+  val counts = Array.tabulate(10, i -> 0)
+  for round in 0 ..< 5000
+    val k = fair.wait()
+    counts(k) += 1
+    always(k).receive()
+    fair.send(always(k), 0, k)
+  println(counts.forall(c -> c > 300), counts.sum)
+
+  // A rebuilt set each wait: the same channels, cleared and added afresh.
+  for i in 0 ..< n do chans(i).send(i)
+  var rebuilt = 0
+  loop
+    sel.clear()
+    for i in 0 ..< n do sel.receive(chans(i), i)
+    sel.poll() match
+      Some(_) -> rebuilt += 1
+      None -> break
+  println(rebuilt)

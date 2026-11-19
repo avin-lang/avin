@@ -1,0 +1,133 @@
+// expect: exit 0
+// An arm of a select may end in an `if` guard. A true guard leaves the arm as it would be without
+// one; a false one makes it absent: its channel, stream and value are not evaluated, nothing of it is
+// watched, and it never runs. Every kind of arm takes one: a receive with each pattern, a send,
+// `readable()`, `writable()` and `after`. Guards are evaluated once, in the order the arms are
+// written, each before the rest of its arm.
+import avin.threads.{Channel, Readiness, Writability}
+import avin.time.{hours, millis}
+
+// Ready while its flag is up; it has no descriptor.
+class Flag(var up: bool): Readiness, Writability
+  override readable() -> bool = up
+  override readinessDescriptor() -> int = -1
+  override writable() -> bool = up
+  override writabilityDescriptor() -> int = -1
+
+val log = Buffer[string]()
+
+// Notes that `what` was evaluated, and answers `x`.
+seen[T](what: string, x: T) -> T
+  log.append(what)
+  x
+
+main()
+  val a = Channel[int](4)
+  val b = Channel[int](4)
+  a.send(1)
+  b.send(2)
+
+  // A receive arm with a true guard runs; one with a false guard never does, though its channel has
+  // a value, which stays.
+  println(select
+    a.receive() as Some(x) if false -> s"a $x"
+    b.receive() as Some(y) if true -> s"b $y")
+  println(select
+    a.receive() as Some(x) if true -> s"a $x"
+    b.receive() as Some(y) if false -> s"b $y"
+    else "none")
+  println(select
+    a.receive() as Some(x) if false -> s"a $x"
+    else "nothing ready")
+
+  // Each receive pattern under a guard binds as without one.
+  a.send(3)
+  println(select
+    a.receive() as got if 1 < 2 -> s"named $got")
+  a.send(4)
+  println(select
+    a.receive() as _ if true -> "wildcard")
+  a.send(5)
+  println(select
+    a.receive() if true -> "no pattern")
+  a.close()
+  println(select
+    a.receive() as None if true -> "closed")
+  println(select
+    a.receive() as None if false -> "closed"
+    else "closed arm off")
+
+  // A send arm: a true guard sends; a false one sends nothing, and its value is never evaluated.
+  val c = Channel[int](1)
+  println(select
+    c.send(seen("value 10", 10)) if false -> "sent 10"
+    c.send(seen("value 20", 20)) if true -> "sent 20")
+  println(c.tryReceive(), log.toVector)
+  log.clear()
+
+  // `readable()` and `writable()` arms under guards.
+  val up = Flag(true)
+  println(select
+    up.readable() if false -> "readable"
+    up.writable() if true -> "writable")
+  println(select
+    up.readable() if true -> "readable"
+    up.writable() if false -> "writable")
+  println(select
+    up.readable() if false -> "readable"
+    up.writable() if false -> "writable"
+    else "both off")
+
+  // An `after` with a true guard is the select's timeout; with a false one the select waits until an
+  // arm runs, as one with no `after` does.
+  val d = Channel[int](1)
+  println(select
+    d.receive() as Some(x) -> s"d $x"
+    after millis(10) if true -> "timed out")
+  d.send(7)
+  println(select
+    d.receive() as Some(x) -> s"d $x"
+    after millis(0) if false -> "timed out")
+
+  // Every arm off but an `after`: the select waits its time. Every arm and the `after` off but an
+  // `else`: the `else` runs.
+  println(select
+    d.receive() if false -> "d"
+    after millis(5) -> "waited")
+  println(select
+    d.receive() if false -> "d"
+    else "else")
+
+  // Evaluation order: each guard, then the rest of its arm, arm by arm as written. An arm whose guard
+  // is false has nothing else evaluated: not its channel, not its value. Each guard is evaluated once.
+  val e = Channel[int](4)
+  val r = select
+    seen("channel 0", e).send(seen("value 0", 0)) if seen("guard 0", true) -> "arm 0"
+    seen("channel 1", e).send(seen("value 1", 1)) if seen("guard 1", false) -> "arm 1"
+    seen("channel 2", e).receive() as Some(x) if seen("guard 2", true) -> s"arm 2 $x"
+    after seen("duration", hours(1)) if seen("guard after", true) -> "after"
+  println(r, log.toVector)
+  log.clear()
+
+  // Guards are evaluated afresh each time a select is reached, here in a loop.
+  val f = Channel[int](8)
+  for i in 0 ..< 6 do f.send(i)
+  var odd = 0
+  var even = 0
+  for i in 0 ..< 6
+    select
+      f.receive() as Some(x) if i % 2 == 0 -> even += x
+      f.receive() as Some(x) if i % 2 == 1 -> odd += x
+  println(even, odd)
+
+  // A guard may name what an earlier statement set, and a select nested in a guarded arm's body has
+  // guards of its own.
+  val g = Channel[string](2)
+  g.send("outer")
+  val wanted = true
+  println(select
+    g.receive() as Some(s) if wanted ->
+      select
+        g.receive() as Some(t) if false -> s"$s $t"
+        else s"$s, inner off"
+    after hours(1) if !wanted -> "never")

@@ -1,0 +1,50 @@
+// expect: exit 0
+// A stash under a bounded mailbox: messages set aside leave the mailbox, so they make room, and those
+// `unstashAll` gives back do not count against the bound, which they have passed once already: more
+// than the capacity come back at once and none is dropped. Messages told meanwhile still meet the bound.
+import avin.actors.{ActorRef, Bounded, DropNewest, Stash, spawn}
+import avin.threads.{Future, Promise}
+
+data Msg
+  Write(n: int)
+  Ready(started: Promise[unit], release: Future[unit])
+  Show(seen: Promise[string])
+
+actor Writer receives Msg
+  val waiting = Stash(self, 100)
+  val written = Buffer[int]()
+  var ready = false
+
+  receive
+    Write(n) ->
+      if ready then written.append(n) else waiting.add(Write(n))
+    Ready(started, release) ->
+      ready = true
+      waiting.unstashAll()
+      started.complete(())
+      release.await()
+    Show(p) -> p.complete(s"${waiting.length} stashed, written $written")
+
+show(w: ActorRef[Msg]) -> string
+  val p = Promise[string]()
+  _ = w.send(Show(p))
+  p.future.await()
+
+main()
+  val w = spawn(Writer(), mailbox = Bounded(2, DropNewest))
+  // Each write is taken and stashed, so ten pass through a mailbox of two.
+  for i in 1 .. 10 do _ = w.send(Write(i))
+  println(show(w))
+  println(w.dropped())
+  // Ten given back at once, while the actor holds: the mailbox still takes two more, and drops the
+  // third.
+  val started = Promise[unit]()
+  val release = Promise[unit]()
+  w.tell(Ready(started, release.future))
+  started.future.await()
+  w.tell(Write(11))
+  w.tell(Write(12))
+  w.tell(Write(13))
+  println(w.dropped())
+  release.complete(())
+  println(show(w))

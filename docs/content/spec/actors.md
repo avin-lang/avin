@@ -102,19 +102,22 @@ main() -> int
 ```
 
 - **`spawn[M](behaviour: Behaviour[M], onFailure: Supervision = Escalate, executor: Executor =
-  Executor.shared()) -> ActorRef[M]`** starts the actor and gives back its reference at once; the
-  body runs on the executor's threads, and messages sent before it has finished queue behind it.
-  Called by code an actor is running, `spawn` starts a **child** of that actor; called anywhere else
-  (`main`, a thread, a future's body) it starts a **top-level** actor.
+  Executor.shared(), mailbox: Mailbox = Unbounded) -> ActorRef[M]`** starts the actor and gives back
+  its reference at once; the body runs on the executor's threads, and messages sent before it has
+  finished queue behind it. Called by code an actor is running, `spawn` starts a **child** of that
+  actor; called anywhere else (`main`, a thread, a future's body) it starts a **top-level** actor.
+  `mailbox` [bounds](#bounded-mailboxes) the messages that may wait.
 - **`tell(message: M)`** puts the message in the actor's mailbox and returns at once; it never waits
-  and never fails. `!` is a reserved spelling in Avin, so there is no operator for it, and `tell` is
+  and never fails. A tell to a full [bounded mailbox](#bounded-mailboxes) is dropped as its overflow
+  policy says. `!` is a reserved spelling in Avin, so there is no operator for it, and `tell` is
   written infix where that reads better (`counter tell Reset`).
 - **`ask[R: Sendable](make: ActorRef[R] -> M, timeout: Duration) -> Future[Result[R, AskError]]`**
   makes a reference that accepts one reply, builds the message around it with `make`, sends it, and
   gives back the future of the reply. The first message to the reply reference completes the future
   with `Ok`; any later one is dropped. `AskError` is `TimedOut` where no reply arrived within
-  `timeout`, and `Ended` where the asked actor had already ended, so the message could not be
-  delivered. The timeout is required: an ask always ends.
+  `timeout`, `Ended` where the asked actor had already ended, so the message could not be
+  delivered, and `Full` where its bounded mailbox was full, so the question was not put in it. The
+  timeout is required: an ask always ends.
 - **A reply address is an ordinary `ActorRef[R]`.** An actor that asks another passes the reply
   reference `ask` makes, or its own `self` where its message type is `R`, or an **adapter**:
   `adapter[R: Sendable](f: R -> M) -> ActorRef[R]`, called in an actor, makes a reference whose
@@ -142,12 +145,93 @@ actor that sent, or stops the program where `main` or a thread sent.
 
 ### Mailboxes and order
 
-A mailbox is an unbounded queue. **Two messages one sender sends to one actor arrive in the order
-they were sent**; messages from different senders interleave in any order. A message sent to an
-actor that has ended is dropped, since an actor ending while messages are on their way to it is an
-ordinary race and not a bug; a program that needs to know when an actor ends [watches](#lifecycle)
-it, and an ask of one completes with `Ended`. Mailboxes are not bounded: a producer that must not
-outrun its consumer asks rather than tells, and waits for each answer, or for every *n*th.
+A mailbox is a queue, unbounded unless the actor was given a bound. **Two messages one sender sends
+to one actor arrive in the order they were sent**; messages from different senders interleave in any
+order. A message sent to an actor that has ended is dropped, since an actor ending while messages
+are on their way to it is an ordinary race and not a bug; a program that needs to know when an
+actor ends [watches](#lifecycle) it, and an ask of one completes with `Ended`.
+
+### Bounded mailboxes
+
+An unbounded mailbox lets a fast sender grow a slow actor's memory without limit. An actor spawned
+with **`mailbox = Bounded(capacity, overflow)`** holds at most `capacity` of the messages its
+references send, and its senders choose how to meet a full one:
+
+```avin run
+import avin.actors.{Bounded, DropOldest, spawn}
+import avin.threads.{Future, Promise}
+import avin.time
+
+data Reading
+  Pause(started: Promise[unit], resume: Future[unit])
+  Value(n: int)
+  Latest(values: Promise[string])
+
+actor Gauge receives Reading
+  val values = Buffer[int]()
+  receive
+    Pause(started, resume) ->
+      started.complete(())
+      resume.await()
+    Value(n) -> values.append(n)
+    Latest(p) -> p.complete(s"$values")
+
+main()
+  val gauge = spawn(Gauge(), mailbox = Bounded(3, DropOldest))
+  val started = Promise[unit]()
+  val resume = Promise[unit]()
+  gauge.tell(Pause(started, resume.future))
+  started.future.await()
+  for n in 1 .. 5 do gauge tell Value(n)
+  println(gauge.offer(Value(6)))
+  println(gauge.dropped())
+  resume.complete(())
+  val latest = Promise[string]()
+  println(gauge.send(Latest(latest), time.seconds(5)))
+  println(latest.future.await())
+```
+
+```text output
+Err(the actor's mailbox was full)
+2
+Ok(())
+[3, 4, 5]
+```
+
+- **`data Mailbox`** is `Unbounded`, the default, or **`Bounded(capacity: int, overflow:
+  Overflow)`**. A capacity less than one traps in `spawn`. The bound is the actor's for its whole
+  life: a [restart](#supervision) keeps the mailbox, the messages in it and its bound.
+- **`tell` never waits**, so a tell to a full mailbox is settled by the **`Overflow`**: **`DropNewest`**
+  drops the message told, and **`DropOldest`** drops the oldest message waiting that a reference
+  sent, and puts the one told at the back. Either way the message dropped is gone as a message sent
+  to an ended actor is; a question among them times out.
+- **`offer(message: M) -> Result[unit, SendError]`** puts the message in only where there is room
+  now, and never waits: `Err(Full)` where the mailbox is full, `Err(Ended)` where the actor has
+  ended, the message then put nowhere and its handles still the sender's. An unbounded mailbox is
+  never full.
+- **`send(message: M) -> Result[unit, SendError]`** waits while the mailbox is full until the actor
+  takes a message and there is room, the backpressure a producer that must not outrun its consumer
+  wants; **`send(message: M, timeout: Duration)`** waits at most `timeout`, answering `Err(TimedOut)`
+  where no room came, and a timeout of zero or less is `offer`. A sender waiting when the actor ends
+  is told `Err(Ended)`. The wait parks only the waiting thread, counts for the
+  [deadlock check](/spec/threads/#deadlock), and is a [cancellation
+  point](/spec/threads/#cancellation): a cancelled sender stops there and leaves nothing in the
+  mailbox. Senders waiting are let in as room frees, each sender's messages in the order it sent
+  them. An actor that sends to its own full mailbox has `Err(Full)` at once, since nothing could make
+  room while its turn waits; to an unbounded or roomy one, `send` is `tell` that answers.
+- **`ask` never waits for room** and never drops for it: an ask of a full mailbox completes at once
+  with `Err(Full)`, under either policy, rather than waiting out its timeout.
+- **`dropped() -> long`** on the reference counts the messages the overflow policy has dropped since
+  the actor started; a refused `offer` or `send`, and the messages dropped as the actor ends, are not
+  among them.
+- **What the actor arranged for itself is never refused.** A [watch](#lifecycle)'s notice of an end,
+  a [timer](#timers)'s message and a `pipeToSelf`'s message are put in the mailbox whatever it holds
+  and do not count against the bound, so a full mailbox drops no notice. A stop, a restart and a
+  child's failure are not messages, and a full mailbox never holds them back. The messages a
+  [stash](#setting-messages-aside) gives back have passed the bound once, and do not count against it
+  again.
+- `SendError` is `Full`, `TimedOut` or `Ended`; `Full` and `Ended` are names `AskError` has too, and
+  each is decided by the type expected where it is written.
 
 ## What may be sent
 
@@ -475,11 +559,12 @@ Ok(Squarer#2: 16)
 ```
 
 - **`Router.pool[M: Sendable](size: int, behaviour: Behaviour[M], routing: Routing[M] = RoundRobin,
-  onFailure: Supervision = Escalate, executor: Executor = Executor.shared()) -> ActorRef[M]`**
-  starts a router and `size` routees of `behaviour`, the router's children, and gives back the
-  router's reference at once. The router is a child of the code that calls `pool`, as `spawn`'s
-  actor is, and its reference is shown as `Router#n`, the router numbered before its routees. A
-  size less than one, and a `Restart` that `spawn` would refuse, trap in the calling code.
+  onFailure: Supervision = Escalate, executor: Executor = Executor.shared(), mailbox: Mailbox =
+  Unbounded) -> ActorRef[M]`** starts a router and `size` routees of `behaviour`, the router's
+  children, and gives back the router's reference at once. The router is a child of the code that
+  calls `pool`, as `spawn`'s actor is, and its reference is shown as `Router#n`, the router numbered
+  before its routees. A size less than one, a `Restart` that `spawn` would refuse, and a bounded
+  mailbox's capacity less than one, trap in the calling code.
 - **Each message sent to the router goes to one routee**, chosen by the `Routing`:
   - **`RoundRobin`**, the default: each routee in turn.
   - **`AtRandom`**: any routee, each equally likely.
@@ -491,6 +576,14 @@ Ok(Squarer#2: 16)
     and a routee that ends moves only its own keys to the others.
 - **Order.** Two messages one sender sends that go to one routee arrive in the order they were sent,
   so with `ByKey`, each key's messages from one sender are handled in order.
+- **A bounded pool.** A `Bounded` mailbox bounds the router's own mailbox and each routee's, at the
+  same capacity. The router waits for room in the routee it chose rather than drop, handling nothing
+  else meanwhile, so once the routees are full the router's own mailbox fills, and there the overflow
+  policy, `offer`, `send`, `ask` and `dropped()` act as for any [bounded
+  mailbox](#bounded-mailboxes): a pool of `n` routees of capacity `c` holds at most `(n + 1) × c`
+  messages waiting, and one more the router is placing. `RoundRobin`, `AtRandom` and `ByKey` wait on
+  the routee they chose; `SmallestMailbox` waits only when every routee is full, and its count is the
+  bounded mailbox's own.
 - **An ask through a router** is answered by the routee that takes the question; the reply goes to
   the asker's reply reference as any reply does. An ask of a router that has ended answers `Ended`.
 - **Supervision as a group.** Each routee is supervised by `onFailure` and runs on `executor`. A
@@ -738,6 +831,9 @@ Ok([a, b, c])
 - **A stash is the actor's state.** Its messages are lost where the actor ends or restarts, as its
   fields are, and a question among them times out; messages already given back are in the mailbox,
   which a restart keeps, so the fresh state handles them.
+- **Under a [bounded mailbox](#bounded-mailboxes)**, a message stashed has left the mailbox and made
+  room, and the messages `unstashAll` gives back do not count against the bound, which they passed
+  once already: however many come back, none is dropped.
 
 ## Keywords
 

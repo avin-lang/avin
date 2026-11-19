@@ -1,0 +1,44 @@
+// expect: exit 0
+// Threads whose frames hold the only references to strings they built, parked while collections run.
+// One kind parks at the bottom of its recursion, every frame above it live: trimming gives back only
+// the pages below where it parked, never a live frame, and every string is intact when it wakes. The
+// other recurses, returns and sleeps, so the pages its frames used are given back, then builds its
+// frames again on pages committed afresh, sleeping at the bottom once more while the main thread
+// allocates; and then descends once more and, at the bottom, calls out to C to read the program's
+// memory, on pages that had been given back.
+import avin.process.{pid, residentBytes}
+import avin.threads.{sleep, spawn}
+import avin.time.millis
+
+hold(n: int, tag: int) -> long
+  val mine = s"thread $tag frame $n"
+  val below = if n == 0 then bottom(tag) else hold(n - 1, tag)
+  if mine == s"thread $tag frame $n" then below + long(mine.byteLength) else -1000000
+
+bottom(tag: int) -> long
+  sleep(millis(10))
+  0
+
+callOut(n: int, tag: int) -> long
+  val mine = s"call $tag at $n"
+  if n == 0
+    val bytes = residentBytes(pid()).ok.get
+    if bytes > 0 then long(mine.byteLength) else -1000000
+  else
+    callOut(n - 1, tag) + long(mine.byteLength)
+
+expected(n: int, tag: int) -> long = (0 ..< (n + 1)).map(i -> long(s"thread $tag frame $i".byteLength)).sum
+
+main() -> int
+  val threads = (0 ..< 4).map(tag ->
+    spawn(() ->
+      val first = hold(400, tag)
+      sleep(millis(20))
+      val second = hold(400, tag)
+      val calls = callOut(400, tag)
+      first == expected(400, tag) && second == first && calls > 0)).toVector
+  var churn = 0
+  for i in 0 ..< 2000 do churn += s"garbage $i".byteLength
+  println(churn > 0)
+  for t in threads do println(t.join())
+  0

@@ -1,0 +1,73 @@
+module avin.rt
+
+import sysl.fs.from_errno
+import sysl.slices.as_ptr
+
+// Standard input, output and error as bytes, for `avin.io.stdin()`, `stdout()` and `stderr()`.
+//
+// Bytes read from standard input come out of the same buffer `readLine`, `lines`, `readAll` and
+// `Source.stdin()` take from, under the same lock, `input_readers`: a program may mix them, and each
+// byte goes to exactly one read. A lightweight thread waiting for input parks on the poller, as one
+// reading a line does.
+//
+// A byte write goes out at once, behind whatever `print` buffered and never inside another thread's
+// line (`__posix__/stdio_bytes.c`), and a write to a pipe whose reader has gone answers its failure.
+
+/** Why reading or writing standard input, output or error failed, as `avin.io` tells them apart. */
+enum StdioFailure
+    /** Nothing reads the other end any more (EPIPE). */
+    Closed
+    Failed(message: string)
+
+private extern "avin_rt_stdio_write" c_stdio_write(fd: i32, p: *u8, n: i64) -> i64
+
+/** Opens `/dev/null` on each of descriptors 0, 1 and 2 the program was started without, so the
+ * runtime's own descriptors never take their numbers: a program started with standard input closed
+ * reads it as empty rather than reading the runtime's own pipe. Called first thing at start. */
+extern "avin_rt_open_standard_descriptors" open_standard_descriptors() -> unit
+
+/** The failure an errno stands for. */
+private stdio_failure(code: i64) -> StdioFailure
+    if code == 32 then return Closed
+    Failed(from_errno(int(code)).message())
+
+/** Up to `max` bytes of standard input, `max` being at least one: those the buffer holds, or where it
+ * holds none, those one read gives; none once the input has ended, and its failure where a read
+ * failed. The lock over standard input is held for the whole of it. */
+read_input_bytes(max: int) -> Result[[]u8, StdioFailure]
+    val ctx = current_context
+    if ctx == null then return Err(Failed("standard input is read from a thread the runtime does not run"))
+    input_hold(ctx)
+    val got = take_bytes(ctx, max)
+    val failure = if got.len == 0 then input_failure else 0
+    input_release(ctx)
+    if failure != 0 then return Err(stdio_failure(failure))
+    Ok(got)
+
+/** Up to `max` bytes of standard input that can be had without waiting, `max` being at least one:
+ * `Some` of what `read_input_bytes` would answer where it would answer now, none once the input has
+ * ended, and `None` where it would wait, standard input having nothing yet or another thread being in
+ * the middle of reading it. Never waits. */
+read_input_available(max: int) -> Result[Option[[]u8], StdioFailure]
+    val ctx = current_context
+    if ctx == null then return Err(Failed("standard input is read from a thread the runtime does not run"))
+    if !input_try_hold(ctx) then return Ok(None)
+    if !input_ready_held()
+        input_release_quietly(ctx)
+        return Ok(None)
+    val got = take_bytes(ctx, max)
+    val failure = if got.len == 0 then input_failure else 0
+    input_release(ctx)
+    if failure != 0 then return Err(stdio_failure(failure))
+    Ok(Some(got))
+
+/** Every byte of `bytes` to standard output (`fd` 1) or standard error (`fd` 2), safe for the
+ * collector while the write waits for room. */
+write_standard(fd: int, bytes: []const u8) -> Result[unit, StdioFailure]
+    if bytes.len == 0 then return Ok(())
+    val ctx = current_context
+    if ctx != null then enter_safe(ctx)
+    val got = c_stdio_write(i32(fd), as_ptr(bytes), i64(bytes.len))
+    if ctx != null then leave_safe(ctx)
+    if got < 0 then return Err(stdio_failure(-got))
+    Ok(())

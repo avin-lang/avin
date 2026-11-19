@@ -247,7 +247,10 @@ private plain_name(name: string) -> bool
 /** The members of a value of type `t` (`instance`), or the static members of type `t`: fields, the
  * `val`s of its traits, and its methods, inherited and added by impls and traits included, each as
  * the code being checked may see it. */
-private member_candidates(c: *Checker, t: &Type, group: usize, instance: bool)
+private member_candidates(c: *Checker, t: &Type, group: usize, instance: bool) = member_candidates_at(c, t, group, instance, 0)
+
+// `depth` counts the exports followed to reach `t`, which stops a round of them.
+private member_candidates_at(c: *Checker, t: &Type, group: usize, instance: bool, depth: usize)
     val ty = zonk(c, t)
     if instance
         *ty match
@@ -296,6 +299,41 @@ private member_candidates(c: *Checker, t: &Type, group: usize, instance: bool)
                 taken.push(m)
                 val s = c.symbols[m]
                 add_candidate(c, Candidate(name, group, FunctionTarget(m), Some((s.unit, s.decl.span.start)), true, None, false))
+    if instance then forward_candidates(c, ty, group, depth)
+
+// The members a value's exports present, after its own: each export's member type's members, under
+// the names the export presents, an export by name keeping the one it names and a wildcard those the
+// value does not already have.
+private forward_candidates(c: *Checker, ty: &Type, group: usize, depth: usize)
+    val ix = c.index match
+        Some(ix) -> ix
+        None -> return
+    if depth > c.classes.len() + c.data.len() then return
+    var own: Buf[string] = buf()
+    for cand in ix.probe.candidates
+        own.push(cand.label)
+    for f in visible_forwards(c, ty)
+        val first = ix.probe.candidates.len()
+        member_candidates_at(c, forward_via_type(c, f, ty), group, true, depth + 1)
+        var kept: Buf[Candidate] = buf()
+        for i in 0..<first
+            kept.push(ix.probe.candidates[i])
+        val binding = forward_binding(c, f)
+        for i in first..<ix.probe.candidates.len()
+            var cand = ix.probe.candidates[i]
+            if binding != ""
+                if !forward_presents_member(c, f, cand.label) then continue
+                cand.label = binding
+            elif contains_label(own, cand.label) || cand.label == "equals" || cand.label == "hash" then continue
+            if contains_label(own, cand.label) then continue
+            own.push(cand.label)
+            kept.push(cand)
+        ix.probe.candidates = kept
+
+private contains_label(labels: Buf[string], label: string) -> bool
+    for l in labels
+        if l == label then return true
+    false
 
 private class_field_candidates(c: *Checker, k: usize, group: usize)
     for i in 0..<c.classes[k].fields.len()
