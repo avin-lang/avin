@@ -8882,7 +8882,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
-- Proposed 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
+- Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
   wait for input while part of a record a `writeSome` made is still unsent waits for input OR room,
   whichever comes first, and sends that rest as room comes**; its wait keeps the connection's time
   limit (`TimedOut` where it runs out, the unsent rest kept in order for the next read or write).
@@ -8908,7 +8908,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   select watches one direction per arm, so such a loop keeps a `writable()` arm while `writable()`
   answers `false`, as the threads chapter's write loop does. Review with the user: whether that
   select case deserves more (a `readable()` that also sends what room allows).
-- Proposed 2026-11-18 (built on branch `pg-flake-0032`): **the writing half of a split TLS
+- Settled on the user's delegation 2026-11-18 (built on branch `pg-flake-0032`): **the writing half of a split TLS
   connection sends the whole record each `writeSome` makes before it answers, waiting for room for
   the rest where the connection has too little**, refining the 2026-11-15 `writeSome` entry for that
   half (spec system-library.md, TLS). Why: a `writeSome` that kept the rest of its record for a later
@@ -8931,9 +8931,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   woken); a flush the caller must call after its last `writeSome` (every caller would have to know
   it, and a generic `StreamWriter` caller cannot); a low-water mark of a whole record on the socket
   so a record always fits after `writable()` (not settable on every system); the whole connection's
-  `writeSome` waiting too (a single thread reading and writing a busy peer could deadlock). Review
-  with the user: whether a whole `TlsStream`'s kept rest should also go while a read waits, so a
-  program that ends a request with `writeSome` and then only reads cannot hang the same way.
+  `writeSome` waiting too (a single thread reading and writing a busy peer could deadlock). Its review
+  question, whether a whole `TlsStream`'s kept rest should also go while a read waits, is settled by
+  the `tls-strand` entry above: it does.
 - Settled on the user's delegation 2026-11-17 (built on branch `println-atomic`): **`println(x)` and
   `print(x)` render all their arguments (and `println` its new line) first, into a string, and add
   that to standard output in ONE write, so a line printed is never split by another thread's
@@ -10871,7 +10871,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `-L` directory for counts as the system's, which on Linux leaves a distribution's `/usr/lib`
   libraries dynamic; and that the C libraries of a program's Sysl packages (`requires { pkg_config }`)
   are not covered.
-- Proposed 2026-11-18 (branch `contra-infer`): **inference holds an argument to its parameter by
+- Settled on the user's delegation 2026-11-18 (branch `contra-infer`): **inference holds an argument to its parameter by
   each type argument's variance, and a type argument named at a contravariant argument is decided as
   the type given there.** `take[T](b: Box[B, T])` for `Box[-I, +T]` accepts a `Box[A, int]` where
   `B` is an `A` and takes `T` as `int`, as the non-generic `takeInt(b: Box[B, int])` always did; the
@@ -10888,8 +10888,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the probe above whenever `T` is named nowhere else). A type argument named at a contravariant
   argument nested in another contravariant one is still held whole. **Review with the user**: whether
   the meet is worth adding when a program meets the order-dependent case.
-
-- Proposed (branch `stdin-serialize`, 2026-11-18): **threads read standard input one at a time, and
+- Settled on the user's delegation 2026-11-18 (branch `stdin-serialize`): **threads read standard input one at a time, and
   each read is whole** ([system library](/spec/system-library/#standard-input)). A `readLine`, an
   iterator's step, a character and `readAll` each hold the input from their look at whether it has
   ended to their taking of what they read, so a line goes to exactly one reader, never split
@@ -10911,7 +10910,7 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `avin.io` (the same lock, with an object to keep alive and the module made to depend on
   `avin.threads`); an iterator whose `hasNext` takes nothing (racy across threads, as above).
   **Review with the user**: the iterator's taking of its line at `hasNext`.
-- Proposed 2026-11-18 (built on branch `typaram-bound`, for the parsing library's
+- Settled on the user's delegation 2026-11-18 (built on branch `typaram-bound`, for the parsing library's
   `Rule[-I: Reader, +T]`): **a function's or a method's own type parameter may be bounded by a type
   parameter declared before it, `[J: I]`** ([generics](/spec/generics/#bounds-by-a-type-parameter)),
   the twin of the lower bound `[W >: T]`. A `J` is an `I` with no conversion and has `I`'s bounds; each
