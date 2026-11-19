@@ -9026,6 +9026,56 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
 
+- **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
+  `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
+  `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
+  run-time condition ("watch `local.writable()` only while bytes are pending for it") and spelled
+  out twelve selects, one per combination; and nothing could wait on N connections or N tunnels,
+  which blocks a multi-connection `ssh -L` and `-R`. The surface is [select](/spec/threads/#select)
+  and [selectors](/spec/threads/#selectors).
+  - Settled on the user's delegation 2026-11-19: **any arm but `else` may end in an `if` guard**,
+    written as a match arm's is, after the operation and its `as` pattern. **A false guard makes the
+    arm absent**: not evaluated beyond its guard, not watched, never run, its value never sent. **The
+    guard is evaluated first**, with the arms' other expressions, once and in written order, before
+    any arm is tried, so it cannot name the arm's pattern's bindings, which no value has yet. WHY:
+    evaluating the guard first lets it protect the arm's own expressions (`conns(i).readable() if i
+    < n`) and keeps a value meant for an absent arm from being computed; an arm that is not there
+    should cost nothing. ALTERNATIVES: the guard after the arm's expressions (a send's value computed
+    for nothing, and a guard that cannot protect its arm); a guard that sees the received value, as
+    a match guard sees its bindings (it would have to receive before deciding, then put the value
+    back, which a channel cannot do without reordering).
+  - Settled on the user's delegation 2026-11-19: **a select whose every arm is guarded off, with no
+    `after` or `else` left, traps**, and so does `wait` on an empty `Selector`. WHY: only a
+    cancellation could end such a wait, which is almost always a loop's exit condition gone wrong;
+    the trap names it where it happens, instead of a thread that hangs or a deadlock report later.
+    A thread meant to wait for its cancellation says so with an `after` or a channel. ALTERNATIVES:
+    waiting for cancellation (as the brief offered; silent where it is a bug); a compile-time error
+    (guards are run-time values, so it can only be caught at run time).
+  - Settled on the user's delegation 2026-11-19: **`after` takes a guard; `else` does not.** A false
+    guard on `after` leaves a select that waits until an arm runs. `else`'s body follows it with no
+    arrow, so `else if c then a else b` already means an `if` there. WHY: a guarded `after` is the
+    "time out only while something is pending" case; a guarded `else` is `after 0` guarded, which
+    already exists. ALTERNATIVES: a guard on `else` (`else if` would read two ways).
+  - Settled on the user's delegation 2026-11-19: **the dynamic form is a library type,
+    `avin.threads.Selector[K: Eq]`**: entries `receive(channel, key) -> SelectReceive[T]` (whose
+    `received()` holds what was received), `send(channel, x, key)`, `readable(source, key)` and
+    `writable(sink, key)`; `remove(key)`, `removeWhere(p)`, `clear()`, `size`, `isEmpty`; waits
+    `wait() -> K`, `within(timeout)`, `until(deadline)` and `poll() -> Option[K]`. The entries stay
+    between waits; a send entry is taken out once its value has gone. Each entry is the arm object a
+    `select` block is read into, and a wait runs the same library loop and the same runtime park on
+    the poller, so there is one wait path. WHY: a set of N sources needs a value the program can
+    build, keep and change between waits, and keys of the program's choosing answer "which one"
+    without index bookkeeping; mixed kinds (channels and streams) live in one set. ALTERNATIVES: a
+    `for` arm in `select` (`for c in conns: c.readable() -> …`), which reads well for one homogeneous
+    collection but rebuilds the set every time the select is reached, needs a second arm per kind of
+    source, and adds a binding form to the select grammar; both (two ways to say the same thing, the
+    `for` arm being sugar the library type can carry later if programs want it); entries answered by
+    index (indices shift as entries are removed); a send entry that stays after it ran (it would send
+    the same value again at the next wait).
+    **Review with the user:** the `Selector` surface (its name, keys over indices, `receive`
+    answering the entry, a send entry taken out once it ran), and whether `select` should gain a
+    `for` arm as sugar over it.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to

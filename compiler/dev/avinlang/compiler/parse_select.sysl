@@ -23,6 +23,10 @@ import sysl.buf.{Buf, buf}
 //   stream and value sent is evaluated once,
 //   before any arm is tried, and an `after`'s
 //   duration bound where it is written, `val select$<at>$after = 100.millis`;
+// - an arm with an `if` guard binds instead `val select$<at>$<i>$guarded = if guard then
+//   Some(<its object>) else None`, so a false guard evaluates nothing else of the arm, and the
+//   choice is given `avin.threads.selectGuarded(select$<at>$<i>$guarded)`, never ready for `None`;
+//   a guarded `after` binds its duration the same way and the choice is `selectWithinIf`;
 // - the choice, `val select$<at> = avin.threads.selectWaiting(arms)`, or `selectOrElse(arms)` with
 //   an `else`, or `selectWithin(duration, arms)` with an `after`, answering the number of the arm
 //   that ran: a channel arm's place, then the `after`, then the `else`;
@@ -60,6 +64,8 @@ private enum SelectArmKind
 private struct WrittenArm
     span: Span
     kind: SelectArmKind
+    /** The arm's `if` guard, after its operation and pattern: false, the arm is absent. */
+    guard: Option[&Expr]
     body: &Expr
 
 parse_select(p: *Parser, at: Span) -> &Expr
@@ -82,16 +88,17 @@ parse_select(p: *Parser, at: Span) -> &Expr
     select_code(span, at, number, arms)
 
 // One arm: `else` and its body, `after` a duration, or a channel's `receive()`, with an optional
-// `as` pattern, or `send(x)`, then `->` and the body.
+// `as` pattern, or `send(x)`, or a stream's `readable()` or `writable()`, then an optional `if`
+// guard, `->` and the body. `else` takes no guard: what follows it is its body, `else if` an `if`.
 private select_arm(p: *Parser) -> WrittenArm
     val start = p.toks.here()
     if p.accept("else")
         val body = parse_line_body(p, false)
-        return WrittenArm(start.to(p.ended()), ElseArm, body)
+        return WrittenArm(start.to(p.ended()), ElseArm, None, body)
     if p.at("if")
-        p.report.add(error(start, MalformedArmText + "; it takes no guard"))
+        p.report.add(error(start, MalformedArmText + "; a guard follows the arm's operation"))
         skip_line(p)
-        return WrittenArm(start, MalformedArm, Expr(start, UnitLit))
+        return WrittenArm(start, MalformedArm, None, Expr(start, UnitLit))
     val previous = p.lambda_boundary
     p.lambda_boundary = match_guard_boundary(p)
     var kind: SelectArmKind = MalformedArm
@@ -103,10 +110,16 @@ private select_arm(p: *Parser) -> WrittenArm
         var pattern: Option[&Pattern] = None
         if p.accept("as") then pattern = Some(parse_pattern(p))
         kind = channel_arm(p, op, pattern)
+    var guard: Option[&Expr] = None
+    if p.accept("if") then guard = Some(expression(p, 0))
     p.lambda_boundary = previous
+    if guard is Some(_) && p.at("if")
+        p.report.add(error(p.toks.here(), "a select arm takes one guard; join its conditions with `&&`"))
+        skip_line(p)
+        return WrittenArm(start, MalformedArm, None, Expr(start, UnitLit))
     p.expect("->")
     val body = parse_line_body(p, false)
-    WrittenArm(start.to(p.ended()), kind, body)
+    WrittenArm(start.to(p.ended()), kind, guard, body)
 
 /** What an arm that is none of a select's arms is told. */
 private const MalformedArmText: string =
@@ -192,6 +205,7 @@ private select_code(span: Span, at: Span, number: usize, arms: Buf[WrittenArm]) 
     var items: Buf[&Expr] = buf()
     var channel_arms: Buf[&Expr] = buf()
     var duration: Option[&Expr] = None
+    var after_guarded = false
     var otherwise = false
     // The arm objects, and the `after`'s duration, in the order written.
     for i in 0..<arms.len()
@@ -202,39 +216,32 @@ private select_code(span: Span, at: Span, number: usize, arms: Buf[WrittenArm]) 
                 var values: Buf[&Expr] = buf()
                 values.push(channel)
                 values.push(Expr(channel.span, IntLit(wants)))
-                val made = call_of(channel.span, select_ref(channel.span, core_path("threads.SelectReceive")), values)
-                items.push(Expr(arm.span, Binding(name, None, made, false)))
-                channel_arms.push(select_ref(channel.span, name))
+                arm_object(&items, &channel_arms, arm, name, channel.span, "threads.SelectReceive", values)
             SendArm(channel, value) ->
                 var values: Buf[&Expr] = buf()
                 values.push(channel)
                 values.push(value)
-                val made = call_of(channel.span, select_ref(channel.span, core_path("threads.SelectSend")), values)
-                items.push(Expr(arm.span, Binding(name, None, made, false)))
-                channel_arms.push(select_ref(channel.span, name))
+                arm_object(&items, &channel_arms, arm, name, channel.span, "threads.SelectSend", values)
             ReadableArm(stream) ->
                 var values: Buf[&Expr] = buf()
                 values.push(stream)
-                val made = call_of(stream.span, select_ref(stream.span, core_path("threads.SelectReadable")), values)
-                items.push(Expr(arm.span, Binding(name, None, made, false)))
-                channel_arms.push(select_ref(stream.span, name))
+                arm_object(&items, &channel_arms, arm, name, stream.span, "threads.SelectReadable", values)
             WritableArm(stream) ->
                 var values: Buf[&Expr] = buf()
                 values.push(stream)
-                val made = call_of(stream.span, select_ref(stream.span, core_path("threads.SelectWritable")), values)
-                items.push(Expr(arm.span, Binding(name, None, made, false)))
-                channel_arms.push(select_ref(stream.span, name))
+                arm_object(&items, &channel_arms, arm, name, stream.span, "threads.SelectWritable", values)
             AfterArm(d) ->
                 if duration is None
-                    items.push(Expr(d.span, Binding(name, None, d, false)))
+                    items.push(Expr(d.span, Binding(name, None, guarded_value(arm.guard, d), false)))
                     duration = Some(select_ref(d.span, name))
+                    after_guarded = arm.guard is Some(_)
             ElseArm -> otherwise = true
             MalformedArm -> ()
     // The choice.
     var values: Buf[&Expr] = buf()
     var chooser = "threads.selectWaiting"
     if duration is Some(d) && !otherwise
-        chooser = "threads.selectWithin"
+        chooser = if after_guarded then "threads.selectWithinIf" else "threads.selectWithin"
         values.push(d)
     elif otherwise then chooser = "threads.selectOrElse"
     for a in channel_arms
@@ -281,14 +288,46 @@ private select_code(span: Span, at: Span, number: usize, arms: Buf[WrittenArm]) 
 
 private number_arm(at: Span, n: usize, body: &Expr) -> Arm = Arm(Pattern(at, Literal(int_literal(at, n))), None, body)
 
-// A receive arm's body, after the binding its pattern makes.
+// The suffix of a guarded arm's `Option` of its object.
+private const GuardedSuffix: string = "$guarded"
+
+// Binds arm `name`'s object, made by calling `maker` with `values`, and adds what the choice is
+// given for it. A guarded arm binds `Some` of the object where its guard is true and `None`, the
+// object never made and so none of `values` evaluated, where it is false; the choice is given
+// `selectGuarded` of that, an arm never ready for `None`.
+private arm_object(items: *Buf[&Expr], channel_arms: *Buf[&Expr], arm: WrittenArm, name: string, at: Span, maker: string, values: Buf[&Expr])
+    val made = call_of(at, select_ref(at, core_path(maker)), values)
+    if arm.guard is None
+        items.push(Expr(arm.span, Binding(name, None, made, false)))
+        channel_arms.push(select_ref(at, name))
+        return
+    val held = name + GuardedSuffix
+    items.push(Expr(arm.span, Binding(held, None, guarded_value(arm.guard, made), false)))
+    var given: Buf[&Expr] = buf()
+    given.push(select_ref(at, held))
+    channel_arms.push(call_of(at, select_ref(at, core_path("threads.selectGuarded")), given))
+
+// `value` under `guard`: `if guard then Some(value) else None`; `value` itself where there is none.
+private guarded_value(guard: Option[&Expr], value: &Expr) -> &Expr
+    val g = guard match
+        Some(x) -> x
+        None -> return value
+    var held: Buf[&Expr] = buf()
+    held.push(value)
+    val some = call_of(value.span, select_ref(value.span, core_path("Some")), held)
+    Expr(g.span, If(g, some, Some(select_ref(g.span, core_path("None")))))
+
+// A receive arm's body, after the binding its pattern makes. A guarded arm's object is taken out of
+// its `Option` first, which holds it, since the arm ran.
 private received_body(arm: WrittenArm, name: string, wants: string, binding: Option[&Pattern]) -> &Expr
     val pt = binding match
         Some(x) -> x
         None -> return arm.body
     val at = pt.span
     val method = if wants == ReceiveValue then "value" else "received"
-    val read = Expr(at, Call(Expr(at, Member(select_ref(at, name), method)), buf()))
+    var target = select_ref(at, name)
+    if arm.guard is Some(_) then target = Expr(at, Member(select_ref(at, name + GuardedSuffix), "get"))
+    val read = Expr(at, Call(Expr(at, Member(target, method)), buf()))
     val bound: Option[&Expr] = pt.kind match
         Wildcard -> None
         Name(n) -> Some(Expr(at, Binding(n, None, read, false)))
