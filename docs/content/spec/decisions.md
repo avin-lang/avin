@@ -12892,6 +12892,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   above 100, since the collector stops every thread and marks on one, so the trade favours memory
   less than it would for a concurrent collector.
 
+- Settled on the user's delegation 2026-11-20 (branch `gc-release`): **a collection gives the whole
+  pages of large free runs back to the system** ([runtime](/compiler/#runtime)), through the page
+  release hook of gc 0.4.0, with the system's page size (`getpagesize`, 16 KiB on macOS arm64).
+  - **How, on macOS: the range is mapped afresh in place** (`mmap` with `MAP_FIXED`), as the
+    stacks' unused pages already are. Measured on a burst of 8 million strings (932 MB at the peak)
+    dropped and followed by churn: the resident size the system reports (`process.residentBytes`,
+    what marshal reads) stayed at 1047 MB with `MADV_FREE` and with `MADV_FREE_REUSABLE`, and fell
+    to 2 MB with the remap. `MADV_FREE_REUSABLE` also expects `MADV_FREE_REUSE` before the pages are
+    used again, and the collector hands a released run out again with no call to the client, so it
+    was not sound here even had it measured well. **On Linux, `madvise(MADV_DONTNEED)`**, which
+    drops the pages at once; written, not run on this machine.
+  - **When: a collection releases only when the arena reaches more than twice the budget past
+    what the last collection left live, and at most once a second.** Without the first condition a
+    program whose live data is small churns its 8 MiB of allocation in and out of the system at
+    every collection; without the second, one whose live objects sit high in the arena (a buffer
+    made after a burst) releases and refaults the free pages below them at every collection. Both
+    were measured: unthrottled, the churn after the drop took 1.2 s more system time over 2000
+    collections; with both conditions the system time is the same as with releasing off. A
+    collection that does not release runs with the hook removed, so its free runs stay ordinary
+    blocks a later collection can release. The first release in a program is never delayed.
+  - **`AVIN_GC_RELEASE=0` turns it off**; unset or any other value leaves it on.
+  - Cost: binarytrees 21 at -O2, three runs each way, 7.01–7.81 s with releasing and 7.01–7.39 s
+    without (the same within noise); the burst reproducer's churn 9.16–9.72 s user with and
+    8.78–9.56 s without, system time 0.09–0.11 s both ways.
+  - Alternatives weighed: `MADV_FREE` and `MADV_FREE_REUSABLE` (above); releasing at every
+    collection (the refault cost above); a retained cushion skipped inside the hook (unsound with
+    this gc: a range the hook skips is still marked released, and is never offered again until
+    written); a library call to release on demand (no program needs it yet). Review with the user:
+    whether one second is the right interval, and whether a program should be able to ask for a
+    release (a collection) itself, since without one a program that drops a burst and then
+    allocates little keeps its pages until enough allocation brings a collection.
+
 - Settled on the user's delegation 2026-11-16 (branch `read-alloc`): **a stream's `read(max)`
   allocates what it answers, not `max`.** A TCP, Unix or split socket read receives into a buffer
   the runtime keeps per operating system thread (on its carrier), grown to the largest read asked

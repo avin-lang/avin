@@ -451,3 +451,136 @@ pacing_keeps_what_is_live()
         assert_eq(live_objects(), 1)
         percent = DefaultPercent
         reset()
+
+// -- Releasing: free pages given back to the system --------------------------------------------------
+
+private const Block: usize = 65536
+
+// Allocates `count` blocks of 64 KiB through `first`, with no collection between them, each written
+// at its first, middle and last byte; collects with the budget at the floor, so that the heap reaches
+// far past what it holds; and answers how many bytes that collection released. The collection before
+// the burst releases nothing, so whatever an earlier burst left is still there to be counted.
+private burst_and_collect(count: usize) -> usize
+    attach(&first)
+    val was = releasing
+    releasing = false
+    collect_now()
+    releasing = was
+    budget = 1usize << 40
+    for _ in 0..<count
+        val p = allocate_sized(&first, &garbage, Block)
+        p[0] = 0xffu8
+        p[Block / 2] = 0xffu8
+        p[Block - 1] = 0xffu8
+    budget = Floor
+    val before = released_heap_bytes()
+    collect_now()
+    val released = released_heap_bytes() - before
+    reset()
+    released
+
+@test("AVIN_GC_RELEASE unset or anything but 0 releases, and 0 does not")
+release_settings()
+    assert(release_setting_of(None))
+    assert(release_setting_of(Some("1")))
+    assert(release_setting_of(Some("")))
+    assert(release_setting_of(Some("off")))
+    assert(release_setting_of(Some("00")))
+    assert(!release_setting_of(Some("0")))
+    assert(releasing)
+
+@test("the page size is the system's: a power of two of at least 4096 bytes, which the collector takes")
+page_size_is_the_systems()
+    assert(page_size >= 4096)
+    assert_eq(page_size & (page_size - 1), 0usize)
+    assert(gc.release_pages(&space, null, page_size))
+
+@test("a collection releases only when the heap reaches more than twice the budget past what was live")
+release_follows_the_reach()
+    assert(!releases_after(0, 0, Floor))
+    assert(!releases_after(Floor, 0, Floor))
+    assert(!releases_after(2 * Floor, 0, Floor))
+    assert(releases_after(2 * Floor + 1, 0, Floor))
+    assert(!releases_after(100 * MiB + 2 * Floor, 100 * MiB, Floor))
+    assert(releases_after(100 * MiB + 2 * Floor + 1, 100 * MiB, Floor))
+    assert(!releases_after(MiB, 2 * MiB, Floor))
+    assert(!releases_after(400 * MiB, 100 * MiB, 200 * MiB))
+    assert(releases_after(500 * MiB + 1, 100 * MiB, 200 * MiB))
+
+@test("a collection releases at most once in the interval, and the first one at once")
+release_is_paced()
+    assert(release_due(0, -1))
+    assert(release_due(123456789, -1))
+    assert(!release_due(5000000, 5000000))
+    assert(!release_due(5000000 + ReleaseInterval - 1, 5000000))
+    assert(release_due(5000000 + ReleaseInterval, 5000000))
+    assert(release_due(5000000 + 10 * ReleaseInterval, 5000000))
+    assert(!release_due(4000000, 5000000))
+
+@test("a dropped burst is released, the arena shrinks, and what is allocated there again is zero and holds what is written")
+dropped_burst_is_released_and_reused()
+    last_release = -1
+    val released = burst_and_collect(1024)
+    assert(released >= 1000 * Block)
+    assert(gc.used(&space) < 8 * MiB)
+    attach(&first)
+    budget = 1usize << 40
+    val first_block = allocate_sized(&first, &garbage, Block)
+    var last_block = first_block
+    for i in 0..<1024
+        val p = allocate_sized(&first, &garbage, Block)
+        assert_eq(p[0], 0u8)
+        assert_eq(p[Block / 2], 0u8)
+        assert_eq(p[Block - 1], 0u8)
+        for j in 0..<Block
+            p[j] = u8((i + j) & 0xff)
+        last_block = p
+    first_block[7] = 0x5au8
+    assert_eq(first_block[7], 0x5au8)
+    for j in 0..<Block
+        assert_eq(last_block[j], u8((1023 + j) & 0xff))
+    budget = Floor
+    reset()
+    collect_now()
+    last_release = -1
+
+@test("a second release inside the interval waits, and the next one after it releases")
+release_waits_out_the_interval()
+    last_release = -1
+    assert(burst_and_collect(512) > 0)
+    assert_eq(burst_and_collect(512), 0usize)
+    last_release = -1
+    assert(burst_and_collect(512) > 0)
+    last_release = -1
+
+@test("a heap allocating no further than its budget between collections releases nothing")
+steady_allocation_releases_nothing()
+    last_release = -1
+    attach(&first)
+    collect_now()
+    collect_now()
+    last_release = -1
+    val before = released_heap_bytes()
+    val ran = collections
+    for _ in 0..<40000
+        _ = allocate(&first, &garbage)
+    assert(collections - ran >= 4)
+    assert_eq(released_heap_bytes(), before)
+    reset()
+    collect_now()
+    last_release = -1
+
+@test("with releasing off, a dropped burst keeps its pages, and the arena does not shrink")
+release_off_keeps_the_pages()
+    last_release = -1
+    releasing = false
+    assert_eq(burst_and_collect(512), 0usize)
+    assert(gc.used(&space) >= 512 * Block)
+    releasing = true
+    attach(&first)
+    collect_now()
+    budget = Floor
+    collect_now()
+    reset()
+    assert(gc.used(&space) < 8 * MiB)
+    last_release = -1

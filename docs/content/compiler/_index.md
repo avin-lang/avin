@@ -609,6 +609,15 @@ proportion: 200 lets the heap allocate twice what survived between collections, 
 marking costs per byte allocated for a heap that much larger; 0 collects at every 8 MiB whatever is
 live. It is a whole number in decimal digits, at most 100000; any other value is ignored.
 
+A collection gives free pages back to the operating system, so a program that drops a burst of
+data falls back from its peak resident size rather than keeping it: the whole pages of every free
+run of 64 KiB or more are released, and a free run at the top of the heap shrinks it. It does so
+only when the heap reaches more than twice the allocation allowed between collections past what
+the last one left live, and at most once a second, so a program allocating steadily does not hand
+pages back that it takes again at once. A released page reads as zero when it is next used. On
+macOS the range is mapped afresh, on Linux `MADV_DONTNEED` drops it. `AVIN_GC_RELEASE=0` turns
+the release off and keeps every page the heap has touched.
+
 The collector owns each object's header, which sits just before the object: the word 16 bytes
 before an object's address holds its **kind**, the collector's record of how to trace it, and the
 word after that is the collector's own. An object's address is its first field. Every descriptor
