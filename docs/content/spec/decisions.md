@@ -9629,6 +9629,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
 
+- Settled on the user's delegation 2026-11-19 (branch `scalar-left-ops`): **a built-in value may
+  stand on an operator method's left.** An impl of no trait adding to `int`, `long` (any integer
+  width), `real`, `byte`, `char`, `string` or `bool`, in the type's module or as an extension, may add
+  a binary arithmetic, ordering, bitwise or shift method whose one parameter is a data type, a class,
+  a trait or an opaque type (any type arguments): `impl real` adding `*(v: Vec) -> Vec = v * self`
+  makes `k * v` legal. `l op r` with `l` built-in and `r` of such a type calls `l`'s method when an
+  overload takes `r` (or `r`'s type has no integer/decimal conversion, so the call reports the
+  overloads); resolution is static by parameter types, chains and `<`-links included. An integer
+  literal on the left is `int` where an `int` overload fits, else `long`, else `real` (`2 * v`). A
+  method of such a name on a built-in type taking a built-in type, tuple, function, union or type
+  parameter stays an error (a type parameter could be filled by a built-in type), as does any such
+  method in a trait implementation (`impl Grow for real`) and every prefix method; an unseen
+  extension's operator is reported with the module to import. WHY: `k * v` is how scaling is
+  written, and code was forced into `v * k`; since the operand is never built-in, built-in ×
+  built-in arithmetic can never change meaning, and the rule reuses relaxed impls and overloading,
+  adding no new declaration form. A type that takes integers (`BigInt`) keeps meeting integers by
+  `fromInteger` unless an overload names it. ALTERNATIVES: reflected methods on the right operand
+  (`*:` or a `reverse *`, as a second dispatch step: two places a reader must look for one operator,
+  and a precedence question when both sides define one); a `Scalar` trait the right type implements
+  (`scale(k)`), which serves only multiplication by numbers and not `"label" + v` or `k < v`;
+  widening `FromInteger`-style conversion of the left operand to the right type (wrong for `k * v`,
+  where a real is not a vector). The literal preference `int`, `long`, `real` was chosen over
+  "ambiguous when several fit" so `2 * v` works with only `real` adding `*`. Tests:
+  `tests/run/scalar_left_operators`, `tests/reject/scalar_left_operator_{declarations,builtin_operands,calls}`,
+  `tests/programs/{run,reject}/scalar_left_extensions`. **Review with the user**: whether an operand
+  of a type parameter bounded by a trait (`[T: Shape] k * s`) should also dispatch (left out: the
+  right operand must be a concrete program type today), and the literal preference order.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma

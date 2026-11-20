@@ -2735,15 +2735,21 @@ private declare_trait_method(c: *Checker, i: usize, f: &Function, public: bool, 
     // one overloads. Impls adding to different types built from one, as `Option[Option[T]]` and
     // `Option[List[T]]`, are told apart by the receiver at a call; extensions of two modules, by
     // which of the modules a file imports.
+    // An impl adding to a built-in type may add a binary operator whose operand is of a type the
+    // program declares, `impl real` adding `*(v: Vec)` for `k * v`; between two built-in values the
+    // operator stays the machine's.
+    val scalar_left = !block.on_trait && block.instance is None && scalar_left_operator(c, f.name, symbol.params, target)
     // The bitwise and shift operators of the integers and bytes are the machine's, which no method
     // replaces.
-    if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte)
-        c.note(unit, f.name_span, s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it")
+    if bitwise_method_name(f.name) && (*target is Int(_) || *target is Byte) && !scalar_left
+        val message = if !block.on_trait && block.instance is None && f.params.len() == 1 then scalar_left_message(f.name, target) else s"`${f.name}` is the language's operator on ${type_name(target)}, and no method can redefine it"
+        c.note(unit, f.name_span, message)
         return
     // So are the arithmetic and orderings of every built-in type: only a data type, a class or a trait
     // has methods of those names, and an impl for every type would reach the built-in ones.
-    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _))
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _) || *target is Class(_, _, _) || *target is Applied(_, _)) && !scalar_left
         if *target is TypeVar(_, _, _) then c.note(unit, f.name_span, s"`${f.name}` names a method only of a data type, a class or a trait, and an impl for every type would redefine the built-in types' operator")
+        elif !block.on_trait && block.instance is None && f.params.len() == 1 && scalar_builtin(target) && arithmetic_method_name(f.name) then c.note(unit, f.name_span, scalar_left_message(f.name, target))
         else c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     var same_name: Buf[usize] = buf()
@@ -4986,8 +4992,10 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
                 c.note(unit, f.name_span, "annotations on methods are not implemented")
                 break
     // A built-in type's arithmetic and orderings are the machine's, which no method replaces, in a
-    // trait's implementation either.
-    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _))
+    // trait's implementation either. A binary one an impl of no trait adds to a scalar built-in type
+    // is judged by its operand's type once the signature is known.
+    val maybe_scalar_left = trait_id is None && scalar_builtin(target) && f.params.len() == 1 && arithmetic_method_name(f.name)
+    if (arithmetic_method_name(f.name) || prefix_method_name(f.name, f.params.len())) && !(*target is Data(_, _, _)) && !maybe_scalar_left
         c.note(unit, f.name_span, builtin_operator_message(f.name, f.params.len(), target))
         return
     if trait_id is Some(_) || overrides then refuse_override_defaults(c, unit, f)
@@ -5067,6 +5075,9 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     symbol.name = type_name_of + "." + f.name
     symbol.public = public
     symbol.receiver = Some(target)
+    if maybe_scalar_left && !scalar_left_operator(c, f.name, symbol.params, target)
+        c.note(unit, f.name_span, scalar_left_message(f.name, target))
+        return
     symbol.static_member = static_member
     var method_defaults: Buf[Option[usize]] = buf()
     for _ in receiver_types
@@ -18838,6 +18849,87 @@ private builtin_operator_message(name: string, arity: usize, target: &Type) -> s
         return s"`$name` is the language's operator on ${type_name(target)}, and no method can redefine it"
     s"a prefix `$name` on ${type_name(target)} is the language's own, and no method can define it; only a data type, a class or a trait has a method `$name` taking no argument"
 
+/** Whether a method `name` with parameters `params`, the receiver first, that an impl of no trait adds
+ * to the built-in type `target`, is an operator with a built-in value on its left: a binary
+ * arithmetic, ordering, bitwise or shift operator taking one argument of a data type, a class, a
+ * trait or an opaque type, as `impl real` adding `*(v: Vec) -> Vec` for `k * v`. The operand's type
+ * is never built-in, so an operator between two built-in values stays the machine's. */
+private scalar_left_operator(c: *Checker, name: string, params: Buf[&Type], target: &Type) -> bool
+    if !scalar_builtin(target) || params.len() != 2 then return false
+    if !(arithmetic_method_name(name) || bitwise_method_name(name)) then return false
+    program_operand_type(zonk(c, params[1]))
+
+/** Whether `t` is a type a program declares rather than one the language builds in: a data type, a
+ * class, a trait or an opaque type, of any type arguments. */
+private program_operand_type(t: &Type) -> bool = *t match
+    Data(_, _, _) -> true
+    Class(_, _, _) -> true
+    Opaque(_, _, _, _) -> true
+    _ -> false
+
+// What a method named by a binary operator, added to a built-in type, is told where its operand's
+// type is built-in too: an operator between two built-in values is the machine's.
+private scalar_left_message(name: string, target: &Type) -> string = s"`$name` is the language's operator on ${type_name(target)}, and no method can redefine it; a method `$name` added to ${type_name(target)} takes one argument of a data type, a class, a trait or an opaque type"
+
+/** The type a built-in left operand of `left op right` is the receiver of a method `op` as: `l` where an
+ * impl adds `l`'s type a method of the name for the right operand's type `r`, a data type, a class, a
+ * trait or an opaque type (`k * v`). An integer literal on the left that `int` has no such method for
+ * is the `long`, then the `real`, that has one, as a literal takes the type it meets elsewhere: `2 * v`
+ * with `real` adding `*`. `None` where no such method serves, and the operator keeps its own meaning. */
+private scalar_left_type(c: *Checker, name: string, left: &Expr, l: &Type, r: &Type) -> Option[&Type]
+    if scalar_left_method(c, name, l, r) && scalar_left_fits(c, name, l, r) then return Some(zonk(c, l))
+    if is_literal(left) && *zonk(c, l) is Int(32)
+        val long_type: &Type = Int(64)
+        if scalar_left_method(c, name, long_type, r) && scalar_left_fits(c, name, long_type, r) then return Some(long_type)
+        val real_type: &Type = Real
+        if scalar_left_method(c, name, real_type, r) && scalar_left_fits(c, name, real_type, r) then return Some(real_type)
+    // Where none fits, the call names the overloads there are.
+    if scalar_left_method(c, name, l, r) then return Some(zonk(c, l))
+    None
+
+/** Reports `l op r`, a built-in `l` and an `r` of a type of the program, where the method `op` that
+ * takes `r` is one an extension adds to `l`'s type in a module this file does not import. */
+private refuse_unseen_scalar_left(c: *Checker, at: Span, name: string, l: &Type, r: &Type) -> bool
+    val x = zonk(c, l)
+    val y = zonk(c, r)
+    if !scalar_builtin(x) || !program_operand_type(y) then return false
+    for tm in c.trait_methods
+        val m = tm.function
+        val s = c.symbols[m]
+        if s.decl.name != name || s.params.len() != 2 || !added_applies(c, x, tm) || extension_seen(c, tm) then continue
+        val p = zonk(c, s.params[1])
+        if !(same_head(p, y) || is_trait_type(c, p) || fits(c, y, p)) then continue
+        c.note(unit_of(c), at, s"`$name` taking ${type_name(y)} is added to `${impls_owner(c, m)}` by ${module_label(s.module_name)}, which this file does not import")
+        return true
+    false
+
+/** Whether one of built-in type `l`'s methods `name` plainly takes a value of type `r`: one of `r`'s
+ * type with any type arguments, one `r` fits, or a trait, which the call itself checks `r` against. */
+private scalar_left_fits(c: *Checker, name: string, l: &Type, r: &Type) -> bool
+    val y = zonk(c, r)
+    for m in methods_of(c, zonk(c, l), name)
+        val s = c.symbols[m]
+        if s.params.len() >= 2
+            val p = zonk(c, s.params[1])
+            if same_head(p, y) || is_trait_type(c, p) || fits(c, y, p) then return true
+    false
+
+/** Whether built-in type `l` has a method `name` taking one argument that `l op r` calls, `r` being a
+ * data type, a class, a trait or an opaque type. A type that takes integers or decimals still meets a
+ * number by conversion (`i * big`), unless one of the methods takes that type itself. */
+private scalar_left_method(c: *Checker, name: string, l: &Type, r: &Type) -> bool
+    val x = zonk(c, l)
+    val y = zonk(c, r)
+    if !scalar_builtin(x) || !settled(y) || !program_operand_type(y) then return false
+    val ms = methods_of(c, x, name)
+    if !takes_one_argument(c, ms) then return false
+    if !(takes_integers(c, y) || takes_decimals(c, y)) then return true
+    for m in ms
+        val s = c.symbols[m]
+        if s.params.len() >= 2
+            if same_head(zonk(c, s.params[1]), y) then return true
+    false
+
 // A prefix operator on a data type, a class or a type parameter with a method of its name taking no
 // argument is a call of that method, whatever it yields: `-a` is `a.-()`, `!a` is `a.!()`. Where the
 // type has none, `None`, and the operator keeps its own meaning.
@@ -18860,6 +18952,11 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
         val l = check_expr(c, left, Some(r.ty))
         // A literal that became a value of a type with a method of the operator's name calls it.
         if operator_method(c, op, l.ty) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, r), expected)
+        // So does a literal beside a value of a type of the program that its type has such a method
+        // for: `2.0 * v`.
+        if scalar_left_type(c, binary_spelling(op), left, l.ty, r.ty) is Some(as_type)
+            val receiver = if same_type(as_type, zonk(c, l.ty)) then l else check_expr(c, left, Some(as_type))
+            return operator_method_call(c, e.span, op_span, left, receiver, binary_spelling(op), checked_slot(c, r), expected)
         return operate(c, e.span, op_span, op, binary_spelling(op), l, r)
     val l = refined_operand(c, check_expr(c, left, expected))
     if operator_method(c, op, l.ty)
@@ -18877,7 +18974,12 @@ private binary_expr(c: *Checker, e: &Expr, op: BinaryOp, left: &Expr, right: &Ex
                 val arg = if integer_type(c, zonk(c, r.ty)) then from_integer(c, r, zonk(c, l.ty)) elif big_int_beside(c, r.ty, l.ty) then from_big_int(c, r, zonk(c, l.ty)) else r
                 return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, arg), expected)
         return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), right, expected)
-    operate(c, e.span, op_span, op, binary_spelling(op), l, refined_operand(c, check_expr(c, right, Some(l.ty))))
+    val r = refined_operand(c, check_expr(c, right, Some(l.ty)))
+    // A built-in value beside a value of a type of the program calls the method its type has for it,
+    // where an impl adds one: `k * v`.
+    if scalar_left_type(c, binary_spelling(op), left, l.ty, r.ty) is Some(_) then return operator_method_call(c, e.span, op_span, left, l, binary_spelling(op), checked_slot(c, r), expected)
+    if refuse_unseen_scalar_left(c, e.span, binary_spelling(op), l.ty, r.ty) then return TExpr(e.span, ErrorType, UnitConst)
+    operate(c, e.span, op_span, op, binary_spelling(op), l, r)
 
 // Whether one of the methods `ms` takes an integer as its first argument.
 private takes_an_integer(c: *Checker, ms: Buf[usize]) -> bool
@@ -19238,7 +19340,12 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     var methods: Buf[Option[LinkMethod]] = buf()
     for i in 0..<ops.len()
         methods.push(None)
-        if ordering_op(ops[i]) && ordering_method(c, ops[i], settle_operand(c, typed[i], typed[i + 1]).ty)
+        // A built-in value beside a value of a type of the program calls the method its type has for
+        // it, where an impl adds one: `k < v`; a literal takes the type that has it.
+        if ordering_op(ops[i])
+            if scalar_left_type(c, compare_spelling(ops[i]), operands[i], typed[i].ty, typed[i + 1].ty) is Some(as_type)
+                if !same_type(as_type, zonk(c, typed[i].ty)) then typed[i] = check_expr(c, operands[i], Some(as_type))
+        if ordering_op(ops[i]) && (ordering_method(c, ops[i], settle_operand(c, typed[i], typed[i + 1]).ty) || scalar_left_method(c, compare_spelling(ops[i]), typed[i].ty, typed[i + 1].ty))
             val left = settle_operand(c, typed[i], typed[i + 1])
             if ops.len() == 1 then return operator_method_call(c, e.span, e.span, checked_slot(c, left), left, compare_spelling(ops[0]), checked_slot(c, typed[1]), None)
             methods[i] = Some(link_method(c, ops[i], left, typed[i + 1]))
