@@ -8027,6 +8027,45 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `-` unless it is a number; typed positional arguments, left out until a program needs one;
   `Option`-typed defaults (`default = Some(3)`), exact but noisy at every declaration.
 
+- Settled on the user's delegation 2026-11-19 (built on branch `cli-subcommands`): **`avin.cli`
+  commands are parsers of their own.** `Parser.command(sub)` adds the command `sub.name`, whose
+  options and arguments `sub` declares and whose help line is `sub.about`; a command may have
+  commands (`git remote add`). The first positional argument names the command and every argument
+  after it is the command's, so the program's options come before the command word and the
+  command's after it (`todo --file t.txt add -p high milk`); a parser with commands takes no
+  positional arguments, and declaring both traps. `Args.command` is the command's name (empty where
+  the parser has none) and `Args.commandArgs` the command's own `Args`. While a command reads its
+  arguments its parser is named after the program and the command, so its usage line, help and
+  messages say `todo add`. Every parser with commands has the command `help` (`todo help add`,
+  `todo help remote add`) unless the program declares one of that name, as with `--help`; `todo add
+  --help` is the command's own. No command is ``missing command; the commands are `add`, …``; an
+  unknown one is ``unknown command `lst`; did you mean `list`?``, the suggestion being the nearest
+  name within two edits (fewer than the word's characters), else the one name the word begins,
+  else the list of commands. WHY: a sub-parser is the value a program already knows how to build,
+  so a command needs no new kind of declaration, and nesting comes free; reading only the program's
+  options before the word is the convention every tool with commands follows, and keeps a
+  command's options free to reuse the program's names. Alternatives weighed:
+  `command(name, help, sub)` (repeats what `sub` already holds); a dispatch table of functions
+  (`command(sub, run)`) that `parse` would call, which hides control flow and fixes a return type
+  on every command; options of the program accepted after the command word too (ambiguous where
+  both declare a name); a missing command printing the help instead of a mistake; matching
+  commands by unique prefix outright (`todo l` running `list`), which turns a later command into a
+  breaking change. Review with the user: whether a missing command should show the help (git's
+  way) rather than be a mistake.
+  **A mistake is reportable without ending the program.** `ArgsError.Invalid` gains `program`
+  (the name of the parser that found it, `todo add`) and `hint` (``Run `todo add --help` for the
+  options.``, ``Run `todo --help` for the commands.``, or `help` where `--help` is the program's
+  own, or empty), so `Invalid(reason, usage, program, hint)`; `ArgsError.report` is the whole
+  text `parseOrExit` writes, every line ending in a newline, and `exitCode` its status (0 for the
+  help or the version, 2 for a mistake). A shell or script runner calls `parse`, writes
+  `e.report` and reads the next line; `message` and the `Display` stay the reason alone, so an
+  `ArgsError` passed on with `?` still reads as one sentence. WHY: the error must carry the
+  failing command's name, since only it knows it; a parser method `report(e)` would name the
+  top program for a command's mistake. Alternatives weighed: keeping `Invalid(reason, usage)` and
+  folding the name into `usage` (changes what the field means); making the `Display` the whole
+  report (a multi-line display breaks error chaining). Review with the user: the two new fields
+  change `Invalid`'s shape, so a program matching `Invalid(reason, usage)` must add `_, _`.
+
 - Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **one family of case names, `toUpper` and `toLower`, for
   `char` and `string` alike.** `string.toUpperCase` and `toLowerCase` are renamed to `toUpper` and
   `toLower`, the names `char` already had, across the library, its tests, the corpus, the scripts
