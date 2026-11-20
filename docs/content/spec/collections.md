@@ -1203,7 +1203,7 @@ val q = PriorityQueue[int]()
 q.enqueue(3, 9, 1)
 q += 5
 q.head           // 9, left in the queue
-q.dequeue        // 9
+q.dequeue()      // 9
 q.dequeueAll()     // [5, 3, 1], and q is empty
 
 val soonest = PriorityQueue.withOrdering(reverseOrder(compareBy((t: Task) -> t.due)))
