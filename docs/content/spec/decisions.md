@@ -10591,6 +10591,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   the directory (`examples/NAME/NAME.out`; a second convention beside `tests/programs/run`'s); an
   opt-in line in the program (every run example would carry it, where the `.out` already says it).
 
+- Settled on the user's delegation 2026-11-20 (branch `mem-mir-size`): **the mid-level
+  representation keeps an integer constant as a number and shares each call signature.** An
+  `Operand` was 40 bytes because `ConstInt` held its decimal text; it now holds a `long`
+  (`ConstInt(bits, value)`), and an integer no `long` spells the same way (one wider than 64 bits, a
+  `BigInt` literal) is `ConstWide(bits, digits: &string)`, so the LLVM text stays byte for byte what
+  it was. A `Runtime` or `Indirect` callee names a `&MirSignature` that lowering makes once per shape
+  (`MirSignatures`, keyed by the signature's types), so a call no longer carries its own two lists.
+  `Operand` 40 → 24 bytes, `Inst` 136 → 88, `Terminator` 64 → 48. Measured on marshal at -O2 with a
+  cold cache: the lower phase's resident memory 2.98 → 2.28 GB, its in-use heap 1.80 → 1.41 GB, the
+  build's peak 5.54 → 4.66 GB; the emitted module of marshal (with and without `-g`) and of 252
+  corpus programs is unchanged. The instance cache's entry format is unchanged too: a constant is
+  still written as its digits and a signature in full, and reading one shares it again.
+  Alternatives weighed: signatures by index into a table on `MirProgram` (as small, but every pass
+  that reads a call's signature, emit, devirtualization, union words and the instance cache, would
+  need the table handed to it, where a shared reference needs nothing); keeping one signature per
+  call behind a reference (no sharing: the lists stay per call); boxing the rare large instructions
+  (`Variable`, `AtomicCompareSet`, a C call's `CFunction`): once operands shrank, the largest
+  variants, `Call`, `Select`, `AtomicCompareSet` and `Variable`, all carry 80 bytes, and `Call` and
+  `Select` are common, so boxing the rare ones shrinks no instruction and was left out.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
