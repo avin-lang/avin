@@ -234,6 +234,32 @@ The built-in types keep their operators: a method of one of these names on `int`
 on two `int`s is always the machine's addition, and so is a method `!`, or `~` taking no argument,
 there: `!` on a `bool` is always its negation. `==` and `!=` stay `Eq`'s.
 
+One exception puts a built-in value on an operator's left. An impl adding methods to `int`,
+`long`, `real`, `byte`, `char`, `string` or `bool`, in the type's module or as an extension, may add
+a binary operator method, an arithmetic, ordering, bitwise or shift one, whose one parameter is of a
+type the program declares: a data type, a class, a trait or an opaque type, of any type arguments.
+Its operand is never built-in, so an operator between two built-in values still never reaches a
+method. `k * v` with `k` a `real` calls `real`'s method `*` taking `v`'s type, chosen statically by
+that type like any overload; where the left type has no method of the name the operator keeps its
+own meaning. An integer literal on the left is an `int` where `int` has a method taking the right
+operand, and otherwise the `long`, then the `real`, that has one, so `2 * v` reads as it is written.
+A trait implementation cannot add one, and a method of this kind taking a built-in type, a tuple, a
+function, a union or a type parameter is an error. An extension's is seen where its module is
+imported, as every extension method is:
+
+```text
+data Vec(x: real, y: real)
+
+impl Vec
+  *(k: real) -> Vec = Vec(x * k, y * k)
+
+impl real
+  *(v: Vec) -> Vec = v * self
+
+val doubled = 2.0 * v
+val tripled = 3 * v
+```
+
 A symbol method's call binds at the level of the language's operator its name's first character
 belongs to, so a name reads with the operator it resembles, unless the method declares another
 ([below](#a-declared-precedence)). One character overrides the first: a
