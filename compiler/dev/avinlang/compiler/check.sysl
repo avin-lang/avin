@@ -14718,13 +14718,25 @@ private builds_literals(c: *Checker, t: &Type) -> bool
         None -> return false
     val k = zonk(c, t)
     *k match
-        Class(_, _, _) -> conformance_impl(c, k, b) is Some(_)
-        Data(_, _, _) -> conformance_impl(c, k, b) is Some(_)
+        Class(_, _, _) -> conformance_impl(c, k, b) is Some(_) || instance_conformance_to(c, k, b, true)
+        Data(_, _, _) -> conformance_impl(c, k, b) is Some(_) || instance_conformance_to(c, k, b, true)
         TypeVar(_, _, _) ->
             for bound in bounds_of(c, k)
                 if ancestor_type(c.classes, c.data, bound, b) is Some(_) then return true
             false
         _ -> false
+
+/** Whether an impl for instances of `own`'s declaration states a conformance to trait `t`, or to a
+ * trait requiring it: `impl[A: Ord] Buildable[A] for SortedSet[A]`, a trait type's own conformance,
+ * or `impl Buildable[int] for Box[int]`. `holding` asks that it hold of `own` itself, its type
+ * arguments meeting the impl's; otherwise any instance of the declaration will do. */
+private instance_conformance_to(c: *Checker, own: &Type, t: usize, holding: bool) -> bool
+    for n in 0..<c.instances.len()
+        val x = c.instances[n]
+        if !impl_targets(x.ty, own) || ancestor_type(c.classes, c.data, x.trait_type, t) is None then continue
+        if !holding then return true
+        if instance_args(conformances(c), n, own) is Some(_) then return true
+    false
 
 /** The core library's collection `name`, with its own type parameters as its arguments. */
 private core_collection_type(c: *Checker, name: string) -> Option[&Type]
@@ -14734,8 +14746,9 @@ private core_collection_type(c: *Checker, name: string) -> Option[&Type]
 
 /** Whether `want`, the type a collection literal is expected to be, is a collection that the
  * literal's default collection `default` is not an instance of and that is not `Buildable` itself, so
- * that no literal can build it: an `Iterable`, or a type whose companion has a `newBuilder`, which
- * builds no literal without the trait. */
+ * that no literal can build it: an `Iterable`, a type whose companion has a `newBuilder`, which
+ * builds no literal without the trait, or an instance of a type that is `Buildable` at other type
+ * arguments only. */
 private unbuildable_collection(c: *Checker, want: &Type, default: &Type) -> bool
     val w = zonk(c, want)
     val companion = *w match
@@ -14748,6 +14761,8 @@ private unbuildable_collection(c: *Checker, want: &Type, default: &Type) -> bool
             c.data[d].companion
         _ -> return false
     if builds_literals(c, w) then return false
+    if c.core.trait_named("Buildable") is Some(b)
+        if instance_conformance_to(c, w, b, false) then return true
     if companion is Some(o)
         if methods_named(c, o, "newBuilder").len() > 0 then return true
     val iterable = c.class_types.get(qualified(CoreModule, "Iterable")) match

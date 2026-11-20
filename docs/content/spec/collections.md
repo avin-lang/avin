@@ -987,8 +987,9 @@ map literals, the mutable `Set` and `Map` of `avin.collections.mutable` and `Tre
 included. Each is built only by the literal of its own shape: `[1, 2]` where a `Set` is expected is
 an error, as `{1, 2}` is where a `Vector` is; `{}` is the empty set or the empty map, whichever is
 expected. A collection is built by a literal through the core trait `Buildable[A]`, whose one member,
-`static newBuilder() -> Builder[A, Self]`, makes the builder; every library collection implements it,
-and a program's collection joins by an impl in any module:
+`static newBuilder() -> Builder[A, Self]`, makes the builder; every library collection with a builder
+implements it (all but `LazyList`, which is never built eagerly; `LazyList(1, 2)` makes one), and a
+program's collection joins by an impl in the module of the type or of the trait:
 
 ```text
 impl[T] Buildable[T] for Stack[T]
@@ -998,10 +999,15 @@ impl[T] Buildable[T] for Stack[T]
 Such a type is built by a sequence or set literal wherever it is expected, and by a map literal when
 its builder takes `(key, value)` pairs, each entry given to it as one; so is a type parameter bounded
 by the trait, `make[C: Buildable[int]]() -> C = [1, 2, 3]`. The conformance is the expected type's
-own: a `TreeSet` is built by `TreeSet`'s, never by the one of `SortedSet`, a trait it implements. A
+own: a `TreeSet` is built by `TreeSet`'s, never by the one of `SortedSet`, a trait it implements,
+while a `SortedSet`, `Set` or `Map` expected is built by the trait type's own conformance, which
+makes its default kind (`{}` where a `Map` is expected is the empty `HashMap`). An impl for one
+instance of a generic type, `impl Buildable[int] for Count[int]`, builds that instance and no other. A
 method named `newBuilder` in a companion object builds no literal, and an expected collection that
 is not `Buildable` and not an instance of the default (`Vector`, `Set` or `Map`) is an error naming
-the trait. The
+the trait: `val c: Count[string] = [1]` is one. A companion's `apply`, `Deque(1, 2, 3)`, is an
+ordinary method taking a repeated parameter, whose `Vector` is built through `Vector`'s own
+conformance, as a literal is. The
 elements take their types from the expected element type when there is one (`Array[byte]` makes
 each literal a `byte`), and otherwise from the elements themselves, which agree on a type as the
 branches of an `if` do: `[dog, cat]` is a `Vector[Animal]`, and `[1, "two"]` is an error. A number

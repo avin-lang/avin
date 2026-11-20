@@ -9229,8 +9229,19 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   trait for maps); two traits, one for sequences and sets and one for maps (the element type already
   tells a pair from an element, so the second adds nothing); removing the companions' `newBuilder`
   and calling the static as `Vector[int].newBuilder()` (breaks every call site in every avin-lang
-  repo for no gain in soundness). **Review with the user**: the name `Buildable`, and whether the
-  companions' `newBuilder` should eventually be the static member alone.
+  repo for no gain in soundness). A trait type's own conformance builds where the trait type is
+  expected (`SortedSet`, `Set`, `Map`, `SeqMap`, so `{}` where a `Map` is expected is the empty map
+  through `Map`'s own impl), and an impl for one instance, `impl Buildable[int] for Count[int]`,
+  builds that instance only; `Count[string]` expected is the error naming the trait. **The companion
+  `apply` stays an ordinary method** (`Deque(1, 2, 3)`): its repeated parameter's `Vector` is already
+  built through `Vector`'s conformance, so it meets the trait where a literal does, and each
+  collection keeps the cheapest way from that vector to itself. ALTERNATIVES for `apply`: rewriting
+  every companion `apply` over its own `newBuilder` (no gain in soundness, and slower where `apply`
+  converts the vector directly, as `Array`'s `toArray` does); a `static apply(xs: A*) -> Self` in
+  `Buildable` with a default body (makes `C(1, 2)` callable on a bound `C: Buildable[int]`, but adds
+  a second member every program's impl inherits, and `C.newBuilder()` already serves that).
+  **Review with the user**: the name `Buildable`, and whether the companions' `newBuilder` should
+  eventually be the static member alone.
 
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
