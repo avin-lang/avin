@@ -577,7 +577,7 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 
 Designed in [contextual parameters](/spec/contextual-parameters/), its choices
 [settled](/spec/decisions/#settled). Steps 1 and 2 are done (branch `given-1`), step 3 too (branch
-`given-3`); steps 4 to 6 are still to come. A filled argument becomes an ordinary
+`given-3`), and step 4 (branch `given-4`). A filled argument becomes an ordinary
 argument in the checker's output, so lowering, emission and the runtime change nothing; every step
 is in the front end and tooling. Each step is one agent, gated on its own with the files it names.
 
@@ -639,6 +639,15 @@ is in the front end and tooling. Each step is one agent, gated on its own with t
    object givens made in initialization order; a module of several files sharing its givens.
    Files: `check.sysl`, `names.sysl`, `incremental.sysl` (a module's givens are part of what an
    importing file depends on). Tests: `tests/programs/run/given_*` and `tests/programs/reject/given_*`.
+   **Done** (branch `given-4`): `given_module_level` takes, beside the module's own givens, the givens
+   another module declares that the module exports by name and those the call's file imports by name
+   (each under the name its export or import binds, one given however many names reach it); the "no
+   given" error adds, for each public fitting given of a module the file imports whole, the import to
+   write (`given_import_hint`). Imported givens need nothing of the instance cache: a filled argument
+   reads the module-level value, whose interface a key already holds. Initialization order needed no
+   change, a given being a module-level value. Tests: `tests/programs/run/given_import_{forms,named}`,
+   `tests/programs/reject/given_import_{whole,per_file,private,two}`, `given_import_tests.sysl`,
+   `instance_cache_tests.sysl` (`imported_given_*`).
 5. **Lambdas, function values, threads and actors.** `using` lambda parameters as givens in the
    body; a function or method taken as a value filled where taken; captures of givens through the
    existing capture analysis; the `@sendable`, `spawn`, executor-task and actor checks naming a

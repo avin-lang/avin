@@ -171,7 +171,10 @@ level holding one that fits:
 brings `systemClock` in as a value and as a given; `import app.clock.systemClock` and an `as` rename
 do the same, and so does importing it through a module that [exports](/spec/declarations/#visibility-and-modules)
 it. Importing the module whole, `import app.clock`, makes `clock.systemClock` readable as a value
-but not a given. There is no wildcard import, of givens either.
+but not a given. There is no wildcard import, of givens either. An import is its file's own: another
+file of the module sees the given only by importing it too. A module that exports a given has it as
+a given of its own files, as it has every name it exports, and two names that reach one given, by
+import or export, are one given. A `private` given cannot be imported.
 
 A given decides, without anything written at the call, which value a function receives, so every
 file that relies on one says which in its imports. An extension may be seen through any import of
