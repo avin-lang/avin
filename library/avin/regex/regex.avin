@@ -5,8 +5,8 @@ module avin.regex
 // count bytes, as every string offset does; matching itself goes character by character, so `.`
 // matches one character, however many bytes encode it.
 
-// A compiled pattern, as a `Regex` holds it.
-class Pattern(private val text: string, private val program: Program, private val patternNames: Vector[(string, int)])
+// A compiled pattern, as a `Regex` holds it. Like the `Regex`, it may be shared between threads.
+class Pattern(private val text: string, private val program: Program, private val patternNames: Vector[(string, int)]): Sendable
   // The pattern as it was written.
   pattern -> string = text
 
@@ -34,14 +34,15 @@ class Pattern(private val text: string, private val program: Program, private va
     var index = 0
     val limited = limit > 0
     while e.findNext()
-      val m = e.snapshot()
+      val start = e.matchStart
+      val end = e.matchEnd
       if !limited || pieces.length < limit - 1
-        if !(index == 0 && m.start() == 0 && m.end() == 0)
-          pieces.addOne(input.slice(index, m.start()))
-          index = m.end()
+        if !(index == 0 && start == 0 && end == 0)
+          pieces.addOne(input.slice(index, start))
+          index = end
       elif pieces.length == limit - 1
         pieces.addOne(input.slice(index, input.byteLength))
-        index = m.end()
+        index = end
     if index == 0 then return Array.fill(1, input)
     if !limited || pieces.length < limit then pieces.addOne(input.slice(index, input.byteLength))
     var kept = pieces.length
@@ -55,14 +56,15 @@ impl Display for Pattern
 // A regular expression. `Regex(pattern)` compiles the pattern and traps when it is not a valid one,
 // with the message `PatternError` gives; `Regex.compile` answers with the error instead. The group
 // names given after the pattern name its groups in order for `Match.group(name)`, in place of the
-// names the pattern gives them.
+// names the pattern gives them. A compiled regex never changes, so it is sendable: one regex, a
+// module's `val` among them, may match on any number of threads at once.
 class Regex(
     private val text: string,
     private val program: Program,
     private val patternNames: Vector[(string, int)],
     private val names: Vector[string],
     private val unanchoredMatch: bool
-)
+): Sendable
   // The compiled pattern.
   pattern -> Pattern = Pattern(text, program, patternNames)
 
@@ -360,7 +362,11 @@ private class Searched(
   checked[T](value: T) -> Result[T, MatchError] = if engine.exhausted then Err(engine.error()) else Ok(value)
 
   // The text of the current match.
-  matched -> string = source.slice(offsets(engine.groups(0)), offsets(engine.groups(1)))
+  matched -> string = source.slice(matchStart, matchEnd)
+
+  // Where the current match starts and ends, as byte offsets.
+  matchStart -> int = offsets(engine.groups(0))
+  matchEnd -> int = offsets(engine.groups(1))
 
   // Searches on from the current match: from its end, or one character past it when it was empty.
   findNext() -> bool
@@ -381,7 +387,7 @@ private class Searched(
       if s >= 0
         starts(g) = offsets(s)
         ends(g) = offsets(engine.groups(g * 2 + 1))
-    Match(source, starts, ends, patternNames, names)
+    Match(source, starts.toArraySeq, ends.toArraySeq, patternNames, names)
 
 // The code points of `s`, with the byte offset of each and of the end added to `offsets`.
 private decode(s: string, offsets: Buffer[int]) -> Array[int]
@@ -397,14 +403,15 @@ private decode(s: string, offsets: Buffer[int]) -> Array[int]
   codes.toArray()
 
 // One match: the text it was found in, and where the whole match and each group start and end, as
-// byte offsets. A group that took no part in the match starts and ends at -1 and has no text.
+// byte offsets. A group that took no part in the match starts and ends at -1 and has no text. Nothing
+// in a match changes once it is found, so it may be sent to another thread.
 class Match(
     val source: string,
-    private val starts: Array[int],
-    private val ends: Array[int],
+    private val starts: ArraySeq[int],
+    private val ends: ArraySeq[int],
     private val patternNames: Vector[(string, int)],
     private val names: Vector[string]
-)
+): Sendable
   // The number of capturing groups, not counting the whole match.
   groupCount -> int = starts.length - 1
 
