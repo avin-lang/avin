@@ -1,0 +1,105 @@
+// expect: exit 0
+// Several megabytes through `cat` both ways at once, with no deadlock: far more than a pipe holds
+// (64 KiB on macOS and Linux), so `cat` stops reading while its output is full and the program stops
+// writing while `cat`'s input is, and neither side's wait may hold up the other. Three ways: a thread
+// of its own writes while the program reads; one thread drives both pipes through a `select` on
+// `writable()` and `readable()`, writing only what goes at once (`writeSome`) and reading only what
+// has arrived (`readAvailable`); and the two writes and reads in two lightweight threads beside a
+// third that only counts, which goes on counting while the pipes wait. Every byte comes back in
+// order, checked by length and a sum weighted by position.
+import avin.io.IoError
+import avin.process.{Child, ChildInput, ChildOutput, Command}
+import avin.threads.{Atomic, sleep, spawn}
+import avin.time.millis
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+val Size = 6 * 1024 * 1024
+
+// The test's bytes: `Size` of them, a pattern a shift or a lost piece would break.
+data() -> Array[byte] = Array.tabulate(Size, i -> byte((i * 7 + i / 4093) % 127))
+
+// The length of the bytes taken in so far and their sum, each weighted by its position.
+class Tally
+  var length: long = 0
+  var sum: long = 0
+
+  add(bytes: Array[byte])
+    for b in bytes
+      sum = sum +% long(int(b)) * (length % 13 + 1)
+      length += 1
+
+tallyOf(bytes: Array[byte]) -> (long, long)
+  val t = Tally()
+  t.add(bytes)
+  (t.length, t.sum)
+
+cat() -> Child = Command("cat").pipeInput().pipeOutput().start().ok.get
+
+main() -> int
+  val want = tallyOf(data())
+
+  // A thread writes everything and closes the input; the program reads until the output ends.
+  val c1 = cat()
+  val input1 = c1.stdin()
+  val writer = spawn(() ->
+    ok(input1.write(data()))
+    ok(input1.close()))
+  val got1 = Tally()
+  val output1 = c1.stdout()
+  loop
+    val piece = ok(output1.read(65536))
+    if piece.length == 0 then break
+    got1.add(piece)
+  writer.join()
+  println(s"a writing thread: ${(got1.length, got1.sum) == want}, ${c1.waitFor().ok.get}")
+
+  // One thread, both pipes, in a select: each arm only when there is something to do.
+  val c2 = cat()
+  val input2 = c2.stdin()
+  val output2 = c2.stdout()
+  val bytes = data()
+  var sent = 0
+  var inputOpen = true
+  var outputOpen = true
+  var partial = 0
+  val got2 = Tally()
+  while outputOpen
+    select
+      input2.writable() if inputOpen ->
+        val n = ok(input2.writeSome(bytes.slice(sent, if Size - sent > 100000 then sent + 100000 else Size)))
+        if n < 100000 && sent + n < Size then partial += 1
+        sent += n
+        if sent == Size
+          ok(input2.close())
+          inputOpen = false
+      output2.readable() ->
+        ok(output2.readAvailable(65536)) match
+          Some(piece) if piece.length == 0 -> outputOpen = false
+          Some(piece) -> got2.add(piece)
+          None -> ()
+  println(s"one thread in a select: ${(got2.length, got2.sum) == want}, ${c2.waitFor().ok.get}")
+  println(s"some writes went in part: ${partial > 0}")
+
+  // Writing and reading in threads of their own while a third counts.
+  val c3 = cat()
+  val input3 = c3.stdin()
+  val output3 = c3.stdout()
+  val counting = Atomic(true)
+  val count = Atomic(long(0))
+  val counter = spawn(() ->
+    while counting.load()
+      count.add(1)
+      sleep(millis(1)))
+  val w = spawn(() ->
+    ok(input3.write(data()))
+    ok(input3.close()))
+  val r = spawn(() -> tallyOf(ok(output3.readAll())))
+  val got3 = r.join()
+  w.join()
+  counting.store(false)
+  counter.join()
+  println(s"two threads: ${got3 == want}, ${c3.waitFor().ok.get}, the counter ran: ${count.load() > 0}")
+  0

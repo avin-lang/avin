@@ -266,6 +266,7 @@ Environment changes apply in the order called; on a pipeline or a sequence the c
 | `c.errorsToFile(file: string)`, `c.errorsAppendTo(file: string)` | The same command, its standard error written to the file, emptied first or added to. |
 | `c.errorsToOutput()` | The same command, its standard error going where its standard output goes: into the same open file, so neither empties what the other wrote, and into what `output()` and `lines()` capture. |
 | `c.inNewGroup` | The same command, started in a process group of its own, which every program it starts joins ([proposed](/spec/decisions/#proposed)). |
+| `c.pipeInput()`, `c.pipeOutput()`, `c.pipeErrors()` | The same command, its standard input, output or error a pipe the program writes or reads through the `Child` that `start()` answers ([pipes](#pipes-to-a-started-command)). With `errorsToOutput()`, standard error goes into the output's pipe. |
 | `a andThen b` | `a`, then `b` only where `a` succeeded; the status is the last one run. |
 | `a orElse b` | `a`, then `b` only where `a` did not succeed. |
 | `a followedBy b` | `a`, then `b` whatever `a`'s status. |
@@ -301,6 +302,8 @@ it.
 | `detach() -> long` | Lets go of the command without stopping it, so it outlives its `Child` and the program, and answers `pid()`. |
 | `residentBytes() -> Result[long, IoError]` | The memory the program `pid()` names holds in RAM now, as `process.residentBytes(pid())` answers it; a command seen to have ended, or with no program started, is `Err(NotFound)`. |
 | `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the command's programs used, each with its reaped descendants', a pipeline's stages and a sequence's parts added. After `waitFor` it is the whole command's; before, what the programs seen to have ended used. A detached program counts nothing. |
+| `stdin() -> ChildInput` | The pipe the command reads its standard input from, for a command started `pipeInput()`; the same one every time. A command that asked for none traps. |
+| `stdout() -> ChildOutput`, `stderr() -> ChildOutput` | The pipe the command writes its standard output, or its standard error, into, for a command started `pipeOutput()` or `pipeErrors()`. A command that asked for none traps. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
@@ -360,6 +363,86 @@ nothing. A program that leaves its terminal's group as well starts the command `
 detaches itself with `newSession()`.
 
 The iterator `lines()` answers is not sendable: the thread that reads a command's output starts it.
+
+#### Pipes to a started command
+
+A command started with `pipeInput()`, `pipeOutput()` or `pipeErrors()` talks to the program over
+pipes while it runs, a request written and its reply read, as an editor talks to a language server
+([settled](/spec/decisions/#settled)):
+
+```text run
+import avin.process.Command
+
+main() -> int
+  val doubler = Command("/bin/sh", "-c", "while read n; do echo $((n * 2)); done").pipeInput().pipeOutput().start().ok.get
+  val requests = doubler.stdin()
+  val replies = doubler.stdout()
+  for n in [1, 20, 300]
+    _ = requests.writeText(s"$n\n")
+    println(s"$n doubled is ${replies.readLine().ok.get.get}")
+  _ = requests.close()
+  println(s"after its input ended: ${replies.readLine().ok.get}, ${doubler.waitFor().ok.get}")
+  0
+```
+
+```text output
+1 doubled is 2
+20 doubled is 40
+300 doubled is 600
+after its input ended: None, Exited(0)
+```
+
+`stdin()` is a `ChildInput`, which is an `avin.net.StreamWriter`, and `stdout()` and `stderr()` are
+`ChildOutput`s, each an `avin.net.StreamReader`: the two halves of a [split connection](#split-connections)
+in all but name, so code that speaks a protocol over a connection speaks it over a child's standard
+streams unchanged, and anything that takes an `io.Reader` or an `io.ByteWriter` takes them.
+
+| `ChildOutput` | Meaning |
+| --- | --- |
+| `read(max: int)` | Up to `max` bytes of what has arrived, waiting only while nothing has; an empty array once the output has ended, as often as asked. |
+| `readLine()`, `readAll()` | A line, `None` at the end, or everything until the end, as a connection reads them. |
+| `readAvailable(max: int)` | `Some` of what `read(max)` would answer without waiting, `None` where nothing has arrived. Never waits. |
+| `readable()` | Whether a read would answer now: a `select` waits on it with an `out.readable()` arm, a `Selector` with `readable(out, key)`. |
+| `setTimeout(d)`, `close()` | A wait longer than `d` answers `TimedOut`; closing it tells a command that still writes that its reader has gone. |
+
+| `ChildInput` | Meaning |
+| --- | --- |
+| `write(bytes)`, `writeText(text)` | Writes all of it, waiting for the command to read where the pipe is full. |
+| `writeSome(bytes)` | Writes what goes without waiting, after waiting for room for the first byte, and answers how many. |
+| `writable()` | Whether a write would write something now; a `select` waits on it with an `in.writable()` arm. |
+| `setTimeout(d)`, `close()` | A wait longer than `d` answers `TimedOut`; closing it ends the command's input, which it reads once it has read everything written before. |
+
+**A wait parks.** Each end is non-blocking, and a read or write that has to wait waits as a
+connection's does: a lightweight thread parks on the runtime's poller, leaving its worker to the
+others, and any other thread waits on the descriptor alone, safe for the collector.
+
+**Nothing ends the program.** A write to a command that has ended, or has closed its input, answers
+`Err(IoError(ConnectionReset, "write to", "the standard input of …"))`, never SIGPIPE. A command that
+ends, or is killed, with output unread leaves it in the pipe: `waitFor` answers its status, and the
+reads that follow answer what it wrote and then the end. Output ends when every program holding the
+stream has ended or closed it, a program the command started and left running among them. A
+command's [time limit](#commands) bounds every wait on its pipes too: one that would wait past it
+answers `TimedOut`, and `waitFor` then stops the command and answers `TimedOut`.
+
+**A full pipe waits for its reader.** A pipe holds 64 KiB; a command writing more waits until the
+program reads, and the program writing more than the command reads waits for it. A program that writes
+a command's input and reads its output, both larger than that, does the two at once: in two threads,
+or in one through a `select` on `in.writable()` and `out.readable()` with `writeSome` and
+`readAvailable`. Waiting for a command with `waitFor` reads nothing, so a command that writes more
+than a pipe holds is read before it is waited for.
+
+**Each end belongs to the code it is handed to, not to the `Child`.** An end is used by one thread at a
+time and checked at every operation, as a connection is; handed to a thread, it is that thread's until
+the thread returns. Handing the `Child` over hands over none of its pipes, so a thread may wait for the
+command while the program writes and reads them. `close()` on the `Child` stops and waits for the
+command and leaves the pipes to their own `close()`; an end closes too when the collector frees it.
+The pipes do not keep the command running: it is the `Child`'s, which stops it when collected.
+
+**Only the command `start()` starts hands its pipes over.** `run()`, `output()` and `lines()` of a
+command asking for a pipe trap, and so does a part of a pipeline or a sequence asking for one: a
+pipeline's input pipe is its first stage's, its output pipe its last stage's, and its error pipe every
+stage's; a sequence's parts write into its output pipe one after the other. The program's ends of the
+pipes are closed on exec, so no other command started meanwhile, from any thread, inherits one.
 
 ```text
 data ExitStatus

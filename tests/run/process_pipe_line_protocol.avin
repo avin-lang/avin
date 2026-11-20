@@ -1,0 +1,52 @@
+// expect: exit 0
+// A line protocol back and forth over a child's standard input and output: each request is written,
+// and its reply read, before the next is sent, so nothing is buffered ahead on either side. A shell
+// loop answers each line it reads, `ok` and the line's length; `quit` ends it, after which its output
+// ends and it exits by itself. A reply longer than one read, an empty line and a line ending `\r\n`
+// go across whole. A `ChildOutput` is a `StreamReader` and a `ChildInput` a
+// `StreamWriter`, so code written for a connection's halves speaks the protocol unchanged.
+import avin.io.IoError
+import avin.net.{StreamReader, StreamWriter}
+import avin.process.Command
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// One request and its reply, over any connection's halves.
+ask(to: StreamWriter, from: StreamReader, line: string) -> string
+  ok(to.writeText(line + "\n"))
+  ok(from.readLine()).getOrElse("(ended)")
+
+server() -> Command = Command(
+  "/bin/sh",
+  "-c",
+  "while IFS= read -r line; do if [ \"$line\" = quit ]; then echo bye; exit 3; fi; echo \"ok ${#line} $line\"; done"
+)
+
+main() -> int
+  val child = server().pipeInput().pipeOutput().start().ok.get
+  val to = child.stdin()
+  val from = child.stdout()
+  for word in ["alpha", "", "two words", "x"]
+    println(s"<${ask(to, from, word)}>")
+  // A hundred round trips, each answered before the next is asked.
+  var answered = 0
+  for i in 0 ..< 100
+    if ask(to, from, s"request $i") == s"ok ${s"request $i".byteLength} request $i" then answered += 1
+  println(s"round trips answered in order: $answered")
+  // A reply far longer than the 8 KiB a line read takes at once.
+  val longLine = "z".repeat(100000)
+  println(s"long line back whole: ${ask(to, from, longLine) == s"ok 100000 $longLine"}")
+  // A `\r` before the newline is the line's terminator to the reader, not part of its text.
+  ok(to.writeText("crlf\r\n"))
+  println(s"crlf: ${ok(from.readLine()).get.byteLength}")
+  println(ask(to, from, "quit"))
+  println(s"after quit: ${ok(from.readLine())}")
+  println(s"status: ${child.waitFor().ok.get}")
+  // The child has gone: a write to its input says its reader has gone, and does not end the program.
+  val gone = to.writeText("anyone?\n")
+  println(s"write after it ended: ${gone.err.get.kind}")
+  _ = to.close()
+  _ = from.close()
+  0
