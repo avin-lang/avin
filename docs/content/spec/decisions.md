@@ -8232,6 +8232,45 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `-` unless it is a number; typed positional arguments, left out until a program needs one;
   `Option`-typed defaults (`default = Some(3)`), exact but noisy at every declaration.
 
+- Settled on the user's delegation 2026-11-19 (built on branch `cli-subcommands`): **`avin.cli`
+  commands are parsers of their own.** `Parser.command(sub)` adds the command `sub.name`, whose
+  options and arguments `sub` declares and whose help line is `sub.about`; a command may have
+  commands (`git remote add`). The first positional argument names the command and every argument
+  after it is the command's, so the program's options come before the command word and the
+  command's after it (`todo --file t.txt add -p high milk`); a parser with commands takes no
+  positional arguments, and declaring both traps. `Args.command` is the command's name (empty where
+  the parser has none) and `Args.commandArgs` the command's own `Args`. While a command reads its
+  arguments its parser is named after the program and the command, so its usage line, help and
+  messages say `todo add`. Every parser with commands has the command `help` (`todo help add`,
+  `todo help remote add`) unless the program declares one of that name, as with `--help`; `todo add
+  --help` is the command's own. No command is ``missing command; the commands are `add`, …``; an
+  unknown one is ``unknown command `lst`; did you mean `list`?``, the suggestion being the nearest
+  name within two edits (fewer than the word's characters), else the one name the word begins,
+  else the list of commands. WHY: a sub-parser is the value a program already knows how to build,
+  so a command needs no new kind of declaration, and nesting comes free; reading only the program's
+  options before the word is the convention every tool with commands follows, and keeps a
+  command's options free to reuse the program's names. Alternatives weighed:
+  `command(name, help, sub)` (repeats what `sub` already holds); a dispatch table of functions
+  (`command(sub, run)`) that `parse` would call, which hides control flow and fixes a return type
+  on every command; options of the program accepted after the command word too (ambiguous where
+  both declare a name); a missing command printing the help instead of a mistake; matching
+  commands by unique prefix outright (`todo l` running `list`), which turns a later command into a
+  breaking change. Review with the user: whether a missing command should show the help (git's
+  way) rather than be a mistake.
+  **A mistake is reportable without ending the program.** `ArgsError.Invalid` gains `program`
+  (the name of the parser that found it, `todo add`) and `hint` (``Run `todo add --help` for the
+  options.``, ``Run `todo --help` for the commands.``, or `help` where `--help` is the program's
+  own, or empty), so `Invalid(reason, usage, program, hint)`; `ArgsError.report` is the whole
+  text `parseOrExit` writes, every line ending in a newline, and `exitCode` its status (0 for the
+  help or the version, 2 for a mistake). A shell or script runner calls `parse`, writes
+  `e.report` and reads the next line; `message` and the `Display` stay the reason alone, so an
+  `ArgsError` passed on with `?` still reads as one sentence. WHY: the error must carry the
+  failing command's name, since only it knows it; a parser method `report(e)` would name the
+  top program for a command's mistake. Alternatives weighed: keeping `Invalid(reason, usage)` and
+  folding the name into `usage` (changes what the field means); making the `Display` the whole
+  report (a multi-line display breaks error chaining). Review with the user: the two new fields
+  change `Invalid`'s shape, so a program matching `Invalid(reason, usage)` must add `_, _`.
+
 - Settled on the user's delegation 2026-11-13 (built on branch `small-papercuts`): **one family of case names, `toUpper` and `toLower`, for
   `char` and `string` alike.** `string.toUpperCase` and `toLowerCase` are renamed to `toUpper` and
   `toLower`, the names `char` already had, across the library, its tests, the corpus, the scripts
@@ -10133,6 +10172,53 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `tests/programs/{run,reject}/scalar_left_extensions`. **Review with the user**: whether an operand
   of a type parameter bounded by a trait (`[T: Shape] k * s`) should also dispatch (left out: the
   right operand must be a concrete program type today), and the literal preference order.
+
+- Settled on the user's delegation 2026-11-19 (branch `display-width`): **the standard library
+  measures the columns of a terminal: `char.displayWidth`, `string.displayWidth`,
+  `padStartWidth(width, ch = ' ')`, `padEndWidth(width, ch = ' ')` and `truncateWidth(width,
+  ellipsis = "…")`, and a formatted field's width counts those columns.** The rules
+  (`library/avin/display_width.avin`): a character is 2 when East Asian Wide or Fullwidth; 0 when a
+  nonspacing or enclosing mark, a format character (but the soft hyphen and the marks before a
+  number), or a Hangul vowel or final jamo; 0 when a control character; 1 otherwise, Ambiguous and
+  unassigned included. Text is measured by cluster: a character with the zero-width characters after
+  it, a skin tone after an emoji, and, after a pictograph, each pictograph a zero-width joiner joins;
+  a cluster is as wide as its first character, except that a variation selector 16 after an emoji, or
+  a skin tone, makes it 2, and two regional indicators are one flag of 2. The table is generated from
+  the Unicode Character Database 17.0.0 (the version `sysl.unicode` answers with) by
+  `scripts/display_width_table.avin` into `library/avin/display_width_table.avin`, about 3 KB of
+  base-32 runs decoded on the first character beyond ASCII; ASCII is answered without it. Choices,
+  each with its rationale and the alternatives weighed:
+  - **Control characters are 0**, not -1 as C's `wcwidth` answers: a width is summed, and a -1 makes
+    every sum wrong; where a tab or newline moves the cursor is the terminal's business. Alternative:
+    1, as `tui` draws a control as U+FFFD (a drawing choice, not a measure).
+  - **Emoji sequences are 2 per cluster**, as kitty, WezTerm, iTerm2, Ghostty and the other modern
+    terminals draw them; older terminals that measure each code point make a family 6 or more. A
+    variation selector 15 changes nothing, since terminals mostly keep a default-emoji character two
+    wide under it. A lone regional indicator is 1, its East Asian width. A zero-width joiner joins only
+    a pictograph to a pictograph, as the grapheme rule GB11 does, so `a` + ZWJ + `😀` is 3.
+    Alternative: full extended grapheme clusters from the break tables `avin.regex` carries (exact for
+    Indic conjuncts and prepended marks, but the prelude would carry those tables and the widths come
+    out the same for what a terminal draws).
+  - **Separate names, `padStartWidth`/`padEndWidth`, beside `padStart`/`padEnd`**, which keep counting
+    characters. Alternative: a named parameter (`padEnd(10, byWidth = true)`), rejected as a flag that
+    changes what the first argument means; or changing `padEnd` itself, rejected because a sequence's
+    `padTo` and `take`/`drop` count characters and `padEnd` pairs with them. A wide fill character fills
+    two columns at a time and a space fills a column left over; a fill of no width traps (`padding by
+    width needs a fill character that takes a column`) when padding is needed, rather than looping or
+    silently using a space.
+  - **`truncateWidth` never cuts a cluster**, so the result may be a column short of `width` where a
+    wide character does not fit, and adds no padding (pad it after when a fixed width is wanted). An
+    ellipsis wider than `width` is dropped and the clusters that fit kept; a `width` of 0 or less keeps
+    nothing.
+  - **A formatted field's width (`%8s`, `%-6?`, `%3c`, and `FormatSpec.width` in `writeField`) counts
+    columns**: field widths exist to line columns up, and for ASCII nothing changes. The precision of
+    `%s` and `%?` still counts characters, as `take` does. The runtime's `text_width` intrinsic, which
+    counted code points for the field, is removed. Review with the user: this changes the output of an
+    existing program that formats wide or combining text into a field (a CJK `%10s` now pads four
+    columns less for two ideographs).
+  - `avin.cli`'s help measures names with `displayWidth` and pads with `padEndWidth`. The `tui`
+    package's own table (`width_table.avin`, Unicode 16.0.0) and its `charWidth`/`textWidth` can
+    become calls to these.
 
 ## Proposed
 

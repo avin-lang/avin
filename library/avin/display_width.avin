@@ -1,0 +1,193 @@
+module avin
+
+// How many columns of a terminal a character, and a piece of text, takes: the measure that lines up
+// text in a fixed-width font, where a CJK ideograph or an emoji takes two columns and a combining
+// accent none.
+//
+// A character on its own, `char.displayWidth`:
+//
+// - 2 for the East Asian Wide and Fullwidth characters: CJK ideographs, kana, Hangul syllables,
+//   fullwidth forms, and the emoji shown as pictures by default.
+// - 0 for the nonspacing and enclosing marks (combining accents and the variation selectors), the
+//   format characters (the zero-width space and joiner, the bidirectional marks, the byte order
+//   mark), and the Hangul vowels and finals that join the syllable before them. The soft hyphen and
+//   the marks written before a number are shown, and take 1.
+// - 0 for the control characters, U+0000 to U+001F and U+007F to U+009F, tab and newline among
+//   them: where they move the cursor is the terminal's business, not a width.
+// - 1 for everything else, the East Asian Ambiguous characters and unassigned code points included.
+//
+// Text, `string.displayWidth`, is measured cluster by cluster, as a modern terminal draws it. A
+// cluster is a character and what joins it: the zero-width characters after it, a skin-tone modifier
+// after an emoji, and, when it is a pictograph, the pictograph after each zero-width joiner (an emoji
+// family or profession). A cluster is as wide as its first character, except that a variation
+// selector 16 after an emoji makes it 2 (`❤️`, the keycap `1️⃣`), a skin tone makes an emoji 2, and
+// two regional indicators are one flag of 2. A variation selector 15 changes nothing. A control
+// character is a cluster of its own and joins nothing, and zero-width characters with nothing before
+// them make a cluster of 0.
+//
+// The table is generated from the Unicode Character Database 17.0.0 by
+// `scripts/display_width_table.avin` into `display_width_table.avin`, and decoded the first time a
+// character beyond ASCII is measured.
+
+impl char
+  // The columns it takes on a terminal when drawn on its own: 2, 1, or 0 for a combining or other
+  // zero-width character and for a control character.
+  displayWidth -> int
+    val n = int(self)
+    if 0x20 <= n < 0x7f then return 1
+    columnsOfKind(displayKind(n))
+
+impl string
+  // The columns it takes on a terminal, cluster by cluster: `"日本".displayWidth` is 4,
+  // `"e\u{301}"` (an `e` and a combining acute) is 1, and an emoji with a skin tone, a family joined
+  // by zero-width joiners, or a flag is 2.
+  displayWidth -> int
+    val clusters = DisplayClusters(self, 0, 0)
+    var total = 0
+    while clusters.advance()
+      total += clusters.width
+    total
+
+  // At least `width` columns wide on a terminal, `ch` repeated in front as often as it fits; where a
+  // wide `ch` leaves a column over, a space fills it. A string already that wide is returned as it
+  // is. Traps when `ch` takes no column.
+  padStartWidth(width: int, ch: char = ' ') -> string
+    val short = width - displayWidth
+    if short <= 0 then self else widthFill(short, ch) + self
+
+  // As `padStartWidth`, with the padding after the string.
+  padEndWidth(width: int, ch: char = ' ') -> string
+    val short = width - displayWidth
+    if short <= 0 then self else self + widthFill(short, ch)
+
+  // At most `width` columns wide on a terminal: the string itself when it fits, or else as many of
+  // its clusters from the start as fit with `ellipsis` after them. A cluster is never cut, so the
+  // result may be a column narrower than `width` where a wide one does not fit. When `ellipsis` is
+  // wider than `width` itself, the clusters that fit are kept with no ellipsis; a `width` of 0 or less
+  // keeps none.
+  truncateWidth(width: int, ellipsis: string = "…") -> string
+    if displayWidth <= width then return self
+    val room = width - ellipsis.displayWidth
+    val keep = if room >= 0 then room else width
+    val clusters = DisplayClusters(self, 0, 0)
+    var used = 0
+    var kept = 0
+    while clusters.advance() && used + clusters.width <= keep
+      used += clusters.width
+      kept = clusters.past
+    slice(0, kept) + (if room >= 0 then ellipsis else "")
+
+// `columns` columns of `ch`, a space after them where a wide `ch` leaves one over.
+private widthFill(columns: int, ch: char) -> string
+  val w = ch.displayWidth
+  if w <= 0 then fail("padding by width needs a fill character that takes a column")
+  ch.toString().repeat(columns / w) + " ".repeat(columns % w)
+
+// The kinds the table gives a code point, in its two low bits, and its emoji properties above them.
+private val KindOne: int = 0
+private val KindZero: int = 1
+private val KindTwo: int = 2
+private val KindControl: int = 3
+private val EmojiBit: int = 4
+private val ModifierBit: int = 8
+private val PictographicBit: int = 16
+
+private val ZeroWidthJoiner: int = 0x200d
+private val VariationSelector16: int = 0xfe0f
+
+private columnsOfKind(kind: int) -> int
+  val k = kind & 3
+  if k == KindOne then 1 elif k == KindTwo then 2 else 0
+
+// The value the table gives `n`: its kind and its emoji properties. ASCII is answered without the
+// table: the printable characters take one column, and the digits, `#` and `*` are emoji (a keycap
+// is one of them, a variation selector 16 and U+20E3).
+private displayKind(n: int) -> int
+  if n < 0x80
+    if n < 0x20 || n == 0x7f then return KindControl
+    if int('0') <= n <= int('9') || n == int('#') || n == int('*') then return KindOne | EmojiBit
+    return KindOne
+  val table = DisplayWidths
+  val starts = table.starts
+  var low = 0
+  var high = starts.length
+  while low < high
+    val middle = (low + high) / 2
+    if starts(middle) <= n then low = middle + 1 else high = middle
+  table.values(low - 1)
+
+private isRegionalIndicator(n: int) -> bool = 0x1f1e6 <= n <= 0x1f1ff
+
+// The value of a digit of the table's encoding: `0`–`9`, `A`–`Z`, `a`–`z`, `-` and `_` are 0 to 63,
+// and those from 32 on are followed by more digits of the same number.
+private widthDigitValue(b: int) -> int
+  if int('0') <= b <= int('9') then return b - int('0')
+  if int('A') <= b <= int('Z') then return b - int('A') + 10
+  if int('a') <= b <= int('z') then return b - int('a') + 36
+  if b == int('-') then 62 else 63
+
+// The table decoded: where each run starts, and its value. They are `ArraySeq`s, which nothing writes
+// once made, so every thread may read them.
+private class WidthTable(val starts: ArraySeq[int], val values: ArraySeq[int]): Sendable
+
+private lazy val DisplayWidths: WidthTable = decodeWidthTable()
+
+// The table from its text, each run's length followed by its value.
+private decodeWidthTable() -> WidthTable
+  val numbers = Buffer[int]()
+  var n = 0
+  val text = DisplayWidthRuns
+  for k in 0 ..< text.byteLength
+    val d = widthDigitValue(int(text.byteAt(k)))
+    if d >= 32
+      n = n * 32 + d - 32
+    else
+      numbers.addOne(n * 32 + d)
+      n = 0
+  val count = numbers.length / 2
+  val starts = Array.fill(count, 0)
+  val values = Array.fill(count, 0)
+  var at = 0
+  for k in 0 ..< count
+    starts(k) = at
+    at += numbers(2 * k)
+    values(k) = numbers(2 * k + 1)
+  WidthTable(starts.toArraySeq, values.toArraySeq)
+
+// A walk over the clusters of `text`: each `advance()` moves to the next one, which ends just before
+// byte offset `past` and takes `width` columns, and answers false past the last.
+private class DisplayClusters(text: string, var past: int, var width: int)
+  advance() -> bool
+    val n = text.byteLength
+    if past >= n then return false
+    val base = text.charAt(past)
+    val baseCode = int(base)
+    var at = past + encodedLength(base)
+    val kind = displayKind(baseCode)
+    width = columnsOfKind(kind)
+    if (kind & 3) == KindControl
+      past = at
+      return true
+    if isRegionalIndicator(baseCode) && at < n
+      val next = text.charAt(at)
+      if isRegionalIndicator(int(next))
+        at += encodedLength(next)
+        width = 2
+    // Only a character beyond ASCII joins the one before it.
+    while at < n && int(text.byteAt(at)) >= 0x80
+      val c = text.charAt(at)
+      val code = int(c)
+      val k = displayKind(code)
+      if (k & 3) == KindZero
+        at += encodedLength(c)
+        if code == VariationSelector16 && (kind & EmojiBit) != 0 then width = 2
+        if code == ZeroWidthJoiner && (kind & PictographicBit) != 0 && at < n
+          val joined = text.charAt(at)
+          if (displayKind(int(joined)) & PictographicBit) != 0 then at += encodedLength(joined)
+      elif (k & ModifierBit) != 0 && (kind & EmojiBit) != 0
+        at += encodedLength(c)
+        width = 2
+      else
+        break
+    past = at
+    true

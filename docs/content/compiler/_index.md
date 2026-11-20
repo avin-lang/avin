@@ -1423,8 +1423,8 @@ An intrinsic that is not a string operation is lowered to a function whose body 
 checker's `intrinsic_entry` table with its parameters and result. The formatting library
 (`format.avin`) reaches the runtime this way: `write_out` and `write_int` write to standard output,
 an integer's digits rendered on the stack; `render_int`, `render_real` and `render_char` make a
-value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` and
-`text_width` count a string's bytes and characters; `text_append` and `text_take` keep a
+value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` counts a
+string's bytes; `text_append` and `text_take` keep a
 `StringWriter`'s text in a string object of its own whose length is its capacity, filled in place
 and doubled when full, and copy the written part out.
 
