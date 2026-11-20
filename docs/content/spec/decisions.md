@@ -9074,8 +9074,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   writing to the descriptor, and `println` writes its whole line through the same stream, so a
   printed line is never split by a byte write (the println-atomic entry of 2026-11-15 still holds);
   a write to standard error flushes standard output first, as `eprint` does. (6) **A reader that
-  has gone**: SIGPIPE is blocked on the writing thread for the length of a byte write, and the one
-  the write raised is taken back, so the write answers `ConnectionReset` (`EPIPE`, the kind a
+  has gone**: SIGPIPE is held off for the length of a byte write (on macOS by the descriptor's own
+  mark, the 2026-11-20 entry below; elsewhere blocked on the writing thread, the one the write
+  raised taken back), so the write answers `ConnectionReset` (`EPIPE`, the kind a
   connection's write answers) and the program goes on; `print` keeps its quiet death, which a
   filter in a pipeline wants. (7) **Closed descriptors**: a bug met on the way, a program started
   with standard input closed read the runtime's own pipe, which had taken descriptor 0; the runtime
@@ -9090,6 +9091,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   pseudo-terminal, at -O0 and -O2. **Review with the user:** the names `stdin()`, `stdout()`,
   `stderr()` and the object names `StandardInputBytes`, `StandardOutputBytes`,
   `StandardErrorBytes` (beside the text writers `StandardOutput` and `StandardError`).
+  - Settled on the user's delegation 2026-11-20 (branch `stdio-sigpipe`): **on macOS a byte write
+    to standard output or error marks the descriptor never to raise SIGPIPE (`F_SETNOSIGPIPE`) for
+    the length of the write only**, and puts back the mark it found. WHY: macOS raises the SIGPIPE
+    of a write to a gone reader on the whole process, where any thread not blocking it takes it, so
+    blocking it on the writing thread (item (6) above) failed whenever the program had another
+    thread: four threads writing to `prog | head -c 10`, or one writer beside busy threads, ended
+    with status 141 every time at -O0 and -O2 before the change. The mark belongs to the open pipe
+    or socket, which the shell and the program's children share, so it is held under the stdio
+    locks of both standard streams and taken off before the write returns: `print`, `eprint` and a
+    child writing to the same output keep their SIGPIPE, and nothing is left changed on the shell's
+    pipe after the program ends. On Linux the signal goes to the writing thread, so the thread mask
+    is kept there unchanged. ALTERNATIVES: marking descriptors 1 and 2 once at startup (every
+    `print` to a gone reader would then fail silently and a printing loop would never end, every
+    child and every later process on the shell's pipe would inherit the mark); ignoring SIGPIPE for
+    the whole program (the same `print` problem, and an ignored signal survives `exec` into every
+    child). Tests: `stdio_tests.sysl` § several writing threads, a writer beside busy threads,
+    threads writing to standard error, `print` without a newline after a failed byte write, and a
+    child (`yes`) started after one, at -O0 and -O2.
 
 - **Linux as a target, and machines in packages** (branch `linux-plan`, 2026-11-19; the user,
   2026-11-19: Avin is "for anyone who would enjoy using it"). The plan is
