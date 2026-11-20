@@ -801,8 +801,34 @@ Settled by the user on 2026-11-03:
   generators `pattern in source` separated by commas, each followed by any number of `if` guards,
   then `yield` and the value on the rest of the line or in an indented block; or the generators one
   to a line in a block after `for`, a line starting with `if` guarding the generator above, with
-  `yield` on the line after the block. `yield` is a keyword. A `for` without `yield` keeps one
-  generator and no guards.
+  `yield` on the line after the block. `yield` is a keyword. A `for` without `yield` once kept one
+  generator and no guards; the entry on loops of several generators below replaces that.
+- **Settled on the user's delegation 2026-11-19: a `for` without `yield` takes every clause a
+  comprehension takes** (several generators, `if` guards after each, value definitions between
+  them) **and runs as the loops they nest into** (branch `for-forms`). The parser writes it out:
+  each generator a `for` inside the one before, each guard an `if` around the rest, each definition
+  a `val` before the rest; so `break` and `continue` act on the innermost generator's loop and
+  `return` leaves the function, exactly as the hand-nested form does, and each generator is counted,
+  indexed or iterated as a loop of its own (no allocation over ranges and arrays). Why: porting
+  numeric programs hit the one-generator rule five times in four programs, each time with an
+  obvious meaning; the nested form is the one reading that adds no new semantics. Avin has no loop
+  labels, so a `break` out of every generator is a `return` from a local function or a flag, as for
+  hand-nested loops. Alternatives: keep the rule (pushes the nesting onto every grid and pair loop);
+  `break` leaving the whole `for` (a meaning the nested form cannot show, and a `continue` would then
+  want the same, making the two forms differ); a loop over a lazy product (allocates, and loses
+  per-generator counting). The one-to-a-line block form after `for` stays a comprehension's: `do`
+  on the line after the block would read as a `do … while` statement. Review with the user: it
+  reverses a settled rule, and `break` acting on the innermost generator only is the choice to look
+  at.
+- **Settled on the user's delegation 2026-11-19: `yield` may start a line indented under a
+  one-line `for`'s clauses** (branch `for-forms`), with its value on the rest of the line or in a
+  block under it; nothing else may follow it inside that indentation. Why: a function body whose
+  comprehension's header fills the line wants its `yield` below it, as a continuation line holds an
+  operator below its expression. `do` is not accepted there, since an indented line starting with
+  `do` is already a `do … while` statement in a loop's body, and an indented body needs no `do`.
+  Alternatives: the block form only (`for` + clauses one to a line + `yield` at `for`'s depth, which
+  reads poorly for one generator); a general rule continuing any keyword-led line (wider than the
+  need, and ambiguous with bodies).
 - A guard is `withFilter`, a lazy view each collection provides; on a source that is no `Iterable`
   it is `Filter`'s `filter` (see the entry on comprehensions by conformance). `flatMap` on
   the library's collections takes any `Iterable` from its function, or an `Option` (see the
