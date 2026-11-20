@@ -577,7 +577,7 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 
 Designed in [contextual parameters](/spec/contextual-parameters/), its choices
 [settled](/spec/decisions/#settled). Steps 1 and 2 are done (branch `given-1`), step 3 too (branch
-`given-3`), and step 4 (branch `given-4`). A filled argument becomes an ordinary
+`given-3`), step 4 (branch `given-4`) and step 5 (branch `given-5`); step 6 is still to come. A filled argument becomes an ordinary
 argument in the checker's output, so lowering, emission and the runtime change nothing; every step
 is in the front end and tooling. Each step is one agent, gated on its own with the files it names.
 
@@ -630,7 +630,7 @@ is in the front end and tooling. Each step is one agent, gated on its own with t
    defaults are computed first, each seeing the section before it, and an ordinary default takes the
    whole section after its earlier parameters (`default_inputs`). A `using` lambda's parameters are
    givens in its body already. Givens imported from another module fill nothing yet (step 4); a
-   function value keeps its section as positional parameters (step 5). Tests:
+   function value's section is step 5's. Tests:
    `tests/run/given_calls_{levels,shapes,edges}.avin`, `tests/reject/given_calls_{none,scope,two,
    positional,values}.avin`, `tests/programs/run/given_module_files`,
    `tests/programs/reject/given_import_{whole,named}`.
@@ -652,7 +652,16 @@ is in the front end and tooling. Each step is one agent, gated on its own with t
    body; a function or method taken as a value filled where taken; captures of givens through the
    existing capture analysis; the `@sendable`, `spawn`, executor-task and actor checks naming a
    captured given; actor constructors' sections. Files: `check.sysl`. Tests: run and reject files as
-   above.
+   above. **Done** (branch `given-5`): `function_value` and `method_value` take the parameters before
+   the section, and with a section make the value a closure (`value_closure`) whose body is the call a
+   call written there would be, checked with the closure as the current function and its parameters
+   passed as checked arguments (`passed_on`, a repeated one spliced), so `apply` fills the section
+   from the givens in scope where the value is taken or from its defaults, and each given read is
+   recorded as the closure's capture. Overloads, an object's `apply` and constructors are chosen by
+   the parameters before the section. The `spawn`, `@sendable`, executor and actor checks name a
+   captured given through the existing capture analysis; an actor's section is held to `Sendable` as
+   any actor parameter. Tests: `tests/run/given_{values,captures,threads}.avin`,
+   `tests/reject/given_calls_values.avin`, `tests/reject/given_values_{more,threads}.avin`.
 6. **Tooling.** Hover on a call shows each filled argument and the given it came from; go to
    definition from a call to the given it used; completion offers `given` and `using`. Files:
    `lsp.sysl`, `completion.sysl`, `definition_index.sysl`; tests in `lsp_tests.sysl`. The

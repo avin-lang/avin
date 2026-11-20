@@ -1,0 +1,50 @@
+// expect: exit 0
+// A sendable given reaches another thread only by being captured: a thread's body, a `@sendable`
+// function value of a function with a section, an executor's future and its task each fill their
+// calls from the given where they are written. An actor takes its context as a `using` parameter of
+// its declaration, filled where the actor is made, by the given in scope or by name, and a given in its
+// body and its `receive`; an actor's section with a default.
+import avin.actors.{ActorRef, spawn}
+import avin.threads.{Executor, Promise}
+import avin.threads as threads
+import avin.time
+
+data Tx(id: int)
+
+data Msg
+  Add(n: int)
+  Get(reply: ActorRef[int])
+
+stamp(n: int, using tx: Tx) -> int = n * 100 + tx.id
+
+actor Counter(start: int, using tx: Tx) receives Msg
+  var total = start + tx.id
+  receive
+    Add(n) -> total += stamp(n)
+    Get(reply) -> reply.tell(total)
+
+actor Defaulted(using tx: Tx = Tx(77)) receives ActorRef[int]
+  receive
+    reply -> reply.tell(stamp(0))
+
+main()
+  val plain = spawn(Defaulted())
+  println(plain.ask(r -> r, time.seconds(5)).await())
+  given tx = Tx(3)
+  val c = spawn(Counter(10))
+  c.tell(Add(1))
+  println(c.ask(r -> Get(r), time.seconds(5)).await())
+  val other = spawn(Counter(0, tx = Tx(5)))
+  other.tell(Add(2))
+  println(other.ask(r -> Get(r), time.seconds(5)).await())
+  val filled = spawn(Defaulted())
+  println(filled.ask(r -> r, time.seconds(5)).await())
+  println(threads.spawn(() -> stamp(4)).join())
+  val f: @sendable (int) -> int = stamp
+  println(threads.spawn(() -> f(5)).join())
+  val pool = Executor.fixed(2)
+  println(pool.future(stamp(6)).await())
+  val done = Promise[int]()
+  pool.execute(() -> done.complete(stamp(7)))
+  println(done.future.await())
+  pool.shutdown()

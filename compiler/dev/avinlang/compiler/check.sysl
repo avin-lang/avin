@@ -15861,7 +15861,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
             // With an overload of no parameters among them, the likelier slip is a call missing its
             // parentheses, so the error names the call.
             for m in ms
-                if c.symbols[m].params.len() == 1 && !is_parameterless(c, m)
+                if c.symbols[m].params.len() - section_size(c.symbols[m].decl) == 1 && !is_parameterless(c, m)
                     empty_list_without_call(c, at, receiver, name)
                     return TExpr(at, ErrorType, UnitConst)
             c.note(unit, at, s"`$name` is overloaded, so as a value with no expected function type it is ambiguous: ${overload_list(c, ms)} could each be meant")
@@ -15870,7 +15870,7 @@ private overloaded_method_value(c: *Checker, at: Span, receiver: &TExpr, name: s
     var compared: Buf[Buf[&Type]] = buf()
     for m in ms
         val s = method_signature(c, receiver, m, ErrorType)
-        val view = substitute_all(s.params, s.owner, s.known)
+        val view = before_section(substitute_all(s.params, s.owner, s.known), s.section)
         if accepts(c, view, s.owner, s.type_params.len(), params)
             fitting.push(m)
             compared.push(view)
@@ -15984,7 +15984,8 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
         return method_call(c, at, at, receiver, m, buf(), explicit, expected, false, buf())
     if refuse_unmet_conformance(c, at, receiver.ty, m) then return TExpr(at, ErrorType, UnitConst)
     if refuse_static_on_value(c, at, receiver, m) then return TExpr(at, ErrorType, UnitConst)
-    if c.symbols[m].params.len() == 1 && !function_expected(c, expected)
+    val section = section_size(c.symbols[m].decl)
+    if c.symbols[m].params.len() - section == 1 && !function_expected(c, expected)
         empty_list_without_call(c, at, receiver, c.symbols[m].decl.name)
         return TExpr(at, ErrorType, UnitConst)
     val target = c.symbols[m]
@@ -16008,7 +16009,8 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
                 unify(c, type_args[known.len() + i], written[i])
     var params: Buf[&Type] = buf()
     var names: Buf[string] = buf()
-    for i in 1..<target.params.len()
+    // A `using` section is filled where the value is made, so the value takes the parameters before it.
+    for i in 1..<target.params.len() - section
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
     val declared: &Type = Function(substitute_all(marked_value_params(c, m, 1, params, expected), target.type_owner, type_args), substitute(with_self(c, m, receiver.ty, result), target.type_owner, type_args), sendable_wanted(c, expected))
@@ -16027,39 +16029,82 @@ private method_value(c: *Checker, at: Span, receiver: &TExpr, m: usize, explicit
     // the receiver gives were held where its type was made.
     hold_to_bounds(c, unit, at, s"`$name`", target.type_owner, type_params, solved, known.len())
     val ty = zonk(c, declared)
-    var lambda_params: Buf[&Type] = buf()
-    var lambda_result: &Type = ErrorType
-    if *ty is Function(ps, r, _)
-        lambda_params = ps
-        lambda_result = r
     // The receiver is held in a local of the code making the value, which the closure captures; a
     // static member's receiver is its type, which has no value to hold.
     val on_type = receiver.kind is TypeReceiver
     val held = if on_type then 0usize else hidden_local(c, receiver.ty)
-    val enclosing = c.symbols[c.current]
-    val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf(), false)
-    val id = c.symbols.len()
-    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, lambda_params, names, Some(lambda_result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None, false))
-    c.states.push(2)
-    c.bodies.push(None)
-    c.locals.push(buf())
-    var args: Buf[&TExpr] = buf()
-    args.push(if on_type then receiver else TExpr(at, receiver.ty, Local(held)))
-    var param_locals: Buf[usize] = buf()
-    for i in 0..<lambda_params.len()
-        val index = c.body.locals.len()
-        c.body.locals.push(TLocal(names[i], lambda_params[i], false, id))
-        param_locals.push(index)
-        args.push(TExpr(at, lambda_params[i], Local(index)))
-    c.symbols[id].param_locals = param_locals
+    val closure = value_closure(c, at, ty, names)
+    val id = closure.id
+    val held_receiver: &TExpr = if on_type then receiver else TExpr(at, receiver.ty, Local(held))
     if !on_type then c.body.uses.push(CaptureUse(id, held, false))
     c.body.calls.push(LocalCall(c.current, id))
-    val call = method_call_kind(c, receiver.ty, m, args, solved, false)
-    c.bodies[id] = Some(TExpr(at, lambda_result, call))
+    if section > 0
+        // The closure calls the method as a call written here would, so its section is filled from
+        // the givens in scope here, which the closure captures, or from the section's defaults.
+        val passed = passed_on(at, closure, names, repeated_at(target.decl))
+        val outer = c.current
+        c.current = id
+        val call = method_call(c, at, at, held_receiver, m, passed.args, None, Some(closure.result), false, passed.checked)
+        c.current = outer
+        c.bodies[id] = Some(call)
+    else
+        var args: Buf[&TExpr] = buf()
+        args.push(held_receiver)
+        for i in 0..<closure.params.len()
+            args.push(TExpr(at, closure.params[i], Local(closure.locals[i])))
+        c.bodies[id] = Some(TExpr(at, closure.result, method_call_kind(c, receiver.ty, m, args, solved, false)))
     var items: Buf[&TExpr] = buf()
     if !on_type then items.push(TExpr(receiver.span, Unit, Let(held, receiver)))
     items.push(TExpr(at, ty, FunctionValue(id, buf())))
     TExpr(at, ty, Block(items))
+
+/** The closure a function value is made as: its symbol, the parameter types and result of its function
+ * type, and the local each parameter is held in. */
+private struct ValueClosure
+    id: usize
+    params: Buf[&Type]
+    result: &Type
+    locals: Buf[usize]
+
+// A closure, of function type `ty` with parameters named `names`, declared in the code being checked,
+// whose body the caller gives it.
+private value_closure(c: *Checker, at: Span, ty: &Type, names: Buf[string]) -> ValueClosure
+    var params: Buf[&Type] = buf()
+    var result: &Type = ErrorType
+    if *ty is Function(ps, r, _)
+        params = ps
+        result = r
+    val enclosing = c.symbols[c.current]
+    val decl = Function(buf(), at, at, "lambda", buf(), buf(), None, None, buf(), false)
+    val id = c.symbols.len()
+    c.symbols.push(FunctionSymbol(enclosing.unit, enclosing.module_name, "lambda", decl, params, names, Some(result), None, Some(c.body.root), buf(), buf(), buf(), true, false, true, buf(), None, id, buf(), None, false, true, "", None, false))
+    c.states.push(2)
+    c.bodies.push(None)
+    c.locals.push(buf())
+    var locals: Buf[usize] = buf()
+    for i in 0..<params.len()
+        val index = c.body.locals.len()
+        c.body.locals.push(TLocal(if i < names.len() then names[i] else "", params[i], false, id))
+        locals.push(index)
+    c.symbols[id].param_locals = locals
+    ValueClosure(id, params, result, locals)
+
+/** The arguments a closure passes on to the function it calls, already checked: each of its
+ * parameters by position, a repeated parameter's vector spliced in. */
+private struct PassedOn
+    args: Buf[Argument]
+    checked: Buf[Option[&TExpr]]
+
+private passed_on(at: Span, closure: ValueClosure, names: Buf[string], repeated: Option[usize]) -> PassedOn
+    var args: Buf[Argument] = buf()
+    var checked: Buf[Option[&TExpr]] = buf()
+    for i in 0..<closure.params.len()
+        val name = if i < names.len() then names[i] else "_"
+        val read: &Expr = Expr(at, Name(name))
+        val value: &Expr = if repeated == Some(i) then Expr(at, Splice(read)) else read
+        args.push(Argument(at, None, value, false))
+        checked.push(Some(TExpr(at, closure.params[i], Local(closure.locals[i]))))
+    PassedOn(args, checked)
 
 // Whether the expected type is a function type: the one place a method declared with an empty
 // parameter list may be named without a call.
@@ -22423,7 +22468,7 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
         val s = if k < constructors.len() then function_signature(c, constructors[k], ErrorType) elif k < first_method then variant_signature(c, variants[0]) else method_signature(c, receiver, ms[k - first_method], ErrorType)
         val label = if k < constructors.len() then overload_text(c, constructors[k]) elif k < first_method then candidate_text(s.name, s.type_params, s.names, s.params, s.variadic) else apply_text(c, o, ms[k - first_method])
         labels.push(label)
-        val view = substitute_all(s.params, s.owner, s.known)
+        val view = before_section(substitute_all(s.params, s.owner, s.known), s.section)
         if accepts(c, view, s.owner, s.type_params.len(), params)
             fitting.push(k)
             fitting_labels.push(label)
@@ -25343,9 +25388,10 @@ private named_function_value(c: *Checker, at: Span, name: string, explicit: Opti
     var compared: Buf[Buf[&Type]] = buf()
     for id in ids
         val f = c.symbols[id]
-        if accepts(c, f.params, f.type_owner, f.type_params.len(), params)
+        val taken = before_section(f.params, section_size(f.decl))
+        if accepts(c, taken, f.type_owner, f.type_params.len(), params)
             fitting.push(id)
-            compared.push(f.params)
+            compared.push(taken)
     if fitting.len() == 0
         c.note(unit, at, s"no overload of `$name` has the parameter types of ${type_name(zonk(c, expected.unwrap()))}; the overloads are ${overload_list(c, ids)}")
         return TExpr(at, ErrorType, UnitConst)
@@ -25426,7 +25472,10 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
             val written = resolve_written_args(c, unit, types, type_params, known.len())
             for i in 0..<types.len()
                 unify(c, type_args[known.len() + i], written[i])
-    val declared: &Type = Function(marked_value_params(c, id, 0, target.params, expected), result, sendable_wanted(c, expected))
+    // A `using` section is filled where the value is made, so the value takes the parameters before it.
+    val section = section_size(target.decl)
+    val taken = before_section(target.params, section)
+    val declared: &Type = Function(marked_value_params(c, id, 0, taken, expected), result, sendable_wanted(c, expected))
     val ty = substitute(declared, target.type_owner, type_args)
     if expected is Some(want) then unify(c, ty, want)
     hold_marked_params(c, unit, at, id, 0, ty)
@@ -25441,8 +25490,36 @@ private function_value(c: *Checker, at: Span, id: usize, explicit: Option[Buf[&T
     // The type arguments, written or taken from the expected type, are held to their bounds as a
     // call's are.
     hold_to_bounds(c, unit, at, s"`${target.name}`", target.type_owner, type_params, solved, known.len())
-    c.symbols[id].value = true
-    TExpr(at, zonk(c, ty), FunctionValue(id, solved))
+    if section == 0
+        c.symbols[id].value = true
+        return TExpr(at, zonk(c, ty), FunctionValue(id, solved))
+    // With a section, the value is a closure calling the function as a call written here would: its
+    // section filled from the givens in scope here, which the closure captures, or from its defaults.
+    // `rows.foreach(insert)` is `rows.foreach(row -> insert(row))`.
+    val made = zonk(c, ty)
+    var names: Buf[string] = buf()
+    for i in 0..<taken.len()
+        names.push(target.param_names[i])
+    val closure = value_closure(c, at, made, names)
+    val offset = target.params.len() - target.decl.params.len()
+    val repeated = repeated_at(target.decl) match
+        Some(r) -> Some(r + offset)
+        None -> None
+    val passed = passed_on(at, closure, names, repeated)
+    c.body.calls.push(LocalCall(c.current, closure.id))
+    val outer = c.current
+    c.current = closure.id
+    val call = call_function(c, at, at, id, passed.args, None, Some(closure.result), passed.checked)
+    c.current = outer
+    c.bodies[closure.id] = Some(call)
+    TExpr(at, made, FunctionValue(closure.id, buf()))
+
+/** `params` without their last `count`, a `using` section: the parameters a function value takes. */
+private before_section(params: Buf[&Type], count: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    for i in 0..<params.len() - count
+        out.push(params[i])
+    out
 
 /** The `apply` methods a value of type `t` may be called through: those of its class, of its bounds
  * for a type parameter, or of its impls. */
