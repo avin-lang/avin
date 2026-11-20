@@ -1858,6 +1858,15 @@ private restore_vars(c: *Checker, saved: Buf[Option[&Type]])
     c.vars.truncate(saved.len())
     for i in 0..<saved.len()
         c.vars[i] = saved[i]
+    // An unknown recorded for a variable made since the save goes with the variable, as a collection
+    // literal checked on trial records its element's. Each was recorded after the save, so after any
+    // mark taken before it, and the unknowns before such a mark keep their places.
+    var kept = 0usize
+    for i in 0..<c.unknowns.len()
+        if c.unknowns[i].var_id < saved.len()
+            if kept != i then c.unknowns[kept] = c.unknowns[i]
+            kept += 1
+    c.unknowns.truncate(kept)
 
 // Reports a type of qualified name `key` declared again, naming the data type or class that has it.
 private note_type_duplicate(c: *Checker, unit: usize, at: Span, name: string, key: string)
@@ -15266,6 +15275,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
             return overloaded_method_value(c, at, self_ref(c, at), name, ms, None, expected)
         Some(TraitFieldOf(m)) -> return trait_field_read(c, at, self_ref(c, at), m, expected)
         None -> ()
+    var constructor_value = false
     if global_named(c, name) is Some(g)
         // An object that declares `apply`, where a function is expected, is that function, unless
         // the object is of a function type and so a function value itself.
@@ -15276,7 +15286,10 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
                     var found: Buf[&Type] = buf()
                     function_ancestors(c.classes, c.data, own_class_type(c.classes[o], o), &found, 0)
                     if found.len() == 0 then return apply_value(c, at, name, o, ids, ps, expected)
-        return global_read(c, at, g)
+                // A class's companion that declares no `apply` leaves the name the class's
+                // constructor where a function is expected, as it is in call position.
+                constructor_value = companion_leaves_constructor(c, g, ids)
+        if !constructor_value then return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
         if parameterless_function(c, name) is Some(f) then return parameterless_function_read(c, at, f, expected)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
@@ -18508,6 +18521,23 @@ private shaped_hint(c: *Checker, e: &Expr, hint: Option[&Type]) -> Option[&Type]
     val shape = collection_shape(c, t)
     if shape == "" || shape == written || (written == "set" && shape == "map") then hint else None
 
+// `hint`, unless `e` is a collection literal and `hint` a collection no literal builds, such as a
+// `Range`. A type only suggested to a literal, by another operand of a comparison, rather than
+// demanded of it, leaves such a literal its default collection, so
+// `(1 .. 3) == [1, 2, 3]` compares the range with a `Vector`, as sequences compare; where the type is
+// demanded, `val r: Range = [1, 2]`, the literal reports the `Buildable` it lacks.
+private buildable_hint(c: *Checker, e: &Expr, hint: Option[&Type]) -> Option[&Type]
+    val t = hint?
+    val default_name = e.kind match
+        ListLit(_) -> "Vector"
+        SetLit(_) -> "Set"
+        MapLit(_, _) -> "Map"
+        _ -> return hint
+    val d = core_collection_type(c, default_name) match
+        Some(d) -> d
+        None -> return hint
+    if unbuildable_collection(c, t, d) then None else hint
+
 // `t`, where it is a type a value can be checked against: not open, not `Any`, and not the type of
 // a branch that never finishes.
 private useful_hint(c: *Checker, t: Option[&Type]) -> Option[&Type]
@@ -19415,7 +19445,7 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     for i in 0..<operands.len()
         early[i] match
             Some(t) -> typed.push(t)
-            None -> typed.push(refined_operand(c, check_expr(c, operands[i], anchor)))
+            None -> typed.push(refined_operand(c, check_expr(c, operands[i], buildable_hint(c, operands[i], anchor))))
     // An integer compared with a value of a type that takes integers is converted to that type, so
     // `big < n` and `n == big` compare two numbers. A chain converts each integer beside one, the
     // pass back reaching an integer whose neighbour was converted on the way forward.
@@ -21526,6 +21556,22 @@ private note_threaded_arguments(c: *Checker, id: usize, applied: AppliedCall)
             Name(n) -> n
             _ -> "_"
         c.body.threaded.push(ThreadedArgument(unit_of(c), arg, decl.name, name, if has_annotation(decl, "c") then "C" else "Sysl"))
+
+/** Whether the global `g`, where a function is expected, is not the object it holds but the
+ * constructor `ids` of the class whose companion it is: the companion declares no `apply`, is not of
+ * a function type itself, and the class is made by its name. */
+private companion_leaves_constructor(c: *Checker, g: usize, ids: Buf[usize]) -> bool
+    val o = c.globals[g].object match
+        Some(o) -> o
+        None -> return false
+    if c.classes[o].companion is None then return false
+    if object_applies(c, o).len() > 0 then return false
+    if ids.len() == 0 then return false
+    for id in ids
+        if !c.symbols[id].constructor then return false
+    var found: Buf[&Type] = buf()
+    function_ancestors(c.classes, c.data, own_class_type(c.classes[o], o), &found, 0)
+    found.len() == 0 && callable_constructors(c, ids).len() > 0
 
 // The object a call by `name` reaches through its `apply` methods: the object of that name, where it
 // declares `apply` and the name is not a function's, only, if anything, its companion class's

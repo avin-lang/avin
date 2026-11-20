@@ -1033,7 +1033,11 @@ set, and beside a sequence, which a set literal cannot build, it is still a set.
 with nothing else to say what it holds takes its type from a later use, as `None` does, and is
 otherwise an error asking for an annotation: `if c then {} else {}` and `[{}, {}]` are. A literal compared with `==`, `!=` or an ordering takes the other
 operand's type as its expected type, so `xs == [1, 2]` compares a `List` with a `List` when `xs` is
-one.
+one. That type is only suggested to it: where it is one no literal builds, such as a `Range`, the
+literal is its default, so `(1 .. 3) == [1, 2, 3]`
+compares the range with a `Vector`, as any two sequences compare. Only a type demanded of the
+literal, by a declaration, a parameter, a result or an ascription, is an error there:
+`val r: Range = [1, 2]` is one.
 
 Literals always build the library's types, even when a user type named `Vector` is in scope.
 

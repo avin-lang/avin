@@ -9325,6 +9325,27 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   **Review with the user**: the name `Buildable`, and whether the companions' `newBuilder` should
   eventually be the static member alone.
 
+- Settled on the user's delegation 2026-11-19 (branch `train-ay`, reconciling `builder-trait` with
+  the comparisons of ranges and literals that predate it): **a type only suggested to a collection
+  literal, by another operand of `==`, `!=` or an ordering, leaves the literal its default where no
+  literal builds that type**, so `(1 .. 3) == [1, 2, 3]` is
+  a `Range` compared with a `Vector` by their elements, as before `Buildable`; a type demanded of
+  the literal (a declaration, a parameter, a result, an ascription) still reports the trait it
+  lacks, `val r: Range = [1, 2]`. WHY: the suggestion exists so a literal compares like with like
+  where it can (`xs == [1, 2]` with `xs` a `List`); where it cannot, a literal of the default
+  compares the same by `Seq` equality, and an error there would refuse a comparison that has an
+  obvious meaning. ALTERNATIVES: refusing the comparison and asking for `.toVector` (breaks
+  established programs for no soundness gain); making `Range` `Buildable` (a literal cannot promise
+  a range's even step, so its builder would have to fail at run time).
+- Settled on the user's delegation 2026-11-19 (branch `train-ay`, reconciling `bytes-sendable`'s
+  `object Isolated` with constructors used as values): **a class's companion object that declares no
+  `apply` leaves the name the class's constructor where a function is expected**, as in call
+  position, so `val mi: (Vector[string]) -> Isolated[Vector[string]] = Isolated` and
+  `[1, 2].map(Box)` make values; elsewhere the name is the object. WHY: adding a companion with
+  unrelated members (`Isolated.move`) must not take away the constructor value its class had.
+  ALTERNATIVES: the object always (breaks every such value when a companion is added); an error
+  asking to choose (nothing is ambiguous where the object is not a function).
+
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
