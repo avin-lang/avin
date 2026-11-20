@@ -9787,6 +9787,24 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   random pairs checked against the quadratic table for minimality. Review with the user: the names
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
+- **`io.inputs` and `io.inputLines`: the files named, or standard input when none.** Settled on the
+  user's delegation 2026-11-19: `io.inputs(paths: Vector[string]) -> Iterator[Result[(string, string),
+  IoError]]` yields each input as its name and all its text, and `io.inputLines(paths)` yields the
+  same shape with one line per element. No paths is one input, standard input; `-` names standard
+  input wherever it stands in the list, and a name is yielded as written, so standard input is
+  `"-"`. Inputs are read as the iterator reaches them; one that cannot be read is an `Err` (the
+  ordinary `IoError`, naming the file) in its place, and the iterator goes on, so a tool reports and
+  carries on, and `.collect`/`?` style stopping at the first failure is the caller's choice. Standard
+  input is read to its end once, so a second `-` is empty. A file's lines come from its whole text
+  (`readText`), standard input's as it advances. Why: every command-line filter writes this loop,
+  and an element carrying its name serves the `name:line` output of `grep` and an error message
+  alike. Placed in `avin.io` beside `readAll` and `lines`, named as they are. Alternatives weighed:
+  `Vector` of results (reads every file before the first line is used, and cannot stream standard
+  input); a `Source` of the concatenation (loses where each line came from); stopping at the first
+  failing file (a tool wants to report each); a name of `""` for standard input (indistinguishable
+  from a named empty string, and `-` is what the tool was told). Tests: `tests/run/io_inputs_files`,
+  `io_inputs_stdin`, `io_inputs_lines_stdin`. Review with the user: the name `"-"` yielded for
+  standard input, and files being read whole rather than streamed by line.
 
 - **A symbol method may declare its precedence and grouping** (branch `declared-precedence`,
   2026-11-19; the user approved "perhaps declared precedence" in the missing-features list,
