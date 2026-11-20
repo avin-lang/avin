@@ -1,0 +1,141 @@
+// Graph algorithms over a description read from standard input. Two kinds of line build two graphs:
+//
+//     road Ayr Troon 12          an undirected road and its length
+//     task deploy needs build test   a task and the tasks it waits for
+//
+// From the roads the program finds the shortest route from the first town named to every other,
+// with Dijkstra's algorithm on a priority queue; the towns that cannot reach each other, as connected
+// components; and the cheapest set of roads that still joins every town in each component, with
+// Kruskal's algorithm on a union-find. From the tasks it finds an order to do them in, by repeatedly
+// taking a task with nothing left to wait for (the alphabetically first, so the order is
+// reproducible), and reports the tasks a cycle keeps from ever being ready. A line it cannot read is reported with its
+// number, and the rest are still used.
+//
+//     avin build main.avin && ./main < ../graphs.in
+//
+// expect: exit 0
+import avin.io
+import avin.collections.mutable
+
+data Road(from: string, to: string, length: int)
+
+data Line
+  RoadLine(road: Road)
+  TaskLine(task: string, needs: Vector[string])
+
+parseLine(words: Vector[string]) -> Option[Line] = words match
+  ["road", a, b, n] -> n.toIntOption().filter(_ >= 0).map(len -> RoadLine(Road(a, b, len)))
+  ["task", t] -> Some(TaskLine(t, []))
+  ["task", t, "needs", needs*] if needs.nonEmpty -> Some(TaskLine(t, needs.toVector))
+  _ -> None
+
+// ---- Shortest routes
+
+// Each town's neighbours with the length of the road to each.
+adjacency(roads: Vector[Road]) -> Map[string, Vector[(string, int)]] =
+  roads.flatMap(r -> [(r.from, (r.to, r.length)), (r.to, (r.from, r.length))]).groupMap(_.0, _.1)
+
+// The distance to every town `source` reaches and the town each is reached from on a shortest way.
+dijkstra(graph: Map[string, Vector[(string, int)]], source: string) -> (Map[string, int], Map[string, string])
+  val dist = mutable.Map[string, int]()
+  val via = mutable.Map[string, string]()
+  val queue = mutable.PriorityQueue.withOrdering(reverseOrder(compareBy((e: (int, string)) -> e)))
+  dist(source) = 0
+  queue += (0, source)
+  while queue.nonEmpty
+    val (d, town) = queue.dequeue()
+    if d > dist(town) then continue
+    for (next, length) in graph.getOrElse(town, [])
+      val candidate = d + length
+      if dist.get(next).forall(candidate < _)
+        dist(next) = candidate
+        via(next) = town
+        queue += (candidate, next)
+  (dist.toMap, via.toMap)
+
+// The towns on the way from the source to `town`, the source first.
+route(via: Map[string, string], town: string) -> List[string]
+  var path = List(town)
+  while via.contains(path.head) do path = via(path.head) :: path
+  path
+
+// ---- Components and spanning trees
+
+// Disjoint sets of towns, each named by one of its members, merging by size.
+class UnionFind
+  private val parent = mutable.Map[string, string]()
+  private val size = mutable.Map[string, int]()
+
+  find(x: string) -> string
+    val p = parent.getOrElse(x, x)
+    if p == x then return x
+    val root = find(p)
+    parent(x) = root
+    root
+
+  // Joins the sets of `a` and `b`; false when they were one set already.
+  union(a: string, b: string) -> bool
+    val (ra, rb) = (find(a), find(b))
+    if ra == rb then return false
+    val (big, small) = if size.getOrElse(ra, 1) >= size.getOrElse(rb, 1) then (ra, rb) else (rb, ra)
+    parent(small) = big
+    size(big) = size.getOrElse(big, 1) + size.getOrElse(small, 1)
+    true
+
+kruskal(roads: Vector[Road]) -> (Vector[Road], Vector[Vector[string]])
+  val sets = UnionFind()
+  val chosen = roads.sortBy(r -> (r.length, r.from, r.to)).filter(r -> sets.union(r.from, r.to))
+  val towns = roads.flatMap(r -> [r.from, r.to]).distinct
+  val components = towns.groupBy(sets.find).values.map(_.sorted).sortBy(_.head)
+  (chosen, components)
+
+// ---- Ordering tasks
+
+// An order in which every task comes after the tasks it needs, as far as one exists, and the tasks
+// no order can place: those in a cycle, and those waiting on one.
+schedule(tasks: Map[string, Vector[string]]) -> (Vector[string], Vector[string])
+  val all = (tasks.keys ++ tasks.values.flatten).distinct
+  val waiting = mutable.Map[string, int]()
+  val unblocks = mutable.Map[string, Buffer[string]]()
+  for t in all do waiting(t) = tasks.getOrElse(t, []).distinct.length
+  for (t, needs) in tasks
+    for n in needs.distinct do unblocks.getOrElseUpdate(n, Buffer()) += t
+  val ready = mutable.TreeSet[string]()
+  ready ++= all.filter(waiting(_) == 0)
+  val order = Buffer[string]()
+  while ready.nonEmpty
+    val next = ready.head
+    ready -= next
+    order += next
+    for t in unblocks.getOrElse(next, Buffer())
+      waiting(t) -= 1
+      if waiting(t) == 0 then ready += t
+  (order.toVector, all.filter(waiting(_) > 0).sorted)
+
+main()
+  val roads = Buffer[Road]()
+  val tasks = mutable.Map[string, Vector[string]]()
+  for (line, number) in io.lines().zipWithIndex
+    val words = line.trim.split(" ").filter(_.nonEmpty)
+    if words.isEmpty || words.head.startsWith("#") then continue
+    parseLine(words) match
+      Some(RoadLine(r)) -> roads += r
+      Some(TaskLine(t, needs)) -> tasks(t) = tasks.getOrElse(t, []) ++ needs
+      None -> println(s"line ${number + 1} is not a road or a task: $line")
+
+  if roads.nonEmpty
+    val source = roads.head.from
+    val (dist, via) = dijkstra(adjacency(roads.toVector), source)
+    println(s"shortest routes from $source:")
+    for (town, d) in dist.toVector.sortBy(e -> (e.1, e.0))
+      if town != source then println(f"  ${town}%-12s ${d}%4d  ${route(via, town).mkString(" > ")}")
+    val (tree, components) = kruskal(roads.toVector)
+    println(s"${components.length} connected groups of towns:")
+    for c in components do println(s"  ${c.mkString(", ")}")
+    println(s"the cheapest roads joining them, ${tree.map(_.length).sum} in all:")
+    for r in tree do println(f"  ${s"${r.from} - ${r.to}"}%-26s ${r.length}%4d")
+
+  if tasks.nonEmpty
+    val (order, stuck) = schedule(tasks.toMap)
+    println(s"tasks in order: ${order.mkString(", ")}")
+    if stuck.nonEmpty then println(s"never ready, waiting on a cycle: ${stuck.mkString(", ")}")

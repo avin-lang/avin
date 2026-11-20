@@ -8955,6 +8955,16 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
 
+- **Example programs of many files are run-checked** (branch `ports-numeric`, 2026-11-19).
+  Settled on the user's delegation 2026-11-19: **an example directory `examples/NAME/` with a
+  `NAME.out` beside it is built and run at `-O0` and `-O2` as `examples/*.avin` are**, its `.in`,
+  `.err` and expectation lines read as a program of many files in `tests/programs/run` has them; an
+  example directory with no `.out` (a program that opens a window) is still only built. WHY: it is
+  the corpus's existing rule for a program that is a directory, so nothing new is learned to write
+  one, and a window program needs no marker to opt out. ALTERNATIVES: the expected output inside
+  the directory (`examples/NAME/NAME.out`; a second convention beside `tests/programs/run`'s); an
+  opt-in line in the program (every run example would carry it, where the `.out` already says it).
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to
