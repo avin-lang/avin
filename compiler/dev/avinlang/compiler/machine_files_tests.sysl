@@ -1,0 +1,366 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.path.parent
+import sysl.process.Stdio
+
+// Files for one machine: `name.<symbol>.avin` read only where its symbol holds, a module existing
+// where any of its files is read, the rule an import of a module that is not everywhere is held to,
+// `avin check` once for each target on which anything differs, and `avin.target`'s values decided as
+// the program is compiled, each tried for a machine the test names rather than the one it runs on.
+
+private const Mac: string = "aarch64-macos"
+private const Intel: string = "x86_64-linux"
+private const Arm: string = "aarch64-linux"
+
+private const Symbols: string = "the symbols are macos, linux, posix, aarch64 and x86_64"
+
+private struct Said
+    status: int
+    said: string
+    noted: string
+    out: string
+
+private avin(dir: string, args: []const string) -> Said
+    var said = ""
+    var noted = ""
+    val status = run_cli_with(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(dir + "/run.out"), Stdio.Inherit)
+    Said(status, said, noted, read_text(dir + "/run.out").unwrap_or(""))
+
+private write(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+private package_text(name: string, rest: string) -> string = s"package {\n  name = \"$name\"\n  version = \"0.1.0\"\n}\n$rest"
+
+private on(target: string) -> FeatureChoice = choice_for(every_feature(), target)
+
+private offline(dir: string) -> Fetching = Fetching(dir + "/cache", "", false)
+
+// The names of a loaded program's files below `dir`, one a line.
+private names_below(p: LoadedProgram, dir: string) -> string
+    var out = ""
+    for f in p.files
+        out = out + (if f.src.name.starts_with(dir) then f.src.name[dir.bytes.len..] else f.src.name) + "\n"
+    out
+
+private count(text: string, part: string) -> usize = text.split(part).len - 1
+
+// Whether the program's function `name` is called anywhere in the LLVM IR `text`, besides its
+// definition.
+private called(text: string, name: string) -> bool
+    assert_eq(count(text, "define internal tailcc ptr @\"<program>." + name + "\"(") + count(text, "define internal tailcc i32 @\"<program>." + name + "\"("), 1usize)
+    count(text, "@\"<program>." + name + "\"(") > 1
+
+// The message for an import of `module` from `file`, read on `missing` too, where the module exists
+// only on `present`, read from `files`.
+private width(named: string, present: string, files: string, file: string, missing: string) -> string = s"`$named` exists only on $present, where $files, and `$file` is read on $missing too: import it from a file read no more widely, or make `$named` exist on $missing"
+
+@test("a file's name carries one condition symbol between its name and its extension, or none")
+file_names()
+    assert_eq(file_machine("watch.avin").unwrap(), "")
+    assert_eq(file_machine("/a/b/watch.avin").unwrap(), "")
+    for s in ["macos", "linux", "posix", "aarch64", "x86_64"]
+        assert_eq(file_machine("watch." + s + ".avin").unwrap(), s)
+        assert_eq(file_machine("/p/q/watch." + s + ".lavin").unwrap(), s)
+    // A file named as a symbol alone is an ordinary file, read everywhere.
+    assert_eq(file_machine("linux.avin").unwrap(), "")
+    assert_eq(file_machine("Ünïcode.linux.avin").unwrap(), "linux")
+    assert_eq(file_machine("watch.lunix.avin").unwrap_err(), "`watch.lunix.avin`: `lunix` is not something a file's name can ask about the machine: a file read only on some machines is named `<name>.<symbol>.avin`, and " + Symbols)
+    assert_eq(file_machine("doc.lunix.lavin").unwrap_err(), "`doc.lunix.lavin`: `lunix` is not something a file's name can ask about the machine: a file read only on some machines is named `<name>.<symbol>.lavin`, and " + Symbols)
+    // Symbols are lowercase; a target's name is no symbol.
+    assert(file_machine("watch.Linux.avin").unwrap_err().contains("`Linux` is not something"))
+    assert(file_machine("watch.x86_64-linux.avin").unwrap_err().contains("`x86_64-linux` is not something"))
+    // One symbol, never two: a compound part is refused, naming each part.
+    assert_eq(file_machine("watch.linux.x86_64.avin").unwrap_err(), "`watch.linux.x86_64.avin` carries 2 parts between its name and `.avin`, `linux` and `x86_64`, and a file read only on some machines carries one symbol there, `<name>.<symbol>.avin`: " + Symbols)
+    assert(file_machine("a.b.c.d.avin").unwrap_err().contains("carries 3 parts between its name and `.avin`, `b`, `c` and `d`"))
+    assert(file_machine("watch..avin").unwrap_err().contains("``"))
+
+@test("each file is read on the machines its symbol holds on, and a file with none on every machine")
+selection_by_symbol()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    for s in ["", ".macos", ".linux", ".posix", ".aarch64", ".x86_64"]
+        write(dir + "/app/watch/watch" + s + ".avin", "module watch\n")
+    assert_eq(read(dir, Mac), "watch/watch.aarch64.avin\nwatch/watch.avin\nwatch/watch.macos.avin\nwatch/watch.posix.avin\nmain.avin\n")
+    assert_eq(read(dir, Intel), "watch/watch.avin\nwatch/watch.linux.avin\nwatch/watch.posix.avin\nwatch/watch.x86_64.avin\nmain.avin\n")
+    assert_eq(read(dir, Arm), "watch/watch.aarch64.avin\nwatch/watch.avin\nwatch/watch.linux.avin\nwatch/watch.posix.avin\nmain.avin\n")
+    // The root module's files are selected as well, and literate files as ordinary ones.
+    write(dir + "/app/main.linux.avin", "onLinux() -> int = 1\n")
+    write(dir + "/app/watch/notes.macos.lavin", "# Notes\n\n    module watch\n")
+    assert(read(dir, Intel).contains("main.linux.avin") && !read(dir, Mac).contains("main.linux.avin"))
+    assert(read(dir, Mac).contains("watch/notes.macos.lavin") && !read(dir, Arm).contains("notes"))
+    // A program with no manifest builds for every target, each reading its own files.
+    write(dir + "/loose/main.avin", "main()\n  println(\"loose\")\n")
+    write(dir + "/loose/main.linux.avin", "onLinux() -> int = 1\n")
+    assert_eq(names_below(load_program_with(dir + "/loose", offline(dir), choice_for(default_features(), Mac)).unwrap(), dir + "/loose/"), "main.avin\n")
+    assert_eq(names_below(load_program_with(dir + "/loose", offline(dir), choice_for(default_features(), Arm)).unwrap(), dir + "/loose/"), "main.avin\nmain.linux.avin\n")
+
+// The files of the package `dir/app` read on `target`, below its directory.
+private read(dir: string, target: string) -> string = names_below(load_package_with(dir + "/app", offline(dir), on(target)).unwrap(), dir + "/app/")
+
+// The modules of the package `dir/app` on `target`, each once, in the order read.
+private modules_on(dir: string, target: string) -> string
+    var out = ""
+    for f in load_package_with(dir + "/app", offline(dir), on(target)).unwrap().files
+        if f.module_name is Some(m)
+            if m != "" && !out.contains(m + " ") then out = out + m + " "
+    out
+
+@test("a file whose name carries a part that is not one symbol is refused on every machine, in a package, a program and a dependency")
+bad_names_refused()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    write(dir + "/app/watch/watch.lunix.avin", "module watch\n")
+    for t in [Mac, Intel, Arm]
+        val refused = load_package_with(dir + "/app", offline(dir), on(t)).unwrap_err()
+        assert(refused.contains("/app/watch/watch.lunix.avin: `watch.lunix.avin`: `lunix` is not something a file's name can ask about the machine"), refused)
+    write(dir + "/loose/main.linux.x86_64.avin", "x() -> int = 1\n")
+    assert(load_program_with(dir + "/loose", offline(dir), default_features()).unwrap_err().contains("carries 2 parts"))
+    // A dependency's file is held to the same rule.
+    write(dir + "/lib/avin.hocon", package_text("lib", ""))
+    write(dir + "/lib/lib/lib.lnux.avin", "module lib\n")
+    write(dir + "/user/avin.hocon", package_text("user", "dependencies {\n  lib { path = \"../lib\" }\n}\n"))
+    write(dir + "/user/main.avin", "main()\n  println(\"user\")\n")
+    assert(load_package_with(dir + "/user", offline(dir), on(Mac)).unwrap_err().contains("`lnux` is not something a file's name can ask about the machine"))
+    // `avin check` says so too, and stops.
+    val said = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(said.status, 1)
+    assert(said.noted.contains("`lunix` is not something a file's name can ask about the machine"), said.noted)
+
+@test("a module exists on a machine where any of its files is read, and a module whose every file carries one system exists only there")
+module_existence()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/main.avin", "main()\n  println(\"app\")\n")
+    write(dir + "/app/net/net.linux.avin", "module net\n\nsize() -> int = 1\n")
+    write(dir + "/app/fs/fs.macos.avin", "module fs\n")
+    write(dir + "/app/fs/fs.linux.avin", "module fs\n")
+    assert_eq(modules_on(dir, Mac), "fs ")
+    assert_eq(modules_on(dir, Intel), "fs net ")
+    assert_eq(modules_on(dir, Arm), "fs net ")
+    // A package that differs by machine is checked once for each set of machines that read it alike.
+    val program = load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap()
+    assert_eq(program.target, Mac)
+    assert_eq(program.machines.len(), 2)
+    assert_eq(ticked(program.machines[0]), "`aarch64-macos`")
+    assert_eq(ticked(program.machines[1]), "`x86_64-linux` and `aarch64-linux`")
+    // One that lists its targets is checked for those.
+    write(dir + "/app/avin.hocon", "package {\n  name = \"app\"\n  version = \"0.1.0\"\n  targets = [\"x86_64-linux\", \"aarch64-macos\"]\n}\n")
+    val listed = load_package_with(dir + "/app", offline(dir), on(Mac)).unwrap()
+    assert_eq(listed.machines.len(), 2)
+    assert_eq(ticked(listed.machines[0]), "`x86_64-linux`")
+    assert_eq(ticked(listed.machines[1]), "`aarch64-macos`")
+
+@test("a package with nothing for one machine only reads as it did, checked once for its own machine")
+nothing_differs()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/main.avin", "import shapes\n\nmain()\n  println(shapes.area())\n")
+    write(dir + "/app/shapes/shapes.avin", "module shapes\n\narea() -> int = 6\n")
+    val program = load_package_with(dir + "/app", offline(dir), default_features()).unwrap()
+    assert_eq(program.machines.len(), 0)
+    for f in program.files
+        assert_eq(f.fences.len(), 0)
+    val said = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(said.status, 0)
+    assert_eq(said.said, "checked " + dir + "/app\n")
+    // A manifest taking an entry by a condition differs, though no file does.
+    write(dir + "/app/avin.hocon", package_text("app", "c-libraries {\n  z { link = [\"z\"], if = \"linux\" }\n}\n"))
+    assert(load_package_with(dir + "/app", offline(dir), default_features()).unwrap().machines.len() > 0)
+
+@test("an import of a module that is not everywhere is allowed from a file read no more widely")
+import_width_allowed()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/main.avin", "import fs\n\nmain()\n  println(fs.name())\n")
+    write(dir + "/app/net/net.linux.avin", "module net\n\nsize() -> int = 1\n")
+    // From a file read only on Linux, by module and by declaration.
+    write(dir + "/app/main.linux.avin", "import net\nimport net.size\n\nonLinux() -> int = net.size() + size()\n")
+    // From a module whose every file is read only on Linux.
+    write(dir + "/app/proc/proc.linux.avin", "module proc\n\nimport net\n\ncount() -> int = net.size()\n")
+    // From a file read on fewer machines than the module: x86_64 holds only on x86_64-linux.
+    write(dir + "/app/main.x86_64.avin", "import proc\n\nonIntel() -> int = proc.count()\n")
+    // A module that exists everywhere through a different file on each system is imported from anywhere.
+    write(dir + "/app/fs/fs.macos.avin", "module fs\n\nname() -> string = \"apfs\"\n")
+    write(dir + "/app/fs/fs.linux.avin", "module fs\n\nname() -> string = \"ext4\"\n")
+    val said = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(said.noted, "")
+    assert_eq(said.status, 0)
+    for t in [Mac, Intel, Arm]
+        assert_eq(avin(dir, ["avin", "check", dir + "/app", "--target", t]).status, 0)
+
+@test("an import of a module that is not on every machine its file is read on is refused at the import, on every machine, naming the files and the machines")
+import_width_refused()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/net/net.linux.avin", "module net\n\nsize() -> int = 1\n")
+    write(dir + "/app/main.avin", "import net.size\n\nmain()\n  println(size())\n")
+    val message = width("net", "x86_64-linux and aarch64-linux", "`net.linux.avin` is read", "main.avin", "aarch64-macos")
+    // Whichever machine the check is for, a machine that reads the module included.
+    for t in [Mac, Intel, Arm]
+        val said = avin(dir, ["avin", "check", dir + "/app", "--target", t])
+        assert_eq(said.status, 1)
+        assert(said.noted.contains("error: " + message + "\n --> " + dir + "/app/main.avin:1:8"), said.noted)
+        // Told by the import's own error alone.
+        assert_eq(count(said.noted, "error:"), 1usize)
+    // Without `--target`, once, though every machine's check meets it.
+    val all = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(all.status, 1)
+    assert_eq(count(all.noted, message), 1usize)
+    assert(!all.noted.contains(message + " (on"), all.noted)
+    // The module whole, and a POSIX file, read on macOS too.
+    write(dir + "/app/main.avin", "main()\n  println(1)\n")
+    write(dir + "/app/main.posix.avin", "import net\n\nn() -> int = net.size()\n")
+    assert(avin(dir, ["avin", "check", dir + "/app"]).noted.contains(width("net", "x86_64-linux and aarch64-linux", "`net.linux.avin` is read", "main.posix.avin", "aarch64-macos")))
+    // A file for a processor reaches across systems: aarch64 is read on aarch64-macos.
+    write(dir + "/app/main.posix.avin", "x() -> int = 1\n")
+    write(dir + "/app/main.aarch64.avin", "import net\n\nn() -> int = net.size()\n")
+    assert(avin(dir, ["avin", "check", dir + "/app"]).noted.contains(width("net", "x86_64-linux and aarch64-linux", "`net.linux.avin` is read", "main.aarch64.avin", "aarch64-macos")))
+    // A Linux file importing a module that exists only on 64-bit Arm misses x86_64-linux.
+    write(dir + "/app/main.aarch64.avin", "y() -> int = 2\n")
+    write(dir + "/app/arm/arm.aarch64.avin", "module arm\n\nbits() -> int = 64\n")
+    write(dir + "/app/arm/more.aarch64.avin", "module arm\n")
+    write(dir + "/app/main.linux.avin", "import arm\n\nb() -> int = arm.bits()\n")
+    assert(avin(dir, ["avin", "check", dir + "/app"]).noted.contains(width("arm", "aarch64-macos and aarch64-linux", "`arm.aarch64.avin` and `more.aarch64.avin` are read", "main.linux.avin", "x86_64-linux")))
+
+@test("an import of a module of a dependency taken only on some machines is refused from a file read more widely, naming the package")
+import_width_of_a_dependency()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/lin/avin.hocon", package_text("lin", ""))
+    write(dir + "/lin/lin/lin.avin", "module lin\n\nsize() -> int = 1\n")
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  lin { path = \"../lin\", if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "import lin.size\n\nmain()\n  println(size())\n")
+    val message = "`lin`, a module of the package `lin`, exists only on x86_64-linux and aarch64-linux, where `lin.avin` is read, and `main.avin` is read on aarch64-macos too: import it from a file read no more widely, or make `lin` exist on aarch64-macos"
+    for t in [Mac, Arm]
+        val said = avin(dir, ["avin", "check", dir + "/app", "--target", t])
+        assert_eq(said.status, 1)
+        assert(said.noted.contains(message), said.noted)
+    // From a Linux file it is allowed, on every machine.
+    write(dir + "/app/main.avin", "main()\n  println(0)\n")
+    write(dir + "/app/main.linux.avin", "import lin.size\n\nlinSize() -> int = size()\n")
+    assert_eq(avin(dir, ["avin", "check", dir + "/app"]).status, 0)
+    for t in [Mac, Intel, Arm]
+        assert_eq(avin(dir, ["avin", "check", dir + "/app", "--target", t]).status, 0)
+
+@test("avin check checks once for each target on which anything differs, telling a diagnostic not every machine has with the machines it is for")
+check_every_target()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/probe/avin.hocon", package_text("probe", ""))
+    write(dir + "/probe/watch/watch.avin", "module watch\n\nchanges(dir: string) -> int = start(dir)\n")
+    write(dir + "/probe/watch/watch.linux.avin", "module watch\n\nprivate start(dir: string) -> int = dir.byteLength\n")
+    // The shared file calls what only Linux's file supplies: an error on macOS, naming it.
+    val said = avin(dir, ["avin", "check", dir + "/probe"])
+    assert_eq(said.status, 1)
+    val missing = "error: no function `start` is declared in `watch` on `aarch64-macos`: `watch.linux.avin` supplies it on Linux, and no file read on this machine does -- add it to a file read there, or leave the machine out of `targets`\n --> " + dir + "/probe/watch/watch.avin:3:31"
+    assert(said.noted.contains(missing), said.noted)
+    assert_eq(count(said.noted, "error:"), 1usize)
+    // Missing on both Linux targets, one check of them both, said once.
+    write(dir + "/probe/watch/watch.linux.avin", "module watch\n\nprivate unused() -> int = 0\n")
+    write(dir + "/probe/watch/watch.macos.avin", "module watch\n\nprivate start(dir: string) -> int = dir.byteLength\n")
+    val linux =avin(dir, ["avin", "check", dir + "/probe"])
+    assert(linux.noted.contains("error: no function `start` is declared in `watch` on `x86_64-linux` and `aarch64-linux`: `watch.macos.avin` supplies it on macOS, and no file read on these machines does -- add it to a file read there, or leave the machines out of `targets`"), linux.noted)
+    assert_eq(count(linux.noted, "error:"), 1usize)
+    // A value and a type are named as such.
+    write(dir + "/probe/watch/watch.avin", "module watch\n\nchanges(dir: string) -> int = limit\n\nshape(s: Shape) -> int = 1\n")
+    write(dir + "/probe/watch/watch.macos.avin", "module watch\n\nval limit: int = 3\n\ndata Shape\n  Dot\n")
+    val kinds = avin(dir, ["avin", "check", dir + "/probe"])
+    assert(kinds.noted.contains("no value `limit` is declared in `watch` on `x86_64-linux` and `aarch64-linux`: `watch.macos.avin` supplies it on macOS"), kinds.noted)
+    assert(kinds.noted.contains("no type `Shape` is declared in `watch` on `x86_64-linux` and `aarch64-linux`"), kinds.noted)
+    // An error in a file one system reads is told with the machines it is for; one every machine has
+    // is told once, as it is.
+    write(dir + "/probe/watch/watch.avin", "module watch\n\nchanges(dir: string) -> int = start(dir)\n\nwrong() -> int = \"text\"\n")
+    write(dir + "/probe/watch/watch.macos.avin", "module watch\n\nprivate start(dir: string) -> int = dir.byteLength\n")
+    write(dir + "/probe/watch/watch.linux.avin", "module watch\n\nprivate start(dir: string) -> int = dir.length\n")
+    val mixed = avin(dir, ["avin", "check", dir + "/probe"])
+    assert_eq(mixed.status, 1)
+    assert(mixed.noted.contains("string has no field `length`; a string counts its characters with `charCount` and its bytes with `byteLength` (on `x86_64-linux` and `aarch64-linux`)\n --> " + dir + "/probe/watch/watch.linux.avin:3:41"), mixed.noted)
+    assert_eq(count(mixed.noted, "watch.avin:5:"), 1usize)
+    assert(!mixed.noted.contains("(on `aarch64-macos`)"), mixed.noted)
+    // `--target` checks that machine alone, naming none.
+    val one = avin(dir, ["avin", "check", dir + "/probe", "--target", Intel])
+    assert(one.noted.contains("byteLength`\n --> " + dir + "/probe/watch/watch.linux.avin:3:41"), one.noted)
+    assert(!one.noted.contains("(on"), one.noted)
+    assert_eq(avin(dir, ["avin", "check", dir + "/probe", "--target", Mac]).noted.contains("watch.linux.avin"), false)
+    // The targets the package lists are the ones checked.
+    write(dir + "/probe/avin.hocon", "package {\n  name = \"probe\"\n  version = \"0.1.0\"\n  targets = [\"aarch64-macos\", \"x86_64-linux\"]\n}\n")
+    val listed = avin(dir, ["avin", "check", dir + "/probe"])
+    assert(listed.noted.contains("byteLength` (on `x86_64-linux`)"), listed.noted)
+    // Clean on every machine, it says so once.
+    write(dir + "/probe/watch/watch.linux.avin", "module watch\n\nprivate start(dir: string) -> int = dir.byteLength + 1\n")
+    write(dir + "/probe/watch/watch.avin", "module watch\n\nchanges(dir: string) -> int = start(dir)\n")
+    val clean = avin(dir, ["avin", "check", dir + "/probe"])
+    assert_eq(clean.noted, "")
+    assert_eq(clean.said, "checked " + dir + "/probe\n")
+    assert_eq(clean.status, 0)
+
+@test("a machine whose program cannot be read is reported by avin check with the machine, the others still checked")
+check_machine_unreadable()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    // A Linux-only dependency that is no package fails only Linux's reading.
+    write(dir + "/app/avin.hocon", package_text("app", "dependencies {\n  gone { path = \"../gone\", if = \"linux\" }\n}\n"))
+    write(dir + "/app/main.avin", "main()\n  println(1)\n")
+    val said = avin(dir, ["avin", "check", dir + "/app"])
+    assert_eq(said.status, 1)
+    assert(said.noted.contains("on `x86_64-linux` and `aarch64-linux`:\n"), said.noted)
+    assert(said.noted.contains("`gone` is a path dependency, and `../gone` is not a directory"), said.noted)
+
+@test("avin.target's values are the machine's, the branch it does not take left out of the code at every level")
+target_folded()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    val source = dir + "/fold.avin"
+    write(source, "import avin.target\nimport avin.process.{Linux, MacOS}\nimport avin.target.{Aarch64, X86_64}\n\nonMacBranch() -> string = \"m\"\n\nonOtherBranch() -> string = \"o\"\n\nonArmBranch() -> int = 64\n\nonIntelBranch() -> int = 86\n\nonLinuxTest() -> string = \"l\"\n\nonNotLinuxTest() -> string = \"n\"\n\nmain()\n  val name = target.os match\n    MacOS -> onMacBranch()\n    _ -> onOtherBranch()\n  val bits = if target.arch == Aarch64 then onArmBranch() else onIntelBranch()\n  val linux = if target.os is Linux then onLinuxTest() else onNotLinuxTest()\n  println(s\"$name $bits $linux\")\n")
+    val ir = dir + "/fold.ll"
+    val emitted = avin(dir, ["avin", "emit-llvm", source, "-o", ir])
+    assert_eq(emitted.noted, "")
+    val text = read_text(ir).unwrap()
+    val mac = host_target().ends_with("macos")
+    val arm = host_target().starts_with("aarch64")
+    // Every function of the program is compiled; only the branch taken calls one.
+    assert_eq(called(text, "onMacBranch"), mac)
+    assert_eq(called(text, "onOtherBranch"), !mac)
+    assert_eq(called(text, "onArmBranch"), arm)
+    assert_eq(called(text, "onIntelBranch"), !arm)
+    assert_eq(called(text, "onLinuxTest"), !mac)
+    assert_eq(called(text, "onNotLinuxTest"), mac)
+    val want = (if mac then "m" else "o") + " " + (if arm then "64" else "86") + " " + (if mac then "n" else "l") + "\n"
+    for level in ["-O0", "-O2"]
+        val ran = avin(dir, ["avin", "run", source, level])
+        assert_eq(ran.status, 0)
+        assert_eq(ran.out, want)
+
+@test("avin build, avin run and avin test read the files of the machine they build for")
+build_and_test_read_the_host()
+    val dir = make_temp_dir("avin-machine-files").unwrap()
+    defer _ = remove_dir_all(dir)
+    write(dir + "/app/avin.hocon", package_text("app", ""))
+    write(dir + "/app/main.avin", "import sys\n\nmain()\n  println(sys.name())\n")
+    write(dir + "/app/sys/sys.macos.avin", "module sys\n\nname() -> string = \"macos\"\n\n@test(\"the macOS file's test\")\nmacTest()\n  assert(name() == \"macos\")\n")
+    write(dir + "/app/sys/sys.linux.avin", "module sys\n\nname() -> string = \"linux\"\n\n@test(\"the Linux file's test\")\nlinuxTest()\n  assert(name() == \"linux\")\n")
+    val system = if host_target().ends_with("macos") then "macos" else "linux"
+    val ran = avin(dir, ["avin", "run", dir + "/app"])
+    assert_eq(ran.status, 0)
+    assert_eq(ran.out, system + "\n")
+    val tested = avin(dir, ["avin", "test", dir + "/app"])
+    assert_eq(tested.status, 0)
+    assert_eq(tested.said.contains("the macOS file's test"), system == "macos")
+    assert_eq(tested.said.contains("the Linux file's test"), system == "linux")
+    val exe = dir + "/app-built"
+    assert_eq(avin(dir, ["avin", "build", dir + "/app", "-o", exe]).status, 0)
+    // `--target` is `check`'s alone: a build is for the machine it runs on.
+    assert_eq(avin(dir, ["avin", "build", dir + "/app", "--target", Intel]).status, 2)
+    assert_eq(avin(dir, ["avin", "test", dir + "/app", "--target", Intel]).status, 2)

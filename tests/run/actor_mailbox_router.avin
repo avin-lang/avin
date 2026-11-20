@@ -1,0 +1,90 @@
+// expect: exit 0
+// A pool's bounded mailbox bounds the router's own mailbox and each routee's. The router waits for room
+// in the routee it chose rather than drop, so once the routees are full the router's mailbox fills,
+// and there the overflow policy, `offer`, `send`, `ask` and `dropped()` act as for any actor. Round
+// robin waits on the routee whose turn it is; `SmallestMailbox` fills every routee before it waits.
+// Every message the bound did not drop is handled.
+import avin.actors.{ActorRef, AskError, Bounded, DropNewest, Router, RoundRobin, SendError, SmallestMailbox}
+import avin.threads.{Future, Mutex, Promise, sleep}
+import avin.threads as threads
+import avin.time
+
+data Job
+  Hold(started: Promise[unit], release: Future[unit])
+  Note(n: int)
+  Get(replyTo: ActorRef[string])
+
+actor Worker(log: Mutex[Buffer[int]]) receives Job
+  receive
+    Hold(started, release) ->
+      started.complete(())
+      release.await()
+    Note(n) -> log.with(b -> b.append(n))
+    Get(replyTo) -> replyTo.tell("answered")
+
+said(r: Result[unit, SendError]) -> string = r match
+  Ok(()) -> "ok"
+  Err(e) -> e.message
+
+asked(r: Result[string, AskError]) -> string = r match
+  Ok(s) -> s
+  Err(e) -> e.message
+
+// Holds every one of `n` routees, round robin or not, and gives back what lets them go.
+holdAll(pool: ActorRef[Job], n: int) -> Promise[unit]
+  val release = Promise[unit]()
+  val started = (0 ..< n).toVector.map(_ -> Promise[unit]())
+  for p in started do _ = pool.send(Hold(p, release.future))
+  for p in started do p.future.await()
+  release
+
+// The notes logged once `n` of them are, sorted.
+logged(log: Mutex[Buffer[int]], n: int) -> string
+  val start = time.monotonic()
+  while log.with(b -> b.length) < n && time.monotonic() - start < time.seconds(20) do sleep(time.millis(1))
+  log.with(b -> s"${b.sorted}")
+
+main()
+  // Round robin, two routees of one each: two notes reach the routees, the third waits in the
+  // router for the first routee, the fourth fills the router's mailbox.
+  val log = Mutex(Buffer[int]())
+  val pool = Router.pool(2, Worker(log), RoundRobin, mailbox = Bounded(1, DropNewest))
+  val release = holdAll(pool, 2)
+  for i in 1 .. 4 do println(said(pool.send(Note(i))))
+  // Now full throughout.
+  println(said(pool.offer(Note(5))))
+  println(said(pool.send(Note(6), time.millis(30))))
+  println(asked(pool.ask(r -> Get(r), timeout = time.seconds(30)).await()))
+  pool.tell(Note(7))
+  println(pool.dropped())
+  release.complete(())
+  println(logged(log, 4))
+  println(asked(pool.ask(r -> Get(r), timeout = time.seconds(10)).await()))
+
+  // Smallest mailbox, two routees of two: four notes fill both routees, the fifth waits in the
+  // router, the sixth and seventh fill the router's mailbox of two. The seventh's send returns only
+  // once the router has taken the fifth, so the mailbox is full then.
+  val log2 = Mutex(Buffer[int]())
+  val smallest = Router.pool(2, Worker(log2), SmallestMailbox, mailbox = Bounded(2, DropNewest))
+  val release2 = holdAll(smallest, 2)
+  for i in 1 .. 7 do println(said(smallest.send(Note(i))))
+  println(said(smallest.offer(Note(8))))
+  smallest.tell(Note(9))
+  smallest.tell(Note(10))
+  println(smallest.dropped())
+  release2.complete(())
+  println(logged(log2, 7))
+
+  // Many senders through a bounded pool: every message sent is handled.
+  val log3 = Mutex(Buffer[int]())
+  val busy = Router.pool(3, Worker(log3), SmallestMailbox, mailbox = Bounded(4, DropNewest))
+  val senders = (0 ..< 4).toVector.map(k -> threads.spawn(() ->
+    var oks = 0
+    for i in 0 ..< 50
+      if busy.send(Note(k * 100 + i)) is Ok(_) then oks += 1
+    oks))
+  println(senders.map(t -> t.join()))
+  val start = time.monotonic()
+  while log3.with(b -> b.length) < 200 && time.monotonic() - start < time.seconds(20) do sleep(time.millis(1))
+  println(log3.with(b -> b.length))
+  println(busy.dropped())

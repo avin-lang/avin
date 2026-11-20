@@ -1,0 +1,102 @@
+// expect: exit 0
+// A `Selector` waits on a set of entries made at run time, each under a key, and answers the key of
+// the one that ran: receives, sends, `readable()` sources and `writable()` sinks, mixed in one set.
+// The set stays from one wait to the next and changes between waits. Empty, it answers nothing from
+// `poll`, waits out `within`'s time and `until`'s deadline.
+import avin.threads.{Channel, Readiness, Selector, Writability, sleep, spawn}
+import avin.time.{Duration, millis, now, seconds}
+
+// Ready while its flag is up; it has no descriptor.
+class Flag(var up: bool): Readiness, Writability
+  override readable() -> bool = up
+  override readinessDescriptor() -> int = -1
+  override writable() -> bool = up
+  override writabilityDescriptor() -> int = -1
+
+main()
+  // Empty.
+  val empty = Selector[string]()
+  println(empty.size, empty.isEmpty, empty.poll())
+  val t0 = now()
+  println(empty.within(millis(20)), now() - t0 >= millis(20))
+  val t1 = now()
+  println(empty.until(t1 + millis(20)), now() - t1 >= millis(20))
+  println(empty.within(millis(0)), empty.within(millis(-5)))
+
+  // One receive: its value through the entry, and the entry stays for the next wait.
+  val a = Channel[int](4)
+  val sel = Selector[string]()
+  val fromA = sel.receive(a, "a")
+  println(sel.size, sel.poll())
+  a.send(1)
+  println(sel.wait(), fromA.received())
+  a.send(2)
+  println(sel.wait(), fromA.received())
+
+  // A value sent from another thread wakes a wait.
+  val sender = spawn(() ->
+    sleep(millis(10))
+    a.send(3))
+  println(sel.wait(), fromA.received())
+  sender.join()
+
+  // A timed wait that runs out answers `None`; one that does not answers the key.
+  println(sel.within(millis(10)))
+  a.send(4)
+  println(sel.within(seconds(5)), fromA.received())
+
+  // Mixed: a receive, a send, a readable and a writable source. Only the ready entry runs.
+  val b = Channel[int](1)
+  val r = Flag(false)
+  val w = Flag(false)
+  sel.send(b, 10, "send b")
+  sel.readable(r, "readable")
+  sel.writable(w, "writable")
+  println(sel.size)
+  println(sel.wait(), b.tryReceive())
+  // The send ran, so its entry is gone; the others stay.
+  println(sel.size, sel.poll())
+  r.up = true
+  println(sel.wait())
+  r.up = false
+  w.up = true
+  println(sel.wait())
+  w.up = false
+
+  // A send entry that does not run sends nothing and stays.
+  b.send(0)
+  sel.send(b, 20, "send b")
+  println(sel.poll(), sel.size)
+  println(b.receive(), sel.wait(), b.receive(), sel.size)
+
+  // The set changed between waits: an entry removed no longer runs; several under one key go
+  // together; `removeWhere` and `clear`.
+  r.up = true
+  println(sel.remove("readable"), sel.size, sel.poll())
+  val c = Channel[int](2)
+  val d = Channel[int](2)
+  sel.receive(c, "cd")
+  sel.receive(d, "cd")
+  d.send(5)
+  println(sel.wait())
+  println(sel.remove("cd"), sel.remove("cd"), sel.size)
+  sel.readable(r, "r1")
+  sel.readable(r, "r2")
+  println(sel.removeWhere(k -> k.startsWith("r")), sel.size)
+  sel.clear()
+  println(sel.size, sel.isEmpty, sel.poll())
+
+  // A closed channel's receive entry runs with `None` once drained, every time after.
+  val e = Channel[int](2)
+  e.send(6)
+  e.close()
+  val closing = Selector[int]()
+  val fromE = closing.receive(e, 0)
+  println(closing.wait(), fromE.received())
+  println(closing.wait(), fromE.received())
+  println(closing.wait(), fromE.received())
+
+  // Keys of any type: here a data type.
+  val keyed = Selector[(string, int)]()
+  keyed.readable(r, ("r", 1))
+  println(keyed.wait(), keyed.remove(("r", 1)), keyed.size)

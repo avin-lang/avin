@@ -1,0 +1,60 @@
+// expect: exit 0
+// The relay of two connections in the threads chapter: one select with guarded arms on one thread,
+// each side read only while nothing it gave waits to be written and watched for room only while
+// something does. Both ways carry more than the sockets hold, each end finishing in turn; every byte
+// arrives in order, and the loop ends as its last arm is guarded off rather than the select trapping.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+relayPair(a: TcpStream, b: TcpStream) -> Result[unit, IoError]
+  var toA: Array[byte] = Array.empty()
+  var toB: Array[byte] = Array.empty()
+  var aOpen = true
+  var bOpen = true
+  while aOpen || bOpen || toA.length > 0 || toB.length > 0
+    select
+      a.readable() if aOpen && toB.length == 0 ->
+        toB = a.read(4096)?
+        if toB.length == 0
+          aOpen = false
+          b.shutdownOutput()?
+      b.readable() if bOpen && toA.length == 0 ->
+        toA = b.read(4096)?
+        if toA.length == 0
+          bOpen = false
+          a.shutdownOutput()?
+      a.writable() if toA.length > 0 -> toA = toA.slice(a.writeSome(toA)?, toA.length)
+      b.writable() if toB.length > 0 -> toB = toB.slice(b.writeSome(toB)?, toB.length)
+  Ok(())
+
+payload(size: int, tag: int) -> Array[byte] = Array.tabulate(size, i -> byte((i * 31 + tag) % 256))
+
+main()
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val x = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val a = ok(l.accept())
+  val y = ok(TcpStream.connect("127.0.0.1", l.port()))
+  val b = ok(l.accept())
+  val relaying = spawn(() -> relayPair(a, b))
+  // Both ends send at once, more than the sockets hold, so the relay's writes wait for room while its
+  // reads are held back.
+  val (yr, yw) = y.split()
+  val yWriter = spawn(() ->
+    ok(yw.write(payload(300000, 2)))
+    ok(yw.close()))
+  val ySide = spawn(() ->
+    val got = ok(yr.readAll())
+    ok(yr.close())
+    (got.length, got == payload(500000, 1)))
+  ok(x.write(payload(500000, 1)))
+  ok(x.shutdownOutput())
+  val atX = ok(x.readAll())
+  println(ySide.join())
+  yWriter.join()
+  println(atX.length, atX == payload(300000, 2))
+  println(relaying.join())

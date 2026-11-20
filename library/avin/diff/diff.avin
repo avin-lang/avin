@@ -1,0 +1,369 @@
+module avin.diff
+
+// The differences between two sequences, found with Myers' O(ND) algorithm in its linear-space form:
+// the search runs from both ends at once until the two meet in a middle snake, which splits the
+// problem in two, so the memory used is proportional to the sizes of the inputs and never to the
+// product of them, and the time to their sizes times the number of differences D.
+//
+//     val edits = diff([1, 2, 3, 4], [1, 3, 4, 5])
+//     // [Keep(1), Delete(2), Keep(3), Keep(4), Insert(5)]
+//     assertEq(apply([1, 2, 3, 4], edits), [1, 3, 4, 5])
+//
+// The script is a shortest one: it has the fewest `Insert`s and `Delete`s that turn the first
+// sequence into the second. Where several scripts are that short the one found keeps the common
+// elements as early as it can. Within a run of changes the `Delete`s come before the `Insert`s, as
+// `diff -u` prints them.
+//
+// Text is compared a line at a time: `diffLines` splits both texts at `\n`, and `unifiedDiff` writes
+// the result as `diff -u` and `git diff` do, hunks and `\ No newline at end of file` included.
+//
+//     print(unifiedDiff("a\nb\n", "a\nc\n", "old.txt", "new.txt"))
+//     // --- old.txt
+//     // +++ new.txt
+//     // @@ -1,2 +1,2 @@
+//     //  a
+//     // -b
+//     // +c
+
+// One step of a script: an element of the first sequence kept, one of the second inserted, or one
+// of the first deleted. A `Keep` holds the element of the first sequence.
+data Edit[+T]
+  Keep(value: T)
+  Insert(value: T)
+  Delete(value: T)
+
+// One line of a text: its characters without the `\n` that ended it, and whether one did. Only the
+// last line of a text can be unterminated.
+data Line(text: string, terminated: bool)
+
+// How two texts' lines are compared. With `ignoreTrailingSpace` lines that differ only in white
+// space at their ends (a `\r` included) are equal. With `finalNewline` (the default, and what
+// `diff` does) a last line with no `\n` differs from the same line with one; without it they are
+// equal.
+data LineOptions(ignoreTrailingSpace: bool = false, finalNewline: bool = true)
+
+// A run of changes and the unchanged lines around it: `aCount` elements of the first sequence from
+// the 0-based `aStart`, and `bCount` of the second from `bStart`, with the edits that cover them.
+data Hunk[+T](aStart: int, aCount: int, bStart: int, bCount: int, edits: Vector[Edit[T]])
+
+private val keepStep = 0
+
+private val insertStep = 1
+
+private val deleteStep = 2
+
+// The shortest script that turns the `n` elements of one sequence into the `m` of another, as one
+// step per element kept, inserted or deleted, where `same(i, j)` says whether element `i` of the
+// first equals element `j` of the second.
+private script(n: int, m: int, same: (int, int) -> bool) -> Buffer[int]
+  val steps = Buffer[int]()
+  if n + m == 0 then return steps
+  val size = n + m + 5
+  solve(0, n, 0, m, same, Array.fill(size, 0), Array.fill(size, 0), steps)
+  steps
+
+// Adds `count` steps of `kind`.
+private emit(steps: Buffer[int], kind: int, count: int)
+  var i = 0
+  while i < count
+    steps.addOne(kind)
+    i += 1
+
+// The steps for elements `aLo` up to `aHi` of the first sequence and `bLo` up to `bHi` of the
+// second: the elements the ranges share at either end are kept, a range left empty is deleted or
+// inserted whole, and otherwise the middle snake splits the rest into the parts before and after it.
+private solve(
+    aLo: int,
+    aHi: int,
+    bLo: int,
+    bHi: int,
+    same: (int, int) -> bool,
+    forward: Array[int],
+    backward: Array[int],
+    steps: Buffer[int]
+)
+  var aStart = aLo
+  var bStart = bLo
+  var aEnd = aHi
+  var bEnd = bHi
+  while aStart < aEnd && bStart < bEnd && same(aStart, bStart)
+    steps.addOne(keepStep)
+    aStart += 1
+    bStart += 1
+  var tail = 0
+  while aStart < aEnd && bStart < bEnd && same(aEnd - 1, bEnd - 1)
+    aEnd -= 1
+    bEnd -= 1
+    tail += 1
+  if aStart == aEnd then emit(steps, insertStep, bEnd - bStart)
+  elif bStart == bEnd then emit(steps, deleteStep, aEnd - aStart)
+  else
+    val (x0, y0, x1, y1) = middleSnake(aStart, aEnd, bStart, bEnd, same, forward, backward)
+    solve(aStart, x0, bStart, y0, same, forward, backward, steps)
+    emit(steps, keepStep, x1 - x0)
+    solve(x1, aEnd, y1, bEnd, same, forward, backward, steps)
+  emit(steps, keepStep, tail)
+
+// The middle snake of the ranges, as the positions it starts and ends at in each sequence. Paths
+// are grown from the start and from the end, one more difference each round, until one reaches a
+// diagonal the other has been to; the run of equal elements that path ends with is the snake. The
+// diagonal `k` holds the points where the position in the first sequence is `k` more than in the
+// second, and `forward` and `backward` hold the furthest each path has got on each, the backward
+// one measured from the ends.
+private middleSnake(
+    aLo: int,
+    aHi: int,
+    bLo: int,
+    bHi: int,
+    same: (int, int) -> bool,
+    forward: Array[int],
+    backward: Array[int]
+) -> (int, int, int, int)
+  val n = aHi - aLo
+  val m = bHi - bLo
+  val delta = n - m
+  val odd = delta % 2 != 0
+  val rounds = (n + m + 1) / 2
+  val at = rounds + 1
+  forward(at + 1) = 0
+  backward(at + 1) = 0
+  var d = 0
+  while d <= rounds
+    var k = -d
+    while k <= d
+      var x = if k == -d || (
+        k != d && forward(at + k - 1) < forward(at + k + 1)
+      ) then forward(at + k + 1) else forward(at + k - 1) + 1
+      var y = x - k
+      val x0 = x
+      val y0 = y
+      while x < n && y < m && same(aLo + x, bLo + y)
+        x += 1
+        y += 1
+      forward(at + k) = x
+      if odd && -(d - 1) <= delta - k <= d - 1 && x + backward(at + delta - k) >= n then return (
+        aLo + x0,
+        bLo + y0,
+        aLo + x,
+        bLo + y
+      )
+      k += 2
+    k = -d
+    while k <= d
+      var x = if k == -d || (
+        k != d && backward(at + k - 1) < backward(at + k + 1)
+      ) then backward(at + k + 1) else backward(at + k - 1) + 1
+      var y = x - k
+      val x0 = x
+      val y0 = y
+      while x < n && y < m && same(aHi - 1 - x, bHi - 1 - y)
+        x += 1
+        y += 1
+      backward(at + k) = x
+      if !odd && -d <= delta - k <= d && x + forward(at + delta - k) >= n then return (
+        aHi - x,
+        bHi - y,
+        aHi - x0,
+        bHi - y0
+      )
+      k += 2
+    d += 1
+  fail("diff: no middle snake")
+
+// A script as edits, given the elements of the two sequences. The inserts of a run of changes wait
+// until the run ends, so its deletes come first.
+private assemble[T](steps: Buffer[int], a: Vector[T], b: Vector[T]) -> Vector[Edit[T]]
+  val out = Vector.newBuilder[Edit[T]]()
+  val pending = Buffer[Edit[T]]()
+  var i = 0
+  var j = 0
+  for step in steps
+    if step == insertStep
+      pending.addOne(Insert(b(j)))
+      j += 1
+    else
+      if step == deleteStep
+        out.addOne(Delete(a(i)))
+        i += 1
+      else
+        out.addAll(pending)
+        pending.clear()
+        out.addOne(Keep(a(i)))
+        i += 1
+        j += 1
+  out.addAll(pending)
+  out.result()
+
+// The shortest script that turns `a` into `b`: `apply(a, diff(a, b))` is `b`, and no script with
+// fewer `Insert`s and `Delete`s does so. Elements are compared with `==`.
+diff[T: Eq](a: Vector[T], b: Vector[T]) -> Vector[Edit[T]] = assemble(
+  script(a.length, b.length, (i, j) -> a(i) == b(j)),
+  a,
+  b
+)
+
+// The sequence `edits` turn `a` into: a `Keep` or `Delete` takes the next element of `a`, which must
+// equal the one it holds, an `Insert` adds its element, and `a` must be used up. Traps where the
+// edits do not fit `a`, naming the first that does not.
+apply[T: Eq](a: Vector[T], edits: Vector[Edit[T]]) -> Vector[T]
+  val out = Vector.newBuilder[T]()
+  var i = 0
+  var n = 0
+  for edit in edits
+    n += 1
+    edit match
+      Insert(v) -> out.addOne(v)
+      Keep(v) ->
+        if i >= a.length || a(i) != v then fail(s"apply: edit $n does not match the input")
+        out.addOne(v)
+        i += 1
+      Delete(v) ->
+        if i >= a.length || a(i) != v then fail(s"apply: edit $n does not match the input")
+        i += 1
+  if i != a.length then fail("apply: the edits stop before the end of the input")
+  out.result()
+
+// The number of elements `edits` insert and delete: the length of the script.
+changes[T](edits: Vector[Edit[T]]) -> int = edits.count(e -> e match
+  Keep(_) -> false
+  _ -> true)
+
+// The lines of `text`, split at each `\n`, which the lines do not keep. A `\r` before it stays in
+// the line. Text that ends in `\n` has no empty line after it, and the empty text has no lines.
+splitLines(text: string) -> Vector[Line]
+  val out = Vector.newBuilder[Line]()
+  val n = text.byteLength
+  var from = 0
+  while from < n
+    val at = text.indexOf("\n", from)
+    if at < 0
+      out.addOne(Line(text.slice(from, n), false))
+      from = n
+    else
+      out.addOne(Line(text.slice(from, at), true))
+      from = at + 1
+  out.result()
+
+// The text of `lines`: each line with the `\n` that ended it, if one did. `joinLines(splitLines(t))`
+// is `t`.
+joinLines(lines: Vector[Line]) -> string
+  val out = StringWriter()
+  for line in lines
+    out.write(line.text)
+    if line.terminated then out.write("\n")
+  out.text
+
+// The shortest script that turns the lines of `a` into the lines of `b`, compared as `options`
+// say. A `Keep` holds the line of `a`.
+diffLines(a: string, b: string, options: LineOptions = LineOptions()) -> Vector[Edit[Line]]
+  val x = splitLines(a)
+  val y = splitLines(b)
+  val xs = x.map(line -> lineKey(line, options))
+  val ys = y.map(line -> lineKey(line, options))
+  val strict = options.finalNewline
+  assemble(
+    script(x.length, y.length, (i, j) -> xs(i) == ys(j) && (!strict || x(i).terminated == y(j).terminated)),
+    x,
+    y
+  )
+
+// What a line is compared by.
+private lineKey(
+    line: Line,
+    options: LineOptions
+) -> string = if options.ignoreTrailingSpace then line.text.stripTrailing else line.text
+
+// The edits cut into hunks: each run of changes with `context` unchanged elements on either side,
+// the runs whose contexts meet or overlap (no more than `2 * context` unchanged elements between
+// them) sharing one hunk. A script with no changes has no hunks. Traps on a negative `context`.
+hunks[T](edits: Vector[Edit[T]], context: int) -> Vector[Hunk[T]]
+  if context < 0 then fail("hunks: negative context")
+  val n = edits.length
+  val aBefore = Array.fill(n + 1, 0)
+  val bBefore = Array.fill(n + 1, 0)
+  for i in 0 ..< n
+    edits(i) match
+      Keep(_) ->
+        aBefore(i + 1) = aBefore(i) + 1
+        bBefore(i + 1) = bBefore(i) + 1
+      Insert(_) ->
+        aBefore(i + 1) = aBefore(i)
+        bBefore(i + 1) = bBefore(i) + 1
+      Delete(_) ->
+        aBefore(i + 1) = aBefore(i) + 1
+        bBefore(i + 1) = bBefore(i)
+  val out = Vector.newBuilder[Hunk[T]]()
+  var i = 0
+  while i < n
+    while i < n && isKeep(edits(i)) do i += 1
+    if i < n
+      val start = if i > context then i - context else 0
+      var last = i
+      var j = i + 1
+      while j < n
+        if !isKeep(edits(j))
+          last = j
+          j += 1
+        else
+          var k = j
+          while k < n && isKeep(edits(k)) do k += 1
+          if k < n && k - j <= 2 * context
+            last = k
+            j = k + 1
+          else j = n
+      val stop = if n - last - 1 > context then last + 1 + context else n
+      out.addOne(
+        Hunk(
+          aBefore(start),
+          aBefore(stop) - aBefore(start),
+          bBefore(start),
+          bBefore(stop) - bBefore(start),
+          edits.slice(start, stop)
+        )
+      )
+      i = last + 1
+  out.result()
+
+private isKeep[T](edit: Edit[T]) -> bool = edit match
+  Keep(_) -> true
+  _ -> false
+
+// A hunk's range as a unified diff writes it: the 1-based first line and the count, the count left
+// out when it is 1, and an empty range named by the line before it.
+private range(start: int, count: int) -> string = count match
+  1 -> s"${start + 1}"
+  0 -> s"$start,0"
+  _ -> s"${start + 1},$count"
+
+// `edits` of two texts' lines written as a unified diff, as `diff -u` does: no output at all where
+// there are no changes, otherwise the `---` and `+++` headers naming the two sides, then each hunk
+// of `context` lines (3 as `diff -u` has it) behind an `@@ -a,b +c,d @@` line, its lines marked
+// ` `, `-` and `+`, and a line that had no `\n` followed by `\ No newline at end of file`.
+renderUnified(edits: Vector[Edit[Line]], fromName: string, toName: string, context: int = 3) -> string
+  val cut = hunks(edits, context)
+  if cut.isEmpty then return ""
+  val out = StringWriter()
+  out.write(s"--- $fromName\n+++ $toName\n")
+  for h in cut
+    out.write(s"@@ -${range(h.aStart, h.aCount)} +${range(h.bStart, h.bCount)} @@\n")
+    for edit in h.edits
+      val (mark, line) = edit match
+        Keep(l) -> (" ", l)
+        Insert(l) -> ("+", l)
+        Delete(l) -> ("-", l)
+      out.write(mark)
+      out.write(line.text)
+      out.write("\n")
+      if !line.terminated then out.write("\\ No newline at end of file\n")
+  out.text
+
+// The unified diff of two texts, byte for byte what `diff -u` prints for files holding them, with
+// `fromName` and `toName` as the names on its two header lines.
+unifiedDiff(
+    a: string,
+    b: string,
+    fromName: string,
+    toName: string,
+    context: int = 3,
+    options: LineOptions = LineOptions()
+) -> string = renderUnified(diffLines(a, b, options), fromName, toName, context)
