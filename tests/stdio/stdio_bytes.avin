@@ -1,6 +1,7 @@
 import avin.io
 import avin.io.{ByteWriter, IoError, Reader}
 import avin.process
+import avin.process.Command
 import avin.threads.{Atomic, spawn}
 
 // Standard input, output and error as bytes, driven by `stdio_tests.sysl` through the shell, which
@@ -112,6 +113,27 @@ whilePossible(out: ByteWriter, what: string, say: (string) -> unit)
       say(s"$what: never failed")
       return
 
+// Four threads write the pattern to `out` until its reader goes, each saying how its write failed on
+// standard error, or on standard output where `out` is standard error: the SIGPIPE a write raises
+// must end none of them, whichever thread the system offers it to.
+whilePossibleThreads[W: ByteWriter & Sendable](out: W, what: string, sayOnOutput: bool)
+  val ts = Vector.tabulate(4, t -> spawn(() ->
+    whilePossible(out, s"$what t$t", m -> if sayOnOutput then println(m) else eprintln(m))
+    t))
+  for t in ts do t.join()
+
+// Writes the pattern to standard output until its reader goes while four other threads keep running,
+// so a SIGPIPE raised on the whole program has threads not blocking it to land on.
+whilePossibleBusy()
+  val stop = Atomic(false)
+  val spinners = Vector.tabulate(4, _ -> spawn(() ->
+    var n: long = 0
+    while !stop.load() do n += 1
+    n))
+  whilePossible(io.stdout(), "stdout", m -> eprintln(m))
+  stop.store(true)
+  for s in spinners do s.join()
+
 // Threads printing lines and writing lines as bytes at once; `verify` checks each line arrived whole.
 // The writer is taken as a writing thread of a server takes it, sendable.
 interleave() = interleaveTo(io.stdout())
@@ -197,6 +219,23 @@ main(args: Vector[string])
       println("stderr: survived")
       flush()
       process.exit(0)
+    "epipe-threads" -> whilePossibleThreads(io.stdout(), "stdout", false)
+    "epipe-busy" -> whilePossibleBusy()
+    "epipe-err-threads" ->
+      whilePossibleThreads(io.stderr(), "stderr", true)
+      println("stderr: survived")
+      flush()
+      process.exit(0)
+    // After a byte write has failed, `print` without a newline still ends the program quietly.
+    "epipe-then-print" ->
+      whilePossible(io.stdout(), "stdout", m -> eprintln(m))
+      for _ in 0 ..< 1000000 do print("x")
+      flush()
+      eprintln("print: survived")
+    // After a byte write has failed, a child writing to the same standard output is ended by SIGPIPE.
+    "epipe-then-child" ->
+      whilePossible(io.stdout(), "stdout", m -> eprintln(m))
+      eprintln(s"child: ${Command("/usr/bin/yes").run()}")
     "interleave" -> interleave()
     "verify" -> verify()
     "order" -> order()

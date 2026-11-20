@@ -810,7 +810,9 @@ output first, as `eprint` does. An empty write writes nothing and answers `Ok`.
 
 **A write to a reader that has gone fails; it does not end the program.** A byte write to a pipe or
 socket whose reader has closed answers `Err(IoError(ConnectionReset, "write", "standard output"))`
-(or `"standard error"`), and every later byte write answers the same; the program goes on. `print`
+(or `"standard error"`), and every later byte write answers the same; the program goes on, however
+many of its threads are writing or running. A child the program starts writes to the same output
+as any program does, and is ended by its broken pipe as usual. `print`
 is not changed by it: a program that only prints still ends quietly when its reader goes, as a
 filter in a pipeline should.
 
