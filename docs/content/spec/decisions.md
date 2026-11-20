@@ -11742,8 +11742,8 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   of every module but a test module (`@tests` files and a package's `tests` module), each with the
   header hover shows (a function's, a field's and a value's as the checker typed it; a type's first
   line as written), a data type's variants and a record's fields, a class's public fields and methods,
-  a trait's members, an object's, the impls a type has with their public methods, and a module's
-  exports. An impl is listed with its type when the site documents the type among modules of the same
+  a trait's members, an object's, a type's public member exports as written (`export f.{m, n as k}`),
+  the impls a type has with their public methods, and a module's exports. An impl is listed with its type when the site documents the type among modules of the same
   kind (the program's, a dependency's, the library's), with the module it is written in named when
   that is another; otherwise under its own module's "Implementations". A method is shown without its
   type (`map[U](…)`, not `Option[T].map[U](…)`). A module with nothing public and no comment has no
