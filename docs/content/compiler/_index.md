@@ -310,8 +310,12 @@ those.
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
 cannot be written is an error before any work is done. Unset or empty, nothing is written and no
-clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its counts as
-`key=<n>` words, in this order:
+clock is read. Each phase writes one line, `phase=<name> ms=<n> rss=<n> inuse=<n> maxrss=<n>`
+followed by its counts as `key=<n>` words, in this order. The three memory fields are bytes of the
+compiler process as the phase ends: `rss` is its resident size, `inuse` what the allocator holds
+for live blocks (zero where the platform does not say; macOS does), and `maxrss` the most resident
+bytes it has held. The allocator keeps freed small blocks for the life of the process, so `rss`
+stays high after `inuse` falls.
 
 | Phase | Counts |
 |---|---|
