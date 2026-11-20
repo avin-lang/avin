@@ -48,7 +48,8 @@ import sysl.text.from_utf8_unchecked
 // comments of its program, read from the program with the prose stripped.
 //
 // `tests/reject/*.avin` must fail to compile, and each `// error: TEXT` line in it names text the
-// diagnostics must contain.
+// diagnostics must contain. A `// errors: exactly` line says those are all its errors: one more
+// fails it.
 //
 // `tests/programs/run/NAME/` and `tests/programs/reject/NAME/` are programs of many files, each
 // directory the root of one program, held to the same standards. Their expectation lines may be in
@@ -79,9 +80,11 @@ private struct Expectation
     numbers_vary: bool
     places_hidden: Buf[string]
     times_vary: bool
+    /** Whether the `// error:` lines name every error the program has, so another one fails it. */
+    exact: bool
 
 private expectation(text: string) -> Expectation
-    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false, buf(), false)
+    var e = Expectation(0, false, buf(), buf(), buf(), false, "", false, buf(), false, false)
     for line in text.split("\n")
         if line == "// ignore" || line.starts_with("// ignore:")
             e.ignored = true
@@ -92,6 +95,7 @@ private expectation(text: string) -> Expectation
         elif line == "// stderr: times vary" then e.times_vary = true
         elif line.starts_with("// stderr: places hidden in ") then e.places_hidden.push(line["// stderr: places hidden in ".bytes.len..].trim())
         elif line.starts_with("// error: ") then e.errors.push(line["// error: ".bytes.len..])
+        elif line == "// errors: exactly" then e.exact = true
         elif line.starts_with("// env: ")
             val setting = line["// env: ".bytes.len..]
             for i in 0..<setting.bytes.len
@@ -908,8 +912,18 @@ private reject_all(tc: Toolchain, all: Buf[string]) -> Tally
         for message in want.errors
             if !compiled.diagnostics.contains(message)
                 failures = failures + s"$path: no `$message` in:\n${compiled.diagnostics}\n"
+        if want.exact
+            val reported = errors_in(compiled.diagnostics)
+            if reported != want.errors.len() then failures = failures + s"$path: names ${want.errors.len()} errors, and ${reported} were reported:\n${compiled.diagnostics}\n"
         t = record(t, failures)
     t
+
+/** How many errors `diagnostics` reports: the lines that begin one. */
+private errors_in(diagnostics: string) -> usize
+    var n = 0usize
+    for line in diagnostics.split("\n")
+        if line.starts_with("error: ") then n += 1
+    n
 
 @test("an ignore line carries its reason, and combines with the other expectation lines")
 corpus_ignore_lines()
@@ -996,6 +1010,51 @@ corpus_refused_file_name()
     val wrong = reject_all(tc, program_cases_in(dir))
     assert(wrong.failed == 1)
     assert(wrong.failures.contains("no `some other message`"), wrong.failures)
+
+@test("a reject program with an `// errors: exactly` line fails on an error it does not name, and passes once it names every one")
+corpus_exact_rejects()
+    assert(expectation("// errors: exactly\n// error: x\n").exact)
+    assert(!expectation("// error: x\n").exact)
+    assert(!expectation("// errors: exactly please\n").exact)
+    val tc = repository_toolchain()
+    val dir = make_temp_dir("avin-corpus-exact").unwrap()
+    defer _ = remove_dir_all(dir)
+    val program = "main()\n  val a: int = \"one\"\n  val b: string = 2\n"
+    write_text(dir + "/two.avin", "// errors: exactly\n// error: expected int\n" + program).unwrap()
+    val short = reject_all(tc, cases_in(dir))
+    assert(short.failed == 1, short.failures)
+    assert(short.failures.contains("names 1 errors, and 2 were reported"), short.failures)
+    // Without the line, naming one of them is enough.
+    write_text(dir + "/two.avin", "// error: expected int\n" + program).unwrap()
+    assert(reject_all(tc, cases_in(dir)).failures == "")
+    write_text(dir + "/two.avin", "// errors: exactly\n// error: expected int\n// error: expected string\n" + program).unwrap()
+    val named = reject_all(tc, cases_in(dir))
+    assert(named.failures == "", named.failures)
+    assert(named.passed == 1)
+
+@test("a thread's body reaches a program's method that reads module state only where its code may call it, through generic code at its type arguments and through the classes a receiver may have")
+corpus_thread_reach()
+    val tc = repository_toolchain()
+    var rejects: Buf[string] = buf()
+    rejects.push(tc.root + "/tests/reject/thread_module_reach.avin")
+    rejects.push(tc.root + "/tests/reject/thread_module_reach_generic.avin")
+    val rejected = reject_all(tc, rejects)
+    assert(rejected.failures == "", rejected.failures)
+    assert(rejected.passed == 2)
+    var runs: Buf[string] = buf()
+    runs.push(tc.root + "/tests/run/thread_module_reach_precise.avin")
+    val ran = run_all(tc, runs)
+    assert(ran.failures == "", ran.failures)
+    assert(ran.passed == 1)
+
+@test("a module-level value whose initializer applies an operator to a final class needs only what that class's method uses")
+corpus_init_order_class_operator()
+    val tc = repository_toolchain()
+    var runs: Buf[string] = buf()
+    runs.push(tc.root + "/tests/run/init_order_class_operator.avin")
+    val ran = run_all(tc, runs)
+    assert(ran.failures == "", ran.failures)
+    assert(ran.passed == 1)
 
 @test("an ignore line with no reason is an error in both kinds of directory")
 corpus_ignore_needs_reason()

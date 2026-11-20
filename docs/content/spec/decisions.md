@@ -2581,6 +2581,29 @@ their words are reserved.
     implementation reads a module-level `var` and the body never meets a value of that type.
     *Alternative*: following the receiver's static type only where the class is final, which is
     finer but has to agree with devirtualization.
+  - Settled on the user's delegation 2026-11-19 (branch `reach-chains`): **what a call through a
+    method table, a bound or an operator reaches follows the types its receiver may have.** On a data
+    type it is that type's own method; on a class, that class's and its subclasses'; on a built-in
+    scalar, nothing of the program's; on a trait or a type parameter, the method of that name of every
+    type conforming to the trait or to the parameter's bounds; on `Any`, every one, as before. A
+    generic function or method is followed instance by instance: called at known type arguments (or
+    a method on a receiver of known type arguments), its operators and bound calls on its type
+    parameters reach only what those types implement, and a lambda runs in the instance that makes
+    it. An equality on a type with an `equals` of its own reaches that; one without compares fields
+    and elements and still reaches every `equals`. *Why*: the rule above counted every method of the
+    name in the program, so a program's `impl Sub for Money` reading a module-level `var` made the
+    standard library's `BigInt` subtraction, and with it `Map`, `Future` and `println`, look as if they
+    reached it: a thread's body was rejected through chains no value could follow. Every narrowing
+    keeps every implementation a value of the type can really have, so nothing the check closed is
+    reopened (`thread_module_reach_generic.avin` pins the reachable routes). *Alternatives*: keeping
+    the name-wide rule and deduplicating the chains (still rejects correct programs); a flow analysis
+    of which types each generic class is made with, which would also see that an `Iterator[Any]` in
+    `println` never yields a program's type (much larger, and an instance whose arguments are not
+    known still stands for every instance); narrowing by bounds alone, without instances (leaves
+    `Map[int, …]` reaching every `hash`). Review with the user: a code path through a trait-typed
+    value whose type arguments are not known still reaches every conforming type's method, so a
+    program whose own `Hash` or `Eq` reads a module-level `var` still sees library code rejected in a
+    thread's body (`println` reaches `HashSet.contains` through an `Iterator[Any]`).
   - What is passed for an `@isolated` parameter is not held to this, since it runs at once on the
     calling thread. A `Mutex`'s value and `with` body were `@isolated`; they are now `@isolating`,
     which is held to it (see the `mutex-isolating` entry below).

@@ -22,6 +22,11 @@ struct Uses
      * them to `functions`. */
     dispatched: Buf[usize]
     dispatched_slots: Buf[usize]
+    /** The type of the receiver of each call in `dispatched`, where it has one. */
+    dispatched_receivers: Buf[Option[&Type]]
+    /** Each place the code calls or makes a function, with what instantiates it, so an instance of
+     * the code reaches the instances of the functions it names. */
+    sites: Buf[CallSite]
     /** The core trait method (`add`, `less`, `equals`, `negate`, ...) and the operand type of each
      * operator applied to values that are not built-in scalars. Which impl method it calls is
      * decided when the program is lowered, so the caller adds the candidates to `functions`. */
@@ -40,10 +45,22 @@ struct LazyFieldRead
     index: usize
     name: string
 
+/** A call or a closure of `function`: the type arguments that instantiate it, empty where none are
+ * written, and the type of its receiver, where it has one. */
+struct CallSite
+    function: usize
+    type_args: Buf[&Type]
+    receiver: Option[&Type]
+
 uses_of(body: &TExpr) -> Uses
-    var u = Uses(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    var u = Uses(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
     collect(&u, body)
     u
+
+private receiver_of(args: Buf[&TExpr]) -> Option[&Type] = if args.len() > 0 then Some(args[0].ty) else None
+
+private add_site(u: *Uses, f: usize, type_args: Buf[&Type], receiver: Option[&Type])
+    u.sites.push(CallSite(f, type_args, receiver))
 
 /** Records that the code applies the core trait method `name` to values of type `t`, unless they are
  * built-in scalars, whose operators are the machine's own. */
@@ -159,28 +176,36 @@ private collect(u: *Uses, e: &TExpr)
         // A local one's read may run the lambda its declaration made, wherever the read is.
         LazyLocal(cell, initialize, function, _) ->
             add_function(u, function)
+            add_site(u, function, buf(), None)
             collect(u, cell)
             collect(u, initialize)
         StoreGlobal(g, value, _) ->
             add(&u.globals, g)
             collect(u, value)
-        Call(f, args, _) ->
+        Call(f, args, type_args) ->
             add_function(u, f)
+            add_site(u, f, type_args, receiver_of(args))
             collect_all(u, args)
-        Dispatch(f, slot, args, _) ->
+        Dispatch(f, slot, args, type_args) ->
             add_function(u, f)
+            add_site(u, f, type_args, receiver_of(args))
             u.dispatched.push(f)
             u.dispatched_slots.push(slot)
+            u.dispatched_receivers.push(receiver_of(args))
             collect_all(u, args)
         // A call through a bound reaches the implementation of whichever type an instance has.
-        BoundCall(f, slot, args, _) ->
+        BoundCall(f, slot, args, type_args) ->
             add_function(u, f)
+            add_site(u, f, type_args, receiver_of(args))
             if slot is Some(s)
                 u.dispatched.push(f)
                 u.dispatched_slots.push(s)
+                u.dispatched_receivers.push(receiver_of(args))
             collect_all(u, args)
         // A function value is made here and runs wherever it is called, which the code may hand on.
-        FunctionValue(f, _) -> add_made(u, f)
+        FunctionValue(f, type_args) ->
+            add_made(u, f)
+            add_site(u, f, type_args, None)
         CallValue(callee, args) ->
             collect(u, callee)
             collect_all(u, args)
