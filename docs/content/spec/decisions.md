@@ -9327,6 +9327,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `receive`. Why: an actor's parameters are carried to it by its behaviour, so the section is checked
   where the actor is declared, once, with the message every other parameter gets. Alternatives
   weighed: none that keeps one rule for actor parameters.
+- Settled on the user's delegation 2026-11-20 (branch `bound-static-value`): **a static member
+  reached through a type parameter's bound, named without a call, is a function value of it**
+  (`xs.map(T.parse)` in `f[T: Parse]`), exactly as on a known type: an overload is chosen by the
+  function type expected, a member declared with `()` needs one, a `using` section is filled where the
+  value is taken, and each instance makes the value of its type argument's member. `T.parse` had
+  reported "`T` is not defined", against the chapter's "a static member named without a call is a
+  function value" and generics' "takes every form a method call takes: … the method as a value"; a
+  name no bound declares now gets the call's errors ("`T` has no static member", "a method of a value
+  of `T`"). The one choice: **where `T` is bounded by one generic trait at several type arguments
+  (`T: Make[int] & Make[string]`), `T.make` is an error** pointing at the lambda `x -> T.make(x)`.
+  Why: a call chooses the instance by its arguments, which a value has none of, and choosing by the
+  expected function type would be a second rule for the rare case where a lambda says it plainly.
+  Alternatives weighed: choosing the instance by the expected function type's parameters (more code
+  and a rule no other value form has); taking the first instance (silently wrong for the others).
+  Review with the user: whether the several-instance case should choose by the expected type.
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a

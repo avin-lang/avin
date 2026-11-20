@@ -1200,7 +1200,11 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   the trait's type would have no type to give the member.
 - **A static member named without a call is a function value** of its parameters, as a method of a
   value is: `xs.map(string.fromUtf8Lossy)`, `val zero = Point.zero`. Where the member is overloaded,
-  the function type expected says which, and without one the value is an error.
+  the function type expected says which, and without one the value is an error. Through a type
+  parameter's bound it is the same: `xs.map(T.parse)` in `f[T: Parse]`, each instance making it of
+  its type argument's member. A trait the parameter is bounded by at several type arguments
+  (`T: Make[int] & Make[string]`) has one `make` per instance, which only a call's arguments choose
+  between, so `T.make` there is an error; a lambda, `x -> T.make(x)`, is the value.
 
 ### Static members of built-in types
 
