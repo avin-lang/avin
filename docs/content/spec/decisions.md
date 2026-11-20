@@ -2317,6 +2317,18 @@ their words are reserved.
   underivable. Review with the user: the `Err`-first choice is the one a reader of the declaration
   could find surprising. Tuples needed no change: their `Ord`, lexicographic by part at every
   arity, was already written by the compiler for each arity and is now covered by tests.
+- Settled on the user's delegation 2026-11-19 (branch `bool-ord`): **[`bool` is `Ord`, `false`
+  before `true`](/spec/equality-and-memory/#display-and-debug)**, reversing the earlier rule that
+  `bool` had no order. `compare`, `min`/`max`/`clamp`, `Reverse`, sorting, `TreeSet`/`TreeMap` keys,
+  tuple keys and derived orders all take a bool, and `<`, `<=`, `>` and `>=` are allowed on two bools
+  as on every built-in `Ord` (one unsigned machine comparison). Rationale: porting a to-do list met
+  `tasks.sortBy(t -> (t.done, t.id))` refused, the one-line way to put open items first; without an
+  order a bool field also leaves a record underivable for `Ord` and a tuple key holding a flag
+  unusable, and `false < true` is the one order everyone already reads (0 before 1). Alternatives
+  weighed: keeping the refusal, so a key is written `if t.done then 1 else 0` (noise at every sort,
+  and still no `derives Ord` with a flag); an `Ord` for `bool` without the operators, a split no
+  other `Ord` type has; a helper such as `byDone`, too narrow for a general type. `unit` keeps no
+  order. Review with the user: it reverses a settled rule, and `b1 < b2` reads oddly to some.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
