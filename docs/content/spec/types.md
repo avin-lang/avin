@@ -701,7 +701,8 @@ as it is written, `@sendable (int) -> int`.
 ### Placeholder lambdas
 
 A call's argument that holds `_` is a lambda: each `_` is a parameter of its own, in the order
-written, and the argument is the body. A `val` or `var` with a declared type takes one the same way.
+written, and the argument is the body. A `val` or `var` with a declared type takes one the same way,
+as does the body of a function with a declared result type, and each of its clauses' bodies.
 
 ```text
 xs.map(_ + 1)                 // xs.map(x -> x + 1)
@@ -712,7 +713,25 @@ people.sortBy(_.age)
 xs.map(scale(_, 2))           // xs.map(x -> scale(x, 2))
 orders.map(_.items.map(_ * 2))  // orders.map(o -> o.items.map(x -> x * 2))
 val inc: (int) -> int = _ + 1
+adder(n: int) -> (int) -> int = _ + n
 ```
+
+- **A branch is a place of its own.** Where an `if`, a `match` or a block stands in one of these
+  places, each branch of the `if`, each arm of the `match` and the block's last line is a place in
+  turn, with the same rules, so a choice of functions reads as one:
+
+  ```text
+  val key: (Request) -> string = by match
+    "method" -> _.method
+    "status" -> _.status.toString()
+    _ -> _.path
+  xs.map(if up then _ + 1 else _ - 1)
+  ```
+
+  The condition, the subject, a guard and a block's earlier lines keep their own `_`, and so do an
+  `if` or `match` anywhere else: `val f = if up then _ + 1 else 0`, with no declared type, is an
+  error, and so is a function's body with no declared result. A branch may be a written lambda or
+  any other value of the function type beside the placeholder ones.
 
 - **The lambda is the nearest argument holding the `_`.** A `_` is found through operators of every
   precedence, member access and method calls on it, tuple parts (`(_, 0)`), `is`, a range's bounds,
@@ -726,8 +745,9 @@ val inc: (int) -> int = _ + 1
   parameters in order, `xs.map(double(_))`, is that function: it is an error saying to pass
   `double`. A constructor's name is no function's, so `xs.map(Some(_))` is `x -> Some(x)`.
 - **A lambda, a block, an `if`, a `match`, a collection literal and an interpolation keep their
-  own `_`**: none of them is searched, so `xs.map(n -> n + _)` is an error, as is any `_` outside a
-  call's argument and a declared value, `val y = x + _`. A `_` alone as a whole argument of a call
+  own `_`**: none of them is searched from around it, so `xs.map(n -> n + _)` is an error, as is any
+  `_` outside the places above, `val y = x + _`; only an `if`'s branches, a `match`'s arms and a
+  block's last line pass a place on. A `_` alone as a whole argument of a call
   that is itself no argument, `scale(_, 2)` as a statement, is an error too.
 - **The parameters take their types from the function expected**, as any lambda's do, and their
   count must be its parameter count; a lambda of two `_`s where a function of one tuple is
