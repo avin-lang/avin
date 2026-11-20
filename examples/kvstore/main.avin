@@ -1,0 +1,128 @@
+// A key-value store served over TCP with a line protocol. One actor owns the data, so the clients'
+// commands never race on it: each connection is served by an actor of its own, which parses a line,
+// asks the store, and writes the reply.
+//
+//   SET key value   -> OK            GET key  -> the value, or (nil)
+//   DEL key         -> :1 or :0      INCR key -> :the new count
+//   KEYS            -> the keys, sorted, on one line
+//   QUIT            -> BYE, and the connection ends
+//
+//     avin build main.avin -o kvstore && ./kvstore 6380
+//     nc localhost 6380
+//
+// Given `--try`, it serves on a port the system chooses, runs a scripted session and four clients
+// counting at once with its own client, and stops.
+//
+// args: --try
+// expect: exit 0
+import avin.actors.{ActorRef, spawn}
+import avin.collections.mutable.TreeMap
+import avin.io.IoError
+import avin.net.{TcpServer, TcpStream}
+import avin.threads.scope
+import avin.time
+
+data Command
+  Set(key: string, value: string)
+  Get(key: string)
+  Del(key: string)
+  Incr(key: string)
+  Keys
+  Quit
+
+data Request(command: Command, replyTo: ActorRef[string])
+
+// The store: the only code that touches the data.
+actor Store receives Request
+  val data = TreeMap[string, string]()
+
+  receive
+    Request(command, replyTo) -> replyTo.tell(run(command))
+
+  run(command: Command) -> string = command match
+    Set(key, value) ->
+      data(key) = value
+      "OK"
+    Get(key) -> data.getOrElse(key, "(nil)")
+    Del(key) -> if data.remove(key).isDefined then ":1" else ":0"
+    Incr(key) -> data.getOrElse(key, "0").toIntOption() match
+      Some(n) ->
+        data(key) = s"${n + 1}"
+        s":${n + 1}"
+      None -> "ERR not a number"
+    Keys -> data.keys.mkString(" ")
+    Quit -> "BYE"
+
+// A line of the protocol as a command; the command's word is read without regard to case, and a
+// value may hold spaces.
+parse(line: string) -> Result[Command, string]
+  val words = line.trim.split(" ").filter(_ != "")
+  words.headOption.map(_.toUpper) match
+    None -> Err("ERR empty command")
+    Some("SET") if words.length >= 3 -> Ok(Set(words(1), words.drop(2).mkString(" ")))
+    Some(verb) -> (verb, words.length) match
+      ("GET", 2) -> Ok(Get(words(1)))
+      ("DEL", 2) -> Ok(Del(words(1)))
+      ("INCR", 2) -> Ok(Incr(words(1)))
+      ("KEYS", 1) -> Ok(Keys)
+      ("QUIT", 1) -> Ok(Quit)
+      ("SET" | "GET" | "DEL" | "INCR" | "KEYS" | "QUIT", _) -> Err(s"ERR wrong number of arguments for $verb")
+      _ -> Err(s"ERR unknown command ${words(0)}")
+
+// Serves one connection until the client quits or goes away, or the server stops.
+serve(store: ActorRef[Request], s: TcpStream, server: TcpServer)
+  while server.idle(() -> s.readLine()) is Some(Ok(Some(line)))
+    val reply = parse(line) match
+      Err(message) -> message
+      Ok(command) -> store.ask(r -> Request(command, r), timeout = time.seconds(5)).await() match
+        Ok(answer) -> answer
+        Err(_) -> "ERR the store did not answer"
+    _ = s.writeText(reply + "\n")
+    if reply == "BYE" then return
+
+// The client side: sends each command and reads its one-line reply.
+session(port: int, commands: Vector[string]) -> Result[Vector[string], IoError]
+  val c = TcpStream.connect("127.0.0.1", port)?
+  defer _ = c.close()
+  var replies = Vector.empty[string]()
+  for command in commands
+    c.writeText(command + "\n")?
+    replies = replies :+ c.readLine()?.getOrElse("(closed)")
+  Ok(replies)
+
+tryOut(port: int) -> Result[unit, IoError]
+  val script = [
+    "SET greeting hello there", "GET greeting", "get missing", "INCR visits", "INCR visits", "INCR greeting",
+    "SET lang avin", "KEYS", "DEL lang", "DEL lang", "GET", "PING", "QUIT"
+  ]
+  for (command, reply) in script.zip(session(port, script)?)
+    println(s"> $command")
+    println(reply)
+  // Four clients counting at once: the store sees every increment exactly once.
+  val counted = scope(s ->
+    val clients = (1 .. 4).map(_ -> s.spawn(() -> session(port, Vector.fill(250, "INCR hits")).map(_.length)))
+    clients.map(_.join()))
+  println(s"clients finished: ${counted.map(_.getOrElse(0))}")
+  println(s"hits: ${session(port, ["GET hits"])?(0)}")
+  Ok(())
+
+main(args: Vector[string]) -> int
+  val trying = args.contains("--try")
+  val port = if trying then 0 else args.headOption.flatMap(_.toIntOption()).getOrElse(6380)
+  val store = spawn(Store())
+  val server = TcpServer.start("127.0.0.1", port, (s, server) -> serve(store, s, server)) match
+    Ok(server) -> server
+    Err(e) ->
+      eprintln(s"cannot listen: ${e.message}")
+      return 1
+  if !trying
+    println(s"serving on port ${server.port()}")
+    server.join()
+    return 0
+  val outcome = tryOut(server.port())
+  server.shutdown()
+  outcome match
+    Ok(_) -> 0
+    Err(e) ->
+      eprintln(e.message)
+      1

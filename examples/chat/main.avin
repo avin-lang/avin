@@ -1,0 +1,114 @@
+// A chat room of actors. The room owns who is present and what was said; each user is an actor that
+// keeps what it has heard. The room publishes on a topic every member subscribes to, through an
+// adapter that turns the room's events into the user's own messages, and sends a whisper straight to
+// the one member it is for. A newcomer is sent the last few lines said before it came.
+//
+// The program plays a short conversation and prints what each user heard. Every step is an ask that
+// the room answers once the step is done, so the transcripts come out the same on every run.
+//
+// expect: exit 0
+import avin.actors.{ActorRef, Topic, spawn}
+import avin.collections.mutable.Map
+import avin.time
+
+// What a member hears.
+data ChatEvent
+  Joined(name: string)
+  Left(name: string)
+  Said(name: string, text: string)
+  Whispered(from: string, text: string)
+  Backlog(lines: Vector[string])
+
+data RoomMsg
+  Join(name: string, member: ActorRef[ChatEvent], replyTo: ActorRef[bool])
+  Leave(name: string, replyTo: ActorRef[unit])
+  Post(name: string, text: string, replyTo: ActorRef[unit])
+  Direct(from: string, to: string, text: string, replyTo: ActorRef[bool])
+
+actor Room(backlog: int) receives RoomMsg
+  val events = Topic[ChatEvent]()
+  val members = Map[string, ActorRef[ChatEvent]]()
+  var recent = Vector.empty[string]()
+
+  receive
+    Join(name, member, replyTo) if members.contains(name) -> replyTo.tell(false)
+    Join(name, member, replyTo) ->
+      if recent.nonEmpty then member.tell(Backlog(recent))
+      members(name) = member
+      events.subscribe(member)
+      events.publish(Joined(name))
+      replyTo.tell(true)
+    Leave(name, replyTo) ->
+      members.remove(name).foreach(events.unsubscribe)
+      events.publish(Left(name))
+      replyTo.tell(())
+    Post(name, text, replyTo) ->
+      recent = (recent :+ s"<$name> $text").takeRight(backlog)
+      events.publish(Said(name, text))
+      replyTo.tell(())
+    Direct(from, to, text, replyTo) -> members.get(to) match
+      Some(member) ->
+        member.tell(Whispered(from, text))
+        replyTo.tell(true)
+      None -> replyTo.tell(false)
+
+data UserMsg
+  Heard(event: ChatEvent)
+  Enter(replyTo: ActorRef[bool])
+  Say(text: string, replyTo: ActorRef[unit])
+  Whisper(to: string, text: string, replyTo: ActorRef[bool])
+  Quit(replyTo: ActorRef[unit])
+  Transcript(replyTo: ActorRef[Vector[string]])
+
+actor User(name: string, room: ActorRef[RoomMsg]) receives UserMsg
+  val ear = adapter[ChatEvent](e -> Heard(e))
+  var heard = Vector.empty[string]()
+
+  receive
+    Heard(event) -> heard = heard ++ lines(event)
+    Enter(replyTo) -> room.tell(Join(name, ear, replyTo))
+    Say(text, replyTo) -> room.tell(Post(name, text, replyTo))
+    Whisper(to, text, replyTo) -> room.tell(Direct(name, to, text, replyTo))
+    Quit(replyTo) ->
+      room.tell(Leave(name, replyTo))
+      stop()
+    Transcript(replyTo) -> replyTo.tell(heard)
+
+lines(event: ChatEvent) -> Vector[string] = event match
+  Joined(name) -> [s"* $name joined"]
+  Left(name) -> [s"* $name left"]
+  Said(name, text) -> [s"<$name> $text"]
+  Whispered(from, text) -> [s"($from whispers) $text"]
+  Backlog(lines) -> lines.map(line -> s"  earlier: $line")
+
+// Asks and waits for the answer: the conversation goes one step at a time.
+step[R: Sendable](user: ActorRef[UserMsg], make: (ActorRef[R]) -> UserMsg) -> R =
+  user.ask(make, timeout = time.seconds(5)).await() match
+    Ok(answer) -> answer
+    Err(e) -> fail(s"$user did not answer: $e")
+
+main()
+  val room = spawn(Room(backlog = 2))
+  val ada = spawn(User("ada", room))
+  val bo = spawn(User("bo", room))
+  val cy = spawn(User("cy", room))
+  val bo2 = spawn(User("bo", room))
+  step(ada, r -> Enter(r))
+  step(bo, r -> Enter(r))
+  step(ada, r -> Say("hello, bo", r))
+  step(bo, r -> Say("hi ada! anyone else here?", r))
+  println(s"a second bo may join: ${step(bo2, r -> Enter(r))}")
+  step(ada, r -> Say("cy said they would come", r))
+  step(cy, r -> Enter(r))
+  println(s"ada can whisper to cy: ${step(ada, r -> Whisper("cy", "bo is new here", r))}")
+  println(s"ada can whisper to di: ${step(ada, r -> Whisper("di", "are you there?", r))}")
+  step(cy, r -> Say("hello both", r))
+  println()
+  println("bo heard, before leaving:")
+  for line in step(bo, r -> Transcript(r)) do println(s"  $line")
+  step(bo, r -> Quit(r))
+  step(cy, r -> Say("bye bo", r))
+  for (name, user) in [("ada", ada), ("cy", cy)]
+    println()
+    println(s"$name heard:")
+    for line in step(user, r -> Transcript(r)) do println(s"  $line")

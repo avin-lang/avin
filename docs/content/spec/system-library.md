@@ -2136,6 +2136,7 @@ target)` traps on any other, so a handler can be tried without a connection. A r
 the values a middleware handed on, read by `value[T]()` (below).
 
 A `Response` is the client's: `Response.text(status, text)` (`text/plain; charset=utf-8`),
+`Response.html(status, text)` (`text/html; charset=utf-8`, the text sent as given),
 `Response.json(status, text)` (`application/json`, the text sent as given and not checked to be
 JSON), `Response.bytes(status, body, contentType)`, `Response.empty(status)` and `withHeader(name, value)`,
 which traps on a name that is not a token or a value holding a line break; `http.reasonPhrase(status)`
