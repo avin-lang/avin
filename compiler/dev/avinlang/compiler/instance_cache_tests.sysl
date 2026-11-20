@@ -3,8 +3,9 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
+import sysl.checksum.crc32
 import sysl.container.{Map, map}
-import sysl.fs.{current_dir, entries, exists, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, set_modified, symlink, write_text}
+import sysl.fs.{current_dir, entries, exists, is_dir, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, set_modified, symlink, write_text}
 import sysl.process.{Exited, Stdio, Var, capture, spawn}
 import sysl.slices.sort
 import sysl.text.parse_int
@@ -317,6 +318,131 @@ missing_files_are_misses()
     val second = cached(files, cache)
     assert_eq(lowered_of(second).reused.len(), 0)
     assert_eq(second.llvm, clean(files))
+
+// The text a module file of `items` holds, made whole in memory with an entry writer: what the
+// streamed file must be, byte for byte.
+private module_text_of(items: Buf[CacheEntry]) -> string
+    var w = entry_writer()
+    for e in items
+        w.num(usize(e.kind))
+        w.word(e.key)
+        w.text(e.payload)
+    val body = w.finish()
+    s"avin instances 1\n${crc32(body.bytes)} ${body.bytes.len}\n" + body
+
+// Entries of every shape a payload can take: empty, one byte, spaces, line breaks, colons, digits
+// that look like a length, multi-byte text, and bytes that look like the next entry.
+private awkward_entries() -> Buf[CacheEntry]
+    var out: Buf[CacheEntry] = buf()
+    out.push(CacheEntry(LoweredEntry, "a0", ""))
+    out.push(CacheEntry(TextEntry, "a1", "x"))
+    out.push(CacheEntry(LoweredEntry, "a2", "  two  spaces  "))
+    out.push(CacheEntry(TextEntry, "a3", "line\nbreaks\n\n"))
+    out.push(CacheEntry(LoweredEntry, "a4", "12:colons:3: "))
+    out.push(CacheEntry(TextEntry, "a5", "Grüße, 世界 🌍"))
+    out.push(CacheEntry(LoweredEntry, "a6", "0 k 3:abc 1 k2 0: "))
+    out
+
+@test("a module file is streamed byte for byte as an entry writer writes its entries, behind their checksum and length, and reads back")
+module_file_streams_the_entry_format()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val items = awkward_entries()
+    val file = dir + "/0123456789abcdef0123456789abcdef.mod"
+    assert(write_module_file(file, items))
+    assert_eq(read_text(file).unwrap(), module_text_of(items))
+    write_text(dir + "/manifest", "0123456789abcdef0123456789abcdef.mod\n").unwrap()
+    val store = read_instance_store(dir)
+    assert_eq(store.damaged, 0)
+    assert_eq(store.lowered.len() + store.texts.len(), items.len())
+    for e in items
+        val held = if e.kind == LoweredEntry then store.lowered.get(e.key) else store.texts.get(e.key)
+        assert_eq(held.unwrap(), e.payload)
+    // Only the file itself is left: no write under a temporary name.
+    assert_eq(entries(dir).unwrap().len(), 2)
+
+@test("a module file of no entries is its format line and an empty body's checksum and length")
+module_file_of_no_entries()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/0123456789abcdef0123456789abcdef.mod"
+    assert(write_module_file(file, buf()))
+    assert_eq(read_text(file).unwrap(), "avin instances 1\n0 0\n")
+    assert_eq(read_text(file).unwrap(), module_text_of(buf()))
+
+@test("a module file of payloads larger than the file's buffer, and of many that cross its edges, is written whole")
+module_file_of_large_and_many_payloads()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    var items: Buf[CacheEntry] = buf()
+    items.push(CacheEntry(TextEntry, "big", "y".repeat(1000000)))
+    for i in 0..<5000
+        items.push(CacheEntry(if i % 2 == 0 then LoweredEntry else TextEntry, s"k$i", "z".repeat(i % 97)))
+    items.push(CacheEntry(LoweredEntry, "edge", "w".repeat(8192)))
+    items.push(CacheEntry(TextEntry, "edge1", "v".repeat(8191)))
+    val file = dir + "/0123456789abcdef0123456789abcdef.mod"
+    assert(write_module_file(file, items))
+    assert_eq(read_text(file).unwrap(), module_text_of(items))
+
+@test("a module file that cannot be put in place, or made at all, is not written and leaves nothing behind")
+module_file_write_failures()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    // A directory with something in it holds the file's name, so the rename into place fails.
+    val taken = dir + "/0123456789abcdef0123456789abcdef.mod"
+    make_dir_all(taken + "/inside").unwrap()
+    assert(!write_module_file(taken, awkward_entries()))
+    assert_eq(entries(dir).unwrap().len(), 1)
+    assert(is_dir(taken + "/inside"))
+    // A directory that does not exist cannot hold the temporary file.
+    assert(!write_module_file(dir + "/missing/fedcba9876543210fedcba9876543210.mod", awkward_entries()))
+    assert(!exists(dir + "/missing"))
+
+@test("a store of modules written whole is each module's entries in key order, the manifest naming the files, and reads back")
+store_writes_each_module_in_key_order()
+    val dir = make_temp_dir("avin-ic").unwrap()
+    defer _ = remove_dir_all(dir)
+    val cache = dir + "/cache"
+    var store = instance_store_at(cache)
+    // Kept out of order and into two modules; a key kept twice in a module keeps its last entry.
+    val items = awkward_entries()
+    for i in 0..<items.len()
+        keep_entry(&store, if i % 2 == 0 then "m.one" else "m.two", items[items.len() - 1 - i])
+    keep_entry(&store, "m.one", CacheEntry(LoweredEntry, "a0", "replaced"))
+    val written = write_instance_store(store)
+    assert_eq(written.written, 2)
+    assert_eq(written.kept, 0)
+    val files = module_files(cache)
+    assert_eq(files.len(), 2)
+    var texts: Buf[string] = buf()
+    for f in files
+        texts.push(read_text(f).unwrap())
+    var one: Buf[CacheEntry] = buf()
+    var two: Buf[CacheEntry] = buf()
+    for i in 0..<items.len()
+        val e = items[i]
+        val j = items.len() - 1 - i
+        if e.key == "a0" then one.push(CacheEntry(LoweredEntry, "a0", "replaced"))
+        elif j % 2 == 0 then one.push(e)
+        else two.push(e)
+    val expected_one = module_text_of(one)
+    val expected_two = module_text_of(two)
+    assert(texts[0] == expected_one && texts[1] == expected_two || texts[0] == expected_two && texts[1] == expected_one)
+    val back = read_instance_store(cache)
+    assert_eq(back.files, 2)
+    assert_eq(back.damaged, 0)
+    assert_eq(back.lowered.get("a0").unwrap(), "replaced")
+    assert_eq(back.texts.get("a5").unwrap(), "Grüße, 世界 🌍")
+    // The same modules kept again by a build that read them whole are left in place, not rewritten.
+    var again = read_instance_store(cache)
+    for e in one
+        keep_entry(&again, "m.one", e)
+    for e in two
+        keep_entry(&again, "m.two", e)
+    val second = write_instance_store(again)
+    assert_eq(second.written, 0)
+    assert_eq(second.kept, 2)
+    assert_eq(read_instance_store(cache).damaged, 0)
 
 @test("a manifest naming anything but a module file of its directory has that name passed over, never read")
 manifest_names_only_module_files()
