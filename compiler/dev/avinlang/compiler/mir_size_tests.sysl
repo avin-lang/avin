@@ -1,0 +1,105 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// How small the mid-level representation is kept: every instruction is as large as the largest
+// variant of `Inst`, so an operand holds an integer constant as a number, a call names a shared
+// signature, and an integer no `long` spells is kept behind a reference.
+
+private lowered(text: string) -> MirProgram = lower_source(repository_toolchain(), source_of("probe.avin", text)) match
+    Ok(p) -> p
+    Err(d) -> panic(d)
+
+private function_of(program: MirProgram, name: string) -> MirFunction
+    for f in program.functions
+        if f.symbol == "<program>." + name then return f
+    panic("no function " + name)
+
+// The constant `name` returns.
+private returned(program: MirProgram, name: string) -> Operand
+    for block in function_of(program, name).blocks
+        if block.term is Return(Some(o)) then return o
+    panic("no constant returned by " + name)
+
+private ints(digits: string) -> bool = const_int(64, digits) is ConstInt(_, _)
+
+@test("an operand is three words and an instruction eleven")
+sizes_of_the_representation()
+    assert_eq(sizeof(Operand), 24)
+    assert(sizeof(Callee) <= 56)
+    assert(sizeof(Inst) <= 88)
+    assert(sizeof(Terminator) <= 48)
+
+@test("an integer a long spells is kept as a number, and spelled back the same")
+canonical_integers_are_numbers()
+    for d in ["0", "1", "-1", "255", "2147483647", "-2147483648", "9223372036854775807", "-9223372036854775808"]
+        val o = const_int(64, d)
+        assert(o is ConstInt(64, _))
+        assert_eq(int_digits(o), d)
+    assert(const_int(8, "255") is ConstInt(8, 255))
+    assert(const_int(32, "-7") is ConstInt(32, -7))
+
+@test("an integer no long spells keeps its digits exactly")
+other_integers_keep_their_digits()
+    for d in ["9223372036854775808", "-9223372036854775809", "18446744073709551615", "-0", "007", "+5", ""]
+        assert(!ints(d))
+        assert_eq(int_digits(const_int(64, d)), d)
+    val wide = const_int(128, "1")
+    assert(wide is ConstWide(128, _))
+    assert_eq(int_digits(wide), "1")
+    assert_eq(int_digits(const_int(192, "-123456789012345678901234567890")), "-123456789012345678901234567890")
+
+@test("a program's limits and literals lower to numbers, and a literal wider than a long to its digits")
+lowered_integer_constants()
+    val program = lowered("most() -> long = long.MaxValue\n\nleast() -> long = long.MinValue\n\nbig() -> BigInt = 123456789012345678901234567890\n\nmain()\n    println(most())\n    println(least())\n    println(big())\n")
+    assert(returned(program, "most") is ConstInt(64, 9223372036854775807))
+    assert_eq(int_digits(returned(program, "least")), "-9223372036854775808")
+    var wide = false
+    for block in function_of(program, "big").blocks
+        for inst in block.insts
+            if inst is Call(_, _, args)
+                for a in args
+                    if a is ConstWide(_, digits)
+                        if *digits == "123456789012345678901234567890" then wide = true
+    assert(wide)
+
+@test("signatures of one shape are one shared copy; different shapes are different copies")
+signatures_are_shared()
+    var s = mir_signatures()
+    val a = s.plain(buf(), Some(MRef))
+    val b = s.plain(buf(), Some(MRef))
+    assert(a === b)
+    var params: Buf[MirType] = buf()
+    params.push(MInt(64))
+    val c = s.plain(params, Some(MRef))
+    assert(!(a === c))
+    assert(!(s.plain(buf(), Some(MInt(32))) === s.plain(buf(), Some(MInt(64)))))
+    assert(!(s.plain(buf(), None) === a))
+    assert(!(s.plain(buf(), Some(MCell(true))) === s.plain(buf(), Some(MCell(false)))))
+    var rest: Buf[MirType] = buf()
+    rest.push(MRef)
+    assert(!(s.of(MirSignature(buf(), Some(MRef), rest)) === a))
+    assert(s.of(MirSignature(buf(), Some(MRef), buf())) === a)
+
+@test("every call of one runtime entry in a lowered program names the same signature")
+lowered_calls_share_signatures()
+    val program = lowered("data Pt(x: int, y: int)\n\nmake(n: int) -> Pt = Pt(n, n)\n\nmain()\n    println(make(1).x + make(2).y)\n    println(\"a\" + \"b\" + \"c\")\n")
+    var firsts: Buf[string] = buf()
+    var shared: Buf[&MirSignature] = buf()
+    var calls = 0
+    for f in program.functions
+        for block in f.blocks
+            for inst in block.insts
+                if inst is Call(_, Runtime(symbol, signature), _)
+                    calls = calls + 1
+                    var found = false
+                    for i in 0..<firsts.len()
+                        if firsts[i] == symbol
+                            found = true
+                            if signature_key(*shared[i]) == signature_key(*signature) then assert(shared[i] === signature)
+                    if !found
+                        firsts.push(symbol)
+                        shared.push(signature)
+    assert(calls > firsts.len())
