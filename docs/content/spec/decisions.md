@@ -11999,6 +11999,16 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   **Review with the user**: the remaining write-loop check and the memory above, and whether
   `Buffer` should move the same way (its length is a field of its own, so it would need its own
   owner).
+- Settled on the user's delegation 2026-11-19 (branch `ports-cli`): **an example of many files,
+  `examples/NAME/`, is run and its output checked when `examples/NAME.out` stands beside it, and is
+  only built and linked when it has none**, as a program that opens a window has none. Its input
+  and expected standard error are `examples/NAME.in` and `examples/NAME.err`, its expectation lines
+  (`// args:`, `// expect:`) in its own files, exactly as a program in `tests/programs/run` has them.
+  *Why*: the command-line examples (`wordfreq`, `grep`, `logsum`, `dusage`, `markdown`, `todo`) are
+  directories with a README, and the sidecar beside the directory is the rule the corpus already
+  reads for programs of many files, so nothing new is learned to read one. *Alternatives weighed*:
+  sidecars inside the directory (a second rule for the same thing); a header line marking a window
+  program as not run (a marker on the exception rather than on the output that makes the check).
 
 ## Open
 
