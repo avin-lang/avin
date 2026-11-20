@@ -335,7 +335,11 @@ whose type is not sendable. Avin compiles the whole program, so every function a
 known: the one a call names, every implementation a call through a trait method or an operator may
 reach, every closure made on the way, an extractor a pattern calls, and the initializer of every
 `lazy val`, module-level or a field, that it reads, since its first read runs the initializer on
-whichever thread makes it. A module-level `val` of an
+whichever thread makes it. Which implementations a call may reach follows the types its receiver may
+have: a data type's own, a class's and its subclasses', those of the types conforming to a trait or
+to a type parameter's bounds, and, in a generic function called at known type arguments, those of
+the types it is called at. So `Map[int, string]` in a body never reaches a program's own `hash`, and
+`[Money(1), Money(2)].sum` reaches `Money`'s `+`. A module-level `val` of an
 `Atomic`, a `Mutex`, a `Channel` or immutable data is the way to share state between threads; a
 `lazy val` of a sendable type is initialized once whichever threads read it. A local `lazy val` a
 body captures brings its initializer along, so what that initializer captures and reaches is held to

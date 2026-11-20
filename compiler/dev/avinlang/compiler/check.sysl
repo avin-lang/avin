@@ -1393,7 +1393,7 @@ check_program(units: Buf[SourceUnit], root_module: string, testing: bool, indexi
     check_expansion(&c)
     check_tailrec(&c)
     val direct = direct_uses(&c)
-    check_module_state_in_threads(&c, direct)
+    check_module_state_in_threads(&c)
     check_lazy_cycles(&c, direct)
     check_lazy_field_cycles(&c)
     check_local_lazy_cycles(&c)
@@ -9668,10 +9668,12 @@ private push_all(out: *Buf[&TExpr], items: Buf[&TExpr])
 // to it too: it runs at once, but what it makes leaves isolated, as an `Isolated`'s objects do, and a
 // module-level value it stored one in would let code outside reach it. What is passed for an
 // `@isolated` parameter runs at once on the calling thread, and is not held to this.
-private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
+private check_module_state_in_threads(c: *Checker)
     val k = c.core.trait_named("Sendable") match
         Some(k) -> k
         None -> return
+    var graph = reach_graph(c)
+    val g = &graph
     for id in 0..<c.symbols.len()
         if id >= c.bodies.len() then break
         val body = c.bodies[id] match
@@ -9679,9 +9681,9 @@ private check_module_state_in_threads(c: *Checker, direct: Buf[Option[Uses]])
             None -> continue
         val root = c.symbols[id].root.unwrap_or(id)
         var held: Buf[HeldArgument] = buf()
-        scan_thread_bodies(c, id, root, body, k, direct, &held)
+        scan_thread_bodies(c, id, root, body, k, g, &held)
 
-private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+private scan_thread_bodies(c: *Checker, id: usize, root: usize, e: &TExpr, k: usize, direct: *ReachGraph, held: *Buf[HeldArgument])
     if sendable_match_attempt(c, e) is Some(attempt)
         if module_state_path(c, attempt, k, direct) is Some(why)
             c.note(c.symbols[id].unit, e.span, s"a `match` function passed for a type argument bounded by `Sendable` may run on another thread, which shares the program's module-level state, but $why")
@@ -9708,7 +9710,7 @@ private struct StateReached
     global: usize
     via: Buf[usize]
 
-private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, args: Buf[&TExpr], k: usize, direct: Buf[Option[Uses]], held: *Buf[HeldArgument])
+private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, args: Buf[&TExpr], k: usize, direct: *ReachGraph, held: *Buf[HeldArgument])
     for i in 0..<args.len()
         val mark = param_mark(c, f, i)
         if mark < IsolatingMark then continue
@@ -9724,9 +9726,8 @@ private thread_body_arguments(c: *Checker, id: usize, root: usize, f: usize, arg
 
 // Where the code `arg` runs reaches module-level state a thread's body may not: the functions it is
 // reached through and what it is.
-private module_state_path(c: *Checker, arg: &TExpr, k: usize, direct: Buf[Option[Uses]]) -> Option[string]
-    val start = with_implementations(c, uses_of(arg))
-    val r = module_state_reached(c, direct, start, k)?
+private module_state_path(c: *Checker, arg: &TExpr, k: usize, g: *ReachGraph) -> Option[string]
+    val r = module_state_reached(c, g, uses_of(arg), k)?
     var through = ""
     for step in r.via
         val s = c.symbols[step]
@@ -9761,45 +9762,329 @@ private lazy_field_named(c: *Checker, f: usize) -> Option[string]
     None
 
 // The first module-level value the uses `start` reach that a thread's body may not, found breadth
-// first so that the path to it is a shortest one.
-private module_state_reached(c: *Checker, direct: Buf[Option[Uses]], start: Uses, k: usize) -> Option[StateReached]
-    if forbidden_global(c, start, k) is Some(g) then return Some(StateReached(g, buf()))
-    val none = c.symbols.len()
+// first so that the path to it is a shortest one. The code is followed instance by instance: a generic
+// function called at known type arguments reaches only what those types implement.
+private module_state_reached(c: *Checker, g: *ReachGraph, start: Uses, k: usize) -> Option[StateReached]
+    if forbidden_global(c, start, k) is Some(global) then return Some(StateReached(global, buf()))
+    val none = NoReach
     var parent: Buf[usize] = buf()
     var seen: Buf[bool] = buf()
-    for _ in 0..<direct.len()
-        parent.push(none)
-        seen.push(false)
     var pending: Buf[usize] = buf()
-    for f in start.functions
-        if f < direct.len() && !seen[f]
-            seen[f] = true
-            pending.push(f)
+    for n in reach_successors(c, g, start, no_reach_env())
+        grow_marks(&parent, &seen, g.nodes.len(), none)
+        if !seen[n]
+            seen[n] = true
+            pending.push(n)
     var next = 0usize
     while next < pending.len()
-        val f = pending[next]
+        val n = pending[next]
         next += 1
-        val u = direct[f] match
+        val u = g.raw[g.nodes[n].function] match
             Some(u) -> u
             None -> continue
-        if forbidden_global(c, u, k) is Some(g)
+        if forbidden_global(c, u, k) is Some(global)
             var chain: Buf[usize] = buf()
-            var at = f
+            var at = n
             while at != none
-                chain.push(at)
+                chain.push(g.nodes[at].function)
                 at = parent[at]
             var via: Buf[usize] = buf()
             var j = chain.len()
             while j > 0
                 j -= 1
                 via.push(chain[j])
-            return Some(StateReached(g, via))
-        for callee in u.functions
-            if callee < direct.len() && !seen[callee]
+            return Some(StateReached(global, via))
+        for callee in node_successors(c, g, n)
+            grow_marks(&parent, &seen, g.nodes.len(), none)
+            if !seen[callee]
                 seen[callee] = true
-                parent[callee] = f
+                parent[callee] = n
                 pending.push(callee)
     None
+
+private grow_marks(parent: *Buf[usize], seen: *Buf[bool], len: usize, none: usize)
+    while seen.len() < len
+        parent.push(none)
+        seen.push(false)
+
+/** One instance of a function as a thread's body reaches it: `args` instantiate the type parameters
+ * `owner` owns. An instance whose arguments are not known (`known` false) stands for every instance:
+ * its calls on its type parameters reach every implementation the program has. */
+private struct ReachNode
+    function: usize
+    owner: usize
+    args: Buf[&Type]
+    known: bool
+
+/** The instances of functions the thread-state check has met, each once, and what each reaches. */
+private struct ReachGraph
+    raw: Buf[Option[Uses]]
+    nodes: Buf[ReachNode]
+    index: Map[string, usize]
+    next: Buf[Option[Buf[usize]]]
+    /** The traits each class and each data type conforms to. */
+    class_traits: Buf[Buf[usize]]
+    data_traits: Buf[Buf[usize]]
+
+/** The type arguments in force where code runs: `owner`'s parameters are `args` when `known`. */
+private struct ReachEnv
+    owner: usize
+    args: Buf[&Type]
+    known: bool
+
+/** No node and no owner. */
+private const NoReach: usize = 0xffffffffffffffff
+
+private no_reach_env() -> ReachEnv = ReachEnv(NoReach, buf(), false)
+
+// The instances a search keeps apart before it treats the rest as every instance, and the longest
+// type argument it keeps, so a function that calls itself at ever larger types ends.
+private const ReachInstanceLimit: usize = 20000
+private const ReachTypeKeyLimit: usize = 200
+
+private reach_graph(c: *Checker) -> ReachGraph
+    var raw: Buf[Option[Uses]] = buf()
+    for b in c.bodies
+        raw.push(b match
+            Some(body) -> Some(uses_of(body))
+            None -> None)
+    var class_traits: Buf[Buf[usize]] = buf()
+    for k in 0..<c.classes.len()
+        class_traits.push(if is_trait(c, k) then buf() else conformed_traits(c, k))
+    var data_traits_of: Buf[Buf[usize]] = buf()
+    for d in 0..<c.data.len()
+        data_traits_of.push(data_traits(c, d))
+    ReachGraph(raw, buf(), map(), buf(), class_traits, data_traits_of)
+
+/** The traits every type a value of type `t` may have conforms to: a type parameter's bounds, or the
+ * trait whose `Self` it is. Empty where nothing is known of it. */
+private required_traits(c: *Checker, t: &Type) -> Buf[usize]
+    var ids: Buf[usize] = buf()
+    val (owner, index) = *t match
+        TypeVar(o, i, _) -> (o, i)
+        // A value of a trait's type is of a type conforming to the trait.
+        Class(k, _, _) ->
+            if is_trait(c, k) then ids.push(k)
+            return ids
+        _ -> return ids
+    if owner >= self_owner(0)
+        val k = owner - self_owner(0)
+        if k < c.classes.len() && is_trait(c, k) then ids.push(k)
+        return ids
+    val params: Buf[TypeParam] = if owner < c.symbols.len() then c.symbols[owner].type_params else buf()
+    for b in scope_bounds(conformances(c), owner, params, index)
+        if *b is Class(k, _, _)
+            if is_trait(c, k) && !contains_id(ids, k) then ids.push(k)
+    ids
+
+private meets_traits(have: Buf[usize], need: Buf[usize]) -> bool
+    for n in need
+        if !contains_id(have, n) then return false
+    true
+
+/** The node of `f` at `env`, made the first time it is met. */
+private reach_node(c: *Checker, g: *ReachGraph, f: usize, env: ReachEnv) -> usize
+    var known = env.known
+    if g.nodes.len() >= ReachInstanceLimit then known = false
+    var key = s"$f"
+    if known
+        key = key + s"@${env.owner}"
+        for a in env.args
+            val ak = type_key(a)
+            if ak.bytes.len > ReachTypeKeyLimit then known = false
+            key = key + "," + ak
+    // With no arguments to substitute, every instance reaches the same code.
+    if !known || env.args.len() == 0
+        known = false
+        key = s"$f"
+    if g.index.get(key) is Some(n) then return n
+    val n = g.nodes.len()
+    g.nodes.push(ReachNode(f, env.owner, if known then env.args else buf(), known))
+    g.next.push(None)
+    g.index.put(key, n)
+    n
+
+private node_env(node: ReachNode) -> ReachEnv = ReachEnv(node.owner, node.args, node.known)
+
+/** What node `n` reaches, worked out once. */
+private node_successors(c: *Checker, g: *ReachGraph, n: usize) -> Buf[usize]
+    if g.next[n] is Some(out) then return out
+    val node = g.nodes[n]
+    val out = g.raw[node.function] match
+        Some(u) -> reach_successors(c, g, u, node_env(node))
+        None -> buf()
+    g.next[n] = Some(out)
+    out
+
+/** `t` as it is in the instance `env`. */
+private in_env(c: *Checker, t: &Type, env: ReachEnv) -> &Type
+    val solved = zonk(c, t)
+    if env.known then substitute(solved, env.owner, env.args) else solved
+
+/** The instances the code with uses `u` reaches, running at `env`: each function it calls or makes,
+ * and each implementation its calls through a method table or a bound and its operators may reach. */
+private reach_successors(c: *Checker, g: *ReachGraph, u: Uses, env: ReachEnv) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    for site in u.sites
+        add_node(&out, reach_node(c, g, site.function, site_env(c, site, env)))
+    for i in 0..<u.dispatched.len()
+        val receiver = u.dispatched_receivers[i] match
+            Some(t) -> Some(in_env(c, t, env))
+            None -> None
+        dispatch_targets(c, g, &out, u.dispatched[i], u.dispatched_slots[i], receiver)
+    for i in 0..<u.operators.len()
+        operator_targets(c, g, &out, u.operators[i], in_env(c, u.operator_types[i], env))
+    // A `lazy val` field's read runs the initializer its class made: where the object's class is not
+    // known, every field of that name.
+    for read in u.lazy_fields
+        val declaring: Option[usize] = *in_env(c, read.object, env) match
+            Class(id, _, _) -> if read.index < c.classes[id].fields.len() then Some(c.classes[id].fields[read.index].owner) else None
+            _ -> None
+        for init in c.lazy_initializers
+            val same = declaring match
+                Some(owner) -> init.owner == owner && init.index == read.index
+                None -> c.classes[init.owner].fields[init.index].name == read.name
+            if same then add_node(&out, reach_node(c, g, init.function, no_reach_env()))
+    out
+
+private add_node(out: *Buf[usize], n: usize)
+    for x in *out
+        if x == n then return
+    out.push(n)
+
+// The instance a call or a closure reaches. Type arguments written at the call instantiate the function;
+// a local function or a lambda runs in the instance of the code that makes it; a method of a generic
+// type is instantiated by its receiver's type arguments. Anything else stands for every instance.
+private site_env(c: *Checker, site: CallSite, env: ReachEnv) -> ReachEnv
+    val s = c.symbols[site.function]
+    if site.type_args.len() > 0
+        if site.type_args.len() != s.type_params.len() then return no_reach_env()
+        var args: Buf[&Type] = buf()
+        for t in site.type_args
+            args.push(in_env(c, t, env))
+        return ReachEnv(s.type_owner, args, true)
+    if s.root is Some(_) || s.lambda then return env
+    if s.type_params.len() == 0 then return ReachEnv(s.type_owner, buf(), true)
+    site.receiver match
+        Some(t) -> receiver_env(c, site.function, in_env(c, t, env))
+        None -> no_reach_env()
+
+/** The instance method `m` runs in, called on a receiver of type `t`: the type's arguments, where `m`
+ * belongs to that type and takes no type parameters of its own. */
+private receiver_env(c: *Checker, m: usize, t: &Type) -> ReachEnv
+    val s = c.symbols[m]
+    val (owner, args) = *t match
+        Data(d, _, xs) -> (data_owner(d), xs)
+        Class(k, _, xs) -> (class_owner(k), xs)
+        _ -> return no_reach_env()
+    if s.type_owner == owner && s.type_params.len() == args.len() then ReachEnv(owner, args, true) else no_reach_env()
+
+/** Whether values of type `t` are built-in scalars, whose operators and methods are the machine's own
+ * or the standard library's, never a method of a class or a data type. */
+private builtin_scalar(t: &Type) -> bool = *t match
+    Int(_) -> true
+    Real -> true
+    Byte -> true
+    Char -> true
+    Bool -> true
+    Unit -> true
+    Str -> true
+    _ -> false
+
+// A call through a method table or a bound reaches the method in `slot` of the table of the receiver's
+// type: a data type's own table, or that of the class or of any class descending from it. Where the
+// receiver's type is not known (a trait, a type parameter, `Any`), it reaches the method of that name
+// in that slot of the table of any class, or of a class descending from the method's own, and of any
+// data type, among those that conform to the trait or to the type parameter's bounds.
+private dispatch_targets(c: *Checker, g: *ReachGraph, out: *Buf[usize], f: usize, slot: usize, receiver: Option[&Type])
+    val name = c.symbols[f].decl.name
+    if receiver is Some(t)
+        if builtin_scalar(t) then return
+        *t match
+            Data(d, _, _) ->
+                if slot < c.data[d].table.len()
+                    if c.data[d].table[slot] is Some(m)
+                        if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, receiver_env(c, m, t)))
+                return
+            Class(k, _, _) ->
+                if !is_trait(c, k)
+                    for kk in 0..<c.classes.len()
+                        if !descends(c, kk, k) then continue
+                        if slot < c.classes[kk].table.len()
+                            if c.classes[kk].table[slot] is Some(m)
+                                if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, receiver_env(c, m, t)))
+                    return
+            _ -> ()
+    var declared: Option[usize] = None
+    if c.symbols[f].owner_class is Some(o)
+        if !is_trait(c, o) then declared = Some(o)
+    val need = required_of(c, receiver)
+    for kk in 0..<c.classes.len()
+        if declared is Some(o)
+            if !descends(c, kk, o) then continue
+        if !candidate_class(c, g, kk, need) then continue
+        if slot < c.classes[kk].table.len()
+            if c.classes[kk].table[slot] is Some(m)
+                if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, no_reach_env()))
+    if declared is Some(_) then return
+    for d in 0..<c.data.len()
+        if !meets_traits(g.data_traits[d], need) then continue
+        if slot < c.data[d].table.len()
+            if c.data[d].table[slot] is Some(m)
+                if c.symbols[m].decl.name == name then add_node(out, reach_node(c, g, m, no_reach_env()))
+
+/** The traits a receiver of type `receiver` is known to conform to. */
+private required_of(c: *Checker, receiver: Option[&Type]) -> Buf[usize] = receiver match
+    Some(t) -> required_traits(c, t)
+    None -> buf()
+
+/** Whether a value known to conform to the traits `need` may be an object of class `k`: a trait's own
+ * table, which holds what its implementers inherit, is always kept. */
+private candidate_class(c: *Checker, g: *ReachGraph, k: usize, need: Buf[usize]) -> bool
+    is_trait(c, k) || meets_traits(g.class_traits[k], need)
+
+// An operator calls the core trait method `name` of its operand's type: nothing on a built-in scalar, a
+// data type's own method, or that of the class or of a class descending from it. Where the type is not
+// known (a trait, a type parameter, `Any`), it reaches the method of that name of every type that may
+// be the operand's: one conforming to the type parameter's bounds or to the trait. An equality on a
+// type with no `equals` of its own compares fields and elements by their own methods, so it reaches
+// every `equals`.
+private operator_targets(c: *Checker, g: *ReachGraph, out: *Buf[usize], name: string, t: &Type)
+    if builtin_scalar(t) then return
+    var found = false
+    var known = false
+    *t match
+        Data(d, _, _) ->
+            known = true
+            found = named_targets(c, g, out, c.data[d].table, name, Some(t))
+        Class(k, _, _) ->
+            if !is_trait(c, k)
+                known = true
+                for kk in 0..<c.classes.len()
+                    if descends(c, kk, k)
+                        if named_targets(c, g, out, c.classes[kk].table, name, Some(t)) then found = true
+        _ -> ()
+    if known && (found || name != "equals") then return
+    // A type parameter's value conforms to its bounds, so only the types that do are candidates; an
+    // equality is not narrowed, since it compares fields and elements by their own methods.
+    val need: Buf[usize] = if name == "equals" then buf() else required_traits(c, t)
+    for kk in 0..<c.classes.len()
+        if candidate_class(c, g, kk, need) then named_targets(c, g, out, c.classes[kk].table, name, None)
+    for d in 0..<c.data.len()
+        if meets_traits(g.data_traits[d], need) then named_targets(c, g, out, c.data[d].table, name, None)
+
+/** Adds each method of `table` named `name`, answering whether there is one. */
+private named_targets(c: *Checker, g: *ReachGraph, out: *Buf[usize], table: Buf[Option[usize]], name: string, receiver: Option[&Type]) -> bool
+    var found = false
+    for entry in table
+        if entry is Some(m)
+            if c.symbols[m].decl.name == name
+                val env = receiver match
+                    Some(t) -> receiver_env(c, m, t)
+                    None -> no_reach_env()
+                add_node(out, reach_node(c, g, m, env))
+                found = true
+    found
 
 private forbidden_global(c: *Checker, u: Uses, k: usize) -> Option[usize]
     for g in u.globals
@@ -17613,32 +17898,50 @@ private struct InitOrder
 // keep their declaration order. A value that needs itself is a cycle, reported with the values it
 // passes through.
 // A call through a method table reaches the method the call names or any override of it: the method
-// of that name in the same slot of any class's table. Every one counts as called.
+// of that name in the same slot of the table of a class its receiver may have. A class's method is
+// overridden only in the classes descending from it; a trait's is implemented by any class or data
+// type. Every one counts as called.
 private with_implementations(c: *Checker, uses: Uses) -> Uses
     var u = uses
     for i in 0..<u.dispatched.len()
         val name = c.symbols[u.dispatched[i]].decl.name
         val slot = u.dispatched_slots[i]
-        for k in c.classes
+        var declared: Option[usize] = None
+        if c.symbols[u.dispatched[i]].owner_class is Some(o)
+            if !is_trait(c, o) then declared = Some(o)
+        for kk in 0..<c.classes.len()
+            val k = c.classes[kk]
+            if declared is Some(o)
+                if !descends(c, kk, o) then continue
             if slot < k.table.len()
                 if k.table[slot] is Some(m)
                     if c.symbols[m].decl.name == name then add_function(&u, m)
+        // A class's method is never in a data type's table.
+        if declared is Some(_) then continue
         // A method table of a data type is called through a bound as well.
         for d in c.data
             if slot < d.table.len()
                 if d.table[slot] is Some(m)
                     if c.symbols[m].decl.name == name then add_function(&u, m)
     // An operator on a data type or a class calls the core trait method in the type's table. A data
-    // type's own operator is found in its table; the rest, which may be a class with subclasses, a
+    // type's own operator is found in its table, and a class's in the table of that class or of a
+    // class descending from it, the classes its values may have. The rest, which may be a trait, a
     // type parameter, `Any`, or an equality that compares fields and elements by their own methods,
     // reaches every method of that name.
     for i in 0..<u.operators.len()
         val name = u.operators[i]
         var own: Option[usize] = None
+        var class_of: Option[usize] = None
         if name != "equals"
-            if *u.operator_types[i] is Data(id, _, _) then own = Some(id)
+            *zonk(c, u.operator_types[i]) match
+                Data(id, _, _) -> own = Some(id)
+                Class(id, _, _) -> if !is_trait(c, id) then class_of = Some(id)
+                _ -> ()
         if own is Some(d)
             add_named(c, &u, c.data[d].table, name)
+        elif class_of is Some(declared)
+            for kk in 0..<c.classes.len()
+                if descends(c, kk, declared) then add_named(c, &u, c.classes[kk].table, name)
         else
             for k in c.classes
                 add_named(c, &u, k.table, name)
