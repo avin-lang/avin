@@ -266,6 +266,7 @@ Environment changes apply in the order called; on a pipeline or a sequence the c
 | `c.errorsToFile(file: string)`, `c.errorsAppendTo(file: string)` | The same command, its standard error written to the file, emptied first or added to. |
 | `c.errorsToOutput()` | The same command, its standard error going where its standard output goes: into the same open file, so neither empties what the other wrote, and into what `output()` and `lines()` capture. |
 | `c.inNewGroup` | The same command, started in a process group of its own, which every program it starts joins ([proposed](/spec/decisions/#proposed)). |
+| `c.pipeInput()`, `c.pipeOutput()`, `c.pipeErrors()` | The same command, its standard input, output or error a pipe the program writes or reads through the `Child` that `start()` answers ([pipes](#pipes-to-a-started-command)). With `errorsToOutput()`, standard error goes into the output's pipe. |
 | `a andThen b` | `a`, then `b` only where `a` succeeded; the status is the last one run. |
 | `a orElse b` | `a`, then `b` only where `a` did not succeed. |
 | `a followedBy b` | `a`, then `b` whatever `a`'s status. |
@@ -301,6 +302,8 @@ it.
 | `detach() -> long` | Lets go of the command without stopping it, so it outlives its `Child` and the program, and answers `pid()`. |
 | `residentBytes() -> Result[long, IoError]` | The memory the program `pid()` names holds in RAM now, as `process.residentBytes(pid())` answers it; a command seen to have ended, or with no program started, is `Err(NotFound)`. |
 | `cpuTime() -> CpuTime` | The [CPU time](#cpu-time) the command's programs used, each with its reaped descendants', a pipeline's stages and a sequence's parts added. After `waitFor` it is the whole command's; before, what the programs seen to have ended used. A detached program counts nothing. |
+| `stdin() -> ChildInput` | The pipe the command reads its standard input from, for a command started `pipeInput()`; the same one every time. A command that asked for none traps. |
+| `stdout() -> ChildOutput`, `stderr() -> ChildOutput` | The pipe the command writes its standard output, or its standard error, into, for a command started `pipeOutput()` or `pipeErrors()`. A command that asked for none traps. |
 
 A started `Child` is [sendable](/spec/actors/#what-may-be-sent) ([proposed](/spec/decisions/#proposed)):
 it belongs to one thread at a time, as a [connection](#tcp) does. Handed to a thread's or a future's
@@ -360,6 +363,86 @@ nothing. A program that leaves its terminal's group as well starts the command `
 detaches itself with `newSession()`.
 
 The iterator `lines()` answers is not sendable: the thread that reads a command's output starts it.
+
+#### Pipes to a started command
+
+A command started with `pipeInput()`, `pipeOutput()` or `pipeErrors()` talks to the program over
+pipes while it runs, a request written and its reply read, as an editor talks to a language server
+([settled](/spec/decisions/#settled)):
+
+```text run
+import avin.process.Command
+
+main() -> int
+  val doubler = Command("/bin/sh", "-c", "while read n; do echo $((n * 2)); done").pipeInput().pipeOutput().start().ok.get
+  val requests = doubler.stdin()
+  val replies = doubler.stdout()
+  for n in [1, 20, 300]
+    _ = requests.writeText(s"$n\n")
+    println(s"$n doubled is ${replies.readLine().ok.get.get}")
+  _ = requests.close()
+  println(s"after its input ended: ${replies.readLine().ok.get}, ${doubler.waitFor().ok.get}")
+  0
+```
+
+```text output
+1 doubled is 2
+20 doubled is 40
+300 doubled is 600
+after its input ended: None, Exited(0)
+```
+
+`stdin()` is a `ChildInput`, which is an `avin.net.StreamWriter`, and `stdout()` and `stderr()` are
+`ChildOutput`s, each an `avin.net.StreamReader`: the two halves of a [split connection](#split-connections)
+in all but name, so code that speaks a protocol over a connection speaks it over a child's standard
+streams unchanged, and anything that takes an `io.Reader` or an `io.ByteWriter` takes them.
+
+| `ChildOutput` | Meaning |
+| --- | --- |
+| `read(max: int)` | Up to `max` bytes of what has arrived, waiting only while nothing has; an empty array once the output has ended, as often as asked. |
+| `readLine()`, `readAll()` | A line, `None` at the end, or everything until the end, as a connection reads them. |
+| `readAvailable(max: int)` | `Some` of what `read(max)` would answer without waiting, `None` where nothing has arrived. Never waits. |
+| `readable()` | Whether a read would answer now: a `select` waits on it with an `out.readable()` arm, a `Selector` with `readable(out, key)`. |
+| `setTimeout(d)`, `close()` | A wait longer than `d` answers `TimedOut`; closing it tells a command that still writes that its reader has gone. |
+
+| `ChildInput` | Meaning |
+| --- | --- |
+| `write(bytes)`, `writeText(text)` | Writes all of it, waiting for the command to read where the pipe is full. |
+| `writeSome(bytes)` | Writes what goes without waiting, after waiting for room for the first byte, and answers how many. |
+| `writable()` | Whether a write would write something now; a `select` waits on it with an `in.writable()` arm. |
+| `setTimeout(d)`, `close()` | A wait longer than `d` answers `TimedOut`; closing it ends the command's input, which it reads once it has read everything written before. |
+
+**A wait parks.** Each end is non-blocking, and a read or write that has to wait waits as a
+connection's does: a lightweight thread parks on the runtime's poller, leaving its worker to the
+others, and any other thread waits on the descriptor alone, safe for the collector.
+
+**Nothing ends the program.** A write to a command that has ended, or has closed its input, answers
+`Err(IoError(ConnectionReset, "write to", "the standard input of …"))`, never SIGPIPE. A command that
+ends, or is killed, with output unread leaves it in the pipe: `waitFor` answers its status, and the
+reads that follow answer what it wrote and then the end. Output ends when every program holding the
+stream has ended or closed it, a program the command started and left running among them. A
+command's [time limit](#commands) bounds every wait on its pipes too: one that would wait past it
+answers `TimedOut`, and `waitFor` then stops the command and answers `TimedOut`.
+
+**A full pipe waits for its reader.** A pipe holds 64 KiB; a command writing more waits until the
+program reads, and the program writing more than the command reads waits for it. A program that writes
+a command's input and reads its output, both larger than that, does the two at once: in two threads,
+or in one through a `select` on `in.writable()` and `out.readable()` with `writeSome` and
+`readAvailable`. Waiting for a command with `waitFor` reads nothing, so a command that writes more
+than a pipe holds is read before it is waited for.
+
+**Each end belongs to the code it is handed to, not to the `Child`.** An end is used by one thread at a
+time and checked at every operation, as a connection is; handed to a thread, it is that thread's until
+the thread returns. Handing the `Child` over hands over none of its pipes, so a thread may wait for the
+command while the program writes and reads them. `close()` on the `Child` stops and waits for the
+command and leaves the pipes to their own `close()`; an end closes too when the collector frees it.
+The pipes do not keep the command running: it is the `Child`'s, which stops it when collected.
+
+**Only the command `start()` starts hands its pipes over.** `run()`, `output()` and `lines()` of a
+command asking for a pipe trap, and so does a part of a pipeline or a sequence asking for one: a
+pipeline's input pipe is its first stage's, its output pipe its last stage's, and its error pipe every
+stage's; a sequence's parts write into its output pipe one after the other. The program's ends of the
+pipes are closed on exec, so no other command started meanwhile, from any thread, inherits one.
 
 ```text
 data ExitStatus
@@ -455,6 +538,7 @@ Run `wc --help` for the options.
 | `choice(name, choices, short, help, default = "", required = false, repeated = false)` | `--name` whose value is one of `choices` exactly as written; the help shows them, `<text\|json>`. |
 | `positional(name, help = "", required = true)` | One positional argument, after those declared before it. |
 | `positionals(name, help = "", required = false)` | Every argument left, none or more, or one or more where `required`. It is the last declared. |
+| `command(sub)` | The command `sub.name`, whose options and arguments the parser `sub` declares, listed in the help with `sub.about`. A parser with commands takes no positional arguments. |
 
 Each declaration answers a new parser and leaves the one it was called on as it was, so a parser is
 an ordinary value: built once at the top of a module, or in a function.
@@ -462,12 +546,14 @@ an ordinary value: built once at the top of a module, or in a function.
 | Reading | Meaning |
 | --- | --- |
 | `parse(args) -> Result[Args, ArgsError]` | The arguments read, or why not. |
-| `parseOrExit(args) -> Args` | As `parse`, and where it gives no `Args` the program ends: the help or the version to standard output and status 0, a mistake to standard error, as the name and the reason, the usage line and where the help is, and status 2. |
+| `parseOrExit(args) -> Args` | As `parse`, and where it gives no `Args` the program ends: the error's `report`, the help or the version to standard output and status 0, a mistake to standard error, as the name and the reason, the usage line and where the help is, and status 2. |
+| `e.report -> string`, `e.exitCode -> int` | For an `ArgsError`, the whole text `parseOrExit` writes, each line ending in a newline, and the status it exits with. |
 | `usage -> string`, `help -> string` | The usage line, and the whole help: usage, `about`, the arguments, then the options in the order declared, each with its help, its default where it has one, and whether it is required or may be repeated. |
 | `a.flag(name) -> bool`, `a.count(name) -> int` | Whether the flag was given, and how many times: 3 for `-vvv`. |
 | `a.string(name)`, `a.int(name)`, `a.real(name)` | The option's last value, else its default; the text of a choice or of a positional argument (empty where an optional one was left off). |
 | `a.strings(name)`, `a.ints(name)`, `a.reals(name)` | Every value of a repeated option in order, or its default alone where none was given and it has one; every argument a `positionals` took. |
 | `a.given(name) -> bool` | Whether the option or argument was on the command line, rather than taking its default. |
+| `a.command -> string`, `a.commandArgs -> Args` | The command given, empty where the parser has none, and the arguments after it as the command's parser read them. |
 
 **The arguments are read as a command line is.** An argument starting with `-` is an option, except
 `-` alone, which is positional, as is the empty argument. `--name=value` and `--name value` give a
@@ -486,9 +572,22 @@ a version. Each is acted on where it stands: `--help` after a mistake is never r
 mistake after `--help` is not looked at.
 
 **A mistake on the command line is an `ArgsError`, never a trap.** `ArgsError` is
-`HelpRequested(text)`, `VersionRequested(text)` or `Invalid(reason, usage)`, and an
+`HelpRequested(text)`, `VersionRequested(text)` or `Invalid(reason, usage, program, hint)`, and an
 [`Error`](/spec/errors/), so a `main` answering a `Result` may pass it on with `?` and the program
-ends with `error: ` and the reason. The reasons name what the user wrote, as they wrote it:
+ends with `error: ` and the reason. `program` is the name of the parser that found the mistake,
+`todo add` for a command's, and `hint` the line saying where its help is (empty where the program
+declared both `--help` and `help` itself). A program that reads one command line after another, a
+shell or a script runner, calls `parse` rather than `parseOrExit`, writes the error's `report` and
+carries on:
+
+```text
+for line in io.lines()
+  parser.parse(words(line)) match
+    Ok(opts) -> run(opts)
+    Err(e) -> if e.exitCode == 0 then print(e.report) else eprint(e.report)
+```
+
+The reasons name what the user wrote, as they wrote it:
 
 | Command line | Reason |
 | --- | --- |
@@ -501,12 +600,97 @@ ends with `error: ` and the reason. The reasons name what the user wrote, as the
 | a required option left off | ``missing required option `--to` `` |
 | a required argument left off | ``missing argument `<file>` `` |
 | one argument more than declared | ``unexpected argument `extra` `` |
+| no command, to a parser with commands | ``missing command; the commands are `add`, `list`, `help` `` |
+| `lst` | ``unknown command `lst`; did you mean `list`? `` |
+| `frobnicate` | ``unknown command `frobnicate`; the commands are `add`, `list`, `help` `` |
 
 **A mistake in the declarations, or in asking for a value, is the program's, and traps.** Two
 options of one name or one letter, a name written with its dashes, a choice with no choices or a
 default not among them, an argument after the one taking the rest or a required one after an
-optional one trap where they are declared; asking `Args` for a name never declared, or as another
-type than it was declared with (`a.int("out")` for a string option), traps where it is asked.
+optional one, two commands of one name, a command whose name is not one word or starts with `-`,
+and a parser given both commands and positional arguments trap where they are declared; asking
+`Args` for a name never declared, or as another type than it was declared with (`a.int("out")`
+for a string option), or for `commandArgs` where the parser has no commands, traps where it is
+asked.
+
+### Commands
+
+A program of several commands gives its parser one parser for each, declaring that command's
+own options and arguments. A command may have commands of its own, as `git remote add` does.
+
+```text
+val add = cli.Parser("add", "Add a task.")
+  .choice("priority", ["high", "normal", "low"], short = 'p', default = "normal")
+  .positionals("words", help = "the task's title", required = true)
+
+val parser = cli.Parser("todo", "Keep a to-do list.")
+  .string("file", short = 'f', help = "the list", default = "todo.txt")
+  .command(add)
+  .command(cli.Parser("list", "List the tasks.").flag("all", short = 'a'))
+
+main(args: Vector[string]) -> int
+  val opts = parser.parseOrExit(args)
+  val file = opts.string("file")
+  opts.command match
+    "add" -> addTask(file, opts.commandArgs.string("priority"), opts.commandArgs.strings("words"))
+    _ -> listTasks(file, opts.commandArgs.flag("all"))
+```
+
+**The first positional argument names the command, and every argument after it is the
+command's.** The program's own options come before the command word, `todo --file t.txt add -p
+high milk`, and the command's after it; an option of the program's after the word is unknown to
+the command (`todo list --file x` is ``unknown option `--file` ``), so a command may use a name
+the program does too. An option's value is never a command, so `todo --file list add` writes to
+the file `list`. `--` before the word ends only the program's options; the command reads its own.
+
+**While a command reads its arguments, its parser is named after the program and the command,**
+so its usage line, its help and its mistakes say `todo add`: `todo add --help` writes
+
+```text
+Usage: todo add [options] <words>...
+
+Add a task.
+
+Arguments:
+  <words>...                        the task's title
+
+Options:
+  -p, --priority <high|normal|low>  (default: normal)
+  -h, --help                        show this help and exit
+```
+
+and `todo --help` lists the commands, with their `about`, before the options:
+
+```text
+Usage: todo [options] <command> ...
+
+Keep a to-do list.
+
+Commands:
+  add                Add a task.
+  list               List the tasks.
+  help <command>     show the help of a command
+
+Options:
+  -f, --file <file>  the list (default: todo.txt)
+  -h, --help         show this help and exit
+```
+
+**Every parser with commands has the command `help`,** unless the program declares a command of
+that name, which then is its own: `todo help` is `todo --help`, `todo help add` is `todo add
+--help`, and `todo help remote add` names a command of a command. `--version` is the program's,
+before the command word.
+
+**A command not given or not known is a mistake.** The reason for an unknown command names the
+command it was most likely meant to be: the nearest within two edits (fewer than the word has
+characters), or else the one command the word begins, `rem` for `remote`; otherwise it lists the
+commands. `todo lst` writes to standard error, and exits with 2:
+
+```text
+todo: unknown command `lst`; did you mean `list`?
+Usage: todo [options] <command> ...
+Run `todo --help` for the commands.
+```
 
 ## `avin.signal`
 
@@ -662,6 +846,22 @@ main()
 | `readLine() -> Option[string]` | The next line without its terminator, `None` at the end of the input. An empty line is `Some("")`. |
 | `lines() -> Iterator[string]` | The lines left, each as `readLine` gives it, read as the iterator advances. |
 | `readAll() -> string` | Everything left, terminators and all; empty when nothing is left. |
+| `inputs(paths: Vector[string]) -> Iterator[Result[(string, string), IoError]]` | The files `paths` names, or standard input when it is empty, each as its name and all its text. |
+| `inputLines(paths: Vector[string]) -> Iterator[Result[(string, string), IoError]]` | The same a line at a time: an input's name and one of its lines. |
+
+**`inputs` and `inputLines` are for a tool that reads the files it is given, or standard input.** A
+path of `-` names standard input wherever it stands, and no paths at all is one input, standard
+input; a name comes back as it was written, so standard input is `"-"`. An input is read when the
+iterator reaches it, and one that cannot be read is an `Err` naming it in its place: the iterator
+goes on, so a tool reports each failure and carries on. Standard input is read to its end, so a
+second `-` finds it empty; it shares the buffer of `readLine`, `lines()` and `readAll`.
+
+```avin
+for r in io.inputLines(args)
+  r match
+    Ok((name, line)) -> println(s"$name:$line")
+    Err(e) -> eprintln(e.message)
+```
 
 **A line ends at `\n`, and a `\r` just before it belongs to the terminator**, so input written with
 either convention reads the same. A `\r` anywhere else is part of the line. The last line needs no
@@ -794,7 +994,9 @@ output first, as `eprint` does. An empty write writes nothing and answers `Ok`.
 
 **A write to a reader that has gone fails; it does not end the program.** A byte write to a pipe or
 socket whose reader has closed answers `Err(IoError(ConnectionReset, "write", "standard output"))`
-(or `"standard error"`), and every later byte write answers the same; the program goes on. `print`
+(or `"standard error"`), and every later byte write answers the same; the program goes on, however
+many of its threads are writing or running. A child the program starts writes to the same output
+as any program does, and is ended by its broken pipe as usual. `print`
 is not changed by it: a program that only prints still ends quietly when its reader goes, as a
 filter in a pipeline should.
 
@@ -1934,6 +2136,7 @@ target)` traps on any other, so a handler can be tried without a connection. A r
 the values a middleware handed on, read by `value[T]()` (below).
 
 A `Response` is the client's: `Response.text(status, text)` (`text/plain; charset=utf-8`),
+`Response.html(status, text)` (`text/html; charset=utf-8`, the text sent as given),
 `Response.json(status, text)` (`application/json`, the text sent as given and not checked to be
 JSON), `Response.bytes(status, body, contentType)`, `Response.empty(status)` and `withHeader(name, value)`,
 which traps on a name that is not a token or a value holding a line break; `http.reasonPhrase(status)`

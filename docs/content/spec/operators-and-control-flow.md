@@ -234,8 +234,35 @@ The built-in types keep their operators: a method of one of these names on `int`
 on two `int`s is always the machine's addition, and so is a method `!`, or `~` taking no argument,
 there: `!` on a `bool` is always its negation. `==` and `!=` stay `Eq`'s.
 
+One exception puts a built-in value on an operator's left. An impl adding methods to `int`,
+`long`, `real`, `byte`, `char`, `string` or `bool`, in the type's module or as an extension, may add
+a binary operator method, an arithmetic, ordering, bitwise or shift one, whose one parameter is of a
+type the program declares: a data type, a class, a trait or an opaque type, of any type arguments.
+Its operand is never built-in, so an operator between two built-in values still never reaches a
+method. `k * v` with `k` a `real` calls `real`'s method `*` taking `v`'s type, chosen statically by
+that type like any overload; where the left type has no method of the name the operator keeps its
+own meaning. An integer literal on the left is an `int` where `int` has a method taking the right
+operand, and otherwise the `long`, then the `real`, that has one, so `2 * v` reads as it is written.
+A trait implementation cannot add one, and a method of this kind taking a built-in type, a tuple, a
+function, a union or a type parameter is an error. An extension's is seen where its module is
+imported, as every extension method is:
+
+```text
+data Vec(x: real, y: real)
+
+impl Vec
+  *(k: real) -> Vec = Vec(x * k, y * k)
+
+impl real
+  *(v: Vec) -> Vec = v * self
+
+val doubled = 2.0 * v
+val tripled = 3 * v
+```
+
 A symbol method's call binds at the level of the language's operator its name's first character
-belongs to, so a name reads with the operator it resembles. One character overrides the first: a
+belongs to, so a name reads with the operator it resembles, unless the method declares another
+([below](#a-declared-precedence)). One character overrides the first: a
 name with `~` anywhere in it binds at the tightest symbol level, so `~`, `~>`, `<~`, `<~>`, `~!` and
 `^~` all bind together, the way a grammar's sequencing operators are read. A leading `#` is passed
 over, so a name starting with `#` binds at the level of its first other character: `#::` binds as
@@ -255,8 +282,8 @@ single `#` is no operator. The levels, tightest first:
 | Range | `..` `..<` | |
 | Named calls | `a max b` | |
 | Comparison | `==` `!=` `<` `<=` `>` `>=` `===` `!==`, `is` | `<` `>` `=` `!`: `<=>`, `<>`, `!!` |
-| Logical and | `&&` | |
-| Logical or | `\|\|` | |
+| Logical and | `&&` | none; a method declared `@precedence("&&")` |
+| Logical or | `\|\|` | none; a method declared `@precedence("\|\|")` |
 | Assignment | `=` `:=` and compound forms | a name ending in `=` that is not a comparison: `+=`, `++=`, `\|=` |
 
 So `a ++ b + c` is `(a ++ b) + c`, `a ++ b * c` is `a ++ (b * c)`, `xs ++ ys :+ z` is
@@ -271,6 +298,60 @@ are still evaluated in the order written, `x` before `xs`. Operators of one leve
 opposite directions, whether symbol methods or the language's own, do not mix without parentheses:
 `a ++ b +: c`, `a + b +: c` and `1 :: xs :+ 2` are errors, and `(a ++ b) :+ c` and `1 :: (xs :+ 2)`
 are not. Operators of different levels need none: `1 +: xs :+ 2` is `(1 +: xs) :+ 2`.
+
+#### A declared precedence
+
+A method named by a symbol may declare the level its calls bind at, by naming the language's
+operator of that level in `@precedence`, and that its calls group to the right with `@groupsRight`:
+
+```text
+class Parser(val name: string)
+  ~(next: Parser) -> Parser = Parser(s"$name ~ ${next.name}")
+  @precedence("|")
+  <|>(other: Parser) -> Parser = Parser(s"$name | ${other.name}")
+
+class Num(val n: int)
+  @groupsRight
+  ^^(e: Num) -> Num = Num(power(n, e.n))
+
+data Cond(sql: string)
+
+class Column(val name: string)
+  >=(v: int) -> Cond = Cond(s"$name >= $v")
+
+class Rows(val sql: string)
+  @precedence("||")
+  |>(c: Cond) -> Rows = Rows(s"$sql WHERE ${c.sql}")
+
+val p = a ~ b <|> c ~ d             // (a ~ b) <|> (c ~ d), where `<|>` would bind as `<` does
+val big = two ^^ three ^^ two       // two ^^ (three ^^ two)
+val adults = people |> age >= 18    // people |> (age >= 18)
+```
+
+The level is one row of the table, named by any operator of it: `"~"` for the tightest symbol
+level, `"*"`, `"+"`, `"&"`, `"^"`, `"|"`, `"::"`, `"=="`, and the two only a declaration reaches,
+`"&&"` and `"||"`; `"-"`, `"<<"` or `"!="` name their rows as well. No level is added, so the table
+stays the whole account of how an expression reads, and a declared call binds exactly as the
+operator its declaration names does. A range, an assignment or the named-call level is not one a
+method may take. `@groupsRight` keeps the receiver on the left, `a ^^ b ^^ c` being
+`a.^^(b.^^(c))`; only a name ending in `:` takes its receiver on the right. A name ending in `:`
+groups right already, and `@groupsRight` on one is an error; `@precedence` on one moves its level
+and keeps its grouping. A declared grouping follows the rule against mixing: `a ^^ b ^ c` is an
+error, as is `a <=< b < c` where `<=<` is declared at `"=="` grouping right.
+
+A declaration belongs to the method's **name**, across the whole program, because a program is
+parsed before any type is known: `a <|> b` is read the same way whatever `a` turns out to be, in
+the declaring module, in every module that imports it, and in any module holding a value of the
+type without naming it. So every method of one name in a program binds alike. An overload, another
+type's method, a trait's declaration and each of its implementations either carry the same
+declaration or one that reads the same, and a method of the name declaring nothing agrees only
+where the declaration restates what the name gives. Any other is an error naming both methods,
+reported at the program's method where the other is the standard library's: a program cannot
+declare `:+` at `*`'s level, since the library's sequences already read it as `::`.
+
+Only a method named by a symbol the language does not use may declare: `@precedence` on `+`, `|`,
+`<` or `==`, which keep their levels, on an assignment such as `++=`, on a method named by a word,
+which binds as every named call does, and on a function is an error.
 
 #### A right operand taken by name
 
@@ -615,8 +696,8 @@ block and starts a line again, up to a last line that closes the brackets, which
 - a variant with fields named alone, bare or qualified (`Shipped`, `Status.Shipped`), which tests
   for the variant and binds none of its fields, as `Shipped(_, _)` does with one `_` per field;
   `Shipped()`, with parentheses, is matched against the fields by number;
-- [extractor patterns](#extractor-patterns), `Name(p1, p2)` where `Name` is a value with
-  `unapply` or `unapplySeq`;
+- [extractor patterns](#extractor-patterns), `Name(p1, p2)` where `Name` is a value implementing
+  `Extractor`, `BoolExtractor` or `SeqExtractor`;
 - list patterns: `head :: tail` matches a non-empty `List`, grouping to the right
   (`first :: second :: rest`);
 - [sequence patterns](/spec/collections/#sequence-patterns): `[]` matches an empty sequence and
@@ -754,38 +835,52 @@ arm's name starts with a capital letter.
 ### Extractor patterns
 
 A pattern `Name(p1, p2)` whose `Name` is not a variant is an **extractor**: a value, such as an
-object, a class's companion or a local, whose type has an `unapply` or `unapplySeq` method. The
-matched value is passed to the method, and its answer decides the match:
+object, a class's companion, a local or a parameter, whose type implements one of the core
+library's extractor traits. The conformance makes the extractor; a method merely named `unapply`
+does not. The matched value is passed to the trait's method, and its answer decides the match:
 
-- `unapply(x) -> bool` matches where it answers `true`, and is written with no patterns, `Even()`;
-- `unapply(x) -> Option[U]` matches its `Some`: one pattern matches the value whole, and several
-  match the parts of a tuple of as many, `Split(key, value)` for an `Option[(string, string)]`;
-- `unapplySeq(x) -> Option[S]`, `S` a sequence, matches its `Some` as a
-  [sequence pattern](/spec/collections/#sequence-patterns) does, so `Words(first, second)` needs
-  exactly two elements and `Words(first, rest*)` one or more.
+- `BoolExtractor[A]`, with `unapply(value: A) -> bool`, matches where it answers `true`, and is
+  written with no patterns, `Even()`;
+- `Extractor[A, B]`, with `unapply(value: A) -> Option[B]`, matches its `Some`: one pattern
+  matches the value whole, and several match the parts of a tuple of as many,
+  `Split(key, value)` for an `Extractor[string, (string, string)]`;
+- `SeqExtractor[A, S]`, with `unapplySeq(value: A) -> Option[S]`, `S` a sequence, matches its
+  `Some` as a [sequence pattern](/spec/collections/#sequence-patterns) does, so
+  `Words(first, second)` needs exactly two elements and `Words(first, rest*)` one or more.
 
 ```text
-object Twice
-    unapply(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
+object Twice: Extractor[int, int]
+  override unapply(n: int) -> Option[int] = if n % 2 == 0 then Some(n / 2) else None
 
-object Even
-    unapply(n: int) -> bool = n % 2 == 0
+object Even: BoolExtractor[int]
+  override unapply(n: int) -> bool = n % 2 == 0
 
 describe(n: int) -> string = n match
-    Twice(Twice(q)) -> s"four times $q"
-    Twice(h) if h > 100 -> "a large double"
-    Even() -> "even"
-    _ -> "odd"
+  Twice(Twice(q)) -> s"four times $q"
+  Twice(h) if h > 100 -> "a large double"
+  Even() -> "even"
+  _ -> "odd"
 
 val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
 "2024-06-30" match
-    date(year, month, day) -> …
+  date(year, month, day) -> …
 ```
 
-A variant of the name is always the variant, so a data type's companion declares an `unapply` to be
-called by name, not to change what its variant's pattern means. Where the type has both methods,
-`unapply` is the one called. The method's parameter accepts the matched value's type, as any call's
-argument would, and a generic method infers its type arguments from it. The method is called once
+The traits are ordinary ones: `A` is contravariant and `B` and `S` covariant, so an
+`Extractor[Animal, string]` takes a `Dog`; an extractor may be held in a value of the trait's type,
+passed as a parameter, `e: Extractor[string, int]`, or bound on a type parameter,
+`[E: BoolExtractor[int]]`; a data type implements one through an `impl`; and a subclass keeps its
+superclass's conformance. A generic extractor is a value of a generic class,
+`class Pair[A]: Extractor[List[A], (A, A)]` matched as `pair(a, b)` with `val pair = Pair[A]()`. A
+type implements each trait at one type argument; the trait whose `A` takes the matched value
+serves, and where an `unapply` trait and `SeqExtractor` both take it, the `unapply` one does. A
+type's name is no value, so it is no extractor whatever static members it has. A pattern naming a
+value whose type implements no extractor trait is an error that names the trait to implement, from
+the type's own `unapply` or `unapplySeq` where it has one.
+
+A variant of the name is always the variant, so a data type's companion implements an extractor
+trait to be matched by name, not to change what its variant's pattern means. The method's parameter
+accepts the matched value's type, as any call's argument would. The method is called once
 each time the pattern is tested, the patterns inside it are matched against its answer, and its
 names are bound like any pattern's; extractors nest, take guards, and appear in `is`, alternatives,
 clauses and match functions. An extractor may answer that it does not match, so it never counts

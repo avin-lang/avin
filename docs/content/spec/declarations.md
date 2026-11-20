@@ -522,7 +522,13 @@ data Option[+T]
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
-constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, and
+constructors, not types: `Some(1)` has type `Option[int]`. A variant without fields is a value
+(`None`); one with fields, named and not called, is its constructor as a function value, as a
+class's name is: a function of all its fields, in order, to its data type or a refined variant's
+declared instance, so `[1, 2].map(Some)` is `[Some(1), Some(2)]` and `val f = Circle` is a
+`(real) -> Shape`. A generic variant takes its instance from the function type expected there, whose
+result also decides between variants sharing a name, or from written type arguments, `Some[int]`;
+where a value of the variant's own type is expected, the variant is to be called. A variant is a name of its module, and
 several data types of one module, in one file or in several, may each have a variant of one name:
 
 ```text
@@ -1198,6 +1204,8 @@ value: `Add`'s `zero` and `Mul`'s `one` are the identities of their operators.
   It may have parameters, defaults and type parameters as a method does.
 - **A trait with a static member is a bound and not a type**, as one mentioning `Self` is: a value of
   the trait's type would have no type to give the member.
+- **A trait has no static members of its own**, except those of an impl stating its own conformance
+  to a trait whose members are all static ([impl](#impl)): `Set[int].newBuilder()`.
 - **A static member named without a call is a function value** of its parameters, as a method of a
   value is: `xs.map(string.fromUtf8Lossy)`, `val zero = Point.zero`. Where the member is overloaded,
   the function type expected says which, and without one the value is an error.
@@ -1267,6 +1275,17 @@ the arguments' types: `AppError.from(e)` as any overloaded method, and on a type
 by several instances, `T: Make[int] & Make[string]`, the instance whose member the arguments fit.
 Each conformance gives every member of the trait at its own type arguments. Any other trait is
 implemented once, at one list of type arguments.
+
+**A trait type may implement a trait whose members are all static** (with those of the traits it
+requires), as its **own** conformance: `impl[A] Buildable[A] for Set[A]`, with `static
+newBuilder() -> Builder[A, Set[A]]`. It holds of the trait type itself, where `Set[A]` is the type
+a call names (`Set[int].newBuilder()`) or a bound's argument (`build[Set[int], int](…)`), and of no
+type implementing the trait: a `HashSet[A]` does not get `Set`'s impl, but has its own or none, and
+a type parameter bounded by `Set[A]` does not reach it, since its argument may be any set. It lives
+in the module of the trait type or of the static trait, as any conformance does. An impl of a trait
+with a member of a value for a trait type is an error: every value of the trait type is of some
+implementing type, whose methods the trait's are. A conformance to such a trait is also no
+[variance](/spec/generics/#variance) position of a class or `data` type.
 
 A built-in type conforms to a trait only through an impl, and meets the trait as a bound: each
 instance of generic code calls the impl's method directly. A built-in value is not an object, so a
@@ -1532,9 +1551,9 @@ the constructor's parameter type is the more specific.
   called by the object's name the same way.
 - **As a function value.** Where a function type is expected, the name of an object that declares
   `apply` is its companion class's constructor or the `apply` whose parameters accept that type's,
-  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. A variant with fields
-  is not a value, so a data type's companion offers its `apply` methods alone. Elsewhere the bare
-  name is the object.
+  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. For a data type's
+  companion, a variant of the object's name is one of those choices, as it is at a call. Elsewhere
+  the bare name is the object.
   An object that is itself of a function type stays that value.
 - `Name.apply(…)` is an ordinary member call, and chooses among the `apply` methods alone.
 
@@ -1810,6 +1829,40 @@ main() = println(s"${circleArea(Circle(2))}")
 - **Modules may import one another**, in a cycle if need be: the program is compiled whole. Its
   module-level values initialize before `main`, each after the values its initializer needs, across
   modules as within one.
+
+## Doc comments
+
+**The comment directly above a declaration documents it**: the run of `//` lines with no blank line
+between them and the declaration, any annotations between skipped. The comment above a file's
+`module` line documents the module. Nothing else marks a doc comment: the language server's hover
+shows it under the declaration's header, and [`avin doc`](/getting-started/#api-documentation)
+writes it into the program's pages.
+
+````avin
+// A shape in the plane; [area] measures one.
+//
+// ```
+// val s = Circle(1.0)
+// println(area(s))
+// ```
+data Shape
+  // A circle of the given radius.
+  Circle(radius: real)
+  Rect(width: real, height: real)
+````
+
+- **It is Markdown**, with GitHub's extensions. Each line loses its `//` and one space after it;
+  what is left keeps its indentation, so a code block indented in the comment stays one.
+- **A block with no language, or marked `avin`, is Avin code**, coloured as Avin; `avin doc --check`
+  fails on one that parses neither as declarations nor as the statements of a function's body. A
+  block of anything else names its language (`text`, `sh`).
+- **A link to a declaration** is written with its path as the destination, `[the map](Vector.map)`,
+  or as `[Name]` or `` [`Name`] `` alone. The path is found from the declaration the comment
+  documents: a member of its type, then a declaration of its module, then a full path such as
+  `avin.fs.File` or a module's name, then the prelude, then the one declaration of the program with
+  that name. `[Name]` that names nothing is left as the text it is; `` [`Name`] `` that names nothing,
+  and a destination that names neither a declaration nor a page of the documentation, are what
+  `avin doc --check` fails on.
 
 ## Literate source
 

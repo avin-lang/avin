@@ -251,7 +251,7 @@ so the check is made once, where the type is named, and never at a send:
 | `Channel[T]` and `Atomic[T]` of a sendable `T`, `Mutex[T]` and `RwLock[T]` of any `T`, a mutex's `Condition`, `Once`, `WaitGroup`, `Semaphore`, `Barrier` | synchronization: every access is synchronized, and a mutex's value is reached only under its lock, so a mutex is the one deliberate door to shared mutable state |
 | `Thread[T]` of a sendable `T`, an `Executor` | joining a thread and giving an executor work are synchronized |
 | a [Sysl handle](/spec/sysl-bindings/#handles) | sent by handing over its ownership, checked when it is used (below) |
-| `Isolated[T]` | an object graph nothing else reaches (below) |
+| `Isolated[T]` | an object graph nothing else reaches, or an array moved out of the sender's hands (below) |
 | a [`@sendable` function type](/spec/types/#function-types), `@sendable (A) -> B` | checked where each value is made: it captures only sendable values and no `var`, and reaches no module-level mutable state |
 
 **Not sendable**: `Array`, `Buffer`, `Deque`, the mutable maps and sets, a class with a `var` field
@@ -265,6 +265,9 @@ shared](/spec/threads/#what-is-shared)). The error names the part that is not se
 ```text
 error: `JobMsg` cannot be sent between actors: its variant `Fill` holds a `Buffer[byte]`, which is mutable; send an immutable copy (`toVector`), or the buffer as an `Isolated[Buffer[byte]]`
 ```
+
+An `Array` is not sendable either, however it is used; it crosses without a copy as an
+`Isolated[Array[T]]`, made by [`Isolated.move`](#handing-over-ownership).
 
 A declaration may also **promise** `Sendable`: a trait or a class after `:` in its header, a data
 type in an impl (`impl Sendable for Reading`). The promise is checked against the structure, and
@@ -337,6 +340,31 @@ connection, and a large buffer filled by one actor goes to the next.
   The rule is a parameter's mark, **`@isolating`**, which a program's own functions may write too
   ([what is shared](/spec/threads/#what-is-shared)): `isolate[T](@isolating body: -> T) ->
   Isolated[T]`, and `with`'s `f`. `Isolated` and `isolate` are imported from `avin.actors`.
+- **An array the program already holds moves with `Isolated.move(items)`**, with no copy:
+  `move[T: Sendable](items: Array[T]) -> Isolated[Array[T]]`. A buffer a socket read filled, or one
+  a relay hands back and forth, was not made inside an `isolate`, and the code that holds it may
+  hold other references to it too, in a field or a closure. So the array itself carries its owner:
+  every array has an owner word beside its length, empty until the array is first moved. A move
+  gives it an owner no running code is, and **every use of the array after it, through any
+  reference, traps** with `` `Array` was moved to another owner `` — reading or writing an element,
+  its length, a slice, a copy into it or out of it, an iterator's next step, handing it to a Sysl or
+  C binding, and moving it again. The code that takes it out of the `Isolated` becomes its owner, and
+  uses it through any reference it holds; `with` makes the code running it the owner while `f` runs
+  and moves the array again after. An array taken back by the code that moved it is that code's
+  again, through the references it kept:
+
+  ```text
+  val chunk = conn.read(16384)?
+  writer.send(Isolated.move(chunk))      // chunk(0) here traps
+  val again = done.receive().get.take()  // the same array, ours again: again === chunk
+  ```
+
+  Its elements must be sendable, since they are shared with the receiver as they are; an array of
+  buffers is refused. Only an `Array` moves this way: a slice is a copy, so one taken before the
+  move stays the sender's, and a `Buffer`, a map or any other mutable object moves inside an
+  `isolate`. An array never moved, which is every array most programs make, pays eight bytes of
+  header and no check beyond its bounds check: a move rewrites the length word so that every index
+  fails that check, and only then is the owner compared.
 
 The cheapest way across stays the plainest: build with a `Buffer` or a builder, turn the result into
 an immutable collection, and send that.

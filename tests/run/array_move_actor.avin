@@ -1,0 +1,45 @@
+// expect: exit 0
+// A moved array goes to an actor in a message it is told, and comes back in the reply to an ask,
+// at no elements, one and a mebibyte, never copied: the actor keeps the array it was told as its
+// state across messages, whichever worker runs it, changes it there, and gives the same array back
+// when asked. The sender's reference sees the actor's change once the reply is taken.
+import avin.actors.{ActorRef, Isolated, spawn}
+import avin.time
+
+data Keeper
+  Keep(items: Isolated[Array[byte]])
+  Bump
+  Give(reply: ActorRef[Isolated[Array[byte]]])
+
+actor Holder receives Keeper
+  var kept: Option[Array[byte]] = None
+  receive
+    Keep(items) -> kept = Some(items.take())
+    Bump ->
+      val a = kept.get
+      for i in 0 ..< a.length do a(i) = byte(int(a(i)) + 1)
+    Give(reply) ->
+      reply.tell(Isolated.move(kept.get))
+      kept = None
+
+sumOf(a: Array[byte]) -> long
+  var total: long = 0
+  for b in a do total += long(int(b))
+  total
+
+trip(holder: ActorRef[Keeper], size: int)
+  val a = Array.fill[byte](size, byte(2))
+  holder.tell(Keep(Isolated.move(a)))
+  holder.tell(Bump)
+  holder.tell(Bump)
+  val back = holder.ask(r -> Give(r), time.seconds(30)).await()
+  val b = back match
+    Ok(items) -> items.take()
+    Err(_) -> Array.empty[byte]()
+  println(s"$size: same array ${b === a}, sum ${sumOf(a)}")
+
+main()
+  val holder = spawn(Holder())
+  trip(holder, 0)
+  trip(holder, 1)
+  trip(holder, 1048576)

@@ -35,6 +35,28 @@ private waitMillis(d: Duration) -> long = if d.micros <= 0 then 0 else (d.micros
 @sysl("avin.rt.on_main_thread")
 isMainThread() -> bool
 
+// Whether the calling code runs on a thread pinned to the main thread, one `spawnOnMain` started:
+// `isMainThread()` answers true there too, but such a thread parks where the main thread's own code
+// would block it.
+@sysl("avin.rt.on_main_scheduler")
+isPinnedToMain() -> bool
+
+// Starts a thread pinned to the main thread running `run` on a stack of `stack` bytes, and gives back
+// the object it is joined by.
+@intrinsic("thread_start_main")
+private startOnMain(run: () -> unit, stack: long) -> Any
+
+// Runs the pinned threads ready now, on the main thread.
+@sysl("avin.rt.main_step")
+private mainStep() -> long
+
+// Runs on the main thread each thread pinned to it that is ready now, until it waits or ends, in the
+// order they became ready, and answers how many ran; one made ready meanwhile runs at the next call.
+// The frame loop of a window calls it once a frame, and the main thread's own waits run pinned threads
+// as they become ready, so a program calls it itself only where it runs a loop of its own that does
+// not wait. Called from a pinned thread, or from another thread, it runs nothing and answers 0.
+runMainThreads() -> int = int(mainStep())
+
 // Starts a thread running `run` on a stack of `stack` bytes, and gives back the object it is joined
 // by. The thread's context is attached before it starts, so `run` is never out of the collector's
 // sight.
@@ -137,6 +159,40 @@ private launch[T: Sendable](
     if outcome.value.isEmpty then handOver(body, owner, inTransit)
   (Thread(joint, outcome), joint, handBack)
 
+// Starts `body` on a new thread pinned to the main thread, with a stack of `stack` bytes, 8 MiB unless
+// asked otherwise, and 64 KiB at the least. It runs on the main thread only, between the frames of a
+// window and while the main thread's own code waits, so it reaches what the main thread reaches: the
+// interface's state, and the Sysl handles the main thread owns, as their owner. Its waits park it
+// rather than block the main thread, and it carries on there when its wait ends:
+//
+//     spawnOnMain(() ->
+//       val page = fetch(url).await()
+//       shown.set(page))
+//
+// Started from the main thread only, its own code or a pinned thread; started from another thread, it
+// stops the program. The thread takes the calling thread's request context and no deadline.
+spawnOnMain[T](body: () -> T, stack: long = 8388608) -> Thread[T] =
+  launchOnMain(body, stack, currentState().detached).0
+
+// `spawnOnMain`, giving back too the joint a scope cancels the thread by. The thread runs with
+// `context` as its request context state; where `runs` is false it runs nothing, and ends with no
+// result.
+private launchOnMain[T](body: () -> T, stack: long, context: ContextState, runs: bool = true) -> (Thread[T], Any)
+  if !isMainThread() then fail(
+    "a thread pinned to the main thread is started on the main thread, and `spawnOnMain` was called on another"
+  )
+  val outcome = Outcome[T]()
+  if !runs
+    val joint = startOnMain(() -> (), stack)
+    return (Thread(joint, outcome), joint)
+  val owner = currentOwner()
+  val run = () ->
+    contextSet(context)
+    runAs(owner)
+    outcome.finish(body())
+  val joint = startOnMain(run, stack)
+  (Thread(joint, outcome), joint)
+
 // Cancels the thread `joint` was given back for, unless it has ended.
 @intrinsic("thread_cancel")
 private cancelThread(joint: Any)
@@ -222,6 +278,18 @@ class Scope(private val started: Started)
     val (t, joint, handBack) = launch(body, stack, currentState(), !started.cancelled)
     started.joints = joint :: started.joints
     started.handBacks = handBack :: started.handBacks
+    leaveUncancellable()
+    t
+
+  // Starts `body` on a new thread pinned to the main thread, as `spawnOnMain` does, which the scope
+  // waits for and cancels as it does the threads its `spawn` starts. A scope run on the main thread
+  // starts one; on another it stops the program. The thread takes the calling thread's whole request
+  // context.
+  spawnOnMain[T](body: () -> T, stack: long = 8388608) -> Thread[T]
+    started.use("started")
+    enterUncancellable()
+    val (t, joint) = launchOnMain(body, stack, currentState(), !started.cancelled)
+    started.joints = joint :: started.joints
     leaveUncancellable()
     t
 

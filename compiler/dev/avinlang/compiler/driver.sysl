@@ -425,9 +425,12 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
         for f in index
             want_module(&wanted, &queue, f.module_name)
     var program: Buf[SourceUnit] = buf()
+    var program_origins: Buf[UnitOrigin] = buf()
+    var library_origins: Map[usize, UnitOrigin] = map()
     var root_module = ""
     var broken = false
     for file in files
+        program_origins.push(UnitOrigin(held(file.src), file.module_name, false))
         var parsed = parse(held(file.src))
         file.module_name match
             Some(m) -> place_file(&parsed, m, false)
@@ -448,20 +451,32 @@ load_units(library: string, files: Buf[ProgramFile], whole_library: bool, held: 
             if index[i].module_name != module_name then continue
             val path = index[i].path
             val text = read_text(path).map_err(e -> s"$path: ${e.to_string()}")?
-            var parsed = parse(held(source_of(path, text)))
+            val src = held(source_of(path, text))
+            var parsed = parse(src)
             place_file(&parsed, module_name, true)
             if parsed.report.has_errors() then broken = true
             want_imports(parsed.file, modules, &wanted, &queue)
             parsed_library.put(i, SourceUnit(parsed.source, parsed.file, parsed.report))
+            library_origins.put(i, UnitOrigin(src, Some(module_name), true))
     var units: Buf[SourceUnit] = buf()
+    var origins: Buf[UnitOrigin] = buf()
     for i in 0..<index.len()
-        if parsed_library.get(i) is Some(u) then units.push(u)
+        if parsed_library.get(i) is Some(u)
+            units.push(u)
+            origins.push(library_origins.get(i).unwrap())
     val library_units = units.len()
-    for u in program
-        units.push(u)
+    for j in 0..<program.len()
+        units.push(program[j])
+        origins.push(program_origins[j])
     var program_modules: Map[string, bool] = map()
     for j in 0..<files.len()
         if files[j].module_name is Some(m) then program_modules.put(m, true)
+    // A file read again at its declared levels may lose an error or gain one, so whether some unit
+    // is broken is asked again of them all.
+    read_declared_levels(&units, origins, library_units)
+    broken = false
+    for u in units
+        if u.report.has_errors() then broken = true
     for k in 0..<units.len()
         var report = units[k].report
         var said: Buf[string] = buf()
@@ -507,6 +522,34 @@ private fenced(fence: Fence, path: string, program_modules: Map[string, bool]) -
     if path == fence.prefix then return true
     if !fence.exact then return path.starts_with(fence.prefix + ".")
     enclosing_module(path) == fence.prefix && program_modules.get(path) is None
+
+/** Where a unit came from: its source as read, before a literate file's prose is blanked, and the
+ * module it is placed in, which a file of the program's root directory names in its own header. */
+struct UnitOrigin
+    src: Source
+    module_name: Option[string]
+    in_library: bool
+
+/** Reads the precedence and grouping the methods of `units` declare (`declared_levels`), and parses
+ * again, at those levels, each unit that writes the name of a method whose declared reading differs
+ * from the one its name gives. The errors in the declarations go into the units' reports. */
+read_declared_levels(units: *Buf[SourceUnit], origins: Buf[UnitOrigin], library: usize)
+    val found = declared_levels(*units, library)
+    if found.levels.len() > 0
+        for k in 0..<units.len()
+            if !mentions_declared(origins[k].src, found.levels) then continue
+            var parsed = parse_declared(origins[k].src, found.levels)
+            if origins[k].module_name is Some(m) then place_file(&parsed, m, origins[k].in_library)
+            units[k] = SourceUnit(parsed.source, parsed.file, parsed.report)
+    for d in found.problems
+        units[d.unit].report.add(d.diagnostic)
+
+// Whether the text of `src` holds the name of one of the methods `levels` declares.
+private mentions_declared(src: Source, levels: Buf[DeclaredLevel]) -> bool
+    val text = from_utf8_unchecked(src.bytes)
+    for d in levels
+        if text.contains(d.name) then return true
+    false
 
 // Refuses the import `i` with `message`, once for the declaration it is part of: the names of
 // `import a.b.{c, d}` are one import each and share the path written, `said` holding each declaration

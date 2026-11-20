@@ -1,0 +1,117 @@
+// Summarizes a web server's request log kept as CSV: how many requests, how they ended, which
+// routes were busiest and slowest, and which hours had errors. The log's first line names its
+// columns, in any order; a field may be quoted, holding commas and doubled quotes. A row that is
+// not a request is counted and reported on standard error, and the summary goes on without it.
+//
+//     avin build logsum && ./logsum --top 3 < ../logsum.in
+//
+// expect: exit 0
+// args: --top 3
+import avin.cli
+import avin.io
+
+val parser = cli.Parser("logsum", "Summarize a request log kept as CSV.")
+  .int("top", short = 'n', help = "how many routes to list", default = 5, value = "N")
+  .choice("by", ["path", "method", "status"], default = "path", help = "what to group the requests by")
+
+data Request(hour: string, method: string, path: string, status: int, bytes: long, millis: int)
+
+// The fields of one CSV line. A quoted field runs to its closing quote, a doubled quote inside it
+// standing for one.
+fields(line: string) -> Vector[string]
+  var out = Vector.empty[string]()
+  val field = StringWriter()
+  var quoted = false
+  var i = 0
+  val cs = line.chars
+  while i < cs.length
+    val c = cs(i)
+    if quoted
+      if c == '"' && i + 1 < cs.length && cs(i + 1) == '"'
+        field.writeChar('"')
+        i += 1
+      elif c == '"' then quoted = false
+      else field.writeChar(c)
+    elif c == '"' then quoted = true
+    elif c == ','
+      out = out :+ field.text
+      field.clear()
+    else field.writeChar(c)
+    i += 1
+  out :+ field.text
+
+// A request read from a row, given where each column is, or why the row is not one.
+request(row: Vector[string], at: Map[string, int]) -> Result[Request, string]
+  if row.length != at.size then return Err(s"expected ${at.size} fields, found ${row.length}")
+  val time = row(at("time"))
+  val status = row(at("status")).toIntOption()
+  val bytes = row(at("bytes")).toLongOption()
+  val millis = row(at("ms")).toIntOption()
+  (status, bytes, millis) match
+    (Some(s), Some(b), Some(m)) if time.charCount >= 13 ->
+      Ok(Request(time.take(13), row(at("method")), row(at("path")), s, b, m))
+    _ -> Err("a number or the time is malformed")
+
+// How a status ended, by its hundreds.
+outcome(status: int) -> string
+outcome(200 <= s < 300) = "success"
+outcome(300 <= s < 400) = "redirect"
+outcome(400 <= s < 500) = "client error"
+outcome(500 <= s < 600) = "server error"
+outcome(_) = "unknown"
+
+// `bytes` as people read them: 1023 B, 1.5 KiB, 2.0 MiB.
+human(bytes: long) -> string
+human(b < 1024) = s"$b B"
+human(b < 1048576) = f"${b.toReal / 1024.0}%.1f KiB"
+human(b) = f"${b.toReal / 1048576.0}%.1f MiB"
+
+// The value below which `p` percent of the sorted `values` lie, by the nearest rank.
+percentile(sorted: Vector[int], p: int) -> int =
+  sorted(max(0, (sorted.length * p + 99) / 100 - 1))
+
+main(args: Vector[string]) -> int
+  val opts = parser.parseOrExit(args)
+  val lines = io.lines().toVector.filter(l -> !l.isBlank)
+  if lines.isEmpty
+    eprintln("logsum: the log is empty")
+    return 1
+  val at = fields(lines.head).map(_.trim).zipWithIndex.toMap
+  for column in ["time", "method", "path", "status", "bytes", "ms"]
+    if !at.contains(column)
+      eprintln(s"logsum: the log has no column `$column`")
+      return 1
+  val (bad, requests) = lines.tail.zipWithIndex.partitionMap((line, i) ->
+    request(fields(line), at) match
+      Ok(r) -> Right(r)
+      Err(why) -> Left(s"line ${i + 2}: $why"))
+  for why in bad do eprintln(s"logsum: skipped $why")
+
+  val total = requests.length
+  println(s"$total requests, ${human(requests.map(_.bytes).sum)} sent, ${bad.length} rows skipped")
+  println()
+  println("outcome")
+  for (name, rs) in requests.groupBy(r -> outcome(r.status)).toVector.sortBy(_.0)
+    println(f"  $name%-13s ${rs.length}%5d  ${real(rs.length * 100) / real(total)}%5.1f%")
+
+  val key: (Request) -> string = opts.string("by") match
+    "method" -> r -> r.method
+    "status" -> r -> r.status.toString()
+    _ -> r -> r.path
+  println()
+  println(f"${opts.string("by")}%-20s count    avg    p95    max")
+  val groups = requests.groupBy(key).toVector
+    .sortBy((k, rs) -> (-rs.length, k))
+    .take(opts.int("top"))
+  for (k, rs) in groups
+    val times = rs.map(_.millis).sorted
+    val avg = times.sum / times.length
+    println(f"$k%-20s ${rs.length}%5d ${avg}%6d ${percentile(times, 95)}%6d ${times.last}%6d")
+
+  val failing = requests.filter(_.status >= 500).groupBy(_.hour)
+  if failing.nonEmpty
+    println()
+    println("server errors by hour")
+    for (hour, rs) in failing.toVector.sortBy(_.0)
+      println(s"  $hour:00  ${"*".repeat(rs.length)} ${rs.length}")
+  0

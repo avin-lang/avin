@@ -310,8 +310,12 @@ those.
 **The build log.** A build reports what it did when `AVIN_BUILD_LOG` names a file, or `-` for the
 error channel. The file is emptied when the build starts, so it holds that build alone; a file that
 cannot be written is an error before any work is done. Unset or empty, nothing is written and no
-clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its counts as
-`key=<n>` words, in this order:
+clock is read. Each phase writes one line, `phase=<name> ms=<n> rss=<n> inuse=<n> maxrss=<n>`
+followed by its counts as `key=<n>` words, in this order. The three memory fields are bytes of the
+compiler process as the phase ends: `rss` is its resident size, `inuse` what the allocator holds
+for live blocks (zero where the platform does not say; macOS does), and `maxrss` the most resident
+bytes it has held. The allocator keeps freed small blocks for the life of the process, so `rss`
+stays high after `inuse` falls.
 
 | Phase | Counts |
 |---|---|
@@ -324,11 +328,23 @@ clock is read. Each phase writes one line, `phase=<name> ms=<n>` followed by its
 | `shims` | `bindings`, `handles`: the Sysl shims built |
 | `emit` | `bytes`, `reused`: the size of the LLVM text, and the functions whose text came from the cache |
 | `store` | with the instance cache only: `written`, `kept`, `trimmed`: module files written, those left as they were, and those trimmed |
+| `handoff` | `bytes`: the LLVM text written for the compiler that links |
+| `restore` | `bytes`: the LLVM text that compiler read back |
 | `split` | `units`: the codegen units the module was cut into |
 | `units` | `units`, `compiled`, `reused`: units clang compiled, and units taken from its cache |
 | `link` | none |
 
 A run that finds its executable already built writes the one line `phase=cached ms=0 built=0`.
+
+**The link runs in a compiler that never compiled.** Compiling leaves gigabytes of freed small
+allocations that the allocator keeps for the life of the process, so the executable `avin build`,
+`avin run` and `avin test` compile with does not link: it writes the compilation to a temporary
+directory and replaces itself (`exec`) with `avin --linking-handed <dir>` and the same command,
+which takes the compilation in place of compiling and splits, compiles the units and links. The
+process, its streams and its exit status are the same throughout, and the log goes on in the same
+file with `handoff` and `restore` between the compile's phases and the link's. Building marshal at
+`-O2` with a cold cache, the processes together peaked at 8.2 GB before and 5.5 GB after. A
+compiler run in memory, as its tests run it, links in place.
 The keys and phase names are stable; later phases add lines and keys, never rename them.
 
 **Testing it.** A build reports what it did through that log: each phase's time,
@@ -608,6 +624,15 @@ grows with what is live, is spread over that much allocation. `AVIN_GC_PERCENT` 
 proportion: 200 lets the heap allocate twice what survived between collections, halving what
 marking costs per byte allocated for a heap that much larger; 0 collects at every 8 MiB whatever is
 live. It is a whole number in decimal digits, at most 100000; any other value is ignored.
+
+A collection gives free pages back to the operating system, so a program that drops a burst of
+data falls back from its peak resident size rather than keeping it: the whole pages of every free
+run of 64 KiB or more are released, and a free run at the top of the heap shrinks it. It does so
+only when the heap reaches more than twice the allocation allowed between collections past what
+the last one left live, and at most once a second, so a program allocating steadily does not hand
+pages back that it takes again at once. A released page reads as zero when it is next used. On
+macOS the range is mapped afresh, on Linux `MADV_DONTNEED` drops it. `AVIN_GC_RELEASE=0` turns
+the release off and keeps every page the heap has touched.
 
 The collector owns each object's header, which sits just before the object: the word 16 bytes
 before an object's address holds its **kind**, the collector's record of how to trace it, and the
@@ -1423,8 +1448,8 @@ An intrinsic that is not a string operation is lowered to a function whose body 
 checker's `intrinsic_entry` table with its parameters and result. The formatting library
 (`format.avin`) reaches the runtime this way: `write_out` and `write_int` write to standard output,
 an integer's digits rendered on the stack; `render_int`, `render_real` and `render_char` make a
-value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` and
-`text_width` count a string's bytes and characters; `text_append` and `text_take` keep a
+value's text; `quote_text` and `quote_char` its quoted, escaped literal; `text_size` counts a
+string's bytes; `text_append` and `text_take` keep a
 `StringWriter`'s text in a string object of its own whose length is its capacity, filled in place
 and doubled when full, and copy the written part out.
 
@@ -1523,10 +1548,17 @@ copy and stays covariant. `clearElements` (`array_clear`, `avin_rt_array_clear`)
 a buffer's vacated capacity keeps nothing alive.
 
 **Sequence literals** (`sequence_literal` in `check.sysl`) are checked against the expected type. A
-`List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected class
-whose companion object has a `newBuilder` method, or else the core library's `Vector`, looked up by
-qualified name so a program's own `Vector` never takes its place. The literal becomes a block: a
-hidden local holding `Companion.newBuilder()`, one `addOne` call per element, and `result()`. The
+`List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected type where
+an impl of the core trait `Buildable` targets it or a bound of it is that trait (`builds_literals`,
+through `conformance_impl`, and `instance_conformance_to` for an impl for an instance or a trait
+type's own conformance, holding at the expected type's arguments; an inherited conformance does not
+count), or else the core library's
+`Vector`, looked up by qualified name so a program's own `Vector` never takes its place, with a fresh
+variable for each type argument (`core_collection_type`). An expected `Iterable`, a type whose
+companion has a `newBuilder`, or a type `Buildable` at other type arguments only, that is neither is
+reported naming the trait
+(`unbuildable_collection`). The literal becomes a block: a hidden local holding the static call
+`T.newBuilder()` (`static_call` on a `TypeReceiver`), one `addOne` call per element, and `result()`. The
 result type is unified with the expected type, or with the instance of the expected trait the
 collection is (`ancestor_type`), which settles the element type, and the elements are then checked as `addOne`'s
 arguments. With no element type expected, each element is checked alone and their types are joined

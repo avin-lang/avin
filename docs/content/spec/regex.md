@@ -203,7 +203,7 @@ is repeated or tried more than once:
 | `replaceFirstIn(s, replacement)` | `s` with its first match replaced |
 | `replaceSomeIn(s, f)` | `s` with each match `m` replaced where `f(m)`, an `Option[string]`, is `Some`, and kept where it is `None` |
 | `split(s)` | `pattern.split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
-| `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; it makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
+| `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; `Regex` implements it from `SeqExtractor`, which makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
 | `unanchored`, `anchored` | The same regex with `matches` and the extractor asking about any part, or the whole |
 | `withStepLimit(n)` | The same regex, each attempt at a start allowed `n` steps in place of the [default budget](#matching); `n` must be above 0 |
 | `tryMatches(s)`, `tryFindFirstIn(s)`, `tryFindFirstMatchIn(s)`, `tryFindPrefixOf(s)`, `tryFindPrefixMatchOf(s)` | The [checked](#matching) searches: `Result[T, MatchError]`, `T` what the plain search answers |
@@ -213,12 +213,29 @@ is repeated or tried more than once:
 | `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
 | `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |
 
-**Extractors.** A regex is an [extractor](/spec/operators-and-control-flow/#extractor-patterns)
-whose patterns match its groups' texts in order: `case date(y, m, d)` matches a text the whole of
+**A `Regex` is [sendable](/spec/threads/).** Compiling makes everything the regex holds, and nothing
+changes it after: each search keeps its own state. So one regex, a module's `val` among them, is
+captured by a `spawn` body or sent on a channel as it is, and any number of threads match with it at
+once. A `Pattern` is sendable too.
+
+```avin
+import avin.regex.Regex
+import avin.threads.spawn
+
+val word = Regex("[a-z]+")
+
+main()
+  val t = spawn(() -> word.findFirstIn("42 apples"))
+  println(t.join())
+```
+
+**Extractors.** A regex is an [extractor](/spec/operators-and-control-flow/#extractor-patterns), a
+`SeqExtractor[string, List[string]]`, whose patterns match its groups' texts in order: `date(y, m,
+d)` matches a text the whole of
 which the regex matches (any part of it, for a regex made by `unanchored`), and needs one pattern
 for each group, or `rest*` for those left. A group that took no part gives the empty string. A
-regex with no groups is a test, written `word()`. `Groups`, imported from `avin.regex`, takes apart
-a `Match` found by any regex the same way, and does not match a match of a pattern with no groups.
+regex with no groups is a test, written `word()`. `Groups`, imported from `avin.regex`, a
+`SeqExtractor[Match, List[string]]`, takes apart a `Match` found by any regex the same way, and does not match a match of a pattern with no groups.
 
 ```text
 val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
@@ -299,6 +316,10 @@ A `Match` holds its `source` text and where the match and each group start and e
 
 A group number outside `0..groupCount` traps, and so does a name no group has: by the names given
 to the `Regex` where there are any (`""` is group 0), otherwise by the pattern's own.
+
+A `Match` is sendable: nothing in it changes once it is found, so a thread may answer one
+(`spawn(() -> r.findFirstMatchIn(s))`) or send it on a channel. A `MatchIterator` is not: it is
+the state of a search in progress.
 
 A `MatchIterator` is an `Iterator[string]` of the matched texts. After `next()`, until the following
 `hasNext()`, its `start()`, `end()`, `start(i)`, `end(i)`, `group(i)`, `groupCount` and `matched`

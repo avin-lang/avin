@@ -1,0 +1,155 @@
+// A small ray tracer: three spheres on a checkered floor, lit by two lights, with shadows, shiny
+// highlights and mirror reflections. One ray goes from the eye through each pixel; where it meets
+// the nearest surface, the colour there is the light that reaches the point unblocked, plus what the
+// surface reflects, traced again up to a few bounces deep. Bands of rows are rendered on threads of
+// their own, in parallel. The picture is written to standard
+// output as a plain-text PPM image, one row of pixels to a line, which most image viewers open.
+//
+//     avin build main.avin && ./main 320 200 > scene.ppm
+//
+// args: 32 20
+// expect: exit 0
+import avin.math
+import avin.threads.spawn
+
+// A point or a direction in space, and also a colour, its three parts red, green and blue.
+data Vec(x: real, y: real, z: real)
+
+impl Vec
+  +(o: Vec) -> Vec = Vec(x + o.x, y + o.y, z + o.z)
+  -(o: Vec) -> Vec = Vec(x - o.x, y - o.y, z - o.z)
+  -() -> Vec = Vec(-x, -y, -z)
+  *(k: real) -> Vec = Vec(x * k, y * k, z * k)
+  // Two colours mixed: each part multiplied by the other's.
+  *(o: Vec) -> Vec = Vec(x * o.x, y * o.y, z * o.z)
+  dot(o: Vec) -> real = x * o.x + y * o.y + z * o.z
+  cross(o: Vec) -> Vec = Vec(y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x)
+  length -> real = math.sqrt(dot(self))
+  unit -> Vec = self * (1.0 / length)
+  // This direction bounced off a surface facing `normal`.
+  reflect(normal: Vec) -> Vec = self - normal * (2.0 * dot(normal))
+
+val Black = Vec(0.0, 0.0, 0.0)
+val White = Vec(1.0, 1.0, 1.0)
+
+data Ray(origin: Vec, dir: Vec)
+
+impl Ray
+  at(t: real) -> Vec = origin + dir * t
+
+// What a surface looks like: its colour at a point, how much it reflects, and how sharp its
+// highlight is. The colour is a `@sendable` function, so a scene can be shared by the threads that
+// render it.
+data Material(colour: @sendable (Vec) -> Vec, reflect: real, shine: real)
+
+data Shape
+  Sphere(centre: Vec, radius: real, material: Material)
+  Plane(point: Vec, normal: Vec, material: Material)
+
+// Where a ray meets a surface: how far along, the point, the surface's normal there, and its look.
+data Hit(t: real, point: Vec, normal: Vec, material: Material)
+
+// Distances closer than this are the surface a ray just left, met again through rounding.
+val Epsilon = 1e-6
+
+impl Shape
+  // The nearest place along `ray`, beyond Epsilon, where it meets this shape.
+  intersect(ray: Ray) -> Option[Hit] = self match
+    Sphere(centre, radius, material) ->
+      val oc = ray.origin - centre
+      val b = oc.dot(ray.dir)
+      val disc = b * b - oc.dot(oc) + radius * radius
+      if disc < 0.0 then return None
+      val root = math.sqrt(disc)
+      [-b - root, -b + root].find(_ > Epsilon).map(t ->
+        val p = ray.at(t)
+        Hit(t, p, (p - centre).unit, material))
+    Plane(point, normal, material) ->
+      val facing = normal.dot(ray.dir)
+      if math.abs(facing) < Epsilon then return None
+      val t = (point - ray.origin).dot(normal) / facing
+      if t > Epsilon then Some(Hit(t, ray.at(t), normal, material)) else None
+
+data Light(position: Vec, colour: Vec)
+
+class Scene(val shapes: Vector[Shape], val lights: Vector[Light], val ambient: Vec, val sky: Vec)
+  nearest(ray: Ray) -> Option[Hit] = shapes.flatMap(_.intersect(ray)).minByOption(_.t)
+
+  // Whether anything stands between `point` and `light`.
+  shadowed(point: Vec, light: Light) -> bool
+    val toLight = light.position - point
+    val distance = toLight.length
+    nearest(Ray(point, toLight.unit)) match
+      Some(hit) -> hit.t < distance
+      None -> false
+
+  trace(ray: Ray, depth: int) -> Vec = nearest(ray) match
+    None -> sky
+    Some(hit) ->
+      val base = hit.material.colour(hit.point)
+      var colour = base * ambient
+      for light in lights
+        if shadowed(hit.point, light) then continue
+        val toLight = (light.position - hit.point).unit
+        val diffuse = math.max(0.0, hit.normal.dot(toLight))
+        val highlight = math.max(0.0, toLight.reflect(hit.normal).dot(ray.dir))
+        colour = colour + base * light.colour * diffuse + light.colour * math.pow(highlight, hit.material.shine)
+      if depth > 0 && hit.material.reflect > 0.0
+        val bounced = trace(Ray(hit.point, ray.dir.reflect(hit.normal)), depth - 1)
+        colour = colour * (1.0 - hit.material.reflect) + bounced * hit.material.reflect
+      colour
+
+plain(colour: Vec) -> @sendable (Vec) -> Vec = _ -> colour
+
+checks(p: Vec) -> Vec =
+  if (math.floor(p.x) + math.floor(p.z)).toLong % 2 == 0 then Vec(0.9, 0.9, 0.9) else Vec(0.2, 0.2, 0.25)
+
+scene() -> Scene = Scene(
+  [
+    Sphere(Vec(0.0, 1.0, 0.0), 1.0, Material(plain(Vec(0.9, 0.2, 0.2)), 0.3, 50.0)),
+    Sphere(Vec(-2.2, 0.7, 0.8), 0.7, Material(plain(Vec(0.2, 0.8, 0.3)), 0.1, 10.0)),
+    Sphere(Vec(1.9, 0.6, 1.1), 0.6, Material(plain(White), 0.8, 200.0)),
+    Plane(Vec(0.0, 0.0, 0.0), Vec(0.0, 1.0, 0.0), Material(checks, 0.2, 20.0)),
+  ],
+  [Light(Vec(-5.0, 8.0, 6.0), Vec(0.8, 0.8, 0.8)), Light(Vec(6.0, 4.0, 4.0), Vec(0.3, 0.3, 0.4))],
+  Vec(0.1, 0.1, 0.1),
+  Vec(0.5, 0.7, 1.0)
+)
+
+// A camera at `eye` looking at `target`, its picture `width` pixels across and `height` down.
+class Camera(eye: Vec, target: Vec, val width: int, val height: int)
+  private val forward = (target - eye).unit
+  private val right = forward.cross(Vec(0.0, 1.0, 0.0)).unit
+  private val up = right.cross(forward)
+  private val aspect = real(width) / real(height)
+
+  // The ray through the centre of pixel `(col, row)`, rows counted from the top.
+  ray(col: int, row: int) -> Ray
+    val u = (2.0 * (real(col) + 0.5) / real(width) - 1.0) * aspect * 0.6
+    val v = (1.0 - 2.0 * (real(row) + 0.5) / real(height)) * 0.6
+    Ray(eye, (forward + right * u + up * v).unit)
+
+// A colour part as a byte's value, 0 to 255, clamped.
+level(part: real) -> int = int(math.min(1.0, math.max(0.0, part)) * 255.0 + 0.5)
+
+// One row of the picture as a line of the image file.
+renderRow(world: Scene, camera: Camera, row: int) -> string
+  val pixels = for col in 0 ..< camera.width yield
+    val c = world.trace(camera.ray(col, row), 3)
+    s"${level(c.x)} ${level(c.y)} ${level(c.z)}"
+  pixels.mkString(" ")
+
+main(args: Vector[string])
+  val width = args.lift(0).flatMap(_.toIntOption()).getOrElse(320)
+  val height = args.lift(1).flatMap(_.toIntOption()).getOrElse(200)
+  val camera = Camera(Vec(0.0, 2.5, 7.0), Vec(0.0, 0.8, 0.0), width, height)
+  val world = scene()
+  // The rows are cut into eight bands, each rendered on a thread of its own; the scene and the
+  // camera are immutable, so every thread reads them at once. The bands are joined in order.
+  val bands = (0 ..< height).grouped(max(1, (height + 7) / 8)).map(rows ->
+    spawn(() -> rows.map(r -> renderRow(world, camera, r)))).toVector
+  println("P3")
+  println(s"$width $height")
+  println("255")
+  for band in bands
+    for line in band.join() do println(line)

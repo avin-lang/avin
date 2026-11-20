@@ -1,0 +1,84 @@
+// expect: exit 0
+// Standard error piped apart from standard output, and merged into it. Apart, each pipe carries only
+// its own stream, and a child that writes megabytes to both is read to the end of both from two
+// threads; merged with `errorsToOutput()`, both streams arrive on `stdout()`, in the order the child
+// wrote them. Standard error alone may be piped while the output goes to a file, and the input alone
+// while both outputs stay the program's own. A pipeline's pipes are its first stage's input and its
+// last stage's output, its standard error every stage's; a sequence's output pipe carries each part's
+// output in turn.
+import avin.fs
+import avin.io.IoError
+import avin.process.Command
+import avin.threads.spawn
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+text(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+sh(script: string) -> Command = Command("/bin/sh", "-c", script)
+
+main() -> int
+  // A child whose input alone is piped writes to the program's own output, before the program has
+  // printed anything.
+  val own = Command("cat").pipeInput().start().ok.get
+  ok(own.stdin().writeText("to the program's own output\n"))
+  ok(own.stdin().close())
+  _ = own.waitFor()
+
+  // Apart.
+  val apart = sh("echo out1; echo err1 >&2; echo out2; echo err2 >&2").pipeOutput().pipeErrors().start().ok.get
+  println(s"output: ${text(ok(apart.stdout().readAll())).split("\n").filter(l -> l.nonEmpty)}")
+  println(s"errors: ${text(ok(apart.stderr().readAll())).split("\n").filter(l -> l.nonEmpty)}")
+  println(s"status: ${apart.waitFor().ok.get}")
+
+  // Megabytes to both at once, each read to its end by a thread of its own: neither full pipe holds
+  // up the other.
+  val noisy = sh("head -c 3000000 /dev/zero; head -c 2000000 /dev/zero >&2; head -c 1000000 /dev/zero")
+  val loud = noisy.pipeOutput().pipeErrors().start().ok.get
+  val out = loud.stdout()
+  val err = loud.stderr()
+  val outLength = spawn(() -> ok(out.readAll()).length)
+  val errLength = spawn(() -> ok(err.readAll()).length)
+  println(s"lengths: ${outLength.join()} ${errLength.join()}, ${loud.waitFor().ok.get}")
+
+  // Merged, in the order written.
+  val merged = sh("echo a; echo b >&2; echo c; echo d >&2").pipeOutput().errorsToOutput().start().ok.get
+  println(s"merged: ${text(ok(merged.stdout().readAll())).split("\n").filter(l -> l.nonEmpty)}")
+  println(s"status: ${merged.waitFor().ok.get}")
+
+  // Standard error piped, the output to a file.
+  val dir = ok(fs.createTempDir("avin-pipes"))
+  val file = dir + "/out"
+  val split = sh("echo to-file; echo to-pipe >&2").toFile(file).pipeErrors().start().ok.get
+  println(s"pipe: ${text(ok(split.stderr().readAll())).trim}, file: ${ok(fs.readText(file)).trim}")
+  _ = split.waitFor()
+
+  // A pipeline: input into the first stage, output from the last, errors from both.
+  val pipeline = (
+    sh("tr a-z A-Z; echo first >&2") | sh("sed s/^/:/; echo second >&2")
+  ).pipeInput().pipeOutput().pipeErrors()
+  val p = pipeline.start().ok.get
+  ok(p.stdin().writeText("abc\n"))
+  ok(p.stdin().close())
+  println(s"pipeline: ${text(ok(p.stdout().readAll())).trim}")
+  println(s"its errors: ${text(ok(p.stderr().readAll())).split("\n").filter(l -> l.nonEmpty).sorted}")
+  println(s"status: ${p.waitFor().ok.get}")
+
+  // A sequence: each part writes into the one pipe in turn.
+  val sequence = (Command("echo", "one") andThen Command("echo", "two") andThen Command("echo", "three")).pipeOutput()
+  val q = sequence.start().ok.get
+  val reader = q.stdout()
+  val lines = spawn(() ->
+    val all = Buffer[string]()
+    loop
+      reader.readLine().ok.get match
+        Some(l) -> all.addOne(l)
+        None -> break
+    all.toVector)
+  println(s"sequence: ${q.waitFor().ok.get}")
+  println(s"its lines: ${lines.join()}")
+
+  _ = fs.removeDirAll(dir)
+  0
