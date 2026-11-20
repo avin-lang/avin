@@ -4690,6 +4690,38 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   answering `int` as Sysl does (the `Child` answers every id as a `long`); refusing to detach a
   pipeline or a sequence. **Review with the user**: whether a detached command should be reaped
   by the runtime so it leaves no zombie.
+- Settled on the user's delegation 2026-11-19 (branch `process-pipes`): **a started command's
+  standard streams as pipes** ([pipes to a started command](/spec/system-library/#pipes-to-a-started-command)).
+  `pipeInput()`, `pipeOutput()` and `pipeErrors()` on `Command` ask for them, each replacing an
+  earlier redirection of its stream as the other redirections do, and `pipeOutput().errorsToOutput()`
+  merges standard error into the output's pipe; `Child.stdin()`, `stdout()` and `stderr()` answer
+  them, the same end every time, and trap for a stream not piped. The ends are new public classes,
+  `ChildInput: avin.net.StreamWriter` and `ChildOutput: avin.net.StreamReader`, with
+  `ChildOutput.readAvailable(max)` as standard input has it. Why: the halves of a split connection
+  are exactly the shape (a `Reader`/`ByteWriter` that is also a `Readiness`/`Writability`, with
+  `readLine`, `readAll`, `writeSome`, `setTimeout` and `close`), so a protocol written against a
+  connection's halves (a language server's client) runs over a child unchanged, and `select` and
+  `Selector` take them with no new arm. Each end is non-blocking and waits as a socket does
+  (`runtime/avin/rt/pipes.sysl`), parking a lightweight thread on the poller; a write to a reader
+  that has gone answers `ConnectionReset` (on macOS the end is marked `F_SETNOSIGPIPE`, since that
+  system raises the write's SIGPIPE on the whole process; elsewhere SIGPIPE is blocked on the writing
+  thread for the write and taken back). The ends are made by `sysl.process.pipe`, closed on exec.
+  Choices: **only `start()` hands pipes over**: `run()`, `output()`, `lines()` and a part of a
+  pipeline or sequence asking for one trap, since nothing could ever hold the pipe; **the pipes do not
+  belong to the `Child`** (`Pipes` is `@keeps_owners`), so handing the `Child` to a thread that waits
+  for it leaves the pipes with the code using them; **`waitFor` and `Child.close()` leave the pipes
+  alone** (each end closes with its own `close()`, or when collected), because an end may belong to
+  another thread at the time; **the command's time limit bounds every wait on its pipes**, a wait
+  past it answering `TimedOut`, so `withTimeout` cannot be outwaited by a read nobody times; the pipes
+  do not keep the command running. Alternatives weighed: the ends as `io.Reader`/`io.ByteWriter`
+  classes of `avin.process` alone (no `avin.net` dependency, but every connection protocol would need
+  an adapter); socket pairs in place of pipes (all of the socket code reused, but a child sees a socket
+  where it expects a pipe); `Option`-answering or take-once accessors (`takeStdout()`), which make a
+  loop of `child.stdin().write(…)` wrong; ends owned by the `Child` and handed over with it, which
+  traps a program reading a child's output while a thread waits for it; `waitFor` closing the input
+  first, which reaches across threads; `run()` with a pipe meaning an empty input. **Review with the
+  user**: whether `Child.close()` should also close the pipes the closing code holds, and whether the
+  ends should keep the command alive.
 - Settled on the user's delegation 2026-11-06 (branch `sysl-098`): **`totalMemory` and `residentBytes`** ([the environment and the
   platform](/spec/system-library/#the-environment-and-the-platform)). `process.totalMemory() ->
   Result[long, IoError]` and `process.residentBytes(pid: long) -> Result[long, IoError]` over Sysl's
