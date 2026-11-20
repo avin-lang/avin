@@ -1,0 +1,413 @@
+module dev.avinlang.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.fs.{current_dir, exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, remove_file, set_permissions, write_text}
+import sysl.process.{Exited, Output, Stdio, Var, capture}
+import sysl.text.join
+
+// The link handed to a compiler that never compiled (`link_handoff.sysl`): the command line split,
+// the compilation written and read back, and the real executable, which hands off, against the
+// compiler run in memory, which does not.
+
+// A test entry with every field set.
+private entry(name: string, trap: Option[string], ignore: Option[string], timeout: Option[int]) -> TestEntry =
+    TestEntry(name, "dir/a.avin", 12, "demo.inner", trap, ignore, timeout, "setUp", "", "", "afterAll")
+
+// A compilation of `llvm`, with `archive`, `c_link` and `tests`.
+private compilation(llvm: string, archive: Option[string], c_link: []const string, tests: Buf[TestEntry]) -> Compilation
+    var flags: Buf[string] = buf()
+    for f in c_link
+        flags.push(f)
+    Compilation("", Some(llvm), archive, tests, flags)
+
+// Asserts that `got` is `want` in every field.
+private assert_same(got: Compilation, want: Compilation)
+    assert_eq(got.diagnostics, want.diagnostics)
+    assert_eq(got.llvm.unwrap_or("<none>"), want.llvm.unwrap_or("<none>"))
+    assert_eq(got.archive.unwrap_or("<none>"), want.archive.unwrap_or("<none>"))
+    assert_eq(got.c_link.len(), want.c_link.len())
+    for i in 0..<want.c_link.len()
+        assert_eq(got.c_link[i], want.c_link[i])
+    assert_eq(got.tests.len(), want.tests.len())
+    for i in 0..<want.tests.len()
+        val g = got.tests[i]
+        val w = want.tests[i]
+        assert_eq(g.name, w.name)
+        assert_eq(g.file, w.file)
+        assert_eq(g.line, w.line)
+        assert_eq(g.module_name, w.module_name)
+        assert_eq(g.should_trap.unwrap_or("<none>"), w.should_trap.unwrap_or("<none>"))
+        assert_eq(g.ignore.unwrap_or("<none>"), w.ignore.unwrap_or("<none>"))
+        assert_eq(g.timeout.unwrap_or(-1), w.timeout.unwrap_or(-1))
+        assert_eq(g.setup, w.setup)
+        assert_eq(g.teardown, w.teardown)
+        assert_eq(g.setup_all, w.setup_all)
+        assert_eq(g.teardown_all, w.teardown_all)
+
+// Writes `c` to a fresh directory and reads it back.
+private round_trip(c: Compilation) -> Compilation
+    val dir = make_temp_dir("avin-handoff-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    assert(write_handoff(dir, c))
+    read_handoff(dir).unwrap()
+
+@test("a compiler run plainly carries out its command as given, and one run with the hand-off's flag carries out the command after the directory")
+command_line_split()
+    val (plain, none) = handoff_split(["avin", "build", "x.avin", "-O2"])
+    assert(none is None)
+    assert_eq(plain.len(), 4)
+    assert_eq(plain[0], "avin")
+    assert_eq(plain[3], "-O2")
+    val (handed, dir) = handoff_split(["/bin/avin", LinkHandoffFlag, "/tmp/h", "run", "x.avin", "--", "a b", ""])
+    assert_eq(dir.unwrap(), "/tmp/h")
+    assert_eq(handed.len(), 6)
+    assert_eq(handed[0], "/bin/avin")
+    assert_eq(handed[1], "run")
+    assert_eq(handed[4], "a b")
+    assert_eq(handed[5], "")
+    // `avin` alone, as the hand-off of a bare `avin` makes it.
+    val (bare, bare_dir) = handoff_split(["avin", LinkHandoffFlag, "/tmp/h"])
+    assert_eq(bare_dir.unwrap(), "/tmp/h")
+    assert_eq(bare.len(), 1)
+    // The flag without its directory, or anywhere but first, is an ordinary argument.
+    val (short, short_dir) = handoff_split(["avin", LinkHandoffFlag])
+    assert(short_dir is None)
+    assert_eq(short.len(), 2)
+    val (later, later_dir) = handoff_split(["avin", "run", LinkHandoffFlag, "/tmp/h"])
+    assert(later_dir is None)
+    assert_eq(later.len(), 4)
+    val (alone, alone_dir) = handoff_split(["avin"])
+    assert(alone_dir is None)
+    assert_eq(alone.len(), 1)
+
+@test("a handed compilation reads back exactly as it was written: its text, archive, C flags and tests")
+handoff_round_trips()
+    var tests: Buf[TestEntry] = buf()
+    tests.push(entry("plain", None, None, None))
+    tests.push(entry("traps\twith a tab\nand a line", Some("index out of range"), None, Some(3)))
+    tests.push(entry("skipped é ü 漢", None, Some("not yet"), None))
+    tests.push(entry("any trap", Some(""), Some(""), Some(0)))
+    val full = compilation("; ModuleID = 'p'\ndefine i32 @main() {\n  ret i32 0\n}\n; é 漢 😀\n", Some("/cache/shims/libshim.a"), ["/cache/cunit/c.o", "-lz", "-framework", "Cocoa", "-L/opt/x y"], tests)
+    assert_same(round_trip(full), full)
+    // No archive, no flags, no tests, and an empty text.
+    val empty = compilation("", None, [], buf())
+    assert_same(round_trip(empty), empty)
+    // A flag that begins like the archive's line is still a flag.
+    val tricky = compilation("x", None, ["archive /a", "c d"], buf())
+    assert_same(round_trip(tricky), tricky)
+
+@test("a handed compilation with any part missing or not as written reads as none")
+damaged_handoff_reads_as_none()
+    val c = compilation("text", Some("/a.a"), ["-lm"], buf())
+    for part in ["program.ll", "link", "tests"]
+        val dir = make_temp_dir("avin-handoff-test").unwrap()
+        defer _ = remove_dir_all(dir)
+        assert(write_handoff(dir, c))
+        remove_file(dir + "/" + part).unwrap()
+        assert(read_handoff(dir) is None, part)
+    val dir = make_temp_dir("avin-handoff-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    assert(write_handoff(dir, c))
+    write_text(dir + "/link", "avin link 2\n").unwrap()
+    assert(read_handoff(dir) is None)
+    write_text(dir + "/link", "").unwrap()
+    assert(read_handoff(dir) is None)
+    write_text(dir + "/link", "avin link 1\nmystery line\n").unwrap()
+    assert(read_handoff(dir) is None)
+    write_text(dir + "/link", "avin link 1\narchive /a\narchive /b\n").unwrap()
+    assert(read_handoff(dir) is None)
+    write_text(dir + "/link", "avin link 1\n").unwrap()
+    write_text(dir + "/tests", "another key\n").unwrap()
+    assert(read_handoff(dir) is None)
+    write_text(dir + "/tests", "avin link 1\nnot\tenough\tfields\n").unwrap()
+    assert(read_handoff(dir) is None)
+    assert(read_handoff(dir + "/no/such/dir") is None)
+
+@test("a handed compilation is taken once and its directory removed; one that cannot be read is none and removed too")
+handed_compilation_is_taken_once()
+    val dir = make_temp_dir("avin-handoff-test").unwrap()
+    val c = compilation("text", None, [], buf())
+    assert(write_handoff(dir, c))
+    start_link_handoff(["avin", "build"], Some(dir))
+    defer stop_link_handoff()
+    assert(link_handed())
+    assert_same(handed_compilation().unwrap(), c)
+    assert(!exists(dir))
+    assert(!link_handed())
+    assert(handed_compilation() is None)
+    val damaged = make_temp_dir("avin-handoff-test").unwrap()
+    write_text(damaged + "/link", "nothing\n").unwrap()
+    start_link_handoff(["avin", "build"], Some(damaged))
+    assert(handed_compilation() is None)
+    assert(!exists(damaged))
+    // One the command never took is removed when the compiler ends.
+    val untaken = make_temp_dir("avin-handoff-test").unwrap()
+    assert(write_handoff(untaken, c))
+    start_link_handoff(["avin", "build"], Some(untaken))
+    forget_handed()
+    assert(!exists(untaken))
+    assert(!link_handed())
+    forget_handed()
+
+@test("a compiler run in memory, or handed a compilation, never hands its link off")
+no_handoff_in_memory()
+    val c = compilation("text", None, [], buf())
+    // Run in memory: nothing was allowed, and the call comes back.
+    stop_link_handoff()
+    hand_off_link(c)
+    // Handed one: it links itself rather than handing on.
+    val dir = make_temp_dir("avin-handoff-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    start_link_handoff(["avin", "build"], Some(dir))
+    defer stop_link_handoff()
+    hand_off_link(c)
+    // A command with no arguments at all is never handed off.
+    start_link_handoff([], None)
+    hand_off_link(c)
+    stop_link_handoff()
+
+@test("a build log opened to go on keeps what the compiler that compiled wrote, and adds to it")
+continued_log_keeps_its_lines()
+    val dir = make_temp_dir("avin-handoff-test").unwrap()
+    defer _ = remove_dir_all(dir)
+    val file = dir + "/build.log"
+    write_text(file, "phase=emit ms=1 bytes=3\n").unwrap()
+    open_build_log(Some(file), true).unwrap()
+    defer close_build_log()
+    _ = phase_done("link", phase_start())
+    val text = read_text(file).unwrap()
+    assert(text.starts_with("phase=emit ms=1 bytes=3\nphase=link ms="), text)
+    // A file that is not there is made.
+    open_build_log(Some(dir + "/fresh.log"), true).unwrap()
+    _ = phase_done("link", phase_start())
+    assert(read_text(dir + "/fresh.log").unwrap().starts_with("phase=link ms="))
+
+// The real executable, built once for a test, and a directory for its programs and its cache.
+private struct Bench
+    dir: string
+    bin: string
+
+private bench() -> Bench
+    val dir = make_temp_dir("avin-handoff-bin").unwrap()
+    val bin = dir + "/avin"
+    val built = capture(repository_toolchain().sysl, ["build", "compiler", "-o", bin], stderr = true, timeout = 900000).unwrap()
+    assert(built.status.ok(), built.err.unwrap_or(""))
+    make_dir_all(dir + "/cache").unwrap()
+    make_dir_all(dir + "/tmp").unwrap()
+    Bench(dir, bin)
+
+// The variables the executable runs with: the repository's library, a cache and a temporary
+// directory of the bench's own and a build log, then `more`.
+private bench_env(b: Bench, more: []const Var) -> Buf[Var]
+    var env: Buf[Var] = buf()
+    env.push(Var("AVIN_ROOT", current_dir().unwrap()))
+    env.push(Var("AVIN_CACHE", b.dir + "/cache"))
+    env.push(Var("TMPDIR", b.dir + "/tmp"))
+    env.push(Var("AVIN_BUILD_LOG", b.dir + "/build.log"))
+    for v in more
+        env.push(v)
+    env
+
+private avin(b: Bench, args: []const string, more: []const Var = []) -> Output =
+    capture(b.bin, args, env = bench_env(b, more).view(), stderr = true, timeout = 600000).unwrap()
+
+// The phases the build log names, in order.
+private logged_phases(b: Bench) -> Buf[string]
+    var names: Buf[string] = buf()
+    for line in read_text(b.dir + "/build.log").unwrap_or("").split("\n")
+        if line.starts_with("phase=") then names.push(line.split(" ")[0][6..])
+    names
+
+// Where `name` is in `names`, or -1.
+private index_of(names: Buf[string], name: string) -> int
+    for i in 0..<names.len()
+        if names[i] == name then return int(i)
+    -1
+
+// Asserts the build the log describes was compiled by one compiler and linked by another: the
+// compilation's phases, then the hand-off, then the link's, which begin with the split whether or
+// not the link succeeds.
+private assert_handed(b: Bench)
+    val names = logged_phases(b)
+    val emit = index_of(names, "emit")
+    val handoff = index_of(names, "handoff")
+    val restore = index_of(names, "restore")
+    val split = index_of(names, "split")
+    assert(0 <= emit && emit < handoff && handoff < restore && restore < split, read_text(b.dir + "/build.log").unwrap_or(""))
+    // Nothing is compiled twice.
+    var emits = 0
+    for n in names
+        if n == "emit" then emits += 1
+    assert_eq(emits, 1)
+
+// The handed compilations left in the executable's temporary directory: none, once each command is
+// over.
+private handoffs_left(b: Bench) -> int
+    val listed = capture("/bin/ls", [b.dir + "/tmp"]).unwrap()
+    var n = 0
+    for name in listed.text.split("\n")
+        if name.starts_with("avin-handoff") then n += 1
+    n
+
+// What the compiler run in memory says for `args` in `dir`: its status, standard output and error.
+private in_memory(args: []const string, dir: string) -> (int, string, string)
+    var said = ""
+    var noted = ""
+    val out = dir + "/mem.out"
+    val err = dir + "/mem.err"
+    // A command that runs no program leaves the files as the last one wrote them.
+    _ = remove_file(out)
+    _ = remove_file(err)
+    val status = run_cli_in(".", args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n", Stdio.ToPath(out), Stdio.ToPath(err))
+    (status, said + read_text(out).unwrap_or(""), noted + read_text(err).unwrap_or(""))
+
+// A program that reaches the library's Sysl bindings, so its link takes the archive of their shims,
+// and says its arguments and exits with their count and three.
+private const Echo: string = "import avin.process\n\nmain(args: Vector[string]) -> int\n  println(s\"args ${args} ${process.args().length} é\")\n  args.length + 3\n"
+
+@test("the executable's build, run and test link in the compiler handed the build, at -O0 and -O2, and say and exit exactly as the compiler in memory does")
+executable_hands_off_and_behaves_the_same()
+    val b = bench()
+    defer _ = remove_dir_all(b.dir)
+    val source = b.dir + "/echo.avin"
+    write_text(source, Echo).unwrap()
+    val tests =b.dir + "/suite.avin"
+    write_text(tests, "@test(\"passes\")\npasses()\n  assert(1 + 1 == 2)\n\n@test(\"fails\")\nfails()\n  assert(1 + 1 == 3)\n\n@test(\"skipped\", ignore: \"later\")\nskipped()\n  assert(false)\n\nmain() = ()\n").unwrap()
+    val passing = b.dir + "/green.avin"
+    write_text(passing, "@test(\"one\")\none()\n  assert(true)\n\nmain() = ()\n").unwrap()
+    for level in ["-O0", "-O2"]
+        // build
+        val exe = b.dir + "/echo" + level
+        val built = avin(b, ["build", source, level, "-o", exe])
+        assert_eq(built.status, Exited(0), built.text + built.err.unwrap_or(""))
+        assert_eq(built.text, "")
+        assert_handed(b)
+        val ran = capture(exe, ["x", "y"]).unwrap()
+        assert(ran.text.starts_with("args ") && ran.text.ends_with(" é\n"), ran.text)
+        assert_eq(ran.status, Exited(5))
+        // run: the program's arguments, output and exit status pass through.
+        val run = avin(b, ["run", source, level, "--", "a b", "c"])
+        assert_handed(b)
+        val (mem_status, mem_out, mem_err) = in_memory(["avin", "run", source, level, "--", "a b", "c"], b.dir)
+        assert_eq(run.status, Exited(mem_status))
+        assert_eq(run.status, Exited(5))
+        assert_eq(run.text, mem_out)
+        assert_eq(run.err.unwrap_or(""), mem_err)
+        // A second run finds the executable built and compiles nothing, so hands nothing off.
+        val again = avin(b, ["run", source, level, "--", "a b", "c"])
+        assert_eq(again.text, run.text)
+        assert_eq(index_of(logged_phases(b), "handoff"), -1)
+        // `avin file` is `avin run file`, through the hand-off too.
+        write_text(source, "main(args: Vector[string]) -> int\n  println(s\"bare ${args}\")\n  0\n").unwrap()
+        val bare = avin(b, [source, level])
+        assert_eq(bare.text, "bare []\n")
+        assert_eq(bare.status, Exited(0))
+        assert_handed(b)
+        write_text(source, Echo).unwrap()
+        // test: the report and the status, a failure among the tests and none.
+        val tested = avin(b, ["test", tests, level])
+        assert_handed(b)
+        val (t_status, t_out, _) = in_memory(["avin", "test", tests, level], b.dir)
+        assert_eq(tested.status, Exited(t_status))
+        assert_eq(tested.status, Exited(1))
+        assert(tested.text.contains("ok    passes"), tested.text)
+        assert(tested.text.contains("FAIL  fails"), tested.text)
+        assert(tested.text.contains("skip  skipped"), tested.text)
+        assert_eq(without_times(tested.text), without_times(t_out))
+        val green = avin(b, ["test", passing, level])
+        assert_eq(green.status, Exited(0), green.text)
+        assert_handed(b)
+    assert_eq(handoffs_left(b), 0)
+
+// `text` with the random part of every temporary output's name taken out: what follows `.pending-`
+// up to the quote that ends the path.
+private without_pending(text: string) -> string
+    val parts = text.split(".pending-")
+    var out: Buf[string] = buf()
+    out.push(parts[0])
+    for i in 1..<parts.len
+        val quote = parts[i].index_of("'")
+        out.push(quote match
+            Some(at) -> parts[i][at..]
+            None -> "")
+    join(out.view(), ".pending-")
+
+// `text` with every `<n>ms` duration taken out, so two runs of one suite compare equal.
+private without_times(text: string) -> string
+    var out: Buf[string] = buf()
+    for line in text.split("\n")
+        var words: Buf[string] = buf()
+        for w in line.split(" ")
+            val timed = w.ends_with("ms") && w.bytes.len > 2 && w.bytes[0] >= u8('0') && w.bytes[0] <= u8('9')
+            if !timed then words.push(w)
+        out.push(join(words.view(), " "))
+    join(out.view(), "\n")
+
+@test("the executable's failures are what they were: diagnostics, a link that cannot write its output, a clang that fails, and no clang at all")
+executable_failures_are_unchanged()
+    val b = bench()
+    defer _ = remove_dir_all(b.dir)
+    // Diagnostics are the compiler's own, before any hand-off.
+    val wrong = b.dir + "/wrong.avin"
+    write_text(wrong, "main() -> int\n  \"not an int\"\n").unwrap()
+    for command in ["build", "run", "test"]
+        var args: Buf[string] = buf()
+        args.push(command)
+        args.push(wrong)
+        args.push(if command == "run" then "-O2" else "-O0")
+        if command == "build"
+            args.push("-o")
+            args.push(b.dir + "/w")
+        var full: Buf[string] = buf()
+        full.push("avin")
+        for a in args
+            full.push(a)
+        val got = avin(b, args.view())
+        val (status, out, err) = in_memory(full.view(), b.dir)
+        assert_eq(got.status, Exited(status))
+        assert_eq(got.status, Exited(1))
+        assert_eq(got.text, out)
+        assert_eq(got.err.unwrap_or(""), err)
+        assert_eq(index_of(logged_phases(b), "handoff"), -1)
+    val source = b.dir + "/hello.avin"
+    write_text(source, "main() -> int\n  println(\"hello\")\n  0\n").unwrap()
+    // A link whose output cannot be written fails in the compiler handed the build, as before.
+    for level in ["-O0", "-O2"]
+        val missing = b.dir + "/no/such/dir/hello"
+        val got = avin(b, ["build", source, level, "-o", missing])
+        val (status, out, err) = in_memory(["avin", "build", source, level, "-o", missing], b.dir)
+        assert_handed(b)
+        assert_eq(got.status, Exited(status))
+        assert_eq(got.status, Exited(1))
+        assert_eq(got.text, out)
+        assert_eq(without_pending(got.err.unwrap_or("")), without_pending(err))
+        assert(err.contains("/no/such/dir/hello.pending-"), err)
+        // The runtime the cache now holds lets the next builds run without `sysl`.
+        assert_eq(avin(b, ["build", source, level, "-o", b.dir + "/hello" + level]).status, Exited(0))
+    // A clang that fails: its status and what it said, through the hand-off.
+    make_dir_all(b.dir + "/fake").unwrap()
+    write_text(b.dir + "/fake/clang", "#!/bin/sh\necho 'fake clang refuses' >&2\nexit 3\n").unwrap()
+    set_permissions(b.dir + "/fake/clang", 493u32).unwrap()
+    val real_path = get("PATH").unwrap_or("/usr/bin:/bin")
+    write_text(source, "main() -> int\n  println(\"hello again\")\n  0\n").unwrap()
+    for level in ["-O0", "-O2"]
+        val got = avin(b, ["build", source, level, "-o", b.dir + "/refused"], [Var("PATH", b.dir + "/fake:" + real_path)])
+        assert_handed(b)
+        assert_eq(got.status, Exited(1))
+        val err = got.err.unwrap_or("")
+        // A codegen unit's clang fails first, and says so with the unit's number.
+        assert(err.contains("avin: clang failed on codegen unit 0: exited 3\n"), err)
+        assert(err.contains("fake clang refuses"), err)
+        assert(!exists(b.dir + "/refused"))
+    // No clang at all: the missing tool is named, with how to install it.
+    make_dir_all(b.dir + "/empty").unwrap()
+    for level in ["-O0", "-O2"]
+        val got = avin(b, ["build", source, level, "-o", b.dir + "/absent"], [Var("PATH", b.dir + "/empty")])
+        assert_handed(b)
+        assert_eq(got.status, Exited(1))
+        val err = got.err.unwrap_or("")
+        assert(err.starts_with("avin: cannot run `clang` ("), err)
+        assert(err.contains("xcode-select --install"), err)
+    assert_eq(handoffs_left(b), 0)

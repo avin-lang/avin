@@ -9628,6 +9628,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   random pairs checked against the quadratic table for minimality. Review with the user: the names
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
+- Settled on the user's delegation 2026-11-20 (branch `mem-clang-child`): **a build's clangs and
+  link run in a compiler image that never compiled.** Once `avin build`, `avin run` or `avin test`
+  has compiled (diagnostics already said, the instance cache already written), the compiler writes
+  the module's text, the shim archive, the C flags and the tests to a temporary directory and
+  replaces itself with `exec` as `avin --linking-handed <dir> <the same command>`; the new image
+  carries out the same command, takes the compilation from the directory where it would compile,
+  removes it, and splits, compiles the units and links. Freed small allocations stay resident for a
+  process's life on macOS, so only a new image drops them: marshal at `-O2`, cold, peaked at 8.19 GB
+  for the process tree before and 5.48 GB after (the compile alone; the linking image held 1.10 GB
+  beside its 8 clangs), at the same speed. Same process id, standard streams, exit status and
+  signals; `AVIN_BUILD_LOG` goes on in the same file, with `handoff` and `restore` lines between
+  the compile's phases and the link's. When the directory cannot be written or the image cannot be
+  started, the link runs in place as before; a directory that cannot be read is compiled again.
+  Only the compiler's own `main` hands off, so a compiler run in memory (its tests) links in place.
+  Alternatives weighed: a child that compiles and exits while the first process waits to link
+  (what Sysl's `sysl test` does; two processes, and every diagnostic and the live report passed
+  across); a child for the link while the compiling process waits (its retained heap stays
+  resident beside the clangs, so nothing is gained); returning freed memory to the system (macOS
+  gives none back). Review with the user: the internal `--linking-handed` argument shows in `ps`
+  while a link runs.
 
 ## Proposed
 
