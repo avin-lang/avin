@@ -270,8 +270,14 @@ a decision changes, this page and the chapter change together.
   `hypot`; `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`;
   `floor`, `ceil`, `rint` (ties to even), `abs`, `max`, `min` (NaN when either is, `-0.0` below
   `0.0`), `signum`, `toRadians` and `toDegrees`. All take and give `real`, follow IEEE 754 and
-  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`, and no
-  integer overloads of `abs`, `max` and `min` yet; the reference's `round`, which answers a `long`,
+  never trap: `sqrt(-1.0)` is NaN, `log(0.0)` negative infinity. Not methods on `real`. Settled on
+  the user's delegation 2026-11-19: `abs`, `max`, `min` and `signum` also have `int` and `long`
+  overloads (the only functions here with an integer meaning; `math.abs(int.MinValue)` traps as a
+  negation does, and `math.max(1, n)` on an `int` `n` calls the `int` one), written in Avin; the
+  generic `max`/`min`/`clamp` of `ordering` stay for other types and the several-argument form. A
+  call no overload accepts already names every overload (`no overload of `math.max` accepts these
+  arguments; the overloads are …`); the two contradictory "expected" errors came from `real` being
+  the only candidate. Branch `math-int-overloads`. The reference's `round`, which answers a `long`,
   is left out until real-to-integer rounding is decided with the conversions. Bindings: one
   runtime function per function, over the methods of Sysl's `Float` on `real`, since a binding names
   a function and these are methods.
