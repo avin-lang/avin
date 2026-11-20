@@ -26210,18 +26210,15 @@ private variant_of_member(c: *Checker, name: string, t: &Type) -> bool
         if v.data == d then return true
     false
 
-// Whether the extractor named `path` has an `unapply` or `unapplySeq` that takes a value of `t`.
+// Whether the extractor named `path` implements an extractor trait taking a value of `t`.
 private extractor_takes(c: *Checker, path: string, t: &Type) -> bool
     val owner = extractor_type(c, path_expr(Span(0, 0), path)) match
         Some(o) -> o
         None -> return false
-    var ms = methods_of(c, owner, "unapply")
-    if ms.len() == 0 then ms = methods_of(c, owner, "unapplySeq")
-    for m in ms
-        val params = c.symbols[m].params
-        if params.len() == 0 then continue
-        val taken = params[params.len() - 1]
-        if has_type_params(taken) || may_match(c, t, taken) then return true
+    for instance in extractor_instances(c, owner)
+        val taken = conformance_args(instance)
+        if taken.len() == 0 then continue
+        if has_type_params(taken[0]) || may_match(c, t, taken[0]) then return true
     false
 
 private has_type_params(t: &Type) -> bool = *t match
@@ -26877,29 +26874,65 @@ private sequence_pattern(c: *Checker, p: &Pattern, items: Buf[&Pattern], ty: &Ty
             typed.push(check_pattern(c, binder, dropped.ty, no_bind))
     TPattern(p.span, ty, PSequence(local, length, elements, typed, rest))
 
-// An extractor pattern, `Name(p1, p2)`, where `Name` is not a variant but a value, an object or a
-// local, whose type has an `unapply` or an `unapplySeq` method. The matched value is held in a local
-// of its own and passed to the method. An `unapply` answering a `bool` matches where it answers
-// `true`, with no patterns; one answering an `Option` matches its `Some`, whose value one pattern
-// matches whole and several match part by part, as a tuple of as many parts. An `unapplySeq`
-// answers an `Option` of a sequence, which the patterns match as a sequence pattern does, `rest*`
-// included. A variant of the name is always the variant.
+// An extractor pattern, `Name(p1, p2)`, where `Name` is not a variant but a value, an object, a
+// companion or a local, whose type implements an extractor trait, `Extractor`, `BoolExtractor` or
+// `SeqExtractor`, taking the matched value; the conformance makes the extractor, not a method's name.
+// The matched value is held in a local of its own and passed to the trait's method. A
+// `BoolExtractor`'s `unapply` matches where it answers `true`, with no patterns; an `Extractor`'s
+// matches its `Some`, whose value one pattern matches whole and several match part by part, as a
+// tuple of as many parts. A `SeqExtractor`'s `unapplySeq` answers an `Option` of a sequence, which
+// the patterns match as a sequence pattern does, `rest*` included. A variant of the name is always
+// the variant.
 private extractor_pattern(c: *Checker, p: &Pattern, path: string, args: Buf[&Pattern], ty: &Type, no_bind: string) -> &TPattern
     val unit = unit_of(c)
     val at = p.span
     val target = path_expr(at, path)
-    var method = ""
-    if extractor_type(c, target) is Some(t)
-        if methods_of(c, t, "unapply").len() > 0 then method = "unapply"
-        elif methods_of(c, t, "unapplySeq").len() > 0 then method = "unapplySeq"
-        else c.note(unit, at, s"`$path` is not a variant, and ${type_name(t)} has no `unapply` or `unapplySeq` to make it an extractor")
-    else c.note(unit, at, alias_not_value(c, unit, path).unwrap_or(s"`$path` is not a variant or an extractor"))
-    if method == "" then return failed_extractor(c, p, args, no_bind)
+    val t = extractor_type(c, target) match
+        Some(t) -> t
+        None ->
+            c.note(unit, at, alias_not_value(c, unit, path).unwrap_or(s"`$path` is not a variant or an extractor"))
+            return failed_extractor(c, p, args, no_bind)
+    val instances = extractor_instances(c, t)
+    if instances.len() == 0
+        c.note(unit, at, s"`$path` is not a variant, and ${type_name(t)} implements no extractor trait${extractor_remedy(c, t)}")
+        return failed_extractor(c, p, args, no_bind)
+    // The `unapply` traits come first, so where a type implements one and `SeqExtractor` both, its
+    // `unapply` serves a value both take.
+    var chosen: Option[&Type] = None
+    for instance in instances
+        if chosen is None
+            val taken = conformance_args(instance)
+            if taken.len() > 0 && fits(c, ty, taken[0]) then chosen = Some(instance)
+    val instance = chosen match
+        Some(i) -> i
+        None ->
+            var shown = ""
+            for i in 0..<instances.len()
+                if i > 0 then shown = shown + if i + 1 == instances.len() then " and " else ", "
+                shown = shown + s"`${type_name(instances[i])}`"
+            c.note(unit, at, s"`$path` implements $shown, which takes no ${type_name(zonk(c, ty))}, the value matched here")
+            return failed_extractor(c, p, args, no_bind)
+    val k = *instance match
+        Class(k, _, _) -> k
+        _ -> return failed_extractor(c, p, args, no_bind)
+    val method = if c.classes[k].name == "SeqExtractor" then "unapplySeq" else "unapply"
+    var member: Option[usize] = None
+    for m in c.classes[k].methods
+        if c.symbols[m].decl.name == method then member = Some(m)
+    val trait_method = member match
+        Some(m) -> m
+        None -> return failed_extractor(c, p, args, no_bind)
     val name = s"extractor ${at.start}"
     val local = declare_local(c, at, name, ty, false)
     var call_args: Buf[Argument] = buf()
     call_args.push(Argument(at, None, name_at(at, name), false))
-    val view = check_expr(c, Expr(at, Call(Expr(at, Member(target, method)), call_args)), None)
+    val typed_target = check_expr(c, target, None)
+    // A class's or a data type's own implementation is called directly; a trait's value, a bounded
+    // type parameter's and a built-in type's call the trait's method, a built-in value boxed as the
+    // trait's.
+    val callee = implementing_method(c, t, k, trait_method)
+    val receiver = if callee != trait_method || *t is TypeVar(_, _, _) then typed_target else to_trait(c, typed_target, instance)
+    val view = method_call(c, at, at, receiver, callee, call_args, None, None, false, buf())
     val result = zonk(c, view.ty)
     if *result is ErrorType then return failed_extractor(c, p, args, no_bind)
     val written = s"`$path.$method`"
@@ -26962,9 +26995,9 @@ private path_expr(at: Span, path: string) -> &Expr
 private extractor_type(c: *Checker, target: &Expr) -> Option[&Type]
     c.muted = c.muted + 1
     val before = c.muted_notes
+    // A type's name is no value, so it names no extractor, whatever static members it has.
     var found: Option[&Type] = None
-    if static_receiver(c, target, "unapply") is Some(t) then found = Some(t)
-    else
+    if static_receiver(c, target, "unapply") is None
         val typed = check_expr(c, target, None)
         found = Some(zonk(c, typed.ty))
     c.muted = c.muted - 1
@@ -26972,6 +27005,76 @@ private extractor_type(c: *Checker, target: &Expr) -> Option[&Type]
     if found is Some(t)
         if *t is ErrorType then return None
     found
+
+// The instances of the extractor traits a value of type `t` is, its own conformances or its bounds':
+// those of `Extractor` and `BoolExtractor`, whose `unapply` serves first, then of `SeqExtractor`.
+private extractor_instances(c: *Checker, t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    var names: Buf[string] = buf()
+    names.push("Extractor")
+    names.push("BoolExtractor")
+    names.push("SeqExtractor")
+    for name in names
+        if c.class_types.get(qualified(CoreModule, name)) is Some(k)
+            for instance in from_sources(c, t, k)
+                out.push(instance)
+    out
+
+// The method of class or data type `t` filling the place of method `tm` of trait `k`, which `t`
+// implements; `tm` itself for any other type, or where `t` leaves it to the trait.
+private implementing_method(c: *Checker, t: &Type, k: usize, tm: usize) -> usize
+    var position = c.classes[k].base
+    var found = false
+    for m in c.classes[k].methods
+        if m == tm
+            found = true
+            break
+        position = position + 1
+    if !found then return tm
+    val table = *t match
+        Class(id, _, _) -> if is_trait(c, id) then return tm else c.classes[id].table
+        Data(d, _, _) -> c.data[d].table
+        _ -> return tm
+    if position >= table.len() then return tm
+    table[position] match
+        Some(m) -> if is_abstract_method(c.symbols[m]) then tm else m
+        None -> tm
+
+// The type arguments of an instance of a trait.
+private conformance_args(t: &Type) -> Buf[&Type] = *t match
+    Class(_, _, xs) -> xs
+    _ -> buf()
+
+// What a value of type `t` that implements no extractor trait would declare to be one, after a
+// semicolon: the trait its own `unapply` or `unapplySeq` fits, which a method's name alone does not
+// make an extractor; otherwise the three traits and their methods.
+private extractor_remedy(c: *Checker, t: &Type) -> string
+    val traits = "; an extractor implements `Extractor[A, B]` (`unapply(value: A) -> Option[B]`), `BoolExtractor[A]` (`unapply(value: A) -> bool`) or `SeqExtractor[A, S]` (`unapplySeq(value: A) -> Option[S]`)"
+    val owner = type_name(t)
+    var methods: Buf[string] = buf()
+    methods.push("unapply")
+    methods.push("unapplySeq")
+    for method in methods
+        for m in methods_of(c, t, method)
+            val s = c.symbols[m]
+            if s.static_member || s.params.len() == 0 then continue
+            if s.decl.type_params.len() > 0
+                return s"; its `$method` makes no extractor by its name alone, and a generic one implements no trait: declare the type parameters on a class implementing `Extractor`, `BoolExtractor` or `SeqExtractor`, and match with a value of it"
+            val taken = type_name(s.params[s.params.len() - 1])
+            val result = zonk(c, s.result.unwrap_or(ErrorType))
+            var wanted = ""
+            if method == "unapply" && *result is Bool then wanted = s"BoolExtractor[$taken]"
+            else
+                *result match
+                    Data(d, _, xs) ->
+                        if is_option_data(c, d) && xs.len() == 1
+                            val trait_name = if method == "unapply" then "Extractor" else "SeqExtractor"
+                            wanted = s"$trait_name[$taken, ${type_name(zonk(c, xs[0]))}]"
+                    _ -> ()
+            if wanted != ""
+                return s"; its `$method` makes no extractor by its name alone: make `$owner` implement `$wanted` and mark `$method` `override`"
+            return s"; its `$method` answers ${type_name(result)}$traits"
+    traits
 
 // A list pattern is the core library's `List` variant `name` with the patterns `parts` for its
 // fields, whatever `Cons` and `Nil` name where it is written. On any other type it is reported with

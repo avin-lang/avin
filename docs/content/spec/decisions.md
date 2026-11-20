@@ -1632,7 +1632,8 @@ Settled by the user on 2026-11-04:
 - Settled by the user 2026-11-04: Extractor patterns ([control flow](/spec/operators-and-control-flow/#extractor-patterns)):
   `Name(p…)` names a variant wherever one of that name is in scope, and only otherwise a value (an
   object, a companion, a local) whose type has `unapply` or `unapplySeq`; where it has both,
-  `unapply` is used. `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
+  `unapply` is used (the methods are now found through the extractor traits, settled 2026-11-19
+  below). `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
   `Option`, one pattern matching its value whole and several a tuple's parts. `unapplySeq` answers
   an `Option` of a sequence, matched as a sequence pattern; the prefix-and-sequence form is not
   taken. The matched value is passed to the method as it is, with no type test first, so the
@@ -9241,6 +9242,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `FD_CLOEXEC` is `1` on macOS and on Linux, so the pipe is inherited by a child started during a
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
+- Settled on the user's delegation 2026-11-19 (the user approved moving extractors onto a trait the
+  same day; branch `extractor-trait`): **an extractor is a value whose type implements one of three
+  core traits**, `Extractor[-A, +B]` (`unapply(value: A) -> Option[B]`), `BoolExtractor[-A]`
+  (`unapply(value: A) -> bool`) and `SeqExtractor[-A, +S]` (`unapplySeq(value: A) -> Option[S]`),
+  in `library/avin/extractor.avin`; the pattern checker finds the conformance (`extractor_instances`
+  in `check.sysl`) and calls the trait's method, a class's or data type's own implementation
+  directly, so a method merely named `unapply` no longer makes an extractor. The pattern syntax, the
+  three result shapes, coverage (an extractor never counts) and refinement (an extractor learns no
+  equalities) are unchanged, and the methods keep the names `unapply` and `unapplySeq`. A type
+  implements each trait at one type argument (the rule for every trait with instance members); the
+  trait whose `A` takes the matched value serves, an `unapply` trait before `SeqExtractor`. A
+  type's name is no extractor. A value implementing none is reported with the trait to implement,
+  worked out from the type's own `unapply` or `unapplySeq` where it has one, or with the three
+  traits and their methods. WHY: the user's rule that Avin is sound and nominal, which the soundness
+  audit found broken here by a lookup by name; as ordinary traits, extractors also become
+  first-class: held in a value of the trait's type, passed as a parameter, bounded on a type
+  parameter, implemented by a data type through an impl, inherited by a subclass, with the
+  variance a function's argument and result have. The `S` of `SeqExtractor` is left open rather
+  than bounded by `Seq`, so a `List` stays a `List` for its `rest*` and list patterns; the pattern
+  asks for a sequence where it is used. ALTERNATIVES: a marker trait with no members, the method
+  still found by name inside it (half nominal; a value of the trait's type could not be matched);
+  one trait with the result shape as a type parameter (the three shapes are different methods);
+  `unapply` keeping its role by name with a modifier (not a trait, so no extractor values).
+  **Review with the user:** two things the structural rule allowed are gone: an extractor object
+  with a generic method, `object Pair` with `unapply[A](xs: List[A])`, which no trait instance can
+  name, is now a generic class used through a value (`val pair = Pair[A]()`, `pair(a, b)`); and
+  one object with `unapply`s overloaded on several input types now picks one input type per trait.
+  Each implementation is also written `override`, as every trait member's is.
 
 - Settled on the user's delegation 2026-11-19 (built on branch `builder-trait`; the move onto a trait
   approved by the user 2026-11-19): **a collection literal finds its builder through the core trait

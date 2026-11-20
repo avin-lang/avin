@@ -203,7 +203,7 @@ is repeated or tried more than once:
 | `replaceFirstIn(s, replacement)` | `s` with its first match replaced |
 | `replaceSomeIn(s, f)` | `s` with each match `m` replaced where `f(m)`, an `Option[string]`, is `Some`, and kept where it is `None` |
 | `split(s)` | `pattern.split(s)`: the pieces of `s` between the matches, as an `Array[string]` |
-| `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; it makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
+| `unapplySeq(s)` | The groups' texts, an `Option[List[string]]`, where `s` matches as `matches` asks; `Regex` implements it from `SeqExtractor`, which makes the regex an [extractor](/spec/operators-and-control-flow/#extractor-patterns) |
 | `unanchored`, `anchored` | The same regex with `matches` and the extractor asking about any part, or the whole |
 | `withStepLimit(n)` | The same regex, each attempt at a start allowed `n` steps in place of the [default budget](#matching); `n` must be above 0 |
 | `tryMatches(s)`, `tryFindFirstIn(s)`, `tryFindFirstMatchIn(s)`, `tryFindPrefixOf(s)`, `tryFindPrefixMatchOf(s)` | The [checked](#matching) searches: `Result[T, MatchError]`, `T` what the plain search answers |
@@ -213,12 +213,13 @@ is repeated or tried more than once:
 | `Regex.quote(text)` | A pattern matching `text` literally: `\Q`, the text, `\E`, each `\E` in the text written so it does not end the quotation |
 | `Regex.quoteReplacement(text)` | A replacement writing `text` literally: each `\` and `$` with a backslash before it |
 
-**Extractors.** A regex is an [extractor](/spec/operators-and-control-flow/#extractor-patterns)
-whose patterns match its groups' texts in order: `case date(y, m, d)` matches a text the whole of
+**Extractors.** A regex is an [extractor](/spec/operators-and-control-flow/#extractor-patterns), a
+`SeqExtractor[string, List[string]]`, whose patterns match its groups' texts in order: `date(y, m,
+d)` matches a text the whole of
 which the regex matches (any part of it, for a regex made by `unanchored`), and needs one pattern
 for each group, or `rest*` for those left. A group that took no part gives the empty string. A
-regex with no groups is a test, written `word()`. `Groups`, imported from `avin.regex`, takes apart
-a `Match` found by any regex the same way, and does not match a match of a pattern with no groups.
+regex with no groups is a test, written `word()`. `Groups`, imported from `avin.regex`, a
+`SeqExtractor[Match, List[string]]`, takes apart a `Match` found by any regex the same way, and does not match a match of a pattern with no groups.
 
 ```text
 val date = Regex("(\\d{4})-(\\d\\d)-(\\d\\d)")
