@@ -12531,3 +12531,5 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resumed on, changing the buffer's count there while the buffer's own carrier used it, which
   freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
   reading at once).
+
+- **`end` closes a form only when a name follows it, wherever it stands.** Settled on the user's delegation 2026-11-19 (branch `keyword-member-diag`): `end = at` after a statement with an indented body is the word `end` used as a name and gets the one error `end is not defined`, instead of an `end` closer that swallowed the `=` and cascaded into an infix-call error quoting the whole enclosing body. The infix-call "no argument" suggestion quotes a receiver that spans lines as `…`, and is not reported when the receiver is itself an already-reported error. Alternatives weighed: a dedicated "`end` is a keyword" error (a second message for what the name lookup already says); quoting the last line of a multi-line receiver (a fragment that is not the receiver).
