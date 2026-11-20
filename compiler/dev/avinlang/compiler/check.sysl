@@ -10211,7 +10211,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "FromDecimal", "Display", "Debug", "Sendable", "Boundary"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "FromDecimal", "Buildable", "Display", "Debug", "Sendable", "Boundary"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -14722,20 +14722,75 @@ private variant_members(c: *Checker, name: string, members: Buf[&Type]) -> Buf[&
                     break
     found
 
-// The members a collection literal can build: a `List`, and a type whose companion has `newBuilder`.
+// The members a collection literal can build: a `List`, and a type that implements `Buildable`.
 private collection_members(c: *Checker, members: Buf[&Type]) -> Buf[&Type]
     var found: Buf[&Type] = buf()
     for m in members
         val t = zonk(c, m)
-        val companion = *t match
-            Class(k, _, _) -> c.classes[k].companion
-            Data(d, _, _) -> c.data[d].companion
-            _ -> None
-        var collection = is_list_type(c, t)
-        if companion is Some(o)
-            if methods_named(c, o, "newBuilder").len() > 0 then collection = true
-        if collection then found.push(m)
+        if is_list_type(c, t) || builds_literals(c, t) then found.push(m)
     found
+
+/** Whether a collection literal builds `t` through `t`'s own conformance to the core trait
+ * `Buildable`: `t` is a class or data type an impl of the trait targets, or a type parameter bounded
+ * by it. A type that is a `Buildable` only through a trait it implements is not built by that trait's
+ * builder, which would make the trait's collection rather than `t`. */
+private builds_literals(c: *Checker, t: &Type) -> bool
+    val b = c.core.trait_named("Buildable") match
+        Some(b) -> b
+        None -> return false
+    val k = zonk(c, t)
+    *k match
+        Class(_, _, _) -> conformance_impl(c, k, b) is Some(_) || instance_conformance_to(c, k, b, true)
+        Data(_, _, _) -> conformance_impl(c, k, b) is Some(_) || instance_conformance_to(c, k, b, true)
+        TypeVar(_, _, _) ->
+            for bound in bounds_of(c, k)
+                if ancestor_type(c.classes, c.data, bound, b) is Some(_) then return true
+            false
+        _ -> false
+
+/** Whether an impl for instances of `own`'s declaration states a conformance to trait `t`, or to a
+ * trait requiring it: `impl[A: Ord] Buildable[A] for SortedSet[A]`, a trait type's own conformance,
+ * or `impl Buildable[int] for Box[int]`. `holding` asks that it hold of `own` itself, its type
+ * arguments meeting the impl's; otherwise any instance of the declaration will do. */
+private instance_conformance_to(c: *Checker, own: &Type, t: usize, holding: bool) -> bool
+    for n in 0..<c.instances.len()
+        val x = c.instances[n]
+        if !impl_targets(x.ty, own) || ancestor_type(c.classes, c.data, x.trait_type, t) is None then continue
+        if !holding then return true
+        if instance_args(conformances(c), n, own) is Some(_) then return true
+    false
+
+/** The core library's collection `name`, with its own type parameters as its arguments. */
+private core_collection_type(c: *Checker, name: string) -> Option[&Type]
+    if c.class_types.get(qualified(CoreModule, name)) is Some(k) then return Some(own_class_type(c.classes[k], k))
+    if c.types.get(qualified(CoreModule, name)) is Some(d) then return Some(own_type(c.data[d], d))
+    None
+
+/** Whether `want`, the type a collection literal is expected to be, is a collection that the
+ * literal's default collection `default` is not an instance of and that is not `Buildable` itself, so
+ * that no literal can build it: an `Iterable`, a type whose companion has a `newBuilder`, which
+ * builds no literal without the trait, or an instance of a type that is `Buildable` at other type
+ * arguments only. */
+private unbuildable_collection(c: *Checker, want: &Type, default: &Type) -> bool
+    val w = zonk(c, want)
+    val companion = *w match
+        Class(k, _, _) ->
+            if ancestor_type(c.classes, c.data, default, k) is Some(_) then return false
+            c.classes[k].companion
+        Data(d, _, _) ->
+            if *default is Data(e, _, _)
+                if d == e then return false
+            c.data[d].companion
+        _ -> return false
+    if builds_literals(c, w) then return false
+    if c.core.trait_named("Buildable") is Some(b)
+        if instance_conformance_to(c, w, b, false) then return true
+    if companion is Some(o)
+        if methods_named(c, o, "newBuilder").len() > 0 then return true
+    val iterable = c.class_types.get(qualified(CoreModule, "Iterable")) match
+        Some(i) -> i
+        None -> return false
+    ancestor_type(c.classes, c.data, w, iterable) is Some(_)
 
 // The member an integer literal is: its default type, `int` or `long` for one too large for `int`,
 // where that is a member; otherwise the one numeric member it fits. Fitting several is an error.
@@ -18507,14 +18562,11 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
     // A `List` is a data type, built from the back with `::`, which needs no builder.
     if want is Some(t)
         if is_list_type(c, t) && shape == "sequence" then return list_literal(c, e, items, expected)
-    var collection: Option[usize] = None
+    // The type whose `newBuilder()` builds the literal: the expected type where it is `Buildable`
+    // itself, and otherwise the core library's default for the literal's shape.
+    var collection: Option[&Type] = None
     if want is Some(t)
-        val companion = *t match
-            Class(k, _, _) -> c.classes[k].companion
-            Data(d, _, _) -> c.data[d].companion
-            _ -> None
-        if companion is Some(o)
-            if methods_named(c, o, "newBuilder").len() > 0 then collection = Some(o)
+        if builds_literals(c, t) then collection = Some(t)
         val wanted_shape = collection_shape(c, t)
         // `{}` is a set literal with nothing in it, and as such the empty map too.
         val fitting = wanted_shape == "" || wanted_shape == shape || (shape == "set" && items.len() == 0 && wanted_shape == "map")
@@ -18526,13 +18578,39 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             for value in values
                 check_ignored(c, value)
             return TExpr(at, ErrorType, UnitConst)
-    val from_expected = collection is Some(_)
+    // The builder's element type is open until the expected type or the elements settle it; an
+    // empty literal with neither is reported as one.
+    val first_unknown = c.unknowns.len()
     if collection is None
         val default_name = if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"
-        if c.class_types.get(qualified(CoreModule, default_name)) is Some(k) then collection = c.classes[k].companion
-        elif c.types.get(qualified(CoreModule, default_name)) is Some(d) then collection = c.data[d].companion
-    val o = collection match
-        Some(o) -> o
+        val default_type = core_collection_type(c, default_name)
+        if default_type is Some(d)
+            // An expected collection the default is not, which builds no literal of its own, is
+            // reported by the trait it lacks rather than as the default's mismatch.
+            if want is Some(w)
+                if unbuildable_collection(c, w, d)
+                    c.note(unit, at, s"a $shape literal cannot build ${type_name(w)}, which does not implement `Buildable`, the trait a collection literal is built through; an impl of it gives `static newBuilder()`")
+                    for item in items
+                        check_ignored(c, item)
+                    for value in values
+                        check_ignored(c, value)
+                    return TExpr(at, ErrorType, UnitConst)
+            // The default's type arguments are the literal's to settle.
+            val args: Buf[&Type] = *d match
+                Class(_, _, xs) -> xs
+                Data(_, _, xs) -> xs
+                _ -> buf()
+            var open: Buf[&Type] = buf()
+            for _ in args
+                val v = fresh_var(c)
+                if *v is Var(id) then c.unknowns.push(Unknown(id, unit, at, "", false))
+                open.push(v)
+            collection = Some(*d match
+                Class(k, name, _) -> Class(k, name, open)
+                Data(id, name, _) -> Data(id, name, open)
+                _ -> d)
+    val built = collection match
+        Some(t) -> t
         None ->
             for item in items
                 check_ignored(c, item)
@@ -18540,22 +18618,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                 check_ignored(c, value)
             c.note(unit, at, s"a $shape literal needs the core library's `${if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"}`")
             return TExpr(at, ErrorType, UnitConst)
-    val companion = global_read(c, at, c.classes[o].global.unwrap())
-    // A `newBuilder` declared to return a `Builder` of the expected collection takes its type
-    // arguments from it at the call, where bounds on them are checked: `Set.newBuilder[A: Eq & Hash]`
-    // learns `A` from the `Set[int]` expected.
-    var wanted_builder: Option[&Type] = None
-    if want is Some(w)
-        if from_expected
-            if c.class_types.get(qualified(CoreModule, "Builder")) is Some(b)
-                var args: Buf[&Type] = buf()
-                args.push(fresh_var(c))
-                args.push(w)
-                wanted_builder = Some(Class(b, "Builder", args))
-    // The builder's element type is open until the expected type or the elements settle it; an
-    // empty literal with neither is reported as one.
-    val first_unknown = c.unknowns.len()
-    val builder = call_method(c, at, at, companion, "newBuilder", methods_named(c, o, "newBuilder"), buf(), None, wanted_builder, false)
+    val builder = static_call(c, at, at, checked_slot(c, TExpr(at, built, TypeReceiver)), built, "newBuilder", buf(), None, None, false)
     val example = if shape == "sequence" then "`val xs: Vector[int] = []`" elif shape == "set" then "`val s: Set[int] = {}`" else "`val m: Map[string, int] = {}`"
     for i in first_unknown..<c.unknowns.len()
         c.unknowns[i].message = s"cannot infer the element type of an empty collection literal; give it a type, as in $example"
@@ -23857,15 +23920,10 @@ private repeated_vector(c: *Checker, at: Span, element: &Type, items: Buf[&TExpr
     val vector = vector_of(c, element)
     if spliced is Some(xs)
         if same_type(zonk(c, xs.ty), vector) || *xs.ty is Nothing || *xs.ty is ErrorType then return xs
-    val o = c.class_types.get(qualified(CoreModule, "Vector")) match
-        Some(k) -> c.classes[k].companion
-        None -> None
-    val companion = o match
-        Some(o) -> o
-        None ->
-            c.note(unit, at, "a repeated parameter needs the core library's `Vector`")
-            return TExpr(at, ErrorType, UnitConst)
-    val builder = call_method(c, at, at, global_read(c, at, c.classes[companion].global.unwrap()), "newBuilder", methods_named(c, companion, "newBuilder"), buf(), None, None, false)
+    if !(*vector is Class(_, _, _))
+        c.note(unit, at, "a repeated parameter needs the core library's `Vector`")
+        return TExpr(at, ErrorType, UnitConst)
+    val builder = static_call(c, at, at, checked_slot(c, TExpr(at, vector, TypeReceiver)), vector, "newBuilder", buf(), None, None, false)
     *zonk(c, builder.ty) match
         Class(_, _, a) -> if a.len() == 1 then unify(c, a[0], element)
         _ -> return TExpr(at, ErrorType, UnitConst)

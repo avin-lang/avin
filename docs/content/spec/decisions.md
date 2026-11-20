@@ -761,9 +761,8 @@ Settled by the user on 2026-11-03:
   type of its module is its companion. A variant of the type's own name stays the constructor in call
   position; a type with no such variant (`List`) has nothing of its name to call. An object cannot
   share its name with a variant of another type, nor with a fieldless variant of its own type's name.
-  A `newBuilder` returning a `Builder` of its collection takes its type arguments from the type a
-  literal expects, so their bounds are checked at the call.
-- A collection literal builds whatever collection is expected through its companion's `newBuilder`: a
+- A collection literal builds whatever collection is expected through the type's own conformance to
+  the core trait `Buildable` (the entry of 2026-11-19 on branch `builder-trait`): a
   sequence literal a sequence, a set literal `{a, b}` a set and a map literal `{k: v}` a map, giving
   the builder each entry as a `(key, value)` pair; with no expected collection they are a `Vector`, a
   `Set` and a `Map`.
@@ -9242,6 +9241,48 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `FD_CLOEXEC` is `1` on macOS and on Linux, so the pipe is inherited by a child started during a
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
+
+- Settled on the user's delegation 2026-11-19 (built on branch `builder-trait`; the move onto a trait
+  approved by the user 2026-11-19): **a collection literal finds its builder through the core trait
+  `Buildable[A]`, never by a method's name** ([literals](/spec/collections/#literals)). The trait has
+  one member, `static newBuilder() -> Builder[A, Self]`; `A` is the element a literal gives the
+  builder, a map's `(K, V)` pair. A literal where a type `C` is expected is built by `C.newBuilder()`
+  where an impl of `Buildable` targets `C` itself, or where `C` is a type parameter bounded by it
+  (`make[C: Buildable[int]]() -> C = [1, 2, 3]`); otherwise it is the default `Vector`, `Set` or
+  `Map`, built through their own conformances. A companion object's `newBuilder` builds no literal.
+  Every library collection implements it, its impl calling the companion's `newBuilder`, which stays
+  the public way to get a builder (`Vector.newBuilder[int]()`); a repeated parameter's vector is
+  built through `Vector`'s conformance too. An expected collection (an `Iterable`, or a type whose
+  companion has a `newBuilder`) that is neither `Buildable` nor an instance of the default is
+  reported by the trait it lacks: "a sequence literal cannot build `Stack[int]`, which does not
+  implement `Buildable`…". WHY: the user's goal is a sound, nominally typed language, and a literal
+  that called whatever its expected type's companion named `newBuilder` was the last structural
+  lookup the soundness audit left; a trait is a stated promise, checked where it is made. One trait
+  for sequences, sets and maps, parameterized by the element rather than by a type constructor,
+  serves every collection the library has: `BitSet` (a `Buildable[int]` with no parameter of its
+  own), `TreeSet` (an `Ord` bound on its impl), maps (pairs), traits (`Set`, `SortedMap`, building
+  their default kinds), and any program's collection, with or without a companion, from any module,
+  as `FromInteger` does for integer literals. **The conformance is the type's own**: a `TreeSet`
+  expected is built by `TreeSet`'s impl, never by `SortedSet`'s or `Set`'s, since those would make
+  a different collection. ALTERNATIVES: a constructor trait on the companion, `trait
+  IterableFactory[C[_]]` with `newBuilder[A]()` (cannot express `BitSet`, which takes no
+  parameter, nor `TreeSet`'s `Ord` and `HashSet`'s `Eq & Hash` element bounds, and needs a second
+  trait for maps); two traits, one for sequences and sets and one for maps (the element type already
+  tells a pair from an element, so the second adds nothing); removing the companions' `newBuilder`
+  and calling the static as `Vector[int].newBuilder()` (breaks every call site in every avin-lang
+  repo for no gain in soundness). A trait type's own conformance builds where the trait type is
+  expected (`SortedSet`, `Set`, `Map`, `SeqMap`, so `{}` where a `Map` is expected is the empty map
+  through `Map`'s own impl), and an impl for one instance, `impl Buildable[int] for Count[int]`,
+  builds that instance only; `Count[string]` expected is the error naming the trait. **The companion
+  `apply` stays an ordinary method** (`Deque(1, 2, 3)`): its repeated parameter's `Vector` is already
+  built through `Vector`'s conformance, so it meets the trait where a literal does, and each
+  collection keeps the cheapest way from that vector to itself. ALTERNATIVES for `apply`: rewriting
+  every companion `apply` over its own `newBuilder` (no gain in soundness, and slower where `apply`
+  converts the vector directly, as `Array`'s `toArray` does); a `static apply(xs: A*) -> Self` in
+  `Buildable` with a default body (makes `C(1, 2)` callable on a bound `C: Buildable[int]`, but adds
+  a second member every program's impl inherits, and `C.newBuilder()` already serves that).
+  **Review with the user**: the name `Buildable`, and whether the companions' `newBuilder` should
+  eventually be the static member alone.
 
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
