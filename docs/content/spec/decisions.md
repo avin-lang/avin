@@ -9302,6 +9302,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   likeliest fix, naming the argument, where a call has one positional argument per contextual
   parameter; beyond that it was not meant for the section. Alternatives weighed: always the "passed
   by name" error (wrong advice for a call of too many arguments).
+- Settled on the user's delegation 2026-11-19 (branch `given-6`): **an editor sees each argument a
+  call's `using` section was filled with at the call's name.** Hover on the name shows the
+  function's signature, then "Filled from givens:" and one line per filled parameter as it would be
+  written, with the given's declaration beside it (`tx = current  // val current: Tx`); go to
+  definition answers the function first and then each given, in the section's order (an editor
+  shows a list to pick from); a given's references and highlights include the calls it filled, at
+  the call's name; a rename of a given never edits a call it filled, since nothing there spells
+  it; and the call's name stays one semantic token, the function's. A signature shown by hover or
+  completion writes `using` once before its section (`send(n: int, using tx: Tx, log: Log)`), and a
+  completed call's snippet leaves the section out. Why: a filled argument has no text of its own,
+  and the call's name is the one place a reader looks at when asking what the call receives;
+  listing the givens in definition makes the jump one step from where the question arises.
+  Alternatives weighed: an inlay hint after the call's parentheses (`insert(2)⟨tx = current⟩`;
+  cleaner to read, but a separate request most editors show only when asked, and nothing here
+  serves inlay hints yet); definition going to the given alone (loses the function, the commoner
+  question); leaving filled calls out of references (then "where is this given used" has no
+  answer). Review with the user: whether inlay hints for filled arguments are wanted as well.
+- Settled on the user's delegation 2026-11-19 (branch `given-6`): **completion offers `given` and
+  `using` where a form may begin with them**: both among the statement keywords where a name in an
+  expression is being written (a block's given; a `using` lambda, `using tx -> …`); `given` at the
+  start of a line no expression holds (a module's or an object's given); and `using` at an item's
+  start in a parenthesized list no expression holds (a parameter list, on its line or a line of its
+  own). A type, a member after a dot and an import offer neither. Why: the checker already tells an
+  expression's place apart; the other two are read off the text before the cursor, which is all a
+  half-written declaration offers. Alternatives weighed: walking the parsed declaration for a
+  parameter at the cursor (exact, but a half-written parameter list rarely parses); offering both
+  everywhere (noise in types and imports, where neither can be written).
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a

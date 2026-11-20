@@ -490,7 +490,7 @@ finish_completion(c: *Checker) -> Completions
     Completions(ix.probe.site, items)
 
 // The parameters a call of a function writes, past a method's receiver and leaving out those with a
-// default.
+// default and its `using` section, which givens fill.
 private call_params(c: *Checker, target: Target) -> Buf[string]
     var out: Buf[string] = buf()
     val id = target match
@@ -499,7 +499,9 @@ private call_params(c: *Checker, target: Target) -> Buf[string]
     val s = c.symbols[id]
     if trait_field_reads(c, id) then return out
     val first = if s.owner_class is Some(_) || s.receiver is Some(_) || s.static_member then 1usize else 0usize
-    for i in first..<s.param_names.len()
+    val section = section_size(s.decl)
+    val written = if s.param_names.len() >= section then s.param_names.len() - section else 0usize
+    for i in first..<written
         if i < s.defaults.len() && s.defaults[i] is Some(_) then continue
         out.push(s.param_names[i])
     out
@@ -554,6 +556,39 @@ completion_in_code(name: string, text: string, offset: usize) -> bool
         elif ch == u8('/') && k + 1 < at && b[k + 1] == u8('/') then return false
         k += 1
     !quoted
+
+/** The keywords that may begin a form where `word` is being written in `text`, the checker having
+ * found the stand-in at `site` (`NoSite` where it found none, or no text parsed):
+ *
+ * - where a name in an expression is: the words that begin a statement or an expression, `given`
+ *   (a block's given) and `using` (a lambda's contextual parameters, `using tx -> …`) among them;
+ * - at the start of a line no expression holds, where a declaration begins: `given`, a given of the
+ *   module or of an object's body;
+ * - at the start of an item of a parenthesized list no expression holds, a parameter list's: `using`,
+ *   which begins its contextual section.
+ *
+ * A type, a member after a dot and an import take none. */
+completion_keywords(text: string, word: CompletionWord, site: CompletionSite) -> Buf[string]
+    var out: Buf[string] = buf()
+    site match
+        ValueSite ->
+            for k in ["def", "val", "var", "given", "using", "if", "match", "select", "for", "while", "loop", "return", "break", "continue", "defer", "true", "false"]
+                out.push(k)
+        NoSite ->
+            // A list's item may be on a line of its own, `(` or `,` ending the line before.
+            val before = previous_mark(text.bytes, word.start, true)
+            if before == u8('(') || before == u8(',') then out.push("using")
+            elif previous_mark(text.bytes, word.start, false) == u8('\n') then out.push("given")
+        _ -> ()
+    out
+
+// The last byte before `at` that is not a space or a tab, nor, `across` lines, a line break; the
+// text's start reads as a line break.
+private previous_mark(b: []const u8, at: usize, across: bool) -> u8
+    var k = if at > b.len then b.len else at
+    while k > 0 && (b[k - 1] == u8(' ') || b[k - 1] == u8('\t') || (across && (b[k - 1] == u8('\n') || b[k - 1] == u8('\r'))))
+        k -= 1
+    if k == 0 || b[k - 1] == u8('\r') then u8('\n') else b[k - 1]
 
 /** The texts to try in turn, each with the word at the cursor replaced by the stand-in: as written;
  * with the rest of the line replaced by the brackets that close the line's open ones; and with that,
