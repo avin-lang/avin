@@ -35,6 +35,9 @@ struct Parser
     /** How many `select`s the file has read so far: each one's hidden names carry its number, which,
      * unlike its position, stays the same when the formatter moves it. */
     selects: usize
+    /** The symbol methods of the program that declare their precedence or grouping, which their calls
+     * are parsed by in place of the level their names give them. */
+    declared: Buf[DeclaredLevel]
 
     spelling(self, t: Spanned[Token]) -> string = from_utf8_unchecked(self.src.text(t.span))
 
@@ -132,9 +135,39 @@ impl TokenStream for Parser
                 if layout.value == Dedent then self.open_lines -= 1
         self.toks.advance()
 
-parser_for(src: Source) -> Parser
+parser_for(src: Source) -> Parser = declared_parser_for(src, buf())
+
+/** A parser that reads the calls of the symbol methods `declared` names at their declared levels. */
+declared_parser_for(src: Source, declared: Buf[DeclaredLevel]) -> Parser
     val lexed = lex(src)
-    Parser(src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0, 0)
+    Parser(src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0, 0, declared)
+
+/** A symbol method's declared precedence and grouping, from `@precedence` and `@groupsRight` on the
+ * methods of that name: the level its calls bind at, as the token of that level, and whether they
+ * group to the right. A program's methods of one name all declare the same (`declared_levels`). */
+struct DeclaredLevel
+    name: string
+    level: Token
+    right: bool
+
+// The declaration of the symbol method `name` among `declared`, if the program has one.
+private declared_of(declared: Buf[DeclaredLevel], name: string) -> Option[DeclaredLevel]
+    for d in declared
+        if d.name == name then return Some(d)
+    None
+
+// The level a call of the symbol method `name` binds at: its declared one, or the one its name gives.
+private level_token(declared: Buf[DeclaredLevel], name: string) -> Token = declared_of(declared, name) match
+    Some(d) -> d.level
+    None -> symbol_token(name)
+
+/** Whether calls of the infix method `name` group to the right: its name ends in `:`, or it is
+ * declared `@groupsRight`. */
+private grouped_right(declared: Buf[DeclaredLevel], name: string) -> bool
+    if groups_right(name) then return true
+    declared_of(declared, name) match
+        Some(d) -> d.right
+        None -> false
 
 private after_dedent(p: Parser) -> bool = p.toks.position > 0 && p.toks.items[p.toks.position - 1].value == Dedent
 
@@ -156,9 +189,9 @@ private as_infix(p: Parser, t: Spanned[Token], offset: usize) -> Spanned[Token]
     // `with` right before a brace is the update tail of a data value, binding as a postfix operator.
     if t.value == Word && p.spelling(t) == "with" && p.ahead(offset + 1) == "{" then return Spanned(Postfix, t.span)
     if t.value == Word && !is_keyword(p.spelling(t)) then return Spanned(InfixName, t.span)
-    if t.value == SymbolOp then return Spanned(symbol_token(p.spelling(t)), t.span)
-    if t.value == Symbol && p.spelling(t) == "~" then return Spanned(SymbolTight, t.span)
-    if t.value == Postfix && operand_follows(p, t, offset) then return Spanned(SymbolAdd, t.span)
+    if t.value == SymbolOp then return Spanned(level_token(p.declared, p.spelling(t)), t.span)
+    if t.value == Symbol && p.spelling(t) == "~" then return Spanned(level_token(p.declared, "~"), t.span)
+    if t.value == Postfix && operand_follows(p, t, offset) then return Spanned(level_token(p.declared, p.spelling(t)), t.span)
     t
 
 // Whether the token `offset` places ahead can start a continuation line: an operator that can stand
@@ -237,8 +270,11 @@ struct ParsedExpr
     report: Report
 
 /** Parses one expression; used by tests and tools. */
-parse_expression(src: Source) -> ParsedExpr
-    var p = parser_for(src)
+parse_expression(src: Source) -> ParsedExpr = parse_declared_expression(src, buf())
+
+/** Parses one expression, reading the calls of the methods `declared` names at their declared levels. */
+parse_declared_expression(src: Source, declared: Buf[DeclaredLevel]) -> ParsedExpr
+    var p = declared_parser_for(src, declared)
     val tree = expression(&p, 0)
     if !p.toks.at_end() then p.report.add(error(p.toks.here(), "unexpected input after expression"))
     ParsedExpr(tree, p.report)
@@ -265,6 +301,8 @@ private binding(t: Spanned[Token]) -> u16
         CompareOp -> 30
         IsKeyword -> 30
         SymbolCompare -> 30
+        SymbolAnd -> 20
+        SymbolOr -> 10
         InfixName -> InfixBinding
         RangeOp -> 34
         ConsOp -> 35
@@ -314,9 +352,10 @@ symbol_token(whole: string) -> Token
     elif first == "<" || first == ">" || first == "=" || first == "!" then SymbolCompare
     else SymbolTight
 
-/** The binding power of a method named by a symbol, or of one named by a word. */
-private call_level(name: string) -> u16 =
-    if is_operator_spelling(name) then binding(Spanned(symbol_token(name), Span(0, 0))) else InfixBinding
+/** The binding power of a method named by a symbol, declared or given by its name, or of one named
+ * by a word. */
+private call_level(declared: Buf[DeclaredLevel], name: string) -> u16 =
+    if is_operator_spelling(name) then binding(Spanned(level_token(declared, name), Span(0, 0))) else InfixBinding
 
 // The reserved words, which keep their meaning wherever they stand and so never name a method called
 // infix. `not` is not among them: it is a keyword only directly after `is`, and an ordinary name
@@ -392,7 +431,7 @@ private hole(p: *Parser, span: Span) -> &Expr
         p.report.add(error(span, "an interpolation hole needs an expression"))
         return Expr(span, Invalid)
     val lexed = lex_hole(p.src, span)
-    var inner = Parser(p.src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0, p.selects)
+    var inner = Parser(p.src, lexed.items, lexed.report, None, false, 0, buf(), false, 0, 0, p.selects, p.declared)
     val e = expression(&inner, 0)
     saw_tuple(p, inner.widest_tuple)
     p.selects = inner.selects
@@ -626,7 +665,7 @@ private infix(left: &Expr, t: Spanned[Token], p: *Parser) -> &Expr
             Expr(left.span.to(pattern.span), Is(left, pattern, negated))
         MatchKeyword -> match_expression(p, left)
         InfixName -> infix_call(left, t, op, p)
-        SymbolTight | SymbolMultiply | SymbolAdd | SymbolBitAnd | SymbolBitXor | SymbolBitOr | SymbolCons | SymbolCompare -> symbol_call(left, t, op, p)
+        SymbolTight | SymbolMultiply | SymbolAdd | SymbolBitAnd | SymbolBitXor | SymbolBitOr | SymbolCons | SymbolCompare | SymbolAnd | SymbolOr -> symbol_call(left, t, op, p)
         Postfix -> postfix(left, t, op, p)
         _ ->
             // `xs*` with nothing after the `*` in an argument list is a splice, which the checker
@@ -654,17 +693,20 @@ private infix_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> 
 // name gives it (`symbol_token`). Unlike a name, a symbol may start a line, which continues the
 // expression above it as any binary operator does. A name ending in `:` groups to the right and
 // takes its receiver on the right: `x +: xs` is `xs.+:(x)`, and `a +: b +: xs` is `a +: (b +: xs)`.
-// Left- and right-grouping operators do not mix at one level without parentheses.
+// A method declared `@groupsRight` groups to the right too, but keeps its receiver on the left:
+// `a ^^ b ^^ c` is `a.^^(b.^^(c))`. Left- and right-grouping operators do not mix at one level
+// without parentheses.
 private symbol_call(left: &Expr, t: Spanned[Token], name: string, p: *Parser) -> &Expr
     if !p.at_kind(Indent) && (p.at_line_end() || argument_cannot_start(p))
         p.report.add(error(t.span, s"`$name` has no right operand: a method named by a symbol is called between two operands, and has no postfix form"))
         return Expr(left.span.to(t.span), Invalid)
-    val right = groups_right(name)
+    val right = grouped_right(p.declared, name)
     val level = binding(t)
     mixed_grouping(p, left, right, level, t.span)
     val arg = if p.at_kind(Indent) then parse_body(p, false) else expression(p, if right then level - 1 else level)
     if !right then return Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
     mixed_grouping(p, arg, right, level, t.span)
+    if !groups_right(name) then return Expr(left.span.to(arg.span), InfixCall(left, name, t.span, arg))
     Expr(left.span.to(arg.span), InfixCall(arg, name, t.span, left))
 
 /** Whether an infix method of this name groups to the right: a symbol ending in `:`. */
@@ -675,8 +717,10 @@ groups_right(name: string) -> bool = name.ends_with(":") && is_operator_spelling
 // grouping.
 private mixed_grouping(p: *Parser, operand: &Expr, right: bool, level: u16, at: Span)
     val (other, other_level, other_right) = operand.kind match
-        InfixCall(_, name, _, _) -> (name, call_level(name), groups_right(name))
+        InfixCall(_, name, _, _) -> (name, call_level(p.declared, name), grouped_right(p.declared, name))
         Cons(_, _, _) -> ("::", 35u16, true)
+        Compare(_, ops) -> (compare_spelling(ops[0]), 30u16, false)
+        Is(_, _, _) -> ("is", 30u16, false)
         Binary(_, _, _, op_span) ->
             val spelled = from_utf8_unchecked(p.src.text(op_span))
             (spelled, binding(Spanned(operator_token(spelled), op_span)), false)
