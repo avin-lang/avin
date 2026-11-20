@@ -10460,7 +10460,10 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   directories with a README, and the sidecar beside the directory is the rule the corpus already
   reads for programs of many files, so nothing new is learned to read one. *Alternatives weighed*:
   sidecars inside the directory (a second rule for the same thing); a header line marking a window
-  program as not run (a marker on the exception rather than on the output that makes the check).
+  program as not run (a marker on the exception rather than on the output that makes the check); a
+  separate `examples/run/` directory (splits the examples a reader browses by how they are tested).
+  Branches `ports-concurrent` and `ports-numeric` reached the same rule on their own, with the same
+  reasons; the corpus keeps one copy of it.
 
 - Settled on the user's delegation 2026-11-19 (branch `variant-fn-value`): **a variant with fields,
   named and not called, is its constructor as a function value, as a class's name is.** `Heard`,
@@ -10566,30 +10569,112 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 - **Examples of concurrent programs, and what they asked of the library** (branch
   `ports-concurrent`, 2026-11-19).
-  - Settled on the user's delegation 2026-11-19: **an example of many files, `examples/NAME/`, is
-    run and checked when its output is beside it, `examples/NAME.out`**, as a program of
-    `tests/programs/run` is, its expectation lines in its files; one with no output beside it
-    opens a window and is only built. WHY: the convention the corpus already has for a program of
-    many files, so an example directory needs nothing new, and the window examples keep the check
-    they had. ALTERNATIVES: the output inside the directory (`examples/NAME/main.out`, a second
-    sidecar rule for one directory); a header line saying whether to run (the output file already
-    says it); a separate `examples/run/` directory (splits the examples a reader browses by how
-    they are tested).
+  - Running an example of many files that has its output beside it: the `ports-cli` entry above.
   - Settled on the user's delegation 2026-11-19: **`Response.html(status, text)`**, a response of
     the type `text/html; charset=utf-8` with the text sent as given, beside `Response.text` and
     `Response.json`. WHY: a server that renders a page wrote `Response.bytes(status, text.utf8,
     "text/html; charset=utf-8")` by hand. ALTERNATIVES: none kept; escaping the text (it is markup,
     already written).
 
-- **Example programs of many files are run-checked** (branch `ports-numeric`, 2026-11-19).
-  Settled on the user's delegation 2026-11-19: **an example directory `examples/NAME/` with a
-  `NAME.out` beside it is built and run at `-O0` and `-O2` as `examples/*.avin` are**, its `.in`,
-  `.err` and expectation lines read as a program of many files in `tests/programs/run` has them; an
-  example directory with no `.out` (a program that opens a window) is still only built. WHY: it is
-  the corpus's existing rule for a program that is a directory, so nothing new is learned to write
-  one, and a window program needs no marker to opt out. ALTERNATIVES: the expected output inside
-  the directory (`examples/NAME/NAME.out`; a second convention beside `tests/programs/run`'s); an
-  opt-in line in the program (every run example would carry it, where the `.out` already says it).
+- Settled on the user's delegation 2026-11-19 (branch `lib-papercuts`): **four library papercuts.**
+  (1) Every hasher of `avin.crypto` (`Sha256`, `Sha512`, `Sha1`, `Md5`) gains `update(bytes:
+  Array[byte])` and the range forms `update(bytes, from, until)` for a vector and for an array; the
+  array is handed to the digest in place through the `@sysl` binding, with no copy, and a range
+  outside `0 ..< bytes.length` or with `from > until` traps. (2) `Channel.length` answers the number
+  of buffered values, a snapshot under the lock that is stale at once (documented as a racy
+  observation); `size` is the same number, since the inherited `size` would consume the channel by
+  iterating it; `capacity`, the constructor's bound, is now a public `val` (`unbounded` for a channel
+  made with none, `0` for a rendezvous). (3) `max` and `min` are methods of every integer type,
+  `real` (as `math.max`/`math.min`: NaN when either is, `-0.0` below `0.0`), `char` and `byte`,
+  returning the first operand when equal; they are separate from `int.MaxValue`/`MinValue`, which are
+  static members. (4) The mutable `Map`, `Set`, `LinkedMap` and `LinkedSet` companions gain the
+  variadic `apply`, shaped as the mutable `TreeMap` and `TreeSet` have it (`Map((1, "a"), (2, "b"))`;
+  later pairs replace earlier ones, a linked collection keeps first-insertion order). Why: each
+  closes a gap a ported program met and costs one line of surface. Alternatives weighed: a `Slice`
+  type for the range form (rejected, `(bytes, from, until)` is the shape `string.slice` and the
+  collections already use); `Channel.length` as a method with a call (kept parameterless, as
+  `size`); `max`/`min` only through `Ord` (rejected, `Ord` has none, and the free functions need an
+  import for `real`).
+
+- **`end` closes a form only when a name follows it, wherever it stands.** Settled on the user's
+  delegation 2026-11-19 (branch `keyword-member-diag`): `end = at` after a statement with an
+  indented body is the word `end` used as a name and gets the one error `end is not defined`,
+  instead of an `end` closer that swallowed the `=` and cascaded into an infix-call error quoting
+  the whole enclosing body. The infix-call "no argument" suggestion quotes a receiver that spans
+  lines as `…`, and is not reported when the receiver is itself an already-reported error.
+  Alternatives weighed: a dedicated "`end` is a keyword" error (a second message for what the name
+  lookup already says); quoting the last line of a multi-line receiver (a fragment that is not the
+  receiver).
+
+- Settled on the user's delegation 2026-11-19 (branch `given-grammar`): **the editor grammar scopes
+  `given` and `using` only where they are keywords.** `given` is `keyword.declaration` at the start
+  of a line (after an optional `private`) when a name and then `:` or `=` follow, and never after
+  `.`, before `val`/`var`, or as a name (`given = 3`, `given(x)`). `using` is `storage.modifier`
+  when a parameter name follows and then `:`, `,`, `)`, `->` or `=`, in a parameter list or a
+  lambda, and not as a name (`f(using: Mode)`, `using -> using`, `val using = 1`, `x.using y`). Why:
+  the spec makes both words keywords only in those positions, and a line-local TextMate pattern can
+  see exactly them. Alternatives weighed: scoping both words everywhere (colours ordinary names
+  wrongly); a begin/end rule for parameter lists (a parameter list can span lines and nest, which
+  the line-based tokenizer cannot track reliably). Review with the user: a `using` whose parameter
+  name ends its line (a parameter list broken across lines) is not coloured.
+
+- **API documentation from the source** (branch `avin-doc`; [`avin doc`](/getting-started/#api-documentation),
+  [doc comments](/spec/declarations/#doc-comments)).
+  - Settled on the user's delegation 2026-11-19: **a doc comment is the run of `//` lines directly
+    above a declaration, past any annotations between**: exactly what the language server's hover
+    already showed, so no second comment form exists and every comment the standard library already
+    wrote is its documentation. It is Markdown with GitHub's extensions; each line loses its `//` and
+    one space, and keeps the rest of its indentation. *Alternatives weighed*: a `///` form of its own
+    (every existing comment would have to be rewritten, and a plain comment above a declaration would
+    silently stop being shown).
+  - Settled on the user's delegation 2026-11-19: **`avin doc [<program>] [-o <dir>] [--check]
+    [--std-url <url>] [<features>]` and `avin doc --std`**: the program is checked as `avin check`
+    checks it, with every feature on, and refused with its diagnostics when it does not check; a page
+    per module (`<module>.html`), the root module's declarations on `index.html` beside the list of
+    modules, a shared `style.css` and a `search.js` the search box reads, no fetch from anywhere else.
+    The default output is `.avin/doc` beside the program (the package's directory, the directory of a
+    program without a manifest, or the file's), which a package's `.gitignore` already names; a
+    directory is written only when it is new, empty, or holds `.avin-doc`, the marker `avin doc` writes,
+    and then its old pages are removed first. *Alternatives weighed*: `doc/` beside the program (a
+    directory of hand-written docs by that name would be overwritten); `--check` that also writes (a
+    check in CI wants nothing written).
+  - Settled on the user's delegation 2026-11-19: **what a page shows**: every public declaration
+    of every module but a test module (`@tests` files and a package's `tests` module), each with the
+    header hover shows (a function's, a field's and a value's as the checker typed it; a type's first
+    line as written), a data type's variants and a record's fields, a class's public fields and methods,
+    a trait's members, an object's, a type's public member exports as written (`export f.{m, n as k}`),
+    the impls a type has with their public methods, and a module's exports. An impl is listed with its
+    type when the site documents the type among modules of the same kind (the program's, a
+    dependency's, the library's), with the module it is written in named when that is another;
+    otherwise under its own module's "Implementations". A method is shown without its type
+    (`map[U](…)`, not `Option[T].map[U](…)`). A module with nothing public and no comment has no
+    page. Anchors are `Type`, `Type.member`, `function`, an overload's `name-2`, an impl's
+    `Type.impl`; a byte outside a name is written `~` and its hex.
+  - Settled on the user's delegation 2026-11-19: **a type named in a signature links to the
+    declaration the checker resolved it there**, so two types of one name in two modules are never
+    confused; a name the checker inferred rather than read (an alias's body shown in its place) links
+    to the one type of the site with that name, and a type parameter never links. **The standard
+    library's modules the program reads, and its dependencies' modules, are written beside its own**,
+    listed apart on the index, so every link stays inside the site; `--std-url` names where the
+    library's pages are published instead and writes none of them. *Alternatives weighed*: always
+    linking to a fixed public URL (a site that breaks offline, and on a version mismatch); never
+    linking into the library (the commonest types of every signature would be dead text). **Review
+    with the user**: whether the library's pages should come with every package's documentation by
+    default.
+  - Settled on the user's delegation 2026-11-19: **links in a doc comment**: a link whose destination
+    is a path of names, `[the map](Vector.map)`, and `[Name]` or `` [`Name`] `` with no destination,
+    link to that declaration, found as a member of the documented declaration's type (and its
+    owners'), then in its module, then as a full path or a module's name, then in the prelude, then as
+    the one declaration of the site with that name (`Type.member` included). A relative destination
+    that names no declaration must be a page of the site. **`--check` fails on a destination link that
+    leads nowhere, a backticked `` [`Name`] `` that resolves to nothing, and a fenced block with no
+    language or `avin` that parses neither as declarations nor as the statements of a function body**;
+    a bare `[words]` that names nothing stays prose, and `http:`-style links are not fetched. Without
+    `--check` the same problems are warnings and the pages are written. Only the program's own modules
+    are checked, never a dependency's or the library's. *Alternatives weighed*: reporting every
+    unresolved `[x]` (prose in brackets is common: `[1, 2, 3]`); fetching external links (slow, flaky,
+    and a fetch the command promises not to make); running the blocks as tests (a separate feature,
+    left for later).
 
 - Settled on the user's delegation 2026-11-20 (branch `mem-mir-size`): **the mid-level
   representation keeps an integer constant as a number and shares each call signature.** An
@@ -10631,6 +10716,38 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resident beside the clangs, so nothing is gained); returning freed memory to the system (macOS
   gives none back). Review with the user: the internal `--linking-handed` argument shows in `ps`
   while a link runs.
+
+- Settled on the user's delegation 2026-11-20 (branch `gc-release`): **a collection gives the whole
+  pages of large free runs back to the system** ([runtime](/compiler/#runtime)), through the page
+  release hook of gc 0.4.0, with the system's page size (`getpagesize`, 16 KiB on macOS arm64).
+  - **How, on macOS: the range is mapped afresh in place** (`mmap` with `MAP_FIXED`), as the
+    stacks' unused pages already are. Measured on a burst of 8 million strings (932 MB at the peak)
+    dropped and followed by churn: the resident size the system reports (`process.residentBytes`,
+    what marshal reads) stayed at 1047 MB with `MADV_FREE` and with `MADV_FREE_REUSABLE`, and fell
+    to 2 MB with the remap. `MADV_FREE_REUSABLE` also expects `MADV_FREE_REUSE` before the pages are
+    used again, and the collector hands a released run out again with no call to the client, so it
+    was not sound here even had it measured well. **On Linux, `madvise(MADV_DONTNEED)`**, which
+    drops the pages at once; written, not run on this machine.
+  - **When: a collection releases only when the arena reaches more than twice the budget past
+    what the last collection left live, and at most once a second.** Without the first condition a
+    program whose live data is small churns its 8 MiB of allocation in and out of the system at
+    every collection; without the second, one whose live objects sit high in the arena (a buffer
+    made after a burst) releases and refaults the free pages below them at every collection. Both
+    were measured: unthrottled, the churn after the drop took 1.2 s more system time over 2000
+    collections; with both conditions the system time is the same as with releasing off. A
+    collection that does not release runs with the hook removed, so its free runs stay ordinary
+    blocks a later collection can release. The first release in a program is never delayed.
+  - **`AVIN_GC_RELEASE=0` turns it off**; unset or any other value leaves it on.
+  - Cost: binarytrees 21 at -O2, three runs each way, 7.01–7.81 s with releasing and 7.01–7.39 s
+    without (the same within noise); the burst reproducer's churn 9.16–9.72 s user with and
+    8.78–9.56 s without, system time 0.09–0.11 s both ways.
+  - Alternatives weighed: `MADV_FREE` and `MADV_FREE_REUSABLE` (above); releasing at every
+    collection (the refault cost above); a retained cushion skipped inside the hook (unsound with
+    this gc: a range the hook skips is still marked released, and is never offered again until
+    written); a library call to release on demand (no program needs it yet). Review with the user:
+    whether one second is the right interval, and whether a program should be able to ask for a
+    release (a collection) itself, since without one a program that drops a burst and then
+    allocates little keeps its pages until enough allocation brings a collection.
 
 ## Proposed
 
@@ -12721,83 +12838,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
 
-- Settled on the user's delegation 2026-11-19 (branch `lib-papercuts`): **four library papercuts.**
-  (1) Every hasher of `avin.crypto` (`Sha256`, `Sha512`, `Sha1`, `Md5`) gains `update(bytes:
-  Array[byte])` and the range forms `update(bytes, from, until)` for a vector and for an array; the
-  array is handed to the digest in place through the `@sysl` binding, with no copy, and a range
-  outside `0 ..< bytes.length` or with `from > until` traps. (2) `Channel.length` answers the number
-  of buffered values, a snapshot under the lock that is stale at once (documented as a racy
-  observation); `size` is the same number, since the inherited `size` would consume the channel by
-  iterating it; `capacity`, the constructor's bound, is now a public `val` (`unbounded` for a channel
-  made with none, `0` for a rendezvous). (3) `max` and `min` are methods of every integer type,
-  `real` (as `math.max`/`math.min`: NaN when either is, `-0.0` below `0.0`), `char` and `byte`,
-  returning the first operand when equal; they are separate from `int.MaxValue`/`MinValue`, which are
-  static members. (4) The mutable `Map`, `Set`, `LinkedMap` and `LinkedSet` companions gain the
-  variadic `apply`, shaped as the mutable `TreeMap` and `TreeSet` have it (`Map((1, "a"), (2, "b"))`;
-  later pairs replace earlier ones, a linked collection keeps first-insertion order). Why: each
-  closes a gap a ported program met and costs one line of surface. Alternatives weighed: a `Slice`
-  type for the range form (rejected, `(bytes, from, until)` is the shape `string.slice` and the
-  collections already use); `Channel.length` as a method with a call (kept parameterless, as
-  `size`); `max`/`min` only through `Ord` (rejected, `Ord` has none, and the free functions need an
-  import for `real`).
-
-**API documentation from the source** (branch `avin-doc`; [`avin doc`](/getting-started/#api-documentation), [doc comments](/spec/declarations/#doc-comments))
-
-- Settled on the user's delegation 2026-11-19: **a doc comment is the run of `//` lines directly
-  above a declaration, past any annotations between**: exactly what the language server's hover
-  already showed, so no second comment form exists and every comment the standard library already
-  wrote is its documentation. It is Markdown with GitHub's extensions; each line loses its `//` and
-  one space, and keeps the rest of its indentation. *Alternatives weighed*: a `///` form of its own
-  (every existing comment would have to be rewritten, and a plain comment above a declaration would
-  silently stop being shown).
-- Settled on the user's delegation 2026-11-19: **`avin doc [<program>] [-o <dir>] [--check]
-  [--std-url <url>] [<features>]` and `avin doc --std`**: the program is checked as `avin check`
-  checks it, with every feature on, and refused with its diagnostics when it does not check; a page
-  per module (`<module>.html`), the root module's declarations on `index.html` beside the list of
-  modules, a shared `style.css` and a `search.js` the search box reads, no fetch from anywhere else.
-  The default output is `.avin/doc` beside the program (the package's directory, the directory of a
-  program without a manifest, or the file's), which a package's `.gitignore` already names; a
-  directory is written only when it is new, empty, or holds `.avin-doc`, the marker `avin doc` writes,
-  and then its old pages are removed first. *Alternatives weighed*: `doc/` beside the program (a
-  directory of hand-written docs by that name would be overwritten); `--check` that also writes (a
-  check in CI wants nothing written).
-- Settled on the user's delegation 2026-11-19: **what a page shows**: every public declaration
-  of every module but a test module (`@tests` files and a package's `tests` module), each with the
-  header hover shows (a function's, a field's and a value's as the checker typed it; a type's first
-  line as written), a data type's variants and a record's fields, a class's public fields and methods,
-  a trait's members, an object's, a type's public member exports as written (`export f.{m, n as k}`),
-  the impls a type has with their public methods, and a module's exports. An impl is listed with its type when the site documents the type among modules of the same
-  kind (the program's, a dependency's, the library's), with the module it is written in named when
-  that is another; otherwise under its own module's "Implementations". A method is shown without its
-  type (`map[U](…)`, not `Option[T].map[U](…)`). A module with nothing public and no comment has no
-  page. Anchors are `Type`, `Type.member`, `function`, an overload's `name-2`, an impl's
-  `Type.impl`; a byte outside a name is written `~` and its hex.
-- Settled on the user's delegation 2026-11-19: **a type named in a signature links to the
-  declaration the checker resolved it there**, so two types of one name in two modules are never
-  confused; a name the checker inferred rather than read (an alias's body shown in its place) links
-  to the one type of the site with that name, and a type parameter never links. **The standard
-  library's modules the program reads, and its dependencies' modules, are written beside its own**,
-  listed apart on the index, so every link stays inside the site; `--std-url` names where the
-  library's pages are published instead and writes none of them. *Alternatives weighed*: always
-  linking to a fixed public URL (a site that breaks offline, and on a version mismatch); never
-  linking into the library (the commonest types of every signature would be dead text). **Review
-  with the user**: whether the library's pages should come with every package's documentation by
-  default.
-- Settled on the user's delegation 2026-11-19: **links in a doc comment**: a link whose destination is
-  a path of names, `[the map](Vector.map)`, and `[Name]` or `` [`Name`] `` with no destination,
-  link to that declaration, found as a member of the documented declaration's type (and its
-  owners'), then in its module, then as a full path or a module's name, then in the prelude, then as
-  the one declaration of the site with that name (`Type.member` included). A relative destination
-  that names no declaration must be a page of the site. **`--check` fails on a destination link that
-  leads nowhere, a backticked `` [`Name`] `` that resolves to nothing, and a fenced block with no
-  language or `avin` that parses neither as declarations nor as the statements of a function body**;
-  a bare `[words]` that names nothing stays prose, and `http:`-style links are not fetched. Without
-  `--check` the same problems are warnings and the pages are written. Only the program's own modules
-  are checked, never a dependency's or the library's. *Alternatives weighed*: reporting every
-  unresolved `[x]` (prose in brackets is common: `[1, 2, 3]`); fetching external links (slow, flaky,
-  and a fetch the command promises not to make); running the blocks as tests (a separate feature,
-  left for later).
-
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per
@@ -12933,38 +12973,6 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   above 100, since the collector stops every thread and marks on one, so the trade favours memory
   less than it would for a concurrent collector.
 
-- Settled on the user's delegation 2026-11-20 (branch `gc-release`): **a collection gives the whole
-  pages of large free runs back to the system** ([runtime](/compiler/#runtime)), through the page
-  release hook of gc 0.4.0, with the system's page size (`getpagesize`, 16 KiB on macOS arm64).
-  - **How, on macOS: the range is mapped afresh in place** (`mmap` with `MAP_FIXED`), as the
-    stacks' unused pages already are. Measured on a burst of 8 million strings (932 MB at the peak)
-    dropped and followed by churn: the resident size the system reports (`process.residentBytes`,
-    what marshal reads) stayed at 1047 MB with `MADV_FREE` and with `MADV_FREE_REUSABLE`, and fell
-    to 2 MB with the remap. `MADV_FREE_REUSABLE` also expects `MADV_FREE_REUSE` before the pages are
-    used again, and the collector hands a released run out again with no call to the client, so it
-    was not sound here even had it measured well. **On Linux, `madvise(MADV_DONTNEED)`**, which
-    drops the pages at once; written, not run on this machine.
-  - **When: a collection releases only when the arena reaches more than twice the budget past
-    what the last collection left live, and at most once a second.** Without the first condition a
-    program whose live data is small churns its 8 MiB of allocation in and out of the system at
-    every collection; without the second, one whose live objects sit high in the arena (a buffer
-    made after a burst) releases and refaults the free pages below them at every collection. Both
-    were measured: unthrottled, the churn after the drop took 1.2 s more system time over 2000
-    collections; with both conditions the system time is the same as with releasing off. A
-    collection that does not release runs with the hook removed, so its free runs stay ordinary
-    blocks a later collection can release. The first release in a program is never delayed.
-  - **`AVIN_GC_RELEASE=0` turns it off**; unset or any other value leaves it on.
-  - Cost: binarytrees 21 at -O2, three runs each way, 7.01–7.81 s with releasing and 7.01–7.39 s
-    without (the same within noise); the burst reproducer's churn 9.16–9.72 s user with and
-    8.78–9.56 s without, system time 0.09–0.11 s both ways.
-  - Alternatives weighed: `MADV_FREE` and `MADV_FREE_REUSABLE` (above); releasing at every
-    collection (the refault cost above); a retained cushion skipped inside the hook (unsound with
-    this gc: a range the hook skips is still marked released, and is never offered again until
-    written); a library call to release on demand (no program needs it yet). Review with the user:
-    whether one second is the right interval, and whether a program should be able to ask for a
-    release (a collection) itself, since without one a program that drops a burst and then
-    allocates little keeps its pages until enough allocation brings a collection.
-
 - Settled on the user's delegation 2026-11-16 (branch `read-alloc`): **a stream's `read(max)`
   allocates what it answers, not `max`.** A TCP, Unix or split socket read receives into a buffer
   the runtime keeps per operating system thread (on its carrier), grown to the largest read asked
@@ -12982,6 +12990,3 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resumed on, changing the buffer's count there while the buffer's own carrier used it, which
   freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
   reading at once).
-
-- **`end` closes a form only when a name follows it, wherever it stands.** Settled on the user's delegation 2026-11-19 (branch `keyword-member-diag`): `end = at` after a statement with an indented body is the word `end` used as a name and gets the one error `end is not defined`, instead of an `end` closer that swallowed the `=` and cascaded into an infix-call error quoting the whole enclosing body. The infix-call "no argument" suggestion quotes a receiver that spans lines as `…`, and is not reported when the receiver is itself an already-reported error. Alternatives weighed: a dedicated "`end` is a keyword" error (a second message for what the name lookup already says); quoting the last line of a multi-line receiver (a fragment that is not the receiver).
-- Settled on the user's delegation 2026-11-19 (branch `given-grammar`): **the editor grammar scopes `given` and `using` only where they are keywords.** `given` is `keyword.declaration` at the start of a line (after an optional `private`) when a name and then `:` or `=` follow, and never after `.`, before `val`/`var`, or as a name (`given = 3`, `given(x)`). `using` is `storage.modifier` when a parameter name follows and then `:`, `,`, `)`, `->` or `=`, in a parameter list or a lambda, and not as a name (`f(using: Mode)`, `using -> using`, `val using = 1`, `x.using y`). Why: the spec makes both words keywords only in those positions, and a line-local TextMate pattern can see exactly them. Alternatives weighed: scoping both words everywhere (colours ordinary names wrongly); a begin/end rule for parameter lists (a parameter list can span lines and nest, which the line-based tokenizer cannot track reliably). Review with the user: a `using` whose parameter name ends its line (a parameter list broken across lines) is not coloured.
