@@ -1,0 +1,151 @@
+// A to-do list kept in a text file, driven by subcommands, each with options of its own:
+//
+//     todo add [--priority high|normal|low] [--tag T]... WORDS...
+//     todo list [--all] [--tag T]
+//     todo done ID...
+//     todo remove ID...
+//     todo stats
+//     todo script        run each line of standard input as a command, on a list made for the purpose
+//
+// The list is the file `--file` names, `todo.txt` by default, one task to a line:
+// `id|done|priority|tags|title`. `script` runs its commands against a list in a temporary
+// directory, removed afterwards, so a session can be tried without touching a real list.
+//
+//     avin build todo && ./todo add --priority high --tag home "fix the gate"
+//
+// expect: exit 0
+// args: script
+import avin.cli
+import avin.fs
+import avin.io
+
+// Ordered as declared, the most urgent first.
+data Priority derives Ord
+  High
+  Normal
+  Low
+
+data Task(id: int, done: bool, priority: Priority, tags: Vector[string], title: string)
+
+priorityName(p: Priority) -> string
+priorityName(High) = "high"
+priorityName(Normal) = "normal"
+priorityName(Low) = "low"
+
+priorityNamed(name: string) -> Priority
+priorityNamed("high") = High
+priorityNamed("low") = Low
+priorityNamed(_) = Normal
+
+// One line of the file as a task, or `None` for a line that is not one.
+parseTask(line: string) -> Option[Task] = line.split("|", 5) match
+  [id, done, priority, tags, title] ->
+    id.toIntOption().map(n -> Task(n, done == "x", priorityNamed(priority), tags.split(",").filter(_.nonEmpty), title))
+  _ -> None
+
+formatTask(t: Task) -> string =
+  s"${t.id}|${if t.done then "x" else " "}|${priorityName(t.priority)}|${t.tags.mkString(",")}|${t.title}"
+
+load(file: string) -> Vector[Task] =
+  if !fs.exists(file) then [] else fs.readText(file).getOrElse("").lines.flatMap(l -> parseTask(l).toList)
+
+save(file: string, tasks: Vector[Task]) =
+  fs.writeText(file, tasks.map(formatTask).map(_ + "\n").mkString("")).getOrElse(fail(s"cannot write $file"))
+
+// The subcommands' own command lines.
+val addParser = cli.Parser("todo add", "Add a task.")
+  .choice("priority", ["high", "normal", "low"], short = 'p', default = "normal")
+  .string("tag", short = 't', help = "a tag for the task", repeated = true)
+  .positionals("words", help = "the task's title", required = true)
+
+val listParser = cli.Parser("todo list", "List the tasks, most urgent first.")
+  .flag("all", short = 'a', help = "list finished tasks too")
+  .string("tag", short = 't', help = "list only the tasks with this tag")
+
+val idsParser = cli.Parser("todo", "Act on tasks by their numbers.")
+  .positionals("id", help = "the tasks' numbers", required = true)
+
+// Runs one command against the list in `file`; the exit status it ends with.
+run(file: string, args: Vector[string]) -> int = args match
+  ["add", rest*] ->
+    val opts = addParser.parseOrExit(rest)
+    val tasks = load(file)
+    val id = tasks.map(_.id).maxOption.getOrElse(0) + 1
+    val priority = priorityNamed(opts.string("priority"))
+    save(file, tasks :+ Task(id, false, priority, opts.strings("tag"), opts.strings("words").mkString(" ")))
+    println(s"added $id")
+    0
+  ["list", rest*] ->
+    val opts = listParser.parseOrExit(rest)
+    val shown = load(file)
+      .filter(t -> opts.flag("all") || !t.done)
+      .filter(t -> !opts.given("tag") || t.tags.contains(opts.string("tag")))
+      .sortBy(t -> (if t.done then 1 else 0, t.priority, t.id))
+    if shown.isEmpty then println("nothing to do")
+    for t in shown
+      val box = if t.done then "[x]" else "[ ]"
+      val tags = t.tags.map("#" + _).mkString(" ")
+      println(f"${t.id}%3d $box ${priorityName(t.priority)}%-6s ${t.title} $tags".stripTrailing)
+    0
+  [verb @ ("done" | "remove"), rest*] ->
+    val opts = idsParser.parseOrExit(rest)
+    val tasks = load(file)
+    val ids = opts.strings("id").flatMap(_.toIntOption().toList).toSet
+    val missing = ids.filter(id -> !tasks.exists(_.id == id))
+    if missing.nonEmpty
+      eprintln(s"todo: no task ${missing.toVector.sorted.mkString(", ")}")
+      return 1
+    val after =
+      if verb == "done" then tasks.map(t -> if ids(t.id) then t with {done = true} else t)
+      else tasks.filter(t -> !ids(t.id))
+    save(file, after)
+    println(s"$verb: ${ids.toVector.sorted.mkString(", ")}")
+    0
+  ["stats"] ->
+    val tasks = load(file)
+    val open = tasks.count(!_.done)
+    println(s"${tasks.length} tasks, $open open, ${tasks.length - open} done")
+    for (tag, n) in tasks.flatMap(_.tags).groupMapReduce(t -> t, _ -> 1, _ + _).toVector.sortBy(_.0)
+      println(s"  #$tag $n")
+    0
+  [command, _*] ->
+    eprintln(s"todo: no command `$command`; the commands are add, list, done, remove, stats and script")
+    2
+  [] ->
+    eprintln("usage: todo [--file FILE] <add|list|done|remove|stats|script> [options]")
+    2
+
+// The words of a command line as a shell splits them: on spaces, a double-quoted word keeping its own.
+words(line: string) -> Vector[string]
+  var out = Vector.empty[string]()
+  val word = StringWriter()
+  var quoted = false
+  var started = false
+  for c in line.chars
+    c match
+      '"' ->
+        quoted = !quoted
+        started = true
+      ' ' if !quoted ->
+        if started then out = out :+ word.text
+        word.clear()
+        started = false
+      _ ->
+        word.writeChar(c)
+        started = true
+  if started then out :+ word.text else out
+
+main(args: Vector[string]) -> int
+  val (file, rest) = args match
+    ["--file", f, more*] -> (f, more)
+    _ -> ("todo.txt", args)
+  if rest != ["script"] then return run(file, rest)
+  val scratch = fs.tempDir("todo").getOrElse(fail("no temporary directory"))
+  defer _ = scratch.close()
+  val list = fs.join(scratch.path, "todo.txt")
+  for line in io.lines()
+    if line.trim.isEmpty || line.startsWith("#") then continue
+    println(s"$$ todo $line")
+    val code = run(list, words(line))
+    if code != 0 then println(s"(exit $code)")
+  0

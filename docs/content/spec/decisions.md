@@ -145,7 +145,43 @@ a decision changes, this page and the chapter change together.
   function results are covariant and function parameters contravariant on the same terms.
 - A variance error is reported in private members as in public ones; there is no escape for a
   private `var`. The methods an impl adds to a `data` type are not variance positions; the traits
-  its impls name are.
+  its impls name are, except a trait whose members are all static (revised 2026-11-19, below).
+- Settled on the user's delegation 2026-11-19 (branch `static-traits`): **static members are not
+  variance positions of a class or `data` type, and neither is a conformance to a trait whose
+  members are all static** (with those of the traits it requires, at least one); the entry above
+  read "the traits its impls name are" without exception, which refused `abstract class Vector[+T]`
+  stating `impl[T] Buildable[T] for Vector[T]` with `static newBuilder() -> Builder[T, Vector[T]]`.
+  Why it is sound: a static member is reached through a type, never a value. On the type, the call
+  names the arguments (`Vector[Animal].newBuilder()` is that instance's own impl); through a bound
+  `C: Buildable[A]`, `C`'s own impl at `C`'s own arguments runs, and a `Vector[Cat]` is a
+  `Buildable[Cat]`, not a `Buildable[Animal]`, so `build[Vector[Cat], Animal](dog)` is refused. No
+  value of the trait exists (a trait with a static member is a bound, not a type), so no value path
+  from `Vector[Cat]` to `Buildable[Animal]` exists either. The one path left is a type parameter
+  bounded by a widened instance, `U: Box[Animal]` with `U = Box[Cat]`: **a bound whose class or
+  `data` type has a covariant or contravariant parameter reaches neither the type's static members
+  nor its conformances to all-static traits** (`U.make(dog)` is an error saying to bound `U` by the
+  trait). Kept as positions: a trait's own static members (a type conforming to `Take[Cat]`
+  conforms to `Take[Animal]` through the trait's variance, so `trait Take[+A]` with `static take(x:
+  A)` is refused), a trait requiring an all-static trait, and a conformance to a trait with any
+  member of a value. Alternatives: exempting every trait's statics (unsound as shown); exempting
+  only `impl` statics and not the trait argument (still refuses `Buildable[T]` on `Vector[+T]`);
+  refusing static calls through every class bound (narrower than needed: an invariant class's
+  bound widens nothing). Tests: `static_trait_variance`, `static_trait_variance_attacks`,
+  `static_trait_variance_kept`, `programs/run/static_trait_modules`. Review with the user: the
+  widening-bound rule is new and visible ("bound `U` by the trait declaring `make`").
+- Settled on the user's delegation 2026-11-19 (branch `static-traits`): **a trait type may implement
+  a trait whose members are all static, as its own conformance**: `impl[A] Buildable[A] for
+  Set[A]`. It holds of the trait type itself, as the type a call names (`Set[int].newBuilder()`) or
+  a bound's argument, and is not inherited by the trait's implementers (a `HashSet[A]` has its own
+  or none) nor reached through a type parameter bounded by the trait type, whose argument may be
+  any implementer. An impl of a trait with a member of a value for a trait type is still refused
+  with the old message. Why: a collection literal typed by a trait (`val s: Set[int] = {1, 2}`)
+  needs a builder the trait type names, and a trait's conformance cannot be its implementers'
+  (each builds its own collection). It is built on the impls for instances of a type, matched
+  against the trait type exactly rather than through its subtypes. Alternatives: inheriting it
+  (wrong: `HashSet`'s literal would build through `Set`'s builder); a companion object's
+  `newBuilder` reached by name (the convention `Buildable` replaces). Tests:
+  `trait_own_static_conformance`, `trait_own_static_refusals`, `programs/run/static_trait_modules`.
 - A type pattern matches an object whose type conforms to the pattern's type through variance, as
   the checker's subtyping does: a `List[Dog]` held as an `Any` matches `List[Animal]`.
 - Settled by the user 2026-11-04: [lower bounds](/spec/generics/#lower-bounds) on a function's or a
@@ -725,9 +761,8 @@ Settled by the user on 2026-11-03:
   type of its module is its companion. A variant of the type's own name stays the constructor in call
   position; a type with no such variant (`List`) has nothing of its name to call. An object cannot
   share its name with a variant of another type, nor with a fieldless variant of its own type's name.
-  A `newBuilder` returning a `Builder` of its collection takes its type arguments from the type a
-  literal expects, so their bounds are checked at the call.
-- A collection literal builds whatever collection is expected through its companion's `newBuilder`: a
+- A collection literal builds whatever collection is expected through the type's own conformance to
+  the core trait `Buildable` (the entry of 2026-11-19 on branch `builder-trait`): a
   sequence literal a sequence, a set literal `{a, b}` a set and a map literal `{k: v}` a map, giving
   the builder each entry as a `(key, value)` pair; with no expected collection they are a `Vector`, a
   `Set` and a `Map`.
@@ -1597,7 +1632,8 @@ Settled by the user on 2026-11-04:
 - Settled by the user 2026-11-04: Extractor patterns ([control flow](/spec/operators-and-control-flow/#extractor-patterns)):
   `Name(p…)` names a variant wherever one of that name is in scope, and only otherwise a value (an
   object, a companion, a local) whose type has `unapply` or `unapplySeq`; where it has both,
-  `unapply` is used. `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
+  `unapply` is used (the methods are now found through the extractor traits, settled 2026-11-19
+  below). `unapply` answers a `bool`, matched with no patterns (`Even()`), or an
   `Option`, one pattern matching its value whole and several a tuple's parts. `unapplySeq` answers
   an `Option` of a sequence, matched as a sequence pattern; the prefix-and-sequence form is not
   taken. The matched value is passed to the method as it is, with no type test first, so the
@@ -2281,6 +2317,18 @@ their words are reserved.
   underivable. Review with the user: the `Err`-first choice is the one a reader of the declaration
   could find surprising. Tuples needed no change: their `Ord`, lexicographic by part at every
   arity, was already written by the compiler for each arity and is now covered by tests.
+- Settled on the user's delegation 2026-11-19 (branch `bool-ord`): **[`bool` is `Ord`, `false`
+  before `true`](/spec/equality-and-memory/#display-and-debug)**, reversing the earlier rule that
+  `bool` had no order. `compare`, `min`/`max`/`clamp`, `Reverse`, sorting, `TreeSet`/`TreeMap` keys,
+  tuple keys and derived orders all take a bool, and `<`, `<=`, `>` and `>=` are allowed on two bools
+  as on every built-in `Ord` (one unsigned machine comparison). Rationale: porting a to-do list met
+  `tasks.sortBy(t -> (t.done, t.id))` refused, the one-line way to put open items first; without an
+  order a bool field also leaves a record underivable for `Ord` and a tuple key holding a flag
+  unusable, and `false < true` is the one order everyone already reads (0 before 1). Alternatives
+  weighed: keeping the refusal, so a key is written `if t.done then 1 else 0` (noise at every sort,
+  and still no `derives Ord` with a flag); an `Ord` for `bool` without the operators, a split no
+  other `Ord` type has; a helper such as `byDone`, too narrow for a general type. `unit` keeps no
+  order. Review with the user: it reverses a settled rule, and `b1 < b2` reads oddly to some.
 
 - Settled on the user's delegation 2026-11-05 (built on branch `sysl-callbacks`): [passing Avin functions to
   Sysl](/spec/sysl-bindings/#callbacks), the choices the request left open:
@@ -5464,6 +5512,47 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   ends when `main` returns whatever its threads are doing. Alternatives weighed: closing inboxes
   (needs a lifetime the interface does not have yet); running the queue at exit (runs interface code
   after the interface is gone).
+- Settled on the user's delegation 2026-11-19 (built on branch `main-lwt`): **Threads pinned to the
+  main thread, on a main scheduler of its own** ([Threads](/spec/threads/#pinned-to-the-main-thread),
+  [User interfaces](/spec/ui/#threads)). What was missing: code on the main thread could not wait
+  for a future, a channel or an ask without blocking the frame loop, so a handler had no way to
+  fetch something and then set a signal. `spawnOnMain(body)` (and a scope's `spawnOnMain`) starts a
+  lightweight thread that runs on the main thread only; it parks as any thread does, whatever wakes
+  it puts it on the main scheduler's ready queue, and it carries on on the main thread. Its body is
+  not checked as sendable and runs as the main thread's owner of Sysl handles, so it reaches the
+  interface's state; only the main thread starts one (a worker that tries stops the program).
+  `isMainThread()` answers `true` in it; `isPinnedToMain()` tells it from the main thread's own code,
+  so an `ask` there parks rather than trapping, and `run` there traps.
+  - **How the loop drives it:** once a frame, from `handlePosted`, which runs `runMainThreads()`
+    after the messages and posted work; and the main thread's own waits (lock, condition, join,
+    channel, future, select, sleep) run pinned threads as they become ready, a ready one waking the
+    blocked main thread. syslui-sdl's loop polls every frame, so no wake source is needed.
+  - **With no window:** the same, so a plain `main` joining a pinned thread runs it, and a loop of
+    its own calls `runMainThreads()`.
+  - **Order against posted work:** posted work and messages first, in the order sent, then the
+    pinned threads ready by then, each once, in the order they became ready. A pinned thread that
+    posted work makes ready runs in the same call; one another pinned thread makes ready runs at the
+    next, which bounds a call as `handlePosted` already is bounded.
+  - **Cancellation and deadlock:** a scope's `spawnOnMain` is cancelled with the scope, as its other
+    threads are; the deadlock check counts a ready pinned thread as work, and its report marks each
+    pinned thread `pinned to the main thread`.
+  - **A pinned thread parked when `run` ends** stays parked and runs whenever the main thread next
+    runs the main scheduler; when `main` returns it is dropped, as every thread is.
+
+  *Why*: the interface's state belongs to the main thread, so the code that waits and then touches
+  it has to run there; a lightweight thread pinned to it reuses everything that already parks and
+  wakes a thread, and the main thread stays the only one that ever touches the state. *Alternatives
+  weighed*: `await` inside a handler, which runs on the main thread's own stack (it would have to
+  block the frame or re-enter the loop from inside the handler); running every posted piece of work
+  and every message as a pinned thread, which would give one order for all of it and let any handler
+  wait (a stack for every message, the common case paying for the rare one, and a handler's answer
+  coming frames later); a wake source the loop waits on, the runtime's poller descriptor or a
+  run-loop source on macOS (needed only by a loop that sleeps when idle, which syslui-sdl's does
+  not); letting `runMainThreads` from a pinned thread run the others (nested switching on the main
+  thread's stack for no gain); a body checked as sendable (could not reach a `State`, which is the
+  point); time-slicing pinned threads (they share the main thread with the frames, which no slice
+  makes fairer). Review with the user: the order of a pinned thread's resumption against posted work
+  (posted first, per frame, not one interleaved order) and the name `spawnOnMain`.
 - Settled on the user's delegation 2026-11-10 (built on branch `binding-f32`): **A `real` crosses into and out of any Sysl floating-point type
   that rounds: `f32`, `f16`, `bf16` and `real`.** A binding's own `real` parameter, a mirror's `real`
   field going into Sysl, and a callback's `real` answer are rounded into the Sysl type to the nearest
@@ -9165,6 +9254,97 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `FD_CLOEXEC` is `1` on macOS and on Linux, so the pipe is inherited by a child started during a
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
+- Settled on the user's delegation 2026-11-19 (the user approved moving extractors onto a trait the
+  same day; branch `extractor-trait`): **an extractor is a value whose type implements one of three
+  core traits**, `Extractor[-A, +B]` (`unapply(value: A) -> Option[B]`), `BoolExtractor[-A]`
+  (`unapply(value: A) -> bool`) and `SeqExtractor[-A, +S]` (`unapplySeq(value: A) -> Option[S]`),
+  in `library/avin/extractor.avin`; the pattern checker finds the conformance (`extractor_instances`
+  in `check.sysl`) and calls the trait's method, a class's or data type's own implementation
+  directly, so a method merely named `unapply` no longer makes an extractor. The pattern syntax, the
+  three result shapes, coverage (an extractor never counts) and refinement (an extractor learns no
+  equalities) are unchanged, and the methods keep the names `unapply` and `unapplySeq`. A type
+  implements each trait at one type argument (the rule for every trait with instance members); the
+  trait whose `A` takes the matched value serves, an `unapply` trait before `SeqExtractor`. A
+  type's name is no extractor. A value implementing none is reported with the trait to implement,
+  worked out from the type's own `unapply` or `unapplySeq` where it has one, or with the three
+  traits and their methods. WHY: the user's rule that Avin is sound and nominal, which the soundness
+  audit found broken here by a lookup by name; as ordinary traits, extractors also become
+  first-class: held in a value of the trait's type, passed as a parameter, bounded on a type
+  parameter, implemented by a data type through an impl, inherited by a subclass, with the
+  variance a function's argument and result have. The `S` of `SeqExtractor` is left open rather
+  than bounded by `Seq`, so a `List` stays a `List` for its `rest*` and list patterns; the pattern
+  asks for a sequence where it is used. ALTERNATIVES: a marker trait with no members, the method
+  still found by name inside it (half nominal; a value of the trait's type could not be matched);
+  one trait with the result shape as a type parameter (the three shapes are different methods);
+  `unapply` keeping its role by name with a modifier (not a trait, so no extractor values).
+  **Review with the user:** two things the structural rule allowed are gone: an extractor object
+  with a generic method, `object Pair` with `unapply[A](xs: List[A])`, which no trait instance can
+  name, is now a generic class used through a value (`val pair = Pair[A]()`, `pair(a, b)`); and
+  one object with `unapply`s overloaded on several input types now picks one input type per trait.
+  Each implementation is also written `override`, as every trait member's is.
+
+- Settled on the user's delegation 2026-11-19 (built on branch `builder-trait`; the move onto a trait
+  approved by the user 2026-11-19): **a collection literal finds its builder through the core trait
+  `Buildable[A]`, never by a method's name** ([literals](/spec/collections/#literals)). The trait has
+  one member, `static newBuilder() -> Builder[A, Self]`; `A` is the element a literal gives the
+  builder, a map's `(K, V)` pair. A literal where a type `C` is expected is built by `C.newBuilder()`
+  where an impl of `Buildable` targets `C` itself, or where `C` is a type parameter bounded by it
+  (`make[C: Buildable[int]]() -> C = [1, 2, 3]`); otherwise it is the default `Vector`, `Set` or
+  `Map`, built through their own conformances. A companion object's `newBuilder` builds no literal.
+  Every library collection implements it, its impl calling the companion's `newBuilder`, which stays
+  the public way to get a builder (`Vector.newBuilder[int]()`); a repeated parameter's vector is
+  built through `Vector`'s conformance too. An expected collection (an `Iterable`, or a type whose
+  companion has a `newBuilder`) that is neither `Buildable` nor an instance of the default is
+  reported by the trait it lacks: "a sequence literal cannot build `Stack[int]`, which does not
+  implement `Buildable`…". WHY: the user's goal is a sound, nominally typed language, and a literal
+  that called whatever its expected type's companion named `newBuilder` was the last structural
+  lookup the soundness audit left; a trait is a stated promise, checked where it is made. One trait
+  for sequences, sets and maps, parameterized by the element rather than by a type constructor,
+  serves every collection the library has: `BitSet` (a `Buildable[int]` with no parameter of its
+  own), `TreeSet` (an `Ord` bound on its impl), maps (pairs), traits (`Set`, `SortedMap`, building
+  their default kinds), and any program's collection, with or without a companion, from any module,
+  as `FromInteger` does for integer literals. **The conformance is the type's own**: a `TreeSet`
+  expected is built by `TreeSet`'s impl, never by `SortedSet`'s or `Set`'s, since those would make
+  a different collection. ALTERNATIVES: a constructor trait on the companion, `trait
+  IterableFactory[C[_]]` with `newBuilder[A]()` (cannot express `BitSet`, which takes no
+  parameter, nor `TreeSet`'s `Ord` and `HashSet`'s `Eq & Hash` element bounds, and needs a second
+  trait for maps); two traits, one for sequences and sets and one for maps (the element type already
+  tells a pair from an element, so the second adds nothing); removing the companions' `newBuilder`
+  and calling the static as `Vector[int].newBuilder()` (breaks every call site in every avin-lang
+  repo for no gain in soundness). A trait type's own conformance builds where the trait type is
+  expected (`SortedSet`, `Set`, `Map`, `SeqMap`, so `{}` where a `Map` is expected is the empty map
+  through `Map`'s own impl), and an impl for one instance, `impl Buildable[int] for Count[int]`,
+  builds that instance only; `Count[string]` expected is the error naming the trait. **The companion
+  `apply` stays an ordinary method** (`Deque(1, 2, 3)`): its repeated parameter's `Vector` is already
+  built through `Vector`'s conformance, so it meets the trait where a literal does, and each
+  collection keeps the cheapest way from that vector to itself. ALTERNATIVES for `apply`: rewriting
+  every companion `apply` over its own `newBuilder` (no gain in soundness, and slower where `apply`
+  converts the vector directly, as `Array`'s `toArray` does); a `static apply(xs: A*) -> Self` in
+  `Buildable` with a default body (makes `C(1, 2)` callable on a bound `C: Buildable[int]`, but adds
+  a second member every program's impl inherits, and `C.newBuilder()` already serves that).
+  **Review with the user**: the name `Buildable`, and whether the companions' `newBuilder` should
+  eventually be the static member alone.
+
+- Settled on the user's delegation 2026-11-19 (branch `train-ay`, reconciling `builder-trait` with
+  the comparisons of ranges and literals that predate it): **a type only suggested to a collection
+  literal, by another operand of `==`, `!=` or an ordering, leaves the literal its default where no
+  literal builds that type**, so `(1 .. 3) == [1, 2, 3]` is
+  a `Range` compared with a `Vector` by their elements, as before `Buildable`; a type demanded of
+  the literal (a declaration, a parameter, a result, an ascription) still reports the trait it
+  lacks, `val r: Range = [1, 2]`. WHY: the suggestion exists so a literal compares like with like
+  where it can (`xs == [1, 2]` with `xs` a `List`); where it cannot, a literal of the default
+  compares the same by `Seq` equality, and an error there would refuse a comparison that has an
+  obvious meaning. ALTERNATIVES: refusing the comparison and asking for `.toVector` (breaks
+  established programs for no soundness gain); making `Range` `Buildable` (a literal cannot promise
+  a range's even step, so its builder would have to fail at run time).
+- Settled on the user's delegation 2026-11-19 (branch `train-ay`, reconciling `bytes-sendable`'s
+  `object Isolated` with constructors used as values): **a class's companion object that declares no
+  `apply` leaves the name the class's constructor where a function is expected**, as in call
+  position, so `val mi: (Vector[string]) -> Isolated[Vector[string]] = Isolated` and
+  `[1, 2].map(Box)` make values; elsewhere the name is the object. WHY: adding a companion with
+  unrelated members (`Isolated.move`) must not take away the constructor value its class had.
+  ALTERNATIVES: the object always (breaks every such value when a companion is added); an error
+  asking to choose (nothing is ambiguous where the object is not a function).
 
 - Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`, the
   design approved by the user 2026-11-13 and its build approved 2026-11-19; built from branch
@@ -9804,6 +9984,141 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   random pairs checked against the quadratic table for minimality. Review with the user: the names
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
+- **`io.inputs` and `io.inputLines`: the files named, or standard input when none.** Settled on the
+  user's delegation 2026-11-19: `io.inputs(paths: Vector[string]) -> Iterator[Result[(string, string),
+  IoError]]` yields each input as its name and all its text, and `io.inputLines(paths)` yields the
+  same shape with one line per element. No paths is one input, standard input; `-` names standard
+  input wherever it stands in the list, and a name is yielded as written, so standard input is
+  `"-"`. Inputs are read as the iterator reaches them; one that cannot be read is an `Err` (the
+  ordinary `IoError`, naming the file) in its place, and the iterator goes on, so a tool reports and
+  carries on, and `.collect`/`?` style stopping at the first failure is the caller's choice. Standard
+  input is read to its end once, so a second `-` is empty. A file's lines come from its whole text
+  (`readText`), standard input's as it advances. Why: every command-line filter writes this loop,
+  and an element carrying its name serves the `name:line` output of `grep` and an error message
+  alike. Placed in `avin.io` beside `readAll` and `lines`, named as they are. Alternatives weighed:
+  `Vector` of results (reads every file before the first line is used, and cannot stream standard
+  input); a `Source` of the concatenation (loses where each line came from); stopping at the first
+  failing file (a tool wants to report each); a name of `""` for standard input (indistinguishable
+  from a named empty string, and `-` is what the tool was told). Tests: `tests/run/io_inputs_files`,
+  `io_inputs_stdin`, `io_inputs_lines_stdin`. Review with the user: the name `"-"` yielded for
+  standard input, and files being read whole rather than streamed by line.
+
+- **A symbol method may declare its precedence and grouping** (branch `declared-precedence`,
+  2026-11-19; the user approved "perhaps declared precedence" in the missing-features list,
+  2026-11-19). The surface is [A declared precedence](/spec/operators-and-control-flow/#a-declared-precedence).
+  **Review with the user:** the whole surface, the annotation names `@precedence` and
+  `@groupsRight`, naming a level by an operator's string, and the program-wide rule.
+  - Settled on the user's delegation 2026-11-19: **`@precedence("|")` names a row of the existing
+    level table by any operator in it, and `@groupsRight` makes calls group to the right with the
+    receiver kept on the left.** The rows a method may take are the symbol levels plus `&&`'s and
+    `||`'s, which a pipe looser than every comparison needs. WHY: no level is added, so the table
+    stays the whole account of how an expression reads, and a reader who knows how `|` binds knows
+    how a call declared as `|` binds; naming the row by its operator needs no new vocabulary.
+    ALTERNATIVES: numeric levels (refused: a reader cannot place `infixl 6` without a table of
+    every declaration in scope, and two libraries' numbers interleave in ways neither author
+    saw); identifier level names such as `@precedence(additive)` (a second set of names for rows
+    the operators already name); one annotation with a grouping argument,
+    `@precedence("^", right)` (a positional flag reads worse than a word of its own); `@groups(left)`
+    as well (a name ending in `:` would then take its receiver on the right yet group left, a
+    combination nothing needs); nothing new, with documentation (the user approved the feature).
+  - Settled on the user's delegation 2026-11-19: **a declaration belongs to the method's name
+    across the whole program**, and every method of that name in the program reads alike: an
+    overload, another type's method, a trait's declaration and each implementation either declare
+    the same reading or one that comes to the same (a method declaring nothing agrees only where
+    the declaration restates what its name gives); any other is an error naming both, reported at
+    the program's method where the other is the standard library's. WHY: the parse runs before
+    any type is known, so `a <|> b` cannot be read by `a`'s type; a module holding a value of the
+    type without importing it must read its calls as the declaring module does, which only a
+    program-wide reading guarantees; and a module's code cannot change meaning silently when an
+    unrelated library joins the program, because that is an error instead. ALTERNATIVES: by the
+    receiver's type at each call (needs types at parse time, or a second parse after checking,
+    and makes `a op b op2 c` unreadable without knowing every operand's type); visible through
+    imports only, as some languages scope fixity (a module that reaches the type through a
+    function's result, without importing its module, would read the calls differently from the
+    declaring module); undeclared methods silently following a declaration (another library's
+    `<|>`, written for the default reading, would be re-read by a declaration it never saw).
+  - Settled on the user's delegation 2026-11-19: **the compiler reads declarations after parsing
+    every unit with the default levels, then parses again, at the declared levels, only the units
+    that write a declared name**, a program with no declaration that changes a reading being parsed
+    once as before. WHY: the declarations are on methods inside the files, so they are known only
+    after a first parse; re-parsing keeps the parser the one place precedence lives, with no tree
+    rewriting pass to keep in step with it. ALTERNATIVES: a fixity-resolution pass over the parsed
+    trees (a second implementation of the precedence rules over every expression form); a lexical
+    pre-scan for declarations (a second, partial parser of class and impl bodies).
+  - Settled on the user's delegation 2026-11-19: **only a method named by a symbol the language
+    does not use declares**: `@precedence` or `@groupsRight` on one of the language's operators
+    (`+`, `|`, `<`), an assignment (`++=`), a method named by a word, or a function is an error;
+    `~`, `++` and `--` between two operands may declare. `@groupsRight` on a name ending in `:` is an
+    error (it groups right already). A comparison and `is` take part in the rule against mixing
+    groupings now that a right-grouping method can share their level. WHY: the language's own
+    operators keep one reading everywhere, and every named call binds alike.
+  - `avin parse`, `avin fmt` and the LSP's single-file views read one file at a time and so parse
+    it at the default levels; `avin check`, `run`, `build`, `test` and the LSP's diagnostics load
+    the whole program and read the declarations. `avin fmt` keeps the file's tokens, so a default
+    reading changes only where it chooses to break a long line.
+
+- Settled on the user's delegation 2026-11-19 (branch `bytes-sendable`; found by the ssh package on
+  `pty-forward`, whose relay could hand read buffers to per-connection threads only by copying each
+  into a `Vector[byte]`): **an array the program holds moves to another thread with
+  `Isolated.move(items)`, with no copy, and the array carries an owner that every use checks**
+  ([handing over ownership](/spec/actors/#handing-over-ownership)).
+  `move[T: Sendable](items: Array[T]) -> Isolated[Array[T]]`, on `Isolated`'s companion in
+  `avin.actors`; it covers every `Array` of sendable elements, bytes or not, and nothing else. An
+  array's header gains an owner word beside its length (eight bytes), zero for an array never moved,
+  which any code that reaches it may use as before, since an array is still not sendable. A move
+  also rewrites the length word for good: its top bit set, the length in bits 32 to 62, the low 32
+  bits zero. So an element use of an array never moved checks exactly what it did before, the index
+  against the low 32 bits, and a moved array fails that check for every index and goes on, on a
+  path the optimizer is told is cold, to compare its owner; `length`, a slice, a clear and a copy
+  test the word's sign as they read it. A move
+  gives it an owner no running code is, by one compare-and-set; `take` claims it for the taker, `with`
+  for the code running `f` and moves it again after; every use by other code traps with
+  `` `Array` was moved to another owner ``: an element read or write, `length`, `slice`, a copy into
+  or out of it, an iterator's step, a C binding's argument (checked before C sees it), a Sysl
+  binding's argument (checked as its shim reads it), a `ByteBlock` write from it, and a second move.
+  **Aliases** (a field, a closure's capture, an iterator) are the same object, so their uses trap
+  as the local's does; a **slice** taken before the move is a copy and stays the sender's; frozen
+  arrays (a `Vector`'s or an `ArraySeq`'s) are the library's own, never moved, and unchecked. Why:
+  an array's elements are stored inside the object, so a move cannot hand the receiver new storage
+  and leave the sender an empty shell; the only sound zero-copy move of an array other references
+  may reach is one the array itself enforces, and an owner word read beside the length the bounds
+  check already reads keeps the common path to a load and a compare. Handles already move this
+  way, and the messages match. *Alternatives weighed*: (a) **transfer on send**, making `Array`
+  sendable and moving it implicitly at every send — then an `@isolating` body (a mutex's value,
+  `isolate`) could capture an array that was never moved and share it unchecked between threads, so
+  every array would need a real owner from birth and every mutex, pool and `Isolated` a walk to
+  re-own what it holds; far wider and slower for the same gain. (b) **`freeze()`/`toBytes()`**, an
+  immutable sendable view — still needs the array to refuse later writes (the same owner word), and
+  the relay wants a buffer the receiver can write and hand back. (c) **a separate `Transfer[T]`
+  type** — `Isolated` already is the type of "mutable, moving, taken once", with `take`, `with` and
+  its place in the handover walk; a second type would duplicate it. (d) **lifting
+  `@trusted_sendable`'s restriction** to the standard library — rejected: it would let any package
+  declare an array-holding class sendable with nothing checking the claim, which is a data race,
+  not a gap closed. A compile-time refusal of the sender's later use was weighed too: it needs
+  uniqueness or alias analysis the checker does not have, and the runtime check covers every
+  alias. *The cost, measured on the build that settled it*: memory, a million live arrays of 0 to
+  100 bytes take 0 or 16 more bytes each, by whether the eight cross a 16-byte allocation class
+  (56→56 bytes at 0, 1 and 8 elements; 56→72 at 9 and 16; 72→88 at 32; 104→120 at 64; 152→152 at
+  100). Time, at -O2: a read loop over an array never moved compiles to the same ten instructions
+  as before; a write loop bounded by `a.length` keeps an element bounds check the optimizer used to
+  drop, plus a sign test, three predictable instructions an iteration. A first encoding that loaded
+  the owner word at every use was measured (preliminary, eleven interleaved runs, before the
+  benchmark was cut short) at 3% to 54% slower in tight loops, which is why the owner sits behind
+  the bounds check; the encoding that settled was checked in the generated code, not timed.
+  **Review with the user**: the remaining write-loop check and the memory above, and whether
+  `Buffer` should move the same way (its length is a field of its own, so it would need its own
+  owner).
+
+- Settled on the user's delegation 2026-11-19 (branch `ports-cli`): **an example of many files,
+  `examples/NAME/`, is run and its output checked when `examples/NAME.out` stands beside it, and is
+  only built and linked when it has none**, as a program that opens a window has none. Its input
+  and expected standard error are `examples/NAME.in` and `examples/NAME.err`, its expectation lines
+  (`// args:`, `// expect:`) in its own files, exactly as a program in `tests/programs/run` has them.
+  *Why*: the command-line examples (`wordfreq`, `grep`, `logsum`, `dusage`, `markdown`, `todo`) are
+  directories with a README, and the sidecar beside the directory is the rule the corpus already
+  reads for programs of many files, so nothing new is learned to read one. *Alternatives weighed*:
+  sidecars inside the directory (a second rule for the same thing); a header line marking a window
+  program as not run (a marker on the exception rather than on the output that makes the check).
 
 ## Proposed
 
@@ -11914,10 +12229,9 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     vendored package, or trust the hash recorded beside each package as it trusts the cache's.
 
 - Lightweight threads, the open parts of the settled design above (cancellation is under
-  [Proposed](#proposed)): **keeping user-interface work on the main thread** (a scheduler that runs a
-  lightweight thread on the main operating system thread only, which also gives the `ui` package
-  its change from another thread). Stack size and growth are settled above (branch
-  `lwt-stacks`). The allocation chunk belongs to the carrier (proposed above), so
+  [Proposed](#proposed)): none is left open. Stack size and growth are settled above (branch
+  `lwt-stacks`), and keeping user-interface work on the main thread is settled above as threads
+  pinned to the main thread (branch `main-lwt`). The allocation chunk belongs to the carrier (proposed above), so
   thousands of parked lightweight threads hold no chunk each. The collector needs nothing new: its roots are what the
   runtime's callback marks, so a parked lightweight thread's context keeps its exact shadow stack
   and is walked as an attached thread's is, and switching stacks happens only at the runtime's own

@@ -1875,6 +1875,15 @@ private restore_vars(c: *Checker, saved: Buf[Option[&Type]])
     c.vars.truncate(saved.len())
     for i in 0..<saved.len()
         c.vars[i] = saved[i]
+    // An unknown recorded for a variable made since the save goes with the variable, as a collection
+    // literal checked on trial records its element's. Each was recorded after the save, so after any
+    // mark taken before it, and the unknowns before such a mark keep their places.
+    var kept = 0usize
+    for i in 0..<c.unknowns.len()
+        if c.unknowns[i].var_id < saved.len()
+            if kept != i then c.unknowns[kept] = c.unknowns[i]
+            kept += 1
+    c.unknowns.truncate(kept)
 
 // Reports a type of qualified name `key` declared again, naming the data type or class that has it.
 private note_type_duplicate(c: *Checker, unit: usize, at: Span, name: string, key: string)
@@ -2218,6 +2227,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     elif c.class_types.get(key) is Some(id)
         if is_trait(c, id)
             if d.trait_name is None then resolve_trait_impl(c, unit, module_name, d, id)
+            elif names_static_only_trait(c, unit, d) then resolve_instance_impl(c, unit, module_name, d, path, c.classes[id].module_name, true)
             else c.note(unit, d.target.span, s"`$path` is a trait; an impl of a trait is for a data type, a class, an object or a built-in type")
             return invalid
         owner = class_owner(id)
@@ -2245,7 +2255,7 @@ private resolve_impl(c: *Checker, unit: usize, module_name: string, written_decl
     // adding methods to a type of another module is matched the same way: its methods are not the
     // type's, so they reach no private member and no method table.
     if !in_order && d.trait_name is Some(_)
-        resolve_instance_impl(c, unit, module_name, d, path, home)
+        resolve_instance_impl(c, unit, module_name, d, path, home, false)
         return invalid
     if !in_order || (d.trait_name is None && module_name != home)
         c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, module_name != home, None))
@@ -2568,8 +2578,9 @@ private declared_at(c: *Checker, unit: usize, at: Span) -> string
 // giving the impl's parameters, which then meet their bounds. Its methods are functions over the
 // impl's parameters whose first parameter is the value, as those of an impl adding to a type built
 // from its parameters are; its table places them at the trait's positions. Whether it overlaps
-// another impl of the trait is decided once every conformance is known.
-private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, path: string, home: string)
+// another impl of the trait is decided once every conformance is known. `own` marks a trait type's
+// own conformance to a trait whose members are all static (see `InstanceConformance`).
+private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: &ImplDecl, path: string, home: string, own: bool)
     val n = c.instances.len()
     val owner = instance_owner(n)
     val outer_generic = c.generic
@@ -2615,7 +2626,7 @@ private resolve_instance_impl(c: *Checker, unit: usize, module_name: string, d: 
             if is_class_named(c, k, qualified(CoreModule, name))
                 c.note(unit, written_trait_span(d), s"`$name` holds of a type at every instance alike, so its impl is for the type at the impl's type parameters, in order, as in `impl[T] $name for Box[T]`")
                 return
-    c.instances.push(InstanceConformance(target, t, d.type_params, unit, d.target.span, module_name, buf(), buf()))
+    c.instances.push(InstanceConformance(target, t, d.type_params, unit, d.target.span, module_name, buf(), buf(), own))
     c.trait_impls.push(TraitImpl(unit, module_name, d, 0, false, false, Some(n)))
 
 // Each method an impl adds to a trait is a generic function over the impl's parameters, then `Self`,
@@ -3352,6 +3363,99 @@ several_conformances(d: &ClassDecl) -> bool
                 any = true
             _ -> return false
     any
+
+/** Whether class `k` is a trait whose members, with those of the traits it requires, are all static,
+ * at least one: `trait Buildable[A]` with only `static newBuilder()`. A value of it has nothing to
+ * call, and no value of it exists (a trait with a static member is a bound and not a type), so a
+ * conformance to it is no variance position of the conforming type, and a trait type may state one
+ * of its own. Read from the traits each trait requires, so once headers are resolved. */
+static_only_trait(classes: Buf[ClassSymbol], k: usize) -> bool = static_members_only(classes, k, 0) > 0
+
+/** The static members trait `k` and the traits it requires declare, or -1 where any member is not
+ * static or `k` is not a trait. */
+private static_members_only(classes: Buf[ClassSymbol], k: usize, depth: usize) -> i64
+    if depth > classes.len() || classes[k].decl.modifier != "trait" then return -1
+    var count: i64 = 0
+    for m in classes[k].decl.members
+        m match
+            MethodMember(_, _, _, static_member) ->
+                if !static_member then return -1
+                count += 1
+            _ -> return -1
+    for t in classes[k].traits
+        val r = *t match
+            Class(r, _, _) -> r
+            _ -> return -1
+        val more = static_members_only(classes, r, depth + 1)
+        if more < 0 then return -1
+        count += more
+    count
+
+/** Whether `t` is an instance of a trait whose members are all static. */
+private static_only_conformance(c: *Checker, t: &Type) -> bool = *t match
+    Class(k, _, _) -> static_only_trait(c.classes, k)
+    _ -> false
+
+/** Whether impl `d` names a trait whose members are all static, as `static_only_trait` says, read from
+ * the traits' declarations, since impls are resolved before any header. */
+private names_static_only_trait(c: *Checker, unit: usize, d: &ImplDecl) -> bool
+    val written = d.trait_name match
+        Some(t) -> t
+        None -> return false
+    val path = written.kind match
+        Named(p, _) -> p
+        _ -> return false
+    c.class_types.get(resolve_name(c, unit, path)) match
+        Some(k) -> declared_static_only(c, k, 0) > 0
+        None -> false
+
+private declared_static_only(c: *Checker, k: usize, depth: usize) -> i64
+    if depth > c.classes.len() || !is_trait(c, k) then return -1
+    var count: i64 = 0
+    for m in c.classes[k].decl.members
+        m match
+            MethodMember(_, _, _, static_member) ->
+                if !static_member then return -1
+                count += 1
+            _ -> return -1
+    for parent in c.classes[k].decl.parents
+        val r = parent_trait(c, c.classes[k].unit, parent) match
+            Some(r) -> r
+            None -> return -1
+        val more = declared_static_only(c, r, depth + 1)
+        if more < 0 then return -1
+        count += more
+    count
+
+/** Whether a type parameter bounded by `b` may stand for a type seen as `b` only through variance: `b`
+ * is an instance of a class or data type with a covariant or contravariant parameter, so an argument
+ * `Box[Cat]` meets the bound `Box[Animal]`. The type's static members and its conformances to traits
+ * whose members are all static are the argument's own, at its own type arguments, and are not
+ * reached through such a bound, since they are no variance positions. */
+widening_bound(classes: Buf[ClassSymbol], data: Buf[DataSymbol], b: &Type) -> bool
+    val params = *b match
+        Class(k, _, _) ->
+            if classes[k].decl.modifier == "trait" then return false
+            classes[k].decl.type_params
+        Data(d, _, _) -> data[d].decl.type_params
+        _ -> return false
+    for tp in params
+        if !(tp.variance is Invariant) then return true
+    false
+
+/** `b`, a bound of a type parameter, as an instance of trait `k`, as `holding_ancestor` finds it, but
+ * without the conformances that hold only of a type itself: a trait type's own, and, for a trait
+ * whose members are all static, a widening bound's (see `widening_bound`). */
+bound_ancestor(f: Conformances, b: &Type, k: usize) -> Option[&Type]
+    if static_only_trait(f.classes, k) && widening_bound(f.classes, f.data, b) then return None
+    holding_ancestor_from(f, b, k, false)
+
+/** Every instance of trait `k` that bound `b` is, as `bound_ancestor` finds one. */
+bound_ancestors(f: Conformances, b: &Type, k: usize) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    if static_only_trait(f.classes, k) && widening_bound(f.classes, f.data, b) then return out
+    collect_ancestors(f, b, k, &out, 0, false)
+    out
 
 private written_trait_span(d: &ImplDecl) -> Span = d.trait_name match
     Some(t) -> t.span
@@ -5001,7 +5105,7 @@ private declare_impl_method(c: *Checker, i: usize, f: &Function, public: bool, o
     if bound || (mirror && has_annotation(f, "sysl")) then check_bound_method_annotations(c, unit, f, bound, "mirror")
     else
         for a in f.annotations
-            if a.name == "tailrec" || a.name == "sendable_result" then continue
+            if a.name == "tailrec" || a.name == "sendable_result" || level_annotation(a.name) then continue
             if a.name != "intrinsic" || !builtin || trait_id is Some(_)
                 c.note(unit, f.name_span, "annotations on methods are not implemented")
                 break
@@ -5193,7 +5297,7 @@ private trait_view(c: *Checker, t: &Type, k: usize) -> Option[&Type]
     val f = conformances(c)
     if *known is TypeVar(_, _, _)
         for b in bounds_of(c, known)
-            if holding_ancestor(f, b, k) is Some(up) then return Some(up)
+            if bound_ancestor(f, b, k) is Some(up) then return Some(up)
         return None
     holding_ancestor(f, known, k)
 
@@ -7124,9 +7228,15 @@ private check_class_variance(c: *Checker, id: usize)
     val at = k.decl.name_span
     if k.superclass is Some(sup) then variance_in(c, k.unit, params, owner, sup, 1, at, s"the superclass ${type_name(sup)}")
     // A constructor trait's arguments are holes, which no value's type fills, so they are no
-    // position of a variance.
+    // position of a variance. Nor is a class's conformance to a trait whose members are all static:
+    // no value of the trait exists, and its members are reached through a type, never through an
+    // instance seen at a wider type (see `widening_bound`). A trait requiring one keeps the position,
+    // since every type implementing the trait is seen as the trait through its variance.
+    val is_trait_type = k.decl.modifier == "trait"
     for t in k.traits
-        if !names_constructor_trait(c, t) then variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
+        if names_constructor_trait(c, t) then continue
+        if !is_trait_type && static_only_conformance(c, t) then continue
+        variance_in(c, k.unit, params, owner, t, 1, at, s"the trait ${type_name(t)}")
     for f in k.functions
         variance_in(c, k.unit, params, owner, f, 1, at, s"the function type ${type_name(f)}")
     for i in k.inherited..<k.fields.len()
@@ -7161,6 +7271,11 @@ private check_class_variance(c: *Checker, id: usize)
         if exempt && contains_id(c.impl_methods, m) then continue
         // The method assigning a trait's `var` field is the field, checked above.
         if contains_id(c.trait_setters, m) then continue
+        // A class's static member is called on the type at the type arguments the call names, or
+        // through a bound at the argument's own, never through an instance seen at a wider type, so
+        // it is no position. A trait's static member is one: a type conforming to the trait at one
+        // argument conforms to it at a wider one through the trait's variance.
+        if !is_trait_type && c.symbols[m].static_member then continue
         val symbol = c.symbols[m]
         val name = symbol.decl.name
         for j in 1..<symbol.params.len()
@@ -7201,7 +7316,7 @@ private check_data_variance(c: *Checker, id: usize)
             val name = if i < v.field_names.len() then v.field_names[i] else "_"
             variance_in(c, d.unit, params, owner, v.fields[i], 1, v.span, s"the field `$name` of `${v.name}`")
     for t in d.traits
-        if !names_constructor_trait(c, t) then variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
+        if !names_constructor_trait(c, t) && !static_only_conformance(c, t) then variance_in(c, d.unit, params, owner, t, 1, d.decl.span, s"the trait ${type_name(t)}")
     for f in d.functions
         variance_in(c, d.unit, params, owner, f, 1, d.decl.span, s"the function type ${type_name(f)}")
 
@@ -7920,6 +8035,8 @@ private intrinsic_of(c: *Checker, unit: usize, module_name: string, f: &Function
             val example = if a.name == "should_trap" then "should_trap" elif a.name == "timeout" then "timeout: 30" else "ignore: \"why\""
             c.note(unit, a.span, s"`${a.name}` is said of a test, as an argument of `@test`: `@test($example)`")
             continue
+        // Read, and refused where they are misplaced, before the parse (`declared_levels`).
+        if level_annotation(a.name) then continue
         if a.name != "intrinsic"
             c.note(unit, a.span, misplaced_annotation(c, unit, a.name, "a function"))
             continue
@@ -8063,6 +8180,13 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         params.push(Function(none, Unit, false))
         params.push(Int(64))
         result = AnyType
+    elif name == "thread_start_main"
+        // The same, for a thread pinned to the main thread.
+        entry = "avin_rt_thread_start_main"
+        var none: Buf[&Type] = buf()
+        params.push(Function(none, Unit, false))
+        params.push(Int(64))
+        result = AnyType
     elif name == "actor_guarded"
         // An actor's code run so that a trap in it fails the actor: the closure, the actor's shown
         // name and the array of one string its reason goes in; whether it trapped.
@@ -8145,6 +8269,17 @@ intrinsic_entry(name: string) -> Option[(string, Buf[&Type], &Type)]
         params.push(AnyType)
         params.push(Int(64))
         params.push(Int(64))
+    // Moving an array out of the running code's hands, giving it an owner no running code is, which
+    // answers that owner or zero where the code may not use the array; and claiming one so moved.
+    elif name == "move_array"
+        entry = "avin_rt_array_move"
+        params.push(AnyType)
+        result = Int(64)
+    elif name == "claim_array"
+        entry = "avin_rt_array_claim"
+        params.push(AnyType)
+        params.push(Int(64))
+        result = Bool
     // A sleeping lock and a condition variable, each an opaque object on the collected heap.
     elif name == "lock_new"
         entry = "avin_rt_lock_new"
@@ -8828,7 +8963,7 @@ meets_bound(f: Conformances, x: &Type, bound: &Type) -> bool
         Var(_) -> true
         TypeVar(_, _, _) ->
             for b in type_var_bounds(f, x)
-                if holding_ancestor(f, b, k) is Some(up)
+                if bound_ancestor(f, b, k) is Some(up)
                     if conforms(up, bound) then return true
             false
         _ ->
@@ -9981,15 +10116,20 @@ rendered_at_run_time(classes: Buf[ClassSymbol], t: &Type) -> bool = *t match
 /** `t` as an instance of the class or trait `target`, as `ancestor_type` finds it, through only the
  * conformances that hold at `t`'s type arguments: one an impl with bounds of its own states holds
  * where the arguments meet them. */
-holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
+holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type] = holding_ancestor_from(f, t, target, true)
+
+/** `holding_ancestor`, where `own` says whether a trait type's own conformances count: they do for
+ * the type asked about, and not for the traits and superclasses it is seen as on the way. */
+private holding_ancestor_from(f: Conformances, t: &Type, target: usize, own: bool) -> Option[&Type]
     if f.instances.len() > 0 && (*t is Data(_, _, _) || *t is Class(_, _, _))
         for n in 0..<f.instances.len()
+            if f.instances[n].own && !own then continue
             if instance_args(f, n, t) is Some(args)
-                if holding_ancestor(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target) is Some(found) then return Some(found)
+                if holding_ancestor_from(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, false) is Some(found) then return Some(found)
     if *t is Data(d, _, xs)
         for required in f.data[d].traits
             if !conformance_holds(f, data_owner(d), required, xs) then continue
-            if holding_ancestor(f, substitute(required, data_owner(d), xs), target) is Some(found) then return Some(found)
+            if holding_ancestor_from(f, substitute(required, data_owner(d), xs), target, false) is Some(found) then return Some(found)
         return None
     val k = *t match
         Class(k, _, _) -> k
@@ -10000,22 +10140,23 @@ holding_ancestor(f: Conformances, t: &Type, target: usize) -> Option[&Type]
         _ -> buf()
     for required in f.classes[k].traits
         if !conformance_holds(f, class_owner(k), required, args) then continue
-        if holding_ancestor(f, substitute(required, class_owner(k), args), target) is Some(found) then return Some(found)
-    holding_ancestor(f, substitute(f.classes[k].superclass?, class_owner(k), args), target)
+        if holding_ancestor_from(f, substitute(required, class_owner(k), args), target, false) is Some(found) then return Some(found)
+    holding_ancestor_from(f, substitute(f.classes[k].superclass?, class_owner(k), args), target, false)
 
 /** Every instance of the class or trait `target` that `t` is through the conformances holding at its
  * type arguments: one at most, except for a trait a type implements at several type arguments. */
 holding_ancestors(f: Conformances, t: &Type, target: usize) -> Buf[&Type]
     var out: Buf[&Type] = buf()
-    collect_ancestors(f, t, target, &out, 0)
+    collect_ancestors(f, t, target, &out, 0, true)
     out
 
-private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
+// `own` says whether a trait type's own conformances count, as in `holding_ancestor_from`.
+private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize, own: bool)
     if depth > f.classes.len() then return
-    collect_instance_ancestors(f, t, target, out, depth)
+    collect_instance_ancestors(f, t, target, out, depth, own)
     if *t is Data(d, _, xs)
         for required in f.data[d].traits
-            if conformance_holds(f, data_owner(d), required, xs) then collect_ancestors(f, substitute(required, data_owner(d), xs), target, out, depth + 1)
+            if conformance_holds(f, data_owner(d), required, xs) then collect_ancestors(f, substitute(required, data_owner(d), xs), target, out, depth + 1, false)
         return
     val k = *t match
         Class(k, _, _) -> k
@@ -10029,8 +10170,8 @@ private collect_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&T
         Class(_, _, a) -> a
         _ -> buf()
     for required in f.classes[k].traits
-        if conformance_holds(f, class_owner(k), required, args) then collect_ancestors(f, substitute(required, class_owner(k), args), target, out, depth + 1)
-    if f.classes[k].superclass is Some(sup) then collect_ancestors(f, substitute(sup, class_owner(k), args), target, out, depth + 1)
+        if conformance_holds(f, class_owner(k), required, args) then collect_ancestors(f, substitute(required, class_owner(k), args), target, out, depth + 1, false)
+    if f.classes[k].superclass is Some(sup) then collect_ancestors(f, substitute(sup, class_owner(k), args), target, out, depth + 1, false)
 
 /** Whether the type whose parameters `owner` owns, at type arguments `args`, has the conformance to
  * `required` its declaration or an impl states: at once, unless an impl with bounds of its own
@@ -10049,8 +10190,14 @@ conformance_holds(f: Conformances, owner: usize, required: &Type, args: Buf[&Typ
  * hold. The parts are matched exactly, so `Vector[byte]`'s conformance is not a `Vector[Nothing]`'s. */
 instance_args(f: Conformances, n: usize, t: &Type) -> Option[Buf[&Type]]
     val x = f.instances[n]
+    // A trait type's own conformance holds of the trait type itself, not of its implementers.
     val seen = *x.ty match
-        Class(k, _, _) -> ancestor_type(f.classes, f.data, t, k)?
+        Class(k, _, _) ->
+            if x.own
+                *t match
+                    Class(j, _, _) -> if j == k then t else return None
+                    _ -> return None
+            else ancestor_type(f.classes, f.data, t, k)?
         Data(d, _, _) -> *t match
             Data(e, _, _) -> if d == e then t else return None
             _ -> return None
@@ -10103,11 +10250,12 @@ private match_instance_parts(ps: Buf[&Type], owner: usize, xs: Buf[&Type], binds
 
 /** The instances of trait `target` that `t` is through the instance conformances holding of it and
  * the traits theirs require. */
-private collect_instance_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize)
+private collect_instance_ancestors(f: Conformances, t: &Type, target: usize, out: *Buf[&Type], depth: usize, own: bool)
     if f.instances.len() == 0 then return
     if !(*t is Data(_, _, _) || *t is Class(_, _, _)) then return
     for n in 0..<f.instances.len()
-        if instance_args(f, n, t) is Some(args) then collect_ancestors(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, out, depth + 1)
+        if f.instances[n].own && !own then continue
+        if instance_args(f, n, t) is Some(args) then collect_ancestors(f, substitute(f.instances[n].trait_type, instance_owner(n), args), target, out, depth + 1, false)
 
 /** Whether type arguments `args` meet the bounds of conditional conformance `x`. */
 conditions_met(f: Conformances, x: ConditionalConformance, args: Buf[&Type]) -> bool = unmet_condition(f, x.owner, x.conditions, args) is None
@@ -10125,7 +10273,7 @@ unmet_condition(f: Conformances, owner: usize, conditions: Buf[Buf[&Type]], args
 private find_core_traits(c: *Checker)
     var traits: Map[string, usize] = map()
     var methods: Map[string, usize] = map()
-    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "FromDecimal", "Display", "Debug", "Sendable", "Boundary"]
+    for name in ["Eq", "Hash", "Ord", "Add", "Sub", "Mul", "Div", "Rem", "Neg", "Numeric", "Integer", "FromInteger", "FromDecimal", "Buildable", "Display", "Debug", "Sendable", "Boundary"]
         if c.class_types.get(qualified(CoreModule, name)) is Some(k)
             if is_trait(c, k)
                 traits.put(name, k)
@@ -12920,11 +13068,13 @@ private is_sysl_path(p: string) -> bool
 // A name a type could have: an identifier beginning with a capital letter.
 private is_type_name(n: string) -> bool = is_capitalized(n) && spelled_as_name(n) && is_nfc(n)
 
-/** The annotations on a method other than `@tailrec`, which any method with a body may have. */
+/** The annotations on a method other than `@tailrec`, which any method with a body may have, and
+ * `@precedence` and `@groupsRight`, which any method may have and the parse reads
+ * (`declared_levels`). */
 private method_annotations(f: &Function) -> usize
     var n = 0usize
     for a in f.annotations
-        if a.name != "tailrec" && a.name != "sendable_result" then n += 1
+        if a.name != "tailrec" && a.name != "sendable_result" && !level_annotation(a.name) then n += 1
     n
 
 private has_annotation(f: &Function, name: string) -> bool
@@ -14643,20 +14793,75 @@ private variant_members(c: *Checker, name: string, members: Buf[&Type]) -> Buf[&
                     break
     found
 
-// The members a collection literal can build: a `List`, and a type whose companion has `newBuilder`.
+// The members a collection literal can build: a `List`, and a type that implements `Buildable`.
 private collection_members(c: *Checker, members: Buf[&Type]) -> Buf[&Type]
     var found: Buf[&Type] = buf()
     for m in members
         val t = zonk(c, m)
-        val companion = *t match
-            Class(k, _, _) -> c.classes[k].companion
-            Data(d, _, _) -> c.data[d].companion
-            _ -> None
-        var collection = is_list_type(c, t)
-        if companion is Some(o)
-            if methods_named(c, o, "newBuilder").len() > 0 then collection = true
-        if collection then found.push(m)
+        if is_list_type(c, t) || builds_literals(c, t) then found.push(m)
     found
+
+/** Whether a collection literal builds `t` through `t`'s own conformance to the core trait
+ * `Buildable`: `t` is a class or data type an impl of the trait targets, or a type parameter bounded
+ * by it. A type that is a `Buildable` only through a trait it implements is not built by that trait's
+ * builder, which would make the trait's collection rather than `t`. */
+private builds_literals(c: *Checker, t: &Type) -> bool
+    val b = c.core.trait_named("Buildable") match
+        Some(b) -> b
+        None -> return false
+    val k = zonk(c, t)
+    *k match
+        Class(_, _, _) -> conformance_impl(c, k, b) is Some(_) || instance_conformance_to(c, k, b, true)
+        Data(_, _, _) -> conformance_impl(c, k, b) is Some(_) || instance_conformance_to(c, k, b, true)
+        TypeVar(_, _, _) ->
+            for bound in bounds_of(c, k)
+                if ancestor_type(c.classes, c.data, bound, b) is Some(_) then return true
+            false
+        _ -> false
+
+/** Whether an impl for instances of `own`'s declaration states a conformance to trait `t`, or to a
+ * trait requiring it: `impl[A: Ord] Buildable[A] for SortedSet[A]`, a trait type's own conformance,
+ * or `impl Buildable[int] for Box[int]`. `holding` asks that it hold of `own` itself, its type
+ * arguments meeting the impl's; otherwise any instance of the declaration will do. */
+private instance_conformance_to(c: *Checker, own: &Type, t: usize, holding: bool) -> bool
+    for n in 0..<c.instances.len()
+        val x = c.instances[n]
+        if !impl_targets(x.ty, own) || ancestor_type(c.classes, c.data, x.trait_type, t) is None then continue
+        if !holding then return true
+        if instance_args(conformances(c), n, own) is Some(_) then return true
+    false
+
+/** The core library's collection `name`, with its own type parameters as its arguments. */
+private core_collection_type(c: *Checker, name: string) -> Option[&Type]
+    if c.class_types.get(qualified(CoreModule, name)) is Some(k) then return Some(own_class_type(c.classes[k], k))
+    if c.types.get(qualified(CoreModule, name)) is Some(d) then return Some(own_type(c.data[d], d))
+    None
+
+/** Whether `want`, the type a collection literal is expected to be, is a collection that the
+ * literal's default collection `default` is not an instance of and that is not `Buildable` itself, so
+ * that no literal can build it: an `Iterable`, a type whose companion has a `newBuilder`, which
+ * builds no literal without the trait, or an instance of a type that is `Buildable` at other type
+ * arguments only. */
+private unbuildable_collection(c: *Checker, want: &Type, default: &Type) -> bool
+    val w = zonk(c, want)
+    val companion = *w match
+        Class(k, _, _) ->
+            if ancestor_type(c.classes, c.data, default, k) is Some(_) then return false
+            c.classes[k].companion
+        Data(d, _, _) ->
+            if *default is Data(e, _, _)
+                if d == e then return false
+            c.data[d].companion
+        _ -> return false
+    if builds_literals(c, w) then return false
+    if c.core.trait_named("Buildable") is Some(b)
+        if instance_conformance_to(c, w, b, false) then return true
+    if companion is Some(o)
+        if methods_named(c, o, "newBuilder").len() > 0 then return true
+    val iterable = c.class_types.get(qualified(CoreModule, "Iterable")) match
+        Some(i) -> i
+        None -> return false
+    ancestor_type(c.classes, c.data, w, iterable) is Some(_)
 
 // The member an integer literal is: its default type, `int` or `long` for one too large for `int`,
 // where that is a member; otherwise the one numeric member it fits. Fitting several is an error.
@@ -15133,6 +15338,7 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
             return overloaded_method_value(c, at, self_ref(c, at), name, ms, None, expected)
         Some(TraitFieldOf(m)) -> return trait_field_read(c, at, self_ref(c, at), m, expected)
         None -> ()
+    var constructor_value = false
     if global_named(c, name) is Some(g)
         // An object that declares `apply`, where a function is expected, is that function, unless
         // the object is of a function type and so a function value itself.
@@ -15143,7 +15349,10 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
                     var found: Buf[&Type] = buf()
                     function_ancestors(c.classes, c.data, own_class_type(c.classes[o], o), &found, 0)
                     if found.len() == 0 then return apply_value(c, at, name, o, ids, ps, expected)
-        return global_read(c, at, g)
+                // A class's companion that declares no `apply` leaves the name the class's
+                // constructor where a function is expected, as it is in call position.
+                constructor_value = companion_leaves_constructor(c, g, ids)
+        if !constructor_value then return global_read(c, at, g)
     if lookup_function(c, name) is Some(id)
         if parameterless_function(c, name) is Some(f) then return parameterless_function_read(c, at, f, expected)
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
@@ -15416,9 +15625,23 @@ bound_methods(c: *Checker, t: &Type, name: string) -> Buf[usize]
     var out: Buf[usize] = buf()
     for b in bounds_of(c, t)
         if *b is Class(k, _, _)
+            // An argument meeting a widening bound may be the type at other type arguments, whose
+            // static members are its own (see `widening_bound`).
+            val widening = widening_bound(c.classes, c.data, b)
             for m in methods_named(c, k, name)
+                if widening && c.symbols[m].static_member then continue
                 if !contains_id(out, m) then out.push(m)
     unreplaced(c, out)
+
+/** A bound of type parameter `t` that has a static member `name` which `bound_methods` leaves out,
+ * since the bound is a widening one. */
+private widening_bound_with_static(c: *Checker, t: &Type, name: string) -> Option[&Type]
+    for b in bounds_of(c, t)
+        if *b is Class(k, _, _)
+            if !widening_bound(c.classes, c.data, b) then continue
+            for m in methods_named(c, k, name)
+                if c.symbols[m].static_member then return Some(b)
+    None
 
 // The bounds of type parameter `t`, as a diagnostic names them.
 private bound_names(c: *Checker, t: &Type) -> string
@@ -18582,6 +18805,23 @@ private shaped_hint(c: *Checker, e: &Expr, hint: Option[&Type]) -> Option[&Type]
     val shape = collection_shape(c, t)
     if shape == "" || shape == written || (written == "set" && shape == "map") then hint else None
 
+// `hint`, unless `e` is a collection literal and `hint` a collection no literal builds, such as a
+// `Range`. A type only suggested to a literal, by another operand of a comparison, rather than
+// demanded of it, leaves such a literal its default collection, so
+// `(1 .. 3) == [1, 2, 3]` compares the range with a `Vector`, as sequences compare; where the type is
+// demanded, `val r: Range = [1, 2]`, the literal reports the `Buildable` it lacks.
+private buildable_hint(c: *Checker, e: &Expr, hint: Option[&Type]) -> Option[&Type]
+    val t = hint?
+    val default_name = e.kind match
+        ListLit(_) -> "Vector"
+        SetLit(_) -> "Set"
+        MapLit(_, _) -> "Map"
+        _ -> return hint
+    val d = core_collection_type(c, default_name) match
+        Some(d) -> d
+        None -> return hint
+    if unbuildable_collection(c, t, d) then None else hint
+
 // `t`, where it is a type a value can be checked against: not open, not `Any`, and not the type of
 // a branch that never finishes.
 private useful_hint(c: *Checker, t: Option[&Type]) -> Option[&Type]
@@ -18636,14 +18876,11 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
     // A `List` is a data type, built from the back with `::`, which needs no builder.
     if want is Some(t)
         if is_list_type(c, t) && shape == "sequence" then return list_literal(c, e, items, expected)
-    var collection: Option[usize] = None
+    // The type whose `newBuilder()` builds the literal: the expected type where it is `Buildable`
+    // itself, and otherwise the core library's default for the literal's shape.
+    var collection: Option[&Type] = None
     if want is Some(t)
-        val companion = *t match
-            Class(k, _, _) -> c.classes[k].companion
-            Data(d, _, _) -> c.data[d].companion
-            _ -> None
-        if companion is Some(o)
-            if methods_named(c, o, "newBuilder").len() > 0 then collection = Some(o)
+        if builds_literals(c, t) then collection = Some(t)
         val wanted_shape = collection_shape(c, t)
         // `{}` is a set literal with nothing in it, and as such the empty map too.
         val fitting = wanted_shape == "" || wanted_shape == shape || (shape == "set" && items.len() == 0 && wanted_shape == "map")
@@ -18655,13 +18892,39 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
             for value in values
                 check_ignored(c, value)
             return TExpr(at, ErrorType, UnitConst)
-    val from_expected = collection is Some(_)
+    // The builder's element type is open until the expected type or the elements settle it; an
+    // empty literal with neither is reported as one.
+    val first_unknown = c.unknowns.len()
     if collection is None
         val default_name = if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"
-        if c.class_types.get(qualified(CoreModule, default_name)) is Some(k) then collection = c.classes[k].companion
-        elif c.types.get(qualified(CoreModule, default_name)) is Some(d) then collection = c.data[d].companion
-    val o = collection match
-        Some(o) -> o
+        val default_type = core_collection_type(c, default_name)
+        if default_type is Some(d)
+            // An expected collection the default is not, which builds no literal of its own, is
+            // reported by the trait it lacks rather than as the default's mismatch.
+            if want is Some(w)
+                if unbuildable_collection(c, w, d)
+                    c.note(unit, at, s"a $shape literal cannot build ${type_name(w)}, which does not implement `Buildable`, the trait a collection literal is built through; an impl of it gives `static newBuilder()`")
+                    for item in items
+                        check_ignored(c, item)
+                    for value in values
+                        check_ignored(c, value)
+                    return TExpr(at, ErrorType, UnitConst)
+            // The default's type arguments are the literal's to settle.
+            val args: Buf[&Type] = *d match
+                Class(_, _, xs) -> xs
+                Data(_, _, xs) -> xs
+                _ -> buf()
+            var open: Buf[&Type] = buf()
+            for _ in args
+                val v = fresh_var(c)
+                if *v is Var(id) then c.unknowns.push(Unknown(id, unit, at, "", false))
+                open.push(v)
+            collection = Some(*d match
+                Class(k, name, _) -> Class(k, name, open)
+                Data(id, name, _) -> Data(id, name, open)
+                _ -> d)
+    val built = collection match
+        Some(t) -> t
         None ->
             for item in items
                 check_ignored(c, item)
@@ -18669,22 +18932,7 @@ private collection_literal(c: *Checker, e: &Expr, shape: string, items: Buf[&Exp
                 check_ignored(c, value)
             c.note(unit, at, s"a $shape literal needs the core library's `${if shape == "sequence" then "Vector" elif shape == "set" then "Set" else "Map"}`")
             return TExpr(at, ErrorType, UnitConst)
-    val companion = global_read(c, at, c.classes[o].global.unwrap())
-    // A `newBuilder` declared to return a `Builder` of the expected collection takes its type
-    // arguments from it at the call, where bounds on them are checked: `Set.newBuilder[A: Eq & Hash]`
-    // learns `A` from the `Set[int]` expected.
-    var wanted_builder: Option[&Type] = None
-    if want is Some(w)
-        if from_expected
-            if c.class_types.get(qualified(CoreModule, "Builder")) is Some(b)
-                var args: Buf[&Type] = buf()
-                args.push(fresh_var(c))
-                args.push(w)
-                wanted_builder = Some(Class(b, "Builder", args))
-    // The builder's element type is open until the expected type or the elements settle it; an
-    // empty literal with neither is reported as one.
-    val first_unknown = c.unknowns.len()
-    val builder = call_method(c, at, at, companion, "newBuilder", methods_named(c, o, "newBuilder"), buf(), None, wanted_builder, false)
+    val builder = static_call(c, at, at, checked_slot(c, TExpr(at, built, TypeReceiver)), built, "newBuilder", buf(), None, None, false)
     val example = if shape == "sequence" then "`val xs: Vector[int] = []`" elif shape == "set" then "`val s: Set[int] = {}`" else "`val m: Map[string, int] = {}`"
     for i in first_unknown..<c.unknowns.len()
         c.unknowns[i].message = s"cannot infer the element type of an empty collection literal; give it a type, as in $example"
@@ -19481,7 +19729,7 @@ private compare_expr(c: *Checker, e: &Expr, operands: Buf[&Expr], ops: Buf[Compa
     for i in 0..<operands.len()
         early[i] match
             Some(t) -> typed.push(t)
-            None -> typed.push(refined_operand(c, check_expr(c, operands[i], anchor)))
+            None -> typed.push(refined_operand(c, check_expr(c, operands[i], buildable_hint(c, operands[i], anchor))))
     // An integer compared with a value of a type that takes integers is converted to that type, so
     // `big < n` and `n == big` compare two numbers. A chain converts each integer beside one, the
     // pass back reaching an integer whose neighbour was converted on the way forward.
@@ -19685,8 +19933,8 @@ private equality_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
             if same_type(zonk(c, a), zonk(c, b)) then return
     c.note(unit_of(c), at, s"`$spelling` cannot compare ${apart_with(c, x, y)}")
 
-// `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes and strings have them, and a type
-// parameter, a data type or a class through `Ord`.
+// `<`, `<=`, `>` and `>=` are `Ord`'s: the numbers, chars, bytes, bools (`false < true`) and strings
+// have them, and a type parameter, a data type or a class through `Ord`.
 private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Type)
     // A use settles what is still unknown: `Some(1) < None` compares two `Option[int]`s.
     if !same_type(x, y)
@@ -19699,6 +19947,7 @@ private ordering_link(c: *Checker, at: Span, spelling: string, x: &Type, y: &Typ
         Byte -> ()
         Char -> ()
         Real -> ()
+        Bool -> ()
         Str -> ()
         TypeVar(_, _, _) -> operator_conforms(c, at, spelling, t, "Ord")
         Data(_, _, _) -> operator_conforms(c, at, spelling, t, "Ord")
@@ -20341,7 +20590,7 @@ private viewed(c: *Checker, x: &Type, to: &Type) -> &Type
     if *x is TypeVar(_, _, _)
         if *zonk(c, to) is Class(k, _, _)
             for b in bounds_of(c, x)
-                if holding_ancestor(conformances(c), b, k) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
+                if bound_ancestor(conformances(c), b, k) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
         if *zonk(c, to) is Function(_, _, _)
             for b in bounds_of(c, x)
                 if function_ancestor(c.classes, c.data, b) is Some(_) then return view_as(conformances(c), b, zonk(c, to))
@@ -20923,7 +21172,7 @@ private iterable_at(f: Conformances, x: &Type, k: usize) -> bool = *x match
         members.len() > 0
     TypeVar(_, _, _) ->
         for b in type_var_bounds(f, x)
-            if holding_ancestor(f, b, k) is Some(_) then return true
+            if bound_ancestor(f, b, k) is Some(_) then return true
         false
     _ ->
         if is_builtin(x) || *x is Tuple(_)
@@ -21448,7 +21697,7 @@ private from_sources(c: *Checker, t: &Type, k: usize) -> Buf[&Type]
     var out: Buf[&Type] = buf()
     if *t is TypeVar(_, _, _)
         for b in bounds_of(c, t)
-            for up in holding_ancestors(f, b, k)
+            for up in bound_ancestors(f, b, k)
                 out.push(up)
         return out
     if is_builtin_or_opaque(t) || *t is Tuple(_)
@@ -21605,6 +21854,22 @@ private note_threaded_arguments(c: *Checker, id: usize, applied: AppliedCall)
             Name(n) -> n
             _ -> "_"
         c.body.threaded.push(ThreadedArgument(unit_of(c), arg, decl.name, name, if has_annotation(decl, "c") then "C" else "Sysl"))
+
+/** Whether the global `g`, where a function is expected, is not the object it holds but the
+ * constructor `ids` of the class whose companion it is: the companion declares no `apply`, is not of
+ * a function type itself, and the class is made by its name. */
+private companion_leaves_constructor(c: *Checker, g: usize, ids: Buf[usize]) -> bool
+    val o = c.globals[g].object match
+        Some(o) -> o
+        None -> return false
+    if c.classes[o].companion is None then return false
+    if object_applies(c, o).len() > 0 then return false
+    if ids.len() == 0 then return false
+    for id in ids
+        if !c.symbols[id].constructor then return false
+    var found: Buf[&Type] = buf()
+    function_ancestors(c.classes, c.data, own_class_type(c.classes[o], o), &found, 0)
+    found.len() == 0 && callable_constructors(c, ids).len() > 0
 
 // The object a call by `name` reaches through its `apply` methods: the object of that name, where it
 // declares `apply` and the name is not a function's, only, if anything, its companion class's
@@ -22343,6 +22608,17 @@ private param_type_text(t: &Type, repeated: bool) -> string
 // The type `target` names where it is the receiver of a call, as `int` in `int.zero()`, `T` in
 // `T.zero()` and `Box[int]` in `Box[int].zero()`; `None` where it is a value, a value of the name
 // hiding the type. A trait names no type with static members of its own, which is reported.
+/** Whether trait `k` has a static member `name` of its own, through an impl stating its own
+ * conformance to a trait whose members are all static: `impl[A] Buildable[A] for Set[A]`. */
+private owns_static(c: *Checker, k: usize, name: string) -> bool
+    for x in c.instances
+        if !x.own then continue
+        if *x.ty is Class(j, _, _)
+            if j != k then continue
+            for m in x.methods
+                if c.symbols[m].decl.name == name && c.symbols[m].static_member then return true
+    false
+
 static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
     var name = ""
     var written: Buf[&TypeExpr] = buf()
@@ -22369,7 +22645,7 @@ static_receiver(c: *Checker, target: &Expr, member: string) -> Option[&Type]
     val key = resolve_name(c, unit, name)
     if c.types.get(key) is Some(_) then names_type = true
     if c.class_types.get(key) is Some(k)
-        if is_trait(c, k)
+        if is_trait(c, k) && !owns_static(c, k, member)
             if is_constructor_trait(c, k)
                 c.note(unit, target.span, s"`$name` is a trait, which has no static members of its own: call one on a constructor implementing it, as in `F.$member(…)` with `F[${hole_marks(c.classes[k].decl.type_params.len())}]: $name`")
                 return Some(ErrorType)
@@ -22540,6 +22816,10 @@ private static_call(c: *Checker, at: Span, name_span: Span, target: &Expr, ty: &
     for m in ms
         if c.symbols[m].static_member then statics.push(m)
     if statics.len() == 0
+        val widening = if *t is TypeVar(_, _, _) && !reported then widening_bound_with_static(c, t, name) else None
+        if widening is Some(b)
+            c.note(unit, name_span, s"`$name` is a static member of `${type_name(b)}`, which is not reached through the bound of `${type_name(t)}`: a type argument meeting `${type_name(b)}` may be the type at other type arguments, through its variance, and its static members are its own; bound `${type_name(t)}` by the trait declaring `$name`")
+            reported = true
         if !reported
             if ms.len() > 0 then c.note(unit, name_span, s"`$name` is a method of a value of `${type_name(t)}`, not of the type; call it on a value")
             elif !(scalar_builtin(t) && refuse_private_trait_method(c, name_span, t, name)) then c.note(unit, name_span, s"`${type_name(t)}` has no static member `$name`")
@@ -24216,15 +24496,10 @@ private repeated_vector(c: *Checker, at: Span, element: &Type, items: Buf[&TExpr
     val vector = vector_of(c, element)
     if spliced is Some(xs)
         if same_type(zonk(c, xs.ty), vector) || *xs.ty is Nothing || *xs.ty is ErrorType then return xs
-    val o = c.class_types.get(qualified(CoreModule, "Vector")) match
-        Some(k) -> c.classes[k].companion
-        None -> None
-    val companion = o match
-        Some(o) -> o
-        None ->
-            c.note(unit, at, "a repeated parameter needs the core library's `Vector`")
-            return TExpr(at, ErrorType, UnitConst)
-    val builder = call_method(c, at, at, global_read(c, at, c.classes[companion].global.unwrap()), "newBuilder", methods_named(c, companion, "newBuilder"), buf(), None, None, false)
+    if !(*vector is Class(_, _, _))
+        c.note(unit, at, "a repeated parameter needs the core library's `Vector`")
+        return TExpr(at, ErrorType, UnitConst)
+    val builder = static_call(c, at, at, checked_slot(c, TExpr(at, vector, TypeReceiver)), vector, "newBuilder", buf(), None, None, false)
     *zonk(c, builder.ty) match
         Class(_, _, a) -> if a.len() == 1 then unify(c, a[0], element)
         _ -> return TExpr(at, ErrorType, UnitConst)
@@ -26546,18 +26821,15 @@ private variant_of_member(c: *Checker, name: string, t: &Type) -> bool
         if v.data == d then return true
     false
 
-// Whether the extractor named `path` has an `unapply` or `unapplySeq` that takes a value of `t`.
+// Whether the extractor named `path` implements an extractor trait taking a value of `t`.
 private extractor_takes(c: *Checker, path: string, t: &Type) -> bool
     val owner = extractor_type(c, path_expr(Span(0, 0), path)) match
         Some(o) -> o
         None -> return false
-    var ms = methods_of(c, owner, "unapply")
-    if ms.len() == 0 then ms = methods_of(c, owner, "unapplySeq")
-    for m in ms
-        val params = c.symbols[m].params
-        if params.len() == 0 then continue
-        val taken = params[params.len() - 1]
-        if has_type_params(taken) || may_match(c, t, taken) then return true
+    for instance in extractor_instances(c, owner)
+        val taken = conformance_args(instance)
+        if taken.len() == 0 then continue
+        if has_type_params(taken[0]) || may_match(c, t, taken[0]) then return true
     false
 
 private has_type_params(t: &Type) -> bool = *t match
@@ -27213,29 +27485,65 @@ private sequence_pattern(c: *Checker, p: &Pattern, items: Buf[&Pattern], ty: &Ty
             typed.push(check_pattern(c, binder, dropped.ty, no_bind))
     TPattern(p.span, ty, PSequence(local, length, elements, typed, rest))
 
-// An extractor pattern, `Name(p1, p2)`, where `Name` is not a variant but a value, an object or a
-// local, whose type has an `unapply` or an `unapplySeq` method. The matched value is held in a local
-// of its own and passed to the method. An `unapply` answering a `bool` matches where it answers
-// `true`, with no patterns; one answering an `Option` matches its `Some`, whose value one pattern
-// matches whole and several match part by part, as a tuple of as many parts. An `unapplySeq`
-// answers an `Option` of a sequence, which the patterns match as a sequence pattern does, `rest*`
-// included. A variant of the name is always the variant.
+// An extractor pattern, `Name(p1, p2)`, where `Name` is not a variant but a value, an object, a
+// companion or a local, whose type implements an extractor trait, `Extractor`, `BoolExtractor` or
+// `SeqExtractor`, taking the matched value; the conformance makes the extractor, not a method's name.
+// The matched value is held in a local of its own and passed to the trait's method. A
+// `BoolExtractor`'s `unapply` matches where it answers `true`, with no patterns; an `Extractor`'s
+// matches its `Some`, whose value one pattern matches whole and several match part by part, as a
+// tuple of as many parts. A `SeqExtractor`'s `unapplySeq` answers an `Option` of a sequence, which
+// the patterns match as a sequence pattern does, `rest*` included. A variant of the name is always
+// the variant.
 private extractor_pattern(c: *Checker, p: &Pattern, path: string, args: Buf[&Pattern], ty: &Type, no_bind: string) -> &TPattern
     val unit = unit_of(c)
     val at = p.span
     val target = path_expr(at, path)
-    var method = ""
-    if extractor_type(c, target) is Some(t)
-        if methods_of(c, t, "unapply").len() > 0 then method = "unapply"
-        elif methods_of(c, t, "unapplySeq").len() > 0 then method = "unapplySeq"
-        else c.note(unit, at, s"`$path` is not a variant, and ${type_name(t)} has no `unapply` or `unapplySeq` to make it an extractor")
-    else c.note(unit, at, alias_not_value(c, unit, path).unwrap_or(s"`$path` is not a variant or an extractor"))
-    if method == "" then return failed_extractor(c, p, args, no_bind)
+    val t = extractor_type(c, target) match
+        Some(t) -> t
+        None ->
+            c.note(unit, at, alias_not_value(c, unit, path).unwrap_or(s"`$path` is not a variant or an extractor"))
+            return failed_extractor(c, p, args, no_bind)
+    val instances = extractor_instances(c, t)
+    if instances.len() == 0
+        c.note(unit, at, s"`$path` is not a variant, and ${type_name(t)} implements no extractor trait${extractor_remedy(c, t)}")
+        return failed_extractor(c, p, args, no_bind)
+    // The `unapply` traits come first, so where a type implements one and `SeqExtractor` both, its
+    // `unapply` serves a value both take.
+    var chosen: Option[&Type] = None
+    for instance in instances
+        if chosen is None
+            val taken = conformance_args(instance)
+            if taken.len() > 0 && fits(c, ty, taken[0]) then chosen = Some(instance)
+    val instance = chosen match
+        Some(i) -> i
+        None ->
+            var shown = ""
+            for i in 0..<instances.len()
+                if i > 0 then shown = shown + if i + 1 == instances.len() then " and " else ", "
+                shown = shown + s"`${type_name(instances[i])}`"
+            c.note(unit, at, s"`$path` implements $shown, which takes no ${type_name(zonk(c, ty))}, the value matched here")
+            return failed_extractor(c, p, args, no_bind)
+    val k = *instance match
+        Class(k, _, _) -> k
+        _ -> return failed_extractor(c, p, args, no_bind)
+    val method = if c.classes[k].name == "SeqExtractor" then "unapplySeq" else "unapply"
+    var member: Option[usize] = None
+    for m in c.classes[k].methods
+        if c.symbols[m].decl.name == method then member = Some(m)
+    val trait_method = member match
+        Some(m) -> m
+        None -> return failed_extractor(c, p, args, no_bind)
     val name = s"extractor ${at.start}"
     val local = declare_local(c, at, name, ty, false)
     var call_args: Buf[Argument] = buf()
     call_args.push(Argument(at, None, name_at(at, name), false))
-    val view = check_expr(c, Expr(at, Call(Expr(at, Member(target, method)), call_args)), None)
+    val typed_target = check_expr(c, target, None)
+    // A class's or a data type's own implementation is called directly; a trait's value, a bounded
+    // type parameter's and a built-in type's call the trait's method, a built-in value boxed as the
+    // trait's.
+    val callee = implementing_method(c, t, k, trait_method)
+    val receiver = if callee != trait_method || *t is TypeVar(_, _, _) then typed_target else to_trait(c, typed_target, instance)
+    val view = method_call(c, at, at, receiver, callee, call_args, None, None, false, buf())
     val result = zonk(c, view.ty)
     if *result is ErrorType then return failed_extractor(c, p, args, no_bind)
     val written = s"`$path.$method`"
@@ -27298,9 +27606,9 @@ private path_expr(at: Span, path: string) -> &Expr
 private extractor_type(c: *Checker, target: &Expr) -> Option[&Type]
     c.muted = c.muted + 1
     val before = c.muted_notes
+    // A type's name is no value, so it names no extractor, whatever static members it has.
     var found: Option[&Type] = None
-    if static_receiver(c, target, "unapply") is Some(t) then found = Some(t)
-    else
+    if static_receiver(c, target, "unapply") is None
         val typed = check_expr(c, target, None)
         found = Some(zonk(c, typed.ty))
     c.muted = c.muted - 1
@@ -27308,6 +27616,76 @@ private extractor_type(c: *Checker, target: &Expr) -> Option[&Type]
     if found is Some(t)
         if *t is ErrorType then return None
     found
+
+// The instances of the extractor traits a value of type `t` is, its own conformances or its bounds':
+// those of `Extractor` and `BoolExtractor`, whose `unapply` serves first, then of `SeqExtractor`.
+private extractor_instances(c: *Checker, t: &Type) -> Buf[&Type]
+    var out: Buf[&Type] = buf()
+    var names: Buf[string] = buf()
+    names.push("Extractor")
+    names.push("BoolExtractor")
+    names.push("SeqExtractor")
+    for name in names
+        if c.class_types.get(qualified(CoreModule, name)) is Some(k)
+            for instance in from_sources(c, t, k)
+                out.push(instance)
+    out
+
+// The method of class or data type `t` filling the place of method `tm` of trait `k`, which `t`
+// implements; `tm` itself for any other type, or where `t` leaves it to the trait.
+private implementing_method(c: *Checker, t: &Type, k: usize, tm: usize) -> usize
+    var position = c.classes[k].base
+    var found = false
+    for m in c.classes[k].methods
+        if m == tm
+            found = true
+            break
+        position = position + 1
+    if !found then return tm
+    val table = *t match
+        Class(id, _, _) -> if is_trait(c, id) then return tm else c.classes[id].table
+        Data(d, _, _) -> c.data[d].table
+        _ -> return tm
+    if position >= table.len() then return tm
+    table[position] match
+        Some(m) -> if is_abstract_method(c.symbols[m]) then tm else m
+        None -> tm
+
+// The type arguments of an instance of a trait.
+private conformance_args(t: &Type) -> Buf[&Type] = *t match
+    Class(_, _, xs) -> xs
+    _ -> buf()
+
+// What a value of type `t` that implements no extractor trait would declare to be one, after a
+// semicolon: the trait its own `unapply` or `unapplySeq` fits, which a method's name alone does not
+// make an extractor; otherwise the three traits and their methods.
+private extractor_remedy(c: *Checker, t: &Type) -> string
+    val traits = "; an extractor implements `Extractor[A, B]` (`unapply(value: A) -> Option[B]`), `BoolExtractor[A]` (`unapply(value: A) -> bool`) or `SeqExtractor[A, S]` (`unapplySeq(value: A) -> Option[S]`)"
+    val owner = type_name(t)
+    var methods: Buf[string] = buf()
+    methods.push("unapply")
+    methods.push("unapplySeq")
+    for method in methods
+        for m in methods_of(c, t, method)
+            val s = c.symbols[m]
+            if s.static_member || s.params.len() == 0 then continue
+            if s.decl.type_params.len() > 0
+                return s"; its `$method` makes no extractor by its name alone, and a generic one implements no trait: declare the type parameters on a class implementing `Extractor`, `BoolExtractor` or `SeqExtractor`, and match with a value of it"
+            val taken = type_name(s.params[s.params.len() - 1])
+            val result = zonk(c, s.result.unwrap_or(ErrorType))
+            var wanted = ""
+            if method == "unapply" && *result is Bool then wanted = s"BoolExtractor[$taken]"
+            else
+                *result match
+                    Data(d, _, xs) ->
+                        if is_option_data(c, d) && xs.len() == 1
+                            val trait_name = if method == "unapply" then "Extractor" else "SeqExtractor"
+                            wanted = s"$trait_name[$taken, ${type_name(zonk(c, xs[0]))}]"
+                    _ -> ()
+            if wanted != ""
+                return s"; its `$method` makes no extractor by its name alone: make `$owner` implement `$wanted` and mark `$method` `override`"
+            return s"; its `$method` answers ${type_name(result)}$traits"
+    traits
 
 // A list pattern is the core library's `List` variant `name` with the patterns `parts` for its
 // fields, whatever `Cons` and `Nil` name where it is written. On any other type it is reported with

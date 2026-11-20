@@ -83,7 +83,8 @@ that prints an address.
 
 A tuple is also an `Ord` where each of its parts is, at every arity: part by part, the first part
 that differs deciding, so later parts break ties. `(1, "b") < (2, "a")`, and `(1, 2) < (1, 3)`.
-`bool` and `unit` have no order, so a tuple holding one has none. `List` and `ArraySeq` are `Ord`
+`bool` is `Ord` with `false` before `true`, operators included, so `tasks.sortBy(t -> (t.done,
+t.id))` puts the open tasks first; `unit` has no order, so a tuple holding one has none. `List` and `ArraySeq` are `Ord`
 where their elements are, element by element with a prefix before the longer sequence, and
 `Reverse[T]` is `Ord` with the order of `T` turned round ([collections](collections.md#sorting)).
 

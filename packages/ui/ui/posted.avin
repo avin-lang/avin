@@ -6,7 +6,7 @@ module ui
 // frame loop handles everything waiting at the start of every frame, in the order it was sent.
 
 import avin.collections.mutable.{Map as MutableMap}
-import avin.threads.{Channel, Future, Promise, isMainThread}
+import avin.threads.{Channel, Future, Promise, isMainThread, isPinnedToMain, runMainThreads}
 
 // The inbox each message and piece of work waits in, in the order they were sent from every thread:
 // an inbox's number, or `Posted` for posted work.
@@ -40,10 +40,11 @@ class Inbox[T: Sendable, R: Sendable](private val box: Mailbox[T, R])
     reply.future
 
   /// Queues `message` and waits for the handler's answer. A lightweight thread parks while it waits,
-  /// freeing its worker. On the main thread, which handles the message itself, the wait would never
-  /// end, so there it stops the program.
+  /// freeing its worker, and a thread pinned to the main thread parks too, until the frame that
+  /// handles the message. In the main thread's own code, which handles the message itself, the wait
+  /// would never end, so there it stops the program.
   ask(message: T) -> R
-    if isMainThread() then fail(
+    if isMainThread() && !isPinnedToMain() then fail(
       "an inbox was asked from the main thread, which would wait for itself to handle the message"
     )
     send(message).await()
@@ -69,9 +70,13 @@ post(@sendable work: () -> unit)
   order.send(Posted)
 
 /// Runs on the main thread every message and piece of work waiting when it is called, in the order
-/// they were sent, and answers how many it ran. What they send or post meanwhile waits for the next
-/// call. The frame loop calls it at the start of every frame and once more when it ends; a program
-/// with no window calls it itself. Called on another thread, it stops the program.
+/// they were sent, then each thread pinned to the main thread that is ready by then
+/// (`runMainThreads`), and answers how many it ran of both. What they send or post meanwhile waits
+/// for the next call, and so does a pinned thread one of the pinned threads makes ready; a pinned
+/// thread a message or posted work makes ready runs in the same call. The frame loop calls it at the start of
+/// every frame and once more when it ends; a program with no window calls it itself. Called on
+/// another thread, it stops the program; called from a pinned thread, it runs the messages and work
+/// but no pinned thread, which only the main thread's own code runs.
 handlePosted() -> int
   if !isMainThread() then fail("posted work runs on the main thread, and `handlePosted` was called on another")
   val due = Buffer[int]()
@@ -81,7 +86,7 @@ handlePosted() -> int
       Some(number) -> due.append(number)
       None -> draining = false
   for number in due do handleOne(number)
-  due.length
+  due.length + runMainThreads()
 
 // Runs the next message or piece of work waiting in the inbox `number`, or the next posted one.
 private handleOne(number: int)

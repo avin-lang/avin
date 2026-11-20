@@ -889,3 +889,113 @@ refused_releases_leave_stacks_whole()
     trimmed.condition = null
     without_joints(me)
     thread_detach(me)
+
+// Threads pinned to the main thread. The test's own thread stands for the main thread: it attaches the
+// main thread's context as the program's start does, and a thread-local flag set on it alone tells
+// whether code runs on that operating system thread.
+@thread_local private var on_test_thread: bool = false
+
+private struct Pinning
+    runs: Atomic[u32]
+    elsewhere: Atomic[u32]
+    not_main: Atomic[u32]
+    started: Atomic[u32]
+
+private var pinning: Pinning = Pinning(Atomic(0), Atomic(0), Atomic(0), Atomic(0))
+
+// Counts, in `s`, a step of a pinned thread that is not on the test's thread or not seen as the main
+// thread's.
+private pinned_check(s: *Pinning)
+    if !on_test_thread then _ = s.elsewhere.add(1)
+    if !on_main_thread() || !on_main_scheduler() then _ = s.not_main.add(1)
+
+// A pinned thread: it parks on a sleep, then on a join of a thread it starts on the workers, and looks
+// where it runs before and after each wait.
+private pinned_run(c: *Context, run: *u8) -> unit
+    val s: *Pinning = ptr_cast(run)
+    _ = s.started.add(1)
+    pinned_check(s)
+    sleep_for(c, 2000)
+    pinned_check(s)
+    val j = thread_start(c, ptr_cast(&counting), LeastStack, ptr_cast(&count_run))
+    var r = Holding(Frame(c.top, 1), j, null)
+    c.top = &r.frame
+    thread_join(c, j)
+    c.top = r.frame.prev
+    pinned_check(s)
+    _ = s.runs.add(1)
+
+// `pinned_run` as a thread's runner, whose context outlives the call.
+private pinned_runner() -> *u8
+    val runner: *extern(@lets_out *Context, *u8) -> unit = &pinned_run
+    ptr_cast(runner)
+
+// Makes the test's thread the main thread, as the program's start does.
+private as_main() -> *Context
+    on_test_thread = true
+    attach(&main_context)
+    leave_safe(&main_context)
+    current_context = &main_context
+    &main_context
+
+private no_longer_main()
+    detach(&main_context)
+    on_test_thread = false
+
+private reset_pinning()
+    pinning.runs.store(0)
+    pinning.elsewhere.store(0)
+    pinning.not_main.store(0)
+    pinning.started.store(0)
+    counting.runs.store(0)
+    counting.lightweight.store(0)
+
+@test("threads pinned to the main thread run on it only: they park there without blocking it, and resume there when a worker or a timer makes them ready")
+pinned_threads_run_on_main()
+    reset_pinning()
+    val me = as_main()
+    with_joints(me)
+    val n: usize = 40
+    for i in 0..<n
+        joints.slots[i] = thread_start_main(me, ptr_cast(&pinning), LeastStack, pinned_runner())
+    // Started, ready on the main scheduler, and not run until the main thread runs it: the scheduler
+    // is not quiet meanwhile.
+    sleep(millis(5))
+    assert_eq(pinning.started.load(), 0u32)
+    assert(!scheduler_quiet())
+    // One step runs each once, to its sleep.
+    assert_eq(main_step(), long(n))
+    assert_eq(pinning.started.load(), u32(n))
+    var parked_lines = 0
+    for line in lightweight_lines(now_micros(), false)
+        if line.contains(", pinned to the main thread: sleeping") then parked_lines += 1
+    assert(parked_lines > 0)
+    // The main thread's joins run them as their waits end.
+    join_n(me, n)
+    assert_eq(pinning.runs.load(), u32(n))
+    assert_eq(pinning.elsewhere.load(), 0u32)
+    assert_eq(pinning.not_main.load(), 0u32)
+    // The threads they started ran on the workers.
+    assert_eq(counting.lightweight.load(), u32(n))
+    assert_eq(main_step(), 0)
+    without_joints(me)
+    collect(me)
+    no_longer_main()
+
+@test("only the main thread's own code runs the main scheduler: another thread's step runs nothing")
+main_step_elsewhere()
+    reset_pinning()
+    val me = as_main()
+    with_joints(me)
+    joints.slots[0] = thread_start_main(me, ptr_cast(&pinning), LeastStack, pinned_runner())
+    val other = thread_attach()
+    assert(!on_main_thread())
+    assert_eq(main_step(), 0)
+    thread_detach(other)
+    current_context = me
+    assert_eq(pinning.started.load(), 0u32)
+    join_n(me, 1)
+    assert_eq(pinning.runs.load(), 1u32)
+    assert_eq(pinning.elsewhere.load(), 0u32)
+    without_joints(me)
+    no_longer_main()

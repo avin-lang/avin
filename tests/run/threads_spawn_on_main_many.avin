@@ -1,0 +1,59 @@
+// expect: exit 0
+// Many threads pinned to the main thread at once, each parking again and again on channels the
+// workers answer, with what they allocate kept across every wait; and a pinned thread never runs
+// beside the main thread's own code: one ready while the main thread computes without waiting runs
+// only once the main thread runs the main scheduler.
+import avin.threads.{Channel, isMainThread, runMainThreads, spawn, spawnOnMain}
+import avin.time.{millis, now}
+
+data Hop(from: int, n: int)
+
+main()
+  // Not beside the main thread's own code: a pinned thread made ready waits while `main` computes.
+  val flag = Buffer[int]()
+  val ready = spawnOnMain(() -> flag.append(1))
+  val until = now() + millis(20)
+  var spins = 0
+  while now() < until
+    spins += 1
+  println(flag.length)
+  println(runMainThreads())
+  println(flag.length)
+  ready.join()
+
+  // Many pinned threads, each sending to a worker and waiting for its answer several times.
+  val threads = 300
+  val rounds = 5
+  val requests = Channel[(Hop, Channel[int])]()
+  val server = spawn(() ->
+    var served = 0
+    var open = true
+    while open
+      requests.receive() match
+        Some((hop, reply)) ->
+          reply.send(hop.from * 1000 + hop.n)
+          served += 1
+        None -> open = false
+    served)
+  val kept = Buffer[List[int]]()
+  val pinned = (0 ..< threads).map(i -> spawnOnMain(() ->
+    var mine: List[int] = []
+    for n in 0 ..< rounds
+      val reply = Channel[int](1)
+      requests.send((Hop(i, n), reply))
+      mine = reply.receive().getOrElse(-1) :: mine
+    kept.append(mine)
+    isMainThread()))
+  var onMain = 0
+  for t in pinned do if t.join() then onMain += 1
+  requests.close()
+  println(server.join())
+  println(onMain)
+  println(kept.length)
+  // Every thread's values arrived in its own order, each the one asked for.
+  var whole = true
+  for mine in kept
+    val from = mine.head / 1000
+    val expected = (0 ..< rounds).map(n -> from * 1000 + n).reverse.toList
+    if mine != expected then whole = false
+  println(whole)

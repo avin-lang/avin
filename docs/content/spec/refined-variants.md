@@ -172,7 +172,8 @@ every value of the instance is that variant's. An instance the variant cannot ma
 and a field whose type keeps a parameter the instance does not say is reached through a `match`.
 
 An arm learns equalities from variants only. An extractor pattern does not refine, since an
-`unapply`'s result type is its own signature's, and neither does a type pattern: `x: Expr[int]` on
+extractor's result is the type its trait's instance declares, and neither does a type pattern:
+`x: Expr[int]` on
 an `Any` binds an `Expr[int]` and learns nothing of any type parameter.
 
 ### Why it is sound

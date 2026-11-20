@@ -2,6 +2,7 @@ module dev.avinlang.compiler
 @tests
 
 import sh.sysl.parsing.{source_of, Span}
+import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_unchecked
 
 private tree(text: string) -> string
@@ -1480,3 +1481,134 @@ using_lambdas()
     // `using` alone is an ordinary parameter's or value's name.
     assert_eq(tree("using -> using"), "(fn (using) using)")
     assert_eq(tree("f(using)"), "(call f using)")
+
+private declared_tree(text: string, declared: Buf[DeclaredLevel]) -> string
+    val src = source_of("test.avin", text)
+    val parsed = parse_declared_expression(src, declared)
+    if parsed.report.has_errors() then panic(parsed.report.render(src))
+    show_expr(parsed.tree)
+
+private declared_diagnostics(text: string, declared: Buf[DeclaredLevel]) -> string
+    val src = source_of("test.avin", text)
+    parse_declared(src, declared).report.render(src)
+
+// Declarations of `|>` (as `||`), `<|>` (as `|`), `&>` (as `&&`), `^^` (grouping right) and `+::`
+// (as `==`), as a program's methods would make them.
+private grammar_levels() -> Buf[DeclaredLevel]
+    var out: Buf[DeclaredLevel] = buf()
+    out.push(DeclaredLevel("|>", SymbolOr, false))
+    out.push(DeclaredLevel("<|>", SymbolBitOr, false))
+    out.push(DeclaredLevel("&>", SymbolAnd, false))
+    out.push(DeclaredLevel("^^", SymbolBitXor, true))
+    out.push(DeclaredLevel("+::", SymbolCompare, true))
+    out
+
+// What `declared_levels` reads from units of the texts given, the first `library` of them the
+// standard library's: each level as `name op grouping;`, then each problem as `[unit] message;`.
+private levels_of(texts: Buf[string], library: usize) -> string
+    var units: Buf[SourceUnit] = buf()
+    for i in 0..<texts.len()
+        val parsed = parse(source_of(s"u$i.avin", texts[i]))
+        if parsed.report.has_errors() then panic(parsed.report.render(parsed.source))
+        units.push(SourceUnit(parsed.source, parsed.file, parsed.report))
+    val found = declared_levels(units, library)
+    var out = ""
+    for d in found.levels
+        out = out + s"${d.name} ${level_operator(d.level)} ${if d.right then "right" else "left"}; "
+    for p in found.problems
+        out = out + s"[${p.unit}] ${p.diagnostic.message}; "
+    out
+
+private texts(a: string, b: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    out.push(a)
+    if b != "" then out.push(b)
+    out
+
+@test("a symbol method's declared level and grouping replace the ones its name gives, for its calls alone")
+declared_levels_parse()
+    val g = grammar_levels()
+    // `<|>` binds as `|`, where its first character would put it with the comparisons.
+    assert_eq(tree("a <|> b | c"), "(call (. a <|>) (| b c))")
+    assert_eq(declared_tree("a <|> b | c", g), "(| (call (. a <|>) b) c)")
+    assert_eq(declared_tree("a | b <|> c", g), "(call (. (| a b) <|>) c)")
+    assert_eq(declared_tree("a <|> b < c", g), "((call (. a <|>) b) < c)")
+    // `|>` binds as `||`, below every comparison and `&&`; `&>` as `&&`.
+    assert_eq(declared_tree("a |> f == b", g), "(call (. a |>) (f == b))")
+    assert_eq(declared_tree("a |> b && c", g), "(call (. a |>) (&& b c))")
+    assert_eq(declared_tree("a |> b || c", g), "(|| (call (. a |>) b) c)")
+    assert_eq(declared_tree("a || b |> c", g), "(call (. (|| a b) |>) c)")
+    assert_eq(declared_tree("a &> b || c", g), "(|| (call (. a &>) b) c)")
+    assert_eq(declared_tree("a &> b == c", g), "(call (. a &>) (b == c))")
+    assert_eq(declared_tree("a |> b &> c", g), "(call (. a |>) (call (. b &>) c))")
+    // `^^` groups to the right, keeping its receiver on the left.
+    assert_eq(tree("a ^^ b ^^ c"), "(call (. (call (. a ^^) b) ^^) c)")
+    assert_eq(declared_tree("a ^^ b ^^ c", g), "(call (. a ^^) (call (. b ^^) c))")
+    assert_eq(declared_tree("a ^^ b ^^ c ^^ d", g), "(call (. a ^^) (call (. b ^^) (call (. c ^^) d)))")
+    // A name ending in `:` keeps its receiver on the right at its declared level.
+    assert_eq(tree("a | b +:: c"), "(| a (call (. c +::) b))")
+    assert_eq(declared_tree("a | b +:: c", g), "(call (. c +::) (| a b))")
+    assert_eq(declared_tree("a +:: b +:: c", g), "(call (. (call (. c +::) b) +::) a)")
+    // Names not declared keep the levels their names give, and the language's operators theirs.
+    assert_eq(declared_tree("a <+> b | c", g), "(call (. a <+>) (| b c))")
+    assert_eq(declared_tree("a + b * c", g), "(+ a (* b c))")
+    assert_eq(declared_tree("a |>> b | c", g), "(| (call (. a |>>) b) c)")
+    // Parentheses settle a grouping, an interpolation hole and a continuation line read the levels.
+    assert_eq(declared_tree("(a |> f) == b", g), "((call (. a |>) f) == b)")
+    assert(declared_tree("s\"${a <|> b | c}\"", g).contains("(| (call (. a <|>) b) c)"))
+    assert(!parse_declared(source_of("t.avin", "f() = a\n    <|> b\n    | c\n"), g).report.has_errors())
+
+@test("a declared grouping does not mix, at one level, with an operator grouping the other way")
+declared_levels_mixing()
+    val g = grammar_levels()
+    assert(declared_diagnostics("f() = a ^^ b ^ c\n", g).contains("`^` groups to the left and `^^` to the right"))
+    assert(declared_diagnostics("f() = a ^ b ^^ c\n", g).contains("`^` groups to the left and `^^` to the right"))
+    assert(declared_diagnostics("f() = a +:: b < c\n", g).contains("`<` groups to the left and `+::` to the right"))
+    assert(declared_diagnostics("f() = a == b +:: c\n", g).contains("`==` groups to the left and `+::` to the right"))
+    // Not without the declaration, and not across levels or with parentheses.
+    assert_eq(diagnostics("f() = a ^^ b ^ c\n"), "")
+    assert_eq(declared_diagnostics("f() = a ^^ b | c\n", g), "")
+    assert_eq(declared_diagnostics("f() = (a ^^ b) ^ c\n", g), "")
+    assert_eq(declared_diagnostics("f() = a ^ (b ^^ c)\n", g), "")
+    // A comparison and `is` group to the left, beside a method declared at their level grouping right.
+    var right_compare: Buf[DeclaredLevel] = buf()
+    right_compare.push(DeclaredLevel("<=<", SymbolCompare, true))
+    assert(declared_diagnostics("f() = a <=< b < c\n", right_compare).contains("`<` groups to the left and `<=<` to the right"))
+    assert(declared_diagnostics("f() = a < b <=< c\n", right_compare).contains("`<` groups to the left and `<=<` to the right"))
+    assert(declared_diagnostics("f() = a is B <=< c\n", right_compare).contains("`is` groups to the left and `<=<` to the right"))
+
+@test("a program's declarations are read per name, and a method disagreeing with the first is an error naming both")
+declared_levels_read()
+    // A declaration that changes a reading is a level; one that restates the name's own is none.
+    assert_eq(levels_of(texts("class A\n    @precedence(\"|\")\n    <|>(o: A) -> A = o\n    @precedence(\"+\")\n    +>(o: A) -> A = o\n    @groupsRight\n    ^^(o: A) -> A = o\n", ""), 0), "<|> | left; ^^ ^ right; ")
+    assert_eq(levels_of(texts("class A\n    <|>(o: A) -> A = o\n", ""), 0), "")
+    // Every method of the name agrees, in one unit or another, an impl or a trait.
+    assert_eq(levels_of(texts("class A\n    @precedence(\"|\")\n    <|>(o: A) -> A = o\n", "trait P\n    @precedence(\"|\")\n    <|>(o: A) -> A\nimpl A\n    @precedence(\"|\")\n    <|>(n: int) -> A = self\n"), 0), "<|> | left; ")
+    // A method of the name declaring nothing, or something else, disagrees.
+    assert_eq(levels_of(texts("class A\n    @precedence(\"|\")\n    <|>(o: A) -> A = o\n", "class B\n    <|>(o: B) -> B = o\n"), 0), "<|> | left; [1] every method named `<|>` binds alike, but this one binds at the level of `==`, grouping to the left and the one at u0.avin:3:5 at the level of `|`, grouping to the left: give each the same `@precedence` and `@groupsRight`; ")
+    assert(levels_of(texts("class A\n    @precedence(\"|\")\n    <|>(o: A) -> A = o\n    @precedence(\"&\")\n    <|>(n: int) -> A = o\n", ""), 0).contains("[0] every method named `<|>` binds alike, but this one binds at the level of `&`"))
+    // Against the library's method, the error is the program's.
+    assert(levels_of(texts("class L\n    <|>(o: L) -> L = o\n", "class A\n    @precedence(\"|\")\n    <|>(o: A) -> A = o\n"), 1).contains("[1] every method named `<|>` binds alike, but this one binds at the level of `|`, grouping to the left and the one at u0.avin:2:5 at the level of `==`"))
+    // A misplaced or malformed declaration is refused and declares nothing.
+    assert(levels_of(texts("class A\n    @precedence(\"..\")\n    <|>(o: A) -> A = o\n", ""), 0).starts_with("[0] `@precedence` takes one string"))
+    assert(levels_of(texts("class A\n    @precedence(\"|\")\n    +(o: A) -> A = o\n", ""), 0).contains("`+` is the language's own operator"))
+    assert(levels_of(texts("class A\n    @precedence(\"|\")\n    <(o: A) -> A = o\n", ""), 0).contains("`<` is the language's own operator"))
+    assert(levels_of(texts("class A\n    @groupsRight\n    |(o: A) -> A = o\n", ""), 0).contains("`|` is the language's own operator"))
+    assert(levels_of(texts("@groupsRight\nf() = 1\n", ""), 0).contains("`@groupsRight` declares how the calls of a method named by a symbol bind"))
+    // `~`, `++` and `--` may declare; every operator of a level names it.
+    assert_eq(levels_of(texts("class A\n    @precedence(\"|\")\n    ~(o: A) -> A = o\n    @precedence(\"*\")\n    --(o: A) -> A = o\n", ""), 0), "~ | left; -- * left; ")
+    for op in ["*", "/", "%", "<<", ">>", "*%", "*|"]
+        assert_eq(level_named(op), "*")
+    for op in ["+", "-", "+%", "-%", "+|", "-|"]
+        assert_eq(level_named(op), "+")
+    for op in ["==", "!=", "<", "<=", ">", ">=", "===", "!=="]
+        assert_eq(level_named(op), "==")
+    for op in ["~", "&", "^", "|", "::", "&&", "||"]
+        assert_eq(level_named(op), op)
+    for op in ["..", "..<", "=", "+=", "<|>", "max", "", "?", "."]
+        assert_eq(level_named(op), "none")
+
+// The operator standing for the level `@precedence(op)` names, or "none".
+private level_named(op: string) -> string = precedence_level(op) match
+    Some(t) -> level_operator(t)
+    None -> "none"

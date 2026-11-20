@@ -1523,10 +1523,17 @@ copy and stays covariant. `clearElements` (`array_clear`, `avin_rt_array_clear`)
 a buffer's vacated capacity keeps nothing alive.
 
 **Sequence literals** (`sequence_literal` in `check.sysl`) are checked against the expected type. A
-`List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected class
-whose companion object has a `newBuilder` method, or else the core library's `Vector`, looked up by
-qualified name so a program's own `Vector` never takes its place. The literal becomes a block: a
-hidden local holding `Companion.newBuilder()`, one `addOne` call per element, and `result()`. The
+`List` is built as `::` chains (`list_literal`). Otherwise the collection is the expected type where
+an impl of the core trait `Buildable` targets it or a bound of it is that trait (`builds_literals`,
+through `conformance_impl`, and `instance_conformance_to` for an impl for an instance or a trait
+type's own conformance, holding at the expected type's arguments; an inherited conformance does not
+count), or else the core library's
+`Vector`, looked up by qualified name so a program's own `Vector` never takes its place, with a fresh
+variable for each type argument (`core_collection_type`). An expected `Iterable`, a type whose
+companion has a `newBuilder`, or a type `Buildable` at other type arguments only, that is neither is
+reported naming the trait
+(`unbuildable_collection`). The literal becomes a block: a hidden local holding the static call
+`T.newBuilder()` (`static_call` on a `TypeReceiver`), one `addOne` call per element, and `result()`. The
 result type is unified with the expected type, or with the instance of the expected trait the
 collection is (`ancestor_type`), which settles the element type, and the elements are then checked as `addOne`'s
 arguments. With no element type expected, each element is checked alone and their types are joined

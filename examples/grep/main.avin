@@ -1,0 +1,95 @@
+// Prints the lines that match a pattern, as the classic line matcher does: a regular expression or,
+// with `-F`, plain text; case ignored with `-i`; whole words only with `-w`; the lines that do not
+// match with `-v`; line numbers with `-n`; only the count with `-c`; only the matched text with
+// `-o`; and `-C N` lines of context around each match, `--` between groups that do not touch.
+// It reads the files named after the pattern, or standard input. It ends 0 when a line matched,
+// 1 when none did and 2 when the pattern or a file was wrong.
+//
+//     avin build grep && ./grep -n -i -C 1 'warn|error' < ../grep.in
+//
+// expect: exit 0
+// args: -n -i -C 1 "timed? ?out|refused"
+import avin.cli
+import avin.fs
+import avin.io
+import avin.regex.Regex
+
+val parser = cli.Parser("grep", "Print the lines that match a pattern.")
+  .flag("ignore-case", short = 'i', help = "match upper and lower case alike")
+  .flag("invert", short = 'v', help = "print the lines that do not match")
+  .flag("line-number", short = 'n', help = "put each line's number before it")
+  .flag("count", short = 'c', help = "print only how many lines matched")
+  .flag("only-matching", short = 'o', help = "print only the matched text, one match to a line")
+  .flag("word", short = 'w', help = "match whole words only")
+  .flag("fixed", short = 'F', help = "the pattern is plain text, not a regular expression")
+  .int("context", short = 'C', help = "print N lines around each match", value = "N")
+  .int("max-count", short = 'm', help = "stop after N matching lines", value = "N")
+  .positional("pattern", help = "what to look for")
+  .positionals("file", help = "the files to search; standard input when there are none")
+
+// What to print for one line: matched, or shown as context around a match.
+data Shown
+  Hit(number: int, text: string)
+  Around(number: int, text: string)
+
+// The expression the options ask for: quoted when it is plain text, bounded by word edges with
+// `-w`, case folded with `-i`.
+expression(pattern: string, fixed: bool, word: bool, fold: bool) -> string =
+  val body = if fixed then Regex.quote(pattern) else pattern
+  val bounded = if word then s"\\b(?:$body)\\b" else s"(?:$body)"
+  if fold then "(?i)" + bounded else bounded
+
+// The lines of `lines` to print: each match, and up to `context` lines on either side of it, in
+// order and each once, ending after `limit` matches when `limit` is above zero.
+select(lines: Vector[string], hit: (string) -> bool, context: int, limit: int) -> Vector[Shown]
+  var out = Vector.empty[Shown]()
+  var printedUpTo = 0 // lines before this index are printed or passed over for good
+  var afterLeft = 0
+  var hits = 0
+  for (line, i) in lines.zipWithIndex
+    if 0 < limit <= hits && afterLeft == 0 then break
+    if hit(line) && !(0 < limit <= hits)
+      for j in max(printedUpTo, i - context) ..< i do out = out :+ Around(j + 1, lines(j))
+      out = out :+ Hit(i + 1, line)
+      hits += 1
+      afterLeft = context
+      printedUpTo = i + 1
+    elif afterLeft > 0
+      out = out :+ Around(i + 1, line)
+      afterLeft -= 1
+      printedUpTo = i + 1
+  out
+
+main(args: Vector[string]) -> int
+  val opts = parser.parseOrExit(args)
+  val source = expression(opts.string("pattern"), opts.flag("fixed"), opts.flag("word"), opts.flag("ignore-case"))
+  val regex = Regex.compile(source) match
+    Ok(r) -> r
+    Err(e) ->
+      eprintln(s"grep: bad pattern: ${e.message}")
+      return 2
+  val invert = opts.flag("invert")
+  val hit = (line: string) -> regex.findFirstIn(line).isDefined != invert
+  val named = opts.strings("file")
+  val inputs = if named.isEmpty then Vector(("", io.readAll())) else named.map(f -> (f, fs.readText(f).getOrElse("")))
+  var matched = 0
+  for (name, text) in inputs
+    val prefix = if named.length > 1 then name + ":" else ""
+    val shown = select(text.lines, hit, opts.int("context"), opts.int("max-count"))
+    val hits = shown.count(_ is Hit)
+    matched += hits
+    if opts.flag("count")
+      println(s"$prefix$hits")
+      continue
+    var last = 0
+    for s in shown
+      val (number, text, mark) = s match
+        Hit(n, t) -> (n, t, ':')
+        Around(n, t) -> (n, t, '-')
+      if opts.int("context") > 0 && last > 0 && number > last + 1 then println("--")
+      last = number
+      val numbered = if opts.flag("line-number") then s"$prefix$number$mark" else prefix
+      if opts.flag("only-matching")
+        if mark == ':' && !invert then for m in regex.findAllIn(text) do println(numbered + m)
+      else println(numbered + text)
+  if matched > 0 then 0 else 1

@@ -1,0 +1,123 @@
+// expect: exit 0
+// Threads pinned to the main thread with no window: `handlePosted`, which the frame loop calls at the
+// start of every frame, runs the messages and posted work waiting, then the pinned threads ready by
+// then. A pinned thread waits for a worker, an inbox's answer or a future without holding a frame,
+// and changes the interface's state when it carries on; one still parked when the loop ends runs
+// again whenever the main scheduler next runs.
+import avin.threads.{Channel, Promise, isMainThread, isPinnedToMain, sleep, spawn, spawnOnMain}
+import avin.time.{millis, now}
+
+import ui.{handlePosted, inbox, post, state}
+
+// One frame of a loop that never waits: a millisecond spent computing.
+frame()
+  val until = now() + millis(1)
+  while now() < until do ()
+
+// What has been noted on `log` so far, in the order noted.
+noted(log: Channel[string]) -> string
+  val seen = Buffer[string]()
+  var more = true
+  while more
+    log.tryReceive() match
+      Some(s) -> seen.append(s)
+      None -> more = false
+  seen.mkString(", ")
+
+main()
+  // Posted work first, in the order posted, then the pinned threads ready.
+  val log = Channel[string]()
+  _ = spawnOnMain(() -> log.send(s"pinned ${isMainThread()} ${isPinnedToMain()}"))
+  post(() -> log.send(s"posted 1 ${isMainThread()} ${isPinnedToMain()}"))
+  post(() -> log.send("posted 2"))
+  println(handlePosted())
+  println(noted(log))
+  println(handlePosted())
+
+  // A pinned thread that posted work makes ready runs in the same call.
+  val go = Promise[unit]()
+  val a = spawnOnMain(() ->
+    go.future.await()
+    log.send("a resumed"))
+  println(handlePosted())
+  post(() ->
+    go.complete(())
+    log.send("posted completes"))
+  println(handlePosted())
+  println(noted(log))
+  a.join()
+
+  // One that another pinned thread makes ready waits for the next call.
+  val order = Buffer[string]()
+  val go2 = Promise[unit]()
+  val b = spawnOnMain(() ->
+    go2.future.await()
+    order.append("b resumed"))
+  val c = spawnOnMain(() ->
+    go2.complete(())
+    order.append("c completes"))
+  println(handlePosted())
+  println(order.mkString(", "))
+  println(handlePosted())
+  println(order.mkString(", "))
+  b.join()
+  c.join()
+
+  // A pinned thread asks an inbox: it parks until the frame that handles the message, and carries on
+  // in that frame once the answer is in.
+  val doubled = inbox((n: int) -> n * 2)
+  val asker = spawnOnMain(() -> doubled.ask(21) + 1)
+  println(handlePosted())
+  println(handlePosted())
+  println(asker.join())
+
+  // A pinned thread waits for a worker's result and sets the interface's state, frame by frame, with
+  // no frame held while it waits.
+  val shown = state("loading")
+  var frames = 0
+  _ = spawnOnMain(() ->
+    val page = spawn(() ->
+      sleep(millis(3))
+      "page").join()
+    shown.set(s"$page ${isMainThread()}"))
+  while shown.get() == "loading"
+    _ = handlePosted()
+    frame()
+    frames += 1
+  println(shown.get())
+  println(frames > 1)
+
+  // An inbox made in a pinned thread, sent to from a worker, handled by a frame.
+  val made = spawnOnMain(() -> inbox((s: string) -> s.byteLength)).join()
+  val sent = spawn(() -> made.send("größe")).join()
+  println(handlePosted())
+  println(sent.await())
+
+  // `handlePosted` in a pinned thread runs the messages and work waiting, and no pinned thread.
+  post(() -> log.send("work"))
+  val handling = spawnOnMain(() -> handlePosted())
+  _ = spawnOnMain(() -> log.send("other pinned"))
+  println(handling.join())
+  println(noted(log))
+
+  // Still parked when the frame loop ends: it runs again when the main scheduler next runs.
+  val later = Promise[string]()
+  val tail = Buffer[string]()
+  _ = spawnOnMain(() -> tail.append(later.future.await()))
+  for _ in 0 ..< 3
+    _ = handlePosted()
+    frame()
+  println(handlePosted())
+  println(tail.length)
+  later.complete("after the loop")
+  println(handlePosted())
+  println(tail.mkString(", "))
+
+  // Made ready by a worker while the main thread joins it: the join, a wait of the main thread, may
+  // run it, or the next call does, whichever comes first; either way it runs once.
+  val later2 = Promise[string]()
+  _ = spawnOnMain(() -> tail.append(later2.future.await()))
+  println(handlePosted())
+  spawn(() -> later2.complete("from a worker")).join()
+  _ = handlePosted()
+  println(tail.mkString(", "))

@@ -1,0 +1,177 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+/** Whether `name` is one of the annotations that declare how a symbol method's calls bind:
+ * `@precedence("|")` and `@groupsRight`. */
+level_annotation(name: string) -> bool = name == "precedence" || name == "groupsRight"
+
+/** What a program's methods named by symbols declare of their precedence and grouping: the names
+ * whose calls the parse reads otherwise than their spellings give, and the errors in the
+ * declarations, each in the unit it is reported in. */
+struct DeclaredLevels
+    levels: Buf[DeclaredLevel]
+    problems: Buf[UnitDiagnostic]
+
+/** A diagnostic and the unit it belongs to. */
+struct UnitDiagnostic
+    unit: usize
+    diagnostic: Diagnostic
+
+/** A method named by a symbol the language does not use: where its name is, and how its calls bind,
+ * as declared or as its name gives. */
+struct LevelSite
+    unit: usize
+    at: Span
+    name: string
+    level: Token
+    right: bool
+    declares: bool
+
+/** Reads the `@precedence` and `@groupsRight` declarations of the methods of `units`, the first
+ * `library` of which are the standard library's. A declaration is a property of the method's name
+ * across the whole program, since the parse reads every call before any type is known: each method
+ * of one name binds alike, and one whose reading, declared or given by its name, differs from the
+ * first declaration of that name is an error naming both. The error is reported at the program's
+ * method rather than the library's. */
+declared_levels(units: Buf[SourceUnit], library: usize) -> DeclaredLevels
+    var sites: Buf[LevelSite] = buf()
+    var problems: Buf[UnitDiagnostic] = buf()
+    for k in 0..<units.len()
+        for item in units[k].file.items
+            if item is FunctionItem(f) then refuse_on_function(k, f, &problems)
+            elif item is ClassItem(d) then read_members(k, d.members, &sites, &problems)
+            elif item is ImplItem(d) then read_members(k, d.members, &sites, &problems)
+    var levels: Buf[DeclaredLevel] = buf()
+    for i in 0..<sites.len()
+        val first = sites[i]
+        if !first.declares || first_declaring(sites, first.name) != i then continue
+        var reported_at_first = false
+        for j in 0..<sites.len()
+            val other = sites[j]
+            if j == i || other.name != first.name then continue
+            if other.level == first.level && other.right == first.right then continue
+            if other.unit < library && first.unit >= library
+                if !reported_at_first then problems.push(UnitDiagnostic(first.unit, error(first.at, disagreement(units, first, other))))
+                reported_at_first = true
+            else problems.push(UnitDiagnostic(other.unit, error(other.at, disagreement(units, other, first))))
+        if first.level != symbol_token(first.name) || first.right != groups_right(first.name)
+            levels.push(DeclaredLevel(first.name, first.level, first.right))
+    DeclaredLevels(levels, problems)
+
+// The place in `sites` of the first method named `name` that declares its level or grouping.
+private first_declaring(sites: Buf[LevelSite], name: string) -> usize
+    for i in 0..<sites.len()
+        if sites[i].declares && sites[i].name == name then return i
+    sites.len()
+
+// The error for the method `here`, whose reading differs from that of `there`.
+private disagreement(units: Buf[SourceUnit], here: LevelSite, there: LevelSite) -> string
+    val src = units[there.unit].src
+    s"every method named `${here.name}` binds alike, but this one binds ${reading(here)} and the one at ${src.name}:${src.locate(there.at.start)} ${reading(there)}: give each the same `@precedence` and `@groupsRight`"
+
+// How a site's calls bind, in words.
+private reading(s: LevelSite) -> string =
+    s"at the level of `${level_operator(s.level)}`, grouping to the ${if s.right then "right" else "left"}"
+
+/** The operator of the language that stands for a level a symbol method's calls bind at, as
+ * `@precedence` names it. */
+level_operator(level: Token) -> string = level match
+    SymbolMultiply -> "*"
+    SymbolAdd -> "+"
+    SymbolBitAnd -> "&"
+    SymbolBitXor -> "^"
+    SymbolBitOr -> "|"
+    SymbolCons -> "::"
+    SymbolCompare -> "=="
+    SymbolAnd -> "&&"
+    SymbolOr -> "||"
+    _ -> "~"
+
+/** The level `@precedence(op)` puts a method's calls at: that of the language's operator `op`, or
+ * of `~`, the tightest a symbol method binds at. `None` for anything else. */
+precedence_level(op: string) -> Option[Token]
+    if op == "~" then return Some(SymbolTight)
+    operator_token(op) match
+        MultiplyOp -> Some(SymbolMultiply)
+        AddOp -> Some(SymbolAdd)
+        BitAndOp -> Some(SymbolBitAnd)
+        BitXorOp -> Some(SymbolBitXor)
+        BitOrOp -> Some(SymbolBitOr)
+        ConsOp -> Some(SymbolCons)
+        CompareOp -> Some(SymbolCompare)
+        AndOp -> Some(SymbolAnd)
+        OrOp -> Some(SymbolOr)
+        _ -> None
+
+/** Whether a method named `name` may declare its level and grouping: a name the language does not
+ * use, which the parse reads as a method's call, rather than one of the language's operators or an
+ * assignment. `~`, `++` and `--` are such names between two operands. */
+declarable_name(name: string) -> bool = operator_token(name) == SymbolOp || name == "~" || name == "++" || name == "--"
+
+const PrecedenceForm: string = "`@precedence` takes one string, an operator of the language whose level the method's calls bind at: `\"~\"` (the tightest), `\"*\"`, `\"+\"`, `\"&\"`, `\"^\"`, `\"|\"`, `\"::\"`, `\"==\"`, `\"&&\"` or `\"||\"`, or another operator of one of those levels"
+
+private refuse_on_function(unit: usize, f: &Function, problems: *Buf[UnitDiagnostic])
+    for a in f.annotations
+        if level_annotation(a.name)
+            problems.push(UnitDiagnostic(unit, error(a.span, s"`@${a.name}` declares how the calls of a method named by a symbol bind, so it goes on a method of a class, trait, object or impl; a function is called by its name")))
+
+private read_members(unit: usize, members: Buf[ClassMember], sites: *Buf[LevelSite], problems: *Buf[UnitDiagnostic])
+    for m in members
+        if m is MethodMember(f, _, _, _) then read_method(unit, f, sites, problems)
+
+// Reads one method's declarations into `sites`, or the errors in them into `problems`. A method of a
+// language operator's name, or of a word, that declares nothing is no site: its calls are not read by
+// a declaration.
+private read_method(unit: usize, f: &Function, sites: *Buf[LevelSite], problems: *Buf[UnitDiagnostic])
+    var level: Option[Token] = None
+    var right = false
+    var declares = false
+    var refused = false
+    var seen_precedence = false
+    var seen_right = false
+    for a in f.annotations
+        if a.name == "precedence"
+            declares = true
+            if seen_precedence
+                problems.push(UnitDiagnostic(unit, error(a.span, "`@precedence` is written twice on one method")))
+                refused = true
+                continue
+            seen_precedence = true
+            var op: Option[string] = None
+            if a.args.len() == 1 && a.args[0].name is None
+                if a.args[0].value.kind is StringLit(s) then op = Some(s)
+            val found = op match
+                Some(s) -> precedence_level(s)
+                None -> None
+            found match
+                Some(t) -> level = Some(t)
+                None ->
+                    problems.push(UnitDiagnostic(unit, error(a.span, PrecedenceForm)))
+                    refused = true
+        elif a.name == "groupsRight"
+            declares = true
+            if seen_right
+                problems.push(UnitDiagnostic(unit, error(a.span, "`@groupsRight` is written twice on one method")))
+                refused = true
+                continue
+            seen_right = true
+            if a.args.len() > 0
+                problems.push(UnitDiagnostic(unit, error(a.span, "`@groupsRight` takes no arguments")))
+                refused = true
+            elif groups_right(f.name)
+                problems.push(UnitDiagnostic(unit, error(a.span, s"`${f.name}` ends in `:`, so its calls group to the right already: remove `@groupsRight`")))
+                refused = true
+            right = true
+    if !is_operator_spelling(f.name)
+        if declares then problems.push(UnitDiagnostic(unit, error(f.name_span, s"`${f.name}` is named by a word, and every method called infix by its name binds alike: only a method named by a symbol declares `@precedence` or `@groupsRight`")))
+        return
+    if !declarable_name(f.name)
+        if declares
+            val what = if operator_token(f.name) == AssignOp then "an assignment, and binds as `=` does" else "the language's own operator, and keeps its level and grouping"
+            problems.push(UnitDiagnostic(unit, error(f.name_span, s"`${f.name}` is $what: only a method named by a symbol the language does not use declares `@precedence` or `@groupsRight`")))
+        return
+    if refused then return
+    val given = symbol_token(f.name)
+    sites.push(LevelSite(unit, f.name_span, f.name, level.unwrap_or(given), right || groups_right(f.name), declares))
