@@ -1825,6 +1825,40 @@ main() = println(s"${circleArea(Circle(2))}")
   module-level values initialize before `main`, each after the values its initializer needs, across
   modules as within one.
 
+## Doc comments
+
+**The comment directly above a declaration documents it**: the run of `//` lines with no blank line
+between them and the declaration, any annotations between skipped. The comment above a file's
+`module` line documents the module. Nothing else marks a doc comment: the language server's hover
+shows it under the declaration's header, and [`avin doc`](/getting-started/#api-documentation)
+writes it into the program's pages.
+
+````avin
+// A shape in the plane; [area] measures one.
+//
+// ```
+// val s = Circle(1.0)
+// println(area(s))
+// ```
+data Shape
+  // A circle of the given radius.
+  Circle(radius: real)
+  Rect(width: real, height: real)
+````
+
+- **It is Markdown**, with GitHub's extensions. Each line loses its `//` and one space after it;
+  what is left keeps its indentation, so a code block indented in the comment stays one.
+- **A block with no language, or marked `avin`, is Avin code**, coloured as Avin; `avin doc --check`
+  fails on one that parses neither as declarations nor as the statements of a function's body. A
+  block of anything else names its language (`text`, `sh`).
+- **A link to a declaration** is written with its path as the destination, `[the map](Vector.map)`,
+  or as `[Name]` or `` [`Name`] `` alone. The path is found from the declaration the comment
+  documents: a member of its type, then a declaration of its module, then a full path such as
+  `avin.fs.File` or a module's name, then the prelude, then the one declaration of the program with
+  that name. `[Name]` that names nothing is left as the text it is; `` [`Name`] `` that names nothing,
+  and a destination that names neither a declaration nor a page of the documentation, are what
+  `avin doc --check` fails on.
+
 ## Literate source
 
 **A file named `.lavin` is a Markdown document, and the part of it indented four columns is the

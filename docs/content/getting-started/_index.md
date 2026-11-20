@@ -275,6 +275,35 @@ literate file only the program is formatted, inside its four-column margin. A fi
 parse is left alone and its errors are reported. The [decisions](/spec/decisions/) list the style
 in full; the language server formats with the same rules.
 
+## API documentation
+
+`avin doc` writes a program's API documentation as a static site: a page per module, listing every
+public declaration with its header and its [doc comment](/spec/declarations/#doc-comments), and an
+index of the modules with a box that searches every name. A type named in a signature links to its
+declaration, in another module, a dependency or the standard library, whose pages the program reads
+are written beside its own. The pages are plain HTML with one stylesheet, light or dark as the
+reader's system is, and fetch nothing from anywhere.
+
+```sh
+./compiler/avin doc hello
+./compiler/avin doc hello -o site
+./compiler/avin doc hello --check
+./compiler/avin doc --std -o std
+```
+
+- **The program is checked first**, as `avin check` checks it, with every feature on; one that does
+  not check is refused with its diagnostics. A package, a directory of modules and one file are each
+  documented; a test module and a `private` declaration are not.
+- **The pages go to `-o`**, or to `.avin/doc` beside the program, which a package's `.gitignore`
+  already names. A directory is written only when it is new, empty, or one `avin doc` wrote before,
+  whose old pages it replaces.
+- **`--check` writes nothing**, and fails on a doc comment's link that leads nowhere and on an Avin
+  block in one that does not parse, for a build or a commit hook. Without it the same problems are
+  warnings.
+- **`--std-url <url>`** links the standard library's names to its pages published at that URL
+  instead of writing them beside the program's. **`avin doc --std`** documents the whole standard
+  library.
+
 ## The compiler's tests
 
 ```sh

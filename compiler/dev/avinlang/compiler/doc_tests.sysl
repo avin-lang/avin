@@ -1,0 +1,326 @@
+module dev.avinlang.compiler
+@tests
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.path.parent
+
+// `avin doc`: the command line, the pages a small package makes (against the golden pages in
+// `tests/doc/expected`), the links between modules, into a dependency and into the standard library,
+// what is left out, `--check`, and the pieces the pages are made of.
+
+/** What one command did: its status and what it said on each channel. */
+private struct DocRun
+    status: int
+    said: string
+    noted: string
+
+private doc_avin(args: []const string) -> DocRun
+    var said = ""
+    var noted = ""
+    val status = run_cli(args, Some(repository_toolchain()), s -> said = said + s + "\n", s -> noted = noted + s + "\n")
+    DocRun(status, said, noted)
+
+// Writes `text` to `file`, making the directories above it.
+private doc_put(file: string, text: string)
+    make_dir_all(parent(file).unwrap()).unwrap()
+    write_text(file, text).unwrap()
+
+private doc_page(dir: string, name: string) -> string = read_text(dir + "/" + name).unwrap_or("")
+
+/** The fixture package, documented into a fresh directory with the standard library's pages named
+ * elsewhere, so the pages do not change when the library does. */
+private doc_shapes(dir: string) -> DocRun = doc_avin(["avin", "doc", "tests/doc/shapes", "-o", dir + "/out", "--std-url", "https://avin.example/std"])
+
+@test("doc: an incorrect invocation prints the usage and exits 2")
+doc_usage_errors()
+    doc_refused(["avin", "doc", "--bogus"])
+    doc_refused(["avin", "doc", "--std", "tests/doc/shapes"])
+    doc_refused(["avin", "doc", "--std", "--std-url", "x"])
+    doc_refused(["avin", "doc", "-o"])
+    doc_refused(["avin", "doc", "a", "b"])
+    doc_refused(["avin", "doc", "--check", "--check"])
+    doc_refused(["avin", "doc", "--std", "--features", "x"])
+    val help = doc_avin(["avin", "--help"])
+    assert(help.said.contains("avin doc [<program>] [-o <dir>] [--check] [--std-url <url>] [<features>]"))
+    assert(help.said.contains("avin doc --std [-o <dir>] [--check]"))
+    assert(is_command("doc"))
+
+private doc_refused(args: []const string)
+    val run = doc_avin(args)
+    assert_eq(run.status, 2)
+    assert_eq(run.said, "")
+    assert(run.noted.starts_with("usage: avin doc "))
+
+@test("doc: a package's pages are the golden ones, file for file")
+doc_golden_pages()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val run = doc_shapes(dir)
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 0)
+    assert_eq(run.said, s"wrote $dir/out/index.html\n")
+    val expected = "tests/doc/expected"
+    var wanted = entries(expected).unwrap()
+    var written = entries(dir + "/out").unwrap()
+    var names: Buf[string] = buf()
+    for n in written
+        if n != DocMarker then names.push(n)
+    assert_eq(names.len(), wanted.len())
+    for name in wanted
+        assert_eq(doc_page(dir + "/out", name), doc_page(expected, name))
+
+@test("doc: a type named in a signature links to its declaration in another module, a dependency and the standard library")
+doc_links_across_modules()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    assert_eq(doc_shapes(dir).status, 0)
+    val shapes = doc_page(dir + "/out", "shapes.html")
+    // Another module of the package, a dependency's module, and the standard library at `--std-url`.
+    assert(shapes.contains("<a href=\"shapes.geometry.html#Point\"><span class=\"hl-type\">Point</span></a>"))
+    assert(shapes.contains("<a href=\"units.html#Metres\"><span class=\"hl-type\">Metres</span></a>"))
+    assert(shapes.contains("<a href=\"https://avin.example/std/avin.html#Vector\"><span class=\"hl-type\">Vector</span></a>"))
+    assert(shapes.contains("<a href=\"https://avin.example/std/avin.html#Ord\"><span class=\"hl-type\">Ord</span></a>"))
+    // The other module links back, through an impl of this module's trait for its own type.
+    val geometry = doc_page(dir + "/out", "shapes.geometry.html")
+    assert(geometry.contains("<a href=\"shapes.html#Named\"><span class=\"hl-type\">Named</span></a> <span class=\"hl-keyword\">for</span> <a href=\"shapes.geometry.html#Point\">"))
+    // A type parameter is never a link, even where a type of its name exists.
+    assert(!shapes.contains(">T</span></a>"))
+    // Links written in doc comments: a member, a function, a path through a module, a dependency's
+    // type by its name alone, a library type, and a member of a trait from another module.
+    assert(shapes.contains("<a href=\"shapes.html#Shape.Circle\">Shape.Circle</a>"))
+    assert(shapes.contains("<a href=\"shapes.html#area\">area</a>"))
+    assert(shapes.contains("<a href=\"shapes.geometry.html#Point\"><code>geometry.Point</code></a>"))
+    assert(shapes.contains("in <a href=\"units.html#Metres\">Metres</a>"))
+    assert(geometry.contains("<a href=\"https://avin.example/std/avin.html#Option\"><code>Option</code></a>"))
+    assert(geometry.contains("<a href=\"shapes.html#Named.name\">Named.name</a>"))
+    // An export presents its declaration.
+    assert(shapes.contains("<a href=\"shapes.geometry.html#Point\">export shapes.geometry.Point</a>"))
+
+@test("doc: without --std-url the standard library modules the program reads are written beside it")
+doc_writes_the_library_it_reads()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val run = doc_avin(["avin", "doc", "tests/doc/shapes", "-o", dir + "/out"])
+    assert_eq(run.status, 0)
+    val shapes = doc_page(dir + "/out", "shapes.html")
+    assert(shapes.contains("<a href=\"avin.html#Vector\"><span class=\"hl-type\">Vector</span></a>"))
+    val library = doc_page(dir + "/out", "avin.html")
+    assert(library.contains("id=\"Vector\""))
+    assert(library.contains("id=\"Option\""))
+    val index = doc_page(dir + "/out", "index.html")
+    assert(index.contains("<h2>Standard library</h2>"))
+    assert(index.contains("<a href=\"avin.html\">avin</a>"))
+    // A library module the program does not read is not written.
+    assert(!exists(dir + "/out/avin.regex.html"))
+    // The library's names are found by the search box too.
+    assert(doc_page(dir + "/out", "search.js").contains("[\"avin.Vector\", \"class\", \"avin.html#Vector\"]"))
+
+@test("doc: private declarations, private members, test modules and modules with nothing public are left out")
+doc_leaves_out_what_is_not_public()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    assert_eq(doc_shapes(dir).status, 0)
+    val shapes = doc_page(dir + "/out", "shapes.html")
+    assert(!shapes.contains("secret"))
+    assert(!shapes.contains("scratch"))
+    assert(!shapes.contains("id=\"Canvas.used\""))
+    assert(shapes.contains("id=\"Canvas.width\""))
+    assert(!exists(dir + "/out/tests.html"))
+    assert(!exists(dir + "/out/shapes.hidden.html"))
+    assert(!doc_page(dir + "/out", "index.html").contains("shapes.hidden"))
+    assert(!doc_page(dir + "/out", "search.js").contains("rectArea"))
+
+@test("doc: --check passes a package whose doc comments are sound, and writes nothing")
+doc_check_passes()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    val run = doc_avin(["avin", "doc", "tests/doc/shapes", "--check", "-o", dir + "/out"])
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 0)
+    assert_eq(run.said, "checked the documentation of 2 modules\n")
+    assert(!exists(dir + "/out"))
+
+@test("doc: --check fails on a link that leads nowhere and an Avin block that does not parse, and only on those")
+doc_check_fails()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    doc_put(dir + "/p/avin.hocon", "package { name = \"p\", version = \"0.1.0\" }\n")
+    doc_put(dir + "/p/p/lib.avin", "module p\n\n" +
+        "// See [`Nowhere`], [the thing](Missing.thing) and [the page](other.html).\n" +
+        "// [prose in brackets] and [`thing`]: neither is a link, the second a definition.\n" +
+        "//\n" +
+        "// [`thing`]: https://example.com\n" +
+        "// [fine](https://example.com/x.html), [this page](#top) and [index](index.html) are not checked.\n" +
+        "//\n" +
+        "// ```\n" +
+        "// val = 1 +\n" +
+        "// ```\n" +
+        "//\n" +
+        "// ```text\n" +
+        "// not ( avin\n" +
+        "// ```\n" +
+        "//\n" +
+        "// ```avin\n" +
+        "// data Ok(n: int)\n" +
+        "// ```\n" +
+        "//\n" +
+        "// ```\n" +
+        "// val x = 1\n" +
+        "// println(x)\n" +
+        "// ```\n" +
+        "thing() -> int = 1\n")
+    val checked = doc_avin(["avin", "doc", dir + "/p", "--check"])
+    assert_eq(checked.status, 1)
+    assert_eq(checked.said, "")
+    val place = dir + "/p/p/lib.avin:25: the doc comment of `thing`"
+    assert(checked.noted.contains(place + " links to `Nowhere`, which names no declaration\n"))
+    assert(checked.noted.contains(place + " links to `Missing.thing`, which names no declaration and no page\n"))
+    assert(checked.noted.contains(place + " links to `other.html`, which names no declaration and no page\n"))
+    assert(checked.noted.contains(place + ": an Avin block in it does not parse: "))
+    assert(checked.noted.contains("(line 1 of the block)"))
+    assert(checked.noted.contains("avin: 4 documentation problems are reported above\n"))
+    assert(!checked.noted.contains("prose"))
+    assert(!checked.noted.contains("not ( avin"))
+    // Without --check the pages are written all the same, and the problems are warnings.
+    val written = doc_avin(["avin", "doc", dir + "/p", "-o", dir + "/out"])
+    assert_eq(written.status, 0)
+    assert(written.noted.contains("warning: " + place + " links to `Nowhere`"))
+    assert(doc_page(dir + "/out", "p.html").contains("<a href=\"https://example.com\"><code>thing</code></a>"))
+
+@test("doc: a program that does not check is refused with its diagnostics, and so is one that does not parse")
+doc_refuses_a_broken_program()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    doc_put(dir + "/bad.avin", "f() -> int = missing\n")
+    val bad = doc_avin(["avin", "doc", dir + "/bad.avin", "-o", dir + "/out"])
+    assert_eq(bad.status, 1)
+    assert(bad.noted.contains("`missing` is not defined"))
+    assert(!exists(dir + "/out"))
+    doc_put(dir + "/broken.avin", "f( -> int = 1\n")
+    assert_eq(doc_avin(["avin", "doc", dir + "/broken.avin", "-o", dir + "/out"]).status, 1)
+    val absent = doc_avin(["avin", "doc", dir + "/absent.avin"])
+    assert_eq(absent.status, 1)
+    assert(absent.noted.contains("absent.avin"))
+    var noted = ""
+    assert_eq(run_cli(["avin", "doc", dir + "/bad.avin"], None, s -> (), s -> noted = noted + s), 1)
+    assert(noted.contains("AVIN_ROOT"))
+
+@test("doc: the output directory is refused when something else wrote it, and rewritten when avin doc did")
+doc_output_directory()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    doc_put(dir + "/one.avin", "// One.\none() -> int = 1\n")
+    doc_put(dir + "/theirs/notes.txt", "keep me\n")
+    val refused = doc_avin(["avin", "doc", dir + "/one.avin", "-o", dir + "/theirs"])
+    assert_eq(refused.status, 1)
+    assert(refused.noted.contains("holds files `avin doc` did not write"))
+    assert_eq(read_text(dir + "/theirs/notes.txt").unwrap(), "keep me\n")
+    doc_put(dir + "/a-file", "x")
+    assert(doc_avin(["avin", "doc", dir + "/one.avin", "-o", dir + "/a-file"]).noted.contains("is not a directory"))
+    // An empty directory is taken, and a second run over the first removes a page no longer made.
+    make_dir_all(dir + "/empty").unwrap()
+    assert_eq(doc_avin(["avin", "doc", dir + "/one.avin", "-o", dir + "/empty"]).status, 0)
+    write_text(dir + "/empty/gone.html", "old").unwrap()
+    write_text(dir + "/empty/kept.txt", "mine").unwrap()
+    assert_eq(doc_avin(["avin", "doc", dir + "/one.avin", "-o", dir + "/empty"]).status, 0)
+    assert(!exists(dir + "/empty/gone.html"))
+    assert(exists(dir + "/empty/kept.txt"))
+    assert(exists(dir + "/empty/index.html"))
+
+@test("doc: without -o the pages go to .avin/doc beside the package, the directory or the file")
+doc_default_output()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    doc_put(dir + "/pkg/avin.hocon", "package { name = \"pkg\", version = \"0.1.0\" }\n")
+    doc_put(dir + "/pkg/pkg/lib.avin", "module pkg\n\n// Doubles.\ntwice(n: int) -> int = n * 2\n")
+    val run = doc_avin(["avin", "doc", dir + "/pkg/pkg/lib.avin"])
+    assert_eq(run.status, 0)
+    assert(run.said.ends_with("/pkg/.avin/doc/index.html\n"))
+    assert(doc_page(dir + "/pkg/.avin/doc", "pkg.html").contains("<p>Doubles.</p>"))
+    doc_put(dir + "/loose/tool.avin", "tool() -> int = 1\n")
+    assert(doc_avin(["avin", "doc", dir + "/loose/tool.avin"]).said.ends_with("/loose/.avin/doc/index.html\n"))
+    assert(exists(dir + "/loose/.avin/doc/index.html"))
+    // A directory of modules without a manifest keeps its pages inside it.
+    doc_put(dir + "/tree/main.avin", "main() = ()\n")
+    assert_eq(doc_avin(["avin", "doc", dir + "/tree"]).status, 0)
+    assert(exists(dir + "/tree/.avin/doc/index.html"))
+
+@test("doc: a program of one file is documented on the index, under the file's name, Unicode names and text included")
+doc_single_file()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    doc_put(dir + "/café.avin", "// A café, with its menu — in French: « carte ».\ndata Café(menu: Vector[string])\n\n// Opens the café.\n//\n//     indented code survives\n// **Strong** survives too.\n@tailrec\nvisit(c: Café, n: int) -> bool = if n == 0 then true else visit(c, n - 1)\n")
+    val run = doc_avin(["avin", "doc", dir + "/café.avin", "-o", dir + "/out"])
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 0)
+    val index = doc_page(dir + "/out", "index.html")
+    assert(index.contains("<h1>café</h1>"))
+    assert(index.contains("<section class=\"decl data\" id=\"Caf~c3~a9\">"))
+    assert(index.contains("<p>A café, with its menu — in French: « carte ».</p>"))
+    assert(index.contains("<a href=\"index.html#Caf~c3~a9\"><span class=\"hl-type\">Café</span></a>"))
+    // An indented block names no language, so it is Avin, as a fence with none is.
+    assert(index.contains("<pre><code class=\"language-avin\"><span class=\"hl-name\">indented</span> <span class=\"hl-name\">code</span>"))
+    assert(index.contains("<strong>Strong</strong> survives too."))
+    assert(!index.contains("<h2>Modules</h2>"))
+
+@test("doc: a type's public member exports are listed with its members, as written, and a private one is not")
+doc_member_exports()
+    val dir = make_temp_dir("avin-doc").unwrap()
+    defer _ = remove_dir_all(dir)
+    doc_put(dir + "/box.avin", "class Counter(var count: int)\n  plus(n: int) -> int = count + n\n  minus(n: int) -> int = count - n\n\nclass Box(c: Counter)\n  // Counting, as the counter counts.\n  export c.{plus, minus as less}\n  export c.count\n  private export c.count as hidden\n\nclass Names(names: Vector[string])\n  export names.*\n")
+    val run = doc_avin(["avin", "doc", dir + "/box.avin", "-o", dir + "/out"])
+    assert_eq(run.noted, "")
+    assert_eq(run.status, 0)
+    val index = doc_page(dir + "/out", "index.html")
+    assert(index.contains("<section class=\"decl export\" id=\"Box.export\">"))
+    assert(index.contains("<span class=\"hl-name\">minus</span> <span class=\"hl-keyword\">as</span> <span class=\"hl-name\">less</span>"))
+    assert(index.contains("<p>Counting, as the counter counts.</p>"))
+    assert(index.contains("id=\"Box.export-2\""))
+    assert(!index.contains("<span class=\"hl-name\">hidden</span>"))
+    assert(index.contains("id=\"Names.export\""))
+    assert(!doc_page(dir + "/out", "search.js").contains("\"export\""))
+    assert_eq(doc_member_export_text(MemberExport(Span(0, 0), "f", Span(0, 0), buf(), true, Span(0, 0), true)), "export f.*")
+
+@test("doc: an Avin block parses as declarations or as statements, and one that does neither says where")
+doc_blocks()
+    assert(doc_block_problem("data P(x: int)\n\nf(p: P) -> int = p.x\n") is None)
+    assert(doc_block_problem("val x = 1\nprintln(x + 1)\n") is None)
+    assert(doc_block_problem("if x then\n  1\nelse\n  2\n") is None)
+    assert(doc_block_problem("") is None)
+    val statements = doc_block_problem("val x = 1\nval = 2\n").unwrap_or("")
+    assert(statements.ends_with("(line 2 of the block)"))
+    val declaration = doc_block_problem("data P(\n").unwrap_or("")
+    assert(declaration.contains("of the block)"))
+
+@test("doc: a link is to a declaration when it is a path of names")
+doc_paths()
+    for good in ["Vector", "Vector.map", "avin.collections.Map", "x", "_a.b1"]
+        assert(doc_path_like(good))
+    for bad in ["", ".a", "a.", "a..b", "1a", "a b", "a/b", "http://x", "a#b", "`a`"]
+        assert(!doc_path_like(bad))
+
+@test("doc: a member's signature is shown without the type it belongs to")
+doc_member_signatures()
+    assert_eq(doc_member_signature("Option[T].map[U](f: (T) -> U) -> Option[U]", "map"), "map[U](f: (T) -> U) -> Option[U]")
+    assert_eq(doc_member_signature("Canvas.draw(s: Shape)", "draw"), "draw(s: Shape)")
+    assert_eq(doc_member_signature("isEmpty -> bool", "isEmpty"), "isEmpty -> bool")
+    // A dot inside the parameters, and a name that only begins the same, are not the owner's.
+    assert_eq(doc_member_signature("f(x: a.f) -> int", "f"), "f(x: a.f) -> int")
+    assert_eq(doc_member_signature("Box.mapAll(x: int)", "map"), "Box.mapAll(x: int)")
+
+@test("doc: a page's name is its module's, the root module's the index")
+doc_page_names()
+    assert_eq(doc_page_name(""), "index.html")
+    assert_eq(doc_page_name("index"), "index_.html")
+    assert_eq(doc_page_name("a.b"), "a.b.html")
+    assert_eq(doc_escape("<a href=\"x\">&</a>"), "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;")
+
+@test("doc: a doc comment keeps the indentation after `// `, and skips the annotations below it")
+doc_comment_text()
+    val lines = "// One.\n//\n//     code\n// **Strong**\n@tailrec\nf() = 1\n"
+    assert_eq(doc_before(lines.bytes, lines.index_of("f()").unwrap()), "One.\n\n    code\n**Strong**")
+    // A blank line between the comment and the declaration ends it.
+    val apart = "// Not this one.\n\nf() = 1\n"
+    assert_eq(doc_before(apart.bytes, apart.index_of("f()").unwrap()), "")
