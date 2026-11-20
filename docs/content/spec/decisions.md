@@ -5298,6 +5298,27 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   - The matcher learns of a spent budget by a flag every step checks, so a spent budget ends the
     whole search through every nested part; a lookaround's or atomic group's body answering no for
     it is never taken as the body failing.
+- Settled on the user's delegation 2026-11-19 (built on branch `regex-sendable`, a gap the
+  concurrent-program ports met): **a compiled [`Regex`](/spec/regex/#regex), its `Pattern` and a
+  `Match` are sendable**, and each class declares `: Sendable`, so a change that makes one hold
+  something mutable fails to compile in the library rather than in a program. A `MatchIterator`
+  stays not sendable: it is a search in progress. *How*: a compiled program's operations, a
+  literal's characters and a branch's alternatives are `ArraySeq`s, filled once at compile time; a
+  character class's test is a `@sendable (int) -> bool`, so every closure that builds one is checked
+  to capture only sendable values (a class's table of the first 256 characters is copied into an
+  `ArraySeq`); and a class's answers for the characters below 128, an array of 128 `bool`s, are two
+  `long`s of bits, which is no slower and holds nothing mutable. Each search already kept its own
+  state (the engine's groups, locals and backtracking stack), so no search allocates more than
+  before. A `Match` holds its group offsets as `ArraySeq`s, which costs one copy of two small arrays
+  per `Match` made; `split` no longer makes a `Match` per piece at all. *Why*: a pattern compiled
+  once at module level and used from every worker is the ordinary way to write a concurrent
+  scanner, crawler or server, and an immutable value that cannot be shared reads as a defect.
+  *Alternatives*: compiling a regex per thread (what the port had to do; wasteful and easy to miss);
+  a `@sendable` field marker trusting the library (no check would keep it true); making the core
+  library's frozen array type reachable from `avin.regex` (saves one load per operation dispatched
+  but widens what the core module shares; `ArraySeq` is the public form of the same thing).
+  Review with the user: whether the one extra load per dispatched operation through `ArraySeq`
+  is worth a library-internal way to name a frozen array outside the core module.
 
 - Settled on the user's delegation 2026-11-09: **Union types: the rules beyond the user's five points** (branch `unions-design`;
   [union types](/spec/unions/)).
