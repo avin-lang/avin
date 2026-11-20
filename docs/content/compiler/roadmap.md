@@ -577,7 +577,7 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 
 Designed in [contextual parameters](/spec/contextual-parameters/), its choices
 [settled](/spec/decisions/#settled). Steps 1 and 2 are done (branch `given-1`), step 3 too (branch
-`given-3`), step 4 (branch `given-4`) and step 5 (branch `given-5`); step 6 is still to come. A filled argument becomes an ordinary
+`given-3`), step 4 (branch `given-4`), step 5 (branch `given-5`) and step 6 (branch `given-6`). A filled argument becomes an ordinary
 argument in the checker's output, so lowering, emission and the runtime change nothing; every step
 is in the front end and tooling. Each step is one agent, gated on its own with the files it names.
 
@@ -666,7 +666,17 @@ is in the front end and tooling. Each step is one agent, gated on its own with t
    definition from a call to the given it used; completion offers `given` and `using`. Files:
    `lsp.sysl`, `completion.sysl`, `definition_index.sysl`; tests in `lsp_tests.sysl`. The
    IntelliJ plugin's grammar (`avin-intellij`) is its own item, shipped with the release that
-   carries step 1.
+   carries step 1. **Done** (branch `given-6`): `fill_contextual` records each call's givens
+   (`index_filled_call`), and when the call is indexed each becomes a reference at the call's name
+   marked `filled` with its parameter (`index_fills`). Hover adds "Filled from givens:" with
+   `tx = current  // val current: Tx` per parameter; definition answers the function, then each
+   given; a given's references and highlights include the calls it filled; rename and semantic
+   tokens leave them out. Signatures write `using` once before the section, and a completed call's
+   snippet leaves the section out. `completion_keywords` offers `given` and `using` where a form may
+   begin with them. Tests: `lsp_tests.sysl` (`lsp_hover_filled_call`, `lsp_definition_filled_call`,
+   `lsp_references_filled_call`, `lsp_semantic_tokens_filled_call`, `lsp_definition_given_levels`,
+   `lsp_definition_given_other_file`, `lsp_signature_using_section`, `lsp_completion_given_using`,
+   `lsp_completion_keywords_of_sites`).
 
 **The test matrix.** Each claim of the chapter is a test; these are the cases the steps owe.
 
