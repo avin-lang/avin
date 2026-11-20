@@ -9302,6 +9302,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   likeliest fix, naming the argument, where a call has one positional argument per contextual
   parameter; beyond that it was not meant for the section. Alternatives weighed: always the "passed
   by name" error (wrong advice for a call of too many arguments).
+- Settled on the user's delegation 2026-11-19 (branch `given-5`): **a function, method or
+  constructor with a `using` section, taken as a value, is a closure calling it as a call written
+  where the value is taken would: its type is the parameters before the section, the section is
+  filled from the givens in scope there, which the closure captures, and a contextual parameter no
+  given fills takes its default, computed at each call of the value.** `rows.map(insert)` is exactly
+  `rows.map(row -> insert(row))`, so a value with no given in scope is the call's "needs a `Tx`"
+  error, two that fit are the call's "two givens" error, an overload is chosen by the parameters
+  before its section, and a value cannot take the section explicitly (a lambda does: `(r, t) ->
+  insert(r, tx = t)`). A method whose parameters are all in its section is called with `()` as one of
+  no parameters is: `s.current` with no function type expected is the "called with `()`" error, and
+  `val f: () -> int = s.current` is its value. Why: the chapter's own equivalence, taken literally,
+  gives every other answer: the given is captured as any read of it is, so the `spawn`, `@sendable`,
+  executor and `@threaded` checks name it with no new rule, and a default is computed where an
+  omitted argument's always is, at the call. Alternatives weighed: keeping the section as positional
+  parameters of the value (the step-3 behaviour; the given in scope would be ignored, and the value
+  would not fit the function types it reads as); computing the defaults once where the value is
+  taken (a second time at which a default runs, unlike every other default); a value of a method of
+  only contextual parameters made where no function type is expected (`s.current` would then quietly
+  be a function where a call was almost certainly meant).
+- Settled on the user's delegation 2026-11-19 (branch `given-5`): **an actor's `using` section is
+  held to `Sendable` as any actor parameter is, filled where the actor is made**, by the given in
+  scope, by name, or by its default, and its parameters are givens in the actor's body and its
+  `receive`. Why: an actor's parameters are carried to it by its behaviour, so the section is checked
+  where the actor is declared, once, with the message every other parameter gets. Alternatives
+  weighed: none that keeps one rule for actor parameters.
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a

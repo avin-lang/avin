@@ -189,7 +189,12 @@ its module because it can only add a method a call names; a given changes what a
   called with positional arguments only, all of them.
 - **A function or method taken as a value has its section filled where it is taken**:
   `rows.foreach(insert)` with a given `tx` in scope is `rows.foreach(row -> insert(row))`, the
-  transaction captured there. Where none is in scope it is the error a call would be.
+  transaction captured there. Where none is in scope it is the error a call would be. The value's
+  type is the parameters before the section, `(Row) -> unit` for `insert`, so a value never takes the
+  section explicitly; a lambda does, `(row, tx) -> insert(row, tx = tx)`. A contextual parameter no
+  given fills takes its default at each call of the value, as the lambda would. A method whose
+  parameters are all in its section is called with `()`, so `s.current` is its value only where a
+  function type is expected.
 
 ## Generic code
 
