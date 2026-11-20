@@ -37,6 +37,16 @@ import sysl.time.monotonic
 //
 // The main thread is not a worker: its waits block it, as an operating system thread's do, and it
 // stays free for work that has to run on it.
+//
+// The main scheduler runs the lightweight threads pinned to the main thread, and runs them there only.
+// They have a ready queue of their own, under `sched`, and a carrier of their own, made by the main
+// thread when it starts the first of them; the main thread's own stack is that carrier's home. Nothing
+// but the main thread takes from that queue: it runs the threads ready when `main_step` is called,
+// which the frame loop of a window does once a frame, and it runs them while its own code waits, so a
+// pinned thread is never stranded behind a wait of the main thread. A pinned thread parks as any other
+// does, and whatever makes it ready puts it on the main queue and wakes the main thread where it is
+// blocked. No monitor slices a pinned thread: it shares the main thread with the window's frames and
+// runs until it waits or ends.
 
 /** A lightweight thread: its context, then a frame of two slots holding the closure it runs and the
  * object it is joined by, its fiber and stack, and its place in the ready queue. It keeps itself alive
@@ -87,6 +97,8 @@ struct Lwt
     trim_listed: Atomic[u32]
     trim_prev: *Lwt
     trim_next: *Lwt
+    /** Whether the thread is pinned to the main thread: it runs there only, on the main scheduler. */
+    pinned: bool
 
 @assert(offsetof(Lwt, context) == 0, "a lightweight thread's context is the start of its storage")
 @assert(offsetof(Lwt, run) == offsetof(Lwt, root) + sizeof(Frame), "a frame's slots follow its header")
@@ -142,6 +154,12 @@ private var last_lwt: *Lwt = null
 private var lwts_started: u64 = 0
 /** How many workers have taken a thread to run and not yet come back for another. */
 private var running_now: usize = 0
+/** The main scheduler's ready queue: the pinned threads ready, which only the main thread runs. */
+private var main_head: *Lwt = null
+private var main_tail: *Lwt = null
+/** The carrier the main thread runs pinned threads on, made by the first one it starts; only the main
+ * thread reads it. */
+private var main_carrier: *Carrier = null
 
 // A lightweight thread's phase, for the thread dump.
 /** In the ready queue. */
@@ -181,10 +199,11 @@ start_lightweight(p: *Lwt)
     sched.unlock_raw()
     make_ready(p)
 
-/** Whether no lightweight thread is running or ready: every one started is parked, or there is none. */
+/** Whether no lightweight thread is running or ready, on the workers or on the main scheduler: every
+ * one started is parked, or there is none. */
 scheduler_quiet() -> bool
     sched.lock_raw()
-    val quiet = running_now == 0 && ready_head == null
+    val quiet = running_now == 0 && ready_head == null && main_head == null
     sched.unlock_raw()
     quiet
 
@@ -198,7 +217,8 @@ lightweight_lines(now: long, timed: bool) -> Buf[string]
         val phase = p.phase.load()
         val waits = p.context.waits.load()
         if timed || phase != PhaseParked || !idle_worker(waits)
-            lines.push("  thread " + p.id.to_string() + ": " + phase_text(p, phase, waits, now, timed) + "\n")
+            val pin = if p.pinned then ", pinned to the main thread" else ""
+            lines.push("  thread " + p.id.to_string() + pin + ": " + phase_text(p, phase, waits, now, timed) + "\n")
         p = p.all_next
     sched.unlock_raw()
     lines
@@ -240,6 +260,13 @@ make_ready(p: *Lwt)
     sched.lock_raw()
     _ = wakes.add(1)
     p.next = null
+    if p.pinned
+        // A pinned thread waits for the main thread, which is woken where it is blocked in a wait.
+        if main_tail == null then main_head = p else main_tail.next = p
+        main_tail = p
+        sched.unlock_raw()
+        wake_blocked()
+        return
     if ready_tail == null then ready_head = p else ready_tail.next = p
     ready_tail = p
     val start = more_hands()
@@ -279,6 +306,10 @@ private start_worker()
     spawn(&work_loop, &workers_started, LoopStack) match
         Some(_) -> ()
         None -> cannot_schedule()
+    start_monitor()
+
+// Starts the monitor, where it has not been started: it fires every timer, a pinned thread's too.
+private start_monitor()
     sched.lock_raw()
     val first = !monitoring
     monitoring = true
@@ -313,7 +344,7 @@ private work_loop(started: *Atomic[u64]) -> unit
     loop
         val p = next_ready(k, ran, ended)
         ran = true
-        ended = run_on(k, p)
+        ended = run_on(k, p, null)
 
 // The next thread for `k` to run, waiting while there is none. A worker the monitor released rejoins
 // the count here, or rests as a spare until it is called where the count is full. Where `ran`, the
@@ -361,8 +392,9 @@ private next_ready(k: *Carrier, ran: bool, ended: *Lwt) -> *Lwt
 
 // Runs `p` on `k` until it switches back, then does what it asked for, and answers `p` where it ended,
 // for the worker to give back, or null. The worker's own code never moves between threads, so it is
-// where the thread-local context is set.
-private run_on(k: *Carrier, p: *Lwt) -> *Lwt
+// where the thread-local context is set: to `back` again once the thread has switched back, null on a
+// worker and the main thread's context on the main scheduler.
+private run_on(k: *Carrier, p: *Lwt, back: *Context) -> *Lwt
     p.context.carrier = k
     p.phase.store(PhaseRunning)
     // The monitor trims a stack only while it sees the thread parked with its parking finished: once
@@ -379,7 +411,7 @@ private run_on(k: *Carrier, p: *Lwt) -> *Lwt
     use_stack_guard(p.low)
     fiber.switch(&k.home, &p.fiber)
     use_stack_guard(k.own_low)
-    set_current(null)
+    set_current(back)
     k.busy.store(0)
     val after = k.after
     k.after = AfterNothing
@@ -410,6 +442,73 @@ private run_on(k: *Carrier, p: *Lwt) -> *Lwt
 @noinline
 private set_current(c: *Context)
     current_context = c
+
+/** Whether the calling code runs on a lightweight thread pinned to the main thread. */
+on_main_scheduler() -> bool
+    val c = current_context
+    if c == null || !runs_lightweight(c) then return false
+    val p: *Lwt = ptr_cast(c)
+    p.pinned
+
+/** Makes the main scheduler's carrier, where the main thread, `ctx`, has not yet started a pinned
+ * thread. Its home is the main thread's own stack, and the overflow report goes back to that stack's
+ * low end whenever a pinned thread switches back to it. The monitor, which fires the timers of
+ * pinned threads' sleeps and timed waits as it does every other's, is started with it, since a
+ * program may start no worker at all. */
+make_main_scheduler(ctx: *Context)
+    if main_carrier != null then return
+    start_monitor()
+    val k = new_carrier(true)
+    k.own_low = stack_guard_low()
+    lock_heap(ctx)
+    link_carrier(k)
+    heap_lock.unlock()
+    main_carrier = k
+
+/** Runs on the main thread the pinned threads that are ready now, each until it waits or ends, in the
+ * order they became ready, and answers how many it ran; one made ready meanwhile waits for the next
+ * call. Only the main thread's own code runs the main scheduler: called from a pinned thread, or from
+ * any other, it runs nothing and answers 0. */
+main_step() -> long
+    val c = current_context
+    if c != &main_context then return 0
+    mark_safe(c)
+    val n = run_main_ready()
+    mark_running(c)
+    n
+
+// Whether a pinned thread is ready.
+private main_ready() -> bool
+    sched.lock_raw()
+    val ready = main_head != null
+    sched.unlock_raw()
+    ready
+
+// On the main thread, its context safe: runs each pinned thread ready now once, and answers how many.
+// Only the main thread takes from the main queue, so the last one ready now is still on it until this
+// takes it.
+private run_main_ready() -> long
+    sched.lock_raw()
+    val last = main_tail
+    sched.unlock_raw()
+    if last == null then return 0
+    var ran: long = 0
+    loop
+        sched.lock_raw()
+        val p = main_head
+        main_head = p.next
+        if main_head == null then main_tail = null
+        p.next = null
+        sched.unlock_raw()
+        val final = p == last
+        val ended = run_on(main_carrier, p, &main_context)
+        if ended != null
+            sched.lock_raw()
+            forget_lwt(ended)
+            sched.unlock_raw()
+            ended.me = None
+        ran += 1
+        if final then return ran
 
 /** The body of every lightweight thread, on its own stack: it waits for any collection in progress,
  * runs the closure through the program's runner, and ends. Its worker has told the overflow report
@@ -688,12 +787,19 @@ private var blocked_woken: Condvar = Condvar.new()
 /** Blocks the operating system thread of `ctx` until `w` is woken or `deadline` passes. The main
  * thread, waiting without a limit, looks for a deadlock as it begins and each time a worker pokes it:
  * a poke that comes between its look and its wait is seen, since the count it read has moved. A
- * select waits here too (`select.sysl`). */
+ * select waits here too (`select.sysl`). While the main thread waits it runs the threads pinned to it
+ * as they become ready, before it looks for a deadlock: a pinned thread made ready wakes it. */
 block_until_woken(ctx: *Context, w: *Waiter, deadline: long)
-    val watched = deadline <= 0 && ctx == &main_context
+    val main = ctx == &main_context
+    val watched = deadline <= 0 && main
     if watched then main_watching.store(1)
     blocked_lock.lock_raw()
     while w.state.load() == WaitPending
+        if main && main_ready()
+            blocked_lock.unlock_raw()
+            _ = run_main_ready()
+            blocked_lock.lock_raw()
+            continue
         if deadline <= 0
             if watched
                 val seen = pokes.load()

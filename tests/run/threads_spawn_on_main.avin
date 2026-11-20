@@ -1,0 +1,98 @@
+// expect: exit 0
+// A thread pinned to the main thread (`spawnOnMain`) runs on the main thread only. It waits for
+// nothing until the main thread runs the main scheduler: `runMainThreads()`, or a wait of the main
+// thread's own code. It parks on a channel, a future, a sleep, a join, a lock and a select without
+// blocking the main thread, and carries on there when its wait ends, whatever thread or timer ends it.
+// It reaches what the main thread reaches, mutable values among them, since nothing else runs it.
+import avin.threads.{
+  Channel, Mutex, Promise, Thread, isMainThread, isPinnedToMain, runMainThreads, sleep, spawn, spawnOnMain
+}
+import avin.time.millis
+
+where() -> string = s"${isMainThread()}/${isPinnedToMain()}"
+
+chosen(a: Channel[string], b: Channel[string]) -> string = select
+  a.receive() as Some(v) -> s"a $v"
+  b.receive() as Some(v) -> s"b $v"
+  a.receive() as None -> "a closed"
+  b.receive() as None -> "b closed"
+
+main()
+  // The main thread's own code is the main thread, and not a pinned thread.
+  println(where())
+
+  // Started, and not run until the main thread runs the main scheduler.
+  val log = Buffer[string]()
+  val first = spawnOnMain(() ->
+    log.append(s"first ${where()}")
+    7)
+  println(log.length)
+  println(runMainThreads())
+  println(log.mkString(","))
+  println(runMainThreads())
+  // Joining a thread that has ended answers at once, as often as asked.
+  println(first.join() + first.join())
+
+  // Parked on a channel a worker sends to: the main thread's join runs it when the value arrives.
+  val c = Channel[int]()
+  val received = spawnOnMain(() ->
+    val got = c.receive().getOrElse(-1)
+    s"received $got on ${where()}")
+  spawn(() ->
+    sleep(millis(2))
+    c.send(41))
+  println(received.join())
+
+  // Parked on a future a worker completes.
+  val p = Promise[string]()
+  val awaited = spawnOnMain(() -> s"${p.future.await()} on ${where()}")
+  spawn(() ->
+    sleep(millis(2))
+    p.complete("completed"))
+  println(awaited.join())
+
+  // Parked on a sleep: a timer makes it ready.
+  println(spawnOnMain(() ->
+    sleep(millis(3))
+    where()).join())
+
+  // Parked on a join of a thread on the workers, which is not the main thread.
+  println(spawnOnMain(() -> spawn(() -> where()).join() + " joined on " + where()).join())
+
+  // Parked on a lock a worker holds.
+  val m = Mutex(0)
+  val holding = Promise[unit]()
+  val letGo = Promise[unit]()
+  val holder = spawn(() ->
+    m.update(v ->
+      holding.complete(())
+      letGo.future.await()
+      v + 1))
+  holding.future.await()
+  val locked = spawnOnMain(() -> m.update(v -> v + 10))
+  println(runMainThreads())
+  letGo.complete(())
+  holder.join()
+  println(locked.join())
+
+  // Parked in a select on two channels.
+  val a = Channel[string]()
+  val b = Channel[string]()
+  val selected = spawnOnMain(() -> chosen(a, b) + " on " + where())
+  spawn(() -> b.send("second"))
+  println(selected.join())
+
+  // A pinned thread starts another, which is pinned too, and joins it.
+  println(spawnOnMain(() -> spawnOnMain(() -> where()).join() + " from " + where()).join())
+
+  // Both see one mutable value of the main thread's, which no other thread could take.
+  val counts = Buffer[int]()
+  val ts = Buffer[Thread[unit]]()
+  for i in 0 ..< 5
+    ts.append(spawnOnMain(() ->
+      counts.append(i)
+      sleep(millis(1))
+      counts.append(i + 10)))
+  for t in ts do t.join()
+  println(counts.length)
+  println(counts.filter(v -> v < 10).mkString(","))

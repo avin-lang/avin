@@ -321,19 +321,43 @@ spawn(() ->
   build the tree again, so a state the work sets is built in that same frame. `run` runs what is still waiting
   once more when the loop ends. A program with no window, a test among them, calls
   `handlePosted()` itself.
+- **Then it runs the threads pinned to the main thread.** A handler that has to wait, for a worker's
+  result, a future or an ask, starts a [thread pinned to the main
+  thread](/spec/threads/#pinned-to-the-main-thread) with `spawnOnMain`, which parks while it waits
+  rather than holding the frame, and carries on on the main thread with the interface's state in
+  reach:
+
+  ```text
+  button("Load", () ->
+    spawnOnMain(() ->
+      shown.set("loading")
+      shown.set(spawn(() -> fetch(url)).join())))
+  ```
+
+  `handlePosted` runs the messages and posted work waiting, then each pinned thread ready by then,
+  in the order they became ready (`runMainThreads`), and answers how many it ran of both. A pinned
+  thread that a message or posted work makes ready runs in the same call; one that another pinned
+  thread makes ready runs at the next, as work that work posts does. The loop polls every frame, so
+  it needs no wake of its own: what a worker makes ready runs at the next frame. A pinned thread
+  still parked when `run` returns stays parked, and runs again whenever the main thread next runs
+  them, in a later `run`, a `handlePosted` or a wait of its own.
 - **What the work sends or posts waits for the next frame.** `handlePosted` runs only what was
   waiting when it was called, so work that posts itself again runs once a frame rather than holding
   the frame for ever.
 - **An ask parks.** A lightweight thread waiting in `ask`, or in `await` on what `send` answered,
-  frees its worker until the main thread has handled the message. An ask on the main thread, which
-  would wait for itself, stops the program:
+  frees its worker until the main thread has handled the message; a pinned thread parks too, until
+  the frame that handles it. An ask in the main thread's own code, which would wait for itself,
+  stops the program:
 
   ```text
   avin: trap: an inbox was asked from the main thread, which would wait for itself to handle the message
   ```
 
   A send or a post from the main thread, from a handler too, is queued like any other.
-- **Only the main thread makes an inbox, handles what is waiting and runs a window.** Each reaches
+- **Only the main thread makes an inbox, handles what is waiting and runs a window**, and only its
+  own code runs a window: a pinned thread makes an inbox and handles what is waiting, but `run` on a
+  pinned thread stops the program, since the frames that would run the pinned threads would be its
+  own. Each reaches
   the main thread's own state, so code for another thread that does one of them is refused where it
   is compiled, as reaching any module-level mutable state is:
 
