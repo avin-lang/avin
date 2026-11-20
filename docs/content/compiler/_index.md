@@ -328,11 +328,23 @@ stays high after `inuse` falls.
 | `shims` | `bindings`, `handles`: the Sysl shims built |
 | `emit` | `bytes`, `reused`: the size of the LLVM text, and the functions whose text came from the cache |
 | `store` | with the instance cache only: `written`, `kept`, `trimmed`: module files written, those left as they were, and those trimmed |
+| `handoff` | `bytes`: the LLVM text written for the compiler that links |
+| `restore` | `bytes`: the LLVM text that compiler read back |
 | `split` | `units`: the codegen units the module was cut into |
 | `units` | `units`, `compiled`, `reused`: units clang compiled, and units taken from its cache |
 | `link` | none |
 
 A run that finds its executable already built writes the one line `phase=cached ms=0 built=0`.
+
+**The link runs in a compiler that never compiled.** Compiling leaves gigabytes of freed small
+allocations that the allocator keeps for the life of the process, so the executable `avin build`,
+`avin run` and `avin test` compile with does not link: it writes the compilation to a temporary
+directory and replaces itself (`exec`) with `avin --linking-handed <dir>` and the same command,
+which takes the compilation in place of compiling and splits, compiles the units and links. The
+process, its streams and its exit status are the same throughout, and the log goes on in the same
+file with `handoff` and `restore` between the compile's phases and the link's. Building marshal at
+`-O2` with a cold cache, the processes together peaked at 8.2 GB before and 5.5 GB after. A
+compiler run in memory, as its tests run it, links in place.
 The keys and phase names are stable; later phases add lines and keys, never rename them.
 
 **Testing it.** A build reports what it did through that log: each phase's time,
