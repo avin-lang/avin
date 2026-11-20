@@ -714,3 +714,178 @@ stack_bounds_are_the_stacks_own()
     assert_eq(bounds.runs.load(), u32(n * 6))
     assert_eq(bounds.exact.load(), u32(n * 6))
     assert_eq(bounds.inside.load(), u32(n * 6))
+
+// Recursion that commits about 4 KiB of stack a call, each frame's bytes read back on the way out, so
+// a page given back under live frames would show as a wrong sum.
+private dig(depth: usize) -> usize
+    var pad: [4096]u8 = [0; 4096]
+    for i in 0..<4096 do pad[i] = u8((depth + i) % 251)
+    val below = if depth == 0 then 0 else dig(depth - 1)
+    var sum: usize = 0
+    for i in 0..<4096 do sum += usize(pad[i])
+    below + sum
+
+/** How deep the threads dig: about 1.5 MiB of stack. */
+private const DigDepth: usize = 384
+
+// What threads that dug deep and then parked saw of their stacks: what was committed after the dig,
+// after the park and after a second dig, and whether every dig summed as the first did.
+private struct Trimmed
+    lock: *u8
+    condition: *u8
+    go: bool
+    parked: Atomic[u32]
+    right: Atomic[u32]
+    deep: Atomic[u64]
+    after_park: Atomic[u64]
+    sleep_ms: long
+
+private var trimmed: Trimmed = Trimmed(null, null, false, Atomic(0), Atomic(0), Atomic(0), Atomic(0), 0)
+
+private committed_now(c: *Context) -> u64
+    val p: *Lwt = ptr_cast(c)
+    p.stack match
+        Some(st) -> u64(st.committed())
+        None -> 0
+
+// Digs, records what its stack holds, parks until told to go (or sleeps, where `sleep_ms` is set), then
+// records what its stack holds after the park and digs again.
+private dig_and_park(c: *Context, run: *u8) -> unit
+    val s: *Trimmed = ptr_cast(run)
+    val first = dig(DigDepth)
+    _ = s.deep.add(committed_now(c))
+    if s.sleep_ms > 0
+        _ = s.parked.add(1)
+        sleep_for(c, s.sleep_ms * 1000)
+    else
+        lock_acquire(c, s.lock)
+        _ = s.parked.add(1)
+        while !s.go do condition_wait(c, s.condition, s.lock)
+        lock_release(c, s.lock)
+    _ = s.after_park.add(committed_now(c))
+    if dig(DigDepth) == first then _ = s.right.add(1)
+
+private trimmed_round(me: *Context, n: usize, sleep_ms: long)
+    trimmed.go = false
+    trimmed.parked.store(0)
+    trimmed.right.store(0)
+    trimmed.deep.store(0)
+    trimmed.after_park.store(0)
+    trimmed.sleep_ms = sleep_ms
+    for i in 0..<n
+        joints.slots[i] = thread_start(me, ptr_cast(&trimmed), 8388608, ptr_cast(&dig_and_park))
+    while trimmed.parked.load() < u32(n) do sleep(millis(1))
+    if sleep_ms == 0
+        // Long enough for every parked stack to be trimmed: the monitor trims after a millisecond
+        // parked, a batch a tick.
+        sleep(millis(50))
+        lock_acquire(me, trimmed.lock)
+        trimmed.go = true
+        condition_notify_all(me, trimmed.condition)
+        lock_release(me, trimmed.lock)
+    join_n(me, n)
+
+@test("a thread that dug deep and parked gives back the pages below where it parked, and digs again correctly once woken")
+parked_stacks_are_trimmed()
+    val me = thread_attach()
+    with_joints(me)
+    joints.slots[62] = lock_new(me)
+    joints.slots[63] = condition_new(me)
+    trimmed.lock = joints.slots[62]
+    trimmed.condition = joints.slots[63]
+    val n = crowd() - 2
+    val before = stacks_trimmed.load()
+    trimmed_round(me, n, 0)
+    assert_eq(trimmed.right.load(), u32(n))
+    // Each dig committed well over a mebibyte; each parked thread came back holding a few pages.
+    assert(trimmed.deep.load() / u64(n) > 1048576u64)
+    assert(trimmed.after_park.load() / u64(n) < 131072u64)
+    assert(stacks_trimmed.load() - before >= u64(n))
+    joints.slots[62] = null
+    joints.slots[63] = null
+    trimmed.lock = null
+    trimmed.condition = null
+    without_joints(me)
+    thread_detach(me)
+
+@test("a thread that dug deep and then sleeps is trimmed while it sleeps")
+sleeping_stacks_are_trimmed()
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd()
+    val before = stacks_trimmed.load()
+    trimmed_round(me, n, 50)
+    assert_eq(trimmed.right.load(), u32(n))
+    assert(trimmed.deep.load() / u64(n) > 1048576u64)
+    assert(trimmed.after_park.load() / u64(n) < 131072u64)
+    assert(stacks_trimmed.load() - before >= u64(n))
+    without_joints(me)
+    thread_detach(me)
+
+// What a thread saw of its stack as it began: what was committed before it touched anything below
+// its first frame.
+private struct Fresh
+    committed: Atomic[u64]
+    runs: Atomic[u32]
+
+private var fresh: Fresh = Fresh(Atomic(0), Atomic(0))
+
+private dig_and_end(c: *Context, run: *u8) -> unit
+    _ = dig(DigDepth)
+
+private look_at_start(c: *Context, run: *u8) -> unit
+    val s: *Fresh = ptr_cast(run)
+    _ = s.committed.add(committed_now(c))
+    _ = s.runs.add(1)
+
+@test("a stack kept from a thread that dug deep is given back down to its top pages before the next thread takes it")
+kept_stacks_are_trimmed()
+    fresh.committed.store(0)
+    fresh.runs.store(0)
+    val me = thread_attach()
+    with_joints(me)
+    val n = crowd()
+    for i in 0..<n do joints.slots[i] = thread_start(me, null, 8388608, ptr_cast(&dig_and_end))
+    join_n(me, n)
+    for i in 0..<n do joints.slots[i] = thread_start(me, ptr_cast(&fresh), 8388608, ptr_cast(&look_at_start))
+    join_n(me, n)
+    without_joints(me)
+    thread_detach(me)
+    assert_eq(fresh.runs.load(), u32(n))
+    assert(fresh.committed.load() / u64(n) < 131072u64)
+
+@test("a release of stack pages the system refuses is counted and leaves the pages committed, and every thread runs on correctly")
+refused_releases_leave_stacks_whole()
+    val me = thread_attach()
+    with_joints(me)
+    joints.slots[62] = lock_new(me)
+    joints.slots[63] = condition_new(me)
+    trimmed.lock = joints.slots[62]
+    trimmed.condition = joints.slots[63]
+    val n = crowd() - 2
+    val refused_before = stack_releases_refused.load()
+    refuse_stack_releases.store(1)
+    // Parked threads: each trim is refused, so each thread comes back holding what it dug.
+    trimmed_round(me, n, 0)
+    assert_eq(trimmed.right.load(), u32(n))
+    assert(trimmed.after_park.load() / u64(n) > 1048576u64)
+    assert(stack_releases_refused.load() - refused_before >= u64(n))
+    // Kept stacks: each release as a deep thread ends is refused, and the next threads run on them.
+    fresh.committed.store(0)
+    fresh.runs.store(0)
+    for i in 0..<n do joints.slots[i] = thread_start(me, null, 8388608, ptr_cast(&dig_and_end))
+    join_n(me, n)
+    for i in 0..<n do joints.slots[i] = thread_start(me, ptr_cast(&fresh), 8388608, ptr_cast(&look_at_start))
+    join_n(me, n)
+    assert_eq(fresh.runs.load(), u32(n))
+    refuse_stack_releases.store(0)
+    // With releases allowed again, the same stacks are trimmed as before.
+    trimmed_round(me, n, 0)
+    assert_eq(trimmed.right.load(), u32(n))
+    assert(trimmed.after_park.load() / u64(n) < 131072u64)
+    joints.slots[62] = null
+    joints.slots[63] = null
+    trimmed.lock = null
+    trimmed.condition = null
+    without_joints(me)
+    thread_detach(me)

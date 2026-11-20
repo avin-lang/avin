@@ -1,0 +1,270 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Diagnostic, Report, Source, report}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.path.file_name
+
+// A program on each machine. A module exists on a machine where any of its files is read there, so a
+// module whose files all carry `linux` exists only on Linux. An import of a module that does not exist
+// on every machine is allowed only from a file read no more widely, whichever machine is being built:
+// each file of the program is held to every machine its package lists that reads it. And `avin check`
+// checks a program once for each of its targets on which anything differs, telling each diagnostic
+// with the machines it is for.
+
+/** A program as one machine reads it: its files, or why it could not be read there. */
+struct MachineView
+    target: string
+    files: Buf[ProgramFile]
+    /** Why the program could not be read for the machine, or "" where it was. */
+    failure: string
+
+/** Gives `program`, read for its own machine, the machines `avin check` checks it for, and to each of
+ * its files a fence against every module that does not exist on every machine `views` read the file
+ * on. A machine whose program could not be read is checked, where the check reports why, and holds no
+ * file to anything. */
+with_machines(program: *LoadedProgram, views: Buf[MachineView])
+    program.machines = machine_groups(views)
+    var read: Buf[MachineView] = buf()
+    for v in views
+        if v.failure == "" then read.push(v)
+    // Each module, the machines it exists on, the files it is read from, and its package.
+    var modules: Buf[string] = buf()
+    var index: Map[string, usize] = map()
+    var present: Buf[Buf[string]] = buf()
+    var module_files: Buf[Buf[string]] = buf()
+    var packages: Buf[string] = buf()
+    // The files each machine reads, by path.
+    var reads: Buf[Map[string, bool]] = buf()
+    for v in read
+        var names: Map[string, bool] = map()
+        for f in v.files
+            names.put(f.src.name, true)
+            val m = f.module_name.unwrap_or("")
+            if m == "" then continue
+            val k = index.get(m) match
+                Some(k) -> k
+                None ->
+                    index.put(m, modules.len())
+                    modules.push(m)
+                    present.push(buf())
+                    module_files.push(buf())
+                    packages.push(f.package)
+                    modules.len() - 1
+            if !has_text(present[k], v.target) then present[k].push(v.target)
+            val base = file_name(f.src.name).unwrap_or(f.src.name)
+            if !has_text(module_files[k], base) then module_files[k].push(base)
+        reads.push(names)
+    var narrow: Buf[usize] = buf()
+    for k in 0..<modules.len()
+        if present[k].len() < read.len() then narrow.push(k)
+    if narrow.len() == 0 then return
+    for j in 0..<program.files.len()
+        val f = program.files[j]
+        var on: Buf[string] = buf()
+        for i in 0..<read.len()
+            if reads[i].get(f.src.name) is Some(_) then on.push(read[i].target)
+        val own = f.module_name.unwrap_or("")
+        val base = file_name(f.src.name).unwrap_or(f.src.name)
+        for k in narrow
+            if modules[k] == own then continue
+            var missing: Buf[string] = buf()
+            for t in on
+                if !has_text(present[k], t) then missing.push(t)
+            if missing.len() == 0 then continue
+            val of_package = if packages[k] != "" && packages[k] != f.package then s", a module of the package `${packages[k]}`," else ""
+            val is_read = if module_files[k].len() == 1 then "is read" else "are read"
+            val message = s"`${modules[k]}`$of_package exists only on ${targets_listing(present[k])}, where ${ticked(module_files[k])} $is_read, and `$base` is read on ${targets_listing(missing)} too: import it from a file read no more widely, or make `${modules[k]}` exist on ${targets_listing(missing)}"
+            program.files[j].fences.push(Fence(modules[k], message, true))
+
+/** The machines of `views` in sets that read the program alike, each set once, in the order of
+ * `views`: two machines reading the same files are one check. A machine whose program could not be
+ * read is a set of its own. */
+machine_groups(views: Buf[MachineView]) -> Buf[Buf[string]]
+    var keys: Buf[string] = buf()
+    var groups: Buf[Buf[string]] = buf()
+    for v in views
+        var key = "!" + v.target
+        if v.failure == ""
+            key = ""
+            for f in v.files
+                key = key + f.src.name + "\n"
+        var placed = false
+        for i in 0..<keys.len()
+            if keys[i] == key
+                groups[i].push(v.target)
+                placed = true
+        if !placed
+            keys.push(key)
+            var one: Buf[string] = buf()
+            one.push(v.target)
+            groups.push(one)
+    groups
+
+private has_text(items: Buf[string], item: string) -> bool
+    for i in items
+        if i == item then return true
+    false
+
+/** `a`, `a` and `b`, `a`, `b` and `c`: each of `items` in backquotes. */
+ticked(items: Buf[string]) -> string
+    var out = ""
+    for i in 0..<items.len()
+        if i > 0 then out = out + (if i + 1 == items.len() then " and " else ", ")
+        out = out + "`" + items[i] + "`"
+    out
+
+// `avin check` across machines.
+
+/** One diagnostic of a check across machines, with the machines it was reported on, and for a name
+ * another machine's file supplies, that file, its symbol and what it declares. */
+private struct MachineSaid
+    key: string
+    src: Source
+    diagnostic: Diagnostic
+    machines: Buf[string]
+    module_name: string
+    name: string
+    supplier: string
+    symbol: string
+    kind: string
+
+/** The checks `avin check` makes of `program`, read for its own machine, on each set of machines in
+ * its `machines`: each set read as `load` reads it for its first machine (the program's own where the
+ * set holds it), checked as `check_for` checks it, and the diagnostics of every check told once, each
+ * that not every machine reported naming the machines it is for. Says `checked <path>` and answers 0
+ * where no check reported an error, and notes the diagnostics and answers 1 where one did. */
+check_machines(tc: Toolchain, path: string, program: LoadedProgram, testing: bool, load: string -> Result[LoadedProgram, string], say: string -> unit, note: string -> unit) -> int
+    var programs: Buf[Option[LoadedProgram]] = buf()
+    var reports: Buf[MachineReport] = buf()
+    var all: Buf[string] = buf()
+    for g in program.machines
+        for t in g
+            all.push(t)
+        val p: Result[LoadedProgram, string] = if has_text(g, program.target) then Ok(program) else load(g[0])
+        p match
+            Ok(lp) ->
+                programs.push(Some(lp))
+                reports.push(check_for(tc, lp.files, testing, lp.c, lp.target))
+            Err(message) ->
+                programs.push(None)
+                reports.push(MachineReport(buf(), message.trim_end() + "\n"))
+    var said: Buf[MachineSaid] = buf()
+    var texts: Buf[string] = buf()
+    var text_machines: Buf[Buf[string]] = buf()
+    for i in 0..<reports.len()
+        val r = reports[i]
+        val g = program.machines[i]
+        if r.text != ""
+            var at: Option[usize] = None
+            for k in 0..<texts.len()
+                if texts[k] == r.text then at = Some(k)
+            at match
+                Some(k) -> push_all(&text_machines[k], g)
+                None ->
+                    texts.push(r.text)
+                    text_machines.push(copy_of(g))
+        for u in r.units
+            if !u.report.has_errors() then continue
+            for d_index in 0..<u.report.len()
+                val d = u.report.at(d_index)
+                val key = s"${u.src.name}|${d.span.start}|${d.span.end}|${d.message}|${d.label}|${d.note}"
+                var at: Option[usize] = None
+                for k in 0..<said.len()
+                    if said[k].key == key then at = Some(k)
+                at match
+                    Some(k) -> push_all(&said[k].machines, g)
+                    None ->
+                        var one = MachineSaid(key, u.src, d, copy_of(g), u.file.module_name, undefined_name(d.message), "", "", "")
+                        if one.name != "" then supply(&one, programs, i)
+                        said.push(one)
+    // Each file's diagnostics in one report, the files in the order first reported.
+    var sources: Buf[Source] = buf()
+    var told: Buf[Report] = buf()
+    for s in said
+        var at: Option[usize] = None
+        for k in 0..<sources.len()
+            if sources[k].name == s.src.name then at = Some(k)
+        val k = at match
+            Some(k) -> k
+            None ->
+                sources.push(s.src)
+                told.push(report())
+                sources.len() - 1
+        var d = s.diagnostic
+        d.message = machine_message(s, all.len())
+        told[k].add(d)
+    var out = ""
+    for k in 0..<sources.len()
+        out = out + told[k].render(sources[k])
+    for k in 0..<texts.len()
+        out = out + (if text_machines[k].len() < all.len() then s"on ${ticked(text_machines[k])}:\n" else "") + texts[k]
+    if out != ""
+        note(out.trim_end())
+        return 1
+    say("checked " + path)
+    0
+
+// The message of `s`: a name another machine's file supplies said as missing on the machines that
+// lack it; any other, where not every one of the `machines` checked reported it, with those that did.
+private machine_message(s: MachineSaid, machines: usize) -> string
+    if s.supplier != ""
+        val module_text = if s.module_name == "" then "the program's root module" else s"`${s.module_name}`"
+        val one = s.machines.len() == 1
+        val these = if one then "this machine" else "these machines"
+        val them = if one then "the machine" else "the machines"
+        return s"no ${s.kind} `${s.name}` is declared in $module_text on ${ticked(s.machines)}: `${s.supplier}` supplies it on ${symbol_words(s.symbol)}, and no file read on $these does -- add it to a file read there, or leave $them out of `targets`"
+    if s.machines.len() < machines then return s"${s.diagnostic.message} (on ${ticked(s.machines)})"
+    s.diagnostic.message
+
+// The name a diagnostic says is not declared, `x` for "`x` is not defined" and `T` for "unknown type
+// `T`", or "" for any other diagnostic.
+private undefined_name(message: string) -> string
+    if message.starts_with("`") && message.ends_with("` is not defined")
+        val name = message[1..<message.bytes.len - "` is not defined".bytes.len]
+        if !name.contains("`") then return name
+    if message.starts_with("unknown type `") && message.ends_with("`")
+        val name = message["unknown type `".bytes.len..<message.bytes.len - 1]
+        if !name.contains("`") then return name
+    ""
+
+// Finds, for the name `s` says is not declared, a file of its module that another machine reads and
+// the machine of check `here` does not, declaring it: what `s` then says is that the name is missing
+// on this machine. A name no such file declares is left as it was reported.
+private supply(s: *MachineSaid, programs: Buf[Option[LoadedProgram]], here: usize)
+    val mine = programs[here] match
+        Some(p) -> p.files
+        None -> return
+    var read_here: Map[string, bool] = map()
+    for f in mine
+        read_here.put(f.src.name, true)
+    for i in 0..<programs.len()
+        if i == here then continue
+        val files = programs[i] match
+            Some(p) -> p.files
+            None -> continue
+        for f in files
+            if f.module_name.unwrap_or("") != s.module_name then continue
+            if read_here.get(f.src.name) is Some(_) then continue
+            val symbol = file_machine(f.src.name).unwrap_or("")
+            if symbol == "" then continue
+            val parsed = parse(f.src)
+            for item in parsed.file.items
+                if item_name(item) != s.name then continue
+                s.supplier = file_name(f.src.name).unwrap_or(f.src.name)
+                s.symbol = symbol
+                s.kind = item match
+                    FunctionItem(_) -> "function"
+                    ValueItem(_) -> "value"
+                    _ -> "type"
+                return
+
+private push_all(into: *Buf[string], items: Buf[string])
+    for t in items
+        if !has_text(*into, t) then into.push(t)
+
+private copy_of(items: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    for t in items
+        out.push(t)
+    out

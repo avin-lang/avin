@@ -1,8 +1,11 @@
 module avin.io
 
-// Talking to the world outside the program: standard input, read as text, and what can go wrong when
+// Talking to the world outside the program: standard input, read as text or as bytes, standard output
+// and error written as bytes, and what can go wrong when
 // a program reads or writes files, directories and connections. Each failure is a
 // value a correct program can meet and handle.
+
+import avin.threads.Readiness
 
 // Why an input or output operation failed: what kind of failure it was, what was being done, and
 // what it was done to, a path, a program or an address. It shows as a sentence naming all three,
@@ -44,6 +47,8 @@ data ErrorKind
   ConnectionReset
   // A read or write on a connection waited longer than its timeout.
   TimedOut
+  // The program has no controlling terminal to read from or write to.
+  NoTerminal
   // Any other failure, in words.
   Other(text: string)
 
@@ -61,6 +66,7 @@ impl ErrorKind
     ConnectionRefused -> "connection refused"
     ConnectionReset -> "connection reset by peer"
     TimedOut -> "timed out"
+    NoTerminal -> "there is no terminal"
     Other(m) -> m
 
 // Bytes read from somewhere a piece at a time: an open file, a connection, or a source a program
@@ -144,6 +150,56 @@ readLine() -> Option[string]
   releaseInput()
   line
 
+// Why a secret could not be read, as the runtime tells the failures apart.
+@sysl("avin.rt.SecretFailure")
+private data SecretFailure
+  NoTty
+  Ended
+  Signalled
+  Failed(message: string)
+
+@sysl("avin.rt.read_secret")
+private takeSecret(prompt: string) -> Result[Array[byte], SecretFailure]
+
+private secretError(e: SecretFailure) -> IoError = e match
+  NoTty -> IoError(NoTerminal, "read", "the terminal")
+  Ended -> IoError(Other("end of input"), "read", "the terminal")
+  Signalled -> IoError(Other("interrupted"), "read", "the terminal")
+  Failed(m) -> IoError(Other(m), "read", "the terminal")
+
+// One line typed at the controlling terminal with what is typed not shown, after `prompt` is written
+// to the terminal: for a password or a passphrase. The terminal is `/dev/tty`, not standard input, so
+// a program whose input or output is a pipe can ask, as `sudo` and `ssh` do. The line comes back
+// without its terminator, as bytes the caller owns and can overwrite once it is done with them.
+//
+// The terminal is put back exactly as it was found whichever way the read ends. A line the user ends
+// with Ctrl-D, or with the terminal's end, still counts if it has bytes in it. A program that has no
+// terminal gets `Err(IoError(NoTerminal, _, _))`; the end of input before any byte, and an interrupt
+// the program survives, are `Err` of kind `Other`. A line is at most what the terminal keeps of one:
+// 1023 bytes on macOS, 4095 on Linux.
+//
+// The read takes the same lock as reading standard input, so threads never read both at once: a
+// thread that asks waits for one reading, and the other way round. A thread cancelled while it waits
+// for the line is stopped once the line has been read, as one reading standard input is.
+readSecretBytes(prompt: string) -> Result[Array[byte], IoError] = takeSecret(prompt).mapErr(secretError)
+
+// `readSecretBytes` as text; bytes that are not UTF-8 become U+FFFD.
+readSecret(prompt: string) -> Result[string, IoError] = readSecretBytes(prompt).map(
+  bytes -> string.fromUtf8Lossy(bytes)
+)
+
+// `readSecret`, or where the program has no terminal, `prompt` written to standard error and a line
+// read from standard input, shown as it arrives: for a tool a script runs with its password piped in.
+// A closed standard input is `Err` of kind `Other`.
+readSecretOrLine(prompt: string) -> Result[string, IoError]
+  readSecret(prompt) match
+    Err(e) if e.kind is NoTerminal ->
+      eprint(prompt)
+      readLine() match
+        Some(line) -> Ok(line)
+        None -> Err(IoError(Other("end of input"), "read", "standard input"))
+    other -> other
+
 // The lines left on standard input, each as `readLine` gives it, read as the iterator is advanced.
 lines() -> Iterator[string] = InputLines()
 
@@ -156,6 +212,88 @@ private takeAllInput() -> string
   val rest = takeRest()
   releaseInput()
   rest
+
+// Why reading or writing a standard stream failed, as the runtime tells the failures apart.
+@sysl("avin.rt.StdioFailure")
+private data StdioFailure
+  Closed
+  Failed(message: string)
+
+@sysl("avin.rt.read_input_bytes")
+private takeInputBytes(max: int) -> Result[Array[byte], StdioFailure]
+
+@sysl("avin.rt.write_standard")
+private writeStandard(fd: int, bytes: Array[byte]) -> Result[unit, StdioFailure]
+
+private stdioError(operation: string, subject: string) -> (StdioFailure) -> IoError = e -> e match
+  Closed -> IoError(ConnectionReset, operation, subject)
+  Failed(m) -> IoError(Other(m), operation, subject)
+
+@sysl("avin.rt.read_input_available")
+private takeAvailableInput(max: int) -> Result[Option[Array[byte]], StdioFailure]
+
+@sysl("avin.rt.input_readable")
+private inputReadable() -> bool
+
+// Standard input as bytes: what `stdin()` answers. See there.
+object StandardInputBytes: Reader, Readiness
+  override read(max: int) -> Result[Array[byte], IoError]
+    if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
+    takeInputBytes(max).mapErr(stdioError("read", "standard input"))
+
+  // Up to `max` bytes, `max` being at least one, of what `read(max)` would answer without waiting:
+  // `Some` of the bytes already read ahead, or of what one read gives where standard input has bytes
+  // now, an empty array once it has ended; `None` where a read would wait, standard input having
+  // nothing yet or another thread being in the middle of reading it. Never waits.
+  readAvailable(max: int) -> Result[Option[Array[byte]], IoError]
+    if max < 1 then fail(s"a read of $max bytes: a read takes at least one")
+    takeAvailableInput(max).mapErr(stdioError("read", "standard input"))
+
+  // Whether a read would answer now, without waiting: bytes are already read ahead, a `readLine`'s
+  // beyond its line among them, or have arrived, or the input has ended or failed, which the read then
+  // answers, or standard input is a file. False while another thread is reading it. Never waits.
+  override readable() -> bool = inputReadable()
+
+  override readinessDescriptor() -> int = 0
+
+// Standard output as bytes: what `stdout()` answers. See there.
+object StandardOutputBytes: ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError] =
+    writeStandard(1, bytes).mapErr(stdioError("write", "standard output"))
+
+// Standard error as bytes: what `stderr()` answers. See there.
+object StandardErrorBytes: ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError] =
+    writeStandard(2, bytes).mapErr(stdioError("write", "standard error"))
+
+// Standard input as a `Reader` of bytes, for input whose bytes count, a `Content-Length` most of all,
+// or that is not text. Its bytes come from the same buffer `readLine`, `lines`, `readAll` and
+// `Source.stdin()` take from, so a program may mix them: a header read as a line and a body read as
+// bytes go on from each other, and no byte is lost or read twice. Threads read it one at a time, under
+// the same lock as the text reads, and a lightweight thread waiting for input parks, leaving its
+// worker to the others.
+//
+// `read(max)` answers the bytes already read ahead where there are any, else waits for one read of
+// the input, so it may answer fewer than `max`; an empty array once the input has ended, as often as
+// it is asked. A read that fails answers `Err`, with the platform's sentence, where the text readers
+// see the end. Standard input may be a terminal, a pipe or a file. A `max` below one traps, as a
+// connection's read does. The answer is `Sendable`.
+//
+// It is a `Readiness` (`avin.threads`), so a `select` waits on it beside channels and an `after`
+// (`stdin().readable() -> …`), and a `Selector` among connections; any thread may, since standard
+// input belongs to none. `readAvailable(max)` reads only what is there, never waiting for more.
+stdin() -> StandardInputBytes = StandardInputBytes
+
+// Standard output as a `ByteWriter`. Each write goes out whole before it returns: behind whatever
+// `print` and `println` have written so far, which is sent on first, and never inside a line
+// another thread prints, so there is nothing to flush afterwards. A write to a pipe or a socket whose
+// reader has gone answers `Err(IoError(ConnectionReset, "write", "standard output"))` rather than
+// ending the program. The answer is `Sendable`, so a thread of its own can do the writing.
+stdout() -> StandardOutputBytes = StandardOutputBytes
+
+// Standard error as a `ByteWriter`: each write goes out whole before it returns, after standard
+// output has been flushed, as `eprint` does; a reader that has gone is `Err` as for `stdout()`.
+stderr() -> StandardErrorBytes = StandardErrorBytes
 
 // The lines of standard input. `hasNext` takes the next line when it has none in hand, so a line it
 // answers for is this iterator's even while other threads read.

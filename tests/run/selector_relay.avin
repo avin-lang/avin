@@ -1,0 +1,76 @@
+// expect: exit 0
+// One thread relays bytes both ways between eight pairs of connections with one `Selector`, the
+// relay in the threads chapter: each leg's reading side is watched while it has nothing pending and
+// its writing side while it has. Each pair carries a request large enough to fill the sockets one
+// way, then a reply the other, each end finishing its sending in turn, and every byte arrives in
+// order on the right connection.
+import avin.io.IoError
+import avin.net.{TcpListener, TcpStream}
+import avin.threads.{Selector, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// One direction of a relayed connection pair, and what it has read and not yet written.
+class Leg(val from: TcpStream, val to: TcpStream)
+  var pending: Array[byte] = Array.empty()
+  var open = true
+
+relay(pairs: Vector[(TcpStream, TcpStream)]) -> Result[unit, IoError]
+  val legs = Buffer[Leg]()
+  for (a, b) in pairs
+    legs.append(Leg(a, b))
+    legs.append(Leg(b, a))
+  val sel = Selector[int]()
+  while legs.exists(l -> l.open || l.pending.length > 0)
+    sel.clear()
+    for i in 0 ..< legs.length
+      val leg = legs(i)
+      if leg.pending.length > 0 then sel.writable(leg.to, i)
+      elif leg.open then sel.readable(leg.from, i)
+    val leg = legs(sel.wait())
+    if leg.pending.length > 0
+      leg.pending = leg.pending.slice(leg.to.writeSome(leg.pending)?, leg.pending.length)
+    else
+      val bytes = leg.from.read(4096)?
+      if bytes.length == 0
+        leg.open = false
+        leg.to.shutdownOutput()?
+      else leg.pending = bytes
+  Ok(())
+
+// The bytes pair `p` sends one way, `tag` telling the ways apart.
+payload(p: int, tag: int, size: int) -> Array[byte] = Array.tabulate(size, i -> byte((i * 7 + p * 13 + tag) % 256))
+
+// A connected pair of connections through `l`: the end a test thread uses, and the end the relay
+// uses.
+connected(l: TcpListener) -> (TcpStream, TcpStream)
+  val outside = ok(TcpStream.connect("127.0.0.1", l.port()))
+  (outside, ok(l.accept()))
+
+main()
+  val n = 8
+  val size = 300000
+  val l = ok(TcpListener.bind("127.0.0.1", 0))
+  val asks = Vector.tabulate(n, p -> connected(l))
+  val answers = Vector.tabulate(n, p -> connected(l))
+  val pairs = Vector.tabulate(n, p -> (asks(p).1, answers(p).1))
+  val relaying = spawn(() -> relay(pairs))
+  val threads = Vector.tabulate(n, p ->
+    val asking = asks(p).0
+    val answering = answers(p).0
+    val answerer = spawn(() ->
+      val got = ok(answering.readAll())
+      ok(answering.write(payload(p, 1, size / 2)))
+      ok(answering.shutdownOutput())
+      ok(answering.close())
+      got == payload(p, 0, size))
+    spawn(() ->
+      ok(asking.write(payload(p, 0, size)))
+      ok(asking.shutdownOutput())
+      val reply = ok(asking.readAll())
+      ok(asking.close())
+      (reply == payload(p, 1, size / 2), answerer.join())))
+  for p in 0 ..< n do println(p, threads(p).join())
+  println(relaying.join())
