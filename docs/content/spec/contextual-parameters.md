@@ -117,7 +117,8 @@ a parameter named `using` (`using: Mode`) is still one.
   by name too: `describe(n: int, using tx: Tx)` is followed by `describe(0) = …`.
 - A contextual parameter may have a **default**, used where a call finds no given:
   `now(using clock: Clock = SystemClock) -> Instant`. The default is evaluated where the function is
-  declared, as every default is.
+  declared, as every default is, and sees the section's parameters before it:
+  `using tx: Tx, clock: Clock = Clock(tx.start)`.
 
 ## Calls
 
@@ -136,19 +137,20 @@ parameter is still [called infix](/spec/operators-and-control-flow/#infix-method
 section filled the same way.
 
 Filling an argument from a given evaluates nothing: a given is a value already made. The written
-arguments are evaluated in the order written; then the omitted parameters' defaults in parameter
-order, as before, and every default, of an ordinary parameter too, sees the contextual parameters,
-which are filled first: `level: Level = logger.defaultLevel` before `using logger: Logger` is
-legal.
+arguments are evaluated in the order written; then the section's omitted defaults, in order; then
+the other omitted parameters' defaults in parameter order, as before. Every default of an ordinary
+parameter sees the parameters before it and the whole section, which is filled first:
+`level: Level = logger.defaultLevel` before `using logger: Logger` is legal.
 
 ## Resolution and scope
 
 A call looks for a given outward from where it is written, level by level, and stops at the first
 level holding one that fits:
 
-1. the enclosing blocks, innermost first, each with the givens declared before the call;
-2. the contextual parameters of the enclosing function, and of each function or lambda enclosing
-   that, innermost first;
+1. the enclosing blocks, innermost first, each with the givens declared before the call, where a
+   local function's or a lambda's contextual parameters are a level between its body and the block
+   it is written in: nearer than that block, and further than the blocks of its body;
+2. the contextual parameters of the enclosing function;
 3. the contextual parameters of the enclosing class's constructor or actor, for its methods, field
    initializers and `receive`;
 4. the givens of the enclosing object's body, for its methods and fields;

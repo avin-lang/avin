@@ -576,8 +576,8 @@ its samples), `conformance_holds`, `same_type` and `collect_ancestors`.
 ### Contextual parameters: build plan
 
 Designed in [contextual parameters](/spec/contextual-parameters/), its choices
-[settled](/spec/decisions/#settled). Steps 1 and 2 are done (branch `given-1`); steps 3 to 6 are
-still to come. A filled argument becomes an ordinary
+[settled](/spec/decisions/#settled). Steps 1 and 2 are done (branch `given-1`), step 3 too (branch
+`given-3`); steps 4 to 6 are still to come. A filled argument becomes an ordinary
 argument in the checker's output, so lowering, emission and the runtime change nothing; every step
 is in the front end and tooling. Each step is one agent, gated on its own with the files it names.
 
@@ -619,7 +619,21 @@ is in the front end and tooling. Each step is one agent, gated on its own with t
    two, and a positional argument; defaults seeing the section; class constructors, `super`
    arguments, companions' `apply`, infix calls, clauses, static members through a bound, trait
    methods through a trait type and through a bound, extensions. Files: `check.sysl`. Tests:
-   `tests/run/given_*.avin` and `tests/reject/given_*.avin`.
+   `tests/run/given_*.avin` and `tests/reject/given_*.avin`. **Done** (branch `given-3`):
+   `fill_contextual` runs in `apply` after the written arguments bind, so every call shape that
+   reaches `apply` fills its section; `fitting_givens` walks the levels (block givens and local
+   functions' and lambdas' contextual parameters by their scope in `visible`, then the checked
+   function's parameters, the class's constructor fields, the object's given fields, the module's
+   givens of every file) and a filled argument is a by-name argument already checked, so lowering is
+   untouched. Positional arguments and a trailing block reach only the parameters before the section;
+   a repeated parameter followed by a section binds and packs at its own position; the section's
+   defaults are computed first, each seeing the section before it, and an ordinary default takes the
+   whole section after its earlier parameters (`default_inputs`). A `using` lambda's parameters are
+   givens in its body already. Givens imported from another module fill nothing yet (step 4); a
+   function value keeps its section as positional parameters (step 5). Tests:
+   `tests/run/given_calls_{levels,shapes,edges}.avin`, `tests/reject/given_calls_{none,scope,two,
+   positional,values}.avin`, `tests/programs/run/given_module_files`,
+   `tests/programs/reject/given_import_{whole,named}`.
 4. **Modules and imports.** A named import (direct, braced, `as`, through an export) brings a given
    in; a whole import does not, with the hint naming the import to write; `private`; module and
    object givens made in initialization order; a module of several files sharing its givens.

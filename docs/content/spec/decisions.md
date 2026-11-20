@@ -9274,6 +9274,34 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   nothing for it; a class's contextual parameter is a private field and a given by definition.
   The section comes last, so a repeated parameter is last of the others (`all(xs: int*, using tx:
   Tx)`). A data variant takes no section, reported where it is parsed.
+- Settled on the user's delegation 2026-11-19 (branch `given-3`): **a local function's or a lambda's
+  contextual parameters are a level of the scope walk between its body and the block it is written
+  in**, so they beat the givens of the blocks around it and lose to the givens of its own body's
+  blocks. Why: the chapter listed "the enclosing blocks" before "the contextual parameters of each
+  enclosing function or lambda", which read literally would let a block outside a local function hide
+  the function's own `using` parameter, the value its caller chose for it; resolving by lexical
+  nearness is the rule every other name follows, and it is the reading of "nearer level wins" a
+  reader expects. Alternatives weighed: every block first, then every function's parameters
+  innermost out (the literal list, where `helper(using tx: Tx) = tag()` written in a block with
+  `given t = Tx(…)` would ignore its own `tx`).
+- Settled on the user's delegation 2026-11-19 (branch `given-3`): **the section's defaults are
+  computed before the other omitted defaults, and a contextual parameter's default sees the
+  section's parameters before it, not the ordinary ones**; an ordinary default sees the parameters
+  before it and the whole section. Why: the chapter has ordinary defaults see the section, so the
+  section must be complete first; a section default that also saw ordinary parameters could depend
+  on an ordinary default that depends on it, a cycle with no order to compute it in. Alternatives
+  weighed: a section default seeing every parameter before it in the list (needs an order that
+  interleaves the two kinds, and the cycle above is then a compile error to explain); a section
+  default seeing nothing of the call (`using tx: Tx, clock: Clock = Clock(tx.start)` lost).
+- Settled on the user's delegation 2026-11-19 (branch `given-3`): **a positional argument past the
+  parameters before the section is the "passed by name" error when the call writes no more
+  positional arguments than the function has parameters, and the argument-count error otherwise**
+  (`tag(tx, tx)` for `tag(using tx: Tx)` says it takes 0 arguments, not 2). Where a repeated
+  parameter comes before the section, every positional argument is the repeated parameter's, so a
+  `tx` written last is a type error there, and the section is still filled. Why: the error names the
+  likeliest fix, naming the argument, where a call has one positional argument per contextual
+  parameter; beyond that it was not meant for the section. Alternatives weighed: always the "passed
+  by name" error (wrong advice for a call of too many arguments).
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
