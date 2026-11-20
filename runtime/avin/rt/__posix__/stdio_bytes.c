@@ -24,8 +24,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -111,6 +109,9 @@ static int write_guarded(int fd, const unsigned char *p, int64_t n) {
 }
 
 #else
+
+#include <pthread.h>
+#include <signal.h>
 
 /* Runs the write with SIGPIPE held off this thread, and takes back a SIGPIPE it raised. */
 static int write_guarded(int fd, const unsigned char *p, int64_t n) {
