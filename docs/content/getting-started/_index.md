@@ -278,10 +278,29 @@ avin> worker.join()
 res2: int = 42
 ```
 
-A session is a program that grows. Imports go to its top, the declarations of types below them, and
-everything else into `main`, each input a block nested in the one before it, so a name entered again
-hides the earlier one from the inputs after it (a type declared again replaces the earlier
-declaration). After each input the whole program is built, through the same cache `avin run` uses,
+A session is a program that grows. Imports go to its top, and everything else into `main`, each
+input a block nested in the one before it, so a name entered again hides the earlier one from the
+inputs after it. A declaration of types is a module of its own, and so is a function or a `val` that
+uses no `var` or other local of the session's code, so the classes and functions entered after it
+can call or read it, and keep the one they were declared after when it is entered again:
+
+```text
+avin> twice(n: int) = n * 2
+twice(n: int) -> int
+avin> class Doubler
+    |   run(n: int) -> int = twice(n)
+    |
+class Doubler
+avin> twice(n: int) = n * 3
+twice(n: int) -> int
+avin> Doubler().run(4)
+res0: int = 8
+```
+
+A function or `val` that uses a `var` of the session's stays in its code, where declarations cannot
+reach it; and the session's code sees a type declared again in place of the earlier one, so a new
+declaration is refused where earlier code no longer checks against it. After each input the whole
+program is built, through the same cache `avin run` uses,
 and run; what the earlier inputs write is not shown again. That costs something worth knowing: an
 earlier input runs again each time, so its side effects repeat, unseen, and a value it computes
 afresh (a random number, the time) may differ from the one shown when it was entered. An input that
@@ -290,9 +309,13 @@ diagnostic or a trap names its place in the input as it was typed.
 
 An input that opens a block (an `if`, a `for`, a function's body, a type's declaration with its
 members) goes on over the lines after it until an empty line; so does one with a bracket left open
-or ending with an operator. At a terminal the line is edited in place, with the arrow keys reaching
-back through the session's earlier lines; Ctrl-C abandons a line or stops a running input, and
-Ctrl-D on an empty line ends the session. Read from a file or a pipe, the session prints no prompts.
+or ending with an operator. At a terminal the input is edited whole: Enter on an unfinished input
+begins a new line under a `|` prompt, indented for what the line above opened, and the arrow keys
+move through its lines and, past the first or the last, through the inputs entered before. Tab
+completes the name before the cursor (a local, a declaration, a member after a `.`, a module after
+`import`), listing the choices when there are several, and indents at a line's start. Ctrl-C
+abandons an input or stops a running one, and Ctrl-D on an empty input ends the session. Read from a
+file or a pipe, the session prints no prompts.
 
 | Command | |
 | --- | --- |

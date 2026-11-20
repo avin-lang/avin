@@ -9187,15 +9187,47 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - Settled on the user's delegation 2026-11-19: **each code input is a block nested in the one
     before it** (`if true` around the rest), so `val x` entered again hides the earlier `x` from the
     later inputs, as a block's local does, and the earlier inputs keep the `x` they saw; a local
-    function entered again does the same. **Functions are local functions of `main`**, so they see the
-    session's `val`s and `var`s and change them. **A type declared again replaces the earlier
-    declaration**, refused where an input already kept no longer checks against it. WHY: Avin
-    forbids a second `val` of one name in one block, and a top-level type cannot be hidden; nesting
-    gives the hiding every interactive language has without renaming anything. ALTERNATIVES:
-    renaming earlier bindings (rewrites what the user typed, and diagnostics show other names);
-    top-level functions (they cannot see the session's values); module-level `val`s (initialized
-    before `main`, out of order with the statements between). **Review with the user:** types
-    hiding rather than replacing, which needs per-input modules.
+    function entered again does the same. WHY: Avin forbids a second `val` of one name in one block;
+    nesting gives the hiding every interactive language has without renaming anything.
+    ALTERNATIVES: renaming earlier bindings (rewrites what the user typed, and diagnostics show other
+    names).
+  - Settled on the user's delegation 2026-11-19 (branch `repl-2`; replaces "functions are local
+    functions of `main`" and "a type declared again replaces the earlier declaration"): **each
+    declaration of types, and each function or `val` that uses no local of `main`, is a module of the
+    session's own** (`avinrepl.c3`), which imports, by name, the newest of each name the inputs
+    before it gave, and every earlier module whole (so their extensions are seen). Such a function or
+    `val` is *hoisted*: a class, trait or function entered after it calls or reads it. A hoisted
+    function is also written into `main` where it was entered, and a hoisted `val` read there under
+    its name (`val base = avinReplC2.base`), so code in `main` sees every name in the order entered,
+    exactly as before. A name entered again hides the earlier one from every later input, module or
+    code, and a module entered before keeps the one it imported: a class calling `twice` keeps the
+    `twice` it was declared after. "Uses no local" is the checker's answer, not a guess: the input is
+    first checked and run as code of `main`, and hoisted when none of its references resolve to a
+    local of `main` other than a hoisted input's. A hoisted input is written as a module only once a
+    declaration of types comes after it (nothing else can reach it there), so a session of code
+    alone checks and builds no extra files; one that does not check as a module when a declaration
+    first needs it stays code of `main`, and the declaration is checked again without it. A function
+    or `val` that uses a local stays in `main`, and a `var`, a `lazy val`, a
+    destructuring `val` and an input of several statements stay there too, out of the modules'
+    reach; a module never imports a name whose newest declaration is such a local. `main` imports the
+    newest of each type's name, so code there sees a type declared again in place of the old one,
+    and the new declaration is refused where earlier code of `main` no longer checks against it. An
+    impl of a type or trait the session declared joins that declaration's module, where a
+    conformance has to be and a plain impl's methods are the type's own; any other impl is an
+    extension in a module of its own. A session import binding a name a module gives is left out of
+    the later modules, the module's name being the nearer. A hoisted `val` is computed before `main`
+    when the session runs again, which is not seen: an earlier input's output is passed over.
+    WHY: a declaration can only reach what is declared at the top level of some module, and modules
+    are how Avin scopes names, so one module per input gives declarations the same hiding `main`
+    has, with nothing renamed and every diagnostic in the user's own names; and each module's text is
+    fixed once entered, so its instances stay in the build cache. ALTERNATIVES: one top-level module
+    for every declaration (a function or `val` entered again would replace the earlier one under the
+    inputs that used it, and a value computed from it would change when the session runs again);
+    hoisting by renaming (`twice$2`; diagnostics and types show the other names); hoisting by a
+    syntactic test of the free names (a parameter named like a local would keep the function local).
+    **Review with the user:** that code of `main` sees a type declared again where modules keep the
+    old one (Avin has no local types to hide it with), and whether a `var` should be reachable from
+    declarations too (a module-level `var` changes what threads may read).
   - Settled on the user's delegation 2026-11-19: **an expression's value is kept as `resN` and shown
     as `res0: int = 42`, by its type's `Debug` through `Any`** (a string quoted, a type with no
     `Debug` by its name, a function as `<function>`); a `val` or `var` shows its own name, a local
@@ -9209,12 +9241,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     call) — which an empty line ends. `greet()` alone is a call; a function of no parameters opens
     its block with a result type or `=`. ALTERNATIVES: a continuation character; always waiting for
     an empty line after an indented line (one more Enter for every one-line input).
-  - Settled on the user's delegation 2026-11-19: **at a terminal the line is edited by Sysl's
-    `sysl.term.edit`** (history, arrows, Ctrl-A/E/K/U), raw mode only while a line is read, so a
-    running input gets Ctrl-C; **read from a pipe there are no prompts**, so a scripted session's
-    output is what its inputs write. An input's standard output and error reach the session as one
-    stream, in the order written. No new C dependency. ALTERNATIVES: linenoise (multi-line editing
-    and completion, a C dependency); prompts to standard error when piped.
+  - Settled on the user's delegation 2026-11-19 (branch `repl-2`, replacing `sysl.term.edit`,
+    which edits one line and completes nothing): **at a terminal an input is edited whole by the
+    session's own editor** (`repl_editor.sysl`, over `sysl.term.keys`): Enter enters an input the
+    completeness rule above finds complete, wherever the cursor is, and otherwise breaks the line at
+    the cursor and goes on under a `    | ` prompt, indented as the line above and two more after a
+    line opening a block (`if`, `else`, a header, an open bracket, a trailing operator; a trailing
+    comma keeps the indentation); Backspace over an indentation takes back two columns; the arrows
+    move through the input's lines and, past its first or last, through the inputs entered before
+    (500, whole); Ctrl-A/E/B/F/P/N/K/U as usual, Ctrl-C drops the input, Ctrl-D on an empty one ends
+    the session. Lines wider than the terminal are drawn over as many rows as they take (its width is
+    asked at each drawing). Raw mode only while an input is read, so a running input gets Ctrl-C;
+    **read from a pipe there are no prompts**, and lines are taken one at a time as before, so a
+    scripted session's output is what its inputs write. An input's standard output and error reach
+    the session as one stream, in the order written. No new C dependency. ALTERNATIVES: linenoise
+    (a C dependency); a line at a time with a continuation prompt (an earlier line cannot be
+    changed); entering on an empty line always (one more Enter for every one-line input).
+  - Settled on the user's delegation 2026-11-19 (branch `repl-2`): **Tab completes from the
+    language server's completion** (`completion.sysl`): the input is placed in the session's
+    program as it would be entered (an import among the imports, a declaration of types as a module
+    of its own, other code in `main`), the word at the cursor replaced by the stand-in, and what the
+    check finds there is offered: names in scope (locals of `main`, hoisted inputs, types, imports,
+    the core library, and the keywords an expression may begin with), a receiver's members after a
+    `.`, modules after `import`. The names are ordered nearest scope first, then by name; Tab writes
+    what all of them begin with, and when that adds nothing and there are several, lists them under
+    the input. Tab with only spaces before the cursor indents. The session's own names
+    (`avinReplShow`, the module aliases) are never offered. ALTERNATIVES: names collected from the
+    session's text (no members, no types of expressions); a menu to choose from (a larger editor).
   - Settled on the user's delegation 2026-11-19: **in a package, or a directory holding a program,
     the session's program is that program with its root module replaced by the session**, so its
     modules import as they do from `main`, and its dependencies, Sysl packages and C libraries come

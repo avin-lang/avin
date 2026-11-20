@@ -1,0 +1,399 @@
+module dev.avinlang.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.term.keys.Key
+import sysl.text.{char_columns, chars_of, str_builder}
+
+// The terminal editor `avin repl` reads its inputs with. An input is edited whole, over as many lines
+// as it takes: Enter on an input that is complete enters it, and on one that is not (a bracket open,
+// a line ending with an operator, a block whose empty line has not come) begins a new line under the
+// `|` prompt, indented as the line before it and two columns more after a line that opens a block.
+// The arrow keys move through the input's lines, and past its first or last line through the inputs
+// entered before; Tab indents at a line's start and completes the word before the cursor elsewhere.
+//
+// The editor is a value with no terminal of its own: a key changes it and answers what the session
+// is to do (`key`, `enter`), and `render` answers the text that draws it, so every part of it is a
+// pure function a test can drive. `repl_read` in `repl.sysl` joins it to the terminal.
+
+/** The prompt before an input's first line. */
+const ReplPrompt: string = "avin> "
+/** The prompt before each line after an input's first, as wide as `ReplPrompt`. */
+const ReplMorePrompt: string = "    | "
+/** How many inputs the arrow keys reach back through. */
+const ReplHistoryLimit: usize = 500
+
+/** What a key asks of the session. */
+enum EditStep
+    /** The input or the cursor changed: draw it again. */
+    Edited
+    /** Enter: the session says whether the input is complete, and `enter` takes it from there. */
+    Entering
+    /** A complete input, entered. */
+    Accepted(text: string)
+    /** Ctrl-C: the input is dropped and a new one begun. */
+    Cancelled
+    /** Ctrl-D on an empty input: the session ends. */
+    Ended
+    /** Tab after a word: what may complete it is wanted. */
+    Completing
+    /** A key that changes nothing. */
+    Ignored
+
+/** An input being edited: its lines, the cursor (a line, and a byte offset in it that is always at
+ * the start of a character), and the inputs entered before. */
+struct ReplEditor
+    lines: Buf[string]
+    row: usize
+    col: usize
+    history: Buf[string]
+    /** Which earlier input the arrows are showing; `history.len()` is the one being typed. */
+    browse: usize
+    /** What was typed before the arrows reached back, given back when they come forward again. */
+    draft: string
+    /** The screen row the cursor was left on, counted from the input's first, when it was last drawn. */
+    drawn: usize
+    /** The screen row the input's last line ends on, counted the same way. */
+    bottom: usize
+
+    /** The input, its lines joined. */
+    text(self) -> string = editor_joined(self.lines)
+
+    /** Where the cursor is in `text()`. */
+    offset(self) -> usize
+        var at = 0usize
+        for i in 0..<self.row
+            at += self.lines[i].bytes.len + 1
+        at + self.col
+
+    /** A new input, empty, the arrows showing it. */
+    clear(*self)
+        self.lines = one_line("")
+        self.row = 0
+        self.col = 0
+        self.browse = self.history.len()
+        self.draft = ""
+        self.drawn = 0
+        self.bottom = 0
+
+    /** Keeps an entered input for the arrows, unless it is the one entered last. */
+    remember(*self, text: string)
+        if text.trim() == "" then return
+        val n = self.history.len()
+        if n > 0 && self.history[n - 1] == text then return
+        self.history.push(text)
+        if self.history.len() > ReplHistoryLimit then _ = self.history.remove(0)
+
+    /** One key. */
+    key(*self, k: Key) -> EditStep
+        k match
+            Key.Char(c) ->
+                var b = str_builder()
+                b.push_char(c)
+                self.insert(b.finish())
+                Edited
+            Key.Enter -> Entering
+            Key.Tab ->
+                if self.lines[self.row][0..<self.col].trim() != "" then return Completing
+                self.insert("  ")
+                Edited
+            Key.Backspace -> self.backspace()
+            Key.Delete -> self.delete()
+            Key.Left -> self.left()
+            Key.Right -> self.right()
+            Key.Home -> self.home()
+            Key.End -> self.end_of_line()
+            Key.Up -> self.up()
+            Key.Down -> self.down()
+            Key.Ctrl(c) -> self.control(c)
+            _ -> Ignored
+
+    // A key typed with Ctrl, by its letter.
+    private control(*self, c: char) -> EditStep
+        if c == 'a' then return self.home()
+        if c == 'e' then return self.end_of_line()
+        if c == 'b' then return self.left()
+        if c == 'f' then return self.right()
+        if c == 'p' then return self.up()
+        if c == 'n' then return self.down()
+        if c == 'k' then return self.kill_to_end()
+        if c == 'u' then return self.kill_to_start()
+        if c == 'c' then return Cancelled
+        if c == 'd'
+            if self.lines.len() == 1 && self.lines[0] == "" then return Ended
+            return self.delete()
+        Ignored
+
+    /** Enter, once the session has said whether the input is `complete`: a complete one is entered,
+     * the cursor wherever it is; otherwise the line is broken at the cursor and the new line indented. */
+    enter(*self, complete: bool) -> EditStep
+        if complete then return Accepted(self.text())
+        val line = self.lines[self.row]
+        val before = line[0..<self.col]
+        val after = line[self.col..]
+        val indent = leading_spaces(line) + (if line_opens_block(before.trim()) then 2 else 0)
+        self.lines[self.row] = before.trim_end()
+        self.lines.insert(self.row + 1, " ".repeat(indent) + after.trim_start())
+        self.row += 1
+        self.col = indent
+        Edited
+
+    /** Writes `text` at the cursor, which moves past it. */
+    insert(*self, text: string)
+        val line = self.lines[self.row]
+        self.lines[self.row] = line[0..<self.col] + text + line[self.col..]
+        self.col += text.bytes.len
+
+    /** Takes back the character before the cursor, or, at a line's start, joins the line to the one
+     * above. Where only spaces are before the cursor it takes back an indentation step of two. */
+    backspace(*self) -> EditStep
+        if self.col == 0
+            if self.row == 0 then return Ignored
+            val above = self.lines[self.row - 1]
+            self.lines[self.row - 1] = above + self.lines[self.row]
+            _ = self.lines.remove(self.row)
+            self.row -= 1
+            self.col = above.bytes.len
+            return Edited
+        val line = self.lines[self.row]
+        val before = line[0..<self.col]
+        val from = if before.trim() == "" then (self.col - 1) / 2 * 2 else char_before(line, self.col)
+        self.lines[self.row] = line[0..<from] + line[self.col..]
+        self.col = from
+        Edited
+
+    /** Takes away the character under the cursor, or, at a line's end, joins the next line to it. */
+    delete(*self) -> EditStep
+        val line = self.lines[self.row]
+        if self.col == line.bytes.len
+            if self.row + 1 == self.lines.len() then return Ignored
+            self.lines[self.row] = line + self.lines[self.row + 1]
+            _ = self.lines.remove(self.row + 1)
+            return Edited
+        self.lines[self.row] = line[0..<self.col] + line[char_after(line, self.col)..]
+        Edited
+
+    left(*self) -> EditStep
+        if self.col > 0
+            self.col = char_before(self.lines[self.row], self.col)
+            return Edited
+        if self.row == 0 then return Ignored
+        self.row -= 1
+        self.col = self.lines[self.row].bytes.len
+        Edited
+
+    right(*self) -> EditStep
+        val line = self.lines[self.row]
+        if self.col < line.bytes.len
+            self.col = char_after(line, self.col)
+            return Edited
+        if self.row + 1 >= self.lines.len() then return Ignored
+        self.row += 1
+        self.col = 0
+        Edited
+
+    home(*self) -> EditStep
+        self.col = 0
+        Edited
+
+    end_of_line(*self) -> EditStep
+        self.col = self.lines[self.row].bytes.len
+        Edited
+
+    /** Up: to the line above, at the same column or the line's end; from the first line, to the
+     * input entered before. */
+    up(*self) -> EditStep
+        if self.row == 0 then return self.earlier()
+        self.row -= 1
+        self.col = column_within(self.lines[self.row], self.col)
+        Edited
+
+    /** Down: to the line below; from the last line, to the input entered after the one shown, and
+     * from the newest, back to what was being typed. */
+    down(*self) -> EditStep
+        if self.row + 1 == self.lines.len() then return self.later()
+        self.row += 1
+        self.col = column_within(self.lines[self.row], self.col)
+        Edited
+
+    kill_to_end(*self) -> EditStep
+        self.lines[self.row] = self.lines[self.row][0..<self.col]
+        Edited
+
+    kill_to_start(*self) -> EditStep
+        self.lines[self.row] = self.lines[self.row][self.col..]
+        self.col = 0
+        Edited
+
+    earlier(*self) -> EditStep
+        if self.browse == 0 then return Ignored
+        if self.browse == self.history.len() then self.draft = self.text()
+        self.browse -= 1
+        self.show(self.history[self.browse])
+        Edited
+
+    later(*self) -> EditStep
+        if self.browse >= self.history.len() then return Ignored
+        self.browse += 1
+        self.show(if self.browse == self.history.len() then self.draft else self.history[self.browse])
+        Edited
+
+    // `text` as the input, the cursor at its end.
+    show(*self, text: string)
+        self.lines = editor_lines(text)
+        self.row = self.lines.len() - 1
+        self.col = self.lines[self.row].bytes.len
+
+    /** Completes the word before the cursor, which begins at `start` in `text()`, from `labels`: what
+     * all of them begin with past what is typed is written, and when that is nothing and there is
+     * more than one, they are answered, to be listed. */
+    complete_with(*self, start: usize, labels: Buf[string]) -> Buf[string]
+        var listed: Buf[string] = buf()
+        if labels.len() == 0 then return listed
+        val typed = self.offset() - start
+        val common = common_prefix(labels)
+        if common.bytes.len > typed
+            self.insert(common[typed..])
+            return listed
+        if labels.len() > 1
+            for l in labels
+                listed.push(l)
+        listed
+
+    /** The text that draws the input over what was drawn of it before, at a terminal `width` columns
+     * wide, and leaves the cursor where it is in the input. Every line is written whole, and the
+     * cursor moved only up and to the right from the start of the input's last screen row. */
+    render(*self, width: usize) -> string
+        val w = if width == 0 then 80usize else width
+        var out = str_builder()
+        if self.drawn > 0 then out.push(s"\u{1b}[${self.drawn}A")
+        out.push("\r\u{1b}[J")
+        var top = 0usize
+        var cursor_row = 0usize
+        var cursor_col = 0usize
+        var last = 0usize
+        for i in 0..<self.lines.len()
+            val line = self.lines[i]
+            out.push(if i == 0 then ReplPrompt else ReplMorePrompt)
+            out.push(line)
+            val wide = ReplPrompt.bytes.len + text_columns(line)
+            if i == self.row
+                val at = ReplPrompt.bytes.len + text_columns(line[0..<self.col])
+                cursor_row = top + at / w
+                cursor_col = at % w
+            val rows = (wide - 1) / w + 1
+            if i + 1 < self.lines.len()
+                out.push("\r\n")
+                top += rows
+            else
+                last = top + rows - 1
+                // A line filling its last row exactly leaves the terminal waiting to wrap; a new line
+                // settles it, and the cursor may be wanted on that row.
+                if wide % w == 0
+                    out.push("\r\n")
+                    last += 1
+        out.push("\r")
+        if last > cursor_row then out.push(s"\u{1b}[${last - cursor_row}A")
+        if cursor_col > 0 then out.push(s"\u{1b}[${cursor_col}C")
+        self.drawn = cursor_row
+        self.bottom = last
+        out.finish()
+
+    /** The text that takes the cursor below the input's last line, to a new line, when the input is
+     * entered or completions are listed under it. */
+    leave(*self) -> string
+        var out = str_builder()
+        if self.bottom > self.drawn then out.push(s"\u{1b}[${self.bottom - self.drawn}B")
+        out.push("\r\n")
+        self.drawn = 0
+        self.bottom = 0
+        out.finish()
+end ReplEditor
+
+/** An empty editor. */
+repl_editor() -> ReplEditor = ReplEditor(one_line(""), 0, 0, buf(), 0, "", 0, 0)
+
+// A list of one line.
+private one_line(text: string) -> Buf[string]
+    var lines: Buf[string] = buf()
+    lines.push(text)
+    lines
+
+/** `text`'s lines, at least one. */
+editor_lines(text: string) -> Buf[string]
+    var lines: Buf[string] = buf()
+    for l in text.lines()
+        lines.push(l)
+    if lines.len() == 0 || text.ends_with("\n") then lines.push("")
+    lines
+
+/** `lines` joined by line breaks. */
+editor_joined(lines: Buf[string]) -> string
+    var out = str_builder()
+    for i in 0..<lines.len()
+        if i > 0 then out.push("\n")
+        out.push(lines[i])
+    out.finish()
+
+/** How many spaces `line` begins with. */
+leading_spaces(line: string) -> usize
+    var n = 0usize
+    while n < line.bytes.len && line.bytes[n] == u8(' ')
+        n += 1
+    n
+
+/** Whether a line, trimmed, opens a block or goes on to the next: the line after it is indented two
+ * columns more. */
+line_opens_block(line: string) -> bool
+    if line == "" then return false
+    if line == "else" || line.starts_with("elif ") then return true
+    // A comma goes on to the next item, at the same indentation.
+    if line.ends_with(",") then return open_brackets(line) > 0
+    open_brackets(line) > 0 || continues_line(line) || declares_type(line) || heads_function(line) || unfinished_at_end(line)
+
+/** What every one of `labels` begins with. */
+common_prefix(labels: Buf[string]) -> string
+    if labels.len() == 0 then return ""
+    var common = labels[0]
+    for l in labels
+        var n = 0usize
+        while n < common.bytes.len && n < l.bytes.len && common.bytes[n] == l.bytes[n]
+            n += 1
+        // A character is never cut in two.
+        while n > 0 && n < common.bytes.len && continuation(common.bytes[n])
+            n -= 1
+        common = common[0..<n]
+    common
+
+/** The columns `text` takes at a terminal. */
+text_columns(text: string) -> usize
+    var n = 0usize
+    for c in chars_of(text.bytes)
+        n += char_columns(c)
+    n
+
+// The offset of the character before `at` in `line`.
+private char_before(line: string, at: usize) -> usize
+    var i = at
+    if i == 0 then return 0
+    i -= 1
+    while i > 0 && continuation(line.bytes[i])
+        i -= 1
+    i
+
+// Whether `b` continues a character rather than beginning one.
+private continuation(b: u8) -> bool = (b & 0xC0) == 0x80
+
+// The offset of the character after the one at `at` in `line`.
+private char_after(line: string, at: usize) -> usize
+    var i = at + 1
+    while i < line.bytes.len && continuation(line.bytes[i])
+        i += 1
+    if i > line.bytes.len then line.bytes.len else i
+
+// `col` within `line`: its end where the line is shorter, and the start of the character it is in.
+private column_within(line: string, col: usize) -> usize
+    if col >= line.bytes.len then return line.bytes.len
+    var i = col
+    while i > 0 && continuation(line.bytes[i])
+        i -= 1
+    i

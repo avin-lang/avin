@@ -2,24 +2,33 @@ module dev.avinlang.compiler
 
 import sh.sysl.parsing.{Diagnostic, Report, Source, Span, source_of}
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.env.get
 import sysl.fs.{File, create, is_dir, make_dir_all, make_temp_dir, open, read_text, remove_dir_all, write_text}
-import sysl.io.{console_lines, stdin}
+import sysl.io.{Reader, console_lines, stdin}
 import sysl.path.file_name
-import sysl.posix.tty.{cooked, is_tty, raw, tty_writer}
+import sysl.posix.tty.{cooked, is_tty, raw, window_size}
 import sysl.process.{Exited, Signalled, Stdio, TimedOut}
-import sysl.term.edit.editor
+import sysl.term.keys.key_decoder
 import sysl.text.{chars_of, from_utf8_lossy, str_builder}
 
 // `avin repl`: an interactive session. A session is a program that grows: each input accepted is
 // kept, and the program made of everything kept so far, with the new input last, is checked, built
-// through the instance cache and run. Imports go to the top of the program, declarations of types
-// below them, and everything else (values, local functions, statements and expressions) into `main`,
-// each input a block nested in the one before it, so an input may declare a name again and hide the
-// earlier one from the inputs after it. An earlier input's output is not shown again: what the program
-// writes before the new input begins is passed over, up to a mark it writes there. An input whose
-// program does not check, or traps, or ends the program, is not kept; the session goes on without it.
-// What each new value is, and its type, is shown after its input's own output, as `res0: int = 42`.
+// through the instance cache and run. Imports go to the top of the program, and everything else into
+// `main`, each input a block nested in the one before it, so an input may declare a name again and
+// hide the earlier one from the inputs after it. An earlier input's output is not shown again: what
+// the program writes before the new input begins is passed over, up to a mark it writes there. An
+// input whose program does not check, or traps, or ends the program, is not kept; the session goes on
+// without it. What each new value is, and its type, is shown after its input's own output, as
+// `res0: int = 42`.
+//
+// **Declarations reach what was entered before them through modules of their own.** A declaration of
+// types is a module of the session's, `avinrepl.c3`, which imports the newest of each name the inputs
+// before it gave; so is a function or a `val` that uses no local of `main` (it is *hoisted*), so the
+// classes and functions entered after it can call or read it. A hoisted function is also written into
+// `main` where it was entered, and a hoisted `val` read there under its name, so the inputs in `main`
+// see the same names in the same order as before. A name entered again hides the earlier one from
+// every later input, module or code, while the earlier modules keep the one they imported.
 
 /** What the program writes, before an input's own code, so the session knows where that input's
  * output begins: everything before it was written by inputs already shown. */
@@ -34,18 +43,41 @@ const ReplShow: string = "avinReplShow"
 /** The name `:type` binds the expression it is asked about to. */
 const ReplTypeName: string = "avinReplType"
 
-const ReplHelp: string = "Enter a declaration, an import, a statement or an expression. An expression's value is shown with its type, as `res0: int = 42`, and a `val` or `var` by its own name.\nAn input that opens a block (`if`, `for`, a function's body, a type's declaration) goes on over the lines after it until an empty line.\n:type <expression>   show an expression's type without running it\n:imports             list the session's imports\n:load <file>         enter a file's imports and declarations, one at a time\n:reset               forget every input\n:help                show this\n:quit                end the session (so does Ctrl-D on an empty line)"
+const ReplHelp: string = "Enter a declaration, an import, a statement or an expression. An expression's value is shown with its type, as `res0: int = 42`, and a `val` or `var` by its own name.\nAn input that opens a block (`if`, `for`, a function's body, a type's declaration) goes on over the lines after it until an empty line.\nA function or a `val` that uses no local of the session's code can be called or read by the classes and functions entered after it.\nAt a terminal, Tab completes a name, and the arrow keys move through an input's lines and the inputs entered before.\n:type <expression>   show an expression's type without running it\n:imports             list the session's imports\n:load <file>         enter a file's imports and declarations, one at a time\n:reset               forget every input\n:help                show this\n:quit                end the session (so does Ctrl-D on an empty line)"
 
-/** A declaration of types a session keeps: its text, and the names it declares, by which a later
- * declaration of one of them replaces it. */
-struct ReplDecl
-    text: string
+/** The name of the module the session's modules are under: `avinrepl.c3` is the third. */
+const ReplModule: string = "avinrepl"
+
+/** What a kept input is: code of `main`, local to it; a declaration of types, a module of its own; a
+ * function or a `val` hoisted to a module of its own, and also written into `main`. */
+const CellCode: u8 = 0
+const CellTypes: u8 = 1
+const CellFunction: u8 = 2
+const CellValue: u8 = 3
+
+/** An input a session keeps. */
+struct ReplCell
+    kind: u8
+    /** The number of its module, when it is one. */
+    number: usize
+    /** Its text as a module: one input, or a type's declaration and the impls entered for it after. */
+    texts: Buf[string]
+    /** What it writes into `main`: nothing for a declaration of types. */
+    main: string
+    /** The names it gives the inputs after it: those a module may import from it, or the locals of
+     * `main` that hide the same names from the modules after it. */
     names: Buf[string]
+    /** How many of the session's imports were entered before it, which its module imports. */
+    imports: usize
+    /** How many cells were kept before its newest text was entered: its module imports from them.
+     * An impl joining a declaration reaches what was entered before the impl. */
+    upto: usize
 
-/** Where in the program's text an input was placed: the line its first line is on, counted from one,
- * how many lines it is, how many columns every one of its lines was moved right, and how many more
- * its first line was. */
+/** Where in the program's files an input was placed: the file, the line its first line is on,
+ * counted from one, how many lines it is, how many columns every one of its lines was moved right,
+ * and how many more its first line was. */
 struct ReplPlace
+    file: string
     line: usize
     count: usize
     indent: usize
@@ -54,10 +86,23 @@ struct ReplPlace
     /** Whether line `n` of the program is one of the input's. */
     holds(self, n: usize) -> bool = self.line <= n && n < self.line + self.count
 
-/** The program a session is, written out, with the place of its newest input. */
+/** One of the session's modules, written out. */
+struct ReplModuleFile
+    file: string
+    name: string
+    text: string
+
+/** The program a session is, written out: its root file, where `main` is, its modules, and the
+ * place of its newest input. `start` and `end` are where the newest code is in the root file,
+ * `main_start` where `main` begins there, and `copies` where the hoisted inputs are written into it. */
 struct ReplProgram
     text: string
+    modules: Buf[ReplModuleFile]
     place: ReplPlace
+    start: usize
+    end: usize
+    main_start: usize
+    copies: Buf[Span]
 
 /** A session: what it builds with and what it has kept. */
 struct ReplSession
@@ -72,9 +117,10 @@ struct ReplSession
     sysl: Buf[SyslPackage]
     c: Buf[CLibrary]
     imports: Buf[string]
-    decls: Buf[ReplDecl]
-    /** The inputs of `main`, as they are written there. */
-    code: Buf[string]
+    /** The inputs kept, in the order they were entered. */
+    cells: Buf[ReplCell]
+    /** The number the next module of the session's is given. */
+    modules: usize
     /** The number the next expression's value is named by: `res0`, `res1`. */
     results: int
     /** The lines of an input not yet complete. */
@@ -99,6 +145,11 @@ repl_command(here: string, args: []const string, tc: Option[Toolchain], say: str
     if library_version_error(toolchain) is Some(message)
         note(message)
         return 1
+    // `AVIN_BUILD_LOG` names where each input's phases are logged, as a build's are.
+    if open_build_log(get(BuildLogVariable)) is Err(message)
+        note(message)
+        return 1
+    defer close_build_log()
     var session = repl_session(toolchain, dir) match
         Ok(s) -> s
         Err(message) ->
@@ -138,34 +189,109 @@ repl_session(tc: Toolchain, dir: string) -> Result[ReplSession, string]
     val home = build_cache(tc.builds, root) + "/repl"
     make_dir_all(home).map_err(e -> s"avin: $home: ${e.to_string()}")?
     val scratch = make_temp_dir("avin-repl").map_err(e -> s"avin: ${e.to_string()}")?
-    Ok(ReplSession(tc, home + "/repl.avin", scratch, base, package, sysl, c, buf(), buf(), buf(), 0, buf(), false))
+    Ok(ReplSession(tc, home + "/repl.avin", scratch, base, package, sysl, c, buf(), buf(), 1, 0, buf(), false))
 
 /** The feature flags of a command given none. */
 private no_feature_flags() -> FeatureFlags = FeatureFlags(false, false, false, buf())
 
-/** Reads the session's inputs from standard input until it ends or `:quit`: at a terminal through a
- * line editor with history, prompting for each line, and otherwise a line at a time with no prompt. */
+/** Reads the session's inputs from standard input until it ends or `:quit`: at a terminal through the
+ * session's editor (`repl_editor.sysl`), an input of many lines at a time, and otherwise a line at a
+ * time with no prompt. */
 repl_terminal(session: *ReplSession)
     val out: &Fn(string) -> unit = text -> repl_write(text)
-    if is_tty(0)
+    if is_tty(0) && raw()
+        cooked()
         out(s"avin $Version: :help lists the commands\n")
         var input = stdin()
-        var ed = editor(&input, tty_writer())
+        var ed = repl_editor()
+        var chunk: []u8 = [0; 256]
         loop
-            out(if session.pending.len() == 0 then "avin> " else "  ... ")
             if !raw() then break
-            val line = ed.getline()
+            val got = repl_read(session, &ed, &input, chunk)
             cooked()
-            line match
-                Some(l) -> if !repl_line(session, l, out) then return
-                None ->
-                    repl_finish(session, out)
-                    return
+            got match
+                Some(text) ->
+                    ed.remember(text)
+                    if !repl_submit(session, text, out) then return
+                None -> return
         return
     var input = stdin()
     for line in console_lines(&input)
         if !repl_line(session, line, out) then return
     repl_finish(session, out)
+
+/** Reads one input at the terminal, which is in raw mode, a key at a time: `None` once the input ends
+ * or Ctrl-D is typed on an empty input. */
+repl_read(s: *ReplSession, ed: *ReplEditor, input: *Reader, chunk: []u8) -> Option[string]
+    ed.clear()
+    var keys = key_decoder()
+    repl_write(ed.render(repl_width()))
+    loop
+        val got = input.read(chunk)
+        if got.len == 0 then return None
+        for b in got
+            keys.push(b)
+            loop
+                val k = keys.next() match
+                    Some(k) -> k
+                    None -> break
+                var step = ed.key(k)
+                if step is Entering then step = ed.enter(!input_wants_more(ed.lines))
+                step match
+                    Accepted(text) ->
+                        ed.row = ed.lines.len() - 1
+                        ed.col = ed.lines[ed.row].bytes.len
+                        repl_write(ed.render(repl_width()) + ed.leave())
+                        return Some(text)
+                    Cancelled ->
+                        ed.row = ed.lines.len() - 1
+                        ed.col = ed.lines[ed.row].bytes.len
+                        repl_write(ed.render(repl_width()) + "^C" + ed.leave())
+                        ed.clear()
+                        repl_write(ed.render(repl_width()))
+                    Ended ->
+                        repl_write(ed.leave())
+                        return None
+                    Completing ->
+                        val found = repl_complete(s, ed.text(), ed.offset())
+                        val listed = ed.complete_with(found.start, found.labels)
+                        if listed.len() > 0
+                            repl_write(ed.leave() + completion_listing(listed, repl_width(), "\r\n"))
+                        repl_write(ed.render(repl_width()))
+                    Ignored -> ()
+                    _ -> repl_write(ed.render(repl_width()))
+
+// The terminal's width, or 80 where it does not say.
+private repl_width() -> usize = window_size(1) match
+    Some(size) -> usize(size.cols)
+    None -> 80
+
+/** `labels` in columns as wide as the widest and two more, as many to a line as `width` holds, each
+ * line ended by `ending`. */
+completion_listing(labels: Buf[string], width: usize, ending: string) -> string
+    var widest = 0usize
+    for l in labels
+        if text_columns(l) > widest then widest = text_columns(l)
+    val column = widest + 2
+    val per_line = if width > column then width / column else 1usize
+    var out = str_builder()
+    for i in 0..<labels.len()
+        val l = labels[i]
+        out.push(l)
+        if (i + 1) % per_line == 0 || i + 1 == labels.len() then out.push(ending)
+        else out.push(" ".repeat(column - text_columns(l)))
+    out.finish()
+
+/** Enters an input the editor read whole: a command, or the input's lines. Answers false once the
+ * session is to end. */
+repl_submit(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
+    val trimmed = text.trim()
+    if trimmed == "" then return true
+    if trimmed.starts_with(":") && !trimmed.contains("\n") then return repl_command_line(s, trimmed, out)
+    s.pending.clear()
+    s.block = false
+    _ = repl_enter(s, repl_joined(editor_lines(text)), out)
+    true
 
 /** Writes `text` to standard output at once. */
 private repl_write(text: string)
@@ -210,21 +336,36 @@ private repl_joined(lines: Buf[string]) -> string
  * comma, or the input opened a block, which only an empty line ends. A block is opened by a type's
  * declaration (whose members follow it indented) and by a line the parser finds unfinished at its
  * end, as `if x > 0` or a function's header is. */
-repl_wants_more(s: *ReplSession) -> bool
-    val n = s.pending.len()
-    val last = s.pending[n - 1]
-    if s.block then return last.trim() != ""
-    val text = repl_joined(s.pending)
+repl_wants_more(s: *ReplSession) -> bool = wants_more_at(s.pending, &s.block)
+
+/** `repl_wants_more` for the lines typed so far, `block` saying whether a block is open and set when
+ * the last line opens one. */
+wants_more_at(lines: Buf[string], block: *bool) -> bool
+    val n = lines.len()
+    val last = lines[n - 1]
+    if *block then return last.trim() != ""
+    val text = repl_joined(lines)
     if text.trim() == "" then return false
     if open_brackets(text) > 0 then return true
     if continues_line(text.trim_end()) then return true
     if n == 1 && declares_type(text.trim())
-        s.block = true
+        *block = true
         return true
     if unfinished_at_end(text) || heads_function(text)
-        s.block = true
+        *block = true
         return true
     false
+
+/** Whether an input the editor holds whole goes on: the lines are taken one at a time, as
+ * `repl_wants_more` takes them, so a block one of them opened is ended only by an empty last line. */
+input_wants_more(lines: Buf[string]) -> bool
+    var block = false
+    var so_far: Buf[string] = buf()
+    var more = false
+    for l in lines
+        so_far.push(l)
+        more = wants_more_at(so_far, &block)
+    more
 
 /** How many brackets `text` leaves open, outside its strings, characters and comments. */
 open_brackets(text: string) -> int
@@ -329,8 +470,7 @@ repl_command_line(s: *ReplSession, line: string, out: &Fn(string) -> unit) -> bo
         if rest != "" then out(":reset takes nothing after it\n")
         else
             s.imports.clear()
-            s.decls.clear()
-            s.code.clear()
+            s.cells.clear()
             s.results = 0
             out("the session is empty\n")
     elif word == ":imports"
@@ -352,13 +492,110 @@ repl_type(s: *ReplSession, text: string, out: &Fn(string) -> unit)
         out("usage: :type <expression>, on one line\n")
         return
     val head = s"val $ReplTypeName = "
-    val program = repl_program(s, s.imports, s.decls, Some(head + text), buf(), false, head.bytes.len, FocusCode)
+    val program = repl_program(s, s.imports, s.cells, Some(head + text), buf(), false, head.bytes.len, FocusCode, 0)
     var checked = repl_check(s, program, out) match
         Some(c) -> c
         None -> return
     repl_value_type(&checked, s.file, program.text, ReplTypeName) match
         Some(t) -> out(t + "\n")
         None -> out("the expression has no type to show\n")
+
+// ---- completion ----
+
+/** What Tab may complete: where in the input the word being completed begins, and the names that
+ * begin with what is typed of it, nearest scope first and then by name. */
+struct ReplCompletion
+    start: usize
+    labels: Buf[string]
+
+/** The completions at `offset` in the input `text`, from the language server's completion
+ * (`completion.sysl`): the input is placed in the session's program as it would be entered (an import
+ * among the imports, a declaration of types as a module of its own, and anything else as code of
+ * `main`), the word at the cursor replaced by a stand-in, and the program checked; what the check
+ * finds in scope there, or among the receiver's members after a `.`, or the modules an import may
+ * name, is answered. A command completes nothing. */
+repl_complete(s: *ReplSession, text: string, offset: usize) -> ReplCompletion
+    val none = ReplCompletion(offset, buf())
+    val head = text.trim_start()
+    if head.starts_with(":") then return none
+    // The line and column of the cursor in the input, and the program the input is placed in.
+    var row = 0usize
+    var col = offset
+    for i in 0..<offset
+        if text.bytes[i] == u8('\n')
+            row += 1
+            col = offset - i - 1
+    val program = completion_program(s, text, head)
+    val place = program.place
+    var file_text = program.text
+    for m in program.modules
+        if m.file == place.file then file_text = m.text
+    val source = source_of(place.file, file_text)
+    val line_text = editor_lines(text)[row]
+    val at = source.line_span(place.line + row).start + (if line_text == "" then 0 else place.indent) + col
+    val word = completion_word(file_text, at)
+    var chosen = ""
+    for t in completion_texts(file_text, word)
+        if !parse(source_of(place.file, t)).report.has_errors()
+            chosen = t
+            break
+    if chosen == "" then return none
+    val loaded = load_units(s.tc.library_dir(), repl_files_with(s, program, place.file, chosen), false, src -> src) match
+        Ok(l) -> l
+        Err(_) -> return none
+    val found = check_program(loaded.units, loaded.root_module, false, false, CompletionMarker).completions
+    var groups: Buf[usize] = buf()
+    var labels: Buf[string] = buf()
+    for c in found.items
+        if c.label.starts_with(word.prefix) && !c.label.starts_with("avinRepl") && !has_name(labels, c.label)
+            groups.push(c.group)
+            labels.push(c.label)
+    if found.site is ValueSite
+        for k in ["val", "var", "def", "if", "match", "select", "for", "while", "loop", "return", "break", "continue", "defer", "true", "false"]
+            if k.starts_with(word.prefix) && !has_name(labels, k)
+                groups.push(5)
+                labels.push(k)
+    ReplCompletion(offset - word.prefix.bytes.len, sorted_labels(groups, labels))
+
+// The program an input being completed is placed in, as `repl_complete` says.
+private completion_program(s: *ReplSession, text: string, head: string) -> ReplProgram
+    if head.starts_with("import ")
+        var imports: Buf[string] = buf()
+        imports.push(text)
+        for i in s.imports
+            imports.push(i)
+        return repl_program(s, imports, s.cells, None, buf(), false, 0, FocusImports, 0)
+    if declares_type(head)
+        var cells = copy_cells(s.cells)
+        var texts: Buf[string] = buf()
+        texts.push(text)
+        cells.push(ReplCell(CellTypes, s.modules, texts, "", buf(), s.imports.len(), s.cells.len()))
+        return repl_program(s, s.imports, cells, None, buf(), false, 0, FocusDecl, cells.len() - 1)
+    repl_program(s, s.imports, s.cells, Some(text), buf(), false, 0, FocusCode, 0)
+
+// `labels` ordered by their `groups`, nearest scope first, and then by name.
+private sorted_labels(groups: Buf[usize], labels: Buf[string]) -> Buf[string]
+    var order: Buf[usize] = buf()
+    for i in 0..<labels.len()
+        var at = order.len()
+        while at > 0 && before_label(groups[i], labels[i], groups[order[at - 1]], labels[order[at - 1]])
+            at -= 1
+        order.insert(at, i)
+    var out: Buf[string] = buf()
+    for i in order
+        out.push(labels[i])
+    out
+
+// Whether `(g, l)` sorts before `(h, m)`.
+private before_label(g: usize, l: string, h: usize, m: string) -> bool
+    if g != h then return g < h
+    val a = l.bytes
+    val b = m.bytes
+    var i = 0usize
+    while i < a.len && i < b.len
+        if a[i] != b[i] then return a[i] < b[i]
+        i += 1
+    a.len < b.len
 
 /** `:load file`: each import and top-level declaration of `file` entered in turn, as if typed, until
  * one is not accepted. A `main` it holds becomes a local function the session can call. */
@@ -405,22 +642,24 @@ repl_enter(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
             out("an input has no module header: the session is the root module\n")
             return false
         if parsed.file.imports.len() > 0 && parsed.file.items.len() == 0 then return repl_import(s, text, out)
-        if parsed.file.items.len() > 0 && parsed.file.imports.len() == 0 && only_types(parsed.file.items) then return repl_declare(s, text, item_names(parsed.file.items), out)
+        if parsed.file.items.len() > 0 && parsed.file.imports.len() == 0 && only_types(parsed.file.items) then return repl_declare(s, text, parsed.file.items, parsed.file.private_items, out)
         if parsed.file.imports.len() > 0
             out("an import is entered on its own\n")
             return false
     repl_code(s, text, out)
 
-// Whether every item declares a type, an impl or an alias, which a session keeps at the top level.
+// Whether the items declare types, impls or aliases (an actor's function among them), which a
+// session keeps as a module of their own.
 private only_types(items: Buf[Item]) -> bool
+    var types = false
     for item in items
         item match
-            FunctionItem(_) -> return false
+            FunctionItem(_) -> ()
             ValueItem(_) -> return false
-            _ -> ()
-    true
+            _ -> types = true
+    types
 
-// The names the items declare.
+// The names of the types the items declare, shown when they are entered.
 private item_names(items: Buf[Item]) -> Buf[string]
     var names: Buf[string] = buf()
     for item in items
@@ -430,6 +669,34 @@ private item_names(items: Buf[Item]) -> Buf[string]
             AliasItem(a) -> names.push(a.name)
             _ -> ()
     names
+
+/** Every public name the items declare, which the session's later modules and `main` import: types,
+ * a data type's variants, and an actor's function. */
+public_names(items: Buf[Item], private_items: Buf[bool]) -> Buf[string]
+    var names: Buf[string] = buf()
+    for i in 0..<items.len()
+        if i < private_items.len() && private_items[i] then continue
+        items[i] match
+            DataItem(d) ->
+                add_name(&names, d.name)
+                for v in d.variants
+                    add_name(&names, v.name)
+            ClassItem(k) -> add_name(&names, k.name)
+            AliasItem(a) -> add_name(&names, a.name)
+            FunctionItem(f) -> add_name(&names, f.name)
+            _ -> ()
+    names
+
+// `name` added to `names` unless it is there.
+private add_name(names: *Buf[string], name: string)
+    if has_name(*names, name) then return
+    names.push(name)
+
+/** Whether `names` holds `name`. */
+has_name(names: Buf[string], name: string) -> bool
+    for n in names
+        if n == name then return true
+    false
 
 /** An import: kept when the program still checks with it. */
 repl_import(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
@@ -442,32 +709,98 @@ repl_import(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
         for i in imports
             if i == l then known = true
         if !known then imports.push(l)
-    val program = repl_program(s, imports, s.decls, None, buf(), false, 0, FocusImports)
+    val program = repl_program(s, imports, s.cells, None, buf(), false, 0, FocusImports, 0)
     if repl_check(s, program, out) is None then return false
     s.imports = imports
     true
 
-/** A declaration of types: kept, in place of every earlier one declaring a name it declares, when the
- * program still checks with it. */
-repl_declare(s: *ReplSession, text: string, names: Buf[string], out: &Fn(string) -> unit) -> bool
-    var decls: Buf[ReplDecl] = buf()
-    for d in s.decls
-        var replaced = false
-        for n in d.names
-            for m in names
-                if n == m then replaced = true
-        if !replaced then decls.push(d)
-    decls.push(ReplDecl(text, names))
-    val program = repl_program(s, s.imports, decls, None, buf(), false, 0, FocusDecl)
-    var checked = repl_check(s, program, out) match
+/** A declaration of types: a module of its own, kept when the program still checks with it. A name
+ * it declares hides the same name from the inputs after it, and the modules before it keep the one
+ * they imported. An impl of a type or a trait the session declared joins that declaration's module,
+ * where a conformance has to be. */
+repl_declare(s: *ReplSession, text: string, items: Buf[Item], private_items: Buf[bool], out: &Fn(string) -> unit) -> bool
+    var cells = copy_cells(s.cells)
+    var focus = cells.len()
+    if only_impls(items)
+        if impl_home(cells, items) is Some(k)
+            val home = cells[k]
+            var texts: Buf[string] = buf()
+            for t in home.texts
+                texts.push(t)
+            texts.push(text)
+            cells[k] = ReplCell(home.kind, home.number, texts, home.main, home.names, s.imports.len(), cells.len())
+            focus = k
+    val joined = focus < cells.len()
+    if !joined
+        var texts: Buf[string] = buf()
+        texts.push(text)
+        cells.push(ReplCell(CellTypes, s.modules, texts, "", public_names(items, private_items), s.imports.len(), s.cells.len()))
+    var program = repl_program(s, s.imports, cells, None, buf(), false, 0, FocusDecl, focus)
+    var found = repl_check_quiet(s, program)
+    if found is None
+        // A function or `val` hoisted before, which this declaration now writes as a module, may not
+        // check there; such inputs stay code of `main`, and the declaration is checked again.
+        val broken = repl_broken_files(s, program)
+        var demoted = false
+        for k in 0..<cells.len()
+            val cell = cells[k]
+            if (cell.kind == CellFunction || cell.kind == CellValue) && has_name(broken, cell_file(s, cell.number))
+                cells[k] = as_code(cell)
+                demoted = true
+        if demoted then program = repl_program(s, s.imports, cells, None, buf(), false, 0, FocusDecl, focus)
+        found = repl_check(s, program, out)
+    var checked = found match
         Some(c) -> c
         None -> return false
-    s.decls = decls
-    for n in names
-        repl_declared(&checked, s.file, program.text, n) match
+    s.cells = cells
+    if !joined then s.modules += 1
+    var module_text = ""
+    for m in program.modules
+        if m.file == program.place.file then module_text = m.text
+    for n in item_names(items)
+        repl_declared(&checked, program.place.file, module_text, n) match
             Some(detail) -> out(detail + "\n")
             None -> out(s"defined $n\n")
     true
+
+// A copy of `cells`, which a change to does not reach the session's.
+private copy_cells(cells: Buf[ReplCell]) -> Buf[ReplCell]
+    var out: Buf[ReplCell] = buf()
+    for c in cells
+        out.push(c)
+    out
+
+// Whether every item is an impl.
+private only_impls(items: Buf[Item]) -> bool
+    for item in items
+        if !(item is ImplItem(_)) then return false
+    true
+
+/** The kept declaration of types an impl belongs with: the one declaring, as the newest of its name,
+ * the type the impl is for, or else the trait it implements. */
+impl_home(cells: Buf[ReplCell], items: Buf[Item]) -> Option[usize]
+    val decl = items[0] match
+        ImplItem(d) -> d
+        _ -> return None
+    if newest_types_cell(cells, type_head(decl.target)) is Some(k) then return Some(k)
+    decl.trait_name match
+        Some(t) -> newest_types_cell(cells, type_head(t))
+        None -> None
+
+// The name a written type is headed by: `Box` of `Box[int]`.
+private type_head(t: &TypeExpr) -> string = t.kind match
+    Named(path, _) -> path
+    _ -> ""
+
+// The kept declaration of types whose `name` is the newest of that name, if the newest is one.
+private newest_types_cell(cells: Buf[ReplCell], name: string) -> Option[usize]
+    if name == "" then return None
+    var k = cells.len()
+    while k > 0
+        k -= 1
+        if has_name(cells[k].names, name)
+            return if cells[k].kind == CellTypes then Some(k) else None
+    None
 
 /** Code for `main`: values, local functions, statements, or one expression, whose value is kept as
  * the next `resN`. Checked, then built and run; kept when it runs to its end. */
@@ -476,40 +809,155 @@ repl_code(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
     var code = text
     var shows: Buf[string] = buf()
     var result = ""
+    var found: Option[(Checked, ReplProgram)] = None
     if items is Some(xs)
         if xs.len() == 1 && is_expression(xs[0])
             // An expression is first tried as the next result's value; one of type `unit`, or one that
             // is no value, is run as a statement.
             val name = s"res${s.results}"
             val bound = if text.contains("\n") then s"val $name =\n" + repl_indented(text, 2, 0).trim_end() else s"val $name = $text"
-            val tried = repl_program(s, s.imports, s.decls, Some(bound), buf(), false, 0, FocusCode)
-            if repl_check_quiet(s, tried) is Some(found)
-                var c = found
-                if repl_value_type(&c,s.file, tried.text, name) is Some(t)
+            val tried = repl_program(s, s.imports, s.cells, Some(bound), buf(), false, 0, FocusCode, 0)
+            if repl_check_quiet(s, tried) is Some(checked)
+                var c = checked
+                if repl_value_type(&c, s.file, tried.text, name) is Some(t)
                     if t != "unit"
                         code = bound
                         result = name
                         shows.push(repl_show_call(name, t))
+                        found = Some((c, tried))
     if result == ""
-        val program = repl_program(s, s.imports, s.decls, Some(text), buf(), false, 0, FocusCode)
+        val program = repl_program(s, s.imports, s.cells, Some(text), buf(), false, 0, FocusCode, 0)
         var c = repl_check(s, program, out) match
-            Some(found) -> found
+            Some(checked) -> checked
             None -> return false
         if items is Some(xs)
             for x in xs
                 repl_shown(&c, s.file, program.text, x) match
                     Some(line) -> shows.push(line)
                     None -> ()
-    var run = repl_program(s, s.imports, s.decls, Some(code), shows, true, 0, FocusCode)
+        found = Some((c, program))
+    var run = repl_program(s, s.imports, s.cells, Some(code), shows, true, 0, FocusCode, 0)
     // An expression kept as a result is written after `val resN = `, on its line or, over several
     // lines, under it moved two columns more; a place in it is shown as the place in what was typed.
     if result != ""
         val p = run.place
-        run.place = if text.contains("\n") then ReplPlace(p.line + 1, p.count - 1, p.indent + 2, 0) else ReplPlace(p.line, p.count, p.indent, s"val $result = ".bytes.len)
+        run.place = if text.contains("\n") then ReplPlace(p.file, p.line + 1, p.count - 1, p.indent + 2, 0) else ReplPlace(p.file, p.line, p.count, p.indent, s"val $result = ".bytes.len)
     if !repl_run(s, run, out) then return false
-    s.code.push(code)
     if result != "" then s.results += 1
+    found match
+        Some((c, program)) ->
+            var checked = c
+            repl_keep(s, code, items, result, &checked, program)
+        None -> ()
     true
+
+/** Keeps code that ran: hoisted to a module of its own when it is one function (its clauses
+ * together) or one `val`, a result's among them, that uses no local of `main` and checks there; and
+ * otherwise as code of `main`. A hoisted function is also written into `main` where it was entered,
+ * and a hoisted `val` read there under its name. */
+repl_keep(s: *ReplSession, code: string, items: Option[Buf[&Expr]], result: string, c: *Checked, program: ReplProgram)
+    var names: Buf[string] = buf()
+    var hoist: Option[(u8, string)] = None
+    if result != ""
+        names.push(result)
+        hoist = Some((CellValue, result))
+    elif items is Some(xs)
+        for x in xs
+            statement_names(x, &names)
+        hoist = hoisted_kind(xs)
+    var single: Buf[string] = buf()
+    single.push(code)
+    if hoist is Some((kind, name))
+        if !repl_captures(c, s.file, program)
+            val m = s.modules
+            val main = if kind == CellFunction then code else s"val $name = ${module_alias(m)}.$name"
+            s.cells.push(ReplCell(kind, m, single, main, names, s.imports.len(), s.cells.len()))
+            s.modules += 1
+            return
+    s.cells.push(ReplCell(CellCode, 0, single, code, names, s.imports.len(), s.cells.len()))
+
+/** `cells` as the program writes them: a hoisted function or `val` is a module only once a
+ * declaration of types comes after it, which is the only input that can reach it there; until then
+ * it is code of `main`, as it was when it was entered, and costs nothing more to check and build. */
+written_cells(cells: Buf[ReplCell]) -> Buf[ReplCell]
+    var last_types = 0usize
+    var any = false
+    for k in 0..<cells.len()
+        if cells[k].kind == CellTypes
+            last_types = k
+            any = true
+    var out: Buf[ReplCell] = buf()
+    for k in 0..<cells.len()
+        val cell = cells[k]
+        val hoisted = cell.kind == CellFunction || cell.kind == CellValue
+        if hoisted && !(any && k < last_types) then out.push(as_code(cell)) else out.push(cell)
+    out
+
+// A hoisted cell as code of `main`, as it was entered.
+private as_code(cell: ReplCell) -> ReplCell = ReplCell(CellCode, 0, cell.texts, cell.texts[0], cell.names, cell.imports, cell.upto)
+
+/** What code may be hoisted as: one function, written as one declaration or as its clauses, or one
+ * `val` of a name. */
+hoisted_kind(xs: Buf[&Expr]) -> Option[(u8, string)]
+    if xs.len() == 0 then return None
+    var function = ""
+    for x in xs
+        x.kind match
+            LocalFunction(f) ->
+                if function != "" && f.name != function then return None
+                function = f.name
+            Binding(name, _, _, mutable) ->
+                if xs.len() > 1 || mutable || name.starts_with("_") then return None
+                return Some((CellValue, name))
+            _ -> return None
+    Some((CellFunction, function))
+
+/** The names a statement of `main` declares for the statements after it. */
+statement_names(e: &Expr, names: *Buf[string])
+    e.kind match
+        Binding(name, _, _, _) -> add_name(names, name)
+        LazyBinding(name, _, _) -> add_name(names, name)
+        LocalFunction(f) -> add_name(names, f.name)
+        Destructure(pattern, _, _, _) -> pattern_names(pattern, names)
+        _ -> ()
+
+// The names a pattern binds: those written in lower case, which a pattern binds rather than matches.
+private pattern_names(p: &Pattern, names: *Buf[string])
+    p.kind match
+        Name(n) -> if n != "" && u8('a') <= n.bytes[0] && n.bytes[0] <= u8('z') then add_name(names, n)
+        Named(n, inner) ->
+            add_name(names, n)
+            pattern_names(inner, names)
+        Tuple(items) ->
+            for q in items
+                pattern_names(q, names)
+        Sequence(items) ->
+            for q in items
+                pattern_names(q, names)
+        Constructor(_, args, _) ->
+            for q in args
+                pattern_names(q, names)
+        Cons(head, tail) ->
+            pattern_names(head, names)
+            pattern_names(tail, names)
+        _ -> ()
+
+/** Whether the code the check of `program` placed newest uses a local of `main` it does not declare
+ * itself: a name declared in `main` before it, other than a hoisted input's. */
+repl_captures(c: *Checked, file: string, program: ReplProgram) -> bool
+    for r in c.references
+        if r.at_file != file || r.declared_file != file then continue
+        if r.at_span.start < program.start || r.at_span.start >= program.end then continue
+        val at = r.declared_span.start
+        if at < program.main_start || program.start <= at && at < program.end then continue
+        var copied = false
+        for k in program.copies
+            if k.start <= at && at < k.end then copied = true
+        if !copied then return true
+    false
+
+/** The name a module of the session's is imported whole by. */
+module_alias(n: usize) -> string = s"avinReplC$n"
 
 // The statements of `text`, read as the body of a function, or `None` where it does not parse.
 private cell_items(text: string) -> Option[Buf[&Expr]]
@@ -594,46 +1042,158 @@ const FocusCode: u8 = 0
 const FocusDecl: u8 = 1
 const FocusImports: u8 = 2
 
-/** The program of the session with `imports` and `decls`, its kept code, and `code` last, followed by
- * `shows`; with `marked`, writing `ReplStart` before `code` and `ReplEnd` after `shows`. Its place is
- * that of the part `focus` names, `first` columns of the code's first line being no part of what was
- * typed. */
-repl_program(s: *ReplSession, imports: Buf[string], decls: Buf[ReplDecl], code: Option[string], shows: Buf[string], marked: bool, first: usize, focus: u8) -> ReplProgram
-    var out = str_builder()
-    var line = 1usize
-    var place = ReplPlace(1, imports.len(), 0, 0)
-    for i in imports
-        out.push(i + "\n")
-        line += 1
-    if imports.len() > 0
-        out.push("\n")
-        line += 1
-    for d in decls
-        if focus == FocusDecl then place = ReplPlace(line, count_lines(d.text), 0, 0)
-        out.push(d.text + "\n\n")
-        line += count_lines(d.text) + 1
-    out.push("private " + ReplShow + "(name: string, type: string, value: Any) = println(name + \": \" + type + \" = \" + f\"${value}%?\")\n\nmain()\n")
-    line += 3
+/** The program of the session with `imports` and `cells`: a module for each cell that is one, and the
+ * root file, whose `main` holds what each cell writes there, each nested in the one before, and
+ * `code` last, followed by `shows`; with `marked`, writing `ReplStart` before `code` and `ReplEnd`
+ * after `shows`. Its place is that of the part `focus` names (the newest text of cell `focus_cell`
+ * for a declaration), `first` columns of the code's first line being no part of what was typed. */
+repl_program(s: *ReplSession, imports: Buf[string], kept: Buf[ReplCell], code: Option[string], shows: Buf[string], marked: bool, first: usize, focus: u8, focus_cell: usize) -> ReplProgram
+    val cells = written_cells(kept)
+    var modules: Buf[ReplModuleFile] = buf()
+    var place = ReplPlace(s.file, 1, imports.len(), 0, 0)
+    for k in 0..<cells.len()
+        val cell = cells[k]
+        if cell.kind == CellCode then continue
+        val file = cell_file(s, cell.number)
+        var out = ReplText(buf(), 0, 1)
+        out.put(s"module ${cell_module(cell.number)}\n\n")
+        val upto = if cell.imports < imports.len() then cell.imports else imports.len()
+        var before: Buf[string] = buf()
+        for i in 0..<upto
+            before.push(imports[i])
+        out.put(module_imports(before, cells, cell.upto, cell.names, false, k))
+        for i in 0..<cell.texts.len()
+            val t = cell.texts[i]
+            if i > 0 then out.put("\n")
+            if focus == FocusDecl && k == focus_cell && i + 1 == cell.texts.len() then place = ReplPlace(file, out.line, count_lines(t), 0, 0)
+            out.put(t + "\n")
+        modules.push(ReplModuleFile(file, cell_module(cell.number), out.finish()))
+    var out = ReplText(buf(), 0, 1)
+    var none: Buf[string] = buf()
+    out.put(module_imports(imports, cells, cells.len(), none, true, cells.len()))
+    out.put("private " + ReplShow + "(name: string, type: string, value: Any) = println(name + \": \" + type + \" = \" + f\"${value}%?\")\n\n")
+    val main_start = out.at
+    out.put("main()\n")
     var depth = 1usize
-    for k in s.code
-        out.push(repl_indented(k, depth * 2, 0))
-        line += count_lines(k)
-        out.push(" ".repeat(depth * 2) + "if true\n")
-        line += 1
+    var copies: Buf[Span] = buf()
+    for k in 0..<cells.len()
+        val cell = cells[k]
+        if cell.main == "" then continue
+        val from = out.at
+        out.put(repl_indented(cell.main, depth * 2, 0))
+        // A hoisted input, written as a module or not yet, uses no local: a use of it is none either.
+        if kept[k].kind != CellCode then copies.push(Span(from, out.at))
+        out.put(" ".repeat(depth * 2) + "if true\n")
         depth += 1
     val pad = " ".repeat(depth * 2)
+    var start = out.at
+    var end = out.at
     code match
         Some(k) ->
-            if marked
-                out.push(pad + s"print(${avin_string(ReplStart)})\n")
-                line += 1
-            if focus == FocusCode then place = ReplPlace(line, count_lines(k), depth * 2, first)
-            out.push(repl_indented(k, depth * 2, 0))
+            if marked then out.put(pad + s"print(${avin_string(ReplStart)})\n")
+            if focus == FocusCode then place = ReplPlace(s.file, out.line, count_lines(k), depth * 2, first)
+            start = out.at
+            out.put(repl_indented(k, depth * 2, 0))
+            end = out.at
             for sh in shows
-                out.push(pad + sh + "\n")
-            if marked then out.push(pad + s"print(${avin_string(ReplEnd)})\n")
-        None -> out.push(pad + "()\n")
-    ReplProgram(out.finish(), place)
+                out.put(pad + sh + "\n")
+            if marked then out.put(pad + s"print(${avin_string(ReplEnd)})\n")
+        None -> out.put(pad + "()\n")
+    ReplProgram(out.finish(), modules, place, start, end, main_start, copies)
+
+/** The imports at the top of one of the program's files, followed by an empty line when there are
+ * any: the session's `imports`; each module of the session's before cell `upto`, imported whole; and,
+ * by name, the newest of each name the cells before it give, where that is a module's and `own` does
+ * not declare it (`types` keeping only a declaration of types'). A session's import of a name a module
+ * gives is left out, the module's being the nearer. */
+module_imports(imports: Buf[string], cells: Buf[ReplCell], upto: usize, own: Buf[string], types: bool, self_cell: usize) -> string
+    // The newest cell giving each name, in the order the names were first given.
+    var order: Buf[string] = buf()
+    var newest: Map[string, usize] = map()
+    for k in 0..<upto
+        if k == self_cell then continue
+        for n in cells[k].names
+            if newest.get(n) is None then order.push(n)
+            newest.put(n, k)
+    var given: Buf[string] = buf()
+    var from: Buf[usize] = buf()
+    for n in order
+        if has_name(own, n) then continue
+        val k = newest.get(n).unwrap()
+        val kind = cells[k].kind
+        if kind == CellCode || types && kind != CellTypes then continue
+        given.push(n)
+        from.push(k)
+    var out = str_builder()
+    var any = false
+    for line in imports
+        val kept = import_without(line, given, own)
+        if kept != ""
+            out.push(kept + "\n")
+            any = true
+    for k in 0..<upto
+        val cell = cells[k]
+        if cell.kind == CellCode || k == self_cell then continue
+        val m = cell_module(cell.number)
+        out.push(s"import $m as ${module_alias(cell.number)}\n")
+        any = true
+        var names: Buf[string] = buf()
+        for i in 0..<given.len()
+            if from[i] == k then names.push(given[i])
+        if names.len() == 1 then out.push(s"import $m.${names[0]}\n")
+        elif names.len() > 1
+            out.push(s"import $m.{")
+            for i in 0..<names.len()
+                if i > 0 then out.push(", ")
+                out.push(names[i])
+            out.push("}\n")
+    if any then out.push("\n")
+    out.finish()
+
+/** An import line of the session's with the names `given` or `own` bind left out: the line as it is
+ * when it binds none of them, and "" when it binds only those. */
+import_without(line: string, given: Buf[string], own: Buf[string]) -> string
+    val parsed = parse(source_of(ReplInputName, line + "\n"))
+    var left: Buf[Import] = buf()
+    var dropped = false
+    for i in parsed.file.imports
+        if has_name(given, i.binding) || has_name(own, i.binding) then dropped = true else left.push(i)
+    if !dropped then return line
+    var out = str_builder()
+    var first = true
+    for i in left
+        if !first then out.push("\n")
+        first = false
+        out.push("import " + i.path)
+        if !i.path.ends_with("." + i.binding) && i.path != i.binding then out.push(" as " + i.binding)
+    out.finish()
+
+/** The file the session's module `n` is written to, beside the session's own. */
+cell_file(s: *ReplSession, n: usize) -> string = s.file[0..<s.file.bytes.len - ".avin".bytes.len] + s"-c$n.avin"
+
+/** The name of the session's module `n`. */
+cell_module(n: usize) -> string = s"$ReplModule.c$n"
+
+/** Text written a piece at a time, counting the bytes and the lines written. */
+private struct ReplText
+    parts: Buf[string]
+    /** How many bytes have been written. */
+    at: usize
+    /** The line the next piece begins on, counted from one. */
+    line: usize
+
+    put(*self, text: string)
+        self.parts.push(text)
+        self.at += text.bytes.len
+        for b in text.bytes
+            if b == u8('\n') then self.line += 1
+
+    finish(self) -> string
+        var out = str_builder()
+        for p in self.parts
+            out.push(p)
+        out.finish()
+end ReplText
 
 // How many lines `text` is written on.
 private count_lines(text: string) -> usize
@@ -642,18 +1202,33 @@ private count_lines(text: string) -> usize
         if b == u8('\n') then n += 1
     n
 
-/** The program's files: the modules of the package the session was started in, and the session. */
-private repl_files(s: *ReplSession, text: string) -> Buf[ProgramFile]
+/** The program's files: the modules of the package the session was started in, the session's
+ * modules, and its root file, `main`'s. */
+private repl_files(s: *ReplSession, program: ReplProgram) -> Buf[ProgramFile] = repl_files_with(s, program, "", "")
+
+/** `repl_files`, the file named `file` holding `text` in place of what the program writes there. */
+private repl_files_with(s: *ReplSession, program: ReplProgram, file: string, text: string) -> Buf[ProgramFile]
     var files: Buf[ProgramFile] = buf()
     for f in s.base do files.push(f)
+    for m in program.modules
+        val written = if m.file == file then text else m.text
+        files.push(ProgramFile(source_of(m.file, written), Some(m.name), false, buf(), s.package))
     val module_name: Option[string] = if s.base.len() > 0 then Some("") else None
-    files.push(ProgramFile(source_of(s.file, text), module_name, false, buf(), s.package))
+    val root = if s.file == file then text else program.text
+    files.push(ProgramFile(source_of(s.file, root), module_name, false, buf(), s.package))
     files
+
+/** Whether `name` is one of the files the session writes. */
+private session_file(s: *ReplSession, name: string) -> bool
+    val stem = s.file[0..<s.file.bytes.len - ".avin".bytes.len]
+    name == s.file || name.starts_with(stem + "-c") && name.ends_with(".avin")
 
 /** Checks `program`, recording what each name means; where it does not check, writes the
  * diagnostics, placed in the input where they are in it, and answers `None`. */
 repl_check(s: *ReplSession, program: ReplProgram, out: &Fn(string) -> unit) -> Option[Checked]
-    val files = repl_files(s, program.text)
+    val began = phase_start()
+    defer _ = phase_done("repl-check", began)
+    val files = repl_files(s, program)
     val loaded = load_units(s.tc.library_dir(), files, false, src -> src) match
         Ok(l) -> l
         Err(message) ->
@@ -672,24 +1247,43 @@ repl_check(s: *ReplSession, program: ReplProgram, out: &Fn(string) -> unit) -> O
 
 /** `repl_check`, writing nothing. */
 private repl_check_quiet(s: *ReplSession, program: ReplProgram) -> Option[Checked]
-    val files = repl_files(s, program.text)
+    val began = phase_start()
+    val files = repl_files(s, program)
     val loaded = load_units(s.tc.library_dir(), files, false, src -> src) match
         Ok(l) -> l
         Err(_) -> return None
     if loaded.broken then return None
     val checked = check_program(loaded.units, loaded.root_module, false, true)
+    _ = phase_done("repl-check", began)
     if checked.has_errors() then return None
     Some(checked)
 
+/** The files of `program` that do not check. */
+private repl_broken_files(s: *ReplSession, program: ReplProgram) -> Buf[string]
+    var broken: Buf[string] = buf()
+    val loaded = load_units(s.tc.library_dir(), repl_files(s, program), false, src -> src) match
+        Ok(l) -> l
+        Err(_) -> return broken
+    if loaded.broken
+        for u in loaded.units
+            if u.report.has_errors() then broken.push(u.src.name)
+        return broken
+    val checked = check_program(loaded.units, loaded.root_module, false, true)
+    for u in checked.units
+        if u.report.has_errors() then broken.push(u.src.name)
+    broken
+
 /** The diagnostics of `report`, about `src`: those in the session's newest input are placed in the
- * input as it was typed; any other is rendered against its own file. */
+ * input as it was typed, and those elsewhere in the session's files said to be in an earlier input;
+ * any other is rendered against its own file. */
 repl_render(s: *ReplSession, src: Source, report: Report, place: ReplPlace) -> string
-    if src.name != s.file then return report.render(src)
+    if !session_file(s, src.name) then return report.render(src)
+    val here = if src.name == place.file then place else ReplPlace(src.name, 0, 0, 0, 0)
     var out = str_builder()
     for i in 0..<report.len()
         val d = report.at(i)
         if !d.is_error() then continue
-        out.push(repl_render_one(src, d, place))
+        out.push(repl_render_one(src, d, here))
     out.finish()
 
 // One diagnostic of the session's file, placed in the newest input when it is there.
@@ -764,7 +1358,9 @@ private names_at(text: string, span: Span, name: string) -> bool
  * ran to its end. */
 repl_run(s: *ReplSession, program: ReplProgram, out: &Fn(string) -> unit) -> bool
     _ = write_text(s.file, program.text)
-    val files = repl_files(s, program.text)
+    for m in program.modules
+        _ = write_text(m.file, m.text)
+    val files = repl_files(s, program)
     val built = cached_build(s.tc, s.file, files, false, "-O0", s.sysl, s.c) match
         Ok(b) -> b
         Err(message) ->
@@ -874,10 +1470,39 @@ struct ReplOutput
         out(self.relocated(text))
 
     /** `text` with each place `name:line:column` in the session's file written as the place in the
-     * input, `<input>:line:column`, or, outside it, as `an earlier input`. */
+     * input, `<input>:line:column`, or, outside it, as `an earlier input`; a place in one of the
+     * session's modules is in an earlier input too. */
     relocated(self, text: string) -> string
         if self.name == "" then return text
         val mark = self.name + ":"
+        var rest = self.relocated_main(text, mark)
+        if !self.name.ends_with(".avin") then return rest
+        val stem = self.name[0..<self.name.bytes.len - ".avin".bytes.len] + "-c"
+        var out = str_builder()
+        loop
+            val i = rest.index_of(stem) match
+                Some(i) -> i
+                None -> break
+            out.push(rest[0..<i])
+            rest = rest[i + stem.bytes.len..]
+            // `<stem>N.avin:line:column`
+            val n = digits_at(rest, 0)
+            val tail = rest[n..]
+            if n == 0 || !tail.starts_with(".avin:")
+                out.push(stem)
+                continue
+            val line_digits = digits_at(tail, ".avin:".bytes.len)
+            val after_line = ".avin:".bytes.len + line_digits
+            if line_digits == 0 || after_line >= tail.bytes.len || tail.bytes[after_line] != u8(':') || digits_at(tail, after_line + 1) == 0
+                out.push(stem)
+                continue
+            out.push("an earlier input")
+            rest = tail[after_line + 1 + digits_at(tail, after_line + 1)..]
+        out.push(rest)
+        out.finish()
+
+    // `relocated`'s places in the session's own file, `main`'s.
+    private relocated_main(self, text: string, mark: string) -> string
         var out = str_builder()
         var rest = text
         loop
