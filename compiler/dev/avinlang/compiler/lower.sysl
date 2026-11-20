@@ -4404,6 +4404,15 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
         val form = c_array_form(t, l.program.data, l.program.classes).unwrap()
         val size = c_array_element_size(form.element)
         val a = if !form.optional then x elif pointer_option(l, t) then x else option_pointer(l, t, x)
+        // C reads and writes the array's elements, so an array moved away from the code running stops
+        // the program at the call, as any other use of it does.
+        var check_types: Buf[MirType] = buf()
+        check_types.push(MRef)
+        check_types.push(MPtr)
+        var check_args: Buf[Operand] = buf()
+        check_args.push(a)
+        check_args.push(TrapSiteAddress(trap_site(l, "", symbol.decl.name_span)))
+        l.insts.push(Call(None, Runtime("avin_rt_array_check", mir_signature(check_types, None)), check_args))
         val write = q.ty match
             CText(constant) -> !constant
             _ -> !(" " + q.pointee_text + " ").contains(" const ")
@@ -4419,7 +4428,7 @@ private c_arrays_in(l: *Lowering, symbol: FunctionSymbol, p: CPrototype, blockin
             length = runtime_call(l, "avin_rt_c_array_length", [MRef], MInt(32), [a])
             limit = runtime_call(l, "avin_rt_c_array_limit", [MRef], MInt(64), [a])
         else
-            length = byte_length(l, a)
+            length = array_length_of(l, a)
             limit = convert_op(l, SignExtend, MInt(64), length)
         if c_struct_of(form.element, l.program.data) is Some(d)
             val memory = c_struct_array_in(l, symbol, d, a, length, symbol.decl.name_span)
@@ -6379,8 +6388,93 @@ private intrinsic_operation(l: *Lowering, name: string, args: Buf[Operand], at: 
         return Some(runtime_call(l, "avin_rt_string_repeat", [MRef, MInt(32)], MRef, [s, args[1]]))
     None
 
-/** The bytes of an array's header, its length, before its elements. */
-private const ArrayHeader: usize = 8
+/** The bytes of an array's header, its length and its owner, before its elements. */
+private const ArrayHeader: usize = 16
+
+/** The offset of an array's owner word: zero for an array never moved, which any code may use, and
+ * otherwise the owner of the only code that may. */
+private const ArrayOwner: usize = 8
+
+/** What a use of an array moved away from the code running stops the program with. */
+private const ArrayForeign: string = "`Array` was moved to another owner"
+
+// The length word of the array `a`. For an array never moved it is the length. For one ever moved
+// the top bit is set, so that as a signed number it is negative, the length is in bits 32 to 62, and
+// the low 32 bits are zero, so that the bounds check every element use makes, the index against the
+// low 32 bits, fails for every index and leads to the owner check.
+private array_word(l: *Lowering, a: Operand) -> Operand
+    val word = fresh(l, MInt(64))
+    l.insts.push(Load(word, a))
+    Value(word)
+
+// Stops the program where the code running does not own the array `a`, whose owner word is compared
+// with the context's.
+private trap_unless_owner(l: *Lowering, a: Operand, at: Span)
+    val held = load_field(l, a, FieldSlot(ArrayOwner, MInt(64)))
+    val mine = fresh(l, MInt(64))
+    l.insts.push(Load(mine, OwnerWord))
+    trap_if(l, compare(l, CmpNe, held, Value(mine)), ArrayForeign, at)
+
+// Marks the block being lowered as one the program rarely reaches, by a call to a runtime function
+// declared cold that does nothing: the optimizer lays such a block out of the hot path and weighs
+// the branch to it as almost never taken, as it does a trap's.
+private mark_cold(l: *Lowering) = l.insts.push(Call(None, Runtime("avin_rt_array_slow", mir_signature(buf(), None)), buf()))
+
+// The length a moved array's length word `word` holds, in its bits 32 to 62, as an `int`.
+private moved_length(l: *Lowering, word: Operand) -> Operand
+    val high = binary(l, MInt(64), OpLShr, word, ConstInt(64, "32"))
+    binary(l, MInt(32), OpAnd, convert_op(l, Truncate, MInt(32), high), ConstInt(32, "2147483647"))
+
+// The length of the array `a`, whose length word is `word`, moved or not, as an `int`.
+private decoded_length(l: *Lowering, word: Operand) -> Operand
+    val moved = compare(l, CmpLt, word, ConstInt(64, "0"))
+    val length = fresh(l, MInt(32))
+    l.insts.push(Select(length, moved, moved_length(l, word), convert_op(l, Truncate, MInt(32), word)))
+    Value(length)
+
+// Stops the program unless `index` is within the array `a` and the code running may use it. The
+// fast path is the bounds check of an array never moved, the index against the low 32 bits of the
+// length word, unchanged: a moved array's are zero, so every index fails it, and the slow path tells
+// a moved array, whose owner it checks before the index, from an index out of range.
+private element_in_bounds(l: *Lowering, a: Operand, index: Operand, at: Span)
+    val word = array_word(l, a)
+    val outside = compare(l, CmpUge, index, convert_op(l, Truncate, MInt(32), word))
+    val slow = new_block(l)
+    val next = new_block(l)
+    finish_into(l, Branch(outside, slow, next), slow)
+    mark_cold(l)
+    trap_if(l, compare(l, CmpGe, word, ConstInt(64, "0")), "index out of range", at)
+    trap_unless_owner(l, a, at)
+    trap_if(l, compare(l, CmpUge, index, moved_length(l, word)), "index out of range", at)
+    finish_into(l, Jump(next), next)
+
+// The array `a`'s length, as an `int`, after checking that the code running may use it. The fast
+// path is an array never moved, whose length is its word's low 32 bits as it always was, so a loop
+// bounded by `length` lets the optimizer drop the bounds check of the elements it indexes; a moved
+// one's length is decoded on the slow path, after its owner is checked.
+private checked_length(l: *Lowering, a: Operand, at: Span) -> Operand
+    val word = array_word(l, a)
+    val slot = machine_slot(l, MInt(32))
+    store(l, slot, Some(convert_op(l, Truncate, MInt(32), word)))
+    val moved = compare(l, CmpLt, word, ConstInt(64, "0"))
+    val slow = new_block(l)
+    val next = new_block(l)
+    finish_into(l, Branch(moved, slow, next), slow)
+    mark_cold(l)
+    trap_unless_owner(l, a, at)
+    store(l, slot, Some(moved_length(l, word)))
+    finish_into(l, Jump(next), next)
+    load(l, slot).unwrap()
+
+// The length of the array `a`, moved or not, with no check of its owner: for a caller that has
+// checked it already.
+private array_length_of(l: *Lowering, a: Operand) -> Operand = decoded_length(l, array_word(l, a))
+
+// Whether `array` is the core library's `Array`, rather than the frozen array a `Vector` or an
+// `ArraySeq` keeps, which the library alone makes and nothing moves.
+private movable_array(l: *Lowering, array: &Type) -> bool = *array match
+    Class(k, _, _) -> core_class(l, "Array") == Some(k)
+    _ -> false
 
 // The array operations, on an array of type `array`, whose element type decides each element's
 // width and machine type. An array's length is a 64-bit word at its start, at most the largest
@@ -6406,9 +6500,17 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
     if name == "array_publish"
         l.insts.push(Publish)
         return None
-    if name == "array_length" then return Some(byte_length(l, a))
+    // Every other operation reads or writes the array, so it checks that the array was not moved
+    // away: an element's bounds check does it in passing (below), and the rest read the length word
+    // and test its top bit. A copy checks its target too, which is always an `Array`, whatever its
+    // source. A frozen array is the library's own and never moved.
+    val movable = movable_array(l, array)
+    if name == "array_copy"
+        if movable then _ = checked_length(l, a, at)
+        _ = checked_length(l, args[2], at)
+    if name == "array_length" then return Some(if movable then checked_length(l, a, at) else byte_length(l, a))
     if name == "array_clear"
-        trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)
+        trap_if(l, compare(l, CmpUgt, args[2], checked_length(l, a, at)), "slice out of range", at)
         trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
         var types: Buf[MirType] = buf()
         types.push(MRef)
@@ -6428,11 +6530,12 @@ private array_operation(l: *Lowering, name: string, array: &Type, args: Buf[Oper
         l.insts.push(Call(None, Runtime("avin_rt_array_copy", mir_signature(types, None)), args))
         return None
     if name == "array_slice"
-        trap_if(l, compare(l, CmpUgt, args[2], byte_length(l, a)), "slice out of range", at)
+        trap_if(l, compare(l, CmpUgt, args[2], if movable then checked_length(l, a, at) else byte_length(l, a)), "slice out of range", at)
         trap_if(l, compare(l, CmpUgt, args[1], args[2]), "slice out of range", at)
         return Some(runtime_call(l, "avin_rt_array_slice", [MRef, MInt(32), MInt(32)], MRef, [a, args[1], args[2]]))
     // `array_apply` and `array_update`: the element at the index, checked against the length.
-    trap_if(l, compare(l, CmpUge, args[1], byte_length(l, a)), "index out of range", at)
+    if movable then element_in_bounds(l, a, args[1], at)
+    else trap_if(l, compare(l, CmpUge, args[1], byte_length(l, a)), "index out of range", at)
     val t = m match
         Some(t) -> t
         None -> return None
