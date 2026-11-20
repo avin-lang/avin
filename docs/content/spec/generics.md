@@ -1083,9 +1083,13 @@ traits, subtyping with declaration-site variance, traits implemented through `im
 [opaque types](/spec/declarations/#opaque-types), new types laid out as an existing one, and
 [refined variants](/spec/refined-variants/), whose `match` arms learn type equalities. It has no type lambdas beyond the partial
 application of one type's own arguments, no constructors of constructors, and no type members,
-inferred unions, implicit parameters, implicit conversions or macros. Intersections exist only as
+inferred unions, implicit conversions or macros. Intersections exist only as
 [bounds](#bounds), `[T: A & B]`: there is no intersection type to annotate a value with, so a value
-of two traits at once is always a bounded parameter's, monomorphized at its type argument. The
+of two traits at once is always a bounded parameter's, monomorphized at its type argument. A
+context a call needs (a transaction, a logger) may be passed as a
+[contextual parameter](/spec/contextual-parameters/), filled from a `given` in scope; that is a value
+and never a conformance: a bound is met only by the type's `impl`, whatever givens are in scope, and
+a contextual parameter's type names no type parameter. The
 [collections chapter](/spec/collections/) shows how the library gets precise result types without
 constructor parameters; the standard constructor traits stand beside those methods rather than
 replacing them.

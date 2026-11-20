@@ -9652,6 +9652,114 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     typed; its `main` becomes a local function to call. ALTERNATIVES: keeping the root module
     (its `main` collides with the session's); `:load` running the file's `main` (it can be called).
 
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`, the
+  design approved by the user 2026-11-13 and its build approved 2026-11-19; built from branch
+  `given-1` on): **contextual parameters are for context values, never for
+  conformances** ([contextual parameters](/spec/contextual-parameters/)). A `using` parameter is
+  filled from a `given` in scope; a bound is met only by the type's `impl`, a given never overrides
+  or adds to one, a contextual parameter's type names no type parameter, and a given has none. Why:
+  Avin already resolves trait instances coherently through `impl` and bounds, so letting a given
+  fill a bound would be a second way to supply an instance, and an incoherent one: a `TreeSet`
+  built under one ordering and searched under another. Under the principle the user set the same
+  day (*"the ultimate SOUND, NOMINALLY typed, compiled, garbage-collected high-level language"*),
+  coherence is not negotiable, so givens carry what conformances cannot: a transaction, a logger,
+  a request, a clock. A non-natural order stays an argument of its call (`sortWith`, `sortBy` with
+  `Reverse`). Alternatives weighed: a `using` of a trait type filled by a given, falling back to the
+  impl (two ways to do one thing, and incoherent across values built under different scopes);
+  givens for bounds only with priorities (the search and ambiguity rules that cost compile time and
+  predictability); no contextual parameters at all (every layer threads a logger by hand).
+  **Review with the user.** This is the central choice.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **every given is named; no anonymous givens.**
+  `given tx = db.begin()`, `given log: Logger = …`. Why: one way to declare one; the name is what a
+  call passes explicitly (`tx = …`), what a diagnostic names and what another file imports.
+  Alternatives weighed: anonymous `given RequestContext(id)` (a second form for the same thing, and
+  an import with nothing to name); `given existingName` to make a value a given (a second way to
+  make a lambda's parameter one, beside `using`). Review with the user: anonymous givens are the
+  likeliest to be missed.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **`using` is a trailing section of the one parameter
+  list**, `f(a: A, using tx: Tx, log: Logger)`, passed explicitly only by name. Why: Avin has one
+  parameter list per function and named arguments already; positional passing would let an
+  argument meant for an ordinary parameter land on a contextual one. Alternatives weighed: a second
+  parameter list `f(a)(using tx)` (Avin has no curried lists); `using` on each parameter (repetition);
+  positional explicit passing (ambiguous next to defaults).
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 3 of the [plan](/compiler/roadmap/#contextual-parameters-build-plan)): **resolution is lexical, nearest level wins, two fits
+  at one level are an error**: blocks, then enclosing functions' and lambdas' `using` parameters,
+  the class constructor's or actor's, the object's givens, then the module's own givens with the
+  file's imported ones; fit is nominal conformance; then the parameter's default. Why: one
+  deterministic answer per call, decided where it is written and shown by the source; no ranking by
+  specificity, so no rule a reader must simulate. Alternatives weighed: exact-type matching only (a
+  given `FileLogger` could not fill a `Logger`); most-specific ranking across levels (search, and
+  surprising winners); one flat scope (a block could not narrow a module's given).
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 4 of the plan): **a given is seen in another file only when imported
+  by name** (directly or through an export); importing the module whole does not bring its givens.
+  Why: a given changes what a call receives with nothing written at the call, so the file says
+  which; a library adding a given then cannot change an existing call elsewhere. Alternatives
+  weighed: givens seen through any import of their module, as extensions are (silent changes of
+  meaning); a `.given` wildcard import (Avin has no wildcard import). Review with the user.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **a given's type is a nominal type of the program**
+  (a class, an object's type, a trait used as a type, a `data` type, closed type arguments); built-in
+  types, tuples, function types and unions are refused, and a given is a `val`. Why: nominal typing
+  — a value fills a parameter because its type declares what it is, not because a common shape such
+  as `int` fits; and a `var` given would share a box across closures and threads.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; built
+  on branch `given-1`): **givens are declared in blocks, at a module's top
+  level and in object bodies; classes and actors take context as `using` parameters of their
+  constructors** (private fields, givens in their bodies). No `given` in class, trait or `data`
+  bodies, and none of `data` variants, `main`, tests, hooks or bindings take a `using` section. Why:
+  one place per kind of declaration; a class's context comes from whoever makes it.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 5 of the plan): **lambdas and function values.** A lambda resolves
+  where it is written and captures the givens it uses; its parameters after `using` are givens in
+  its body but positional in its type; function types have no `using` section; a function taken as a
+  value has its section filled where it is taken. Why: a function value is called with positional
+  arguments only (as for names and defaults), and lexical capture keeps one rule for every closure.
+  Alternatives weighed: contextual function types (`(using Tx) -> R`, a new kind of type); a
+  `given tx` statement in the lambda's body (a second way). Review with the user: contextual
+  function types are what would make `db.transaction { insert(row) }` need no parameter.
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; to be
+  built at step 5 of the plan): **a given does not cross `spawn` by itself**; a
+  closure that uses one captures it and is checked as any capture (sendability, no `var`). Why: a
+  given is a lexical value, not thread-local state, so the sharing rules see it. Alternatives
+  weighed: an inherited per-thread context (dynamic scoping, invisible in the source).
+- Settled on the user's delegation 2026-11-19 (proposed 2026-11-13 on branch `given-design`; the
+  section built on branch `given-1`, its filling at step 3 of the plan): **contextual parameters may have defaults**, used
+  where no given fits, and every default of the function sees the contextual parameters, which are
+  filled first. The section takes no part in choosing an overload. Why: a default is the natural
+  fallback (`using clock: Clock = SystemClock`), and resolving after the overload is chosen keeps
+  the cost of a call linear and its errors at the chosen function. No standard-library API adopts
+  contextual parameters in this design; adopting one (an `Executor` for `Future(body)`) is its own
+  item, since `ex.future(body)` already exists and the two would be two ways.
+- Settled on the user's delegation 2026-11-19 (branch `given-1`): **an opaque type may be a given's
+  and a contextual parameter's type**, beside classes, objects, traits used as types and `data`
+  types. Why: the refusal of built-in types exists because a given `int` would be given wherever
+  any `int` is asked for; an opaque type is a nominal type of its own (`opaque type UserId =
+  long`), which only what asks for a `UserId` receives, so it has none of that problem, and "avin is
+  for everyone" favours the wider rule. Alternatives weighed: refusing it as the design's list did
+  (a wrapper `data` type would be needed for a value an opaque type already names). Review with
+  the user.
+- Settled on the user's delegation 2026-11-19 (branch `given-1`): **where `given` and `using`
+  begin their forms.** `given` begins a given where a name and its `:` or `=` follow it; before
+  `val`, `var` or a capitalized name it is read as a given and reported (a `val` already; never a
+  `var`; every given named); everywhere else it is a name. `using` begins a section where a name
+  (or a class parameter's modifier) follows it in a parameter list, also in a parenthesized lambda
+  and as `using tx ->`, alone or as a call's trailing lambda. Why: the smallest test that keeps
+  every existing use (`args.given(…)`, `given = 3`, `given(x)`, a parameter `using: Mode`) meaning
+  what it did; the capitalized-name case turns the likeliest mistake, an unnamed given, into its
+  own message rather than a parse error. Alternatives weighed: reserving both words (breaks
+  existing programs); reading `given` before any name as a declaration (an infix call `given max
+  b` on a value named `given` would change meaning).
+- Settled on the user's delegation 2026-11-19 (branch `given-1`): **a contextual parameter has a
+  name, is neither by-name nor repeated, and a class's is written without `val`, `var` or
+  `private`; a repeated parameter may come just before the section.** Why: it is passed explicitly
+  only by name; a given is one value already made, so by-name evaluation and repetition mean
+  nothing for it; a class's contextual parameter is a private field and a given by definition.
+  The section comes last, so a repeated parameter is last of the others (`all(xs: int*, using tx:
+  Tx)`). A data variant takes no section, reported where it is parsed.
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
