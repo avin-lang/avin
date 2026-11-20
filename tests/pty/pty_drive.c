@@ -212,6 +212,9 @@ int main(int argc, char **argv) {
     int notty = 0;
     int job = 0;
     int i = 1;
+    /* A script may type at a program that has already finished: the write then fails with EPIPE,
+     * which is ignored, rather than killing the driver with SIGPIPE. */
+    signal(SIGPIPE, SIG_IGN);
     if (i < argc && strcmp(argv[i], "--notty") == 0) {
         notty = 1;
         i++;
@@ -233,6 +236,7 @@ int main(int argc, char **argv) {
         if (pipe(in) != 0 || pipe(out) != 0) return 2;
         child = fork();
         if (child == 0) {
+            signal(SIGPIPE, SIG_DFL);
             setsid();
             dup2(in[0], 0);
             dup2(out[1], 1);
