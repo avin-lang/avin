@@ -423,10 +423,13 @@ struct BodyState
 
 fresh_body(root: usize) -> BodyState = BodyState(root, buf(), buf(), buf(), buf(), 0, buf(), 0, buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None, 0, buf(), false, buf())
 
-/** A given declared in a block: its local, and where it is declared. */
+/** A given declared in a block, or a contextual parameter of a local function or a lambda: its local,
+ * where it is declared, and its scope, the position in `visible` where its block, or the function's
+ * parameters, begin. */
 struct GivenLocal
     local: usize
     span: Span
+    scope: usize
 
 /** A local type equality: type parameter `index` of `owner` is `ty` wherever local `marker`, which a
  * refining pattern declares beside the names it binds, is in scope. */
@@ -7784,7 +7787,7 @@ private check_conformance_members(c: *Checker, self_type: &Type, t: &Type, unit:
                 val want = c.symbols[tm].params
                 for i in 1..<want.len()
                     if i > 1 then shown = shown + ", "
-                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${param_type_text(seen_from(c, self_type, tm, want[i]), declares_variadic(c.symbols[tm].decl) && i + 1 == want.len())}"
+                    shown = shown + s"${c.symbols[tm].param_names[i]}: ${param_type_text(seen_from(c, self_type, tm, want[i]), repeated_at(c.symbols[tm].decl) == Some(i - 1))}"
                 c.note(unit, at, s"`${type_name(self_type)}` implements `${type_name(t)}` without `static $name($shown)`")
     c.seen_instance = None
 
@@ -7942,8 +7945,28 @@ private signature(c: *Checker, unit: usize, module_name: string, f: &Function, o
     c.generic = outer_generic
     FunctionSymbol(unit, module_name, f.name, f, params, names, result, intrinsic, None, buf(), buf(), buf(), false, false, false, buf(), None, owner, type_params, None, false, true, "", None, false)
 
+/** The parameters of `f` (its receiver, if it has one, before the `first`) that the default of its
+ * parameter `i` takes, in order: the receiver; then, for an ordinary parameter, those before it and
+ * the whole `using` section, which a call fills first; for a parameter of the section, the section's
+ * parameters before it. */
+default_inputs(f: FunctionSymbol, first: usize, i: usize) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    val start = f.params.len() - section_size(f.decl)
+    for k in 0..<first
+        out.push(k)
+    if i >= start
+        for k in start..<i
+            out.push(k)
+        return out
+    for k in first..<i
+        out.push(k)
+    for k in start..<f.params.len()
+        out.push(k)
+    out
+
 // Each default argument becomes a function of its own, declared beside the function whose parameter
-// it belongs to: it takes the parameters before that one, so the default may use them, and yields
+// it belongs to: it takes the parameters before that one (`default_inputs`), so the default may use
+// them, and the contextual parameters, which are givens in it, and yields
 // the default. It is checked in the declaring function's scope, never the caller's, and a call that
 // omits the argument calls it. A generic function's defaults are generic over the same parameters.
 // The default of a by-name parameter is its delayed expression: the function yields it unevaluated.
@@ -7988,7 +8011,7 @@ private declare_defaults(c: *Checker, id: usize)
         var params: Buf[&Type] = buf()
         var names: Buf[string] = buf()
         var decls: Buf[Param] = buf()
-        for k in 0..<i
+        for k in default_inputs(f, first, i)
             params.push(if shared then f.params[k] else substitute(f.params[k], id, own))
             names.push(f.param_names[k])
             if k >= first then decls.push(f.decl.params[k - first])
@@ -13476,7 +13499,7 @@ private opaque_wrap(c: *Checker, at: Span, name_span: Span, id: usize, args: Buf
     names.push("repr")
     var defaults: Buf[Option[usize]] = buf()
     defaults.push(None)
-    val signature = Signature(d.name, true, d.type_params, alias_owner(id), params, names, defaults, opaque_own_type(c, id), buf(), None, false, buf(), buf())
+    val signature = Signature(d.name, true, d.type_params, alias_owner(id), params, names, defaults, opaque_own_type(c, id), buf(), None, false, buf(), buf(), 0)
     val applied = apply(c, at, name_span, signature, args, explicit, expected, buf())
     if applied.cut || applied.args.len() != 1 then return applied.wrap(at, UnitConst)
     applied.wrap(at, Reveal(applied.args[0]))
@@ -14504,7 +14527,7 @@ private super_initialization(c: *Checker, receiver: &TExpr, sup: &Type, parent: 
         name_span = callee.span
     val s = c.classes[sid]
     val constructor = c.symbols[s.constructor]
-    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl), function_sites(c, s.constructor, 0), buf())
+    val signature = Signature(s.name, true, constructor.type_params, class_owner(sid), constructor.params, constructor.param_names, constructor.defaults, Unit, sargs, None, declares_variadic(constructor.decl), function_sites(c, s.constructor, 0), buf(), section_size(constructor.decl))
     val outer = c.super_args
     c.super_args = true
     val applied = apply(c, parent.span, name_span, signature, args, None, None, buf())
@@ -14874,6 +14897,10 @@ private check_local_symbol(c: *Checker, id: usize)
     for i in 0..<symbol.params.len()
         param_locals.push(add_local(c, decl.span, symbol.param_names[i], symbol.params[i], false))
     c.symbols[id].param_locals = param_locals
+    // Its contextual parameters are givens in its body, a level of their own outside it.
+    val offset = symbol.params.len() - decl.params.len()
+    for k in 0..<decl.params.len()
+        if decl.params[k].contextual then c.body.givens.push(GivenLocal(param_locals[k + offset], decl.params[k].span, mark))
     note_refined_function(c, id)
     var subjects: Buf[&TExpr] = buf()
     for i in 0..<param_locals.len()
@@ -17062,18 +17089,20 @@ private joined_types(types: Buf[&Type]) -> string
 private takes_params(c: *Checker, t: &Type, ms: Buf[usize], wanted: Buf[&Type]) -> bool
     for m in ms
         val s = c.symbols[m]
-        val total = s.params.len() - 1
+        // A `using` section is filled where the call is made, so it takes no part.
+        val total = s.params.len() - 1 - section_size(s.decl)
         var required = total
-        for i in 1..<s.defaults.len()
-            if s.defaults[i] is Some(_) && required > 0 then required -= 1
-        val variadic = s.decl.params.len() > 0 && s.decl.params[s.decl.params.len() - 1].variadic
+        for i in 1..<total + 1
+            if i < s.defaults.len() && s.defaults[i] is Some(_) && required > 0 then required -= 1
+        val repeated = repeated_at(s.decl)
+        val variadic = repeated is Some(_)
         if variadic && required > 0 then required -= 1
         if wanted.len() < required || (wanted.len() > total && !variadic) then continue
         if s.decl.type_params.len() > 0 then return true
         var all = true
         for i in 0..<wanted.len()
-            if i + 1 >= s.params.len() then break
-            if variadic && i + 2 == s.params.len() then break
+            if i >= total then break
+            if repeated == Some(i) then break
             if !fits(c, wanted[i], seen_from(c, t, m, s.params[i + 1])) then all = false
         if all then return true
     false
@@ -17104,7 +17133,10 @@ private forwarder(c: *Checker, f: usize, k: usize, tm: usize, several: bool) -> 
         overload = overload + type_name(ty)
         val read = Expr(at, Name(base.param_names[i]))
         val variadic = i - 1 < base.decl.params.len() && base.decl.params[i - 1].variadic
-        args.push(Argument(at, None, if variadic then Expr(at, Splice(read)) else read, false))
+        // A contextual parameter is passed on by name, the one way an argument reaches one.
+        val contextual = i - 1 < base.decl.params.len() && base.decl.params[i - 1].contextual
+        val named: Option[string] = if contextual then Some(base.param_names[i]) else None
+        args.push(Argument(at, named, if variadic then Expr(at, Splice(read)) else read, false))
     val via = Expr(at, Member(Expr(at, Name("self")), fw.decl.via))
     val member = Expr(at, Member(via, item.name))
     val body = if base.decl.parameterless then member else Expr(at, Call(member, args))
@@ -17545,7 +17577,7 @@ private given_binding_expr(c: *Checker, e: &Expr, name: string, declared: Option
                 c.note(unit, e.span, s"`$name` is a second given of type `${type_name(ty)}` in this block, beside `${other.name}` (line ${c.units[unit].src.locate(g.span.start).line})")
                 break
     val index = declare_local(c, e.span, name, ty, false)
-    c.body.givens.push(GivenLocal(index, e.span))
+    c.body.givens.push(GivenLocal(index, e.span, c.body.block_start))
     TExpr(e.span, if *typed.ty is Nothing then Nothing else Unit, Let(index, typed))
 
 /** Whether local `index` is declared in the innermost block, and in scope there. */
@@ -21806,8 +21838,22 @@ is_array_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name =
 /** Whether a class is the core library's `Vector`, whose one field is the array of its elements. */
 is_vector_class(k: ClassSymbol) -> bool = k.module_name == CoreModule && k.name == "Vector" && !k.decl.object
 
-/** Whether a function's last parameter is repeated, `values: T*`. */
-declares_variadic(f: &Function) -> bool = f.params.len() > 0 && f.params[f.params.len() - 1].variadic
+/** Whether a function has a repeated parameter, `values: T*`: its last, or its last before its `using`
+ * section. */
+declares_variadic(f: &Function) -> bool = repeated_at(f) is Some(_)
+
+/** The position among `f`'s written parameters of its repeated one, if it has one. */
+repeated_at(f: &Function) -> Option[usize]
+    for i in 0..<f.params.len()
+        if f.params[i].variadic then return Some(i)
+    None
+
+/** How many parameters `f`'s `using` section holds, which come last. */
+section_size(f: &Function) -> usize
+    var n = 0usize
+    for p in f.params
+        if p.contextual then n += 1
+    n
 
 /** `Vector[t]`: inside its function, a repeated parameter of element type `t` is a vector. */
 private vector_of(c: *Checker, t: &Type) -> &Type = core_class_of(c, "Vector", t)
@@ -22318,7 +22364,7 @@ private apply_text(c: *Checker, o: usize, m: usize) -> string
     for i in 1..<f.params.len()
         names.push(f.param_names[i])
         params.push(f.params[i])
-    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params, declares_variadic(f.decl))
+    candidate_text(c.classes[o].name + ".apply", f.type_params, names, params, repeated_at(f.decl))
 
 // A call by the name of object `o`, which declares `apply`: `Name(…)` chooses among the object's
 // `apply` methods and, for a companion, the constructor its name has in call position, the class's
@@ -22338,7 +22384,7 @@ private apply_call(c: *Checker, at: Span, name_span: Span, name: string, o: usiz
     if variant is Some(v)
         val s = variant_signature(c, v)
         signatures.push(s)
-        labels.push(candidate_text(s.name, s.type_params, s.names, s.params, s.variadic))
+        labels.push(candidate_text(s.name, s.type_params, s.names, s.params, repeated_of(s)))
     val first_method = signatures.len()
     for m in ms
         signatures.push(method_signature(c, receiver, m, ErrorType))
@@ -22398,7 +22444,7 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
-    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, enclosing_type_args(f), None, declares_variadic(f.decl), function_sites(c, id, 0), buf())
+    Signature(f.name, true, f.type_params, f.type_owner, f.params, f.param_names, f.defaults, result, enclosing_type_args(f), None, declares_variadic(f.decl), function_sites(c, id, 0), buf(), section_size(f.decl))
 
 /** A generic local function's type arguments for the type parameters it shares with the code it is
  * declared in: those parameters themselves, as every call it can be named from sees them. */
@@ -22989,10 +23035,11 @@ private overload_text(c: *Checker, id: usize) -> string
         names.push(f.param_names[i])
         params.push(f.params[i])
     // A local function shows its own type parameters, not those it shares with the enclosing code.
-    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params, declares_variadic(f.decl))
+    candidate_text(f.name, if f.root is Some(_) then f.decl.type_params else f.type_params, names, params, repeated_at(f.decl))
 
-/** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". */
-private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type], variadic: bool) -> string
+/** A candidate of a call as written, for a diagnostic: "`f[T](x: T)`". `repeated` is the position of
+ * its repeated parameter among `params`. */
+private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[string], params: Buf[&Type], repeated: Option[usize]) -> string
     var text = name
     if type_params.len() > 0
         text = text + "["
@@ -23003,7 +23050,7 @@ private candidate_text(name: string, type_params: Buf[TypeParam], names: Buf[str
     text = text + "("
     for i in 0..<params.len()
         if i > 0 then text = text + ", "
-        text = text + names[i] + ": " + param_type_text(params[i], variadic && i + 1 == params.len())
+        text = text + names[i] + ": " + param_type_text(params[i], repeated == Some(i))
     "`" + text + ")`"
 
 /** A parameter's type as declared: a repeated parameter, held as `Vector[T]`, is written `T*`. */
@@ -23640,12 +23687,12 @@ private takes_one_argument(c: *Checker, ms: Buf[usize]) -> bool
     for m in ms
         val s = c.symbols[m]
         var required = 0usize
-        // A repeated parameter takes zero arguments or more, so it is never required.
-        val repeated = declares_variadic(s.decl)
+        // A repeated parameter takes zero arguments or more, so it is never required, and a `using`
+        // section is filled from the givens.
         for i in 1..<s.params.len()
-            if repeated && i + 1 == s.params.len() then continue
+            if !written_required(s, i) then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
-        if required <= 1 && s.params.len() >= 2 then return true
+        if required <= 1 && s.params.len() - section_size(s.decl) >= 2 then return true
     false
 
 // Whether one of the methods `ms` can be called with no argument: the method `-` a prefix `-` calls.
@@ -23653,12 +23700,18 @@ private takes_no_argument(c: *Checker, ms: Buf[usize]) -> bool
     for m in ms
         val s = c.symbols[m]
         var required = 0usize
-        val repeated = declares_variadic(s.decl)
         for i in 1..<s.params.len()
-            if repeated && i + 1 == s.params.len() then continue
+            if !written_required(s, i) then continue
             if i >= s.defaults.len() || s.defaults[i] is None then required += 1
         if required == 0 then return true
     false
+
+/** Whether parameter `i` of method `s` (its receiver at 0) is one a call writes an argument for unless
+ * it has a default: neither its repeated parameter nor in its `using` section. */
+private written_required(s: FunctionSymbol, i: usize) -> bool
+    if i == 0 || i - 1 >= s.decl.params.len() then return true
+    val p = s.decl.params[i - 1]
+    !p.variadic && !p.contextual
 
 // An infix call of a method that takes some other number of arguments. A tuple written as the
 // argument is spelled back as the arguments of a dotted call.
@@ -23774,7 +23827,7 @@ private method_signature(c: *Checker, receiver: &TExpr, m: usize, result: &Type)
         params.push(with_self(c, m, receiver.ty, target.params[i]))
         names.push(target.param_names[i])
         defaults.push(if i < target.defaults.len() then target.defaults[i] else None)
-    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl), function_sites(c, m, 1), buf())
+    Signature(target.decl.name, true, target.type_params, target.type_owner, params, names, defaults, with_self(c, m, receiver.ty, result), known, Some(receiver), declares_variadic(target.decl), function_sites(c, m, 1), buf(), section_size(target.decl))
 
 /** Type `t` of method `m` with the `Self` of a trait declaring `m` as the receiver's type. */
 private with_self(c: *Checker, m: usize, receiver_type: &Type, t: &Type) -> &Type
@@ -24085,14 +24138,14 @@ private variant_signature(c: *Checker, v: VariantRef) -> Signature
                     kept.push(if kept_constructor(args[i], owner, i) then TypeVar(owner, i, d.decl.type_params[i].name) else args[i])
                 Data(id, name, kept)
             _ -> r
-        None -> return Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false, variant_sites(c, v), buf())
+        None -> return Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, own_type(d, v.data), buf(), None, false, variant_sites(c, v), buf(), 0)
     var fixed: Buf[Option[&Type]] = buf()
     for j in 0..<variant.params.len()
         var named = names_type_var(result, owner, j)
         for f in variant.fields
             if names_type_var(f, owner, j) then named = true
         fixed.push(if named then None else Some(Nothing))
-    Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, result, buf(), None, false, variant_sites(c, v), fixed)
+    Signature(variant.name, called, variant.params, owner, variant.fields, variant.field_names, variant.defaults, result, buf(), None, false, variant_sites(c, v), fixed, 0)
 
 /** What a call is checked against: a function's or a variant's parameters and result, written in
  * terms of the type parameters `type_params` that belong to `owner`. `called` is false for a variant
@@ -24113,7 +24166,8 @@ private struct Signature
     /** A method's receiver, as the call holds it: its defaults take it before the parameters. */
     receiver: Option[&TExpr]
     /** Whether the last parameter is repeated: its type is `Vector[T]`, and the call gives it any
-     * number of `T`s, or one sequence spliced with `xs*`. */
+     * number of `T`s, or one sequence spliced with `xs*`. It is the last parameter before the `using`
+     * section (`repeated_of`). */
     variadic: bool
     /** Where each parameter is declared, for an argument written with its name; empty unless the
      * check is recording references. */
@@ -24122,6 +24176,12 @@ private struct Signature
      * of a data type that one of its refined variants names in neither its fields nor its result,
      * as `T` in `IntLit(value: int) -> Expr[int]`. Empty where every parameter is the call's. */
     fixed: Buf[Option[&Type]]
+    /** How many of the parameters, the last ones, are its `using` section: passed only by name, and
+     * otherwise filled from the givens in scope after the written arguments chose the signature. */
+    section: usize
+
+/** The position of `s`'s repeated parameter, the last before its `using` section, if it has one. */
+private repeated_of(s: Signature) -> Option[usize] = if s.variadic then Some(s.params.len() - s.section - 1) else None
 
 /** A call's arguments, one per parameter in parameter order, its solved type arguments, and its
  * result type. `prelude` evaluates what the call needs first: the written arguments in the order
@@ -24179,13 +24239,19 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var positional = 0usize
     // A repeated parameter takes every positional argument from its position on, or one sequence
     // spliced with `xs*` as the only one.
-    val repeated: Option[usize] = if s.variadic then Some(s.params.len() - 1) else None
+    val repeated = repeated_of(s)
+    // Positional arguments and an indented block reach only the parameters before the `using`
+    // section, whose parameters are passed by name or filled from the givens (`fill_contextual`).
+    val written = s.params.len() - s.section
+    var all_positional = 0usize
+    for a in args
+        if a.name is None && !a.block then all_positional += 1
     for j in 0..<args.len()
         val a = args[j]
         if a.block
             // An indented block after the call's line is given to the last parameter, which takes
             // a delayed expression or a function.
-            val last = s.params.len()
+            val last = written
             if last == 0 || slots[last - 1] is Some(_)
                 if report
                     if last == 0 then c.note(unit, a.span, s"`${s.name}` takes no arguments, so the indented block after the call has no $noun to be given to")
@@ -24222,14 +24288,19 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
                         continue
                 if spliced
                     if report
-                        val given = if j < s.params.len() then s"`${s.names[j]}`, which is not repeated" else "no parameter"
+                        val given = if j < written then s"`${s.names[j]}`, which is not repeated" else "no parameter"
                         c.note(unit, a.span, s"`*` passes a sequence to a repeated parameter, but this argument of `${s.name}` is given to $given")
                     fits = false
                     targets.push(None)
                     continue
-                if j < s.params.len()
+                if j < written
                     slots[j] = Some(j)
                     targets.push(Some(j))
+                elif j < s.params.len() && all_positional <= s.params.len()
+                    // A positional argument written for a contextual parameter: one is passed by name.
+                    if report then c.note(unit, a.span, s"`${s.names[j]}` is a contextual parameter of `${s.name}`, passed by name: `${s.names[j]} = …`")
+                    fits = false
+                    targets.push(None)
                 else targets.push(None)
             Some(n) ->
                 named = true
@@ -24260,26 +24331,194 @@ private bind_arguments(c: *Checker, at: Span, s: Signature, args: Buf[Argument],
     var has_defaults = false
     for d in s.defaults
         if d is Some(_) then has_defaults = true
-    if positional > s.params.len() && !s.variadic
-        if report then c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not $positional")
+    if positional > s.params.len() && !s.variadic || (positional > written && !s.variadic && fits)
+        if report then c.note(unit, at, s"`${s.name}` takes ${count(written, "argument")}, not $positional")
         return Binding(slots, targets, false)
     // A call already reported for a misplaced or misnamed argument is not also reported for the
     // parameter that argument was probably meant for.
     if !fits then return Binding(slots, targets, false)
+    // A contextual parameter given nothing is filled afterwards, from a given or its default.
     var missing: Buf[string] = buf()
-    for i in 0..<s.params.len()
+    for i in 0..<written
         if slots[i] is None && s.defaults[i] is None && repeated != Some(i) then missing.push(s.names[i])
     if missing.len() > 0
         fits = false
         if !report then return Binding(slots, targets, false)
         if !named && !has_defaults && s.variadic
-            c.note(unit, at, s"`${s.name}` takes at least ${count(s.params.len() - 1, "argument")}, not ${args.len()}")
+            c.note(unit, at, s"`${s.name}` takes at least ${count(written - 1, "argument")}, not ${args.len()}")
         elif !named && !has_defaults
-            c.note(unit, at, s"`${s.name}` takes ${count(s.params.len(), "argument")}, not ${args.len()}")
+            c.note(unit, at, s"`${s.name}` takes ${count(written, "argument")}, not ${args.len()}")
         else
             for m in missing
                 c.note(unit, at, s"`${s.name}` needs an argument for `$m`, which has no default")
     Binding(slots, targets, fits)
+
+/** A call's arguments with its `using` section filled: the written ones, then one by name for each
+ * contextual parameter a given fills, already checked, and their binding. */
+private struct Filled
+    args: Buf[Argument]
+    checked: Buf[Option[&TExpr]]
+    binding: Binding
+
+// Fills each contextual parameter of a call the written arguments fit and leave it to: from the given
+// in the nearest scope whose type conforms to the parameter's (`fitting_givens`), or else from its
+// default, which the call computes as any omitted argument's. With neither, or with two givens fitting
+// at the nearest level, the call is an error. A filled argument is an ordinary argument by name, a read
+// of the given, which evaluates nothing.
+private fill_contextual(c: *Checker, at: Span, s: Signature, args: Buf[Argument], checked: Buf[Option[&TExpr]], binding: Binding) -> Filled
+    if s.section == 0 || !binding.fits then return Filled(args, checked, binding)
+    val unit = unit_of(c)
+    var out_args: Buf[Argument] = buf()
+    var out_checked: Buf[Option[&TExpr]] = buf()
+    for j in 0..<args.len()
+        out_args.push(args[j])
+        out_checked.push(if j < checked.len() then checked[j] else None)
+    var ok = true
+    var added = false
+    for i in s.params.len() - s.section..<s.params.len()
+        if binding.slots[i] is Some(_) then continue
+        val want = zonk(c, s.params[i])
+        val param = s.names[i]
+        if *want is ErrorType
+            ok = false
+            continue
+        val found = fitting_givens(c, at, want)
+        if found.len() == 1
+            out_args.push(Argument(at, Some(param), Expr(at, Name(param)), false))
+            out_checked.push(Some(given_read(c, at, found[0])))
+            added = true
+        elif found.len() > 1
+            var each: Buf[string] = buf()
+            for g in found
+                val shown = type_name(zonk(c, g.ty))
+                each.push(s"`${g.name}` (${article(shown)} `$shown`, ${place_of(c, g.unit, unit, g.span)})")
+            val how_many = if found.len() == 2 then "two" elif found.len() == 3 then "three" else s"${found.len()}"
+            c.note(unit, at, s"$how_many givens fit `$param: ${type_name(want)}` of `${s.name}` here: ${spoken_list(each)}; pass `$param = …`")
+            ok = false
+        elif s.defaults[i] is None
+            c.note(unit, at, s"`${s.name}` needs ${article(type_name(want))} `${type_name(want)}` for `$param`, and no given of that type is in scope: declare one (`given $param = …`), take one as `using`, import one, or pass `$param = …`")
+            ok = false
+    if !ok then return Filled(args, checked, Binding(binding.slots, binding.targets, false))
+    if !added then return Filled(args, checked, binding)
+    Filled(out_args, out_checked, bind_arguments(c, at, s, out_args, false))
+
+/** A given a call may be filled from: its name, type and declaration, and where its value is read. */
+private struct GivenCandidate
+    name: string
+    ty: &Type
+    unit: usize
+    span: Span
+    source: GivenSource
+
+private enum GivenSource
+    /** A block's given, or a contextual parameter of a local function or a lambda: a local. */
+    LocalGiven(local: usize)
+    /** A contextual parameter of the function being checked, its parameter `index`. */
+    ParamGiven(index: usize)
+    /** A contextual parameter of the enclosing class's constructor, or a given of the enclosing
+     * object's body: field `index` of class `class`. */
+    FieldGiven(class: usize, index: usize)
+    /** A given at the module's top level: module-level value `global`. */
+    ModuleGiven(global: usize)
+
+// The givens that fit a parameter of type `want` where a call is written: those at the first level
+// outward holding any, of the levels of the chapter's scope walk. The enclosing blocks, innermost first,
+// each with the givens declared before the call, with a local function's or a lambda's contextual
+// parameters a level between its body and the block it is written in; then the contextual parameters
+// of the function being checked; then those of the enclosing class's constructor or actor, for its
+// methods and field initializers; then the givens of the enclosing object's body; then the module's own
+// top-level givens. A nearer level wins outright; two fitting at one level are both returned.
+private fitting_givens(c: *Checker, at: Span, want: &Type) -> Buf[GivenCandidate]
+    var found: Buf[GivenCandidate] = buf()
+    // A given's scope is the position in `visible` where its block begins: a nested block's is
+    // greater than that of any block enclosing it which holds a given visible here.
+    var nearest = 0usize
+    for g in c.body.givens
+        if !local_visible(c, g.local) then continue
+        val ty = zonk(c, c.body.locals[g.local].ty)
+        if !given_fits(c, ty, want) then continue
+        if found.len() > 0 && g.scope < nearest then continue
+        if found.len() > 0 && g.scope > nearest then found.clear()
+        nearest = g.scope
+        found.push(GivenCandidate(c.body.locals[g.local].name, ty, unit_of(c), g.span, LocalGiven(g.local)))
+    if found.len() > 0 then return found
+    val root = c.symbols[c.body.root]
+    // A constructor's parameters are its fields, but in its superclass's arguments.
+    if !root.constructor || c.super_args
+        val offset = if root.params.len() > root.decl.params.len() then root.params.len() - root.decl.params.len() else 0usize
+        for k in 0..<root.decl.params.len()
+            val p = root.decl.params[k]
+            if !p.contextual || k + offset >= root.params.len() then continue
+            val ty = zonk(c, root.params[k + offset])
+            if given_fits(c, ty, want) then found.push(GivenCandidate(root.param_names[k + offset], ty, root.unit, p.span, ParamGiven(k + offset)))
+        if found.len() > 0 then return found
+    if c.super_args || in_static(c) then return given_module_level(c, want)
+    if enclosing_class(c) is Some(k)
+        val cls = c.classes[k]
+        if !cls.decl.object
+            for cp in cls.decl.params
+                if !cp.param.contextual then continue
+                val name = cp.param.pattern.kind match
+                    Name(n) -> n
+                    _ -> continue
+                val i = class_field(c, k, name) match
+                    Some(i) -> i
+                    None -> continue
+                val ty = zonk(c, field_type(c, k, i, at))
+                if given_fits(c, ty, want) then found.push(GivenCandidate(name, ty, cls.unit, cp.param.span, FieldGiven(k, i)))
+        else
+            for m in cls.decl.members
+                val f = m match
+                    FieldMember(f) -> f
+                    _ -> continue
+                if !f.given then continue
+                val i = class_field(c, k, f.name) match
+                    Some(i) -> i
+                    None -> continue
+                // In the object's body, a given is in scope from its declaration on.
+                if c.body.root == cls.initializer && i >= c.classes[k].ready then continue
+                if cls.fields[i].ty is None && c.building[k] == 1 then continue
+                val ty = zonk(c, field_type(c, k, i, at))
+                if given_fits(c, ty, want) then found.push(GivenCandidate(f.name, ty, cls.unit, f.span, FieldGiven(k, i)))
+        if found.len() > 0 then return found
+    given_module_level(c, want)
+
+/** The module's own top-level givens that fit `want`: of every file of the module. One whose initializer
+ * is being checked, the call's own among them, is not yet a value. */
+private given_module_level(c: *Checker, want: &Type) -> Buf[GivenCandidate]
+    var found: Buf[GivenCandidate] = buf()
+    val module_name = c.symbols[c.current].module_name
+    for g in 0..<c.globals.len()
+        val global = c.globals[g]
+        if !global.given || global.module_name != module_name then continue
+        val init = global.init
+        if c.symbols[init].result is None
+            if c.states[init] != 0 then continue
+            check_function(c, init)
+        val ty = zonk(c, c.symbols[init].result.unwrap_or(ErrorType))
+        if given_fits(c, ty, want) then found.push(GivenCandidate(global.name, ty, global.unit, global.span, ModuleGiven(g)))
+    found
+
+/** Whether a given of type `ty` fills a parameter of type `want`: its type conforms to it. */
+private given_fits(c: *Checker, ty: &Type, want: &Type) -> bool = !(*ty is ErrorType) && fits(c, ty, want)
+
+/** Whether local `index` is in scope. */
+private local_visible(c: *Checker, index: usize) -> bool
+    for v in c.body.visible
+        if v == index then return true
+    false
+
+/** The read of given `g` where a call is written, which a contextual parameter is passed: a captured
+ * local or parameter is recorded as a capture, as a read of it by name would be. */
+private given_read(c: *Checker, at: Span, g: GivenCandidate) -> &TExpr = g.source match
+    LocalGiven(index) ->
+        if c.body.locals[index].owner != c.current then c.body.uses.push(CaptureUse(c.current, index, false))
+        TExpr(at, g.ty, Local(index))
+    ParamGiven(i) ->
+        if c.current != c.body.root then c.body.uses.push(CaptureUse(c.current, i, true))
+        TExpr(at, g.ty, Param(i))
+    FieldGiven(k, i) -> field_read(c, at, at, self_ref(c, at), k, i, true)
+    ModuleGiven(global) -> global_read(c, at, global)
 
 // Records each name written in an argument (`width = 3`) as a reference to the parameter it names.
 private index_argument_names(c: *Checker, unit: usize, s: Signature, args: Buf[Argument], binding: Binding)
@@ -24299,7 +24538,7 @@ private index_argument_names(c: *Checker, unit: usize, s: Signature, args: Buf[A
 // Checks a call against a signature: binds its arguments to the parameters, solves the type
 // arguments, and checks each argument against its parameter's type. `checked` holds, for an
 // overloaded call, the arguments checked while its overload was chosen; it is empty otherwise.
-private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], checked: Buf[Option[&TExpr]]) -> AppliedCall
+private apply(c: *Checker, at: Span, name_span: Span, s: Signature, written_args: Buf[Argument], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type], written_checked: Buf[Option[&TExpr]]) -> AppliedCall
     val unit = unit_of(c)
     val name = s.name
     val called = s.called
@@ -24308,8 +24547,14 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
     val params = s.params
     val result = s.result
     val known = s.known
-    var binding = bind_arguments(c, at, s, args, true)
-    index_argument_names(c, unit, s, args, binding)
+    val bound = bind_arguments(c, at, s, written_args, true)
+    index_argument_names(c, unit, s, written_args, bound)
+    // The `using` section is filled once the written arguments fit: each parameter they leave is
+    // given the given in scope, passed as an argument by name already checked.
+    val filled = fill_contextual(c, at, s, written_args, written_checked, bound)
+    val args = filled.args
+    val checked = filled.checked
+    var binding = filled.binding
     val first = c.vars.len()
     var type_args: Buf[&Type] = buf()
     // The parameters a call writes or infers: those after the known ones, but for any fixed.
@@ -24463,8 +24708,8 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
         if *t.ty is Nothing then ty = Nothing
     // The arguments of a repeated parameter become one vector, made where the first of them is
     // written, or after the others when there are none.
-    if s.variadic && binding.fits
-        val packed = pack_repeated(c, at, wanted, binding, args, typed)
+    if repeated_of(s) is Some(r) && binding.fits
+        val packed = pack_repeated(c, at, wanted, r, binding, args, typed)
         typed = packed.typed
         binding = packed.binding
     // Arguments written in parameter order with none omitted are passed as they are; otherwise each
@@ -24487,25 +24732,39 @@ private apply(c: *Checker, at: Span, name_span: Span, s: Signature, args: Buf[Ar
         val local = hidden_local(c, t.ty)
         prelude[prelude.len() - 1] = TExpr(t.span, Unit, Let(local, t))
         held[binding.targets[j].unwrap()] = Some(TExpr(t.span, t.ty, Local(local)))
+    // The `using` section's defaults come first, each seeing the section before it, and then the
+    // other parameters', each seeing those before it and the whole section.
+    val section_start = params.len() - s.section
+    var order: Buf[usize] = buf()
+    for i in section_start..<params.len()
+        order.push(i)
+    for i in 0..<section_start
+        order.push(i)
+    for i in order
+        if held[i] is Some(_) then continue
+        val default = s.defaults[i].unwrap()
+        // A default written as a literal is the literal itself, with nothing to call.
+        if literal_default(c, default) is Some(written)
+            held[i] = Some(check_expr(c, written, Some(zonk(c, wanted[i]))))
+            continue
+        local_use(c, default, at)
+        var before: Buf[&TExpr] = buf()
+        if s.receiver is Some(r) then before.push(r)
+        if i >= section_start
+            for k in section_start..<i
+                before.push(held[k].unwrap())
+        else
+            for k in 0..<i
+                before.push(held[k].unwrap())
+            for k in section_start..<params.len()
+                before.push(held[k].unwrap())
+        val wanted_ty = zonk(c, wanted[i])
+        val local = hidden_local(c, wanted_ty)
+        prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
+        held[i] = Some(TExpr(at, wanted_ty, Local(local)))
     var passed: Buf[&TExpr] = buf()
-    for i in 0..<params.len()
-        held[i] match
-            Some(value) -> passed.push(value)
-            None ->
-                val default = s.defaults[i].unwrap()
-                // A default written as a literal is the literal itself, with nothing to call.
-                if literal_default(c, default) is Some(written)
-                    passed.push(check_expr(c, written, Some(zonk(c, wanted[i]))))
-                    continue
-                local_use(c, default, at)
-                var before: Buf[&TExpr] = buf()
-                if s.receiver is Some(r) then before.push(r)
-                for k in 0..<i
-                    before.push(passed[k])
-                val wanted_ty = zonk(c, wanted[i])
-                val local = hidden_local(c, wanted_ty)
-                prelude.push(TExpr(at, Unit, Let(local, TExpr(at, wanted_ty, Call(default, before, default_type_args(c, s, default, solved))))))
-                passed.push(TExpr(at, wanted_ty, Local(local)))
+    for h in held
+        passed.push(h.unwrap())
     AppliedCall(passed, solved, ty, prelude, false)
 
 /** The body of default function `id` when it is a literal of a built-in type (a number, which may
@@ -24529,7 +24788,7 @@ private argument_type(c: *Checker, s: Signature, params: Buf[&Type], binding: Bi
     val i = binding.targets[j] match
         Some(i) -> i
         None -> return None
-    if !s.variadic || i + 1 != params.len() then return Some(params[i])
+    if repeated_of(s) != Some(i) then return Some(params[i])
     val element = repeated_element(params[i])
     if args[j].value.kind is Splice(_) then Some(core_class_of(c, "Iterable", element)) else Some(element)
 
@@ -24632,10 +24891,10 @@ private struct Packed
     typed: Buf[&TExpr]
     binding: Binding
 
-// Replaces the arguments of the repeated parameter, the last of `params`, with the vector they make,
-// at the place of the first of them; with none, an empty vector follows the other arguments.
-private pack_repeated(c: *Checker, at: Span, params: Buf[&Type], binding: Binding, args: Buf[Argument], typed: Buf[&TExpr]) -> Packed
-    val r = params.len() - 1
+// Replaces the arguments of the repeated parameter `r`, the last of `params` before any `using`
+// section, with the vector they make, at the place of the first of them; with none, an empty vector
+// follows the other arguments.
+private pack_repeated(c: *Checker, at: Span, params: Buf[&Type], r: usize, binding: Binding, args: Buf[Argument], typed: Buf[&TExpr]) -> Packed
     val element = zonk(c, repeated_element(params[r]))
     var out: Buf[&TExpr] = buf()
     var targets: Buf[Option[usize]] = buf()
@@ -25270,6 +25529,8 @@ private lambda_expr(c: *Checker, e: &Expr, params: Buf[LambdaParam], body: &Expr
     var param_locals: Buf[usize] = buf()
     for i in 0..<params.len()
         param_locals.push(declare_local(c, params[i].span, names[i], local_types[i], false))
+        // A parameter after `using` is a given in the body.
+        if params[i].contextual then c.body.givens.push(GivenLocal(param_locals[i], params[i].span, mark))
     c.symbols[id].param_locals = param_locals
     note_refined_function(c, id)
     check_body(c, id, body, hint)
