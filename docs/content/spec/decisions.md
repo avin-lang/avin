@@ -11718,6 +11718,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
 
+- Settled on the user's delegation 2026-11-19 (branch `lib-papercuts`): **four library papercuts.**
+  (1) Every hasher of `avin.crypto` (`Sha256`, `Sha512`, `Sha1`, `Md5`) gains `update(bytes:
+  Array[byte])` and the range forms `update(bytes, from, until)` for a vector and for an array; the
+  array is handed to the digest in place through the `@sysl` binding, with no copy, and a range
+  outside `0 ..< bytes.length` or with `from > until` traps. (2) `Channel.length` answers the number
+  of buffered values, a snapshot under the lock that is stale at once (documented as a racy
+  observation); `size` is the same number, since the inherited `size` would consume the channel by
+  iterating it; `capacity`, the constructor's bound, is now a public `val` (`unbounded` for a channel
+  made with none, `0` for a rendezvous). (3) `max` and `min` are methods of every integer type,
+  `real` (as `math.max`/`math.min`: NaN when either is, `-0.0` below `0.0`), `char` and `byte`,
+  returning the first operand when equal; they are separate from `int.MaxValue`/`MinValue`, which are
+  static members. (4) The mutable `Map`, `Set`, `LinkedMap` and `LinkedSet` companions gain the
+  variadic `apply`, shaped as the mutable `TreeMap` and `TreeSet` have it (`Map((1, "a"), (2, "b"))`;
+  later pairs replace earlier ones, a linked collection keeps first-insertion order). Why: each
+  closes a gap a ported program met and costs one line of surface. Alternatives weighed: a `Slice`
+  type for the range form (rejected, `(bytes, from, until)` is the shape `string.slice` and the
+  collections already use); `Channel.length` as a method with a call (kept parameterless, as
+  `size`); `max`/`min` only through `Ord` (rejected, `Ord` has none, and the free functions need an
+  import for `real`).
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per
