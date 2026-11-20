@@ -10022,6 +10022,33 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   sidecars inside the directory (a second rule for the same thing); a header line marking a window
   program as not run (a marker on the exception rather than on the output that makes the check).
 
+- Settled on the user's delegation 2026-11-19 (branch `variant-fn-value`): **a variant with fields,
+  named and not called, is its constructor as a function value, as a class's name is.** `Heard`,
+  `Event.Heard`, `events.Heard` and `Some[int]` are each a function of the variant's fields, in
+  order and all of them (defaults are not dropped, as a class constructor's value drops none), to
+  its data type, or to a refined variant's declared instance: `["a"].map(Heard)`,
+  `[1, 2].map(Some)`, `adapter(Heard)`, `listener.ask(Stop, patience)`. Where a function type of as
+  many parameters is expected, its parameters stand for the fields' (an open one there takes the
+  field's type, so `adapter(Heard)` needs no `adapter[ChatEvent]`) and its result is the type the
+  variant is made at, which also decides between variants sharing a name; elsewhere the value's
+  type is the variant's own, and a generic variant whose instance nothing decides is reported
+  ("cannot infer `T` for `Some` used as a value; write it, as in `Some[int]`"). An expected type
+  the variant does not fit is reported as the whole value's type against it. Where a value of the
+  variant's own data type is expected, the call was meant, and the old error stands ("`Circle` has
+  fields; call it, as in `Circle(arguments)`"); a variant without fields is still the value it
+  names. A data type's companion object of the variant's name that declares `apply`, where a
+  function type is expected, offers the variant beside its `apply` methods, chosen as among
+  overloads, as the call `Name(…)` already chose among them. The value is a lambda made at the use
+  that calls the variant as written, so it captures nothing and is `@sendable` where one is wanted.
+  *Why*: the smallest rule that makes a variant behave as the constructor it is, with the typing a
+  class constructor's value already has; ports of concurrent programs reached for it at every
+  actor adapter and `ask`. *Alternatives weighed*: a value only where a function type is expected
+  (refuses `val f = Heard`, which a class name allows); a function value that drops defaulted
+  fields (a value has no defaults, and which arity would be ambiguous); keeping the variant out of
+  a companion's overloads (inconsistent with the call). A lambda whose parameter type nothing but
+  its body decides, `adapter(e -> Heard(e))`, still reports "cannot infer the type of `e`": the
+  lambda's parameter is typed before its body is checked, and this item does not widen inference.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
