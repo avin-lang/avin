@@ -8955,6 +8955,62 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     lookup. macOS hides it, starting children with every other descriptor closed; Linux does not.
     It is the first item of the [plan](/compiler/linux/).
 
+- **`avin repl`, an interactive session** (branch `repl`, 2026-11-19; approved by the user the same
+  day). The surface is in [getting started](/getting-started/#the-interactive-session).
+  - Settled on the user's delegation 2026-11-19: **a session is one growing program, built and run
+    whole after each input; earlier inputs run again, their output passed over.** Imports go to the
+    program's top, type declarations below them, everything else into `main`; the program writes a
+    mark before the newest input and one after it, and only what lies between is shown. WHY: Avin
+    compiles a closed world — one LLVM module with the library, monomorphized instances, devirtualized
+    calls and per-program type descriptors — so loading each input as a shared object into one live
+    process (keeping the heap, globals and threads) needs separate compilation across units:
+    instances shared or duplicated between units, type identity across them, the collector's roots
+    registered per loaded unit, and the runtime moved into the host. That is a compiler architecture,
+    not an item. Replaying costs an input's side effects repeating unseen, values computed afresh
+    (random, time) differing from the ones shown, and run time growing with the session; each input
+    still builds in about a second at `-O0` through the instance cache. ALTERNATIVES: `dlopen` per
+    input into a live process (the right end state, above); an interpreter over the checked program
+    (a second semantics to keep equal to the compiled one); replaying with the earlier inputs'
+    effects suppressed (not possible for effects outside the process). **Review with the user:**
+    whether the live-process design is wanted next, and how soon.
+  - Settled on the user's delegation 2026-11-19: **each code input is a block nested in the one
+    before it** (`if true` around the rest), so `val x` entered again hides the earlier `x` from the
+    later inputs, as a block's local does, and the earlier inputs keep the `x` they saw; a local
+    function entered again does the same. **Functions are local functions of `main`**, so they see the
+    session's `val`s and `var`s and change them. **A type declared again replaces the earlier
+    declaration**, refused where an input already kept no longer checks against it. WHY: Avin
+    forbids a second `val` of one name in one block, and a top-level type cannot be hidden; nesting
+    gives the hiding every interactive language has without renaming anything. ALTERNATIVES:
+    renaming earlier bindings (rewrites what the user typed, and diagnostics show other names);
+    top-level functions (they cannot see the session's values); module-level `val`s (initialized
+    before `main`, out of order with the statements between). **Review with the user:** types
+    hiding rather than replacing, which needs per-input modules.
+  - Settled on the user's delegation 2026-11-19: **an expression's value is kept as `resN` and shown
+    as `res0: int = 42`, by its type's `Debug` through `Any`** (a string quoted, a type with no
+    `Debug` by its name, a function as `<function>`); a `val` or `var` shows its own name, a local
+    function its header, a type declaration its header; an expression of type `unit` shows nothing
+    and takes no number. The type is the checker's, as hover shows it. ALTERNATIVES: `Display`
+    (a string unquoted reads like output); `it` for the last value only.
+  - Settled on the user's delegation 2026-11-19: **an input ends** at the end of its line unless a
+    bracket is open, the line ends with an operator, `=` or a comma, or the input opened a block —
+    a type's declaration, a line the parser finds unfinished at its end (`if x > 0`, `f(n: int) ->
+    int`), or a local function's header with parameters (`log(m: string)`, which alone reads as a
+    call) — which an empty line ends. `greet()` alone is a call; a function of no parameters opens
+    its block with a result type or `=`. ALTERNATIVES: a continuation character; always waiting for
+    an empty line after an indented line (one more Enter for every one-line input).
+  - Settled on the user's delegation 2026-11-19: **at a terminal the line is edited by Sysl's
+    `sysl.term.edit`** (history, arrows, Ctrl-A/E/K/U), raw mode only while a line is read, so a
+    running input gets Ctrl-C; **read from a pipe there are no prompts**, so a scripted session's
+    output is what its inputs write. An input's standard output and error reach the session as one
+    stream, in the order written. No new C dependency. ALTERNATIVES: linenoise (multi-line editing
+    and completion, a C dependency); prompts to standard error when piped.
+  - Settled on the user's delegation 2026-11-19: **in a package, or a directory holding a program,
+    the session's program is that program with its root module replaced by the session**, so its
+    modules import as they do from `main`, and its dependencies, Sysl packages and C libraries come
+    with it. `:load <file>` enters a file's imports and top-level declarations one at a time as if
+    typed; its `main` becomes a local function to call. ALTERNATIVES: keeping the root module
+    (its `main` collides with the session's); `:load` running the file's `main` (it can be called).
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-18 (built on branch `tls-strand`): **a read of a whole `TlsStream` that has to

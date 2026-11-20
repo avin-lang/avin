@@ -256,6 +256,57 @@ line, `./tool.avin data.json` is `avin ./tool.avin data.json`, and every argumen
 the program's own; `avin run tool.avin -O0 -- data.json` keeps the usual rule, with `-O0` avin's. The
 [packages chapter](/spec/packages/#programs-of-one-file) has the rules.
 
+## The interactive session
+
+`avin repl` starts a session: each declaration, import, statement or expression entered is checked,
+built and run at once. An expression's value is shown with its type and kept under the next name
+`res0`, `res1`, …; a `val` or `var` is shown by its own name, and a function by its header:
+
+```text
+avin> 1 + 2
+res0: int = 3
+avin> val greeting = "hello"
+greeting: string = "hello"
+avin> twice(n: int) = n * 2
+twice(n: int) -> int
+avin> twice(res0)
+res1: int = 6
+avin> import avin.threads.spawn
+avin> val worker = spawn(() -> twice(21))
+worker: Thread[int] = Thread[int]
+avin> worker.join()
+res2: int = 42
+```
+
+A session is a program that grows. Imports go to its top, the declarations of types below them, and
+everything else into `main`, each input a block nested in the one before it, so a name entered again
+hides the earlier one from the inputs after it (a type declared again replaces the earlier
+declaration). After each input the whole program is built, through the same cache `avin run` uses,
+and run; what the earlier inputs write is not shown again. That costs something worth knowing: an
+earlier input runs again each time, so its side effects repeat, unseen, and a value it computes
+afresh (a random number, the time) may differ from the one shown when it was entered. An input that
+does not check, traps, or ends the program is left out, and the session goes on without it; a
+diagnostic or a trap names its place in the input as it was typed.
+
+An input that opens a block (an `if`, a `for`, a function's body, a type's declaration with its
+members) goes on over the lines after it until an empty line; so does one with a bracket left open
+or ending with an operator. At a terminal the line is edited in place, with the arrow keys reaching
+back through the session's earlier lines; Ctrl-C abandons a line or stops a running input, and
+Ctrl-D on an empty line ends the session. Read from a file or a pipe, the session prints no prompts.
+
+| Command | |
+| --- | --- |
+| `:type <expression>` | the expression's type, without running it |
+| `:imports` | the session's imports |
+| `:load <file>` | each import and top-level declaration of the file, entered in turn; a `main` in it becomes a function the session can call |
+| `:reset` | forget every input |
+| `:help` | the commands |
+| `:quit` | end the session |
+
+In a package, or a directory holding a program, the session may import the program's modules, and
+reads its dependencies; the program's own root module, with its `main`, is left out, the session
+taking its place.
+
 ## Formatting
 
 `avin fmt` rewrites every `.avin` and `.lavin` file under the paths it is given (the current

@@ -1,0 +1,920 @@
+module dev.avinlang.compiler
+
+import sh.sysl.parsing.{Diagnostic, Report, Source, Span, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.fs.{File, create, is_dir, make_dir_all, make_temp_dir, open, read_text, remove_dir_all, write_text}
+import sysl.io.{console_lines, stdin}
+import sysl.path.file_name
+import sysl.posix.tty.{cooked, is_tty, raw, tty_writer}
+import sysl.process.{Exited, Signalled, Stdio, TimedOut}
+import sysl.term.edit.editor
+import sysl.text.{chars_of, from_utf8_lossy, str_builder}
+
+// `avin repl`: an interactive session. A session is a program that grows: each input accepted is
+// kept, and the program made of everything kept so far, with the new input last, is checked, built
+// through the instance cache and run. Imports go to the top of the program, declarations of types
+// below them, and everything else (values, local functions, statements and expressions) into `main`,
+// each input a block nested in the one before it, so an input may declare a name again and hide the
+// earlier one from the inputs after it. An earlier input's output is not shown again: what the program
+// writes before the new input begins is passed over, up to a mark it writes there. An input whose
+// program does not check, or traps, or ends the program, is not kept; the session goes on without it.
+// What each new value is, and its type, is shown after its input's own output, as `res0: int = 42`.
+
+/** What the program writes, before an input's own code, so the session knows where that input's
+ * output begins: everything before it was written by inputs already shown. */
+const ReplStart: string = "\u{1E}avin-repl-start\u{1E}"
+/** What the program writes after an input's code, so the session knows the input finished rather
+ * than ended the program. */
+const ReplEnd: string = "\u{1E}avin-repl-end\u{1E}"
+/** The name an input's file is shown by in a diagnostic. */
+const ReplInputName: string = "<input>"
+/** The function the program shows a value with. */
+const ReplShow: string = "avinReplShow"
+/** The name `:type` binds the expression it is asked about to. */
+const ReplTypeName: string = "avinReplType"
+
+const ReplHelp: string = "Enter a declaration, an import, a statement or an expression. An expression's value is shown with its type, as `res0: int = 42`, and a `val` or `var` by its own name.\nAn input that opens a block (`if`, `for`, a function's body, a type's declaration) goes on over the lines after it until an empty line.\n:type <expression>   show an expression's type without running it\n:imports             list the session's imports\n:load <file>         enter a file's imports and declarations, one at a time\n:reset               forget every input\n:help                show this\n:quit                end the session (so does Ctrl-D on an empty line)"
+
+/** A declaration of types a session keeps: its text, and the names it declares, by which a later
+ * declaration of one of them replaces it. */
+struct ReplDecl
+    text: string
+    names: Buf[string]
+
+/** Where in the program's text an input was placed: the line its first line is on, counted from one,
+ * how many lines it is, how many columns every one of its lines was moved right, and how many more
+ * its first line was. */
+struct ReplPlace
+    line: usize
+    count: usize
+    indent: usize
+    first: usize
+
+    /** Whether line `n` of the program is one of the input's. */
+    holds(self, n: usize) -> bool = self.line <= n && n < self.line + self.count
+
+/** The program a session is, written out, with the place of its newest input. */
+struct ReplProgram
+    text: string
+    place: ReplPlace
+
+/** A session: what it builds with and what it has kept. */
+struct ReplSession
+    tc: Toolchain
+    /** The file the session's program is, which names its cache. */
+    file: string
+    /** A directory of the session's own, for what its inputs write while they run. */
+    scratch: string
+    /** The modules of the package or program the session was started in, its root module left out. */
+    base: Buf[ProgramFile]
+    package: string
+    sysl: Buf[SyslPackage]
+    c: Buf[CLibrary]
+    imports: Buf[string]
+    decls: Buf[ReplDecl]
+    /** The inputs of `main`, as they are written there. */
+    code: Buf[string]
+    /** The number the next expression's value is named by: `res0`, `res1`. */
+    results: int
+    /** The lines of an input not yet complete. */
+    pending: Buf[string]
+    /** Whether the input not yet complete opened a block, which only an empty line ends. */
+    block: bool
+
+/** `avin repl [<program>]`. */
+repl_command(here: string, args: []const string, tc: Option[Toolchain], say: string -> unit, note: string -> unit) -> int
+    if args.len > 3
+        note(Usage)
+        return 2
+    val dir = if args.len == 3 then args[2] else here
+    if args.len == 3 && args[2].starts_with("-")
+        note(Usage)
+        return 2
+    val toolchain = tc match
+        Some(t) -> t
+        None ->
+            note(NoToolchain)
+            return 1
+    if library_version_error(toolchain) is Some(message)
+        note(message)
+        return 1
+    var session = repl_session(toolchain, dir) match
+        Ok(s) -> s
+        Err(message) ->
+            note(message)
+            return 1
+    defer _ = remove_dir_all(session.scratch)
+    val chosen = incremental_mode_of(get(IncrementalVariable)) match
+        Ok(m) -> m
+        Err(message) ->
+            note(message)
+            return 1
+    if chosen != IncrementalOff then open_incremental(program_instance_cache(toolchain.builds, session.file, false, "-O0"), chosen)
+    defer close_incremental()
+    repl_terminal(&session)
+    0
+
+/** A new session for the program at `dir`: the package `dir` is in, or the program of many files it
+ * holds, whose modules the session may import; or, where it holds no program, a session of its own. */
+repl_session(tc: Toolchain, dir: string) -> Result[ReplSession, string]
+    if !is_dir(dir) then return Err(s"avin: $dir is not a directory: `avin repl` starts in a package or a directory")
+    var base: Buf[ProgramFile] = buf()
+    var package = ""
+    var sysl: Buf[SyslPackage] = buf()
+    var c: Buf[CLibrary] = buf()
+    var root = absolute_path(dir)
+    if holds_program(dir)
+        val program = load_program_with(dir, default_fetching(), no_feature_flags().choice(false)).map_err(m -> m.trim_end())?
+        root = absolute_path(program.root)
+        sysl = program.sysl
+        c = program.c
+        // The root module is the program's `main` and what it calls; the session takes its place.
+        for f in program.files
+            if !f.dependency && f.module_name.unwrap_or("-") == ""
+                package = f.package
+                continue
+            base.push(f)
+    val home = build_cache(tc.builds, root) + "/repl"
+    make_dir_all(home).map_err(e -> s"avin: $home: ${e.to_string()}")?
+    val scratch = make_temp_dir("avin-repl").map_err(e -> s"avin: ${e.to_string()}")?
+    Ok(ReplSession(tc, home + "/repl.avin", scratch, base, package, sysl, c, buf(), buf(), buf(), 0, buf(), false))
+
+/** The feature flags of a command given none. */
+private no_feature_flags() -> FeatureFlags = FeatureFlags(false, false, false, buf())
+
+/** Reads the session's inputs from standard input until it ends or `:quit`: at a terminal through a
+ * line editor with history, prompting for each line, and otherwise a line at a time with no prompt. */
+repl_terminal(session: *ReplSession)
+    val out: &Fn(string) -> unit = text -> repl_write(text)
+    if is_tty(0)
+        out(s"avin $Version: :help lists the commands\n")
+        var input = stdin()
+        var ed = editor(&input, tty_writer())
+        loop
+            out(if session.pending.len() == 0 then "avin> " else "  ... ")
+            if !raw() then break
+            val line = ed.getline()
+            cooked()
+            line match
+                Some(l) -> if !repl_line(session, l, out) then return
+                None ->
+                    repl_finish(session, out)
+                    return
+        return
+    var input = stdin()
+    for line in console_lines(&input)
+        if !repl_line(session, line, out) then return
+    repl_finish(session, out)
+
+/** Writes `text` to standard output at once. */
+private repl_write(text: string)
+    prints(text)
+    flush()
+
+/** Takes one line of input: a command, or a line of an input, which is entered once it is complete.
+ * Answers false once the session is to end. */
+repl_line(s: *ReplSession, line: string, out: &Fn(string) -> unit) -> bool
+    if s.pending.len() == 0
+        val trimmed = line.trim()
+        if trimmed == "" then return true
+        if trimmed.starts_with(":") then return repl_command_line(s, trimmed, out)
+    s.pending.push(line)
+    if repl_wants_more(s) then return true
+    val text = repl_joined(s.pending)
+    s.pending.clear()
+    s.block = false
+    repl_enter(s, text, out)
+    true
+
+/** Enters what is left of an input when the input ends without an empty line after it. */
+repl_finish(s: *ReplSession, out: &Fn(string) -> unit)
+    if s.pending.len() == 0 then return
+    val text = repl_joined(s.pending)
+    s.pending.clear()
+    s.block = false
+    if text.trim() != "" then _ = repl_enter(s, text, out)
+
+// The lines of an input as one text, the empty lines at its end left off.
+private repl_joined(lines: Buf[string]) -> string
+    var end = lines.len()
+    while end > 0 && lines[end - 1].trim() == ""
+        end -= 1
+    var out = str_builder()
+    for i in 0..<end
+        if i > 0 then out.push("\n")
+        out.push(lines[i].trim_end())
+    out.finish()
+
+/** Whether the input being typed goes on: a bracket is open, the last line ends with an operator or a
+ * comma, or the input opened a block, which only an empty line ends. A block is opened by a type's
+ * declaration (whose members follow it indented) and by a line the parser finds unfinished at its
+ * end, as `if x > 0` or a function's header is. */
+repl_wants_more(s: *ReplSession) -> bool
+    val n = s.pending.len()
+    val last = s.pending[n - 1]
+    if s.block then return last.trim() != ""
+    val text = repl_joined(s.pending)
+    if text.trim() == "" then return false
+    if open_brackets(text) > 0 then return true
+    if continues_line(text.trim_end()) then return true
+    if n == 1 && declares_type(text.trim())
+        s.block = true
+        return true
+    if unfinished_at_end(text) || heads_function(text)
+        s.block = true
+        return true
+    false
+
+/** How many brackets `text` leaves open, outside its strings, characters and comments. */
+open_brackets(text: string) -> int
+    var depth = 0
+    var i = 0usize
+    val b = text.bytes
+    while i < b.len
+        val ch = b[i]
+        if ch == u8('/') && i + 1 < b.len && b[i + 1] == u8('/')
+            while i < b.len && b[i] != u8('\n')
+                i += 1
+            continue
+        if ch == u8('"') || ch == u8('\'')
+            i += 1
+            while i < b.len && b[i] != ch && b[i] != u8('\n')
+                if b[i] == u8('\\') then i += 1
+                i += 1
+            i += 1
+            continue
+        if ch == u8('(') || ch == u8('[') || ch == u8('{') then depth += 1
+        if ch == u8(')') || ch == u8(']') || ch == u8('}') then depth -= 1
+        i += 1
+    depth
+
+/** Whether a line ending `text` leaves its expression to be finished on the next: it ends with `=`,
+ * `->`, a comma or a binary operator (but not `++` or `--`, which end a statement). */
+continues_line(text: string) -> bool
+    if text == "" then return false
+    if text.ends_with("++") || text.ends_with("--") then return false
+    for ending in ["=", ",", "+", "-", "*", "/", "%", "&&", "||", "&", "|", "^", "<", ">", "::", "|>"]
+        if text.ends_with(ending) then return true
+    false
+
+/** Whether an input's first line begins the declaration of a type, whose members may follow it. */
+declares_type(line: string) -> bool
+    var words = line
+    for modifier in ["private ", "open ", "abstract ", "sealed "]
+        if words.starts_with(modifier) then words = words[modifier.bytes.len..].trim()
+    for keyword in ["class ", "trait ", "data ", "object ", "impl ", "actor ", "machine "]
+        if words.starts_with(keyword) then return true
+    false
+
+/** Whether `text`, read as statements, stops at its end where the parser wanted more. */
+unfinished_at_end(text: string) -> bool
+    val wrapped = "main()\n" + repl_indented(text, 2, 0)
+    val parsed = parse(source_of(ReplInputName, wrapped))
+    if !parsed.report.has_errors() then return false
+    val end = wrapped.trim_end().bytes.len
+    for i in 0..<parsed.report.len()
+        val d = parsed.report.at(i)
+        if d.is_error() && d.span.start >= end then return true
+    false
+
+/** Whether `text` is the header of a local function whose body is still to come, as `log(m: string)`
+ * is: alone it reads as a call, and with an indented body under it, as a function. A header with no
+ * parameters, `greet()`, is a call: a function of none opens its block with a result type or `=`. So
+ * is one whose parameters are patterns, `f(1)`, which would be a clause. */
+heads_function(text: string) -> bool
+    if text.contains("\n") then return false
+    // Whole already, as `f(n: int) = n * 2` is.
+    if cell_items(text) is Some(alone)
+        if alone.len() == 1
+            if alone[0].kind is LocalFunction(f)
+                if f.body is Some(_) || f.clauses.len() > 0 then return false
+    val with_body = cell_items(text + "\n  ()") match
+        Some(items) -> items
+        None -> return false
+    if with_body.len() != 1 then return false
+    with_body[0].kind match
+        LocalFunction(f) -> f.params.len() > 0 && f.clauses.len() == 0
+        _ -> false
+
+/** `text` with every line moved `indent` columns right, and its first `first` more. */
+repl_indented(text: string, indent: usize, first: usize) -> string
+    val pad = " ".repeat(indent)
+    var out = str_builder()
+    var line = 0usize
+    for l in text.lines()
+        if line > 0 then out.push("\n")
+        if l != "" then out.push(pad)
+        if line == 0 then out.push(" ".repeat(first))
+        out.push(l)
+        line += 1
+    out.push("\n")
+    out.finish()
+
+// ---- commands ----
+
+/** Carries out a command line. Answers false for `:quit`. */
+repl_command_line(s: *ReplSession, line: string, out: &Fn(string) -> unit) -> bool
+    val space = line.index_of(" ")
+    val word = space match
+        Some(i) -> line[0..<i]
+        None -> line
+    val rest = space match
+        Some(i) -> line[i + 1..].trim()
+        None -> ""
+    if word == ":quit" || word == ":q"
+        if rest != "" then out(":quit takes nothing after it\n") else return false
+    elif word == ":help" then out(ReplHelp + "\n")
+    elif word == ":reset"
+        if rest != "" then out(":reset takes nothing after it\n")
+        else
+            s.imports.clear()
+            s.decls.clear()
+            s.code.clear()
+            s.results = 0
+            out("the session is empty\n")
+    elif word == ":imports"
+        if rest != "" then out(":imports takes nothing after it\n")
+        elif s.imports.len() == 0 then out("no imports\n")
+        else
+            for i in s.imports
+                out(i + "\n")
+    elif word == ":type"
+        if rest == "" then out("usage: :type <expression>\n") else repl_type(s, rest, out)
+    elif word == ":load"
+        if rest == "" then out("usage: :load <file>\n") else repl_load(s, rest, out)
+    else out(s"unknown command `$word`: :help lists the commands\n")
+    true
+
+/** `:type e`: the type of `e`, checked as the next input would be and not run or kept. */
+repl_type(s: *ReplSession, text: string, out: &Fn(string) -> unit)
+    if text.contains("\n") || open_brackets(text) != 0
+        out("usage: :type <expression>, on one line\n")
+        return
+    val head = s"val $ReplTypeName = "
+    val program = repl_program(s, s.imports, s.decls, Some(head + text), buf(), false, head.bytes.len, FocusCode)
+    var checked = repl_check(s, program, out) match
+        Some(c) -> c
+        None -> return
+    repl_value_type(&checked, s.file, program.text, ReplTypeName) match
+        Some(t) -> out(t + "\n")
+        None -> out("the expression has no type to show\n")
+
+/** `:load file`: each import and top-level declaration of `file` entered in turn, as if typed, until
+ * one is not accepted. A `main` it holds becomes a local function the session can call. */
+repl_load(s: *ReplSession, file: string, out: &Fn(string) -> unit)
+    val text = read_text(file) match
+        Ok(t) -> t
+        Err(e) ->
+            out(s"cannot read $file: ${e.to_string()}\n")
+            return
+    for piece in repl_pieces(text)
+        if piece.starts_with("module ")
+            out(s"$file: a module header is not entered; the session is the root module\n")
+            continue
+        if !repl_enter(s, piece, out) then return
+
+/** The top-level pieces of a file: each import, and each declaration with the annotations and
+ * comments written right above it. A piece begins at a line written at the left margin that is not
+ * the `end` of a declaration, a closing bracket or the continuation of a comment. */
+repl_pieces(text: string) -> Buf[string]
+    var pieces: Buf[string] = buf()
+    var current: Buf[string] = buf()
+    var lead = true
+    for line in text.lines()
+        val starts = line != "" && !line.starts_with(" ") && !line.starts_with("\t") && !line.starts_with("end") && !line.starts_with(")") && !line.starts_with("]") && !line.starts_with("}") && !line.starts_with("*") && !line.starts_with("#!")
+        val attaches = line.starts_with("@") || line.starts_with("//") || line.starts_with("/*")
+        if starts && !lead
+            pieces.push(repl_joined(current))
+            current.clear()
+            lead = true
+        if line.starts_with("#!") then continue
+        if line.trim() == "" && current.len() == 0 then continue
+        current.push(line)
+        if starts && !attaches then lead = false
+    if current.len() > 0 && !lead then pieces.push(repl_joined(current))
+    pieces
+
+// ---- entering an input ----
+
+/** Enters one complete input, and answers whether the session kept it. */
+repl_enter(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
+    val parsed = parse(source_of(ReplInputName, text + "\n"))
+    if !parsed.report.has_errors()
+        if parsed.file.module_name != ""
+            out("an input has no module header: the session is the root module\n")
+            return false
+        if parsed.file.imports.len() > 0 && parsed.file.items.len() == 0 then return repl_import(s, text, out)
+        if parsed.file.items.len() > 0 && parsed.file.imports.len() == 0 && only_types(parsed.file.items) then return repl_declare(s, text, item_names(parsed.file.items), out)
+        if parsed.file.imports.len() > 0
+            out("an import is entered on its own\n")
+            return false
+    repl_code(s, text, out)
+
+// Whether every item declares a type, an impl or an alias, which a session keeps at the top level.
+private only_types(items: Buf[Item]) -> bool
+    for item in items
+        item match
+            FunctionItem(_) -> return false
+            ValueItem(_) -> return false
+            _ -> ()
+    true
+
+// The names the items declare.
+private item_names(items: Buf[Item]) -> Buf[string]
+    var names: Buf[string] = buf()
+    for item in items
+        item match
+            DataItem(d) -> names.push(d.name)
+            ClassItem(k) -> names.push(k.name)
+            AliasItem(a) -> names.push(a.name)
+            _ -> ()
+    names
+
+/** An import: kept when the program still checks with it. */
+repl_import(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
+    var imports: Buf[string] = buf()
+    for i in s.imports do imports.push(i)
+    for line in text.lines()
+        val l = line.trim()
+        if l == "" then continue
+        var known = false
+        for i in imports
+            if i == l then known = true
+        if !known then imports.push(l)
+    val program = repl_program(s, imports, s.decls, None, buf(), false, 0, FocusImports)
+    if repl_check(s, program, out) is None then return false
+    s.imports = imports
+    true
+
+/** A declaration of types: kept, in place of every earlier one declaring a name it declares, when the
+ * program still checks with it. */
+repl_declare(s: *ReplSession, text: string, names: Buf[string], out: &Fn(string) -> unit) -> bool
+    var decls: Buf[ReplDecl] = buf()
+    for d in s.decls
+        var replaced = false
+        for n in d.names
+            for m in names
+                if n == m then replaced = true
+        if !replaced then decls.push(d)
+    decls.push(ReplDecl(text, names))
+    val program = repl_program(s, s.imports, decls, None, buf(), false, 0, FocusDecl)
+    var checked = repl_check(s, program, out) match
+        Some(c) -> c
+        None -> return false
+    s.decls = decls
+    for n in names
+        repl_declared(&checked, s.file, program.text, n) match
+            Some(detail) -> out(detail + "\n")
+            None -> out(s"defined $n\n")
+    true
+
+/** Code for `main`: values, local functions, statements, or one expression, whose value is kept as
+ * the next `resN`. Checked, then built and run; kept when it runs to its end. */
+repl_code(s: *ReplSession, text: string, out: &Fn(string) -> unit) -> bool
+    val items = cell_items(text)
+    var code = text
+    var shows: Buf[string] = buf()
+    var result = ""
+    if items is Some(xs)
+        if xs.len() == 1 && is_expression(xs[0])
+            // An expression is first tried as the next result's value; one of type `unit`, or one that
+            // is no value, is run as a statement.
+            val name = s"res${s.results}"
+            val bound = if text.contains("\n") then s"val $name =\n" + repl_indented(text, 2, 0).trim_end() else s"val $name = $text"
+            val tried = repl_program(s, s.imports, s.decls, Some(bound), buf(), false, 0, FocusCode)
+            if repl_check_quiet(s, tried) is Some(found)
+                var c = found
+                if repl_value_type(&c,s.file, tried.text, name) is Some(t)
+                    if t != "unit"
+                        code = bound
+                        result = name
+                        shows.push(repl_show_call(name, t))
+    if result == ""
+        val program = repl_program(s, s.imports, s.decls, Some(text), buf(), false, 0, FocusCode)
+        var c = repl_check(s, program, out) match
+            Some(found) -> found
+            None -> return false
+        if items is Some(xs)
+            for x in xs
+                repl_shown(&c, s.file, program.text, x) match
+                    Some(line) -> shows.push(line)
+                    None -> ()
+    var run = repl_program(s, s.imports, s.decls, Some(code), shows, true, 0, FocusCode)
+    // An expression kept as a result is written after `val resN = `, on its line or, over several
+    // lines, under it moved two columns more; a place in it is shown as the place in what was typed.
+    if result != ""
+        val p = run.place
+        run.place = if text.contains("\n") then ReplPlace(p.line + 1, p.count - 1, p.indent + 2, 0) else ReplPlace(p.line, p.count, p.indent, s"val $result = ".bytes.len)
+    if !repl_run(s, run, out) then return false
+    s.code.push(code)
+    if result != "" then s.results += 1
+    true
+
+// The statements of `text`, read as the body of a function, or `None` where it does not parse.
+private cell_items(text: string) -> Option[Buf[&Expr]]
+    val parsed = parse(source_of(ReplInputName, "main()\n" + repl_indented(text, 2, 0)))
+    if parsed.report.has_errors() || parsed.file.items.len() != 1 then return None
+    val body = parsed.file.items[0] match
+        FunctionItem(f) -> f.body
+        _ -> None
+    body match
+        Some(b) -> b.kind match
+            Block(items, _) -> Some(items)
+            _ ->
+                var one: Buf[&Expr] = buf()
+                one.push(b)
+                Some(one)
+        None -> None
+
+/** Whether a statement is an expression whose value may be kept: not a declaration, an assignment,
+ * a loop or a jump. */
+is_expression(e: &Expr) -> bool = e.kind match
+    Binding(_, _, _, _) -> false
+    Destructure(_, _, _, _) -> false
+    LazyBinding(_, _, _) -> false
+    LocalFunction(_) -> false
+    Assign(_, _, _, _, _) -> false
+    MultiAssign(_, _, _, _) -> false
+    SymbolAssign(_, _, _, _) -> false
+    Update(_, _, _, _) -> false
+    While(_, _, _) -> false
+    Loop(_) -> false
+    DoWhile(_, _, _) -> false
+    For(_, _, _) -> false
+    Break(_) -> false
+    Continue -> false
+    Return(_) -> false
+    Defer(_) -> false
+    _ -> true
+
+/** The call that shows a statement's value: a `val` or `var` by its name and type, and a local
+ * function by its header, written as a string the program prints. */
+private repl_shown(c: *Checked, file: string, text: string, e: &Expr) -> Option[string]
+    e.kind match
+        Binding(name, _, _, _) ->
+            if name.starts_with("_") then return None
+            if repl_value_type(c, file, text, name) is Some(t) then return Some(repl_show_call(name, t))
+        LazyBinding(name, _, _) ->
+            if repl_value_type(c, file, text, name) is Some(t) then return Some(s"println(${avin_string(name + ": " + t + " = <lazy>")})")
+        LocalFunction(f) ->
+            if repl_declared(c, file, text, f.name) is Some(header) then return Some(s"println(${avin_string(header)})")
+        _ -> ()
+    None
+
+// The statement showing the value `name` of type `ty`.
+private repl_show_call(name: string, ty: string) -> string = s"$ReplShow(${avin_string(name)}, ${avin_string(ty)}, $name)"
+
+/** `text` as an Avin string literal: a quote, a backslash, a line break and every other control
+ * character escaped. */
+avin_string(text: string) -> string
+    var out = str_builder()
+    out.push("\"")
+    for ch in chars_of(text.bytes)
+        if ch == '"' then out.push("\\\"")
+        elif ch == '\\' then out.push("\\\\")
+        elif ch == '\n' then out.push("\\n")
+        elif u32(ch) < 32
+            out.push("\\u{")
+            out.push_char(hex_digit(u32(ch) / 16))
+            out.push_char(hex_digit(u32(ch) % 16))
+            out.push("}")
+        else out.push_char(ch)
+    out.push("\"")
+    out.finish()
+
+// The hexadecimal digit for `n`, below 16.
+private hex_digit(n: u32) -> char = if n < 10 then char(u32('0') + n) else char(u32('a') + n - 10)
+
+// ---- the program a session is ----
+
+/** Which part of a program its diagnostics are placed in: the newest code, the newest declaration, or
+ * the imports. */
+const FocusCode: u8 = 0
+const FocusDecl: u8 = 1
+const FocusImports: u8 = 2
+
+/** The program of the session with `imports` and `decls`, its kept code, and `code` last, followed by
+ * `shows`; with `marked`, writing `ReplStart` before `code` and `ReplEnd` after `shows`. Its place is
+ * that of the part `focus` names, `first` columns of the code's first line being no part of what was
+ * typed. */
+repl_program(s: *ReplSession, imports: Buf[string], decls: Buf[ReplDecl], code: Option[string], shows: Buf[string], marked: bool, first: usize, focus: u8) -> ReplProgram
+    var out = str_builder()
+    var line = 1usize
+    var place = ReplPlace(1, imports.len(), 0, 0)
+    for i in imports
+        out.push(i + "\n")
+        line += 1
+    if imports.len() > 0
+        out.push("\n")
+        line += 1
+    for d in decls
+        if focus == FocusDecl then place = ReplPlace(line, count_lines(d.text), 0, 0)
+        out.push(d.text + "\n\n")
+        line += count_lines(d.text) + 1
+    out.push("private " + ReplShow + "(name: string, type: string, value: Any) = println(name + \": \" + type + \" = \" + f\"${value}%?\")\n\nmain()\n")
+    line += 3
+    var depth = 1usize
+    for k in s.code
+        out.push(repl_indented(k, depth * 2, 0))
+        line += count_lines(k)
+        out.push(" ".repeat(depth * 2) + "if true\n")
+        line += 1
+        depth += 1
+    val pad = " ".repeat(depth * 2)
+    code match
+        Some(k) ->
+            if marked
+                out.push(pad + s"print(${avin_string(ReplStart)})\n")
+                line += 1
+            if focus == FocusCode then place = ReplPlace(line, count_lines(k), depth * 2, first)
+            out.push(repl_indented(k, depth * 2, 0))
+            for sh in shows
+                out.push(pad + sh + "\n")
+            if marked then out.push(pad + s"print(${avin_string(ReplEnd)})\n")
+        None -> out.push(pad + "()\n")
+    ReplProgram(out.finish(), place)
+
+// How many lines `text` is written on.
+private count_lines(text: string) -> usize
+    var n = 1usize
+    for b in text.bytes
+        if b == u8('\n') then n += 1
+    n
+
+/** The program's files: the modules of the package the session was started in, and the session. */
+private repl_files(s: *ReplSession, text: string) -> Buf[ProgramFile]
+    var files: Buf[ProgramFile] = buf()
+    for f in s.base do files.push(f)
+    val module_name: Option[string] = if s.base.len() > 0 then Some("") else None
+    files.push(ProgramFile(source_of(s.file, text), module_name, false, buf(), s.package))
+    files
+
+/** Checks `program`, recording what each name means; where it does not check, writes the
+ * diagnostics, placed in the input where they are in it, and answers `None`. */
+repl_check(s: *ReplSession, program: ReplProgram, out: &Fn(string) -> unit) -> Option[Checked]
+    val files = repl_files(s, program.text)
+    val loaded = load_units(s.tc.library_dir(), files, false, src -> src) match
+        Ok(l) -> l
+        Err(message) ->
+            out(s"avin: $message\n")
+            return None
+    if loaded.broken
+        for u in loaded.units
+            if u.report.has_errors() then out(repl_render(s, u.src, u.report, program.place))
+        return None
+    val checked = check_program(loaded.units, loaded.root_module, false, true)
+    if checked.has_errors()
+        for u in checked.units
+            if u.report.has_errors() then out(repl_render(s, u.src, u.report, program.place))
+        return None
+    Some(checked)
+
+/** `repl_check`, writing nothing. */
+private repl_check_quiet(s: *ReplSession, program: ReplProgram) -> Option[Checked]
+    val files = repl_files(s, program.text)
+    val loaded = load_units(s.tc.library_dir(), files, false, src -> src) match
+        Ok(l) -> l
+        Err(_) -> return None
+    if loaded.broken then return None
+    val checked = check_program(loaded.units, loaded.root_module, false, true)
+    if checked.has_errors() then return None
+    Some(checked)
+
+/** The diagnostics of `report`, about `src`: those in the session's newest input are placed in the
+ * input as it was typed; any other is rendered against its own file. */
+repl_render(s: *ReplSession, src: Source, report: Report, place: ReplPlace) -> string
+    if src.name != s.file then return report.render(src)
+    var out = str_builder()
+    for i in 0..<report.len()
+        val d = report.at(i)
+        if !d.is_error() then continue
+        out.push(repl_render_one(src, d, place))
+    out.finish()
+
+// One diagnostic of the session's file, placed in the newest input when it is there.
+private repl_render_one(src: Source, d: Diagnostic, place: ReplPlace) -> string
+    val at = src.locate(d.span.start)
+    if !place.holds(at.line) then return "error: " + d.message + " (in an earlier input, which this one breaks)\n"
+    // The input as it was typed, from the program's lines it was written on.
+    var lines: Buf[string] = buf()
+    for n in place.line..<place.line + place.count
+        val raw = from_utf8_lossy(src.line_text(n))
+        val skip = place.indent + (if n == place.line then place.first else 0)
+        lines.push(if raw.bytes.len >= skip then raw[skip..] else "")
+    var typed = str_builder()
+    for i in 0..<lines.len()
+        if i > 0 then typed.push("\n")
+        typed.push(lines[i])
+    val text = typed.finish()
+    val input = source_of(ReplInputName, text)
+    val start = repl_offset(src, input, d.span.start, place)
+    val end = repl_offset(src, input, if d.span.end > d.span.start then d.span.end else d.span.start, place)
+    Diagnostic(d.severity, Span(start, if end >= start then end else start), d.message, d.label, d.note).render(input) + "\n"
+
+// The offset in the typed input `input` of `offset` in the program `src`.
+private repl_offset(src: Source, input: Source, offset: usize, place: ReplPlace) -> usize
+    val at = src.locate(offset)
+    if at.line < place.line then return 0
+    val line = at.line - place.line + 1
+    if line > input.line_count() then return input.bytes.len
+    val skip = place.indent + (if at.line == place.line then place.first else 0)
+    val from = src.line_span(at.line).start
+    val within = if offset >= from + skip then offset - from - skip else 0
+    val span = input.line_span(line)
+    if span.start + within > span.end then span.end else span.start + within
+
+/** The type of the newest local named `name` in the program, from the declaration of it the check
+ * recorded latest in the text. */
+repl_value_type(c: *Checked, file: string, text: string, name: string) -> Option[string]
+    var best: Option[string] = None
+    var at = 0usize
+    for r in c.references
+        if !r.declares() || r.at_file != file || !names_at(text, r.at_span, name) then continue
+        for keyword in ["val ", "var ", "lazy val "]
+            val head = keyword + name + ": "
+            if r.detail.starts_with(head) && (best is None || r.at_span.start >= at)
+                best = Some(r.detail[head.bytes.len..])
+                at = r.at_span.start
+    best
+
+/** What the declaration of `name` the check recorded latest says, as hover shows it: a function's
+ * header or a type's. A record's name declares both the type and its one variant; the type is shown. */
+repl_declared(c: *Checked, file: string, text: string, name: string) -> Option[string]
+    var best: Option[string] = None
+    var at = 0usize
+    for r in c.references
+        if !r.declares() || r.at_file != file || !names_at(text, r.at_span, name) then continue
+        if r.detail.starts_with("val ") || r.detail.starts_with("var ") || r.detail.starts_with("lazy val ") then continue
+        val variant = r.detail.starts_with(name + ".")
+        if best is None || r.at_span.start > at || r.at_span.start == at && !variant
+            // A record's own variant, `P.P(a: int)`, is shown as the declaration it is.
+            best = Some(if variant then "data " + r.detail[name.bytes.len + 1..] else r.detail)
+            at = r.at_span.start
+    best
+
+// Whether `span` of `text` is `name` written out.
+private names_at(text: string, span: Span, name: string) -> bool
+    if span.end > text.bytes.len || span.end - span.start != name.bytes.len then return false
+    text[span.start..<span.end] == name
+
+// ---- running ----
+
+/** Builds and runs `program`, passing on what its newest input writes, and answers whether the input
+ * ran to its end. */
+repl_run(s: *ReplSession, program: ReplProgram, out: &Fn(string) -> unit) -> bool
+    _ = write_text(s.file, program.text)
+    val files = repl_files(s, program.text)
+    val built = cached_build(s.tc, s.file, files, false, "-O0", s.sysl, s.c) match
+        Ok(b) -> b
+        Err(message) ->
+            out(message.trim_end() + "\n")
+            return false
+    val path = s.scratch + "/output"
+    var sink = create(path) match
+        Ok(f) -> f
+        Err(e) ->
+            out(s"avin: $path: ${e.to_string()}\n")
+            return false
+    var source = open(path) match
+        Ok(f) -> f
+        Err(e) ->
+            out(s"avin: $path: ${e.to_string()}\n")
+            return false
+    var output = ReplOutput(false, false, "", 0, false, file_name(s.file).unwrap_or(""), program.place)
+    var chunk: []u8 = [0; 4096]
+    val ran = run_attended_ticking(built.path, [], Stdio.ToFile(sink), Stdio.ToFile(sink), () -> output.drain(&source, chunk, out))
+    _ = sink.close()
+    _ = source.close()
+    output.finish(out)
+    val state = ran match
+        Ok(st) -> st
+        Err(e) ->
+            out(s"avin: could not run the session: ${e.to_string()}\n")
+            return false
+    state match
+        Exited(code) ->
+            if code == 0 && output.ended then return true
+            if code == 0 then out("the input ended the program, so it is not kept\n")
+            elif !output.trapped then out(s"the program exited with status $code, so the input is not kept\n")
+        Signalled(signal) ->
+            if signal == 2 then out("interrupted\n")
+            elif !output.trapped then out(s"the program was stopped by signal $signal, so the input is not kept\n")
+        TimedOut -> out("the program took too long\n")
+    false
+
+/** What a run of the session's program has written so far, and how much of it has been passed on. */
+struct ReplOutput
+    /** Whether `ReplStart` has been seen, after which the output is the newest input's. */
+    started: bool
+    /** Whether `ReplEnd` has been seen: the input ran to its end. */
+    ended: bool
+    /** What has been read and not yet passed on. */
+    held: string
+    /** How far into the file the output has been read. */
+    offset: u64
+    /** Whether the output says the program trapped. */
+    trapped: bool
+    /** The name a trap gives the session's file by, and where the newest input is in it: a trap's
+     * place there is shown as a place in the input. */
+    name: string
+    place: ReplPlace
+
+    /** Reads what the program has written since the last call, and passes on what of it is the
+     * newest input's, holding back a tail that may be the beginning of a mark. */
+    drain(*self, source: *File, chunk: []u8, out: &Fn(string) -> unit)
+        loop
+            val got = source.read_at(self.offset, chunk) match
+                Ok(g) -> g
+                Err(_) -> return
+            if got.len == 0 then break
+            self.offset += u64(got.len)
+            self.held = self.held + from_utf8_lossy(got)
+        self.pass(out, false)
+
+    /** Passes on everything held: the run is over. */
+    finish(*self, out: &Fn(string) -> unit)
+        self.pass(out, true)
+        // A program that never reached the newest input failed in an earlier one: what it wrote says
+        // why, and is shown whole.
+        if !self.started && self.held != ""
+            out("an earlier input failed when the session ran again:\n" + self.held)
+            self.held = ""
+
+    pass(*self, out: &Fn(string) -> unit, all: bool)
+        if !self.started
+            val at = self.held.index_of(ReplStart) match
+                Some(i) -> i
+                None -> return
+            self.held = self.held[at + ReplStart.bytes.len..]
+            self.started = true
+        if !self.ended
+            self.held.index_of(ReplEnd) match
+                Some(i) ->
+                    self.emit(self.held[0..<i], out)
+                    self.held = self.held[i + ReplEnd.bytes.len..]
+                    self.ended = true
+                None -> ()
+        if self.ended || all
+            self.emit(self.held, out)
+            self.held = ""
+            return
+        // Every whole line is passed on now; a line still being written may hold the start of
+        // `ReplEnd`, or a place a trap names, and waits for its end.
+        var cut = self.held.bytes.len
+        while cut > 0 && self.held.bytes[cut - 1] != u8('\n')
+            cut -= 1
+        if cut > 0
+            self.emit(self.held[0..<cut], out)
+            self.held = self.held[cut..]
+
+    emit(*self, text: string, out: &Fn(string) -> unit)
+        if text == "" then return
+        if text.contains("trap: ") || text.starts_with("trap") then self.trapped = true
+        out(self.relocated(text))
+
+    /** `text` with each place `name:line:column` in the session's file written as the place in the
+     * input, `<input>:line:column`, or, outside it, as `an earlier input`. */
+    relocated(self, text: string) -> string
+        if self.name == "" then return text
+        val mark = self.name + ":"
+        var out = str_builder()
+        var rest = text
+        loop
+            val i = rest.index_of(mark) match
+                Some(i) -> i
+                None -> break
+            out.push(rest[0..<i])
+            rest = rest[i + mark.bytes.len..]
+            val line_digits = digits_at(rest, 0)
+            if line_digits == 0 || line_digits >= rest.bytes.len || rest.bytes[line_digits] != u8(':')
+                out.push(mark)
+                continue
+            val col_digits = digits_at(rest, line_digits + 1)
+            if col_digits == 0
+                out.push(mark)
+                continue
+            val line = number_of(rest[0..<line_digits])
+            val col = number_of(rest[line_digits + 1..<line_digits + 1 + col_digits])
+            rest = rest[line_digits + 1 + col_digits..]
+            if self.place.holds(line)
+                val skip = self.place.indent + (if line == self.place.line then self.place.first else 0)
+                out.push(s"$ReplInputName:${line - self.place.line + 1}:${if col > skip then col - skip else 1}")
+            else out.push("an earlier input")
+        out.push(rest)
+        out.finish()
+end ReplOutput
+
+// How many decimal digits `text` holds from `from` on.
+private digits_at(text: string, from: usize) -> usize
+    var n = 0usize
+    while from + n < text.bytes.len && u8('0') <= text.bytes[from + n] && text.bytes[from + n] <= u8('9')
+        n += 1
+    n
+
+// The number the decimal digits `text` write.
+private number_of(text: string) -> usize
+    var n = 0usize
+    for b in text.bytes
+        n = n * 10 + usize(b - u8('0'))
+    n
