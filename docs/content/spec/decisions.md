@@ -11031,6 +11031,63 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (none can be named in general, and an intersection type is not a type Avin writes); keeping the
   result-level message (it names a trait the program never mentioned).
 
+**API documentation from the source** (branch `avin-doc`; [`avin doc`](/getting-started/#api-documentation), [doc comments](/spec/declarations/#doc-comments))
+
+- Settled on the user's delegation 2026-11-19: **a doc comment is the run of `//` lines directly
+  above a declaration, past any annotations between**: exactly what the language server's hover
+  already showed, so no second comment form exists and every comment the standard library already
+  wrote is its documentation. It is Markdown with GitHub's extensions; each line loses its `//` and
+  one space, and keeps the rest of its indentation. *Alternatives weighed*: a `///` form of its own
+  (every existing comment would have to be rewritten, and a plain comment above a declaration would
+  silently stop being shown).
+- Settled on the user's delegation 2026-11-19: **`avin doc [<program>] [-o <dir>] [--check]
+  [--std-url <url>] [<features>]` and `avin doc --std`**: the program is checked as `avin check`
+  checks it, with every feature on, and refused with its diagnostics when it does not check; a page
+  per module (`<module>.html`), the root module's declarations on `index.html` beside the list of
+  modules, a shared `style.css` and a `search.js` the search box reads, no fetch from anywhere else.
+  The default output is `.avin/doc` beside the program (the package's directory, the directory of a
+  program without a manifest, or the file's), which a package's `.gitignore` already names; a
+  directory is written only when it is new, empty, or holds `.avin-doc`, the marker `avin doc` writes,
+  and then its old pages are removed first. *Alternatives weighed*: `doc/` beside the program (a
+  directory of hand-written docs by that name would be overwritten); `--check` that also writes (a
+  check in CI wants nothing written).
+- Settled on the user's delegation 2026-11-19: **what a page shows**: every public declaration
+  of every module but a test module (`@tests` files and a package's `tests` module), each with the
+  header hover shows (a function's, a field's and a value's as the checker typed it; a type's first
+  line as written), a data type's variants and a record's fields, a class's public fields and methods,
+  a trait's members, an object's, the impls a type has with their public methods, and a module's
+  exports. An impl is listed with its type when the site documents the type among modules of the same
+  kind (the program's, a dependency's, the library's), with the module it is written in named when
+  that is another; otherwise under its own module's "Implementations". A method is shown without its
+  type (`map[U](…)`, not `Option[T].map[U](…)`). A module with nothing public and no comment has no
+  page. Anchors are `Type`, `Type.member`, `function`, an overload's `name-2`, an impl's
+  `Type.impl`; a byte outside a name is written `~` and its hex.
+- Settled on the user's delegation 2026-11-19: **a type named in a signature links to the
+  declaration the checker resolved it there**, so two types of one name in two modules are never
+  confused; a name the checker inferred rather than read (an alias's body shown in its place) links
+  to the one type of the site with that name, and a type parameter never links. **The standard
+  library's modules the program reads, and its dependencies' modules, are written beside its own**,
+  listed apart on the index, so every link stays inside the site; `--std-url` names where the
+  library's pages are published instead and writes none of them. *Alternatives weighed*: always
+  linking to a fixed public URL (a site that breaks offline, and on a version mismatch); never
+  linking into the library (the commonest types of every signature would be dead text). **Review
+  with the user**: whether the library's pages should come with every package's documentation by
+  default.
+- Settled on the user's delegation 2026-11-19: **links in a doc comment**: a link whose destination is
+  a path of names, `[the map](Vector.map)`, and `[Name]` or `` [`Name`] `` with no destination,
+  link to that declaration, found as a member of the documented declaration's type (and its
+  owners'), then in its module, then as a full path or a module's name, then in the prelude, then as
+  the one declaration of the site with that name (`Type.member` included). A relative destination
+  that names no declaration must be a page of the site. **`--check` fails on a destination link that
+  leads nowhere, a backticked `` [`Name`] `` that resolves to nothing, and a fenced block with no
+  language or `avin` that parses neither as declarations nor as the statements of a function body**;
+  a bare `[words]` that names nothing stays prose, and `http:`-style links are not fetched. Without
+  `--check` the same problems are warnings and the pages are written. Only the program's own modules
+  are checked, never a dependency's or the library's. *Alternatives weighed*: reporting every
+  unresolved `[x]` (prose in brackets is common: `[1, 2, 3]`); fetching external links (slow, flaky,
+  and a fetch the command promises not to make); running the blocks as tests (a separate feature,
+  left for later).
+
 ## Open
 
 - Whether constructor traits may carry parameters that are not holes (an error type fixed per

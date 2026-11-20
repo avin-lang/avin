@@ -885,5 +885,8 @@ names its dependencies.
 - `avin vendor [<package>]` copies what the project resolves to into its
   [`vendor/`](#vendoring). It and `build`, `run`, `check` and `test` take the
   [feature flags](#on-the-command-line).
+- `avin doc [<package>]` writes the package's [API documentation](/getting-started/#api-documentation),
+  its dependencies' and the standard library's modules it reads written beside its own so every
+  link stays inside the site, with every feature on.
 - `avin lsp` analyzes a file in a package as the package, with its dependencies as the cache holds
   them, and an `avin.hocon` as a manifest, telling it what is wrong with it at its place.
