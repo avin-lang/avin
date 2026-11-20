@@ -520,7 +520,13 @@ data Option[+T]
 ```
 
 The single-line form declares a one-variant type whose variant has the type's name. Variants are
-constructors, not types: `Some(1)` has type `Option[int]`. A variant is a name of its module, and
+constructors, not types: `Some(1)` has type `Option[int]`. A variant without fields is a value
+(`None`); one with fields, named and not called, is its constructor as a function value, as a
+class's name is: a function of all its fields, in order, to its data type or a refined variant's
+declared instance, so `[1, 2].map(Some)` is `[Some(1), Some(2)]` and `val f = Circle` is a
+`(real) -> Shape`. A generic variant takes its instance from the function type expected there, whose
+result also decides between variants sharing a name, or from written type arguments, `Some[int]`;
+where a value of the variant's own type is expected, the variant is to be called. A variant is a name of its module, and
 several data types of one module, in one file or in several, may each have a variant of one name:
 
 ```text
@@ -1527,9 +1533,9 @@ the constructor's parameter type is the more specific.
   called by the object's name the same way.
 - **As a function value.** Where a function type is expected, the name of an object that declares
   `apply` is its companion class's constructor or the `apply` whose parameters accept that type's,
-  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. A variant with fields
-  is not a value, so a data type's companion offers its `apply` methods alone. Elsewhere the bare
-  name is the object.
+  chosen as for any overloaded function used as a value: `[1, 2].map(Pair)`. For a data type's
+  companion, a variant of the object's name is one of those choices, as it is at a call. Elsewhere
+  the bare name is the object.
   An object that is itself of a function type stays that value.
 - `Name.apply(…)` is an ordinary member call, and chooses among the `apply` methods alone.
 

@@ -14743,14 +14743,18 @@ private results_as(c: *Checker, typed: &TExpr, want: &Type) -> &TExpr
     TExpr(at, lambda.ty, Block(items))
 
 /** A lambda of `arity` parameters, checked against `want`, that passes them on to a call of `callee`. */
-private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want: &Type) -> &TExpr
+private calling_lambda(c: *Checker, at: Span, callee: string, arity: usize, want: &Type) -> &TExpr = calling_lambda_of(c, at, name_at(at, callee), arity, want)
+
+/** A lambda of `arity` parameters, checked against `want`, that passes them on to a call of the
+ * expression `callee`, a name as written, qualified or with type arguments. */
+private calling_lambda_of(c: *Checker, at: Span, callee: &Expr, arity: usize, want: &Type) -> &TExpr
     var params: Buf[LambdaParam] = buf()
     var args: Buf[Argument] = buf()
     for i in 0..<arity
         val param = s"adapted $i"
         params.push(LambdaParam(at, param, None))
         args.push(Argument(at, None, name_at(at, param), false))
-    val body = Expr(at, Call(name_at(at, callee), args))
+    val body = Expr(at, Call(callee, args))
     lambda_expr(c, Expr(at, Lambda(params, body)), params, body, Some(want), false)
 
 private function_arity(t: &Type) -> usize = *t match
@@ -14890,7 +14894,7 @@ private check_kind(c: *Checker, e: &Expr, expected: Option[&Type], used: bool) -
     Member(target, name) ->
         // The rewritten use is judged as this one is, by the caller, so it is checked as used.
         if module_use(c, e) is Some(q) then check_form(c, q, expected, true)
-        elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e.span, found, explicit, expected)
+        elif variant_use(c, e.span, target, name) is Some((found, explicit)) then qualified_variant_value(c, e, found, explicit, expected)
         elif limit_constant(c, e.span, target, name) is Some(k) then k
         elif static_value(c, e.span, target, name, expected) is Some(v) then v
         else member_expr(c, e, target, name, expected)
@@ -15086,10 +15090,10 @@ private name_expr(c: *Checker, at: Span, name: string, expected: Option[&Type]) 
         if abstract_constructor(c, id, at) then return TExpr(at, ErrorType, UnitConst)
         if adapted_function(c, at, name, id, expected) is Some(lambda) then return lambda
         return named_function_value(c, at, name, None, expected)
-    val (chosen, is_variant) = choose_variant(c, at, name, expected)
+    val (chosen, is_variant) = choose_variant(c, at, name, made_type(c, expected))
     if chosen is Some(v)
         if c.data[v.data].variants[v.index].fields.len() == 0 then return construct(c, at, at, v, buf(), None, expected)
-        c.note(symbol.unit, at, s"`$name` has fields; call it, as in `$name(arguments)`")
+        return variant_function(c, at, name_at(at, name), name, v, None, expected)
     elif is_variant then ()
     elif tested_named(c, name) then c.note(symbol.unit, at, s"`$name` is bound by an `is` test, and is in scope only where that test is known to hold")
     elif alias_not_value(c, unit_of(c), name) is Some(message) then c.note(symbol.unit, at, message)
@@ -15595,11 +15599,11 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if abstract_constructor(c, id, target.span) then return TExpr(e.span, ErrorType, UnitConst)
             return named_function_value(c, e.span, name, Some(types), expected)
         if lookup_local(c, name) is None && param_index(c, name) is None
-            val (chosen, is_variant) = choose_variant(c, target.span, name, expected)
+            val (chosen, is_variant) = choose_variant(c, target.span, name, made_type(c, expected))
             if chosen is Some(v)
                 if c.data[v.data].variants[v.index].fields.len() == 0
                     return construct(c, e.span, target.span, v, buf(), Some(types), expected)
-                return variant_needs_call(c, e.span, name)
+                return variant_function(c, e.span, e, name, v, Some(types), expected)
             elif is_variant then return TExpr(e.span, ErrorType, UnitConst)
     if target.kind is Member(inner, name)
         // A variant reached through its type with the type arguments on the variant, `T.V[A]`.
@@ -15610,7 +15614,7 @@ private type_apply(c: *Checker, e: &Expr, target: &Expr, types: Buf[&TypeExpr], 
             if on_type is Some(_)
                 c.note(unit_of(c), target.span, "a variant's type arguments are written once, on its type or on the variant")
                 return TExpr(e.span, ErrorType, UnitConst)
-            return qualified_variant_value(c, e.span, Some(v), Some(types), expected)
+            return qualified_variant_value(c, e, Some(v), Some(types), expected)
     // A method named without a call, with its own type arguments, as in `box.convert[int]`.
     if target.kind is Member(inner, name)
         val object = check_expr(c, inner, None)
@@ -17439,8 +17443,10 @@ private variant_use(c: *Checker, at: Span, target: &Expr, name: string) -> Optio
     if no_such_variant(c, at, path) then return Some((None, None))
     None
 
-// `T.V` not called: a variant without fields, made; one with fields is reported, as its bare name is.
-private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+// `T.V` not called, `e`: a variant without fields, made; one with fields is its function value, as
+// its bare name is.
+private qualified_variant_value(c: *Checker, e: &Expr, found: Option[VariantRef], explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val at = e.span
     val v = found match
         Some(v) -> v
         None -> return TExpr(at, ErrorType, UnitConst)
@@ -17449,14 +17455,96 @@ private qualified_variant_value(c: *Checker, at: Span, found: Option[VariantRef]
             if c.data[v.data].variants[v.index].result is Some(_) then return construct(c, at, at, v, buf(), None, Some(written_instance(c, v, types)))
         return construct(c, at, at, v, buf(), explicit, expected)
     val written = c.data[v.data].name + "." + c.data[v.data].variants[v.index].name
-    c.note(unit_of(c), at, s"`$written` has fields; call it, as in `$written(arguments)`")
-    TExpr(at, ErrorType, UnitConst)
+    variant_function(c, at, e, written, v, explicit, expected)
 
-// A variant with fields named with type arguments and not called, as in `Some[int]`: reported, since
-// a variant with fields is not a value.
-private variant_needs_call(c: *Checker, at: Span, name: string) -> &TExpr
-    c.note(unit_of(c), at, s"`$name` has fields; call it, as in `$name(arguments)`")
-    TExpr(at, ErrorType, UnitConst)
+/** Whether a value of type `got` may be given where `want` is expected, or either is still open. */
+private fits_settled(c: *Checker, got: &Type, want: &Type) -> bool
+    val g = zonk(c, got)
+    val w = zonk(c, want)
+    has_unknowns(g) || has_unknowns(w) || *g is ErrorType || *w is ErrorType || fits(c, g, w)
+
+/** The type a value made where `expected` is wanted has: the result of an expected function type,
+ * which decides among variants sharing a name as the type itself would. */
+private made_type(c: *Checker, expected: Option[&Type]) -> Option[&Type]
+    val t = expected?
+    *zonk(c, t) match
+        Function(_, r, _) -> Some(r)
+        _ -> Some(t)
+
+// A variant with fields named and not called, `callee` as written (`Heard`, `Event.Heard`,
+// `Some[int]`): its constructor as a function value, as a class's name is its constructor. The value
+// is a lambda taking the variant's fields, in order, and making the variant from them, so the
+// variant's own rules hold at the call it makes: a generic variant's type arguments come from the
+// expected function type, or from written ones; the result is the data type, or a refined variant's
+// declared instance. Where a function type of as many parameters is expected, its parameters stand
+// in for the fields' and its result is the one the variant is made at; elsewhere the value's type is
+// the variant's own, `(text: string) -> Msg` taken as `(string) -> Msg`.
+private variant_function(c: *Checker, at: Span, callee: &Expr, written: string, v: VariantRef, explicit: Option[Buf[&TypeExpr]], expected: Option[&Type]) -> &TExpr
+    val unit = unit_of(c)
+    // Where a value of the variant's own type is expected, the call was meant.
+    if expected is Some(t)
+        if *zonk(c, t) is Data(id, _, _) && id == v.data
+            c.note(unit, at, s"`$written` has fields; call it, as in `$written(arguments)`")
+            return TExpr(at, ErrorType, UnitConst)
+    val s = variant_signature(c, v)
+    val first = c.vars.len()
+    var type_args: Buf[&Type] = buf()
+    var writable: Buf[usize] = buf()
+    for i in 0..<s.type_params.len()
+        var preset: Option[&Type] = None
+        if i < s.fixed.len()
+            if s.fixed[i] is Some(t) then preset = Some(t)
+        preset match
+            Some(t) -> type_args.push(t)
+            None ->
+                type_args.push(fresh_var(c))
+                writable.push(i)
+    // Written type arguments fix the instance; too many are reported by the call the value makes.
+    if explicit is Some(types)
+        val fitting = if types.len() > writable.len() then writable.len() else types.len()
+        for i in 0..<fitting
+            unify(c, type_args[writable[i]], resolve_type_arg(c, unit, types[i], s.type_params, writable[i]))
+    val fields = substitute_all(s.params, s.owner, type_args)
+    val made = substitute(s.result, s.owner, type_args)
+    var params: Buf[&Type] = buf()
+    var result = made
+    var sendable = false
+    var matched = false
+    if expected is Some(t)
+        if *zonk(c, t) is Function(ps, r, m)
+            if ps.len() == fields.len()
+                matched = true
+                sendable = m
+                result = r
+                for i in 0..<ps.len()
+                    val want = zonk(c, ps[i])
+                    if has_unknowns(want) then unify(c, want, fields[i])
+                    params.push(zonk(c, ps[i]))
+                // An expected type the variant does not fit is reported as the value's own type
+                // against it, as any function value's is, rather than inside the call it makes.
+                for i in 0..<ps.len()
+                    if !fits_settled(c, params[i], fields[i]) then matched = false
+                if !fits_settled(c, made, r) then matched = false
+                if !matched
+                    params.clear()
+                    result = made
+                    sendable = false
+    if !matched
+        for f in fields
+            params.push(zonk(c, f))
+    // A parameter neither the expected type nor written type arguments decide leaves the value's type
+    // open, as a generic function's name leaves it.
+    for p in params
+        if *p is Var(x)
+            var named = "a type argument"
+            var sample = "int"
+            for i in 0..<type_args.len()
+                if *zonk(c, type_args[i]) is Var(y) && x == y && y >= first
+                    named = s"`${s.type_params[i].name}`"
+                    sample = sample_type_arg(s.type_params[i])
+            c.note(unit, at, s"cannot infer $named for `$written` used as a value; write it, as in `$written[$sample]`")
+            return TExpr(at, ErrorType, UnitConst)
+    calling_lambda_of(c, at, callee, params.len(), Function(params, result, sendable))
 
 // `T.V(args)`: the variant made from the arguments. Type arguments are written once, on the type,
 // `T[A].V(…)`, or on the variant, `T.V[A](…)`.
@@ -21397,15 +21485,19 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
     val receiver = global_read(c, at, c.classes[o].global.unwrap())
     val constructors = callable_constructors(c, ids)
     val ms = object_applies(c, o)
+    // A data type's variant of the object's name is its constructor, as a class's is.
+    var variants: Buf[VariantRef] = buf()
+    if companion_variant(c, o, name) is Some(v) then variants.push(v)
+    val first_method = constructors.len() + variants.len()
     var labels: Buf[string] = buf()
     var fitting: Buf[usize] = buf()
     var fitting_labels: Buf[string] = buf()
     var owners: Buf[usize] = buf()
     var counts: Buf[usize] = buf()
     var compared: Buf[Buf[&Type]] = buf()
-    for k in 0..<constructors.len() + ms.len()
-        val s = if k < constructors.len() then function_signature(c, constructors[k], ErrorType) else method_signature(c, receiver, ms[k - constructors.len()], ErrorType)
-        val label = if k < constructors.len() then overload_text(c, constructors[k]) else apply_text(c, o, ms[k - constructors.len()])
+    for k in 0..<first_method + ms.len()
+        val s = if k < constructors.len() then function_signature(c, constructors[k], ErrorType) elif k < first_method then variant_signature(c, variants[0]) else method_signature(c, receiver, ms[k - first_method], ErrorType)
+        val label = if k < constructors.len() then overload_text(c, constructors[k]) elif k < first_method then candidate_text(s.name, s.type_params, s.names, s.params, s.variadic) else apply_text(c, o, ms[k - first_method])
         labels.push(label)
         val view = substitute_all(s.params, s.owner, s.known)
         if accepts(c, view, s.owner, s.type_params.len(), params)
@@ -21423,7 +21515,8 @@ private apply_value(c: *Checker, at: Span, name: string, o: usize, ids: Buf[usiz
             c.note(unit, at, s"`$name` used as ${type_name(zonk(c, expected.unwrap()))} is ambiguous: ${joined_labels(fitting_labels)} each accept it")
             return TExpr(at, ErrorType, UnitConst)
     if k < constructors.len() then function_value(c, at, constructors[k], None, expected)
-    else method_value(c, at, receiver, ms[k - constructors.len()], None, expected)
+    elif k < first_method then variant_function(c, at, name_at(at, name), name, variants[0], None, expected)
+    else method_value(c, at, receiver, ms[k - first_method], None, expected)
 
 private function_signature(c: *Checker, id: usize, result: &Type) -> Signature
     val f = c.symbols[id]
