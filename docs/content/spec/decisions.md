@@ -4952,7 +4952,38 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   undeclared `val f = _ + 1` is an error, as are a function's body, `return` and an assignment's
   right side, whose expected type the parser does not see. Why: the brief's rule, kept syntactic so
   the lambda's extent never depends on type inference. Alternative weighed: any expression with an
-  expected function type, which makes the extent of a lambda depend on checking.
+  expected function type, which makes the extent of a lambda depend on checking. (Amended
+  2026-11-19, branch `underscore-fn-expected`: a function's body with a written result type is a
+  place too, since its type is written as a declared value's is; see the entries below.)
+- Settled on the user's delegation 2026-11-19 (branch `underscore-fn-expected`): **a branch is a
+  place of its own.** Where an `if`, a `match` or a block stands where a placeholder lambda may (a
+  call's argument, a declared value, a function's body with a declared result), each branch of the
+  `if`, each arm of the `match` and the block's last line is such a place in turn, recursively, with
+  a call argument's rules: `val key: (Request) -> string = by match "method" -> _.method …` and
+  `xs.map(if up then _ + 1 else _ - 1)`. The condition, subject, guards and a block's earlier lines
+  keep their own `_`, and an `if` or `match` anywhere else gives no branch a place, so
+  `val f = if c then _ + 1 else 0` keeps its error. Why: a choice among functions is common
+  (ported command-line programs met it at once), each branch's value is the function expected, and
+  the rule stays syntactic, so a lambda's extent still never depends on checking. Alternatives
+  weighed: searching the whole `if`/`match` for one lambda around it (makes `if _ > 0 then …` a
+  lambda of the condition, a different meaning per position), and deciding by the expected type the
+  checker finds (any position, but extent then depends on inference). Review with the user: it
+  widens the 2026-11-09 rule that an `if` and a `match` keep their own `_`.
+- Settled on the user's delegation 2026-11-19 (branch `underscore-fn-expected`): **a function's
+  body with a declared result type, and each of its clauses' bodies, is a placeholder's place**, by
+  the same rule as a declared value: any written result but a tuple, so a type alias of a function
+  type works, `adder(n: int) -> (int) -> int = _ + n`. A function with no declared result is not
+  one, and `return`'s value stays none (the parser does not carry the result type to it). Why: the
+  result type is written beside the body as a value's type is beside its value. Alternatives
+  weighed: only a result written as a function type (excludes aliases, unlike values), and leaving
+  bodies out as before (the 2026-11-09 reason, that the parser does not see the type, holds for
+  `return` but not for a body whose type is written above it).
+- Settled on the user's delegation 2026-11-19 (branch `underscore-fn-expected`): **a placeholder
+  lambda where no function is expected is reported once**, as "cannot infer the type of this `_`",
+  and is then of no type, so `val n: int = _ + 1` and `count() -> int = if c then _ + 1 else 0` no
+  longer add "expected int, found (<error>) -> <error>" or "the branches agree on no type". Why: the
+  second message only repeats the first in worse words. Alternative weighed: keeping the function of
+  errors, which is what a written lambda's unknown parameter still gives.
 
 - Settled on the user's delegation 2026-11-09 (branch `type-aliases`): **type aliases are transparent**, `type Name[T] =
   Body` ([type](/spec/declarations/#type)): each use is the body with the type arguments
