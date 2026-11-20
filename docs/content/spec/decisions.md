@@ -9667,6 +9667,52 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   random pairs checked against the quadratic table for minimality. Review with the user: the names
   `Edit`, `Keep`, `Insert`, `Delete`, `diffLines`, `unifiedDiff` and `changes`, and whether a
   patience diff should join this one as `diffLines`' option.
+- Settled on the user's delegation 2026-11-19 (branch `display-width`): **the standard library
+  measures the columns of a terminal: `char.displayWidth`, `string.displayWidth`,
+  `padStartWidth(width, ch = ' ')`, `padEndWidth(width, ch = ' ')` and `truncateWidth(width,
+  ellipsis = "…")`, and a formatted field's width counts those columns.** The rules
+  (`library/avin/display_width.avin`): a character is 2 when East Asian Wide or Fullwidth; 0 when a
+  nonspacing or enclosing mark, a format character (but the soft hyphen and the marks before a
+  number), or a Hangul vowel or final jamo; 0 when a control character; 1 otherwise, Ambiguous and
+  unassigned included. Text is measured by cluster: a character with the zero-width characters after
+  it, a skin tone after an emoji, and, after a pictograph, each pictograph a zero-width joiner joins;
+  a cluster is as wide as its first character, except that a variation selector 16 after an emoji, or
+  a skin tone, makes it 2, and two regional indicators are one flag of 2. The table is generated from
+  the Unicode Character Database 17.0.0 (the version `sysl.unicode` answers with) by
+  `scripts/display_width_table.avin` into `library/avin/display_width_table.avin`, about 3 KB of
+  base-32 runs decoded on the first character beyond ASCII; ASCII is answered without it. Choices,
+  each with its rationale and the alternatives weighed:
+  - **Control characters are 0**, not -1 as C's `wcwidth` answers: a width is summed, and a -1 makes
+    every sum wrong; where a tab or newline moves the cursor is the terminal's business. Alternative:
+    1, as `tui` draws a control as U+FFFD (a drawing choice, not a measure).
+  - **Emoji sequences are 2 per cluster**, as kitty, WezTerm, iTerm2, Ghostty and the other modern
+    terminals draw them; older terminals that measure each code point make a family 6 or more. A
+    variation selector 15 changes nothing, since terminals mostly keep a default-emoji character two
+    wide under it. A lone regional indicator is 1, its East Asian width. A zero-width joiner joins only
+    a pictograph to a pictograph, as the grapheme rule GB11 does, so `a` + ZWJ + `😀` is 3.
+    Alternative: full extended grapheme clusters from the break tables `avin.regex` carries (exact for
+    Indic conjuncts and prepended marks, but the prelude would carry those tables and the widths come
+    out the same for what a terminal draws).
+  - **Separate names, `padStartWidth`/`padEndWidth`, beside `padStart`/`padEnd`**, which keep counting
+    characters. Alternative: a named parameter (`padEnd(10, byWidth = true)`), rejected as a flag that
+    changes what the first argument means; or changing `padEnd` itself, rejected because a sequence's
+    `padTo` and `take`/`drop` count characters and `padEnd` pairs with them. A wide fill character fills
+    two columns at a time and a space fills a column left over; a fill of no width traps (`padding by
+    width needs a fill character that takes a column`) when padding is needed, rather than looping or
+    silently using a space.
+  - **`truncateWidth` never cuts a cluster**, so the result may be a column short of `width` where a
+    wide character does not fit, and adds no padding (pad it after when a fixed width is wanted). An
+    ellipsis wider than `width` is dropped and the clusters that fit kept; a `width` of 0 or less keeps
+    nothing.
+  - **A formatted field's width (`%8s`, `%-6?`, `%3c`, and `FormatSpec.width` in `writeField`) counts
+    columns**: field widths exist to line columns up, and for ASCII nothing changes. The precision of
+    `%s` and `%?` still counts characters, as `take` does. The runtime's `text_width` intrinsic, which
+    counted code points for the field, is removed. Review with the user: this changes the output of an
+    existing program that formats wide or combining text into a field (a CJK `%10s` now pads four
+    columns less for two ideographs).
+  - `avin.cli`'s help measures names with `displayWidth` and pads with `padEndWidth`. The `tui`
+    package's own table (`width_table.avin`, Unicode 16.0.0) and its `charWidth`/`textWidth` can
+    become calls to these.
 
 ## Proposed
 

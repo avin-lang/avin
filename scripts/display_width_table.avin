@@ -1,0 +1,153 @@
+// Writes `library/avin/display_width_table.avin`, the table `char.displayWidth` and
+// `string.displayWidth` read the columns of a terminal from, out of three files of the Unicode
+// Character Database:
+//
+//     avin run scripts/display_width_table.avin -- <ucd directory> library/avin/display_width_table.avin
+//
+// The directory holds, side by side, `EastAsianWidth.txt`, `DerivedGeneralCategory.txt` (from the
+// database's `extracted/` directory) and `emoji-data.txt` (from its `emoji/` directory), all of one
+// version: the one `sysl.unicode` answers with, 17.0.0, at `https://www.unicode.org/Public/17.0.0/ucd/`.
+//
+// Every code point gets a value: its kind in the two low bits (0 one column, 1 no column of its own,
+// 2 two columns, 3 a control character), plus 4 when it has the `Emoji` property, 8 when it is an
+// `Emoji_Modifier` (a skin tone) and 16 when it is `Extended_Pictographic`. Neighbours with the same
+// value are merged into a run, and the runs are written as each run's length followed by its value,
+// in the base-32 encoding `scripts/unicode_tables.avin` describes.
+import avin.fs
+import avin.process
+
+val Limit: int = 0x110000
+
+// The digits of the encoding: the first 32 end a number, the last 32 are followed by more digits.
+val Digits: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+
+val One: int = 0
+val Zero: int = 1
+val Two: int = 2
+val Control: int = 3
+
+// One line of a database file: its first and last code point and its fields after the code points.
+data Entry(first: int, last: int, fields: Vector[string])
+
+main(args: Vector[string]) -> int
+  if args.length != 2
+    eprintln("usage: display_width_table <ucd directory> <output file>")
+    return 2
+  val dir = args(0)
+  val version = versionOf(dir, "EastAsianWidth.txt")
+  val categories = versionOf(dir, "DerivedGeneralCategory.txt")
+  if categories != version
+    eprintln(s"DerivedGeneralCategory.txt is Unicode $categories and EastAsianWidth.txt $version")
+    return 1
+
+  val values = Array.fill(Limit, One)
+  // Two columns: East Asian Wide and Fullwidth, the reserved code points the file gives them included.
+  for e in entries(dir, "EastAsianWidth.txt")
+    if e.fields(0) == "W" || e.fields(0) == "F"
+      for c in e.first .. e.last do values(c) = Two
+  // No column of its own: nonspacing and enclosing marks and format characters, which take precedence
+  // over a wide East Asian width, and the Hangul vowels and finals that join the syllable before them.
+  for e in entries(dir, "DerivedGeneralCategory.txt")
+    val category = e.fields(0)
+    if category == "Mn" || category == "Me" || category == "Cf"
+      for c in e.first .. e.last do values(c) = Zero
+    elif category == "Cc"
+      for c in e.first .. e.last do values(c) = Control
+  for c in 0x1160 .. 0x11ff do values(c) = Zero
+  for c in 0xd7b0 .. 0xd7ff do values(c) = Zero
+  // The format characters that are shown: the soft hyphen, and the marks written before a number.
+  for c in [0xad, 0x600, 0x601, 0x602, 0x603, 0x604, 0x605, 0x6dd, 0x70f, 0x890, 0x891, 0x8e2, 0x110bd, 0x110cd]
+    values(c) = One
+
+  flag(dir, values, "Emoji", 4)
+  flag(dir, values, "Emoji_Modifier", 8)
+  flag(dir, values, "Extended_Pictographic", 16)
+
+  val out = StringWriter()
+  out.write("module avin\n\n")
+  out.write(s"// The columns of a terminal each code point takes, from the Unicode Character Database $version,\n")
+  out.write("// written by `scripts/display_width_table.avin`, which says how the runs are encoded. Do not edit.\n\n")
+  out.write("// Every code point's kind and emoji properties, as runs of a length and a value.\n")
+  out.write("private val DisplayWidthRuns: string = \"" + encodeMap(values) + "\"\n")
+  fs.writeText(args(1), out.text) match
+    Ok(_) ->
+      println(s"wrote ${args(1)} from Unicode $version")
+      0
+    Err(e) ->
+      eprintln(s"${args(1)}: ${e.message}")
+      1
+
+// Adds `bit` to the value of every code point `emoji-data.txt` gives the property `property`.
+flag(dir: string, values: Array[int], property: string, bit: int)
+  var any = false
+  for e in entries(dir, "emoji-data.txt")
+    if e.fields(0) == property
+      any = true
+      for c in e.first .. e.last do values(c) = values(c) | bit
+  if !any
+    eprintln(s"no property $property in emoji-data.txt")
+    process.exit(1)
+
+readFile(dir: string, name: string) -> string = fs.readText(dir + "/" + name) match
+  Ok(text) -> text
+  Err(e) ->
+    eprintln(s"$dir/$name: ${e.message}")
+    process.exit(1)
+
+// The version a data file's first line names: `# EastAsianWidth-17.0.0.txt` is `17.0.0`.
+versionOf(dir: string, name: string) -> string
+  val first = readFile(dir, name).lines(0)
+  val dash = first.lastIndexOf("-")
+  val dot = first.lastIndexOf(".txt")
+  if dash < 0 || dot < dash then "unknown" else first.slice(dash + 1, dot)
+
+// The lines of a file that give code points a value: `first..last ; fields`, comments dropped.
+entries(dir: string, name: string) -> Vector[Entry]
+  val found = Buffer[Entry]()
+  for line in readFile(dir, name).lines
+    val hash = line.indexOf("#")
+    val content = (if hash >= 0 then line.slice(0, hash) else line).trim
+    if content.isEmpty then continue
+    val fields = content.split(";").map(f -> f.trim)
+    val codes = fields(0)
+    val dots = codes.indexOf("..")
+    val first = hexValue(if dots >= 0 then codes.slice(0, dots) else codes)
+    val last = if dots >= 0 then hexValue(codes.slice(dots + 2, codes.byteLength)) else first
+    found.addOne(Entry(first, last, fields.drop(1)))
+  found.toVector
+
+hexValue(text: string) -> int
+  var n = 0
+  for c in text.chars
+    val d = c.asDigit
+    if !(0 <= d < 16)
+      eprintln(s"not a hexadecimal number: $text")
+      process.exit(1)
+    n = n * 16 + d
+  n
+
+// A number in the encoding: its digits from the most significant, every one but the last marked as
+// followed by more.
+encodeNumber(out: StringWriter, n: int)
+  val digits = Buffer[int]()
+  var rest = n
+  loop
+    digits.addOne(rest % 32)
+    rest = rest / 32
+    if rest == 0 then break
+  var k = digits.length - 1
+  while k >= 0
+    val d = if k > 0 then digits(k) + 32 else digits(k)
+    out.writeChar(Digits.charAt(d))
+    k -= 1
+
+// The values as each run's length followed by its value.
+encodeMap(values: Array[int]) -> string
+  val out = StringWriter()
+  var start = 0
+  for c in 1 .. Limit
+    if c == Limit || values(c) != values(start)
+      encodeNumber(out, c - start)
+      encodeNumber(out, values(start))
+      start = c
+  out.text
