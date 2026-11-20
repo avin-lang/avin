@@ -24396,7 +24396,7 @@ private fill_contextual(c: *Checker, at: Span, s: Signature, args: Buf[Argument]
             c.note(unit, at, s"$how_many givens fit `$param: ${type_name(want)}` of `${s.name}` here: ${spoken_list(each)}; pass `$param = …`")
             ok = false
         elif s.defaults[i] is None
-            c.note(unit, at, s"`${s.name}` needs ${article(type_name(want))} `${type_name(want)}` for `$param`, and no given of that type is in scope: declare one (`given $param = …`), take one as `using`, import one, or pass `$param = …`")
+            c.note(unit, at, s"`${s.name}` needs ${article(type_name(want))} `${type_name(want)}` for `$param`, and no given of that type is in scope: declare one (`given $param = …`), take one as `using`, import one, or pass `$param = …`${given_import_hint(c, want)}")
             ok = false
     if !ok then return Filled(args, checked, Binding(binding.slots, binding.targets, false))
     if !added then return Filled(args, checked, binding)
@@ -24483,21 +24483,90 @@ private fitting_givens(c: *Checker, at: Span, want: &Type) -> Buf[GivenCandidate
         if found.len() > 0 then return found
     given_module_level(c, want)
 
-/** The module's own top-level givens that fit `want`: of every file of the module. One whose initializer
- * is being checked, the call's own among them, is not yet a value. */
+/** The givens of the module level that fit `want`: the module's own top-level givens, of every file of
+ * the module, together with those another module declares that the module exports by name and those
+ * the call's file imports by name, each under the name the export or import binds. A module imported
+ * whole brings in none. One whose initializer is being checked, the call's own among them, is not yet
+ * a value. */
 private given_module_level(c: *Checker, want: &Type) -> Buf[GivenCandidate]
     var found: Buf[GivenCandidate] = buf()
     val module_name = c.symbols[c.current].module_name
     for g in 0..<c.globals.len()
         val global = c.globals[g]
         if !global.given || global.module_name != module_name then continue
-        val init = global.init
-        if c.symbols[init].result is None
-            if c.states[init] != 0 then continue
-            check_function(c, init)
-        val ty = zonk(c, c.symbols[init].result.unwrap_or(ErrorType))
-        if given_fits(c, ty, want) then found.push(GivenCandidate(global.name, ty, global.unit, global.span, ModuleGiven(g)))
+        given_global_fits(c, g, global.name, want, &found)
+    var seen: Buf[usize] = buf()
+    for u in c.units
+        if u.file.module_name != module_name then continue
+        for e in u.file.exports
+            if c.exports.get(qualified(module_name, e.binding)) is Some(key)
+                if c.global_names.get(key) is Some(g)
+                    if c.globals[g].given && c.globals[g].module_name != module_name && !holds_index(seen, g)
+                        seen.push(g)
+                        given_global_fits(c, g, e.binding, want, &found)
+    val unit = unit_of(c)
+    if unit < c.files.len()
+        for i in c.units[unit].file.imports
+            if c.files[unit].imports.get(i.binding) is Some(key)
+                if c.global_names.get(key) is Some(g)
+                    if c.globals[g].given && c.globals[g].module_name != module_name && !holds_index(seen, g)
+                        seen.push(g)
+                        given_global_fits(c, g, i.binding, want, &found)
     found
+
+/** Adds module-level given `g`, reached by `name`, to `found` where it fits `want`. */
+private given_global_fits(c: *Checker, g: usize, name: string, want: &Type, found: *Buf[GivenCandidate])
+    val global = c.globals[g]
+    val init = global.init
+    if c.symbols[init].result is None
+        if c.states[init] != 0 then return
+        check_function(c, init)
+    val ty = zonk(c, c.symbols[init].result.unwrap_or(ErrorType))
+    if given_fits(c, ty, want) then found.push(GivenCandidate(name, ty, global.unit, global.span, ModuleGiven(g)))
+
+private holds_index(items: Buf[usize], x: usize) -> bool
+    for i in items
+        if i == x then return true
+    false
+
+/** The note a call that finds no given adds where a module its file imports whole declares one that
+ * fits, or exports one: the import to write. Empty where none does. */
+private given_import_hint(c: *Checker, want: &Type) -> string
+    val unit = unit_of(c)
+    if unit >= c.files.len() then return ""
+    val own = c.symbols[c.current].module_name
+    var hints: Buf[string] = buf()
+    for i in c.units[unit].file.imports
+        val module_path = c.files[unit].modules.get(i.binding) match
+            Some(m) -> m
+            None -> continue
+        if module_path == own then continue
+        // The module's own givens, and those it exports, each by the name the module presents it under.
+        var offered: Buf[(usize, string)] = buf()
+        for g in 0..<c.globals.len()
+            val global = c.globals[g]
+            if global.given && global.module_name == module_path && exported(c, qualified(global.module_name, global.name))
+                offered.push((g, global.name))
+        for u in c.units
+            if u.file.module_name != module_path then continue
+            for e in u.file.exports
+                if c.exports.get(qualified(module_path, e.binding)) is Some(key)
+                    if c.global_names.get(key) is Some(g)
+                        if c.globals[g].given && exported(c, key) then offered.push((g, e.binding))
+        for (g, name) in offered
+            if c.files[unit].imports.get(name) is Some(_) then continue
+            val init = c.globals[g].init
+            if c.symbols[init].result is None
+                if c.states[init] != 0 then continue
+                check_function(c, init)
+            val ty = zonk(c, c.symbols[init].result.unwrap_or(ErrorType))
+            if !given_fits(c, ty, want) then continue
+            hints.push(s"`$module_path` declares the given `$name`, which this file does not import: `import $module_path.{$name}`")
+    if hints.len() == 0 then return ""
+    var out = ""
+    for h in hints
+        out = out + "; " + h
+    out
 
 /** Whether a given of type `ty` fills a parameter of type `want`: its type conforms to it. */
 private given_fits(c: *Checker, ty: &Type, want: &Type) -> bool = !(*ty is ErrorType) && fits(c, ty, want)

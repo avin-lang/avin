@@ -9788,6 +9788,30 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   likeliest fix, naming the argument, where a call has one positional argument per contextual
   parameter; beyond that it was not meant for the section. Alternatives weighed: always the "passed
   by name" error (wrong advice for a call of too many arguments).
+- Settled on the user's delegation 2026-11-19 (branch `given-4`): **a given a module exports by name
+  is a given of that module's own files too**, beside the givens it declares, at the module level of
+  the scope walk; a given and an export of it, or two imports of one given (`current as tx` and
+  `kit.{current}`), are one given, never two that fit. Why: an export names the given as explicitly
+  as an import does, and a module's files already see every name it exports as one of their own, so
+  the rule "a file sees another module's given only where a name of it is written" holds for both.
+  Alternatives weighed: an export presents the given to importers only, its own files needing an
+  import as well (a second line naming the same given, with nothing the reader learns from it).
+  Review with the user: whether exporting a given should also bring it in for the exporting module.
+- Settled on the user's delegation 2026-11-19 (branch `given-4`): **the "no given" error's hint names
+  every public given, of the parameter's type or one conforming to it, that a module the file imports
+  whole declares or exports and the file does not already import**, each as its own clause after
+  `; ` (`` `kit` declares the given `kitTx`, which this file does not import: `import kit.{kitTx}` ``),
+  under the name that module presents it by. A private given is never offered, since it cannot be
+  imported. Why: the hint is there to say which import to write, so it offers exactly the imports
+  that would compile and fix the call. Alternatives weighed: the first such given only (hides the
+  choice when two modules offer one); every module of the program (suggests modules the file never
+  named).
+- Settled on the user's delegation 2026-11-19 (branch `given-4`): **imported givens enter the
+  instance cache through the module-level value each filled call reads**, with no extra key input: a
+  filled argument is a read of that value in the typed tree, and a key already holds the interface
+  of every module-level value its tree reads, so an edit of an imported given's type lowers each
+  caller it fills again and an edit of its value alone does not. Alternatives weighed: a key input
+  listing every given a file imports (re-lowers callers on edits that cannot change their text).
 - **Guards on `select` arms, and `Selector` for a set of sources known at run time** (branch
   `select-dynamic`, 2026-11-19). The gap came from the ssh package (branch `pty-forward`,
   `Socket.waitWith`): relaying a tunnel to a local connection, it could not leave out an arm by a
