@@ -177,11 +177,20 @@ line_part_waits_sharing_nothing()
 private three_a(c: *Context, run: *u8) -> unit
     reads_were(c, same(read_line(c), "x") && same(read_line(c), "a".repeat(120000)))
 
+// The chunks of the long line, in module storage: the writing thread reads their bytes while the
+// test waits for the reader, so they must live until it has joined, and a frame holding them would
+// hold their counts across that wait.
+private var long_part: string = ""
+private var long_end: string = ""
+
 @test("a line longer than one read gathers over several waits, holding no share during any of them")
 long_line_waits_sharing_nothing()
-    val a = "a".repeat(40000)
-    val ended = a + "\n"
-    read_lightweight(piped("x\n", [a, a, ended], false), &three_a)
+    long_part = "a".repeat(40000)
+    long_end = long_part + "\n"
+    val p = piped("x\n", [long_part, long_part, long_end], false)
+    read_lightweight(p, &three_a)
+    long_part = ""
+    long_end = ""
 
 private split_crlf(c: *Context, run: *u8) -> unit
     reads_were(c, same(read_line(c), "x") && same(read_line(c), "split") && same(read_line(c), "next"))
@@ -305,9 +314,13 @@ private struct ManyJoints
 
 private var many_joints: ManyJoints = ManyJoints(Frame(null, 6), [null; 6])
 
+/** What a reading thread runs. */
+private type ReaderBody = *extern(@lets_out *Context, *u8) -> unit
+
 /** Runs each of `bodies` as a lightweight thread reading standard input at once, then waits for them
- * and the writing thread, and puts standard input back. */
-private read_at_once(p: Piped, bodies: []const *extern(@lets_out *Context, *u8) -> unit)
+ * and the writing thread, and puts standard input back. A caller passes a view of an array in its
+ * frame: an array literal passed as the slice is a counted temporary, held across the waits here. */
+private read_at_once(p: Piped, bodies: []const ReaderBody)
     assert(bodies.len <= ManyReaders)
     many_joints.frame.prev = p.me.top
     p.me.top = &many_joints.frame
@@ -378,19 +391,22 @@ private each_line_once() -> bool
 @test("lines read by several lightweight threads at once each go whole to exactly one of them")
 lines_read_at_once_go_whole_to_one()
     make_many_text(false)
-    read_at_once(piped_many(), [&take_lines, &take_lines, &take_lines, &take_lines, &take_lines, &take_lines])
+    val bodies: [6]ReaderBody = [&take_lines, &take_lines, &take_lines, &take_lines, &take_lines, &take_lines]
+    read_at_once(piped_many(), bodies[..])
     assert(each_line_once())
 
 @test("lines ended by \\r\\n read by several threads at once lose the \\r, each line going whole to one")
 crlf_lines_read_at_once_go_whole_to_one()
     make_many_text(true)
-    read_at_once(piped_many(), [&take_lines, &take_lines, &take_lines, &take_lines])
+    val bodies: [4]ReaderBody = [&take_lines, &take_lines, &take_lines, &take_lines]
+    read_at_once(piped_many(), bodies[..])
     assert(each_line_once())
 
 @test("two threads reading lines at once each take some, and between them every line once")
 two_readers_share_the_lines()
     make_many_text(false)
-    read_at_once(piped_many(), [&take_lines, &take_lines])
+    val bodies: [2]ReaderBody = [&take_lines, &take_lines]
+    read_at_once(piped_many(), bodies[..])
     assert(each_line_once())
 
 /** Counts the character `c`, as UTF-8, as taken. */
@@ -433,7 +449,8 @@ private every_byte_once() -> bool
 @test("characters and the rest read by one thread while another reads lines take every byte once between them")
 chars_and_rest_beside_lines_take_each_byte_once()
     make_many_text(false)
-    read_at_once(piped_many(), [&chars_then_rest, &take_lines_counting, &take_lines_counting])
+    val bodies: [3]ReaderBody = [&chars_then_rest, &take_lines_counting, &take_lines_counting]
+    read_at_once(piped_many(), bodies[..])
     assert(every_byte_once())
 
 /** Asks whether the input has ended, each time holding the input, until it has. */
@@ -464,6 +481,7 @@ private lines_in_order(c: *Context, run: *u8) -> unit
 @test("threads asking whether the input has ended while one reads lines take nothing from it")
 ended_asked_beside_a_reader_takes_nothing()
     make_many_text(false)
-    read_at_once(piped_many(), [&ask_until_ended, &lines_in_order, &ask_until_ended])
+    val bodies: [3]ReaderBody = [&ask_until_ended, &lines_in_order, &ask_until_ended]
+    read_at_once(piped_many(), bodies[..])
     assert(each_line_once())
     assert_eq(in_order.load(), u32(ManyLines))
