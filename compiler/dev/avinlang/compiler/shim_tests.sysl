@@ -268,27 +268,31 @@ shim_mirror_handle_fields()
     assert(shim.text.contains(".Both(f0, f1) ->\n"))
     assert(shim.text.contains("ds: **u8) -> *u8\n    val o = allocate(ctx, ptr_cast(ds[0]))\n"))
 
-@test("an array the Sysl function may fill is kept as a frame and copied back after the result is made")
+@test("an array of bytes the Sysl function may fill is lent as a view of its own storage, made at the call, kept as a frame and never copied")
 shim_filled_arrays()
     val program = lower_source(repository_toolchain(), source_of("/probe/bytes.avin", BytesProgram)).unwrap()
     val text = shim_source(program.bindings, program.handles).text
-    // The binding's own array parameter goes in as a slice Sysl may write, kept as a root.
-    assert(text.contains("    val s0 = bytes_in(a0)\n    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n"))
-    assert(text.contains("bound_0(s0)"))
-    // The result is made first, then the slice copied back, then the frame dropped.
-    assert(text.contains("    val made: *u8 = bytes_of(ctx, r, d0)\n    copy(array_elements(root0.object)[0..<s0.len], s0)\n    ctx.top = root0.frame.prev\n    made\n"))
-    // An array an option holds goes in read-only.
+    // The binding's own array parameter is checked and counted, then kept as a root.
+    assert(text.contains("    val n0 = array_length(array_held(a0))\n    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n"))
+    // The view of its storage is made in the call itself, where no local holds it across a call that
+    // parks the thread.
+    assert(text.contains("bound_0(array_elements(a0)[0..<n0])"))
+    assert(!text.contains("bytes_in(a0)"))
+    // The result is made first, then the frame dropped: what Sysl wrote is in the array already.
+    assert(text.contains("    val made: *u8 = bytes_of(ctx, r, d0)\n    ctx.top = root0.frame.prev\n    made\n"))
+    assert(!text.contains("copy(array_elements(root0.object)"))
+    // An array an option holds goes in read-only, as a copy.
     assert(text.contains("Some(read_only(bytes_in(p)))"))
 
 private const BlockingProgram: string = "@sysl(\"sysl.hint.black_box\", blocking)\nfill(b: Array[byte]) -> Array[byte]\n\n@sysl(\"sysl.hint.black_box\", blocking)\nsquares(a: Array[int]) -> Array[int]\n\n@sysl(\"sysl.hint.black_box\", blocking)\npair(p: (long, string)) -> (long, string)\n\nmain()\n    fill(Array.fill(2, byte(0)))\n    squares(Array.fill(2, 0))\n    pair((1, \"a\"))\n"
 
-@test("a blocking binding copies a filled array in before the thread is safe, and back after it runs again")
+@test("a blocking binding lends an array of bytes and copies any other filled array in before the thread is safe, and back after it runs again")
 shim_blocking_filled_arrays()
     val program = lower_source(repository_toolchain(), source_of("/probe/blocking.avin", BlockingProgram)).unwrap()
     val text = shim_source(program.bindings, program.handles).text
-    // The copy in and the root come before the safe region, which holds nothing but the Sysl call;
-    // the result and the copy back come after it.
-    assert(text.contains("    val s0 = bytes_in(a0)\n    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n    val x0 = s0\n    enter_safe(ctx)\n    val r = bound_0(x0)\n    leave_safe(ctx)\n    val made: *u8 = bytes_of(ctx, r, d0)\n    copy(array_elements(root0.object)[0..<s0.len], s0)\n    ctx.top = root0.frame.prev\n    made\n"))
+    // The view and the root come before the safe region, which holds nothing but the Sysl call; the
+    // result comes after it, and the bytes need no copying back.
+    assert(text.contains("    val n0 = array_length(array_held(a0))\n    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n    val x0 = array_elements(a0)[0..<n0]\n    enter_safe(ctx)\n    val r = bound_0(x0)\n    leave_safe(ctx)\n    val made: *u8 = bytes_of(ctx, r, d0)\n    ctx.top = root0.frame.prev\n    made\n"))
     // An array of integers is converted in, and its elements converted back, outside the region too.
     assert(text.contains("    var root0 = Root(Frame(ctx.top, 1usize), a0)\n    ctx.top = ptr_cast(&root0)\n    val x0 = s0\n    enter_safe(ctx)\n    val r = bound_1(x0)\n    leave_safe(ctx)\n"))
     assert(text.contains("    for i in 0..<s0.len do f0[i] = "))
@@ -669,3 +673,90 @@ library_waiting_bindings_block()
                 found = true
                 assert(!b.blocking, s"$name is blocking")
         assert(found, s"the program does not reach $name; it reaches${reached(program)}")
+
+private const StringsProgram: string = "@sysl(\"sysl.hint.black_box\")\nsame(s: string) -> string\n\n@sysl(\"sysl.hint.black_box\")\npair(s: string, n: long) -> (string, long)\n\n@sysl(\"sysl.hint.black_box\")\nmaybe(o: Option[string]) -> Option[string]\n\nmain()\n    same(\"a\")\n    pair(\"b\", 1)\n    maybe(Some(\"c\"))\n"
+
+@test("a string a binding whose Sysl function may park the thread is given is held by an atomic count, and one given to any other binding is passed as it is")
+shim_parking_strings()
+    val program = lower_source(repository_toolchain(), source_of("/probe/strings.avin", StringsProgram)).unwrap()
+    val plain = shim_source(program.bindings, program.handles).text
+    assert(plain.contains("bound_0(text_in(a0))"))
+    assert(!plain.contains("&sync"))
+    // Marked as one that parks, the binding holds its string by an atomic count, made before the call
+    // and passed as the string it holds; the other bindings are as they were.
+    var fixed: Buf[string] = buf()
+    fixed.push("waits_1")
+    val text = shim_source_fixing(program.bindings, program.handles, fixed).text
+    assert(text.contains("\n    val t0: &sync string = text_in(a0)\n"))
+    assert(text.contains("bound_1(*t0, "))
+    assert(!text.contains("bound_1(text_in(a0)"))
+    assert(text.contains("bound_0(text_in(a0))"))
+    // The integer beside it is converted as before; a string an option holds is not a parameter's own.
+    assert(!text.contains("val t1"))
+    assert(text.contains("bound_2(in_"))
+    // The binding's own lines still hold all of it, so a diagnostic there names the binding.
+    val shim = shim_source_fixing(program.bindings, program.handles, fixed)
+    val at = shim.text.index_of("val t0: &sync string").unwrap()
+    val line = shim.text[0..<at].split("\n").len
+    assert(line >= shim.first[1] && line <= shim.last[1])
+
+@test("Sysl's refusal of a count held across a call that can park the thread marks the binding whose lines it names, and no other diagnostic does")
+shim_parking_diagnostic()
+    val program = lower_source(repository_toolchain(), source_of("/probe/strings.avin", StringsProgram)).unwrap()
+    val shim = shim_source(program.bindings, program.handles)
+    val inside = shim.first[1] + 2
+    val refusal = "error: 'avin.rt.resolve_host' can reach 'sysl.fiber.switch', which may resume this fiber on another thread, and this frame holds a counted temporary the enclosing expression is still holding across the call\n" +
+        s"   --> /cache/build/x/avin/shims/shims.sysl:$inside:9\n"
+    val marked = unsaid_answers(refusal, shim, program.bindings)
+    assert_eq(marked.len(), 1usize)
+    assert_eq(marked[0], "waits_1")
+    // At the first binding's lines, the first is marked.
+    val first = unsaid_answers(refusal.replace_all(s"shims.sysl:$inside:", s"shims.sysl:${shim.first[0] + 2}:"), shim, program.bindings)
+    assert_eq(first[0], "waits_0")
+    // Another error at the same place marks nothing, and a place outside the shims is not read.
+    assert_eq(unsaid_answers(s"error: 'x' of 'f' is i32, but string was given\n   --> /cache/build/x/avin/shims/shims.sysl:$inside:9\n", shim, program.bindings).len(), 0usize)
+    assert_eq(unsaid_answers(refusal.replace_all("/avin/shims/shims.sysl", "/elsewhere.sysl"), shim, program.bindings).len(), 0usize)
+
+// A program that reaches every library binding whose Sysl function may park the thread, each with a
+// parameter that holds a count in a shim: a string, an array of bytes, a handle, and results of bytes,
+// an option of bytes and a vector of mirrors.
+private val ParkingProgram =
+    "import avin.io\n" +
+    "import avin.net.{TcpStream, UnixStream}\n" +
+    "\n" +
+    "main() -> int\n" +
+    "  TcpStream.connect(\"db.example\", 5432) match\n" +
+    "    Ok(s) ->\n" +
+    "      println(s.write(\"ab\".bytes.toArray()).isOk)\n" +
+    "      println(s.read(4).isOk)\n" +
+    "      val (r, w) = s.split()\n" +
+    "      println(w.write(\"cd\".bytes.toArray()).isOk)\n" +
+    "      println(r.read(4).isOk)\n" +
+    "    Err(_) -> ()\n" +
+    "  UnixStream.connect(\"/probe/socket\") match\n" +
+    "    Ok(s) ->\n" +
+    "      println(s.write(\"ab\".bytes.toArray()).isOk)\n" +
+    "      println(s.read(4).isOk)\n" +
+    "    Err(_) -> ()\n" +
+    "  println(io.readSecretBytes(\"secret: \").isOk)\n" +
+    "  println(io.stdout().write(\"ef\".bytes.toArray()).isOk)\n" +
+    "  println(io.stdin().read(4).isOk)\n" +
+    "  println(io.stdin().readAvailable(4).isOk)\n" +
+    "  0\n"
+
+@test("the shims of every library binding that may park the thread build, holding no count across the call but by an atomic one")
+shim_parking_bindings_build()
+    val dir = make_temp_dir("avin-shim-parking").unwrap()
+    defer _ = remove_dir_all(dir)
+    val tc = shim_toolchain(dir)
+    val program = lower_source(tc, source_of("/probe/parking.avin", ParkingProgram)).unwrap()
+    val parking = ["avin.rt.resolve_host", "avin.rt.socket_send_all", "avin.rt.socket_receive", "avin.rt.read_secret",
+        "avin.rt.write_standard", "avin.rt.read_input_bytes", "avin.rt.read_input_available"]
+    for name in parking
+        var found = false
+        for b in program.bindings
+            if binding_key(b) == name then found = true
+        assert(found, s"the program does not reach $name; it reaches${reached(program)}")
+    val built = compiled_in(tc, ParkingProgram)
+    assert_eq(built.diagnostics, "")
+    assert(built.archive is Some(_))
