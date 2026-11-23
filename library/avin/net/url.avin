@@ -60,20 +60,13 @@ impl Url
 
   // The query's pairs, decoded, in order: the query is split at each `&`, an empty piece skipped, and
   // each piece at its first `=` into a name and a value, empty where there is no `=`. A `+` stands
-  // for a space, as a form writes one. No query gives no pairs.
-  queryParams -> Vector[(string, string)]
-    val pairs = Buffer[(string, string)]()
-    query match
-      Some(q) ->
-        for piece in q.split("&")
-          if piece.nonEmpty
-            val eq = piece.indexOf("=")
-            if eq < 0
-              pairs.addOne((formDecoded(piece), ""))
-            else
-              pairs.addOne((formDecoded(piece.slice(0, eq)), formDecoded(rest(piece, eq + 1))))
-      None -> ()
-    pairs.toVector
+  // for a space, as a form writes one. No query gives no pairs. The query is read by `Url.formDecode`,
+  // which never fails on a query a `Url` holds.
+  queryParams -> Vector[(string, string)] = query match
+    Some(q) -> Url.formDecode(q) match
+      Ok(pairs) -> pairs
+      Err(e) -> fail(s"${e.message}: $q")
+    None -> Vector.empty[(string, string)]()
 
   // `ref` resolved against this URL as RFC 3986 resolves a reference against a base: the reference
   // read, relative or absolute, then its missing components taken from the base and its dot
@@ -238,6 +231,41 @@ object Url
   // `text` with each percent-escape replaced by the byte it names, read as UTF-8; every other
   // character is kept, `+` included.
   decode(text: string) -> Result[string, UrlError] = decodeRange(text, 0, text.byteLength, false)
+
+  // The name and value pairs of `text` written as `application/x-www-form-urlencoded`, in order,
+  // read as the WHATWG URL standard reads them: the text split at each `&`, an empty piece skipped,
+  // each piece at its first `=` into a name and a value (empty where there is no `=`), and each
+  // decoded, a `+` standing for a space. A name given more than once is kept each time. A `%` not
+  // followed by two hexadecimal digits is `BadPercent` and escapes whose bytes are not UTF-8
+  // `InvalidUtf8`, each `at` its byte offset in `text`; any other character is kept as it is.
+  formDecode(text: string) -> Result[Vector[(string, string)], UrlError]
+    val pairs = Buffer[(string, string)]()
+    val n = text.byteLength
+    var start = 0
+    while start < n
+      val amp = byteIndex(text, int('&'), start, n)
+      if amp > start
+        val eq = byteIndex(text, int('='), start, amp)
+        val name = decodeRange(text, start, eq, true)?
+        val value = if eq < amp then decodeRange(text, eq + 1, amp, true)? else ""
+        pairs.addOne((name, value))
+      start = amp + 1
+    Ok(pairs.toVector)
+
+  // `pairs` written as `application/x-www-form-urlencoded`, as the WHATWG URL standard writes them:
+  // each name and value joined by `=`, the pairs by `&`, a space written `+`, and every byte of the
+  // UTF-8 but a letter, a digit, `*`, `-`, `.` and `_` written `%` and two upper-case hexadecimal
+  // digits. `formDecode` reads the text back as the same pairs.
+  formEncode(pairs: Vector[(string, string)]) -> string
+    val out = StringWriter()
+    var first = true
+    for (name, value) in pairs
+      if !first then out.write("&")
+      first = false
+      formEscaped(out, name)
+      out.write("=")
+      formEscaped(out, value)
+    out.text
 
 // A reference as it was read: an absolute URL's components, with the scheme absent from a relative
 // one.
@@ -507,10 +535,29 @@ private decodeRange(text: string, from: int, until: int, form: bool) -> Result[s
     Ok(t) -> Ok(t)
     Err(e) -> Err(InvalidUtf8(sources(int(e.offset))))
 
-// A query piece decoded as a form writes it.
-private formDecoded(piece: string) -> string = decodeRange(piece, 0, piece.byteLength, true) match
-  Ok(t) -> t
-  Err(e) -> fail(s"${e.message}: $piece")
+// The offset of the first byte `b` of `text` from `from` up to `until`, or `until` where there is none.
+private byteIndex(text: string, b: int, from: int, until: int) -> int
+  var i = from
+  while i < until && code(text, i) != b
+    i += 1
+  i
+
+// `text` written to `out` as a form writes a name or a value.
+private formEscaped(out: StringWriter, text: string)
+  val n = text.byteLength
+  var plain = 0
+  for i in 0 ..< n
+    val b = code(text, i)
+    if !(isAlpha(b) || isDigit(b) || b == int('*') || b == int('-') || b == int('.') || b == int('_'))
+      if plain < i then out.write(text.slice(plain, i))
+      if b == int(' ')
+        out.write("+")
+      else
+        out.write("%")
+        out.write(hexDigit(b >> 4))
+        out.write(hexDigit(b & 15))
+      plain = i + 1
+  out.write(text.slice(plain, n))
 
 // `r` resolved against `base` by RFC 3986's algorithm (section 5.2.2), strictly: a reference with a
 // scheme keeps it even where it is the base's.

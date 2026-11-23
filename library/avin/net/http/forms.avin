@@ -1,0 +1,459 @@
+module avin.net.http
+
+// Form bodies: `application/x-www-form-urlencoded`, read by `ServerRequest.form()` and written by
+// `Request.withForm`, and `multipart/form-data` (RFC 7578), read by `ServerRequest.multipart` or
+// `Multipart.parse` and written by `Request.withMultipart` or `Multipart.encoded`. A multipart body
+// is read whole, from a body the server has already buffered within its body limit, under limits of
+// its own: how many parts, how many bytes of headers a part may have, and how many bytes in all.
+
+import avin.net.{InvalidUtf8, Url, UrlError}
+import avin.random.SecureRandom
+
+// Why a body is not the form asked for.
+data FormError
+  // The body's `Content-Type` is not `expected`; `found` is the one it has, `None` where it has none.
+  NotAForm(expected: string, found: Option[string])
+  // An urlencoded body with a malformed escape, or bytes that are not UTF-8.
+  BadEncoding(error: UrlError)
+  // A multipart body whose `Content-Type` names no boundary, or one RFC 2046 does not allow.
+  NoBoundary
+  // A multipart body that does not read as one; `reason` says what is wrong.
+  BadMultipart(reason: string)
+  // A multipart body of more parts than `limit`.
+  TooManyParts(limit: int)
+  // A part whose headers are more than `limit` bytes.
+  PartHeadersTooLarge(limit: int)
+  // A multipart body of more than `limit` bytes.
+  FormTooLarge(limit: int)
+
+impl Error for FormError
+  // A sentence saying what is wrong, for the client.
+  message -> string = self match
+    NotAForm(expected, Some(found)) -> s"the body is `$found`, not `$expected`"
+    NotAForm(expected, None) -> s"the body has no content type, not `$expected`"
+    BadEncoding(e) -> s"the form is not urlencoded: ${e.message}"
+    NoBoundary -> "the multipart body has no valid boundary"
+    BadMultipart(reason) -> s"the multipart body is malformed: $reason"
+    TooManyParts(limit) -> s"the multipart body has more parts than its limit of $limit"
+    PartHeadersTooLarge(limit) -> s"a part's headers are longer than their limit of $limit bytes"
+    FormTooLarge(limit) -> s"the multipart body is longer than its limit of $limit bytes"
+
+// A form error is answered with its message: `415` for a body that is not the form asked for, `413`
+// for one over a limit, and `400` for one that is malformed.
+impl ToResponse for FormError
+  toResponse() -> Response = Response.text(statusOf(self), s"${message}\n")
+
+private statusOf(e: FormError) -> int = e match
+  NotAForm(_, _) -> 415
+  TooManyParts(_) -> 413
+  PartHeadersTooLarge(_) -> 413
+  FormTooLarge(_) -> 413
+  BadEncoding(_) -> 400
+  NoBoundary -> 400
+  BadMultipart(_) -> 400
+
+// The fields of an urlencoded form, in the order they came, a name given more than once kept each
+// time.
+class Form(val pairs: Vector[(string, string)])
+  // The value of the first field named `name`.
+  value(name: string) -> Option[string]
+    for (n, v) in pairs
+      if n == name then return Some(v)
+    None
+
+  // The values of every field named `name`, in order.
+  values(name: string) -> Vector[string]
+    val out = Buffer[string]()
+    for (n, v) in pairs
+      if n == name then out.addOne(v)
+    out.toVector
+
+// One part of a `multipart/form-data` body: the field's `name`, the `filename` a file was sent with,
+// its `contentType` (`text/plain` where the part names none, as RFC 7578 says), its `headers` in
+// order, and its `body`. **A filename is the sender's and is not to be trusted**: it may hold `/`,
+// `..`, a drive letter or any other character, so it is never a path to write to as given. A header's
+// name is a token and its value holds no line break; a part where one does not traps as it is made.
+class Part(
+    val name: string,
+    val filename: Option[string],
+    val contentType: string,
+    val headers: Vector[(string, string)],
+    val body: Array[byte]
+)
+  for (n, v) in headers
+    checkHeader(n, v)
+  checkHeader("Content-Type", contentType)
+
+  // The value of the part's first header of `name`, compared without regard to case.
+  header(name: string) -> Option[string] = headerIn(headers, name)
+
+  // The body read as UTF-8, a sequence that is not UTF-8 read as U+FFFD.
+  text -> string = string.fromUtf8Lossy(body)
+
+  // Whether the part is a file: whether it was sent with a filename.
+  isFile -> bool = filename.isDefined
+
+object Part
+  // A field of `name` whose value is `value`, as UTF-8.
+  field(name: string, value: string) -> Part =
+    Part(name, None, "text/plain", Vector(("Content-Disposition", disposition(name, None))), utf8(value))
+
+  // A file sent as the field `name`, named `filename`, of the type `contentType`, holding `body`.
+  file(name: string, filename: string, contentType: string, body: Array[byte]) -> Part = Part(
+    name,
+    Some(filename),
+    contentType,
+    Vector(("Content-Disposition", disposition(name, Some(filename))), ("Content-Type", contentType)),
+    body
+  )
+
+// How much of a multipart body is read before it is refused: at most `maxParts` parts, each with at
+// most `maxHeaderBytes` bytes of headers, in a body of at most `maxBytes` bytes. The body is also
+// within the server's own body limit, since the server read it. A limit less than zero, or a header
+// limit less than one, traps.
+class MultipartLimits(val maxParts: int = 1000, val maxHeaderBytes: int = 8192, val maxBytes: int = 10485760)
+  if maxParts < 0 then fail(s"a part limit of $maxParts: it is at least zero")
+  if maxHeaderBytes < 1 then fail(s"a part header limit of $maxHeaderBytes bytes: it is at least one")
+  if maxBytes < 0 then fail(s"a multipart limit of $maxBytes bytes: it is at least zero")
+
+// The parts of a `multipart/form-data` body, in order.
+class Multipart(val parts: Vector[Part])
+  // The text of the first part named `name` that is not a file.
+  field(name: string) -> Option[string]
+    for p in parts
+      if p.name == name && !p.isFile then return Some(p.text)
+    None
+
+  // The first part named `name` that is a file.
+  file(name: string) -> Option[Part]
+    for p in parts
+      if p.name == name && p.isFile then return Some(p)
+    None
+
+  // Every part named `name`, in order.
+  named(name: string) -> Vector[Part] = parts.filter(p -> p.name == name)
+
+  // The body written as `multipart/form-data` between delimiters of `boundary`: each part's
+  // `Content-Disposition` written from its name and filename, a `"`, carriage return and line feed
+  // in either written `%22`, `%0D` and `%0A` as the WHATWG HTML standard writes them; its
+  // `Content-Type` where it is a file or its type is not `text/plain`; then its other headers. A
+  // boundary RFC 2046 does not allow, or one some part's body holds, traps.
+  encoded(boundary: string) -> Array[byte]
+    if !isBoundary(boundary) then fail(s"`$boundary` is not a multipart boundary")
+    val dash = utf8("--" + boundary)
+    val out = Buffer[byte]()
+    for p in parts
+      if find(p.body, dash, 0, p.body.length) >= 0 then fail(s"a part named `${p.name}` holds the boundary `$boundary`")
+      val head = StringWriter()
+      head.write(s"--$boundary\r\nContent-Disposition: ${disposition(p.name, p.filename)}\r\n")
+      if p.isFile || p.contentType != "text/plain" then head.write(s"Content-Type: ${p.contentType}\r\n")
+      for (n, v) in p.headers
+        if !n.equalsIgnoreCase("Content-Disposition") && !n.equalsIgnoreCase("Content-Type")
+          head.write(s"$n: $v\r\n")
+      head.write("\r\n")
+      addAll(out, utf8(head.text))
+      addAll(out, p.body)
+      addAll(out, utf8("\r\n"))
+    addAll(out, utf8(s"--$boundary--\r\n"))
+    out.toArray()
+
+  // The `Content-Type` of the body `encoded(boundary)` writes.
+  contentType(boundary: string) -> string =
+    s"multipart/form-data; boundary=${if boundary.indexWhere(c -> !isTokenChar(c)) >= 0 then s"\"$boundary\"" else boundary}"
+
+object Multipart
+  // `body`, of the type `contentType`, read as `multipart/form-data` within `limits`. The type must
+  // be `multipart/form-data` with a `boundary`; text before the first delimiter and after the last
+  // is skipped; a line ends with a carriage return and a line feed; and a delimiter followed by
+  // anything but `--` or the end of its line is part of the body it stands in. Every part has a
+  // `Content-Disposition` of `form-data` with a `name`; a `filename*` (RFC 5987) in UTF-8 or
+  // ISO-8859-1 is preferred to a `filename`, and one in another charset or malformed is ignored.
+  parse(
+      body: Array[byte],
+      contentType: string,
+      limits: MultipartLimits = MultipartLimits()
+  ) -> Result[Multipart, FormError] =
+    multipartOf(body, Some(contentType), limits)
+
+  // A boundary no body is likely to hold: `avin-` and 32 hexadecimal digits from `SecureRandom`.
+  newBoundary() -> string
+    val out = StringWriter()
+    out.write("avin-")
+    for b in SecureRandom.nextBytes(16)
+      out.write(hexOf(int(b) >> 4))
+      out.write(hexOf(int(b) & 15))
+    out.text
+
+private hexOf(v: int) -> string = "0123456789abcdef".slice(v, v + 1)
+
+// The body read as an urlencoded form, its type checked against `contentType`.
+private formOf(contentType: Option[string], body: Array[byte]) -> Result[Form, FormError]
+  val expected = "application/x-www-form-urlencoded"
+  contentType match
+    Some(ct) -> if mediaTypeOf(ct).kind != expected then return Err(NotAForm(expected, contentType))
+    None -> return Err(NotAForm(expected, None))
+  val text = string.fromUtf8(body) match
+    Ok(t) -> t
+    Err(e) -> return Err(BadEncoding(InvalidUtf8(int(e.offset))))
+  Url.formDecode(text) match
+    Ok(pairs) -> Ok(Form(pairs))
+    Err(e) -> Err(BadEncoding(e))
+
+// A media type: its type and subtype in lower case, and its parameters, each name in lower case and
+// each quoted value unquoted.
+private data MediaType(kind: string, params: Vector[(string, string)])
+
+// `text` read as a media type with parameters; a parameter that does not read as one ends them.
+private mediaTypeOf(text: string) -> MediaType
+  val semi = text.indexOf(';')
+  val kind = (if semi < 0 then text else text.slice(0, semi)).trim.toLower
+  val params = if semi < 0 then Vector.empty[(string, string)]() else paramsOf(text, semi, false)
+  MediaType(kind, params)
+
+// The parameters of a header value from the `;` at `at`: `; name=value`, a value a token or a quoted
+// string. A quoted string is read as RFC 9110 reads one, a backslash escaping the character after it,
+// or, where `form` asks, as the WHATWG HTML standard writes a name in a form, running to the next `"`
+// with `%22`, `%0D` and `%0A` read as the characters they name. A parameter that does not read as one
+// ends the list; `None` stands for that in `strictParams`.
+private paramsOf(text: string, at: int, form: bool) -> Vector[(string, string)] = strictParams(text, at, form) match
+  Some(ps) -> ps
+  None -> Vector.empty[(string, string)]()
+
+private strictParams(text: string, at: int, form: bool) -> Option[Vector[(string, string)]]
+  val out = Buffer[(string, string)]()
+  val n = text.byteLength
+  var i = at
+  while i < n
+    if text.byteAt(i) != byte(int(';')) then return None
+    i = skipSpace(text, i + 1)
+    if i == n then return Some(out.toVector)
+    val eq = text.indexOf('=', i)
+    if eq < 0 then return None
+    val name = text.slice(i, eq).trim.toLower
+    if name.isEmpty || name.indexWhere(c -> !isTokenChar(c)) >= 0 then return None
+    i = skipSpace(text, eq + 1)
+    if i < n && text.byteAt(i) == byte(int('"'))
+      val value = Buffer[byte]()
+      i += 1
+      var closed = false
+      while i < n && !closed
+        val c = text.byteAt(i)
+        if c == byte(int('"'))
+          closed = true
+          i += 1
+        elif !form && c == byte(int('\\')) && i + 1 < n
+          value.addOne(text.byteAt(i + 1))
+          i += 2
+        else
+          value.addOne(c)
+          i += 1
+      if !closed then return None
+      val unquoted = string.fromUtf8Lossy(value.toArray())
+      out.addOne((name, if form then formUnescaped(unquoted) else unquoted))
+      i = skipSpace(text, i)
+    else
+      val semi = text.indexOf(';', i)
+      val end = if semi < 0 then n else semi
+      val value = text.slice(i, end).trim
+      if value.isEmpty || value.indexWhere(c -> !isTokenChar(c)) >= 0 then return None
+      out.addOne((name, value))
+      i = end
+  Some(out.toVector)
+
+private skipSpace(text: string, from: int) -> int
+  var i = from
+  while i < text.byteLength && (text.byteAt(i) == byte(int(' ')) || text.byteAt(i) == byte(int('\t')))
+    i += 1
+  i
+
+// A form's name or filename with `%22`, `%0D` and `%0A` read as `"`, a carriage return and a line feed.
+private formUnescaped(text: string) -> string = text.replace("%22", "\"").replace("%0D", "\r").replace("%0A", "\n")
+
+// A form's name or filename written as a quoted string, as the WHATWG HTML standard writes one.
+private formQuoted(text: string) -> string =
+  "\"" + text.replace("\"", "%22").replace("\r", "%0D").replace("\n", "%0A") + "\""
+
+// The `Content-Disposition` value of a part named `name`, with `filename` where it is a file.
+private disposition(name: string, filename: Option[string]) -> string = filename match
+  Some(f) -> s"form-data; name=${formQuoted(name)}; filename=${formQuoted(f)}"
+  None -> s"form-data; name=${formQuoted(name)}"
+
+// The value of the first parameter `name` among `params`.
+private paramIn(params: Vector[(string, string)], name: string) -> Option[string]
+  for (n, v) in params
+    if n == name then return Some(v)
+  None
+
+// Whether `b` may be a boundary: one to seventy characters of RFC 2046's `bchars`, not ending in a
+// space.
+private isBoundary(b: string) -> bool =
+  1 <= b.byteLength <= 70 && !b.endsWith(" ") && b.indexWhere(c -> !isBoundaryChar(c)) < 0
+
+private isBoundaryChar(c: char) -> bool =
+  ('a' <= c <= 'z') || ('A' <= c <= 'Z') || ('0' <= c <= '9') || "'()+_,-./:=? ".indexOf(c) >= 0
+
+// A `filename*` value, `charset'language'escaped`, decoded, or `None` where its charset is neither
+// UTF-8 nor ISO-8859-1 or it does not read as one.
+private extendedValue(text: string) -> Option[string]
+  val first = text.indexOf('\'')
+  if first < 0 then return None
+  val second = text.indexOf('\'', first + 1)
+  if second < 0 then return None
+  val charset = text.slice(0, first).toLower
+  val escaped = text.slice(second + 1, text.byteLength)
+  if charset == "utf-8" then return Url.decode(escaped).toOption
+  if charset != "iso-8859-1" then return None
+  val out = StringWriter()
+  var i = 0
+  val n = escaped.byteLength
+  while i < n
+    val b = int(escaped.byteAt(i))
+    if b == int('%')
+      if i + 2 >= n then return None
+      val high = hexValueOf(int(escaped.byteAt(i + 1)))
+      val low = hexValueOf(int(escaped.byteAt(i + 2)))
+      if high < 0 || low < 0 then return None
+      out.write(char(high * 16 + low).toString())
+      i += 3
+    elif b >= 0x80
+      return None
+    else
+      out.write(escaped.slice(i, i + 1))
+      i += 1
+  Some(out.text)
+
+private hexValueOf(b: int) -> int =
+  if int('0') <= b <= int('9') then b - int('0')
+  elif int('a') <= b <= int('f') then b - int('a') + 10
+  elif int('A') <= b <= int('F') then b - int('A') + 10
+  else -1
+
+// A delimiter found in a multipart body: `start` where its line break begins (or where its dashes
+// do, for one at the body's start), `after` just past its line, and whether it is the closing one.
+private data Delimiter(start: int, after: int, closing: bool)
+
+// The first delimiter of `dash` (`--` and the boundary) at or after `from`: at `from` itself where
+// `atStart`, else after a carriage return and line feed. One followed by `--` closes the body; one
+// followed by spaces or tabs and a line break goes on; any other is not a delimiter.
+private delimiterFrom(body: Array[byte], dash: Array[byte], from: int, atStart: bool) -> Option[Delimiter]
+  if atStart
+    endOfDelimiter(body, from + dash.length) match
+      Some((after, closing)) -> if find(
+        body,
+        dash,
+        from,
+        from + dash.length
+      ) == from then return Some(Delimiter(from, after, closing))
+      None -> ()
+  val delim = Array.tabulate(dash.length + 2, i -> if i == 0 then byte(13) elif i == 1 then byte(10) else dash(i - 2))
+  var at = find(body, delim, from, body.length)
+  while at >= 0
+    endOfDelimiter(body, at + delim.length) match
+      Some((after, closing)) -> return Some(Delimiter(at, after, closing))
+      None -> ()
+    at = find(body, delim, at + 1, body.length)
+  None
+
+// Where a delimiter whose boundary ends at `at` ends, and whether it closes the body: `--` closes it,
+// and spaces or tabs then a line break end its line; anything else is `None`.
+private endOfDelimiter(body: Array[byte], at: int) -> Option[(int, bool)]
+  if at + 1 < body.length && body(at) == byte(int('-')) && body(at + 1) == byte(int('-')) then return Some(
+    (at + 2, true)
+  )
+  var i = at
+  while i < body.length && (body(i) == byte(int(' ')) || body(i) == byte(int('\t')))
+    i += 1
+  if i + 1 < body.length && body(i) == byte(13) && body(i + 1) == byte(10) then Some((i + 2, false)) else None
+
+// The body read as `multipart/form-data`, its type checked against `contentType`.
+private multipartOf(
+    body: Array[byte],
+    contentType: Option[string],
+    limits: MultipartLimits
+) -> Result[Multipart, FormError]
+  val expected = "multipart/form-data"
+  val media = contentType match
+    Some(ct) -> mediaTypeOf(ct)
+    None -> return Err(NotAForm(expected, None))
+  if media.kind != expected then return Err(NotAForm(expected, contentType))
+  val boundary = paramIn(media.params, "boundary") match
+    Some(b) -> if isBoundary(b) then b else return Err(NoBoundary)
+    None -> return Err(NoBoundary)
+  if body.length > limits.maxBytes then return Err(FormTooLarge(limits.maxBytes))
+  val dash = utf8("--" + boundary)
+  var d = delimiterFrom(body, dash, 0, true) match
+    Some(first) -> first
+    None -> return Err(BadMultipart("no delimiter of its boundary"))
+  val parts = Buffer[Part]()
+  while !d.closing
+    val next = delimiterFrom(body, dash, d.after, false) match
+      Some(n) -> n
+      None -> return Err(BadMultipart("no closing delimiter"))
+    if parts.length >= limits.maxParts then return Err(TooManyParts(limits.maxParts))
+    parts.addOne(partOf(body, d.after, next.start, limits)?)
+    d = next
+  Ok(Multipart(parts.toVector))
+
+// The part from `from` up to `until`: its headers, a blank line, and its body.
+private partOf(body: Array[byte], from: int, until: int, limits: MultipartLimits) -> Result[Part, FormError]
+  val blank = utf8("\r\n\r\n")
+  val headEnd = if until - from >= 2 && int(body(from)) == 13 && int(body(from + 1)) == 10 then from else find(
+    body,
+    blank,
+    from,
+    until
+  )
+  if headEnd < 0
+    return Err(
+      if until - from > limits.maxHeaderBytes then PartHeadersTooLarge(limits.maxHeaderBytes) else BadMultipart(
+        "a part's headers do not end"
+      )
+    )
+  if headEnd - from > limits.maxHeaderBytes then return Err(PartHeadersTooLarge(limits.maxHeaderBytes))
+  val bodyStart = if headEnd == from then from + 2 else headEnd + 4
+  val head = string.fromUtf8(body.slice(from, headEnd)) match
+    Ok(t) -> t
+    Err(_) -> return Err(BadMultipart("a part's headers are not UTF-8"))
+  val headers = Buffer[(string, string)]()
+  if head.nonEmpty
+    for line in head.split("\r\n")
+      val colon = line.indexOf(':')
+      if colon <= 0 then return Err(BadMultipart(s"a part's header line `$line` is not a header"))
+      val name = line.slice(0, colon)
+      if name.indexWhere(c -> !isTokenChar(c)) >= 0 then return Err(BadMultipart(s"`$name` is not a header name"))
+      headers.addOne((name, line.slice(colon + 1, line.byteLength).trim))
+  val cd = headerIn(headers.toVector, "Content-Disposition") match
+    Some(v) -> v
+    None -> return Err(BadMultipart("a part has no Content-Disposition"))
+  val semi = cd.indexOf(';')
+  if (if semi < 0 then cd else cd.slice(0, semi)).trim.toLower != "form-data"
+    return Err(BadMultipart(s"a part's disposition `$cd` is not form-data"))
+  val params = if semi < 0 then Some(Vector.empty[(string, string)]()) else strictParams(cd, semi, true)
+  val ps = params match
+    Some(p) -> p
+    None -> return Err(BadMultipart(s"a part's disposition `$cd` does not read"))
+  val name = paramIn(ps, "name") match
+    Some(n) -> n
+    None -> return Err(BadMultipart("a part has no name"))
+  val extended = paramIn(ps, "filename*") match
+    Some(v) -> extendedValue(v)
+    None -> None
+  val filename = extended.orElse(paramIn(ps, "filename"))
+  val contentType = headerIn(headers.toVector, "Content-Type").getOrElse("text/plain")
+  Ok(Part(name, filename, contentType, headers.toVector, body.slice(bodyStart, until)))
+
+// The first offset at or after `from` where `needle` stands whole in `hay` before `until`, or -1.
+private find(hay: Array[byte], needle: Array[byte], from: int, until: int) -> int
+  val m = needle.length
+  var i = from
+  while i + m <= until
+    var j = 0
+    while j < m && hay(i + j) == needle(j)
+      j += 1
+    if j == m then return i
+    i += 1
+  -1
+
+private addAll(out: Buffer[byte], bytes: Array[byte])
+  for b in bytes
+    out.addOne(b)
