@@ -10774,6 +10774,58 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     17 KB/s, and a server taking larger bodies has to raise it; and whether a TLS handshake, whose
     waits are each `readTimeout`'s, should get a total bound too.
 
+- Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
+  `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
+  and `Request.withForm` for `application/x-www-form-urlencoded`, `ServerRequest.multipart(limits)`,
+  `Multipart.parse`, `Multipart.encoded` and `Request.withMultipart` for `multipart/form-data`.
+  - **One urlencoded codec, `Url.formDecode` and `Url.formEncode`**, which `queryParams` now reads
+    through, so a query and a form body decode alike (WHATWG URL's parser and serializer). Decoding
+    is strict where WHATWG is lenient: a malformed `%` escape or bytes that are not UTF-8 are an
+    error (`BadEncoding(UrlError)`, `400`) rather than kept or replaced by U+FFFD, since a silently
+    altered field is worse for a server than a refusal. A `charset` parameter is ignored; the body
+    is read as UTF-8, as WHATWG reads every form. The serializer escapes `~` as WHATWG does, so
+    `formEncode` differs from `Url.encode` there.
+  - **A wrong or missing `Content-Type` is an error (`NotAForm`, `415`)**, never an empty form.
+    `form()` and `multipart()` are methods with parentheses, since each parses the body anew.
+  - **Multipart is read strictly by RFC 2046 lines**: CRLF only (a body of bare line feeds has no
+    delimiter); a delimiter followed by anything but `--` or optional spaces/tabs and CRLF is body
+    content, so binary bytes resembling the boundary stay in the part; a body without the closing
+    delimiter is `BadMultipart`; a body of no parts (`--b--`) is an empty `Multipart`. Every part
+    needs `Content-Disposition: form-data` with a `name` (RFC 7578 §4.2); a part's type defaults
+    to `text/plain` (§4.4). Header lines must be `token: value` in UTF-8; folded lines are refused.
+  - **Names and filenames are read as the WHATWG HTML standard writes them**: a quoted value runs
+    to the next `"`, and `%22`, `%0D`, `%0A` become `"`, CR, LF; there is no backslash escaping
+    (browsers send Windows paths with raw backslashes). The builder writes the same way, so the
+    round trip is exact. A `boundary` in the `Content-Type` is read as an RFC 9110 parameter
+    (quoted-pair escapes honoured) and must be 1–70 `bchars` not ending in a space (`NoBoundary`).
+  - **`filename*` (RFC 5987) in UTF-8 or ISO-8859-1 is preferred to `filename`**, as RFC 6266
+    prefers it; one in another charset or malformed is ignored (falling back to `filename`, or no
+    filename). RFC 7578 says senders should not use it, so the builder never writes it.
+  - **Filenames are untrusted and nothing writes them to disk**: `Part.filename` is the sender's
+    text as given, documented so; the library offers no "save upload" helper that could use it.
+  - **Limits, `MultipartLimits(maxParts = 1000, maxHeaderBytes = 8192, maxBytes = 10485760)`**:
+    a part count (`TooManyParts`), the bytes of one part's header block (`PartHeadersTooLarge`)
+    and the whole body (`FormTooLarge`), each `413`. The body is first bounded by the server's own
+    `maxBodyBytes` (1 MiB by default), so `maxBytes` binds only where a program raises that; it is
+    there so a streaming reader can enforce the same limits. 1000 parts follows common server
+    defaults for form fields and files.
+  - **Streaming is a later addition, not a change**: request bodies are buffered today, so `parse`
+    takes the whole body; a streaming reader will be a separate entry point (a reader yielding
+    each part's head and then its body as a stream) beside `Multipart.parse`, sharing
+    `MultipartLimits`, `FormError` and the header and disposition readers, so nothing here changes
+    shape when it comes.
+  - The client: `withMultipart(form)` uses `Multipart.newBoundary()` (`avin-` and 32 hex digits
+    from `SecureRandom`); `withMultipart(form, boundary)` and `encoded(boundary)` trap on a boundary
+    RFC 2046 refuses or one a part's body holds. Both builders replace any `Content-Type` the
+    request had. `Request.header(name)` was added beside `Response.header`.
+  - Alternatives weighed: lenient urlencoded decoding as WHATWG (silent corruption); accepting LF
+    line ends in multipart (looser than the RFC, invites ambiguity with binary bodies); RFC 9110
+    backslash escapes in disposition values (mangles Windows paths browsers send); refusing a
+    malformed `filename*` (one bad optional parameter failing a whole upload); a `form` returning a
+    plain vector like `queryParams` (a `Form` with `value`/`values` reads better in handlers, and
+    `pairs` keeps the vector). Review with the user: the default limits, and whether a `formAs[T]`
+    mirroring `queryAs[T]` is wanted.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma

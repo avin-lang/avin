@@ -2220,6 +2220,49 @@ half(r: ServerRequest) -> Result[Response, ToResponse]
 val route = Route.get("/half/:n", half)
 ```
 
+**Forms.** `request.form()` reads an `application/x-www-form-urlencoded` body as a `Form`: its
+`pairs` in order, a name given more than once kept each time, `value(name)` the first value of a
+name and `values(name)` every one. The body is decoded by `Url.formDecode`, as UTF-8 whatever
+`charset` the type names. `request.multipart(limits = MultipartLimits())` reads a
+`multipart/form-data` body (RFC 7578) as a `Multipart`: its `parts` in order, `field(name)` the text
+of the first part of that name that is not a file, `file(name)` the first that is, and
+`named(name)` every part of that name. A `Part` has its `name`, its `filename` where it is a file
+(`isFile`), its `contentType` (`text/plain` where it names none), its `headers` with `header(name)`,
+its `body` and `text`. **A filename is the sender's text, untrusted**: it may hold `/`, `..`, a drive
+letter or anything else, and is never a path to write to as given; the library writes nothing to
+disk from it. `Multipart.parse(body, contentType, limits)` reads a body that did not come to a
+server, such as a client's response.
+
+Each answers `Result[_, FormError]`, and `FormError` is a `ToResponse`, so `?` ends a handler with it:
+
+| Error | Status | When |
+| --- | --- | --- |
+| `NotAForm(expected, found)` | 415 | The `Content-Type` is not the form's type, or there is none. |
+| `BadEncoding(UrlError)` | 400 | An urlencoded body with a malformed `%` escape or bytes that are not UTF-8. |
+| `NoBoundary` | 400 | No `boundary` parameter, or one that is not 1 to 70 of RFC 2046's characters, not ending in a space. |
+| `BadMultipart(reason)` | 400 | No delimiter, no closing delimiter, a part's headers unended, not UTF-8 or not `name: value`, or a part without `Content-Disposition: form-data` and a `name`. |
+| `TooManyParts(limit)` | 413 | More parts than `limits.maxParts` (1000 by default). |
+| `PartHeadersTooLarge(limit)` | 413 | A part's headers longer than `limits.maxHeaderBytes` (8192). |
+| `FormTooLarge(limit)` | 413 | A body longer than `limits.maxBytes` (10 MiB); the server's own `maxBodyBytes` bounds it first. |
+
+A multipart body is read as RFC 2046 writes one: text before the first delimiter and after the
+closing one is skipped, every line ends in CRLF, a delimiter's line may end in spaces and tabs, and
+bytes that resemble the boundary but are not followed by `--` or the end of the line stay in the
+part. A name or filename is read as the WHATWG HTML standard writes one, quoted with `%22`, `%0D`
+and `%0A` standing for `"`, CR and LF and no backslash escapes; a `filename*` (RFC 5987) in UTF-8 or
+ISO-8859-1 is preferred to `filename`, and one in another charset or malformed is ignored. The body
+is read whole, as the server has buffered it; a streaming reader for large uploads will come beside
+`parse`, with the same limits and errors
+([decided](/spec/decisions/#settled)).
+
+```text
+upload(r: ServerRequest) -> Result[Response, ToResponse]
+  val form = r.multipart()?
+  val title = form.field("title").getOrElse("untitled")
+  val size = form.file("doc").map(p -> p.body.length).getOrElse(0)
+  Ok(Response.text(200, s"$title: $size bytes\n"))
+```
+
 **Groups and middleware.** `type Handler = @sendable (ServerRequest) -> Response`; a middleware is a
 `(Handler) -> Handler`. `route.wrap(middleware)` passes a route's handler through one, wrapping again
 putting the newer outside, so it runs first; `route.under(prefix)` puts a route's pattern after
@@ -2577,6 +2620,8 @@ equal, and a `Url` displays as the text it was read from with exactly those diff
 | `u.withScheme(s)`, `withUserInfo(i)`, `withHost(h)`, `withPort(p)`, `withPath(p)`, `withQuery(q)`, `withFragment(f)` | The URL with one component replaced, as written with its escapes, held as `parse` holds it; the optional ones take a value or an `Option`, `None` taking the component away. A component the URL cannot hold traps: one with a character it may not, a port outside 0 to 65535, user information or a port without a host, a path beside a host not beginning with `/`. |
 | `Url.encode(text) -> string` | Every byte of the text's UTF-8 but a letter, a digit, `-`, `.`, `_` and `~` written `%XX` in upper case, so the result can stand as any component. |
 | `Url.decode(text) -> Result[string, UrlError]` | Each `%XX` replaced by its byte and the bytes read as UTF-8; a `+` is kept. |
+| `Url.formDecode(text) -> Result[Vector[(string, string)], UrlError]` | `application/x-www-form-urlencoded` read as WHATWG URL reads it, and as `queryParams` reads a query: split at each `&` (an empty piece skipped) and each piece at its first `=`, a `+` a space, each decoded; a malformed escape is `BadPercent` and bytes not UTF-8 `InvalidUtf8`, at their offset. |
+| `Url.formEncode(pairs) -> string` | The pairs written as WHATWG URL writes a form: `name=value` joined by `&`, a space as `+`, every byte but a letter, a digit, `*`, `-`, `.` and `_` as `%XX`; `formDecode` reads it back as the same pairs. |
 
 `UrlError` says why text is not a URL, with `at`, the byte offset of what is wrong: `MissingScheme`
 (a relative reference, or text beginning with `:`), `BadScheme(at)`, `BadCharacter(at)`,
@@ -2602,6 +2647,15 @@ sent after the ones the client writes, in order. `post`, `put` and `patch` send 
 contentType` first, so a `Content-Type` among `headers` follows it. `withQueryParam(name, value)`
 adds `name=value` to the request's URL, each encoded by `Url.encode`, after any query it has (with
 `?` where it has none, `&` otherwise, nothing after a trailing `?` or `&`) and before its fragment.
+`withForm(pairs)` sends the pairs as an urlencoded form, written by `Url.formEncode`, and
+`withMultipart(form)` a `Multipart` of `Part.field(name, value)` and `Part.file(name, filename,
+contentType, bytes)` parts as `multipart/form-data` between delimiters of a fresh
+`Multipart.newBoundary()` (`avin-` and 32 hexadecimal digits from `SecureRandom`); each replaces the
+request's `Content-Type` with its own. `withMultipart(form, boundary)`, `form.encoded(boundary)` and
+`form.contentType(boundary)` take a boundary of the caller's, and trap on one RFC 2046 does not allow
+or one a part's body holds. A part's name and filename are written quoted as the WHATWG HTML standard
+writes them, `"`, CR and LF as `%22`, `%0D` and `%0A`, so the server's `multipart()` reads them back
+exactly. `request.header(name)` looks a header up as a response's does.
 
 A `Response` has its `status` and `reason`, its `headers` as a vector of name and value pairs,
 `header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text`
