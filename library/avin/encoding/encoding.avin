@@ -1,7 +1,8 @@
 module avin.encoding
 
 // Bytes written as text and text read back as bytes, as RFC 4648 defines them: hexadecimal, base64
-// with its `=` padding, and base64url, the URL- and filename-safe alphabet written without padding.
+// with its `=` padding, base64url, the URL- and filename-safe alphabet written without padding, and
+// base32, written padded, unpadded or in lower case.
 //
 //     println(toBase64("hello"))
 //     println(fromBase64("aGVsbG8="))
@@ -169,3 +170,90 @@ toBase64Url(text: string) -> string = encode64(text.utf8, true)
 
 // The bytes unpadded base64url `text` spells; an empty text is no bytes.
 fromBase64Url(text: string) -> Result[Vector[byte], DecodeError] = decode64(text.utf8, true)
+
+// The code of the base32 digit of the five-bit value `v`: `A`–`Z` then `2`–`7`, or for `lower` `a`–`z`
+// then `2`–`7`.
+private digit32(v: int, lower: bool) -> byte
+digit32(v < 26, lower) = byte(int(if lower then 'a' else 'A') + v)
+digit32(v, _) = byte(int('2') + v - 26)
+
+// The five-bit value of the base32 digit whose code is `c`, in either case; -1 for any other character.
+private quint(c: int) -> int
+quint(c)
+  | int('A') <= c <= int('Z') = c - int('A')
+  | int('a') <= c <= int('z') = c - int('a')
+  | int('2') <= c <= int('7') = c - int('2') + 26
+  | _ = -1
+
+// `bytes` in base32: each five bytes eight digits, and a last one to four bytes two, four, five or
+// seven digits, followed when `pad` by `=` up to eight.
+private encode32(bytes: Array[byte], lower: bool, pad: bool) -> string
+  val n = bytes.length
+  val rest = n % 5
+  val tail = if rest == 0 then 0 else if pad then 8 else (rest * 8 + 4) / 5
+  val out = Array.fill(n / 5 * 8 + tail, byte(int('=')))
+  var acc = 0
+  var bits = 0
+  var o = 0
+  for i in 0 ..< n
+    acc = ((acc << 8) | int(bytes(i))) & 0xFFF
+    bits += 8
+    while bits >= 5
+      bits -= 5
+      out(o) = digit32((acc >> bits) & 31, lower)
+      o += 1
+  if bits > 0 then out(o) = digit32((acc << (5 - bits)) & 31, lower)
+  ascii(out)
+
+// The bytes base32 `codes` spell, either case, with or without padding. The characters are checked
+// first, in order, then the padding, then the length, then the last digit's unused bits.
+private decode32(codes: Array[byte]) -> Result[Vector[byte], DecodeError]
+  val n = codes.length
+  var end = n
+  for i in 0 ..< n
+    val c = int(codes(i))
+    if c == int('=')
+      if end == n then end = i
+    elif quint(c) < 0 then return Err(BadCharacter(i))
+    elif end < n then return Err(BadPadding(end))
+  if n - end > 6 then return Err(BadPadding(end))
+  if n != end && n % 8 != 0 then return Err(Truncated(n))
+  val r = end % 8
+  if r == 1 || r == 3 || r == 6 then return Err(Truncated(n))
+  val out = Array.fill(end / 8 * 5 + end % 8 * 5 / 8, byte(0))
+  var acc = 0
+  var bits = 0
+  var w = 0
+  for i in 0 ..< end
+    acc = ((acc << 5) | quint(int(codes(i)))) & 0xFFF
+    bits += 5
+    if bits >= 8
+      bits -= 8
+      out(w) = byte((acc >> bits) & 255)
+      w += 1
+  if (acc & ((1 << bits) - 1)) != 0 then return Err(UnusedBits(end - 1))
+  Ok(out.toVector)
+
+// `bytes` in base32 with RFC 4648's alphabet (`A`–`Z`, `2`–`7`), padded with `=` to a multiple of
+// eight characters.
+toBase32(bytes: Vector[byte]) -> string = encode32(bytes.toArray(), false, true)
+
+// The UTF-8 bytes of `text` in base32.
+toBase32(text: string) -> string = encode32(text.utf8, false, true)
+
+// `bytes` in base32 with RFC 4648's alphabet and no padding.
+toBase32Unpadded(bytes: Vector[byte]) -> string = encode32(bytes.toArray(), false, false)
+
+// The UTF-8 bytes of `text` in unpadded base32.
+toBase32Unpadded(text: string) -> string = encode32(text.utf8, false, false)
+
+// `bytes` in base32 written in lower case (`a`–`z`, `2`–`7`) with no padding; sixteen bytes are 26
+// characters.
+toBase32Lower(bytes: Vector[byte]) -> string = encode32(bytes.toArray(), true, false)
+
+// The UTF-8 bytes of `text` in lower-case unpadded base32.
+toBase32Lower(text: string) -> string = encode32(text.utf8, true, false)
+
+// The bytes base32 `text` spells: upper or lower case (also mixed), padded to a multiple of eight or
+// not padded at all; an empty text is no bytes.
+fromBase32(text: string) -> Result[Vector[byte], DecodeError] = decode32(text.utf8)
