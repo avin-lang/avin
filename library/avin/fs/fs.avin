@@ -117,8 +117,11 @@ writeBytes(file: string, bytes: Array[byte]) -> Result[unit, IoError] =
 appendBytes(file: string, bytes: Array[byte]) -> Result[unit, IoError] =
   syslAppendBytes(file, bytes).mapErr(failed("append to", file))
 
-// Whether anything, file or directory, exists at `file`. A symbolic link is followed.
-exists(file: string) -> bool = syslExists(file)
+// Whether anything, file or directory, exists at `file`. A symbolic link is followed, so a dangling
+// one answers `false`; with `followLinks = false` the link itself is what is asked about, so a
+// dangling one answers `true`.
+exists(file: string, followLinks: bool = true) -> bool =
+  if followLinks then syslExists(file) else syslLinkStat(file).isOk
 
 // Whether `file` names a directory, one the program may not read included. A symbolic link is
 // followed.
@@ -126,10 +129,34 @@ isDir(file: string) -> bool = syslStat(file) match
   Ok(m) -> m.isDir()
   Err(_) -> false
 
-// Whether `file` names something that exists and is not a directory. A symbolic link is followed.
+// Whether `file` names a regular file: not a directory, and not a FIFO, a socket or a device either.
+// A symbolic link is followed.
 isFile(file: string) -> bool = syslStat(file) match
   Ok(m) -> m.isFile()
   Err(_) -> false
+
+@sysl("sysl.fs.readable")
+private syslReadable(file: string) -> bool
+
+@sysl("sysl.fs.writable")
+private syslWritable(file: string) -> bool
+
+// Whether the user who started the program may read `file`, as its permission bits, owner and group
+// say: a file that is not there answers `false`. A symbolic link is followed. The superuser may read
+// any file, so the answer is `true` for one whatever its bits. The answer can be stale by the time
+// the file is opened; opening it is the check that counts.
+isReadable(file: string) -> bool = syslReadable(file)
+
+// Whether the user who started the program may write `file`, as `isReadable` asks about reading.
+isWritable(file: string) -> bool = syslWritable(file)
+
+// Whether `a` and `b` name the same file, whatever path leads there: two hard links to one file, or
+// a symbolic link and what it names, are the same; two files with equal contents are not. Both
+// paths are followed and must exist; a missing one is `NotFound`.
+isSameFile(a: string, b: string) -> Result[bool, IoError]
+  val first = metadata(a)?
+  val second = metadata(b)?
+  Ok(first.inode == second.inode && first.device == second.device)
 
 // Removes the file `file`. A directory is not removed: that is `removeDir`, and `remove` answers
 // `IsADirectory` on every platform, whatever the platform's own refusal says. A link to a directory
@@ -195,9 +222,20 @@ private class SyslStat
   isDir() -> bool
   isFile() -> bool
   permissionBits() -> int
+  kindBits() -> int
+  accessedMicros() -> long
+  changedMicros() -> long
+  ownerId() -> long
+  groupId() -> long
+  linkCount() -> long
+  inodeNumber() -> long
+  deviceNumber() -> long
 
 @sysl("avin.rt.fs_stat")
 private syslStat(file: string) -> Result[SyslStat, SyslError]
+
+@sysl("avin.rt.fs_link_stat")
+private syslLinkStat(file: string) -> Result[SyslStat, SyslError]
 
 @sysl("avin.rt.fs_set_modified")
 private syslSetModified(file: string, micros: long) -> Result[unit, SyslError]
@@ -205,24 +243,95 @@ private syslSetModified(file: string, micros: long) -> Result[unit, SyslError]
 @sysl("avin.rt.fs_set_permissions")
 private syslSetPermissions(file: string, mode: int) -> Result[unit, SyslError]
 
-// What one look at a path found: its size in bytes, when its contents last changed, whether it is a
-// directory, and its permission bits. For a directory the size is the file system's own bookkeeping,
-// not a count of entries. `permissions` is the twelve low bits of the mode: the nine `rwx` bits
-// (`0o644`) with setuid `0o4000`, setgid `0o2000` and the sticky bit `0o1000`; never the file type.
-data Metadata(size: long, modified: Instant, isDir: bool, isFile: bool, permissions: int)
+// What a path names, beside what is in it.
+data FileKind
+  // A file holding bytes: what `isFile` asks about.
+  Regular
+  Directory
+  // A symbolic link itself, which only `linkMetadata` reports; `metadata` follows it.
+  Symlink
+  // A named pipe.
+  Fifo
+  // A Unix-domain socket bound to a path.
+  Socket
+  // A device read and written a character at a time, such as `/dev/null`.
+  CharDevice
+  // A device read and written in blocks, such as a disk.
+  BlockDevice
+  // A kind of entry the platform has beyond these, with the type bits `stat` reported for it.
+  UnknownKind(bits: int)
+
+// The kind the type bits of a mode name.
+private fileKindOf(bits: int) -> FileKind
+fileKindOf(0o100000) = Regular
+fileKindOf(0o040000) = Directory
+fileKindOf(0o120000) = Symlink
+fileKindOf(0o010000) = Fifo
+fileKindOf(0o140000) = Socket
+fileKindOf(0o020000) = CharDevice
+fileKindOf(0o060000) = BlockDevice
+fileKindOf(bits) = UnknownKind(bits)
+
+// What one look at a path found. `size` is in bytes; for a directory it is the file system's own
+// bookkeeping, not a count of entries. `modified` is when the contents last changed, `accessed` when
+// they were last read, and `changed` when the entry itself last changed, which a change of
+// permissions or owner moves too and no ordinary call can set back. `isDir` and `isFile` say whether
+// it is a directory and a regular file, and `kind` says which of every kind it is. `permissions` is
+// the twelve low bits of the mode: the nine `rwx` bits (`0o644`) with setuid `0o4000`, setgid
+// `0o2000` and the sticky bit `0o1000`; never the file type. `owner` and `group` are the numeric user
+// and group ids (`process.userName(owner)` names the user). `links` counts the names that lead to
+// the file: more than one means a hard link. `inode` and `device` together identify the file on this
+// machine, which is what `isSameFile` compares; neither does on its own.
+data Metadata(
+    size: long,
+    modified: Instant,
+    isDir: bool,
+    isFile: bool,
+    permissions: int,
+    kind: FileKind,
+    accessed: Instant,
+    changed: Instant,
+    owner: long,
+    group: long,
+    links: long,
+    inode: long,
+    device: long
+)
+
+impl Metadata
+  // Whether it is a symbolic link, which only a `linkMetadata` reading can be.
+  isLink -> bool = kind match
+    Symlink -> true
+    _ -> false
+
+private metadataOf(s: SyslStat) -> Metadata =
+  Metadata(
+    s.sizeBytes(),
+    epochMicros(s.modifiedMicros()),
+    s.isDir(),
+    s.isFile(),
+    s.permissionBits(),
+    fileKindOf(s.kindBits()),
+    epochMicros(s.accessedMicros()),
+    epochMicros(s.changedMicros()),
+    s.ownerId(),
+    s.groupId(),
+    s.linkCount(),
+    s.inodeNumber(),
+    s.deviceNumber()
+  )
 
 // Everything `Metadata` holds, read at once so the fields describe one entry. A symbolic link is
-// followed. A path that is not there is `NotFound`.
-metadata(file: string) -> Result[Metadata, IoError] =
-  syslStat(file).map(
-    s -> Metadata(
-      s.sizeBytes(),
-      epochMicros(s.modifiedMicros()),
-      s.isDir(),
-      s.isFile(),
-      s.permissionBits()
-    )
-  ).mapErr(failed("read metadata of", file))
+// followed, so a dangling one is `NotFound`. A path that is not there is `NotFound`.
+metadata(file: string) -> Result[Metadata, IoError] = syslStat(file).map(metadataOf).mapErr(
+  failed("read metadata of", file)
+)
+
+// `metadata` of the entry `file` itself: a symbolic link is described rather than followed, so its
+// `kind` is `Symlink`, its `size` the length of the path it holds, and a dangling one answers `Ok`.
+// Anything else answers as `metadata` does.
+linkMetadata(file: string) -> Result[Metadata, IoError] =
+  syslLinkStat(file).map(metadataOf).mapErr(failed("read metadata of", file))
 
 // The permission bits of `file`, a file or a directory, as `Metadata.permissions` holds them:
 // `0o600` for one only its owner may read and write. A symbolic link is followed.

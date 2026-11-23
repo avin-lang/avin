@@ -5021,6 +5021,40 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   shape and answers `Err`). Creating a file with a mode from the start (no moment with wider bits)
   is not in this entry: Sysl 0.13.2 exposes no create-with-mode, `fchmod` or umask call.
 
+- **`isFile` means a regular file** Settled on the user's delegation 2026-11-23 (branch
+  `fs-metadata`): `fs.isFile(path)` and `Metadata.isFile` are true for a regular file alone; a FIFO,
+  a socket and a character or block device now answer `false`, where before `isFile` was "exists and
+  is not a directory". Why: every caller in the library, marshal and fettle asks `isFile` before
+  reading, running or sizing a file, and a FIFO there blocks the read and a socket fails it; the
+  `evictOlderThan` example in the chapter would have removed another program's socket. Alternatives
+  weighed: keeping "not a directory" and adding `isRegular` (the common name would keep answering
+  the question no caller means). Review with the user: it changes behaviour, though no test,
+  example or caller found relied on the old meaning.
+
+- **Complete file metadata in `avin.fs`** Settled on the user's delegation 2026-11-23 (branch
+  `fs-metadata`): `Metadata` gains `kind: FileKind`, `accessed`, `changed` (both `Instant`),
+  `owner`, `group`, `links`, `inode` and `device` (all `long`), after its five existing fields, and
+  an `isLink` member; `linkMetadata(path)` reads a link itself; `exists(path, followLinks = true)`
+  asks about a dangling link with `followLinks = false`; `isSameFile(a, b) -> Result[bool, IoError]`
+  compares inode and device; `isReadable`/`isWritable` ask the platform's `access`; and
+  `avin.process` gains `userId()`, `groupId()` and `userName(id)`. `FileKind` is `Regular |
+  Directory | Symlink | Fifo | Socket | CharDevice | BlockDevice | UnknownKind(bits)`, named from
+  the type bits Sysl's `Meta.kind` reports (its `Special(bits)` split into the four POSIX kinds).
+  Why: walking safely, de-duplicating and copying with attributes need the kind, identity and owner
+  of an entry, and they come from the one `stat` already made. Choices: **ids are `long`**, since a
+  user id is unsigned 32-bit and macOS's `nobody` is `4294967294`; inode and device are `long`
+  wrapped from 64 bits, compared, never done arithmetic on. **`Regular` rather than `File`**: `File`
+  is the open-file class of the same module, and a variant is a module-level name. **`isSameFile`
+  is a `Result`**, not `false` for a missing path, since "no such file" is not "a different file".
+  **`exists` takes a named flag** rather than a second name (`existsNoFollow`), as the copy options
+  will. **`isReadable` answers for the user who started the program** (`access(2)`'s real ids), and
+  the superuser is `true` whatever the bits. **Owner names are user names only**, in
+  `avin.process`: Sysl 0.13.2 has `user_name` and no group-name lookup, so `groupName` is left out
+  until it does. Alternatives weighed: a separate `LinkMetadata` type (the fields are the same); a
+  `Permissions`-style object for ids (one number is what every reader thinks in); `accessed` left
+  out because some file systems do not record reads (it is still right after `setModified`, and the
+  chapter says which do not).
+
 - Settled on the user's delegation 2026-11-08 (branch `runner-streaming`): **`avin test` pushes its report out as it goes, and on SIGTERM or
   SIGINT writes out what it holds and names the work in progress.** The report text of a run is
   unchanged. The report is pushed to its reader when a test finishes and at least half a second has
