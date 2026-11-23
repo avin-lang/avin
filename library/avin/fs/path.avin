@@ -1,10 +1,12 @@
 module avin.fs
 
 // Paths, tree walks and patterns. A path is a `string`, as every other call of `avin.fs` takes one.
-// The functions down to `matches` answer from the text alone and touch no disk; `absolute`,
-// `canonicalize`, `isLink`, `walk` and `glob` ask the file system. Paths are POSIX: `/` separates
+// The functions before `absolute` answer from the text alone and touch no disk, as do `matches` and
+// `matcher`; `absolute`, `canonicalize`, `isLink`, `walker`, `walk`, `find` and `glob` ask the file
+// system. Paths are POSIX: `/` separates
 // components, and a path starting with `/` starts at the root.
 
+import avin.io
 import avin.io.IoError
 
 @sysl("sysl.path.is_absolute")
@@ -118,55 +120,215 @@ symlink(target: string, link: string) -> Result[unit, IoError] = syslSymlink(tar
 // What the symbolic link `link` holds, as it was written. A path that is not a link is an `Err`.
 readLink(link: string) -> Result[string, IoError] = syslReadLink(link).mapErr(failed("read the link", link))
 
-// One entry found by `walk`: its `path` (the root joined with `relative`), its path `relative` to the
-// root, its `depth` (1 for the root's own entries), whether it is a directory and whether it is a
-// symbolic link. A link is never a directory here, whatever it names. `error` is what stopped the walk
-// from listing a directory, whose entries are then absent.
+// One entry found by a walk: its `path` (the root joined with `relative`), its path `relative` to the
+// root (empty for the root itself), its `depth` (0 for the root, 1 for the root's own entries),
+// whether it is a directory and whether it is a symbolic link. A link is a directory here only when
+// the walk follows links and it names one. `error` is what stopped the walk from going into a
+// directory, whose entries are then absent: it could not be listed, or, following links, it is a
+// directory the walk is already inside.
 data Entry(path: string, relative: string, depth: int, isDir: bool, isLink: bool, error: Option[IoError])
 
-// Every entry below the directory `root`, the root itself not included: depth first, a directory
-// before what it holds, the entries of each directory in code-point order, so two walks of an
-// unchanged tree agree. A symbolic link is listed and never followed, so a link back up the tree ends
-// nothing early and repeats nothing. A directory that cannot be listed is still an entry, with the
-// reason in its `error`, and the walk goes on past it. The root itself is followed when it is a link,
-// and when it cannot be listed the whole walk is that error.
-walk(root: string) -> Result[Vector[Entry], IoError]
-  val names = listDir(root)?
+// The entries of the tree at `root`, read as the iterator advances: each directory is listed when the
+// walk reaches it, so taking the first few entries of a huge tree lists only the directories on the
+// way to them. The walk is depth first, each directory's entries in code-point order, so two walks of
+// an unchanged tree agree.
+//
+// - `maxDepth`: entries deeper than this are left out; a directory at `maxDepth` is an entry but is
+//   not listed. 0 is the root alone. A negative `maxDepth` fails.
+// - `includeRoot`: the root itself is the first entry (the last, in post-order), at depth 0.
+// - `postOrder`: a directory comes after what it holds rather than before.
+// - `followLinks`: a link that names a directory is gone into as a directory is; one that names a
+//   directory the walk is already inside is an entry whose `error` says so, and is not gone into, so a
+//   link back up the tree ends. Otherwise a link is an entry and is never followed.
+// - `prune`: asked about each directory the walk is about to go into, the root excepted; one it
+//   answers true for is an entry, but nothing in it is.
+// - `stopOnError`: a directory that cannot be gone into ends the walk with that `Err`, rather than
+//   being an entry carrying it while the walk goes on past.
+//
+// The root itself is followed when it is a link. A root that cannot be listed is one `Err` and
+// nothing else; so is a root that is not a directory, unless `includeRoot` asks for it, when it is the
+// one entry.
+walker(
+    root: string,
+    maxDepth: int = int.MaxValue,
+    includeRoot: bool = false,
+    postOrder: bool = false,
+    followLinks: bool = false,
+    prune: (Entry) -> bool = _ -> false,
+    stopOnError: bool = false
+) -> Iterator[Result[Entry, IoError]]
+  if maxDepth < 0 then fail(s"walk of $root with a negative maxDepth: $maxDepth")
+  Walker(root, maxDepth, includeRoot, postOrder, followLinks, prune, stopOnError)
+
+// Every entry `walker` finds with the same options, gathered into a vector; the first `Err` the walk
+// meets is the answer instead. With no options it is every entry below the root, a directory before
+// what it holds, links not followed, and a directory that cannot be listed an entry carrying the
+// reason in its `error`.
+walk(
+    root: string,
+    maxDepth: int = int.MaxValue,
+    includeRoot: bool = false,
+    postOrder: bool = false,
+    followLinks: bool = false,
+    prune: (Entry) -> bool = _ -> false,
+    stopOnError: bool = false
+) -> Result[Vector[Entry], IoError]
   val out = Buffer[Entry]()
-  walkInto(root, "", 1, names, out)
+  for step in walker(root, maxDepth, includeRoot, postOrder, followLinks, prune, stopOnError)
+    out.addOne(step?)
   Ok(out.toVector)
 
-private walkInto(root: string, relative: string, depth: int, names: Vector[string], out: Buffer[Entry])
-  for name in names
-    val rel = syslJoin(relative, name)
-    val full = syslJoin(root, rel)
-    if syslIsLink(full)
-      out.addOne(Entry(full, rel, depth, false, true, None))
-    else if isDir(full)
-      listDir(full) match
-        Ok(inner) ->
-          out.addOne(Entry(full, rel, depth, true, false, None))
-          walkInto(root, rel, depth + 1, inner, out)
-        Err(e) -> out.addOne(Entry(full, rel, depth, true, false, Some(e)))
+// The paths of the entries below `root` that `p` is true for, in the walk's order, with the walk's
+// options as `walk` takes them.
+find(
+    root: string,
+    p: (Entry) -> bool,
+    maxDepth: int = int.MaxValue,
+    followLinks: bool = false,
+    prune: (Entry) -> bool = _ -> false,
+    stopOnError: bool = false
+) -> Result[Vector[string], IoError]
+  val out = Buffer[string]()
+  for step in walker(root, maxDepth, false, false, followLinks, prune, stopOnError)
+    val e = step?
+    if p(e) then out.addOne(e.path)
+  Ok(out.toVector)
+
+// The paths of the entries below `root` whose path relative to the root fits `pattern`, as `matches`
+// reads it: `find(dir, "**/*.avin")`.
+find(
+    root: string,
+    pattern: string,
+    maxDepth: int = int.MaxValue,
+    followLinks: bool = false,
+    prune: (Entry) -> bool = _ -> false,
+    stopOnError: bool = false
+) -> Result[Vector[string], IoError]
+  val fits = matcher(pattern)
+  find(root, e -> fits(e.relative), maxDepth, followLinks, prune, stopOnError)
+
+// A directory the walk is inside: its entry, its names, how many of them the walk has taken, and,
+// when links are followed, the one path the file system gives it.
+private class WalkFrame(val entry: Entry, val names: Vector[string], val canonical: string)
+  var index = 0
+
+private class Walker(
+    private val root: string,
+    private val maxDepth: int,
+    private val includeRoot: bool,
+    private val postOrder: bool,
+    private val followLinks: bool,
+    private val prune: (Entry) -> bool,
+    private val stopOnError: bool
+): Iterator[Result[Entry, IoError]]
+  private var started = false
+  private var done = false
+  private val stack = Buffer[WalkFrame]()
+  private var pending: Option[Result[Entry, IoError]] = None
+
+  override hasNext() -> bool
+    fill()
+    pending is Some(_)
+
+  override next() -> Result[Entry, IoError]
+    fill()
+    pending match
+      Some(r) ->
+        pending = None
+        r
+      None -> fail("next on an exhausted iterator")
+
+  // Fills `pending` with the next entry or error, or leaves it empty when the walk is over.
+  private fill()
+    if !started
+      started = true
+      start()
+    while pending is None && !done
+      if stack.isEmpty
+        done = true
+        return
+      val top = stack(stack.length - 1)
+      if top.index < top.names.length
+        val name = top.names(top.index)
+        top.index += 1
+        val rel = syslJoin(top.entry.relative, name)
+        val full = syslJoin(root, rel)
+        val link = syslIsLink(full)
+        val dir = (!link || followLinks) && isDir(full)
+        val e = Entry(full, rel, top.entry.depth + 1, dir, link, None)
+        if dir && e.depth < maxDepth && !prune(e) then enter(e) else pending = Some(Ok(e))
+      else
+        stack.remove(stack.length - 1)
+        if postOrder && (stack.nonEmpty || includeRoot) then pending = Some(Ok(top.entry))
+
+  private start()
+    val e = Entry(root, "", 0, isDir(root), syslIsLink(root), None)
+    if !e.isDir
+      if includeRoot && metadata(root).isOk then pending = Some(Ok(e))
+      else pending = Some(Err(listDir(root).err.getOrElse(IoError(io.NotADirectory, "list", root))))
+      done = true
+    else if maxDepth == 0
+      if includeRoot then pending = Some(Ok(e))
+      done = true
     else
-      out.addOne(Entry(full, rel, depth, false, false, None))
+      listDir(root) match
+        Ok(names) ->
+          stack.addOne(WalkFrame(e, names, canonicalOf(root)))
+          if includeRoot && !postOrder then pending = Some(Ok(e))
+        Err(err) ->
+          pending = Some(Err(err))
+          done = true
+
+  // Goes into the directory `e`: lists it and, before its entries in pre-order, makes it the next
+  // entry; or makes it an entry carrying why it could not, or ends the walk with that.
+  private enter(e: Entry)
+    val canonical = canonicalOf(e.path)
+    val listed =
+      if followLinks && stack.exists(f -> f.canonical == canonical)
+        Err(IoError(io.Other("file system loop"), "walk into", e.path))
+      else listDir(e.path)
+    listed match
+      Ok(names) ->
+        stack.addOne(WalkFrame(e, names, canonical))
+        if !postOrder then pending = Some(Ok(e))
+      Err(err) ->
+        if stopOnError
+          pending = Some(Err(err))
+          done = true
+        else pending = Some(Ok(Entry(e.path, e.relative, e.depth, e.isDir, e.isLink, Some(err))))
+
+  // The path the file system gives `p`, asked only when links are followed, since only then can a walk
+  // come back to a directory it is inside.
+  private canonicalOf(p: string) -> string =
+    if followLinks then syslCanonicalize(p).getOrElse(p) else p
 
 // Whether the path `p` fits `pattern`. Both are compared component by component (`components`), so
 // doubled and trailing separators do not matter, and an absolute pattern fits only an absolute path.
 // In a component, `*` is any run of characters, `?` one character, `[abc]` and `[a-z]` one character
 // of the set, `[!a-z]` and `[^a-z]` one not in it, and `\` makes the next character literal. A
-// component that is exactly `**` is any number of whole components, none at all included. A name
-// starting with `.` is hidden: only a pattern component starting with a literal `.` fits it, and `**`
-// never passes through it. A `[` with no closing `]` is a literal `[`.
-matches(pattern: string, p: string) -> bool =
-  syslIsAbsolute(pattern) == syslIsAbsolute(p)
-    && matchParts(syslComponents(pattern).map(compileComponent), 0, syslComponents(p), 0)
+// component that is exactly `**` is any number of whole components, none at all included. `{a,b}` is
+// any one of its comma-separated alternatives, which may hold `/`, wildcards and further braces:
+// `src/{lib,test}/**/*.{c,h}`. A name starting with `.` is hidden: only a pattern component starting
+// with a literal `.` fits it, and `**` never passes through it. A `[` with no closing `]` is a literal
+// `[`, and a `{` with no closing `}` a literal `{`.
+matches(pattern: string, p: string) -> bool = matcher(pattern)(p)
+
+// `matches` for one pattern read once, for testing many paths: `fs.matcher("**/*.avin")`.
+matcher(pattern: string) -> (string) -> bool
+  val each = expandBraces(pattern).map(one -> (syslIsAbsolute(one), syslComponents(one).map(compileComponent)))
+  p ->
+    val absolute = syslIsAbsolute(p)
+    val parts = syslComponents(p)
+    each.exists(c -> c.0 == absolute && matchParts(c.1, 0, parts, 0))
 
 // The paths that exist and fit `pattern`, in code-point order, each once. A relative pattern is read
 // from the current directory and answers relative paths; an absolute one answers absolute paths. A
 // `**` does not go through symbolic links, as `walk` does not; a link named by another component is
-// followed. A directory that cannot be read contributes nothing.
-glob(pattern: string) -> Vector[string]
+// followed. A directory that cannot be read contributes nothing. Each alternative of a `{a,b}` is
+// globbed in turn and the answers merged.
+glob(pattern: string) -> Vector[string] = expandBraces(pattern).flatMap(globOne).distinct.sorted
+
+private globOne(pattern: string) -> Vector[string]
   val parts = syslComponents(pattern)
   if parts.isEmpty
     return if syslIsAbsolute(pattern) then ["/"] else []
@@ -186,7 +348,61 @@ glob(pattern: string) -> Vector[string]
           for name in listDir(dirOf(base)).getOrElse(Vector.empty[string]())
             if matchName(tokens, name) then next.addOne(syslJoin(base, name))
     current = next.toVector
-  current.distinct.sorted
+  current
+
+// The patterns a `{a,b}` alternation stands for, each brace written out, in the order the
+// alternatives are written: `x{a,b}{1,2}` is `xa1`, `xa2`, `xb1`, `xb2`. A brace escaped with `\` or
+// inside a `[...]` class is not one, a `{` with no closing `}` is literal, and `{a}` is `a`.
+private expandBraces(pattern: string) -> Vector[string]
+  val cs = pattern.chars
+  findBraces(cs, 0) match
+    None -> [pattern]
+    Some((open, close, commas)) ->
+      val before = cs.slice(0, open).mkString("")
+      val after = cs.slice(close + 1, cs.length).mkString("")
+      val bounds = Vector(open) ++ commas ++ Vector(close)
+      (0 ..< bounds.length - 1).toVector.flatMap(
+        k -> expandBraces(before + cs.slice(bounds(k) + 1, bounds(k + 1)).mkString("") + after)
+      )
+
+// The first `{` from `from` with a closing `}`: its index, the closing one's, and the commas between
+// them that are not inside a nested brace.
+private findBraces(cs: Vector[char], from: int) -> Option[(int, int, Vector[int])]
+  var i = from
+  while i < cs.length
+    val c = cs(i)
+    if c == '\\' then i += 2
+    else if c == '[' then i = afterClass(cs, i)
+    else if c == '{'
+      closeBrace(cs, i) match
+        Some((close, commas)) -> return Some((i, close, commas))
+        None -> i += 1
+    else i += 1
+  None
+
+// The `}` closing the `{` at `open`, and the commas at its own level.
+private closeBrace(cs: Vector[char], open: int) -> Option[(int, Vector[int])]
+  val commas = Buffer[int]()
+  var depth = 0
+  var i = open + 1
+  while i < cs.length
+    val c = cs(i)
+    if c == '\\' then i += 2
+    else if c == '[' then i = afterClass(cs, i)
+    else
+      if c == '{' then depth += 1
+      else if c == '}'
+        if depth == 0 then return Some((i, commas.toVector))
+        depth -= 1
+      else if c == ',' && depth == 0 then commas.addOne(i)
+      i += 1
+  None
+
+// The index after the class starting with the `[` at `at`, or after the `[` alone when it is not
+// closed and so is a literal `[`.
+private afterClass(cs: Vector[char], at: int) -> int = readClass(cs, at + 1) match
+  Some((_, after)) -> after
+  None -> at + 1
 
 private dirOf(base: string) -> string = if base.isEmpty then "." else base
 
