@@ -13005,3 +13005,19 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   resumed on, changing the buffer's count there while the buffer's own carrier used it, which
   freed it under other threads (a crash in `malloc`, or corrupted bytes, with thousands of threads
   reading at once).
+- Settled on the user's delegation 2026-11-23 (branch `http-date`): **HTTP-dates live in `avin.time`
+  as `Instant.toHttpDate()` and `parseHttpDate(text[, now])`.** They sit beside the ISO 8601 text and
+  parse, share `TimeParseError`, and `avin.net.http` imports them. Writing is IMF-fixdate only, drops
+  the fraction toward the earlier second, and traps outside years 0000 to 9999 (the form has four
+  digits; it matches `date(...)` trapping out of range, and no real header value is outside it).
+  Parsing is exact: a day name that is not the date's is refused (`OutOfRange(text, "weekday")`), names
+  and `GMT` are case-sensitive as RFC 9110's ABNF is, widths are fixed, extra whitespace anywhere is
+  refused, `asctime`'s day under ten must be space-padded, a second of `60` is refused as in every
+  other parse. A two-digit RFC 850 year follows RFC 9110's fifty-year rule against `now`, which is an
+  argument of the two-argument form so the rule is testable and the one-argument form reads the
+  clock. Alternatives weighed: a lenient parser ignoring the day name or case (what some servers do;
+  it accepts corrupt dates and hides client bugs, and a caller can always trim or fold case first);
+  `Option` instead of `Result` (every other parse here says why); the format as a method on `Zoned`
+  (an HTTP-date is always UTC, so an `Instant` method has no zone to get wrong). Review with the
+  user: strict weekday and case checking on `If-Modified-Since`, where a lenient server would
+  answer 200 instead of ignoring a malformed date, which RFC 9110 also allows.
