@@ -10927,6 +10927,28 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     the file's thread ownership, above).
   - **The HTTP access log** gains an overload `accessLog(logger, clock, ids)`, writing an `Info`
     record `request` with its fields; the sink form is unchanged.
+- **File conveniences in `avin.fs` (branch `fs-conveniences`).** Settled on the user's delegation
+  2026-11-23: `readLines`/`lines`/`writeLines`, `writeTextAtomic`/`writeBytesAtomic`, a
+  `createParents = false` argument on every write, `removeAll` and `removeIfExists`.
+  - Lines end at `\n` or `\r\n`; the last line needs no terminator; a final terminator ends the
+    last line rather than starting an empty one (so an empty file has no lines). `writeLines` always
+    writes `\n`, so a file it writes ends in a newline.
+  - `lines(file)` answers `Result[Lines, IoError]`: an open failure is immediate, a read failure
+    mid-stream is the last item. `Lines` is an iterator and an `io.Close`. The file closes when the
+    iterator is exhausted or fails; an early stop is `close()` (`defer`), and a forgotten one is
+    closed by the collector like any `File`. Alternatives weighed: closing on garbage collection
+    alone (descriptors held for an unbounded time); a callback form `withLines(file, f)` (does not
+    compose with iterator adapters).
+  - `createParents` is a default argument rather than twin functions, since the language has
+    default arguments; the default is `false`, so existing calls are unchanged.
+  - Atomic writes: a uniquely named file beside the target (its name from the system layer, unique
+    per call and per process), written, `fsync`ed, closed, and renamed over the target; any failure
+    removes it and leaves the target untouched. The directory itself is not synced after the rename,
+    and the replacement has default permissions rather than the old file's.
+  - `removeAll` removes a file, a link (never followed) or a tree, and a missing path is `NotFound`;
+    `removeIfExists` returns `Result[bool, IoError]` (`Ok(false)` for nothing there) rather than a
+    bare `bool`, since removal can fail for other reasons and a `bool` would hide them. Review with
+    the user: whether `removeAll` of a missing path should rather succeed, as `removeDirAll` does.
 
 ## Proposed
 
