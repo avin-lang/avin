@@ -1706,7 +1706,8 @@ main()
 ## `avin.encoding`
 
 Bytes written as text and read back, as RFC 4648 defines them: hexadecimal, base64 with its `=`
-padding, and base64url, the URL- and filename-safe alphabet written without padding.
+padding, base64url, the URL- and filename-safe alphabet written without padding, and base32, written
+padded, unpadded or in lower case.
 
 ```text
 import avin.encoding.{toBase64, fromBase64, toBase64Url, fromHex}
@@ -1726,6 +1727,10 @@ main()
 | `fromBase64(text) -> Result[Vector[byte], DecodeError]` | The bytes padded, standard base64 spells. |
 | `toBase64Url(x) -> string` | `x` in base64url: `-` and `_` in place of `+` and `/`, and no padding. |
 | `fromBase64Url(text) -> Result[Vector[byte], DecodeError]` | The bytes unpadded base64url spells. |
+| `toBase32(x) -> string` | `x` in base32: `A`–`Z` and `2`–`7`, padded with `=` to a multiple of eight characters. |
+| `toBase32Unpadded(x) -> string` | `x` in base32 with no padding. |
+| `toBase32Lower(x) -> string` | `x` in base32 in lower case (`a`–`z`, `2`–`7`) with no padding: sixteen bytes are 26 characters. |
+| `fromBase32(text) -> Result[Vector[byte], DecodeError]` | The bytes base32 spells, in upper, lower or mixed case, padded to a multiple of eight or not padded at all. |
 
 Encoding never fails, and the empty input encodes as the empty text and decodes back from it.
 
@@ -1734,7 +1739,10 @@ and line breaks, the other alphabet's characters, a missing, extra or misplaced 
 base64url, and a last digit with bits set below the last whole byte, which an encoder always leaves
 zero (`Zh==` is refused; `Zg==` is `f`). Two different texts therefore never decode to the same
 bytes, which matters for a token or a signature carried as text. Text wrapped across lines has its
-line breaks taken out before it is decoded.
+line breaks taken out before it is decoded. `fromBase32` is as strict, except that a digit's case
+carries no bits, so either case is read, and the `=` padding is optional: a padded text must be padded
+to a multiple of eight with the right number of `=`, and an unpadded one must end on a whole number of
+bytes (2, 4, 5 or 7 digits past a multiple of eight, not 1, 3 or 6).
 
 **A refusal is a `DecodeError`**, an `Error` whose `at` is a byte offset in the text. The checks run
 in order, the characters first, then the padding, the length and the unused bits, so the offset
@@ -1744,7 +1752,7 @@ named is of the first thing wrong.
 | --- | --- |
 | `BadCharacter(at)` | A character the encoding does not use. |
 | `BadPadding(at)` | An `=` where padding cannot stand: before the last two characters, followed by a character that is not `=`, more than two of them, or any in base64url. |
-| `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one. `at` is the text's length. |
+| `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one, base32 whose digits past a multiple of eight are 1, 3 or 6 or whose padding is not completed to eight. `at` is the text's length. |
 | `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
 
 ## `avin.net`

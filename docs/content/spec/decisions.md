@@ -11223,6 +11223,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   Avin's decoder is stricter than Sysl's (above), and encoding is a few lines of byte arithmetic with
   no platform behind it. Alternative weighed: binding `sysl.encoding`'s encoders and writing only the
   checks in Avin (two passes over the text, and a second implementation of the alphabet anyway).
+- Settled on the user's delegation 2026-11-23: **`avin.encoding` gains base32** (RFC 4648 alphabet `A`–`Z`, `2`–`7`): `toBase32`
+  (padded with `=` to a multiple of eight), `toBase32Unpadded`, `toBase32Lower` (lower case, no
+  padding), each over a `Vector[byte]` or a `string`, and one `fromBase32`. The decoder reads either
+  case (also mixed) and padded or unpadded text, because a digit's case and a trailing `=` carry no
+  bits; it stays strict otherwise, with the same `DecodeError` cases and check order as base64: a
+  padded text needs the right count of `=` (`Truncated` when the length is not a multiple of eight,
+  `BadPadding` for a misplaced `=` or more than six), an unpadded one must end on 0, 2, 4, 5 or 7
+  digits past a multiple of eight (`Truncated` otherwise), and a last digit with unused bits set is
+  `UnusedBits`. Why: marshal writes a 128-bit token as 26 lower-case characters (`toBase32Lower`),
+  and a token read back from a case-folding source (a URL host, a file name) must still decode.
+  Alternatives weighed: an options argument or default arguments for case and padding (the base64
+  family has one function per spelling, and `fromBase64Url` shows the unpadded form as its own
+  name); four encoders (padded lower case has no user); a decoder strict about case (a token typed
+  or lower-cased in transit would fail for no gain in uniqueness a caller relies on). Review with the
+  user: base32 decoding is therefore not one-spelling-per-value as base64's is (case and padding vary).
 - Settled on the user's delegation 2026-11-15: **`constantTimeEquals(a, b)` in `avin.crypto`**, for `Vector[byte]` and for `string`
   (compared as UTF-8 bytes, so `"é"` and `"e\u{301}"` differ), bound to Sysl's `sysl.crypto.verify`,
   which reads every byte and branches only on the lengths. Why: Sysl pins that function's
