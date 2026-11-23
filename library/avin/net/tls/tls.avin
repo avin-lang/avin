@@ -13,7 +13,7 @@ import avin.io
 import avin.io.IoError
 import avin.net.{ByteStream, ReadAhead, StreamReader, StreamWriter, TcpStream}
 import avin.threads.{Atomic, Semaphore}
-import avin.time.Duration
+import avin.time.{Duration, monotonic, seconds}
 
 // Why a TLS connection could not be made.
 data TlsError
@@ -242,7 +242,9 @@ private serverContext(server: TlsServer) -> Result[ServerContext, TlsError] =
 // failure of TLS itself after the handshake is an `IoError` of kind `Other` beginning `TLS:`, naming the peer. The connection
 // ends where the peer closes TLS or the TCP connection beneath. It may be handed to another thread
 // or actor, which takes it over, as a `TcpStream` is.
-@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps")
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps"
+)
 class TlsStream(
     private val tcp: TcpStream,
     private val engine: Engine,
@@ -447,10 +449,23 @@ class TlsStream(
 
   // Drives the handshake: each step is asked for first and what it wrote sent after, since nothing
   // is written before a step asks for it, and what arrives is handed over where a step wants more.
-  // An alert saying why a handshake failed is sent before the failure is answered.
-  private handshake() -> Result[unit, TlsError]
+  // An alert saying why a handshake failed is sent before the failure is answered. Where `limit` is
+  // positive the whole handshake must be done within it of `start` on the monotonic clock: each wait
+  // is cut to what is left, and one left nothing fails as `TimedOut`. The connection's own limit is
+  // put back afterwards, the handshake done or not.
+  private handshake(start: Duration, limit: Duration) -> Result[unit, TlsError]
+    if limit <= Duration.Zero then return shaken(start, limit, Duration.Zero)
+    val own = tcp.timeout
+    val answer = shaken(start, limit, own)
+    _ = tcp.setTimeout(own)
+    answer
+
+  // `handshake`'s steps, each wait cut to what is left of `limit`, the connection's own limit being
+  // `own`.
+  private shaken(start: Duration, limit: Duration, own: Duration) -> Result[unit, TlsError]
     while true
       val step = engine.handshake()
+      cut(start, limit, own)?
       val sent = flush()
       val done = step match
         Ok(Done) -> true
@@ -458,9 +473,18 @@ class TlsStream(
         Err(f) -> return Err(handshakeError(f, peer))
       sent.mapErr(e -> Transport(e))?
       if done then return Ok(())
+      cut(start, limit, own)?
       if !pull().mapErr(e -> Transport(e))?
         return Err(Handshake("the connection ended during the handshake"))
     Ok(())
+
+  // Sets the connection's next waits to what is left of `limit` from `start`, or to its own limit
+  // `own` where that is sooner; a `limit` of zero is none, and one already spent is `TimedOut`.
+  private cut(start: Duration, limit: Duration, own: Duration) -> Result[unit, TlsError]
+    if limit <= Duration.Zero then return Ok(())
+    val left = limit - (monotonic() - start)
+    if left <= Duration.Zero then return Err(Transport(IoError(io.TimedOut, "handshake with", peer)))
+    tcp.setTimeout(if own <= Duration.Zero || left < own then left else own).mapErr(e -> Transport(e))
 
   // Writes on the connection what an earlier `writeSome` left, then whatever ciphertext TLS has to
   // send, waiting for room as long as it takes.
@@ -576,17 +600,19 @@ private firstRecordOf(bytes: Array[byte]) -> Array[byte] =
 // beneath only holding `sending`, so the ciphertext either half has TLS make goes out whole and in
 // order. Each handle is in transit between uses, taken by the code holding its lock and handed back
 // before the lock goes, a cancellation of that code included.
-@trusted_sendable("its TLS state is reached only holding `state`, and its TCP writer only holding `sending`, each handed back to no owner before the lock goes")
+@trusted_sendable(
+  "its TLS state is reached only holding `state`, and its TCP writer only holding `sending`, each handed back to no owner before the lock goes"
+)
 @keeps_owners
 private class TlsShared(
-    private val engine: Engine,
-    private val out: StreamWriter,
-    // The descriptor of the TCP connection, for `writable()` to look at without `sending`.
-    val descriptor: int,
-    val peer: string,
-    // Ciphertext that did not go when it was sent, its wait having run out of time or failed, which
-    // goes before anything else is sent. Holding `sending`.
-    private var pending: Array[byte]
+  private val engine: Engine,
+  private val out: StreamWriter,
+  // The descriptor of the TCP connection, for `writable()` to look at without `sending`.
+  val descriptor: int,
+  val peer: string,
+  // Ciphertext that did not go when it was sent, its wait having run out of time or failed, which
+  // goes before anything else is sent. Holding `sending`.
+  private var pending: Array[byte]
 ): Sendable
   private val state = Semaphore(1)
   private val sending = Semaphore(1)
@@ -781,7 +807,9 @@ private class TlsShared(
     if open.sub(1) == 0 then _ = engaged(e -> e.close())
 
 // The reading half of a split `TlsStream`.
-@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its writing half is reached under locks")
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its writing half is reached under locks"
+)
 private class TlsReader(
     private val tcp: StreamReader,
     private val shared: TlsShared,
@@ -886,7 +914,9 @@ private class TlsReader(
 
 // The writing half of a split `TlsStream`. Where TLS must hear from the peer before it can send
 // more, which only a renegotiation asks, a write waits for the reading half to read.
-@trusted_sendable("it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its reading half is reached under locks")
+@trusted_sendable(
+  "it belongs to one thread at a time: a send hands it over, and every operation first checks its owner, so the code that handed it over traps; what it shares with its reading half is reached under locks"
+)
 private class TlsWriter(
     private val shared: TlsShared,
     private val peer: string,
@@ -943,41 +973,77 @@ private class TlsWriter(
 
 object TlsStream
   // A TLS connection to `host` and `port`, its certificate checked for `host` against what
-  // `client` trusts.
-  connect(host: string, port: int, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError]
-    val tcp = TcpStream.connect(host, port).mapErr(e -> Transport(e))?
-    val made = TlsStream.clientOver(tcp, host, settings, s"$host:$port")
+  // `client` trusts. Looking the host up, connecting and the handshake must all be done within
+  // `timeout`, else the connection is closed and the failure is a `Transport` error of kind
+  // `TimedOut`; zero takes the limit away, and a negative timeout traps. The connection made has no
+  // limit on its waits until `setTimeout` gives it one.
+  connect(
+      host: string,
+      port: int,
+      settings: TlsClient = TlsClient(),
+      timeout: Duration = seconds(30)
+  ) -> Result[TlsStream, TlsError]
+    if timeout.isNegative then fail(s"a TLS connect timeout of $timeout: it is at least zero")
+    val start = monotonic()
+    val tcp = TcpStream.connect(host, port, timeout).mapErr(e -> Transport(e))?
+    val made = TlsStream.clientOver(tcp, host, settings, s"$host:$port", start, timeout)
     if made.isErr then _ = tcp.close()
     made
 
   // TLS as the client over `tcp`, a connection to `host`, its certificate checked for `host`
-  // against what `client` trusts. The handshake's waits keep `tcp`'s limit. Where it fails, `tcp`
-  // is left for the caller to close.
-  client(tcp: TcpStream, host: string, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError] =
-    clientOver(tcp, host, settings, host)
+  // against what `client` trusts. Each of the handshake's waits keeps `tcp`'s limit, and the whole
+  // handshake must be done within `timeout`, else it fails as a `Transport` error of kind
+  // `TimedOut`; zero, the default, takes that limit away, and a negative timeout traps. Where it
+  // fails, `tcp` is left for the caller to close.
+  client(
+      tcp: TcpStream,
+      host: string,
+      settings: TlsClient = TlsClient(),
+      timeout: Duration = Duration.Zero
+  ) -> Result[TlsStream, TlsError]
+    if timeout.isNegative then fail(s"a TLS handshake timeout of $timeout: it is at least zero")
+    clientOver(tcp, host, settings, host, monotonic(), timeout)
 
-  // `client`, the connection's errors naming `peer`.
-  private clientOver(tcp: TcpStream, host: string, settings: TlsClient, peer: string) -> Result[TlsStream, TlsError]
+  // `client`, the connection's errors naming `peer`, its handshake done within `limit` of `start`.
+  private clientOver(
+      tcp: TcpStream,
+      host: string,
+      settings: TlsClient,
+      peer: string,
+      start: Duration,
+      limit: Duration
+  ) -> Result[TlsStream, TlsError]
     val context = clientContext(settings)?
     val made = clientEngine(context, host)
     context.close()
     val engine = made.mapErr(f -> Handshake(f.message))?
-    opened(tcp, engine, peer)
+    opened(tcp, engine, peer, start, limit)
 
-  // TLS as the server over `tcp`, an accepted connection, presenting `server`'s certificate. The
-  // handshake's waits keep `tcp`'s limit. Where it fails, `tcp` is left for the caller to close.
-  server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]
+  // TLS as the server over `tcp`, an accepted connection, presenting `server`'s certificate. Each of
+  // the handshake's waits keeps `tcp`'s limit, and the whole handshake must be done within
+  // `timeout`, else it fails as a `Transport` error of kind `TimedOut`; zero, the default, takes that
+  // limit away, and a negative timeout traps. Where it fails, `tcp` is left for the caller to close.
+  server(tcp: TcpStream, settings: TlsServer, timeout: Duration = Duration.Zero) -> Result[TlsStream, TlsError]
+    if timeout.isNegative then fail(s"a TLS handshake timeout of $timeout: it is at least zero")
+    val start = monotonic()
     val context = serverContext(settings)?
     val made = serverEngine(context)
     context.close()
     val engine = made.mapErr(f -> Handshake(f.message))?
-    opened(tcp, engine, "a TLS client")
+    opened(tcp, engine, "a TLS client", start, timeout)
 
-  // A TLS connection over `tcp` once `engine`'s handshake is done; where it fails, `engine` is
-  // released and `tcp` left open. Its errors name `peer`.
-  private opened(tcp: TcpStream, engine: Engine, peer: string) -> Result[TlsStream, TlsError]
+  // A TLS connection over `tcp` once `engine`'s handshake is done, within `limit` of `start` where
+  // `limit` is positive; where it fails, `engine` is released and `tcp` left open. Its errors name
+  // `peer`.
+  private opened(
+      tcp: TcpStream,
+      engine: Engine,
+      peer: string,
+      start: Duration,
+      limit: Duration
+  ) -> Result[TlsStream, TlsError]
     val stream = TlsStream(tcp, engine, ReadAhead(Array.empty[byte](), 0), Array.fill(RecordSize, byte(0)), false, peer)
-    stream.handshake() match
+    stream.handshake(start, limit) match
       Ok(_) -> Ok(stream)
       Err(e) ->
         engine.close()
