@@ -1,0 +1,131 @@
+// expect: exit 0
+// `fs.permissions`, `fs.setPermissions` and `Metadata.permissions`: round trips of 0o600, 0o644,
+// 0o755, 0o777 and 0o0 on a file and on a directory; setuid, setgid and the sticky bit, where every
+// platform allows them; a mode outside 0o0 to 0o7777 refused with the file left as it was; missing
+// paths and a path through a file; a symbolic link, which is followed; a Unicode name; a mode that
+// survives rewriting the file; and what setting the mode leaves alone. The link is made through
+// Sysl's `sysl.fs.symlink`, which `avin.fs` does not offer.
+import avin.fs
+import avin.io
+import avin.io.IoError
+import avin.time
+
+@sysl("sysl.fs.IoError")
+private data SyslIoError
+  NotFound
+  PermissionDenied
+  AlreadyExists
+  NotADirectory
+  IsADirectory
+  DirectoryNotEmpty
+  TooManyOpenFiles
+  NoSpaceLeft
+  Interrupted
+  NotOpen
+  NotPermitted
+  InvalidUtf8(offset: long)
+  Other(code: int)
+
+@sysl("sysl.fs.symlink")
+private symlinkRaw(target: string, link: string) -> Result[unit, SyslIoError]
+
+// The temporary directory the test works in, written as `DIR` in what it prints, which an error
+// names, so the output is the same on every run.
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+// The permission bits of `file` in octal, or the error reading them.
+mode(file: string) -> string = fs.permissions(file) match
+  Ok(p) -> f"${p}%o"
+  Err(e) -> s"$e"
+
+// Sets `bits` on `file` and reads them back through both `permissions` and `metadata`.
+roundTrip(file: string, bits: int)
+  val set = fs.setPermissions(file, bits)
+  val viaMeta = fs.metadata(file).map(m -> m.permissions).getOrElse(-1)
+  say(s"$set ${mode(file)} ${viaMeta == bits}")
+
+main()
+  val dir = fs.createTempDir("avin-fs-perm").getOrElse("")
+  root = dir
+  val file = dir + "/token"
+  _ = fs.writeText(file, "secret")
+  // A file made by `writeText` is never executable and always readable and writable by its owner,
+  // whatever the umask takes from the group and others.
+  val made = fs.permissions(file).getOrElse(-1)
+  say(s"${made & 0o111} ${(made & 0o600) == 0o600}")
+  // Round trips on a file, the zero mode included, which `stat` still reads.
+  for bits in [0o600, 0o644, 0o755, 0o777, 0o400, 0o0, 0o1, 0o600]
+    roundTrip(file, bits)
+  // The contents and the modification time stay as they were.
+  _ = fs.setModified(file, time.epochSeconds(1000000000))
+  _ = fs.setPermissions(file, 0o640)
+  say(s"${fs.readText(file)} ${fs.modified(file).getOrElse(time.epochMicros(0)) == time.epochSeconds(1000000000)}")
+  // Writing the whole file again keeps its mode: an existing file is truncated, not remade.
+  _ = fs.setPermissions(file, 0o600)
+  say(fs.writeText(file, "rotated"))
+  say(s"${mode(file)} ${fs.readText(file)}")
+  _ = fs.appendText(file, "!")
+  say(s"${mode(file)} ${fs.readText(file)}")
+  // setuid on a file its owner holds.
+  roundTrip(file, 0o4755)
+  roundTrip(file, 0o4700)
+  // The sticky bit on a plain file is the platform's call: macOS refuses it to anyone but the
+  // superuser, Linux keeps it. Either way the answer and the mode agree.
+  _ = fs.setPermissions(file, 0o644)
+  val sticky = fs.setPermissions(file, 0o1644)
+  say(if sticky.isOk then mode(file) == "1644" else mode(file) == "644")
+  // A directory: ordinary modes, the zero mode and back, setgid and the sticky bit, all twelve.
+  val sub = dir + "/sub"
+  _ = fs.createDir(sub)
+  for bits in [0o700, 0o755, 0o0, 0o711, 0o1777, 0o2755, 0o3770, 0o755]
+    roundTrip(sub, bits)
+  say(s"${fs.isDir(sub)} ${fs.metadata(sub).map(m -> m.isDir)}")
+  // Outside 0o0 to 0o7777 is refused, naming the mode, and the file keeps the mode it had.
+  _ = fs.setPermissions(file, 0o640)
+  for bits in [-1, 0o10000, 0o100644, 0o170777, 2147483647, -2147483648]
+    say(fs.setPermissions(file, bits))
+  say(mode(file))
+  // The edges of the range are accepted.
+  say(fs.setPermissions(file, 0o0))
+  say(mode(file))
+  roundTrip(sub, 0o7777)
+  _ = fs.setPermissions(sub, 0o755)
+  // Missing paths and a path through a file.
+  say(fs.permissions(dir + "/missing"))
+  say(fs.setPermissions(dir + "/missing", 0o600))
+  say(fs.permissions(dir + "/missing/deeper"))
+  _ = fs.setPermissions(file, 0o600)
+  say(fs.setPermissions(file + "/inside", 0o600))
+  say(fs.permissions(file + "/inside"))
+  // The kinds a program tells the failures apart by.
+  say(fs.setPermissions(dir + "/missing", 0o600) match
+    Err(e) -> e.kind == io.NotFound
+    Ok(_) -> false)
+  say(fs.setPermissions(file + "/inside", 0o600) match
+    Err(e) -> e.kind == io.NotADirectory
+    Ok(_) -> false)
+  say(fs.setPermissions(file, -1) match
+    Err(IoError(io.Other(_), _, _)) -> true
+    _ -> false)
+  // A refused mode is refused before the path is looked at.
+  say(fs.setPermissions(dir + "/missing", 0o10000))
+  // A symbolic link is followed both ways: setting through it changes the file it names.
+  say(symlinkRaw(file, dir + "/link").isOk)
+  say(fs.setPermissions(dir + "/link", 0o644))
+  say(s"${mode(file)} ${mode(dir + "/link")}")
+  say(symlinkRaw(dir + "/nowhere", dir + "/dangling").isOk)
+  say(fs.setPermissions(dir + "/dangling", 0o600))
+  say(fs.permissions(dir + "/dangling"))
+  // A Unicode name.
+  val named = dir + "/日本語-é.txt"
+  _ = fs.writeText(named, "abc")
+  roundTrip(named, 0o600)
+  roundTrip(named, 0o755)
+  // An empty path names nothing.
+  say(fs.permissions(""))
+  say(fs.setPermissions("", 0o600))
+  _ = fs.removeDirAll(dir)
+  say(fs.exists(dir))
