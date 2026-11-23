@@ -1,0 +1,242 @@
+module avin.net.http
+
+// Cookies, RFC 6265 and its revision. A request carries the cookies the client holds in its `Cookie`
+// headers, which `ServerRequest.cookies()` reads into `Cookie`s. A response sets one with a
+// `Set-Cookie` header per cookie, which `Response.setCookie` adds (never folded into one header) and
+// `Response.cookies()` reads back into `SetCookie`s, so a client sees what a server wrote.
+//
+// What a cookie is made of is checked where it is made, and a value that does not hold traps, as a
+// header's does: the name is a token, the value holds only the octets RFC 6265 allows (printable ASCII
+// without space, `"`, `,`, `;` and `\`), `Domain` is a host name and `Path` begins with `/`, neither
+// holding `;` or a control character. A cookie whose name begins with `__Host-` is `Secure`, has
+// `Path=/` and no `Domain`; one beginning with `__Secure-` is `Secure`; the prefixes are compared
+// without regard to case, as browsers do. `SameSite=None` and `Partitioned` need `Secure`.
+// Reading is lenient where the specification says to be: see `Cookie.parse` and `SetCookie.parse`.
+
+import avin.time.{Instant, parseHttpDate, now}
+
+// Which requests a browser sends a cookie with.
+data SameSite
+  // Only for requests made from the cookie's own site.
+  Strict
+  // As `Strict`, and for a top-level navigation from another site that is a safe method.
+  Lax
+  // For every request, written `SameSite=None`; the cookie must then be `Secure`. Named for what it
+  // allows because `None` is `Option`'s.
+  Unrestricted
+
+// A cookie a client sent: its name and value, the value without the quotes it may have been written in.
+data Cookie(name: string, value: string)
+
+// Why a `Set-Cookie` header is not a cookie.
+data CookieError(text: string)
+
+impl Error for CookieError
+  // A sentence saying what is wrong with the cookie.
+  message -> string = s"bad cookie: $text"
+
+// A cookie a server sets, written as a `Set-Cookie` header. `expires` is written as an HTTP-date,
+// `maxAge` in seconds (a value of zero or less, which expires the cookie at once, is written as `0`).
+// A cookie is `Secure` only where it is made so; `httpOnly` keeps it from a page's scripts.
+class SetCookie(
+    val name: string,
+    val value: string,
+    val expires: Option[Instant] = None,
+    val maxAge: Option[long] = None,
+    val domain: Option[string] = None,
+    val path: Option[string] = None,
+    val secure: bool = false,
+    val httpOnly: bool = false,
+    val sameSite: Option[SameSite] = None,
+    val partitioned: bool = false
+)
+  cookieProblem(name, value, domain, path, secure, sameSite, partitioned) match
+    Some(reason) -> fail(reason)
+    None -> ()
+
+  // The header's value: `name=value` and the attributes, in the order `Expires`, `Max-Age`, `Domain`,
+  // `Path`, `Secure`, `HttpOnly`, `SameSite`, `Partitioned`, separated by `; `.
+  header -> string
+    var out = s"$name=$value"
+    expires match
+      Some(t) -> out += "; Expires=" + t.toHttpDate()
+      None -> ()
+    maxAge match
+      Some(n) -> out += "; Max-Age=" + (if n < 0 then 0 else n).toString()
+      None -> ()
+    domain match
+      Some(d) -> out += "; Domain=" + d
+      None -> ()
+    path match
+      Some(p) -> out += "; Path=" + p
+      None -> ()
+    if secure then out += "; Secure"
+    if httpOnly then out += "; HttpOnly"
+    sameSite match
+      Some(Strict) -> out += "; SameSite=Strict"
+      Some(Lax) -> out += "; SameSite=Lax"
+      Some(Unrestricted) -> out += "; SameSite=None"
+      None -> ()
+    if partitioned then out += "; Partitioned"
+    out
+
+object SetCookie
+  // The cookie a `Set-Cookie` header's value says. The first pair is `name=value`, its value read
+  // without the quotes it may be in; an attribute's name is compared without regard to case. A
+  // cookie whose name, value or attributes break the rules `SetCookie` checks, such as `SameSite=None`
+  // without `Secure`, is an `Err`. Left out, as a browser leaves them: an attribute the cookie does
+  // not know, an `Expires` that is not an HTTP-date, a `Max-Age` that is not a whole number, a
+  // `Path` not beginning with `/`, an empty `Domain` (a leading `.` of one is dropped, and it is
+  // lowercased), a `SameSite` that is not `Strict`, `Lax` or `None`. An attribute given twice takes
+  // its last.
+  parse(text: string) -> Result[SetCookie, CookieError]
+    val parts = text.split(';')
+    val first = parts(0)
+    val eq = first.indexOf('=')
+    if eq < 0 then return Err(CookieError("no `=` in the cookie's first pair"))
+    val name = first.slice(0, eq).trim
+    val value = unquoted(first.slice(eq + 1, first.byteLength).trim)
+    var expires: Option[Instant] = None
+    var maxAge: Option[long] = None
+    var domain: Option[string] = None
+    var path: Option[string] = None
+    var secure = false
+    var httpOnly = false
+    var sameSite: Option[SameSite] = None
+    var partitioned = false
+    var i = 1
+    while i < parts.size
+      val part = parts(i).trim
+      i += 1
+      val at = part.indexOf('=')
+      val key = (if at < 0 then part else part.slice(0, at).trim).toLower
+      val arg = if at < 0 then "" else part.slice(at + 1, part.byteLength).trim
+      if key == "expires" then
+        parseHttpDate(arg, now()) match
+          Ok(t) -> expires = Some(t)
+          Err(_) -> ()
+      else if key == "max-age" then
+        arg.toLongOption() match
+          Some(n) -> maxAge = Some(n)
+          None -> ()
+      else if key == "domain" then
+        val d = (if arg.startsWith(".") then arg.slice(1, arg.byteLength) else arg).toLower
+        if !d.isEmpty then domain = Some(d)
+      else if key == "path" then
+        if arg.startsWith("/") then path = Some(arg)
+      else if key == "secure" then secure = true
+      else if key == "httponly" then httpOnly = true
+      else if key == "samesite" then
+        val v = arg.toLower
+        if v == "strict" then sameSite = Some(Strict)
+        else if v == "lax" then sameSite = Some(Lax)
+        else if v == "none" then sameSite = Some(Unrestricted)
+      else if key == "partitioned" then partitioned = true
+    cookieProblem(name, value, domain, path, secure, sameSite, partitioned) match
+      Some(reason) -> Err(CookieError(reason))
+      None -> Ok(SetCookie(name, value, expires, maxAge, domain, path, secure, httpOnly, sameSite, partitioned))
+
+object Cookie
+  // The cookies a `Cookie` header's value holds, in order: pairs `name=value` separated by `;`, space
+  // around a pair and around its name and value dropped, a value in double quotes read without them.
+  // The same name twice gives two cookies, in the order written. A pair that is not a cookie is
+  // skipped and the rest are kept: an empty one, one without `=`, one whose name is not a token, one
+  // whose value holds an octet RFC 6265 does not allow (a space inside it, a comma, a backslash, a
+  // character beyond ASCII). An empty value is a cookie, and a `=` in a value belongs to it.
+  parse(header: string) -> Vector[Cookie]
+    var out = Vector.empty[Cookie]()
+    for piece in header.split(';')
+      val pair = piece.trim
+      val eq = pair.indexOf('=')
+      if eq > 0 then
+        val name = pair.slice(0, eq).trim
+        val value = unquoted(pair.slice(eq + 1, pair.byteLength).trim)
+        if isCookieName(name) && isCookieValue(value) then out = out :+ Cookie(name, value)
+    out
+
+impl ServerRequest
+  // The cookies of every `Cookie` header, in the order the headers and the pairs came, as
+  // `Cookie.parse` reads each.
+  cookies() -> Vector[Cookie]
+    var out = Vector.empty[Cookie]()
+    for (n, v) in headers
+      if n.equalsIgnoreCase("Cookie") then out = out ++ Cookie.parse(v)
+    out
+
+  // The value of the first cookie called `name`, where the request has one.
+  cookie(name: string) -> Option[string]
+    for c in cookies()
+      if c.name == name then return Some(c.value)
+    None
+
+impl Response
+  // The response with a `Set-Cookie` header for `cookie` added after the headers it has, one header
+  // for each cookie, never joined with another.
+  setCookie(cookie: SetCookie) -> Response = withHeader("Set-Cookie", cookie.header)
+
+  // The cookies of the response's `Set-Cookie` headers, in order, as `SetCookie.parse` reads each; a
+  // header that is not a cookie is skipped.
+  cookies() -> Vector[SetCookie]
+    var out = Vector.empty[SetCookie]()
+    for (n, v) in headers
+      if n.equalsIgnoreCase("Set-Cookie") then
+        SetCookie.parse(v) match
+          Ok(c) -> out = out :+ c
+          Err(_) -> ()
+    out
+
+// `text` without the double quotes around it, where it has both.
+private unquoted(text: string) -> string =
+  if text.byteLength >= 2 && text.startsWith("\"") && text.endsWith("\"") then text.slice(
+    1,
+    text.byteLength - 1
+  ) else text
+
+// A character a cookie's value may hold: printable ASCII but space, `"`, `,`, `;` and `\`.
+private isCookieOctet(c: char) -> bool =
+  c == '!' || '#' <= c <= '+' || '-' <= c <= ':' || '<' <= c <= '[' || ']' <= c <= '~'
+
+private isCookieName(name: string) -> bool = !name.isEmpty && name.forall(isTokenChar)
+
+private isCookieValue(value: string) -> bool = value.forall(isCookieOctet)
+
+private isControl(c: char) -> bool = int(c) < 32 || int(c) == 127
+
+// A host name's characters: letters, digits, `.` and `-`.
+private isHostChar(c: char) -> bool = (
+  'a' <= c <= 'z'
+) || ('A' <= c <= 'Z') || ('0' <= c <= '9') || c == '.' || c == '-'
+
+private hasPrefixFold(name: string, prefix: string) -> bool =
+  name.byteLength >= prefix.byteLength && name.slice(0, prefix.byteLength).equalsIgnoreCase(prefix)
+
+// Why a cookie of these parts is not one, or `None` where it is.
+private cookieProblem(
+    name: string,
+    value: string,
+    domain: Option[string],
+    path: Option[string],
+    secure: bool,
+    sameSite: Option[SameSite],
+    partitioned: bool
+) -> Option[string]
+  if !isCookieName(name) then return Some(s"`$name` is not a cookie name")
+  if !isCookieValue(value) then return Some(s"the value of the cookie `$name` holds a character a cookie value may not")
+  domain match
+    Some(d) ->
+      if d.isEmpty || !d.forall(isHostChar) then return Some(s"`$d` is not a cookie's domain")
+    None -> ()
+  path match
+    Some(p) ->
+      if !p.startsWith("/") || p.exists(c -> c == ';' || isControl(c)) then return Some(s"`$p` is not a cookie's path")
+    None -> ()
+  if hasPrefixFold(name, "__Host-")
+    if !secure then return Some(s"the cookie `$name` is `__Host-` and so `Secure`")
+    if path != Some("/") then return Some(s"the cookie `$name` is `__Host-` and so has `Path=/`")
+    if domain.isDefined then return Some(s"the cookie `$name` is `__Host-` and so has no `Domain`")
+  if hasPrefixFold(name, "__Secure-") && !secure then return Some(s"the cookie `$name` is `__Secure-` and so `Secure`")
+  if sameSite == Some(Unrestricted) && !secure then return Some(
+    s"the cookie `$name` is `SameSite=None` and so `Secure`"
+  )
+  if partitioned && !secure then return Some(s"the cookie `$name` is `Partitioned` and so `Secure`")
+  None

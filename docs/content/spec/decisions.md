@@ -13037,3 +13037,23 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   formatting on every response (about a microsecond of calendar arithmetic per request); a
   `Duration`-valued setting naming a refresh period (the second is what the header can show). The
   switch is a bool named `date`, as the header is. Tests that read raw heads pass `date = false`.
+- Settled on the user's delegation 2026-11-23 (branch `http-cookies`): **cookies in `avin.net.http`**
+  (`Cookie`, `SetCookie`, `SameSite`, `CookieError`; `ServerRequest.cookies()`/`cookie(name)`,
+  `Response.setCookie`/`cookies()`). Choices: (1) reading a `Cookie` header is lenient and per pair: a
+  malformed pair is skipped and the others kept (one bad cookie must not hide the session cookie), with
+  a value read only if every octet is a RFC 6265 cookie octet (commas and spaces in values are skipped,
+  not accepted as some servers do); duplicates are all kept in order. (2) Making a `SetCookie` traps on
+  a bad name/value/domain/path, on a broken `__Host-`/`__Secure-` rule (prefixes compared without
+  regard to case, as browsers do) and on `SameSite=None` or `Partitioned` without `Secure` — the library's
+  convention for a programmer-supplied header value (as `withHeader`), nothing escaped or cut; the secure
+  default is that `Secure` is never implied, only demanded. (3) The `SameSite` variant for `None` is
+  `Unrestricted`, since `None` is `Option`'s and would make `Some(None)` ambiguous; it is written
+  `SameSite=None`. (4) `Max-Age` of zero or less is accepted and written `0` (the grammar has no negative
+  and the meaning is the same). (5) `SetCookie.parse` (client) is an `Err` for what a browser would
+  reject (bad name/value, prefix rules, `SameSite=None`/`Partitioned` without `Secure`) and ignores
+  attributes it cannot read; `Expires` is read only as an HTTP-date (via `parseHttpDate`), not by RFC
+  6265's lenient date algorithm. Alternatives weighed: `Result` constructors (a second constructor path
+  for every cookie a handler writes); quoting values that need it (mangling); treating a pair without
+  `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
+  expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
+  (a client sending `a=b,c` loses that cookie).
