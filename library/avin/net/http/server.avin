@@ -13,7 +13,7 @@ import avin.io.{IoError, TimedOut}
 import avin.net.{ByteStream, TcpServer, TcpStream, Url}
 import avin.net.tls.{TlsServer, TlsStream}
 import avin.threads.{Atomic, Mutex}
-import avin.time.{Duration, Instant, millis, now, seconds}
+import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
 
 // A request as a server read it: its method, its target as the request line gave it, its headers in
 // order, its body, its version (`HTTP/1.1` or `HTTP/1.0`) and the parameters its route bound. A
@@ -336,11 +336,13 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // `handler`. At most `maxConnections` are held at once, the next waiting unaccepted. Each wait while
 // a request is read may last `readTimeout`, each wait while a response is written `writeTimeout`,
 // and the wait for the next request on a connection kept alive `idleTimeout`, after which it is
-// closed; zero takes a limit away. A request line may be at most `maxHeaderBytes` long, and the
-// request line and headers together as long; a body may be at most `maxBodyBytes`. A
-// `maxHeaderBytes` less than one, or a `maxBodyBytes` or `maxConnections` less than zero or one,
-// traps. With `tls`, the server speaks HTTPS: each connection begins with a TLS handshake presenting
-// its certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
+// closed; and the whole of a request, its line, headers and body, must arrive within
+// `requestTimeout` of its first byte, else it is answered `408` and the connection closed; zero
+// takes a limit away. A request line may be at most `maxHeaderBytes` long, and the request line and
+// headers together as long; a body may be at most `maxBodyBytes`. A `maxHeaderBytes` less than one,
+// a `maxBodyBytes` or `maxConnections` less than zero or one, or a negative `requestTimeout`, traps.
+// With `tls`, the server speaks HTTPS: each connection begins with a TLS handshake presenting its
+// certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
 // whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
 // answer, since the answer would have to go through the connection's TLS, which ended with the
 // handler; so does one that traps while it streams a response, whose head is already sent. The
@@ -359,14 +361,17 @@ serve(
     maxBodyBytes: int = 1048576,
     tls: Option[TlsServer] = None,
     errors: ErrorPage = plainError,
-    date: bool = true
+    date: bool = true,
+    requestTimeout: Duration = seconds(60)
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
+  if requestTimeout.isNegative then fail(s"a request timeout of $requestTimeout: it is at least zero")
   val s = Settings(
     readTimeout,
     writeTimeout,
     idleTimeout,
+    requestTimeout,
     maxHeaderBytes,
     maxBodyBytes,
     errors,
@@ -405,6 +410,7 @@ private data Settings(
     readTimeout: Duration,
     writeTimeout: Duration,
     idleTimeout: Duration,
+    requestTimeout: Duration,
     maxHeaderBytes: int,
     maxBodyBytes: int,
     errors: ErrorPage,
@@ -471,6 +477,7 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
   var limit = s.readTimeout
   while input.awaits(limit, server)
     limit = s.idleTimeout
+    input.begin(s.requestTimeout)
     val request = readRequest(input, stream, server, s) match
       Ok(r) -> r
       Err(Quietly) -> return
@@ -546,13 +553,17 @@ private connectionWords(headers: Vector[(string, string)]) -> Vector[string] =
   headerIn(headers, "Connection").getOrElse("").toLower.split(",").map(w -> w.trim)
 
 // Answers `status` and closes the connection gently: the server's side is shut, then what the client
-// still sends is read and dropped for a moment, so the answer is not lost to a reset.
+// still sends is read and dropped for a moment, half a second in all, so the answer is not lost to a
+// reset and a client still trickling bytes does not hold the connection.
 private refuse(stream: ByteStream, status: int, s: Settings)
   if written(stream, false, rendered(s.errors, status), false, "HTTP/1.1", s.writeTimeout, dated(s))
     if stream.shutdownOutput().isErr then return
-    if stream.setTimeout(millis(500)).isErr then return
+    val start = monotonic()
     var left = 1 << 20
     while left > 0
+      val wait = millis(500) - (monotonic() - start)
+      if wait <= Duration.Zero then return
+      if stream.setTimeout(wait).isErr then return
       stream.read(65536) match
         Ok(got) ->
           if got.length == 0 then return
@@ -654,6 +665,15 @@ private headOf(
 private class Incoming(private val stream: ByteStream)
   private var ahead: Array[byte] = Array.empty[byte]()
   private var at = 0
+  // When the request being read began, on the monotonic clock, and how long it may take in all;
+  // a zero budget is no limit.
+  private var started = Duration.Zero
+  private var budget = Duration.Zero
+
+  // Begins a request, which must be read whole within `limit` from now; zero is no limit.
+  begin(limit: Duration)
+    started = monotonic()
+    budget = limit
 
   // Whether a byte is waiting, or arrives within `limit`. The wait is the connection's idle one,
   // through `server.idle`, so a server that stops ends it at once and it answers false.
@@ -701,10 +721,16 @@ private class Incoming(private val stream: ByteStream)
       at = end
     Ok(out.toArray())
 
-  // Reads the next piece, waiting at most `limit`: a wait that runs out is answered `408`, and a
-  // peer that has finished or failed ends the connection quietly.
+  // Reads the next piece, waiting at most `limit` and no later than the request's budget allows: a
+  // wait that runs out, or a budget already spent, is answered `408`, and a peer that has finished
+  // or failed ends the connection quietly.
   private fill(limit: Duration) -> Result[unit, Refusal]
-    if stream.setTimeout(limit).isErr then return Err(Quietly)
+    var wait = limit
+    if budget > Duration.Zero
+      val left = budget - (monotonic() - started)
+      if left <= Duration.Zero then return Err(Answer(408))
+      if wait <= Duration.Zero || left < wait then wait = left
+    if stream.setTimeout(wait).isErr then return Err(Quietly)
     stream.read(8192) match
       Ok(got) ->
         if got.length == 0 then return Err(Quietly)

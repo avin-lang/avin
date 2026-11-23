@@ -10748,6 +10748,31 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     whether one second is the right interval, and whether a program should be able to ask for a
     release (a collection) itself, since without one a program that drops a burst and then
     allocates little keeps its pages until enough allocation brings a collection.
+- Settled on the user's delegation 2026-11-23 (branch `http-request-timeout`): **`http.serve`
+  bounds the whole of a request** ([servers](/spec/system-library/#servers)) by `requestTimeout`,
+  60 seconds unless asked, measured from the request's first byte and covering its line, headers
+  and body, chunked or of a length; once spent, the next wait for bytes is answered `408` and the
+  connection closed, freeing its slot among `maxConnections`. *Why*: `readTimeout` bounds each wait
+  alone, so a client sending a byte every few seconds held a connection, and a slot, for ever.
+  - **Each request has its own bound**, begun when its first byte is read; on a connection kept
+    alive the idle wait before it is `idleTimeout`'s and no part of it, and a connection's wait for
+    its first byte stays `readTimeout`'s. A wait is cut to what is left of the bound, so the `408`
+    comes at about the bound and not at the next `readTimeout`. Bytes already read ahead
+    (pipelining) are parsed without a wait, so the bound costs a clock reading per wait only.
+  - **Zero is no limit**, as for the other timeouts; a negative bound traps where the server
+    starts, as a negative `maxBodyBytes` does (a negative timeout is a mistake, not a wish).
+  - **The parameter comes last**, after `errors`, so no call passing the earlier ones by position
+    changes meaning.
+  - **A refusal's drain is bounded in time too**: after a refusal the server read and dropped
+    what the client still sent, each read waiting half a second, up to 1 MiB, so a client trickling
+    on after its `408` kept the connection for as long as it liked. The drain now lasts half a
+    second in all.
+  - Alternatives weighed: a header bound alone (as some servers keep apart from a body's) leaves a
+    trickled body open; a minimum data rate is harder to state and to test; 30 seconds (as
+    `readTimeout`) or 300 seconds for the default. Review with the user: whether 60 seconds suits
+    as the default, since a slow client uploading the default largest body of 1 MiB needs about
+    17 KB/s, and a server taking larger bodies has to raise it; and whether a TLS handshake, whose
+    waits are each `readTimeout`'s, should get a total bound too.
 
 ## Proposed
 
