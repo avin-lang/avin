@@ -2146,7 +2146,9 @@ is RFC 9110's phrase for a status, empty for one it does not name.
 method and a pattern; a method that is not a token or a pattern not beginning with `/` traps.
 `Router(routes)` tries its routes in order. A pattern's segments match a request's decoded segments
 one for one, a segment `:name` matching any one that is not empty and binding it, so Unicode paths
-route whether escaped or not. A `GET` route answers `HEAD` too where no `HEAD` route matches. A path
+route whether escaped or not. A last segment `*name` matches the rest of the path, none of it or
+several segments, binding them joined by `/` (`/files/*path` binds `a/b` for `/files/a/b`, and `""`
+for `/files` and `/files/`); a `*name` before the last segment traps, and a bare `*` is a literal. A `GET` route answers `HEAD` too where no `HEAD` route matches. A path
 no route matches is answered `404`, and one that routes match for other methods only `405`, with
 `Allow` naming those methods, `HEAD` beside `GET`.
 
@@ -2309,6 +2311,59 @@ id holding a line break trapping; `comment(text)` sends a comment, which a clien
 `retry(delay)` tells the client how long to wait before reconnecting. `Response.events(keepAlive,
 write)` sets how often a comment is sent while `untilStopped` waits, fifteen seconds by default and
 none for zero, so a client that has gone is noticed and one still there keeps the stream open.
+
+**Static files.** `FileServer(root, index = Some("index.html"), listing = false, dotfiles = false,
+linksOutside = false, cacheControl = None, types = MimeTypes.standard, chunkBytes = 65536, errors =
+plainError)` serves the files under the directory `root`; `server.at(prefix)` is the `GET` route
+`prefix/*path` serving them below `prefix` (`at("/")` serves every path), and `server.handle` is the
+handler itself, which serves the whole request path. It answers `GET` and `HEAD`, any other method
+`405` with `Allow: GET, HEAD`:
+
+```text
+import avin.net.http
+import avin.net.http.{FileServer, Router}
+
+main()
+  val site = FileServer("public", cacheControl = Some("public, max-age=3600"))
+  http.serve("0.0.0.0", 8080, Router([site.at("/static")]).handle).ok.get.join()
+```
+
+A file is answered `200` with its type, its length, `Accept-Ranges: bytes`, a weak `ETag`
+(`W/"<size>-<modified>"`, the size in bytes and the modification time in microseconds, both in
+hexadecimal), its `Last-Modified` as an HTTP-date, and `Cache-Control` where `cacheControl` gives
+one. Its body is streamed from the file `chunkBytes` at a time with `Response.stream`, so memory does
+not grow with the file; `HEAD` has the same headers and no body, and does not open the file.
+
+Conditional requests follow RFC 9110 §13.2.2: an `If-Match` that does not match strongly, or with no
+`If-Match` an `If-Unmodified-Since` the file has changed since, answers `412`; an `If-None-Match` that
+matches weakly, or with no `If-None-Match` an `If-Modified-Since` the file has not changed since
+(compared in whole seconds), answers `304` with the `ETag`, `Last-Modified` and `Cache-Control` and
+no body. A date that is not an HTTP-date is ignored. Because the tag is weak, only `If-Match: *`
+matches it strongly. A `Range` is honoured on `GET` after the conditions: one byte range (`bytes=0-0`,
+`bytes=500-`, `bytes=-500`, a last position past the end held at the end, the unit compared without
+regard to case) is answered `206` with `Content-Range: bytes first-last/length`; one starting at or
+past the end, or a suffix of zero bytes, `416` with `Content-Range: bytes */length`. A `Range`
+that is malformed, of another unit or of several ranges is ignored and the whole file is sent `200`.
+An `If-Range` keeps the range only where it is the file's `Last-Modified` exactly, a date at least a
+second old; an entity tag there never matches the weak tag, so the whole file is sent.
+
+A path naming a directory without its final `/` is redirected there with `301`, the query kept; a
+directory is answered with its `index` file, or, without one, with an HTML listing of its entries
+where `listing`, otherwise `404`. The path is refused `400` where a decoded segment is `.` or `..` or
+holds `/`, `\` or NUL (so `%2e%2e`, `%2F` and `%00` are refused as plainly written ones are); a name
+beginning with `.` anywhere in the path is `404` unless `dotfiles`; a path whose links resolve
+outside `root` is `403` unless `linksOutside`, a directory's index file included; a file that cannot
+be read is `403`; a missing one, a file asked for with a final `/`, and anything that is neither file
+nor directory are `404`. Empty segments (`//`) are passed over. The error responses are rendered by
+`errors`.
+
+`MimeTypes.standard` gives the types of the web by a file's extension, compared without regard to
+case: pages, styles and scripts (`text/html`, `text/css`, `text/javascript`, each with `;
+charset=utf-8`, as every `text/` type there is), data (`application/json`, `xml`, `yaml`, `wasm`,
+...), images, fonts, audio, video and archives, and `application/octet-stream` for a name it does not
+know or one with no extension (`.bashrc` has none). `types.typeOf(name)`, `types.get(extension)`,
+`types.with(extension, contentType)` (an empty extension, one holding `.` or `/`, or a type holding a
+line break traps) and `types.withFallback(contentType)` read and extend a table.
 
 **Waiting in a handler.** `request.isStopping()` says whether the server that read the request is
 stopping, and `request.untilStopped(wait)` runs `wait`, a `@sendable () -> T`, on a thread of its own
