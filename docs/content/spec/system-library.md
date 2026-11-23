@@ -2116,8 +2116,15 @@ main()
 `type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
 `http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError) ->
-Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError,
+date: bool = true) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. **Each
+response carries a `Date` header** (RFC 9110 section 6.6.1), the time it is sent as an IMF-fixdate
+(`Sun, 06 Nov 1994 08:49:37 GMT`, as `Instant.toHttpDate()` writes it), on every status: a
+handler's, the server's own `400` or `503`, sized, chunked, closing and event-stream responses
+alike. A handler that sets `Date` (in any case of the name) keeps its own value, and `date = false`
+sends none; the `101` of an upgrade carries none. A `DateHeader(clock = now)` formats its text once
+a second and hands it to every connection, with no lock, so sending the header costs a clock read
+and a comparison; `DateHeader.value()` gives the text. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
 `writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
 takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The

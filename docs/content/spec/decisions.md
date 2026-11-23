@@ -13021,3 +13021,19 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (an HTTP-date is always UTC, so an `Instant` method has no zone to get wrong). Review with the
   user: strict weekday and case checking on `If-Modified-Since`, where a lenient server would
   answer 200 instead of ignoring a malformed date, which RFC 9110 also allows.
+- Settled on the user's delegation 2026-11-23 (branch `http-date-header`): **`http.serve` sends a
+  `Date` header on every response, switched off by `date: bool = true`.** RFC 9110 section 6.6.1
+  requires it of an origin server with a clock in 2xx, 3xx and 4xx and allows it in 1xx and 5xx; it
+  is sent on every status the server writes (5xx and its own `400`/`503` included, since a client or
+  cache gains from the clock there too) and not on the `101` of an upgrade, which the protocol
+  switched to has its own say on. A `Date` the handler set, in any case of the name, is kept, as
+  `Last-Modified` and the like are the handler's. The text comes from `DateHeader(clock = now)`, a
+  public class so its rollover is testable with a clock of the test's own: one `Atomic` holds the
+  latest second and its text, a read compares the clock's second with it, and a thread that finds the
+  second over formats and stores the next (two threads doing so store equal texts, and a store
+  racing a later one is corrected by the next read, each answer being right for its own clock
+  read). Alternatives weighed: a mutex around the text (a lock on every request's path); a timer
+  actor refreshing the text (a thread idling in every server, and a stale text if it is starved);
+  formatting on every response (about a microsecond of calendar arithmetic per request); a
+  `Duration`-valued setting naming a refresh period (the second is what the header can show). The
+  switch is a bool named `date`, as the header is. Tests that read raw heads pass `date = false`.

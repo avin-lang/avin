@@ -12,8 +12,8 @@ module avin.net.http
 import avin.io.{IoError, TimedOut}
 import avin.net.{ByteStream, TcpServer, TcpStream, Url}
 import avin.net.tls.{TlsServer, TlsStream}
-import avin.threads.Mutex
-import avin.time.{Duration, millis, seconds}
+import avin.threads.{Atomic, Mutex}
+import avin.time.{Duration, Instant, millis, now, seconds}
 
 // A request as a server read it: its method, its target as the request line gave it, its headers in
 // order, its body, its version (`HTTP/1.1` or `HTTP/1.0`) and the parameters its route bound. A
@@ -344,7 +344,9 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
 // answer, since the answer would have to go through the connection's TLS, which ended with the
 // handler; so does one that traps while it streams a response, whose head is already sent. The
-// answers the server makes itself for an error status are rendered by `errors`.
+// answers the server makes itself for an error status are rendered by `errors`. Each response
+// carries a `Date` header, the time it is sent as an HTTP-date, unless the handler gave one or `date`
+// is false; the `101` answer of an upgrade carries none.
 serve(
     host: string,
     port: int,
@@ -356,11 +358,21 @@ serve(
     maxHeaderBytes: int = 16384,
     maxBodyBytes: int = 1048576,
     tls: Option[TlsServer] = None,
-    errors: ErrorPage = plainError
+    errors: ErrorPage = plainError,
+    date: bool = true
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
-  val s = Settings(readTimeout, writeTimeout, idleTimeout, maxHeaderBytes, maxBodyBytes, errors, Streaming())
+  val s = Settings(
+    readTimeout,
+    writeTimeout,
+    idleTimeout,
+    maxHeaderBytes,
+    maxBodyBytes,
+    errors,
+    Streaming(),
+    if date then Some(DateHeader()) else None
+  )
   tls match
     None -> TcpServer.start(
       host,
@@ -387,8 +399,8 @@ private secured(tcp: TcpStream, server: TcpServer, handler: Handler, s: Settings
       _ = stream.close()
     Err(_) -> ()
 
-// The limits a server was started with, the error page it renders its own answers by, and the
-// connections streaming a response.
+// The limits a server was started with, the error page it renders its own answers by, the
+// connections streaming a response, and the source of its `Date` header where it sends one.
 private data Settings(
     readTimeout: Duration,
     writeTimeout: Duration,
@@ -396,8 +408,30 @@ private data Settings(
     maxHeaderBytes: int,
     maxBodyBytes: int,
     errors: ErrorPage,
-    streaming: Streaming
+    streaming: Streaming,
+    date: Option[DateHeader]
 )
+
+// The date a server's responses carry, as the text of a `Date` header: the HTTP-date of the clock's
+// now, formatted once for each second and handed to every connection that asks within it. The latest
+// second and its text are one value in an `Atomic`, so connections on any thread read it without a
+// lock; a thread that finds the second over writes the next text, and two threads that do so at
+// once write the same one.
+class DateHeader(private val clock: @sendable () -> Instant = now): Sendable
+  private val latest: Atomic[DateStamp] = Atomic(stamped(clock()))
+
+  // The `Date` header's value for the clock's now.
+  value() -> string
+    val t = clock()
+    val seen = latest.load()
+    if seen.second == t.epochSeconds then return seen.text
+    val fresh = stamped(t)
+    latest.store(fresh)
+    fresh.text
+
+private data DateStamp(second: long, text: string)
+
+private stamped(t: Instant) -> DateStamp = DateStamp(t.epochSeconds, t.toHttpDate())
 
 // The connections whose response's head has been sent while its body is streamed, so a handler that
 // traps there has its connection closed without a `500` written into the middle of the body. Each
@@ -453,10 +487,20 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
     val keep = keepsAlive(request) && !server.isStopping() && !asksToClose(response.headers)
     val headOnly = request.method == "HEAD"
     val kept = response.streamed match
-      None -> written(stream, headOnly, response, keep, request.version, s.writeTimeout) && keep
+      None -> written(stream, headOnly, response, keep, request.version, s.writeTimeout, dated(s)) && keep
       Some(body) ->
         if marks then s.streaming.hold(stream)
-        val going = streamedOut(stream, server, headOnly, response, body, keep, request.version, s.writeTimeout)
+        val going = streamedOut(
+          stream,
+          server,
+          headOnly,
+          response,
+          body,
+          keep,
+          request.version,
+          s.writeTimeout,
+          dated(s)
+        )
         if marks then _ = s.streaming.release(stream)
         going
     if !kept then return
@@ -504,7 +548,7 @@ private connectionWords(headers: Vector[(string, string)]) -> Vector[string] =
 // Answers `status` and closes the connection gently: the server's side is shut, then what the client
 // still sends is read and dropped for a moment, so the answer is not lost to a reset.
 private refuse(stream: ByteStream, status: int, s: Settings)
-  if written(stream, false, rendered(s.errors, status), false, "HTTP/1.1", s.writeTimeout)
+  if written(stream, false, rendered(s.errors, status), false, "HTTP/1.1", s.writeTimeout, dated(s))
     if stream.shutdownOutput().isErr then return
     if stream.setTimeout(millis(500)).isErr then return
     var left = 1 << 20
@@ -515,22 +559,27 @@ private refuse(stream: ByteStream, status: int, s: Settings)
           left -= got.length
         Err(_) -> return
 
+// The `Date` header's value for the response about to be written, where the server sends one.
+private dated(s: Settings) -> Option[string] = s.date.map(d -> d.value())
+
 // Writes `response`, whether or not the connection stays open, and answers whether it was written.
 // The server writes `Content-Length` and `Connection` itself, in place of any the handler gave, and
-// no body for `HEAD` or for `204` and `304`. A status outside 200 to 599, or a header the response
-// cannot carry, traps. A streamed response is written by `streamedOut`; here its body is empty.
+// no body for `HEAD` or for `204` and `304`; `date` is the value of the `Date` header it adds where
+// the handler gave none. A status outside 200 to 599, or a header the response cannot carry, traps.
+// A streamed response is written by `streamedOut`; here its body is empty.
 private written(
     stream: ByteStream,
     headOnly: bool,
     response: Response,
     keep: bool,
     version: string,
-    limit: Duration
+    limit: Duration,
+    date: Option[string]
 ) -> bool
   val bodiless = response.status == 204 || response.status == 304
   val length = if bodiless then None else Some(s"Content-Length: ${response.body.length}")
   val all = Buffer[byte]()
-  all.addAll(utf8(headOf(response, length, keep, version)))
+  all.addAll(utf8(headOf(response, length, keep, version, date)))
   if !headOnly && !bodiless then all.addAll(response.body)
   stream.setTimeout(limit).isOk && stream.write(all.toArray()).isOk
 
@@ -547,7 +596,8 @@ private streamedOut(
     body: StreamedBody,
     keep: bool,
     version: string,
-    limit: Duration
+    limit: Duration,
+    date: Option[string]
 ) -> bool
   val bodiless = response.status == 204 || response.status == 304
   val framing = body.length match
@@ -559,7 +609,7 @@ private streamedOut(
     Chunked -> Some("Transfer-Encoding: chunked")
     Closing -> None
   if !(
-    stream.setTimeout(limit).isOk && stream.write(utf8(headOf(response, line, going, version))).isOk
+    stream.setTimeout(limit).isOk && stream.write(utf8(headOf(response, line, going, version, date))).isOk
   ) then return false
   if headOnly || bodiless then return going
   val writer = BodyWriter(stream, Some(server), framing, limit)
@@ -567,8 +617,15 @@ private streamedOut(
   writer.finish() && going
 
 // The status line and headers of `response`, with `framing`, the line saying how its body is framed,
-// where it has one, and the `Connection` header `keep` and `version` call for.
-private headOf(response: Response, framing: Option[string], keep: bool, version: string) -> string
+// where it has one, the `Connection` header `keep` and `version` call for, and a `Date` header of
+// `date` where the response has none of its own.
+private headOf(
+    response: Response,
+    framing: Option[string],
+    keep: bool,
+    version: string,
+    date: Option[string]
+) -> string
   if !(200 <= response.status <= 599) then fail(
     s"a response of status ${response.status}: a handler answers 200 to 599"
   )
@@ -586,6 +643,7 @@ private headOf(response: Response, framing: Option[string], keep: bool, version:
       "Transfer-Encoding"
     ) || name.equalsIgnoreCase("Connection")
     if !own then out.write(s"$name: $value\r\n")
+  if date is Some(d) && headerIn(response.headers, "Date").isEmpty then out.write(s"Date: $d\r\n")
   if framing is Some(f) then out.write(s"$f\r\n")
   if !keep then out.write("Connection: close\r\n")
   else if version == "HTTP/1.0" then out.write("Connection: keep-alive\r\n")
