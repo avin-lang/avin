@@ -10930,6 +10930,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
+  `readAt`/`writeAt`, `setLength` (alias `truncate`), `sync`/`syncData`/`fullSync` and
+  `deleteOnClose`.** Positioned calls never move the position and hand over or give up what the
+  handle buffered (written bytes are drained, read-ahead dropped), so they mix freely with `read`
+  and `write`. `readAt` loops until `max` bytes or the end, so a short answer only means the end;
+  `writeAt` loops over partial writes, so it writes all or answers `Err`. `syncData` on macOS is
+  `fsync`; `fullSync` is the one that empties the drive's cache. `deleteOnClose` is a flag on the
+  handle that `close` honours by removing the name (a file the collector frees is not removed),
+  built in Avin on `remove`, with no new Sysl function. Why: positioned I/O is what random-access
+  files, stores and concurrent writers need; one handle per lightweight thread keeps the "a file
+  belongs to the thread that opened it" rule. Alternatives weighed: a `Result[long]` partial
+  write (every caller would loop); marking at open time (`createTemp`), which would need a new
+  open variant. Review with the user: whether delete-on-close should instead be an open option
+  once Sysl exposes `open_with`.
+
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma
   after a `select`'s one-line arm ends the arm, the `select` and the item, as it does a match's**,
   and a `select` on a block's last line that closes a bracket ends at that line's comma. Why: the

@@ -1420,6 +1420,15 @@ follow(log: string) -> Result[unit, IoError]
 | `readLine()`, `readCompleteLine()` | The next line, `None` at the end. `readLine` also answers a last line with no `\n`; `readCompleteLine` answers only a line ended by `\n`, and leaves later bytes unread, so a line another program is still writing arrives whole. |
 | `write(bytes)`, `writeText(text)` | Writes at the position, buffered. A file is an [`io.ByteWriter`](#bytewriter) by `write`, and an [`io.Reader`](#reader) by `read`. |
 | `flush()`, `close()` | `flush` hands what is written to the platform, so other handles and programs see it. `close` flushes and releases, answering the flush's `Err`; closing twice is fine and answers `Ok`. A file is an [`io.Close`](#close). |
+| `readAt(offset, max)` | Up to `max` bytes from `offset`, **without moving the position**: fewer only where the file ends first, empty at or past the end. What this handle has written is included. A negative `offset` or `max` is an `Err`. |
+| `writeAt(offset, bytes)` | Writes all of `bytes` at `offset`, **without moving the position**; past the end the file grows, the gap reading as zeros. A handle opened to `append` may put the bytes at the end whatever the offset, as the platform decides. A negative `offset` is an `Err`. |
+| `setLength(length)`, `truncate(length)` | Cuts the file to `length` bytes or extends it with zeros; the position does not move and may end up past the end. A negative length, or a file not open for writing, is an `Err`. |
+| `sync()`, `syncData()`, `fullSync()` | Hands over what is written and asks the device to keep it. `syncData` skips details a reader of the contents does not need where the platform can; on macOS it is `sync`, which reaches the drive but not its write cache. `fullSync` also empties the drive's cache (`F_FULLFSYNC` on macOS) and is the slowest. A closed file is an `Err`; a file opened only to read may be synced. |
+| `deleteOnClose()` | Marks the file so `close` removes its name after releasing it; a failed removal is the `Err` of `close`. A file the collector frees without a `close` is not removed. |
+
+Positioned calls on one file from several lightweight threads belong to separate handles, one per
+thread, opened on the same path: each call is the platform's own positioned read or write, so
+disjoint ranges written at once come out as written.
 
 **One position serves reading and writing**, and lines, `read` and `position` agree on it: bytes the
 file has buffered ahead are never lost to a `seek`, a `write` or a `read`. **A read at the end does
