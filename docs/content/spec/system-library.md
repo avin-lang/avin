@@ -1755,6 +1755,94 @@ named is of the first thing wrong.
 | `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one, base32 whose digits past a multiple of eight are 1, 3 or 6 or whose padding is not completed to eight. `at` is the text's length. |
 | `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
 
+## `avin.log`
+
+Structured logging for programs that run for a long time: records of a level, a message and
+key/value fields, written one line each as text for people or as JSON objects for machines. A
+`Logger` is a [given](/spec/contextual-parameters/): the record functions take
+`using logger: Logger`, and a program declares one given, at its module's top level or in the block
+handling a request, rather than passing it down by hand.
+
+```text
+import avin.log
+import avin.log.{Json, Level, Logger, info, warn}
+
+given appLog: Logger = Logger(level = Level.Debug, fields = [("app", "shop")])
+
+handle(order: Order)
+  given reqLog: Logger = appLog.child([("order", order.id)])
+  info("placing", [("items", order.items.length)])
+  if order.total > 1000 then warn("large order", [("total", order.total)])
+
+main()
+  info("started", [("port", 8080)])
+```
+
+```text
+2026-11-23T10:20:30.5Z INFO  started app=shop port=8080
+2026-11-23T10:20:31.012Z INFO  placing app=shop order=a17 items=3
+{"time":"2026-11-23T10:20:31.012Z","level":"info","message":"placing","app":"shop","order":"a17","items":3}
+```
+
+The first two are `Text`, the third the second record as `Json`. **A record below the logger's level
+costs one comparison**: the message and the fields are [by-name](/spec/by-name/) arguments, so
+`log.debug(s"state ${dump()}", [("size", measure())])` calls neither `dump` nor `measure` where
+`Debug` is not written. `if logger.enabled(Level.Debug)` guards a costly block of several records.
+
+**Where the logger comes from.** Each record function finds the nearest given `Logger` as any
+contextual parameter does, and where there is none it writes to `DefaultLogger`: `Info` and above, as
+text, to standard error. There is no logger to set at run time: a program configures its logging by
+declaring a given at its top level, which every function of its module finds, and a request's
+handler declares a child of it as a given of its own block.
+
+**Fields.** A field is a `(string, Any)`. In a JSON line an `int`, `long`, `bool` and finite `real`
+are written as JSON values, and every other value, a not finite `real` too, as a string of its
+`Display`. In a text line each is `key=value` by its `Display`, quoted and escaped as a JSON string
+where it is empty or holds a space, a control character, `"`, `=` or `\`; a key likewise. A value not
+known is left out of the fields: `None` is written as its `Display`, `None`, like any other value.
+Fields follow the message in order: the logger's own, each child's after its parent's, then the
+record's. A key written twice is written twice. JSON escapes `"`, `\` and every control character
+(`\b`, `\f`, `\n`, `\r`, `\t` short, the rest and DEL as `\u00XX`) and writes every other character,
+Unicode included, as it is. A text line escapes a message's control characters the same way, so a
+record is always one line and cannot move a terminal's cursor.
+
+**Lines.** A text line is the time, the level's name in upper case padded to five columns, the
+message and the fields, separated by spaces. A JSON line is an object of `time`, `level` (its name
+in lower case), `message` and then the fields. The time is the logger's `clock`, `now` unless a test
+gives another, in RFC 3339 form in UTC (`Instant`'s display: the fraction only where there is one).
+A text logger paints the level's name (trace dim, debug cyan, info green, warn yellow, error bold
+red) only where it was made with `colour = true` (the default) and its sink takes colour; the
+standard sinks take it only where their stream is a terminal, `NO_COLOR` is not set and `TERM` is
+not `dumb`. A JSON logger never paints.
+
+**Sinks and threads.** A `Logger` is `Sendable`: its own fields are rendered when it is made, so a
+child costs nothing per record and one logger serves every thread. Each line, with its `\n`, reaches
+its sink in one call, and every standard sink writes it in one write or under one lock, so lines
+from many threads at once never interleave. A line a sink cannot write is dropped: logging never
+stops the program it reports on.
+
+| Member | Meaning |
+| --- | --- |
+| `Level` | `Trace`, `Debug`, `Info`, `Warn`, `Error`, ordered so; `name` (`"warn"`), `label` (`"WARN "`), displayed by its name. |
+| `parseLevel(text) -> Option[Level]` | A level's name in any case, `warning` for `Warn`; `None` for anything else. |
+| `Format` | `Text` or `Json`. |
+| `Field` | `(string, Any)`. |
+| `Logger(level = Info, format = Text, sink = stderrSink(), colour = true, clock = now, fields = [])` | A logger writing the records at `level` and above. |
+| `trace`, `debug`, `info`, `warn`, `error(message, fields = [])` | Methods of a `Logger`, and module functions taking `using logger: Logger = DefaultLogger`; `message` and `fields` by-name. |
+| `log(at, message, fields = [])` | A record at a level chosen while running. |
+| `enabled(at) -> bool` | Whether a record at `at` would be written. |
+| `child(fields) -> Logger` | The same logger carrying `fields` after its own. |
+| `atLevel(level) -> Logger` | The same logger with another threshold, its fields kept. |
+| `level`, `format` | What the logger was made with. |
+| `DefaultLogger` | `Logger()`: `Info` and above, as text, to standard error. |
+| `Sink(write, colours = false)` | A sink calling `write: @sendable (string) -> unit` once a line, the line ending in `\n`; `colours` says it takes colour. |
+| `stderrSink()`, `stdoutSink()` | The standard streams, each line in one write, taking colour on a colour terminal. |
+| `fileSink(path) -> Result[Sink, IoError]` | Appends to `path`, creating it; an `Err` where it cannot be opened. Each line is appended and on disk when the record's call returns, under a lock, the file opened for it, so a file a rotator moved away is made again by the next line. |
+| `writerSink(target: Mutex[W])` | Any `Writer`, each line written whole under its mutex. |
+
+The access log of [`avin.net.http`](#http-server) writes through a logger as well: see
+`http.accessLog(logger)` there.
+
 ## `avin.net`
 
 TCP connections, TLS over them, servers, URLs, and a small HTTP client and server that speak `https`
@@ -2343,6 +2431,16 @@ otherwise, 32 hexadecimal digits from `SecureRandom` by default; the handler rea
 handler set its own. The default sink writes each line to standard error in one write, so lines from
 several connections never interleave. The time is read from `clock`, a `@sendable () -> Duration`,
 before and after the handler. A handler that traps writes no line.
+
+`http.accessLog(logger, clock = monotonic, ids = newRequestId)` is the same middleware writing
+through an [`avin.log`](#avinlog) `Logger`: an `Info` record `request` for each request, its fields
+`id`, `method`, `path`, `status`, `bytes`, `micros` and `remote` after the logger's own, a length or
+an address not known left out, in the logger's format. A logger that leaves out `Info` records
+makes none, though the request id is still found, passed on and answered.
+
+```text
+2026-11-23T10:20:30.5Z INFO  request svc=web id=4f1c…e2 method=GET path=/items/7 status=200 bytes=12 micros=1500 remote=127.0.0.1
+```
 
 **Metrics.** `Metrics(buckets = defaultBuckets, clock = monotonic)` counts the requests its
 `middleware` passes on, shared by every connection's actor under a lock of its own:

@@ -10826,6 +10826,55 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `pairs` keeps the vector). Review with the user: the default limits, and whether a `formAs[T]`
     mirroring `queryAs[T]` is wanted.
 
+- Settled on the user's delegation 2026-11-23 (branch `avin-log`): **`avin.log`, structured logging
+  in the standard library** ([system library](/spec/system-library/#avinlog)).
+  - **The central API: a `Sendable` class `Logger`, reached as a given.** The record functions
+    `trace` … `error(message, fields)` are a logger's methods and also module functions taking
+    `using logger: Logger = DefaultLogger`; a program declares a given at its module's top level, and
+    a request's handler a `child` as a given of its own block. **There is no global logger to set**:
+    the default is a fixed `val` (`Info`, text, standard error), and configuration is a given, so no
+    module-level mutable state exists and a test's logger can never leak into another's. Alternatives
+    weighed: a given only, with no default (every library function logging would demand one of every
+    caller); a settable global default (mutable shared state, and two configurations racing in a
+    test run); a logger passed explicitly everywhere (what contextual parameters exist to remove).
+    Review with the user: the central API, the name of the module functions (`log.info(…)` reads
+    well, but `debug` and `error` imported by name hide the prelude's `debug` of a value and read
+    like the `Error` trait), and whether a settable process-wide default is wanted after all.
+  - **Laziness by by-name parameters.** The message (`-> string`) and the fields
+    (`-> Vector[Field]`) are by-name, so a record below the threshold evaluates neither; the
+    threshold is one `Level` comparison. Measured at `-O2`, 10 million disabled `debug` calls with an
+    interpolated message and two fields take about 17 ns each beside 0.4 ns for the bare loop, and
+    2.8 ns each behind `if logger.enabled(Level.Debug)`: the difference is the two delayed
+    arguments' closures being made, which the by-name chapter's representation says live on the
+    caller's stack where they cannot escape. Alternatives: a closure parameter `() -> string`
+    (heavier to write at every call), a string built always (the cost a disabled record must not
+    pay), a macro (the language has none).
+  - **A field is `(string, Any)`**: any value can be written without conversion, a number and a
+    `bool` keep their kind in JSON and anything else is its `Display`. An `Option` is not unwrapped:
+    a type pattern cannot match an `Option` of any element type held in an `Any` (`Option[_]` is
+    refused as an open constructor), so a field not known is left out (the access log leaves out an
+    unknown length or address). Alternatives: a union of the JSON kinds (every other value converted
+    by hand at the call); a `LogValue` trait (an impl for every type a program logs).
+  - **A logger's own fields are rendered when it is made**, in its format, and held as text, which
+    keeps the logger `Sendable` (an `Any` is not) and makes a child free per record. A key written
+    twice, by a child and a record, is written twice rather than replaced.
+  - **Text lines**: RFC 3339 time (`Instant`'s display), the upper-case level padded to five
+    columns, the message with its control characters escaped, then `key=value` with a value or key
+    quoted as a JSON string where it is empty or holds a space, a control character, `"`, `=` or `\`.
+    Colour paints only the level's name, only where `colour` is asked and the sink takes it (the
+    standard sinks: a terminal, `NO_COLOR` unset, `TERM` not `dumb`, through `sysl.posix.tty`).
+  - **Sinks** are a `Sendable` `Sink(write, colours)` called once a line with its `\n`, so one call
+    is one write and lines never interleave, as `println` keeps them. **The file sink appends each
+    line under a lock with the file opened for that line** (`fs.appendText`), rather than holding a
+    `File` open: an open `File` belongs to the thread that opened it and traps when another thread
+    writes it, even inside a `Mutex`; and reopening per line also survives a log rotator moving the
+    file away. A line that cannot be written is dropped: logging never stops the program it reports
+    on. Alternatives: a writer thread owning the file behind a channel (a thread to start and stop,
+    and lines not yet written when the record's call returns); a `File` behind a `Mutex` (refused by
+    the file's thread ownership, above).
+  - **The HTTP access log** gains an overload `accessLog(logger, clock, ids)`, writing an `Info`
+    record `request` with its fields; the sink form is unchanged.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma

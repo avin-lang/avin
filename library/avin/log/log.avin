@@ -1,0 +1,261 @@
+module avin.log
+
+// Structured logging: records of a level, a message and key/value fields, written one line each as
+// human text or as JSON objects, to standard error, a file or any sink. A `Logger` holds a level
+// threshold, a format, a sink and fields of its own; `child` makes one carrying more fields, such as a
+// request's id. A record below the threshold costs one comparison: its message and fields are by-name
+// arguments, so nothing of them is evaluated. Each line reaches its sink whole, in one call, so lines
+// written at once from many threads never interleave.
+//
+// A program reaches a logger as a given: the module functions `trace` to `error` take
+// `using logger: Logger`, and find the nearest `given` one, or `DefaultLogger` where there is none.
+
+import avin.fs
+import avin.io.IoError
+import avin.threads.Mutex
+import avin.time.{Instant, now}
+
+// How much a record matters, least first. A logger writes the records at its level and above.
+data Level derives Ord
+  Trace
+  Debug
+  Info
+  Warn
+  Error
+
+// The level written `text`, in any case: `trace`, `debug`, `info`, `warn` (or `warning`) and `error`;
+// `None` for any other text, so a level read from the environment or a flag is checked.
+parseLevel(text: string) -> Option[Level] = levelNamed(text.toLower)
+
+private levelNamed(name: string) -> Option[Level]
+levelNamed("trace") = Some(Trace)
+levelNamed("debug") = Some(Debug)
+levelNamed("info") = Some(Info)
+levelNamed("warn") = Some(Warn)
+levelNamed("warning") = Some(Warn)
+levelNamed("error") = Some(Error)
+levelNamed(_) = None
+
+impl Level
+  // The level's name in lower case, as a JSON line writes it.
+  name -> string = self match
+    Trace -> "trace"
+    Debug -> "debug"
+    Info -> "info"
+    Warn -> "warn"
+    Error -> "error"
+
+  // The level's name in upper case, padded to five columns, as a text line writes it.
+  label -> string = self match
+    Trace -> "TRACE"
+    Debug -> "DEBUG"
+    Info -> "INFO "
+    Warn -> "WARN "
+    Error -> "ERROR"
+
+// The terminal colour a text line paints a level's name in: dim, cyan, green, yellow and bold red.
+private colourOf(level: Level) -> string = level match
+  Trace -> "\u{1b}[2m"
+  Debug -> "\u{1b}[36m"
+  Info -> "\u{1b}[32m"
+  Warn -> "\u{1b}[33m"
+  Error -> "\u{1b}[1;31m"
+
+impl Display for Level
+  display(out: Writer, spec: FormatSpec) = out.writeField(name, spec)
+
+// How a logger writes a record: as a line of text for people, or as one JSON object a line.
+data Format
+  Text
+  Json
+
+// One field of a record: a key and its value. An `int`, `long`, `real` and `bool` keep their kind in a
+// JSON line; any other value is written by its `Display`, as a string. A value not known is left out
+// of the fields rather than written.
+type Field = (string, Any)
+
+// Where a logger's lines go. `write` is called once for each line, which ends with `\n`, so a sink
+// that hands each call to one write keeps lines whole. `colours` says whether the sink is a terminal
+// that takes colour, which a text logger asked for colour then paints its levels for.
+class Sink(private val put: @sendable (string) -> unit, val colours: bool = false): Sendable
+  // Writes `line`, a whole line with its `\n`.
+  write(line: string) = put(line)
+
+// Standard error, each line in one write. It takes colour where standard error is a terminal, `NO_COLOR`
+// is not set and `TERM` is not `dumb`.
+stderrSink() -> Sink = Sink(line -> StandardError.write(line), colourOnStderr())
+
+// Standard output, each line in one write. It takes colour where standard output is a terminal,
+// `NO_COLOR` is not set and `TERM` is not `dumb`.
+stdoutSink() -> Sink = Sink(line -> StandardOutput.write(line), colourOnStdout())
+
+// The file `file`, created if it is not there and appended to if it is; an `Err` where it cannot be
+// opened to append to. Each line is appended under a lock the sink's users share, the file opened for
+// it and closed again, so the line is in the file, whole, when the record's call returns, and a file
+// moved away by a log rotator is made again by the next line. A line that cannot be written is
+// dropped: logging never stops the program it reports on.
+fileSink(file: string) -> Result[Sink, IoError]
+  fs.appendText(file, "")?
+  val lock = Mutex(0)
+  Ok(Sink(line -> lock.with(_ -> appendLine(file, line))))
+
+private appendLine(file: string, line: string)
+  _ = fs.appendText(file, line)
+
+// Any `Writer`, behind its mutex: each line is written whole while the mutex is held.
+writerSink[W: Writer](target: Mutex[W]) -> Sink = Sink(line -> target.with(w -> w.write(line)))
+
+// What a logger reads the time by: the wall clock unless a test gives another.
+type Clock = @sendable () -> Instant
+
+// A logger: writes records at `level` and above to `sink`, as `format` lays them out, each with the
+// time from `clock`, then the logger's own fields, then the record's. Its own fields are rendered once,
+// when it is made, so a logger is a `Sendable` value shared freely between threads.
+class Logger(
+    val level: Level,
+    val format: Format,
+    private val sink: Sink,
+    private val paint: bool,
+    private val clock: Clock,
+    private val context: string
+): Sendable
+  // Whether a record at `at` would be written.
+  enabled(at: Level) -> bool = at >= level
+
+  // A logger like this one carrying `fields` after its own, as every record it writes will.
+  child(fields: Vector[Field]) -> Logger =
+    Logger(level, format, sink, paint, clock, context + renderFields(format, fields))
+
+  // A logger like this one writing the records at `threshold` and above.
+  atLevel(threshold: Level) -> Logger = Logger(threshold, format, sink, paint, clock, context)
+
+  // Writes a record at `at` with `message` and `fields`, after the logger's own. Neither is evaluated
+  // where `at` is below the logger's level.
+  log(at: Level, message: -> string, fields: -> Vector[Field] = [])
+    if at < level then return
+    sink.write(line(at, message, fields))
+
+  trace(message: -> string, fields: -> Vector[Field] = []) = log(Trace, message, fields)
+  debug(message: -> string, fields: -> Vector[Field] = []) = log(Debug, message, fields)
+  info(message: -> string, fields: -> Vector[Field] = []) = log(Info, message, fields)
+  warn(message: -> string, fields: -> Vector[Field] = []) = log(Warn, message, fields)
+  error(message: -> string, fields: -> Vector[Field] = []) = log(Error, message, fields)
+
+  // The whole line for a record, with its `\n`.
+  private line(at: Level, message: string, fields: Vector[Field]) -> string
+    val time = clock().toString()
+    val rest = context + renderFields(format, fields)
+    format match
+      Text ->
+        val name = if paint then colourOf(at) + at.label + "\u{1b}[0m" else at.label
+        s"$time $name ${textMessage(message)}$rest\n"
+      Json ->
+        s"{\"time\":\"$time\",\"level\":\"${at.name}\",\"message\":${jsonString(message)}$rest}\n"
+
+object Logger
+  // A logger writing the records at `level` and above, as `format` lays them out, to `sink`, each
+  // carrying `fields`. A text logger paints its levels where `colour` asks it to and the sink takes
+  // colour; a JSON logger never does.
+  apply(
+      level: Level = Info,
+      format: Format = Text,
+      sink: Sink = stderrSink(),
+      colour: bool = true,
+      clock: Clock = now,
+      fields: Vector[Field] = []
+  ) -> Logger =
+    Logger(level, format, sink, colour && sink.colours && format == Text, clock, renderFields(format, fields))
+
+// The logger a record goes to where no `given` one is in scope: `Info` and above, as text, to standard
+// error, coloured where it is a terminal.
+val DefaultLogger: Logger = Logger()
+
+// A record at each level, written through the nearest given `Logger`, or `DefaultLogger`. Neither the
+// message nor the fields are evaluated where the logger's level is above the record's.
+trace(message: -> string, fields: -> Vector[Field] = [], using logger: Logger = DefaultLogger) =
+  logger.log(Trace, message, fields)
+
+debug(message: -> string, fields: -> Vector[Field] = [], using logger: Logger = DefaultLogger) =
+  logger.log(Debug, message, fields)
+
+info(message: -> string, fields: -> Vector[Field] = [], using logger: Logger = DefaultLogger) =
+  logger.log(Info, message, fields)
+
+warn(message: -> string, fields: -> Vector[Field] = [], using logger: Logger = DefaultLogger) =
+  logger.log(Warn, message, fields)
+
+error(message: -> string, fields: -> Vector[Field] = [], using logger: Logger = DefaultLogger) =
+  logger.log(Error, message, fields)
+
+// The fields as they follow the message in `format`: ` key=value` each in text, `,"key":value` each in
+// JSON; empty for none.
+private renderFields(format: Format, fields: Vector[Field]) -> string
+  if fields.isEmpty then return ""
+  val out = StringWriter()
+  for (key, value) in fields
+    format match
+      Text -> out.write(" " + textToken(key) + "=" + textToken(textValue(value)))
+      Json -> out.write("," + jsonString(key) + ":" + jsonValue(value))
+  out.text
+
+// A value as text, before it is quoted where it needs to be.
+private textValue(value: Any) -> string = value.toString()
+
+// A value as JSON: an `int`, a `long` and a `bool` as themselves, a finite `real` as a number and any
+// other as a string, and anything else as a string of its `Display`.
+private jsonValue(value: Any) -> string = value match
+  n: int -> n.toString()
+  n: long -> n.toString()
+  r: real -> if r.isFinite then r.toString() else jsonString(r.toString())
+  b: bool -> b.toString()
+  _ -> jsonString(value.toString())
+
+// `text` as one token of a text line: as it is where it is not empty and every character is visible
+// and none of `"`, `=` and `\`; quoted and escaped as a JSON string otherwise.
+private textToken(text: string) -> string =
+  if text.isEmpty || text.indexWhere(c -> needsQuote(c)) >= 0 then jsonString(text) else text
+
+private needsQuote(c: char) -> bool = c <= ' ' || c == '"' || c == '=' || c == '\\' || c == '\u{7f}'
+
+// A message as a text line writes it: control characters escaped as in JSON, so a record is one line
+// and cannot move a terminal's cursor; everything else as it is.
+private textMessage(text: string) -> string
+  if text.indexWhere(c -> c < ' ' || c == '\u{7f}') < 0 then return text
+  val out = StringWriter()
+  for c in text.chars
+    out.write(if c < ' ' || c == '\u{7f}' then jsonChar(c) else c.toString())
+  out.text
+
+// `text` as a JSON string: in quotes, a quote and a backslash escaped, a control character written
+// `\uXXXX` (`\b`, `\f`, `\n`, `\r` and `\t` by their short forms), every other character as it is.
+private jsonString(text: string) -> string
+  if text.indexWhere(c -> c < ' ' || c == '"' || c == '\\' || c == '\u{7f}') < 0 then return "\"" + text + "\""
+  val out = StringWriter()
+  out.write("\"")
+  for c in text.chars
+    out.write(jsonChar(c))
+  out.write("\"")
+  out.text
+
+private jsonChar(c: char) -> string
+jsonChar('"') = "\\\""
+jsonChar('\\') = "\\\\"
+jsonChar('\u{8}') = "\\b"
+jsonChar('\u{c}') = "\\f"
+jsonChar('\n') = "\\n"
+jsonChar('\r') = "\\r"
+jsonChar('\t') = "\\t"
+jsonChar('\u{7f}') = "\\u007F"
+jsonChar(c < ' ') = "\\u00" + hexPair(int(c))
+jsonChar(c) = c.toString()
+
+// The two upper-case hexadecimal digits of `n`, from 0 to 255.
+private hexPair(n: int) -> string
+  val digits = "0123456789ABCDEF"
+  digits.slice(n / 16, n / 16 + 1) + digits.slice(n % 16, n % 16 + 1)
+
+@sysl("sysl.posix.tty.color_err")
+private colourOnStderr() -> bool
+
+@sysl("sysl.posix.tty.color")
+private colourOnStdout() -> bool
