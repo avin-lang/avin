@@ -2108,11 +2108,17 @@ main()
 `type Handler = @sendable (ServerRequest) -> Response` names what answers a request.
 `http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
-16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError) ->
-Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
+16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError,
+requestTimeout = seconds(60)) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does. Each
 wait while a request is read may last `readTimeout`, each wait while a response is written
-`writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; zero
-takes a limit away. A `maxHeaderBytes` less than one or a `maxBodyBytes` less than zero traps. The
+`writeTimeout`, and the wait for the next request on a connection kept alive `idleTimeout`; and the
+whole of a request, its line, headers and body, must arrive within `requestTimeout` of its first
+byte, so a client trickling bytes just faster than `readTimeout` cannot hold a connection, and its
+slot among `maxConnections`, for ever. Each request on a kept-alive connection has a bound of its
+own, and the idle wait before it is no part of it. Zero takes any of these limits away. A
+`maxHeaderBytes` less than one, a `maxBodyBytes` less than zero or a negative `requestTimeout` traps.
+A server taking bodies larger than the default `maxBodyBytes` from slow clients raises
+`requestTimeout` with it. The
 wait for a connection's next request, its first among them, is made through `idle`, so a shutdown
 closes a connection waiting there at once, unanswered; a request already being read or answered
 finishes, its response saying `Connection: close`, and a request read once the server is stopping
@@ -2329,12 +2335,13 @@ answered `100 Continue` once the body is known to fit. The server writes `Conten
 outside 200 to 599, or a header the response cannot carry, traps.
 
 **A request the server cannot take is answered and the connection closed**, gently: its side is shut
-and what the client still sends read and dropped for a moment, so the answer is not lost to a reset.
+and what the client still sends read and dropped for half a second at most, so the answer is not
+lost to a reset and a client that goes on trickling is closed all the same.
 
 | Status | When |
 | --- | --- |
 | `400` | A request line that is not three words, a method that is not a token, a malformed version, a target that is not one (a fragment, an escape that is not UTF-8 among them), no `Host` in HTTP/1.1 or two, a header without a colon, with a name that is not a token or folded onto a second line, a `Content-Length` that is not digits or two that differ, one beside `Transfer-Encoding`, a coding list not ending in `chunked`, a malformed chunk |
-| `408` | A wait while a request is read outlasts `readTimeout` |
+| `408` | A wait while a request is read outlasts `readTimeout`, or the request is not read whole within `requestTimeout` of its first byte |
 | `413` | A body longer than `maxBodyBytes`, by its length before it is read, or as its chunks arrive |
 | `414` | A request line longer than `maxHeaderBytes` |
 | `417` | An `Expect` other than `100-continue` |
