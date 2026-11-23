@@ -1,0 +1,160 @@
+module avin.time
+
+// The date HTTP writes in its headers (`Date`, `Last-Modified`, `Expires`, `If-Modified-Since`,
+// `Retry-After`, a cookie's `Expires`). It is always UTC, always `GMT`, and has whole seconds.
+//
+// `Instant.toHttpDate()` writes the one form a sender may use, IMF-fixdate:
+// `Sun, 06 Nov 1994 08:49:37 GMT`. `parseHttpDate` reads that form and the two obsolete ones a
+// recipient must still accept: the RFC 850 form, `Sunday, 06-Nov-94 08:49:37 GMT`, and the form of
+// C's `asctime`, `Sun Nov  6 08:49:37 1994`. A text is read whole and exactly: the names are written
+// as above (capitals as shown), the numbers have the widths shown (a day under ten has a leading zero,
+// or in the `asctime` form a leading space), the single spaces are single, and nothing comes before
+// or after. The day name must be the one the date falls on.
+
+private val ShortWeekdays: Vector[string] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+private val ShortMonths: Vector[string] = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+]
+
+private val LongWeekdays: Vector[string] = [
+  "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+]
+
+impl Instant
+  // This instant as an HTTP-date in IMF-fixdate form, `Sun, 06 Nov 1994 08:49:37 GMT`, the fraction
+  // of a second dropped toward the earlier second. An instant outside the years 0000 to 9999, which
+  // the form has no digits for, traps.
+  toHttpDate() -> string
+    val reading = readingOf(epochMicros, Duration.Zero)
+    val date = reading.date
+    if !(0 <= date.year <= 9999) then fail(s"the instant $self has no HTTP-date: its year is outside 0 to 9999")
+    val second = reading.time.microsOfDay / MicrosPerSecond
+    val clock = padded(second / 3600, 2) + ":" + padded(second % 3600 / 60, 2) + ":" + padded(second % 60, 2)
+    val dayName = ShortWeekdays(date.weekday.isoNumber - 1)
+    val monthName = ShortMonths(date.month - 1)
+    s"$dayName, ${padded(long(date.day), 2)} $monthName ${padded(date.year, 4)} $clock GMT"
+
+// Steps past `word` where the text has it at the cursor, answering whether it did.
+private skipWord(c: TimeCursor, word: string) -> bool
+  if c.at + word.byteLength > c.text.byteLength then return false
+  var k = 0
+  while k < word.byteLength
+    if c.text.byteAt(c.at + k) != word.byteAt(k) then return false
+    k += 1
+  c.at += word.byteLength
+  true
+
+// The index of the first of `names` found at the cursor, stepping past it, or `-1` with the cursor
+// where it was.
+private skipName(c: TimeCursor, names: Vector[string]) -> int
+  var i = 0
+  while i < names.size
+    if skipWord(c, names(i)) then return i
+    i += 1
+  -1
+
+private skipSpace(c: TimeCursor) -> Result[bool, TimeParseError]
+  if !c.skip(' ') then return Err(c.bad("a space"))
+  Ok(true)
+
+// `hh:mm:ss`, the three fields' shape read and their ranges checked.
+private readClock(c: TimeCursor) -> Result[Time, TimeParseError]
+  val hour = c.digits(2, "two digits of the hour")?
+  if !c.skip(':') then return Err(c.bad("':'"))
+  val minute = c.digits(2, "two digits of the minute")?
+  if !c.skip(':') then return Err(c.bad("':'"))
+  val second = c.digits(2, "two digits of the second")?
+  checkedTime(c.text, WrittenTime(hour, minute, second, 0, 0))
+
+// The month `Jan` to `Dec` as `1` to `12`.
+private readMonth(c: TimeCursor) -> Result[int, TimeParseError]
+  val i = skipName(c, ShortMonths)
+  if i < 0 then return Err(c.bad("a month name such as Nov"))
+  Ok(i + 1)
+
+// The instant of the fields once the day name has been checked against the date.
+private httpInstant(text: string, weekday: int, date: WrittenDate, clock: Time) -> Result[Instant, TimeParseError]
+  val day = checkedDate(text, date)?
+  if day.weekday.isoNumber - 1 != weekday then return Err(OutOfRange(text, "weekday"))
+  instantAt(DateTime(day, clock), Duration.Zero) match
+    Some(t) -> Ok(t)
+    None -> Err(OutOfRange(text, "instant"))
+
+// `Sun, 06 Nov 1994 08:49:37 GMT`, the cursor after the comma that follows the day name.
+private readImf(c: TimeCursor, weekday: int) -> Result[Instant, TimeParseError]
+  skipSpace(c)?
+  val day = c.digits(2, "two digits of the day")?
+  skipSpace(c)?
+  val month = readMonth(c)?
+  skipSpace(c)?
+  val year = c.digits(4, "four digits of the year")?
+  skipSpace(c)?
+  val clock = readClock(c)?
+  skipSpace(c)?
+  if !skipWord(c, "GMT") then return Err(c.bad("GMT"))
+  if !c.atEnd() then return Err(Trailing(c.text, c.at))
+  httpInstant(c.text, weekday, WrittenDate(long(year), month, day), clock)
+
+// A number that orders readings as the timeline does, for readings whose day need not exist.
+private readingKey(year: long, month: int, day: int, t: Time) -> long =
+  ((year * 13 + long(month)) * 32 + long(day)) * MicrosPerDay + t.microsOfDay
+
+// `Sunday, 06-Nov-94 08:49:37 GMT`, the cursor after the comma that follows the day name. A year of
+// two digits is the one in `now`'s century, or the century before where that would be more than fifty
+// years after `now`.
+private readRfc850(c: TimeCursor, weekday: int, now: Instant) -> Result[Instant, TimeParseError]
+  skipSpace(c)?
+  val day = c.digits(2, "two digits of the day")?
+  if !c.skip('-') then return Err(c.bad("'-'"))
+  val month = readMonth(c)?
+  if !c.skip('-') then return Err(c.bad("'-'"))
+  val short = c.digits(2, "two digits of the year")?
+  skipSpace(c)?
+  val clock = readClock(c)?
+  skipSpace(c)?
+  if !skipWord(c, "GMT") then return Err(c.bad("GMT"))
+  if !c.atEnd() then return Err(Trailing(c.text, c.at))
+  val current = readingOf(now.epochMicros, Duration.Zero)
+  val limit = readingKey(current.date.year + 50, current.date.month, current.date.day, current.time)
+  val thisCentury = current.date.year / 100 * 100 + long(short)
+  val year = if readingKey(thisCentury, month, day, clock) > limit then thisCentury - 100 else thisCentury
+  httpInstant(c.text, weekday, WrittenDate(year, month, day), clock)
+
+// `Sun Nov  6 08:49:37 1994`, the cursor after the space that follows the day name. The day is two
+// characters, a space and a digit for a day under ten.
+private readAsctime(c: TimeCursor, weekday: int) -> Result[Instant, TimeParseError]
+  val month = readMonth(c)?
+  skipSpace(c)?
+  val dayAt = c.at
+  val spaced = c.skip(' ')
+  val day = if spaced then c.digits(1, "a digit of the day after a space")? else c.digits(2, "two digits of the day")?
+  if !spaced && day < 10 then return Err(BadShape(c.text, dayAt, "a space before a day under ten"))
+  skipSpace(c)?
+  val clock = readClock(c)?
+  skipSpace(c)?
+  val year = c.digits(4, "four digits of the year")?
+  if !c.atEnd() then return Err(Trailing(c.text, c.at))
+  httpInstant(c.text, weekday, WrittenDate(long(year), month, day), clock)
+
+// The instant an HTTP-date names, in any of the three forms, reading a two-digit year of the RFC 850
+// form against the clock's now. See `parseHttpDate(text, now)`.
+parseHttpDate(text: string) -> Result[Instant, TimeParseError] = parseHttpDate(text, now())
+
+// The instant an HTTP-date names, in IMF-fixdate, RFC 850 or `asctime` form, a two-digit year read
+// against `now`: it is in the century of `now`'s year unless that puts it more than fifty years after
+// `now`, and then it is in the century before. A text of none of the forms is a shape error saying
+// what was expected where; a day name that is not the date's, a month's day it does not have, an hour
+// of `24` and a second of `60` are out-of-range errors naming the field (`weekday`, `day`, `hour`,
+// `second`). It never traps.
+parseHttpDate(text: string, now: Instant) -> Result[Instant, TimeParseError]
+  val c = TimeCursor(text)
+  val full = skipName(c, LongWeekdays)
+  if full >= 0
+    if !c.skip(',') then return Err(c.bad("','"))
+    return readRfc850(c, full, now)
+  val short = skipName(c, ShortWeekdays)
+  if short < 0 then return Err(c.bad("a day name such as Sun"))
+  if c.skip(',') then return readImf(c, short)
+  if c.skip(' ') then return readAsctime(c, short)
+  Err(c.bad("',' or a space"))
