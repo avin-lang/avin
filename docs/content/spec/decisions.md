@@ -10749,6 +10749,47 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     release (a collection) itself, since without one a program that drops a burst and then
     allocates little keeps its pages until enough allocation brings a collection.
 
+- Settled on the user's delegation 2026-11-23 (branch `fs-walk`): **`avin.fs` walks lazily, with
+  options** ([system library](/spec/system-library/#paths)).
+  - **`walker(root, …)` is an `Iterator[Result[Entry, IoError]]`**, the shape `io.inputs` already
+    has for a lazy sequence whose steps can fail; each directory is listed (whole, as `listDir`
+    sorts it) when the walk reaches it. **`walk(root)` keeps its name, result and behaviour** and
+    takes the same named options, gathering `walker`; nothing is deprecated. Alternatives: changing
+    `walk` to answer the iterator (breaks every caller's `match` on its `Result`), and a separate
+    options value (named, defaulted parameters read as well at the call and need no new type).
+  - **Options: `maxDepth` (no limit by default; 0 the root alone; negative fails at the call),
+    `includeRoot`, `postOrder`, `followLinks`, `prune`, `stopOnError`.** `prune` is asked about each
+    directory the walk is about to go into, never the root (a hidden or oddly named root would
+    otherwise end a walk before it starts) and never a directory at `maxDepth` (it would not be gone
+    into anyway); a pruned directory is still an entry.
+  - **An unreadable directory: reported by default, failing on request.** By default it is an entry
+    with the reason in `error` and the walk goes on, as `walk` always did; with `stopOnError` it is
+    an `Err`, the walk's last element. A root that cannot be listed is an `Err` either way. A root
+    that is not a directory is `NotADirectory` (as `walk` always answered) unless `includeRoot` asks
+    for it, when it is the one entry.
+  - **Following links, a loop is found by canonical path**: a link naming a directory whose
+    `canonicalize` equals that of a directory on the walk's own way down is an entry carrying
+    `Other("file system loop")` and is not gone into; `stopOnError` makes it the `Err`. Only
+    ancestors count, so two links to one directory are both walked. Device and inode would avoid a
+    `realpath` per directory, but `Metadata` does not carry them yet (branch `fs-metadata` adds
+    them); switching is a change inside `Walker` with no change to what a program sees. Canonical
+    paths are asked only when `followLinks` is on. Alternatives: a global visited set (would skip a
+    second link to a directory outside any cycle), a dedicated `ErrorKind` (adds a variant every
+    exhaustive match of `ErrorKind` would have to name).
+  - **`Entry` keeps its fields**; its kind is `isDir` and `isLink`, two calls per entry as before.
+    A `kind` field joins it when `Metadata.kind` lands. A followed link to a directory has both true.
+  - **`find(root, p, …)` answers paths** (as `glob` does), and has a pattern overload matched
+    against `relative`; it takes the options but `includeRoot` and `postOrder`.
+  - **`{a,b}` alternation in `matches`, `matcher` and `glob`**, written out before the pattern is
+    split into components, so an alternative may hold `/`, `**` and further braces. `{a}` is `a`,
+    `{}` and `{,x}` have the empty alternative, an unclosed `{` is literal, as an unclosed `[` is,
+    and braces escaped or inside a class are literal. The hidden-name rule applies to each written-out
+    pattern, so `{.git,src}` fits `.git`. Alternatives: `{a}` kept literal (some shells do; no
+    pattern reads better for it), and alternation inside a component only (forbids
+    `{src,lib}/**`). Review with the user: overlaps the path-helpers item, which also lists `{a,b}`.
+  - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
+    class; a function value is all a walk filter needs.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-19 (branch `train-ax`): **inside brackets whose commas separate items a comma

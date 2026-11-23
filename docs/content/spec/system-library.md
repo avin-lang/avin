@@ -1284,8 +1284,11 @@ The questions below ask the file system.
 | `isLink(p) -> bool` | Whether `p` is a symbolic link, dangling or not. |
 | `symlink(target, link) -> Result[unit, IoError]` | Makes `link` a symbolic link holding `target` as written; a relative target is read from the link's directory. `AlreadyExists` when something is at `link`. |
 | `readLink(link) -> Result[string, IoError]` | What a link holds, as written; a path that is not a link is an `Err`. |
-| `walk(root) -> Result[Vector[Entry], IoError]` | Every entry below the directory `root`, as described below. |
+| `walker(root, …) -> Iterator[Result[Entry, IoError]]` | The entries of the tree at `root`, read as the iterator advances, with the options described below. |
+| `walk(root, …) -> Result[Vector[Entry], IoError]` | The same entries gathered, or the first `Err` the walk meets. |
+| `find(root, p, …) -> Result[Vector[string], IoError]` | The paths of the entries below `root` that the predicate `p` is true for, or, when `p` is a pattern, whose path relative to `root` fits it. |
 | `matches(pattern, p) -> bool` | Whether `p` fits the pattern, as described below. |
+| `matcher(pattern) -> (string) -> bool` | `matches` for one pattern read once, to test many paths. |
 | `glob(pattern) -> Vector[string]` | The paths that exist and fit the pattern. |
 
 **`normalize` reads only the text, and the difference matters.** Where `a/lib` is a link to
@@ -1293,24 +1296,49 @@ The questions below ask the file system.
 `src/lib` into `src`: `canonicalize` of the same path names `src/main.c`. Whatever decides access to
 a file is decided on `canonicalize`.
 
-**A walk is the whole tree, sorted.** `walk` answers an `Entry(path, relative, depth, isDir, isLink,
-error)` for each file, directory and link below the root, the root itself left out: `relative` is the
-path from the root and `path` the root joined with it; `depth` is 1 for the root's own entries. The
-order is depth first, a directory before what it holds, and each directory's names in code-point
-order, as `listDir` sorts them, so two walks of an unchanged tree agree. **A symbolic link is listed
-and never followed**: its `isLink` is true and its `isDir` false, whatever it names, so a link back up
-the tree is one entry and not a loop. The root itself is followed when it is a link. **A directory the
-walk cannot list is still an entry**, with `isDir` true and the reason in `error` (for example
-`Some(PermissionDenied)`), and the walk goes on past it; only a root that cannot be listed makes the
-answer an `Err`: `NotFound`, `NotADirectory` or `PermissionDenied`.
+**A walk reads the tree as it goes, in a fixed order.** `walker` answers an `Entry(path, relative,
+depth, isDir, isLink, error)` for each file, directory and link below the root: `relative` is the path
+from the root and `path` the root joined with it; `depth` is 1 for the root's own entries. Each
+directory is listed when the walk reaches it, so taking the first entries of a huge tree lists only
+the directories on the way to them. The order is depth first and each directory's names in code-point
+order, as `listDir` sorts them, so two walks of an unchanged tree agree. `walk` takes the same options
+and gathers the entries into a vector; `find` gathers the paths of those a predicate or a pattern
+picks. Every option is named and has a default:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `maxDepth` | no limit | Entries deeper than this are left out; a directory at `maxDepth` is an entry but is not listed. `0` is the root alone; a negative one fails. |
+| `includeRoot` | `false` | The root itself is an entry, with `relative` empty and `depth` 0. |
+| `postOrder` | `false` | A directory comes after what it holds rather than before. |
+| `followLinks` | `false` | A link that names a directory is gone into as the directory is. |
+| `prune` | nothing | A predicate asked about each directory the walk is about to go into, the root excepted; one it answers `true` for is an entry, and nothing in it is. |
+| `stopOnError` | `false` | A directory the walk cannot go into ends it with that `Err`, rather than being an entry that carries the reason. |
+
+`find` takes every option but `includeRoot` and `postOrder`.
+
+**A symbolic link is listed and, unless `followLinks` asks, never followed**: its `isLink` is true and
+its `isDir` false, whatever it names, so a link back up the tree is one entry and not a loop. Followed,
+a link naming a directory has `isLink` and `isDir` both true and is gone into, and one naming a
+directory the walk is already inside, on its own way down from the root, is an entry whose `error`
+says `file system loop` and is not gone into, so a link back up the tree ends the walk's descent there.
+Two links to one directory from elsewhere are both gone into. The root itself is followed when it is
+a link.
+
+**A directory the walk cannot list is still an entry**, with `isDir` true and the reason in `error`
+(for example `Some(PermissionDenied)`), and the walk goes on past it; with `stopOnError`, that reason
+is an `Err` instead, the walk's last element, and `walk` and `find` answer it. A root that cannot be
+listed is the walk's one `Err` either way: `NotFound`, `NotADirectory` or `PermissionDenied`. A root
+that is not a directory is `NotADirectory`, unless `includeRoot` asks for it, when it is the one entry.
 
 ```text
 import avin.fs
 import avin.io.IoError
 
-sourcesIn(dir: string) -> Result[Vector[string], IoError]
-  val found = fs.walk(dir)?.filter(e -> !e.isDir && fs.matches("**/*.avin", e.relative))
-  Ok(found.map(e -> e.path))
+sourcesIn(dir: string) -> Result[Vector[string], IoError] =
+  fs.find(dir, "**/*.avin", prune = e -> fs.fileName(e.path) == Some("build"))
+
+firstLarge(dir: string) -> Option[string] =
+  fs.walker(dir).flatMap(r -> r.toOption).find(e -> !e.isDir && fs.size(e.path).getOrElse(0) > 1000000).map(e -> e.path)
 ```
 
 **A pattern is matched component by component**, so doubled and trailing `/` do not matter, and an
@@ -1324,10 +1352,19 @@ absolute pattern fits only an absolute path. Within a component:
 | `[!a-z]`, `[^a-z]` | one character not in the set |
 | `\x` | the character `x` itself |
 | `**`, as a whole component | any number of whole components, none included: `src/**/main.c` fits `src/main.c` and `src/a/b/main.c` |
+| `{a,b}` | any one of the comma-separated alternatives, which may hold `/`, wildcards and further braces: `src/{lib,test}/**/*.{c,h}`; `{,x}` fits the empty text too, and `{a}` is `a` |
+
+**Alternation is written out before anything else is read**: `x{a,b}{1,2}` is the four patterns
+`xa1`, `xa2`, `xb1` and `xb2`, and a path fits when it fits one of them. A brace escaped with `\` or
+inside a class (`[{]`) is a literal character, and so is a `{` with no closing `}`; a `\,` or a comma
+inside a class is a literal comma inside an alternative.
 
 **A name starting with `.` is hidden**: only a component that starts with a literal `.` fits it, so
 `*` does not fit `.git`, nor do `?git` and `[.]git`, while `.*` and `\.git` do; and `**` never passes
 through a hidden name, so `**/*.c` stays out of `.git`. `*/x` does not fit `../x`, for the same reason.
+Each alternative is its own pattern here, so `{.git,src}` fits `.git`. A walk itself lists hidden names
+like any other; only a pattern leaves them out, so `find(dir, "**/*.c")` skips them where
+`find(dir, e -> !e.isDir)` does not.
 **Every pattern is valid**: a `[` with no closing `]` is a literal `[`, and a `\` at the end a literal
 `\`. A `**` inside a component, as in `a**b`, is two `*`.
 
@@ -1336,7 +1373,8 @@ relative paths; an absolute one answers absolute paths. The answer is in code-po
 once, and every path in it fits the pattern by `matches`. A `**` goes through directories as `walk`
 does, never through a link; a link a literal or wildcard component names is followed. A literal last
 component answers a dangling link too. A directory that cannot be read contributes nothing: `glob`
-has no `Err`. The empty pattern answers nothing, and `/` answers `/`.
+has no `Err`. The empty pattern answers nothing, and `/` answers `/`. A pattern with alternatives is
+globbed once for each and the answers merged, still sorted and each path once.
 
 ```text
 for file in fs.glob("tests/**/*.avin")
