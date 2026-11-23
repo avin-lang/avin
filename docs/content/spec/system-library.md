@@ -2289,6 +2289,22 @@ or `maxKeys` below one traps, and so does a `per` too short to give each token a
 The three middlewares compose as any do: `h -> metrics.middleware(limiter.middleware(h))` counts the
 `429`s the limiter answers.
 
+**CORS.** `Cors(origins = ["*"], allowOrigin = _ -> false, methods = ["GET", "HEAD", "POST"], headers =
+[], exposed = [], credentials = false, maxAge = None)` is a policy whose `middleware` lets a page from
+another origin read responses. An origin is allowed if `origins` holds it (compared exactly), holds
+`"*"`, or `allowOrigin` says so; `allows(origin)` asks. An allowed request's response gets
+`Access-Control-Allow-Origin` (`*` where the policy is `*` without credentials, else the origin,
+with `Vary: Origin` merged into any `Vary` the handler set, once, and left alone where it is `*`),
+`Access-Control-Allow-Credentials: true` where `credentials`, and `Access-Control-Expose-Headers`
+where `exposed` names some. A request with no `Origin`, or from one not allowed, is handled as it
+is, with no CORS header. A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`)
+is answered `204` and never reaches the handler; from an allowed origin asking for a method in
+`methods` and headers in `headers` (compared without regard to case; any, where `headers` is empty,
+echoed back) it carries `Access-Control-Allow-Methods`, `-Allow-Headers`, `-Max-Age` (whole
+seconds) and the origin and credentials headers; asking for more, or from an origin not allowed, it
+carries none. `*` together with `credentials`, and a negative `maxAge`, trap where the policy is
+made.
+
 **Streamed responses.** `Response.stream(status, contentType, write)` answers a response whose body
 `write` writes as it goes, through the `BodyWriter` it is given, each write sent to the client at
 once; its `body` is empty. Its head says `Transfer-Encoding: chunked` and each write is a chunk, the
