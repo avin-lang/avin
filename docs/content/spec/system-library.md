@@ -127,6 +127,9 @@ knows is asked for by name, and a program's own settings are its own values.
 | `executable() -> Option[string]` | The absolute path of the running program's file, where the platform can tell. |
 | `processors() -> int` | How many processors the program may run on: the number the futures' pool grows to. |
 | `pid() -> long` | The process's identifier. |
+| `userId() -> long` | The user id the program acts as: the one the file system checks a permission against and the `owner` of a file it creates; `0` is the superuser. |
+| `groupId() -> long` | The group id the program acts as, which a file's `group` is compared with. |
+| `userName(id: long) -> Result[string, IoError]` | The name the system's user database gives user `id`: `userName(0)` is `Ok("root")`. An id with no entry, and one outside `0` to `0xffffffff`, is `Err(NotFound)`. |
 | `totalMemory() -> Result[long, IoError]` | The physical memory the machine has, in bytes: what is installed, not what is free. |
 | `residentBytes(pid: long) -> Result[long, IoError]` | The memory the process `pid` holds in RAM now, in bytes; `residentBytes(pid())` is the program's own. A process that is not there, a reaped child among them, and a `pid` of zero or less are `Err(NotFound)`; one the program may not look at is `Err(PermissionDenied)`. |
 | `groupMembers(pgid: long) -> Result[Vector[long], IoError]` | The live processes whose process group is `pgid`, in no particular order: the leader, the programs it started and their children that stayed in the group. Ended programs not yet waited for are listed, waited-for ones are not. A group nobody is in is `Ok([])`; a `pgid` of zero or less, or past the largest process id, is `Err(Other)`. A snapshot. |
@@ -1184,9 +1187,11 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `appendText(file, text) -> Result[unit, IoError]` | Adds `text` to the end of the file, creating it if it is not there. |
 | `writeBytes(file, bytes) -> Result[unit, IoError]` | As `writeText`, with bytes. |
 | `appendBytes(file, bytes) -> Result[unit, IoError]` | As `appendText`, with bytes. |
-| `exists(file) -> bool` | Whether anything, file or directory, is at the path. |
+| `exists(file, followLinks = true) -> bool` | Whether anything, file or directory, is at the path. A dangling link answers `false`; with `followLinks = false` the link itself is asked about, so it answers `true`. |
 | `isDir(file) -> bool` | Whether the path names a directory, one the program may not read included. |
-| `isFile(file) -> bool` | Whether the path names something that is not a directory. |
+| `isFile(file) -> bool` | Whether the path names a regular file: not a directory, and not a FIFO, a socket or a device either. |
+| `isReadable(file) -> bool` / `isWritable(file) -> bool` | Whether the user who started the program may read, or write, what the path names, as its bits, owner and group say; `false` for a path that is not there. A link is followed. The superuser may read and write anything. Opening the file is the check that counts: the answer can be stale by then. |
+| `isSameFile(a, b) -> Result[bool, IoError]` | Whether the two paths lead to one file: its inode and device, not its name or contents. Two hard links, and a symbolic link and its target, are the same; a copy is not. Both are followed and must exist: a missing one is `NotFound`. |
 | `remove(file) -> Result[unit, IoError]` | Removes a file; never a directory, which is `IsADirectory`. A link is removed, not what it names. |
 | `removeDir(dir) -> Result[unit, IoError]` | Removes an empty directory; `DirectoryNotEmpty` otherwise. |
 | `removeDirAll(dir) -> Result[unit, IoError]` | Removes a directory and everything in it; a path already gone is success. |
@@ -1195,7 +1200,8 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success; a file where `dir` itself would go is `AlreadyExists`, and a file where one of the directories above it would go is `NotADirectory`. |
 | `createTempDir(prefix) -> Result[string, IoError]` | Makes a new, empty directory in the platform's place for temporary files, its name starting with `prefix`, and answers its path. |
 | `tempDir(prefix) -> Result[TempDir, IoError]` | Makes the directory as `createTempDir` does and holds it as an [`io.Close`](#close): `t.path` is its path, `t.close()` removes it and everything in it (closing again does nothing and answers `Ok`; one that failed may be closed again), and `t.isClosed` says whether it has been removed. One never closed stays on the disk. |
-| `metadata(file) -> Result[Metadata, IoError]` | One look at a path: a `Metadata` of `size` (bytes), `modified` (an `avin.time.Instant`), `isDir`, `isFile` and `permissions`. A symbolic link is followed; a missing path is `NotFound`. For a directory `size` is the file system's bookkeeping, not a count of entries. |
+| `metadata(file) -> Result[Metadata, IoError]` | One look at a path, as a [`Metadata`](#file-metadata). A symbolic link is followed, so a dangling one is `NotFound`; a missing path is `NotFound`. |
+| `linkMetadata(file) -> Result[Metadata, IoError]` | As `metadata`, but a symbolic link is described rather than followed: its `kind` is `Symlink`, its `size` the length of the path it holds, and a dangling one answers `Ok`. |
 | `permissions(file) -> Result[int, IoError]` | The permission bits of the file or directory: the nine `rwx` bits with setuid `0o4000`, setgid `0o2000` and the sticky bit `0o1000`, never the file type. |
 | `setPermissions(file, mode) -> Result[unit, IoError]` | Sets the permission bits to exactly `mode`, `0o0` to `0o7777`; not a mask added to what is there, and the umask plays no part. A mode outside that range is an `Err` of kind `Other` naming it, before the path is looked at, and changes nothing. |
 | `size(file) -> Result[long, IoError]` | The size of the file in bytes. |
@@ -1228,6 +1234,30 @@ evictOlderThan(dir: string, age: Duration) -> Result[long, IoError]
 ```
 
 Recording that an entry was used is `fs.setModified(file, time.now())`, which writes nothing to the file.
+`m.isFile` is true for a regular file alone, so a socket or a FIFO another program left in the
+directory is passed over rather than removed.
+
+### File metadata
+
+A `Metadata` is everything one `stat` answered, so its fields describe one entry:
+
+| Field | Meaning |
+| --- | --- |
+| `size: long` | The size in bytes. For a directory it is the file system's bookkeeping, not a count of entries; for a link read by `linkMetadata`, the length of the path it holds. |
+| `modified: Instant` | When the contents last changed. |
+| `accessed: Instant` | When the contents were last read. Whether a read moves it is the file system's choice: one that records reads moves it to now, and one that does not (macOS's) leaves it. `setModified` sets it with `modified`. |
+| `changed: Instant` | When the entry itself last changed: a write, a change of permissions, and `setModified` move it to now, a read does not, and no ordinary call sets it back, which is what makes it the time a security check reads. |
+| `isDir: bool`, `isFile: bool` | Whether it is a directory, and whether a regular file. |
+| `kind: FileKind` | Which kind of entry it is: `Regular`, `Directory`, `Symlink`, `Fifo`, `Socket`, `CharDevice` (`/dev/null`), `BlockDevice` (a disk), or `UnknownKind(bits)` with the type bits for any other the platform has. `Symlink` comes only from `linkMetadata`. |
+| `isLink: bool` | Whether `kind` is `Symlink`. |
+| `permissions: int` | The twelve permission bits, as `permissions(file)` answers them. |
+| `owner: long`, `group: long` | The numeric user and group ids. `process.userId()` is the program's own, and `process.userName(owner)` names the owner. |
+| `links: long` | How many names lead to the file: more than one means a hard link. |
+| `inode: long`, `device: long` | The file's number within its file system, and which file system: together, not either alone, they identify the file, which is what `isSameFile` compares. |
+
+`FileKind`'s variants are written qualified, `m.kind == fs.Socket`, and compare as values. A walk that
+must not leave a tree asks `linkMetadata(p).isLink` (or `isLink(p)`); a walk that follows links
+remembers each directory's `(inode, device)` so a link back up is seen.
 
 **Permissions** are written as octal literals, `fs.setPermissions(file, 0o600)`, and read back the
 same way: `fs.permissions(file)` is `Ok(0o600)`, and `f"${p}%o"` prints it as `600`. A file the
