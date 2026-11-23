@@ -2142,6 +2142,28 @@ JSON), `Response.bytes(status, body, contentType)`, `Response.empty(status)` and
 which traps on a name that is not a token or a value holding a line break; `http.reasonPhrase(status)`
 is RFC 9110's phrase for a status, empty for one it does not name.
 
+**Cookies** (RFC 6265). `request.cookies()` reads every `Cookie` header into `Cookie(name, value)`s
+in order, `request.cookie(name)` the first value of a name; `Cookie.parse(header)` reads one header.
+Pairs are split at `;`, space around a pair, name and value is dropped, a value in double quotes is
+read without them, a name seen twice gives two cookies, an empty value is a cookie and a `=` in a
+value belongs to it. A pair that is not a cookie is skipped and the rest kept: empty, no `=`, a name
+that is not a token, a value with an octet RFC 6265 does not allow (space, `"`, `,`, `;`, `\`,
+non-ASCII). `SetCookie(name, value, expires, maxAge, domain, path, secure, httpOnly, sameSite,
+partitioned)` is a cookie to set; `header` is its `Set-Cookie` value, attributes in that order, `Expires`
+written by `Instant.toHttpDate()`, `Max-Age` in seconds (zero or less written `0`), `sameSite` an
+`Option[SameSite]` of `Strict`, `Lax` or `Unrestricted` (written `SameSite=None`). A cookie is checked
+where it is made and traps where it breaks a rule, nothing being escaped or cut: the name is a
+token; the value holds only cookie octets; `Domain` is letters, digits, `.` and `-`; `Path` begins
+with `/` and holds no `;` or control character; a `__Host-` name (any case) needs `Secure`,
+`Path=/` and no `Domain`; a `__Secure-` name needs `Secure`; `SameSite=None` and `Partitioned` need
+`Secure`. `response.setCookie(cookie)` adds one `Set-Cookie` header per cookie, never folded. On the
+client side `response.cookies()` and `SetCookie.parse(text)` (a `Result[SetCookie, CookieError]`)
+read `Set-Cookie` into the same type: attribute names are case-insensitive, the last of a repeated
+attribute wins, and an unknown attribute, an `Expires` that is not an HTTP-date, a non-numeric
+`Max-Age`, a `Path` not beginning with `/`, an empty `Domain` and an unknown `SameSite` are ignored;
+a bad name or value, a broken prefix rule, or `SameSite=None` / `Partitioned` without `Secure` is an
+`Err`, and `response.cookies()` skips it. A cookie jar is not part of this.
+
 `Route(method, pattern, handler)`, or `Route.get`, `post`, `put`, `delete` and `patch`, routes a
 method and a pattern; a method that is not a token or a pattern not beginning with `/` traps.
 `Router(routes)` tries its routes in order. A pattern's segments match a request's decoded segments
