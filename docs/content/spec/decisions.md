@@ -12613,6 +12613,21 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   smooth, more state). Review with the user: evicting a bucket that is not full forgives that
   client's debt, which an attacker cycling more than `maxKeys` addresses can use; and the default
   key, the client's address, puts every client behind one proxy in one bucket.
+- Settled on the user's delegation 2026-11-23 (built on branch `http-cors`): **CORS middleware.**
+  `Cors(origins, allowOrigin, methods, headers, exposed, credentials, maxAge)` with a `middleware`.
+  Origins match exactly (a browser's origin is serialized in lower case, and its own check is
+  exact); `*` with credentials traps at construction; with credentials the origin is echoed, never
+  `*`, and `Vary: Origin` is merged into the handler's. A preflight is always answered `204` by the
+  middleware, granting nothing (no CORS header) for an origin, method or header not allowed, which
+  is how a browser is told to refuse; empty `headers` reflects the requested ones. Defaults are
+  the safe ones: methods `GET, HEAD, POST`, no credentials, no max age. A disallowed origin's
+  actual request is still handled (it carries `Vary: Origin` so a cache keeps the answers apart).
+  Alternatives weighed: forwarding a disallowed origin's preflight to the handler (the handler would
+  answer a route's `405`, a confusing signal and extra work); case-insensitive origin matching (not
+  what a browser does); a wildcard that echoes with credentials (the Fetch standard forbids
+  `*` there, and an echo of any origin with credentials is an open door, so `allowOrigin` must be
+  asked for). Review with the user: empty `headers` reflecting any requested header is the
+  common default but allows more than a closed list would.
 - Settled on the user's delegation 2026-11-15 (built on branch `resolve-blocking`): **which library
   bindings are [blocking](/spec/sysl-bindings/#calls-that-wait).** Name resolution
   (`sysl.net.resolve`, which `TcpStream.connect` calls; since 2026-11-16 made on a helper thread
