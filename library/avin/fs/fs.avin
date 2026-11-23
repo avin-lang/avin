@@ -194,6 +194,7 @@ private class SyslStat
   modifiedMicros() -> long
   isDir() -> bool
   isFile() -> bool
+  permissionBits() -> int
 
 @sysl("avin.rt.fs_stat")
 private syslStat(file: string) -> Result[SyslStat, SyslError]
@@ -201,17 +202,46 @@ private syslStat(file: string) -> Result[SyslStat, SyslError]
 @sysl("avin.rt.fs_set_modified")
 private syslSetModified(file: string, micros: long) -> Result[unit, SyslError]
 
-// What one look at a path found: its size in bytes, when its contents last changed, and whether it
-// is a directory. For a directory the size is the file system's own bookkeeping, not a count of
-// entries.
-data Metadata(size: long, modified: Instant, isDir: bool, isFile: bool)
+@sysl("avin.rt.fs_set_permissions")
+private syslSetPermissions(file: string, mode: int) -> Result[unit, SyslError]
+
+// What one look at a path found: its size in bytes, when its contents last changed, whether it is a
+// directory, and its permission bits. For a directory the size is the file system's own bookkeeping,
+// not a count of entries. `permissions` is the twelve low bits of the mode: the nine `rwx` bits
+// (`0o644`) with setuid `0o4000`, setgid `0o2000` and the sticky bit `0o1000`; never the file type.
+data Metadata(size: long, modified: Instant, isDir: bool, isFile: bool, permissions: int)
 
 // Everything `Metadata` holds, read at once so the fields describe one entry. A symbolic link is
 // followed. A path that is not there is `NotFound`.
 metadata(file: string) -> Result[Metadata, IoError] =
   syslStat(file).map(
-    s -> Metadata(s.sizeBytes(), epochMicros(s.modifiedMicros()), s.isDir(), s.isFile())
+    s -> Metadata(
+      s.sizeBytes(),
+      epochMicros(s.modifiedMicros()),
+      s.isDir(),
+      s.isFile(),
+      s.permissionBits()
+    )
   ).mapErr(failed("read metadata of", file))
+
+// The permission bits of `file`, a file or a directory, as `Metadata.permissions` holds them:
+// `0o600` for one only its owner may read and write. A symbolic link is followed.
+permissions(file: string) -> Result[int, IoError] = metadata(file).map(m -> m.permissions)
+
+// Sets the permission bits of `file`, a file or a directory, to exactly `mode`: it is not a mask
+// added to what is there, so `0o600` takes every bit for the group and others away. The process
+// umask plays no part. `mode` is `0o0` to `0o7777`; setuid, setgid and the sticky bit are allowed
+// where the platform allows them, and anything outside that range is an `Err` that leaves the file
+// as it was. A symbolic link is followed. A path that is not there is `NotFound`.
+setPermissions(file: string, mode: int) -> Result[unit, IoError]
+  if !(0 <= mode <= 0o7777)
+    return Err(IoError(io.Other(s"a mode outside 0o0 to 0o7777: ${octal(mode)}"), "set permissions of", file))
+  syslSetPermissions(file, mode).mapErr(failed("set permissions of", file))
+
+// `mode` as an octal literal reads, its sign before the prefix.
+private octal(mode: int) -> string
+octal(mode < 0) = f"-0o${-long(mode)}%o"
+octal(mode) = f"0o${mode}%o"
 
 // The size of the file `file` in bytes. A symbolic link is followed.
 size(file: string) -> Result[long, IoError] = metadata(file).map(m -> m.size)

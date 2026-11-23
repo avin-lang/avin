@@ -5002,6 +5002,25 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   `set_modified`, so it costs a line, and it lets "last used" be recorded without writing).
   Times are microseconds, the library's resolution.
 
+- **Permission bits in `avin.fs`** Settled on the user's delegation 2026-11-23 (branch
+  `fs-permissions`): `Metadata` gains a fifth field, `permissions: int`, the twelve low bits of the
+  mode (the nine `rwx` with setuid, setgid and sticky; never the file type), read by the same one
+  `stat`; `permissions(path)` is its shorthand, as `size` and `modified` are; `setPermissions(path,
+  mode)` sets exactly `mode`, following a link. The mode is an `int` written as an octal literal
+  (`0o600`), which the lexer already reads. **A mode outside `0o0`..`0o7777` is an `Err`** of kind
+  `Other` naming it in octal (`a mode outside 0o0 to 0o7777: 0o10000`), raised before the path is
+  touched, so the file keeps its mode. Setuid, setgid and sticky are accepted, since `permissions`
+  reports them and the two must round trip; where a platform refuses one (macOS: sticky on a plain
+  file for a non-superuser) its error comes back as the platform's. Why: marshal's token file must
+  be owner-only, and the bits belong with the other facts one `stat` gives. Alternatives weighed:
+  a separate `Permissions` type with `ownerRead`-style accessors (more surface than one octal number,
+  which is how every reader already thinks of a mode; can come later over the same int); masking an
+  out-of-range mode silently to `0o7777`, as Sysl's `set_permissions` does (a type bit passed by
+  mistake, `0o100644` from a raw `st_mode`, would succeed quietly); trapping instead of `Err` (a mode
+  read from a config file is input, not a program bug; `File.seek`'s negative offset is the same
+  shape and answers `Err`). Creating a file with a mode from the start (no moment with wider bits)
+  is not in this entry: Sysl 0.13.2 exposes no create-with-mode, `fchmod` or umask call.
+
 - Settled on the user's delegation 2026-11-08 (branch `runner-streaming`): **`avin test` pushes its report out as it goes, and on SIGTERM or
   SIGINT writes out what it holds and names the work in progress.** The report text of a run is
   unchanged. The report is pushed to its reader when a test finishes and at least half a second has

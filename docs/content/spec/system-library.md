@@ -1195,7 +1195,9 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success; a file where `dir` itself would go is `AlreadyExists`, and a file where one of the directories above it would go is `NotADirectory`. |
 | `createTempDir(prefix) -> Result[string, IoError]` | Makes a new, empty directory in the platform's place for temporary files, its name starting with `prefix`, and answers its path. |
 | `tempDir(prefix) -> Result[TempDir, IoError]` | Makes the directory as `createTempDir` does and holds it as an [`io.Close`](#close): `t.path` is its path, `t.close()` removes it and everything in it (closing again does nothing and answers `Ok`; one that failed may be closed again), and `t.isClosed` says whether it has been removed. One never closed stays on the disk. |
-| `metadata(file) -> Result[Metadata, IoError]` | One look at a path: a `Metadata` of `size` (bytes), `modified` (an `avin.time.Instant`), `isDir` and `isFile`. A symbolic link is followed; a missing path is `NotFound`. For a directory `size` is the file system's bookkeeping, not a count of entries. |
+| `metadata(file) -> Result[Metadata, IoError]` | One look at a path: a `Metadata` of `size` (bytes), `modified` (an `avin.time.Instant`), `isDir`, `isFile` and `permissions`. A symbolic link is followed; a missing path is `NotFound`. For a directory `size` is the file system's bookkeeping, not a count of entries. |
+| `permissions(file) -> Result[int, IoError]` | The permission bits of the file or directory: the nine `rwx` bits with setuid `0o4000`, setgid `0o2000` and the sticky bit `0o1000`, never the file type. |
+| `setPermissions(file, mode) -> Result[unit, IoError]` | Sets the permission bits to exactly `mode`, `0o0` to `0o7777`; not a mask added to what is there, and the umask plays no part. A mode outside that range is an `Err` of kind `Other` naming it, before the path is looked at, and changes nothing. |
 | `size(file) -> Result[long, IoError]` | The size of the file in bytes. |
 | `modified(file) -> Result[Instant, IoError]` | When the contents of the file or directory last changed, to the file system's resolution. |
 | `setModified(file, when) -> Result[unit, IoError]` | Sets the modification time (the access time moves with it); reading it back may round to the file system's resolution. |
@@ -1226,6 +1228,13 @@ evictOlderThan(dir: string, age: Duration) -> Result[long, IoError]
 ```
 
 Recording that an entry was used is `fs.setModified(file, time.now())`, which writes nothing to the file.
+
+**Permissions** are written as octal literals, `fs.setPermissions(file, 0o600)`, and read back the
+same way: `fs.permissions(file)` is `Ok(0o600)`, and `f"${p}%o"` prints it as `600`. A file the
+library creates asks for `0o666`, which the process umask narrows; rewriting a file with
+`writeText` or `writeBytes` keeps the mode it has, so a file set to `0o600` stays so. Where the
+platforms differ the platform decides and the answer says so: macOS refuses the sticky bit on a
+plain file to anyone but the superuser (an `Err`, the mode unchanged), and Linux keeps it.
 
 **A temporary directory is the program's to remove.** `createTempDir` makes the directory rather than
 inventing a name, so no other program can take it in between, and nothing removes it at the end:
