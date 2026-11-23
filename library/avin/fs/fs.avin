@@ -240,6 +240,18 @@ private class SyslFile
   failed() -> bool
   @sysl(blocking)
   flush() -> Result[unit, SyslError]
+  @sysl(blocking)
+  sync() -> Result[unit, SyslError]
+  @sysl("sync_data", blocking)
+  syncData() -> Result[unit, SyslError]
+  @sysl("full_sync", blocking)
+  fullSync() -> Result[unit, SyslError]
+  @sysl("truncate", blocking)
+  setLength(length: long) -> Result[unit, SyslError]
+  @sysl("read_at", blocking)
+  readAt(offset: long, into: Array[byte]) -> Result[Array[byte], SyslError]
+  @sysl("write_at", blocking)
+  writeAt(offset: long, bytes: Array[byte]) -> Result[long, SyslError]
   @sysl("close")
   release() -> Result[unit, SyslError]
 
@@ -372,14 +384,92 @@ class File(
     if closed then return Err(closedError("flush"))
     handle.flush().mapErr(failed("flush", name))
 
+  // Up to `max` bytes starting `offset` bytes from the start of the file, without moving the
+  // position: reads and writes go on from where they were. Fewer bytes come back only where the file
+  // ends first, and none at or past its end. What this handle has written is handed over first, so
+  // the bytes read include it. An offset or a `max` below zero is an `Err`.
+  readAt(offset: long, max: int) -> Result[Array[byte], IoError]
+    if closed then return Err(closedError("read"))
+    if !readable then return Err(notReadable)
+    if offset < 0 then return Err(IoError(io.Other(s"a negative offset: $offset"), "read", name))
+    if max < 0 then return Err(IoError(io.Other(s"a read of $max bytes: a read takes none or more"), "read", name))
+    val got = Buffer[byte]()
+    while got.length < max
+      val part = handle.readAt(offset + long(got.length), Array.fill(max - got.length, byte(0))).mapErr(failed("read", name))?
+      if part.length == 0 then break
+      got.addAll(part)
+    Ok(got.toArray())
+
+  // Writes all of `bytes` starting `offset` bytes from the start of the file, without moving the
+  // position. An offset past the end extends the file, the gap reading as zero bytes. A handle opened
+  // to append may put the bytes at the end whatever the offset, as the platform decides. An offset
+  // below zero is an `Err`.
+  writeAt(offset: long, bytes: Array[byte]) -> Result[unit, IoError]
+    if closed then return Err(closedError("write"))
+    if !writable then return Err(IoError(io.Other("the file is not open for writing"), "write", name))
+    if offset < 0 then return Err(IoError(io.Other(s"a negative offset: $offset"), "write", name))
+    unread()?
+    var done = 0
+    while done < bytes.length
+      val put = handle.writeAt(offset + long(done), bytes.slice(done, bytes.length)).mapErr(failed("write", name))?
+      done += int(put)
+    Ok(())
+
+  // Sets the length of the file to `length` bytes: a shorter file loses its end, a longer one gains
+  // zero bytes. The position does not move, and may then lie past the end. What was written is handed
+  // over first. A length below zero is an `Err`, and so is a file not open for writing.
+  setLength(length: long) -> Result[unit, IoError]
+    if closed then return Err(closedError("set the length of"))
+    if !writable then return Err(IoError(io.Other("the file is not open for writing"), "set the length of", name))
+    if length < 0 then return Err(IoError(io.Other(s"a negative length: $length"), "set the length of", name))
+    unread()?
+    handle.setLength(length).mapErr(failed("set the length of", name))
+
+  // The same as `setLength`.
+  truncate(length: long) -> Result[unit, IoError] = setLength(length)
+
+  // Hands what has been written to the platform and asks the device to keep it, the contents and the
+  // file's own details such as its length, returning once it has.
+  sync() -> Result[unit, IoError]
+    if closed then return Err(closedError("sync"))
+    handle.sync().mapErr(failed("sync", name))
+
+  // As `sync`, without the details a reader of the contents does not need, such as the modification
+  // time, where the platform can skip them. On macOS there is nothing cheaper and it is `sync`, which
+  // reaches the drive but not the drive's own write cache.
+  syncData() -> Result[unit, IoError]
+    if closed then return Err(closedError("sync"))
+    handle.syncData().mapErr(failed("sync", name))
+
+  // The strongest durability the platform offers: as `sync`, and the drive's own write cache is
+  // emptied too (`F_FULLFSYNC` on macOS). The slowest of the three.
+  fullSync() -> Result[unit, IoError]
+    if closed then return Err(closedError("sync"))
+    handle.fullSync().mapErr(failed("sync", name))
+
+  // Makes `close` remove the file from its directory as well, for a scratch file that should not
+  // outlive its use. The name is removed, so a program that renamed the file away should not ask for
+  // this. A file the collector frees without a `close` is not removed.
+  deleteOnClose() -> Result[unit, IoError]
+    if closed then return Err(closedError("mark for removal"))
+    removeOnClose = true
+    Ok(())
+
   // Flushes and releases the file; closing a closed file is not an error. Every later call
-  // answers an `Err`.
+  // answers an `Err`. A file marked by `deleteOnClose` is removed once released, and a failure to
+  // remove it is the `Err` where releasing succeeded.
   override close() -> Result[unit, IoError]
     if closed then return Ok(())
     closed = true
     ahead = Array.empty[byte]()
     at = 0
-    handle.release().mapErr(failed("close", name))
+    val released = handle.release().mapErr(failed("close", name))
+    if removeOnClose
+      val removed = remove(name)
+      if released.isOk then return removed
+    released
+
+  private var removeOnClose = false
 
   // Whether `close` has been called.
   isClosed() -> bool = closed
