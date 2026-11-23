@@ -92,6 +92,17 @@ private syslMakeTempDir(prefix: string) -> Result[string, SyslError]
 @sysl("sysl.fs.entries")
 private syslEntries(dir: string) -> Result[Vector[string], SyslError]
 
+@sysl("sysl.fs.pending_name")
+private syslPendingName(file: string) -> string
+
+@sysl("sysl.fs.publish_file")
+private syslPublishFile(pending: string, file: string) -> Result[unit, SyslError]
+
+// Makes the directories above `file` that are missing; nothing for a name with no directory part.
+private makeParents(file: string) -> Result[unit, IoError] = parent(file) match
+  Some(dir) -> if dir == "" then Ok(()) else createDirAll(dir)
+  None -> Ok(())
+
 // The whole of `file` as text. Bytes that are not UTF-8 are `InvalidUtf8`, at the first one that
 // is not.
 readText(file: string) -> Result[string, IoError] = syslReadText(file).mapErr(failed("read", file))
@@ -100,8 +111,9 @@ readText(file: string) -> Result[string, IoError] = syslReadText(file).mapErr(fa
 readBytes(file: string) -> Result[Array[byte], IoError] = syslReadBytes(file).mapErr(failed("read", file))
 
 // Makes `file` hold exactly `text`, creating it if it does not exist and replacing what it held if
-// it does.
-writeText(file: string, text: string) -> Result[unit, IoError] =
+// it does. With `createParents`, the directories above `file` that are missing are made first.
+writeText(file: string, text: string, createParents: bool = false) -> Result[unit, IoError]
+  if createParents then makeParents(file)?
   syslWriteText(file, text).mapErr(failed("write", file))
 
 // Adds `text` to the end of `file`, creating it if it does not exist.
@@ -109,8 +121,9 @@ appendText(file: string, text: string) -> Result[unit, IoError] =
   syslAppendText(file, text).mapErr(failed("append to", file))
 
 // Makes `file` hold exactly `bytes`, creating it if it does not exist and replacing what it held if
-// it does.
-writeBytes(file: string, bytes: Array[byte]) -> Result[unit, IoError] =
+// it does. With `createParents`, the directories above `file` that are missing are made first.
+writeBytes(file: string, bytes: Array[byte], createParents: bool = false) -> Result[unit, IoError]
+  if createParents then makeParents(file)?
   syslWriteBytes(file, bytes).mapErr(failed("write", file))
 
 // Adds `bytes` to the end of `file`, creating it if it does not exist.
@@ -144,6 +157,23 @@ removeDir(dir: string) -> Result[unit, IoError] = syslRemoveDir(dir).mapErr(fail
 // Removes `dir` and everything in it. A symbolic link inside is removed, never followed.
 removeDirAll(dir: string) -> Result[unit, IoError] =
   syslRemoveDirAll(dir).mapErr(failed("remove directory", dir))
+
+// Removes whatever is at `path`: a file, a symbolic link, or a directory with everything in it. A
+// link is removed and never followed, so a link to a directory deletes the link and leaves the
+// directory and its contents. A path that is not there is `NotFound`; `removeIfExists` is the call
+// that accepts that.
+removeAll(path: string) -> Result[unit, IoError] = syslRemoveFile(path) match
+  Ok(_) -> Ok(())
+  Err(e) -> if isDir(path) then removeDirAll(path) else Err(failed("remove", path)(e))
+
+// As `removeAll`, but a path that is not there is success: `Ok(true)` when something was removed,
+// `Ok(false)` when nothing was there. A dangling link is something and is removed. Any other failure
+// is the `Err`.
+removeIfExists(path: string) -> Result[bool, IoError] = removeAll(path) match
+  Ok(_) -> Ok(true)
+  Err(e) -> e.kind match
+    io.NotFound -> Ok(false)
+    _ -> Err(e)
 
 // Moves `from` to `to`, a file or a directory, in one step: a reader sees the old `to` or the new
 // one, never a mixture. A file already at `to` is replaced; an empty directory at `to` is replaced
@@ -240,6 +270,8 @@ private class SyslFile
   failed() -> bool
   @sysl(blocking)
   flush() -> Result[unit, SyslError]
+  @sysl(blocking)
+  sync() -> Result[unit, SyslError]
   @sysl("close")
   release() -> Result[unit, SyslError]
 
@@ -521,6 +553,99 @@ readTailLines(file: string, count: int) -> Result[Vector[string], IoError]
   if start < bytes.length && !first then lines.addOne(lineText(bytes, start, bytes.length))
   val all = lines.toVector
   Ok(if all.length > count then all.slice(all.length - count, all.length) else all)
+
+// Every line of `file` in a vector, each without its terminator: a line ends at `\n` or `\r\n`, the
+// last line needs no terminator, and a final terminator ends the last line rather than starting an
+// empty one, so an empty file has no lines. Bytes that are not UTF-8 become U+FFFD. The whole file
+// is held in memory; `lines` reads it a line at a time.
+readLines(file: string) -> Result[Vector[string], IoError]
+  val reader = lines(file)?
+  val all = Buffer[string]()
+  while reader.hasNext()
+    all.addOne(reader.next()?)
+  Ok(all.toVector)
+
+// The lines of `file` as they are read: an iterator of each line, or the `Err` that stopped the
+// reading, after which it has no more. Lines are split as `readLines` splits them. Only the line
+// being read is held in memory. The file is closed when the iterator has given its last line or its
+// `Err`; a program that stops early closes it with `close()` (`defer reader.close()`), and one that
+// forgets leaves it to the collector.
+lines(file: string) -> Result[Lines, IoError] = open(file).map(f -> Lines(f, None, false))
+
+// The iterator `lines` answers, which is also an `io.Close`: closing it closes the file under it.
+class Lines(
+    private val source: File,
+    private var held: Option[Result[string, IoError]],
+    private var finished: bool
+): Iterator[Result[string, IoError]], io.Close
+  override hasNext() -> bool
+    if held.isDefined then return true
+    if finished then return false
+    source.readLine() match
+      Ok(Some(line)) -> held = Some(Ok(line))
+      Ok(None) ->
+        finished = true
+        _ = source.close()
+      Err(e) ->
+        finished = true
+        held = Some(Err(e))
+        _ = source.close()
+    held.isDefined
+
+  override next() -> Result[string, IoError]
+    hasNext()
+    held match
+      Some(x) ->
+        held = None
+        x
+      None -> fail("next on an exhausted iterator")
+
+  // Closes the file; the iterator has no more lines afterwards. Closing again does nothing.
+  override close() -> Result[unit, IoError]
+    finished = true
+    held = None
+    source.close()
+
+// Writes each of `lines` to `file` followed by `\n`, so a file of three lines ends in a newline and
+// no list of lines is written with `\r\n`. The file is made or emptied first, and what was written
+// before a failure stays. With `createParents`, missing directories above `file` are made first.
+writeLines(file: string, lines: Iterable[string], createParents: bool = false) -> Result[unit, IoError]
+  if createParents then makeParents(file)?
+  val out = create(file)?
+  val it = lines.iterator()
+  while it.hasNext()
+    val wrote = out.writeText(it.next() + "\n")
+    if wrote.isErr
+      _ = out.close()
+      return wrote
+  out.close()
+
+// As `writeText`, but a reader of `file` sees all of the old contents or all of the new, never a mix,
+// and a failure leaves `file` as it was. The text is written to a new file beside `file` (so on its
+// file system), synced to the device, and renamed over `file`; the new file has a name no other
+// call or program gets, and is removed on every failure. `file`'s directory must exist unless
+// `createParents`. A new file takes the default permissions, not those of the file it replaces.
+writeTextAtomic(file: string, text: string, createParents: bool = false) -> Result[unit, IoError] =
+  writeBytesAtomic(file, Array.tabulate(text.byteLength, i -> text.byteAt(i)), createParents)
+
+// As `writeTextAtomic`, with bytes.
+writeBytesAtomic(file: string, bytes: Array[byte], createParents: bool = false) -> Result[unit, IoError]
+  if createParents then makeParents(file)?
+  val pending = syslPendingName(file)
+  val h = syslCreate(pending).mapErr(failed("write", file))?
+  h.write(bytes)
+  val outcome = if h.failed() then Err(
+    IoError(io.Other("the write failed"), "write", file)
+  ) else h.sync().mapErr(failed("write", file))
+  val closed = h.release().mapErr(failed("write", file))
+  val result = outcome match
+    Ok(_) -> closed
+    Err(e) -> Err(e)
+  result match
+    Ok(_) -> syslPublishFile(pending, file).mapErr(failed("write", file))
+    Err(e) ->
+      _ = syslRemoveFile(pending)
+      Err(e)
 
 // The names of the entries of the directory `dir`, without `dir` before them and without `.` and
 // `..`, sorted by code point, so two listings of an unchanged directory agree. A name that is not

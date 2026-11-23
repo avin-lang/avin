@@ -1184,12 +1184,19 @@ copyNotes(from: string, to: string) -> Result[unit, IoError]
 | `appendText(file, text) -> Result[unit, IoError]` | Adds `text` to the end of the file, creating it if it is not there. |
 | `writeBytes(file, bytes) -> Result[unit, IoError]` | As `writeText`, with bytes. |
 | `appendBytes(file, bytes) -> Result[unit, IoError]` | As `appendText`, with bytes. |
+| `writeText(file, text, createParents = false)`, `writeBytes(file, bytes, createParents = false)` | With `createParents`, the directories above the file that are missing are made first (`createDirAll` of its parent). |
+| `writeTextAtomic(file, text, createParents = false) -> Result[unit, IoError]`, `writeBytesAtomic(file, bytes, createParents = false)` | Writes to a new file beside `file`, syncs it to the device and renames it over `file`: a reader sees the whole old contents or the whole new, and a failure leaves `file` as it was and removes the new file. The new file's name is unique per call and per process. The replacement takes default permissions, not the old file's. |
+| `readLines(file) -> Result[Vector[string], IoError]` | Every line without its terminator. `\n` and `\r\n` both end a line; a last line with no terminator is kept; a final terminator does not start an empty line, so an empty file has no lines and `"\n"` has one empty line. Invalid UTF-8 becomes U+FFFD. |
+| `lines(file) -> Result[Lines, IoError]` | The same lines, lazily: `Lines` is an `Iterator[Result[string, IoError]]` holding one line at a time. The file closes when the iterator gives its last item (a line, or the `Err` that ended it). To stop early, `close()` it (`defer reader.close()`); one forgotten is closed by the collector. |
+| `writeLines(file, lines, createParents = false) -> Result[unit, IoError]` | Writes each line followed by `\n` to a made or emptied file, so the file ends in a newline; an empty collection leaves an empty file. |
 | `exists(file) -> bool` | Whether anything, file or directory, is at the path. |
 | `isDir(file) -> bool` | Whether the path names a directory, one the program may not read included. |
 | `isFile(file) -> bool` | Whether the path names something that is not a directory. |
 | `remove(file) -> Result[unit, IoError]` | Removes a file; never a directory, which is `IsADirectory`. A link is removed, not what it names. |
 | `removeDir(dir) -> Result[unit, IoError]` | Removes an empty directory; `DirectoryNotEmpty` otherwise. |
 | `removeDirAll(dir) -> Result[unit, IoError]` | Removes a directory and everything in it; a path already gone is success. |
+| `removeAll(path) -> Result[unit, IoError]` | Removes a file, a link or a directory with everything in it. A link is removed and never followed (a link to a directory leaves the directory and its contents); a path that is not there is `NotFound`. |
+| `removeIfExists(path) -> Result[bool, IoError]` | As `removeAll`, but a path that is not there is `Ok(false)`; `Ok(true)` when something was removed (a dangling link included). |
 | `rename(from, to) -> Result[unit, IoError]` | Moves a file or directory in one step, replacing what is at `to`: a file replaces a file, a directory an empty directory (`DirectoryNotEmpty` if it holds entries); a file onto a directory is `IsADirectory`, a directory onto a file `NotADirectory`; a missing source or a missing directory above `to` is `NotFound`. The same path on both sides succeeds and changes nothing. Both names must be on one file system, or nothing moves. |
 | `createDir(dir) -> Result[unit, IoError]` | Makes one directory, whose parent must exist; `AlreadyExists` if something is there. |
 | `createDirAll(dir) -> Result[unit, IoError]` | Makes the directory and every missing one above it; a directory already there is success; a file where `dir` itself would go is `AlreadyExists`, and a file where one of the directories above it would go is `NotADirectory`. |
