@@ -13329,3 +13329,48 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **ALPN and the version range
+  are fields of the settings, `TlsClient` and `TlsServer`**, set by `offer(names)` and
+  `versions(min, max)`, each answering new settings, as `trust` does; the connection reads what was
+  settled as `s.protocol -> Option[string]` and `s.version -> TlsVersion`. Alternatives weighed:
+  named parameters on `TlsStream.connect`/`client`/`server` (would have to be repeated at every call,
+  and `http.send`, `WebSocket.connect` and `serve` would each grow them too, where the settings
+  already travel); a separate options type (a second value to pass beside the settings). Both
+  bindings over sysl:openssl 0.2.5's `offer`, `versions`, `protocol` and `version`; no sysl change.
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **`TlsVersion` names TLS 1.2
+  and TLS 1.3 alone**, defaults `Tls12` to `Tls13`, so the floor of TLS 1.2 cannot be lowered: an
+  insecure range is not representable rather than refused. OpenSSL's own mirror with TLS 1.0 and 1.1
+  stays private. The ceiling is set explicitly to TLS 1.3 (OpenSSL's default has none); a newer
+  version joins `TlsVersion` and the default together. A `min` newer than `max` traps (in `versions`,
+  and at the first connection of settings made directly), as a negative timeout does: it is the
+  program's mistake, and no `TlsError` variant is added that every exhaustive match would have to
+  name. Alternatives: the four-version mirror public with 1.0/1.1 refused at the call (a trap for a
+  value the type offers); `Option` for "no ceiling" (a value nobody needs to write).
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **ALPN names are checked
+  where they are given**: one empty or over 255 bytes (bytes, not characters), or a list over the
+  65535 bytes RFC 7301's `ProtocolNameList` carries with each name's length byte, traps in `offer`,
+  and at the first connection of settings made directly. The server's order wins (sysl:openssl's
+  choice) and no protocol in common fails the handshake with `no_application_protocol`, as RFC 7301
+  asks; a server or client offering none leaves `protocol` `None`. Duplicate names are not refused.
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **certificate reload is a
+  `TlsSource`, asked for its `current` settings as each handshake begins**, with
+  `ReloadableTlsServer` holding them in an `Atomic` and a `TlsServer` its own source; `http.serve`'s
+  `tls` became an `Option[TlsSource]`, which every `Some(server)` already written still is. Because
+  each connection makes its OpenSSL context from the settings it took (as it always has), a reload
+  touches no open connection: nothing is swapped under a live session. `reload(certificate, key)`
+  checks the pair before it replaces anything, keeps the protocols and versions, and retries by
+  `compareAndSet` so a whole-settings reload made meanwhile is not lost. Alternatives: a mutable
+  `TlsServer` (its builders answer new values, so a reload of the old one would silently miss the
+  new); a callback (`() -> TlsServer`) as the source (a trait names the role and lets a provider
+  keep state, a certificate store or an ACME client); the library watching `Hangup` itself (a
+  program chooses its own reload trigger; the example in the chapter watches `Hangup`). Review with
+  the user: each connection still parses its PEM into a fresh context, which a cached context per
+  `TlsServer` would avoid; that is a performance item, not a correctness one.
+- Settled on the user's delegation 2026-11-24 (branch `tls-options`): **`http.serve` offers
+  `http/1.1` by ALPN where the settings offer no protocol of their own**, since it serves HTTP/1.1
+  alone: a client offering `h2` and `http/1.1` is told `http/1.1`, and one offering `h2` alone is
+  refused in the handshake rather than answered in a protocol it did not ask for. Settings with
+  protocols of their own are used as they are. The `http` client offers no protocol yet, which every
+  server accepts. Alternatives: leaving ALPN off under `serve` (a
+  client offering `h2` alone would get HTTP/1.1 bytes); always replacing the settings' list (would
+  override a program's choice silently).
