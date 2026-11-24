@@ -1,0 +1,442 @@
+module avin.html
+
+// Text made safe to stand in HTML, and markup built from templates that escape every value they are
+// given.
+//
+//     import avin.html.{Html, escapeHtml}
+//
+//     val name = "<b>Ann</b>"
+//     println(escapeHtml(name))
+//     println(html"<p title=\"$name\">Hello, $name</p>")
+//
+// Each escaper answers text for one context: `escapeHtml` for an element's text and a quoted
+// attribute's value, `escapeAttribute` for any attribute's value, quoted or not, `safeUrl` for a URL
+// a page will follow, and `escapeJs` and `jsString` for a script. An `Html` is markup trusted as it
+// stands. The `html"…"` interpolator reads its template as the browser will, and writes each hole
+// escaped for the place it stands in, an `Html` in an element's text as it is; a hole where no
+// escaping would make it safe traps.
+
+// Markup trusted to be HTML as it stands: written by the program, or built by `html"…"` from values
+// it escaped. Making one from other text is a statement that the text is safe, so `Html(text)`
+// should be written only of text the program wrote itself, or that an escaper made.
+data Html(text: string)
+
+impl Display for Html
+  display(out: Writer, spec: FormatSpec) = out.writeField(text, spec)
+
+object Html
+  // No markup at all.
+  empty -> Html = Html("")
+
+  // `text` escaped by `escapeHtml`, as markup that shows it as it is.
+  escaped(text: string) -> Html = Html(escapeHtml(text))
+
+  // The markup of each of `items` in order, with `separator`'s between them.
+  join(items: Vector[Html], separator: Html = Html("")) -> Html =
+    Html(items.map(h -> h.text).mkString(separator.text))
+
+  // The template `parts`, as written in an `html"…"` literal, with `args` in its holes, each written
+  // as `html"…"` writes it; or, where `html"…"` would trap, why. See `HtmlInterpolation`.
+  render(parts: Vector[string], args: Vector[Display]) -> Result[Html, string]
+    if args.length != parts.length - 1 then return Err(
+      s"an interpolator was given ${args.length} arguments for ${parts.length} parts"
+    )
+    val scanner = Scanner(InText, false, 0, "", "", false, -1, 0, "")
+    val out = StringWriter()
+    for i in 0 ..< parts.length
+      if i > 0
+        out.write(scanner.hole(args(i - 1)))
+        if scanner.error != "" then return Err(scanner.error)
+      val part = StringContext(Vector(parts(i))).s()
+      scanner.feed(part)
+      out.write(part)
+      if scanner.error != "" then return Err(scanner.error)
+    scanner.finish()
+    if scanner.error != "" then Err(scanner.error) else Ok(Html(out.text))
+
+// `html"…"`: markup from a template, with each hole written for the place it stands in, as the
+// browser will read the template:
+//
+// - in an element's text, `<textarea>`'s and `<title>`'s included, an `Html` as it is and any other
+//   value escaped by `escapeHtml`;
+// - in an attribute's quoted value, escaped by `escapeHtml`; in a URL attribute such as `href` or
+//   `src`, passed through `safeUrl` first when it begins the value, or percent-encoded when it
+//   follows text of the value;
+// - in a `<script>` element or an event handler attribute such as `onclick`, as `jsString` writes
+//   it, a whole string literal; a hole written just inside quotes there, or an `Html` there, traps;
+// - anywhere else, which no escaping makes safe, it traps: in a tag's or an attribute's name, as an
+//   unquoted attribute value, in a comment or a declaration, in a `style` or `srcdoc` attribute, and
+//   in `<style>` and the other elements of raw text.
+//
+// A template whose script holds `<!--`, or that ends anywhere but in an element's text, traps too,
+// so markup made by `html"…"` can always be joined to more. `Html.render` answers the same markup,
+// or the reason as an `Err` where `html"…"` traps.
+trait HtmlInterpolation
+  html(args: Display*) -> Html
+
+impl HtmlInterpolation for StringContext
+  html(args: Display*) -> Html = Html.render(parts, args) match
+    Ok(h) -> h
+    Err(why) -> fail(why)
+
+// `text` with `&`, `<`, `>`, `"` and `'` written as the character references `&amp;`, `&lt;`,
+// `&gt;`, `&quot;` and `&#39;`, and every other character as it is. The result is safe as an
+// element's text and as an attribute's value in double or single quotes, where the browser reads it
+// back as `text`; it is not safe as an unquoted attribute value, in a script or style, or as a URL
+// (see `escapeAttribute`, `escapeJs` and `safeUrl`).
+escapeHtml(text: string) -> string
+  val out = StringWriter()
+  val n = text.byteLength
+  var plain = 0
+  for i in 0 ..< n
+    val reference = textReference(char(int(text.byteAt(i))))
+    if reference != ""
+      out.write(text.slice(plain, i))
+      out.write(reference)
+      plain = i + 1
+  if plain == 0 then return text
+  out.write(text.slice(plain, n))
+  out.text
+
+private textReference(c: char) -> string
+textReference('&') = "&amp;"
+textReference('<') = "&lt;"
+textReference('>') = "&gt;"
+textReference('"') = "&quot;"
+textReference('\'') = "&#39;"
+textReference(_) = ""
+
+// `text` with every ASCII character but a letter and a digit written as a hexadecimal character
+// reference (`&#x20;` for a space), and every other character as it is. The result is safe as an
+// attribute's value in double quotes, single quotes or none, where the browser reads it back as
+// `text`; it is not safe in a script, a style, or as a URL. An empty `text` is empty, and an empty
+// unquoted value takes the next attribute as its own, so an unquoted value still needs one character.
+escapeAttribute(text: string) -> string
+  val out = StringWriter()
+  val n = text.byteLength
+  var plain = 0
+  for i in 0 ..< n
+    val b = int(text.byteAt(i))
+    if b < 0x80 && !isAlphanumeric(b)
+      out.write(text.slice(plain, i))
+      out.write("&#x")
+      out.write(upperHex(b >> 4))
+      out.write(upperHex(b & 15))
+      out.write(";")
+      plain = i + 1
+  if plain == 0 then return text
+  out.write(text.slice(plain, n))
+  out.text
+
+// `text` with every character but an ASCII letter and a digit written as a script escape: `\xHH` for
+// the rest of ASCII, `\uHHHH` beyond it, and a character beyond U+FFFF as its two surrogate escapes.
+// The result is pure ASCII letters, digits and escapes, safe inside a script's string literal in
+// double quotes, single quotes or backticks, in a `<script>` element and in an event handler
+// attribute, and the literal reads back as `text`: no character of it can end a string, a comment,
+// a template or the element.
+escapeJs(text: string) -> string
+  val out = StringWriter()
+  for c in text.charIterator()
+    val n = int(c)
+    if n < 0x80 && isAlphanumeric(n) then out.writeChar(c)
+    elif n < 0x80
+      out.write("\\x")
+      out.write(upperHex(n >> 4))
+      out.write(upperHex(n & 15))
+    elif n < 0x10000 then unicodeEscape(out, n)
+    else
+      unicodeEscape(out, 0xd800 + ((n - 0x10000) >> 10))
+      unicodeEscape(out, 0xdc00 + ((n - 0x10000) & 0x3ff))
+  out.text
+
+// `text` as a script's string literal: `escapeJs(text)` in double quotes.
+jsString(text: string) -> string = s"\"${escapeJs(text)}\""
+
+private unicodeEscape(out: Writer, n: int)
+  out.write("\\u")
+  for shift in [12, 8, 4, 0]
+    out.write(upperHex((n >> shift) & 15))
+
+// The URL a link, image or form may follow: `url` itself when it is relative or its scheme is
+// `http`, `https`, `mailto` or `tel`, and otherwise `about:invalid#unsafe-url`, which goes nowhere.
+// The scheme is read as a browser reads it: after dropping the spaces and control characters at
+// either end and every tab and line break within, the text before the first `:` that comes before
+// any `/`, `?` and `#`, in either case. So `javascript:`, `data:` and `vbscript:` URLs, however
+// spelled, are refused. The result is not escaped: write it into an attribute with `escapeHtml`.
+safeUrl(url: string) -> string = if hasSafeScheme(url) then url else "about:invalid#unsafe-url"
+
+private hasSafeScheme(url: string) -> bool
+  val n = url.byteLength
+  var start = 0
+  while start < n && int(url.byteAt(start)) <= 0x20
+    start += 1
+  for i in start ..< n
+    val b = int(url.byteAt(i))
+    if b == int(':')
+      val scheme = asciiLower(url.slice(start, i).replace("\t", "").replace("\n", "").replace("\r", ""))
+      return scheme == "http" || scheme == "https" || scheme == "mailto" || scheme == "tel"
+    if b == int('/') || b == int('?') || b == int('#') then return true
+  true
+
+// `text` with every byte of its UTF-8 but a letter, a digit, `-`, `.`, `_` and `~` written as `%`
+// and two upper-case hexadecimal digits, as a part of a URL.
+private percentEncoded(text: string) -> string
+  val out = StringWriter()
+  val n = text.byteLength
+  var plain = 0
+  for i in 0 ..< n
+    val b = int(text.byteAt(i))
+    if !isAlphanumeric(b) && b != int('-') && b != int('.') && b != int('_') && b != int('~')
+      if plain < i then out.write(text.slice(plain, i))
+      out.write("%")
+      out.write(upperHex(b >> 4))
+      out.write(upperHex(b & 15))
+      plain = i + 1
+  out.write(text.slice(plain, n))
+  out.text
+
+private isAlphanumeric(b: int) -> bool =
+  (int('a') <= b <= int('z')) || (int('A') <= b <= int('Z')) || (int('0') <= b <= int('9'))
+
+private isAsciiLetter(b: int) -> bool = (int('a') <= b <= int('z')) || (int('A') <= b <= int('Z'))
+
+// The characters the HTML tokenizer reads as space between a tag's parts.
+private isSpace(b: int) -> bool = b == int(' ') || b == int('\t') || b == int('\n') || b == int('\r') || b == 0x0c
+
+private upperHex(v: int) -> string = "0123456789ABCDEF".slice(v, v + 1)
+
+// `s` with its ASCII capitals in lower case, as HTML compares tag and attribute names.
+private asciiLower(s: string) -> string
+  val out = StringWriter()
+  for c in s.charIterator()
+    if 'A' <= c <= 'Z' then out.writeChar(char(int(c) + 32)) else out.writeChar(c)
+  out.text
+
+// The attributes whose value is a URL the browser follows or loads.
+private isUrlAttribute(name: string) -> bool = name match
+  "href" | "src" | "action" | "formaction" | "cite" | "data" | "poster" | "background" | "codebase" -> true
+  "longdesc" | "usemap" | "manifest" | "icon" | "ping" | "srcset" | "xlink:href" | "profile" -> true
+  _ -> false
+
+// The elements whose content is raw text that ends only at the element's own end tag.
+private isRawText(name: string) -> bool = name match
+  "style" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript" -> true
+  _ -> false
+
+// Where the HTML tokenizer stands, as far as a template needs to know.
+private data Mode
+  // An element's text, `<textarea>`'s and `<title>`'s included.
+  InText
+  // Just after `<`.
+  InTagOpen
+  // Just after `</`.
+  InEndTagOpen
+  InTagName
+  // Inside a tag, before an attribute's name.
+  InTag
+  InAttributeName
+  AfterAttributeName
+  // After an attribute's `=`, before its value.
+  BeforeValue
+  InDoubleQuotedValue
+  InSingleQuotedValue
+  InUnquotedValue
+  // After `<!`, before the two dashes that begin a comment.
+  InMarkup
+  InComment
+  // `<?…>`, `<!doctype …>` and the like, up to the next `>`.
+  InBogus
+  // A `<script>` element's content.
+  InScript
+  // The content of another element of raw text, such as `<style>`.
+  InRawText
+  // Everything after `<plaintext>`.
+  InPlaintext
+
+// The HTML tokenizer's state over a template's text, which `render` feeds part by part.
+private class Scanner(
+    private var mode: Mode,
+    private var closing: bool,
+    private var nameStart: int,
+    private var tag: string,
+    private var attribute: string,
+    private var valueStarted: bool,
+    private var last: int,
+    private var dashes: int,
+    private var problem: string
+)
+  // Why the template cannot be made safe, or empty while it can.
+  error -> string = problem
+
+  // Reads the template text `part`.
+  feed(part: string)
+    val n = part.byteLength
+    var i = 0
+    while i < n
+      i = step(part, i)
+
+  // Reads the byte at `i` of `part`, answering the offset of the next byte to read.
+  private step(part: string, i: int) -> int
+    val c = int(part.byteAt(i))
+    mode match
+      InText -> if c == int('<') then mode = InTagOpen
+      InTagOpen ->
+        if isAsciiLetter(c) then startTag(i, false)
+        elif c == int('/') then mode = InEndTagOpen
+        elif c == int('!')
+          mode = InMarkup
+          dashes = 0
+        elif c == int('?') then mode = InBogus
+        else
+          mode = InText
+          return i
+      InEndTagOpen ->
+        if isAsciiLetter(c) then startTag(i, true)
+        elif c == int('>') then mode = InText
+        else mode = InBogus
+      InTagName ->
+        if isSpace(c) || c == int('/') || c == int('>')
+          tag = asciiLower(part.slice(nameStart, i))
+          if c == int('>') then endOfTag() else mode = InTag
+      InTag ->
+        if c == int('>') then endOfTag()
+        elif !isSpace(c) && c != int('/') then startAttribute(i)
+      InAttributeName ->
+        if isSpace(c) || c == int('/') || c == int('=') || c == int('>')
+          attribute = asciiLower(part.slice(nameStart, i))
+          if isSpace(c) then mode = AfterAttributeName
+          elif c == int('/') then mode = InTag
+          elif c == int('=') then mode = BeforeValue
+          else endOfTag()
+      AfterAttributeName ->
+        if c == int('/') then mode = InTag
+        elif c == int('=') then mode = BeforeValue
+        elif c == int('>') then endOfTag()
+        elif !isSpace(c) then startAttribute(i)
+      BeforeValue ->
+        if c == int('"') then startValue(InDoubleQuotedValue)
+        elif c == int('\'') then startValue(InSingleQuotedValue)
+        elif c == int('>') then endOfTag()
+        elif !isSpace(c) then mode = InUnquotedValue
+      InDoubleQuotedValue -> if c == int('"') then mode = InTag else noteValue(c)
+      InSingleQuotedValue -> if c == int('\'') then mode = InTag else noteValue(c)
+      InUnquotedValue ->
+        if isSpace(c) then mode = InTag
+        elif c == int('>') then endOfTag()
+      InMarkup ->
+        if c == int('-')
+          dashes += 1
+          if dashes == 2
+            mode = InComment
+            dashes = 0
+        elif c == int('>') then mode = InText
+        else mode = InBogus
+      InComment ->
+        if c == int('-') then dashes += 1
+        elif c == int('>') && dashes >= 2 then mode = InText
+        else dashes = 0
+      InBogus -> if c == int('>') then mode = InText
+      InScript ->
+        if part.startsWith("<!--", i) then note(
+          "an `html` template's script holds `<!--`, which changes where the browser ends the script"
+        )
+        if c == int('<') && closes(part, i) then return i + 2 + tag.byteLength
+        last = c
+      InRawText -> if c == int('<') && closes(part, i) then return i + 2 + tag.byteLength
+      InPlaintext -> ()
+    i + 1
+
+  // Whether the end tag of the raw text element `tag` begins at `i` of `part`, entering it if so.
+  private closes(part: string, i: int) -> bool
+    val end = i + 2 + tag.byteLength
+    if end > part.byteLength || !part.startsWith("</", i) then return false
+    if asciiLower(part.slice(i + 2, end)) != tag then return false
+    if end < part.byteLength
+      val after = int(part.byteAt(end))
+      if !isSpace(after) && after != int('/') && after != int('>') then return false
+    closing = true
+    mode = InTag
+    true
+
+  private startTag(i: int, end: bool)
+    mode = InTagName
+    closing = end
+    nameStart = i
+
+  private startAttribute(i: int)
+    mode = InAttributeName
+    nameStart = i
+
+  private startValue(quoted: Mode)
+    mode = quoted
+    valueStarted = false
+    last = -1
+
+  private noteValue(c: int)
+    if !isSpace(c) then valueStarted = true
+    last = c
+
+  // The `>` that ends a tag: a start tag of a raw text element begins its content.
+  private endOfTag()
+    if closing then mode = InText
+    elif tag == "script"
+      mode = InScript
+      last = -1
+    elif isRawText(tag) then mode = InRawText
+    elif tag == "plaintext" then mode = InPlaintext
+    else mode = InText
+
+  // `value` written for the place the scanner stands in, as a template's hole.
+  hole(value: Display) -> string
+    val written = mode match
+      InText -> if value is h: Html then h.text else escapeHtml(value.toString())
+      InDoubleQuotedValue | InSingleQuotedValue -> attributeHole(value)
+      InScript -> scriptHole(value, "a script")
+      InTagOpen | InEndTagOpen | InTagName -> refuse("names a tag")
+      InTag | InAttributeName | AfterAttributeName -> refuse(
+        "stands inside a tag, where only a quoted attribute value takes one"
+      )
+      BeforeValue | InUnquotedValue -> refuse(s"is the unquoted value of `$attribute`; write the value in quotes")
+      InMarkup | InComment -> refuse("stands in a comment")
+      InBogus -> refuse("stands in a declaration such as `<!doctype>`")
+      InRawText -> refuse(s"stands in a `<$tag>` element, whose content is not escaped")
+      InPlaintext -> refuse("stands after `<plaintext>`")
+    valueStarted = true
+    last = -1
+    written
+
+  private attributeHole(value: Display) -> string
+    val text = if value is h: Html then h.text else value.toString()
+    if attribute.startsWith("on") then return escapeHtml(scriptHole(value, s"the event handler `$attribute`"))
+    if attribute == "style" then return refuse("stands in a `style` attribute, whose value is not escaped")
+    if attribute == "srcdoc" then return refuse("stands in a `srcdoc` attribute, whose value is a document of its own")
+    if isUrlAttribute(attribute)
+      escapeHtml(if valueStarted then percentEncoded(text) else safeUrl(text))
+    else escapeHtml(text)
+
+  private scriptHole(value: Display, where: string) -> string
+    if value is _: Html then return refuse(s"in $where is `Html`, which is trusted as markup, not as script")
+    if last == int('"') || last == int('\'') || last == int('`') then return refuse(
+      s"in $where stands inside quotes; write it bare, as it becomes a whole string literal"
+    )
+    jsString(value.toString())
+
+  // Notes a hole that no escaping makes safe where it stands, answering no text for it.
+  private refuse(why: string) -> string
+    note(s"an `html` template's hole $why")
+    ""
+
+  // Notes the first reason the template cannot be made safe.
+  private note(why: string)
+    if problem == "" then problem = why
+
+  // Notes the template's end unless it has ended where its markup may be joined to other markup.
+  finish()
+    val where = mode match
+      InText -> ""
+      InScript | InRawText -> s"inside a `<$tag>` element"
+      InMarkup | InComment -> "inside a comment"
+      InBogus -> "inside a declaration such as `<!doctype>`"
+      InPlaintext -> "after `<plaintext>`"
+      _ -> "inside a tag"
+    if where != "" then note(s"an `html` template ends $where")

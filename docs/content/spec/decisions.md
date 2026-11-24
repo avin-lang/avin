@@ -13329,3 +13329,37 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-24 (branch `html-escape`): **`avin.html` escapes per
+  context, and `html"…"` is a contextual auto-escaping template whose output is the trusted `Html`.**
+  (1) Five escapers, each for one context, each safe on its own: `escapeHtml` (the five characters
+  `& < > " '`, for text and quoted attributes; `'` as `&#39;`, which every HTML version reads),
+  `escapeAttribute` (every ASCII non-alphanumeric as `&#xHH;`, the OWASP rule for any attribute value,
+  unquoted too), `escapeJs` (every character but ASCII letters and digits as `\xHH`/`\uHHHH`, so the
+  output is pure ASCII and cannot end a string, comment, template, regular expression or the
+  `<script>` element, U+2028/9 included), `jsString` (that in double quotes) and `safeUrl` (relative
+  URLs and `http`, `https`, `mailto`, `tel` kept; anything else `about:invalid#unsafe-url`, the scheme
+  read as a browser reads it, after stripping leading C0/space and inner tab/newline). (2) `Html` is
+  `data Html(text)`: the constructor is the explicit act of trust, since Avin has no private
+  constructors to funnel it through a named `Html.trusted`. (3) `html"…"` is a library interpolator
+  (trait + `impl` for `StringContext`) that runs a small HTML tokenizer over the template's parts and
+  writes each hole for its context: text → `escapeHtml` (an `Html` raw); quoted attribute →
+  `escapeHtml`; a URL attribute's start → `safeUrl` then escaped, later in the value → percent-encoded;
+  script and `on*` attributes → `jsString`, a whole literal; everywhere else (names, unquoted values,
+  comments, `style`, `srcdoc`, raw text elements) it traps. A template must end in text, so `Html` from
+  `html"…"` always composes. `Html.render(parts, args)` answers `Result` for the same work. (4) Holes in
+  scripts become whole string literals rather than escaped string contents, so no JavaScript lexer is
+  needed: with every non-alphanumeric escaped, even a misjudged context (a hole inside a string the
+  template author opened) yields a syntax error or a harmless `in` expression, never code; a hole just
+  after a quote traps to catch that mistake. (5) A template's context is checked when it renders, not
+  when it compiles: an interpolator is an ordinary method, and the language has no way for a library
+  to inspect a literal's parts at compile time (`f"…"` is checked by the compiler itself). WHY: the
+  smallest design that is safe by default in every context a server page meets, with raw output only
+  through a named type. ALTERNATIVES weighed: one escaper for everything (unsafe in URLs and scripts);
+  a non-contextual `html"…"` that only escapes text (silent XSS through `href` and `onclick`); a
+  template language in its own files with a compiler (a large item, likely a package); a JavaScript
+  lexer to escape inside the author's quotes (more code, more ways to misjudge); allowing unquoted
+  attribute holes with `escapeAttribute` (an empty value swallows the next attribute); escaping rather
+  than refusing `Html` in a script (it is trusted as markup, not as code). Review with the user: a
+  compile-time hook for interpolators (checking a template's parts as it compiles, as `f"…"` is), which
+  would move every template mistake from first render to compile time; and private constructors, which
+  would let `Html` be made only through a named trusting function.

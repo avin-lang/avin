@@ -1848,6 +1848,100 @@ named is of the first thing wrong.
 | `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one, base32 whose digits past a multiple of eight are 1, 3 or 6 or whose padding is not completed to eight. `at` is the text's length. |
 | `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
 
+## `avin.html`
+
+Text made safe to stand in HTML, and markup built from templates that escape every value they are
+given. An `Html` is markup trusted as it stands; the `html"…"` interpolator builds one, reading its
+template as a browser will and writing each hole escaped for the place it stands in.
+
+```text
+import avin.html.{Html, escapeHtml, escapeAttribute, jsString, safeUrl}
+
+data Link(title: string, url: string)
+
+item(link: Link) -> Html = html"<li><a href=\"${link.url}\" title=\"${link.title}\">${link.title}</a></li>"
+
+page(user: string, links: Vector[Link]) -> Html =
+  html"<h1>Hello, $user</h1><ul>${Html.join(links.map(item))}</ul><script>greet($user)</script>"
+
+main()
+  val links = [Link("Docs & <more>", "https://avin.dev/docs?a=1&b=2"), Link("Click", "javascript:alert(1)")]
+  println(page("<b>Ann</b>", links))
+  println(escapeHtml("a < b & \"c\""))
+  println(escapeAttribute("x onmouseover=1"))
+  println(jsString("</script>"))
+  println(safeUrl(" JavaScript:alert(1)"))
+```
+
+prints the page with the user's name escaped as text in the heading and as a string literal in the
+script, the first link's URL kept and the second's refused, and then:
+
+```text
+a &lt; b &amp; &quot;c&quot;
+x&#x20;onmouseover&#x3D;1
+"\x3C\x2Fscript\x3E"
+about:invalid#unsafe-url
+```
+
+### Escaping
+
+Each escaper answers text for one context, and the browser reads what it writes back as the text it
+was given. Each keeps the empty text empty and every character it does not name as it is, Unicode
+included, and answers its argument itself when nothing needs escaping.
+
+| Function | Meaning |
+| --- | --- |
+| `escapeHtml(text) -> string` | `&`, `<`, `>`, `"` and `'` written `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#39;`. Safe as an element's text, `<textarea>`'s and `<title>`'s too, and as an attribute's value in double or single quotes. |
+| `escapeAttribute(text) -> string` | Every ASCII character but a letter or digit written as a hexadecimal reference (`&#x20;` for a space). Safe as an attribute's value quoted or unquoted; an empty unquoted value takes the next attribute as its own, so an unquoted one still needs a character. |
+| `escapeJs(text) -> string` | Every character but an ASCII letter or digit written as a script escape: `\xHH` within ASCII, `\uHHHH` beyond it, a character beyond U+FFFF as its two surrogate escapes. Safe inside a string literal in double quotes, single quotes or backticks, in a `<script>` element and in an event handler attribute: no character of it can end a string, a comment, a template or the element, U+2028 and U+2029 included. |
+| `jsString(text) -> string` | `escapeJs(text)` in double quotes: a whole string literal. |
+| `safeUrl(url) -> string` | `url` itself when it is relative or its scheme is `http`, `https`, `mailto` or `tel`; otherwise `about:invalid#unsafe-url`, which goes nowhere. Not escaped: write it into an attribute with `escapeHtml`. |
+
+**`safeUrl` reads a scheme as a browser does.** It drops the spaces and control characters at the
+start and every tab and line break within, and takes the text before the first `:` that comes before
+any `/`, `?` or `#`, in either case. So ` JavaScript:`, `java\tscript:`, `data:` and `vbscript:` are
+all refused, and `/a/b:c` and `?q=a:b` are relative. A scheme part holding anything else
+(`java&script:`, `java script:`) is refused too, since no allowed scheme is spelled so. A character reference in
+the URL stays text, since the URL is escaped after it is checked: `javascript&colon;x` and
+`jav&#x09;ascript:x` (whose `#` begins a fragment) are kept, and written into an attribute as
+`javascript&amp;colon;x` and `jav&amp;#x09;ascript:x`, relative URLs.
+
+### `Html` and templates
+
+`Html(text)` is markup trusted as it stands: making one says that `text` is safe, so it is written
+only of text the program wrote itself or an escaper made. `Html.empty` is no markup,
+`Html.escaped(text)` is `Html(escapeHtml(text))`, and `Html.join(items, separator = Html.empty)` joins
+markup. An `Html` displays as its markup, so it prints and interpolates into `s"…"` as it is, and
+`Response.html(status, page)` sends it as a response of the type `text/html; charset=utf-8`.
+
+**`html"…"` writes each hole for the place it stands in**, in scope wherever `avin.html` or one of its
+declarations is imported. A hole may be any `Display` value:
+
+| Where the hole stands | What is written |
+| --- | --- |
+| An element's text, `<textarea>`'s and `<title>`'s included | An `Html` as it is; any other value escaped by `escapeHtml`. |
+| An attribute's value in double or single quotes | The value, an `Html`'s markup included, escaped by `escapeHtml`. |
+| The start of a URL attribute's value (`href`, `src`, `action`, `formaction`, `xlink:href` and the others whose value a browser follows) | The value passed through `safeUrl`, then escaped. Blanks written before it in the template are not text of the value. |
+| A URL attribute's value after text of it, as in `href="/search?q=$q"` | The value percent-encoded, every byte of its UTF-8 but a letter, a digit, `-`, `.`, `_` and `~`, then escaped. |
+| A `<script>` element, or an event handler attribute (`onclick`, any name beginning `on`) | The value as `jsString` writes it, a whole string literal, then, in an attribute, escaped. |
+
+**A hole where no escaping makes it safe traps**, naming why: a hole in a tag's name or among its
+attributes, an attribute's name, an unquoted attribute value (write it in quotes), a comment, a
+declaration such as `<!doctype>`, a `style` or `srcdoc` attribute, the content of `<style>`,
+`<noscript>`, `<iframe>`, `<xmp>`, `<noembed>`, `<noframes>` and everything after `<plaintext>`; a hole
+in a script written just inside quotes (`f('$x')`: write `f($x)`, since the hole becomes the whole
+literal); and an `Html` in a script, which is trusted as markup, not as script. A template whose
+script holds `<!--`, which changes where the browser ends it, traps, and so does one that ends
+anywhere but in an element's text, inside a tag, a comment or a script, so markup made by `html"…"`
+can always be joined to more. `Html.render(parts, args)` is the interpolator as a function: the
+markup, or the reason as an `Err` where `html"…"` traps.
+
+**The template is read as the program runs**, each time it renders, as the HTML tokenizer reads it:
+tag and attribute names in either case, the end of a script or a style only at its own end tag, a
+`<` not followed by a letter, `/`, `!` or `?` as text. Its escapes are decoded first, as `s"…"`
+decodes them. A mistake in a template is found the first time it renders, not as the program
+compiles.
+
 ## `avin.log`
 
 Structured logging for programs that run for a long time: records of a level, a message and
