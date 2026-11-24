@@ -5018,8 +5018,34 @@ spec did not settle, each settled on the user's delegation 2026-11-06. Review wi
   out-of-range mode silently to `0o7777`, as Sysl's `set_permissions` does (a type bit passed by
   mistake, `0o100644` from a raw `st_mode`, would succeed quietly); trapping instead of `Err` (a mode
   read from a config file is input, not a program bug; `File.seek`'s negative offset is the same
-  shape and answers `Err`). Creating a file with a mode from the start (no moment with wider bits)
-  is not in this entry: Sysl 0.13.2 exposes no create-with-mode, `fchmod` or umask call.
+  shape and answers `Err`). Creating a file with a mode from the start is the next entry.
+
+- **Creating files with a mode in `avin.fs`** Settled on the user's delegation 2026-11-24 (branch
+  `fs-create-mode`, on Sysl 0.13.4's `create(path, mode)`, `create_update(path, mode)` and
+  `File.set_permissions`): `create`, `createUpdate`, `writeLines`, `writeTextAtomic` and
+  `writeBytesAtomic` take a last optional `mode: int = 0o666`, the bits a new file is made with, which
+  the umask narrows as every new file is; a file already there keeps its mode. `File.setPermissions
+  (mode)` is `fchmod` on the open file. Both validate as `fs.setPermissions` does: outside `0o0`..
+  `0o7777` is an `Err` of kind `Other` raised before anything is touched (no file made or emptied,
+  no parents made). **An atomic write keeps the exact bits of the file it replaces** (`mode` applies
+  only where there was none): the pending file is made with those bits (so less the umask, never
+  more than the result), written and flushed, then `fchmod`ed to them exactly, since a write clears
+  setuid and setgid and the umask may have taken others. **After the rename the directory is synced**
+  (opened to read and `fsync`ed), so the rename survives a crash; a failure there is an `Err` with the
+  new contents already in place. Why: marshal's remote-API token must be owner-only from the moment
+  it exists, and an atomic rewrite of it must not widen it; the old atomic write gave the replacement
+  default bits. Alternatives weighed: chmod after create (the window the item exists to close); the
+  atomic write taking `mode` even over an existing file (a rewrite would silently change a file's
+  bits, and `writeText` already keeps them); creating the pending file `0o600` and chmod-ing it to
+  the target's bits (as safe, but making it with the target's own bits keeps one rule for the new
+  and the replacing case); ignoring a failed directory sync (the
+  point of the sync is that the caller learns the write may not survive). `writeText`, `writeBytes`,
+  `appendText`, `appendBytes` and `append` take no mode: Sysl's `write_bytes`, `write_text`, `append`
+  and the `append_*` calls take none, and building them on `create(path, mode)` plus a write would
+  report a failed large write as `Other` rather than its kind, since `File`'s latched failure is not
+  public in Sysl; that is a Sysl gap, closed there first. The umask cannot be read or set from Avin, so the tests measure
+  it by making a `0o777` file. Review with the user: the directory-sync failure answering `Err`
+  after the rename, and whether `appendText`/`writeText` should gain `mode` once Sysl offers it.
 
 - **`isFile` means a regular file** Settled on the user's delegation 2026-11-23 (branch
   `fs-metadata`): `fs.isFile(path)` and `Metadata.isFile` are true for a regular file alone; a FIFO,
