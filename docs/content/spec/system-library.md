@@ -1320,6 +1320,19 @@ backupOf(file: string) -> string
 | `stem(p) -> Option[string]` | The file name without its extension and its dot: `a.tar` for `a.tar.gz`, `.profile` for `.profile`. |
 | `normalize(p) -> string` | `.` and `..` resolved in the text, doubled and trailing `/` dropped. A `..` at the root is dropped (`/..` is `/`), one leading a relative path is kept (`a/../..` is `..`), and a path that cancels to nothing is `/` or `.`. |
 | `relativeTo(p, base) -> Option[string]` | `p` written from `base`, both normalized: `../c` for `/a/c` from `/a/b`, `.` for a path from itself. `None` when one is absolute and the other not, or when `base` climbs above what it names with `..`. |
+| `root(p) -> Option[string]` | `Some("/")` for an absolute path, `None` for a relative one. |
+| `isHidden(p) -> bool` | Whether the file name starts with a dot: `a/.git` is hidden, `a/b`, `.`, `..` and the root are not. |
+| `withFileName(p, name) -> string` | `p` with its file name replaced by `name` as written: `/a/b.txt` and `c` give `/a/c`. A path with no file name (`/`, `""`, `.`, `..`, `a/..`) has `name` added after it; an empty `name` leaves the directory alone. |
+| `withExtension(p, ext) -> string` | `p` with the extension of its file name replaced by `ext`, given without its dot: `a.tar.gz` and `xz` give `a.tar.xz`, `a` and `txt` give `a.txt`; an empty `ext` removes the extension; a dotfile such as `.profile` gains one (`.profile.bak`). A path with no file name is returned unchanged. |
+| `sibling(p, name) -> string` | `join` of the parent of `p` and `name`: `/a/b` and `c` give `/a/c`, `b` and `c` give `c`. An absolute `name` is the answer; `name` may hold separators. A path with no file name has `name` joined after it. |
+| `startsWith(p, prefix) -> bool` | Whether the components of `prefix` begin those of `p`, and both are absolute or neither is: `/a/b` starts with `/a` and `/`, not with `/ab` or `a`. Doubled and trailing `/` do not matter; `.` and `..` are not resolved. |
+| `endsWith(p, suffix) -> bool` | Whether the components of `suffix` end those of `p`: `/a/b/c` ends with `c`, `b/c` and `/a/b/c`, not with `bc` or `/c`. An absolute `suffix` must be the whole of an absolute `p`. |
+
+```text
+import avin.fs
+
+reportFor(source: string) -> string = fs.withExtension(fs.sibling(source, "out/" + fs.stem(source).getOrElse("x")), "html")
+```
 
 The questions below ask the file system.
 

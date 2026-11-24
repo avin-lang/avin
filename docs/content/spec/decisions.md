@@ -13329,3 +13329,19 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-24 (branch `fs-path-helpers`): **path helpers in `avin.fs`**
+  (`root`, `isHidden`, `withFileName`, `withExtension`, `sibling`, `startsWith`, `endsWith`; glob
+  alternation was already in). All are pure text, written in Avin over the existing path bindings.
+  (1) `startsWith`/`endsWith` compare components, never characters (`/ab` does not start with `/a`),
+  and never normalize: `a/../b` does not start with `b`'s directory, since resolving `..` without the
+  file system can name another file. `startsWith` also requires equal absoluteness; an absolute suffix
+  must be the whole of an absolute path. (2) `withFileName` uses `name` as written and a path with no
+  file name (`/`, `.`, `..`) has it appended, so the function is total and never loses the directory;
+  an empty name leaves the directory. `sibling` is `join` of the parent and the name, so an absolute
+  name wins, as in `join`; the two differ only there. (3) `withExtension` takes the extension without
+  its dot, an empty one removes it, a path with no file name is unchanged, and a dotfile gains one
+  (`.profile.bak`), matching `stem`. (4) `root` is `Option[string]` (`Some("/")` or `None`), as POSIX
+  has one root and the `Option` matches `parent` and `fileName`. Alternatives weighed: `Result` for a
+  name holding `/` or an empty extension (every caller then unwraps for what is sometimes wanted);
+  normalizing before comparing (silently wrong across links); a `string` root (`""`) for relative paths
+  (cannot tell "no root" from a root written empty).
