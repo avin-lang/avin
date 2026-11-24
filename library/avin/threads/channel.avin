@@ -16,7 +16,9 @@ impl[T: Sendable] Sendable for Channel[T]
 // With a capacity of zero it holds no value at all: each send hands its value straight to a receiver,
 // and waits until one has taken it. `close` ends it: a send to a closed channel traps, and once the
 // values sent before the close are received, `receive` gives `None`. A thread waiting to send or
-// receive is safe for the collector while it waits. Iterating a channel receives from it until it is
+// receive is safe for the collector while it waits. A send puts the Sysl handles its value reaches,
+// an open file or a connection, in transit, so the thread that receives it takes them by using them;
+// once the receiver has, the sender's next use traps. Iterating a channel receives from it until it is
 // closed and drained:
 //
 //     for job in jobs do run(job)
@@ -25,7 +27,9 @@ impl[T: Sendable] Sendable for Channel[T]
 // its next value falls due, a number in the channel, so it costs no timer and no thread while nobody
 // waits on it. The value is delivered by the first receive or select that looks once the time has
 // come, and a thread waiting on such a channel waits on its condition until that time at the most.
-@trusted_sendable("every field but its lock is read and written only while its lock is held, except `timed`, set before the channel is shared")
+@trusted_sendable(
+  "every field but its lock is read and written only while its lock is held, except `timed`, set before the channel is shared"
+)
 @keeps_owners
 class Channel[T](val capacity: int = unbounded): Iterable[T]
   private val bound = boundOf(capacity)
@@ -52,7 +56,7 @@ class Channel[T](val capacity: int = unbounded): Iterable[T]
   // Puts `x` at the back, waiting while a bounded channel is full, or, on a channel of capacity zero,
   // until a receiver has taken it; traps where the channel is closed, or is closed while it waits.
   send(x: T)
-    sendable()
+    sendable(x)
     if bound == 0
       _ = handOff(x, 0)
       return
@@ -71,7 +75,7 @@ class Channel[T](val capacity: int = unbounded): Iterable[T]
   // less is `trySend`. Traps where the channel is closed, as `send` does.
   send(x: T, timeout: Duration) -> bool
     if timeout.micros <= 0 then return trySend(x)
-    sendable()
+    sendable(x)
     val deadline = monotonic().micros +| timeout.micros
     if bound == 0 then return handOff(x, deadline)
     lock.acquire()
@@ -89,7 +93,7 @@ class Channel[T](val capacity: int = unbounded): Iterable[T]
   // Puts `x` at the back where there is room now, or, on a channel of capacity zero, hands it to a
   // receiver waiting now, and answers whether it did; traps where the channel is closed.
   trySend(x: T) -> bool
-    sendable()
+    sendable(x)
     if bound == 0 then return handOff(x, -1)
     lock.acquire()
     if closed
@@ -185,9 +189,13 @@ class Channel[T](val capacity: int = unbounded): Iterable[T]
   // Whether a bounded channel holds as many values as it may; under the lock.
   private full() -> bool = bound > 0 && items.length >= bound
 
-  // Traps where `after` or a `Ticker` made the channel: its values come from its clock alone.
-  private sendable()
+  // Traps where `after` or a `Ticker` made the channel: its values come from its clock alone. Then
+  // puts the Sysl handles `x` reaches that the sending code owns in transit, before any receiver can
+  // see it, so the receiver takes them by using them; a value the send does not deliver after all is
+  // still the sender's to use.
+  private sendable(x: T)
     if timed then fail("a send to a channel `after` or a `Ticker` made, which only its clock sends to")
+    giveUp(x)
 
   // Delivers what the channel's clock has fallen due for, if anything; under the lock. A clock of one
   // value delivers it and ends. A ticking one delivers a tick where the channel holds none, and moves
@@ -359,7 +367,7 @@ impl[T] Channel[T]
   // A send of `x` by arm `index` of the select `wait`: whether there was room for it, the arm
   // enlisted where there was not and `enlist`; traps where the channel is closed, as `send` does.
   offerSend(x: T, wait: Selecting, index: int, enlist: bool) -> bool
-    sendable()
+    sendable(x)
     lock.acquire()
     if closed
       lock.release()
@@ -430,7 +438,7 @@ impl[T] Channel[T]
   // answers: whether a receiver waiting took it. `party` stands for the arm, and a select still trying
   // its arms is waited out, as in `offerTake`.
   offerGive(x: T, wait: Selecting, index: int, enlist: bool, party: Party[T]) -> bool
-    sendable()
+    sendable(x)
     loop
       lock.acquire()
       if party.done
@@ -489,7 +497,9 @@ impl[T] Channel[T]
 // When a channel `after` or a `Ticker` made has its next value: `due`, on the monotonic clock in
 // microseconds, and every `period` after it where `period` is positive. `stamp` makes the value for a
 // time it fell due. A ticker holds its clock only to name it to `stopClock`.
-@trusted_sendable("`due` is read and written only under the lock of the one channel the clock belongs to, and `stamp` is a top-level function of the module")
+@trusted_sendable(
+  "`due` is read and written only under the lock of the one channel the clock belongs to, and `stamp` is a top-level function of the module"
+)
 private class Clock[T](var due: long, val period: long, val stamp: (long) -> T): Sendable
 
 // A thread waiting on a channel of capacity zero to hand a value over: a plain send or receive, which
