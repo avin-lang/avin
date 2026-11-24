@@ -13329,3 +13329,26 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   `=` as an empty-named cookie (6265bis; no server needs it). A cookie jar (domain/path matching,
   expiry, public suffixes) is a later item. Review with the user: strict value octets on `Cookie`
   (a client sending `a=b,c` loses that cookie).
+- Settled on the user's delegation 2026-11-24 (branch `fs-listing-dirs`): **directory listing with
+  paths and kinds, and the well-known directories.** (1) `fs.list(dir, pattern = None, skipInvalid =
+  false)` answers `Vector[DirEntry(name, path, kind)]`, sorted as `listDir`; `kind` is the entry's own
+  (an `lstat`, so a link is `Symlink`), which lists a dangling link and never hides a loop; it costs one
+  `lstat` per entry, which is what the directory's own `d_type` would save but sysl does not expose.
+  (2) Laziness is where it is cheap: `fs.entries` reads the names in one `readdir` pass (a directory
+  stream held open across fiber switches would pin a descriptor, and sysl offers no streaming
+  listing) and stats each entry as the iterator reaches it; an entry vanished meanwhile is skipped.
+  (3) A non-UTF-8 name fails the listing by default, as `listDir` and sysl do (a silently missing entry
+  is a wrong answer that looks right: a copy that leaves a file behind); `skipInvalid = true` is the
+  explicit way through a hostile directory. Alternatives weighed: lossy names (a path that no longer
+  names the file), always skip, a byte-string name type (a second path type for the whole library).
+  (4) A vanished entry is skipped by `list`, any other `lstat` error fails it. (5) The pattern is the
+  existing `matches` grammar applied to the name, so hidden names need a literal `.`. (6) The
+  well-known directories live in `avin.process` beside `homeDir` and `currentDir` (they are facts about
+  where the program runs, and `avin.fs` stays about paths): `tempRoot`, `cacheDir`, `configDir`,
+  `dataDir`, `setCurrentDir`. macOS follows its conventions (`~/Library/Caches`, `~/Library/Application
+  Support` for both configuration and data) and ignores XDG; elsewhere an XDG variable counts only when
+  absolute (the freedesktop rule), else the home leaf. They only name a path and make nothing.
+  `tempRoot` is `TMPDIR` if absolute else `/tmp`, taken as written (no trailing-slash trimming). The
+  Windows spellings are not offered since paths are POSIX. (7) `fs.hardLink` and
+  `process.setCurrentDir` are thin bindings; `setCurrentDir` is process-wide, documented as a
+  program's call, never a library's.
