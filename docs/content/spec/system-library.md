@@ -1961,7 +1961,7 @@ uses it again.
 
 | Function | Meaning |
 | --- | --- |
-| `TcpStream.connect(host: string, port: int) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. |
+| `TcpStream.connect(host: string, port: int, timeout: Duration = Duration.Zero) -> Result[TcpStream, IoError]` | A connection to the first of the host's addresses that answers; where none does, the last one's error. The lookup and the connecting, to every address tried, must be done within `timeout`, else the error is `TimedOut`; zero leaves the waits to the system's own limits, and a negative `timeout` traps. |
 | `s.read(max: int) -> Result[Array[byte], IoError]` | Up to `max` bytes, at least one, waiting for at least one; empty when the other end has finished sending. |
 | `s.readLine() -> Result[Option[string], IoError]` | The next line, as standard input reads one, `None` at the end. |
 | `s.readAll() -> Result[Array[byte], IoError]` | Everything until the other end has finished sending. |
@@ -2044,7 +2044,8 @@ listener a thread is parked on traps, as any use of it from there does.
 cannot be stopped halfway, so the runtime makes each lookup on a helper thread of its own, and the
 `connect` or `bind` that asked waits for the answer as it waits on a socket: a lightweight thread
 parks, `main` waits safe for the collector, and a [cancellation](/spec/threads/#cancellation) or a
-`withTimeout`'s deadline stops the thread at once, so a connect's time limit covers the lookup too.
+`withTimeout`'s deadline stops the thread at once, so a connect's time limit covers the lookup too;
+`connect`'s own `timeout`, running out, abandons the lookup the same way and fails as `TimedOut`.
 The lookup it abandoned runs on to the resolver's answer, which is thrown away. At most 64 helpers
 run at once, which bounds how many abandoned lookups can still be running; a lookup asked for while
 all 64 are busy waits for one to come free, and that wait too is ended by a cancellation. A numeric
@@ -2180,9 +2181,15 @@ main() -> Result[unit, TlsError | IoError]
 
 | Member | Meaning |
 | --- | --- |
-| `TlsStream.connect(host, port, settings: TlsClient = TlsClient()) -> Result[TlsStream, TlsError]` | A TCP connection as `TcpStream.connect` makes one, then TLS as the client, the certificate checked for `host`. |
-| `TlsStream.client(tcp: TcpStream, host, settings = TlsClient()) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, its handshake waiting with `tcp`'s limit. Where it fails, `tcp` is the caller's to close. |
-| `TlsStream.server(tcp: TcpStream, settings: TlsServer) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate. |
+| `TlsStream.connect(host, port, settings: TlsClient = TlsClient(), timeout = seconds(30)) -> Result[TlsStream, TlsError]` | A TCP connection as `TcpStream.connect` makes one, then TLS as the client, the certificate checked for `host`. The lookup, the connecting and the handshake together must be done within `timeout`, else the connection is closed and the error is `Transport` of kind `TimedOut`. The connection made has no limit on its waits until `setTimeout` gives it one. |
+| `TlsStream.client(tcp: TcpStream, host, settings = TlsClient(), timeout = Duration.Zero) -> Result[TlsStream, TlsError]` | TLS as the client over a connection the caller made, each of its handshake's waits with `tcp`'s limit and the whole handshake within `timeout`, else `Transport` of kind `TimedOut`; `tcp`'s limit is put back afterwards. Where it fails, `tcp` is the caller's to close. |
+| `TlsStream.server(tcp: TcpStream, settings: TlsServer, timeout = Duration.Zero) -> Result[TlsStream, TlsError]` | TLS as the server over an accepted connection, presenting the settings' certificate, its handshake bounded as `client`'s is. |
+
+A handshake's waits are each bounded by the connection's own limit, but a peer sending a byte just
+inside that limit, again and again, would hold a handshake open for ever; the `timeout` bounds the
+whole of it, each wait cut to what is left. Zero takes the bound away, as it does for the low-level
+`client` and `server` unless asked, since their caller owns the connection and its timing; a
+negative `timeout` traps.
 | `s.read`, `readLine`, `readAll`, `write`, `writeText`, `setTimeout` | As a `TcpStream`'s, of plaintext; the limit is the TCP connection's, for each of its waits. |
 | `s.readable() -> bool`, `s.readinessDescriptor() -> int` | Whether a read of plaintext would answer now: plaintext is buffered or TLS holds some decrypted, a whole record of it has arrived, or the peer has closed TLS or the connection. It hands TLS the ciphertext already on the socket, so part of a record is not taken for plaintext, and never waits for more; a failure it meets is answered by the next read. The descriptor is the TCP connection's. |
 | `s.shutdownOutput()` | Closes TLS (a `close_notify`) and the TCP connection's sending side; reading goes on. |
@@ -2298,8 +2305,8 @@ main()
 `http.serve(host, port, handler: Handler, maxConnections = 1024,
 readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5), maxHeaderBytes =
 16384, maxBodyBytes = 1048576, tls: Option[TlsServer] = None, errors: ErrorPage = plainError,
-date: bool = true, requestTimeout = seconds(60)) -> Result[TcpServer, IoError]` listens as
-`TcpServer.start` does. **Each
+date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10)) -> Result[TcpServer,
+IoError]` listens as `TcpServer.start` does. **Each
 response carries a `Date` header** (RFC 9110 section 6.6.1), the time it is sent as an IMF-fixdate
 (`Sun, 06 Nov 1994 08:49:37 GMT`, as `Instant.toHttpDate()` writes it), on every status: a
 handler's, the server's own `400` or `503`, sized, chunked, closing and event-stream responses
@@ -2312,8 +2319,12 @@ wait while a request is read may last `readTimeout`, each wait while a response 
 whole of a request, its line, headers and body, must arrive within `requestTimeout` of its first
 byte, so a client trickling bytes just faster than `readTimeout` cannot hold a connection, and its
 slot among `maxConnections`, for ever. Each request on a kept-alive connection has a bound of its
-own, and the idle wait before it is no part of it. Zero takes any of these limits away. A
-`maxHeaderBytes` less than one, a `maxBodyBytes` less than zero or a negative `requestTimeout` traps.
+own, and the idle wait before it is no part of it. With `tls`, each connection's TLS handshake,
+from the connection's acceptance, must be done within `handshakeTimeout`, each of its waits also
+bounded by `readTimeout`; a connection whose handshake runs out of time is closed unanswered, since
+no HTTP answer can reach it before TLS is set up, and its slot freed. Zero takes any of these limits
+away. A `maxHeaderBytes` less than one, a `maxBodyBytes` less than zero or a negative
+`requestTimeout` or `handshakeTimeout` traps.
 A server taking bodies larger than the default `maxBodyBytes` from slow clients raises
 `requestTimeout` with it. The
 wait for a connection's next request, its first among them, is made through `idle`, so a shutdown
@@ -2688,7 +2699,8 @@ and middleware alike, and it works over TLS as every route does.
 `WebSocket.connect(url, headers = [], protocols = [], tls = TlsClient(), timeout = seconds(30),
 maxMessageBytes = 1048576, outboxSize = 64) -> Result[WebSocket, WebSocketError]` opens `ws://` and `wss://` URLs,
 the latter over TLS checked as an `https` request's is, sending `headers` and offering `protocols`
-in the handshake; `timeout` limits each wait of the handshake and each write after it.
+in the handshake; `timeout` limits each wait of the handshake and each write after it, and the
+lookup, the connecting and a `wss://` URL's TLS handshake together. A negative `timeout` traps.
 
 A `WebSocket` sends `send(text)` and `send(bytes)` as one message each, a message over 65536 bytes in
 fragments of that many written one after another, `ping(payload = [])` (at most
@@ -2831,7 +2843,7 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | `http.post(url: string, body: string, contentType: string, headers = []) -> Result[Response, HttpError]` | Sends `body`, as UTF-8, and answers the response. |
 | `http.put(url, body, contentType, headers = [])` | The same with `PUT`. |
 | `http.patch(url, body, contentType, headers = [])` | The same with `PATCH`. |
-| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout` and `withTls`. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout`, `withTls` and `withConnectTimeout`. |
 
 Every verb answers a `Result[Response, HttpError]`, and `headers`, a `Vector[(string, string)]`, are
 sent after the ones the client writes, in order. `post`, `put` and `patch` send `Content-Type:
@@ -2863,10 +2875,15 @@ request's own headers in order. `HEAD`, an interim
 `1xx` (which is skipped for the answer after it), `204` and `304` have no body. A method is a token
 and a header's name one too, and a header's value holds no line break; a request where one does not
 traps as it is made, whether the header came to `Request`'s constructor, to a verb, or by
-`withHeader` or `withHeaders`, so nothing is sent. A request's timeout bounds each read and write on its connection.
+`withHeader` or `withHeaders`, so nothing is sent. A request's timeout bounds each read and write on
+its connection. Its `connectTimeout`, 30 seconds unless `withConnectTimeout(d)` (or the constructor)
+sets another, bounds looking the host up, connecting and an `https` URL's TLS handshake together, on
+each connection the request makes, redirects included, failing with `Io` of kind `TimedOut`; zero
+takes the bound away, and a negative one traps as the request is made.
 
 **An `https` URL just works**: the client makes the TCP connection to the URL's port, 443 where it
-gives none, sets the request's timeout on it, so the handshake's waits are bounded too, and speaks
+gives none, sets the request's timeout on it, so the handshake's waits are bounded too, the whole
+handshake within what is left of the request's `connectTimeout`, and speaks
 the request over a [`TlsStream`](#tls), the certificate checked for the URL's host against the
 machine's trusted authorities and those of the request's `TlsClient`, which `withTls(client)` sets
 (`TlsClient()` unless it is set). A redirect between `http` and `https` is followed like any other,

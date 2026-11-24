@@ -350,10 +350,12 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // `requestTimeout` of its first byte, else it is answered `408` and the connection closed; zero
 // takes a limit away. A request line may be at most `maxHeaderBytes` long, and the request line and
 // headers together as long; a body may be at most `maxBodyBytes`. A `maxHeaderBytes` less than one,
-// a `maxBodyBytes` or `maxConnections` less than zero or one, or a negative `requestTimeout`, traps.
-// With `tls`, the server speaks HTTPS: each connection begins with a TLS handshake presenting its
-// certificate, each of the handshake's waits lasting at most `readTimeout`, and a connection
-// whose handshake fails is closed. A handler that traps on a TLS connection has it closed without an
+// a `maxBodyBytes` or `maxConnections` less than zero or one, or a negative `requestTimeout` or
+// `handshakeTimeout`, traps. With `tls`, the server speaks HTTPS: each connection begins with a TLS
+// handshake presenting its certificate, each of the handshake's waits lasting at most `readTimeout`
+// and the whole of it, from the connection's acceptance, at most `handshakeTimeout`; a connection
+// whose handshake fails or runs out of time is closed unanswered, freeing its place among
+// `maxConnections`. A handler that traps on a TLS connection has it closed without an
 // answer, since the answer would have to go through the connection's TLS, which ended with the
 // handler; so does one that traps while it streams a response, whose head is already sent. The
 // answers the server makes itself for an error status are rendered by `errors`. Each response
@@ -372,11 +374,13 @@ serve(
     tls: Option[TlsServer] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
-    requestTimeout: Duration = seconds(60)
+    requestTimeout: Duration = seconds(60),
+    handshakeTimeout: Duration = seconds(10)
 ) -> Result[TcpServer, IoError]
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
   if requestTimeout.isNegative then fail(s"a request timeout of $requestTimeout: it is at least zero")
+  if handshakeTimeout.isNegative then fail(s"a handshake timeout of $handshakeTimeout: it is at least zero")
   val s = Settings(
     readTimeout,
     writeTimeout,
@@ -399,15 +403,23 @@ serve(
     Some(identity) -> TcpServer.start(
       host,
       port,
-      (stream, server) -> secured(stream, server, handler, s, identity),
+      (stream, server) -> secured(stream, server, handler, s, identity, handshakeTimeout),
       maxConnections,
       failed = stream -> _ = stream.close()
     )
 
-// A connection served over TLS: the handshake, then its requests as `converse` serves them.
-private secured(tcp: TcpStream, server: TcpServer, handler: Handler, s: Settings, identity: TlsServer)
+// A connection served over TLS: the handshake, done within `handshake` in all, then its requests as
+// `converse` serves them.
+private secured(
+    tcp: TcpStream,
+    server: TcpServer,
+    handler: Handler,
+    s: Settings,
+    identity: TlsServer,
+    handshake: Duration
+)
   if tcp.setTimeout(s.readTimeout).isErr then return
-  TlsStream.server(tcp, identity) match
+  TlsStream.server(tcp, identity, handshake) match
     Ok(stream) ->
       converse(stream, server, handler, s, false)
       // The conversation is over; a close notice the client never reads changes nothing.

@@ -10825,7 +10825,44 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `readTimeout`) or 300 seconds for the default. Review with the user: whether 60 seconds suits
     as the default, since a slow client uploading the default largest body of 1 MiB needs about
     17 KB/s, and a server taking larger bodies has to raise it; and whether a TLS handshake, whose
-    waits are each `readTimeout`'s, should get a total bound too.
+    waits are each `readTimeout`'s, should get a total bound too (it did: the next entry).
+- Settled on the user's delegation 2026-11-23 (branch `tls-handshake-timeout`): **a TLS handshake
+  has a total bound, at both ends, and a client's connecting with it**
+  ([servers](/spec/system-library/#servers), [TLS](/spec/system-library/#tls)). *Why*: each of a
+  handshake's waits was bounded by the connection's limit alone, so a client trickling its
+  ClientHello a byte at a time just inside `readTimeout` held an HTTPS connection, and its slot among
+  `maxConnections`, for ever, as a plain request could before `requestTimeout`; and a client facing
+  a server that trickled its answer, or a resolver that never answered, waited as long.
+  - **`http.serve` takes a separate `handshakeTimeout`, 10 seconds unless asked**, measured from the
+    connection's acceptance (so a client silent from the start is cut by it too), each wait cut to
+    what is left and still at most `readTimeout`. On expiry the connection is closed unanswered, as
+    no HTTP answer can reach a client before TLS is set up, and its slot is freed. Reusing
+    `requestTimeout` was weighed: it is sized for bodies (60 seconds, a 1 MiB upload), while a
+    handshake is a few round trips of a few KB, and a slot held a minute by each trickler is what
+    the bound is there to prevent. It comes last among `serve`'s parameters, after
+    `requestTimeout`, so no call passing earlier ones by position changes meaning. Zero is no limit,
+    a negative one traps where the server starts, with or without `tls`, as `requestTimeout` does.
+  - **`TlsStream.client` and `TlsStream.server` take `timeout`, zero unless asked**: their caller
+    made the connection and owns its timing, and a library default there would change every existing
+    caller's behaviour; `http.serve`, the HTTP client and `WebSocket.connect` pass their own bounds.
+    The connection's own limit is put back after the handshake, done or not, and an expiry is
+    `Transport` of kind `TimedOut`, as a wait running out was.
+  - **`TlsStream.connect` takes `timeout`, 30 seconds unless asked**, covering the lookup, the
+    connecting and the handshake together, so the one call that makes the whole connection has a
+    safe default. **`TcpStream.connect` takes `timeout`, zero unless asked**, covering the lookup
+    and the connecting: the runtime's `socket_connect` and `resolve_host` take a limit, a lookup
+    running out being abandoned as a cancelled one is. Zero there leaves the waits to the system's
+    own limits, which are finite, as before.
+  - **The HTTP client's `Request` gains `connectTimeout`, 30 seconds unless asked**
+    (`withConnectTimeout`), covering the lookup, the connecting and an `https` URL's handshake on
+    each connection it makes, an expiry being `Io` of kind `TimedOut`; the per-wait `timeout` stays
+    `None` unless asked, as before. **`WebSocket.connect`'s `timeout`** (30 seconds) now also
+    bounds its lookup, connecting and `wss://` handshake in all, and a negative one traps.
+  - Alternatives weighed: a minimum data rate for the handshake, harder to state and to test;
+    bounding from the ClientHello's first byte, as `requestTimeout` does from a request's, which
+    would leave a silent client to `readTimeout`; a 30-second server default (as `readTimeout`).
+    Review with the user: whether 10 seconds suits as the server default for clients on slow
+    links, and whether `TcpStream.connect`'s default should be a bound rather than zero.
 
 - Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
   `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
