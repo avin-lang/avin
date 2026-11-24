@@ -10,7 +10,7 @@ module avin.net.http
 // is answered `500` and closed.
 
 import avin.io.{IoError, TimedOut}
-import avin.net.{ByteStream, TcpServer, TcpStream, Url}
+import avin.net.{ByteStream, KeepAlive, ListenOptions, TcpOptions, TcpServer, TcpStream, Url}
 import avin.net.tls.{TlsServer, TlsStream}
 import avin.threads.{Atomic, Mutex}
 import avin.time.{Duration, Instant, millis, monotonic, now, seconds}
@@ -358,7 +358,8 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // handler; so does one that traps while it streams a response, whose head is already sent. The
 // answers the server makes itself for an error status are rendered by `errors`. Each response
 // carries a `Date` header, the time it is sent as an HTTP-date, unless the handler gave one or `date`
-// is false; the `101` answer of an upgrade carries none.
+// is false; the `101` answer of an upgrade carries none. The server listens with the socket options
+// `listen`, `ServerListen` unless given others.
 serve(
     host: string,
     port: int,
@@ -372,12 +373,91 @@ serve(
     tls: Option[TlsServer] = None,
     errors: ErrorPage = plainError,
     date: bool = true,
-    requestTimeout: Duration = seconds(60)
+    requestTimeout: Duration = seconds(60),
+    listen: ListenOptions = ServerListen
 ) -> Result[TcpServer, IoError]
+  val s = checkedSettings(
+    readTimeout,
+    writeTimeout,
+    idleTimeout,
+    requestTimeout,
+    maxHeaderBytes,
+    maxBodyBytes,
+    errors,
+    date
+  )
+  tls match
+    None -> TcpServer.start(
+      host,
+      port,
+      (stream, server) -> converse(stream, server, handler, s),
+      maxConnections,
+      failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s),
+      listen = listen
+    )
+    Some(identity) -> TcpServer.start(
+      host,
+      port,
+      (stream, server) -> secured(stream, server, handler, s, identity),
+      maxConnections,
+      failed = stream -> _ = stream.close(),
+      listen = listen
+    )
+
+// Serves HTTP/1.1 at the Unix socket `path`, as `TcpServer.startUnix` listens there with `backlog`
+// and `replacing`, for a server that a proxy on the same machine talks to: everything else is as
+// `serve` does it, but with no TLS, which a connection that never leaves the machine does not need. A
+// request's `remote` is `None`, a Unix connection having no address.
+serveUnix(
+    path: string,
+    handler: Handler,
+    maxConnections: int = 1024,
+    readTimeout: Duration = seconds(30),
+    writeTimeout: Duration = seconds(30),
+    idleTimeout: Duration = seconds(5),
+    maxHeaderBytes: int = 16384,
+    maxBodyBytes: int = 1048576,
+    errors: ErrorPage = plainError,
+    date: bool = true,
+    requestTimeout: Duration = seconds(60),
+    backlog: int = 128,
+    replacing: bool = false
+) -> Result[TcpServer, IoError]
+  val s = checkedSettings(
+    readTimeout,
+    writeTimeout,
+    idleTimeout,
+    requestTimeout,
+    maxHeaderBytes,
+    maxBodyBytes,
+    errors,
+    date
+  )
+  TcpServer.startUnix(
+    path,
+    (stream, server) -> converse(stream, server, handler, s),
+    maxConnections,
+    failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s),
+    backlog = backlog,
+    replacing = replacing
+  )
+
+// The settings of a server, each limit first checked: a `maxHeaderBytes` less than one, a
+// `maxBodyBytes` less than zero or a negative `requestTimeout` traps.
+private checkedSettings(
+    readTimeout: Duration,
+    writeTimeout: Duration,
+    idleTimeout: Duration,
+    requestTimeout: Duration,
+    maxHeaderBytes: int,
+    maxBodyBytes: int,
+    errors: ErrorPage,
+    date: bool
+) -> Settings
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
   if requestTimeout.isNegative then fail(s"a request timeout of $requestTimeout: it is at least zero")
-  val s = Settings(
+  Settings(
     readTimeout,
     writeTimeout,
     idleTimeout,
@@ -388,21 +468,12 @@ serve(
     Streaming(),
     if date then Some(DateHeader()) else None
   )
-  tls match
-    None -> TcpServer.start(
-      host,
-      port,
-      (stream, server) -> converse(stream, server, handler, s),
-      maxConnections,
-      failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s)
-    )
-    Some(identity) -> TcpServer.start(
-      host,
-      port,
-      (stream, server) -> secured(stream, server, handler, s, identity),
-      maxConnections,
-      failed = stream -> _ = stream.close()
-    )
+
+// The socket options `serve` listens with unless given others: the listener's defaults, and each
+// connection sending every write at once, since a response is written in pieces a client waits on
+// whole, and probed once idle for a minute, so one whose client vanished, a stream of events or a
+// WebSocket above all, which no idle timeout ends, is found out within two minutes.
+val ServerListen: ListenOptions = ListenOptions(connections = TcpOptions(noDelay = true, keepAlive = Some(KeepAlive())))
 
 // A connection served over TLS: the handshake, then its requests as `converse` serves them.
 private secured(tcp: TcpStream, server: TcpServer, handler: Handler, s: Settings, identity: TlsServer)

@@ -10827,6 +10827,62 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     17 KB/s, and a server taking larger bodies has to raise it; and whether a TLS handshake, whose
     waits are each `readTimeout`'s, should get a total bound too.
 
+- Settled on the user's delegation 2026-11-24 (branch `net-socket-options`): **socket options are
+  values, given at `connect` and `bind` and changed on the connection**
+  ([socket options](/spec/system-library/#socket-options)). `TcpOptions(noDelay, keepAlive,
+  sendBuffer, receiveBuffer)` and `KeepAlive(idle, interval, count)` are `data`; `connect` takes
+  `options` as a later parameter with a default, `TcpListener.bind` takes a `ListenOptions(backlog,
+  reuseAddress, reusePort, connections)`, and every connection has a setter and a getter for each
+  option, the getter reading the system's value back. *Why*: an options value is one thing to pass
+  through `TcpServer.start` and `http.serve` (`listen`) and to keep as a constant, so a server's
+  defaults have a name (`http.ServerListen`); a later named parameter keeps `connect(host, port)`
+  and the `timeout` parameter another branch adds both compatible; reading back says what the
+  system granted, which for buffers is not what was asked.
+  - **Defaults are the system's for a bare connection** (no `TCP_NODELAY`, no keep-alive, the
+    system's buffers), so `TcpStream` changes nothing a program did not ask for. **HTTP turns
+    `noDelay` and keep-alive on**: a response goes out in pieces (head, body, chunks) that a client
+    waits on whole, so holding a small piece back only adds latency; keep-alive (60 s idle, every
+    10 s, 6 probes: a dead peer found within two minutes) because a WebSocket or an event stream
+    is never ended by `idleTimeout`. Review with the user: the keep-alive timing, and whether a
+    bare `TcpStream` should default `noDelay` on as well, which several server stacks do.
+  - **`reuseAddress` stays on by default** for listeners, as before (a restart must not wait out
+    `TIME_WAIT`), and can now be turned off; **`reusePort` is off** and set only where asked, so
+    a platform without it fails only the listeners that ask for it. `backlog` defaults to 128,
+    `SOMAXCONN` on both hosted platforms.
+  - **Keep-alive times are whole seconds**, rounded up, since the system keeps seconds; a duration
+    of zero or less, fewer than one probe, a negative buffer size in options, a buffer of less than
+    one byte asked directly or a backlog less than one **trap**, as a negative timeout does: they are
+    mistakes, not wishes. A value past a platform's own limit (Linux takes at most 127 probes) is the
+    system's `Err`, not a limit Avin restates.
+  - **A listener's `connections` options are set on every accepted connection** (buffer sizes on
+    the listener too, before it listens, so a large receive window is agreed from the first byte):
+    which options an accepted socket inherits from its listener differs by platform, so setting
+    them explicitly is the only portable meaning. Plain options cost no system call.
+  - Alternatives weighed: setters alone, with no options value (a server then needs a callback to
+    configure each accepted connection); a builder; `Option[int]` for the buffer sizes rather than
+    zero for the system's (zero is never a valid size, and it matches the timeouts' zero for none);
+    validating `KeepAlive` when it is made (data has no checked constructor; the check runs where
+    the options are used, before any lookup).
+
+- Settled on the user's delegation 2026-11-24 (branch `net-socket-options`): **servers listen on
+  Unix sockets too, through a `Listener[S]` trait.** `TcpServer.startUnix(path, serve, …, backlog,
+  replacing)` and `http.serveUnix(path, handler, …)` serve at a socket path, for a server a proxy on
+  the same machine talks to; `TcpListener` and `UnixListener` are each a `Listener[S: ByteStream]`
+  (`accept`, `close`), and the server's acceptor and connection actor are generic over it. The
+  handle stays a `TcpServer`, its `port()` zero for a Unix socket. `serveUnix` takes no `tls` (a
+  connection that never leaves the machine), and its requests' `remote` is `None`. `UnixStream`
+  gains `peerCredentials()` (user, group and process id as the system vouches for them, through a
+  runtime shim widening the ids to `long`), and `UnixListener.bind` a `backlog`.
+  *Why*: serving HTTP behind nginx or a sidecar over a Unix socket is common, and peer credentials
+  are how such a server authenticates a local client without a password. Alternatives weighed:
+  renaming `TcpServer` to `Server` (clearer, but breaks every caller; review with the user
+  whether to rename while the library is young); a `serve` overload taking any listener (it would
+  have to repeat every parameter too, and binding stays the server's to do).
+  - **Not built here, each blocked on Sysl 0.13.5's `sysl.net`**: `IPV6_V6ONLY` (dual-stack
+    control) and binding several addresses, which on Linux needs `IPV6_V6ONLY` to bind `::` beside
+    `0.0.0.0`; and `sendfile` for file responses. `sysl.net.Socket` has neither option nor call; they
+    are Sysl findings.
+
 - Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
   `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
   and `Request.withForm` for `application/x-www-form-urlencoded`, `ServerRequest.multipart(limits)`,

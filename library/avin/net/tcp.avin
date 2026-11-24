@@ -65,12 +65,33 @@ private class Socket
   // socket belongs to the code running.
   @sysl("fd")
   held() -> Result[int, SyslError]
+  local() -> Result[Address, SyslError]
+  setNoDelay(on: bool) -> Result[unit, SyslError]
+  noDelay() -> Result[bool, SyslError]
+  setKeepalive(on: bool) -> Result[unit, SyslError]
+  keepalive() -> Result[bool, SyslError]
+  setKeepaliveIdle(seconds: int) -> Result[unit, SyslError]
+  keepaliveIdle() -> Result[int, SyslError]
+  setKeepaliveInterval(seconds: int) -> Result[unit, SyslError]
+  keepaliveInterval() -> Result[int, SyslError]
+  setKeepaliveCount(probes: int) -> Result[unit, SyslError]
+  keepaliveCount() -> Result[int, SyslError]
+  setSendBuffer(bytes: int) -> Result[unit, SyslError]
+  sendBuffer() -> Result[int, SyslError]
+  setRecvBuffer(bytes: int) -> Result[unit, SyslError]
+  recvBuffer() -> Result[int, SyslError]
 
 // The socket under a listener, closed as a connection's is, on the same Sysl type. Its traps name
 // the `TcpListener`.
 @sysl("sysl.net.Socket", named: "TcpListener")
 private class ListenSocket
   reuseAddress(on: bool) -> Result[unit, SyslError]
+  setReusePort(on: bool) -> Result[unit, SyslError]
+  reusePort() -> Result[bool, SyslError]
+  setSendBuffer(bytes: int) -> Result[unit, SyslError]
+  sendBuffer() -> Result[int, SyslError]
+  setRecvBuffer(bytes: int) -> Result[unit, SyslError]
+  recvBuffer() -> Result[int, SyslError]
   bind(to: Address) -> Result[unit, SyslError]
   listen(backlog: int) -> Result[unit, SyslError]
   local() -> Result[Address, SyslError]
@@ -130,14 +151,6 @@ private openConnection(to: Address) -> Result[Socket, SyslError]
 
 @sysl("sysl.net.socket")
 private openListenSocket(to: Address) -> Result[ListenSocket, SyslError]
-
-// Binds `s` to `to`, letting a port a recently stopped listener used be taken again, and listens
-// with the platform's usual backlog, without blocking.
-private listening(s: ListenSocket, to: Address) -> Result[unit, SyslError]
-  s.reuseAddress(true)?
-  s.bind(to)?
-  s.listen(128)?
-  nonBlocking(s)
 
 // Every address `host` and `port` resolve to, in the order the platform prefers them.
 private addressesOf(host: string, port: int) -> Result[Vector[Address], IoError]
@@ -319,6 +332,72 @@ class TcpStream(
   // The limit `setTimeout` set, in whole milliseconds; zero where there is none.
   timeout -> Duration = Duration(long(limitMs) * 1000)
 
+  // Gives the connection every option of `options`: `noDelay` and `keepAlive` as they say, and each
+  // buffer size that is not zero. A value no socket can be given traps.
+  configure(options: TcpOptions) -> Result[unit, IoError]
+    checkTcpOptions(options)
+    usable("set the options of")?
+    configured(conn, options).mapErr(failed("set the options of", peer))
+
+  // Sends each write at once rather than holding a small one back to join the next, or holds them
+  // back again, which a new connection does.
+  setNoDelay(on: bool) -> Result[unit, IoError]
+    usable("set the options of")?
+    conn.setNoDelay(on).mapErr(failed("set the options of", peer))
+
+  // Whether each write is sent at once, as the system says.
+  noDelay() -> Result[bool, IoError]
+    usable("read the options of")?
+    conn.noDelay().mapErr(failed("read the options of", peer))
+
+  // Probes the connection while it is idle as `k` says, or, for `None`, stops probing it, which is
+  // how a new connection starts. A `KeepAlive` no socket can be given traps.
+  setKeepAlive(k: Option[KeepAlive]) -> Result[unit, IoError]
+    k match
+      Some(asked) -> checkKeepAlive(asked)
+      None -> ()
+    usable("set the options of")?
+    keepAliveOn(conn, k).mapErr(failed("set the options of", peer))
+
+  // How the connection is probed while idle, as the system says, in whole seconds; `None` where it
+  // is not. A connection probed with the system's own timing answers the system's.
+  keepAlive() -> Result[Option[KeepAlive], IoError]
+    usable("read the options of")?
+    keepAliveOf(conn).mapErr(failed("read the options of", peer))
+
+  // Asks the system for a send buffer of `bytes`, which must be at least one.
+  setSendBuffer(bytes: int) -> Result[unit, IoError]
+    if bytes < 1 then fail(s"a send buffer of $bytes bytes: it is at least one")
+    usable("set the options of")?
+    conn.setSendBuffer(bytes).mapErr(failed("set the options of", peer))
+
+  // The size of the send buffer the system gave, in bytes.
+  sendBuffer() -> Result[int, IoError]
+    usable("read the options of")?
+    conn.sendBuffer().mapErr(failed("read the options of", peer))
+
+  // Asks the system for a receive buffer of `bytes`, which must be at least one.
+  setReceiveBuffer(bytes: int) -> Result[unit, IoError]
+    if bytes < 1 then fail(s"a receive buffer of $bytes bytes: it is at least one")
+    usable("set the options of")?
+    conn.setRecvBuffer(bytes).mapErr(failed("set the options of", peer))
+
+  // The size of the receive buffer the system gave, in bytes.
+  receiveBuffer() -> Result[int, IoError]
+    usable("read the options of")?
+    conn.recvBuffer().mapErr(failed("read the options of", peer))
+
+  // This end's address, written numerically without its port: the one of the machine's addresses
+  // the connection goes from.
+  localAddress() -> Result[string, IoError]
+    usable("read the address of")?
+    conn.local().map(a -> a.text()).mapErr(failed("read the address of", peer))
+
+  // This end's port, the one the system chose for a connection made by `connect`.
+  localPort() -> Result[int, IoError]
+    usable("read the address of")?
+    conn.local().map(a -> a.port()).mapErr(failed("read the address of", peer))
+
   // Tells the other end nothing more will be sent; reading goes on.
   override shutdownOutput() -> Result[unit, IoError]
     mine()
@@ -348,6 +427,12 @@ class TcpStream(
   private mine()
     if closed && !halved then _ = conn.close() else _ = conn.held()
 
+  // `Ok` where the connection is open and not split, checking first that it belongs to the code
+  // running; else the error `operation` answers.
+  private usable(operation: string) -> Result[unit, IoError]
+    mine()
+    if closed || halved then Err(unusable(operation, peer)) else Ok(())
+
   // What an operation on the connection answers once it is closed or split.
   private unusable(operation: string, subject: string) -> IoError =
     if halved then splitError(operation, subject) else closedError(operation, subject)
@@ -371,13 +456,16 @@ private millisOf(d: Duration) -> int
 
 object TcpStream
   // A connection to the first of the host's addresses that answers. Where none does, the error is
-  // the last address's; a host that resolves to nothing is `Other`.
-  connect(host: string, port: int) -> Result[TcpStream, IoError]
+  // the last address's; a host that resolves to nothing is `Other`. The socket is given `options`
+  // before it connects, so its buffer sizes hold from the first byte; options no socket can be given
+  // trap before anything is looked up.
+  connect(host: string, port: int, options: TcpOptions = TcpOptions()) -> Result[TcpStream, IoError]
+    checkTcpOptions(options)
     val addresses = addressesOf(host, port)?
     val peer = s"$host:$port"
     var last = IoError(io.Other("no address found"), "connect to", peer)
     for a in addresses
-      openConnection(a) match
+      openConnection(a).flatMap(c -> optioned(c, options)) match
         Ok(c) ->
           connectSocket(c, a) match
             Ok(_) -> return Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, peer, Some(a.text())))
@@ -397,20 +485,35 @@ class TcpListener(
     private val conn: ListenSocket,
     private val boundPort: int,
     private var closed: bool,
-    private val host: string
-): Sendable, io.Close
+    private val host: string,
+    private val chosen: ListenOptions = ListenOptions()
+): Sendable, io.Close, Listener[TcpStream]
   // The port it listens on, the one the platform chose where `bind` was given port 0.
   port() -> int
     mine()
     boundPort
 
-  // Waits for the next connection.
-  accept() -> Result[TcpStream, IoError]
+  // The options it was bound with.
+  options -> ListenOptions = chosen
+
+  // Whether it shares its port with other listeners, as the system says.
+  reusePort() -> Result[bool, IoError]
+    mine()
+    val here = s"$host:$boundPort"
+    if closed then return Err(IoError(io.Other("the listener is closed"), "read the options of", here))
+    conn.reusePort().mapErr(failed("read the options of", here))
+
+  // Waits for the next connection, and gives it the options' `connections`. A connection the system
+  // refuses them is closed, and its error answered.
+  override accept() -> Result[TcpStream, IoError]
     mine()
     val here = s"$host:$boundPort"
     if closed then return Err(IoError(io.Other("the listener is closed"), "accept on", here))
     afterWait(acceptOn(conn)) match
-      Ok((c, a)) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, s"a client of $here", Some(a.text())))
+      Ok((c, a)) ->
+        optioned(c, chosen.connections) match
+          Ok(_) -> Ok(TcpStream(c, ReadAhead(Array.empty[byte](), 0), false, 0, s"a client of $here", Some(a.text())))
+          Err(e) -> Err(failed("set the options of", s"a client of $here")(e))
       Err(e) -> Err(failed("accept on", here)(e))
 
   // Stops listening; closing again does nothing. An `accept` afterwards answers an error.
@@ -428,18 +531,21 @@ class TcpListener(
 object TcpListener
   // Listens on the first of the host's addresses, `127.0.0.1` for this machine alone and `0.0.0.0`
   // for every address it answers on; port `0` lets the platform choose, and `port()` says which.
-  bind(host: string, port: int) -> Result[TcpListener, IoError]
+  // The listener is given `options` before it binds; options no listener can be given trap before
+  // anything is looked up.
+  bind(host: string, port: int, options: ListenOptions = ListenOptions()) -> Result[TcpListener, IoError]
+    checkListenOptions(options)
     val addresses = addressesOf(host, port)?
     val here = s"$host:$port"
     val a = addresses(0)
     val c = openListenSocket(a).mapErr(failed("listen on", here))?
-    listening(c, a) match
+    listening(c, a, options) match
       Ok(_) -> ()
       Err(e) ->
         c.close()
         return Err(failed("listen on", here)(e))
     c.local() match
-      Ok(at) -> Ok(TcpListener(c, at.port(), false, host))
+      Ok(at) -> Ok(TcpListener(c, at.port(), false, host, options))
       Err(e) ->
         c.close()
         Err(failed("listen on", here)(e))
