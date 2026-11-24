@@ -1,0 +1,419 @@
+module avin.net.http
+
+// Trusted proxies: a middleware that reads where a request really came from when a reverse proxy
+// stands between the client and the server. A proxy tells the server the client's address, scheme
+// and host in `Forwarded` (RFC 7239) or `X-Forwarded-For`, `X-Forwarded-Proto` and
+// `X-Forwarded-Host`, but any client can send those headers too, so they are believed only from a
+// connection that comes from a proxy the server was told to trust.
+
+// A block of IP addresses: an address and the number of its leading bits that a member shares,
+// written `10.0.0.0/8`, `2001:db8::/32` or, for one address, `192.0.2.1` (all the bits). The bits
+// of the address past the prefix are ignored, so `10.1.2.3/8` is `10.0.0.0/8`. An IPv4 address and
+// its IPv4-mapped IPv6 form (`::ffff:192.0.2.1`) are the same address. A text that is not a block
+// traps: an address that is neither IPv4 in dotted decimal without leading zeros nor IPv6, a
+// prefix that is not a number from 0 up to the address's length (32 or 128), or a zone (`%eth0`).
+// The prefix `0` is every address of its family.
+class Cidr(val text: string): Sendable
+  private val parsed: (Vector[int], int) = parseCidr(text)
+
+  // The bytes of the block's address: four for IPv4, sixteen for IPv6.
+  val network: Vector[int] = parsed.0
+
+  // How many of the address's leading bits a member shares.
+  val prefix: int = parsed.1
+
+  // Whether the IP address `address` (no port, no brackets) is in the block; `false` for a text that
+  // is not an address.
+  contains(address: string) -> bool = parseAddress(address) match
+    Some(a) -> covers(self, a)
+    None -> false
+
+// What a trusted proxy told the server about a request: the socket's `peer`, the `address` of the
+// client the headers name (the peer's own where they name none), and the `scheme` (`http` or
+// `https`) and `host` the client used, where the headers give one that is well formed.
+class Forwarding(
+    val peer: string,
+    val address: string,
+    val scheme: Option[string],
+    val host: Option[string]
+): Sendable
+
+// The middleware that believes forwarding headers only from `trusted`, a list of CIDR blocks
+// (`Cidr` texts) naming the proxies in front of the server; none, the default, trusts no header.
+//
+// A request whose connection comes from outside `trusted`, or has no known address, is passed on
+// with `Forwarded` and the `X-Forwarded-` headers removed, so nothing downstream can mistake a
+// client's claim for a proxy's. One from a trusted proxy is read as follows. `Forwarded` is read
+// where the request has it, and the `X-Forwarded-` headers where it has not; several header lines
+// of a name count as one list, and empty list entries are skipped. The client is found by walking
+// the addresses (`for` in `Forwarded`, `X-Forwarded-For`) from the last, the nearest hop, towards
+// the first: each address that is itself in `trusted` is another proxy, and the first one that is
+// not is the client, so an address a client put at the front of the list, or any address beyond
+// the first untrusted one, is never believed. Where every address is trusted the first is the
+// client. An address is IPv4, IPv6 or IPv6 in brackets, with an optional port that is dropped, and
+// is given in its shortest form (`::1`, `2001:db8::1`, IPv4-mapped addresses as IPv4), so one
+// client is one text. An address that is not one (`unknown`, an obfuscated `_hidden`), more than
+// `maxHops` entries in the list, or a list with a malformed entry among those walked makes the
+// headers worthless: the client is the peer, and the scheme and host are not given. The scheme and
+// the host are those the outermost trusted proxy wrote: from the end of its list, as many places
+// back as there are trusted hops, or the first where the list is shorter; the scheme is `http` or
+// `https` in any case (given in lower case), a host is a name or an IP literal with an optional
+// port (given in lower case), and one that is not is not given.
+//
+// The request handed on has `remote` set to the client's address, so the access log and the rate
+// limiter see the client, `forwarding` giving the peer and what else was learned, `scheme`, and
+// `host`.
+class TrustedProxies(val trusted: Vector[string] = Vector.empty[string](), val maxHops: int = 32): Sendable
+  if maxHops < 1 then fail(s"a trusted-proxy hop limit of $maxHops: it is at least one")
+
+  private val blocks: Vector[Cidr] = trusted.map(t -> Cidr(t))
+
+  // The middleware that resolves each request's forwarding around `next`.
+  middleware -> (Handler) -> Handler = next -> request -> next(resolved(request))
+
+  // Whether `address` is in a trusted block.
+  isTrusted(address: string) -> bool = parseAddress(address) match
+    Some(a) -> inBlocks(a)
+    None -> false
+
+  private inBlocks(address: Vector[int]) -> bool = blocks.exists(b -> covers(b, address))
+
+  private resolved(request: ServerRequest) -> ServerRequest
+    val peer = request.remote.flatMap(r -> parseAddress(r))
+    peer match
+      None -> stripped(request)
+      Some(p) ->
+        if !inBlocks(p) then return stripped(request)
+        val found = forwardingOf(request, p)
+        request.withRemote(Some(found.address)).withValue(found)
+
+  private forwardingOf(request: ServerRequest, peer: Vector[int]) -> Forwarding
+    val text = render(peer)
+    val none = Forwarding(text, text, None, None)
+    val lines = request.headers.filter(h -> h.0.equalsIgnoreCase("Forwarded")).map(h -> h.1)
+    if !lines.isEmpty
+      return listsOfForwarded(lines.mkString(",")) match
+        Some(l) -> walk(peer, l.0, l.1, l.2).getOrElse(none)
+        None -> none
+    val nodes = entries(request, "X-Forwarded-For")
+    val protos = entries(request, "X-Forwarded-Proto")
+    val hosts = entries(request, "X-Forwarded-Host")
+    walk(peer, nodes, protos, hosts).getOrElse(none)
+
+  // Walks `nodes` from the nearest hop for the client; `None` where an entry walked is not an address
+  // or there are too many.
+  private walk(
+      peer: Vector[int],
+      nodes: Vector[string],
+      protos: Vector[string],
+      hosts: Vector[string]
+  ) -> Option[Forwarding]
+    if nodes.length > maxHops then return None
+    var client = peer
+    var i = nodes.length - 1
+    var seen = 1
+    while i >= 0 && inBlocks(client)
+      parseNode(nodes(i)) match
+        None -> return None
+        Some(a) ->
+          client = a
+          i -= 1
+          seen += 1
+    val hops = if inBlocks(client) then seen else seen - 1
+    Some(Forwarding(render(peer), render(client), schemeOf(pick(protos, hops)), hostOf(pick(hosts, hops))))
+
+// `request` without the headers a proxy would have written.
+private stripped(request: ServerRequest) -> ServerRequest = request
+  .withHeaderRemoved("Forwarded")
+  .withHeaderRemoved("X-Forwarded-For")
+  .withHeaderRemoved("X-Forwarded-Proto")
+  .withHeaderRemoved("X-Forwarded-Host")
+
+// The entries of the header lines named `name`, trimmed, none of them empty.
+private entries(request: ServerRequest, name: string) -> Vector[string] =
+  request.headers
+    .filter(h -> h.0.equalsIgnoreCase(name))
+    .flatMap(h -> h.1.split(","))
+    .map(e -> e.trim)
+    .filter(e -> !e.isEmpty)
+
+// The entry `hops` places from the end of `values`, the first where there are fewer; empty for none.
+private pick(values: Vector[string], hops: int) -> string =
+  if values.isEmpty then ""
+  else if values.length >= hops then values(values.length - hops)
+  else values(0)
+
+// The scheme a header gave, in lower case, where it is `http` or `https`.
+private schemeOf(text: string) -> Option[string] =
+  val lower = text.toLower
+  if lower == "http" || lower == "https" then Some(lower) else None
+
+// The host a header gave, in lower case, where it is a name or IP literal with an optional port.
+private hostOf(text: string) -> Option[string] =
+  if text.isEmpty || text.byteLength > 255 then return None
+  val lower = text.toLower
+  if lower.startsWith("[")
+    val close = lower.indexOf("]")
+    if close < 0 then return None
+    val inside = lower.slice(1, close)
+    val rest = lower.slice(close + 1, lower.byteLength)
+    val ok = parseV6(inside).isDefined && (
+      rest.isEmpty || (rest.startsWith(":") && isPort(rest.slice(1, rest.byteLength)))
+    )
+    return if ok then Some(lower) else None
+  val colon = lower.lastIndexOf(":")
+  val name = if colon < 0 then lower else lower.slice(0, colon)
+  if colon >= 0 && !isPort(lower.slice(colon + 1, lower.byteLength)) then return None
+  if name.isEmpty then return None
+  for i in 0 ..< name.byteLength
+    val b = code(name, i)
+    val ok = isDigitCode(b) || (int('a') <= b <= int('z')) || b == int('-') || b == int('.') || b == int('_')
+    if !ok then return None
+  Some(lower)
+
+private isPort(s: string) -> bool
+  if s.isEmpty || s.byteLength > 5 then return false
+  for i in 0 ..< s.byteLength
+    if !isDigitCode(code(s, i)) then return false
+  s.toInt() <= 65535
+
+// The `for`, `proto` and `host` of each element of a `Forwarded` value, an empty text where an
+// element has none; `None` where the value is malformed: an unterminated quoted string, a parameter
+// without `=` or with an empty name, or one of the three given twice in an element.
+private listsOfForwarded(value: string) -> Option[(Vector[string], Vector[string], Vector[string])] =
+  splitOutside(value, ',') match
+    None -> None
+    Some(elements) ->
+      val fors = Buffer[string]()
+      val protos = Buffer[string]()
+      val hosts = Buffer[string]()
+      for element in elements
+        if !element.trim.isEmpty
+          elementOf(element) match
+            None -> return None
+            Some(e) ->
+              fors.addOne(e.0)
+              protos.addOne(e.1)
+              hosts.addOne(e.2)
+      Some((fors.toVector, protos.toVector, hosts.toVector))
+
+private elementOf(element: string) -> Option[(string, string, string)]
+  val pairs = splitOutside(element, ';') match
+    None -> return None
+    Some(p) -> p
+  var f = ""
+  var p = ""
+  var h = ""
+  var seenF = false
+  var seenP = false
+  var seenH = false
+  for pair in pairs
+    if !pair.trim.isEmpty
+      val eq = pair.indexOf("=")
+      if eq < 0 then return None
+      val name = pair.slice(0, eq).trim.toLower
+      if name.isEmpty then return None
+      val value = unquotedValue(pair.slice(eq + 1, pair.byteLength).trim) match
+        None -> return None
+        Some(v) -> v
+      if name == "for"
+        if seenF then return None
+        seenF = true
+        f = value
+      else if name == "proto"
+        if seenP then return None
+        seenP = true
+        p = value
+      else if name == "host"
+        if seenH then return None
+        seenH = true
+        h = value
+  Some((f, p, h))
+
+// `text` split at `separator` outside double quotes (a backslash escapes the next byte inside them);
+// `None` where a quote is not closed.
+private splitOutside(text: string, separator: char) -> Option[Vector[string]]
+  val out = Buffer[string]()
+  var start = 0
+  var quoted = false
+  var i = 0
+  while i < text.byteLength
+    val b = code(text, i)
+    if quoted
+      if b == int('\\') then i += 1
+      else if b == int('"') then quoted = false
+    else if b == int('"') then quoted = true
+    else if b == int(separator)
+      out.addOne(text.slice(start, i))
+      start = i + 1
+    i += 1
+  if quoted then return None
+  out.addOne(text.slice(start, text.byteLength))
+  Some(out.toVector)
+
+// A parameter value: a token as it is, a quoted string without its quotes and escapes; `None` where
+// a quote is not the whole value or a backslash ends it.
+private unquotedValue(value: string) -> Option[string]
+  if !value.startsWith("\"") then return if value.contains("\"") then None else Some(value)
+  if value.byteLength < 2 || !value.endsWith("\"") then return None
+  val inner = value.slice(1, value.byteLength - 1)
+  var out = ""
+  var i = 0
+  while i < inner.byteLength
+    val b = code(inner, i)
+    if b == int('"') then return None
+    if b == int('\\')
+      i += 1
+      if i >= inner.byteLength then return None
+    out += inner.slice(i, i + 1)
+    i += 1
+  Some(out)
+
+// The bytes of the address a header names: an IPv4 or IPv6 address, an IPv6 one in brackets, with an
+// optional `:port` after IPv4 or a bracketed IPv6 address.
+private parseNode(text: string) -> Option[Vector[int]]
+  val t = text.trim
+  if t.startsWith("[")
+    val close = t.indexOf("]")
+    if close < 0 then return None
+    val rest = t.slice(close + 1, t.byteLength)
+    if !(rest.isEmpty || (rest.startsWith(":") && isPort(rest.slice(1, rest.byteLength)))) then return None
+    return parseAddress(t.slice(1, close))
+  val colons = t.split(":").length - 1
+  if colons == 0 then return parseAddress(t)
+  if colons == 1
+    val at = t.indexOf(":")
+    if !isPort(t.slice(at + 1, t.byteLength)) then return None
+    return parseAddress(t.slice(0, at))
+  parseAddress(t)
+
+// The bytes of an IP address, four or sixteen; an IPv4-mapped IPv6 address is its IPv4 address.
+private parseAddress(text: string) -> Option[Vector[int]] =
+  if text.contains(":")
+    parseV6(text).map(b -> if isMapped(b) then b.drop(12) else b)
+  else parseV4(text)
+
+private isMapped(b: Vector[int]) -> bool =
+  b.length == 16 && b.take(10).forall(x -> x == 0) && b(10) == 255 && b(11) == 255
+
+// An IPv4 address in dotted decimal: four numbers up to 255 without leading zeros.
+private parseV4(s: string) -> Option[Vector[int]]
+  val parts = s.split(".")
+  if parts.length != 4 then return None
+  val out = Buffer[int]()
+  for p in parts
+    if p.isEmpty || p.byteLength > 3 || (p.byteLength > 1 && p.startsWith("0")) then return None
+    for i in 0 ..< p.byteLength
+      if !isDigitCode(code(p, i)) then return None
+    val n = p.toInt()
+    if n > 255 then return None
+    out.addOne(n)
+  Some(out.toVector)
+
+// An IPv6 address's sixteen bytes: eight groups of up to four hexadecimal digits, the last two
+// possibly an IPv4 address, with one run of zero groups written `::`.
+private parseV6(s: string) -> Option[Vector[int]]
+  val gap = s.indexOf("::")
+  if gap >= 0 && s.indexOf("::", gap + 1) >= 0 then return None
+  val head = if gap < 0 then s else s.slice(0, gap)
+  val tail = if gap < 0 then "" else s.slice(gap + 2, s.byteLength)
+  val first = groups(head, gap < 0) match
+    None -> return None
+    Some(g) -> g
+  val second = groups(tail, true) match
+    None -> return None
+    Some(g) -> g
+  if gap < 0 && first.length != 8 then return None
+  if gap >= 0 && first.length + second.length > 7 then return None
+  val zeros = Vector.fill(8 - first.length - second.length, 0)
+  val words = first ++ zeros ++ second
+  Some(words.flatMap(w -> Vector(w >> 8, w & 255)))
+
+// The 16-bit values of the groups of `s` separated by `:`; the last may be an IPv4 address where
+// `last` allows it. `None` where `s` is not groups; the empty string is none.
+private groups(s: string, last: bool) -> Option[Vector[int]]
+  if s.isEmpty then return Some(Vector.empty[int]())
+  val parts = s.split(":")
+  val out = Buffer[int]()
+  var k = 0
+  for g in parts
+    k += 1
+    if last && k == parts.length && g.contains(".")
+      parseV4(g) match
+        None -> return None
+        Some(b) ->
+          out.addOne(b(0) * 256 + b(1))
+          out.addOne(b(2) * 256 + b(3))
+    else
+      if g.isEmpty || g.byteLength > 4 then return None
+      var v = 0
+      for i in 0 ..< g.byteLength
+        val d = hexDigitValue(code(g, i))
+        if d < 0 then return None
+        v = v * 16 + d
+      out.addOne(v)
+  Some(out.toVector)
+
+private hexDigitValue(b: int) -> int =
+  if int('0') <= b <= int('9') then b - int('0')
+  else if int('a') <= b <= int('f') then b - int('a') + 10
+  else if int('A') <= b <= int('F') then b - int('A') + 10
+  else -1
+
+private code(s: string, i: int) -> int = int(s.byteAt(i))
+
+private isDigitCode(b: int) -> bool = int('0') <= b <= int('9')
+
+// The shortest text of an address: dotted decimal, or IPv6 in lower case with its longest run of
+// two or more zero groups (the first of equals) written `::`.
+private render(address: Vector[int]) -> string
+  if address.length == 4 then return address.mkString(".")
+  val words = Vector.tabulate(8, i -> address(2 * i) * 256 + address(2 * i + 1))
+  var bestAt = -1
+  var bestLen = 0
+  var i = 0
+  while i < 8
+    if words(i) == 0
+      var j = i
+      while j < 8 && words(j) == 0
+        j += 1
+      if j - i > bestLen
+        bestLen = j - i
+        bestAt = i
+      i = j
+    else
+      i += 1
+  if bestLen < 2
+    return words.map(w -> w.toRadix(16)).mkString(":")
+  val before = words.take(bestAt).map(w -> w.toRadix(16)).mkString(":")
+  val after = words.drop(bestAt + bestLen).map(w -> w.toRadix(16)).mkString(":")
+  s"$before::$after"
+
+// The address and prefix of a block's text; traps where it is not one.
+private parseCidr(text: string) -> (Vector[int], int)
+  val slash = text.indexOf("/")
+  val addressText = if slash < 0 then text else text.slice(0, slash)
+  val address = parseAddress(addressText) match
+    Some(a) -> a
+    None -> fail(s"`$text` is not a CIDR block: `$addressText` is not an IP address")
+  val mappedV6 = addressText.contains(":") && address.length == 4
+  if slash < 0 then return (address, address.length * 8)
+  val prefixText = text.slice(slash + 1, text.byteLength)
+  val bad = prefixText.isEmpty || prefixText.byteLength > 3 || !prefixText.forall(c -> '0' <= c <= '9')
+  if bad then fail(s"`$text` is not a CIDR block: `$prefixText` is not a prefix length")
+  val written = prefixText.toInt()
+  val prefix = if mappedV6 then written - 96 else written
+  if mappedV6 && written < 96 then fail(s"`$text` is not a CIDR block: an IPv4-mapped block's prefix is at least 96")
+  if prefix > address.length * 8 then fail(s"`$text` is not a CIDR block: the prefix is at most ${address.length * 8}")
+  (address, prefix)
+
+// Whether `address` is in `block`: of the same family, and equal in the first `prefix` bits.
+private covers(block: Cidr, address: Vector[int]) -> bool
+  if address.length != block.network.length then return false
+  val whole = block.prefix / 8
+  for i in 0 ..< whole
+    if address(i) != block.network(i) then return false
+  val rest = block.prefix % 8
+  if rest == 0 then return true
+  val shift = 8 - rest
+  (address(whole) >> shift) == (block.network(whole) >> shift)
