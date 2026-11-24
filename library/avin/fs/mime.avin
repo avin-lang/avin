@@ -1,0 +1,141 @@
+module avin.fs
+
+// Content types of files: a table of extensions, and a sniff of a file's first bytes for the files
+// a name does not tell.
+
+import avin.io.IoError
+
+// How many bytes at the start of a file `sniffContentType` looks at.
+val SniffBytes: int = 512
+
+// The content type of each file extension of the web and of everyday files, keyed by the extension
+// in lower case without its `.`. Every `text/` type says `charset=utf-8`. The table is the one
+// `contentTypeOfName` and `probeContentType` read, so a server's own table can start from it.
+val contentTypes: HashMap[string, string] = HashMap(
+  ("html", "text/html; charset=utf-8"),
+  ("htm", "text/html; charset=utf-8"),
+  ("css", "text/css; charset=utf-8"),
+  ("js", "text/javascript; charset=utf-8"),
+  ("mjs", "text/javascript; charset=utf-8"),
+  ("cjs", "text/javascript; charset=utf-8"),
+  ("txt", "text/plain; charset=utf-8"),
+  ("text", "text/plain; charset=utf-8"),
+  ("md", "text/markdown; charset=utf-8"),
+  ("markdown", "text/markdown; charset=utf-8"),
+  ("csv", "text/csv; charset=utf-8"),
+  ("tsv", "text/tab-separated-values; charset=utf-8"),
+  ("ics", "text/calendar; charset=utf-8"),
+  ("vtt", "text/vtt; charset=utf-8"),
+  ("json", "application/json"),
+  ("map", "application/json"),
+  ("jsonld", "application/ld+json"),
+  ("webmanifest", "application/manifest+json"),
+  ("xml", "application/xml"),
+  ("xhtml", "application/xhtml+xml"),
+  ("rss", "application/rss+xml"),
+  ("atom", "application/atom+xml"),
+  ("yaml", "application/yaml"),
+  ("yml", "application/yaml"),
+  ("toml", "application/toml"),
+  ("wasm", "application/wasm"),
+  ("pdf", "application/pdf"),
+  ("zip", "application/zip"),
+  ("gz", "application/gzip"),
+  ("tar", "application/x-tar"),
+  ("bin", "application/octet-stream"),
+  ("svg", "image/svg+xml"),
+  ("png", "image/png"),
+  ("apng", "image/apng"),
+  ("jpg", "image/jpeg"),
+  ("jpeg", "image/jpeg"),
+  ("gif", "image/gif"),
+  ("webp", "image/webp"),
+  ("avif", "image/avif"),
+  ("ico", "image/x-icon"),
+  ("bmp", "image/bmp"),
+  ("tif", "image/tiff"),
+  ("tiff", "image/tiff"),
+  ("woff", "font/woff"),
+  ("woff2", "font/woff2"),
+  ("ttf", "font/ttf"),
+  ("otf", "font/otf"),
+  ("mp3", "audio/mpeg"),
+  ("ogg", "audio/ogg"),
+  ("oga", "audio/ogg"),
+  ("opus", "audio/opus"),
+  ("wav", "audio/wav"),
+  ("flac", "audio/flac"),
+  ("m4a", "audio/mp4"),
+  ("aac", "audio/aac"),
+  ("mp4", "video/mp4"),
+  ("m4v", "video/mp4"),
+  ("webm", "video/webm"),
+  ("ogv", "video/ogg"),
+  ("mov", "video/quicktime")
+)
+
+// The content type of a file by the extension of its name, with no disk access: the text after the
+// last `.` of the last segment, where that `.` is not the segment's first character and not its
+// last, compared without regard to case. `None` where the name has no extension or the table does
+// not know it.
+contentTypeOfName(name: string) -> Option[string] =
+  val file = name.slice(name.lastIndexOf("/") + 1, name.byteLength)
+  val dot = file.lastIndexOf(".")
+  if dot <= 0 || dot == file.byteLength - 1 then None
+  else contentTypes.get(file.slice(dot + 1, file.byteLength).toLower)
+
+// The content type the first `SniffBytes` bytes of a file give, by its signature: PNG, JPEG, GIF,
+// WebP, WAV, PDF, ZIP, gzip, WebAssembly, ELF and Mach-O (thin and universal-free forms of either
+// byte order). Where there is no signature, bytes that are UTF-8 text, with no NUL and no control
+// character but tab, line feed, form feed, carriage return and escape, are `text/plain;
+// charset=utf-8`; a character cut off by the end of the first `SniffBytes` bytes does not spoil it.
+// `None` for no bytes and for any others.
+sniffContentType(bytes: Array[byte]) -> Option[string]
+  val head = if bytes.length > SniffBytes then bytes.slice(0, SniffBytes) else bytes
+  if head.length == 0 then return None
+  if signed(head, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) then return Some("image/png")
+  if signed(head, [0xFF, 0xD8, 0xFF]) then return Some("image/jpeg")
+  if signed(head, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]) || signed(head, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+    return Some("image/gif")
+  if signed(head, [0x52, 0x49, 0x46, 0x46]) && head.length >= 12
+    if signedAt(head, 8, [0x57, 0x45, 0x42, 0x50]) then return Some("image/webp")
+    if signedAt(head, 8, [0x57, 0x41, 0x56, 0x45]) then return Some("audio/wav")
+  if signed(head, [0x25, 0x50, 0x44, 0x46, 0x2D]) then return Some("application/pdf")
+  if signed(head, [0x50, 0x4B, 0x03, 0x04]) || signed(head, [0x50, 0x4B, 0x05, 0x06])
+    return Some("application/zip")
+  if signed(head, [0x1F, 0x8B]) then return Some("application/gzip")
+  if signed(head, [0x00, 0x61, 0x73, 0x6D]) then return Some("application/wasm")
+  if signed(head, [0x7F, 0x45, 0x4C, 0x46]) then return Some("application/x-elf")
+  val machO = [[0xFE, 0xED, 0xFA, 0xCE], [0xFE, 0xED, 0xFA, 0xCF], [0xCE, 0xFA, 0xED, 0xFE], [0xCF, 0xFA, 0xED, 0xFE]]
+  if machO.exists(m -> signed(head, m)) then return Some("application/x-mach-binary")
+  if isText(head) then Some("text/plain; charset=utf-8") else None
+
+// The content type of the file `file`: by its name's extension where the table knows it, with no
+// disk access, else by the signature of its first `SniffBytes` bytes. `Ok(None)` where neither knows
+// it; `Err` where the name is not known and the file cannot be opened or read.
+probeContentType(file: string) -> Result[Option[string], IoError]
+  if contentTypeOfName(file) is Some(t) then return Ok(Some(t))
+  val f = open(file)?
+  defer f.close()
+  Ok(sniffContentType(f.read(SniffBytes)?))
+
+// Whether `bytes` begins with the byte values `codes`.
+private signed(bytes: Array[byte], codes: Vector[int]) -> bool = signedAt(bytes, 0, codes)
+
+// Whether `bytes` holds the byte values `codes` from `offset` on.
+private signedAt(bytes: Array[byte], offset: int, codes: Vector[int]) -> bool
+  if bytes.length < offset + codes.length then return false
+  for i in 0 ..< codes.length
+    if int(bytes(offset + i)) != codes(i) then return false
+  true
+
+// Whether `bytes` are UTF-8 text a person could read: no NUL or other control character beyond tab,
+// line feed, form feed, carriage return and escape, and valid UTF-8 except a character the end cuts
+// off.
+private isText(bytes: Array[byte]) -> bool
+  for b in bytes
+    val c = int(b)
+    if c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0C && c != 0x0D && c != 0x1B then return false
+  string.fromUtf8(bytes) match
+    Ok(_) -> true
+    Err(e) -> e.truncated

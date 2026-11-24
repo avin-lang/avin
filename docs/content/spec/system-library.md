@@ -1489,6 +1489,30 @@ skips the rest of that sequence, so the text never starts with a stray byte; byt
 elsewhere become U+FFFD, since a log's last lines are read to be looked at and not to be refused.
 Lines are decoded the same way, a `\r` before the `\n` going with it.
 
+### Content types
+
+| Call | Meaning |
+|---|---|
+| `probeContentType(file) -> Result[Option[string], IoError]` | The type of `file`: by its name's extension where `contentTypes` knows it, touching no disk; otherwise by the signature of its first `SniffBytes` (512) bytes. `Ok(None)` where neither knows, and for an empty file; `Err` where the name is unknown and the file cannot be opened or read. |
+| `contentTypeOfName(name) -> Option[string]` | The type by extension alone: the text after the last `.` of the last segment, neither its first character nor its last, compared without regard to case. |
+| `sniffContentType(bytes) -> Option[string]` | The type by signature: PNG, JPEG, GIF, WebP, WAV, PDF, ZIP, gzip, WebAssembly, ELF and Mach-O; else `text/plain; charset=utf-8` for UTF-8 text with no NUL and no control character but tab, line feed, form feed, carriage return and escape (a character cut off by the 512th byte does not spoil it); else `None`. |
+| `contentTypes: HashMap[string, string]` | The table of extensions (lower case, no `.`) to types; every `text/` type names `charset=utf-8`. |
+
+```avin
+import avin.fs
+
+main()
+  println(fs.contentTypeOfName("site/app.JS").getOrElse("unknown"))
+  println(fs.sniffContentType("hello\n".utf8).getOrElse("unknown"))
+  println(fs.contentTypeOfName("README").getOrElse("unknown"))
+```
+
+```text
+text/javascript; charset=utf-8
+text/plain; charset=utf-8
+unknown
+```
+
 ## `avin.time`
 
 Clocks, lengths of time, the calendar and time zones, in eight types: `Instant` (a point on the
