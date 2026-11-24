@@ -10991,6 +10991,51 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- Settled on the user's delegation 2026-11-24 (branch `resilience`): **`avin.resilience`: retry,
+  circuit breaker, general rate limiter** ([system library](/spec/system-library/#avinresilience)).
+  - **A module of its own**, not `avin.threads`: none of it is a thread primitive, and a program
+    reaching for retries should find them by name. Alternative: `avin.threads` beside `Semaphore`
+    (the audit's heading), which would crowd the threads chapter with policy.
+  - **Work is `() -> Result[T, E]`, and the answer is the last result.** Failure in Avin is a
+    `Result`, and a trap ends the program, so there is nothing else to catch. Giving up answers the
+    last `Err` itself rather than a wrapper with the attempt count: a caller's `?` and `match` stay
+    as they were without retry. Alternative: `RetryError(attempts, last)`; review with the user if
+    callers turn out to want the count (a hook would serve them better).
+  - **Backoff `initialDelay × multiplierⁿ⁻¹` capped at `maxDelay`, with `jitter` a share from 0 to
+    1** taken off at random (1.0, the default, is "full jitter", 0.5 "equal jitter", 0 none). One
+    number covers the common schemes. Defaults: 3 attempts, 100ms, ×2, 10s cap, full jitter, no
+    elapsed bound. Alternatives: an enum of jitter schemes, and decorrelated jitter (stateful across
+    attempts; a later addition if wanted).
+  - **Deadline awareness: a retry is made only where its wait ends strictly before the context's
+    deadline**, read from `Context.current().remaining()`; the first attempt is always made, since
+    there is no `E` to answer without one. `maxElapsed` bounds the policy on its own clock, the
+    attempts' time counted. Alternative: sleep and let the deadline cancel the wait (it still does,
+    as a backstop), which turns a known-futile wait into a cancellation.
+  - **`retryable: (E) -> bool` is a second overload**, not a policy field, so a policy is not
+    generic in the error type and one policy serves many calls. `policy.run(…)` is the same loop as
+    the module's `retry(policy, …)`.
+  - **The breaker counts consecutive failures** (`failureThreshold`, default 5), opens for
+    `openFor` (30s), then admits `trialCalls` (1) concurrent trials; one trial failing reopens it,
+    all succeeding close it. Alternative: a failure rate over a sliding window with a minimum call
+    count, more robust under mixed traffic but with more knobs; review with the user if a service
+    wants it.
+  - **Outcomes are counted only in the state the call was admitted in** (a generation number), and
+    a call cancelled mid-flight frees its trial place through a `defer`. Without these a slow call
+    from before an opening could close a breaker, and a cancelled trial would wedge it half open.
+  - **`call` answers `Result[T, BreakerError[E]]`** (`BreakerOpen(retryIn)` or `CallFailed(e)`), the
+    shape `PoolError` has, and `isFailure: (E) -> bool` lets an answer like not-found count as
+    health. `onChange(from, to)` is told after the lock is released. Alternatives: a nested
+    `Result[Result[T, E], BreakerOpen]` (clumsier to match); separate `acquire`/`record` calls
+    (easy to misuse; the generation would leak into user code).
+  - **The token bucket moved from `avin.net.http` to `avin.resilience.RateLimiter`**, and the HTTP
+    limiter keeps its API and messages and delegates to it. The general one adds a keyless form and
+    `acquire`, which waits for a token and answers `false` at once where the token comes no sooner
+    than the deadline. Alternatives: duplicating the bucket (two copies to keep alike), and a
+    `Semaphore`-based bulkhead, which `Semaphore.acquireFor` already is.
+  - **Every source of time and chance is an injectable named parameter** (`clock`, `pause`,
+    `random`), as the HTTP limiter's `clock` was, so the tests are deterministic and sleep only in
+    the one test of cancellation by a real deadline.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
