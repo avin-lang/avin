@@ -10991,6 +10991,48 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- Settled on the user's delegation 2026-11-24 (branch `fs-poll-watch`): **`avin.fs` watches by
+  polling, behind a face a native engine can take over** ([system
+  library](/spec/system-library/#watching)).
+  - **A `Watcher` is a channel and a thread.** `w.events` is a `Channel[WatchEvent]`, so a thread
+    waits on it alone or in a `select`; the readings run on a lightweight thread of the watcher's
+    own, which `close` stops and joins. What finds changes is that thread alone, so platform
+    notification (kqueue, inotify; fs audit item 17, waiting on Sysl) replaces its loop with no change
+    to `watch`, `WatchEvent`, `events`, `check` or `close`. Alternatives: an iterator the caller
+    pulls (cannot sit in a `select` beside a server's other work), a callback (runs user code on
+    the watcher's thread), a `Readiness` descriptor (no descriptor exists for a poll).
+  - **Deterministic driving: a `ticks` overload and `check()`.** `watch(paths, ticks)` reads on each
+    value of a `Channel[Instant]` instead of a clock, and `check()` reads now and answers once that
+    reading's events are sent, with their count, so a test knows a reading that found nothing has
+    ended. Alternatives: a fake clock (still leaves "has the reading after this tick ended?"
+    unanswerable without a sleep), a synchronous `scan()` returning the events (a second path for
+    events, and a race with the thread's own readings).
+  - **Events: `Created`, `Modified`, `Removed`, `Renamed`, `Overflowed`, each with `isDir`**, in
+    code-point order of their paths within a reading. A file is `Modified` when any of kind, size,
+    mtime, ctime, permissions, owner, group, device or inode differs (ctime catches a write whose
+    mtime was set back); a directory only when its permissions or owner change, since its own times
+    move with every entry it gains or loses and those entries have events of their own. A path that
+    changes kind is `Removed` then `Created`. Alternatives: reporting directory mtime changes
+    (doubles every event, and differs by platform), `Modified` for a change of kind (hides that a
+    directory became a file).
+  - **Renames by identity**: a gone entry and a new one with the same device and inode, and for a
+    file the same size and mtime, which a rename keeps and a reused inode seldom matches. A rename
+    onto an existing path is that path's `Modified` and the old name's `Removed`. Review with the
+    user: pairing a replaced path as `Renamed(from, to)` is possible, at the cost of a `Renamed` whose
+    `to` already existed.
+  - **Bounds: `maxEntries` (100,000) and `capacity` (1,024).** The trees growing past `maxEntries`
+    is an `Err` from `watch` and later an `Overflowed` event that ends the watch, since watching part
+    of a tree silently is worse than stopping loudly. A full events channel holds the watcher back
+    (it reads nothing while it waits to send), so a slow receiver gets no unbounded backlog and the
+    next reading still sees every change. Alternatives: watching the first `maxEntries` entries in
+    walk order (entries past it become spurious `Created` events as the tree shrinks), dropping events
+    on a full channel (loses changes a poll would otherwise still see).
+  - **Paths must exist at the start** (`watch` answers the `Err`); later a root may go and come back.
+    A directory that cannot be listed keeps what the last reading found in it, rather than reporting
+    everything inside as removed. Links below a root are not followed; a root that is a link is.
+  - **`interval` counts from the end of one reading to the start of the next** (an `after` per
+    wait, not a `Ticker`), so a slow reading never queues the next one behind it.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned

@@ -1427,6 +1427,92 @@ for file in fs.glob("tests/**/*.avin")
   println(file)
 ```
 
+### Watching
+
+`watch(paths, …)` reads the trees at `paths` and reads them again every `interval`, sending what
+changed between two readings to the watcher's `events` channel, which any thread receives from, alone
+or as an arm of a [`select`](/spec/threads/#select). The readings run on a lightweight thread of the
+watcher's own; a `Watcher` is sendable and an `io.Close`.
+
+| Function or member | Meaning |
+| --- | --- |
+| `watch(paths, interval, recursive, maxEntries, capacity) -> Result[Watcher, IoError]` | Reads `paths` now, then every `interval` (1 s) after the last reading ends. |
+| `watch(paths, ticks, recursive, maxEntries, capacity) -> Result[Watcher, IoError]` | The same, reading on each value received from `ticks`, a `Channel[Instant]`, rather than on a clock; a closed `ticks` ends the watch. |
+| `w.events: Channel[WatchEvent]` | The changes, in order. `None` once the watch has ended and every event sent is received. |
+| `w.check() -> Option[int]` | Reads now and answers once that reading's events are sent: how many. `None` once the watch has ended. |
+| `w.close() -> Result[unit, IoError]` | Ends the watch and waits for its thread; always `Ok`, and closing again does nothing. |
+| `w.isClosed -> bool` | Whether the watch has ended: closed, overflowed or out of ticks. |
+
+A `WatchEvent` is `Created(path, isDir)`, `Modified(path, isDir)`, `Removed(path, isDir)`,
+`Renamed(from, to, isDir)` or `Overflowed(limit)`, written qualified (`fs.Created`). `path` is the
+watched path joined with the entry's path below it, as `walker` makes it.
+
+- **What counts as a change.** A reading keeps a stamp of each entry: kind, size, modification and
+  change times, permissions, owner, group, device and inode. A file is `Modified` when any of them
+  differs, so a write that keeps the size, and a time set back, are both seen; a directory is
+  `Modified` only when its permissions or owner change, since what it gains and loses is reported as
+  those entries' own events. A path that changes what it is, a file that becomes a directory, is a
+  `Removed` and then a `Created`. A file created and removed between two readings is never seen.
+- **Renames, where they can be seen.** An entry gone from `from` and one new at `to` with the same
+  device and inode (for a file, the same size and modification time too) is one `Renamed`. A
+  directory renamed is a `Renamed` for it and for every entry below it. A file renamed onto a path
+  that was already there replaces it: that path is `Modified`, and the old name, where a reading saw
+  it, `Removed`.
+- **Order.** A reading's events come in code-point order of their paths, `to` for a rename, so a
+  directory comes before what it holds; for one path, `Removed` before `Created`.
+- **What is watched.** Each path must exist when the watch starts, or `watch` answers its `Err`
+  (`NotFound`, say); later it may go and come back, which is a `Removed` for it and everything below
+  and a `Created` again. A directory is watched with every entry below it, or with `recursive =
+  false` its own entries alone. Links below a watched path are watched as links and never followed;
+  a watched path that is a link is followed. A directory that cannot be listed keeps what the last
+  reading found in it, so a `chmod 000` is one `Modified` and not the loss of everything inside.
+- **The first reading is made before `watch` answers**, so every change after it is reported, and
+  `check` makes the reading a test or a "look now" needs: when it answers, that reading's events are
+  in `events`.
+
+**The cost is bounded and grows with the tree, not with time.** Each reading lists every watched
+directory and reads every entry's metadata, a few system calls an entry: on a laptop's SSD a reading
+of 20,000 entries takes about 0.15 s of one thread, so a tree that size read every second keeps a
+sixth of a core busy; a longer `interval`, or `recursive = false`, is cheaper. Between readings the
+watcher holds one stamp for each entry (nine numbers, the path and its slot in a map), and a reading
+builds the next set beside it, leaving the old one and the walk's own values to the collector: the
+same 20,000 entries grew the process by about 1.2 KB an entry over the first reading, garbage
+included. `maxEntries` (100,000) bounds both sets. More entries than that is an `Err` from `watch`
+and, later, an `Overflowed` event that ends the watch. The `events` channel holds at most `capacity` events (1,024; `0` hands
+each over): while it is full the watcher waits and reads nothing, so a receiver that lags is never
+handed a backlog bigger than that, and the next reading sees every change made meanwhile. An
+`interval` of zero or less, a `maxEntries` below one and a negative `capacity` trap.
+
+```text run
+import avin.fs
+import avin.threads.Channel
+import avin.time.Instant
+
+main()
+  val dir = fs.createTempDir("watch-example").getOrElse(fail("no directory"))
+  val w = fs.watch(Vector(dir), Channel[Instant]()).getOrElse(fail("cannot watch"))
+  _ = fs.writeText(fs.join(dir, "app.conf"), "port = 8080")
+  println(w.check())
+  w.events.tryReceive() match
+    Some(fs.Created(p, _)) -> println(s"created ${fs.fileName(p).getOrElse("")}")
+    _ -> println("something else")
+  _ = w.close()
+  _ = fs.removeDirAll(dir)
+```
+
+```text output
+Some(1)
+created app.conf
+```
+
+A server reloading its configuration waits on the watcher beside its other work:
+
+```text
+serve(conf: string, jobs: Channel[Job], w: fs.Watcher) = select
+  w.events.receive() as Some(e) -> reload(conf)
+  jobs.receive() as Some(j) -> run(j)
+```
+
 ### Open files
 
 A file held open is a `File`, for a program that reads or writes a file piece by piece, follows one
