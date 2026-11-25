@@ -2259,6 +2259,91 @@ operation; a bare `Mutex` contended the same way falls the same way.
 | `capacity`, `ttl` | What the cache was made with. |
 | `stats() -> CacheStats` | The counts since the cache was made; `requests` and `hitRate` (0 with no request). |
 
+## `avin.resilience`
+
+Keeping a program working while what it depends on fails for a while. `retry` runs work again
+after a growing, spread-out wait, inside the deadline the calling code runs under; a
+`CircuitBreaker` stops calling what keeps failing, and lets a trial call through once it has had
+time to recover; a `RateLimiter` holds any work to a rate. Work is a function answering a `Result`,
+and an `Err` is the failure each of them reacts to.
+
+```text run
+import avin.resilience.{BreakerOpen, CallFailed, CircuitBreaker, RateLimiter, RetryPolicy, retry}
+import avin.time.{millis, seconds}
+
+main()
+  var calls = 0
+  val policy = RetryPolicy(maxAttempts = 5, initialDelay = millis(1))
+  println(retry(policy, (e: string) -> e.startsWith("busy"), () ->
+    calls += 1
+    if calls < 3 then Err(s"busy $calls") else Ok(s"done after $calls")))
+
+  val breaker = CircuitBreaker(failureThreshold = 2, openFor = seconds(30))
+  for _ in 0 ..< 3
+    val reply = breaker.call(() -> Err[int, string]("refused")) match
+      Ok(n) -> s"answered $n"
+      Err(BreakerOpen(_)) -> "open: not called"
+      Err(CallFailed(e)) -> s"failed: $e"
+    println(reply)
+  println(breaker.state)
+
+  val limiter = RateLimiter(2, seconds(1))
+  println([limiter.admit("feed").isOk, limiter.admit("feed").isOk, limiter.admit("feed").isOk])
+```
+
+```text output
+Ok(done after 3)
+failed: refused
+failed: refused
+open: not called
+Open
+[true, true, false]
+```
+
+**Retrying.** `RetryPolicy(maxAttempts = 3, initialDelay = 100ms, maxDelay = 10s, multiplier =
+2.0, jitter = 1.0, maxElapsed = None)` makes at most `maxAttempts` attempts, the first included.
+Before retry `n` (counted from one) it waits the backoff `initialDelay × multiplierⁿ⁻¹`, at most
+`maxDelay` (`policy.backoff(n)`), less a random part of it: `jitter` is the share that may be taken
+off, so `1.0` spreads a wait anywhere from zero to the backoff, `0.5` over its upper half, and `0.0`
+waits the backoff exactly (`policy.delay(n)` draws one). `retry(policy, body)` retries every `Err`;
+`retry(policy, retryable, body)` only those `retryable` accepts, answering any other at once, so a
+refused password is not tried again. Either answers the last result `body` gave, and
+`policy.run(…)` is the same loop. The first attempt is always made. A retry is not made where its
+wait would end more than `maxElapsed` after the first attempt began, the attempts' own time
+counted, nor where the wait would reach the deadline the calling code runs under
+([`withDeadline`](/spec/threads/#request-context)): a retry needs time left after its wait, and
+the deadline cancels a wait it does reach. A `maxAttempts` below one, a negative `initialDelay` or
+`maxElapsed`, a `maxDelay` below `initialDelay`, a `multiplier` below one or not finite, and a
+`jitter` outside zero to one trap where the policy is made.
+
+**Circuit breaking.** `CircuitBreaker(failureThreshold = 5, openFor = 30s, trialCalls = 1)` is
+`Closed` to begin with and makes every call; `failureThreshold` failures in a row open it (a success
+clears the count, `failures` reads it). `Open`, it makes no call for `openFor`, answering
+`BreakerOpen(retryIn)` at once, `retryIn` the time until it will try again. Then it is `HalfOpen`
+and lets `trialCalls` calls through at once, answering the rest `BreakerOpen(0s)`: one trial
+failing opens it again for another `openFor`, and `trialCalls` succeeding close it.
+`breaker.call(body)` counts every `Err` as a failure and answers `Result[T, BreakerError[E]]`,
+`CallFailed(e)` wrapping the call's own error; `call(isFailure, body)` counts only the errors
+`isFailure` accepts, an answer such as not-found showing the service is up. A call cancelled before
+it answers counts neither way and frees its place as a trial, and an outcome arriving after the
+breaker has changed state since the call began counts neither way either. `state` reads where it stands, `reset()` closes
+it and `trip()` opens it by hand, and `onChange: (from, to) -> unit` is told of each change, after
+the breaker's lock is free. A `failureThreshold` or `trialCalls` below one and a negative `openFor`
+trap. `BreakerError[E]` is an `Error` where `E` is, a failed call's error its `cause`.
+
+**Rate limiting.** `RateLimiter(rate, per, burst = rate, maxKeys = 10000)` is the token bucket the
+[HTTP middleware](#http-server) uses, for any work: a bucket per key of `burst` tokens filled again at
+`rate` every `per`. `admit(key)` takes a token or answers `Err` of the time until the next, never
+waiting; `acquire(key)` waits for the token and answers `true`, or answers `false` at once where the
+next token comes no sooner than the calling code's deadline. Both have a keyless form, the one bucket
+`""`. Its bound on buckets and its traps are the HTTP limiter's.
+
+**Time of one's own.** Each reads the time through a named parameter `clock: () -> Duration` (the
+monotonic clock); the policy and the limiter wait through `pause: (Duration) -> unit`
+(`threads.sleep`), and the policy draws through `random: () -> real` (the shared generator's
+`nextReal`). A test gives its own, and drives a policy, a breaker or a limiter on a clock it moves
+itself, with nothing sleeping. The deadline is still the real one, read from `Context.current()`.
+
 ## `avin.net`
 
 TCP connections, TLS over them, servers, URLs, and a small HTTP client and server that speak `https`
@@ -2900,6 +2985,7 @@ one. `admit(key) -> Result[unit, Duration]` takes a token directly, `Err` saying
 next. At most `maxKeys` buckets are held (`size` says how many): making one more forgets every bucket
 full again, which a new one would equal, and where none is, the one nearest to full. A rate, burst
 or `maxKeys` below one traps, and so does a `per` too short to give each token a whole microsecond.
+The buckets are [`avin.resilience`](#avinresilience)'s `RateLimiter`, which limits work of any kind.
 The three middlewares compose as any do: `h -> metrics.middleware(limiter.middleware(h))` counts the
 `429`s the limiter answers.
 
