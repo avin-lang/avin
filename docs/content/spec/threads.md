@@ -458,9 +458,11 @@ between its bodies (below).
   under the lock, giving back the new value. The [Sysl handles](/spec/sysl-bindings/#handles) the
   value reaches, an open file or a connection, belong to whichever thread holds the lock: they are
   in transit once the mutex is made and whenever a body ends or waits on the mutex's condition, and
-  the first body to use one takes it, so any thread may write a file a mutex keeps. A value of a type
-  that cannot reach a handle costs nothing for this, the compiler knowing it of the type. A mutex is
-  not reentrant: a thread that takes one it
+  the first body to use one takes it, so any thread may write a file a mutex keeps. Only the handles
+  the value's type shows are handed on — the value itself, or what its fields, a tuple's parts or a
+  collection's elements are declared to be — and a type that shows none costs nothing for this, the
+  compiler knowing it of the type; a handle reached only through a function value, an `Any` or a
+  trait's object stays where it was, and another thread's use of it traps. A mutex is not reentrant: a thread that takes one it
   already holds, from inside a body, would wait for ever, so it traps instead.
 - **`Condition`**, made by a mutex's `condition()` and waited for inside that mutex's `with`; like
   its mutex, it is sendable.

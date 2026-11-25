@@ -1875,10 +1875,18 @@ their words are reserved.
   when it is made (the code that made the value may never use it) and again whenever a body ends,
   `update` included, or waits on the mutex's condition (`wait`, `waitFor`, a select's arm), so
   whichever thread holds the lock takes them by using them. A body only gives up what its own thread
-  owns, so two readers of an `RwLock` cannot share a handle: the second to use it traps. The walk is
-  decided per type where the program is compiled (`holds_handles`, now an intrinsic of
-  `avin.threads` as well as `avin.actors`), so a channel or a lock of numbers, strings or plain
-  objects pays nothing. Why: the settled rule made a value inside a `Mutex` usable only by the code
+  owns, so two readers of an `RwLock` cannot share a handle: the second to use it traps. **Only the
+  handles a value's type shows are handed on**: the value is one, or its fields, a tuple's parts, a
+  data type's variants or a standard collection's type arguments are declared to show one; a
+  function value, `Any`, a trait, an open or abstract class, a union and a variant hiding types count
+  as showing none. This is decided per type where the program is compiled (`shows_handles`, the
+  threads' intrinsic beside the actors' `holds_handles`), so a channel or a lock of numbers,
+  strings, plain objects, callbacks or a trait's objects pays nothing. Why the narrower rule than a
+  send's: a lock is entered far more often than an actor is sent to, and the library's own registries
+  (every actor's core, the timers, the exit hooks) are locks of traits and functions — walking them
+  made a lock's every entry cost the whole registry, and ten thousand actors starting took longer
+  than the suite allows. A handle hidden in a closure a lock keeps traps at another thread's use, as
+  it did before (`file_mutex_hidden_trap.avin`). Why: the settled rule made a value inside a `Mutex` usable only by the code
   that made it, contradicting what a mutex is for, and a connection or file sent on a channel trapped
   at its receiver, so a server could not hand accepted connections to workers through a queue.
   Alternatives weighed: claiming every handle for the thread taking the lock, whoever owns it (would

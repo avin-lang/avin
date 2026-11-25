@@ -578,7 +578,8 @@ parseBigInt(s: string) -> Option[BigInt]
   awaits the value, or a future made from it, may use those handles at once. A value sent on a
   channel is in transit from the send, for the thread that receives it. A value a `Mutex` or an
   `RwLock` keeps is in transit from the lock's making and again whenever a body ends or waits on a
-  condition, so it belongs to whichever thread holds the lock and uses it.
+  condition, so it belongs to whichever thread holds the lock and uses it. Both hand on only the
+  handles the value's type shows, not those a function value, an `Any` or a trait's object reaches.
   A message sent to an actor hands its handles to that actor ([actors](/spec/actors/#handing-over-ownership)).
   Handing a value over follows what it holds and stops at what is shared between owners — an
   actor's reference, a future, a promise, a channel, a mutex, an atomic, a thread, an executor —
