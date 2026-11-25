@@ -2875,6 +2875,135 @@ names in `library/library.hocon`, its own `sysl-dependencies`; a program's shims
 where a binding the program compiles reaches it, which `avin.net.http` and `avin.net.tls` do and
 `avin.net` alone does not ([proposed](/spec/decisions/#proposed)).
 
+### Redis
+
+`avin.net.redis` is a client of a Redis server (and of the servers that speak its protocol), written
+in Avin over a [`TcpStream`](#tcp) or a [`TlsStream`](#tls) ([settled](/spec/decisions/#settled)).
+`Redis.connect` opens a connection and asks for RESP3 with `HELLO 3`, sending the credentials and
+the client's name in it, and speaks RESP2 where the server has no `HELLO`; `command` sends any
+command and answers its reply as a `Value`, and the typed methods send the common commands and
+answer what their replies mean, the same over either protocol.
+
+```text
+import avin.net.redis.{Redis, RedisError, RedisOptions}
+import avin.time.minutes
+
+visit(page: string) -> Result[long, RedisError]
+  val r = Redis.connect("127.0.0.1", 6379, RedisOptions(password = Some("s3cret")))?
+  r.set(s"last:$page", "now", minutes(10))?
+  val counts = r.pipeline(p ->
+    p.command("INCR", s"views:$page")
+    p.command("EXPIRE", s"views:$page", "86400"))?
+  val views = counts(0)?
+  _ = r.close()
+  Ok(views.asLong.getOrElse(0))
+```
+
+| `RedisOptions(…)` | Meaning |
+| --- | --- |
+| `username`, `password` | Authenticate, in `HELLO` or by `AUTH`; a password with no username is the `default` user's. |
+| `database = 0` | Chosen by `SELECT` once connected; zero sends nothing. |
+| `tls`, `tlsHost` | A `TlsClient` makes the connection TLS, its certificate checked for `tlsHost`, or the host connected to. |
+| `clientName` | The connection's name, as `CLIENT LIST` shows it. |
+| `protocol = 3` | 3 asks for RESP3 and falls back to RESP2 where the server answers `NOPROTO` or has no `HELLO`; 2 never asks. |
+| `connectTimeout = 10 s` | Bounds TCP, TLS and the handshake together. |
+| `timeout = 30 s` | Bounds each wait for the server after that; zero or less is none. |
+| `reconnectAttempts = 3`, `reconnectDelay = 100 ms`, `maxReconnectDelay = 5 s` | How the next command makes a broken connection again: so many tries, the wait doubling between them. |
+| `limits = RespLimits()` | What the server may send (below). |
+
+A protocol other than 2 or 3, a negative database or a negative number of attempts traps.
+
+**A failure is a `RedisError`**: `ConnectionFailed(IoError)` (refused, broken, or `TimedOut`),
+`ConnectionClosed(text)` (by the server or by `close`), `TlsFailed(TlsError)`,
+`ProtocolFailed(RespError)`, `ServerError(code, text)` for an error reply, its code the first word
+(`ERR`, `WRONGTYPE`, `WRONGPASS`, `EXECABORT`), and `UnexpectedReply(expected, got)` for a reply of
+another kind than the method reads. **A broken connection is made again by the next command, never
+by the one it broke under**: that command answers its failure, since it may or may not have run, and
+nothing is sent twice. A server that refuses the credentials while reconnecting is answered at once.
+An error reply, or one of the wrong kind, leaves the connection as it is.
+
+| Typed commands | Answer |
+| --- | --- |
+| `get`, `getBytes`, `set(k, v)`, `set(k, bytes)`, `set(k, v, ttl)`, `setIfAbsent(k, v, ttl?)`, `mget`, `mset`, `append` | Text, bytes, `unit`, whether it was set; a value that is not UTF-8 is `UnexpectedReply` from `get` and read by `getBytes`. |
+| `incr`, `incrBy`, `decr`, `decrBy`, `incrByFloat` | The new number. |
+| `del`, `exists`, `expire(k, d)`, `ttl(k)`, `persist` | Counts, whether the key was there, and `Expiry`: `NoKey`, `NoExpiry` or `ExpiresIn(d)`. Times are whole milliseconds, a part of one counting as one. |
+| `hset(k, pairs*)`, `hget`, `hmget`, `hgetAll`, `hdel`, `hexists`, `hincrBy`, `hlen` | `hgetAll` is a `Map[string, string]`. |
+| `lpush`, `rpush`, `lpop`, `rpop`, `lrange`, `llen` | `lrange(k, 0, -1)` is the whole list. |
+| `sadd`, `srem`, `smembers`, `sismember`, `scard` | Members in no order. |
+| `zadd(k, (score, member)*)`, `zrange`, `zrangeWithScores`, `zscore`, `zincrBy`, `zrank`, `zrem`, `zcard` | Scores are `real`s, the infinities among them. |
+| `scan(pattern, count)`, `hscan`, `sscan`, `zscan` | An `Iterator` of `Result`s following the cursor page by page; a failure is its last element. A key there throughout comes at least once. |
+| `ping`, `select`, `flushDb`, `dbSize`, `publish`, `watch`, `unwatch` | As the commands answer. |
+
+**`pipeline(p -> …)`** sends every command the callback adds before reading a reply, and answers
+each reply in order as its own `Result`; an outer `Err` is a failure of the connection. It is written
+a batch of at most 64 KiB at a time, the batch's replies read before the next, so a long pipeline
+never fills the connection both ways. **`transaction(t -> …)`** sends `MULTI`, the commands and
+`EXEC` as one pipeline and answers `Some` of each command's reply, `None` where a key `watch`
+watched changed so nothing ran, and `Err(ServerError("EXECABORT", …))` where the server refused a
+command as it was queued. Every reply is read whatever failed, so the connection stays in step.
+
+**`Redis.pool(host, port, options, maxSize = 8, …)`** is an [`avin.threads.Pool`](#concurrency) of
+connections, shared between threads and actors: `pool.use(r -> r.incr("hits"))` lends one for the
+call, and a connection broken while lent is closed rather than lent again. Its other settings
+(`minIdle`, `idleTimeout = 5 min`, `acquireTimeout = 10 s`, `maxLifetime`, `maxWaiting`) are the
+pool's.
+
+**Publish and subscribe** go through a `Subscriber`, a connection of its own:
+`Subscriber.connect(host, port, options)`, then `subscribe(channels*)` and `psubscribe(patterns*)`,
+each answering once the server has confirmed every name, a message that arrives meanwhile kept;
+`unsubscribe` and `punsubscribe`, all of them where none is named. `receive()` waits for the next
+`PubSubMessage(channel, payload, pattern)` (`text` reads its payload), `receive(timeout)` answers
+`None` where none comes in time, and `messages()` is an `Iterator` of them that ends at a failure,
+which `lastFailure` keeps. A broken connection is made again and every channel and pattern
+subscribed again; what was published meanwhile is not received. RESP2's arrays and RESP3's pushes
+are read alike, and a push arriving on a `Redis` connection, not a subscriber, is passed over.
+
+**RESP itself** is public too. A `Value` is one of `SimpleString`, `BlobString` (an
+`ArraySeq[byte]`), `VerbatimString(format, text)`, `SimpleError`, `BlobError`, `Number` (a
+`long`), `Double` (a `real`, `inf`, `-inf` and `nan` among them), `BigNumber` (a `BigInt`),
+`Boolean`, `Null` (RESP2's `$-1` and `*-1` too), `ArrayValue`, `MapValue` (pairs in order),
+`SetValue`, `Push` and `Attributed(attributes, value)`, with `asText`, `asBytes`, `asLong`,
+`asReal`, `asBool`, `asItems`, `asEntries` (a RESP2 flat array too), `isNull`, `isError` and
+`plain` (without attributes). `encode(v)` writes RESP3, `encodeResp2(v)` RESP2,
+`encodeCommand(args)` and `encodeCommandBytes(args)` a command; a simple string or error holding a
+CR or LF traps, as does a verbatim format that is not three bytes. A `RespParser(limits)` reads
+values out of bytes as they arrive: `feed(bytes)`, then `next()` answers `Ok(Some(v))`, `Ok(None)`
+while the value is not whole, or a `RespError` (`Malformed`, `TooLong`, `TooDeep`, `TooMany`, each
+with its offset in the stream), which is final. Streamed strings and aggregates are read whole.
+
+| `RespLimits(…)` | Default | Bounds |
+| --- | --- | --- |
+| `maxBulkBytes` | 536870912 (512 MiB, a Redis string's most) | one blob string, blob error, verbatim string, or a streamed string's chunks together |
+| `maxDepth` | 64 | how deep aggregates nest; a top-level array's items are at depth one |
+| `maxAggregateLength` | 16777216 | the items of an array, set or push, or the pairs of a map or attributes |
+| `maxLineBytes` | 1048576 (1 MiB) | a simple string's or error's line, a number's, a length's |
+
+Each length is checked as its header is read, before the bytes it claims arrive; a limit below one
+traps.
+
+```text run
+import avin.net.redis.{ArrayValue, Number, RespLimits, RespParser, blobOf, encode}
+
+main()
+  val bytes = encode(ArrayValue(Vector(blobOf("views"), Number(42))))
+  println(string.fromUtf8Lossy(bytes).replace("\r\n", "|"))
+  val p = RespParser()
+  p.feed(bytes.slice(0, 9))
+  println(p.next())
+  p.feed(bytes.slice(9, bytes.length))
+  println(p.next().map(v -> v.map(x -> x.asItems.get(1).asLong)))
+  val strict = RespParser(RespLimits(maxDepth = 2))
+  strict.feed("*1\r\n*1\r\n*1\r\n:1\r\n".utf8)
+  println(strict.next().err.map(e -> e.message))
+```
+
+```text output
+*2|$5|views|:42|
+Ok(None)
+Ok(Some(Some(42)))
+Some(RESP aggregates nested deeper than 2 at byte 8)
+```
+
 ## Concurrency
 
 Futures and promises stay in [`avin.threads`](/spec/threads/#futures), beside the

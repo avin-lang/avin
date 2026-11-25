@@ -10991,6 +10991,72 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   - **`matcher(pattern)` is a function value** reading the pattern once. Alternative: a `Glob`
     class; a function value is all a walk filter needs.
 
+- Settled on the user's delegation 2026-11-24 (branch `redis`): **a Redis client,
+  `avin.net.redis`** ([Redis](/spec/system-library/#redis)), written in Avin over `TcpStream` and
+  `TlsStream`, with no C library.
+  - **A standard-library module, not a package.** A server reaches Redis as often as it reaches a
+    database, the client is pure Avin with no dependency beyond `avin.net` and `avin.threads`, and
+    it builds on the library's own `Pool`, which a package would reach only through the same
+    public API. Alternatives: a package `dev.avinlang.redis` (what the audit first named; versioned
+    apart from the language, but every server would add it), binding hiredis (a C dependency for
+    what is a small protocol, and its reader would sit outside Avin's limits and its threads).
+    Review with the user: whether clients for outside services belong in the standard library or
+    in packages as a rule; `pg` is a package.
+  - **One `Value` type for both RESP versions**, a variant per RESP3 type, RESP2's `$-1` and `*-1`
+    read as `Null`, RESP2's flat maps read by `asEntries`, and a blob string's bytes an
+    `ArraySeq[byte]` so that a value, and an error carrying one, is sendable and comes back out of
+    a pool's `use`. Alternatives: `Array[byte]` (not sendable, so no reply could leave a pooled
+    call), separate RESP2 and RESP3 types (every caller would handle both).
+  - **The parser is incremental and its failures final.** It holds bytes fed to it and answers
+    `None` until a value is whole, so a read that times out mid-frame loses nothing and a
+    subscriber's timed wait resumes the frame; after bytes that are not RESP nothing more is read.
+    Streamed strings and aggregates (`$?`, `*?`) are read whole. A value that has not all arrived
+    is parsed again from its start; the client reads until the parser holds twice as much before
+    parsing again, so a reply in many pieces costs a few parses, not one a piece. Alternative: a
+    resumable parser with an explicit stack (no re-parsing, much more code).
+  - **Limits with defaults:** `maxBulkBytes` 512 MiB (what a Redis server itself stores in one
+    string, so no legitimate value is refused), `maxDepth` 64 (Redis's deepest replies nest a few
+    levels), `maxAggregateLength` 16777216 items, `maxLineBytes` 1 MiB. Each length is checked as
+    its header is read, before its bytes arrive, and nothing is allocated for a claimed length.
+    Review with the user: 512 MiB lets a hostile server make a client hold that much; a lower
+    default would refuse real values.
+  - **The handshake is `HELLO 3` with `AUTH` and `SETNAME` in it**, falling back to RESP2 with
+    `AUTH` and `CLIENT SETNAME` where the server answers `NOPROTO` or an unknown command; a
+    password without a username is the `default` user's. `protocol = 2` never sends `HELLO`. Any
+    other error answering `HELLO` (a wrong password) fails the connection.
+  - **Reconnecting is lazy and never repeats a command.** A command that fails because the
+    connection broke, timed out or read something not RESP answers that failure, since it may or
+    may not have run, and the connection is closed; the next command makes it again, trying
+    `reconnectAttempts` times (3) with `reconnectDelay` (100 ms) doubling up to 5 s. A server's
+    refusal while reconnecting (a changed password) is answered at once. An error reply leaves the
+    connection as it is. A timed-out command breaks the connection rather than leaving its late
+    reply to be skipped. Alternatives: retrying the command (runs `INCR` twice), retrying only
+    commands known to be idempotent (a table to keep in step with Redis), discarding late replies
+    on the same connection (a dead server costs a timeout per command).
+  - **Timeouts:** `connectTimeout` (10 s) bounds TCP, TLS and the handshake together, through
+    `withTimeout`; `timeout` (30 s) bounds each wait after, as the stream's own timeout.
+  - **Pipelines and transactions are built in a callback**, `pipeline(p -> …)` and
+    `transaction(t -> …)`, and answer each reply as its own `Result`. A pipeline is written a batch
+    of at most 64 KiB at a time, its replies read before the next batch, so a long pipeline never
+    fills the socket both ways at once. A transaction is `MULTI`, the commands and `EXEC` sent as one
+    pipeline; every reply is read, so the connection stays in step whatever failed; `EXEC`'s null
+    (a watched key changed) is `None` and `EXECABORT` an `Err`.
+  - **Pub/sub is a `Subscriber` of its own**, never a mode of a `Redis`, so a subscribed connection
+    cannot be given a command it cannot run. `subscribe` waits for each confirmation, keeping
+    messages that arrive meanwhile; `unsubscribe` does not wait. Messages come by `receive`,
+    `receive(timeout)` and `messages()`, an iterator ending at a failure (`lastFailure`). A broken
+    connection is made again and every channel and pattern subscribed again; what was published
+    meanwhile is lost. A push on a command connection (client tracking's invalidations) is passed
+    over. Alternatives: a channel fed by a thread of the subscriber's own (a thread per subscriber,
+    and subscribing from another thread races it); an `Iterator` is enough to feed one.
+  - **The pool is `avin.threads.Pool`**, `Redis.pool(…)` setting `validate` to `isOpen` and
+    `destroy` to `close`, so a connection broken while lent is not lent again.
+  - **Typed commands answer what the reply means** (`Option[string]`, `long`, `bool`, `Expiry`,
+    `Map[string, string]`), RESP2's and RESP3's shapes alike, and a value that is not UTF-8 is
+    `UnexpectedReply` from `get` and read by `getBytes`; `ttl` is `PTTL` and `expire` and `set`'s
+    expiry are milliseconds, a part of one counting as one. Scans are iterators of `Result`s, a
+    failure their last element.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned

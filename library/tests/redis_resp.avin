@@ -1,0 +1,499 @@
+// RESP, as `avin.net.redis` reads and writes it: every RESP3 type and RESP2's forms, golden bytes both
+// ways, values fed a byte at a time and many in one feed, streamed strings and aggregates, attributes
+// and pushes, and hostile input: lengths past the limits and past a `long`, nesting past the depth
+// limit, frames cut short at every byte, numbers that are not numbers, stray CRs and LFs, and a
+// failure that stays.
+
+import avin.net.redis
+
+import avin.net.redis.{
+  ArrayValue, Attributed, BigNumber, BlobError, BlobString, Boolean, Double, Malformed, MapValue, Null, Number, Push,
+  RespError, RespLimits, RespParser, SetValue, SimpleError, SimpleString, TooDeep, TooLong, TooMany, Value,
+  VerbatimString, blobOf, encode, encodeCommand, encodeCommandBytes, encodeResp2
+}
+
+respText(bytes: Array[byte]) -> string = string.fromUtf8Lossy(bytes)
+
+respJoined(parts: Array[byte]*) -> Array[byte]
+  val out = Buffer[byte]()
+  for p in parts do out.addAll(p)
+  out.toArray()
+
+// What a fresh parser makes of `input` fed at once.
+respParsed(input: string, limits: RespLimits = RespLimits()) -> Result[Option[Value], RespError]
+  val p = RespParser(limits)
+  p.feed(input.utf8)
+  p.next()
+
+// The one value `input` is, all of it taken.
+respOne(input: string) -> Value
+  val p = RespParser()
+  p.feed(input.utf8)
+  val v = p.next() match
+    Ok(Some(v)) -> v
+    other -> fail(s"${debug(input)} parsed as $other")
+  assertEq(p.buffered, 0)
+  v
+
+// `input` fed one byte at a time: no value until its last byte, then the value.
+respByteByByte(input: string) -> Value
+  val p = RespParser()
+  val bytes = input.utf8
+  for i in 0 ..< bytes.length - 1
+    p.feed(Array(bytes(i)))
+    assertEq(p.next(), Ok(None))
+  p.feed(Array(bytes(bytes.length - 1)))
+  p.next() match
+    Ok(Some(v)) -> v
+    other -> fail(s"${debug(input)} fed by bytes parsed as $other")
+
+// `input` is `v`, read at once and a byte at a time, and `encode(v)` writes `input` back.
+respGolden(input: string, v: Value)
+  assertEq(respOne(input), v)
+  assertEq(respByteByByte(input), v)
+  assertEq(respText(encode(v)), input)
+
+respFailure(input: string, limits: RespLimits = RespLimits()) -> RespError = respParsed(input, limits) match
+  Err(e) -> e
+  other -> fail(s"${debug(input)} parsed as $other, not a failure")
+
+respMalformed(e: RespError) -> bool = e is Malformed(_, _)
+
+@test("simple strings, errors and their Unicode text")
+respSimple()
+  respGolden("+OK\r\n", SimpleString("OK"))
+  respGolden("+\r\n", SimpleString(""))
+  respGolden("+héllo wörld 😀\r\n", SimpleString("héllo wörld 😀"))
+  respGolden("-ERR unknown command 'FOO'\r\n", SimpleError("ERR unknown command 'FOO'"))
+  respGolden("-\r\n", SimpleError(""))
+
+@test("blob strings hold any bytes, CR, LF and NUL among them")
+respBlobs()
+  respGolden("$5\r\nhello\r\n", blobOf("hello"))
+  respGolden("$0\r\n\r\n", blobOf(""))
+  respGolden("$4\r\na\r\nb\r\n", blobOf("a\r\nb"))
+  respGolden("$4\r\n😀\r\n", blobOf("😀"))
+  assertEq(respOne("$4\r\n😀\r\n").asText, Some("😀"))
+  val binary = Array(byte(0), byte(255), byte(13), byte(10), byte(128))
+  val framed = respJoined("$5\r\n".utf8, binary, "\r\n".utf8)
+  val p = RespParser()
+  p.feed(framed)
+  assertEq(p.next(), Ok(Some(BlobString(binary.toArraySeq))))
+  assertEq(encode(BlobString(binary.toArraySeq)), framed)
+  assertEq(BlobString(binary.toArraySeq).asText, None)
+  assertEq(BlobString(binary.toArraySeq).asBytes.map(b -> b.toArraySeq), Some(binary.toArraySeq))
+
+@test("blob errors and verbatim strings")
+respBlobErrorsAndVerbatim()
+  respGolden("!21\r\nSYNTAX invalid syntax\r\n", BlobError("SYNTAX invalid syntax"))
+  respGolden("!4\r\na\r\nb\r\n", BlobError("a\r\nb"))
+  respGolden("!0\r\n\r\n", BlobError(""))
+  respGolden("=15\r\ntxt:Some string\r\n", VerbatimString("txt", "Some string"))
+  respGolden("=4\r\nmkd:\r\n", VerbatimString("mkd", ""))
+  respGolden("=11\r\ntxt:a\r\nb\r\nc\r\n", VerbatimString("txt", "a\r\nb\r\nc"))
+  assertEq(VerbatimString("txt", "hi").asText, Some("hi"))
+
+@test("numbers at their bounds, and signs")
+respNumbers()
+  respGolden(":0\r\n", Number(0))
+  respGolden(":1000\r\n", Number(1000))
+  respGolden(":-42\r\n", Number(-42))
+  respGolden(":9223372036854775807\r\n", Number(long.MaxValue))
+  respGolden(":-9223372036854775808\r\n", Number(long.MinValue))
+  assertEq(respOne(":+7\r\n"), Number(7))
+
+@test("doubles: fractions, exponents, infinities and NaN")
+respDoubles()
+  respGolden(",1.5\r\n", Double(1.5))
+  respGolden(",-0.25\r\n", Double(-0.25))
+  respGolden(",inf\r\n", Double(real.PositiveInfinity))
+  respGolden(",-inf\r\n", Double(real.NegativeInfinity))
+  assertEq(respOne(",10\r\n"), Double(10.0))
+  assertEq(respOne(",1.23e3\r\n"), Double(1230.0))
+  assertEq(respOne(",1E-2\r\n"), Double(0.01))
+  assertEq(respOne(",+inf\r\n"), Double(real.PositiveInfinity))
+  assert(respOne(",nan\r\n").asReal.get.isNaN)
+  assertEq(respText(encode(Double(real.NaN))), ",nan\r\n")
+  assertEq(respOne(respText(encode(Double(0.1)))), Double(0.1))
+  assertEq(respOne(respText(encode(Double(1e300)))), Double(1e300))
+  assertEq(respOne(respText(encode(Double(5e-324)))), Double(5e-324))
+
+@test("big numbers past a long")
+respBigNumbers()
+  respGolden(
+    "(3492890328409238509324850943850943825024385\r\n",
+    BigNumber(BigInt.parse("3492890328409238509324850943850943825024385").get)
+  )
+  respGolden(
+    "(-3492890328409238509324850943850943825024385\r\n",
+    BigNumber(BigInt.parse("-3492890328409238509324850943850943825024385").get)
+  )
+  respGolden("(0\r\n", BigNumber(BigInt.parse("0").get))
+  assertEq(respOne("(+12\r\n"), BigNumber(BigInt.parse("12").get))
+
+@test("booleans and null, RESP2's nulls among them")
+respBooleansAndNull()
+  respGolden("#t\r\n", Boolean(true))
+  respGolden("#f\r\n", Boolean(false))
+  respGolden("_\r\n", Null)
+  assertEq(respOne("$-1\r\n"), Null)
+  assertEq(respOne("*-1\r\n"), Null)
+  assert(Null.isNull)
+  assert(!blobOf("").isNull)
+
+@test("arrays, maps, sets and pushes, empty, flat and nested")
+respAggregates()
+  respGolden("*0\r\n", ArrayValue(Vector.empty[Value]()))
+  respGolden("*2\r\n$3\r\nfoo\r\n:7\r\n", ArrayValue(Vector(blobOf("foo"), Number(7))))
+  respGolden(
+    "*2\r\n*1\r\n+a\r\n*0\r\n",
+    ArrayValue(Vector(ArrayValue(Vector(SimpleString("a"))), ArrayValue(Vector.empty[Value]())))
+  )
+  respGolden("*3\r\n_\r\n#t\r\n,2.5\r\n", ArrayValue(Vector(Null, Boolean(true), Double(2.5))))
+  respGolden("%0\r\n", MapValue(Vector.empty[(Value, Value)]()))
+  respGolden(
+    "%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n",
+    MapValue(Vector((SimpleString("first"), Number(1)), (SimpleString("second"), Number(2))))
+  )
+  respGolden(
+    "%1\r\n*1\r\n:1\r\n%1\r\n+k\r\n+v\r\n",
+    MapValue(Vector((ArrayValue(Vector(Number(1))), MapValue(Vector((SimpleString("k"), SimpleString("v")))))))
+  )
+  respGolden(
+    "~3\r\n+orange\r\n+apple\r\n#t\r\n",
+    SetValue(Vector(SimpleString("orange"), SimpleString("apple"), Boolean(true)))
+  )
+  respGolden("~0\r\n", SetValue(Vector.empty[Value]()))
+  respGolden(
+    ">3\r\n+message\r\n+news\r\n$2\r\nhi\r\n",
+    Push(Vector(SimpleString("message"), SimpleString("news"), blobOf("hi")))
+  )
+  respGolden("*1\r\n_\r\n", ArrayValue(Vector(Null)))
+  // RESP2's null array inside an array reads as a null.
+  assertEq(respOne("*2\r\n*-1\r\n$-1\r\n"), ArrayValue(Vector(Null, Null)))
+
+@test("attributes come with the value after them, at the top and inside an aggregate")
+respAttributes()
+  val attrs = Vector((SimpleString("key-popularity"), MapValue(Vector((blobOf("a"), Double(0.1923))))))
+  respGolden(
+    "|1\r\n+key-popularity\r\n%1\r\n$1\r\na\r\n,0.1923\r\n*2\r\n:2039123\r\n:9543892\r\n",
+    Attributed(attrs, ArrayValue(Vector(Number(2039123), Number(9543892))))
+  )
+  respGolden(
+    "*2\r\n|1\r\n+ttl\r\n:3600\r\n:1\r\n:2\r\n",
+    ArrayValue(Vector(Attributed(Vector((SimpleString("ttl"), Number(3600))), Number(1)), Number(2)))
+  )
+  respGolden("|0\r\n+OK\r\n", Attributed(Vector.empty[(Value, Value)](), SimpleString("OK")))
+  val v = respOne("|1\r\n+a\r\n+b\r\n:5\r\n")
+  assertEq(v.plain, Number(5))
+  assertEq(v.asLong, Some(5))
+  assert(!respOne("|1\r\n+a\r\n+b\r\n_\r\n").plain.isError)
+  assert(respOne("|1\r\n+a\r\n+b\r\n_\r\n").isNull)
+  assert(respOne("|1\r\n+a\r\n+b\r\n-ERR x\r\n").isError)
+
+@test("streamed strings and aggregates read whole")
+respStreamed()
+  assertEq(respOne("$?\r\n;4\r\nHell\r\n;5\r\no wor\r\n;1\r\nd\r\n;0\r\n"), blobOf("Hello word"))
+  assertEq(respOne("$?\r\n;0\r\n"), blobOf(""))
+  assertEq(respByteByByte("$?\r\n;2\r\nab\r\n;0\r\n"), blobOf("ab"))
+  assertEq(respOne("*?\r\n:1\r\n:2\r\n:3\r\n.\r\n"), ArrayValue(Vector(Number(1), Number(2), Number(3))))
+  assertEq(respOne("*?\r\n.\r\n"), ArrayValue(Vector.empty[Value]()))
+  assertEq(
+    respOne("%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n.\r\n"),
+    MapValue(Vector((SimpleString("a"), Number(1)), (SimpleString("b"), Number(2))))
+  )
+  assertEq(respOne("~?\r\n+x\r\n.\r\n"), SetValue(Vector(SimpleString("x"))))
+  assertEq(respByteByByte("*?\r\n*?\r\n:1\r\n.\r\n.\r\n"), ArrayValue(Vector(ArrayValue(Vector(Number(1))))))
+  assert(respMalformed(respFailure("%?\r\n+a\r\n.\r\n")))
+  assert(respMalformed(respFailure("*?\r\n.x\r\n")))
+  assert(respMalformed(respFailure("$?\r\n+4\r\n")))
+  assert(respMalformed(respFailure("!?\r\n")))
+  assert(respMalformed(respFailure("|?\r\n")))
+
+@test("several values in one feed, and a value split across feeds, come out in order")
+respManyAndSplit()
+  val p = RespParser()
+  p.feed("+one\r\n:2\r\n$5\r\nth".utf8)
+  assertEq(p.next(), Ok(Some(SimpleString("one"))))
+  assertEq(p.next(), Ok(Some(Number(2))))
+  assertEq(p.next(), Ok(None))
+  assertEq(p.next(), Ok(None))
+  p.feed("ree\r\n*1\r".utf8)
+  assertEq(p.next(), Ok(Some(blobOf("three"))))
+  assertEq(p.next(), Ok(None))
+  p.feed("\n#f\r\n".utf8)
+  assertEq(p.next(), Ok(Some(ArrayValue(Vector(Boolean(false))))))
+  assertEq(p.next(), Ok(None))
+  assertEq(p.buffered, 0)
+  // An empty feed changes nothing; a parser with nothing fed has nothing.
+  p.feed(Array.empty[byte]())
+  assertEq(p.next(), Ok(None))
+  assertEq(RespParser().next(), Ok(None))
+
+@test("a long run of values through one parser, its buffer reused and grown")
+respLongRun()
+  val p = RespParser()
+  for i in 0 ..< 5000
+    p.feed(encode(ArrayValue(Vector(Number(long(i)), blobOf("x".repeat(i % 300))))))
+    if i % 3 == 0 then assertEq(
+      p.next(),
+      Ok(Some(ArrayValue(Vector(Number(long(i / 3)), blobOf("x".repeat(i / 3 % 300))))))
+    )
+  var rest = 0
+  while p.next() is Ok(Some(_)) do rest += 1
+  assertEq(rest, 5000 - 1667)
+  assertEq(p.buffered, 0)
+  val big = "y".repeat(1000000)
+  p.feed(encode(blobOf(big)))
+  assertEq(p.next(), Ok(Some(blobOf(big))))
+
+@test("every prefix of a frame is incomplete, not a failure")
+respTruncated()
+  val frames = Vector(
+    "+OK\r\n",
+    "-ERR x\r\n",
+    ":123\r\n",
+    "$5\r\nhello\r\n",
+    "$0\r\n\r\n",
+    "!3\r\nERR\r\n",
+    "=7\r\ntxt:abc\r\n",
+    ",1.5\r\n",
+    "(123\r\n",
+    "#t\r\n",
+    "_\r\n",
+    "*2\r\n:1\r\n*1\r\n+a\r\n",
+    "%1\r\n+a\r\n:1\r\n",
+    "~1\r\n+a\r\n",
+    ">2\r\n+a\r\n+b\r\n",
+    "|1\r\n+a\r\n+b\r\n+c\r\n",
+    "$?\r\n;1\r\na\r\n;0\r\n",
+    "*?\r\n:1\r\n.\r\n"
+  )
+  for f in frames
+    val bytes = f.utf8
+    for n in 0 ..< bytes.length
+      val p = RespParser()
+      p.feed(bytes.slice(0, n))
+      if p.next() != Ok(None) then fail(s"${debug(f)} cut at $n is not incomplete")
+    assert(respParsed(f).isOk)
+
+@test("lengths past the limits are refused from the header, before the bytes arrive")
+respLengthLimits()
+  val small = RespLimits(maxBulkBytes = 8, maxAggregateLength = 3, maxLineBytes = 16)
+  assertEq(respParsed("$8\r\n12345678\r\n", small), Ok(Some(blobOf("12345678"))))
+  assertEq(respFailure("$9\r\n", small), TooLong("blob string", 9, 8, 0))
+  assertEq(respFailure("!9\r\n", small), TooLong("blob error", 9, 8, 0))
+  assertEq(respFailure("=9\r\n", small), TooLong("verbatim string", 9, 8, 0))
+  assertEq(respFailure("$?\r\n;5\r\n12345\r\n;4\r\n", small), TooLong("streamed string", 9, 8, 0))
+  assert(respParsed("*3\r\n:1\r\n:2\r\n:3\r\n", small).isOk)
+  assertEq(respFailure("*4\r\n", small), TooMany(4, 3, 0))
+  assertEq(respFailure("%4\r\n", small), TooMany(4, 3, 0))
+  assertEq(respFailure("~4\r\n", small), TooMany(4, 3, 0))
+  assertEq(respFailure(">4\r\n", small), TooMany(4, 3, 0))
+  assertEq(respFailure("|4\r\n", small), TooMany(4, 3, 0))
+  assertEq(respFailure("*?\r\n:1\r\n:2\r\n:3\r\n:4\r\n", small), TooMany(4, 3, 0))
+  assertEq(respFailure("*1\r\n*4\r\n", small), TooMany(4, 3, 4))
+  // The default limits: 512 MiB a blob, 16777216 items an aggregate.
+  assertEq(respFailure("$536870913\r\n"), TooLong("blob string", 536870913, 536870912, 0))
+  assertEq(respParsed("$536870912\r\n"), Ok(None))
+  assertEq(respFailure("*16777217\r\n"), TooMany(16777217, 16777216, 0))
+  assertEq(respParsed("*16777216\r\n"), Ok(None))
+  // A length past a `long`, or past what any limit could allow, is refused as it is read.
+  assert(respMalformed(respFailure("$99999999999999999999999\r\n")))
+  assertEq(respFailure("$999999999999999999\r\n"), TooLong("blob string", 999999999999999999, 536870912, 0))
+  assertEq(respFailure("*999999999999999999\r\n"), TooMany(999999999999999999, 16777216, 0))
+
+@test("a line past its limit is refused before its end arrives")
+respLineLimits()
+  val small = RespLimits(maxLineBytes = 16)
+  assert(respParsed("+" + "a".repeat(16) + "\r\n", small).isOk)
+  assertEq(respFailure("+" + "a".repeat(17) + "\r\n", small), TooLong("line", 17, 16, 1))
+  assertEq(respFailure("+" + "a".repeat(17), small), TooLong("line", 17, 16, 1))
+  assertEq(respParsed("+" + "a".repeat(16), small), Ok(None))
+  assertEq(respFailure(":" + "1".repeat(40), small), TooLong("line", 17, 16, 1))
+  assertEq(respFailure("$" + "1".repeat(40), small), TooLong("line", 17, 16, 1))
+  // The default is 1 MiB.
+  assertEq(respParsed("+" + "b".repeat(1048576)), Ok(None))
+  assertEq(respFailure("+" + "b".repeat(1048577)), TooLong("line", 1048577, 1048576, 1))
+
+@test("nesting deeper than the limit is refused, and the limit itself is reached")
+respDepth()
+  val limits = RespLimits(maxDepth = 3)
+  assert(respParsed("*1\r\n*1\r\n*1\r\n:1\r\n", limits).isOk)
+  assertEq(respFailure("*1\r\n*1\r\n*1\r\n*1\r\n", limits), TooDeep(3, 12))
+  assertEq(respFailure("%1\r\n+k\r\n~1\r\n>1\r\n*0\r\n", limits), TooDeep(3, 16))
+  // Attributes count as a level for what they hold, and leave the value after them where it was.
+  assert(respParsed("|1\r\n+a\r\n*1\r\n*1\r\n:1\r\n:1\r\n", limits).isOk)
+  assert(respParsed("|1\r\n+a\r\n+b\r\n*1\r\n*1\r\n*1\r\n:1\r\n", limits).isOk)
+  // The default depth is 64: 64 arrays nest, 65 do not, however many bytes that is.
+  assert(respParsed("*1\r\n".repeat(63) + "*0\r\n").isOk)
+  assertEq(respFailure("*1\r\n".repeat(65)), TooDeep(64, 64 * 4))
+  assertEq(respFailure("*1\r\n".repeat(100000)), TooDeep(64, 64 * 4))
+
+@test("numbers, doubles, big numbers, booleans and nulls that are not one")
+respBadScalars()
+  for input in Vector(
+    ":\r\n",
+    ":abc\r\n",
+    ":1.5\r\n",
+    ": 1\r\n",
+    ":1 \r\n",
+    ":-\r\n",
+    ":+\r\n",
+    ":9223372036854775808\r\n",
+    ":-9223372036854775809\r\n",
+    ":99999999999999999999\r\n",
+    ",\r\n",
+    ",abc\r\n",
+    ",1.2.3\r\n",
+    ", 1\r\n",
+    ",1e\r\n",
+    ",infinity\r\n",
+    "(\r\n",
+    "(12a\r\n",
+    "(-\r\n",
+    "(1.5\r\n",
+    "#\r\n",
+    "#x\r\n",
+    "#tt\r\n",
+    "#T\r\n",
+    "_x\r\n",
+    "_ \r\n"
+  )
+    if !respMalformed(respFailure(input)) then fail(s"${debug(input)} was not refused")
+
+@test("lengths that are not one, and frames that do not end as they say")
+respBadFrames()
+  for input in Vector(
+    "$\r\n",
+    "$-2\r\n",
+    "$+1\r\na\r\n",
+    "$ 1\r\na\r\n",
+    "$1x\r\na\r\n",
+    "!-1\r\n",
+    "=-1\r\n",
+    "%-1\r\n",
+    "~-1\r\n",
+    ">-1\r\n",
+    "|-1\r\n",
+    "*-2\r\n",
+    "$3\r\nabcd\r\n",
+    "$3\r\nab\r\n\r\n",
+    "$2\r\nab\n\r",
+    "=3\r\ntxt\r\n",
+    "=5\r\ntxt-a\r\n",
+    "$?\r\n;-1\r\n",
+    "?\r\n",
+    "x\r\n",
+    "\r\n",
+    " +OK\r\n"
+  )
+    if !respMalformed(respFailure(input)) then fail(s"${debug(input)} was not refused")
+
+@test("a bare CR or LF in a line is refused")
+respStrayLineEnds()
+  assertEq(respFailure("+a\nb\r\n"), Malformed("an LF not after a CR", 2))
+  assertEq(respFailure("+a\rb\r\n"), Malformed("a CR not followed by LF", 2))
+  assertEq(respFailure("+OK\n"), Malformed("an LF not after a CR", 3))
+  assertEq(respParsed("+OK\r"), Ok(None))
+  assert(respMalformed(respFailure(":1\n")))
+
+@test("a failure is final, and names the offset in the whole stream")
+respFailureSticks()
+  val p = RespParser()
+  p.feed("+OK\r\n:1\r\n".utf8)
+  assertEq(p.next(), Ok(Some(SimpleString("OK"))))
+  assertEq(p.next(), Ok(Some(Number(1))))
+  p.feed(":x\r\n+fine\r\n".utf8)
+  val e = p.next()
+  assertEq(e, Err(Malformed("a number that is not one: \"x\"", 9)))
+  assertEq(p.next(), e)
+  p.feed("+more\r\n".utf8)
+  assertEq(p.next(), e)
+  assert(e.err.get.message.contains("byte 9"))
+
+@test("offsets go on counting across values taken and buffers reused")
+respOffsetsAcrossFeeds()
+  val p = RespParser()
+  for _ in 0 ..< 1000
+    p.feed("+0123456789\r\n".utf8)
+    assertEq(p.next(), Ok(Some(SimpleString("0123456789"))))
+  p.feed("?".utf8)
+  assertEq(p.next(), Err(Malformed("no RESP type begins with byte 63", 13000)))
+
+@test("RESP2's encoding writes what RESP2 has no type for in the type it uses instead")
+resp2Encoding()
+  assertEq(respText(encodeResp2(SimpleString("OK"))), "+OK\r\n")
+  assertEq(respText(encodeResp2(SimpleError("ERR x"))), "-ERR x\r\n")
+  assertEq(respText(encodeResp2(BlobError("ERR y"))), "-ERR y\r\n")
+  assertEq(respText(encodeResp2(blobOf("hi"))), "$2\r\nhi\r\n")
+  assertEq(respText(encodeResp2(VerbatimString("txt", "hi"))), "$2\r\nhi\r\n")
+  assertEq(respText(encodeResp2(Number(-5))), ":-5\r\n")
+  assertEq(respText(encodeResp2(Double(1.5))), "$3\r\n1.5\r\n")
+  assertEq(respText(encodeResp2(Double(real.NegativeInfinity))), "$4\r\n-inf\r\n")
+  assertEq(
+    respText(encodeResp2(BigNumber(BigInt.parse("123456789012345678901234567890").get))),
+    "$30\r\n123456789012345678901234567890\r\n"
+  )
+  assertEq(respText(encodeResp2(Boolean(true))), ":1\r\n")
+  assertEq(respText(encodeResp2(Boolean(false))), ":0\r\n")
+  assertEq(respText(encodeResp2(Null)), "$-1\r\n")
+  assertEq(respText(encodeResp2(SetValue(Vector(Number(1))))), "*1\r\n:1\r\n")
+  assertEq(respText(encodeResp2(Push(Vector(Null)))), "*1\r\n$-1\r\n")
+  assertEq(respText(encodeResp2(MapValue(Vector((blobOf("a"), Boolean(true)))))), "*2\r\n$1\r\na\r\n:1\r\n")
+  assertEq(respText(encodeResp2(Attributed(Vector((Null, Null)), Number(3)))), ":3\r\n")
+  // What RESP2 writes, the parser reads back as RESP2 means it.
+  val map = respOne(respText(encodeResp2(MapValue(Vector((blobOf("a"), Number(1)), (blobOf("b"), Number(2)))))))
+  assertEq(map.asEntries, Some(Vector((blobOf("a"), Number(1)), (blobOf("b"), Number(2)))))
+  assertEq(respOne(respText(encodeResp2(Double(2.25)))).asReal, Some(2.25))
+  assertEq(respOne(respText(encodeResp2(Boolean(true)))).asBool, Some(true))
+
+@test("a command is an array of blob strings, binary-safe")
+respCommands()
+  assertEq(respText(encodeCommand(Vector("SET", "key", "value"))), "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n")
+  assertEq(respText(encodeCommand(Vector("PING"))), "*1\r\n$4\r\nPING\r\n")
+  assertEq(respText(encodeCommand(Vector("SET", "", "a\r\nb"))), "*3\r\n$3\r\nSET\r\n$0\r\n\r\n$4\r\na\r\nb\r\n")
+  assertEq(respText(encodeCommand(Vector("SET", "ключ", "😀"))), "*3\r\n$3\r\nSET\r\n$8\r\nключ\r\n$4\r\n😀\r\n")
+  assertEq(respText(encodeCommand(Vector.empty[string]())), "*0\r\n")
+  val bytes = encodeCommandBytes(Vector("SET".utf8, Array(byte(0), byte(255))))
+  val p = RespParser()
+  p.feed(bytes)
+  assertEq(p.next(), Ok(Some(ArrayValue(Vector(blobOf("SET"), BlobString(Array(byte(0), byte(255)).toArraySeq))))))
+
+@test(should_trap: "holds a CR or LF")
+respSimpleStringWithNewline() = _ = encode(SimpleString("a\nb"))
+
+@test(should_trap: "holds a CR or LF")
+respSimpleErrorWithReturn() = _ = encode(SimpleError("a\rb"))
+
+@test(should_trap: "three bytes")
+respVerbatimFormatLength() = _ = encode(VerbatimString("text", "x"))
+
+@test(should_trap: "at least one")
+respZeroDepth() = _ = RespLimits(maxDepth = 0)
+
+@test(should_trap: "at least one")
+respZeroBulk() = _ = RespLimits(maxBulkBytes = 0)
+
+@test("what a value reads as: text, bytes, numbers, booleans, items and entries")
+respAccessors()
+  assertEq(SimpleString("12").asLong, Some(12))
+  assertEq(blobOf("-7").asLong, Some(-7))
+  assertEq(blobOf("x").asLong, None)
+  assertEq(Number(3).asReal, Some(3.0))
+  assertEq(blobOf("2.5").asReal, Some(2.5))
+  assertEq(blobOf("inf").asReal, Some(real.PositiveInfinity))
+  assertEq(blobOf(" 2").asReal, None)
+  assertEq(blobOf("").asReal, None)
+  assertEq(Number(1).asBool, Some(true))
+  assertEq(Number(0).asBool, Some(false))
+  assertEq(Number(2).asBool, None)
+  assertEq(SimpleString("x").asItems, None)
+  assertEq(Null.asItems, None)
+  assertEq(SetValue(Vector(Null)).asItems, Some(Vector(Null)))
+  assertEq(ArrayValue(Vector(Null)).asEntries, None)
+  assertEq(ArrayValue(Vector.empty[Value]()).asEntries, Some(Vector.empty[(Value, Value)]()))
+  assertEq(Number(1).asText, None)
+  assertEq(SimpleString("é").asBytes.map(b -> b.toArraySeq), Some("é".utf8.toArraySeq))
+  assert(BlobError("x").isError)
+  assert(!blobOf("x").isError)
