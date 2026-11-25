@@ -2918,6 +2918,99 @@ monotonic clock); the policy and the limiter wait through `pause: (Duration) -> 
 `nextReal`). A test gives its own, and drives a policy, a breaker or a limiter on a clock it moves
 itself, with nothing sleeping. The deadline is still the real one, read from `Context.current()`.
 
+## `avin.metrics`
+
+Metrics a program keeps about itself for a scraper to read: counters, gauges and histograms, each a
+**family** of **series** told apart by the values of its labels, held by one `Registry` and rendered
+in the Prometheus text exposition format, version 0.0.4. Every type is `Sendable`: one registry
+serves every thread.
+
+```text
+import avin.metrics.Registry
+import avin.time.millis
+
+main()
+  val registry = Registry()
+  val jobs = registry.counter("jobs_total", "Jobs finished, by queue.", ["queue"])
+  val mail = jobs.labels("mail")
+  mail.inc()
+  mail.inc()
+  jobs.labels("print").add(3.0)
+  val depth = registry.gauge("queue_depth", "Jobs waiting.")
+  depth.set(4.0)
+  val took = registry.histogram("job_seconds", "Time a job took.", buckets = [0.1, 1.0])
+  took.observe(millis(250))
+  print(registry.render)
+```
+
+```text
+# HELP jobs_total Jobs finished, by queue.
+# TYPE jobs_total counter
+jobs_total{queue="mail"} 2
+jobs_total{queue="print"} 3
+# HELP queue_depth Jobs waiting.
+# TYPE queue_depth gauge
+queue_depth 4
+# HELP job_seconds Time a job took.
+# TYPE job_seconds histogram
+job_seconds_bucket{le="0.1"} 0
+job_seconds_bucket{le="1"} 1
+job_seconds_bucket{le="+Inf"} 1
+job_seconds_sum 0.25
+job_seconds_count 1
+```
+
+**The hot path.** `labels(values*)` finds a series by one value for each label, in order, making it
+the first time; the series map is read without a lock and replaced whole, under the family's lock,
+only when a series is made. A series counts with one atomic compare-and-set of its value, so a
+program that keeps the series it counts often (`mail` above) pays that alone. Measured at `-O2` on
+an Apple M-series machine, 20 million times each: `inc` on a kept series or on a family without
+labels about 8 ns, a gauge's `inc` about 8 ns, a histogram's `observe` into 11 buckets about 12 ns,
+and `labels("GET", "2xx").inc()`, finding the series by two labels each time, about 125 ns. Four
+threads incrementing one series at once take about 100 ns an increment between them, the cost of
+the value's cache line passing from core to core; series of their own each avoid it.
+
+**The cardinality guard.** Each family holds at most `maxSeries` series (`defaultMaxSeries`, 10000,
+unless given another). Past it, every new label set is the family's **overflow series**, each label
+`OverflowValue` (`"_overflow"`), made the first time one is refused and rendered last, so a label
+taken from what clients send cannot grow a program's memory and a scrape without bound, while the
+totals stay whole. The series already held still count as before; `size` says how many a family
+holds, the overflow series among them.
+
+**The format.** A registry renders its families in the order they were made, each as its `# HELP`
+line (a backslash and a line end escaped), its `# TYPE` line and its series ordered by their label
+values. A label value escapes a backslash, a quote and a line end and keeps every other character,
+Unicode included. A number is written whole without a fraction (`3`), otherwise in its shortest
+decimal form (`0.25`), and infinities and `NaN` as `+Inf`, `-Inf` and `NaN`. A histogram writes each
+bucket's count of the observations at or below its bound (`_bucket{le="…"}`), then `+Inf`, `_sum`
+and `_count`; its count is the buckets' total, so `+Inf` and `_count` always agree, even while other
+threads observe.
+
+**Names.** A metric name is a letter, `_` or `:`, then letters, digits, `_` or `:`; a label name the
+same without `:`, and not beginning `__`; a histogram's labels do not include `le`, which its buckets
+are written with. A name is made once in a registry. A name or label name not allowed, a label named
+twice, a name made again, or a `maxSeries` below one traps where the family is made.
+
+| Member | Meaning |
+| --- | --- |
+| `Registry()` | The families of a program or a part of it. |
+| `counter(name, help, labels = [], maxSeries = defaultMaxSeries) -> Counter` | A counter family. |
+| `gauge(name, help, labels = [], maxSeries = defaultMaxSeries) -> Gauge` | A gauge family. |
+| `histogram(name, help, labels = [], buckets = defaultBuckets, maxSeries = defaultMaxSeries) -> Histogram` | A histogram family; `buckets` are finite upper bounds in increasing order, else it traps. |
+| `gaugeOf(name, help, read: @sendable () -> real)` | A gauge of one series without labels, `read` each time the registry renders. |
+| `render -> string`, `names -> Vector[string]` | The registry in the format; its families' names in the order made. |
+| `Counter`, `Gauge`, `Histogram` | A family: `name`, `help`, `labelNames`, `labels(values*)`, `size`, `render`; made alone, it renders alone. Without labels, its own methods are its one series'; with labels they trap. |
+| `CounterSeries` | `inc()`, `add(amount)`, `value`: `amount` finite and at least zero, else it traps. |
+| `GaugeSeries` | `set(v)`, `inc()`, `dec()`, `add(amount)`, `sub(amount)`, `value`. |
+| `HistogramSeries` | `observe(v: real)`, `observe(took: Duration)` in seconds, `count`, `sum`, `cumulative` (each bucket's count with those below it, then the count). A `NaN` is counted past every bound and makes the sum `NaN`. |
+| `defaultBuckets` | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 and 10 seconds. |
+| `linearBuckets(start, width, count)`, `exponentialBuckets(start, factor, count)` | `count` bounds from `start`, `width` apart or each `factor` times the last; a `count` below one, a `width` not above zero, a `start` not above zero or a `factor` not above one (exponential) traps. |
+| `number(v) -> string` | A number as the format writes it. |
+| `TextContentType` | `text/plain; version=0.0.4; charset=utf-8`. |
+
+[`avin.net.http`](#http-server) serves a registry (`metricsHandler`, `metricsRoute`) and keeps its
+request metrics in one (`Metrics`, `ServerMetrics`).
+
 ## `avin.net`
 
 TCP connections, TLS over them, servers, URLs, and a small HTTP client and server that speak `https`
@@ -3448,8 +3541,10 @@ readTimeout = seconds(30), writeTimeout = seconds(30), idleTimeout = seconds(5),
 16384, maxBodyBytes = 1048576, tls: Option[TlsSource] = None, errors: ErrorPage = plainError,
 date: bool = true, requestTimeout = seconds(60), handshakeTimeout = seconds(10), listen: ListenOptions
 = http.ServerListen, streamsBody: @sendable (ServerRequest) -> bool = http.bufferedBodies,
-headerTimeout = seconds(10), maxHeaders = 100) -> Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
-[socket options](#socket-options) `listen`. **`http.ServerListen`** is the listener's defaults with
+headerTimeout = seconds(10), maxHeaders = 100, metrics: Option[ServerMetrics] = None) ->
+Result[TcpServer, IoError]` listens as `TcpServer.start` does, with the
+[socket options](#socket-options) `listen`; with `metrics` it counts every request it reads,
+answers or refuses (**Metrics**, below). **`http.ServerListen`** is the listener's defaults with
 each connection's `noDelay` on, since a response is written in pieces a client waits on whole, and
 `keepAlive` `Some(KeepAlive())`, so a connection whose client vanished, a stream of events or a
 WebSocket above all, which no idle timeout ends, is found out within two minutes. A server behind a
@@ -3704,25 +3799,47 @@ makes none, though the request id is still found, passed on and answered.
 2026-11-23T10:20:30.5Z INFO  request svc=web id=4f1c…e2 method=GET path=/items/7 status=200 bytes=12 micros=1500 remote=127.0.0.1
 ```
 
-**Metrics.** `Metrics(buckets = defaultBuckets, clock = monotonic)` counts the requests its
-`middleware` passes on, shared by every connection's actor under a lock of its own:
+**Metrics.** Request metrics are families of an [`avin.metrics`](#avinmetrics) `Registry`, so a
+program's own counters are served beside them. `Metrics(buckets = defaultBuckets, clock = monotonic,
+registry = Registry(), maxSeries = 10000)` counts the requests its `middleware` passes on:
 `http_requests_total` by `method`, `route` (the route's pattern, `""` where none was chosen) and
 `status` class (`2xx`); `http_request_duration_seconds`, a histogram of `buckets` (5 ms to 10 s by
 default), a time equal to a bound counted in that bound's bucket, with its `_sum` and `_count`; and
-the gauge `http_requests_in_flight`. `render` is the Prometheus text format, series ordered by route,
-method and status class; `handler` answers it as `200` of the type `MetricsContentType`
-(`text/plain; version=0.0.4; charset=utf-8`), and `route(pattern = "/metrics")` mounts it.
-`observe(method, route, status, took)` counts a request answered another way, and `inFlight` is the
-gauge's value. Buckets not in increasing order, or one not above zero, trap.
+the gauge `http_requests_in_flight`. A method HTTP defines (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`,
+`CONNECT`, `OPTIONS`, `TRACE`, `PATCH`) is its own label and any other is `_other`
+(`methodLabel(method)`), so made-up methods make no new series; each family holds at most
+`maxSeries` series, the rest counted in its overflow series. `render` is the registry in the
+Prometheus text exposition format, every family in it; `handler` answers it as `200` of the type
+`MetricsContentType` (`text/plain; version=0.0.4; charset=utf-8`), and `route(pattern = "/metrics")`
+mounts it; `metricsHandler(registry)` and `metricsRoute(registry, pattern = "/metrics")` serve any
+registry. `observe(method, route, status, took)` counts a request answered another way, and
+`inFlight` is the gauge's value. Buckets not in increasing order, or one not above zero, trap, and so
+does a second `Metrics` in one registry.
+
+**The server's own metrics.** `ServerMetrics(buckets = defaultBuckets, clock = monotonic, registry =
+Registry())`, given to `serve` as `metrics = Some(…)`, counts every request the server reads, by
+method and status class, in `http_server_requests_total`; the time from the request read to its
+response written, a streamed body included, in `http_server_request_duration_seconds` by method;
+the requests being answered in `http_server_requests_in_flight`; and the requests refused before
+any handler saw them (`400`, `408`, `413`, `414`, `431`) in `http_server_rejected_total` by status
+code. A handler that traps is counted as answering `500`, its time and its place in flight ending
+with its connection, over TCP and TLS alike, so this gauge is exact where a middleware's cannot be;
+an upgrade is counted as its `101`.
+`started(method) -> InFlight` and `rejected(status)` count a request served another way; an
+`InFlight`'s first `finish(status)` counts it and answers `true`, any later one nothing.
 
 ```text
-val metrics = Metrics()
-val router = Router(Route.group("/api", routes, metrics.middleware) :+ metrics.route())
+val registry = Registry()
+val orders = registry.counter("shop_orders_total", "Orders placed, by payment.", ["payment"])
+val metrics = Metrics(registry = registry)
+val router = Router(Route.group("/api", routes, metrics.middleware) :+ metricsRoute(registry))
+val server = http.serve("0.0.0.0", 8080, router.handle, metrics = Some(ServerMetrics(registry = registry)))
 ```
 
 Wrapping a group or a route labels each request by its route; wrapping a router's `handle` counts the
-`404`s and `405`s too, every request labelled `""`. A handler that traps is not counted, and leaves the
-gauge one higher.
+`404`s and `405`s too, every request labelled `""`. A handler that traps is not counted by the
+middleware, and leaves its gauge one higher, since a trap runs nothing after it; the server's own
+metrics count it.
 
 **Rate limiting.** `RateLimiter(rate, per, burst = rate, key = clientAddress, maxKeys = 10000, clock =
 monotonic, errors = plainError)` gives each key a token bucket of `burst` tokens filled again at

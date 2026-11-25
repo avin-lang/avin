@@ -13777,6 +13777,41 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   (more than this item needs; `observe` covers counting another way); labelling by status code rather
   than class (more series for little gain). Review with the user: a handler that traps leaves the
   in-flight gauge one too high, for the same lack of unwinding.
+- Settled on the user's delegation 2026-11-24 (branch `metrics`): **`avin.metrics`, a general
+  registry, and the HTTP metrics re-based on it.** `Registry` holds `Counter`, `Gauge` and
+  `Histogram` families (and `gaugeOf`, read at render time), each a family of series by label values,
+  rendered in the Prometheus text exposition format 0.0.4, families in the order made, series by
+  their label values. Values are `real`s: a series is one `Atomic[real]` updated by a
+  compare-and-set loop (a histogram: an `Atomic[long]` a bucket plus one for its sum), and the series
+  map is a persistent `HashMap` in an `Atomic`, read without a lock and replaced under the family's
+  lock only when a series is made. Measured at `-O2`: about 8 ns an increment of a kept series,
+  12 ns a histogram observation into 11 buckets, 125 ns finding a series by two labels and
+  incrementing it, 100 ns an increment with four threads on one series. A histogram's count is the
+  sum of its buckets, so `+Inf` and `_count` agree in every render. Why: counters of seconds and
+  bytes need fractions, and a `real` compare-and-set costs what an integer add does; lock-free reads
+  keep the hot path to one atomic update. Alternatives weighed: `long` counters (exact, but no
+  fractional amounts, and a second type for each kind); one lock per family (simple, but every
+  increment would take it); a separate atomic count for histograms (a render could then show `+Inf`
+  above `_count`); OpenMetrics 1.0 text with content negotiation (the 0.0.4 text is what every
+  scraper reads, and `# EOF` and `_created` add nothing yet; a later addition); a process-wide default
+  registry (a hidden global; a program passes its registry as it does a logger). **The cardinality
+  guard** is a per-family `maxSeries`, 10000 by default, past which every new label set is one
+  overflow series whose labels are all `_overflow`, rendered last. Alternatives: trapping (a
+  client's input would stop the server), dropping the counts (totals would be wrong), refusing with
+  a `Result` (every `labels` call would grow error handling for what is a safety net), a limit on
+  the whole registry (one noisy family would starve the rest). The HTTP metrics label a method HTTP
+  does not define `_other`, so made-up methods cannot fill the guard. `Metrics` keeps its names and
+  API, gains `registry` and `maxSeries`, and its series are now ordered by label values (method
+  first) rather than by route. **The server's own metrics** are a `ServerMetrics` given to
+  `http.serve(metrics = Some(…))`: requests by method and status class, durations by method, in
+  flight, and refusals before any handler by status code, under the names `http_server_*` so they sit
+  beside a `Metrics` in one registry. The server holds each request's `InFlight` by its connection's
+  hash, so a handler that traps, which runs no deferred code, is still counted as `500` and leaves
+  the gauge exact when the connection's failure is reported. Alternatives: hooks as callbacks on
+  `serve` (a general hook API is a larger design, and the counting it would serve is this one);
+  counting refusals in `http_server_requests_total` with an empty method (a refused request has no
+  trustworthy method, and its exact code says which limit was hit). Review with the user: whether a
+  process-wide default registry is wanted after all, and OpenMetrics negotiation.
 - Settled on the user's delegation 2026-11-15 (built on branch `api-observe`): **rate limiting.**
   `RateLimiter(rate, per, burst, key, maxKeys, clock, errors)` is a token bucket per key, computed as
   each bucket's next-token time in integer microseconds (the generic cell rate algorithm, exactly a

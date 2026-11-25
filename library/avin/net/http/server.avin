@@ -466,6 +466,9 @@ private bound(pattern: Vector[string], segments: Vector[string]) -> Option[Vecto
 // reloaded while the server runs changes the certificate the connections accepted after it present
 // and leaves those already open as they were. A `TlsServer` that accepts no application protocol of
 // its own accepts `http/1.1` by ALPN.
+//
+// With `metrics`, the server counts every request it reads, answers or refuses there, a handler's
+// trap among them.
 serve(
     host: string,
     port: int,
@@ -484,7 +487,8 @@ serve(
     listen: ListenOptions = ServerListen,
     streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies,
     headerTimeout: Duration = seconds(10),
-    maxHeaders: int = 100
+    maxHeaders: int = 100,
+    metrics: Option[ServerMetrics] = None
 ) -> Result[TcpServer, IoError]
   val s = checkedSettings(
     readTimeout,
@@ -497,16 +501,19 @@ serve(
     date,
     streamsBody,
     headerTimeout,
-    maxHeaders
+    maxHeaders,
+    metrics
   )
   if handshakeTimeout.isNegative then fail(s"a handshake timeout of $handshakeTimeout: it is at least zero")
   tls match
     None -> TcpServer.start(
       host,
       port,
-      (stream, server) -> converse(stream, server, handler, s),
+      (stream, server) -> converse(stream, server, handler, s, stream.hash()),
       maxConnections,
-      failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s),
+      failed = stream ->
+        s.flights.abandon(stream.hash())
+        if !s.streaming.release(stream) then refuse(stream, 500, s),
       listen = listen
     )
     Some(identity) -> TcpServer.start(
@@ -514,7 +521,9 @@ serve(
       port,
       (stream, server) -> secured(stream, server, handler, s, identity, handshakeTimeout),
       maxConnections,
-      failed = stream -> _ = stream.close(),
+      failed = stream ->
+        s.flights.abandon(stream.hash())
+        _ = stream.close(),
       listen = listen
     )
 
@@ -538,7 +547,8 @@ serveUnix(
     replacing: bool = false,
     streamsBody: @sendable (ServerRequest) -> bool = bufferedBodies,
     headerTimeout: Duration = seconds(10),
-    maxHeaders: int = 100
+    maxHeaders: int = 100,
+    metrics: Option[ServerMetrics] = None
 ) -> Result[TcpServer, IoError]
   val s = checkedSettings(
     readTimeout,
@@ -551,13 +561,16 @@ serveUnix(
     date,
     streamsBody,
     headerTimeout,
-    maxHeaders
+    maxHeaders,
+    metrics
   )
   TcpServer.startUnix(
     path,
-    (stream, server) -> converse(stream, server, handler, s),
+    (stream, server) -> converse(stream, server, handler, s, stream.hash()),
     maxConnections,
-    failed = stream -> if !s.streaming.release(stream) then refuse(stream, 500, s),
+    failed = stream ->
+      s.flights.abandon(stream.hash())
+      if !s.streaming.release(stream) then refuse(stream, 500, s),
     backlog = backlog,
     replacing = replacing
   )
@@ -575,7 +588,8 @@ private checkedSettings(
     date: bool,
     streamsBody: @sendable (ServerRequest) -> bool,
     headerTimeout: Duration,
-    maxHeaders: int
+    maxHeaders: int,
+    metrics: Option[ServerMetrics]
 ) -> Settings
   if maxHeaderBytes < 1 then fail(s"a header limit of $maxHeaderBytes bytes: it is at least one")
   if maxBodyBytes < 0 then fail(s"a body limit of $maxBodyBytes bytes: it is at least zero")
@@ -594,7 +608,9 @@ private checkedSettings(
     errors,
     Streaming(),
     if date then Some(DateHeader()) else None,
-    streamsBody
+    streamsBody,
+    metrics,
+    Flights()
   )
 
 // The socket options `serve` listens with unless given others: the listener's defaults, and each
@@ -616,7 +632,7 @@ private secured(
   if tcp.setTimeout(s.readTimeout).isErr then return
   TlsStream.server(tcp, forHttp(identity.current), handshake) match
     Ok(stream) ->
-      converse(stream, server, handler, s, false)
+      converse(stream, server, handler, s, tcp.hash(), false)
       // The conversation is over; a close notice the client never reads changes nothing.
       _ = stream.close()
     Err(_) -> ()
@@ -626,7 +642,8 @@ private forHttp(server: TlsServer) -> TlsServer =
   if server.protocols.isEmpty then server.offer(["http/1.1"]) else server
 
 // The limits a server was started with, the error page it renders its own answers by, the
-// connections streaming a response, and the source of its `Date` header where it sends one.
+// connections streaming a response, the source of its `Date` header where it sends one, and the
+// metrics it keeps where it keeps them, with the requests they count as in flight.
 private data Settings(
     readTimeout: Duration,
     writeTimeout: Duration,
@@ -639,11 +656,44 @@ private data Settings(
     errors: ErrorPage,
     streaming: Streaming,
     date: Option[DateHeader],
-    streamsBody: @sendable (ServerRequest) -> bool
+    streamsBody: @sendable (ServerRequest) -> bool,
+    metrics: Option[ServerMetrics],
+    flights: Flights
 )
 
 // The `streamsBody` of a server whose every request has its body read before its handler is called.
 bufferedBodies(request: ServerRequest) -> bool = false
+
+// The requests a server's metrics count as in flight, by the hash of their connection, so a handler
+// that traps has its request counted as answering `500` when its connection fails. Two connections
+// sharing a hash only share a list: the one that fails finishes the other's request too, early.
+private class Flights(): Sendable
+  private val held = Mutex(HeldFlights())
+
+  // Holds `f` while the connection `key` answers it.
+  hold(key: long, f: InFlight) = held.with(
+    h -> h.flights = h.flights.updated(key, h.flights.getOrElse(key, Vector.empty[InFlight]()) :+ f)
+  )
+
+  // Lets `f` go, answered.
+  release(key: long, f: InFlight) = held.with(h ->
+    h.flights.get(key) match
+      Some(v) ->
+        val rest = v.filter(g -> !(g === f))
+        h.flights = if rest.isEmpty then h.flights.removed(key) else h.flights.updated(key, rest)
+      None -> ())
+
+  // The connection `key` failed: each request it held is counted as answering `500`.
+  abandon(key: long)
+    val left = held.with(h ->
+      val v = h.flights.getOrElse(key, Vector.empty[InFlight]())
+      h.flights = h.flights.removed(key)
+      v)
+    for f in left
+      _ = f.finish(500)
+
+private class HeldFlights()
+  var flights = HashMap.empty[long, Vector[InFlight]]()
 
 // The date a server's responses carry, as the text of a `Date` header: the HTTP-date of the clock's
 // now, formatted once for each second and handed to every connection that asks within it. The latest
@@ -698,8 +748,9 @@ private data Refusal
 
 // One connection's requests, read and answered in turn until it is not kept alive, its peer ends it,
 // or it waits for a request longer than its limit. Where `marks`, a connection streaming a response
-// is held in `s.streaming` while it does.
-private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, marks: bool = true)
+// is held in `s.streaming` while it does. Where the server keeps metrics, each request read is in
+// flight, held under `key`, until its response is written.
+private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Settings, key: long, marks: bool = true)
   val input = Incoming(stream)
   // A new connection's first request, its line and headers, is due `headerTimeout` after the
   // connection was accepted, so the wait for its first byte is no longer than that either; a later
@@ -715,9 +766,13 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
       Ok(r) -> r
       Err(Quietly) -> return
       Err(Answer(status)) ->
+        if s.metrics is Some(m) then m.rejected(status)
         refuse(stream, status, s)
         return
+    val flight = s.metrics.map(m -> m.started(request.method))
+    if flight is Some(f) then s.flights.hold(key, f)
     if server.isStopping()
+      landed(flight, key, 503, s)
       refuse(stream, 503, s)
       return
     val response = handler(request)
@@ -725,13 +780,20 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
     if source is Some(b)
       b.refusal match
         Some(Answer(status)) ->
+          landed(flight, key, status, s)
           refuse(stream, status, s)
           return
-        Some(Quietly) -> return
+        Some(Quietly) ->
+          // The body broke off, so no answer can be read: counted as the client's fault.
+          landed(flight, key, 400, s)
+          return
         None -> ()
     if response.upgraded is Some(upgrade)
       // The bytes after the request are its body's, not the other protocol's.
-      if source.exists(b -> !b.ended) then return
+      if source.exists(b -> !b.ended)
+        landed(flight, key, 400, s)
+        return
+      landed(flight, key, 101, s)
       upgradedOut(stream, server, response, upgrade, input.rest(), s, marks)
       return
     // Whether the body has been read to its end, so what follows on the connection is a request.
@@ -757,11 +819,18 @@ private converse(stream: ByteStream, server: TcpServer, handler: Handler, s: Set
         )
         if marks then _ = s.streaming.release(stream)
         going
+    landed(flight, key, response.status, s)
     if !kept
       // A body left unread is still arriving; the connection is shut gently, so the answer is not
       // lost to a reset.
       if !whole && source.forall(b -> b.refusal.isEmpty) then lingered(stream)
       return
+
+// Counts the request `flight` is, where the server keeps metrics, as answered `status`.
+private landed(flight: Option[InFlight], key: long, status: int, s: Settings)
+  if flight is Some(f)
+    s.flights.release(key, f)
+    _ = f.finish(status)
 
 // Sends the `101` of `response` and hands the connection to `upgrade`, with the bytes the client sent
 // after its request, which were read ahead; the connection is no longer HTTP's, so the server reads
