@@ -1,0 +1,388 @@
+// `avin.net.idna`: Punycode by RFC 3492's own sample strings and its failures, and UTS #46 processing
+// by the Unicode conformance file and the cases a reader meets first.
+//
+// `tests/fixtures/unicode/IdnaTestV2.txt` is `IdnaTestV2.txt` of Unicode 17.0.0
+// (`https://www.unicode.org/Public/17.0.0/idna/IdnaTestV2.txt`, SHA-256
+// `beb5d0be20e896189b03209a82fdc34f06351502bbd4b8e2523583fc2954d9cf`), as published; its licence is
+// `tests/fixtures/unicode/LICENSE.txt`.
+
+import avin.fs
+import avin.net.idna
+
+import avin.net.idna.{
+  Bidi, BadPunycode, Disallowed, DomainLength, Hyphens, IdnaError, InvalidCodePoint, InvalidInput, Joiners, LabelLength,
+  LeadingMark, MaxLabelLength, Overflow
+}
+
+hexCode(text: string) -> int
+  var n = 0
+  for c in text.chars
+    n = n * 16 + c.asDigit
+  n
+
+// Code points written in hexadecimal with a space between them, as a string.
+fromHex(text: string) -> string
+  val out = StringWriter()
+  for code in text.split(" ") do out.writeChar(char(hexCode(code)))
+  out.text
+
+// The sample strings of RFC 3492 §7.1, each its code points and its Punycode.
+samples() -> Vector[(string, string)] = [
+  (
+    "0644 064A 0647 0645 0627 0628 062A 0643 0644 0645 0648 0634 0639 0631 0628 064A 061F",
+    "egbpdaj6bu4bxfgehfvwxn"
+  ),
+  ("4ED6 4EEC 4E3A 4EC0 4E48 4E0D 8BF4 4E2D 6587", "ihqwcrb4cv8a8dqg056pqjye"),
+  ("4ED6 5011 7232 4EC0 9EBD 4E0D 8AAA 4E2D 6587", "ihqwctvzc91f659drss3x8bo0yb"),
+  (
+    "0050 0072 006F 010D 0070 0072 006F 0073 0074 011B 006E 0065 006D 006C 0075 0076 00ED 010D 0065 0073 006B 0079",
+    "Proprostnemluvesky-uyb24dma41a"
+  ),
+  (
+    "05DC 05DE 05D4 05D4 05DD 05E4 05E9 05D5 05D8 05DC 05D0 05DE 05D3 05D1 05E8 05D9 05DD 05E2 05D1 05E8 05D9 05EA",
+    "4dbcagdahymbxekheh6e0a7fei0b"
+  ),
+  (
+    "092F 0939 0932 094B 0917 0939 093F 0928 094D 0926 0940 0915 094D 092F 094B 0902 0928 0939 0940 0902 092C 094B 0932 0938 0915 0924 0947 0939 0948 0902",
+    "i1baa7eci9glrd9b2ae1bj0hfcgg6iyaf8o0a1dig0cd"
+  ),
+  (
+    "306A 305C 307F 3093 306A 65E5 672C 8A9E 3092 8A71 3057 3066 304F 308C 306A 3044 306E 304B",
+    "n8jok5ay5dzabd5bym9f0cm5685rrjetr6pdxa"
+  ),
+  (
+    "C138 ACC4 C758 BAA8 B4E0 C0AC B78C B4E4 C774 D55C AD6D C5B4 B97C C774 D574 D55C B2E4 BA74 C5BC B9C8 B098 C88B C744 AE4C",
+    "989aomsvi5e83db1d2a355cv1e0vak1dwrv93d5xbh15a0dt30a5jpsd879ccm6fea98c"
+  ),
+  // The RFC writes this one's `d` in upper case, a hint of case its decoder may use; an encoder
+  // writes every digit in lower case.
+  (
+    "043F 043E 0447 0435 043C 0443 0436 0435 043E 043D 0438 043D 0435 0433 043E 0432 043E 0440 044F 0442 043F 043E 0440 0443 0441 0441 043A 0438",
+    "b1abfaaepdrnnbgefbadotcwatmq2g4l"
+  ),
+  (
+    "0050 006F 0072 0071 0075 00E9 006E 006F 0070 0075 0065 0064 0065 006E 0073 0069 006D 0070 006C 0065 006D 0065 006E 0074 0065 0068 0061 0062 006C 0061 0072 0065 006E 0045 0073 0070 0061 00F1 006F 006C",
+    "PorqunopuedensimplementehablarenEspaol-fmd56a"
+  ),
+  (
+    "0054 1EA1 0069 0073 0061 006F 0068 1ECD 006B 0068 00F4 006E 0067 0074 0068 1EC3 0063 0068 1EC9 006E 00F3 0069 0074 0069 1EBF 006E 0067 0056 0069 1EC7 0074",
+    "TisaohkhngthchnitingVit-kjcr8268qyxafd2f1b9g"
+  ),
+  ("0033 5E74 0042 7D44 91D1 516B 5148 751F", "3B-ww4c5e180e575a65lsy2b"),
+  (
+    "5B89 5BA4 5948 7F8E 6075 002D 0077 0069 0074 0068 002D 0053 0055 0050 0045 0052 002D 004D 004F 004E 004B 0045 0059 0053",
+    "-with-SUPER-MONKEYS-pc58ag80a8qai00g7n9n"
+  ),
+  (
+    "0048 0065 006C 006C 006F 002D 0041 006E 006F 0074 0068 0065 0072 002D 0057 0061 0079 002D 305D 308C 305E 308C 306E 5834 6240",
+    "Hello-Another-Way--fc4qua05auwb3674vfr0b"
+  ),
+  ("3072 3068 3064 5C4B 6839 306E 4E0B 0032", "2-u9tlzr9756bt3uc0v"),
+  ("004D 0061 006A 0069 3067 004B 006F 0069 3059 308B 0035 79D2 524D", "MajiKoi5-783gue6qz075azm5e"),
+  ("30D1 30D5 30A3 30FC 0064 0065 30EB 30F3 30D0", "de-jg4avhby1noc0d"),
+  ("305D 306E 30B9 30D4 30FC 30C9 3067", "d9juau41awczczp"),
+  ("002D 003E 0020 0024 0031 002E 0030 0030 0020 003C 002D", "-> $1.00 <--")
+]
+
+@test("Punycode encodes and decodes every sample string of RFC 3492")
+rfcSamples()
+  val wrong = Buffer[string]()
+  for (codes, punycode) in samples()
+    val text = fromHex(codes)
+    if idna.encodePunycode(text) != Ok(punycode) then wrong.addOne(s"encode $codes: ${idna.encodePunycode(text)}")
+    if idna.decodePunycode(punycode) != Ok(text) then wrong.addOne(
+      s"decode $punycode: ${idna.decodePunycode(punycode)}"
+    )
+  assertEq(wrong.toVector, Vector.empty[string]())
+  // The RFC's own spelling, with its case hint, decodes alike.
+  val (russian, _) = samples()(8)
+  assertEq(idna.decodePunycode("b1abfaaepdrnnbgefbaDotcwatmq2g4l"), Ok(fromHex(russian)))
+  // Digits read in either case; the ASCII characters are kept in theirs.
+  assertEq(idna.decodePunycode("BCHER-KVA"), Ok("B\u{fc}CHER"))
+  assertEq(idna.decodePunycode("bcher-KVA"), Ok("b\u{fc}cher"))
+
+@test("Punycode of the empty string, ASCII only, and one character")
+punycodeBoundaries()
+  assertEq(idna.encodePunycode(""), Ok(""))
+  assertEq(idna.decodePunycode(""), Ok(""))
+  assertEq(idna.encodePunycode("abc"), Ok("abc-"))
+  assertEq(idna.decodePunycode("abc-"), Ok("abc"))
+  assertEq(idna.decodePunycode("a-"), Ok("a"))
+  assertEq(idna.encodePunycode("-"), Ok("--"))
+  assertEq(idna.decodePunycode("--"), Ok("-"))
+  assertEq(idna.encodePunycode("\u{fc}"), Ok("tda"))
+  assertEq(idna.decodePunycode("tda"), Ok("\u{fc}"))
+  assertEq(idna.encodePunycode("b\u{fc}cher"), Ok("bcher-kva"))
+  assertEq(idna.encodePunycode("\u{80}"), Ok("a"))
+  assertEq(idna.decodePunycode("a"), Ok("\u{80}"))
+  assertEq(idna.decodePunycode(idna.encodePunycode("\u{10ffff}").getOrElse("")), Ok("\u{10ffff}"))
+  assertEq(idna.decodePunycode(idna.encodePunycode("a\u{10ffff}\u{80}a").getOrElse("")), Ok("a\u{10ffff}\u{80}a"))
+
+@test("Punycode round-trips every code point beyond ASCII, alone and among others")
+punycodeRoundTrips()
+  var wrong = 0
+  var c = 0x80
+  while c <= 0x10ffff
+    if !(0xd800 <= c <= 0xdfff)
+      val text = s"x${char(c)}y${char(0x80 + c % 1000)}"
+      val encoded = idna.encodePunycode(text).getOrElse("!")
+      if !encoded.chars.forall(ch -> int(ch) < 0x80) || idna.decodePunycode(encoded) != Ok(text) then wrong += 1
+    c += if c < 0x3000 then 1 else 97
+  assertEq(wrong, 0)
+  // Every character of a long text, repeated and out of order.
+  val mixed = StringWriter()
+  for k in 0 ..< 1000 do mixed.writeChar(char(0x4e00 + (k * 7919) % 2000))
+  assertEq(idna.decodePunycode(idna.encodePunycode(mixed.text).getOrElse("")), Ok(mixed.text))
+
+// Punycode for the single value 0x110000, one past the last code point: the number 0x110000 - 128
+// in digits of 1, 1, 26 and 26 (RFC 3492's thresholds at the initial bias), `e` `n` `3` `2` `g`.
+val OutOfRange: string = "en32g"
+
+// Punycode for the single value 0xD800, the first surrogate.
+val Surrogate: string = "ib9b"
+
+@test("Punycode refuses text that is not Punycode, saying where")
+punycodeInvalid()
+  assertEq(idna.decodePunycode("-"), Err(InvalidInput(0)))
+  assertEq(idna.decodePunycode("a-!"), Err(InvalidInput(2)))
+  assertEq(idna.decodePunycode("\u{fc}-a"), Err(InvalidInput(0)))
+  assertEq(idna.decodePunycode("ab\u{fc}-a"), Err(InvalidInput(2)))
+  assertEq(idna.decodePunycode("a-\u{fc}"), Err(InvalidInput(2)))
+  assertEq(idna.decodePunycode("a b"), Err(InvalidInput(1)))
+  // A number cut off before its last digit.
+  assertEq(idna.decodePunycode("b"), Err(InvalidInput(1)))
+  assertEq(idna.decodePunycode("bcher-kv9"), Err(InvalidInput(9)))
+  // A value beyond Unicode, and a surrogate.
+  assertEq(idna.decodePunycode(OutOfRange), Err(InvalidCodePoint(0x110000)))
+  assertEq(idna.decodePunycode(Surrogate), Err(InvalidCodePoint(0xd800)))
+
+@test("Punycode answers Overflow for numbers past the range of int, rather than trapping")
+punycodeOverflow()
+  assertEq(idna.decodePunycode("999999999"), Err(Overflow))
+  assertEq(idna.decodePunycode("a-99999999999999999999"), Err(Overflow))
+  // Two thousand ASCII characters and then the last code point: the first number does not fit.
+  assertEq(idna.encodePunycode("a".repeat(2000) + "\u{10ffff}"), Err(Overflow))
+  // One thousand fit.
+  assert(idna.encodePunycode("a".repeat(1000) + "\u{10ffff}").isOk)
+  assert(idna.encodePunycode("\u{10ffff}".repeat(3000)).isOk)
+
+// The columns of the conformance file read: escapes `\uXXXX` turned into characters, `""` into the
+// empty string. `None` where an escape is a surrogate, which a string cannot hold.
+unescape(field: string) -> Option[string]
+  val text = field.trim
+  if text == "\"\"" then return Some("")
+  val out = StringWriter()
+  var i = 0
+  while i < text.byteLength
+    if text.startsWith("\\u", i)
+      val c = hexCode(text.slice(i + 2, i + 6))
+      if 0xd800 <= c <= 0xdfff then return None
+      out.writeChar(char(c))
+      i += 6
+    else
+      val ch = text.slice(i, text.byteLength).chars(0)
+      out.writeChar(ch)
+      i += ch.toString().byteLength
+  Some(out.text)
+
+// The codes of a status column, `[B5, B6]`, as a vector; empty for a blank one.
+statuses(field: string) -> Vector[string]
+  val text = field.trim
+  if text.isEmpty || text == "[]" then return Vector.empty[string]()
+  text.slice(1, text.byteLength - 1).split(",").map(s -> s.trim).toVector
+
+// A line of the conformance file: the source, the expected `toUnicode` result and its status codes,
+// and the expected non-transitional `toAscii` result and its status codes.
+data Case(source: string, unicode: string, unicodeErrors: Vector[string], ascii: string, asciiErrors: Vector[string])
+
+// The conformance file's lines, and how many were skipped for holding a surrogate.
+conformance() -> (Vector[Case], int)
+  val text = fs.readText("tests/fixtures/unicode/IdnaTestV2.txt") match
+    Ok(t) -> t
+    Err(e) -> fail(s"cannot read the conformance file: ${e.message}")
+  val found = Buffer[Case]()
+  var skipped = 0
+  for line in text.split("\n")
+    if line.isEmpty || line.startsWith("#") then continue
+    val hash = line.indexOf("#")
+    val fields = (if hash >= 0 then line.slice(0, hash) else line).split(";")
+    val source = unescape(fields(0))
+    val unicodeField = unescape(fields(1))
+    val asciiField = unescape(fields(3))
+    if source.isEmpty || unicodeField.isEmpty || asciiField.isEmpty
+      skipped += 1
+      continue
+    val s = source.getOrElse("")
+    val unicode = if fields(1).trim.isEmpty then s else unicodeField.getOrElse("")
+    val unicodeErrors = statuses(fields(2))
+    val ascii = if fields(3).trim.isEmpty then unicode else asciiField.getOrElse("")
+    val asciiErrors = if fields(4).trim.isEmpty then unicodeErrors else statuses(fields(4))
+    found.addOne(Case(s, unicode, unicodeErrors, ascii, asciiErrors))
+  (found.toVector, skipped)
+
+// Whether `answer` is what the file expects: the result where no code counts, an error where one does.
+agrees(answer: Result[string, IdnaError], expected: string, codes: Vector[string], ignored: Vector[string]) -> bool
+  val errors = codes.filter(c -> !ignored.contains(c))
+  answer match
+    Ok(t) -> errors.isEmpty && t == expected
+    Err(_) -> errors.nonEmpty
+
+// The source, its code points, for a failure's message.
+shown(s: string) -> string = s.chars.map(c -> int(c).toString()).mkString(" ")
+
+@test("every line of the Unicode conformance file, with every check on")
+conformanceStrict()
+  val (cases, skipped) = conformance()
+  assert(cases.length > 6000)
+  // The two lines holding an unpaired surrogate.
+  assertEq(skipped, 2)
+  var failures = 0
+  for c in cases
+    // `X4_2` is a length rule `toUnicode` reports only for compatibility; it has no length rule.
+    val unicode = idna.toUnicode(c.source, checkHyphens = true, useStd3AsciiRules = true)
+    val ascii = idna.toAscii(c.source, checkHyphens = true, useStd3AsciiRules = true, verifyDnsLength = true)
+    val ok = agrees(unicode, c.unicode, c.unicodeErrors, ["X4_2"]) && agrees(ascii, c.ascii, c.asciiErrors, [])
+    if !ok
+      if failures < 10 then eprintln(
+        s"conformance line fails: ${shown(c.source)}: $unicode $ascii, expected ${c.unicode} ${c.unicodeErrors} ${c.ascii} ${c.asciiErrors}"
+      )
+      failures += 1
+  assertEq(failures, 0)
+
+@test("every line of the Unicode conformance file, with the WHATWG URL standard's checks")
+conformanceWhatwg()
+  val (cases, _) = conformance()
+  // The codes of the checks the URL standard turns off: hyphens, STD3 rules and DNS lengths.
+  val off = ["V2", "V3", "U1", "A4_1", "A4_2", "X4_2"]
+  var failures = 0
+  for c in cases
+    val unicode = idna.toUnicode(c.source)
+    val ascii = idna.toAscii(c.source)
+    if !agrees(unicode, c.unicode, c.unicodeErrors, off) || !agrees(ascii, c.ascii, c.asciiErrors, off)
+      if failures < 10 then eprintln(s"conformance line fails: ${shown(c.source)}: $unicode $ascii")
+      failures += 1
+  assertEq(failures, 0)
+
+@test("toAscii maps, normalizes and writes labels beyond ASCII in Punycode; toUnicode reverses it")
+processing()
+  assertEq(idna.toAscii("B\u{fc}cher.example"), Ok("xn--bcher-kva.example"))
+  assertEq(idna.toUnicode("xn--bcher-kva.example"), Ok("b\u{fc}cher.example"))
+  assertEq(idna.toUnicode("XN--BCHER-KVA.Example"), Ok("b\u{fc}cher.example"))
+  assertEq(idna.toAscii("xn--bcher-kva.example"), Ok("xn--bcher-kva.example"))
+  // Decomposed and composed spellings are one name.
+  assertEq(idna.toAscii("bu\u{308}cher.example"), Ok("xn--bcher-kva.example"))
+  // Non-transitional: `ß` and `ς` are kept.
+  assertEq(idna.toAscii("fa\u{df}.de"), Ok("xn--fa-hia.de"))
+  assertEq(idna.toUnicode("xn--fa-hia.de"), Ok("fa\u{df}.de"))
+  assertEq(idna.toAscii("\u{3c2}"), Ok("xn--3xa"))
+  // Fullwidth letters, the ideographic full stop and upper case are mapped.
+  assertEq(idna.toAscii("\u{ff25}\u{ff38}\u{ff21}\u{ff2d}\u{ff30}\u{ff2c}\u{ff25}\u{3002}com"), Ok("example.com"))
+  assertEq(idna.toAscii("WWW.Example.COM"), Ok("www.example.com"))
+  assertEq(idna.toAscii("\u{3a3}"), idna.toAscii("\u{3c3}"))
+  // Ignored characters are removed: the soft hyphen, a variation selector.
+  assertEq(idna.toAscii("a\u{ad}b\u{fe0f}.c"), Ok("ab.c"))
+  // Compatibility characters are mapped to their plain forms.
+  assertEq(idna.toAscii("\u{2460}.\u{fb01}"), Ok("1.fi"))
+  // Several scripts in several labels.
+  assertEq(idna.toAscii("\u{65e5}\u{672c}.\u{440}\u{444}"), Ok("xn--wgv71a.xn--p1ai"))
+  assertEq(idna.toUnicode("xn--wgv71a.xn--p1ai"), Ok("\u{65e5}\u{672c}.\u{440}\u{444}"))
+  // An emoji is valid.
+  assertEq(idna.toAscii("\u{1f600}.example"), Ok("xn--e28h.example"))
+  // Empty labels, a trailing dot, and the empty name are kept by default.
+  assertEq(idna.toAscii(""), Ok(""))
+  assertEq(idna.toAscii("."), Ok("."))
+  assertEq(idna.toAscii("a..b."), Ok("a..b."))
+  assertEq(idna.toUnicode(""), Ok(""))
+  // ASCII the URL standard allows in a name, without the STD3 rules.
+  assertEq(idna.toAscii("a_b c"), Ok("a_b c"))
+
+@test("each kind of error, in the label it is found in")
+errors()
+  assertEq(idna.toAscii("a.b\u{fffd}c"), Err(Disallowed(1)))
+  assertEq(idna.toAscii("\u{e000}"), Err(Disallowed(0)))
+  assertEq(idna.toAscii("a\u{378}"), Err(Disallowed(0)))
+  assertEq(idna.toAscii("\u{300}a"), Err(LeadingMark(0)))
+  assertEq(idna.toAscii("ok.\u{94d}a"), Err(LeadingMark(1)))
+  assertEq(idna.toAscii("xn--"), Err(BadPunycode(0)))
+  assertEq(idna.toAscii("xn--ascii-"), Err(BadPunycode(0)))
+  assertEq(idna.toAscii("a.xn--a-\u{e4}"), Err(BadPunycode(1)))
+  assertEq(idna.toAscii("xn--9999999999"), Err(BadPunycode(0)))
+  // Punycode for an upper-case letter, which mapping would have lowered: disallowed in the label.
+  assertEq(idna.toAscii("xn--Bcher-kva"), Ok("xn--bcher-kva"))
+  assertEq(idna.toAscii(s"xn--${idna.encodePunycode("\u{dc}x").getOrElse("")}"), Err(Disallowed(0)))
+  // Punycode not in normalization form NFC.
+  assertEq(idna.toAscii(s"xn--${idna.encodePunycode("u\u{308}x").getOrElse("")}"), Err(BadPunycode(0)))
+  // Punycode for a label itself beginning `xn--`.
+  assertEq(idna.toAscii(s"xn--${idna.encodePunycode("xn--\u{fc}").getOrElse("")}"), Err(BadPunycode(0)))
+  // Joiners: allowed after a virama, and a non-joiner between joining letters.
+  assertEq(idna.toAscii("a\u{200d}b"), Err(Joiners(0)))
+  assertEq(idna.toAscii("a\u{200c}b"), Err(Joiners(0)))
+  assert(idna.toAscii("\u{915}\u{94d}\u{200d}\u{937}").isOk)
+  assert(idna.toAscii("\u{915}\u{94d}\u{200c}\u{937}").isOk)
+  assert(idna.toAscii("\u{628}\u{200c}\u{628}").isOk)
+  assert(idna.toAscii("\u{628}\u{64b}\u{200c}\u{64b}\u{628}").isOk)
+  assertEq(idna.toAscii("\u{628}\u{200c}"), Err(Joiners(0)))
+  assertEq(idna.toAscii("\u{200c}\u{628}"), Err(Joiners(0)))
+  assert(idna.toAscii("a\u{200d}b", checkJoiners = false).isOk)
+  // Bidirectional rules, in a name holding a right-to-left label.
+  assertEq(idna.toAscii("\u{e0}\u{5d0}"), Err(Bidi(0)))
+  assertEq(idna.toAscii("0a.\u{5d0}"), Err(Bidi(0)))
+  assertEq(idna.toAscii("\u{5d0}.\u{5d0}0\u{660}"), Err(Bidi(1)))
+  assert(idna.toAscii("\u{5d0}\u{5d1}.example").isOk)
+  assert(idna.toAscii("0a.example").isOk)
+  assert(idna.toAscii("\u{e0}\u{5d0}", checkBidi = false).isOk)
+  // Hyphens, only where asked.
+  assert(idna.toAscii("-a-.ab--c").isOk)
+  assertEq(idna.toAscii("-a", checkHyphens = true), Err(Hyphens(0)))
+  assertEq(idna.toAscii("x.a-", checkHyphens = true), Err(Hyphens(1)))
+  assertEq(idna.toAscii("ab--c", checkHyphens = true), Err(Hyphens(0)))
+  assert(idna.toAscii("a-b--c", checkHyphens = true).isOk)
+  // The STD3 rules, only where asked.
+  assertEq(idna.toAscii("a_b", useStd3AsciiRules = true), Err(Disallowed(0)))
+  assertEq(idna.toAscii("\u{2474}", useStd3AsciiRules = true), Err(Disallowed(0)))
+  assert(idna.toAscii("a-0", useStd3AsciiRules = true).isOk)
+  // Messages.
+  assertEq(Bidi(2).message, "mixed directions not allowed in label 2")
+  assertEq(DomainLength.message, "the domain name is empty or too long")
+  assertEq(Overflow.message, "a Punycode number out of range")
+  assertEq(InvalidInput(3).message, "not Punycode at index 3")
+
+@test("lengths: DNS's limits where asked, and MaxLabelLength always")
+lengths()
+  val a63 = "a".repeat(63)
+  assert(idna.toAscii(a63, verifyDnsLength = true).isOk)
+  assertEq(idna.toAscii("a".repeat(64), verifyDnsLength = true), Err(LabelLength(0)))
+  assert(idna.toAscii("a".repeat(64)).isOk)
+  assertEq(idna.toAscii("", verifyDnsLength = true), Err(LabelLength(0)))
+  assertEq(idna.toAscii("a.", verifyDnsLength = true), Err(LabelLength(1)))
+  assertEq(idna.toAscii("a..b", verifyDnsLength = true), Err(LabelLength(1)))
+  // A label's length is that of its ASCII form: 59 `ü` take more than 63.
+  assertEq(idna.toAscii("\u{fc}".repeat(59), verifyDnsLength = true), Err(LabelLength(0)))
+  assert(idna.toAscii("\u{fc}".repeat(20), verifyDnsLength = true).isOk)
+  // 253 characters in all, and 254.
+  val name253 = s"$a63.$a63.$a63.${"a".repeat(61)}"
+  assertEq(name253.byteLength, 253)
+  assertEq(idna.toAscii(name253, verifyDnsLength = true), Ok(name253))
+  assertEq(idna.toAscii(name253 + "a", verifyDnsLength = true), Err(DomainLength))
+  // MaxLabelLength code points beyond ASCII, or of Punycode, and one more.
+  assertEq(MaxLabelLength, 1024)
+  assert(idna.toAscii("\u{fc}".repeat(MaxLabelLength)).isOk)
+  assertEq(idna.toAscii("\u{fc}".repeat(MaxLabelLength + 1)), Err(LabelLength(0)))
+  assertEq(idna.toUnicode("ok." + "\u{fc}".repeat(MaxLabelLength + 1)), Err(LabelLength(1)))
+  assertEq(idna.toAscii("xn--" + "a".repeat(MaxLabelLength + 1)), Err(LabelLength(0)))
+  // An ASCII label has no such limit: its work is linear.
+  val huge = "a".repeat(1000000)
+  assertEq(idna.toAscii(huge), Ok(huge))
+  assertEq(idna.toAscii("A".repeat(100000)), Ok("a".repeat(100000)))
+
+@test("hostile names are refused quickly: many labels, long Punycode, many joiners")
+hostile()
+  val many = "\u{fc}.".repeat(20000)
+  assertEq(idna.toAscii(many), Ok("xn--tda.".repeat(20000)))
+  assertEq(idna.toAscii("xn--" + "9".repeat(MaxLabelLength)), Err(BadPunycode(0)))
+  assertEq(idna.toAscii(("\u{628}" + "\u{64b}".repeat(500) + "\u{200c}").repeat(2)), Err(Joiners(0)))
+  assertEq(idna.toAscii("\u{200c}".repeat(MaxLabelLength)), Err(Joiners(0)))
+  // A character mapped to many: U+FDFA becomes eighteen, spaces among them.
+  assertEq(idna.toUnicode("\u{fdfa}", checkBidi = false).map(t -> t.chars.length), Ok(18))
+  assertEq(idna.toAscii("\u{fdfa}"), Err(Bidi(0)))
+  assertEq(idna.toAscii("\u{fdfa}".repeat(100)), Err(LabelLength(0)))
