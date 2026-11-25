@@ -1244,6 +1244,35 @@ Recording that an entry was used is `fs.setModified(file, time.now())`, which wr
 `m.isFile` is true for a regular file alone, so a socket or a FIFO another program left in the
 directory is passed over rather than removed.
 
+### Copying and moving
+
+A copy is never seen half-written: each file is written under a new name beside its destination and
+renamed onto it once whole, and a tree copied anew is built the same way and renamed into place in one
+step. Publishing a release directory and keeping the previous one:
+
+```text
+import avin.fs
+import avin.io.IoError
+
+publish(build: string, live: string) -> Result[unit, IoError]
+  val previous = live + ".previous"
+  fs.removeIfExists(previous)?
+  if fs.exists(live) then fs.move(live, previous)?
+  fs.copyAll(build, live, attributes = true)
+```
+
+| Function | Meaning |
+| --- | --- |
+| `copy(from, to, replace = true, attributes = false, followLinks = true, createParents = false) -> Result[unit, IoError]` | Copies one file. A reader of `to` sees the old entry or the whole copy; a failure at any point leaves `to` as it was and removes the new file. `replace` puts the copy in place of a file or link at `to` (the entry is replaced: a hard link to the old file keeps the old bytes, a link at `to` is not written through); without it anything at `to` is `AlreadyExists`, checked and placed in one step. A directory at `to` or `from` is `IsADirectory`. The nine `rwx` bits of `from` always come along; `attributes` adds setuid, setgid, sticky and the modification time (the access time is set to the same instant); the owner never does. `followLinks = false` copies a link as a new link holding the same path. A FIFO, a socket or a device is an `Err` of kind `Other`, opening nothing. A file copied onto itself, by any name, changes nothing. |
+| `copyAll(from, to, merge = false, replace = true, attributes = false, followLinks = false, createParents = false) -> Result[unit, IoError]` | Copies a directory with everything in it, `copy`'s options applying to each entry; anything else at `from` is copied as `copy` copies it. Links stay links unless `followLinks`, which refuses a link back to a directory above it (`Other("file system loop")`). Without `merge`, `to` is replaced as `rename` replaces it (absent, or an empty directory with `replace`; a full directory is `DirectoryNotEmpty`, a file `NotADirectory`), and holds the whole copy or is left as it was. With `merge`, the tree is copied into the directory at `to` (made if missing), directories merged by name, files replaced or (without `replace`) `AlreadyExists`; a failure stops at that entry, keeping those copied before it. Each directory the copy makes gets the source's `rwx` bits once its contents are in. A destination inside the source is an `Err`. Hard links inside become separate files. |
+| `move(from, to, replace = true, createParents = false) -> Result[unit, IoError]` | `rename` within one file system. Across file systems, `copyAll` with `attributes` and links as links, then `removeAll(from)`: a failure while copying leaves `to` as it was and `from` whole; a failure while removing is an `Err` whose operation is `finish moving`, `to` being complete. Without `replace`, anything at `to` is `AlreadyExists`: in one step for a file, by a check just before the rename for a directory or a link. |
+
+**On failure part way**, `copy`, `copyAll` without `merge`, and the copying half of a cross-device
+`move` leave nothing behind and `to` untouched. `copyAll` with `merge` stops at the entry that failed,
+named in the error (`cannot copy src/a/locked to out/a/locked: permission denied`), with every entry
+before it copied whole and none after it started. A copy is not synced to the device; a file that
+must survive a power loss is written with `writeBytesAtomic`.
+
 ### File metadata
 
 A `Metadata` is everything one `stat` answered, so its fields describe one entry:
