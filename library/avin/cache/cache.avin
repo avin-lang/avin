@@ -1,0 +1,391 @@
+module avin.cache
+
+// Caches of computed values, bounded, safe to share between threads. An `LruCache` holds at most a
+// capacity's worth of entries, measured by a weigher (one an entry unless told otherwise), and makes
+// room by dropping the entry used least recently. A `TtlCache` does the same, and an entry it holds
+// also expires a fixed time after it was stored, read from a clock it is given (the monotonic clock
+// unless a test hands it its own).
+//
+// `getOrLoad` and `getOrTry` fill a miss from a loader, and the threads that miss on one key at once
+// share one load: the first runs the loader, outside the cache's lock, and the others wait for what it
+// gives. `getOrTry`'s loader may fail, and a failure is handed to every caller waiting on that load but
+// never stored, so the next call loads again; a cache whose values are `Result`s, filled with
+// `getOrLoad`, stores failures too, where that is what is wanted.
+//
+// Every operation takes the cache's one lock for a handful of map operations, and runs no code of its
+// caller's (a loader, a weigher or a clock) while holding it, so a loader may use the cache, other
+// keys of it included. A loader that asks for the key it is loading waits for itself for ever.
+
+import avin.collections.mutable.{LinkedMap, Map as MutableMap}
+import avin.threads.{Mutex, Promise}
+import avin.time.{Duration, monotonic}
+
+// What a cache has counted since it was made: lookups that found a live value (`hits`) and that did
+// not (`misses`, a call that waited on another's load among them), loads its loaders ran and those
+// that failed or were cancelled, entries dropped to make room, and entries dropped for having expired.
+data CacheStats(hits: long, misses: long, loads: long, loadFailures: long, evictions: long, expirations: long)
+
+impl CacheStats
+  // Every lookup counted, hit or miss.
+  requests -> long = hits + misses
+
+  // The share of lookups that hit, from 0 to 1; 0 where there has been none.
+  hitRate -> real = if hits + misses == 0 then 0.0 else real(hits) / real(hits + misses)
+
+// A value stored, its weight, and the reading of the cache's clock at which it expires, in
+// microseconds (`long.MaxValue` for never).
+private data Entry[V](value: V, weight: long, expires: long)
+
+// A load under way for one key, which other callers asking for the key while it runs wait for.
+private trait Flight[V]: Sendable
+  // Waits for the load to end, and gives its value where it gave one.
+  settled() -> Option[V]
+
+// A load of a loader that may fail with an `E`; its outcome is `None` where the loading thread was
+// cancelled before the loader returned.
+private class Loading[V: Sendable, E: Sendable](val id: long): Flight[V]
+  val outcome = Promise[Option[Result[V, E]]]()
+
+  override settled() -> Option[V] = outcome.future.await() match
+    Some(Ok(v)) -> Some(v)
+    _ -> None
+
+// The cache's record of a load under way: its flight, and whether a write of the key since it began
+// means its value is no longer the newest, to be handed to its waiters but not stored.
+private class Running[V](val flight: Flight[V], val id: long)
+  var stale = false
+
+// The error of the loader `getOrLoad` runs, which cannot fail; no caller names it, so no `getOrTry`
+// shares its load as one of its own.
+private data NoError()
+
+// What a lookup found to do: the value, a load to wait for, or a load to run.
+private data Step[V: Sendable, E: Sendable]
+  Found(value: V)
+  Join(flight: Flight[V])
+  Lead(loading: Loading[V, E])
+
+// The state a cache's lock guards. Every method is called with the lock held, and runs nothing of the
+// caller's.
+private class Store[K: Eq & Hash, V: Sendable](val capacity: long)
+  val entries = LinkedMap[K, Entry[V]]()
+  val running = MutableMap[K, Running[V]]()
+  var weight: long = 0
+  var flights: long = 0
+  var hits: long = 0
+  var misses: long = 0
+  var loads: long = 0
+  var loadFailures: long = 0
+  var evictions: long = 0
+  var expirations: long = 0
+
+  stats() -> CacheStats = CacheStats(hits, misses, loads, loadFailures, evictions, expirations)
+
+  // The live value of `key` at clock reading `now`, made the most recently used and, where `counted`,
+  // counted as a hit or a miss; an expired one is dropped.
+  lookup(key: K, now: long, counted: bool = true) -> Option[V] = entries.get(key) match
+    Some(e) ->
+      if e.expires <= now
+        drop(key, e)
+        expirations += 1
+        if counted then misses += 1
+        None
+      else
+        _ = entries.moveToEnd(key)
+        if counted then hits += 1
+        Some(e.value)
+    None ->
+      if counted then misses += 1
+      None
+
+  // The live value of `key`, touching neither its recency nor the counts.
+  peek(key: K, now: long) -> Option[V] = entries.get(key) match
+    Some(e) -> if e.expires <= now then None else Some(e.value)
+    None -> None
+
+  // `lookup`, and where it misses, the load to wait for or a new one for this caller to run. A caller
+  // looking again after the load it waited on ended with nothing is counted once, at its first look.
+  begin[E: Sendable](key: K, now: long, counted: bool) -> Step[V, E]
+    lookup(key, now, counted) match
+      Some(v) -> Step.Found(v)
+      None -> running.get(key) match
+        Some(r) -> Step.Join(r.flight)
+        None ->
+          flights += 1
+          loads += 1
+          val loading = Loading[V, E](flights)
+          running.update(key, Running[V](loading, flights))
+          Step.Lead(loading)
+
+  // Ends the load `id` of `key`: stores `value` where it gave one and no write came since it began,
+  // or counts a failure where it gave none. A load already ended, or one of an earlier flight, is let
+  // be.
+  finish(key: K, id: long, value: Option[V], weight: long, expires: long)
+    running.get(key) match
+      Some(r) if r.id == id ->
+        _ = running.remove(key)
+        value match
+          Some(v) -> if !r.stale then insert(key, v, weight, expires)
+          None -> loadFailures += 1
+      _ -> ()
+
+  // Stores `value` as `key`'s, the most recently used, and drops the least recently used entries until
+  // the weight is within the capacity again. A value heavier than the whole capacity is not stored, and
+  // the key's old value goes all the same.
+  insert(key: K, value: V, w: long, expires: long)
+    supersede(key)
+    entries.get(key) match
+      Some(old) -> drop(key, old)
+      None -> ()
+    if w > capacity then return
+    entries.putLast(key, Entry(value, w, expires))
+    weight += w
+    while weight > capacity
+      val (k, e) = entries.removeFirst()
+      weight -= e.weight
+      evictions += 1
+
+  // Drops `key`'s entry, giving back its value where it was live at `now`.
+  remove(key: K, now: long) -> Option[V]
+    supersede(key)
+    entries.get(key) match
+      Some(e) ->
+        drop(key, e)
+        if e.expires <= now then None else Some(e.value)
+      None -> None
+
+  // Drops every entry, and marks every load under way stale.
+  clear()
+    entries.clear()
+    weight = 0
+    running.foreach((_, r) -> r.stale = true)
+
+  // Drops every entry expired at `now`, answering how many.
+  purge(now: long) -> int
+    var dropped = 0
+    entries.filterInPlace((_, e) ->
+      val live = e.expires > now
+      if !live
+        weight -= e.weight
+        dropped += 1
+      live)
+    expirations += long(dropped)
+    dropped
+
+  // A write of `key` makes a load of it under way stale.
+  private supersede(key: K) = running.get(key) match
+    Some(r) -> r.stale = true
+    None -> ()
+
+  private drop(key: K, e: Entry[V])
+    _ = entries.remove(key)
+    weight -= e.weight
+
+// What the two caches share: the lock and its state, the weigher, and the time to live with the clock.
+private class Core[K: Eq & Hash & Sendable, V: Sendable](
+    capacity: long,
+    private val weigher: @sendable (K, V) -> long,
+    private val ttl: long,
+    private val clock: @sendable () -> Duration
+)
+  private val store = Mutex(Store[K, V](checkedCapacity(capacity)))
+
+  // The clock's reading now, in microseconds; `0` for a cache whose entries never expire.
+  private now() -> long = if ttl == 0 then 0 else clock().micros
+
+  // The reading at which a value stored now, to live for `life` microseconds, expires.
+  private expiry(life: long) -> long = if ttl == 0 then long.MaxValue else now() +| life
+
+  private weigh(key: K, value: V) -> long
+    val w = weigher(key, value)
+    if w < 0 then fail("a cache's weigher gives a weight of at least zero")
+    w
+
+  get(key: K) -> Option[V]
+    val t = now()
+    store.with(s -> s.lookup(key, t))
+
+  peek(key: K) -> Option[V]
+    val t = now()
+    store.with(s -> s.peek(key, t))
+
+  put(key: K, value: V) = putFor(key, value, ttl)
+
+  putFor(key: K, value: V, life: long)
+    val w = weigh(key, value)
+    val expires = expiry(life)
+    store.with(s -> s.insert(key, value, w, expires))
+
+  remove(key: K) -> Option[V]
+    val t = now()
+    store.with(s -> s.remove(key, t))
+
+  clear() = store.with(s -> s.clear())
+
+  purge() -> int
+    val t = now()
+    store.with(s -> s.purge(t))
+
+  size() -> int = store.with(s -> s.entries.size)
+
+  weight() -> long = store.with(s -> s.weight)
+
+  stats() -> CacheStats = store.with(s -> s.stats())
+
+  getOrLoad(key: K, load: (K) -> V) -> V = getOrTry[NoError](key, k -> Ok(load(k))) match
+    Ok(v) -> v
+    Err(_) -> fail("a cache's loader that cannot fail failed")
+
+  // The value of `key`, from the cache or from `load`, which runs once however many threads miss on
+  // the key at once.
+  getOrTry[E: Sendable](key: K, load: (K) -> Result[V, E]) -> Result[V, E]
+    var counted = true
+    while true
+      val t = now()
+      val first = counted
+      counted = false
+      val step = store.with(s -> s.begin[E](key, t, first))
+      step match
+        Step.Found(v) -> return Ok(v)
+        Step.Lead(loading) -> return lead(key, loading, load)
+        Step.Join(flight) -> flight match
+          mine: Loading[V, E] -> mine.outcome.future.await() match
+            Some(r) -> return r
+            None -> ()
+          other -> other.settled() match
+            Some(v) -> return Ok(v)
+            None -> ()
+    fail("a cache's load loop ends")
+
+  // Runs `load` for `key` as the one load of its flight, stores what it gives, and hands it to the
+  // flight's waiters. A cancellation that stops the load ends the flight with no outcome, so a waiter
+  // loads again.
+  private lead[E: Sendable](key: K, loading: Loading[V, E], load: (K) -> Result[V, E]) -> Result[V, E]
+    val id = loading.id
+    defer abandon(key, loading)
+    val r = load(key)
+    r match
+      Ok(v) ->
+        val w = weigh(key, v)
+        val expires = expiry(ttl)
+        store.with(s -> s.finish(key, id, Some(v), w, expires))
+      Err(_) -> store.with(s -> s.finish(key, id, None, 0, 0))
+    _ = loading.outcome.tryComplete(Some(r))
+    r
+
+  // Ends a flight that did not finish, as its thread stops; one that did is let be.
+  private abandon[E: Sendable](key: K, loading: Loading[V, E])
+    if loading.outcome.isCompleted() then return
+    val id = loading.id
+    store.with(s -> s.finish(key, id, None, 0, 0))
+    _ = loading.outcome.tryComplete(None)
+
+private checkedCapacity(capacity: long) -> long
+  if capacity < 0 then fail("a cache's capacity is at least zero")
+  capacity
+
+private checkedTtl(ttl: Duration) -> long
+  if ttl.micros <= 0 then fail("a cache's time to live is longer than zero")
+  ttl.micros
+
+private checkedLife(life: Duration) -> long
+  if life.micros <= 0 then fail("an entry's life in a cache is longer than zero")
+  life.micros
+
+// A cache holding at most `capacity` worth of entries, each weighing what `weigher` says (one an entry
+// unless told otherwise, so the capacity is a count), which drops the least recently used entries to
+// make room for a new one. Reading a value with `get` or a loader makes it the most recently used;
+// `peek` does not. A value heavier than the whole capacity is not stored. A weigher giving a negative
+// weight traps, as does a negative capacity.
+//
+//     val users = LruCache[long, User](10000)
+//     val u = users.getOrLoad(id, k -> db.user(k))
+class LruCache[K: Eq & Hash & Sendable, V: Sendable](
+    val capacity: long,
+    weigher: @sendable (K, V) -> long = (_, _) -> 1
+)
+  private val core = Core[K, V](capacity, weigher, 0, () -> Duration.Zero)
+
+  // The value of `key`, made the most recently used, or `None`.
+  get(key: K) -> Option[V] = core.get(key)
+
+  // The value of `key` without making it the most recently used or counting a hit or a miss.
+  peek(key: K) -> Option[V] = core.peek(key)
+
+  // Stores `value` as `key`'s, making room for it.
+  put(key: K, value: V) = core.put(key, value)
+
+  // The value of `key`, from the cache, or else from `load(key)`, which is stored. Threads missing on
+  // one key at once run `load` once between them.
+  getOrLoad(key: K, load: (K) -> V) -> V = core.getOrLoad(key, load)
+
+  // The value of `key`, from the cache, or else from `load(key)`: its `Ok` value is stored, and its
+  // `Err` given to every caller waiting on that load but not stored. Threads missing on one key at once
+  // run `load` once between them.
+  getOrTry[E: Sendable](key: K, load: (K) -> Result[V, E]) -> Result[V, E] = core.getOrTry(key, load)
+
+  // Drops `key`'s entry, giving back its value; a load of the key under way then hands its value to
+  // its waiters but does not store it.
+  remove(key: K) -> Option[V] = core.remove(key)
+
+  // Drops every entry; loads under way are not stored, as after `remove`.
+  clear() = core.clear()
+
+  // The number of entries held.
+  size() -> int = core.size()
+
+  // The sum of the entries' weights, never more than the capacity.
+  weight() -> long = core.weight()
+
+  // The counts since the cache was made.
+  stats() -> CacheStats = core.stats()
+
+// An `LruCache` whose entries also expire `ttl` after they were stored, by the readings of `clock`, the
+// monotonic clock unless a test gives its own. An expired entry is never given back; it is dropped as
+// a lookup finds it, as room is made, or by `purgeExpired`, so `size` may count expired entries none
+// of those has reached yet. A time to live that is not positive traps.
+//
+//     val sessions = TtlCache[string, Session](seconds(30), 100000)
+class TtlCache[K: Eq & Hash & Sendable, V: Sendable](
+    val ttl: Duration,
+    val capacity: long,
+    weigher: @sendable (K, V) -> long = (_, _) -> 1,
+    clock: @sendable () -> Duration = monotonic
+)
+  private val core = Core[K, V](capacity, weigher, checkedTtl(ttl), clock)
+
+  // The live value of `key`, made the most recently used, or `None`.
+  get(key: K) -> Option[V] = core.get(key)
+
+  // The live value of `key` without making it the most recently used or counting a hit or a miss.
+  peek(key: K) -> Option[V] = core.peek(key)
+
+  // Stores `value` as `key`'s, to expire after the cache's time to live.
+  put(key: K, value: V) = core.put(key, value)
+
+  // Stores `value` as `key`'s, to expire after `life` instead; a `life` that is not positive traps.
+  put(key: K, value: V, life: Duration) = core.putFor(key, value, checkedLife(life))
+
+  // As `LruCache.getOrLoad`; a loaded value expires a time to live after its load ended.
+  getOrLoad(key: K, load: (K) -> V) -> V = core.getOrLoad(key, load)
+
+  // As `LruCache.getOrTry`; a loaded value expires a time to live after its load ended.
+  getOrTry[E: Sendable](key: K, load: (K) -> Result[V, E]) -> Result[V, E] = core.getOrTry(key, load)
+
+  // Drops `key`'s entry, giving back its value where it was live.
+  remove(key: K) -> Option[V] = core.remove(key)
+
+  // Drops every entry.
+  clear() = core.clear()
+
+  // Drops every expired entry, answering how many.
+  purgeExpired() -> int = core.purge()
+
+  // The number of entries held, expired ones not yet dropped among them.
+  size() -> int = core.size()
+
+  // The sum of the entries' weights, never more than the capacity.
+  weight() -> long = core.weight()
+
+  // The counts since the cache was made.
+  stats() -> CacheStats = core.stats()

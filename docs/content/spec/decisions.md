@@ -13617,3 +13617,43 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
   name holding `/` or an empty extension (every caller then unwraps for what is sometimes wanted);
   normalizing before comparing (silently wrong across links); a `string` root (`""`) for relative paths
   (cannot tell "no root" from a root written empty).
+- Settled on the user's delegation 2026-11-24 (branch `caches`): **`avin.cache`, an `LruCache` and a
+  `TtlCache`.** Choices: (1) One module of its own, written on the public `Mutex` with `@isolating`
+  bodies over a `LinkedMap` (no `@trusted_sendable` class), both caches sharing one private core.
+  (2) One capacity measured by a weigher defaulting to one an entry, instead of a separate count bound
+  and weight bound: a count is the weight of one each, and two bounds would raise which-wins questions.
+  An entry heavier than the whole capacity is not stored (emptying the cache for it would be worse),
+  and its put still drops the key's old value, so a put never leaves a stale one. (3) Nothing of the
+  caller's runs under the lock: the weigher and the clock are read before it is taken, and a loader
+  runs on its caller's thread outside it, so a loader may use the cache and a slow loader holds up
+  only its own key. (4) Singleflight per key: the first miss records a flight and runs the loader;
+  later misses wait on the flight's future. `getOrTry[E]`'s flight is typed by its error, and a caller
+  of another error type joining it (the same key loaded with two loaders) takes its value where it
+  gave one and loads again itself where it failed, by a reified type test, so no error is ever cast.
+  (5) An `Err` is handed to that flight's waiters and never stored; caching failures is asked for by
+  the value type, a cache of `Result`s filled by `getOrLoad`, rather than by a flag, which would need
+  the error type in the cache's own type. (6) A write of a key during its load wins: `put`, `remove`
+  and `clear` mark the flight stale, and its value is handed to its waiters but not stored over the
+  newer one. (7) A load whose thread is cancelled ends its flight with no outcome (a `defer`), and its
+  waiters load again rather than share a failure that is no failure of the loader. (8) The TTL is
+  after write, not after access, measured from the end of a load; lookups keep LRU order, so expiry is
+  lazy (on lookup, when room is made, and by `purgeExpired()`), not a sweep thread; expired entries
+  count toward the capacity until dropped, and the capacity bounds them. The deadline saturates.
+  (9) The clock is `@sendable () -> Duration`, the monotonic clock by default, as `Logger`'s is a
+  function; there is no `Clock` type to inject. (10) Counts kept under the lock, read as one
+  consistent `CacheStats`; a waiter on a load counts one miss however often it looks again. (11) One
+  lock a cache, not striped, so the LRU order and the capacity are exact. Measured at `-O2`: an
+  uncontended hit is about 130 ns, 17 ns of it the lock; eight threads hitting one cache fall from 7.7
+  to about 0.26 million operations a second between them, and a bare contended `Mutex` falls the same
+  way (60 to under 2 million), since the runtime's lock hands itself to the oldest waiter, parking and
+  waking a thread on every contended release. The cure for that is the lock's, for every lock in the
+  library, and striping the cache would only make contention rarer. Review with the user: whether the
+  runtime lock should spin briefly, or let a running thread take a lock just let go, before it parks
+  (fairness against throughput), and whether a sharded cache is wanted besides. Alternatives weighed:
+  a sharded cache (approximate LRU; worth it only past the contention measured, and a later option of
+  the same API); expire-after-access (an idle-session cache wants it; a later `TtlCache` setting); a
+  background sweeper (a thread a cache in every server, for memory the capacity already bounds);
+  storing failures with a negative-caching time (needs `E` in the cache's type); a loader given at
+  construction (the per-call loader is the more general form, and a fixed one is a closure over it).
+  Review with the user: no self-detection of a loader asking for its own key (it waits for ever, as a
+  self-join does; detecting it needs the thread's identity, which `avin.threads` keeps private).
