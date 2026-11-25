@@ -14,7 +14,13 @@ export interface ServerCommand {
 export const DEFAULT_SERVER_PATH = "avin"
 
 // The settings that decide the server's process; changing one restarts it.
-export const SERVER_SETTINGS = ["avin.server.path", "avin.server.repository"]
+// Whether the language server may start: it runs a configured executable, so it waits for the
+// workspace to be trusted. Highlighting and editing need no server and work either way.
+export function mayStartServer(trusted: boolean): boolean {
+    return trusted
+}
+
+export const SERVER_SETTINGS =["avin.server.path", "avin.server.repository"]
 
 // The command line that runs the language server on stdio. With `repository` set, the compiler is
 // run from that checkout through `sysl run`, with AVIN_ROOT naming the checkout so the server finds
