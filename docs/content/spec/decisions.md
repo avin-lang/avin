@@ -11325,6 +11325,64 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     `random`), as the HTTP limiter's `clock` was, so the tests are deterministic and sleep only in
     the one test of cancellation by a real deadline.
 
+- Settled on the user's delegation 2026-11-24 (branch `config-toml`): **`avin.toml`, TOML 1.0 in the
+  standard library, and layered configuration on `avin.cli`** ([system
+  library](/spec/system-library/#avintoml), [configuration
+  files](/spec/system-library/#configuration-files-and-the-environment)).
+  - **Pure Avin, in the standard library.** The reader, the writer and the derivations are Avin,
+    about 1,400 lines. Alternatives weighed: binding `sysl:toml` (another Sysl package every program
+    reading a configuration links, a value tree converted across the boundary, and its errors and
+    limits not ours to set); a package `dev.avinlang.toml` as JSON is (configuration is what nearly
+    every server reads at startup, and `avin.cli`'s layering needs it, so the standard library cannot
+    leave it out). Review with the user: JSON is a package by the user's decision of 2026-11-13,
+    and TOML now is not; the reasons differ (the CLI layer depends on it), but the two formats sit
+    on different sides of that line.
+  - **Conformance is toml-test's own suite**, vendored: the 717 files `files-toml-1.0.0` lists
+    (208 valid documents with their JSON, 509 invalid ones), from commit
+    96fd088448ec0f4d9f061c730ed7854399c46faf, in `tests/fixtures/toml-test` with its MIT licence
+    (copyright the TOML authors), which permits copying with the notice kept. About 100 KB.
+    Alternative: a hand-written set alone (it is there too, `library/tests/toml.avin`, pinning each
+    message; the suite catches the readings nobody thought to write).
+  - **The value tree is `Toml`**, mirroring `Json`: `Str`, `Integer(long)`, `Float(real)`, `Bool`,
+    the four date-time kinds, `Arr`, `Table(members)` keeping the text's order. The date-times are
+    `avin.time`'s `Zoned` (in the offset's fixed zone), `DateTime`, `Date` and `Time`. A fraction
+    past microseconds is cut off, which TOML allows; a leap second is refused, since a `Time` cannot
+    hold it. `-00:00` reads as UTC. Alternatives: types of the module's own for the date-times (two
+    sets of calendar types to convert between); keeping the fraction's text (a value no other
+    library type reads).
+  - **Limits**: 128 deep by default (`maxDepth`), counting every part of a dotted key or a header
+    as well as arrays and inline tables, so no input reaches the reader's or the writer's stack
+    limit; an integer outside 64 bits and a float with no finite `real` are errors. Alternative:
+    JSON's 512 (a configuration file is not a message, and the derivation walks recursively).
+  - **Errors name the key from the document's top**: `t.x` for an `x` defined twice in `[t]`, an
+    inline table's own key included, at the line and column the key starts.
+  - **Derivations as JSON's, on the tree**: the same `@…Key`, `@…Tag`, `@…Omit`, the same `type`
+    discriminator written first, defaults and `whenMissing`, unknown keys skipped. A decoder reads a
+    `Toml` (`static decode(value: Toml)`), since a TOML document must be read whole before its tables
+    are known. An encoder answers a `Result`: TOML has no null, so a field holding `None` is left out
+    and any other `None` is an error, and a date outside the years 0 to 9999 cannot be written.
+    There is no `@TomlOmitNone`, every `None` field being left out. Alternatives: an encoder that
+    traps on those (a program's data, not its mistake, decides them); `None` as an empty string.
+  - **`render` writes a table's plain keys first**, then `[tables]`, then `[[arrays of tables]]`;
+    arrays and tables inside arrays inline; a float always with a point or an exponent; strings as
+    basic strings with only the control characters, `"` and `\` escaped. A tree read back has the
+    same values, a table's keys perhaps in another order; `Toml`'s equality is the order-sensitive
+    one of its members. Alternative: an order-insensitive equality for tables (unusual for a `data`
+    type, and the order is the text's).
+  - **Layers on `avin.cli`**: `parseLayered(args, file, fileRequired, envPrefix, env)`,
+    `parseWithConfig(args, config, source, …)` and `parseLayeredOrExit`; the command line wins over
+    the environment, the environment over the file, the file over the defaults; `Args.origin(name)`
+    answers an `Origin` (`CommandLine`, `Environment(variable)`, `ConfigFile(path)`, `Default`), and
+    `given` is now true of a value any layer gave. Keys are option names, a dotted name also a
+    nested table; a key that is no option is an error with a suggestion; an empty prefix reads no
+    environment; a flag's variable is `true`/`false`/`1`/`0`; a repeated option takes one value from
+    its variable. Only the top parser's options are layered. `--help` and `--version` are answered
+    even when a layer is broken. Alternatives: unknown keys ignored (a misspelt setting silently
+    lost); a comma-split list from an environment variable (ambiguous with a value holding a comma);
+    layering a command's options from a table named after it (more rules for a case no program
+    here has yet). `Origin`, not `Source`, since `avin.io` has a `Source`. Review with the user:
+    strict unknown keys, which means a file shared with another program needs its own table.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
