@@ -11785,6 +11785,57 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     never part of an error. No PIPELINING: a session sends a command and waits, which keeps the
     error for each command exact. Alternative: pipelining MAIL and RCPT, a round trip or two saved.
 
+- Settled on the user's delegation 2026-11-24 (branch `fs-mmap`): **memory-mapped files in
+  `avin.fs`** ([system library](/spec/system-library/#memory-mapped-files)).
+  - **Two classes, `MappedBytes` (read-only) and `MutableMappedBytes` (shared and writable)**, made
+    by `mapFile(path)`, `mapFileMutable(path)`, `File.map()` and `File.mapMutable()`, over Sysl's
+    `map_file`, `File.map` and `File.map_mut` (a mutable map of a path opens it for update and
+    closes it, as `map_file` does). Each is an Avin class holding a Sysl handle on Sysl's `Mapped` or
+    `MappedMut`, so the collector's finalizer for the handle unmaps a mapping the program forgot,
+    and `close()` unmaps at once. Alternatives: one class with a `writable` flag (a read-only map
+    would carry `update` and `flush` that could only fail); the handle itself as the public type
+    (it could not be an `io.Close` or carry the bounds checks).
+  - **Offsets are `long`, with `int` overloads** of `apply`, `update`, `slice` and `writeAt`;
+    `length` is a `long`. A mapped file is routinely past 2 GiB, which `Array`'s `int` indices
+    cannot reach, and `int` does not widen to `long` implicitly, so the overloads keep `m(i)` with an
+    `int` loop variable working. A slice longer than an array can hold traps.
+  - **No array ever aliases the mapping.** Bytes leave only by copy (`apply`, `slice`, `toArray`)
+    and enter only by copy (`update`, `writeAt`), so an `Array[byte]` the program keeps can never
+    read unmapped memory. Alternative: an `Array` view over the mapping — the collector would have
+    to know such an array does not own its storage, and it would outlive `close`.
+  - **Every access is bounds-checked in Avin before Sysl is reached** (Sysl's own slice check stays
+    behind it); an offset outside `0 ..< length` traps, as an array index does, and `writeAt` traps
+    before writing any byte when its range runs past the end.
+  - **Use after `close` traps** (the handle's own "`MappedBytes` is closed" trap, at the call):
+    every call but `close`, `length` and `flush` included; a second `close` does nothing. A trap
+    rather than an `Err` because `apply` answers a byte, and one rule for every call is simpler to
+    state. Alternative: `File`'s `Err` for every call on a closed file (would need a `var` flag,
+    which would make the classes not sendable, and a `Result` from `apply`).
+  - **Sendable, by hand-over.** The classes have only `val` fields and a Sysl handle, so they are
+    `Sendable`, and a mapping given to a thread's body moves to that thread as every handle does;
+    using it from the thread that gave it away traps. Alternative: not sendable, as `File` is; a
+    mapping is often made once and handed to a worker, and the handle rules already keep it to one
+    owner at a time.
+  - **Mappings bring on collections.** A dropped mapping is unmapped only by its finalizer, and a
+    mapping holds one small heap object, so a loop that maps and drops would exhaust the address
+    space (about 2040 mappings of a 64 GiB file on macOS) or Linux's 65530 map entries long before
+    the heap's own budget collected. The runtime counts mappings made since the last collection and
+    collects at 1024 of them or 1 TiB mapped (`charge_mapping` in `heap.sysl`, called by `avin.fs`
+    after each mapping, outside the waiting call). Alternatives: a public "collect now" call
+    (moves the burden to every program); charging the mapped bytes to the heap's budget (a 64 GiB
+    mapping would then collect at every allocation).
+  - **A file cut short under its mapping is a trap, not silent corruption.** The platform answers a
+    touch of a page past the file's new end with `SIGBUS` (for a read-only, private mapping macOS
+    may instead go on answering the old bytes, which corrupts nothing); the runtime's fault handler,
+    which already turns a stack overflow into a trap, now reports any other `SIGBUS` as
+    `avin: trap: bus error: …` and stops the program. Avin cannot make the access succeed or fail softly, since it is an
+    ordinary load or store. Alternatives: a registry of mapped ranges consulted by the handler (more
+    exact, but a lock-free table for a message that already names the one cause Avin code has); a
+    check of the file's size before each access (a system call per byte). Review with the user:
+    whether a program should be able to recover from a cut-short mapping (it cannot, today).
+  - **Left out:** `advise` (Sysl has it on `Mapped` only), a mapping of part of a file, and growing
+    a mapping; a program `setLength`s the file and maps it again.
+
 ## Proposed
 
 - Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has

@@ -1,0 +1,94 @@
+// expect: exit 0
+// A file mapped writable: a byte written by `m(i) = b` and a range by `writeAt` reach the file, which
+// `readBytes`, another handle and a read-only mapping made later all see; `flush` answers `Ok`; writes
+// survive closing the mapping without a flush; `File.mapMutable` maps an open file; an empty file
+// maps to no bytes; and the length is fixed when the file is mapped.
+import avin.fs
+import avin.io.IoError
+
+impl[T] Result[T, IoError]
+  get() -> T = self match
+    Ok(v) -> v
+    Err(e) -> fail(s"unexpected $e")
+
+bytesOf(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+text(b: Array[byte]) -> string = string.fromUtf8Lossy(b)
+
+var root = ""
+
+say(line: Any)
+  println(if root == "" then s"$line" else s"$line".replace(root, "DIR"))
+
+main()
+  val dir = fs.createTempDir("avin-mapped-write").get()
+  root = dir
+  val path = dir + "/a"
+  _ = fs.writeText(path, "0123456789").get()
+  val m = fs.mapFileMutable(path).get()
+  say(s"${m.length} ${m.isEmpty}")
+  // The first and last byte by an int offset, one in the middle by a long one.
+  m(0) = byte(int('A'))
+  m(9) = byte(int('Z'))
+  val mid: long = 5
+  m(mid) = byte(int('M'))
+  say(s"${m(0)} ${m(mid)} ${m(9)}")
+  say(m.flush())
+  say(text(fs.readBytes(path).get()))
+  // A range at the start, the end, and an empty one at the very end.
+  m.writeAt(1, bytesOf("bc"))
+  val at: long = 7
+  m.writeAt(at, bytesOf("xy"))
+  m.writeAt(10, Array.empty[byte]())
+  say(m.flush())
+  say(text(fs.readBytes(path).get()))
+  say(text(m.slice(1, 3)))
+  say(text(m.toArray()))
+  // Another handle reads what the mapping wrote, and a read-only mapping made now sees it too.
+  val f = fs.open(path).get()
+  say(text(f.readAll().get()))
+  _ = f.close()
+  val ro = fs.mapFile(path).get()
+  say(text(ro.toArray()))
+  // A write made while a read-only mapping is open reaches the file all the same.
+  m(4) = byte(int('!'))
+  say(m.flush())
+  say(text(fs.readBytes(path).get()))
+  _ = ro.close()
+  // Writes made without a flush are kept when the mapping is closed.
+  m(2) = byte(int('q'))
+  _ = m.close()
+  say(text(fs.readBytes(path).get()))
+  // Unicode written through the mapping.
+  val u = "日本語"
+  _ = fs.writeBytes(dir + "/u", Array.fill(u.byteLength, byte(0))).get()
+  val um = fs.mapFileMutable(dir + "/u").get()
+  um.writeAt(0, bytesOf(u))
+  _ = um.flush().get()
+  _ = um.close()
+  say(fs.readText(dir + "/u").get() == u)
+  // File.mapMutable on a file open for update, written by the file first.
+  val g = fs.createUpdate(dir + "/b").get()
+  _ = g.write(bytesOf("abcdef")).get()
+  val gm = g.mapMutable().get()
+  _ = g.close()
+  gm(0) = byte(int('X'))
+  say(gm.flush())
+  _ = gm.close()
+  say(fs.readText(dir + "/b").get())
+  // openUpdate too, and the mapping's length stays the file's length when it was mapped.
+  val h = fs.openUpdate(dir + "/b").get()
+  val hm = h.mapMutable().get()
+  _ = h.setLength(100).get()
+  say(s"${hm.length} ${fs.size(dir + "/b").get()}")
+  _ = hm.close()
+  _ = h.close()
+  // An empty file maps to no bytes, and its flush has nothing to do.
+  _ = fs.writeText(dir + "/empty", "").get()
+  val e = fs.mapFileMutable(dir + "/empty").get()
+  say(s"${e.length} ${e.isEmpty} ${e.toArray().length}")
+  e.writeAt(0, Array.empty[byte]())
+  say(e.flush())
+  _ = e.close()
+  say(e.close())
+  _ = fs.removeDirAll(dir).get()

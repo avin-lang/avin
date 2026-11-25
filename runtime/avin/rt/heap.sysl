@@ -642,6 +642,42 @@ collect(c: *Context)
     collect_stopped(c)
     heap_lock.unlock()
 
+/** How many mappings of files, and how many of their bytes, may be made between two collections
+ * before a mapping collects. A mapping costs the heap one small object but holds address space and
+ * one of the system's map entries until its finalizer unmaps it, which only a collection runs, so a
+ * program that maps in a loop and drops what it maps must collect for the mappings' sake as well as
+ * for the heap's. A thousand stays far inside the 65530 map entries Linux allows a process by
+ * default, and a tebibyte far inside the 128 TiB of a process's address space. */
+private const MappingsPerCollection: usize = 1024
+private const MappedBytesPerCollection: u64 = 1099511627776
+
+/** The mappings made since the collection numbered `mapped_epoch`, and their bytes. */
+private var mapped_count: usize = 0
+private var mapped_bytes: u64 = 0
+private var mapped_epoch: usize = 0
+
+/** Counts one mapping of `bytes` bytes just made by the calling thread, and collects, so that
+ * dropped mappings are unmapped, once the mappings made since the last collection reach either
+ * limit. Called by `avin.fs` after each mapping, outside any call that waits. */
+charge_mapping(bytes: long)
+    val c = current_context
+
+    if c == null then return
+
+    lock_heap(c)
+
+    if mapped_epoch != collections
+        mapped_epoch = collections
+        mapped_count = 0
+        mapped_bytes = 0
+
+    mapped_count += 1
+    mapped_bytes += u64(bytes)
+
+    if mapped_count >= MappingsPerCollection || mapped_bytes >= MappedBytesPerCollection then collect_stopped(c)
+
+    heap_lock.unlock()
+
 /** The main thread's context, attached and running, for the program's entry function, which passes on
  * the `argc` arguments at `argv` the platform handed it. */
 @export("avin_rt_start")
