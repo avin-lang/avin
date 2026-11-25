@@ -1,0 +1,103 @@
+// expect: exit 0
+// An open file moves between threads: through a channel, alone or inside a tuple and a class, to a
+// worker that writes it and sends it back; captured by a thread's body, which owns it while it runs,
+// and back to the code that joined it once the body has returned; and through a future, whose
+// awaiter uses it at once. A file closed on one thread answers its `Err` on the next. Many files
+// pass at once through a bounded channel to a pool of workers.
+import avin.fs
+import avin.io.IoError
+import avin.threads.{Channel, Future, scope, spawn}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+class Job(val name: string, val file: fs.File)
+
+written(f: fs.File, text: string) -> fs.File
+  ok(f.writeText(text))
+  f
+
+main() -> int
+  val dir = ok(fs.createTempDir("file-threads"))
+
+  // There and back through channels.
+  val there = Channel[fs.File]()
+  val back = Channel[fs.File]()
+  val worker = spawn(() ->
+    for f in there
+      ok(f.writeText("worker\n"))
+      back.send(f)
+    ())
+  val a = ok(fs.create(dir + "/a.txt"))
+  ok(a.writeText("main\n"))
+  there.send(a)
+  val a2 = back.receive().get
+  ok(a2.writeText("main again\n"))
+  ok(a2.close())
+  there.close()
+  worker.join()
+  print(ok(fs.readText(dir + "/a.txt")))
+
+  // Inside a tuple and a class.
+  val tuples = Channel[(int, fs.File)]()
+  val jobs = Channel[Job]()
+  val done = Channel[int]()
+  val t = spawn(() ->
+    val (n, f) = tuples.receive().get
+    ok(f.writeText(s"tuple $n\n"))
+    ok(f.close())
+    val j = jobs.receive().get
+    ok(j.file.writeText(s"job ${j.name}\n"))
+    ok(j.file.close())
+    done.send(1))
+  tuples.send((7, ok(fs.create(dir + "/tuple.txt"))))
+  jobs.send(Job("x", ok(fs.create(dir + "/job.txt"))))
+  _ = done.receive()
+  t.join()
+  print(ok(fs.readText(dir + "/tuple.txt")))
+  print(ok(fs.readText(dir + "/job.txt")))
+
+  // Captured by a thread's body, and back once it has returned.
+  val b = ok(fs.createUpdate(dir + "/b.txt"))
+  spawn(() -> ok(b.writeText("from the thread\n"))).join()
+  ok(b.writeText("after the join\n"))
+  ok(b.seek(0))
+  print(ok(b.readText()))
+
+  // Through a future.
+  val c = ok(fs.create(dir + "/c.txt"))
+  val fut = Future(written(c, "in the future\n"))
+  val c2 = fut.await()
+  ok(c2.writeText("awaited\n"))
+  ok(c2.close())
+  print(ok(fs.readText(dir + "/c.txt")))
+
+  // Closed on one thread, an `Err` on the next.
+  ok(b.close())
+  val closing = Channel[fs.File]()
+  val checker = spawn(() ->
+    val f = closing.receive().get
+    (f.isClosed(), f.writeText("no").isErr, f.close().isOk))
+  closing.send(b)
+  println(checker.join())
+
+  // Many files through a bounded channel to four workers.
+  val queue = Channel[(int, fs.File)](2)
+  scope(s ->
+    for w in 0 ..< 4
+      s.spawn(() ->
+        for (n, f) in queue
+          for i in 0 ..< 20
+            ok(f.writeText(s"$n.$i\n"))
+          ok(f.close())
+        ())
+    for n in 0 ..< 32
+      queue.send((n, ok(fs.create(dir + s"/q$n.txt"))))
+    queue.close())
+  var lines = 0
+  for n in 0 ..< 32
+    lines += ok(fs.readText(dir + s"/q$n.txt")).split("\n").filter(l -> !l.isEmpty).length
+  println(lines)
+  _ = fs.removeDirAll(dir)
+  if lines == 640 then 0 else 1

@@ -1764,9 +1764,43 @@ file has buffered ahead are never lost to a `seek`, a `write` or a `read`. **A r
 not end the file's life**: a file that grew meanwhile gives the new bytes to the next read, so no
 reopening is needed to follow it. **A file closed by `close` answers every call with an `Err`**, as does
 reading a file opened only to write and writing one opened only to read; none of them is an empty
-answer that looks like the end of the file. A forgotten file is closed when the collector frees it. A
-file belongs to the thread that opened it and is not handed to another. Calls that read and write wait
+answer that looks like the end of the file. A forgotten file is closed when the collector frees it.
+**A file belongs to one thread at a time and moves as a connection does**: it is sendable, so it
+goes to a thread or a future whose body reaches it, with a message to an actor, and on a channel,
+whose receiver takes it by using it; and a file a `Mutex` keeps belongs to whichever thread holds
+the mutex. Every call, on an open file or a closed one, first checks that the code running owns it,
+so the code that handed it over traps (`` `File` belongs to another thread ``). Calls that read and write wait
 as the calls of `avin.fs` above do, which is to say they do not park a lightweight thread.
+
+```text run
+import avin.fs
+import avin.threads.{Channel, Mutex, scope, spawn}
+
+main()
+  val dir = fs.createTempDir("files").ok.get
+  val log = Mutex(fs.append(dir + "/app.log").ok.get)
+  scope(s ->
+    for t in 0 ..< 4
+      s.spawn(() ->
+        _ = log.with(f -> f.writeText(s"thread $t\n").isOk)
+        ()))
+  _ = log.with(f -> f.flush().isOk)
+  println(fs.readText(dir + "/app.log").ok.get.split("\n").filter(l -> !l.isEmpty).length)
+  val files = Channel[fs.File]()
+  val writer = spawn(() ->
+    val f = files.receive().get
+    f.writeText("received\n").isOk && f.close().isOk)
+  files.send(fs.create(dir + "/sent.txt").ok.get)
+  println(writer.join())
+  print(fs.readText(dir + "/sent.txt").ok.get)
+  _ = fs.removeDirAll(dir)
+```
+
+```text output
+4
+true
+received
+```
 
 **A tail starts at a whole character.** When `readTail` begins in the middle of a UTF-8 sequence it
 skips the rest of that sequence, so the text never starts with a stray byte; bytes that are not UTF-8
@@ -2443,7 +2477,7 @@ stops the program it reports on.
 | `DefaultLogger` | `Logger()`: `Info` and above, as text, to standard error. |
 | `Sink(write, colours = false)` | A sink calling `write: @sendable (string) -> unit` once a line, the line ending in `\n`; `colours` says it takes colour. |
 | `stderrSink()`, `stdoutSink()` | The standard streams, each line in one write, taking colour on a colour terminal. |
-| `fileSink(path) -> Result[Sink, IoError]` | Appends to `path`, creating it; an `Err` where it cannot be opened. Each line is appended and on disk when the record's call returns, under a lock, the file opened for it, so a file a rotator moved away is made again by the next line. |
+| `fileSink(path, recheck = seconds(1)) -> Result[Sink, IoError]` | Appends to `path`, creating it; an `Err` where it cannot be opened. The file stays open behind a lock, and each line is one write, handed to the platform before the record's call returns. At most once every `recheck` (before every line where it is zero or less) the sink looks at what `path` names, and opens it again where a rotator moved the file away or put another in its place. |
 | `writerSink(target: Mutex[W])` | Any `Writer`, each line written whole under its mutex. |
 
 The access log of [`avin.net.http`](#http-server) writes through a logger as well: see

@@ -13,7 +13,7 @@ module avin.log
 import avin.fs
 import avin.io.IoError
 import avin.threads.Mutex
-import avin.time.{Instant, now}
+import avin.time.{Duration, Instant, monotonic, now, seconds}
 
 // How much a record matters, least first. A logger writes the records at its level and above.
 data Level derives Ord
@@ -90,17 +90,48 @@ stderrSink() -> Sink = Sink(line -> StandardError.write(line), colourOnStderr())
 stdoutSink() -> Sink = Sink(line -> StandardOutput.write(line), colourOnStdout())
 
 // The file `file`, created if it is not there and appended to if it is; an `Err` where it cannot be
-// opened to append to. Each line is appended under a lock the sink's users share, the file opened for
-// it and closed again, so the line is in the file, whole, when the record's call returns, and a file
-// moved away by a log rotator is made again by the next line. A line that cannot be written is
-// dropped: logging never stops the program it reports on.
-fileSink(file: string) -> Result[Sink, IoError]
-  fs.appendText(file, "")?
-  val lock = Mutex(0)
-  Ok(Sink(line -> lock.with(_ -> appendLine(file, line))))
+// opened to append to. The sink keeps the file open, behind a lock its users share, and each line is
+// one write, handed to the platform before the record's call returns, so it is in the file, whole.
+// At most once every `recheck` the sink looks at what `file` names now, and where a log rotator has
+// moved the file away or put another in its place it opens `file` again, making it where it is gone;
+// a `recheck` of zero or less looks before every line. A line that cannot be written is dropped:
+// logging never stops the program it reports on.
+fileSink(file: string, recheck: Duration = seconds(1)) -> Result[Sink, IoError]
+  val target = Mutex(appending(file)?)
+  Ok(Sink(line -> target.with(a -> a.put(line, recheck))))
 
-private appendLine(file: string, line: string)
-  _ = fs.appendText(file, line)
+// The file a file sink writes, what `file` named when it was opened, and when the sink last looked.
+private class Appending(
+    private val file: string,
+    private var open: fs.File,
+    private var named: (long, long),
+    private var looked: long
+)
+  // Writes `line`, opening the file again first where the time has come to look and the name no
+  // longer leads to the open file.
+  put(line: string, recheck: Duration)
+    val at = monotonic().micros
+    if at - looked >= recheck.micros
+      looked = at
+      if identity(file) != Some(named) then reopen()
+    if open.writeText(line).isOk then _ = open.flush()
+
+  // Opens `file` again, keeping the file open now where it cannot be.
+  private reopen()
+    appending(file) match
+      Ok(fresh) ->
+        _ = open.close()
+        open = fresh.open
+        named = fresh.named
+      Err(_) -> ()
+
+// `file` opened to append to, with what it names now.
+private appending(file: string) -> Result[Appending, IoError]
+  val open = fs.append(file)?
+  Ok(Appending(file, open, identity(file).getOrElse((long(-1), long(-1))), monotonic().micros))
+
+// The device and inode `file` names now, or `None` where it names nothing.
+private identity(file: string) -> Option[(long, long)] = fs.metadata(file).ok.map(m -> (m.device, m.inode))
 
 // Any `Writer`, behind its mutex: each line is written whole while the mutex is held.
 writerSink[W: Writer](target: Mutex[W]) -> Sink = Sink(line -> target.with(w -> w.write(line)))

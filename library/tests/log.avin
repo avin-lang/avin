@@ -9,8 +9,8 @@ import avin.log
 import avin.log.{Format, Json, Level, Logger, Sink, Text, fileSink, parseLevel, writerSink}
 import avin.net.http
 import avin.net.http.{Response, ServerRequest}
-import avin.threads.{Atomic, Mutex, scope}
-import avin.time.{Duration, Instant, epochMicros, epochSeconds}
+import avin.threads.{Atomic, Mutex, scope, sleep}
+import avin.time.{Duration, Instant, epochMicros, epochSeconds, millis, seconds}
 
 private val Levels: Vector[Level] = [Level.Trace, Level.Debug, Level.Info, Level.Warn, Level.Error]
 
@@ -346,7 +346,7 @@ fileSinkConcurrent()
 fileSinkRotation()
   val dir = fs.createTempDir("avin-log-test").ok.get
   val file = dir + "/app.log"
-  val logger = Logger(sink = fileSink(file).ok.get, clock = fixed)
+  val logger = Logger(sink = fileSink(file, Duration.Zero).ok.get, clock = fixed)
   logger.info("before")
   assert(fs.rename(file, dir + "/app.log.1").isOk)
   val big = "y".repeat(20000)
@@ -360,6 +360,63 @@ fileSinkRotation()
   val lines = fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty)
   assertEq(lines.length, 40)
   assert(lines.forall(l -> l == s"$Stamp INFO  $big"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink keeps one file open: until it looks again, lines follow the file a rotator moved")
+fileSinkKeepsTheFile()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, seconds(3600)).ok.get, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  logger.info("two")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n$Stamp INFO  two\n"))
+  assert(!fs.exists(file))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink looks again once its recheck has passed, and not before")
+fileSinkRecheck()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, millis(200)).ok.get, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  logger.info("two")
+  sleep(millis(250))
+  logger.info("three")
+  logger.info("four")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n$Stamp INFO  two\n"))
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  three\n$Stamp INFO  four\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink opens the file a rotator put in the old one's place, and makes one that was removed")
+fileSinkReplacedAndRemoved()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  val logger = Logger(sink = fileSink(file, millis(-5)).ok.get, clock = fixed)
+  logger.info("one")
+  assert(fs.rename(file, dir + "/old.log").isOk)
+  assert(fs.writeText(file, "fresh\n").isOk)
+  logger.info("two")
+  assertEq(fs.readText(dir + "/old.log"), Ok(s"$Stamp INFO  one\n"))
+  assertEq(fs.readText(file), Ok(s"fresh\n$Stamp INFO  two\n"))
+  assert(fs.remove(file).isOk)
+  logger.info("three")
+  assertEq(fs.readText(file), Ok(s"$Stamp INFO  three\n"))
+  _ = fs.removeDirAll(dir)
+
+@test("the file sink appends to what the file already holds, and each line is in the file when its call returns")
+fileSinkAppendsAndFlushes()
+  val dir = fs.createTempDir("avin-log-test").ok.get
+  val file = dir + "/app.log"
+  assert(fs.writeText(file, "kept\n").isOk)
+  val logger = Logger(sink = fileSink(file).ok.get, clock = fixed)
+  for i in 0 ..< 3
+    logger.info("r", [("i", i)])
+    assertEq(fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty).length, i + 2)
+  logger.info("ü ✓ 𝄞")
+  assertEq(fs.readText(file).ok.get.split("\n").filter(l -> !l.isEmpty).last, s"$Stamp INFO  ü ✓ 𝄞")
+  assert(fs.readText(file).ok.get.startsWith("kept\n"))
   _ = fs.removeDirAll(dir)
 
 @test("the file sink is an Err where the file cannot be opened")
