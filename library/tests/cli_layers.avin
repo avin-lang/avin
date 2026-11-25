@@ -1,0 +1,223 @@
+// `avin.cli`'s layered configuration: each option from the command line, else the environment, else
+// a TOML file, else its default; the source each value came from; the checks on each layer's values
+// and the messages naming where a bad one came from.
+
+import avin.cli
+import avin.cli.{Args, ArgsError, CommandLine, ConfigFile, Default, Environment, Invalid, HelpRequested, Origin}
+import avin.fs
+import avin.toml
+import avin.toml.Toml
+
+private val parser = cli.Parser("app", "Serve things.", version = "1.0")
+  .string("host", default = "localhost")
+  .int("port", default = 80)
+  .real("ratio", default = 0.5)
+  .flag("verbose", short = 'v')
+  .choice("mode", ["fast", "safe"], default = "safe")
+  .string("tag", repeated = true)
+  .string("db.host", default = "db")
+  .string("max-conns", default = "")
+  .string("key", required = true)
+
+private conf(text: string) -> Toml = toml.parse(text).ok.get
+
+private env(pairs: (string, string)*) -> Map[string, string]
+  var m: Map[string, string] = HashMap.empty[string, string]()
+  for (k, v) in pairs
+    m = m.updated(k, v)
+  m
+
+private val noEnv: Map[string, string] = HashMap.empty[string, string]()
+
+private run(args: Vector[string], file: string, variables: Map[string, string]) -> Result[Args, ArgsError] =
+  parser.parseWithConfig(args, conf(file), "app.toml", envPrefix = "APP_", env = variables)
+
+private reason(r: Result[Args, ArgsError]) -> string = r match
+  Err(Invalid(why, _, _, _)) -> why
+  Err(e) -> s"not invalid: ${e.message}"
+  Ok(_) -> "accepted"
+
+@test("the command line wins over the environment, the environment over the file, the file over the defaults")
+layersPrecedence()
+  val file = "key = 'k'\nhost = 'file'\nport = 1\nratio = 2\n"
+  val a = run(["--host", "flag"], file, env(("APP_HOST", "env"), ("APP_PORT", "2"))).ok.get
+  assertEq(a.string("host"), "flag")
+  assertEq(a.int("port"), 2)
+  assertEq(a.real("ratio"), 2.0)
+  assertEq(a.string("mode"), "safe")
+  assertEq(a.origin("host"), CommandLine)
+  assertEq(a.origin("port"), Environment("APP_PORT"))
+  assertEq(a.origin("ratio"), ConfigFile("app.toml"))
+  assertEq(a.origin("mode"), Default)
+  assertEq(a.given("ratio"), true)
+  assertEq(a.given("mode"), false)
+  val b = run([], file, noEnv).ok.get
+  assertEq((b.string("host"), b.int("port")), ("file", 1))
+  val c = parser.parseWithConfig(["--key", "x"], Toml.table(), "app.toml").ok.get
+  assertEq((c.string("host"), c.int("port"), c.real("ratio")), ("localhost", 80, 0.5))
+
+@test("each kind of option takes its own TOML type from the file, and a repeated one an array or one value")
+layersFileKinds()
+  val a = run([], "key = 'k'\nverbose = true\nmode = 'fast'\ntag = ['a', 'b']\nratio = 1.25\nport = -3\n", noEnv).ok.get
+  assertEq(a.flag("verbose"), true)
+  assertEq(a.count("verbose"), 1)
+  assertEq(a.string("mode"), "fast")
+  assertEq(a.strings("tag"), ["a", "b"])
+  assertEq(a.real("ratio"), 1.25)
+  assertEq(a.int("port"), -3)
+  assertEq(run([], "key = 'k'\ntag = 'one'\n", noEnv).ok.get.strings("tag"), ["one"])
+  assertEq(run([], "key = 'k'\ntag = []\n", noEnv).ok.get.strings("tag"), Vector.empty[string]())
+  val off = run(["-v"], "key = 'k'\nverbose = false\n", noEnv).ok.get
+  assertEq(off.flag("verbose"), true)
+  val unset = run([], "key = 'k'\nverbose = false\n", noEnv).ok.get
+  assertEq(unset.flag("verbose"), false)
+  assertEq(unset.origin("verbose"), ConfigFile("app.toml"))
+  assertEq(unset.given("verbose"), true)
+  assertEq(run(["--tag", "c"], "key = 'k'\ntag = ['a', 'b']\n", noEnv).ok.get.strings("tag"), ["c"])
+
+@test("an option named with dots is a key of a table, or the quoted dotted key itself")
+layersDottedNames()
+  assertEq(run([], "key = 'k'\n[db]\nhost = 'x'\n", noEnv).ok.get.string("db.host"), "x")
+  assertEq(run([], "key = 'k'\ndb.host = 'y'\n", noEnv).ok.get.string("db.host"), "y")
+  assertEq(run([], "key = 'k'\n\"db.host\" = 'z'\n", noEnv).ok.get.string("db.host"), "z")
+  assertEq(run([], "key = 'k'\n", env(("APP_DB_HOST", "e"))).ok.get.string("db.host"), "e")
+  assertEq(run([], "key = 'k'\n", env(("APP_MAX_CONNS", "9"))).ok.get.string("max-conns"), "9")
+
+@test("a required option is satisfied by the file or the environment")
+layersRequired()
+  assertEq(reason(run([], "", noEnv)), "missing required option `--key`")
+  assertEq(run([], "key = 'f'", noEnv).ok.get.string("key"), "f")
+  assertEq(run([], "", env(("APP_KEY", "e"))).ok.get.string("key"), "e")
+
+@test("the environment gives a flag true, false, 1 or 0, and every other option its text, checked")
+layersEnvironment()
+  assertEq(run([], "key = 'k'", env(("APP_VERBOSE", "1"))).ok.get.flag("verbose"), true)
+  assertEq(run([], "key = 'k'", env(("APP_VERBOSE", "true"))).ok.get.flag("verbose"), true)
+  assertEq(run([], "key = 'k'\nverbose = true", env(("APP_VERBOSE", "0"))).ok.get.flag("verbose"), false)
+  assertEq(run([], "key = 'k'", env(("APP_VERBOSE", "false"))).ok.get.origin("verbose"), Environment("APP_VERBOSE"))
+  assertEq(
+    reason(run([], "key = 'k'", env(("APP_VERBOSE", "yes")))),
+    "the environment variable `APP_VERBOSE` needs true, false, 1 or 0, not `yes`"
+  )
+  assertEq(
+    reason(run([], "key = 'k'", env(("APP_PORT", "eighty")))),
+    "the environment variable `APP_PORT` needs an int, not `eighty`"
+  )
+  assertEq(
+    reason(run([], "key = 'k'", env(("APP_RATIO", "x")))),
+    "the environment variable `APP_RATIO` needs a number, not `x`"
+  )
+  assertEq(
+    reason(run([], "key = 'k'", env(("APP_MODE", "slow")))),
+    "the environment variable `APP_MODE` must be one of `fast`, `safe`, not `slow`"
+  )
+  assertEq(run([], "key = 'k'", env(("APP_TAG", "a,b"))).ok.get.strings("tag"), ["a,b"])
+  assertEq(run([], "key = 'k'", env(("APP_HOST", ""))).ok.get.string("host"), "")
+  assertEq(run([], "key = 'k'", env(("app_host", "lower"), ("HOST", "bare"))).ok.get.string("host"), "localhost")
+  assertEq(
+    parser.parseWithConfig([], conf("key = 'k'"), "app.toml", env = env(("HOST", "x"))).ok.get.string("host"),
+    "localhost"
+  )
+
+@test("a value of the wrong type in the file is an error naming the key and the file")
+layersFileErrors()
+  assertEq(reason(run([], "key = 'k'\nport = 'eighty'", noEnv)), "`port` in app.toml needs an int, not a string")
+  assertEq(reason(run([], "key = 'k'\nport = 1.5", noEnv)), "`port` in app.toml needs an int, not a float")
+  assertEq(
+    reason(run([], "key = 'k'\nport = 3000000000", noEnv)),
+    "`port` in app.toml needs an int, and 3000000000 does not fit one"
+  )
+  assertEq(reason(run([], "key = 'k'\nhost = 1", noEnv)), "`host` in app.toml needs a string, not an integer")
+  assertEq(
+    reason(run([], "key = 'k'\nverbose = 1", noEnv)),
+    "`verbose` in app.toml needs true or false, not an integer"
+  )
+  assertEq(reason(run([], "key = 'k'\nverbose = [true]", noEnv)), "`verbose` in app.toml takes one value, not an array")
+  assertEq(reason(run([], "key = 'k'\nratio = 'x'", noEnv)), "`ratio` in app.toml needs a number, not a string")
+  assertEq(reason(run([], "key = 'k'\nratio = inf", noEnv)), "`ratio` in app.toml needs a finite number, not inf")
+  assertEq(reason(run([], "key = 'k'\nratio = nan", noEnv)), "`ratio` in app.toml needs a finite number, not NaN")
+  assertEq(
+    reason(run([], "key = 'k'\nmode = 'slow'", noEnv)),
+    "`mode` in app.toml must be one of `fast`, `safe`, not `slow`"
+  )
+  assertEq(
+    reason(run([], "key = 'k'\nmode = 1", noEnv)),
+    "`mode` in app.toml must be one of `fast`, `safe`, not an integer"
+  )
+  assertEq(reason(run([], "key = 'k'\nhost = ['a']", noEnv)), "`host` in app.toml takes one value, not an array")
+  assertEq(reason(run([], "key = 'k'\ntag = [1]", noEnv)), "`tag` in app.toml needs a string, not an integer")
+  assertEq(reason(run([], "key = 'k'\nhost = { a = 1 }", noEnv)), "`host` in app.toml needs a string, not a table")
+  assertEq(reason(parser.parseWithConfig([], Toml.num(1), "x.toml")), "x.toml is an integer, not a table of settings")
+  assertEq(reason(run([], "key = 'k'\nhost = 1979-05-27", noEnv)), "`host` in app.toml needs a string, not a local date")
+
+@test("a key that is no option is an error, with the option it was most likely meant to be")
+layersUnknownKeys()
+  assertEq(
+    reason(run([], "key = 'k'\nprot = 1", noEnv)),
+    "`prot` in app.toml is not an option of app; did you mean `port`?"
+  )
+  assertEq(reason(run([], "key = 'k'\nzzzzzz = 1", noEnv)), "`zzzzzz` in app.toml is not an option of app")
+  assertEq(
+    reason(run([], "key = 'k'\n[db]\nhots = 'x'", noEnv)),
+    "`db.hots` in app.toml is not an option of app; did you mean `db.host`?"
+  )
+  assertEq(reason(run([], "key = 'k'\n[server]\nport = 1", noEnv)), "`server` in app.toml is not an option of app")
+  assertEq(reason(run([], "key = 'k'\nhelp = true", noEnv)), "`help` in app.toml is not an option of app")
+
+@test("--help and --version are answered whatever the file and the environment hold")
+layersHelpDespiteErrors()
+  assert(run(["--help"], "port = 'x'", noEnv) is Err(HelpRequested(_)))
+  assert(run(["--version"], "", env(("APP_PORT", "x"))) is Err(cli.VersionRequested(_)))
+  assertEq(reason(run(["--key", "k"], "port = 'x'", noEnv)), "`port` in app.toml needs an int, not a string")
+
+@test("parseLayered reads a TOML file, skips a missing one unless it is required, and names a broken one's line")
+layersFiles()
+  val dir = fs.createTempDir("cli-layers").ok.get
+  val path = s"$dir/app.toml"
+  fs.writeText(path, "key = 'from file'\nport = 8080\n").ok.get
+  val a = parser.parseLayered([], file = path, envPrefix = "APP_", env = env(("APP_PORT", "9"))).ok.get
+  assertEq((a.string("key"), a.int("port")), ("from file", 9))
+  assertEq(a.origin("key"), ConfigFile(path))
+  val missing = s"$dir/none.toml"
+  assertEq(parser.parseLayered(["--key", "k"], file = missing).ok.get.int("port"), 80)
+  assertEq(
+    reason(parser.parseLayered(["--key", "k"], file = missing, fileRequired = true)),
+    s"cannot read $missing: no such file or directory"
+  )
+  fs.writeText(path, "key = 'k'\nport = = 1\n").ok.get
+  assertEq(reason(parser.parseLayered([], file = path)), s"$path: '=' where a value was expected at line 2, column 8")
+  fs.writeBytes(path, Array[byte](byte(0x6b), byte(0x3d), byte(0x22), byte(0xff), byte(0x22))).ok.get
+  assertEq(reason(parser.parseLayered([], file = path)), s"$path: bytes that are not UTF-8 at line 1, column 4")
+  assertEq(parser.parseLayered(["--key", "k"]).ok.get.origin("port"), Default)
+  fs.removeDirAll(dir).ok.get
+
+@test("only the parser's own options are layered; a command's come from the command line alone")
+layersCommands()
+  val p = cli.Parser("todo").string("file", default = "todo.txt").command(cli.Parser("add").flag("urgent"))
+  val a = p.parseWithConfig(
+    ["add"],
+    conf("file = 'mine.txt'"),
+    "todo.toml",
+    envPrefix = "TODO_",
+    env = env(("TODO_URGENT", "1"))
+  ).ok.get
+  assertEq(a.string("file"), "mine.txt")
+  assertEq(a.command, "add")
+  assertEq(a.commandArgs.flag("urgent"), false)
+  assertEq(
+    reason(p.parseWithConfig(["add"], conf("urgent = true"), "todo.toml")),
+    "`urgent` in todo.toml is not an option of todo"
+  )
+
+@test("a source displays as where it is: the command line, the variable, the file's path, the default")
+layersSourceDisplay()
+  assertEq(
+    [CommandLine, Environment("APP_X"), ConfigFile("/etc/app.toml"), Default].map(s -> s"$s"),
+    ["the command line", "the environment variable `APP_X`", "/etc/app.toml", "its default"]
+  )
+  val a = run(["--key", "k", "pos"].take(2), "", noEnv).ok.get
+  assertEq(a.origin("key"), CommandLine)
+
+@test(should_trap: "cli: nothing is declared as `nope`")
+layersOriginOfUndeclaredTraps()
+  parser.parse(["--key", "k"]).ok.get.origin("nope")

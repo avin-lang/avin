@@ -1,0 +1,142 @@
+module avin.toml
+
+// Writing a `Toml` value as TOML text.
+
+import avin.time.{Date, DateTime, Time, Zoned}
+
+impl Toml
+  // The value as TOML text. A table is a document: its keys holding other values first, one to a
+  // line, then each table it holds under a `[header]` and each array of tables under one `[[header]]`
+  // for each element, a blank line before each header. Any other value is written as it stands after
+  // a key's `=`: `[1, 2]`, `{ a = 1 }`. Arrays and tables inside an array are written inline.
+  // Strings are basic strings, every character outside the control characters, `"` and `\` written
+  // as it is. A date outside the years 0 to 9999, which TOML cannot write, traps; `toml.encode`
+  // answers it as an error.
+  render -> string
+    val out = StringWriter()
+    self match
+      Table(members) -> DocumentWriter(out).body(Vector.empty[string](), members)
+      _ -> writeInline(out, self)
+    out.text
+
+// A key as it is written: bare where it is letters, digits, `_` and `-` alone, else a basic string.
+private keyText(key: string) -> string
+  if key.nonEmpty && key.forall(c -> 'a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9' || c == '_' || c == '-')
+    return key
+  val out = StringWriter()
+  writeString(out, key)
+  out.text
+
+// Whether `v` is written under a header of its own: a table, or an array of one table or more.
+private isSection(v: Toml) -> bool = v match
+  Table(_) -> true
+  Arr(items) -> items.nonEmpty && items.forall(i -> i.isTable)
+  _ -> false
+
+// Writes a document; `started` is whether anything is written yet, so a header after it has a blank
+// line before it.
+private class DocumentWriter(out: StringWriter)
+  private var started = false
+
+  // The members of the table at `path`, after its header.
+  body(path: Vector[string], members: Vector[(string, Toml)])
+    for (k, v) in members
+      if !isSection(v)
+        out.write(keyText(k))
+        out.write(" = ")
+        writeInline(out, v)
+        out.writeChar('\n')
+        started = true
+    for (k, v) in members
+      if isSection(v)
+        val inner = path :+ k
+        val name = inner.map(p -> keyText(p)).mkString(".")
+        v match
+          Table(m) ->
+            header(s"[$name]")
+            body(inner, m)
+          Arr(items) ->
+            for item in items
+              header(s"[[$name]]")
+              body(inner, item.asMembers.get)
+          _ -> ()
+
+  private header(line: string)
+    if started then out.writeChar('\n')
+    out.write(line)
+    out.writeChar('\n')
+    started = true
+
+private writeInline(out: StringWriter, v: Toml)
+  v match
+    Str(s) -> writeString(out, s)
+    Integer(n) -> out.write(s"$n")
+    Float(x) -> out.write(floatText(x))
+    Bool(b) -> out.write(if b then "true" else "false")
+    OffsetDateTime(z) -> out.write(zonedText(z))
+    LocalDateTime(dt) -> out.write(s"${dateText(dt.date)}T${dt.time}")
+    LocalDate(d) -> out.write(dateText(d))
+    LocalTime(t) -> out.write(s"$t")
+    Arr(items) ->
+      out.writeChar('[')
+      var first = true
+      for item in items
+        if !first then out.write(", ")
+        writeInline(out, item)
+        first = false
+      out.writeChar(']')
+    Table(members) ->
+      if members.isEmpty
+        out.write("{}")
+      else
+        out.write("{ ")
+        var first = true
+        for (k, item) in members
+          if !first then out.write(", ")
+          out.write(keyText(k))
+          out.write(" = ")
+          writeInline(out, item)
+          first = false
+        out.write(" }")
+
+// `s` as a basic string: the control characters, `"` and `\` escaped, the rest as they are.
+private writeString(out: StringWriter, s: string)
+  out.writeChar('"')
+  for c in s.chars
+    c match
+      '"' -> out.write("\\\"")
+      '\\' -> out.write("\\\\")
+      '\n' -> out.write("\\n")
+      '\t' -> out.write("\\t")
+      '\r' -> out.write("\\r")
+      '\u{8}' -> out.write("\\b")
+      '\u{c}' -> out.write("\\f")
+      _ ->
+        if int(c) < 0x20 || int(c) == 0x7f then out.write(s"\\u${hex4(int(c))}") else out.writeChar(c)
+  out.writeChar('"')
+
+// A float as TOML writes it: `inf`, `-inf` and `nan` by name, and a finite one with a `.` or an
+// exponent, so it reads back as a float rather than an integer.
+private floatText(x: real) -> string
+  if x.isNaN then return "nan"
+  if x == real.PositiveInfinity then return "inf"
+  if x == real.NegativeInfinity then return "-inf"
+  val text = x.toString()
+  if text.contains(".") || text.contains("e") || text.contains("E") then text else text + ".0"
+
+// Whether TOML can write `d`, whose year must be four digits.
+private writable(d: Date) -> bool = 0 <= d.year <= 9999
+
+private dateText(d: Date) -> string
+  if !writable(d) then fail(s"TOML writes the years 0 to 9999, and $d is outside them")
+  s"$d"
+
+// An offset date-time: its reading, then `Z` for no offset or `±hh:mm`.
+private zonedText(z: Zoned) -> string
+  val total = z.offset.micros / 60000000
+  val sign = if total < 0 then "-" else "+"
+  val m = if total < 0 then -total else total
+  val offset = if total == 0 then "Z" else s"$sign${two(m / 60)}:${two(m % 60)}"
+  s"${dateText(z.date)}T${z.time}$offset"
+
+private two(v: long) -> string = if v < 10 then s"0$v" else s"$v"

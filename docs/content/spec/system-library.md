@@ -695,6 +695,90 @@ Usage: todo [options] <command> ...
 Run `todo --help` for the commands.
 ```
 
+### Configuration files and the environment
+
+A server takes its settings from more places than its command line. **`parseLayered` gives each
+option the first value found in four layers**: the command line, then the environment, then a TOML
+file, then the option's default. The command line wins over the environment, the environment over
+the file, and the file over the defaults, so a deployment sets what it must in a file, an operator
+overrides one setting in the environment, and a person trying something overrides it again with a
+flag. `Args.origin(name)` says which layer gave a value.
+
+```text run
+import avin.cli
+import avin.toml
+
+val parser = cli.Parser("srv", "Serve things.")
+  .string("host", default = "localhost")
+  .int("port", default = 80)
+  .flag("verbose", short = 'v')
+  .string("db.url", default = "postgres://localhost")
+
+val file = "port = 8080\nverbose = true\n\n[db]\nurl = \"postgres://db\"\n"
+
+main()
+  val config = toml.parse(file).getOrElse(toml.Toml.table())
+  val env = HashMap.empty[string, string]().updated("SRV_PORT", "9090")
+  parser.parseWithConfig(["--host", "0.0.0.0"], config, "srv.toml", envPrefix = "SRV_", env = env) match
+    Ok(a) ->
+      println(s"${a.string("host")}:${a.int("port")} ${a.flag("verbose")} ${a.string("db.url")}")
+      for name in ["host", "port", "verbose", "db.url"]
+        println(s"$name from ${a.origin(name)}")
+    Err(e) -> println(e.message)
+  val typo = toml.parse("prot = 1\n").getOrElse(toml.Toml.table())
+  println(parser.parseWithConfig([], typo, "srv.toml").err.map(e -> e.message))
+  val wrong = HashMap.empty[string, string]().updated("SRV_PORT", "eighty")
+  println(parser.parseWithConfig([], toml.Toml.table(), "srv.toml", "SRV_", wrong).err.map(e -> e.message))
+```
+
+```text output
+0.0.0.0:9090 true postgres://db
+host from the command line
+port from the environment variable `SRV_PORT`
+verbose from srv.toml
+db.url from srv.toml
+Some(`prot` in srv.toml is not an option of srv; did you mean `port`?)
+Some(the environment variable `SRV_PORT` needs an int, not `eighty`)
+```
+
+| Method on `Parser` | Reads |
+| --- | --- |
+| `parseLayered(args, file = "", fileRequired = false, envPrefix = "", env = process.environment())` | The command line, the environment and the TOML file `file`. An empty `file` reads none; a file that does not exist is skipped unless `fileRequired`. |
+| `parseWithConfig(args, config, source, envPrefix = "", env = process.environment())` | As `parseLayered`, with the file already read into the `Toml` table `config`, named `source` in the messages. |
+| `parseLayeredOrExit(…)` | As `parseLayered`, ending the program on an error as `parseOrExit` does. |
+
+**The file's keys are the options' names.** An option named with dots, `db.url`, is also the key
+`url` of the table `[db]`, or the dotted key `db.url`. A flag's value is `true` or `false`, a
+repeated option's an array of values or a single one, and every other value is of the option's
+type: a string for a string or a choice, an integer that fits for an int, an integer or a finite
+float for a real. **A key that is no option is an error**, naming the option it was most likely
+meant to be, so a misspelt setting is never silently ignored.
+
+**An option's environment variable is the prefix and its name in upper case**, each `-` and `.` an
+`_`: `SRV_DB_URL` for `db.url`, `SRV_MAX_CONNECTIONS` for `max-connections`. With no prefix the
+environment is not read, so `HOME` or `PATH` never set an option by chance. A flag's variable is
+`true`, `false`, `1` or `0`; any other option's is its text, checked as the command line's is; a
+repeated option takes one value from its variable. `env` is the environment to read, the process's
+own unless a test gives another.
+
+**A bad value is an `Invalid` error naming where it came from**, and `parseLayeredOrExit` writes it
+as it writes a mistake on the command line:
+
+| From | Message |
+| --- | --- |
+| The command line | `` `--port` needs an int, not `eighty` `` |
+| The environment | `` the environment variable `SRV_PORT` needs an int, not `eighty` `` |
+| The file's value | `` `port` in srv.toml needs an int, not a string ``; `` `port` in srv.toml needs an int, and 3000000000 does not fit one `` |
+| The file's key | `` `prot` in srv.toml is not an option of srv; did you mean `port`? `` |
+| The file's text | `srv.toml: '=' where a value was expected at line 2, column 8`, the TOML error with its line and column |
+| The file itself | `cannot read srv.toml: permission denied`, and `no such file or directory` where it is required |
+
+A flag the file or the environment sets to `false` stays unset even where a lower layer set it, and
+`given` is true of it, since it was given. A required option is satisfied by any layer. **`--help`
+and `--version` are answered whatever the file and the environment hold**, so a broken setting never
+keeps a user from the help. Only the parser's own options are layered: a command's options, and every
+positional argument, come from the command line alone.
+
 ## `avin.signal`
 
 Signals the program watches for: a number another process, or the platform, sends to ask it to
@@ -1847,6 +1931,117 @@ named is of the first thing wrong.
 | `BadPadding(at)` | An `=` where padding cannot stand: before the last two characters, followed by a character that is not `=`, more than two of them, or any in base64url. |
 | `Truncated(at)` | The text ends inside a unit: an odd number of hexadecimal digits, base64 whose length is not a multiple of four, base64url one character past one, base32 whose digits past a multiple of eight are 1, 3 or 6 or whose padding is not completed to eight. `at` is the text's length. |
 | `UnusedBits(at)` | The last digit of the data sets bits no bytes would set. |
+
+## `avin.toml`
+
+TOML 1.0 documents, the configuration files a server reads: `parse` reads one into a `Toml` value,
+with the line and column of anything wrong in it; `render` writes a value back as TOML text; and
+`derives TomlEncoder, TomlDecoder` reads a document straight into a program's own type and writes
+one from it.
+
+```text run
+import avin.toml
+import avin.toml.{Toml, TomlDecoder, TomlEncoder, TomlKey}
+
+data Database(host: string, port: int = 5432) derives TomlEncoder, TomlDecoder
+
+data Config(
+    name: string,
+    @TomlKey("listen-port") port: int = 8080,
+    tags: Vector[string] = [],
+    db: Database = Database("localhost")
+) derives TomlEncoder, TomlDecoder
+
+val text = "name = \"api\"\nlisten-port = 9000\ntags = [\"a\", \"b\"]\n\n[db]\nhost = \"db.internal\"\n"
+
+main()
+  val config = toml.decode[Config](text)
+  println(config)
+  println(toml.decode[Config]("name = \"api\"\nlisten-port = \"x\"\n"))
+  println(toml.parse("name = 1\nname = 2\n"))
+  val doc = toml.parse(text).getOrElse(Toml.table())
+  println(doc.at(["db", "host"]))
+  print(toml.encode(Config("web", tags = ["ü"])).getOrElse(""))
+```
+
+```text output
+Ok(Config(api, 9000, [a, b], Database(db.internal, 5432)))
+Err(listen-port: expected an integer, found a string)
+Err(the key `name` is defined twice at line 2, column 1)
+Some("db.internal")
+name = "web"
+listen-port = 8080
+tags = ["ü"]
+
+[db]
+host = "localhost"
+port = 5432
+```
+
+**`Toml` is the value tree**, a `data` type with a case for each kind of TOML value. The four
+date-time kinds are `avin.time`'s types: an offset date-time is a `Zoned` in its offset's fixed zone
+(`Z` and `-00:00` read as UTC), a local date-time a `DateTime`, a local date a `Date` and a local time
+a `Time`. A time keeps microseconds, so digits of a second's fraction past the sixth are cut off, as
+TOML allows; a leap second, `:60`, is refused, since a `Time` cannot hold it.
+
+| Case | Holds |
+| --- | --- |
+| `Str(value: string)` | Any of the four kinds of string. |
+| `Integer(value: long)` | A decimal, hexadecimal, octal or binary integer; one outside 64 bits is an error. |
+| `Float(value: real)` | A float, `inf`, `-inf` and `nan` included; one too large for a `real`, `1e309`, is an error. |
+| `Bool(value: bool)` | `true` or `false`. |
+| `OffsetDateTime(value: Zoned)`, `LocalDateTime(value: DateTime)`, `LocalDate(value: Date)`, `LocalTime(value: Time)` | The date-time kinds. |
+| `Arr(items: Vector[Toml])` | An array, of values of any kinds, or an array of tables. |
+| `Table(members: Vector[(string, Toml)])` | A table, its keys in the order the text first wrote them, each once. |
+
+`Toml.table(…)`, `Toml.arr(…)`, `Toml.str(s)` and `Toml.num(n)` make values. The accessors answer an
+`Option`: `asString`, `asLong`, `asInt` (where the integer fits), `asReal` (a float, or an integer
+rounded), `asBool`, `asZoned`, `asDateTime`, `asDate`, `asTime`, `asVector`, `asMembers`; `get(key)`,
+`get(index)`, `at(keys)` along a path of tables, and `has`, `keys`, `size`, `with(key, value)`;
+`apply(key)` and `apply(index)` trap where there is no such value; `kind` names the value's kind for
+a message, `an integer`.
+
+| Function | Meaning |
+| --- | --- |
+| `parse(text, maxDepth = 128) -> Result[Toml, TomlError]` | The table `text` writes. Also for a document's UTF-8 bytes, an `Array[byte]`, whose bytes that are not UTF-8 are an error at the first of them. |
+| `value.render -> string` | A table as a document, any other value as it is written after `=`. Also the value's `Display`. |
+| `decode[A](text, maxDepth = 128) -> Result[A, TomlError]` | The value of type `A` the document holds; also from bytes, and from a `Toml` tree, a part of a larger one. |
+| `encode[A](value) -> Result[string, TomlError]` | `value` as a document. |
+| `toTree[A](value) -> Result[Toml, TomlError]` | The tree `encode` writes. |
+
+**Every rule of the TOML 1.0 grammar is checked, and a breach is a `TomlError`**: its `message`,
+`line` and `column` (counted in characters from 1), byte `offset`, and a `path` of keys and indexes
+where a decoded value is at fault (`replicas[1].host`); one from a tree has no place, and line 0. A
+key defined twice, a table defined twice by headers, a dotted key adding to a table a header or an
+earlier section defined, an array of tables extending a static array, anything added to an inline
+table, an unknown escape, a surrogate, a control character in a string or a comment, a leading zero,
+an underscore not between two digits, a carriage return with no line feed after it: each is an error
+naming the key or the text, at the place it starts. The whole TOML 1.0 suite of toml-test, 208 valid
+and 509 invalid documents, is among the library's tests.
+
+**Nesting is limited, 128 deep unless `maxDepth` says otherwise.** The document's own table is 0
+deep, and each table or array inside another one deeper, counting every part of a dotted key or a
+header, so neither `[[[[…` nor `a.a.a.…` of any length can exhaust the reader's stack. Strings,
+arrays and tables of any length read in time linear in their size.
+
+**`render` writes a table's keys that hold other values first**, one to a line, then each table it
+holds under a `[header]` and each array of tables under one `[[header]]` for each element, with a
+blank line before each header; arrays and tables inside an array are written inline. A key is bare
+where it can be, else a basic string; strings are basic strings, every character but the control
+characters, `"` and `\` written as it is; a float always has a point or an exponent, so it reads
+back a float. A document read back from `render` therefore has the same values, a table's keys
+perhaps in another order. A date outside the years 0 to 9999, which TOML cannot write, traps in
+`render` and is an error from `encode`.
+
+**The derivations are those of JSON, on a tree**: a value is a table of its fields, by name; a type
+of several variants also carries its variant's name under the key `type`, written first. `@TomlKey(
+"name")` renames a field or a variant, `@TomlTag("kind")` the discriminator, and `@TomlOmit` leaves a
+field out both ways. A field absent from the input takes its default, or `None` for an `Option`, or
+is an error naming it; a key no field has is skipped. TOML has no null, so a field holding `None` is
+left out, and a `None` anywhere else, as an array's element, is an error. The built-in encoders and
+decoders are `bool`, `int` (an integer that fits), `long`, `real` (from a float or an integer),
+`string`, `Toml`, `Zoned`, `Instant` (written in UTC), `DateTime`, `Date`, `Time`, `Option`, `Vector`,
+`List`, and `HashMap` and `TreeMap` keyed by a `TomlMapKey`: `string`, `int` or `long`.
 
 ## `avin.log`
 
