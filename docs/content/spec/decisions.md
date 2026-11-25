@@ -10864,6 +10864,69 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     Review with the user: whether 10 seconds suits as the server default for clients on slow
     links, and whether `TcpStream.connect`'s default should be a bound rather than zero.
 
+- Settled on the user's delegation 2026-11-24 (branch `http-client-pool`): **the HTTP client keeps
+  its connections, streams responses and follows redirects by their status**
+  ([client](/spec/system-library/#client)). *Why*: the client wrote `Connection: close` and made a
+  connection, and for `https` a TLS handshake, for every request, read every body whole with no
+  limit, and followed redirects of `GET` and `HEAD` alone, so a `POST` answered `303` stopped there.
+  - **A `Client` class holds the connections, per origin, and the module's functions stay one
+    connection a request** (a `Client(keepAlive = false, maxRedirects = 5, maxResponseBytes =
+    long.MaxValue)` made for each call), so code calling `http.get` keeps its behaviour, its
+    `Connection: close` among it, and a program that talks to a server again and again makes one
+    `Client` and shares it between its threads. A module-level shared client was weighed: it would
+    be module-level mutable state every caller reaches, idle connections no one can close, and
+    limits no one chose.
+  - **The pool is the client's own, a `Mutex` over each origin's kept connections and counts, not
+    `threads.Pool`.** A `Pool`'s body is `@isolating` and gives back a sendable value, so it could
+    capture neither the request's `Array[byte]` body nor give back a `Response`; a per-origin `Pool`
+    in a map was weighed and refused for that. The client hands a connection's handles over, as
+    `Pool` does, when it keeps it (`hand_over` to no owner), so a connection one thread made is
+    used by the next thread that borrows it. Kept connections are a stack per origin, the latest
+    back used first, so a quiet period lets the older ones pass their idle timeout.
+  - **Limits and their defaults**: `maxPerHost = 16` connections an origin, lent and kept together;
+    `idleTimeout = 30 s`; `maxLifetime = 10 min`, so an address that changes is looked up again;
+    `maxRedirects = 10`; `maxHeaderBytes = 64 KiB` for the status line and headers, and the
+    trailers; `maxResponseBytes = 64 MiB` for a body `send` reads whole, checked against a
+    `Content-Length` before reading. The wait for a place among an origin's connections is bounded
+    by the request's existing `connectTimeout` (from branch `tls-handshake-timeout`), not a new
+    timeout: it is part of getting a connection, which that limit already bounds.
+  - **`Request.totalTimeout`**, none unless asked (`withTotalTimeout`), bounds the whole request,
+    redirects, reading the body and a `stream` function included, by `threads.withTimeout`, so a
+    connection stopped in the middle is closed by the exchange's deferred return. A wall-clock
+    deadline argument on `send` was weighed; a field keeps the request one value, carried across
+    redirects, beside its other two timeouts.
+  - **Reuse only after a clean exchange**: `HTTP/1.1`, no `Connection: close` from either end, the
+    body framed by length or chunks (not both, not to the close) and read to its end, nothing after
+    it. A body left partly read closes its connection rather than being drained, so a large
+    download abandoned costs nothing more; a redirect's body alone is drained, up to 64 KiB. A kept
+    connection that is readable (closed by the server, or holding bytes nothing asked for) is
+    closed before use; a request on a kept connection that fails before any response byte, other
+    than by a timeout, is sent once more on a new one where its method is idempotent (RFC 9110
+    9.2.2: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`). Retrying any method was weighed and
+    refused: a `POST` may have been acted on.
+  - **Streaming is scoped**: `client.stream(request, f)` hands `f` a `StreamedResponse` whose `body`
+    is a `BodyReader`, an `avin.io.Reader`, and keeps or closes the connection when `f` returns. A
+    response returned with a body still open, to be closed by its caller, was weighed and refused:
+    a forgotten one leaks a connection and its place among the origin's. Request bodies stay
+    `Array[byte]`; a streamed upload is left for later.
+  - **Redirects by status (RFC 9110 15.4)**: `303` becomes `GET` (a `HEAD` stays a `HEAD`); `301`
+    and `302` turn only a `POST` into a `GET`, as every browser does; `307` and `308` repeat method
+    and body. A request turned into a `GET` drops its body and its `Content-*` and
+    `Transfer-Encoding` headers. A redirect to another origin (scheme, host or port) drops
+    `Authorization`, `Proxy-Authorization`, `Cookie` and a given `Host`. Past the limit the redirect
+    is the answer, as the module's functions already did, rather than an error. This changes the
+    module's functions too: a `POST` answered `301` or `302` is now followed as a `GET`.
+  - **The response is parsed strictly**, the client being the side that meets a hostile server:
+    folded header lines, header names that are not tokens, a `Content-Length` that is not digits or
+    says two lengths, and over-long lines are errors; a new `HttpError.TooLarge(text)` names a
+    reply over a limit. A connection's TLS settings are part of its origin's key (the trusted PEMs
+    as text), so a connection made trusting one authority is never lent to a request trusting
+    another.
+  - Review with the user: the defaults (16 a host, 30 s idle, 10 min lifetime, 64 MiB bodies), and
+    following a `POST`'s `301`/`302` as a `GET` in the module's functions, which changed what
+    `net_http` printed. A key for `TlsClient` must grow with any setting it gains (client
+    certificates, ALPN).
+
 - Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
   `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
   and `Request.withForm` for `application/x-www-form-urlencoded`, `ServerRequest.multipart(limits)`,

@@ -2843,7 +2843,9 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | `http.post(url: string, body: string, contentType: string, headers = []) -> Result[Response, HttpError]` | Sends `body`, as UTF-8, and answers the response. |
 | `http.put(url, body, contentType, headers = [])` | The same with `PUT`. |
 | `http.patch(url, body, contentType, headers = [])` | The same with `PATCH`. |
-| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeout and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout`, `withTls` and `withConnectTimeout`. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeouts and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout`, `withTls`, `withConnectTimeout` and `withTotalTimeout`. |
+| `http.stream[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError]` | Sends the request and answers what `f` makes of the response, its body read as it arrives. |
+| `Client(...)` | A client that keeps its connections for the requests after the first, with the same verbs, `send` and `stream` as methods ([below](#client)). |
 
 Every verb answers a `Result[Response, HttpError]`, and `headers`, a `Vector[(string, string)]`, are
 sent after the ones the client writes, in order. `post`, `put` and `patch` send `Content-Type:
@@ -2864,14 +2866,15 @@ A `Response` has its `status` and `reason`, its `headers` as a vector of name an
 `header(name)` looking a name up without regard to case, its `body` as an `Array[byte]` and `text`
 reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, `Unsupported(text)` for a scheme
-other than `http` and `https`, and `Tls(TlsError)` for TLS that could not be set up (a connection
-that could not be made, broke or timed out being `Io`, for `https` as for `http`). The
-client speaks HTTP/1.1, one request to a connection, reads bodies by `Content-Length`, chunked or to
-the connection's end, and follows up to five redirects of a `GET` or `HEAD` (statuses 301, 302,
-303, 307 and 308), each `Location` resolved against the URL that answered by `Url.resolve`; the sixth
-is the answer. It writes `Host`, `Content-Length` (for a body, and for a `POST`, a `PUT` and a
-`PATCH` even when theirs is empty) and `Connection: close` unless the request gives them, then the
-request's own headers in order. `HEAD`, an interim
+other than `http` and `https`, `Tls(TlsError)` for TLS that could not be set up (a connection
+that could not be made, broke or timed out being `Io`, for `https` as for `http`), and
+`TooLarge(text)` for a reply over the client's limits. The module's functions speak HTTP/1.1 on a
+connection of their own for each request, closed after its response, read bodies by
+`Content-Length`, chunked or to the connection's end, and follow up to five redirects as a
+[`Client`](#client) does; the sixth is the answer. They write `Host`, `Content-Length` (for a body,
+and for a `POST`, a `PUT` and a `PATCH` even when theirs is empty) and `Connection: close` unless
+the request gives them, then the request's own headers in order; a `Client` writes no `Connection`
+of its own. `HEAD`, an interim
 `1xx` (which is skipped for the answer after it), `204` and `304` have no body. A method is a token
 and a header's name one too, and a header's value holds no line break; a request where one does not
 traps as it is made, whether the header came to `Request`'s constructor, to a verb, or by
@@ -2879,7 +2882,11 @@ traps as it is made, whether the header came to `Request`'s constructor, to a ve
 its connection. Its `connectTimeout`, 30 seconds unless `withConnectTimeout(d)` (or the constructor)
 sets another, bounds looking the host up, connecting and an `https` URL's TLS handshake together, on
 each connection the request makes, redirects included, failing with `Io` of kind `TimedOut`; zero
-takes the bound away, and a negative one traps as the request is made.
+takes the bound away, and a negative one traps as the request is made. Its `totalTimeout`, none
+unless `withTotalTimeout(d)` sets one, bounds the whole of it, from the call until the answer:
+getting a connection, writing, every redirect and reading the response, its body included, or for
+`stream`, the function given the response; once it runs out, the request is stopped where it is,
+its connection closed, and it fails with `Io` of kind `TimedOut`.
 
 **An `https` URL just works**: the client makes the TCP connection to the URL's port, 443 where it
 gives none, sets the request's timeout on it, so the handshake's waits are bounded too, the whole
@@ -2891,6 +2898,101 @@ keeping the request's TLS settings. TLS lives in the Sysl package `openssl`, whi
 names in `library/library.hocon`, its own `sysl-dependencies`; a program's shims depend on it only
 where a binding the program compiles reaches it, which `avin.net.http` and `avin.net.tls` do and
 `avin.net` alone does not ([proposed](/spec/decisions/#proposed)).
+
+#### Client
+
+**A `Client` keeps its connections.** It is made once and used for every request, by every thread
+(it is sendable), and sends each request on a connection kept from an earlier one to the same
+origin, its scheme, host and port (and for `https` its `TlsClient`'s settings), so a connection, and
+its TLS handshake, is paid for once:
+
+```text run
+import avin.net.http
+import avin.net.http.{Client, Request, Response}
+
+main()
+  val server = http.serve("127.0.0.1", 0, r -> Response.text(200, "hello, world")).ok.get
+  val base = s"http://127.0.0.1:${server.port()}"
+  val client = Client()
+  for _ in 1 .. 3
+    println(client.get(s"$base/").ok.get.text)
+  val length = client.stream(Request("GET", s"$base/"), r -> r.body.readAll().ok.get.length).ok.get
+  println(s"$length bytes, streamed")
+  println(client.stats())
+  client.close()
+  server.stop()
+```
+
+```text output
+hello, world
+hello, world
+hello, world
+12 bytes, streamed
+ClientStats(1, 3, 1, 0)
+```
+
+`Client(maxPerHost = 16, idleTimeout = seconds(30), maxLifetime = minutes(10), maxRedirects = 10,
+maxHeaderBytes = 65536, maxResponseBytes = 67108864, keepAlive = true)` has `get`, `head`,
+`delete`, `post`, `put`, `patch` and `send` as the module has, and:
+
+| Method | Meaning |
+| --- | --- |
+| `client.stream[R](request, f: (StreamedResponse) -> R) -> Result[R, HttpError]` | Hands `f` the response once its head has come, its `body` a `BodyReader` read as it arrives, and answers what `f` returns. |
+| `client.stats() -> ClientStats` | `ClientStats(opened, reused, idle, active)`: connections made in all, requests sent on a connection an earlier one used, connections kept now and lent now. |
+| `client.evictIdle() -> int` | Closes the kept connections past `idleTimeout` or `maxLifetime` now, answering how many. |
+| `client.close()` | Closes the kept connections; one lent now closes when it comes back, and a request afterwards fails with `Io`, making no connection. |
+
+**Limits.** An origin has at most `maxPerHost` connections, lent and kept together. A request
+that finds them all lent waits for one, within its `connectTimeout`, which also bounds making a new
+one, and fails with `Io` of kind `TimedOut` (`cannot wait for a connection to
+http://host:port: timed out`) when it runs out. A connection kept longer than `idleTimeout`, or
+older than `maxLifetime` (so a host whose address changes is looked up again), is closed instead of
+used; zero takes either away. A response's status line and headers together, and its trailers,
+may be at most `maxHeaderBytes` long, and a body `send` reads whole at most `maxResponseBytes`
+(found from its `Content-Length` before any of it is read, where it has one); over either is
+`TooLarge`. A `maxPerHost` or `maxHeaderBytes` below one, or a negative `maxRedirects`,
+`maxResponseBytes`, `idleTimeout` or `maxLifetime`, traps as the client is made. `keepAlive =
+false` keeps nothing: each request writes `Connection: close` and has its own connection, as the
+module's functions do (they are a `Client(maxRedirects = 5, maxResponseBytes = long.MaxValue,
+keepAlive = false)` made for each call).
+
+**A connection is used again only after a clean exchange**: the request was written whole, the
+response is `HTTP/1.1`, neither it nor the request says `Connection: close`, its body's end was
+found by its `Content-Length` or its chunks (not both, and not by the connection's close) and the
+body was read to that end, and nothing came after it. Anything else closes it: an error or a
+timeout, a body left partly read or not read at all, a trap or a cancellation in the middle, a
+`101`. A kept connection is checked before it is used: one with something to read, the server
+having closed it or sent what nothing asked for, is closed and another found. Where a request on a
+kept connection fails anyway, other than by a timeout, before any byte of its response comes (the
+server's close having crossed it), a request whose method may be repeated (`GET`, `HEAD`,
+`OPTIONS`, `TRACE`, `PUT`, `DELETE`) is sent once more on a new connection; any other fails.
+
+**The response is read strictly.** A header line beginning with a space (an obsolete folded
+line), a header name that is not a token (`Bad Name:`), a `Content-Length` that is not digits or
+says two lengths (`5, 6`; `3, 3` is one), and a chunk size past `int.MaxValue` are `Malformed`. A
+`Transfer-Encoding` whose last coding is `chunked` reads chunks, whatever `Content-Length` says, and
+one with any other coding reads to the close.
+
+**Redirects.** A `301`, `302`, `303`, `307` or `308` with a `Location` is followed, the location
+resolved against the URL that answered, up to `maxRedirects` times; the redirect after them is the
+answer, and with zero none is followed. A `303` asks again with `GET` (a `HEAD` stays a `HEAD`), and
+`301` and `302` turn a `POST`, and only a `POST`, into a `GET`; a request turned into a `GET` loses
+its body and its `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`,
+`Content-Location` and `Transfer-Encoding`. `307` and `308`, and `301` and `302` of any other
+method, send the same method and body again. A redirect to another origin drops `Authorization`,
+`Proxy-Authorization`, `Cookie` and a `Host` the request gave; one to the same origin keeps them. A
+`Location` that is not a URL is `BadUrl`, one to a scheme other than `http` and `https` is
+`Unsupported`, and a redirect with no `Location` is the answer. A redirect's body, up to 64 KiB, is
+read and dropped so its connection is kept.
+
+**Streamed responses.** `StreamedResponse` has the `status`, `reason`, `headers` and `header(name)`
+a `Response` has, and its `body`, a `BodyReader`, is a [`Reader`](#avinio): `read(max)` answers what has
+come of the body, up to `max` bytes, and an empty array at its end, so `io.copy(r.body, file)`
+saves it; `readAll()` reads the rest, `readAll(limit)` the rest or `TooLarge`, and `discard(limit)`
+reads and drops it, stopping past `limit` bytes, answering whether its end was reached;
+`isComplete` says whether it was read to its end. A body that breaks off, or whose chunks are not
+HTTP's, answers an `Err`, as every read after it does. The response belongs to `f`: once `f`
+returns, the body is not read again, and its connection is kept or closed as above.
 
 ## Concurrency
 

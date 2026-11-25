@@ -1,0 +1,108 @@
+// expect: exit 0
+// `Client.stream` and the module's `stream` against `http.serve`: a body by its length and a
+// chunked one read a few bytes at a time, as any `Reader` is, and copied whole by `io.copy`; UTF-8
+// split between reads; an empty body, a `HEAD` and a `204`; `isComplete` before and after the end,
+// and reads after it; `readAll` with a limit, under it and over it; `discard`; what `f` answers given
+// back; and a body read to its end keeping its connection, and one left partly read or not read at
+// all keeping none.
+import avin.io
+import avin.io.{ByteWriter, IoError}
+import avin.net.http
+import avin.net.http.{BodyReader, Client, HttpError, Request, Response, StreamedResponse, TooLarge}
+
+ok[T](r: Result[T, IoError]) -> T = r match
+  Ok(v) -> v
+  Err(e) -> fail(e.message)
+
+// Collects what is written to it.
+class Sink(): ByteWriter
+  val bytes = Buffer[byte]()
+
+  override write(more: Array[byte]) -> Result[unit, IoError]
+    bytes.addAll(more)
+    Ok(())
+
+// The body read `size` bytes at a time, each piece's length, then the text.
+pieces(body: BodyReader, size: int) -> string
+  val lengths = Buffer[int]()
+  val all = Buffer[byte]()
+  while true
+    val part = ok(body.read(size))
+    if part.length == 0 then break
+    lengths.addOne(part.length)
+    all.addAll(part)
+  s"${lengths.toVector} ${string.fromUtf8Lossy(all.toArray())} ${body.isComplete} ${ok(body.read(size)).length}"
+
+main()
+  val server = ok(http.serve("127.0.0.1", 0, r -> r.target.split("?")(0) match
+    "/sized" -> Response.text(200, "héllo, wörld")
+    "/chunked" -> Response.stream(200, "text/plain", w ->
+      _ = w.write("one ")
+      _ = w.write("two ")
+      _ = w.write("three"))
+    "/empty" -> Response.text(200, "")
+    "/none" -> Response.empty(204)
+    _ -> Response.text(200, "x".repeat(1000))))
+  val base = s"http://127.0.0.1:${server.port()}"
+  val client = Client()
+  val show = (r: Result[string, HttpError]) -> println(r match
+    Ok(text) -> text
+    Err(e) -> s"error: ${e.message}")
+
+  // Pieces of a sized body and a chunked one, UTF-8 cut between them.
+  show(
+    client.stream(
+      Request("GET", s"$base/sized"),
+      r -> s"${r.status} ${r.header("content-length")} ${pieces(r.body, 3)}"
+    )
+  )
+  show(client.stream(Request("GET", s"$base/chunked"), r -> s"${r.header("Transfer-Encoding")} ${pieces(r.body, 2)}"))
+  show(client.stream(Request("GET", s"$base/sized"), r -> pieces(r.body, 1000)))
+
+  // Bodies with nothing in them.
+  show(client.stream(Request("GET", s"$base/empty"), r -> s"empty ${r.body.isComplete} ${pieces(r.body, 5)}"))
+  show(client.stream(Request("HEAD", s"$base/sized"), r -> s"head ${r.body.isComplete} ${pieces(r.body, 5)}"))
+  show(client.stream(Request("GET", s"$base/none"), r -> s"${r.status} ${pieces(r.body, 5)}"))
+
+  // Copied by `io.copy`, read by `readAll`, under a limit and over one, and dropped.
+  show(client.stream(Request("GET", s"$base/chunked"), r ->
+    val sink = Sink()
+    val n = ok(io.copy(r.body, sink))
+    s"copied $n ${string.fromUtf8Lossy(sink.bytes.toArray())} ${r.body.isComplete}"))
+  show(client.stream(Request("GET", s"$base/big"), r -> s"all ${ok(r.body.readAll()).length}"))
+  show(client.stream(Request("GET", s"$base/big"), r -> r.body.readAll(1000) match
+    Ok(b) -> s"limit 1000: ${b.length}"
+    Err(e) -> s"limit 1000: ${e.message}"))
+  show(client.stream(Request("GET", s"$base/big"), r -> r.body.readAll(999) match
+    Ok(b) -> s"limit 999: ${b.length}"
+    Err(TooLarge(t)) -> s"limit 999: $t ${r.body.isComplete}"
+    Err(e) -> e.message))
+  show(client.stream(Request("GET", s"$base/chunked"), r -> r.body.readAll(13) match
+    Ok(b) -> s"chunked limit 13: ${b.length}"
+    Err(e) -> s"chunked limit 13: ${e.message}"))
+  show(client.stream(Request("GET", s"$base/chunked"), r -> r.body.readAll(12) match
+    Ok(b) -> s"chunked limit 12: ${b.length}"
+    Err(e) -> s"chunked limit 12: ${e.message}"))
+  show(client.stream(Request("GET", s"$base/big"), r -> s"discard ${r.body.discard(499)} ${r.body.discard(1000)}"))
+  show(client.stream(Request("GET", s"$base/big"), r -> s"discard ${r.body.discard(1000)} ${r.body.isComplete}"))
+
+  // What `f` answers, of any type.
+  client.stream(Request("GET", s"$base/sized"), r -> (r.status, r.headers.length > 0)) match
+    Ok((status, any)) -> println(s"a pair: $status $any")
+    Err(e) -> println(e.message)
+
+  // A body read to its end keeps its connection; one left keeps none.
+  val counting = Client()
+  _ = counting.stream(Request("GET", s"$base/big"), r -> ok(r.body.readAll()).length)
+  _ = counting.stream(Request("GET", s"$base/big"), r -> ok(r.body.readAll()).length)
+  println(s"read to the end: ${counting.stats().opened} ${counting.stats().idle}")
+  _ = counting.stream(Request("GET", s"$base/big"), r -> ok(r.body.read(10)).length)
+  println(s"left: ${counting.stats().opened} ${counting.stats().idle}")
+  _ = counting.stream(Request("GET", s"$base/sized"), r -> r.status)
+  println(s"never read: ${counting.stats().opened} ${counting.stats().idle}")
+  _ = counting.get(s"$base/empty")
+  println(s"empty: ${counting.stats().opened} ${counting.stats().idle} ${counting.stats().reused}")
+
+  // The module's own, on a connection of its own.
+  show(http.stream(Request("GET", s"$base/chunked"), r -> pieces(r.body, 4)))
+  server.stop()
