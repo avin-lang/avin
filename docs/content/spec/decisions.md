@@ -11056,6 +11056,25 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
 
 ## Proposed
 
+- Settled on the user's delegation 2026-11-24 (branch `fs-content-type`): **`avin.fs` has
+  `probeContentType(file) -> Result[Option[string], IoError]`, `contentTypeOfName(name) -> Option[string]`,
+  `sniffContentType(bytes) -> Option[string]`, and one shared extension table `fs.contentTypes`
+  (`HashMap[string, string]`).** The extension decides first and needs no disk; only a name the table
+  does not know is opened and its first 512 bytes sniffed (PNG, JPEG, GIF, WebP, WAV, PDF, ZIP,
+  gzip, WebAssembly, ELF, Mach-O thin forms, then UTF-8 text as `text/plain; charset=utf-8`: no NUL
+  or control character but tab, LF, FF, CR, ESC, and a character cut off by the 512th byte
+  allowed). An empty file is `Ok(None)`; a name that is not known and cannot be opened is `Err`.
+  Why: a probe that answers from the name is what a server wants per request, and sniffing is the
+  fallback for files saved without an extension. *One table for two users:* `http-static`'s
+  `MimeTypes.standard` in `avin.net.http` carries the same web table; to keep a single source,
+  `fs.contentTypes` holds exactly that table (entry for entry), so `MimeTypes.standard` becomes
+  `MimeTypes(fs.contentTypes)` (one line, replacing its `HashMap(...)` literal; `files.avin`
+  already imports `avin.fs`). Alternatives weighed: a table inside `avin.net.http` (then `fs`
+  would import the network layer, the wrong way round); a third shared module (a new module for one
+  value); sniff first (reads the disk for every file and lets file contents override a deliberate
+  name). Not sniffed: universal Mach-O/Java `CAFEBABE` (ambiguous), BMP's `BM` (two letters match
+  too much text), UTF-16 (no charset to name in the table's form); `Result[Option]` over a bare
+  `Option` because a missing or unreadable file is a failure, not "unknown".
 - Settled on the user's delegation 2026-11-23 (branch `fs-handle`): **`File` has positioned
   `readAt`/`writeAt`, `setLength` (alias `truncate`), `sync`/`syncData`/`fullSync` and
   `deleteOnClose`.** Positioned calls never move the position and hand over or give up what the
