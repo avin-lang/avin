@@ -11093,6 +11093,65 @@ Settled on the user's delegation 2026-11-11 (built on branch `json-derive`): **J
     a whole response, should gain a whole-response bound or a minimum rate, since a client reading
     a byte every few seconds holds a connection for as long as a large response lasts.
 
+- Settled on the user's delegation 2026-11-24 (branch `http-client-extras`): **the HTTP client's
+  cookie jar, proxies and `Authorization` helpers** ([client](/spec/system-library/#client)).
+  *Why*: a client talking to a site that logs in by cookie, or from behind a corporate proxy, had to
+  carry cookies and write `CONNECT` itself, and basic authentication was a base64 call by hand.
+  - **A `CookieJar` is opt in, `Client(cookies = Some(jar))`**, never a client's default: a server
+    calling other services should not carry one caller's session into another's request by
+    accident. One jar may serve several clients and threads (a `Mutex` over its list). A jar per
+    client made by default was weighed and refused for that reason.
+  - **RFC 6265bis storage**, reusing `SetCookie.parse` from branch `http-cookies`, so a cookie the
+    server side would refuse to write (a `__Host-` one with a `Domain`, `SameSite=None` without
+    `Secure`, a value with a space) is not stored either; a lenient parser of its own, taking what
+    browsers take, was weighed and refused as a second set of cookie rules. Kept by name, domain,
+    host-only-ness and path; `Max-Age` over `Expires`, both cut to 400 days as 6265bis says; an
+    `http` URL may neither set a `Secure` cookie nor replace or shadow one ("leave secure cookies
+    alone"); the time from an injected `clock`, as `RateLimiter` and `DateHeader` take theirs.
+  - **No public-suffix list.** The jar refuses a `Domain` of one label unless it is the host (which
+    then gets a host-only cookie), and an IP address is a domain only to itself. A suffix of two
+    labels or more (`co.uk`, `github.io`) is not caught, so a host under one may set a cookie for
+    its siblings. Bundling the list (some 10,000 rules, changing monthly) was weighed and left out:
+    it would date with every release, and a client usually talks to a few known services. Review
+    with the user: whether to bundle it, or take one from a file.
+  - **`HttpOnly` and `SameSite` are stored, not enforced**: they guard a page's scripts and its
+    cross-site requests, and a client has neither, so every matching cookie is sent. Ports are not
+    told apart, as RFC 6265 says.
+  - **Limits, with eviction**: 4096 bytes of name and value a cookie, 50 a domain and 3000 in all
+    (6265bis's minimums for a browser); over a limit an expired cookie goes first, then the least
+    recently sent or stored. Refusing the new cookie instead was weighed and refused: a server that
+    sets many short-lived cookies would lock its newest out.
+  - **`Proxy(http, https, noProxy)` is opt in too, `Client(proxy = …)`; `Proxy.fromEnvironment()`
+    reads the environment only when called.** A client reading `HTTP_PROXY` by default was weighed:
+    it is what many command-line tools do, but in a server it lets the environment redirect every
+    outgoing request, and under CGI a request's `Proxy` header becomes `HTTP_PROXY` ("httpoxy"), so
+    `fromEnvironment` also skips `HTTP_PROXY` where `REQUEST_METHOD` is set. Lower case wins over
+    upper case, then `ALL_PROXY`, as tools on the machine read them. Review with the user: whether
+    the default should be the environment.
+  - **`http` by the proxy with an absolute target; `https` through `CONNECT`**, the TLS handshake
+    with the server inside the tunnel, so the proxy sees nothing of the exchange. Only `http://`
+    proxies: a proxy URL of `https://` (TLS to the proxy) or `socks5://` fails the request with
+    `Unsupported`, as does a bad proxy URL with `BadUrl`, rather than going directly, which would
+    leak around a proxy the program asked for. A proxy URL without a scheme is `http`, and its port
+    defaults to 80, the scheme's. Credentials in the proxy URL (percent-decoded) are sent as
+    `Proxy-Authorization: Basic`; a refused `CONNECT` is the new `HttpError.ProxyRefused(status,
+    reason)`, while a `407` for an `http` URL is a response like any other status.
+  - **Pooled connections through a proxy are keyed by the proxy's URL and credentials and the
+    origin**, so a tunnel is never lent to another origin and one client's credentials never reach
+    a connection made with others'. Sharing one plain connection to a proxy across origins was
+    weighed and left out: it saves little and mixes origins on one connection.
+  - **`NO_PROXY` matching**: `*`; names matching themselves and every host under them, a leading `.`
+    or `*.` meaning the same; IP addresses and CIDR networks for both families; an optional `:port`
+    on any entry; entries separated by commas or white space; an entry that is none passed over. A
+    host is matched as written, never resolved, so a name never matches an address entry. A leading
+    `.` matching only the hosts under a name, not the name, was weighed; the tools on the machine
+    disagree, and the wider match only sends more requests directly.
+  - **`Request.withBasicAuth(user, password)` and `withBearer(token)`** replace any `Authorization`
+    and so are dropped on a redirect to another origin by the rule from branch `http-client-pool`.
+    A `user` with `:` or a control character in either part traps (RFC 7617 has no way to write
+    them), and a bearer token must be a `token68` (RFC 6750), or it traps; accepting any header
+    value was weighed and refused, as such a token would not reach a server intact.
+
 - Settled on the user's delegation 2026-11-23 (branch `http-forms`): **form bodies in
   `avin.net.http`** ([HTTP server](/spec/system-library/#http-server)): `ServerRequest.form()`
   and `Request.withForm` for `application/x-www-form-urlencoded`, `ServerRequest.multipart(limits)`,

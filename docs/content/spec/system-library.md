@@ -4361,7 +4361,7 @@ URL**, so `parse` refuses `http://h/%FF` with `InvalidUtf8(9)` and `queryParams`
 | `http.post(url: string, body: string, contentType: string, headers = []) -> Result[Response, HttpError]` | Sends `body`, as UTF-8, and answers the response. |
 | `http.put(url, body, contentType, headers = [])` | The same with `PUT`. |
 | `http.patch(url, body, contentType, headers = [])` | The same with `PATCH`. |
-| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeouts and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout`, `withTls`, `withConnectTimeout` and `withTotalTimeout`. |
+| `http.send(request: Request) -> Result[Response, HttpError]` | Any method, headers, body, timeouts and TLS settings, built from `Request(method, url, headers)` with `withHeader`, `withHeaders`, `withQueryParam`, `withBody`, `withTimeout`, `withTls`, `withConnectTimeout`, `withTotalTimeout`, `withBasicAuth` and `withBearer`. |
 | `http.stream[R](request: Request, f: (StreamedResponse) -> R) -> Result[R, HttpError]` | Sends the request and answers what `f` makes of the response, its body read as it arrives. |
 | `Client(...)` | A client that keeps its connections for the requests after the first, with the same verbs, `send` and `stream` as methods ([below](#client)). |
 
@@ -4385,8 +4385,9 @@ A `Response` has its `status` and `reason`, its `headers` as a vector of name an
 reading that as UTF-8, a sequence that is not read as U+FFFD. **A status is an answer, not a failure**: `404` is an `Ok`. `HttpError` is `Io(IoError)`,
 `BadUrl(UrlError)`, `Malformed(text)` for a reply that is not HTTP, `Unsupported(text)` for a scheme
 other than `http` and `https`, `Tls(TlsError)` for TLS that could not be set up (a connection
-that could not be made, broke or timed out being `Io`, for `https` as for `http`), and
-`TooLarge(text)` for a reply over the client's limits. The module's functions speak HTTP/1.1 on a
+that could not be made, broke or timed out being `Io`, for `https` as for `http`),
+`TooLarge(text)` for a reply over the client's limits, and `ProxyRefused(status, reason)` for a
+proxy that would not open a tunnel ([below](#client)). The module's functions speak HTTP/1.1 on a
 connection of their own for each request, closed after its response, read bodies by
 `Content-Length`, chunked or to the connection's end, and follow up to five redirects as a
 [`Client`](#client) does; the sixth is the answer. They write `Host`, `Content-Length` (for a body,
@@ -4451,7 +4452,8 @@ ClientStats(1, 3, 1, 0)
 ```
 
 `Client(maxPerHost = 16, idleTimeout = seconds(30), maxLifetime = minutes(10), maxRedirects = 10,
-maxHeaderBytes = 65536, maxResponseBytes = 67108864, keepAlive = true)` has `get`, `head`,
+maxHeaderBytes = 65536, maxResponseBytes = 67108864, keepAlive = true, cookies: Option[CookieJar] =
+None, proxy = Proxy())` has `get`, `head`,
 `delete`, `post`, `put`, `patch` and `send` as the module has, and:
 
 | Method | Meaning |
@@ -4513,6 +4515,109 @@ reads and drops it, stopping past `limit` bytes, answering whether its end was r
 `isComplete` says whether it was read to its end. A body that breaks off, or whose chunks are not
 HTTP's, answers an `Err`, as every read after it does. The response belongs to `f`: once `f`
 returns, the body is not read again, and its connection is kept or closed as above.
+
+**Cookies.** A client keeps cookies only when it is given a `CookieJar`: `Client(cookies =
+Some(jar))` stores every response's `Set-Cookie` headers in `jar`, each redirect's too, and sends
+each request, each redirect's included, the cookies `jar` holds for its URL in one `Cookie` header,
+after the cookies of any `Cookie` header the request gives. A jar is safe to share between threads
+and clients:
+
+```text run
+import avin.net.http
+import avin.net.http.{Client, CookieJar, Request, Response}
+
+main()
+  val server = http.serve("127.0.0.1", 0, r -> r.target match
+    "/login" -> Response.empty(302).withHeader("Location", "/home").withHeader("Set-Cookie", "sid=abc; Path=/; HttpOnly")
+    _ -> Response.text(200, s"cookie: ${r.header("Cookie").getOrElse("none")}")).ok.get
+  val base = s"http://127.0.0.1:${server.port()}"
+  val jar = CookieJar()
+  val client = Client(cookies = Some(jar))
+  println(client.get(s"$base/login").ok.get.text)
+  println(client.send(Request("GET", s"$base/").withBearer("t0ken")).ok.get.text)
+  println(jar.header("http://127.0.0.1/"))
+  println(jar.all().map(c -> s"${c.name} ${c.domain} ${c.path} hostOnly=${c.hostOnly} httpOnly=${c.httpOnly}"))
+  server.stop()
+```
+
+```text output
+cookie: sid=abc
+cookie: sid=abc
+Some(sid=abc)
+[sid 127.0.0.1 / hostOnly=true httpOnly=true]
+```
+
+`CookieJar(maxCookieBytes = 4096, maxPerDomain = 50, maxCookies = 3000, clock = now)` follows RFC
+6265bis, reading each header with `SetCookie.parse` (so a cookie breaking its rules is not stored):
+
+| Method | Meaning |
+| --- | --- |
+| `jar.setCookie(url: string, header: string) -> bool` | Stores the cookie of a `Set-Cookie` value from a response to `url`; answers whether it was taken (stored, or removing the one it names where it has already expired). |
+| `jar.receive(url: Url, headers)` | Stores every `Set-Cookie` among a response's headers. |
+| `jar.cookies(url) -> Vector[Cookie]`, `jar.header(url) -> Option[string]` | The cookies a request to `url` carries, in order, and its `Cookie` header; `url` is a `string` or a `Url`. |
+| `jar.all() -> Vector[StoredCookie]`, `jar.size` | The cookies held and not expired, in the order first stored: `StoredCookie(name, value, domain, path, hostOnly, secure, httpOnly, sameSite, expires, created)`. |
+| `jar.clear()`, `jar.clearSession()` | Removes every cookie, or those with no `Max-Age` or `Expires`. |
+
+A cookie without `Domain` goes back to the host that set it only (`hostOnly`); one with `Domain`
+to that domain and the hosts under it, and it is refused unless the host setting it is the domain
+or under it. **The jar has no public-suffix list**: it refuses a `Domain` of one label (`com`)
+unless that is the host itself (`localhost`, which then gets a host-only cookie), so a public
+suffix of two labels or more (`co.uk`) is not caught. An IP address is a domain only to itself, and
+cookies, as RFC 6265 has them, do not tell ports apart. A cookie without a `Path` (or with one not
+beginning with `/`) takes the request path up to its last `/`; a request's path matches a cookie's
+path where they are equal or the cookie's is a prefix of it ending at a `/`. `Max-Age` (seconds)
+wins over `Expires`, either is cut to 400 days, and an expiry already past removes the stored
+cookie of that name, domain and path; the time is read from `clock`. A `Secure` cookie, which every
+`__Secure-` and `__Host-` cookie is, is stored only from an `https` URL and sent only over `https`,
+and a cookie from an `http` URL may not replace a `Secure` one of its name whose domain and path it
+overlaps. A cookie of the same name, domain, host-only-ness and path replaces the stored one and
+keeps its creation time. A request carries the matching cookies with the longer paths first, then
+the earlier created. `HttpOnly` and `SameSite` are stored and shown but hold no cookie back: they
+are rules for a browser's scripts and its cross-site requests, and a client has neither. **The jar
+is bounded**: a cookie whose name and value together are over `maxCookieBytes` is refused, and once a
+domain holds more than `maxPerDomain` cookies, or the jar more than `maxCookies`, an expired one goes
+first, then the one least recently sent or stored. A limit below one traps.
+
+**Proxies.** `Client(proxy = p)` sends each request by the proxy `p` names for its URL; the default
+`Proxy()` names none, so a client goes directly unless it is told otherwise, the environment
+included. `Proxy(http: Option[string] = None, https: Option[string] = None, noProxy = "")` holds a
+proxy URL for `http` URLs and one for `https` URLs and the hosts reached directly; `Proxy.to(url,
+noProxy = "")` sends both schemes by one proxy, and `Proxy.fromEnvironment()` reads the variables
+other tools on the machine read: `http_proxy`, else `HTTP_PROXY`; `https_proxy`, else
+`HTTPS_PROXY`; either, where those leave it unset, from `all_proxy`, else `ALL_PROXY`; and
+`no_proxy`, else `NO_PROXY`. An empty variable is unset, and under CGI (where `REQUEST_METHOD` is
+set) `HTTP_PROXY` is not read, since a request's `Proxy` header arrives as it.
+`Proxy.fromEnvironment(lookup)` reads them through `lookup` instead of the process's environment.
+`p.forUrl(url) -> Option[string]` answers the proxy a URL goes by and `p.bypasses(url)` whether
+`noProxy` sends it directly.
+
+A proxy URL is `http://host:port`, `http://` and port `80` where it leaves them out; a user and
+password in it (`http://user:secret@proxy:3128`, each percent-encoded) are sent as
+`Proxy-Authorization: Basic`. An `http` URL is asked of the proxy with the whole URL as the request's
+target, and the proxy's credentials on every request (a `Proxy-Authorization` the request gives
+itself is sent instead); a `407` is then the answer, as any status is. An `https` URL goes through a
+tunnel: the client sends `CONNECT host:port` with the credentials, and once the proxy answers `2xx`
+makes the TLS handshake with the server through it, so the proxy sees neither request nor response.
+The `CONNECT` and its answer count against the request's `connectTimeout`, its answer's head against
+`maxHeaderBytes`; any other status fails the request with `ProxyRefused(status, reason)`, and bytes
+the proxy sends after a `2xx` with `Malformed`. A proxy URL of another scheme (`https://`,
+`socks5://`) fails the request with `Unsupported`, and one that is not a URL with `BadUrl`; neither
+sends it directly. Connections through a proxy are kept like any other, apart from the direct ones
+and by the proxy and its credentials as well as by the origin.
+
+`noProxy` is a list separated by commas or spaces, compared without regard to case: `*` alone is
+every host; a name (`example.com`, written also `.example.com` or `*.example.com`) is that host and
+every host under it, `api.example.com` but not `badexample.com`; an IP address (`10.1.2.3`, `::1`
+or `[::1]`) is that address, and a CIDR network (`10.0.0.0/8`, `fe80::/10`) every address in it;
+and any of these but `*` may end in `:port`, matching that port only (`[::1]:8080` for IPv6). An
+entry matches the URL's host as written, a name never matching an address entry and no name looked
+up, and an entry that is none of these is passed over.
+
+**Credentials.** `request.withBasicAuth(user, password)` sets the request's only `Authorization` to
+`Basic` and `user:password` in UTF-8 and base64 (RFC 7617), trapping where `user` holds `:` or
+either holds a control character; `request.withBearer(token)` sets it to `Bearer token` (RFC 6750),
+trapping where `token` is empty or not a `token68`. Like any `Authorization`, either is dropped on a
+redirect to another origin and kept on one to the same origin.
 
 ### Redis
 

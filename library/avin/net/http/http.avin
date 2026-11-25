@@ -5,6 +5,7 @@ module avin.net.http
 // beside this file, and the server, `serve`, in `server.avin`; a `Response` is what its handlers
 // answer.
 
+import avin.encoding.toBase64
 import avin.html.Html
 import avin.io.IoError
 import avin.net.{Url, UrlError}
@@ -29,6 +30,9 @@ data HttpError
   // The reply is over one of the client's limits: its head over `maxHeaderBytes`, or the body of a
   // response read whole over `maxResponseBytes`.
   TooLarge(text: string)
+  // The proxy an `https` URL goes by answered its `CONNECT` with `status`, not a `2xx`, opening no
+  // tunnel: a `407` where it wants credentials it was not given or refuses those it was.
+  ProxyRefused(status: int, reason: string)
 
 impl Error for HttpError
   // A sentence saying what went wrong, for a message to a person.
@@ -39,6 +43,7 @@ impl Error for HttpError
     Unsupported(t) -> s"unsupported: $t"
     Tls(e) -> e.message
     TooLarge(t) -> s"reply too large: $t"
+    ProxyRefused(status, reason) -> s"the proxy refused the tunnel: $status $reason"
 
 // A request: its method, its URL as text, the headers sent besides the ones the client writes, its
 // body, how long a read or write on its connection may wait, the TLS settings an `https` URL is
@@ -79,6 +84,33 @@ class Request(
 
   // The value of the first header of `name`, compared without regard to case.
   header(name: string) -> Option[string] = headerIn(headers, name)
+
+  // The request with `Authorization: Basic` and `user` and `password` (RFC 7617), as UTF-8, for its
+  // only `Authorization`. Like every `Authorization`, it is dropped on a redirect to another origin. A
+  // `user` holding `:`, or either holding a control character, traps.
+  withBasicAuth(user: string, password: string) -> Request
+    if user.indexOf(':') >= 0 then fail("a user name for basic authentication holds `:`")
+    if user.exists(isControl) || password.exists(isControl)
+      fail("a user name or password for basic authentication holds a control character")
+    authorized("Basic " + toBase64(s"$user:$password"))
+
+  // The request with `Authorization: Bearer token` (RFC 6750) for its only `Authorization`, dropped on
+  // a redirect to another origin as `withBasicAuth`'s is. A `token` that is empty or not a `token68`
+  // (letters, digits, `-`, `.`, `_`, `~`, `+` and `/`, then any `=`) traps.
+  withBearer(token: string) -> Request
+    if !isToken68(token) then fail("a bearer token is not a token68")
+    authorized("Bearer " + token)
+
+  private authorized(value: string) -> Request = Request(
+    method,
+    url,
+    withoutHeader(headers, "Authorization") :+ ("Authorization", value),
+    body,
+    timeout,
+    tls,
+    connectTimeout,
+    totalTimeout
+  )
 
   // The request with the headers of `more` added after the ones it has, in order.
   withHeaders(more: Vector[(string, string)]) -> Request =
@@ -341,3 +373,16 @@ private withParam(url: string, name: string, value: string) -> string
 
 // The UTF-8 bytes of `text`.
 private utf8(text: string) -> Array[byte] = Array.tabulate(text.byteLength, i -> text.byteAt(i))
+
+// Whether `text` is a `token68` (RFC 9110 section 11.2): one or more of letters, digits, `-`, `.`,
+// `_`, `~`, `+` and `/`, then any number of `=`.
+private isToken68(text: string) -> bool
+  val end = text.indexWhere(c -> c == '=')
+  val body = if end < 0 then text else text.slice(0, end)
+  val pad = if end < 0 then "" else text.slice(end, text.byteLength)
+  !body.isEmpty && body.forall(c ->
+    (
+      'a' <= c <= 'z'
+    ) || ('A' <= c <= 'Z') || ('0' <= c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' || c == '+'
+      || c == '/'
+  ) && pad.forall(c -> c == '=')
